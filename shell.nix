@@ -17,6 +17,9 @@ pkgs.mkShell {
     openssl
     openssl.dev
     libopus
+    # Runtime dep of discord_vox --record: WAV → FLAC (mixed) and
+    # WAV → Opus (per-user) transcode happens via `ffmpeg` at session end.
+    ffmpeg
   ];
 
   # bindgen (used by pipewire-sys) needs libclang at runtime.

@@ -24,8 +24,13 @@ songbird = { version = "0.6", default-features = false, features = [
     "receive",
 ] }
 
-# WAV file writer for per-user and mixed recordings.
+# WAV file writer for the mixed track (transcoded to FLAC at session end).
 hound = "3"
+# Ogg container for raw-Opus per-user capture.
+ogg = "0.9"
+# Provides the `Packet` trait so we can call `.payload()` on the RTP packet
+# songbird hands us via VoiceTick. Version matches songbird 0.6's own dep.
+discortp = "0.6"
 # Timestamped session directory names.
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 

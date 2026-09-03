@@ -1,11 +1,13 @@
 //! Per-session voice recorder.
 //!
 //! For each auto-join session we open a fresh directory containing:
-//!   * `user-<uid>.wav` for each speaker (silence-padded so all files line up
-//!     with the mixed file on the same timeline).
-//!   * `mixed.wav` — everyone summed to a single stereo track.
-//!
-//! Files are 48 kHz, 16-bit signed, stereo (Discord's native decoded format).
+//!   * `mixed.wav` — everyone summed to a single stereo track, transcoded to
+//!     lossless FLAC at session end (see [`transcode_session`]).
+//!   * `user-<uid>[-<name>].opus` for each speaker — the raw Opus packets
+//!     Discord sent us, wrapped in an Ogg container. No re-encoding, so
+//!     these are lossless relative to what left the speaker's client.
+//!     Silence is skipped: per-user files are speech-only and are not time
+//!     aligned with `mixed.wav`.
 
 use std::collections::HashMap;
 use std::fs::{self, File};
@@ -15,7 +17,8 @@ use std::sync::Mutex;
 
 use anyhow::{Context as _, Result};
 use hound::{SampleFormat, WavSpec, WavWriter};
-use tracing::{debug, error, warn};
+use ogg::writing::{PacketWriteEndInfo, PacketWriter};
+use tracing::{debug, error, info, warn};
 
 pub const SAMPLE_RATE: u32 = 48_000;
 pub const CHANNELS: u16 = 2;
@@ -31,29 +34,34 @@ const WAV_SPEC: WavSpec = WavSpec {
     sample_format: SampleFormat::Int,
 };
 
-type Writer = WavWriter<BufWriter<File>>;
+type MixedWriter = WavWriter<BufWriter<File>>;
+type UserWriter = PacketWriter<'static, BufWriter<File>>;
 
 struct State {
     session_dir: PathBuf,
-    mixed: Option<Writer>,
-    /// Per-SSRC writer + interleaved-sample count already written, so we can
-    /// silence-pad late arrivals up to the current session timeline.
+    mixed: Option<MixedWriter>,
     per_user: HashMap<u32, PerUser>,
     ssrc_to_user: HashMap<u32, u64>,
     /// Resolved, sanitized display name per user id (filled in async after
     /// note_speaker fires; may never arrive if the fetch fails).
     user_display_name: HashMap<u64, String>,
-    /// Total 20 ms ticks observed since the recorder started.
-    tick_counter: u64,
 }
 
 struct PerUser {
-    writer: Writer,
+    writer: UserWriter,
     /// Current on-disk path of this file — tracked so we can rename it in
     /// place if the SSRC → UserId mapping arrives after the writer is opened.
     path: PathBuf,
-    /// Total samples (interleaved L,R,L,R,...) written to this file.
-    samples_written: u64,
+    /// Ogg stream serial. Using SSRC directly is unique-enough per session.
+    serial: u32,
+    /// Cumulative 48 kHz samples emitted for this stream (Opus granule
+    /// position). Advances by 960 per 20 ms packet regardless of the
+    /// packet's channel count.
+    granulepos: u64,
+    /// Most recently written packet, held back so `finalize()` can flag it
+    /// with `EndStream` instead of `NormalPacket`. Store the granulepos at
+    /// its end so we can pass it through unchanged.
+    pending: Option<(Vec<u8>, u64)>,
 }
 
 pub struct Recorder {
@@ -74,7 +82,6 @@ impl Recorder {
                 per_user: HashMap::new(),
                 ssrc_to_user: HashMap::new(),
                 user_display_name: HashMap::new(),
-                tick_counter: 0,
             }),
         })
     }
@@ -85,7 +92,7 @@ impl Recorder {
 
     /// Remember the SSRC → Discord user id mapping. Discord may deliver
     /// audio for a new SSRC before the SpeakingStateUpdate that carries the
-    /// user id, so if we've already opened a `ssrc-<num>.wav` fallback file
+    /// user id, so if we've already opened a `ssrc-<num>.opus` fallback file
     /// we rename it in place. The underlying fd keeps writing to the same
     /// inode across the rename.
     pub fn note_speaker(&self, ssrc: u32, user_id: Option<u64>) {
@@ -118,27 +125,25 @@ impl Recorder {
 
     /// Process a single 20 ms voice tick.
     ///
-    /// `speaking`: SSRC → decoded stereo i16 PCM (may be shorter than
-    /// SAMPLES_PER_TICK on packet loss).
-    /// `silent`: SSRCs known to be in the channel but not speaking this tick;
-    /// we silence-pad their files so they stay time-aligned.
-    pub fn write_tick(&self, speaking: &HashMap<u32, &[i16]>, silent: &[u32]) {
+    /// `speaking_pcm`: SSRC → decoded stereo i16 PCM (used only for the
+    /// mixed track). `speaking_opus`: SSRC → raw Opus packet payload
+    /// (written verbatim to each speaker's Ogg file). The two hashmaps are
+    /// keyed identically in normal operation, but each side is tolerant of
+    /// missing entries.
+    pub fn write_tick(
+        &self,
+        speaking_pcm: &HashMap<u32, &[i16]>,
+        speaking_opus: &HashMap<u32, &[u8]>,
+    ) {
         let mut state = self.state.lock().unwrap();
-        state.tick_counter = state.tick_counter.saturating_add(1);
 
+        // Mixed track: sum in i32 to avoid wraparound, hard-clip to i16.
         let mut mix = [0i32; SAMPLES_PER_TICK];
-
-        for (&ssrc, samples) in speaking {
+        for samples in speaking_pcm.values() {
             for (i, &s) in samples.iter().take(SAMPLES_PER_TICK).enumerate() {
                 mix[i] = mix[i].saturating_add(s as i32);
             }
-            state.write_user(ssrc, samples);
         }
-
-        for &ssrc in silent {
-            state.write_silence(ssrc, SAMPLES_PER_TICK);
-        }
-
         if let Some(mixed) = state.mixed.as_mut() {
             for &s in &mix {
                 let clipped = s.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
@@ -149,9 +154,19 @@ impl Recorder {
                 }
             }
         }
+
+        // Per-user Opus files: append the raw packet, if any.
+        for (&ssrc, payload) in speaking_opus {
+            if payload.is_empty() {
+                continue;
+            }
+            let channels = opus_toc_channels(payload[0]);
+            state.write_opus_packet(ssrc, payload, channels);
+        }
     }
 
-    /// Flush and close every writer. Idempotent.
+    /// Flush and close every writer, writing a final EndStream page on each
+    /// per-user file so it terminates cleanly. Idempotent.
     pub fn finalize(&self) {
         let mut state = self.state.lock().unwrap();
         if let Some(w) = state.mixed.take() {
@@ -160,16 +175,20 @@ impl Recorder {
             }
         }
         let per_user = std::mem::take(&mut state.per_user);
-        for (ssrc, pu) in per_user {
-            if let Err(err) = pu.writer.finalize() {
-                warn!(?err, ssrc, "per-user writer finalize failed");
+        for (ssrc, mut pu) in per_user {
+            if let Some((payload, gp)) = pu.pending.take() {
+                if let Err(err) = pu.writer.write_packet(
+                    payload,
+                    pu.serial,
+                    PacketWriteEndInfo::EndStream,
+                    gp,
+                ) {
+                    warn!(?err, ssrc, "per-user EOS write failed");
+                }
             }
+            // Dropping `pu.writer` drops the BufWriter, which flushes.
         }
-        debug!(
-            dir = %state.session_dir.display(),
-            ticks = state.tick_counter,
-            "recorder finalized"
-        );
+        debug!(dir = %state.session_dir.display(), "recorder finalized");
     }
 }
 
@@ -183,10 +202,10 @@ impl State {
     fn desired_filename(&self, ssrc: u32) -> String {
         match self.ssrc_to_user.get(&ssrc) {
             Some(uid) => match self.user_display_name.get(uid) {
-                Some(name) => format!("user-{uid}-{name}.wav"),
-                None => format!("user-{uid}.wav"),
+                Some(name) => format!("user-{uid}-{name}.opus"),
+                None => format!("user-{uid}.opus"),
             },
-            None => format!("ssrc-{ssrc}.wav"),
+            None => format!("ssrc-{ssrc}.opus"),
         }
     }
 
@@ -214,70 +233,96 @@ impl State {
         }
     }
 
-    fn writer_for(&mut self, ssrc: u32) -> Option<&mut PerUser> {
+    /// Open a per-user Ogg-Opus writer on first packet, writing the
+    /// OpusHead + OpusTags headers so the file is a valid Ogg stream from
+    /// byte zero.
+    fn writer_for(&mut self, ssrc: u32, channels: u8) -> Option<&mut PerUser> {
         if !self.per_user.contains_key(&ssrc) {
-            let name = self.desired_filename(ssrc);
-            let path = self.session_dir.join(&name);
-            let writer = match WavWriter::create(&path, WAV_SPEC) {
-                Ok(w) => w,
+            let path = self.session_dir.join(self.desired_filename(ssrc));
+            let file = match File::create(&path) {
+                Ok(f) => f,
                 Err(err) => {
-                    error!(?err, path = %path.display(), "failed to open per-user wav");
+                    error!(?err, path = %path.display(), "failed to open per-user .opus");
                     return None;
                 }
             };
-            let mut pu = PerUser {
-                writer,
-                path: path.clone(),
-                samples_written: 0,
-            };
-            // Silence-pad this file up to the current session position so it
-            // stays aligned with the mixed track.
-            let pad_ticks = self.tick_counter.saturating_sub(1);
-            let pad_samples = pad_ticks * SAMPLES_PER_TICK as u64;
-            for _ in 0..pad_samples {
-                if pu.writer.write_sample(0i16).is_err() {
-                    break;
-                }
+            let mut writer = PacketWriter::new(BufWriter::new(file));
+            let serial = ssrc;
+            let head = build_opus_head(channels);
+            let tags = build_opus_tags();
+            if let Err(err) = writer.write_packet(head, serial, PacketWriteEndInfo::EndPage, 0) {
+                error!(?err, ssrc, "OpusHead write failed");
+                return None;
             }
-            pu.samples_written = pad_samples;
-            self.per_user.insert(ssrc, pu);
+            if let Err(err) = writer.write_packet(tags, serial, PacketWriteEndInfo::EndPage, 0) {
+                error!(?err, ssrc, "OpusTags write failed");
+                return None;
+            }
+            self.per_user.insert(
+                ssrc,
+                PerUser {
+                    writer,
+                    path,
+                    serial,
+                    granulepos: 0,
+                    pending: None,
+                },
+            );
         }
         self.per_user.get_mut(&ssrc)
     }
 
-    fn write_user(&mut self, ssrc: u32, samples: &[i16]) {
-        let Some(pu) = self.writer_for(ssrc) else {
+    fn write_opus_packet(&mut self, ssrc: u32, payload: &[u8], channels: u8) {
+        let Some(pu) = self.writer_for(ssrc, channels) else {
             return;
         };
-        let take = samples.len().min(SAMPLES_PER_TICK);
-        for &s in &samples[..take] {
-            if pu.writer.write_sample(s).is_err() {
-                return;
+        pu.granulepos = pu.granulepos.saturating_add(FRAMES_PER_TICK as u64);
+        // Flush the previously-buffered packet as a normal one, then buffer
+        // this one so finalize() can flag it with EndStream.
+        if let Some((prev, prev_gp)) = pu.pending.take() {
+            if let Err(err) = pu.writer.write_packet(
+                prev,
+                pu.serial,
+                PacketWriteEndInfo::NormalPacket,
+                prev_gp,
+            ) {
+                warn!(?err, ssrc, "opus packet write failed");
             }
         }
-        // If the tick was short (packet loss), pad out the rest with silence
-        // so this file stays aligned tick-for-tick with everything else.
-        for _ in take..SAMPLES_PER_TICK {
-            if pu.writer.write_sample(0i16).is_err() {
-                return;
-            }
-        }
-        pu.samples_written += SAMPLES_PER_TICK as u64;
+        pu.pending = Some((payload.to_vec(), pu.granulepos));
     }
+}
 
-    fn write_silence(&mut self, ssrc: u32, samples: usize) {
-        // Only pad if we've already opened a writer for this speaker; there's
-        // no point opening a file for someone who's never spoken.
-        let Some(pu) = self.per_user.get_mut(&ssrc) else {
-            return;
-        };
-        for _ in 0..samples {
-            if pu.writer.write_sample(0i16).is_err() {
-                return;
-            }
-        }
-        pu.samples_written += samples as u64;
-    }
+/// Decode the "stereo" bit out of an Opus TOC byte. Layout: `CCCCCSFF`
+/// (5 bits config, 1 bit stereo, 2 bits frame-count code). We only need
+/// the S bit to set the correct channel count in the OpusHead header.
+fn opus_toc_channels(toc: u8) -> u8 {
+    if (toc >> 2) & 1 == 1 { 2 } else { 1 }
+}
+
+/// Build the OpusHead identification header packet per RFC 7845 §5.1.
+fn build_opus_head(channels: u8) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(19);
+    buf.extend_from_slice(b"OpusHead");
+    buf.push(1); // version
+    buf.push(channels);
+    buf.extend_from_slice(&312u16.to_le_bytes()); // pre_skip (samples @ 48 kHz)
+    buf.extend_from_slice(&SAMPLE_RATE.to_le_bytes()); // original input rate
+    buf.extend_from_slice(&0i16.to_le_bytes()); // output gain (Q7.8, 0 = no change)
+    buf.push(0); // channel mapping family 0 (mono/stereo, RTP-style)
+    buf
+}
+
+/// Build the OpusTags comment header packet per RFC 7845 §5.2. Minimal —
+/// vendor string only, zero user comments.
+fn build_opus_tags() -> Vec<u8> {
+    let vendor = b"discord_vox";
+    let mut buf = Vec::with_capacity(8 + 4 + vendor.len() + 4);
+    buf.extend_from_slice(b"OpusTags");
+    buf.extend_from_slice(&(vendor.len() as u32).to_le_bytes());
+    buf.extend_from_slice(vendor);
+    buf.extend_from_slice(&0u32.to_le_bytes()); // 0 user comments
+    buf
 }
 
 pub fn timestamped_session_dir(root: &Path) -> PathBuf {
@@ -308,4 +353,51 @@ pub fn sanitize_display_name(raw: &str) -> String {
         out = trimmed.to_string();
     }
     out
+}
+
+/// Post-process a finalized session directory: transcode `mixed.wav` to
+/// lossless FLAC, deleting the source on success. Per-user files are
+/// already Ogg-Opus so they don't need touching. Spawned from
+/// `Handler::leave` so it runs off the hot path.
+///
+/// A short sleep at the start lets any in-flight display-name renames land
+/// before we snapshot the directory contents.
+pub async fn transcode_session(session_dir: PathBuf) {
+    use tokio::process::Command;
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let mixed_wav = session_dir.join("mixed.wav");
+    if !mixed_wav.exists() {
+        return;
+    }
+    let mixed_flac = session_dir.join("mixed.flac");
+
+    let status = Command::new("ffmpeg")
+        .arg("-loglevel").arg("error")
+        .arg("-y")
+        .arg("-i").arg(&mixed_wav)
+        .arg("-c:a").arg("flac")
+        .arg(&mixed_flac)
+        .status()
+        .await;
+
+    match status {
+        Ok(s) if s.success() => {
+            if let Err(err) = std::fs::remove_file(&mixed_wav) {
+                warn!(?err, path = %mixed_wav.display(), "transcode ok but rm failed");
+            } else {
+                info!(out = %mixed_flac.display(), "transcoded mixed track");
+            }
+        }
+        Ok(s) => {
+            warn!(?s, "ffmpeg exited non-zero; leaving mixed.wav in place");
+        }
+        Err(err) => {
+            warn!(
+                ?err,
+                "failed to spawn ffmpeg; leaving mixed.wav in place (is ffmpeg on PATH?)"
+            );
+        }
+    }
 }

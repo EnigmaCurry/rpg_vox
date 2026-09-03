@@ -19,6 +19,7 @@ use serenity::{
     },
     prelude::GatewayIntents,
 };
+use discortp::{Packet, PacketSize, rtp::RtpExtensionPacket};
 use songbird::{
     Config as SongbirdConfig, SerenityInit,
     driver::{DecodeConfig, DecodeMode},
@@ -274,7 +275,12 @@ impl Handler {
         }
         if let Some(rec) = self.active_recorder.lock().unwrap().take() {
             rec.finalize();
-            info!(dir = %rec.session_dir().display(), "recording session finalized");
+            let session_dir = rec.session_dir();
+            info!(dir = %session_dir.display(), "recording session finalized");
+            drop(rec);
+            tokio::spawn(async move {
+                recorder::transcode_session(session_dir).await;
+            });
         }
         self.joined.store(false, Ordering::SeqCst);
     }
@@ -308,15 +314,46 @@ impl VoiceEventHandler for VoiceReceiver {
                 }
             }
             EventContext::VoiceTick(tick) => {
-                let speaking: HashMap<u32, &[i16]> = tick
+                let pcm: HashMap<u32, &[i16]> = tick
                     .speaking
                     .iter()
                     .filter_map(|(&ssrc, data)| {
                         data.decoded_voice.as_deref().map(|d| (ssrc, d))
                     })
                     .collect();
-                let silent: Vec<u32> = tick.silent.iter().copied().collect();
-                self.recorder.write_tick(&speaking, &silent);
+                // Extracting the raw Opus payload from an RTP packet Discord
+                // handed us requires three trims:
+                //   1. RTP header (via rtp.payload()).
+                //   2. Crypto prefix/suffix (via payload_offset..payload_end_pad).
+                //      Note: in the VoiceTick path songbird 0.6 populates
+                //      payload_end_pad as an *end index* into rtp.payload(),
+                //      not the "trim count" its docstring claims.
+                //   3. RTP header extension, if the extension bit is set on
+                //      the outer packet. Discord DOES set this bit for
+                //      per-user audio, so without stripping it decoders see
+                //      [ext_header][opus] and fail with "Error parsing the
+                //      packet header".
+                let opus: HashMap<u32, Vec<u8>> = tick
+                    .speaking
+                    .iter()
+                    .filter_map(|(&ssrc, data)| {
+                        let p = data.packet.as_ref()?;
+                        let rtp = p.rtp();
+                        let has_ext = rtp.get_extension() != 0;
+                        let payload = rtp.payload();
+                        let end = p.payload_end_pad.min(payload.len());
+                        let mut start = p.payload_offset.min(end);
+                        if has_ext && start < end {
+                            if let Some(ext) = RtpExtensionPacket::new(&payload[start..end]) {
+                                start = (start + ext.packet_size()).min(end);
+                            }
+                        }
+                        (start < end).then(|| (ssrc, payload[start..end].to_vec()))
+                    })
+                    .collect();
+                let opus_refs: HashMap<u32, &[u8]> =
+                    opus.iter().map(|(k, v)| (*k, v.as_slice())).collect();
+                self.recorder.write_tick(&pcm, &opus_refs);
             }
             _ => {}
         }
