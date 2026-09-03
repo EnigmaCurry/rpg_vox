@@ -5,6 +5,7 @@ use tracing::info;
 
 mod http;
 mod pw_source;
+mod settings;
 mod tts;
 
 /// Voice bridge over pipewire.
@@ -56,6 +57,7 @@ fn main() -> Result<()> {
         sample_rate: args.sample_rate,
     };
     let pw_handle = pw_source::spawn(pw_cfg, consumer)?;
+    let pw_client = pw_handle.client.clone();
     info!(node = %args.node_name, "PipeWire source node started");
 
     // Everything else lives on the tokio runtime.
@@ -63,16 +65,29 @@ fn main() -> Result<()> {
         .enable_all()
         .build()?;
 
+    let shared_settings = settings::new(settings::Settings {
+        comfyui_base: args.comfyui.trim_end_matches('/').to_string(),
+    });
+
     let result = rt.block_on(async move {
-        let (say_tx, say_rx) = mpsc::channel::<String>(32);
+        let (say_tx, say_rx) = mpsc::channel::<tts::SayRequest>(32);
 
         let tts_cfg = tts::Config {
-            comfyui_base: args.comfyui.clone(),
             target_sample_rate: args.sample_rate,
         };
-        let tts_task = tokio::spawn(tts::run(tts_cfg, say_rx, producer));
+        let tts_task = tokio::spawn(tts::run(
+            tts_cfg,
+            shared_settings.clone(),
+            say_rx,
+            producer,
+        ));
 
-        let http_task = tokio::spawn(http::serve(args.bind.clone(), say_tx));
+        let http_task = tokio::spawn(http::serve(
+            args.bind.clone(),
+            say_tx,
+            pw_client,
+            shared_settings.clone(),
+        ));
 
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {

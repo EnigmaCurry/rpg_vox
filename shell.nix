@@ -4,6 +4,7 @@ pkgs.mkShell {
   nativeBuildInputs = with pkgs; [
     rustc
     cargo
+    cargo-watch
     rustfmt
     clippy
     pkg-config

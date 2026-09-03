@@ -1,0 +1,517 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>RPG Vox</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #14161a;
+    --panel: #1e2127;
+    --border: #2a2e37;
+    --text: #e6e8ec;
+    --muted: #8a92a3;
+    --accent: #7aa2ff;
+    --ok: #6bd490;
+    --err: #ff8080;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font: 15px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    display: flex;
+    justify-content: center;
+  }
+  main {
+    width: 100%;
+    max-width: 680px;
+    padding: 32px 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+  }
+  header {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 12px;
+  }
+  h1 { margin: 0; font-size: 20px; font-weight: 600; }
+  .health { font-size: 12px; color: var(--muted); }
+  .health.ok  { color: var(--ok); }
+  .health.err { color: var(--err); }
+  textarea {
+    width: 100%;
+    min-height: 140px;
+    padding: 12px 14px;
+    background: var(--panel);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    font: inherit;
+    resize: vertical;
+  }
+  textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  .row {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    justify-content: space-between;
+  }
+  button {
+    padding: 10px 18px;
+    border: 1px solid var(--accent);
+    background: var(--accent);
+    color: #0b0d10;
+    border-radius: 8px;
+    font: inherit;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  .hint { font-size: 12px; color: var(--muted); }
+  #status { min-height: 1.2em; font-size: 13px; }
+  #status.ok  { color: var(--ok); }
+  #status.err { color: var(--err); }
+  #log {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-top: 8px;
+  }
+  .entry {
+    padding: 8px 10px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-size: 13px;
+    display: flex;
+    gap: 10px;
+    align-items: baseline;
+  }
+  .entry .ts { color: var(--muted); font-variant-numeric: tabular-nums; }
+  .entry.err { border-color: var(--err); }
+
+  details {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 4px 12px;
+  }
+  details[open] { padding-bottom: 12px; }
+  summary {
+    cursor: pointer;
+    padding: 10px 0;
+    font-weight: 600;
+    user-select: none;
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 12px;
+  }
+  summary::-webkit-details-marker { display: none; }
+  summary::before {
+    content: "▸";
+    display: inline-block;
+    transition: transform 0.15s;
+    color: var(--muted);
+    margin-right: 6px;
+  }
+  details[open] > summary::before { transform: rotate(90deg); }
+  summary .sum-meta { font-weight: 400; color: var(--muted); font-size: 12px; }
+  .section-body {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .sink-list { display: flex; flex-direction: column; gap: 4px; }
+  .sink-list label {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 8px;
+    border-radius: 6px;
+    cursor: pointer;
+  }
+  .sink-list label:hover { background: rgba(255,255,255,0.03); }
+  .sink-list input[type=radio] { accent-color: var(--accent); }
+  .sink-list .id { color: var(--muted); font-size: 11px; margin-left: auto; }
+  .listeners {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 13px;
+    color: var(--muted);
+  }
+  .listener { padding: 4px 8px; background: rgba(255,255,255,0.03); border-radius: 4px; }
+  .empty { color: var(--muted); font-style: italic; font-size: 13px; }
+  .actions { display: flex; gap: 8px; }
+  .actions button { padding: 6px 12px; font-size: 13px; font-weight: 500; }
+  .actions button.secondary {
+    background: transparent;
+    color: var(--text);
+    border-color: var(--border);
+  }
+  .subhead {
+    font-size: 13px;
+    color: var(--muted);
+    margin-bottom: 6px;
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 8px;
+  }
+  .subhead .note { font-size: 11px; }
+  input[type="text"], input[type="url"] {
+    width: 100%;
+    padding: 8px 10px;
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font: inherit;
+    font-size: 13px;
+    font-family: ui-monospace, "SF Mono", monospace;
+  }
+  input[type="text"]:focus, input[type="url"]:focus {
+    outline: 2px solid var(--accent);
+    outline-offset: -1px;
+  }
+  input.dirty { border-color: var(--accent); }
+  .field-row { display: flex; gap: 8px; align-items: center; }
+  .field-row input { flex: 1; }
+  hr.section-sep {
+    border: 0;
+    border-top: 1px solid var(--border);
+    margin: 4px 0;
+  }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>RPG Vox</h1>
+    <span id="health" class="health">checking…</span>
+  </header>
+
+  <textarea id="text" placeholder="Type what the mic should say…" autofocus></textarea>
+
+  <div class="row">
+    <span class="hint">Enter to send · Shift+Enter for newline</span>
+    <button id="send">Say it</button>
+  </div>
+
+  <div id="status"></div>
+  <div id="log"></div>
+
+  <details id="settings-panel">
+    <summary>
+      <span>Settings</span>
+      <span class="sum-meta" id="settings-summary">—</span>
+    </summary>
+    <div class="section-body">
+      <div>
+        <div class="subhead">
+          <span>TTS API endpoint</span>
+          <span class="note">applies to the next utterance</span>
+        </div>
+        <div class="field-row">
+          <input id="tts-endpoint" type="url" spellcheck="false" placeholder="http://127.0.0.1:8188">
+          <button id="tts-save">Save</button>
+          <button id="tts-reset" class="secondary" title="Revert to server value">Revert</button>
+        </div>
+      </div>
+
+      <hr class="section-sep">
+
+      <div>
+        <div class="subhead"><span>Local monitor</span></div>
+        <div class="sink-list" id="sink-list"><div class="empty">no sinks yet</div></div>
+        <div class="actions" style="margin-top:8px">
+          <button id="pw-monitor-stop" class="secondary">Stop monitor</button>
+          <button id="pw-refresh" class="secondary">Refresh</button>
+        </div>
+      </div>
+
+      <hr class="section-sep">
+
+      <div>
+        <div class="subhead"><span>Who's listening</span></div>
+        <div class="listeners" id="listeners"><div class="empty">nobody</div></div>
+      </div>
+    </div>
+  </details>
+</main>
+
+<script>
+  const $text   = document.getElementById("text");
+  const $send   = document.getElementById("send");
+  const $status = document.getElementById("status");
+  const $log    = document.getElementById("log");
+  const $health = document.getElementById("health");
+
+  function setStatus(msg, kind) {
+    $status.textContent = msg;
+    $status.className = kind || "";
+  }
+
+  function logEntry(text, kind) {
+    const div = document.createElement("div");
+    div.className = "entry" + (kind ? " " + kind : "");
+    const ts = new Date().toLocaleTimeString();
+    div.innerHTML = `<span class="ts">${ts}</span><span></span>`;
+    div.lastChild.textContent = text;
+    $log.prepend(div);
+    while ($log.children.length > 20) $log.removeChild($log.lastChild);
+  }
+
+  async function checkHealth() {
+    try {
+      const r = await fetch("/healthz");
+      if (r.ok) {
+        $health.textContent = "online";
+        $health.className = "health ok";
+      } else {
+        throw new Error(r.status);
+      }
+    } catch {
+      $health.textContent = "offline";
+      $health.className = "health err";
+    }
+  }
+
+  async function say() {
+    const text = $text.value.trim();
+    if (!text) return;
+    $send.disabled = true;
+    setStatus("speaking…");
+    let payload = null;
+    try {
+      const r = await fetch("/say", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ text }),
+      });
+      try { payload = await r.json(); } catch { payload = null; }
+
+      if (r.ok && payload && payload.ok) {
+        const frames = payload.frames ?? 0;
+        setStatus(`spoken (${frames.toLocaleString()} samples)`, "ok");
+        logEntry(text);
+        $text.value = "";
+      } else {
+        const detail = (payload && payload.error) || (await r.text().catch(() => "")) || `HTTP ${r.status}`;
+        setStatus(`error: ${detail}`, "err");
+        logEntry(`${text} — ${detail}`, "err");
+      }
+    } catch (e) {
+      setStatus(`network error: ${e.message}`, "err");
+      logEntry(`${text} — ${e.message}`, "err");
+    } finally {
+      $send.disabled = false;
+      $text.focus();
+    }
+  }
+
+  $send.addEventListener("click", say);
+  $text.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      say();
+    }
+  });
+
+  checkHealth();
+  setInterval(checkHealth, 5000);
+
+  // ---- Settings panel -----------------------------------------------------
+  const $panel     = document.getElementById("settings-panel");
+  const $summary   = document.getElementById("settings-summary");
+  const $sinkList  = document.getElementById("sink-list");
+  const $listeners = document.getElementById("listeners");
+  const $monStop   = document.getElementById("pw-monitor-stop");
+  const $refresh   = document.getElementById("pw-refresh");
+  const $endpoint  = document.getElementById("tts-endpoint");
+  const $ttsSave   = document.getElementById("tts-save");
+  const $ttsReset  = document.getElementById("tts-reset");
+
+  let currentMonitor = null;
+  let serverSettings = null; // last known server-side settings
+
+  async function refreshGraph() {
+    try {
+      const r = await fetch("/pw/graph");
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const g = await r.json();
+      renderGraph(g);
+    } catch (e) {
+      $pwSummary.textContent = `error: ${e.message}`;
+    }
+  }
+
+  function renderGraph(g) {
+    currentMonitor = g.monitor_sink_id ?? null;
+    updateSummary(g);
+
+    if (!g.sinks.length) {
+      $sinkList.innerHTML = '<div class="empty">no sinks discovered yet</div>';
+    } else {
+      $sinkList.innerHTML = "";
+      for (const s of g.sinks) {
+        const id = `sink-${s.id}`;
+        const label = document.createElement("label");
+        label.htmlFor = id;
+        const radio = document.createElement("input");
+        radio.type = "radio";
+        radio.name = "monitor-sink";
+        radio.id = id;
+        radio.value = s.id;
+        radio.checked = currentMonitor === s.id;
+        radio.addEventListener("change", () => startMonitor(s.id));
+        const desc = document.createElement("span");
+        desc.textContent = s.description || s.name;
+        const idSpan = document.createElement("span");
+        idSpan.className = "id";
+        idSpan.textContent = `#${s.id}`;
+        label.append(radio, desc, idSpan);
+        $sinkList.append(label);
+      }
+    }
+
+    if (!g.listeners.length) {
+      $listeners.innerHTML = '<div class="empty">nobody</div>';
+    } else {
+      $listeners.innerHTML = "";
+      for (const l of g.listeners) {
+        const div = document.createElement("div");
+        div.className = "listener";
+        div.textContent = `${l.description || l.name}  ·  #${l.id}`;
+        $listeners.append(div);
+      }
+    }
+  }
+
+  async function startMonitor(sinkId) {
+    try {
+      const r = await fetch("/pw/monitor", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ sink_id: sinkId }),
+      });
+      const body = await r.json().catch(() => null);
+      if (!r.ok || (body && !body.ok)) {
+        const err = (body && body.error) || `HTTP ${r.status}`;
+        setStatus(`monitor error: ${err}`, "err");
+      } else {
+        setStatus(`monitoring sink #${sinkId}`, "ok");
+      }
+    } catch (e) {
+      setStatus(`monitor error: ${e.message}`, "err");
+    } finally {
+      refreshGraph();
+    }
+  }
+
+  async function stopMonitor() {
+    try {
+      const r = await fetch("/pw/monitor", { method: "DELETE" });
+      const body = await r.json().catch(() => null);
+      if (!r.ok || (body && !body.ok)) {
+        setStatus(`stop error: ${(body && body.error) || r.status}`, "err");
+      } else {
+        setStatus("monitor stopped", "ok");
+      }
+    } catch (e) {
+      setStatus(`stop error: ${e.message}`, "err");
+    } finally {
+      refreshGraph();
+    }
+  }
+
+  $monStop.addEventListener("click", stopMonitor);
+  $refresh.addEventListener("click", () => { refreshSettings(); refreshGraph(); });
+
+  // ---- TTS endpoint settings ---------------------------------------------
+  function updateSummary(g) {
+    const ttsHost = (() => {
+      if (!serverSettings || !serverSettings.comfyui_base) return "—";
+      try { return new URL(serverSettings.comfyui_base).host; }
+      catch { return serverSettings.comfyui_base; }
+    })();
+    const gPart = g
+      ? ` · ${g.sinks.length} sinks · ${g.listeners.length} listener(s)`
+        + (currentMonitor !== null ? ` · monitor→#${currentMonitor}` : "")
+      : "";
+    $summary.textContent = `tts: ${ttsHost}${gPart}`;
+  }
+
+  function markDirty() {
+    const dirty = serverSettings && $endpoint.value.trim() !== serverSettings.comfyui_base;
+    $endpoint.classList.toggle("dirty", !!dirty);
+  }
+
+  async function refreshSettings() {
+    try {
+      const r = await fetch("/settings");
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      serverSettings = await r.json();
+      // Only overwrite the input if the user isn't actively editing it.
+      if (document.activeElement !== $endpoint) {
+        $endpoint.value = serverSettings.comfyui_base || "";
+      }
+      markDirty();
+      updateSummary();
+    } catch (e) {
+      setStatus(`settings error: ${e.message}`, "err");
+    }
+  }
+
+  async function saveSettings() {
+    const value = $endpoint.value.trim();
+    if (!value) return;
+    $ttsSave.disabled = true;
+    try {
+      const r = await fetch("/settings", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ comfyui_base: value }),
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      serverSettings = await r.json();
+      $endpoint.value = serverSettings.comfyui_base || "";
+      setStatus("settings saved", "ok");
+    } catch (e) {
+      setStatus(`save failed: ${e.message}`, "err");
+    } finally {
+      $ttsSave.disabled = false;
+      markDirty();
+      updateSummary();
+    }
+  }
+
+  $endpoint.addEventListener("input", markDirty);
+  $endpoint.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); saveSettings(); }
+  });
+  $ttsSave.addEventListener("click", saveSettings);
+  $ttsReset.addEventListener("click", () => {
+    if (serverSettings) $endpoint.value = serverSettings.comfyui_base || "";
+    markDirty();
+  });
+
+  // Poll only while the expander is open.
+  function tick() { if ($panel.open) { refreshGraph(); refreshSettings(); } }
+  $panel.addEventListener("toggle", () => {
+    if ($panel.open) { refreshGraph(); refreshSettings(); }
+  });
+  setInterval(tick, 3000);
+
+  // Initial fetch of settings so the summary is populated even when closed.
+  refreshSettings();
+</script>
+</body>
+</html>

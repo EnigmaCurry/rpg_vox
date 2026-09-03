@@ -9,10 +9,12 @@
 //! `ComfyClient` trait below is the seam — swap the impl once the node's
 //! protocol is nailed down.
 
-use anyhow::{anyhow, Context as _, Result};
+use anyhow::{Context as _, Result, anyhow};
 use futures_util::StreamExt;
 use rtrb::Producer;
-use rubato::{Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction};
+use rubato::{
+    Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
+};
 use serde_json::json;
 use std::io::Cursor;
 use symphonia::core::audio::SampleBuffer;
@@ -21,30 +23,47 @@ use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 pub struct Config {
-    pub comfyui_base: String,
     pub target_sample_rate: u32,
+}
+
+/// One utterance request: the text to speak plus a channel to report the
+/// result back to the caller (usually the /say HTTP handler).
+pub struct SayRequest {
+    pub text: String,
+    pub reply: oneshot::Sender<Result<usize, String>>,
 }
 
 pub async fn run(
     cfg: Config,
-    mut say_rx: mpsc::Receiver<String>,
+    settings: crate::settings::Shared,
+    mut say_rx: mpsc::Receiver<SayRequest>,
     mut producer: Producer<f32>,
 ) -> Result<()> {
-    let client = ComfyClientImpl::new(cfg.comfyui_base.clone());
     let http = reqwest::Client::new();
 
-    while let Some(text) = say_rx.recv().await {
+    while let Some(SayRequest { text, reply }) = say_rx.recv().await {
+        // Re-read settings each utterance so live edits take effect immediately.
+        let base = settings.read().await.comfyui_base.clone();
+        let client = ComfyClientImpl::new(base);
         info!(chars = text.len(), "generating speech");
-        match generate_and_push(&http, &client, &text, cfg.target_sample_rate, &mut producer).await {
-            Ok(frames) => info!(frames, "utterance delivered to ring buffer"),
-            Err(err) => error!(?err, "utterance failed"),
-        }
+        let result =
+            generate_and_push(&http, &client, &text, cfg.target_sample_rate, &mut producer)
+                .await
+                .map_err(|err| {
+                    let msg = format!("{err:#}");
+                    error!(err = %msg, "utterance failed");
+                    msg
+                })
+                .inspect(|frames| {
+                    info!(frames, "utterance delivered to ring buffer");
+                });
+        let _ = reply.send(result);
     }
 
     Ok(())
@@ -90,7 +109,11 @@ async fn generate_and_push(
                             if chunk.sample_rate != target_rate {
                                 resampler = Some(build_resampler(chunk.sample_rate, target_rate)?);
                             }
-                            info!(rate = chunk.sample_rate, target = target_rate, "audio format known");
+                            info!(
+                                rate = chunk.sample_rate,
+                                target = target_rate,
+                                "audio format known"
+                            );
                         }
                         let resampled = if let Some(rs) = resampler.as_mut() {
                             resample(rs, &chunk.samples)?
@@ -181,7 +204,7 @@ fn decode_audio_chunk(bytes: &[u8]) -> Result<DecodedChunk> {
             Err(symphonia::core::errors::Error::IoError(e))
                 if e.kind() == std::io::ErrorKind::UnexpectedEof =>
             {
-                break
+                break;
             }
             Err(e) => return Err(e.into()),
         };

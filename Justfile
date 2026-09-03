@@ -33,9 +33,10 @@ fmt:
 run *ARGS:
     nix-shell --run "cargo run --release -- {{ARGS}}"
 
-# Run the debug binary (faster to rebuild while iterating).
+# Auto-rebuild + restart on any change under src/ (and Cargo.toml).
+# SIGINT stops the watcher; the running binary receives SIGTERM on each rebuild.
 dev *ARGS:
-    nix-shell --run "cargo run -- {{ARGS}}"
+    nix-shell --run "cargo watch -q -c -w src -w Cargo.toml -x 'run -- {{ARGS}}'"
 
 # Tests.
 test:
