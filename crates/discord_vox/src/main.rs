@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use clap::Parser;
+use discortp::{Packet, PacketSize, rtp::RtpExtensionPacket};
 use rtrb::{Consumer, RingBuffer};
 use serenity::{
     async_trait,
@@ -14,17 +15,19 @@ use serenity::{
     http::Http,
     model::{
         gateway::Ready,
-        id::{ChannelId, GuildId, UserId},
+        id::{ChannelId, GuildId, MessageId, UserId},
         voice::VoiceState,
     },
     prelude::GatewayIntents,
 };
-use discortp::{Packet, PacketSize, rtp::RtpExtensionPacket};
 use songbird::{
     Config as SongbirdConfig, SerenityInit,
     driver::{DecodeConfig, DecodeMode},
     events::{CoreEvent, Event, EventContext, EventHandler as VoiceEventHandler, TrackEvent},
-    input::{Input, RawAdapter, codecs::{get_codec_registry, get_probe}},
+    input::{
+        Input, RawAdapter,
+        codecs::{get_codec_registry, get_probe},
+    },
     tracks::PlayMode,
 };
 use symphonia_core::io::MediaSource;
@@ -116,7 +119,9 @@ struct Operator {
 impl Operator {
     fn contact_line(&self) -> Option<String> {
         match (&self.discord, &self.email) {
-            (Some(d), Some(e)) => Some(format!("Address all concerns to `{d}` on Discord or to <{e}>.")),
+            (Some(d), Some(e)) => Some(format!(
+                "Address all concerns to `{d}` on Discord or to <{e}>."
+            )),
             (Some(d), None) => Some(format!("Address all concerns to `{d}` on Discord.")),
             (None, Some(e)) => Some(format!("Address all concerns to <{e}>.")),
             (None, None) => None,
@@ -129,27 +134,29 @@ fn format_duration(d: chrono::Duration) -> String {
     let h = secs / 3600;
     let m = (secs % 3600) / 60;
     let s = secs % 60;
-    if h > 0 {
-        format!("{h}h {m}m {s}s")
-    } else if m > 0 {
-        format!("{m}m {s}s")
-    } else {
-        format!("{s}s")
-    }
+    format!("{h}:{m:02}:{s:02}")
 }
 
 /// Companion to the start notice: posted when the recording session ends,
-/// with start/end timestamps and elapsed duration so both bookends are
-/// visible in-channel.
+/// with start/end timestamps, elapsed duration, and the display names of
+/// every speaker seen. Bot deletes the start WARNING after this posts, so
+/// the channel history ends up with only this summary.
 fn build_recording_stop_notice(
     started_at: chrono::DateTime<chrono::Local>,
     ended_at: chrono::DateTime<chrono::Local>,
+    participants: &[String],
 ) -> String {
     let elapsed = ended_at.signed_duration_since(started_at);
+    let participants_line = if participants.is_empty() {
+        "(none)".to_string()
+    } else {
+        participants.join(", ")
+    };
     format!(
-        "*Recording stopped at {end}. Started {start}. Duration: **{dur}**.*",
-        end = ended_at.format("%Y-%m-%d %H:%M:%S %Z"),
+        "Recording commenced at {start}. Recording finished at {end}. \
+         Duration: {dur}. Participants: {participants_line}",
         start = started_at.format("%Y-%m-%d %H:%M:%S %Z"),
+        end = ended_at.format("%Y-%m-%d %H:%M:%S %Z"),
         dur = format_duration(elapsed),
     )
 }
@@ -159,7 +166,7 @@ fn build_recording_stop_notice(
 /// exact start of the recording is on-record in-channel.
 fn build_recording_notice(op: &Operator) -> String {
     let mut msg = String::new();
-    msg.push_str("**WARNING: This bot may record the audio of conversations he is a party of.**\n\n");
+    msg.push_str("**WARNING: This bot may record your audio conversations.**\n\n");
     msg.push_str(
         "These recordings are used only for the game experience. Your voice may \
         be transcribed and processed by a machine that the operator runs locally \
@@ -237,6 +244,10 @@ struct Handler {
     /// The current session's recorder, if we're in a channel and recording.
     /// Held here so leave() can finalize it before songbird drops the Call.
     active_recorder: Mutex<Option<Arc<recorder::Recorder>>>,
+    /// Message id of the recording-start WARNING, if we posted one this
+    /// session. Cleared by leave() after the WARNING is deleted so the
+    /// channel history retains only the stop notice.
+    notice_message: Mutex<Option<MessageId>>,
     /// True iff we currently believe we are connected to the voice channel.
     joined: AtomicBool,
     /// Serialises reconcile() so overlapping voice_state_update events can't
@@ -305,22 +316,24 @@ impl Handler {
                         http: Arc::clone(&ctx.http),
                         metadata: self.metadata.clone(),
                     };
-                    driver.add_global_event(
-                        CoreEvent::SpeakingStateUpdate.into(),
-                        make_receiver(),
-                    );
+                    driver.add_global_event(CoreEvent::SpeakingStateUpdate.into(), make_receiver());
                     driver.add_global_event(CoreEvent::VoiceTick.into(), make_receiver());
                     drop(driver);
                     *self.active_recorder.lock().unwrap() = Some(rec);
                     info!(dir = %session_dir.display(), "recording session started");
 
                     let notice = build_recording_notice(&self.operator);
-                    if let Err(err) = self.channel_id.say(&ctx.http, &notice).await {
-                        warn!(
-                            ?err,
-                            "failed to post recording notice to text-in-voice \
-                             (does the bot have SEND_MESSAGES on the channel?)"
-                        );
+                    match self.channel_id.say(&ctx.http, &notice).await {
+                        Ok(msg) => {
+                            *self.notice_message.lock().unwrap() = Some(msg.id);
+                        }
+                        Err(err) => {
+                            warn!(
+                                ?err,
+                                "failed to post recording notice to text-in-voice \
+                                 (does the bot have SEND_MESSAGES on the channel?)"
+                            );
+                        }
                     }
                 }
                 Err(err) => {
@@ -347,11 +360,7 @@ impl Handler {
             if let Some(guild) = ctx.cache.guild(self.guild_id) {
                 md.upsert_guild(self.guild_id.get(), &guild.name);
                 if let Some(chan) = guild.channels.get(&self.channel_id) {
-                    md.upsert_channel(
-                        self.channel_id.get(),
-                        self.guild_id.get(),
-                        &chan.name,
-                    );
+                    md.upsert_channel(self.channel_id.get(), self.guild_id.get(), &chan.name);
                 }
             }
         }
@@ -401,14 +410,22 @@ impl Handler {
         if let Some(rec) = active {
             let started_at = rec.started_at();
             let ended_at = chrono::Local::now();
+            let participants = rec.participants();
             rec.finalize();
             let session_dir = rec.session_dir();
             info!(dir = %session_dir.display(), "recording session finalized");
             drop(rec);
 
-            let notice = build_recording_stop_notice(started_at, ended_at);
+            let notice = build_recording_stop_notice(started_at, ended_at, &participants);
             if let Err(err) = self.channel_id.say(&ctx.http, &notice).await {
                 warn!(?err, "failed to post recording-stopped notice");
+            }
+
+            let start_msg = self.notice_message.lock().unwrap().take();
+            if let Some(msg_id) = start_msg {
+                if let Err(err) = self.channel_id.delete_message(&ctx.http, msg_id).await {
+                    warn!(?err, "failed to delete recording-start WARNING");
+                }
             }
 
             tokio::spawn(async move {
@@ -454,9 +471,7 @@ impl VoiceEventHandler for VoiceReceiver {
                 let pcm: HashMap<u32, &[i16]> = tick
                     .speaking
                     .iter()
-                    .filter_map(|(&ssrc, data)| {
-                        data.decoded_voice.as_deref().map(|d| (ssrc, d))
-                    })
+                    .filter_map(|(&ssrc, data)| data.decoded_voice.as_deref().map(|d| (ssrc, d)))
                     .collect();
                 // Extracting the raw Opus payload from an RTP packet Discord
                 // handed us requires three trims:
@@ -526,8 +541,7 @@ async fn fetch_display_name(
                 );
                 md.upsert_guild_member(guild_id.get(), user_id, member.nick.as_deref());
             }
-            let sanitized = recorder::sanitize_display_name(raw);
-            (!sanitized.is_empty()).then_some(sanitized)
+            (!raw.trim().is_empty()).then(|| raw.to_string())
         }
         Err(err) => {
             warn!(?err, user_id, "failed to fetch member display name");
@@ -631,7 +645,12 @@ async fn main() -> Result<()> {
             last = now;
             let over = overruns.load(Ordering::Relaxed);
             if delta > 0 || over > 0 {
-                info!(frames_5s = delta, total = now, overruns = over, "sink activity");
+                info!(
+                    frames_5s = delta,
+                    total = now,
+                    overruns = over,
+                    "sink activity"
+                );
             }
         }
     });
@@ -675,6 +694,7 @@ async fn main() -> Result<()> {
         },
         metadata: metadata.clone(),
         active_recorder: Mutex::new(None),
+        notice_message: Mutex::new(None),
         joined: AtomicBool::new(false),
         reconcile: AsyncMutex::new(()),
     };

@@ -69,7 +69,8 @@ impl MetadataDb {
              PRAGMA foreign_keys = ON;",
         )
         .context("apply metadata db pragmas")?;
-        conn.execute_batch(SCHEMA).context("apply metadata schema")?;
+        conn.execute_batch(SCHEMA)
+            .context("apply metadata schema")?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -105,13 +106,7 @@ impl MetadataDb {
     /// `best_name` is whichever display name the caller prefers (typically
     /// guild-nick → global-name → username), stored so downstream tools
     /// don't have to reimplement that fallback chain.
-    pub fn upsert_user(
-        &self,
-        id: u64,
-        username: &str,
-        global_name: Option<&str>,
-        best_name: &str,
-    ) {
+    pub fn upsert_user(&self, id: u64, username: &str, global_name: Option<&str>, best_name: &str) {
         let now = chrono::Utc::now().timestamp();
         let conn = self.conn.lock().unwrap();
         if let Err(err) = conn.execute(

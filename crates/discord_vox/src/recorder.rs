@@ -42,8 +42,10 @@ struct State {
     mixed: Option<MixedWriter>,
     per_user: HashMap<u32, PerUser>,
     ssrc_to_user: HashMap<u32, u64>,
-    /// Resolved, sanitized display name per user id (filled in async after
-    /// note_speaker fires; may never arrive if the fetch fails).
+    /// Raw Discord display name per user id (filled in async after
+    /// note_speaker fires; may never arrive if the fetch fails). Recorder
+    /// sanitizes on-the-fly when building filenames, but the raw form is
+    /// what a summary message should show.
     user_display_name: HashMap<u64, String>,
 }
 
@@ -108,17 +110,18 @@ impl Recorder {
         state.refresh_path(ssrc);
     }
 
-    /// Attach a human-readable display name (already sanitized) to a user
-    /// id, so any writers for that user get renamed to include it. Empty
-    /// names are ignored.
-    pub fn note_display_name(&self, user_id: u64, sanitized: &str) {
-        if sanitized.is_empty() {
+    /// Attach a raw Discord display name (unsanitized) to a user id.
+    /// Recorder sanitizes internally when composing filenames, but stores
+    /// the raw form so callers can render it in summaries. Empty names are
+    /// ignored.
+    pub fn note_display_name(&self, user_id: u64, raw_name: &str) {
+        if raw_name.trim().is_empty() {
             return;
         }
         let mut state = self.state.lock().unwrap();
         state
             .user_display_name
-            .insert(user_id, sanitized.to_string());
+            .insert(user_id, raw_name.to_string());
         let ssrcs: Vec<u32> = state
             .ssrc_to_user
             .iter()
@@ -127,6 +130,28 @@ impl Recorder {
         for ssrc in ssrcs {
             state.refresh_path(ssrc);
         }
+    }
+
+    /// Distinct display names of every speaker seen this session. Users
+    /// whose display-name fetch never landed appear as `<id>`. Sorted
+    /// case-insensitively for stable output.
+    pub fn participants(&self) -> Vec<String> {
+        let state = self.state.lock().unwrap();
+        let mut seen: std::collections::HashSet<u64> = Default::default();
+        let mut names: Vec<String> = state
+            .ssrc_to_user
+            .values()
+            .filter(|uid| seen.insert(**uid))
+            .map(|uid| {
+                state
+                    .user_display_name
+                    .get(uid)
+                    .cloned()
+                    .unwrap_or_else(|| uid.to_string())
+            })
+            .collect();
+        names.sort_by_key(|n| n.to_lowercase());
+        names
     }
 
     /// Process a single 20 ms voice tick.
@@ -183,12 +208,10 @@ impl Recorder {
         let per_user = std::mem::take(&mut state.per_user);
         for (ssrc, mut pu) in per_user {
             if let Some((payload, gp)) = pu.pending.take() {
-                if let Err(err) = pu.writer.write_packet(
-                    payload,
-                    pu.serial,
-                    PacketWriteEndInfo::EndStream,
-                    gp,
-                ) {
+                if let Err(err) =
+                    pu.writer
+                        .write_packet(payload, pu.serial, PacketWriteEndInfo::EndStream, gp)
+                {
                     warn!(?err, ssrc, "per-user EOS write failed");
                 }
             }
@@ -206,12 +229,19 @@ impl Drop for Recorder {
 
 impl State {
     fn desired_filename(&self, ssrc: u32) -> String {
-        match self.ssrc_to_user.get(&ssrc) {
-            Some(uid) => match self.user_display_name.get(uid) {
-                Some(name) => format!("user-{uid}-{name}.opus"),
-                None => format!("user-{uid}.opus"),
-            },
-            None => format!("ssrc-{ssrc}.opus"),
+        let Some(uid) = self.ssrc_to_user.get(&ssrc) else {
+            return format!("ssrc-{ssrc}.opus");
+        };
+        match self.user_display_name.get(uid) {
+            Some(raw) => {
+                let safe = sanitize_display_name(raw);
+                if safe.is_empty() {
+                    format!("user-{uid}.opus")
+                } else {
+                    format!("user-{uid}-{safe}.opus")
+                }
+            }
+            None => format!("user-{uid}.opus"),
         }
     }
 
@@ -286,12 +316,10 @@ impl State {
         // Flush the previously-buffered packet as a normal one, then buffer
         // this one so finalize() can flag it with EndStream.
         if let Some((prev, prev_gp)) = pu.pending.take() {
-            if let Err(err) = pu.writer.write_packet(
-                prev,
-                pu.serial,
-                PacketWriteEndInfo::NormalPacket,
-                prev_gp,
-            ) {
+            if let Err(err) =
+                pu.writer
+                    .write_packet(prev, pu.serial, PacketWriteEndInfo::NormalPacket, prev_gp)
+            {
                 warn!(?err, ssrc, "opus packet write failed");
             }
         }
@@ -380,10 +408,13 @@ pub async fn transcode_session(session_dir: PathBuf) {
     let mixed_flac = session_dir.join("mixed.flac");
 
     let status = Command::new("ffmpeg")
-        .arg("-loglevel").arg("error")
+        .arg("-loglevel")
+        .arg("error")
         .arg("-y")
-        .arg("-i").arg(&mixed_wav)
-        .arg("-c:a").arg("flac")
+        .arg("-i")
+        .arg(&mixed_wav)
+        .arg("-c:a")
+        .arg("flac")
         .arg(&mixed_flac)
         .status()
         .await;
