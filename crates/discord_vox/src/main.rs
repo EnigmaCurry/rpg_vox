@@ -1,5 +1,5 @@
 use std::io::{self, Read, Seek, SeekFrom};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -12,6 +12,7 @@ use serenity::{
     model::{
         gateway::Ready,
         id::{ChannelId, GuildId},
+        voice::VoiceState,
     },
     prelude::GatewayIntents,
 };
@@ -22,6 +23,7 @@ use songbird::{
     tracks::PlayMode,
 };
 use symphonia_core::io::MediaSource;
+use tokio::sync::Mutex as AsyncMutex;
 use tracing::{error, info, warn};
 
 mod pw_sink;
@@ -30,7 +32,8 @@ mod pw_sink;
 ///
 /// Registers an Audio/Sink named `--node-name`. Anything you route into it
 /// (Helvum / qpwgraph / pw-link) is streamed as the bot's mic in the joined
-/// voice channel.
+/// voice channel. The bot auto-joins the configured channel when a human is
+/// present and auto-parts when the channel empties.
 #[derive(Debug, Parser)]
 #[command(version, about)]
 struct Args {
@@ -42,7 +45,7 @@ struct Args {
     #[arg(long, env = "DISCORD_GUILD_ID")]
     guild_id: u64,
 
-    /// Voice channel ID to join on startup.
+    /// Voice channel ID to join when occupied.
     #[arg(long, env = "DISCORD_CHANNEL_ID")]
     channel_id: u64,
 
@@ -71,8 +74,11 @@ struct Args {
 /// Bridges the SPSC ring buffer (fed by the PipeWire RT callback) into a
 /// synchronous byte reader that songbird can consume. On underrun we emit
 /// silence rather than EOF so playback stays live indefinitely.
+///
+/// The consumer is held behind an `Arc<Mutex<...>>` so we can build a fresh
+/// `PcmSource` for each auto-join without losing the shared audio stream.
 struct PcmSource {
-    consumer: Mutex<Consumer<f32>>,
+    consumer: Arc<Mutex<Consumer<f32>>>,
 }
 
 impl Read for PcmSource {
@@ -109,33 +115,55 @@ impl MediaSource for PcmSource {
     }
 }
 
-/// Held by the serenity `EventHandler`; the `Ready` callback consumes the
-/// inner `Option` exactly once to hand ownership to songbird.
-struct SharedSource {
-    inner: Mutex<Option<PcmSource>>,
-    sample_rate: u32,
-    channels: u32,
-}
-
 struct Handler {
     guild_id: GuildId,
     channel_id: ChannelId,
-    source: Arc<SharedSource>,
+    consumer: Arc<Mutex<Consumer<f32>>>,
+    sample_rate: u32,
+    channels: u32,
+    /// True iff we currently believe we are connected to the voice channel.
+    joined: AtomicBool,
+    /// Serialises reconcile() so overlapping voice_state_update events can't
+    /// race into a double-join or leave-during-join.
+    reconcile: AsyncMutex<()>,
 }
 
-#[async_trait]
-impl EventHandler for Handler {
-    async fn ready(&self, ctx: SerenityContext, ready: Ready) {
-        info!(user = %ready.user.name, "discord gateway ready");
+impl Handler {
+    /// Count humans (anyone other than the bot itself) currently in the
+    /// target channel, using serenity's voice-state cache.
+    fn count_humans(&self, ctx: &SerenityContext) -> Option<usize> {
+        let guild = ctx.cache.guild(self.guild_id)?;
+        let bot_id = ctx.cache.current_user().id;
+        let n = guild
+            .voice_states
+            .values()
+            .filter(|vs| vs.channel_id == Some(self.channel_id) && vs.user_id != bot_id)
+            .count();
+        Some(n)
+    }
 
-        let manager = match songbird::get(&ctx).await {
+    async fn reconcile(&self, ctx: &SerenityContext) {
+        let _guard = self.reconcile.lock().await;
+        let Some(humans) = self.count_humans(ctx) else {
+            // Cache not ready yet — nothing to do; we'll get called again.
+            return;
+        };
+        let joined = self.joined.load(Ordering::SeqCst);
+        match (humans > 0, joined) {
+            (true, false) => self.join(ctx).await,
+            (false, true) => self.leave(ctx).await,
+            _ => {}
+        }
+    }
+
+    async fn join(&self, ctx: &SerenityContext) {
+        let manager = match songbird::get(ctx).await {
             Some(m) => m,
             None => {
                 error!("songbird not registered on the client");
                 return;
             }
         };
-
         let call = match manager.join(self.guild_id, self.channel_id).await {
             Ok(call) => {
                 info!(
@@ -151,42 +179,82 @@ impl EventHandler for Handler {
             }
         };
 
-        let pcm = match self.source.inner.lock().expect("shared source mutex").take() {
-            Some(p) => p,
-            None => {
-                // Reconnect / second Ready: source already handed off.
-                return;
-            }
+        let source = PcmSource {
+            consumer: Arc::clone(&self.consumer),
         };
-        let raw = RawAdapter::new(pcm, self.source.sample_rate, self.source.channels);
+        let raw = RawAdapter::new(source, self.sample_rate, self.channels);
         let input: Input = raw.into();
         let input = match input
             .make_playable_async(&get_codec_registry(), &get_probe())
             .await
         {
-            Ok(i) => {
-                info!("input probed and ready");
-                i
-            }
+            Ok(i) => i,
             Err(err) => {
-                error!(?err, "input make_playable failed — songbird/symphonia rejected the raw stream");
+                error!(?err, "input make_playable failed");
+                let _ = manager.remove(self.guild_id).await;
                 return;
             }
         };
         let mut driver = call.lock().await;
         let handle = driver.play_input(input);
         drop(driver);
-        for evt in [TrackEvent::Error, TrackEvent::End, TrackEvent::Playable] {
+        for evt in [TrackEvent::Error, TrackEvent::End] {
             if let Err(err) = handle.add_event(Event::Track(evt), TrackDiag) {
                 warn!(?evt, ?err, "failed to attach track event handler");
             }
         }
+        self.joined.store(true, Ordering::SeqCst);
         info!("streaming PipeWire sink to voice channel");
+    }
+
+    async fn leave(&self, ctx: &SerenityContext) {
+        let manager = match songbird::get(ctx).await {
+            Some(m) => m,
+            None => {
+                error!("songbird not registered on the client");
+                return;
+            }
+        };
+        match manager.remove(self.guild_id).await {
+            Ok(()) => info!("left voice channel (empty)"),
+            Err(err) => warn!(?err, "leave failed"),
+        }
+        self.joined.store(false, Ordering::SeqCst);
     }
 }
 
-/// Logs the actual state on Error/End/Playable so we can see why a track
-/// died instead of guessing.
+#[async_trait]
+impl EventHandler for Handler {
+    async fn ready(&self, _ctx: SerenityContext, ready: Ready) {
+        info!(user = %ready.user.name, "discord gateway ready");
+    }
+
+    async fn cache_ready(&self, ctx: SerenityContext, _guilds: Vec<GuildId>) {
+        info!("guild cache ready");
+        self.reconcile(&ctx).await;
+    }
+
+    async fn voice_state_update(
+        &self,
+        ctx: SerenityContext,
+        old: Option<VoiceState>,
+        new: VoiceState,
+    ) {
+        let bot_id = ctx.cache.current_user().id;
+        if new.user_id == bot_id {
+            // Our own state changes don't affect occupancy.
+            return;
+        }
+        let touches_target = new.channel_id == Some(self.channel_id)
+            || old.as_ref().and_then(|o| o.channel_id) == Some(self.channel_id);
+        if !touches_target {
+            return;
+        }
+        self.reconcile(&ctx).await;
+    }
+}
+
+/// Logs the actual state on Error/End so we can see why a track died.
 struct TrackDiag;
 
 #[async_trait]
@@ -199,7 +267,7 @@ impl VoiceEventHandler for TrackDiag {
                         error!(?err, position = ?state.position, "track errored");
                     }
                     PlayMode::End => {
-                        info!(position = ?state.position, play_time = ?state.play_time, "track ended");
+                        info!(position = ?state.position, "track ended");
                     }
                     other => {
                         info!(state = ?other, "track state changed");
@@ -255,20 +323,17 @@ async fn main() -> Result<()> {
         }
     });
 
-    let source = Arc::new(SharedSource {
-        inner: Mutex::new(Some(PcmSource {
-            consumer: Mutex::new(consumer),
-        })),
-        sample_rate: args.sample_rate,
-        channels: args.channels,
-    });
-
-    let intents = GatewayIntents::GUILDS | GatewayIntents::GUILD_VOICE_STATES;
     let handler = Handler {
         guild_id: GuildId::new(args.guild_id),
         channel_id: ChannelId::new(args.channel_id),
-        source,
+        consumer: Arc::new(Mutex::new(consumer)),
+        sample_rate: args.sample_rate,
+        channels: args.channels,
+        joined: AtomicBool::new(false),
+        reconcile: AsyncMutex::new(()),
     };
+
+    let intents = GatewayIntents::GUILDS | GatewayIntents::GUILD_VOICE_STATES;
 
     let mut client = Client::builder(&args.token, intents)
         .event_handler(handler)
