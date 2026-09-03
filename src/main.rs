@@ -7,6 +7,7 @@ mod http;
 mod pw_source;
 mod settings;
 mod tts;
+mod workflow;
 
 /// Voice bridge over pipewire.
 #[derive(Debug, Parser)]
@@ -35,6 +36,22 @@ struct Args {
     /// Ring buffer capacity in seconds of audio.
     #[arg(long, default_value_t = 4.0)]
     ringbuf_seconds: f32,
+
+    /// Directory of `*.json` ComfyUI workflows to make selectable at runtime.
+    /// Each file must be in API format and contain `{{TEXT}}` wherever the
+    /// utterance text should go.
+    #[arg(long, default_value = "workflows")]
+    workflows_dir: String,
+
+    /// Which workflow (file stem, e.g. "chatterbox") to select at startup.
+    /// If unset, the first workflow found alphabetically is used, or the
+    /// built-in placeholder if the directory is empty.
+    #[arg(long)]
+    default_workflow: Option<String>,
+
+    /// Skip the startup warmup submission.
+    #[arg(long, default_value_t = false)]
+    no_warmup: bool,
 }
 
 fn main() -> Result<()> {
@@ -65,8 +82,55 @@ fn main() -> Result<()> {
         .enable_all()
         .build()?;
 
+    let registry = std::sync::Arc::new(workflow::Registry::from_dir(
+        std::path::Path::new(&args.workflows_dir),
+    ));
+    info!(
+        dir = %args.workflows_dir,
+        count = registry.entries().count(),
+        "workflow registry loaded"
+    );
+
+    let (initial_name, workflow_json, workflow_summary) = {
+        let pick = args
+            .default_workflow
+            .as_deref()
+            .or_else(|| registry.first_name());
+        match pick.and_then(|n| registry.get(n)) {
+            Some(entry) => {
+                info!(name = %entry.name, nodes = entry.summary.node_count, "using workflow");
+                (
+                    Some(entry.name.clone()),
+                    entry.json.clone(),
+                    entry.summary.clone(),
+                )
+            }
+            None => {
+                if args.default_workflow.is_some() {
+                    tracing::warn!(
+                        wanted = ?args.default_workflow,
+                        "requested workflow not in registry; falling back to builtin placeholder"
+                    );
+                } else if registry.is_empty() {
+                    info!("workflow registry empty; using builtin placeholder");
+                }
+                let (j, s) = workflow::builtin_placeholder();
+                (None, j, s)
+            }
+        }
+    };
+    if !workflow_summary.has_text_placeholder {
+        tracing::warn!(
+            "workflow does not contain the `{}` token — utterance text won't reach any node",
+            workflow::TEXT_TOKEN
+        );
+    }
+
     let shared_settings = settings::new(settings::Settings {
         comfyui_base: args.comfyui.trim_end_matches('/').to_string(),
+        workflow_name: initial_name,
+        workflow_json,
+        workflow_summary,
     });
 
     let result = rt.block_on(async move {
@@ -87,7 +151,45 @@ fn main() -> Result<()> {
             say_tx,
             pw_client,
             shared_settings.clone(),
+            registry.clone(),
         ));
+
+        // Verify + warmup run in the background; failures are logged but don't
+        // abort startup, since ComfyUI may be started later than us.
+        let verify_settings = shared_settings.clone();
+        tokio::spawn(async move {
+            let (base, classes) = {
+                let s = verify_settings.read().await;
+                (s.comfyui_base.clone(), s.workflow_summary.node_classes.clone())
+            };
+            let http = reqwest::Client::new();
+            match workflow::missing_nodes(&http, &base, &classes).await {
+                Ok(missing) if missing.is_empty() => {
+                    info!("workflow verified: all node classes present on ComfyUI");
+                }
+                Ok(missing) => {
+                    tracing::warn!(missing = ?missing, "workflow references nodes not present on ComfyUI");
+                }
+                Err(err) => {
+                    tracing::warn!(err = %format!("{err:#}"), "could not verify workflow (is ComfyUI reachable?)");
+                }
+            }
+        });
+
+        if !args.no_warmup {
+            let warm_settings = shared_settings.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                let (base, wf) = {
+                    let s = warm_settings.read().await;
+                    (s.comfyui_base.clone(), s.workflow_json.clone())
+                };
+                match tts::warmup(&base, &wf).await {
+                    Ok(()) => info!("warmup succeeded"),
+                    Err(err) => tracing::warn!(err = %format!("{err:#}"), "warmup failed"),
+                }
+            });
+        }
 
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {

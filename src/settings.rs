@@ -4,30 +4,73 @@
 //! persisted — the CLI is the source of truth on restart.
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-#[derive(Clone, Debug, Serialize)]
+use crate::workflow::{self, Registry, WorkflowSummary};
+
+#[derive(Clone, Debug)]
 pub struct Settings {
     pub comfyui_base: String,
+    /// Selected workflow name (registry key), or None for the built-in placeholder.
+    pub workflow_name: Option<String>,
+    /// Parsed workflow JSON; not exposed over the wire.
+    pub workflow_json: Value,
+    pub workflow_summary: WorkflowSummary,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct SettingsUpdate {
-    pub comfyui_base: Option<String>,
+/// Wire type exposed by `GET /settings`.
+#[derive(Clone, Debug, Serialize)]
+pub struct SettingsPublic {
+    pub comfyui_base: String,
+    pub workflow_name: Option<String>,
+    pub workflow_summary: WorkflowSummary,
 }
 
 impl Settings {
-    /// Applies a partial update in place. Returns whichever fields ended up
-    /// changed (unused for now; useful when we add more settings).
-    pub fn apply(&mut self, update: SettingsUpdate) {
+    pub fn public(&self) -> SettingsPublic {
+        SettingsPublic {
+            comfyui_base: self.comfyui_base.clone(),
+            workflow_name: self.workflow_name.clone(),
+            workflow_summary: self.workflow_summary.clone(),
+        }
+    }
+
+    /// Apply a partial update. `registry` is consulted when switching
+    /// workflows — an unknown name is an error.
+    pub fn apply(&mut self, update: SettingsUpdate, registry: &Registry) -> Result<(), String> {
         if let Some(v) = update.comfyui_base {
             let v = v.trim().trim_end_matches('/').to_string();
             if !v.is_empty() {
                 self.comfyui_base = v;
             }
         }
+        if let Some(name) = update.workflow_name {
+            let trimmed = name.trim().to_string();
+            if trimmed.is_empty() {
+                let (json, summary) = workflow::builtin_placeholder();
+                self.workflow_json = json;
+                self.workflow_summary = summary;
+                self.workflow_name = None;
+            } else {
+                let entry = registry
+                    .get(&trimmed)
+                    .ok_or_else(|| format!("no workflow named '{trimmed}' in registry"))?;
+                self.workflow_json = entry.json.clone();
+                self.workflow_summary = entry.summary.clone();
+                self.workflow_name = Some(entry.name.clone());
+            }
+        }
+        Ok(())
     }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SettingsUpdate {
+    pub comfyui_base: Option<String>,
+    /// Registry key (file stem); empty string reverts to the built-in placeholder.
+    pub workflow_name: Option<String>,
 }
 
 pub type Shared = Arc<RwLock<Settings>>;

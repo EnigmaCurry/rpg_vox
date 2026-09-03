@@ -18,9 +18,12 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc::Sender, oneshot};
 use tracing::info;
 
+use std::sync::Arc;
+
 use crate::pw_source::{GraphSnapshot, PwClient};
 use crate::settings::{self, SettingsUpdate};
-use crate::tts::SayRequest;
+use crate::tts::{self, SayRequest};
+use crate::workflow::{self, Registry};
 
 const INDEX_HTML: &str = include_str!("ui.html");
 
@@ -29,6 +32,7 @@ struct AppState {
     say: Sender<SayRequest>,
     pw: PwClient,
     settings: settings::Shared,
+    registry: Arc<Registry>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -59,8 +63,14 @@ pub async fn serve(
     say: Sender<SayRequest>,
     pw: PwClient,
     settings: settings::Shared,
+    registry: Arc<Registry>,
 ) -> Result<()> {
-    let state = AppState { say, pw, settings };
+    let state = AppState {
+        say,
+        pw,
+        settings,
+        registry,
+    };
     let app = Router::new()
         .route("/", get(index))
         .route("/say", post(say_handler))
@@ -71,6 +81,9 @@ pub async fn serve(
             post(monitor_start_handler).delete(monitor_stop_handler),
         )
         .route("/settings", get(get_settings).post(update_settings))
+        .route("/workflows", get(list_workflows))
+        .route("/workflow/verify", post(verify_workflow))
+        .route("/workflow/warmup", post(warmup_workflow))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&bind)
@@ -147,7 +160,7 @@ async fn monitor_stop_handler(State(state): State<AppState>) -> impl IntoRespons
 }
 
 async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
-    let s = state.settings.read().await.clone();
+    let s = state.settings.read().await.public();
     (StatusCode::OK, Json(s))
 }
 
@@ -156,11 +169,106 @@ async fn update_settings(
     Json(update): Json<SettingsUpdate>,
 ) -> impl IntoResponse {
     let mut guard = state.settings.write().await;
-    guard.apply(update);
-    let s = guard.clone();
-    drop(guard);
-    info!(?s, "settings updated");
-    (StatusCode::OK, Json(s))
+    match guard.apply(update, &state.registry) {
+        Ok(()) => {
+            let s = guard.public();
+            drop(guard);
+            info!("settings updated");
+            (StatusCode::OK, Json(serde_json::to_value(&s).unwrap())).into_response()
+        }
+        Err(err) => {
+            drop(guard);
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ActionResponse {
+                    ok: false,
+                    error: Some(err),
+                }),
+            )
+                .into_response()
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct WorkflowInfo {
+    name: String,
+    summary: workflow::WorkflowSummary,
+}
+
+async fn list_workflows(State(state): State<AppState>) -> impl IntoResponse {
+    let items: Vec<WorkflowInfo> = state
+        .registry
+        .entries()
+        .map(|e| WorkflowInfo {
+            name: e.name.clone(),
+            summary: e.summary.clone(),
+        })
+        .collect();
+    (StatusCode::OK, Json(items))
+}
+
+#[derive(Debug, Serialize)]
+struct VerifyResponse {
+    ok: bool,
+    missing: Vec<String>,
+    error: Option<String>,
+}
+
+async fn verify_workflow(State(state): State<AppState>) -> impl IntoResponse {
+    let (base, classes) = {
+        let s = state.settings.read().await;
+        (
+            s.comfyui_base.clone(),
+            s.workflow_summary.node_classes.clone(),
+        )
+    };
+    let http = reqwest::Client::new();
+    match workflow::missing_nodes(&http, &base, &classes).await {
+        Ok(missing) => (
+            StatusCode::OK,
+            Json(VerifyResponse {
+                ok: missing.is_empty(),
+                missing,
+                error: None,
+            }),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::BAD_GATEWAY,
+            Json(VerifyResponse {
+                ok: false,
+                missing: vec![],
+                error: Some(format!("{err:#}")),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn warmup_workflow(State(state): State<AppState>) -> impl IntoResponse {
+    let (base, wf) = {
+        let s = state.settings.read().await;
+        (s.comfyui_base.clone(), s.workflow_json.clone())
+    };
+    match tts::warmup(&base, &wf).await {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(ActionResponse {
+                ok: true,
+                error: None,
+            }),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::BAD_GATEWAY,
+            Json(ActionResponse {
+                ok: false,
+                error: Some(format!("{err:#}")),
+            }),
+        )
+            .into_response(),
+    }
 }
 
 // GraphSnapshot only needs to be visible to justify the import used above.

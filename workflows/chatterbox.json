@@ -1,0 +1,44 @@
+{
+  "12": {
+    "inputs": {
+      "audio": "leutin09.wav",
+      "audioUI": "/api/view?filename=leutin09.wav&type=input&subfolder=&rand=0.10863147537718654"
+    },
+    "class_type": "LoadAudio",
+    "_meta": {
+      "title": "Load Audio"
+    }
+  },
+  "13": {
+    "inputs": {
+      "audioUI": "/api/view?filename=ComfyUI_temp_mfvfk_00001_.flac&type=temp&subfolder=&rand=0.02676228198469377",
+      "audio": [
+        "16",
+        0
+      ]
+    },
+    "class_type": "PreviewAudio",
+    "_meta": {
+      "title": "Preview Audio"
+    }
+  },
+  "16": {
+    "inputs": {
+      "text": "{{TEXT}}",
+      "exaggeration": 0.5,
+      "cfg_weight": 0.5,
+      "temperature": 0.8,
+      "seed": 2421571919,
+      "use_cpu": false,
+      "keep_model_loaded": true,
+      "audio_prompt": [
+        "12",
+        0
+      ]
+    },
+    "class_type": "FL_ChatterboxTTS",
+    "_meta": {
+      "title": "FL Chatterbox TTS"
+    }
+  }
+}
