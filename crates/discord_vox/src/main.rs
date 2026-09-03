@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::io::{self, Read, Seek, SeekFrom};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -9,16 +11,18 @@ use rtrb::{Consumer, RingBuffer};
 use serenity::{
     async_trait,
     client::{Client, Context as SerenityContext, EventHandler},
+    http::Http,
     model::{
         gateway::Ready,
-        id::{ChannelId, GuildId},
+        id::{ChannelId, GuildId, UserId},
         voice::VoiceState,
     },
     prelude::GatewayIntents,
 };
 use songbird::{
-    SerenityInit,
-    events::{Event, EventContext, EventHandler as VoiceEventHandler, TrackEvent},
+    Config as SongbirdConfig, SerenityInit,
+    driver::{DecodeConfig, DecodeMode},
+    events::{CoreEvent, Event, EventContext, EventHandler as VoiceEventHandler, TrackEvent},
     input::{Input, RawAdapter, codecs::{get_codec_registry, get_probe}},
     tracks::PlayMode,
 };
@@ -27,6 +31,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use tracing::{error, info, warn};
 
 mod pw_sink;
+mod recorder;
 
 /// Discord voice bridge over PipeWire.
 ///
@@ -69,6 +74,13 @@ struct Args {
     /// reduces latency. 2s is a sensible default for voice.
     #[arg(long, default_value_t = 2.0)]
     ringbuf_seconds: f32,
+
+    /// If set, record each join session under this directory. Produces one
+    /// `user-<id>.wav` per speaker plus a combined `mixed.wav`, all at
+    /// 48 kHz 16-bit stereo. Off by default (recording requires consent —
+    /// tell the channel).
+    #[arg(long, env = "DISCORD_RECORD_DIR")]
+    record: Option<PathBuf>,
 }
 
 /// Bridges the SPSC ring buffer (fed by the PipeWire RT callback) into a
@@ -121,6 +133,11 @@ struct Handler {
     consumer: Arc<Mutex<Consumer<f32>>>,
     sample_rate: u32,
     channels: u32,
+    /// If Some, record each session under this root directory.
+    record_root: Option<PathBuf>,
+    /// The current session's recorder, if we're in a channel and recording.
+    /// Held here so leave() can finalize it before songbird drops the Call.
+    active_recorder: Mutex<Option<Arc<recorder::Recorder>>>,
     /// True iff we currently believe we are connected to the voice channel.
     joined: AtomicBool,
     /// Serialises reconcile() so overlapping voice_state_update events can't
@@ -164,20 +181,55 @@ impl Handler {
                 return;
             }
         };
-        let call = match manager.join(self.guild_id, self.channel_id).await {
-            Ok(call) => {
-                info!(
-                    guild = self.guild_id.get(),
-                    channel = self.channel_id.get(),
-                    "joined voice channel"
-                );
-                call
+
+        // Grab (or create) the Call *before* joining voice so we can register
+        // receive handlers up-front. The initial SpeakingStateUpdate events —
+        // which carry the SSRC → UserId mapping for users already in the
+        // channel — fire during the join handshake; if the handlers aren't
+        // attached yet, we miss those mappings and end up with `ssrc-*.wav`
+        // files instead of `user-*.wav`.
+        let call = manager.get_or_insert(self.guild_id);
+
+        if let Some(root) = &self.record_root {
+            let session_dir = recorder::timestamped_session_dir(root);
+            match recorder::Recorder::new(session_dir.clone()) {
+                Ok(rec) => {
+                    let rec = Arc::new(rec);
+                    let mut driver = call.lock().await;
+                    driver.remove_all_global_events();
+                    let make_receiver = || VoiceReceiver {
+                        recorder: Arc::clone(&rec),
+                        guild_id: self.guild_id,
+                        http: Arc::clone(&ctx.http),
+                    };
+                    driver.add_global_event(
+                        CoreEvent::SpeakingStateUpdate.into(),
+                        make_receiver(),
+                    );
+                    driver.add_global_event(CoreEvent::VoiceTick.into(), make_receiver());
+                    drop(driver);
+                    *self.active_recorder.lock().unwrap() = Some(rec);
+                    info!(dir = %session_dir.display(), "recording session started");
+                }
+                Err(err) => {
+                    error!(?err, "failed to start recording session");
+                }
             }
-            Err(err) => {
-                error!(?err, "failed to join voice channel");
-                return;
+        }
+
+        if let Err(err) = manager.join(self.guild_id, self.channel_id).await {
+            error!(?err, "failed to join voice channel");
+            if let Some(rec) = self.active_recorder.lock().unwrap().take() {
+                rec.finalize();
             }
-        };
+            let _ = manager.remove(self.guild_id).await;
+            return;
+        }
+        info!(
+            guild = self.guild_id.get(),
+            channel = self.channel_id.get(),
+            "joined voice channel"
+        );
 
         let source = PcmSource {
             consumer: Arc::clone(&self.consumer),
@@ -197,12 +249,13 @@ impl Handler {
         };
         let mut driver = call.lock().await;
         let handle = driver.play_input(input);
-        drop(driver);
         for evt in [TrackEvent::Error, TrackEvent::End] {
             if let Err(err) = handle.add_event(Event::Track(evt), TrackDiag) {
                 warn!(?evt, ?err, "failed to attach track event handler");
             }
         }
+        drop(driver);
+
         self.joined.store(true, Ordering::SeqCst);
         info!("streaming PipeWire sink to voice channel");
     }
@@ -219,7 +272,76 @@ impl Handler {
             Ok(()) => info!("left voice channel (empty)"),
             Err(err) => warn!(?err, "leave failed"),
         }
+        if let Some(rec) = self.active_recorder.lock().unwrap().take() {
+            rec.finalize();
+            info!(dir = %rec.session_dir().display(), "recording session finalized");
+        }
         self.joined.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Fans SpeakingStateUpdate + VoiceTick events into the current session's
+/// Recorder. Also kicks off async display-name lookups so per-user WAVs can
+/// be renamed from `user-<uid>.wav` to `user-<uid>-<name>.wav`.
+struct VoiceReceiver {
+    recorder: Arc<recorder::Recorder>,
+    guild_id: GuildId,
+    http: Arc<Http>,
+}
+
+#[async_trait]
+impl VoiceEventHandler for VoiceReceiver {
+    async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
+        match ctx {
+            EventContext::SpeakingStateUpdate(speaking) => {
+                let user_id = speaking.user_id.map(|u| u.0);
+                self.recorder.note_speaker(speaking.ssrc, user_id);
+                if let Some(uid) = user_id {
+                    let http = Arc::clone(&self.http);
+                    let recorder = Arc::clone(&self.recorder);
+                    let guild_id = self.guild_id;
+                    tokio::spawn(async move {
+                        if let Some(name) = fetch_display_name(&http, guild_id, uid).await {
+                            recorder.note_display_name(uid, &name);
+                        }
+                    });
+                }
+            }
+            EventContext::VoiceTick(tick) => {
+                let speaking: HashMap<u32, &[i16]> = tick
+                    .speaking
+                    .iter()
+                    .filter_map(|(&ssrc, data)| {
+                        data.decoded_voice.as_deref().map(|d| (ssrc, d))
+                    })
+                    .collect();
+                let silent: Vec<u32> = tick.silent.iter().copied().collect();
+                self.recorder.write_tick(&speaking, &silent);
+            }
+            _ => {}
+        }
+        None
+    }
+}
+
+/// Resolve a Discord user's display name: guild nickname if set, otherwise
+/// their global display name, otherwise their username. Sanitized for use in
+/// a filename. Returns None on any failure or if nothing usable is left.
+async fn fetch_display_name(http: &Http, guild_id: GuildId, user_id: u64) -> Option<String> {
+    match http.get_member(guild_id, UserId::new(user_id)).await {
+        Ok(member) => {
+            let raw = member
+                .nick
+                .as_deref()
+                .or(member.user.global_name.as_deref())
+                .unwrap_or(&member.user.name);
+            let sanitized = recorder::sanitize_display_name(raw);
+            (!sanitized.is_empty()).then_some(sanitized)
+        }
+        Err(err) => {
+            warn!(?err, user_id, "failed to fetch member display name");
+            None
+        }
     }
 }
 
@@ -323,21 +445,34 @@ async fn main() -> Result<()> {
         }
     });
 
+    let recording = args.record.is_some();
+    if recording {
+        info!(dir = %args.record.as_ref().unwrap().display(), "voice recording enabled");
+    }
+
     let handler = Handler {
         guild_id: GuildId::new(args.guild_id),
         channel_id: ChannelId::new(args.channel_id),
         consumer: Arc::new(Mutex::new(consumer)),
         sample_rate: args.sample_rate,
         channels: args.channels,
+        record_root: args.record.clone(),
+        active_recorder: Mutex::new(None),
         joined: AtomicBool::new(false),
         reconcile: AsyncMutex::new(()),
     };
 
     let intents = GatewayIntents::GUILDS | GatewayIntents::GUILD_VOICE_STATES;
 
+    let songbird_config = if recording {
+        SongbirdConfig::default().decode_mode(DecodeMode::Decode(DecodeConfig::default()))
+    } else {
+        SongbirdConfig::default()
+    };
+
     let mut client = Client::builder(&args.token, intents)
         .event_handler(handler)
-        .register_songbird()
+        .register_songbird_from_config(songbird_config)
         .await
         .context("build serenity client")?;
 

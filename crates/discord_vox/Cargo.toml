@@ -21,7 +21,13 @@ songbird = { version = "0.6", default-features = false, features = [
     "rustls",
     "gateway",
     "tungstenite",
+    "receive",
 ] }
+
+# WAV file writer for per-user and mixed recordings.
+hound = "3"
+# Timestamped session directory names.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 # MediaSource trait for the raw PCM adapter that feeds songbird.
 symphonia-core = "0.5"
