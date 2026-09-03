@@ -31,6 +31,10 @@ ogg = "0.9"
 # Provides the `Packet` trait so we can call `.payload()` on the RTP packet
 # songbird hands us via VoiceTick. Version matches songbird 0.6's own dep.
 discortp = "0.6"
+
+# Metadata store: SQLite via rusqlite (bundled so it doesn't depend on a
+# system libsqlite). Small writes only; no server, queryable with `sqlite3`.
+rusqlite = { version = "0.31", features = ["bundled"] }
 # Timestamped session directory names.
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 

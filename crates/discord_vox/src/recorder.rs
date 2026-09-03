@@ -66,6 +66,7 @@ struct PerUser {
 
 pub struct Recorder {
     state: Mutex<State>,
+    started_at: chrono::DateTime<chrono::Local>,
 }
 
 impl Recorder {
@@ -83,11 +84,16 @@ impl Recorder {
                 ssrc_to_user: HashMap::new(),
                 user_display_name: HashMap::new(),
             }),
+            started_at: chrono::Local::now(),
         })
     }
 
     pub fn session_dir(&self) -> PathBuf {
         self.state.lock().unwrap().session_dir.clone()
+    }
+
+    pub fn started_at(&self) -> chrono::DateTime<chrono::Local> {
+        self.started_at
     }
 
     /// Remember the SSRC → Discord user id mapping. Discord may deliver

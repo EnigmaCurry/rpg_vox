@@ -31,6 +31,7 @@ use symphonia_core::io::MediaSource;
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::{error, info, warn};
 
+mod metadata;
 mod pw_sink;
 mod recorder;
 
@@ -82,6 +83,99 @@ struct Args {
     /// tell the channel).
     #[arg(long, env = "DISCORD_RECORD_DIR")]
     record: Option<PathBuf>,
+
+    /// Operator's real name — displayed in the recording-notice message the
+    /// bot posts to text-in-voice on each recorded join.
+    #[arg(long, env = "DISCORD_VOX_OPERATOR_NAME")]
+    operator_name: Option<String>,
+
+    /// Operator's Discord handle (e.g. `enigmacurry`) — displayed in the
+    /// recording-notice message.
+    #[arg(long, env = "DISCORD_VOX_OPERATOR_DISCORD")]
+    operator_discord: Option<String>,
+
+    /// Operator's contact email — displayed in the recording-notice message.
+    #[arg(long, env = "DISCORD_VOX_OPERATOR_EMAIL")]
+    operator_email: Option<String>,
+
+    /// Path to a SQLite database where the bot upserts Discord metadata it
+    /// observes (guild / channel / user names). Defaults to
+    /// `<record>/metadata.db` when `--record` is set; otherwise off.
+    /// Queryable with `sqlite3`; a proper API is planned.
+    #[arg(long, env = "DISCORD_VOX_METADATA_DB")]
+    metadata_db: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct Operator {
+    name: Option<String>,
+    discord: Option<String>,
+    email: Option<String>,
+}
+
+impl Operator {
+    fn contact_line(&self) -> Option<String> {
+        match (&self.discord, &self.email) {
+            (Some(d), Some(e)) => Some(format!("Address all concerns to `{d}` on Discord or to <{e}>.")),
+            (Some(d), None) => Some(format!("Address all concerns to `{d}` on Discord.")),
+            (None, Some(e)) => Some(format!("Address all concerns to <{e}>.")),
+            (None, None) => None,
+        }
+    }
+}
+
+fn format_duration(d: chrono::Duration) -> String {
+    let secs = d.num_seconds().max(0);
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    if h > 0 {
+        format!("{h}h {m}m {s}s")
+    } else if m > 0 {
+        format!("{m}m {s}s")
+    } else {
+        format!("{s}s")
+    }
+}
+
+/// Companion to the start notice: posted when the recording session ends,
+/// with start/end timestamps and elapsed duration so both bookends are
+/// visible in-channel.
+fn build_recording_stop_notice(
+    started_at: chrono::DateTime<chrono::Local>,
+    ended_at: chrono::DateTime<chrono::Local>,
+) -> String {
+    let elapsed = ended_at.signed_duration_since(started_at);
+    format!(
+        "*Recording stopped at {end}. Started {start}. Duration: **{dur}**.*",
+        end = ended_at.format("%Y-%m-%d %H:%M:%S %Z"),
+        start = started_at.format("%Y-%m-%d %H:%M:%S %Z"),
+        dur = format_duration(elapsed),
+    )
+}
+
+/// Consent-notice message posted to the voice channel's text chat when the
+/// bot begins a recording session. Includes the local timestamp so the
+/// exact start of the recording is on-record in-channel.
+fn build_recording_notice(op: &Operator) -> String {
+    let mut msg = String::new();
+    msg.push_str("**WARNING: This bot may record the audio of conversations he is a party of.**\n\n");
+    msg.push_str(
+        "These recordings are used only for the game experience. Your voice may \
+        be transcribed and processed by a machine that the operator runs locally \
+        in his domain.\n",
+    );
+    if let Some(name) = &op.name {
+        msg.push_str(&format!("\nOperator: **{name}**\n"));
+    }
+    if let Some(contact) = op.contact_line() {
+        msg.push('\n');
+        msg.push_str(&contact);
+        msg.push('\n');
+    }
+    let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
+    msg.push_str(&format!("\n*Recording started at {ts}.*"));
+    msg
 }
 
 /// Bridges the SPSC ring buffer (fed by the PipeWire RT callback) into a
@@ -136,6 +230,10 @@ struct Handler {
     channels: u32,
     /// If Some, record each session under this root directory.
     record_root: Option<PathBuf>,
+    /// Operator details, embedded in the recording-notice message.
+    operator: Operator,
+    /// Optional metadata sink for guild/channel/user identifiers we observe.
+    metadata: Option<Arc<metadata::MetadataDb>>,
     /// The current session's recorder, if we're in a channel and recording.
     /// Held here so leave() can finalize it before songbird drops the Call.
     active_recorder: Mutex<Option<Arc<recorder::Recorder>>>,
@@ -192,7 +290,10 @@ impl Handler {
         let call = manager.get_or_insert(self.guild_id);
 
         if let Some(root) = &self.record_root {
-            let session_dir = recorder::timestamped_session_dir(root);
+            let session_root = root
+                .join(self.guild_id.get().to_string())
+                .join(self.channel_id.get().to_string());
+            let session_dir = recorder::timestamped_session_dir(&session_root);
             match recorder::Recorder::new(session_dir.clone()) {
                 Ok(rec) => {
                     let rec = Arc::new(rec);
@@ -202,6 +303,7 @@ impl Handler {
                         recorder: Arc::clone(&rec),
                         guild_id: self.guild_id,
                         http: Arc::clone(&ctx.http),
+                        metadata: self.metadata.clone(),
                     };
                     driver.add_global_event(
                         CoreEvent::SpeakingStateUpdate.into(),
@@ -211,6 +313,15 @@ impl Handler {
                     drop(driver);
                     *self.active_recorder.lock().unwrap() = Some(rec);
                     info!(dir = %session_dir.display(), "recording session started");
+
+                    let notice = build_recording_notice(&self.operator);
+                    if let Err(err) = self.channel_id.say(&ctx.http, &notice).await {
+                        warn!(
+                            ?err,
+                            "failed to post recording notice to text-in-voice \
+                             (does the bot have SEND_MESSAGES on the channel?)"
+                        );
+                    }
                 }
                 Err(err) => {
                     error!(?err, "failed to start recording session");
@@ -231,6 +342,19 @@ impl Handler {
             channel = self.channel_id.get(),
             "joined voice channel"
         );
+
+        if let Some(md) = &self.metadata {
+            if let Some(guild) = ctx.cache.guild(self.guild_id) {
+                md.upsert_guild(self.guild_id.get(), &guild.name);
+                if let Some(chan) = guild.channels.get(&self.channel_id) {
+                    md.upsert_channel(
+                        self.channel_id.get(),
+                        self.guild_id.get(),
+                        &chan.name,
+                    );
+                }
+            }
+        }
 
         let source = PcmSource {
             consumer: Arc::clone(&self.consumer),
@@ -273,11 +397,20 @@ impl Handler {
             Ok(()) => info!("left voice channel (empty)"),
             Err(err) => warn!(?err, "leave failed"),
         }
-        if let Some(rec) = self.active_recorder.lock().unwrap().take() {
+        let active = self.active_recorder.lock().unwrap().take();
+        if let Some(rec) = active {
+            let started_at = rec.started_at();
+            let ended_at = chrono::Local::now();
             rec.finalize();
             let session_dir = rec.session_dir();
             info!(dir = %session_dir.display(), "recording session finalized");
             drop(rec);
+
+            let notice = build_recording_stop_notice(started_at, ended_at);
+            if let Err(err) = self.channel_id.say(&ctx.http, &notice).await {
+                warn!(?err, "failed to post recording-stopped notice");
+            }
+
             tokio::spawn(async move {
                 recorder::transcode_session(session_dir).await;
             });
@@ -293,6 +426,7 @@ struct VoiceReceiver {
     recorder: Arc<recorder::Recorder>,
     guild_id: GuildId,
     http: Arc<Http>,
+    metadata: Option<Arc<metadata::MetadataDb>>,
 }
 
 #[async_trait]
@@ -306,8 +440,11 @@ impl VoiceEventHandler for VoiceReceiver {
                     let http = Arc::clone(&self.http);
                     let recorder = Arc::clone(&self.recorder);
                     let guild_id = self.guild_id;
+                    let metadata = self.metadata.clone();
                     tokio::spawn(async move {
-                        if let Some(name) = fetch_display_name(&http, guild_id, uid).await {
+                        if let Some(name) =
+                            fetch_display_name(&http, guild_id, uid, metadata.as_deref()).await
+                        {
                             recorder.note_display_name(uid, &name);
                         }
                     });
@@ -364,7 +501,15 @@ impl VoiceEventHandler for VoiceReceiver {
 /// Resolve a Discord user's display name: guild nickname if set, otherwise
 /// their global display name, otherwise their username. Sanitized for use in
 /// a filename. Returns None on any failure or if nothing usable is left.
-async fn fetch_display_name(http: &Http, guild_id: GuildId, user_id: u64) -> Option<String> {
+/// Additionally, if a metadata db is provided, upserts the raw identifiers
+/// (username, global name, per-guild nick) as a side-effect — the DB stores
+/// unsanitized values.
+async fn fetch_display_name(
+    http: &Http,
+    guild_id: GuildId,
+    user_id: u64,
+    metadata: Option<&metadata::MetadataDb>,
+) -> Option<String> {
     match http.get_member(guild_id, UserId::new(user_id)).await {
         Ok(member) => {
             let raw = member
@@ -372,6 +517,15 @@ async fn fetch_display_name(http: &Http, guild_id: GuildId, user_id: u64) -> Opt
                 .as_deref()
                 .or(member.user.global_name.as_deref())
                 .unwrap_or(&member.user.name);
+            if let Some(md) = metadata {
+                md.upsert_user(
+                    user_id,
+                    &member.user.name,
+                    member.user.global_name.as_deref(),
+                    raw,
+                );
+                md.upsert_guild_member(guild_id.get(), user_id, member.nick.as_deref());
+            }
             let sanitized = recorder::sanitize_display_name(raw);
             (!sanitized.is_empty()).then_some(sanitized)
         }
@@ -487,6 +641,26 @@ async fn main() -> Result<()> {
         info!(dir = %args.record.as_ref().unwrap().display(), "voice recording enabled");
     }
 
+    let metadata_path: Option<PathBuf> = args
+        .metadata_db
+        .clone()
+        .or_else(|| args.record.as_ref().map(|r| r.join("metadata.db")));
+
+    let metadata = if let Some(path) = &metadata_path {
+        match metadata::MetadataDb::open(path) {
+            Ok(db) => {
+                info!(path = %path.display(), "metadata db opened");
+                Some(Arc::new(db))
+            }
+            Err(err) => {
+                error!(?err, path = %path.display(), "failed to open metadata db; continuing without it");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let handler = Handler {
         guild_id: GuildId::new(args.guild_id),
         channel_id: ChannelId::new(args.channel_id),
@@ -494,6 +668,12 @@ async fn main() -> Result<()> {
         sample_rate: args.sample_rate,
         channels: args.channels,
         record_root: args.record.clone(),
+        operator: Operator {
+            name: args.operator_name.clone(),
+            discord: args.operator_discord.clone(),
+            email: args.operator_email.clone(),
+        },
+        metadata: metadata.clone(),
         active_recorder: Mutex::new(None),
         joined: AtomicBool::new(false),
         reconcile: AsyncMutex::new(()),
