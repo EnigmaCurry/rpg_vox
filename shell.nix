@@ -16,6 +16,7 @@ pkgs.mkShell {
     pipewire.dev
     openssl
     openssl.dev
+    libopus
   ];
 
   # bindgen (used by pipewire-sys) needs libclang at runtime.

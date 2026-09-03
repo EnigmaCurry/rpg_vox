@@ -1,0 +1,46 @@
+[package]
+name = "discord_vox"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Discord voice bridge — routes a PipeWire sink into a Discord voice channel"
+
+[dependencies]
+# Discord gateway + voice.
+serenity = { version = "0.12", default-features = false, features = [
+    "client",
+    "gateway",
+    "model",
+    "voice",
+    "cache",
+    "rustls_backend",
+] }
+songbird = { version = "0.6", default-features = false, features = [
+    "serenity",
+    "driver",
+    "rustls",
+    "gateway",
+    "tungstenite",
+] }
+
+# MediaSource trait for the raw PCM adapter that feeds songbird.
+symphonia-core = "0.5"
+# Enables the PCM decoder in symphonia's default registry. Songbird's RawReader
+# tags the raw stream as CODEC_TYPE_PCM_F32LE, but songbird declares symphonia
+# with no default features, so without this the codec has no decoder and the
+# track fails with `no compatible track found`.
+symphonia = { version = "0.5", default-features = false, features = ["pcm"] }
+
+# PipeWire sink node (in-process).
+pipewire.workspace = true
+libspa.workspace = true
+
+# Realtime SPSC ring buffer — used later to hand samples from the sink's
+# realtime process callback to the songbird Input on the tokio side.
+rtrb.workspace = true
+
+tokio.workspace = true
+clap = { workspace = true, features = ["env"] }
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
