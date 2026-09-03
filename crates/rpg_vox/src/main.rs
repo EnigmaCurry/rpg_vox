@@ -78,6 +78,7 @@ fn main() -> Result<()> {
         node_name: args.node_name.clone(),
         node_description: args.node_description.clone(),
         sample_rate: args.sample_rate,
+        auto_patch_target: args.auto_link.clone(),
     };
     let pw_handle = pw_source::spawn(pw_cfg, consumer)?;
     let pw_client = pw_handle.client.clone();
@@ -222,18 +223,20 @@ fn main() -> Result<()> {
     result
 }
 
-/// Poll the PipeWire graph until an Audio/Sink whose `node.name` matches
-/// `target` shows up, then patch our source's output to it. Exits once the
-/// auto-patch is established. Independent of the debug monitor slot.
+/// Watch the PipeWire graph for an Audio/Sink whose `node.name` matches
+/// `target` and (re)patch our source's output to it any time it's not
+/// already patched. Runs for the process lifetime so we recover when the
+/// peer restarts. Independent of the debug monitor slot.
 async fn auto_link(pw: pw_source::PwClient, target: String) {
     let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut had_patch = false;
     loop {
         interval.tick().await;
         let snap = match pw.snapshot().await {
             Ok(s) => s,
             Err(err) => {
-                tracing::warn!(err = %err, target = %target, "auto-link snapshot failed");
+                tracing::warn!(err = %err, target = %target, "auto-patch snapshot failed");
                 continue;
             }
         };
@@ -241,17 +244,18 @@ async fn auto_link(pw: pw_source::PwClient, target: String) {
             continue;
         }
         if snap.auto_patch_sink_id.is_some() {
-            info!(target = %target, "auto-patch already established; watcher exiting");
-            return;
+            had_patch = true;
+            continue;
         }
         let Some(sink) = snap.sinks.iter().find(|s| s.name == target) else {
+            if had_patch {
+                info!(target = %target, "auto-patch peer gone; awaiting return");
+                had_patch = false;
+            }
             continue;
         };
         match pw.start_auto_patch(sink.id).await {
-            Ok(()) => {
-                info!(target = %target, sink_id = sink.id, "auto-patched to sink");
-                return;
-            }
+            Ok(()) => info!(target = %target, sink_id = sink.id, "auto-patched to sink"),
             Err(err) => {
                 tracing::warn!(target = %target, err = %err, "auto-patch failed; will retry");
             }

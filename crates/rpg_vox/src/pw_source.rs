@@ -2,9 +2,11 @@
 //!
 //! Runs the PipeWire main loop on a dedicated OS thread. Two things live there:
 //!
-//! 1. A source stream that appears as `Audio/Source`. Its realtime `process`
-//!    callback drains f32 mono samples from an `rtrb::Consumer` and writes them
-//!    into the negotiated output buffer, emitting silence on underrun.
+//! 1. A source stream that appears as a stereo `Audio/Source`. Its realtime
+//!    `process` callback drains f32 mono samples from an `rtrb::Consumer` and
+//!    duplicates each into both L and R of the negotiated interleaved output
+//!    buffer, emitting silence on underrun. Downstream FX / panning will run
+//!    against the stereo pair.
 //!
 //! 2. A registry listener that tracks the surrounding graph (sinks + our own
 //!    ports + all links). The tokio side talks to the pw thread through a
@@ -47,10 +49,18 @@ use libspa::{
 // Public API
 // -----------------------------------------------------------------------------
 
+/// Channel count offered to PipeWire. Mono TTS gets fanned out to L=R here so
+/// downstream FX / panning always operate on a stereo pair.
+const SOURCE_CHANNELS: u32 = 2;
+
 pub struct Config {
     pub node_name: String,
     pub node_description: String,
     pub sample_rate: u32,
+    /// `node.name` we should auto-patch our source into on every appearance.
+    /// Exposed in `GraphSnapshot` so the UI can hide the target from the
+    /// monitor picker even while a reconnection is still in flight.
+    pub auto_patch_target: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -67,6 +77,10 @@ pub struct GraphSnapshot {
     pub listeners: Vec<NodeInfo>,
     pub monitor_sink_id: Option<u32>,
     pub auto_patch_sink_id: Option<u32>,
+    /// Configured auto-patch target `node.name`, if any. Stable across
+    /// peer restarts (whereas `auto_patch_sink_id` clears while the peer
+    /// is gone).
+    pub auto_patch_target: Option<String>,
 }
 
 pub enum Command {
@@ -177,8 +191,11 @@ struct Graph {
     own_node_id: Option<u32>,
     /// Debug listen-along link set, toggled by the UI.
     monitor: Option<ActiveLinkSet>,
-    /// Production link set, established at startup from RPG_VOX_AUTO_LINK.
+    /// Production link set. Reset to `None` when the target sink disappears
+    /// so the auto-patch task can re-establish it on reconnect.
     auto_patch: Option<ActiveLinkSet>,
+    /// Configured auto-patch target `node.name`, if any. Set once on startup.
+    auto_patch_target: Option<String>,
 }
 
 struct TrackedNode {
@@ -270,6 +287,7 @@ impl Graph {
             listeners,
             monitor_sink_id: self.monitor.as_ref().map(|m| m.sink_id),
             auto_patch_sink_id: self.auto_patch.as_ref().map(|p| p.sink_id),
+            auto_patch_target: self.auto_patch_target.clone(),
         }
     }
 }
@@ -340,6 +358,14 @@ fn on_global_remove(graph: &Rc<RefCell<Graph>>, id: u32) {
     g.nodes.remove(&id);
     g.ports.remove(&id);
     g.links.remove(&id);
+    // If the disappearing global was our patched-into sink, drop the link
+    // handles so a new appearance is treated as a fresh peer.
+    if g.monitor.as_ref().map(|m| m.sink_id) == Some(id) {
+        g.monitor = None;
+    }
+    if g.auto_patch.as_ref().map(|p| p.sink_id) == Some(id) {
+        g.auto_patch = None;
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -367,10 +393,16 @@ fn handle_command(core: &Core, graph: &Rc<RefCell<Graph>>, cmd: Command) {
     }
 }
 
-/// Create one link from every source output port to every sink input port
-/// (mono → N-channel is fan-out — same signal on L and R for stereo sinks).
-/// Returns the sink's description and the Link handles that must be kept
-/// alive to hold the links open.
+/// Pair our source's output ports with the sink's input ports and create
+/// one PipeWire link per pair. Port IDs are sorted so pairing is stable
+/// across restarts, and PipeWire assigns port IDs in channel-position order
+/// (FL before FR), so a sorted 1:1 mapping preserves stereo channels.
+///
+/// Fallback strategies handle mismatched counts:
+///   * source=1 → fan out to every sink input (mono source, N-channel sink)
+///   * sink=1   → fan in every source output to the one sink input
+///   * N == M   → pair by index
+///   * mismatch → warn and fan out fully (last-resort mesh)
 fn create_links_to_sink(
     core: &Core,
     graph: &Rc<RefCell<Graph>>,
@@ -391,12 +423,14 @@ fn create_links_to_sink(
     let own = g
         .own_node_id
         .ok_or_else(|| anyhow::anyhow!("own source node not yet registered"))?;
-    let out_ports = g.our_output_port_ids();
+    let mut out_ports = g.our_output_port_ids();
+    out_ports.sort();
     anyhow::ensure!(
         !out_ports.is_empty(),
         "our source has no output ports yet — try again in a moment"
     );
-    let in_ports = g.sink_input_port_ids(sink_id);
+    let mut in_ports = g.sink_input_port_ids(sink_id);
+    in_ports.sort();
     anyhow::ensure!(
         !in_ports.is_empty(),
         "sink {sink_desc} has no input ports"
@@ -404,23 +438,39 @@ fn create_links_to_sink(
 
     drop(g);
 
-    let mut created: Vec<pipewire::link::Link> = Vec::new();
-    for &in_port in &in_ports {
-        for &out_port in &out_ports {
-            let props = properties! {
-                "link.output.node" => own.to_string(),
-                "link.output.port" => out_port.to_string(),
-                "link.input.node"  => sink_id.to_string(),
-                "link.input.port"  => in_port.to_string(),
-                "object.linger" => "false",
-            };
-            let link: pipewire::link::Link = core
-                .create_object("link-factory", &props)
-                .with_context(|| {
-                    format!("create link {own}:{out_port} -> {sink_id}:{in_port}")
-                })?;
-            created.push(link);
+    let pairs: Vec<(u32, u32)> = match (out_ports.len(), in_ports.len()) {
+        (1, _) => in_ports.iter().map(|&i| (out_ports[0], i)).collect(),
+        (_, 1) => out_ports.iter().map(|&o| (o, in_ports[0])).collect(),
+        (n, m) if n == m => out_ports.iter().copied().zip(in_ports.iter().copied()).collect(),
+        (n, m) => {
+            warn!(
+                out_ports = n,
+                in_ports = m,
+                sink = %sink_desc,
+                "port count mismatch; falling back to full mesh",
+            );
+            out_ports
+                .iter()
+                .flat_map(|&o| in_ports.iter().map(move |&i| (o, i)))
+                .collect()
         }
+    };
+
+    let mut created: Vec<pipewire::link::Link> = Vec::new();
+    for (out_port, in_port) in pairs {
+        let props = properties! {
+            "link.output.node" => own.to_string(),
+            "link.output.port" => out_port.to_string(),
+            "link.input.node"  => sink_id.to_string(),
+            "link.input.port"  => in_port.to_string(),
+            "object.linger" => "false",
+        };
+        let link: pipewire::link::Link = core
+            .create_object("link-factory", &props)
+            .with_context(|| {
+                format!("create link {own}:{out_port} -> {sink_id}:{in_port}")
+            })?;
+        created.push(link);
     }
 
     Ok((sink_desc, created))
@@ -470,7 +520,10 @@ fn run(
     let context = Context::new(&mainloop).context("Context::new")?;
     let core = context.connect(None).context("Context::connect")?;
 
-    let graph: Rc<RefCell<Graph>> = Rc::new(RefCell::new(Graph::default()));
+    let graph: Rc<RefCell<Graph>> = Rc::new(RefCell::new(Graph {
+        auto_patch_target: cfg.auto_patch_target.clone(),
+        ..Graph::default()
+    }));
 
     // Registry listener.
     let registry: Registry = core.get_registry().context("get_registry")?;
@@ -524,22 +577,28 @@ fn run(
                 return;
             }
             let data = &mut datas[0];
-            let stride = std::mem::size_of::<f32>();
+            // Interleaved stereo: each frame is 2 × f32.
+            let bytes_per_frame = SOURCE_CHANNELS as usize * std::mem::size_of::<f32>();
 
-            let frames_written = if let Some(slice) = data.data() {
+            let capacity_frames = if let Some(slice) = data.data() {
                 let out: &mut [f32] = bytemuck_cast_slice_mut(slice);
+                let frames = out.len() / SOURCE_CHANNELS as usize;
                 let mut written = 0usize;
-                while written < out.len() {
+                while written < frames {
                     match state.consumer.pop() {
                         Ok(sample) => {
-                            out[written] = sample;
+                            let base = written * SOURCE_CHANNELS as usize;
+                            out[base] = sample;
+                            out[base + 1] = sample;
                             written += 1;
                         }
                         Err(_) => break,
                     }
                 }
-                if written < out.len() {
-                    for s in &mut out[written..] {
+                if written < frames {
+                    let tail = &mut out[(written * SOURCE_CHANNELS as usize)
+                        ..(frames * SOURCE_CHANNELS as usize)];
+                    for s in tail {
                         *s = 0.0;
                     }
                     if written == 0 {
@@ -549,15 +608,15 @@ fn run(
                         }
                     }
                 }
-                out.len()
+                frames
             } else {
                 0
             };
 
             let chunk = data.chunk_mut();
             *chunk.offset_mut() = 0;
-            *chunk.stride_mut() = stride as _;
-            *chunk.size_mut() = (stride * frames_written) as _;
+            *chunk.stride_mut() = bytes_per_frame as _;
+            *chunk.size_mut() = (bytes_per_frame * capacity_frames) as _;
         })
         .register()
         .context("Stream::register")?;
@@ -566,7 +625,7 @@ fn run(
     let mut info = AudioInfoRaw::new();
     info.set_format(AudioFormat::F32LE);
     info.set_rate(cfg.sample_rate);
-    info.set_channels(1);
+    info.set_channels(SOURCE_CHANNELS);
     let obj = Object {
         type_: libspa::sys::SPA_TYPE_OBJECT_Format,
         id: libspa::sys::SPA_PARAM_EnumFormat,
