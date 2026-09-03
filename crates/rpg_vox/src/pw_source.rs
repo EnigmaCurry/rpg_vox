@@ -66,6 +66,7 @@ pub struct GraphSnapshot {
     pub sinks: Vec<NodeInfo>,
     pub listeners: Vec<NodeInfo>,
     pub monitor_sink_id: Option<u32>,
+    pub auto_patch_sink_id: Option<u32>,
 }
 
 pub enum Command {
@@ -75,6 +76,10 @@ pub enum Command {
         reply: oneshot::Sender<Result<(), String>>,
     },
     StopMonitor {
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    StartAutoPatch {
+        sink_id: u32,
         reply: oneshot::Sender<Result<(), String>>,
     },
 }
@@ -108,6 +113,17 @@ impl PwClient {
         let (tx, rx) = oneshot::channel();
         self.tx
             .send(Command::StopMonitor { reply: tx })
+            .map_err(|_| "pw thread gone".to_string())?;
+        rx.await.map_err(|_| "pw thread dropped reply".to_string())?
+    }
+
+    pub async fn start_auto_patch(&self, sink_id: u32) -> Result<(), String> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(Command::StartAutoPatch {
+                sink_id,
+                reply: tx,
+            })
             .map_err(|_| "pw thread gone".to_string())?;
         rx.await.map_err(|_| "pw thread dropped reply".to_string())?
     }
@@ -159,7 +175,10 @@ struct Graph {
     ports: HashMap<u32, TrackedPort>,
     links: HashMap<u32, TrackedLink>,
     own_node_id: Option<u32>,
-    monitor: Option<ActiveMonitor>,
+    /// Debug listen-along link set, toggled by the UI.
+    monitor: Option<ActiveLinkSet>,
+    /// Production link set, established at startup from RPG_VOX_AUTO_LINK.
+    auto_patch: Option<ActiveLinkSet>,
 }
 
 struct TrackedNode {
@@ -184,7 +203,7 @@ struct TrackedLink {
     input_node: u32,
 }
 
-struct ActiveMonitor {
+struct ActiveLinkSet {
     sink_id: u32,
     /// Keeps the link proxies alive; dropping them removes the links.
     _links: Vec<pipewire::link::Link>,
@@ -250,6 +269,7 @@ impl Graph {
             sinks,
             listeners,
             monitor_sink_id: self.monitor.as_ref().map(|m| m.sink_id),
+            auto_patch_sink_id: self.auto_patch.as_ref().map(|p| p.sink_id),
         }
     }
 }
@@ -340,14 +360,22 @@ fn handle_command(core: &Core, graph: &Rc<RefCell<Graph>>, cmd: Command) {
             graph.borrow_mut().monitor = None;
             let _ = reply.send(Ok(()));
         }
+        Command::StartAutoPatch { sink_id, reply } => {
+            let result = start_auto_patch(core, graph, sink_id);
+            let _ = reply.send(result.map_err(|e| format!("{e:#}")));
+        }
     }
 }
 
-fn start_monitor(
+/// Create one link from every source output port to every sink input port
+/// (mono → N-channel is fan-out — same signal on L and R for stereo sinks).
+/// Returns the sink's description and the Link handles that must be kept
+/// alive to hold the links open.
+fn create_links_to_sink(
     core: &Core,
     graph: &Rc<RefCell<Graph>>,
     sink_id: u32,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<(String, Vec<pipewire::link::Link>)> {
     let g = graph.borrow();
 
     let sink = g
@@ -374,8 +402,6 @@ fn start_monitor(
         "sink {sink_desc} has no input ports"
     );
 
-    // Mono source → each sink input port. Duplicate the mono channel to every
-    // input port so stereo sinks receive the same signal on L and R.
     drop(g);
 
     let mut created: Vec<pipewire::link::Link> = Vec::new();
@@ -397,11 +423,34 @@ fn start_monitor(
         }
     }
 
-    graph.borrow_mut().monitor = Some(ActiveMonitor {
+    Ok((sink_desc, created))
+}
+
+fn start_monitor(
+    core: &Core,
+    graph: &Rc<RefCell<Graph>>,
+    sink_id: u32,
+) -> anyhow::Result<()> {
+    let (sink_desc, links) = create_links_to_sink(core, graph, sink_id)?;
+    graph.borrow_mut().monitor = Some(ActiveLinkSet {
         sink_id,
-        _links: created,
+        _links: links,
     });
     info!(sink = %sink_desc, "monitor started");
+    Ok(())
+}
+
+fn start_auto_patch(
+    core: &Core,
+    graph: &Rc<RefCell<Graph>>,
+    sink_id: u32,
+) -> anyhow::Result<()> {
+    let (sink_desc, links) = create_links_to_sink(core, graph, sink_id)?;
+    graph.borrow_mut().auto_patch = Some(ActiveLinkSet {
+        sink_id,
+        _links: links,
+    });
+    info!(sink = %sink_desc, "auto-patch established");
     Ok(())
 }
 

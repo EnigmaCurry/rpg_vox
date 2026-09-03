@@ -18,7 +18,7 @@ struct Args {
     bind: String,
 
     /// ComfyUI base URL (HTTP; the WebSocket endpoint is derived from this).
-    #[arg(long, default_value = "http://127.0.0.1:8188")]
+    #[arg(long, env = "RPG_VOX_COMFYUI", default_value = "http://127.0.0.1:8188")]
     comfyui: String,
 
     /// User-facing name shown in Firefox's mic picker.
@@ -52,6 +52,12 @@ struct Args {
     /// Skip the startup warmup submission.
     #[arg(long, default_value_t = false)]
     no_warmup: bool,
+
+    /// PipeWire `node.name` of an Audio/Sink to auto-link this source to on
+    /// startup (retries until the sink appears). Handy for pinning rpg-vox
+    /// to a companion like `discord-vox` without dragging cables in Helvum.
+    #[arg(long, env = "RPG_VOX_AUTO_LINK")]
+    auto_link: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -75,6 +81,7 @@ fn main() -> Result<()> {
     };
     let pw_handle = pw_source::spawn(pw_cfg, consumer)?;
     let pw_client = pw_handle.client.clone();
+    let auto_link_client = pw_client.clone();
     info!(node = %args.node_name, "PipeWire source node started");
 
     // Everything else lives on the tokio runtime.
@@ -176,6 +183,10 @@ fn main() -> Result<()> {
             }
         });
 
+        if let Some(target) = args.auto_link.clone() {
+            tokio::spawn(auto_link(auto_link_client, target));
+        }
+
         if !args.no_warmup {
             let warm_settings = shared_settings.clone();
             tokio::spawn(async move {
@@ -209,4 +220,41 @@ fn main() -> Result<()> {
 
     pw_handle.shutdown();
     result
+}
+
+/// Poll the PipeWire graph until an Audio/Sink whose `node.name` matches
+/// `target` shows up, then patch our source's output to it. Exits once the
+/// auto-patch is established. Independent of the debug monitor slot.
+async fn auto_link(pw: pw_source::PwClient, target: String) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        interval.tick().await;
+        let snap = match pw.snapshot().await {
+            Ok(s) => s,
+            Err(err) => {
+                tracing::warn!(err = %err, target = %target, "auto-link snapshot failed");
+                continue;
+            }
+        };
+        if snap.own_node_id.is_none() {
+            continue;
+        }
+        if snap.auto_patch_sink_id.is_some() {
+            info!(target = %target, "auto-patch already established; watcher exiting");
+            return;
+        }
+        let Some(sink) = snap.sinks.iter().find(|s| s.name == target) else {
+            continue;
+        };
+        match pw.start_auto_patch(sink.id).await {
+            Ok(()) => {
+                info!(target = %target, sink_id = sink.id, "auto-patched to sink");
+                return;
+            }
+            Err(err) => {
+                tracing::warn!(target = %target, err = %err, "auto-patch failed; will retry");
+            }
+        }
+    }
 }

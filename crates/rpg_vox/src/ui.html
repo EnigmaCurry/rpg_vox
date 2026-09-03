@@ -216,20 +216,6 @@
     <div class="section-body">
       <div>
         <div class="subhead">
-          <span>TTS API endpoint</span>
-          <span class="note">applies to the next utterance</span>
-        </div>
-        <div class="field-row">
-          <input id="tts-endpoint" type="url" spellcheck="false" placeholder="http://127.0.0.1:8188">
-          <button id="tts-save">Save</button>
-          <button id="tts-reset" class="secondary" title="Revert to server value">Revert</button>
-        </div>
-      </div>
-
-      <hr class="section-sep">
-
-      <div>
-        <div class="subhead">
           <span>TTS workflow</span>
           <span class="note" id="wf-source">—</span>
         </div>
@@ -249,7 +235,7 @@
         <div class="subhead"><span>Local monitor</span></div>
         <div class="sink-list" id="sink-list"><div class="empty">no sinks yet</div></div>
         <div class="actions" style="margin-top:8px">
-          <button id="pw-monitor-stop" class="secondary">Stop monitor</button>
+          <button id="pw-monitor-stop" class="secondary" style="display:none">Stop monitor</button>
           <button id="pw-refresh" class="secondary">Refresh</button>
         </div>
       </div>
@@ -352,9 +338,6 @@
   const $listeners = document.getElementById("listeners");
   const $monStop   = document.getElementById("pw-monitor-stop");
   const $refresh   = document.getElementById("pw-refresh");
-  const $endpoint  = document.getElementById("tts-endpoint");
-  const $ttsSave   = document.getElementById("tts-save");
-  const $ttsReset  = document.getElementById("tts-reset");
   const $wfSelect  = document.getElementById("wf-select");
   const $wfSource  = document.getElementById("wf-source");
   const $wfSummary = document.getElementById("wf-summary");
@@ -362,6 +345,9 @@
   const $wfWarmup  = document.getElementById("wf-warmup");
 
   let currentMonitor = null;
+  let currentAutoPatch = null;
+  let lastGraph = null; // last snapshot from /pw/graph; kept so refreshSettings
+                        // doesn't wipe listener/monitor info out of the summary
   let serverSettings = null; // last known server-side settings
   let availableWorkflows = []; // populated from /workflows once
 
@@ -372,19 +358,24 @@
       const g = await r.json();
       renderGraph(g);
     } catch (e) {
-      $pwSummary.textContent = `error: ${e.message}`;
+      setStatus(`graph error: ${e.message}`, "err");
     }
   }
 
   function renderGraph(g) {
+    lastGraph = g;
     currentMonitor = g.monitor_sink_id ?? null;
-    updateSummary(g);
+    currentAutoPatch = g.auto_patch_sink_id ?? null;
+    updateSummary();
 
-    if (!g.sinks.length) {
-      $sinkList.innerHTML = '<div class="empty">no sinks discovered yet</div>';
+    $monStop.style.display = currentMonitor !== null ? "" : "none";
+
+    const monitorable = g.sinks.filter((s) => s.id !== currentAutoPatch);
+    if (!monitorable.length) {
+      $sinkList.innerHTML = '<div class="empty">no sinks available</div>';
     } else {
       $sinkList.innerHTML = "";
-      for (const s of g.sinks) {
+      for (const s of monitorable) {
         const id = `sink-${s.id}`;
         const label = document.createElement("label");
         label.htmlFor = id;
@@ -458,23 +449,15 @@
   $monStop.addEventListener("click", stopMonitor);
   $refresh.addEventListener("click", () => { refreshSettings(); refreshGraph(); });
 
-  // ---- TTS endpoint settings ---------------------------------------------
-  function updateSummary(g) {
-    const ttsHost = (() => {
-      if (!serverSettings || !serverSettings.comfyui_base) return "—";
-      try { return new URL(serverSettings.comfyui_base).host; }
-      catch { return serverSettings.comfyui_base; }
-    })();
-    const gPart = g
-      ? ` · ${g.sinks.length} sinks · ${g.listeners.length} listener(s)`
-        + (currentMonitor !== null ? ` · monitor→#${currentMonitor}` : "")
-      : "";
-    $summary.textContent = `tts: ${ttsHost}${gPart}`;
-  }
-
-  function markDirty() {
-    const dirty = serverSettings && $endpoint.value.trim() !== serverSettings.comfyui_base;
-    $endpoint.classList.toggle("dirty", !!dirty);
+  // ---- Settings panel -----------------------------------------------------
+  function updateSummary() {
+    const wf = serverSettings && serverSettings.workflow_name
+      ? serverSettings.workflow_name : "placeholder";
+    const g = lastGraph;
+    const patchPart = g && currentAutoPatch !== null ? ` · auto→#${currentAutoPatch}` : "";
+    const monPart = g && currentMonitor !== null ? ` · monitor→#${currentMonitor}` : "";
+    const gPart = g ? ` · ${g.listeners.length} listener(s)${patchPart}${monPart}` : "";
+    $summary.textContent = `workflow: ${wf}${gPart}`;
   }
 
   async function refreshSettings() {
@@ -482,11 +465,7 @@
       const r = await fetch("/settings");
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       serverSettings = await r.json();
-      if (document.activeElement !== $endpoint) {
-        $endpoint.value = serverSettings.comfyui_base || "";
-      }
       $wfSelect.value = serverSettings.workflow_name || "";
-      markDirty();
       renderWorkflowSummary();
       updateSummary();
     } catch (e) {
@@ -533,9 +512,6 @@
         return false;
       }
       serverSettings = body;
-      if (document.activeElement !== $endpoint) {
-        $endpoint.value = serverSettings.comfyui_base || "";
-      }
       $wfSelect.value = serverSettings.workflow_name || "";
       renderWorkflowSummary();
       setStatus(okMsg, "ok");
@@ -544,17 +520,8 @@
       setStatus(`save failed: ${e.message}`, "err");
       return false;
     } finally {
-      markDirty();
       updateSummary();
     }
-  }
-
-  async function saveSettings() {
-    const value = $endpoint.value.trim();
-    if (!value) return;
-    $ttsSave.disabled = true;
-    await postSettings({ comfyui_base: value }, "endpoint saved");
-    $ttsSave.disabled = false;
   }
 
   function renderWorkflowSummary() {
@@ -611,15 +578,6 @@
     }
   }
 
-  $endpoint.addEventListener("input", markDirty);
-  $endpoint.addEventListener("keydown", (e) => {
-    if (e.key === "Enter") { e.preventDefault(); saveSettings(); }
-  });
-  $ttsSave.addEventListener("click", saveSettings);
-  $ttsReset.addEventListener("click", () => {
-    if (serverSettings) $endpoint.value = serverSettings.comfyui_base || "";
-    markDirty();
-  });
   $wfSelect.addEventListener("change", chooseWorkflow);
   $wfVerify.addEventListener("click", verifyWorkflow);
   $wfWarmup.addEventListener("click", warmupWorkflow);

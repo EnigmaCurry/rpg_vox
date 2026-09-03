@@ -122,6 +122,23 @@ impl MetadataDb {
         }
     }
 
+    /// Best display name previously stored for a user id, if any. Returns
+    /// `Ok(None)` for unknown users and errors only on genuine DB failure
+    /// (which callers can treat as "no info" if they prefer).
+    pub fn get_user_best_name(&self, id: u64) -> rusqlite::Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT best_name FROM users WHERE id = ?1",
+            params![id as i64],
+            |row| row.get::<_, String>(0),
+        )
+        .map(Some)
+        .or_else(|err| match err {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(other),
+        })
+    }
+
     pub fn upsert_guild_member(&self, guild_id: u64, user_id: u64, nick: Option<&str>) {
         let now = chrono::Utc::now().timestamp();
         let conn = self.conn.lock().unwrap();

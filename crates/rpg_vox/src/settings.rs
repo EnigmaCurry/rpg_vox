@@ -1,7 +1,8 @@
 //! Runtime-mutable settings shared between HTTP handlers and worker tasks.
 //!
-//! Seeded from CLI args at startup; edited live via `POST /settings`. Not
-//! persisted — the CLI is the source of truth on restart.
+//! Seeded from CLI args / env vars at startup. `POST /settings` can edit the
+//! workflow selection; the ComfyUI endpoint is fixed at startup and is not
+//! exposed as mutable state.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -23,7 +24,6 @@ pub struct Settings {
 /// Wire type exposed by `GET /settings`.
 #[derive(Clone, Debug, Serialize)]
 pub struct SettingsPublic {
-    pub comfyui_base: String,
     pub workflow_name: Option<String>,
     pub workflow_summary: WorkflowSummary,
 }
@@ -31,7 +31,6 @@ pub struct SettingsPublic {
 impl Settings {
     pub fn public(&self) -> SettingsPublic {
         SettingsPublic {
-            comfyui_base: self.comfyui_base.clone(),
             workflow_name: self.workflow_name.clone(),
             workflow_summary: self.workflow_summary.clone(),
         }
@@ -40,12 +39,6 @@ impl Settings {
     /// Apply a partial update. `registry` is consulted when switching
     /// workflows — an unknown name is an error.
     pub fn apply(&mut self, update: SettingsUpdate, registry: &Registry) -> Result<(), String> {
-        if let Some(v) = update.comfyui_base {
-            let v = v.trim().trim_end_matches('/').to_string();
-            if !v.is_empty() {
-                self.comfyui_base = v;
-            }
-        }
         if let Some(name) = update.workflow_name {
             let trimmed = name.trim().to_string();
             if trimmed.is_empty() {
@@ -68,7 +61,6 @@ impl Settings {
 
 #[derive(Debug, Deserialize)]
 pub struct SettingsUpdate {
-    pub comfyui_base: Option<String>,
     /// Registry key (file stem); empty string reverts to the built-in placeholder.
     pub workflow_name: Option<String>,
 }

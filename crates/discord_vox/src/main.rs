@@ -35,8 +35,26 @@ use tokio::sync::Mutex as AsyncMutex;
 use tracing::{error, info, warn};
 
 mod metadata;
+mod pw_output;
 mod pw_sink;
 mod recorder;
+
+/// Read `DISCORD_VOX_AUDIO_OUTPUT_<N>` env vars (N ≥ 1) and return the
+/// list of user ids to route to dedicated PipeWire source nodes, ordered
+/// by the numeric suffix so slot 1 → first, slot 2 → second, etc.
+/// Invalid or non-numeric values are silently skipped.
+fn scan_audio_outputs() -> Vec<u64> {
+    let mut entries: Vec<(u32, u64)> = std::env::vars()
+        .filter_map(|(k, v)| {
+            let suffix = k.strip_prefix("DISCORD_VOX_AUDIO_OUTPUT_")?;
+            let idx: u32 = suffix.parse().ok()?;
+            let uid: u64 = v.trim().parse().ok()?;
+            Some((idx, uid))
+        })
+        .collect();
+    entries.sort_by_key(|(i, _)| *i);
+    entries.into_iter().map(|(_, uid)| uid).collect()
+}
 
 /// Discord voice bridge over PipeWire.
 ///
@@ -47,16 +65,16 @@ mod recorder;
 #[derive(Debug, Parser)]
 #[command(version, about)]
 struct Args {
-    /// Discord bot token. Prefer setting DISCORD_TOKEN in the environment.
-    #[arg(long, env = "DISCORD_TOKEN", hide_env_values = true)]
+    /// Discord bot token. Prefer setting DISCORD_VOX_TOKEN in the environment.
+    #[arg(long, env = "DISCORD_VOX_TOKEN", hide_env_values = true)]
     token: String,
 
     /// Guild (server) ID containing the target voice channel.
-    #[arg(long, env = "DISCORD_GUILD_ID")]
+    #[arg(long, env = "DISCORD_VOX_GUILD_ID")]
     guild_id: u64,
 
     /// Voice channel ID to join when occupied.
-    #[arg(long, env = "DISCORD_CHANNEL_ID")]
+    #[arg(long, env = "DISCORD_VOX_CHANNEL_ID")]
     channel_id: u64,
 
     /// PipeWire node.name (short id, no spaces).
@@ -84,7 +102,7 @@ struct Args {
     /// `user-<id>.wav` per speaker plus a combined `mixed.wav`, all at
     /// 48 kHz 16-bit stereo. Off by default (recording requires consent —
     /// tell the channel).
-    #[arg(long, env = "DISCORD_RECORD_DIR")]
+    #[arg(long, env = "DISCORD_VOX_RECORD_DIR")]
     record: Option<PathBuf>,
 
     /// Operator's real name — displayed in the recording-notice message the
@@ -248,6 +266,14 @@ struct Handler {
     /// session. Cleared by leave() after the WARNING is deleted so the
     /// channel history retains only the stop notice.
     notice_message: Mutex<Option<MessageId>>,
+    /// Per-user PipeWire output producers keyed by Discord user id. Empty
+    /// when no `DISCORD_VOX_AUDIO_OUTPUT_*` env vars are set. Populated at
+    /// startup; the underlying PW source nodes are always running.
+    audio_outputs: Arc<HashMap<u64, Arc<Mutex<rtrb::Producer<f32>>>>>,
+    /// Shared SSRC → UserId map. Updated on every SpeakingStateUpdate so
+    /// VoiceTick routing can look up which user an incoming SSRC belongs
+    /// to. Shared with both VoiceReceiver clones.
+    ssrc_map: Arc<Mutex<HashMap<u32, u64>>>,
     /// True iff we currently believe we are connected to the voice channel.
     joined: AtomicBool,
     /// Serialises reconcile() so overlapping voice_state_update events can't
@@ -300,44 +326,61 @@ impl Handler {
         // files instead of `user-*.wav`.
         let call = manager.get_or_insert(self.guild_id);
 
-        if let Some(root) = &self.record_root {
+        let rec: Option<Arc<recorder::Recorder>> = if let Some(root) = &self.record_root {
             let session_root = root
                 .join(self.guild_id.get().to_string())
                 .join(self.channel_id.get().to_string());
             let session_dir = recorder::timestamped_session_dir(&session_root);
             match recorder::Recorder::new(session_dir.clone()) {
-                Ok(rec) => {
-                    let rec = Arc::new(rec);
-                    let mut driver = call.lock().await;
-                    driver.remove_all_global_events();
-                    let make_receiver = || VoiceReceiver {
-                        recorder: Arc::clone(&rec),
-                        guild_id: self.guild_id,
-                        http: Arc::clone(&ctx.http),
-                        metadata: self.metadata.clone(),
-                    };
-                    driver.add_global_event(CoreEvent::SpeakingStateUpdate.into(), make_receiver());
-                    driver.add_global_event(CoreEvent::VoiceTick.into(), make_receiver());
-                    drop(driver);
-                    *self.active_recorder.lock().unwrap() = Some(rec);
+                Ok(r) => {
                     info!(dir = %session_dir.display(), "recording session started");
-
-                    let notice = build_recording_notice(&self.operator);
-                    match self.channel_id.say(&ctx.http, &notice).await {
-                        Ok(msg) => {
-                            *self.notice_message.lock().unwrap() = Some(msg.id);
-                        }
-                        Err(err) => {
-                            warn!(
-                                ?err,
-                                "failed to post recording notice to text-in-voice \
-                                 (does the bot have SEND_MESSAGES on the channel?)"
-                            );
-                        }
-                    }
+                    Some(Arc::new(r))
                 }
                 Err(err) => {
                     error!(?err, "failed to start recording session");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // Register receive-side event handlers whenever we need decoded voice
+        // (recording, per-user audio outputs, or both). Without either, the
+        // songbird DecodeMode is DEFAULT (Decrypt only) and no decoded PCM
+        // would arrive anyway.
+        let need_receiver = rec.is_some() || !self.audio_outputs.is_empty();
+        if need_receiver {
+            let mut driver = call.lock().await;
+            driver.remove_all_global_events();
+            let recorder_arc = rec.as_ref().map(Arc::clone);
+            let make_receiver = || VoiceReceiver {
+                recorder: recorder_arc.as_ref().map(Arc::clone),
+                guild_id: self.guild_id,
+                http: Arc::clone(&ctx.http),
+                metadata: self.metadata.clone(),
+                audio_outputs: Arc::clone(&self.audio_outputs),
+                ssrc_map: Arc::clone(&self.ssrc_map),
+            };
+            driver.add_global_event(CoreEvent::SpeakingStateUpdate.into(), make_receiver());
+            driver.add_global_event(CoreEvent::VoiceTick.into(), make_receiver());
+            drop(driver);
+        }
+
+        if let Some(rec) = rec {
+            *self.active_recorder.lock().unwrap() = Some(rec);
+
+            let notice = build_recording_notice(&self.operator);
+            match self.channel_id.say(&ctx.http, &notice).await {
+                Ok(msg) => {
+                    *self.notice_message.lock().unwrap() = Some(msg.id);
+                }
+                Err(err) => {
+                    warn!(
+                        ?err,
+                        "failed to post recording notice to text-in-voice \
+                         (does the bot have SEND_MESSAGES on the channel?)"
+                    );
                 }
             }
         }
@@ -440,10 +483,13 @@ impl Handler {
 /// Recorder. Also kicks off async display-name lookups so per-user WAVs can
 /// be renamed from `user-<uid>.wav` to `user-<uid>-<name>.wav`.
 struct VoiceReceiver {
-    recorder: Arc<recorder::Recorder>,
+    /// None when audio outputs are configured but recording is off.
+    recorder: Option<Arc<recorder::Recorder>>,
     guild_id: GuildId,
     http: Arc<Http>,
     metadata: Option<Arc<metadata::MetadataDb>>,
+    audio_outputs: Arc<HashMap<u64, Arc<Mutex<rtrb::Producer<f32>>>>>,
+    ssrc_map: Arc<Mutex<HashMap<u32, u64>>>,
 }
 
 #[async_trait]
@@ -452,17 +498,24 @@ impl VoiceEventHandler for VoiceReceiver {
         match ctx {
             EventContext::SpeakingStateUpdate(speaking) => {
                 let user_id = speaking.user_id.map(|u| u.0);
-                self.recorder.note_speaker(speaking.ssrc, user_id);
+                if let Some(uid) = user_id {
+                    self.ssrc_map.lock().unwrap().insert(speaking.ssrc, uid);
+                }
+                if let Some(rec) = &self.recorder {
+                    rec.note_speaker(speaking.ssrc, user_id);
+                }
                 if let Some(uid) = user_id {
                     let http = Arc::clone(&self.http);
-                    let recorder = Arc::clone(&self.recorder);
+                    let recorder = self.recorder.as_ref().map(Arc::clone);
                     let guild_id = self.guild_id;
                     let metadata = self.metadata.clone();
                     tokio::spawn(async move {
                         if let Some(name) =
                             fetch_display_name(&http, guild_id, uid, metadata.as_deref()).await
                         {
-                            recorder.note_display_name(uid, &name);
+                            if let Some(rec) = &recorder {
+                                rec.note_display_name(uid, &name);
+                            }
                         }
                     });
                 }
@@ -505,7 +558,29 @@ impl VoiceEventHandler for VoiceReceiver {
                     .collect();
                 let opus_refs: HashMap<u32, &[u8]> =
                     opus.iter().map(|(k, v)| (*k, v.as_slice())).collect();
-                self.recorder.write_tick(&pcm, &opus_refs);
+                if let Some(rec) = &self.recorder {
+                    rec.write_tick(&pcm, &opus_refs);
+                }
+
+                // Route decoded PCM to any per-user PipeWire output whose UID
+                // matches. Best-effort: unknown SSRCs and unrouted users are
+                // ignored; producer overrun (Discord ahead of consumer) drops
+                // trailing samples for this tick.
+                if !self.audio_outputs.is_empty() {
+                    let ssrc_map = self.ssrc_map.lock().unwrap();
+                    for (&ssrc, samples) in &pcm {
+                        let Some(&uid) = ssrc_map.get(&ssrc) else { continue };
+                        let Some(producer) = self.audio_outputs.get(&uid) else { continue };
+                        let mut p = producer.lock().unwrap();
+                        for &s in *samples {
+                            // Discord decoded i16 → f32 in [-1.0, 1.0].
+                            let f = (s as f32) / (i16::MAX as f32);
+                            if p.push(f).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
             }
             _ => {}
         }
@@ -680,6 +755,46 @@ async fn main() -> Result<()> {
         None
     };
 
+    // Per-user PipeWire audio outputs: one PW source node per configured
+    // Discord uid. Ring buffers hold ~1s of 48 kHz stereo f32; overrun
+    // (Discord ahead of downstream consumer) drops samples silently. Node
+    // description picks up the display name from the metadata db if the
+    // user has been observed in a prior session; otherwise falls back to
+    // the raw uid until the next run.
+    let output_uids = scan_audio_outputs();
+    let mut audio_outputs: HashMap<u64, Arc<Mutex<rtrb::Producer<f32>>>> = HashMap::new();
+    let mut output_handles: Vec<pw_output::Handle> = Vec::new();
+    for (idx, uid) in output_uids.iter().enumerate() {
+        let slot = idx + 1;
+        let capacity = (48_000 * 2) as usize; // 1s stereo @ 48kHz
+        let (producer, consumer) = RingBuffer::<f32>::new(capacity);
+        let node_name = format!("discord-vox-out-{slot}");
+        let label = metadata
+            .as_ref()
+            .and_then(|md| md.get_user_best_name(*uid).ok().flatten())
+            .unwrap_or_else(|| uid.to_string());
+        let node_description = format!("Discord Vox: {label}");
+        match pw_output::spawn(
+            pw_output::Config {
+                node_name: node_name.clone(),
+                node_description: node_description.clone(),
+                sample_rate: 48_000,
+                channels: 2,
+            },
+            consumer,
+        ) {
+            Ok(h) => {
+                info!(slot, uid, node = %node_name, desc = %node_description, "audio output node started");
+                audio_outputs.insert(*uid, Arc::new(Mutex::new(producer)));
+                output_handles.push(h);
+            }
+            Err(err) => {
+                error!(?err, slot, uid, "failed to start audio output node");
+            }
+        }
+    }
+    let audio_outputs = Arc::new(audio_outputs);
+
     let handler = Handler {
         guild_id: GuildId::new(args.guild_id),
         channel_id: ChannelId::new(args.channel_id),
@@ -695,13 +810,18 @@ async fn main() -> Result<()> {
         metadata: metadata.clone(),
         active_recorder: Mutex::new(None),
         notice_message: Mutex::new(None),
+        audio_outputs: Arc::clone(&audio_outputs),
+        ssrc_map: Arc::new(Mutex::new(HashMap::new())),
         joined: AtomicBool::new(false),
         reconcile: AsyncMutex::new(()),
     };
 
     let intents = GatewayIntents::GUILDS | GatewayIntents::GUILD_VOICE_STATES;
 
-    let songbird_config = if recording {
+    // Enable DecodeMode::Decode whenever we need decoded PCM downstream
+    // (recording or any audio output route).
+    let want_decode = recording || !audio_outputs.is_empty();
+    let songbird_config = if want_decode {
         SongbirdConfig::default().decode_mode(DecodeMode::Decode(DecodeConfig::default()))
     } else {
         SongbirdConfig::default()
@@ -726,6 +846,9 @@ async fn main() -> Result<()> {
     let start_result = client.start().await;
     frames_logger.abort();
     pw_handle.shutdown();
+    for h in output_handles.drain(..) {
+        h.shutdown();
+    }
 
     if let Err(err) = start_result {
         warn!(?err, "serenity client exited with error");
