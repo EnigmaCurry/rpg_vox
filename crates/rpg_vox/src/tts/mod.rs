@@ -10,6 +10,7 @@
 pub mod chunker;
 pub mod comfyui;
 pub mod piper;
+pub mod qwen3;
 
 use anyhow::Result;
 use rtrb::Producer;
@@ -43,6 +44,7 @@ pub struct AudioChunk {
 pub enum Backend {
     Piper(piper::Backend),
     Comfy(comfyui::Backend),
+    Qwen3(qwen3::Backend),
 }
 
 impl Backend {
@@ -51,16 +53,18 @@ impl Backend {
         match self {
             Self::Piper(_) => "piper",
             Self::Comfy(_) => "comfyui",
+            Self::Qwen3(_) => "qwen3",
         }
     }
 
     /// Drive one utterance. The backend decides internal chunking (phrase
-    /// splits for Piper, per-websocket-message for ComfyUI) and pushes each
-    /// PCM chunk through the shared [`Sink`].
+    /// splits for Piper, per-websocket-message for ComfyUI, single-request
+    /// for remote Qwen3) and pushes each PCM chunk through the shared [`Sink`].
     pub async fn synthesize(&mut self, text: &str, sink: &mut Sink<'_>) -> Result<()> {
         match self {
             Self::Piper(b) => b.synthesize(text, sink).await,
             Self::Comfy(b) => b.synthesize(text, sink).await,
+            Self::Qwen3(b) => b.synthesize(text, sink).await,
         }
     }
 }

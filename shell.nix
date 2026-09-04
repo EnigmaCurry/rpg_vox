@@ -11,6 +11,9 @@ pkgs.mkShell {
     clang
     # espeak-rs-sys (pulled in by piper-rs) builds espeak-ng from vendored source.
     cmake
+    # Web UI: Vite + Svelte SPA built by build.rs and embedded via rust-embed.
+    nodejs_22
+    pnpm
   ];
 
   buildInputs = with pkgs; [

@@ -4,15 +4,20 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Voice bridge over pipewire"
+build = "build.rs"
 
 [dependencies]
+# Embed the Svelte SPA (built by build.rs into crates/rpg_vox/dist-ui/).
+rust-embed = { version = "8", features = ["mime-guess"] }
+
+
 pipewire.workspace = true
 libspa.workspace = true
 
 tokio.workspace = true
 axum = "0.7"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 futures-util = "0.3"
 
 symphonia = { version = "0.5", features = ["wav", "mp3", "flac", "ogg", "vorbis"] }

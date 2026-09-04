@@ -192,7 +192,7 @@ async fn fetch_history_audio_files(
     Ok(out)
 }
 
-fn decode_audio_chunk(bytes: &[u8]) -> Result<AudioChunk> {
+pub(crate) fn decode_audio_chunk(bytes: &[u8]) -> Result<AudioChunk> {
     let cursor = Cursor::new(bytes.to_vec());
     let mss = MediaSourceStream::new(Box::new(cursor), Default::default());
     let probed = symphonia::default::get_probe().format(

@@ -9,11 +9,12 @@
 use anyhow::{Context as _, Result};
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Path, State},
     http::{StatusCode, header},
-    response::{Html, IntoResponse},
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
+use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc::Sender, oneshot};
 use tracing::info;
@@ -26,7 +27,11 @@ use crate::settings::{self, SettingsUpdate};
 use crate::tts::{self, SayRequest};
 use crate::workflow::{self, Registry};
 
-const INDEX_HTML: &str = include_str!("ui.html");
+/// Built by build.rs (`pnpm run build` in crates/rpg_vox/web) into
+/// crates/rpg_vox/dist-ui/. Baked into the binary at compile time.
+#[derive(RustEmbed)]
+#[folder = "dist-ui/"]
+struct Ui;
 
 #[derive(Clone)]
 struct AppState {
@@ -77,6 +82,7 @@ pub async fn serve(
     };
     let app = Router::new()
         .route("/", get(index))
+        .route("/assets/*path", get(asset_handler))
         .route("/say", post(say_handler))
         .route("/healthz", get(|| async { "ok" }))
         .route("/pw/graph", get(graph_handler))
@@ -104,8 +110,44 @@ pub async fn serve(
     Ok(())
 }
 
-async fn index() -> impl IntoResponse {
-    ([(header::CACHE_CONTROL, "no-store")], Html(INDEX_HTML))
+async fn index() -> Response {
+    match Ui::get("index.html") {
+        Some(file) => (
+            [
+                (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+                (header::CACHE_CONTROL, "no-store"),
+            ],
+            file.data.into_owned(),
+        )
+            .into_response(),
+        // dist-ui/ empty means the build didn't produce anything (e.g. someone
+        // set RPG_VOX_SKIP_UI_BUILD without prebuilding). Give a useful hint
+        // instead of a bare 404.
+        None => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "SPA not embedded. Run `just build-ui` or unset RPG_VOX_SKIP_UI_BUILD.",
+        )
+            .into_response(),
+    }
+}
+
+async fn asset_handler(Path(path): Path<String>) -> Response {
+    let full = format!("assets/{path}");
+    match Ui::get(&full) {
+        Some(file) => {
+            let mime = file.metadata.mimetype();
+            (
+                [
+                    (header::CONTENT_TYPE, mime),
+                    // Vite emits content-hashed filenames — safe to cache forever.
+                    (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+                ],
+                file.data.into_owned(),
+            )
+                .into_response()
+        }
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 async fn graph_handler(State(state): State<AppState>) -> impl IntoResponse {

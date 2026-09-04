@@ -14,6 +14,9 @@ mod workflow;
 enum TtsBackend {
     Piper,
     Comfyui,
+    /// Remote Qwen3-TTS Gradio deployment. Inference runs on the remote GPU;
+    /// rpg_vox just fetches the resulting WAV. Configure with --qwen3-*.
+    Qwen3,
 }
 
 /// Voice bridge over pipewire.
@@ -83,6 +86,32 @@ struct Args {
     /// ComfyUI base URL (HTTP; the WebSocket endpoint is derived from this).
     #[arg(long, env = "RPG_VOX_COMFYUI", default_value = "http://127.0.0.1:8188")]
     comfyui: String,
+
+    /// Base URL of a Qwen3-TTS Gradio deployment (no trailing slash).
+    #[arg(
+        long,
+        env = "RPG_VOX_QWEN3_URL",
+        default_value = "https://qwen3-tts.mrfusion.rymcg.tech"
+    )]
+    qwen3_url: String,
+
+    /// Preset speaker on the Qwen3-TTS Gradio app. One of: Serena, Vivian,
+    /// Uncle Fu, Ryan, Aiden, Ono Anna, Sohee, Eric, Dylan.
+    #[arg(long, env = "RPG_VOX_QWEN3_SPEAKER", default_value = "Ryan")]
+    qwen3_speaker: String,
+
+    /// Language for Qwen3-TTS. One of: Auto, Chinese, English, German,
+    /// Italian, Portuguese, Spanish, Japanese, Korean, French, Russian.
+    #[arg(long, env = "RPG_VOX_QWEN3_LANGUAGE", default_value = "Auto")]
+    qwen3_language: String,
+
+    /// Optional voice-style instruction sent to Qwen3-TTS. Empty by default.
+    #[arg(long, env = "RPG_VOX_QWEN3_INSTRUCT", default_value = "")]
+    qwen3_instruct: String,
+
+    /// Per-request timeout in seconds for the Qwen3-TTS Gradio API.
+    #[arg(long, env = "RPG_VOX_QWEN3_TIMEOUT", default_value_t = 600)]
+    qwen3_timeout_secs: u64,
 
     /// User-facing name shown in Firefox's mic picker. Defaults to the
     /// instance name (RPG_VOX_NAME) when that is set, otherwise "RPG Vox".
@@ -272,6 +301,7 @@ fn main() -> Result<()> {
         backend: match args.tts_backend {
             TtsBackend::Piper => "piper",
             TtsBackend::Comfyui => "comfyui",
+            TtsBackend::Qwen3 => "qwen3",
         },
         comfyui_base: args.comfyui.trim_end_matches('/').to_string(),
         workflow_name: initial_name,
@@ -440,6 +470,18 @@ fn build_backend(args: &Args, settings: settings::Shared) -> Result<tts::Backend
             Ok(tts::Backend::Piper(backend))
         }
         TtsBackend::Comfyui => Ok(tts::Backend::Comfy(tts::comfyui::Backend::new(settings))),
+        TtsBackend::Qwen3 => {
+            let cfg = tts::qwen3::Config {
+                base_url: args.qwen3_url.clone(),
+                speaker: args.qwen3_speaker.clone(),
+                language: args.qwen3_language.clone(),
+                instruct: args.qwen3_instruct.clone(),
+                request_timeout: std::time::Duration::from_secs(args.qwen3_timeout_secs),
+            };
+            let backend = tts::qwen3::Backend::new(cfg)
+                .context("configuring remote qwen3-tts backend")?;
+            Ok(tts::Backend::Qwen3(backend))
+        }
     }
 }
 

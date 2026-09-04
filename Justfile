@@ -43,9 +43,33 @@ test:
 run *ARGS:
     nix-shell --run "cargo run -p rpg_vox --release -- {{ARGS}}"
 
-# Auto-rebuild + restart on any change under the rpg_vox crate.
+# Auto-rebuild + restart on any change under the rpg_vox crate. Watches Rust
+# sources only — for hot-reloading the Svelte UI use `just dev-ui` alongside
+# this in a second terminal (Vite serves at :5173 with /say etc. proxied to
+# the running backend).
 dev *ARGS:
     nix-shell --run "cargo watch -q -c -w crates/rpg_vox/src -w crates/rpg_vox/Cargo.toml -x 'run -p rpg_vox -- {{ARGS}}'"
+
+# Serve the Svelte SPA via Vite on http://127.0.0.1:5173 with hot reload;
+# API requests (/say, /chat, /settings, /pw/*, /healthz, /workflows,
+# /workflow/*) are proxied to the running rpg_vox backend on :7331.
+# Override the backend with RPG_VOX_BACKEND=http://host:port just dev-ui.
+dev-ui:
+    nix-shell --run "cd crates/rpg_vox/web && pnpm install && pnpm run dev"
+
+# Build the SPA into crates/rpg_vox/dist-ui/ (embedded by the release binary).
+# Usually not needed manually — `just build` / `just run` invoke build.rs which
+# runs this automatically. Handy for CI / packaging where you want to prebuild
+# and pass RPG_VOX_SKIP_UI_BUILD=1 to cargo.
+build-ui:
+    nix-shell --run "cd crates/rpg_vox/web && pnpm install && pnpm run build"
+
+# Run rpg_vox against a remote Qwen3-TTS Gradio deployment. Configure the
+# endpoint via --qwen3-url (or RPG_VOX_QWEN3_URL); the default points at the
+# user's hosted instance. Extra ARGS append to clap, e.g.
+#   just qwen3 --qwen3-speaker Aiden --qwen3-language English
+qwen3 *ARGS:
+    nix-shell --run "cargo run -p rpg_vox --release -- --tts-backend qwen3 {{ARGS}}"
 
 # Post text to a running rpg_vox instance.
 #   just say "hello world"
