@@ -38,14 +38,22 @@ pub enum Command {
     Synthesize(SynthesizeRequest),
 }
 
+/// Per-request voice overrides. Any field set to `Some` replaces the
+/// backend's startup default for the duration of one synth call; `None`
+/// falls back to the backend's configured value. Only [`qwen3`] consumes
+/// these — other backends silently ignore.
+#[derive(Debug, Default, Clone)]
+pub struct VoiceOverride {
+    pub speaker: Option<String>,
+    pub language: Option<String>,
+    pub instruct: Option<String>,
+}
+
 /// One utterance request: the text to speak plus a channel to report the
 /// result back to the caller (usually the /say HTTP handler).
 pub struct SayRequest {
     pub text: String,
-    /// Per-request voice-style override. Currently only Qwen3 consumes it —
-    /// other backends silently ignore. `None` means "use whatever the backend
-    /// was configured with at startup".
-    pub instruct: Option<String>,
+    pub voice: VoiceOverride,
     pub reply: oneshot::Sender<Result<usize, String>>,
 }
 
@@ -53,7 +61,7 @@ pub struct SayRequest {
 /// a frame count, since nothing plays it back automatically.
 pub struct SynthesizeRequest {
     pub text: String,
-    pub instruct: Option<String>,
+    pub voice: VoiceOverride,
     pub reply: oneshot::Sender<Result<SynthesizeOutcome, String>>,
 }
 
@@ -93,18 +101,18 @@ impl Backend {
     /// splits for Piper, per-websocket-message for ComfyUI, single-request
     /// for remote Qwen3) and pushes each PCM chunk through the shared [`Sink`].
     ///
-    /// `instruct` is a per-request voice-style override. Only [`qwen3`]
-    /// consumes it; other backends ignore.
+    /// `voice` is a per-request voice override (speaker/language/instruct).
+    /// Only [`qwen3`] consumes it; other backends ignore.
     pub async fn synthesize(
         &mut self,
         text: &str,
-        instruct: Option<&str>,
+        voice: &VoiceOverride,
         sink: &mut Sink<'_>,
     ) -> Result<()> {
         match self {
             Self::Piper(b) => b.synthesize(text, sink).await,
             Self::Comfy(b) => b.synthesize(text, sink).await,
-            Self::Qwen3(b) => b.synthesize(text, instruct, sink).await,
+            Self::Qwen3(b) => b.synthesize(text, voice, sink).await,
         }
     }
 }
@@ -132,7 +140,7 @@ async fn handle_say(
 ) {
     let SayRequest {
         text,
-        instruct,
+        voice,
         reply,
     } = req;
     // Strip <think>…</think> here (not just in /chat) so any path that
@@ -146,7 +154,7 @@ async fn handle_say(
     info!(backend = backend.kind(), chars = text.len(), "generating speech");
     let mut sink = Sink::new(producer, cfg.target_sample_rate);
     let result = match backend
-        .synthesize(&text, instruct.as_deref(), &mut sink)
+        .synthesize(&text, &voice, &mut sink)
         .await
     {
         Ok(()) => {
@@ -165,7 +173,7 @@ async fn handle_say(
 async fn handle_synthesize(backend: &mut Backend, cfg: &Config, req: SynthesizeRequest) {
     let SynthesizeRequest {
         text,
-        instruct,
+        voice,
         reply,
     } = req;
     let text = crate::chat::strip_thinking(&text).trim().to_string();
@@ -181,7 +189,7 @@ async fn handle_synthesize(backend: &mut Backend, cfg: &Config, req: SynthesizeR
     // Capture-only sink: pushes nowhere, just accumulates resampled PCM.
     let mut sink = Sink::capture_only(cfg.target_sample_rate);
     let result = match backend
-        .synthesize(&text, instruct.as_deref(), &mut sink)
+        .synthesize(&text, &voice, &mut sink)
         .await
     {
         Ok(()) => {

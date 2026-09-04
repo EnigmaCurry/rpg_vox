@@ -8,6 +8,10 @@
     deleteCharacter,
     addCharacterPicture,
     removeCharacterPicture,
+    addCharacterStyle,
+    renameCharacterStyle,
+    setCharacterStyleInstruct,
+    deleteCharacterStyle,
     QWEN3_SPEAKERS,
     QWEN3_LANGUAGES,
   } from '../lib/scenes.svelte.js';
@@ -43,8 +47,39 @@
   function onLanguageChange(id, ev) {
     updateCharacter(id, { voice: { language: ev.currentTarget.value } });
   }
-  function onInstructInput(id, ev) {
-    updateCharacter(id, { voice: { instruct: ev.currentTarget.value } });
+  function onStyleNameInput(characterId, styleId, ev) {
+    renameCharacterStyle(characterId, styleId, ev.currentTarget.value);
+  }
+  function onStyleInstructInput(characterId, styleId, ev) {
+    setCharacterStyleInstruct(characterId, styleId, ev.currentTarget.value);
+  }
+  function onAddStyle(characterId) {
+    addCharacterStyle(characterId, 'new style');
+  }
+
+  // Two-tap confirm for style deletes; keyed as `${characterId}:${styleId}`
+  // so multiple armed rows never collide.
+  let styleDeleteArmed = $state(null);
+  let styleDeleteTimer = 0;
+  let styleDeleteErr = $state('');
+  function onDeleteStyle(characterId, styleId) {
+    const key = `${characterId}:${styleId}`;
+    if (styleDeleteArmed === key) {
+      if (styleDeleteTimer) clearTimeout(styleDeleteTimer);
+      styleDeleteArmed = null;
+      const res = deleteCharacterStyle(characterId, styleId);
+      if (!res.ok) {
+        styleDeleteErr = res.reason;
+        setTimeout(() => { styleDeleteErr = ''; }, 2500);
+      }
+      return;
+    }
+    styleDeleteArmed = key;
+    if (styleDeleteTimer) clearTimeout(styleDeleteTimer);
+    styleDeleteTimer = setTimeout(() => {
+      styleDeleteArmed = null;
+      styleDeleteTimer = 0;
+    }, DELETE_CONFIRM_MS);
   }
 
   function armDelete(id) {
@@ -202,15 +237,53 @@
                   </label>
                 </div>
 
-                <label class="field">
-                  <span>Voice-style instruction (optional)</span>
-                  <textarea
-                    rows="2"
-                    placeholder="e.g. calm, whisper, angry, cheerful"
-                    value={character.voice.instruct}
-                    oninput={(e) => onInstructInput(character.id, e)}
-                  ></textarea>
-                </label>
+                <div class="styles">
+                  <div class="styles-head">
+                    <span>Voice-style instructions</span>
+                    <button
+                      type="button"
+                      class="file-btn small"
+                      onclick={() => onAddStyle(character.id)}
+                      title="Add a new voice-style slot"
+                    >+ add style</button>
+                  </div>
+                  <ul class="style-list">
+                    {#each character.voice.styles as style (style.id)}
+                      <li class="style-row">
+                        <input
+                          class="style-name"
+                          type="text"
+                          value={style.name}
+                          placeholder="style name"
+                          aria-label="Style name"
+                          oninput={(e) => onStyleNameInput(character.id, style.id, e)}
+                        />
+                        <textarea
+                          class="style-instruct"
+                          rows="2"
+                          placeholder="e.g. calm, whisper, angry, cheerful"
+                          value={style.instruct}
+                          oninput={(e) => onStyleInstructInput(character.id, style.id, e)}
+                        ></textarea>
+                        <button
+                          type="button"
+                          class="style-del"
+                          class:armed={styleDeleteArmed === `${character.id}:${style.id}`}
+                          class:blocked={character.voice.styles.length <= 1}
+                          disabled={character.voice.styles.length <= 1}
+                          onclick={() => onDeleteStyle(character.id, style.id)}
+                          title={character.voice.styles.length <= 1
+                            ? 'At least one style is required'
+                            : (styleDeleteArmed === `${character.id}:${style.id}` ? 'Click again to confirm' : 'Delete style')}
+                          aria-label="Delete style"
+                        >×</button>
+                      </li>
+                    {/each}
+                  </ul>
+                  {#if styleDeleteErr}
+                    <div class="err small">{styleDeleteErr}</div>
+                  {/if}
+                </div>
 
                 <div class="pictures">
                   <div class="pictures-head">
@@ -377,8 +450,7 @@
     letter-spacing: 0.05em;
   }
   .field input,
-  .field select,
-  .field textarea {
+  .field select {
     background: rgba(0,0,0,0.35);
     color: var(--text);
     border: 1px solid var(--border);
@@ -389,15 +461,70 @@
     min-width: 0;
   }
   .field input:focus,
-  .field select:focus,
-  .field textarea:focus { outline: none; border-color: var(--accent); }
-  .field textarea { resize: vertical; }
+  .field select:focus { outline: none; border-color: var(--accent); }
 
   .voice-row {
     display: grid;
     grid-template-columns: 1fr 1fr;
     gap: 10px;
   }
+
+  .styles { display: flex; flex-direction: column; gap: 6px; }
+  .styles-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 11px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  .style-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .style-row {
+    display: grid;
+    grid-template-columns: 130px 1fr auto;
+    gap: 6px;
+    align-items: start;
+  }
+  .style-name,
+  .style-instruct {
+    background: rgba(0,0,0,0.35);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 8px;
+    font-size: 13px;
+    font-family: inherit;
+    min-width: 0;
+  }
+  .style-name:focus,
+  .style-instruct:focus { outline: none; border-color: var(--accent); }
+  .style-instruct { resize: vertical; }
+  .style-del {
+    align-self: stretch;
+    background: transparent;
+    color: var(--muted);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    width: 28px;
+    padding: 0;
+    font-size: 16px;
+    line-height: 1;
+    cursor: pointer;
+    font-family: inherit;
+  }
+  .style-del:hover:not(:disabled) { color: var(--err); border-color: var(--err); }
+  .style-del.armed {
+    color: var(--err);
+    border-color: var(--err);
+    background: rgba(255,128,128,0.10);
+  }
+  .style-del.blocked,
+  .style-del:disabled { opacity: 0.4; cursor: not-allowed; }
 
   .pictures { display: flex; flex-direction: column; gap: 6px; }
   .pictures-head {

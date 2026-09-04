@@ -2,14 +2,15 @@
 //!
 //! Two synthesis paths sharing the same TTS backend:
 //!
-//!   POST /say                  { text, instruct? } → { ok, frames } —
-//!                              pushes to the virtual mic; used by Chat.
-//!   POST /widgets              { text, instruct? } → audio/wav —
-//!                              synthesize, persist a new widget row +
-//!                              WAV in the store, return audio.
-//!   PUT  /widgets/:id          { text, instruct? } → audio/wav —
-//!                              re-synthesize, overwrite the widget's
-//!                              row + WAV file.
+//!   POST /say                  { text, speaker?, language?, instruct? }
+//!                              → { ok, frames } — pushes to the virtual
+//!                              mic; used by Chat.
+//!   POST /widgets              { text, speaker?, language?, instruct? }
+//!                              → audio/wav — synthesize, persist a new
+//!                              widget row + WAV in the store, return audio.
+//!   PUT  /widgets/:id          { text, speaker?, language?, instruct? }
+//!                              → audio/wav — re-synthesize, overwrite the
+//!                              widget's row + WAV file.
 //!   DELETE /widgets/:id                             → 200 — drop the DB
 //!                              row and the WAV file (idempotent).
 //!
@@ -37,7 +38,7 @@ use crate::chat;
 use crate::pw_source::{GraphSnapshot, PwClient};
 use crate::settings::{self, SettingsUpdate};
 use crate::store::{Store, UpdateResult};
-use crate::tts::{self, Command, SayRequest, SynthesizeRequest};
+use crate::tts::{self, Command, SayRequest, SynthesizeRequest, VoiceOverride};
 use crate::workflow::{self, Registry};
 
 /// Built by build.rs (`pnpm run build` in crates/rpg_vox/web) into
@@ -59,10 +60,22 @@ struct AppState {
 #[derive(Debug, Deserialize)]
 struct SayBody {
     text: String,
-    /// Per-request voice-style override. Only Qwen3 uses it; others ignore.
-    /// Empty string is coerced to `None` so a UI can send `""` freely.
+    /// Per-request voice overrides. Only Qwen3 uses them; others ignore.
+    /// Empty strings are coerced to `None` so a UI can send `""` freely.
+    #[serde(default)]
+    speaker: Option<String>,
+    #[serde(default)]
+    language: Option<String>,
     #[serde(default)]
     instruct: Option<String>,
+}
+
+/// Coerce empty/whitespace-only strings to `None` so downstream defaults win.
+fn trim_opt(s: Option<String>) -> Option<String> {
+    s.and_then(|v| {
+        let t = v.trim().to_string();
+        (!t.is_empty()).then_some(t)
+    })
 }
 
 #[derive(Debug, Serialize)]
@@ -368,21 +381,18 @@ async fn say_handler(
         )
             .into_response();
     }
-    // Coerce "" → None so the backend uses its configured default instead of
-    // overriding with an empty instruction string.
-    let instruct = body
-        .instruct
-        .and_then(|s| {
-            let t = s.trim().to_string();
-            (!t.is_empty()).then_some(t)
-        });
+    let voice = VoiceOverride {
+        speaker: trim_opt(body.speaker),
+        language: trim_opt(body.language),
+        instruct: trim_opt(body.instruct),
+    };
 
     let (reply_tx, reply_rx) = oneshot::channel();
     if state
         .tts
         .send(Command::Say(SayRequest {
             text,
-            instruct,
+            voice,
             reply: reply_tx,
         }))
         .await
@@ -529,7 +539,7 @@ fn speak_async(tts: Sender<Command>, text: String) {
         if tts
             .send(Command::Say(SayRequest {
                 text,
-                instruct: None,
+                voice: VoiceOverride::default(),
                 reply: tx,
             }))
             .await
@@ -558,6 +568,10 @@ fn speak_async(tts: Sender<Command>, text: String) {
 struct WidgetBody {
     text: String,
     #[serde(default)]
+    speaker: Option<String>,
+    #[serde(default)]
+    language: Option<String>,
+    #[serde(default)]
     instruct: Option<String>,
 }
 
@@ -577,14 +591,14 @@ struct RenderedClip {
 async fn render_clip(
     state: &AppState,
     text: String,
-    instruct: Option<String>,
+    voice: VoiceOverride,
 ) -> Result<RenderedClip, (StatusCode, String)> {
     let (reply_tx, reply_rx) = oneshot::channel();
     if state
         .tts
         .send(Command::Synthesize(SynthesizeRequest {
             text,
-            instruct,
+            voice,
             reply: reply_tx,
         }))
         .await
@@ -608,18 +622,23 @@ async fn render_clip(
     })
 }
 
-/// Parse+validate a widget body. Empty text is rejected; empty instruct is
-/// coerced to `None`.
-fn normalize_widget_body(body: WidgetBody) -> Result<(String, Option<String>), (StatusCode, String)> {
+/// Parse+validate a widget body. Empty text is rejected; empty voice fields
+/// are coerced to `None` so the backend falls back to its startup default.
+/// Persisted `instruct` (used later by the store row) is returned alongside
+/// the [`VoiceOverride`] the runner consumes.
+fn normalize_widget_body(
+    body: WidgetBody,
+) -> Result<(String, VoiceOverride), (StatusCode, String)> {
     let text = body.text.trim().to_string();
     if text.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "empty text".into()));
     }
-    let instruct = body.instruct.and_then(|s| {
-        let t = s.trim().to_string();
-        (!t.is_empty()).then_some(t)
-    });
-    Ok((text, instruct))
+    let voice = VoiceOverride {
+        speaker: trim_opt(body.speaker),
+        language: trim_opt(body.language),
+        instruct: trim_opt(body.instruct),
+    };
+    Ok((text, voice))
 }
 
 /// Build the audio/wav response with the metadata headers the client uses
@@ -648,11 +667,12 @@ async fn widget_create_handler(
     State(state): State<AppState>,
     Json(body): Json<WidgetBody>,
 ) -> Response {
-    let (text, instruct) = match normalize_widget_body(body) {
+    let (text, voice) = match normalize_widget_body(body) {
         Ok(t) => t,
         Err((code, msg)) => return (code, msg).into_response(),
     };
-    let clip = match render_clip(&state, text.clone(), instruct.clone()).await {
+    let persist_instruct = voice.instruct.clone();
+    let clip = match render_clip(&state, text.clone(), voice).await {
         Ok(c) => c,
         Err((code, msg)) => return (code, msg).into_response(),
     };
@@ -661,7 +681,7 @@ async fn widget_create_handler(
         .store
         .create_widget(
             text,
-            instruct,
+            persist_instruct,
             clip.sample_rate,
             clip.duration_ms,
             clip.wav.clone(),
@@ -688,11 +708,12 @@ async fn widget_update_handler(
     Path(id): Path<String>,
     Json(body): Json<WidgetBody>,
 ) -> Response {
-    let (text, instruct) = match normalize_widget_body(body) {
+    let (text, voice) = match normalize_widget_body(body) {
         Ok(t) => t,
         Err((code, msg)) => return (code, msg).into_response(),
     };
-    let clip = match render_clip(&state, text.clone(), instruct.clone()).await {
+    let persist_instruct = voice.instruct.clone();
+    let clip = match render_clip(&state, text.clone(), voice).await {
         Ok(c) => c,
         Err((code, msg)) => return (code, msg).into_response(),
     };
@@ -702,7 +723,7 @@ async fn widget_update_handler(
         .update_widget(
             id.clone(),
             text,
-            instruct,
+            persist_instruct,
             clip.sample_rate,
             clip.duration_ms,
             clip.wav.clone(),

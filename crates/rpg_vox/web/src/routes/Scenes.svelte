@@ -12,6 +12,9 @@
     laneHasClips,
     setScenePause,
     currentProjectCharacters,
+    sceneCharacters,
+    getCharacter,
+    resolveClipStyle,
     PAUSE_OPTIONS,
   } from '../lib/scenes.svelte.js';
 
@@ -58,7 +61,7 @@
     if (scene) insertClip(scene.id, laneId, position);
   }
 
-  function onVoiceInput(laneId, ev) {
+  function onVoiceChange(laneId, ev) {
     if (scene) setLaneVoice(scene.id, laneId, ev.currentTarget.value);
   }
 
@@ -179,6 +182,44 @@
   const inserterPositions = $derived(
     scene ? Array.from({ length: scene.clips.length + 1 }, (_, i) => i) : [],
   );
+
+  // Characters the picker offers for this scene's lanes. Reactive on
+  // characters state so newly-added ones appear immediately.
+  const laneChoices = $derived(sceneCharacters(scene));
+
+  // True when a lane's stored voice references a character that is no longer
+  // in the project (deleted after the lane was created, or leftover free-text
+  // from before the picker existed).
+  function laneVoiceMissing(lane) {
+    return !!lane.voice && !getCharacter(lane.voice);
+  }
+
+  // Voice payload sent to the server for a given clip's next render. The
+  // effective `instruct` comes from the character's selected style (or the
+  // default style if none picked yet). Empty object if the lane has no
+  // valid character — the server then falls back to its startup default.
+  function clipVoicePayload(clip) {
+    if (!scene) return {};
+    const lane = scene.lanes.find((l) => l.id === clip.laneId);
+    const character = lane ? getCharacter(lane.voice) : null;
+    if (!character) return {};
+    const style = resolveClipStyle(character, clip);
+    return {
+      speaker: character.voice.speaker,
+      language: character.voice.language,
+      instruct: style.instruct,
+    };
+  }
+
+  // Style choices offered by a clip's SpeakCell dropdown. Empty list if the
+  // lane has no character; the SpeakCell then hides the picker.
+  function clipStyleOptions(clip) {
+    if (!scene) return [];
+    const lane = scene.lanes.find((l) => l.id === clip.laneId);
+    const character = lane ? getCharacter(lane.voice) : null;
+    if (!character) return [];
+    return character.voice.styles.map((s) => ({ id: s.id, name: s.name }));
+  }
 </script>
 
 <div class="page">
@@ -243,13 +284,21 @@
               style:grid-column={j + 1}
               style:grid-row="1"
             >
-              <input
+              <select
                 class="voice-input"
-                type="text"
+                class:missing={laneVoiceMissing(lane)}
                 value={lane.voice}
-                oninput={(e) => onVoiceInput(lane.id, e)}
-                placeholder="Voice / character"
-              />
+                onchange={(e) => onVoiceChange(lane.id, e)}
+                aria-label="Character for this lane"
+              >
+                <option value="" disabled>— choose character —</option>
+                {#if laneVoiceMissing(lane)}
+                  <option value={lane.voice} disabled>(deleted character)</option>
+                {/if}
+                {#each laneChoices as ch (ch.id)}
+                  <option value={ch.id}>{ch.name}</option>
+                {/each}
+              </select>
               <button
                 class="del"
                 class:armed={laneDeleteArmed === lane.id}
@@ -271,9 +320,11 @@
             >
               <SpeakCell
                 initialText={clip.text}
-                initialInstruct={clip.instruct}
+                initialStyleId={clip.styleId ?? null}
                 initialWidgetId={clip.widgetId}
                 startEditing={!clip.text && !clip.widgetId}
+                voice={clipVoicePayload(clip)}
+                styles={clipStyleOptions(clip)}
                 onchange={(snap) => onCellChange(clip.id, snap)}
                 ondelete={() => onCellDelete(clip.id)}
                 onaudio={(payload) => onCellAudio(clip.id, payload)}
@@ -431,8 +482,10 @@
     font-size: 13px;
     font-family: inherit;
     min-width: 0;
+    cursor: pointer;
   }
   .voice-input::placeholder { color: var(--muted); }
+  .voice-input.missing { border-color: var(--err); color: var(--err); }
   .voice-input:focus { outline: none; border-color: var(--accent); }
   .del {
     background: transparent;

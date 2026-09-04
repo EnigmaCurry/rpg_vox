@@ -5,15 +5,24 @@
 //   project   = { id, name }
 //   character = {
 //     id, projectId, name,
-//     voice: { speaker, language, instruct },
+//     voice: {
+//       speaker, language,
+//       styles: [{ id, name, instruct }], // >=1; first is the fallback "default"
+//     },
 //     avatar: dataUrl | null,
 //     pictures: [{ id, dataUrl, name }],
 //   }
 //   scene     = {
 //     id, name, projectId,
 //     lanes: [{ id, voice }],            // columns; no clips owned here
-//     clips: [{ id, laneId, widgetId, text, instruct }],  // ordered timeline
+//     clips: [{ id, laneId, widgetId, text, styleId }],   // ordered timeline
 //   }
+//
+// Older sessions stored a single `voice.instruct` string on the character and
+// a `clip.instruct` override string on the clip. On load we promote the
+// character's instruct to a "default" style and leave the legacy clip.instruct
+// in place as a resolver fallback so pre-existing clips still render as they
+// did before styles existed.
 //
 // Projects group scenes; the selected project drives what Scenes.svelte and
 // its sidebar show. Lanes are just column labels + a voice identity. Every
@@ -89,8 +98,16 @@ export const QWEN3_LANGUAGES = [
   'Spanish', 'Japanese', 'Korean', 'French', 'Russian',
 ];
 
+function makeStyle(name = 'default', instruct = '') {
+  return { id: uuid(), name, instruct };
+}
+
 function defaultVoice() {
-  return { speaker: QWEN3_SPEAKERS[0], language: QWEN3_LANGUAGES[0], instruct: '' };
+  return {
+    speaker: QWEN3_SPEAKERS[0],
+    language: QWEN3_LANGUAGES[0],
+    styles: [makeStyle('default')],
+  };
 }
 
 function migrateScene(scene) {
@@ -106,6 +123,8 @@ function migrateScene(scene) {
           laneId: lane.id,
           widgetId: c.widgetId ?? null,
           text: c.text ?? '',
+          styleId: c.styleId ?? null,
+          // Preserved so the resolver can honor pre-styles overrides.
           instruct: c.instruct ?? '',
         });
       }
@@ -114,7 +133,9 @@ function migrateScene(scene) {
   } else {
     // Already v2+ — sanity-scrub in case an older bug left orphaned laneIds.
     const validLaneIds = new Set(scene.lanes.map((l) => l.id));
-    scene.clips = scene.clips.filter((c) => validLaneIds.has(c.laneId));
+    scene.clips = scene.clips
+      .filter((c) => validLaneIds.has(c.laneId))
+      .map((c) => ({ styleId: null, ...c }));
   }
   if (typeof scene.pauseMs !== 'number') scene.pauseMs = DEFAULT_PAUSE_MS;
 }
@@ -166,24 +187,41 @@ function load() {
     let characters = Array.isArray(parsed.characters) ? parsed.characters : [];
     characters = characters
       .filter((c) => c && validProjectIds.has(c.projectId))
-      .map((c) => ({
-        id: c.id ?? uuid(),
-        projectId: c.projectId,
-        name: c.name ?? 'Unnamed',
-        voice: {
-          speaker: c.voice?.speaker ?? QWEN3_SPEAKERS[0],
-          language: c.voice?.language ?? QWEN3_LANGUAGES[0],
-          instruct: c.voice?.instruct ?? '',
-        },
-        avatar: typeof c.avatar === 'string' ? c.avatar : null,
-        pictures: Array.isArray(c.pictures)
-          ? c.pictures.filter((p) => p && typeof p.dataUrl === 'string').map((p) => ({
-              id: p.id ?? uuid(),
-              dataUrl: p.dataUrl,
-              name: p.name ?? '',
-            }))
-          : [],
-      }));
+      .map((c) => {
+        // v3: single voice.instruct string → styles = [{id, name:'default', instruct}].
+        // Existing style arrays are kept as-is (sanitized). Empty/missing → seeded
+        // with an empty "default" so the resolver always has something to return.
+        let styles = Array.isArray(c.voice?.styles)
+          ? c.voice.styles
+              .filter((s) => s && typeof s === 'object')
+              .map((s) => ({
+                id: typeof s.id === 'string' ? s.id : uuid(),
+                name: typeof s.name === 'string' && s.name ? s.name : 'unnamed',
+                instruct: typeof s.instruct === 'string' ? s.instruct : '',
+              }))
+          : null;
+        if (!styles || styles.length === 0) {
+          styles = [makeStyle('default', c.voice?.instruct ?? '')];
+        }
+        return {
+          id: c.id ?? uuid(),
+          projectId: c.projectId,
+          name: c.name ?? 'Unnamed',
+          voice: {
+            speaker: c.voice?.speaker ?? QWEN3_SPEAKERS[0],
+            language: c.voice?.language ?? QWEN3_LANGUAGES[0],
+            styles,
+          },
+          avatar: typeof c.avatar === 'string' ? c.avatar : null,
+          pictures: Array.isArray(c.pictures)
+            ? c.pictures.filter((p) => p && typeof p.dataUrl === 'string').map((p) => ({
+                id: p.id ?? uuid(),
+                dataUrl: p.dataUrl,
+                name: p.name ?? '',
+              }))
+            : [],
+        };
+      });
 
     return { projects, selectedProjectId, scenes, selectedSceneId, characters };
   } catch {
@@ -330,23 +368,42 @@ export function currentProjectScenes() {
 }
 
 // ---- Lane CRUD -------------------------------------------------------------
+//
+// `lane.voice` holds the id of the character speaking in that lane. The field
+// name is kept for storage continuity with older sessions; old free-text
+// values (e.g. "Voice 1") won't resolve to any character and render as
+// unassigned in the picker until the user selects a character.
 
-function newLane(voice = '') {
-  return { id: uuid(), voice };
+function newLane(characterId = '') {
+  return { id: uuid(), voice: characterId };
 }
 
-export function addLane(sceneId, voice = '') {
+export function addLane(sceneId, characterId = '') {
   const scene = scenesState.scenes.find((x) => x.id === sceneId);
   if (!scene) return;
-  const nextIdx = scene.lanes.length + 1;
-  scene.lanes.push(newLane(voice || `Voice ${nextIdx}`));
+  // Auto-pick the first project character so new lanes land already-wired.
+  const fallback = characterId
+    || scenesState.characters.find((c) => c.projectId === scene.projectId)?.id
+    || '';
+  scene.lanes.push(newLane(fallback));
 }
 
-export function setLaneVoice(sceneId, laneId, voice) {
+export function setLaneVoice(sceneId, laneId, characterId) {
   const scene = scenesState.scenes.find((x) => x.id === sceneId);
   if (!scene) return;
   const lane = scene.lanes.find((l) => l.id === laneId);
-  if (lane) lane.voice = voice;
+  if (lane) lane.voice = characterId;
+}
+
+export function getCharacter(id) {
+  if (!id) return null;
+  return scenesState.characters.find((c) => c.id === id) ?? null;
+}
+
+// Characters available to lanes in this scene (i.e. its project's roster).
+export function sceneCharacters(scene) {
+  if (!scene) return [];
+  return scenesState.characters.filter((c) => c.projectId === scene.projectId);
 }
 
 /**
@@ -383,7 +440,7 @@ export function insertClip(sceneId, laneId, position) {
   if (!scene.lanes.some((l) => l.id === laneId)) return null;
   const id = uuid();
   const clamped = Math.max(0, Math.min(position | 0, scene.clips.length));
-  scene.clips.splice(clamped, 0, { id, laneId, widgetId: null, text: '', instruct: '' });
+  scene.clips.splice(clamped, 0, { id, laneId, widgetId: null, text: '', styleId: null });
   return id;
 }
 
@@ -431,7 +488,76 @@ export function updateCharacter(id, patch) {
   if (!character) return;
   if (patch.name !== undefined) character.name = patch.name;
   if (patch.avatar !== undefined) character.avatar = patch.avatar;
-  if (patch.voice) Object.assign(character.voice, patch.voice);
+  if (patch.voice) {
+    // Only merge scalar voice fields — style array edits go through the
+    // dedicated addCharacterStyle/renameCharacterStyle/setCharacterStyleInstruct
+    // helpers so we never accidentally clobber the whole list.
+    if (patch.voice.speaker !== undefined) character.voice.speaker = patch.voice.speaker;
+    if (patch.voice.language !== undefined) character.voice.language = patch.voice.language;
+  }
+}
+
+// ---- Character voice styles -----------------------------------------------
+//
+// Every character owns >=1 style; the first is the fallback "default" used
+// when a clip has no explicit selection. Deletes are refused if a style is
+// the last one so the resolver never has to invent an empty style.
+
+export function addCharacterStyle(characterId, name = 'new style') {
+  const character = scenesState.characters.find((c) => c.id === characterId);
+  if (!character) return null;
+  const style = makeStyle(name, '');
+  character.voice.styles.push(style);
+  return style.id;
+}
+
+export function renameCharacterStyle(characterId, styleId, name) {
+  const character = scenesState.characters.find((c) => c.id === characterId);
+  if (!character) return;
+  const style = character.voice.styles.find((s) => s.id === styleId);
+  if (style) style.name = name;
+}
+
+export function setCharacterStyleInstruct(characterId, styleId, instruct) {
+  const character = scenesState.characters.find((c) => c.id === characterId);
+  if (!character) return;
+  const style = character.voice.styles.find((s) => s.id === styleId);
+  if (style) style.instruct = instruct;
+}
+
+export function deleteCharacterStyle(characterId, styleId) {
+  const character = scenesState.characters.find((c) => c.id === characterId);
+  if (!character) return { ok: false, reason: 'character not found' };
+  if (character.voice.styles.length <= 1) {
+    return { ok: false, reason: 'at least one style is required' };
+  }
+  const idx = character.voice.styles.findIndex((s) => s.id === styleId);
+  if (idx < 0) return { ok: false, reason: 'style not found' };
+  character.voice.styles.splice(idx, 1);
+  return { ok: true };
+}
+
+/**
+ * Effective style for a clip: the character-owned style whose id matches
+ * `clip.styleId`, or (legacy fallback) a synthetic style carrying the clip's
+ * own persisted `instruct` field, or the character's first style. Callers
+ * pass a character (may be null); the return is `{ name, instruct }` — id is
+ * omitted because the synthetic fallback has none.
+ */
+export function resolveClipStyle(character, clip) {
+  if (!character) return { name: '', instruct: '' };
+  const styles = character.voice.styles || [];
+  if (clip?.styleId) {
+    const match = styles.find((s) => s.id === clip.styleId);
+    if (match) return { name: match.name, instruct: match.instruct };
+  }
+  // Pre-styles clips may still carry a per-clip instruct override. Honor it
+  // so old scenes replay identically until the user re-picks a style.
+  if (!clip?.styleId && typeof clip?.instruct === 'string' && clip.instruct !== '') {
+    return { name: '', instruct: clip.instruct };
+  }
+  const first = styles[0];
+  return first ? { name: first.name, instruct: first.instruct } : { name: '', instruct: '' };
 }
 
 export function deleteCharacter(id) {

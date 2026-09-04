@@ -48,11 +48,19 @@ export async function fetchWidget(id) {
   };
 }
 
-async function widgetRender(method, path, text, instruct) {
+// Voice params: `voice = { speaker, language, instruct }` where any subset
+// may be omitted/empty. `instruct` here is the per-clip override; if empty,
+// the server falls back to the character's default (or the process default).
+async function widgetRender(method, path, text, instruct, voice = {}) {
+  const body = { text };
+  const effectiveInstruct = instruct || voice.instruct || '';
+  if (voice.speaker) body.speaker = voice.speaker;
+  if (voice.language) body.language = voice.language;
+  if (effectiveInstruct) body.instruct = effectiveInstruct;
   const r = await fetch(path, {
     method,
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(instruct ? { text, instruct } : { text }),
+    body: JSON.stringify(body),
   });
   if (!r.ok) {
     const detail = await r.text().catch(() => `HTTP ${r.status}`);
@@ -67,11 +75,11 @@ async function widgetRender(method, path, text, instruct) {
   };
 }
 
-export const createWidget = (text, instruct = '') =>
-  widgetRender('POST', '/widgets', text, instruct);
+export const createWidget = (text, instruct = '', voice = {}) =>
+  widgetRender('POST', '/widgets', text, instruct, voice);
 
-export const updateWidget = (id, text, instruct = '') =>
-  widgetRender('PUT', `/widgets/${encodeURIComponent(id)}`, text, instruct);
+export const updateWidget = (id, text, instruct = '', voice = {}) =>
+  widgetRender('PUT', `/widgets/${encodeURIComponent(id)}`, text, instruct, voice);
 
 export async function deleteWidget(id) {
   const r = await fetch(`/widgets/${encodeURIComponent(id)}`, { method: 'DELETE' });

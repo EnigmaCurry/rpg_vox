@@ -30,7 +30,7 @@ use serde::Deserialize;
 use std::time::Duration;
 use tracing::{debug, info};
 
-use super::{Sink, comfyui::decode_audio_chunk};
+use super::{Sink, VoiceOverride, comfyui::decode_audio_chunk};
 
 pub struct Config {
     /// Gradio base URL, no trailing slash (e.g. `https://qwen3-tts.example.com`).
@@ -75,15 +75,19 @@ impl Backend {
         })
     }
 
-    /// `instruct` overrides the configured voice-style for this one call.
-    /// `None` falls back to the value from [`Config`] set at startup.
+    /// Any `voice` field set to `Some` overrides the corresponding [`Config`]
+    /// value (speaker / language / instruct) for this one call; `None` falls
+    /// back to what was configured at startup.
     pub async fn synthesize(
         &mut self,
         text: &str,
-        instruct: Option<&str>,
+        voice: &VoiceOverride,
         sink: &mut Sink<'_>,
     ) -> Result<()> {
-        let event_id = self.submit(text, instruct.unwrap_or(&self.instruct)).await?;
+        let speaker = voice.speaker.as_deref().unwrap_or(&self.speaker);
+        let language = voice.language.as_deref().unwrap_or(&self.language);
+        let instruct = voice.instruct.as_deref().unwrap_or(&self.instruct);
+        let event_id = self.submit(text, speaker, language, instruct).await?;
         let audio_url = self.await_result(&event_id).await?;
         let chunk_bytes = self
             .http
@@ -110,17 +114,23 @@ impl Backend {
         Ok(())
     }
 
-    async fn submit(&self, text: &str, instruct: &str) -> Result<String> {
+    async fn submit(
+        &self,
+        text: &str,
+        speaker: &str,
+        language: &str,
+        instruct: &str,
+    ) -> Result<String> {
         let url = format!("{}/gradio_api/call/run_instruct", self.base_url);
         // Gradio expects `data` positional in declared param order:
         // (text, lang_disp, spk_disp, instruct).
         let body = serde_json::json!({
-            "data": [text, self.language, self.speaker, instruct],
+            "data": [text, language, speaker, instruct],
         });
         info!(
             %url,
-            speaker = %self.speaker,
-            language = %self.language,
+            %speaker,
+            %language,
             chars = text.len(),
             instruct_chars = instruct.len(),
             "qwen3 remote: submitting"

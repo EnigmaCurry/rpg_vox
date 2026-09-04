@@ -25,7 +25,7 @@
   // pre-lane behavior with an empty starting state.
   let {
     initialText = '',
-    initialInstruct = '',
+    initialStyleId = null,
     initialWidgetId = null,
     startEditing = false,
     onchange = null,
@@ -40,6 +40,14 @@
     // scene-level playback to run each cell's own <audio> + progress bar
     // in sequence instead of a shared player.
     bindPlayer = null,
+    // Per-clip voice payload forwarded to the server on render:
+    // `{ speaker, language, instruct }`. The parent resolves `instruct` from
+    // the character's selected style, so this cell no longer edits it.
+    voice = {},
+    // Available voice styles for this cell's character: `[{id, name}]`.
+    // Rendered as a dropdown that picks which style's instruction the
+    // server uses. Empty list → dropdown is hidden.
+    styles = [],
   } = $props();
 
   // Starting state:
@@ -64,7 +72,7 @@
   // svelte-ignore state_referenced_locally
   let text = $state(initialText);
   // svelte-ignore state_referenced_locally
-  let instruct = $state(initialInstruct);
+  let styleId = $state(initialStyleId);
   let error = $state('');
 
   // Snapshot of what produced `blobUrl` — used to detect "dirty" edits and
@@ -73,7 +81,7 @@
   // svelte-ignore state_referenced_locally
   let renderedText = $state(initialWidgetId ? initialText : '');
   // svelte-ignore state_referenced_locally
-  let renderedInstruct = $state(initialWidgetId ? initialInstruct : '');
+  let renderedStyleId = $state(initialWidgetId ? initialStyleId : null);
   let blobUrl = $state(null);
   let durationMs = $state(0);   // exact playback duration from server header
   let sampleRate = $state(0);
@@ -93,19 +101,6 @@
 
   let audioEl = $state(null);  // <audio> element bound below
   let textEl  = $state(null);  // <textarea> for `text`, focused on entry
-
-  // Draggable split between the text and instruction textareas. `splitTop`
-  // is the fraction of the form's inner height that goes to the top pane;
-  // clamped so neither pane can be fully crushed. Default sits at MAX_SPLIT
-  // so the instruction pane starts at its minimum size — big text pane by
-  // default, room to grow the instruction pane if the user wants it.
-  const MIN_SPLIT = 0.18;
-  const MAX_SPLIT = 0.82;
-  let splitTop = $state(MAX_SPLIT);
-  let formLeftEl = $state(null);
-  let dragging = $state(false);   // drives `class:dragging` on the divider
-  let dragStartY = 0;
-  let dragStartSplit = 0;
 
   // Delete button: two-tap confirm. `deleteConfirm=true` swaps the label to
   // "really?" and the second click actually resets the cell. Auto-reverts
@@ -143,7 +138,7 @@
       sampleRate = result.sampleRate || 0;
       durationMs = result.durationMs || 0;
       renderedText = text;
-      renderedInstruct = instruct;
+      renderedStyleId = styleId;
       hydrating = false;
       onaudio?.({ blobUrl, durationMs });
     } catch (e) {
@@ -185,7 +180,7 @@
   let lastEmit = null;
   $effect(() => {
     if (!onchange) return;
-    const snap = { text, instruct, widgetId };
+    const snap = { text, styleId, widgetId };
     const key = JSON.stringify(snap);
     if (key === lastEmit) return;
     lastEmit = key;
@@ -194,7 +189,7 @@
 
   const hasClip = $derived(blobUrl !== null);
   const isDirty = $derived(
-    hasClip && (text !== renderedText || instruct !== renderedInstruct)
+    hasClip && (text !== renderedText || styleId !== renderedStyleId)
   );
   const progressPct = $derived(`${(progress * 100).toFixed(1)}%`);
 
@@ -209,7 +204,7 @@
 
   function cancelEdit() {
     text = renderedText;
-    instruct = renderedInstruct;
+    styleId = renderedStyleId;
     error = '';
     state = 'rendered';
   }
@@ -260,9 +255,9 @@
     cancelRaf();
     if (blobUrl) { URL.revokeObjectURL(blobUrl); blobUrl = null; }
     text = '';
-    instruct = '';
+    styleId = null;
     renderedText = '';
-    renderedInstruct = '';
+    renderedStyleId = null;
     durationMs = 0;
     sampleRate = 0;
     widgetId = null;
@@ -286,7 +281,8 @@
     state = 'rendering';
     progress = 0;
     startedAt = performance.now();
-    estimatedMs = estimateMs(t.length + instruct.length);
+    const voiceInstruct = typeof voice?.instruct === 'string' ? voice.instruct : '';
+    estimatedMs = estimateMs(t.length + voiceInstruct.length);
     rafId = requestAnimationFrame(tickRender);
 
     try {
@@ -295,22 +291,23 @@
       // If we were hydrated with a stale widgetId (server row deleted out
       // from under us — e.g. sqlite wiped), fall back to create so the
       // user's play action still produces a clip.
+      // instruct comes from the character's selected style via `voice`.
       let result;
       try {
         result = widgetId
-          ? await updateWidget(widgetId, t, instruct.trim())
-          : await createWidget(t, instruct.trim());
+          ? await updateWidget(widgetId, t, '', voice)
+          : await createWidget(t, '', voice);
       } catch (e) {
         if (widgetId && /no widget with id/i.test(e.message || '')) {
           widgetId = null;
-          result = await createWidget(t, instruct.trim());
+          result = await createWidget(t, '', voice);
         } else {
           throw e;
         }
       }
       cancelRaf();
       const elapsedMs = performance.now() - startedAt;
-      recordSample(t.length + instruct.length, elapsedMs);
+      recordSample(t.length + voiceInstruct.length, elapsedMs);
 
       if (result.id) widgetId = result.id;
       // Rotate blob URL — release the old one so long sessions don't leak.
@@ -319,7 +316,7 @@
       sampleRate = result.sampleRate || 0;
       durationMs = result.durationMs || 0;
       renderedText = t;
-      renderedInstruct = instruct.trim();
+      renderedStyleId = styleId;
       onaudio?.({ blobUrl, durationMs });
 
       progress = 1;
@@ -435,32 +432,17 @@
     }
   }
 
-  // ---- Divider drag (resize text vs instruct panes) -----------------------
-  // Uses pointer capture so the drag continues even if the cursor leaves the
-  // thin handle. splitTop is a fraction of the form-left column's height.
-  function onDividerDown(e) {
-    if (state === 'rendering' || !formLeftEl) return;
-    dragging = true;
-    dragStartY = e.clientY;
-    dragStartSplit = splitTop;
-    try { e.currentTarget.setPointerCapture(e.pointerId); } catch {}
-    e.preventDefault();
-  }
-  function onDividerMove(e) {
-    if (!dragging || !formLeftEl) return;
-    const rect = formLeftEl.getBoundingClientRect();
-    if (rect.height <= 0) return;
-    const delta = e.clientY - dragStartY;
-    const next = dragStartSplit + delta / rect.height;
-    splitTop = Math.max(MIN_SPLIT, Math.min(MAX_SPLIT, next));
-  }
-  function onDividerUp(e) {
-    if (!dragging) return;
-    dragging = false;
-    try { e.currentTarget.releasePointerCapture(e.pointerId); } catch {}
-  }
-
   const clipMeta = $derived(hasClip ? `${(durationMs / 1000).toFixed(1)}s` : '');
+
+  // Dropdown value is always a string (even for the "default" empty selection),
+  // so we normalize null ↔ '' when reading/writing the styleId state.
+  const styleSelectValue = $derived(styleId ?? '');
+  function onStyleSelectChange(ev) {
+    const val = ev.currentTarget.value;
+    styleId = val === '' ? null : val;
+  }
+  // Show the picker only if the parent handed us any styles.
+  const hasStyles = $derived(Array.isArray(styles) && styles.length > 0);
 </script>
 
 <div class="cell"
@@ -528,10 +510,7 @@
   {:else}
     <!-- editing / rendering: the form. -->
     <div class="form">
-      <div
-        class="form-left"
-        bind:this={formLeftEl}
-        style:grid-template-rows="minmax(0, {splitTop}fr) 10px minmax(0, {1 - splitTop}fr)">
+      <div class="form-left">
         <textarea
           class="text"
           bind:this={textEl}
@@ -540,23 +519,24 @@
           placeholder="Text to speak…"
           disabled={state === 'rendering'}></textarea>
 
-        <div
-          class="divider"
-          class:dragging
-          role="separator"
-          aria-orientation="horizontal"
-          aria-label="Resize text vs instruction"
-          onpointerdown={onDividerDown}
-          onpointermove={onDividerMove}
-          onpointerup={onDividerUp}
-          onpointercancel={onDividerUp}></div>
-
-        <textarea
-          class="instruct"
-          bind:value={instruct}
-          onkeydown={onTextKey}
-          placeholder="Voice-style instruction (optional) — e.g. calm, whisper, angry"
-          disabled={state === 'rendering'}></textarea>
+        {#if hasStyles}
+          <label class="style-picker">
+            <span>Style</span>
+            <select
+              value={styleSelectValue}
+              onchange={onStyleSelectChange}
+              disabled={state === 'rendering'}
+              aria-label="Voice style"
+            >
+              <!-- Empty value = "use the character's default style". Keeps
+                   fresh clips silently on the default until the user opts in. -->
+              <option value="">(default)</option>
+              {#each styles as st (st.id)}
+                <option value={st.id}>{st.name}</option>
+              {/each}
+            </select>
+          </label>
+        {/if}
       </div>
 
       <div class="side">
@@ -776,50 +756,51 @@
     min-height: 0;
   }
 
-  /* Left column: text pane / drag handle / instruction pane. Row template is
-     set inline from `splitTop` so the divider drag can update it live. */
+  /* Left column: text pane fills all available height; style picker sits
+     under it as a short row. */
   .form-left {
-    display: grid;
-    gap: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
     min-height: 0;
     /* min-width:0 prevents flex/grid from forcing intrinsic width from the
        textarea, which would otherwise blow the outer grid column out. */
     min-width: 0;
   }
-  .text, .instruct {
-    height: 100%;
+  .text {
+    flex: 1;
     width: 100%;
     resize: none;
-    /* Absorb the divider's negative visual gap so the panes butt right up
-       against it instead of leaving a padding strip. */
     margin: 0;
+    font-size: 1.5em;
+    min-height: 0;
   }
-  .text     { font-size: 1.5em; }
-  .instruct { font-size: 13px; color: var(--muted); }
-  .instruct::placeholder { color: var(--muted); opacity: 0.7; }
 
-  .divider {
-    position: relative;
-    cursor: row-resize;
-    touch-action: none;
-    user-select: none;
+  .style-picker {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
   }
-  /* Thin visible line inset from the edges — full-width strip is the hit
-     area, the ::before is the visual affordance. */
-  .divider::before {
-    content: '';
-    position: absolute;
-    left: 20%;
-    right: 20%;
-    top: 50%;
-    height: 2px;
-    transform: translateY(-1px);
-    background: var(--border);
-    border-radius: 1px;
-    transition: background 0.1s;
+  .style-picker select {
+    flex: 1;
+    min-width: 0;
+    text-transform: none;
+    letter-spacing: normal;
+    background: rgba(0,0,0,0.35);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 4px 6px;
+    font-size: 12px;
+    font-family: inherit;
+    cursor: pointer;
   }
-  .divider:hover::before,
-  .divider.dragging::before { background: var(--accent); }
+  .style-picker select:focus { outline: none; border-color: var(--accent); }
+  .style-picker select:disabled { opacity: 0.6; cursor: not-allowed; }
 
   /* Disabled textareas (rendering state) must look non-interactive: muted
      text, dimmed background, no focus ring. `rendered` collapses the form
