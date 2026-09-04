@@ -20,6 +20,7 @@ use tracing::info;
 
 use std::sync::Arc;
 
+use crate::chat;
 use crate::pw_source::{GraphSnapshot, PwClient};
 use crate::settings::{self, SettingsUpdate};
 use crate::tts::{self, SayRequest};
@@ -33,6 +34,7 @@ struct AppState {
     pw: PwClient,
     settings: settings::Shared,
     registry: Arc<Registry>,
+    chat: chat::Client,
 }
 
 #[derive(Debug, Deserialize)]
@@ -64,12 +66,14 @@ pub async fn serve(
     pw: PwClient,
     settings: settings::Shared,
     registry: Arc<Registry>,
+    chat: chat::Client,
 ) -> Result<()> {
     let state = AppState {
         say,
         pw,
         settings,
         registry,
+        chat,
     };
     let app = Router::new()
         .route("/", get(index))
@@ -84,6 +88,10 @@ pub async fn serve(
         .route("/workflows", get(list_workflows))
         .route("/workflow/verify", post(verify_workflow))
         .route("/workflow/warmup", post(warmup_workflow))
+        .route(
+            "/chat",
+            get(chat_history).post(chat_send).delete(chat_reset),
+        )
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&bind)
@@ -342,4 +350,112 @@ async fn say_handler(
         )
             .into_response(),
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatSendBody {
+    text: String,
+    /// If true (default), the assistant's reply is queued into the TTS path so
+    /// the mic speaks it.
+    #[serde(default = "default_speak")]
+    speak: bool,
+}
+
+fn default_speak() -> bool {
+    true
+}
+
+#[derive(Debug, Serialize)]
+struct ChatSendResponse {
+    ok: bool,
+    reply: Option<String>,
+    spoken: bool,
+    error: Option<String>,
+}
+
+async fn chat_history(State(state): State<AppState>) -> impl IntoResponse {
+    let h = state.chat.history_snapshot().await;
+    (StatusCode::OK, Json(h)).into_response()
+}
+
+async fn chat_reset(State(state): State<AppState>) -> impl IntoResponse {
+    state.chat.reset().await;
+    (
+        StatusCode::OK,
+        Json(ActionResponse {
+            ok: true,
+            error: None,
+        }),
+    )
+        .into_response()
+}
+
+async fn chat_send(
+    State(state): State<AppState>,
+    Json(body): Json<ChatSendBody>,
+) -> impl IntoResponse {
+    let text = body.text.trim().to_string();
+    if text.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ChatSendResponse {
+                ok: false,
+                reply: None,
+                spoken: false,
+                error: Some("empty text".into()),
+            }),
+        )
+            .into_response();
+    }
+
+    let reply = match state.chat.send(text).await {
+        Ok(r) => r,
+        Err(err) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(ChatSendResponse {
+                    ok: false,
+                    reply: None,
+                    spoken: false,
+                    error: Some(format!("{err:#}")),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    let spoken = if body.speak {
+        speak_async(state.say.clone(), reply.clone());
+        true
+    } else {
+        false
+    };
+
+    (
+        StatusCode::OK,
+        Json(ChatSendResponse {
+            ok: true,
+            reply: Some(reply),
+            spoken,
+            error: None,
+        }),
+    )
+        .into_response()
+}
+
+/// Fire-and-forget a TTS request; log any error so the chat HTTP response
+/// isn't held up on audio generation.
+fn speak_async(say: Sender<SayRequest>, text: String) {
+    tokio::spawn(async move {
+        let (tx, rx) = oneshot::channel();
+        if say.send(SayRequest { text, reply: tx }).await.is_err() {
+            tracing::warn!("tts channel closed; chat reply not spoken");
+            return;
+        }
+        match rx.await {
+            Ok(Ok(frames)) => tracing::debug!(frames, "chat reply queued to mic"),
+            Ok(Err(err)) => tracing::warn!(err = %err, "chat reply tts failed"),
+            Err(_) => tracing::warn!("tts dropped reply oneshot"),
+        }
+    });
 }

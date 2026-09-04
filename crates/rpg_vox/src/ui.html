@@ -280,14 +280,21 @@
 
   <section class="tab-panel" id="tab-chat" role="tabpanel" hidden>
     <div id="chat-log" class="chat-log">
-      <div class="empty">no messages yet — the assistant isn't wired up</div>
+      <div class="empty">no messages yet</div>
     </div>
 
     <textarea id="chat-input" placeholder="Message the assistant…"></textarea>
 
     <div class="row">
       <span class="hint">Enter to send · Shift+Enter for newline</span>
-      <button id="chat-send">Send</button>
+      <div class="actions">
+        <label class="hint" style="display:flex;align-items:center;gap:6px">
+          <input type="checkbox" id="chat-speak" checked>
+          Speak replies
+        </label>
+        <button id="chat-clear" class="secondary">Clear</button>
+        <button id="chat-send">Send</button>
+      </div>
     </div>
 
     <div id="chat-status"></div>
@@ -299,7 +306,9 @@
       <span class="sum-meta" id="settings-summary">—</span>
     </summary>
     <div class="section-body">
-      <div>
+      <!-- Workflow controls are ComfyUI-only; hidden when the backend is
+           something local like piper. Toggled from renderSettings(). -->
+      <div id="wf-block" style="display:none">
         <div class="subhead">
           <span>TTS workflow</span>
           <span class="note" id="wf-source">—</span>
@@ -314,7 +323,7 @@
         </div>
       </div>
 
-      <hr class="section-sep">
+      <hr class="section-sep" id="wf-sep" style="display:none">
 
       <div>
         <div class="subhead"><span>Local monitor</span></div>
@@ -435,14 +444,24 @@
     t.addEventListener("click", () => selectTab(t.dataset.tab));
   }
 
-  // ---- Chat (scaffold — LLM/TTS wiring lands later) ----------------------
+  // ---- Chat ---------------------------------------------------------------
   const $chatLog    = document.getElementById("chat-log");
   const $chatInput  = document.getElementById("chat-input");
   const $chatSend   = document.getElementById("chat-send");
+  const $chatClear  = document.getElementById("chat-clear");
+  const $chatSpeak  = document.getElementById("chat-speak");
   const $chatStatus = document.getElementById("chat-status");
 
+  function setChatStatus(msg, kind) {
+    $chatStatus.textContent = msg || "";
+    $chatStatus.className = kind || "";
+  }
+
+  function clearChatLogUI() {
+    $chatLog.innerHTML = '<div class="empty">no messages yet</div>';
+  }
+
   function appendChatMsg(role, text, opts = {}) {
-    // First message clears the "no messages yet" placeholder.
     const empty = $chatLog.querySelector(".empty");
     if (empty) empty.remove();
     const div = document.createElement("div");
@@ -453,27 +472,77 @@
     return div;
   }
 
+  async function loadChatHistory() {
+    try {
+      const r = await fetch("/chat");
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const msgs = await r.json();
+      clearChatLogUI();
+      for (const m of msgs) {
+        if (m.role === "user" || m.role === "assistant") {
+          appendChatMsg(m.role, m.content);
+        }
+      }
+    } catch (e) {
+      setChatStatus(`history error: ${e.message}`, "err");
+    }
+  }
+
   async function sendChat() {
     const text = $chatInput.value.trim();
     if (!text) return;
     $chatSend.disabled = true;
     appendChatMsg("user", text);
     $chatInput.value = "";
-    appendChatMsg("assistant", "(assistant not connected)", { pending: true });
-    $chatStatus.textContent = "";
-    $chatStatus.className = "";
-    $chatStatus.textContent = "LLM backend not wired up yet";
-    $chatSend.disabled = false;
-    $chatInput.focus();
+    const pending = appendChatMsg("assistant", "…", { pending: true });
+    setChatStatus("thinking…");
+    try {
+      const r = await fetch("/chat", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ text, speak: $chatSpeak.checked }),
+      });
+      const body = await r.json().catch(() => null);
+      if (r.ok && body && body.ok) {
+        pending.classList.remove("pending");
+        pending.textContent = body.reply || "";
+        setChatStatus(body.spoken ? "reply queued to mic" : "reply received", "ok");
+      } else {
+        const detail = (body && body.error) || `HTTP ${r.status}`;
+        pending.remove();
+        setChatStatus(`error: ${detail}`, "err");
+      }
+    } catch (e) {
+      pending.remove();
+      setChatStatus(`network error: ${e.message}`, "err");
+    } finally {
+      $chatSend.disabled = false;
+      $chatInput.focus();
+    }
+  }
+
+  async function clearChat() {
+    if (!confirm("Clear chat history?")) return;
+    try {
+      const r = await fetch("/chat", { method: "DELETE" });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      clearChatLogUI();
+      setChatStatus("history cleared", "ok");
+    } catch (e) {
+      setChatStatus(`clear failed: ${e.message}`, "err");
+    }
   }
 
   $chatSend.addEventListener("click", sendChat);
+  $chatClear.addEventListener("click", clearChat);
   $chatInput.addEventListener("keydown", (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       sendChat();
     }
   });
+
+  loadChatHistory();
 
   // ---- Settings panel -----------------------------------------------------
   const $panel     = document.getElementById("settings-panel");
@@ -495,6 +564,21 @@
                         // doesn't wipe listener/monitor info out of the summary
   let serverSettings = null; // last known server-side settings
   let availableWorkflows = []; // populated from /workflows once
+  let monitorRestored = false; // guards against re-firing the saved pref after
+                               // the user has explicitly interacted this session
+
+  // Persist the monitor selection by node.name (stable across pipewire
+  // sessions) rather than by numeric id (regenerated each boot).
+  const MONITOR_PREF_KEY = "rpg_vox.monitor_sink_name";
+  function savedMonitorName() {
+    try { return localStorage.getItem(MONITOR_PREF_KEY); } catch { return null; }
+  }
+  function setSavedMonitorName(name) {
+    try {
+      if (name) localStorage.setItem(MONITOR_PREF_KEY, name);
+      else      localStorage.removeItem(MONITOR_PREF_KEY);
+    } catch {}
+  }
 
   async function refreshGraph() {
     try {
@@ -558,9 +642,26 @@
         $listeners.append(div);
       }
     }
+
+    // First-graph-after-load: if there's a saved monitor preference and
+    // nothing is monitoring yet, re-apply it. Only fires once per page load
+    // so a later Stop click won't get overridden on the next refresh.
+    if (!monitorRestored && currentMonitor === null) {
+      const wanted = savedMonitorName();
+      if (wanted) {
+        const match = monitorable.find((s) => s.name === wanted);
+        if (match) {
+          monitorRestored = true;
+          startMonitor(match.id, { restore: true });
+        }
+      }
+    }
   }
 
-  async function startMonitor(sinkId) {
+  async function startMonitor(sinkId, opts = {}) {
+    // Any explicit change is a user intent — mark restore as done so the
+    // saved-pref restore loop above doesn't fight the click.
+    monitorRestored = true;
     try {
       const r = await fetch("/pw/monitor", {
         method: "POST",
@@ -572,7 +673,11 @@
         const err = (body && body.error) || `HTTP ${r.status}`;
         setStatus(`monitor error: ${err}`, "err");
       } else {
-        setStatus(`monitoring sink #${sinkId}`, "ok");
+        // Persist by sink.name (id is ephemeral). Fall back to whatever
+        // lastGraph has cached; skip persistence if we can't resolve one.
+        const sink = (lastGraph && lastGraph.sinks || []).find((s) => s.id === sinkId);
+        if (sink && sink.name) setSavedMonitorName(sink.name);
+        setStatus(opts.restore ? `restored monitor: sink #${sinkId}` : `monitoring sink #${sinkId}`, "ok");
       }
     } catch (e) {
       setStatus(`monitor error: ${e.message}`, "err");
@@ -582,12 +687,14 @@
   }
 
   async function stopMonitor() {
+    monitorRestored = true; // user intent — don't auto-re-apply on next graph
     try {
       const r = await fetch("/pw/monitor", { method: "DELETE" });
       const body = await r.json().catch(() => null);
       if (!r.ok || (body && !body.ok)) {
         setStatus(`stop error: ${(body && body.error) || r.status}`, "err");
       } else {
+        setSavedMonitorName(null);
         setStatus("monitor stopped", "ok");
       }
     } catch (e) {
@@ -602,13 +709,27 @@
 
   // ---- Settings panel -----------------------------------------------------
   function updateSummary() {
-    const wf = serverSettings && serverSettings.workflow_name
-      ? serverSettings.workflow_name : "placeholder";
+    const backend = (serverSettings && serverSettings.backend) || "?";
+    const isComfy = backend === "comfyui";
+    const head = isComfy
+      ? `workflow: ${serverSettings && serverSettings.workflow_name ? serverSettings.workflow_name : "placeholder"}`
+      : `backend: ${backend}`;
     const g = lastGraph;
     const patchPart = g && currentAutoPatch !== null ? ` · auto→#${currentAutoPatch}` : "";
     const monPart = g && currentMonitor !== null ? ` · monitor→#${currentMonitor}` : "";
     const gPart = g ? ` · ${g.listeners.length} listener(s)${patchPart}${monPart}` : "";
-    $summary.textContent = `workflow: ${wf}${gPart}`;
+    $summary.textContent = `${head}${gPart}`;
+  }
+
+  // Workflow selector + verify/warmup buttons are ComfyUI-specific; hide the
+  // whole block (and its separator) when the server is running a local backend.
+  function applyBackendVisibility() {
+    const isComfy = serverSettings && serverSettings.backend === "comfyui";
+    const disp = isComfy ? "" : "none";
+    const $wfBlock = document.getElementById("wf-block");
+    const $wfSep   = document.getElementById("wf-sep");
+    if ($wfBlock) $wfBlock.style.display = disp;
+    if ($wfSep)   $wfSep.style.display   = disp;
   }
 
   async function refreshSettings() {
@@ -618,6 +739,7 @@
       serverSettings = await r.json();
       $wfSelect.value = serverSettings.workflow_name || "";
       renderWorkflowSummary();
+      applyBackendVisibility();
       updateSummary();
     } catch (e) {
       setStatus(`settings error: ${e.message}`, "err");
@@ -665,6 +787,7 @@
       serverSettings = body;
       $wfSelect.value = serverSettings.workflow_name || "";
       renderWorkflowSummary();
+      applyBackendVisibility();
       setStatus(okMsg, "ok");
       return true;
     } catch (e) {
@@ -743,9 +866,12 @@
   // Initial fetch of settings + workflow list so the summary is populated
   // even when the panel is closed. The order matters: fetch workflows before
   // settings so the <select> already has the option we want to select.
+  // refreshGraph runs unconditionally too so the saved-monitor restore fires
+  // even if the user never opens the Settings expander.
   (async () => {
     await refreshWorkflows();
     await refreshSettings();
+    await refreshGraph();
   })();
 </script>
 </body>

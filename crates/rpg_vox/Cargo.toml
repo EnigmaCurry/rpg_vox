@@ -18,6 +18,13 @@ futures-util = "0.3"
 symphonia = { version = "0.5", features = ["wav", "mp3", "flac", "ogg", "vorbis"] }
 rubato = "0.15"
 
+# Piper TTS backend. Runs the ONNX voice model in-process via `ort`; espeak-rs
+# vendors espeak-ng (build needs cmake). `ort`'s `load-dynamic` feature makes
+# it dlopen libonnxruntime at runtime — friendlier on NixOS than the default
+# prebuilt-binary download. The shell.nix provides ORT_DYLIB_PATH.
+piper-rs = "0.2"
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dynamic", "ndarray"] }
+
 rtrb.workspace = true
 
 serde.workspace = true

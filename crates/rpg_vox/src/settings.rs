@@ -13,6 +13,9 @@ use crate::workflow::{self, Registry, WorkflowSummary};
 
 #[derive(Clone, Debug)]
 pub struct Settings {
+    /// TTS backend selected at startup. Immutable from HTTP; the UI reads it
+    /// to decide whether to show ComfyUI-only controls.
+    pub backend: &'static str,
     pub comfyui_base: String,
     /// Selected workflow name (registry key), or None for the built-in placeholder.
     pub workflow_name: Option<String>,
@@ -24,6 +27,7 @@ pub struct Settings {
 /// Wire type exposed by `GET /settings`.
 #[derive(Clone, Debug, Serialize)]
 pub struct SettingsPublic {
+    pub backend: &'static str,
     pub workflow_name: Option<String>,
     pub workflow_summary: WorkflowSummary,
 }
@@ -31,6 +35,7 @@ pub struct SettingsPublic {
 impl Settings {
     pub fn public(&self) -> SettingsPublic {
         SettingsPublic {
+            backend: self.backend,
             workflow_name: self.workflow_name.clone(),
             workflow_summary: self.workflow_summary.clone(),
         }

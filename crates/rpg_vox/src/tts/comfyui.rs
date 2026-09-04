@@ -1,20 +1,16 @@
-//! ComfyUI TTS client.
+//! ComfyUI TTS backend.
 //!
 //! Submits a text prompt to a running ComfyUI instance, opens a WebSocket, and
-//! streams audio chunks back from a custom TTS node. Chunks are decoded via
-//! Symphonia, resampled to the target rate if necessary, and pushed into the
-//! shared ring buffer that feeds the PipeWire source.
+//! streams audio chunks back from the workflow's TTS node. Chunks are decoded
+//! via Symphonia and handed to the shared [`Sink`] which owns resampling and
+//! the ring-buffer push.
 //!
-//! The exact wire format of the custom ComfyUI node isn't finalized. The
-//! `ComfyClient` trait below is the seam — swap the impl once the node's
-//! protocol is nailed down.
+//! For workflows that don't stream over the socket (e.g. anything ending in
+//! `SaveAudio`) we fall back to fetching the output files listed in
+//! `/history`.
 
 use anyhow::{Context as _, Result, anyhow};
 use futures_util::StreamExt;
-use rtrb::Producer;
-use rubato::{
-    Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
-};
 use serde_json::{Value, json};
 use std::io::Cursor;
 
@@ -25,54 +21,35 @@ use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
-use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-pub struct Config {
-    pub target_sample_rate: u32,
-}
+use super::{AudioChunk, Sink};
 
-/// One utterance request: the text to speak plus a channel to report the
-/// result back to the caller (usually the /say HTTP handler).
-pub struct SayRequest {
-    pub text: String,
-    pub reply: oneshot::Sender<Result<usize, String>>,
-}
-
-pub async fn run(
-    cfg: Config,
+pub struct Backend {
     settings: crate::settings::Shared,
-    mut say_rx: mpsc::Receiver<SayRequest>,
-    mut producer: Producer<f32>,
-) -> Result<()> {
-    let http = reqwest::Client::new();
+    http: reqwest::Client,
+}
 
-    while let Some(SayRequest { text, reply }) = say_rx.recv().await {
-        // Read live settings + build the per-utterance workflow.
-        let (base, prepared) = {
-            let s = settings.read().await;
-            (
-                s.comfyui_base.clone(),
-                workflow::substitute_text(&s.workflow_json, &text),
-            )
-        };
-        info!(chars = text.len(), "generating speech");
-        let result = generate_and_push(&http, &base, &prepared, cfg.target_sample_rate, &mut producer)
-            .await
-            .map_err(|err| {
-                let msg = format!("{err:#}");
-                error!(err = %msg, "utterance failed");
-                msg
-            })
-            .inspect(|frames| {
-                info!(frames, "utterance delivered to ring buffer");
-            });
-        let _ = reply.send(result);
+impl Backend {
+    pub fn new(settings: crate::settings::Shared) -> Self {
+        Self {
+            settings,
+            http: reqwest::Client::new(),
+        }
     }
 
-    Ok(())
+    pub async fn synthesize(&mut self, text: &str, sink: &mut Sink<'_>) -> Result<()> {
+        let (base, prepared) = {
+            let s = self.settings.read().await;
+            (
+                s.comfyui_base.clone(),
+                workflow::substitute_text(&s.workflow_json, text),
+            )
+        };
+        generate_and_push(&self.http, &base, &prepared, sink).await
+    }
 }
 
 /// Submit a warmup prompt using the given workflow and wait for ComfyUI to
@@ -104,9 +81,8 @@ async fn generate_and_push(
     http: &reqwest::Client,
     comfyui_base: &str,
     prepared_workflow: &Value,
-    target_rate: u32,
-    producer: &mut Producer<f32>,
-) -> Result<usize> {
+    sink: &mut Sink<'_>,
+) -> Result<()> {
     let client_id = Uuid::new_v4().to_string();
 
     let prompt_id = submit_prompt(http, comfyui_base, prepared_workflow, &client_id).await?;
@@ -117,40 +93,15 @@ async fn generate_and_push(
         .await
         .with_context(|| format!("connecting to {ws_url}"))?;
 
-    let mut frames_pushed = 0usize;
-    let mut incoming_rate: Option<u32> = None;
-    let mut resampler: Option<SincFixedIn<f32>> = None;
+    let frames_before = sink.frames_pushed;
 
     while let Some(msg) = ws.next().await {
         let msg = msg.context("ws recv")?;
         match msg {
-            Message::Binary(bytes) => {
-                // The custom node is expected to emit encoded audio (e.g. a WAV
-                // chunk or a raw PCM frame with a small header). Symphonia
-                // handles the format probing for us for standard containers.
-                match decode_audio_chunk(&bytes) {
-                    Ok(chunk) => {
-                        if incoming_rate.is_none() {
-                            incoming_rate = Some(chunk.sample_rate);
-                            if chunk.sample_rate != target_rate {
-                                resampler = Some(build_resampler(chunk.sample_rate, target_rate)?);
-                            }
-                            info!(
-                                rate = chunk.sample_rate,
-                                target = target_rate,
-                                "audio format known"
-                            );
-                        }
-                        let resampled = if let Some(rs) = resampler.as_mut() {
-                            resample(rs, &chunk.samples)?
-                        } else {
-                            chunk.samples
-                        };
-                        frames_pushed += push_samples(producer, &resampled);
-                    }
-                    Err(err) => warn!(?err, "failed to decode audio chunk"),
-                }
-            }
+            Message::Binary(bytes) => match decode_audio_chunk(&bytes) {
+                Ok(chunk) => sink.push(chunk).await?,
+                Err(err) => warn!(?err, "failed to decode audio chunk"),
+            },
             Message::Text(txt) => {
                 if is_terminal_for(&txt, &prompt_id)? {
                     debug!("prompt execution complete");
@@ -165,34 +116,18 @@ async fn generate_and_push(
     // Fallback: some workflows (e.g. anything ending in PreviewAudio/SaveAudio)
     // don't stream audio over WS at all — they just write files. If nothing
     // arrived on the socket, walk /history for output files and fetch them.
-    if frames_pushed == 0 {
+    if sink.frames_pushed == frames_before {
         debug!("no WS audio; falling back to /history + /view");
         let files = fetch_history_audio_files(http, comfyui_base, &prompt_id).await?;
         for (label, bytes) in files {
-            let chunk = match decode_audio_chunk(&bytes) {
-                Ok(c) => c,
-                Err(err) => {
-                    warn!(file = %label, ?err, "failed to decode fetched audio");
-                    continue;
-                }
-            };
-            if incoming_rate.is_none() {
-                incoming_rate = Some(chunk.sample_rate);
-                if chunk.sample_rate != target_rate {
-                    resampler = Some(build_resampler(chunk.sample_rate, target_rate)?);
-                }
-                info!(rate = chunk.sample_rate, target = target_rate, "audio format known");
+            match decode_audio_chunk(&bytes) {
+                Ok(chunk) => sink.push(chunk).await?,
+                Err(err) => warn!(file = %label, ?err, "failed to decode fetched audio"),
             }
-            let resampled = if let Some(rs) = resampler.as_mut() {
-                resample(rs, &chunk.samples)?
-            } else {
-                chunk.samples
-            };
-            frames_pushed += push_samples(producer, &resampled);
         }
     }
 
-    Ok(frames_pushed)
+    Ok(())
 }
 
 /// Return `(display_label, bytes)` for every audio output file listed under
@@ -257,26 +192,7 @@ async fn fetch_history_audio_files(
     Ok(out)
 }
 
-fn push_samples(producer: &mut Producer<f32>, samples: &[f32]) -> usize {
-    let mut written = 0;
-    for &s in samples {
-        if producer.push(s).is_err() {
-            // Ring full — drop the tail rather than block the async task. In
-            // practice this only happens if PipeWire has stalled.
-            warn!("ring buffer full; dropping remaining samples");
-            break;
-        }
-        written += 1;
-    }
-    written
-}
-
-struct DecodedChunk {
-    samples: Vec<f32>,
-    sample_rate: u32,
-}
-
-fn decode_audio_chunk(bytes: &[u8]) -> Result<DecodedChunk> {
+fn decode_audio_chunk(bytes: &[u8]) -> Result<AudioChunk> {
     let cursor = Cursor::new(bytes.to_vec());
     let mss = MediaSourceStream::new(Box::new(cursor), Default::default());
     let probed = symphonia::default::get_probe().format(
@@ -335,40 +251,10 @@ fn decode_audio_chunk(bytes: &[u8]) -> Result<DecodedChunk> {
         }
     }
 
-    Ok(DecodedChunk {
+    Ok(AudioChunk {
         samples,
         sample_rate,
     })
-}
-
-fn build_resampler(input_rate: u32, output_rate: u32) -> Result<SincFixedIn<f32>> {
-    let params = SincInterpolationParameters {
-        sinc_len: 128,
-        f_cutoff: 0.95,
-        interpolation: SincInterpolationType::Cubic,
-        oversampling_factor: 128,
-        window: WindowFunction::BlackmanHarris2,
-    };
-    let ratio = output_rate as f64 / input_rate as f64;
-    Ok(SincFixedIn::<f32>::new(ratio, 2.0, params, 1024, 1)?)
-}
-
-fn resample(rs: &mut SincFixedIn<f32>, input: &[f32]) -> Result<Vec<f32>> {
-    let chunk_size = rs.input_frames_next();
-    let mut out = Vec::new();
-    for chunk in input.chunks(chunk_size) {
-        let mut padded;
-        let slice: &[f32] = if chunk.len() == chunk_size {
-            chunk
-        } else {
-            padded = vec![0.0f32; chunk_size];
-            padded[..chunk.len()].copy_from_slice(chunk);
-            &padded
-        };
-        let processed = rs.process(&[slice], None)?;
-        out.extend_from_slice(&processed[0]);
-    }
-    Ok(out)
 }
 
 // -- ComfyUI protocol helpers -------------------------------------------------
@@ -399,8 +285,6 @@ async fn submit_prompt(
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        // ComfyUI puts diagnostic detail (missing nodes, validation errors,
-        // etc.) in the body — bubble it up so /say returns something useful.
         return Err(anyhow!("ComfyUI /prompt {}: {}", status, summarise(&body)));
     }
     let json: Value = serde_json::from_str(&body)
@@ -417,7 +301,6 @@ async fn submit_prompt(
 /// present, extract those lines instead of dumping the whole tree.
 fn summarise(body: &str) -> String {
     if let Ok(v) = serde_json::from_str::<Value>(body) {
-        // Try to extract validation error messages first.
         let mut lines: Vec<String> = Vec::new();
         if let Some(node_errors) = v.get("node_errors").and_then(|n| n.as_object()) {
             for (node_id, ne) in node_errors {
@@ -441,7 +324,6 @@ fn summarise(body: &str) -> String {
             return lines.join(" | ");
         }
     }
-    // Fallback: whole body, single-line, truncated.
     let flat: String = body
         .chars()
         .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })

@@ -1,13 +1,20 @@
-use anyhow::Result;
-use clap::Parser;
+use anyhow::{Context as _, Result};
+use clap::{Parser, ValueEnum};
 use tokio::sync::mpsc;
 use tracing::info;
 
+mod chat;
 mod http;
 mod pw_source;
 mod settings;
 mod tts;
 mod workflow;
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum TtsBackend {
+    Piper,
+    Comfyui,
+}
 
 /// Voice bridge over pipewire.
 #[derive(Debug, Parser)]
@@ -17,17 +24,76 @@ struct Args {
     #[arg(long, default_value = "127.0.0.1:7331")]
     bind: String,
 
+    /// TTS backend to run. `piper` is local, in-process, low-latency (default);
+    /// `comfyui` submits to a remote ComfyUI instance over HTTP+WS.
+    #[arg(long, value_enum, env = "RPG_VOX_TTS_BACKEND", default_value_t = TtsBackend::Piper)]
+    tts_backend: TtsBackend,
+
+    /// Path to the Piper ONNX voice model (required when --tts-backend=piper).
+    #[arg(
+        long,
+        env = "RPG_VOX_PIPER_MODEL",
+        default_value = "models/piper/en_US-kristin-medium.onnx"
+    )]
+    piper_model: String,
+
+    /// Path to the Piper voice config JSON. Defaults to `{model}.json`.
+    #[arg(long, env = "RPG_VOX_PIPER_CONFIG")]
+    piper_config: Option<String>,
+
+    /// Speaker id for multi-speaker Piper voices. Ignored by single-speaker models.
+    #[arg(long, env = "RPG_VOX_PIPER_SPEAKER")]
+    piper_speaker: Option<i64>,
+
+    /// Minimum words per phrase before the chunker will accept a punctuation
+    /// break. Raise this to get longer, more naturally intonated Piper output
+    /// at the cost of higher time-to-first-audio.
+    #[arg(long, env = "RPG_VOX_PIPER_MIN_WORDS", default_value_t = 5)]
+    piper_min_words: usize,
+
+    /// Upper word count at which the chunker force-breaks a run-on phrase
+    /// even without punctuation. Raise together with --piper-min-words for
+    /// longer chunks; lower for faster first audio.
+    #[arg(long, env = "RPG_VOX_PIPER_MAX_WORDS", default_value_t = 20)]
+    piper_max_words: usize,
+
+    /// Piper duration multiplier (`length_scale`). Values > 1.0 slow speech
+    /// down; < 1.0 speed it up. Unset uses the voice model's own default
+    /// (typically 1.0). Try 1.2–1.4 for a noticeably calmer cadence.
+    #[arg(long, env = "RPG_VOX_PIPER_LENGTH_SCALE")]
+    piper_length_scale: Option<f32>,
+
+    /// Word count at which the chunker will break on a comma / colon /
+    /// semicolon. Unset picks a midpoint between min and max, which biases
+    /// toward sentence-end breaks. Set to the same value as --piper-min-words
+    /// to make commas audibly pause (each comma-terminated segment becomes
+    /// its own chunk with an inter-chunk silence).
+    #[arg(long, env = "RPG_VOX_PIPER_WEAK_AFTER_WORDS")]
+    piper_weak_after_words: Option<usize>,
+
+    /// Silence (ms) inserted after a chunk that ended on `,:;`. Default 140.
+    /// Raise this if comma breaks still feel too rushed.
+    #[arg(long, env = "RPG_VOX_PIPER_WEAK_MS", default_value_t = 140)]
+    piper_weak_ms: u32,
+
+    /// Silence (ms) inserted after a chunk that ended on `.?!`. Default 320.
+    #[arg(long, env = "RPG_VOX_PIPER_STRONG_MS", default_value_t = 320)]
+    piper_strong_ms: u32,
+
     /// ComfyUI base URL (HTTP; the WebSocket endpoint is derived from this).
     #[arg(long, env = "RPG_VOX_COMFYUI", default_value = "http://127.0.0.1:8188")]
     comfyui: String,
 
-    /// User-facing name shown in Firefox's mic picker.
-    #[arg(long, default_value = "RPG Vox")]
-    node_description: String,
+    /// User-facing name shown in Firefox's mic picker. Defaults to the
+    /// instance name (RPG_VOX_NAME) when that is set, otherwise "RPG Vox".
+    #[arg(long)]
+    node_description: Option<String>,
 
-    /// PipeWire node.name (short id, no spaces).
-    #[arg(long, default_value = "rpg-vox")]
-    node_name: String,
+    /// Unique instance name — used as the PipeWire `node.name` (short id, no
+    /// spaces). Set this when running multiple rpg_vox processes so each is
+    /// identifiable in the graph. Defaults to "rpg-vox".
+    #[arg(long, env = "RPG_VOX_NAME")]
+    node_name: Option<String>,
 
     /// Sample rate offered to PipeWire (Hz). 48000 is the sane default.
     #[arg(long, default_value_t = 48_000)]
@@ -58,13 +124,65 @@ struct Args {
     /// to a companion like `discord-vox` without dragging cables in Helvum.
     #[arg(long, env = "RPG_VOX_AUTO_LINK")]
     auto_link: Option<String>,
+
+    /// OpenAI-compatible chat endpoint base URL (must end in `/v1`).
+    #[arg(
+        long,
+        env = "RPG_VOX_CHAT_BASE_URL",
+        default_value = "http://127.0.0.1:8000/v1"
+    )]
+    chat_base_url: String,
+
+    /// Model name to send in `chat/completions` requests.
+    #[arg(long, env = "RPG_VOX_CHAT_MODEL", default_value = "Qwen/Qwen3-8B")]
+    chat_model: String,
+
+    /// Bearer token for the chat endpoint (many local vLLM/ollama servers
+    /// don't require one).
+    #[arg(long, env = "RPG_VOX_CHAT_API_KEY")]
+    chat_api_key: Option<String>,
+
+    /// Path to a file containing the system prompt. Missing file is tolerated
+    /// (the chat runs with no system prompt) so a fresh checkout without the
+    /// default prompts/ dir still boots.
+    #[arg(
+        long,
+        env = "RPG_VOX_CHAT_SYSTEM_PROMPT_FILE",
+        default_value = "prompts/default.txt"
+    )]
+    chat_system_prompt_file: String,
+
+    /// Cap on the number of non-system messages kept in chat history; older
+    /// turns are dropped from the LLM request.
+    #[arg(long, env = "RPG_VOX_CHAT_MAX_HISTORY", default_value_t = 40)]
+    chat_max_history: usize,
+
+    /// Max tokens generated per chat reply.
+    #[arg(long, env = "RPG_VOX_CHAT_MAX_TOKENS", default_value_t = 512)]
+    chat_max_tokens: u32,
+
+    /// Suppress Qwen3-style reasoning by sending
+    /// `chat_template_kwargs.enable_thinking=false` in each request. Default
+    /// on since TTS wants the answer, not the scratchpad — and reasoning
+    /// easily blows past `--chat-max-tokens` and truncates without ever
+    /// producing a reply. Set to `false` to opt back in to reasoning.
+    #[arg(
+        long,
+        env = "RPG_VOX_CHAT_DISABLE_THINKING",
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+    )]
+    chat_disable_thinking: bool,
 }
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                // ort spams per-node optimizer info at INFO — pin it to WARN so
+                // the rpg_vox startup log stays readable.
+                tracing_subscriber::EnvFilter::new("info,ort=warn,ort::logging=warn")
+            }),
         )
         .init();
 
@@ -73,17 +191,33 @@ fn main() -> Result<()> {
     let ringbuf_frames = (args.sample_rate as f32 * args.ringbuf_seconds) as usize;
     let (producer, consumer) = rtrb::RingBuffer::<f32>::new(ringbuf_frames);
 
+    // If RPG_VOX_NAME / --node-name is set, derive the mic-picker label from
+    // it too so multi-instance setups show distinct entries; otherwise keep
+    // the historical "RPG Vox" default.
+    let name_explicit = args.node_name.is_some();
+    let node_name = args
+        .node_name
+        .clone()
+        .unwrap_or_else(|| "rpg-vox".to_string());
+    let node_description = args.node_description.clone().unwrap_or_else(|| {
+        if name_explicit {
+            node_name.clone()
+        } else {
+            "RPG Vox".to_string()
+        }
+    });
+
     // PipeWire runs its own event loop on a dedicated OS thread.
     let pw_cfg = pw_source::Config {
-        node_name: args.node_name.clone(),
-        node_description: args.node_description.clone(),
+        node_name: node_name.clone(),
+        node_description: node_description.clone(),
         sample_rate: args.sample_rate,
         auto_patch_target: args.auto_link.clone(),
     };
     let pw_handle = pw_source::spawn(pw_cfg, consumer)?;
     let pw_client = pw_handle.client.clone();
     let auto_link_client = pw_client.clone();
-    info!(node = %args.node_name, "PipeWire source node started");
+    info!(node = %node_name, description = %node_description, "PipeWire source node started");
 
     // Everything else lives on the tokio runtime.
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -135,11 +269,58 @@ fn main() -> Result<()> {
     }
 
     let shared_settings = settings::new(settings::Settings {
+        backend: match args.tts_backend {
+            TtsBackend::Piper => "piper",
+            TtsBackend::Comfyui => "comfyui",
+        },
         comfyui_base: args.comfyui.trim_end_matches('/').to_string(),
         workflow_name: initial_name,
         workflow_json,
         workflow_summary,
     });
+
+    let system_prompt = match std::fs::read_to_string(&args.chat_system_prompt_file) {
+        Ok(text) => {
+            let trimmed = text.trim().to_string();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            tracing::warn!(
+                path = %args.chat_system_prompt_file,
+                "chat system prompt file not found; chat will run without a system prompt"
+            );
+            None
+        }
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "reading chat system prompt file {}",
+                    args.chat_system_prompt_file
+                )
+            });
+        }
+    };
+    let chat_client = chat::Client::new(chat::Config {
+        base_url: args.chat_base_url.trim_end_matches('/').to_string(),
+        model: args.chat_model.clone(),
+        api_key: args.chat_api_key.clone(),
+        system_prompt,
+        max_history: args.chat_max_history,
+        max_tokens: args.chat_max_tokens,
+        disable_thinking: args.chat_disable_thinking,
+    });
+    info!(
+        base = %chat_client.base_url(),
+        model = %chat_client.model(),
+        "chat client configured"
+    );
+
+    let backend = build_backend(&args, shared_settings.clone())?;
+    info!(backend = backend.kind(), "tts backend ready");
 
     let result = rt.block_on(async move {
         let (say_tx, say_rx) = mpsc::channel::<tts::SayRequest>(32);
@@ -147,12 +328,7 @@ fn main() -> Result<()> {
         let tts_cfg = tts::Config {
             target_sample_rate: args.sample_rate,
         };
-        let tts_task = tokio::spawn(tts::run(
-            tts_cfg,
-            shared_settings.clone(),
-            say_rx,
-            producer,
-        ));
+        let tts_task = tokio::spawn(tts::run(tts_cfg, backend, say_rx, producer));
 
         let http_task = tokio::spawn(http::serve(
             args.bind.clone(),
@@ -160,35 +336,40 @@ fn main() -> Result<()> {
             pw_client,
             shared_settings.clone(),
             registry.clone(),
+            chat_client.clone(),
         ));
 
-        // Verify + warmup run in the background; failures are logged but don't
-        // abort startup, since ComfyUI may be started later than us.
-        let verify_settings = shared_settings.clone();
-        tokio::spawn(async move {
-            let (base, classes) = {
-                let s = verify_settings.read().await;
-                (s.comfyui_base.clone(), s.workflow_summary.node_classes.clone())
-            };
-            let http = reqwest::Client::new();
-            match workflow::missing_nodes(&http, &base, &classes).await {
-                Ok(missing) if missing.is_empty() => {
-                    info!("workflow verified: all node classes present on ComfyUI");
+        // Verify + warmup are ComfyUI-specific — skip both entirely when a
+        // local backend (piper) is active, otherwise the log fills with
+        // "connection refused" from probing an endpoint we're not using.
+        let use_comfyui = matches!(args.tts_backend, TtsBackend::Comfyui);
+        if use_comfyui {
+            let verify_settings = shared_settings.clone();
+            tokio::spawn(async move {
+                let (base, classes) = {
+                    let s = verify_settings.read().await;
+                    (s.comfyui_base.clone(), s.workflow_summary.node_classes.clone())
+                };
+                let http = reqwest::Client::new();
+                match workflow::missing_nodes(&http, &base, &classes).await {
+                    Ok(missing) if missing.is_empty() => {
+                        info!("workflow verified: all node classes present on ComfyUI");
+                    }
+                    Ok(missing) => {
+                        tracing::warn!(missing = ?missing, "workflow references nodes not present on ComfyUI");
+                    }
+                    Err(err) => {
+                        tracing::warn!(err = %format!("{err:#}"), "could not verify workflow (is ComfyUI reachable?)");
+                    }
                 }
-                Ok(missing) => {
-                    tracing::warn!(missing = ?missing, "workflow references nodes not present on ComfyUI");
-                }
-                Err(err) => {
-                    tracing::warn!(err = %format!("{err:#}"), "could not verify workflow (is ComfyUI reachable?)");
-                }
-            }
-        });
+            });
+        }
 
         if let Some(target) = args.auto_link.clone() {
             tokio::spawn(auto_link(auto_link_client, target));
         }
 
-        if !args.no_warmup {
+        if use_comfyui && !args.no_warmup {
             let warm_settings = shared_settings.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -221,6 +402,45 @@ fn main() -> Result<()> {
 
     pw_handle.shutdown();
     result
+}
+
+fn build_backend(args: &Args, settings: settings::Shared) -> Result<tts::Backend> {
+    match args.tts_backend {
+        TtsBackend::Piper => {
+            let config_path = args
+                .piper_config
+                .clone()
+                .unwrap_or_else(|| format!("{}.json", args.piper_model));
+            if args.piper_min_words == 0 || args.piper_max_words < args.piper_min_words {
+                return Err(anyhow::anyhow!(
+                    "invalid piper chunker sizes: min={} max={} (require 1 <= min <= max)",
+                    args.piper_min_words,
+                    args.piper_max_words,
+                ));
+            }
+            let default_pauses = tts::piper::PauseConfig::default();
+            let cfg = tts::piper::Config {
+                model_path: args.piper_model.clone(),
+                config_path,
+                speaker_id: args.piper_speaker,
+                length_scale: args.piper_length_scale,
+                chunker: tts::chunker::Config {
+                    min_words: args.piper_min_words,
+                    max_words: args.piper_max_words,
+                    weak_after_words: args.piper_weak_after_words,
+                },
+                pauses: tts::piper::PauseConfig {
+                    strong_ms: args.piper_strong_ms,
+                    weak_ms: args.piper_weak_ms,
+                    force_ms: default_pauses.force_ms,
+                },
+            };
+            let backend = tts::piper::Backend::load(cfg)
+                .context("loading piper backend at startup")?;
+            Ok(tts::Backend::Piper(backend))
+        }
+        TtsBackend::Comfyui => Ok(tts::Backend::Comfy(tts::comfyui::Backend::new(settings))),
+    }
 }
 
 /// Watch the PipeWire graph for an Audio/Sink whose `node.name` matches
