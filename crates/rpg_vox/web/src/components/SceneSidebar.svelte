@@ -1,18 +1,36 @@
 <script>
-  import { scenesState, createScene, selectScene, renameScene, deleteScene } from '../lib/scenes.svelte.js';
+  import {
+    scenesState,
+    createScene,
+    selectScene,
+    renameScene,
+    deleteScene,
+    currentProjectScenes,
+    currentProject,
+    currentProjectCharacters,
+  } from '../lib/scenes.svelte.js';
 
   // Two-click confirm on delete, per-scene id. Rename is inline via a
   // dblclick → contenteditable-ish pattern using a text input.
   let deleteArmedFor = $state(null);
   let deleteArmTimer = 0;
+  let deleteErr = $state('');
   const DELETE_CONFIRM_MS = 2500;
 
   let renamingId = $state(null);
   let renameDraft = $state('');
   let renameEl = $state(null);
 
+  const scenes = $derived(currentProjectScenes());
+  const project = $derived(currentProject());
+  const hasProject = $derived(project != null);
+  const characters = $derived(currentProjectCharacters());
+  const hasCharacter = $derived(characters.length > 0);
+  const canCreateScene = $derived(hasProject && hasCharacter);
+
   function onNew() {
-    createScene(`Scene ${scenesState.scenes.length + 1}`);
+    if (!canCreateScene) return;
+    createScene(`Scene ${scenes.length + 1}`);
   }
 
   function onSelect(id) {
@@ -20,12 +38,16 @@
     selectScene(id);
   }
 
-  function armDelete(id, ev) {
+  async function armDelete(id, ev) {
     ev.stopPropagation();
     if (deleteArmedFor === id) {
       if (deleteArmTimer) clearTimeout(deleteArmTimer);
       deleteArmedFor = null;
-      deleteScene(id);
+      const { failed } = (await deleteScene(id)) ?? { failed: 0 };
+      if (failed > 0) {
+        deleteErr = `${failed} clip${failed === 1 ? '' : 's'} failed to delete on server`;
+        setTimeout(() => { deleteErr = ''; }, 4000);
+      }
       return;
     }
     deleteArmedFor = id;
@@ -64,15 +86,32 @@
 
 <aside class="sidebar">
   <div class="head">
-    <span class="title">Scenes</span>
-    <button class="new-btn" onclick={onNew} title="New scene">+</button>
+    <span class="title" title={project?.name ?? ''}>
+      {project ? project.name : 'No project'}
+    </span>
+    <button
+      class="new-btn"
+      onclick={onNew}
+      disabled={!canCreateScene}
+      title={!hasProject ? 'Load a project first' : (!hasCharacter ? 'Add a character first' : 'New scene')}
+    >+</button>
   </div>
 
-  {#if scenesState.scenes.length === 0}
+  {#if deleteErr}
+    <div class="delete-err">{deleteErr}</div>
+  {/if}
+
+  {#if !hasProject}
+    <div class="empty">Load a project from the <b>Projects</b> tab to add scenes.</div>
+  {:else if !hasCharacter}
+    <div class="empty">
+      Add at least one character in the <b><a href="#/characters">Characters</a></b> tab before creating scenes.
+    </div>
+  {:else if scenes.length === 0}
     <div class="empty">No scenes yet.<br/>Click <b>+</b> to create one.</div>
   {:else}
     <ul>
-      {#each scenesState.scenes as scene (scene.id)}
+      {#each scenes as scene (scene.id)}
         <li class:selected={scenesState.selectedSceneId === scene.id}>
           <button
             type="button"
@@ -135,11 +174,13 @@
     border-bottom: 1px solid var(--border);
   }
   .title {
-    font-size: 12px;
+    font-size: 13px;
     font-weight: 600;
-    color: var(--muted);
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
+    color: var(--text);
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .new-btn {
     background: transparent;
@@ -156,7 +197,8 @@
     font-size: 16px;
     line-height: 1;
   }
-  .new-btn:hover { color: var(--accent); border-color: var(--accent); }
+  .new-btn:hover:not(:disabled) { color: var(--accent); border-color: var(--accent); }
+  .new-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 
   .empty {
     padding: 16px 8px;
@@ -164,6 +206,13 @@
     color: var(--muted);
     text-align: center;
     line-height: 1.5;
+  }
+  .empty a { color: var(--accent); }
+  .delete-err {
+    font-size: 11px;
+    color: var(--err);
+    padding: 4px 8px;
+    line-height: 1.4;
   }
 
   ul {

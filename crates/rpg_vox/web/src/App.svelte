@@ -3,6 +3,8 @@
   import { route } from './lib/router.js';
   import { startHealthPoll } from './lib/stores.js';
   import Menubar from './components/Menubar.svelte';
+  import Projects from './routes/Projects.svelte';
+  import Characters from './routes/Characters.svelte';
   import Scenes from './routes/Scenes.svelte';
   import Chat from './routes/Chat.svelte';
   import Settings from './routes/Settings.svelte';
@@ -11,11 +13,13 @@
   // Add new experiments here — each is a hash-URL entry mapped to a component.
   // /speak stays as an alias so old bookmarks land on the same page.
   const routes = {
-    '/':         Scenes,
-    '/scenes':   Scenes,
-    '/speak':    Scenes,
-    '/chat':     Chat,
-    '/settings': Settings,
+    '/':           Projects,
+    '/projects':   Projects,
+    '/characters': Characters,
+    '/scenes':     Scenes,
+    '/speak':      Scenes,
+    '/chat':       Chat,
+    '/settings':   Settings,
   };
 
   const View = $derived(routes[$route] ?? NotFound);
@@ -23,7 +27,7 @@
   // The Scenes view is a full-bleed sidebar+lanes layout; other routes keep
   // the narrow centered column. Toggle a class on <main> to switch modes.
   const isFullBleed = $derived(
-    $route === '/' || $route === '/scenes' || $route === '/speak',
+    $route === '/scenes' || $route === '/speak',
   );
 
   onMount(() => { startHealthPoll(); });

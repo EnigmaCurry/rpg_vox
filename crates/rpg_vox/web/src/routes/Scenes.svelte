@@ -11,6 +11,7 @@
     setLaneVoice,
     laneHasClips,
     setScenePause,
+    currentProjectCharacters,
     PAUSE_OPTIONS,
   } from '../lib/scenes.svelte.js';
 
@@ -29,6 +30,8 @@
       ? scenesState.scenes.find((s) => s.id === scenesState.selectedSceneId) ?? null
       : null,
   );
+
+  const hasCharacter = $derived(currentProjectCharacters().length > 0);
 
   // Per-clip transient state: whether each cell has a playable blob (used
   // for enabling the Play scene button + skipping unrendered clips during
@@ -182,9 +185,17 @@
   <SceneSidebar />
 
   <div class="main">
-    {#if !scene}
+    {#if !scenesState.selectedProjectId}
       <div class="hint">
-        {#if scenesState.scenes.length === 0}
+        Load a project from the <a href="#/projects">Projects</a> tab to view its scenes.
+      </div>
+    {:else if !hasCharacter}
+      <div class="hint">
+        Add at least one character in the <a href="#/characters">Characters</a> tab before working on scenes.
+      </div>
+    {:else if !scene}
+      <div class="hint">
+        {#if scenesState.scenes.filter((s) => s.projectId === scenesState.selectedProjectId).length === 0}
           Create a scene from the sidebar to get started.
         {:else}
           Select a scene from the sidebar.

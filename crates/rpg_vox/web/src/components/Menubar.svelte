@@ -1,12 +1,21 @@
 <script>
   import { route } from '../lib/router.js';
+  import { scenesState } from '../lib/scenes.svelte.js';
   import HealthDot from './HealthDot.svelte';
 
   const items = [
-    { href: '#/scenes',   label: 'Scenes',   match: (r) => r === '/' || r === '/scenes' || r === '/speak' },
-    { href: '#/chat',     label: 'Chat',     match: (r) => r === '/chat' },
-    { href: '#/settings', label: 'Settings', match: (r) => r === '/settings' },
+    { href: '#/projects',   label: 'Projects',   match: (r) => r === '/' || r === '/projects' },
+    { href: '#/characters', label: 'Characters', match: (r) => r === '/characters' },
+    { href: '#/scenes',     label: 'Scenes',     match: (r) => r === '/scenes' || r === '/speak' },
+    { href: '#/chat',       label: 'Chat',       match: (r) => r === '/chat' },
+    { href: '#/settings',   label: 'Settings',   match: (r) => r === '/settings' },
   ];
+
+  const currentProject = $derived(
+    scenesState.selectedProjectId
+      ? scenesState.projects.find((p) => p.id === scenesState.selectedProjectId) ?? null
+      : null,
+  );
 </script>
 
 <nav class="menubar">
@@ -18,7 +27,17 @@
       </li>
     {/each}
   </ul>
-  <HealthDot />
+  <div class="status">
+    <a class="project" href="#/projects" title="Change project">
+      {#if currentProject}
+        <span class="proj-label">Project</span>
+        <span class="proj-name">{currentProject.name}</span>
+      {:else}
+        <span class="proj-none">No project loaded</span>
+      {/if}
+    </a>
+    <HealthDot />
+  </div>
 </nav>
 
 <style>
@@ -60,5 +79,41 @@
     color: var(--text);
     background: rgba(122,162,255,0.12);
     box-shadow: inset 0 -2px 0 var(--accent);
+  }
+  .status {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+  }
+  .project {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    text-decoration: none;
+    padding: 4px 8px;
+    border-radius: 6px;
+    max-width: 240px;
+    color: var(--text);
+    font-size: 13px;
+  }
+  .project:hover { background: rgba(255,255,255,0.04); }
+  .proj-label {
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    font-size: 10px;
+    font-weight: 600;
+  }
+  .proj-name {
+    font-weight: 500;
+    color: var(--text);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .proj-none {
+    color: var(--muted);
+    font-style: italic;
+    font-size: 12px;
   }
 </style>

@@ -89,12 +89,9 @@ struct Args {
     comfyui: String,
 
     /// Base URL of a Qwen3-TTS Gradio deployment (no trailing slash).
-    #[arg(
-        long,
-        env = "RPG_VOX_QWEN3_URL",
-        default_value = "https://qwen3-tts.mrfusion.rymcg.tech"
-    )]
-    qwen3_url: String,
+    /// Required when --tts-backend=qwen3; set via CLI or RPG_VOX_QWEN3_URL.
+    #[arg(long, env = "RPG_VOX_QWEN3_URL")]
+    qwen3_url: Option<String>,
 
     /// Preset speaker on the Qwen3-TTS Gradio app. One of: Serena, Vivian,
     /// Uncle Fu, Ryan, Aiden, Ono Anna, Sohee, Eric, Dylan.
@@ -483,8 +480,13 @@ fn build_backend(args: &Args, settings: settings::Shared) -> Result<tts::Backend
         }
         TtsBackend::Comfyui => Ok(tts::Backend::Comfy(tts::comfyui::Backend::new(settings))),
         TtsBackend::Qwen3 => {
+            let base_url = args.qwen3_url.clone().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "qwen3-tts backend requires --qwen3-url or RPG_VOX_QWEN3_URL"
+                )
+            })?;
             let cfg = tts::qwen3::Config {
-                base_url: args.qwen3_url.clone(),
+                base_url,
                 speaker: args.qwen3_speaker.clone(),
                 language: args.qwen3_language.clone(),
                 instruct: args.qwen3_instruct.clone(),
