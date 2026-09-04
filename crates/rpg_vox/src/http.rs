@@ -1,16 +1,28 @@
-//! Local HTTP API. Currently one endpoint:
+//! Local HTTP API.
 //!
-//!   POST /say  { "text": "..." }
+//! Two synthesis paths sharing the same TTS backend:
 //!
-//! The text is forwarded to the TTS task via an mpsc channel. Requests return
-//! as soon as the utterance is queued — audio playback happens asynchronously
-//! through the PipeWire source.
+//!   POST /say                  { text, instruct? } → { ok, frames } —
+//!                              pushes to the virtual mic; used by Chat.
+//!   POST /widgets              { text, instruct? } → audio/wav —
+//!                              synthesize, persist a new widget row +
+//!                              WAV in the store, return audio.
+//!   PUT  /widgets/:id          { text, instruct? } → audio/wav —
+//!                              re-synthesize, overwrite the widget's
+//!                              row + WAV file.
+//!   DELETE /widgets/:id                             → 200 — drop the DB
+//!                              row and the WAV file (idempotent).
+//!
+//! All three synthesis paths go through the single-threaded TTS runner over
+//! the same mpsc so backend access is serialized. `/widgets/*` additionally
+//! reads/writes the sqlite + on-disk clip store from `store.rs`.
 
 use anyhow::{Context as _, Result};
 use axum::{
     Json, Router,
+    body::Bytes,
     extract::{Path, State},
-    http::{StatusCode, header},
+    http::{HeaderName, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -24,7 +36,8 @@ use std::sync::Arc;
 use crate::chat;
 use crate::pw_source::{GraphSnapshot, PwClient};
 use crate::settings::{self, SettingsUpdate};
-use crate::tts::{self, SayRequest};
+use crate::store::{Store, UpdateResult};
+use crate::tts::{self, Command, SayRequest, SynthesizeRequest};
 use crate::workflow::{self, Registry};
 
 /// Built by build.rs (`pnpm run build` in crates/rpg_vox/web) into
@@ -35,16 +48,21 @@ struct Ui;
 
 #[derive(Clone)]
 struct AppState {
-    say: Sender<SayRequest>,
+    tts: Sender<Command>,
     pw: PwClient,
     settings: settings::Shared,
     registry: Arc<Registry>,
     chat: chat::Client,
+    store: Store,
 }
 
 #[derive(Debug, Deserialize)]
 struct SayBody {
     text: String,
+    /// Per-request voice-style override. Only Qwen3 uses it; others ignore.
+    /// Empty string is coerced to `None` so a UI can send `""` freely.
+    #[serde(default)]
+    instruct: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -67,23 +85,32 @@ struct ActionResponse {
 
 pub async fn serve(
     bind: String,
-    say: Sender<SayRequest>,
+    tts: Sender<Command>,
     pw: PwClient,
     settings: settings::Shared,
     registry: Arc<Registry>,
     chat: chat::Client,
+    store: Store,
 ) -> Result<()> {
     let state = AppState {
-        say,
+        tts,
         pw,
         settings,
         registry,
         chat,
+        store,
     };
     let app = Router::new()
         .route("/", get(index))
         .route("/assets/*path", get(asset_handler))
         .route("/say", post(say_handler))
+        .route("/widgets", post(widget_create_handler))
+        .route(
+            "/widgets/:id",
+            axum::routing::get(widget_get_handler)
+                .put(widget_update_handler)
+                .delete(widget_delete_handler),
+        )
         .route("/healthz", get(|| async { "ok" }))
         .route("/pw/graph", get(graph_handler))
         .route(
@@ -341,14 +368,23 @@ async fn say_handler(
         )
             .into_response();
     }
+    // Coerce "" → None so the backend uses its configured default instead of
+    // overriding with an empty instruction string.
+    let instruct = body
+        .instruct
+        .and_then(|s| {
+            let t = s.trim().to_string();
+            (!t.is_empty()).then_some(t)
+        });
 
     let (reply_tx, reply_rx) = oneshot::channel();
     if state
-        .say
-        .send(SayRequest {
+        .tts
+        .send(Command::Say(SayRequest {
             text,
+            instruct,
             reply: reply_tx,
-        })
+        }))
         .await
         .is_err()
     {
@@ -467,7 +503,7 @@ async fn chat_send(
     };
 
     let spoken = if body.speak {
-        speak_async(state.say.clone(), reply.clone());
+        speak_async(state.tts.clone(), reply.clone());
         true
     } else {
         false
@@ -487,10 +523,18 @@ async fn chat_send(
 
 /// Fire-and-forget a TTS request; log any error so the chat HTTP response
 /// isn't held up on audio generation.
-fn speak_async(say: Sender<SayRequest>, text: String) {
+fn speak_async(tts: Sender<Command>, text: String) {
     tokio::spawn(async move {
         let (tx, rx) = oneshot::channel();
-        if say.send(SayRequest { text, reply: tx }).await.is_err() {
+        if tts
+            .send(Command::Say(SayRequest {
+                text,
+                instruct: None,
+                reply: tx,
+            }))
+            .await
+            .is_err()
+        {
             tracing::warn!("tts channel closed; chat reply not spoken");
             return;
         }
@@ -500,4 +544,291 @@ fn speak_async(say: Sender<SayRequest>, text: String) {
             Err(_) => tracing::warn!("tts dropped reply oneshot"),
         }
     });
+}
+
+// ---------------------------------------------------------------------------
+// /widgets — persistent clip design.
+//
+// Each render (create or update) synthesizes fresh PCM, writes it to
+// `data/clips/{id}.wav`, and mirrors the widget's text+instruct into the
+// sqlite row. Delete drops both. See `store.rs` for the storage details.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct WidgetBody {
+    text: String,
+    #[serde(default)]
+    instruct: Option<String>,
+}
+
+/// Rendered clip in a form ready to hand to the store + client. Held as
+/// `Vec<u8>` twice (once as WAV, once as the response body) — small enough
+/// (~200 KB for a 2s clip) that avoiding an extra clone isn't worth
+/// contorting the code.
+struct RenderedClip {
+    wav: Vec<u8>,
+    sample_rate: u32,
+    duration_ms: u64,
+}
+
+/// Push a synth request through the TTS runner, encode WAV, return it. The
+/// caller decides what to do with the bytes (persist + respond, in the
+/// widget handlers below).
+async fn render_clip(
+    state: &AppState,
+    text: String,
+    instruct: Option<String>,
+) -> Result<RenderedClip, (StatusCode, String)> {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    if state
+        .tts
+        .send(Command::Synthesize(SynthesizeRequest {
+            text,
+            instruct,
+            reply: reply_tx,
+        }))
+        .await
+        .is_err()
+    {
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "tts task gone".into()));
+    }
+
+    let outcome = match reply_rx.await {
+        Ok(Ok(o)) => o,
+        Ok(Err(err)) => return Err((StatusCode::BAD_GATEWAY, err)),
+        Err(_) => return Err((StatusCode::INTERNAL_SERVER_ERROR, "tts dropped reply".into())),
+    };
+
+    let duration_ms = (outcome.samples.len() as u64 * 1000) / outcome.sample_rate.max(1) as u64;
+    let wav = encode_wav_pcm16(&outcome.samples, outcome.sample_rate);
+    Ok(RenderedClip {
+        wav,
+        sample_rate: outcome.sample_rate,
+        duration_ms,
+    })
+}
+
+/// Parse+validate a widget body. Empty text is rejected; empty instruct is
+/// coerced to `None`.
+fn normalize_widget_body(body: WidgetBody) -> Result<(String, Option<String>), (StatusCode, String)> {
+    let text = body.text.trim().to_string();
+    if text.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "empty text".into()));
+    }
+    let instruct = body.instruct.and_then(|s| {
+        let t = s.trim().to_string();
+        (!t.is_empty()).then_some(t)
+    });
+    Ok((text, instruct))
+}
+
+/// Build the audio/wav response with the metadata headers the client uses
+/// (widget id, sample rate, duration).
+fn wav_response(id: &str, clip: RenderedClip) -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "audio/wav".to_string()),
+            (header::CACHE_CONTROL, "no-store".to_string()),
+            (HeaderName::from_static("x-widget-id"), id.to_string()),
+            (
+                HeaderName::from_static("x-sample-rate"),
+                clip.sample_rate.to_string(),
+            ),
+            (
+                HeaderName::from_static("x-duration-ms"),
+                clip.duration_ms.to_string(),
+            ),
+        ],
+        Bytes::from(clip.wav),
+    )
+        .into_response()
+}
+
+async fn widget_create_handler(
+    State(state): State<AppState>,
+    Json(body): Json<WidgetBody>,
+) -> Response {
+    let (text, instruct) = match normalize_widget_body(body) {
+        Ok(t) => t,
+        Err((code, msg)) => return (code, msg).into_response(),
+    };
+    let clip = match render_clip(&state, text.clone(), instruct.clone()).await {
+        Ok(c) => c,
+        Err((code, msg)) => return (code, msg).into_response(),
+    };
+
+    let id = match state
+        .store
+        .create_widget(
+            text,
+            instruct,
+            clip.sample_rate,
+            clip.duration_ms,
+            clip.wav.clone(),
+        )
+        .await
+    {
+        Ok(id) => id,
+        Err(err) => {
+            tracing::error!(err = %format!("{err:#}"), "store: create failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("store: {err:#}"),
+            )
+                .into_response();
+        }
+    };
+
+    info!(%id, "widget created");
+    wav_response(&id, clip)
+}
+
+async fn widget_update_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<WidgetBody>,
+) -> Response {
+    let (text, instruct) = match normalize_widget_body(body) {
+        Ok(t) => t,
+        Err((code, msg)) => return (code, msg).into_response(),
+    };
+    let clip = match render_clip(&state, text.clone(), instruct.clone()).await {
+        Ok(c) => c,
+        Err((code, msg)) => return (code, msg).into_response(),
+    };
+
+    match state
+        .store
+        .update_widget(
+            id.clone(),
+            text,
+            instruct,
+            clip.sample_rate,
+            clip.duration_ms,
+            clip.wav.clone(),
+        )
+        .await
+    {
+        Ok(UpdateResult::Updated) => {}
+        Ok(UpdateResult::NotFound) => {
+            return (StatusCode::NOT_FOUND, format!("no widget with id {id}")).into_response();
+        }
+        Err(err) => {
+            tracing::error!(err = %format!("{err:#}"), %id, "store: update failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("store: {err:#}"),
+            )
+                .into_response();
+        }
+    }
+
+    info!(%id, "widget updated");
+    wav_response(&id, clip)
+}
+
+/// Read a previously-rendered clip back from disk. Used by the client on
+/// reload to rehydrate SpeakCells whose widgetId came out of localStorage —
+/// no re-synthesis, just the cached WAV plus its metadata headers.
+async fn widget_get_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    let row = match state.store.get_widget(id.clone()).await {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return (StatusCode::NOT_FOUND, format!("no widget with id {id}"))
+                .into_response();
+        }
+        Err(err) => {
+            tracing::error!(err = %format!("{err:#}"), %id, "store: get failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("store: {err:#}"),
+            )
+                .into_response();
+        }
+    };
+    let path = state.store.clip_path(&id);
+    let wav = match tokio::fs::read(&path).await {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Row exists but WAV file was lost — treat as missing so the
+            // client falls back to a fresh render.
+            return (StatusCode::NOT_FOUND, format!("clip file missing for {id}"))
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("clip read: {e}"),
+            )
+                .into_response();
+        }
+    };
+    wav_response(
+        &id,
+        RenderedClip {
+            wav,
+            sample_rate: row.sample_rate,
+            duration_ms: row.duration_ms,
+        },
+    )
+}
+
+async fn widget_delete_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    match state.store.delete_widget(id.clone()).await {
+        Ok(()) => {
+            info!(%id, "widget deleted");
+            (StatusCode::OK, Json(ActionResponse { ok: true, error: None })).into_response()
+        }
+        Err(err) => {
+            tracing::error!(err = %format!("{err:#}"), %id, "store: delete failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ActionResponse {
+                    ok: false,
+                    error: Some(format!("{err:#}")),
+                }),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Encode a mono f32 PCM buffer as a 16-bit little-endian WAV. Handrolled to
+/// avoid pulling in `hound` for one call site. Clips saturating instead of
+/// wrapping since TTS samples occasionally sit right at ±1.0.
+fn encode_wav_pcm16(samples: &[f32], sample_rate: u32) -> Vec<u8> {
+    let channels: u16 = 1;
+    let bits: u16 = 16;
+    let byte_rate = sample_rate * channels as u32 * (bits / 8) as u32;
+    let block_align = channels * (bits / 8);
+    let data_bytes: u32 = (samples.len() * 2) as u32;
+    let chunk_size: u32 = 36 + data_bytes;
+
+    let mut out = Vec::with_capacity(44 + data_bytes as usize);
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&chunk_size.to_le_bytes());
+    out.extend_from_slice(b"WAVE");
+    out.extend_from_slice(b"fmt ");
+    out.extend_from_slice(&16u32.to_le_bytes());        // PCM subchunk size
+    out.extend_from_slice(&1u16.to_le_bytes());         // PCM format
+    out.extend_from_slice(&channels.to_le_bytes());
+    out.extend_from_slice(&sample_rate.to_le_bytes());
+    out.extend_from_slice(&byte_rate.to_le_bytes());
+    out.extend_from_slice(&block_align.to_le_bytes());
+    out.extend_from_slice(&bits.to_le_bytes());
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&data_bytes.to_le_bytes());
+
+    for &s in samples {
+        let clipped = s.clamp(-1.0, 1.0);
+        let i = (clipped * i16::MAX as f32) as i16;
+        out.extend_from_slice(&i.to_le_bytes());
+    }
+    out
 }

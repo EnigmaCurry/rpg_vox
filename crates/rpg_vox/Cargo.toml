@@ -40,3 +40,9 @@ thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid = { version = "1", features = ["v4"] }
+
+# Persistent store for the Speak-widget clips. `bundled` avoids a system
+# sqlite dep on NixOS. Pinned to 0.31 to share `libsqlite3-sys` with the
+# discord_vox crate (cargo forbids two versions of the same links="sqlite3"
+# native lib in one build graph).
+rusqlite = { version = "0.31", features = ["bundled"] }

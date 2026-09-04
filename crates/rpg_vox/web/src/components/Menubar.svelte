@@ -3,7 +3,7 @@
   import HealthDot from './HealthDot.svelte';
 
   const items = [
-    { href: '#/speak',    label: 'Speak',    match: (r) => r === '/' || r === '/speak' },
+    { href: '#/scenes',   label: 'Scenes',   match: (r) => r === '/' || r === '/scenes' || r === '/speak' },
     { href: '#/chat',     label: 'Chat',     match: (r) => r === '/chat' },
     { href: '#/settings', label: 'Settings', match: (r) => r === '/settings' },
   ];

@@ -7,6 +7,7 @@ mod chat;
 mod http;
 mod pw_source;
 mod settings;
+mod store;
 mod tts;
 mod workflow;
 
@@ -137,6 +138,12 @@ struct Args {
     /// utterance text should go.
     #[arg(long, default_value = "workflows")]
     workflows_dir: String,
+
+    /// Root of the app-managed persistent store. Holds `rpg_vox.sqlite`
+    /// (widget metadata) and `clips/{id}.wav` (rendered audio). Created on
+    /// first boot if absent.
+    #[arg(long, env = "RPG_VOX_DATA_DIR", default_value = "data")]
+    data_dir: std::path::PathBuf,
 
     /// Which workflow (file stem, e.g. "chatterbox") to select at startup.
     /// If unset, the first workflow found alphabetically is used, or the
@@ -352,21 +359,26 @@ fn main() -> Result<()> {
     let backend = build_backend(&args, shared_settings.clone())?;
     info!(backend = backend.kind(), "tts backend ready");
 
+    let store = store::Store::open(&args.data_dir)
+        .with_context(|| format!("opening store at {}", args.data_dir.display()))?;
+    info!(data_dir = %args.data_dir.display(), "widget store opened");
+
     let result = rt.block_on(async move {
-        let (say_tx, say_rx) = mpsc::channel::<tts::SayRequest>(32);
+        let (tts_tx, tts_rx) = mpsc::channel::<tts::Command>(32);
 
         let tts_cfg = tts::Config {
             target_sample_rate: args.sample_rate,
         };
-        let tts_task = tokio::spawn(tts::run(tts_cfg, backend, say_rx, producer));
+        let tts_task = tokio::spawn(tts::run(tts_cfg, backend, tts_rx, producer));
 
         let http_task = tokio::spawn(http::serve(
             args.bind.clone(),
-            say_tx,
+            tts_tx,
             pw_client,
             shared_settings.clone(),
             registry.clone(),
             chat_client.clone(),
+            store,
         ));
 
         // Verify + warmup are ComfyUI-specific — skip both entirely when a

@@ -75,8 +75,15 @@ impl Backend {
         })
     }
 
-    pub async fn synthesize(&mut self, text: &str, sink: &mut Sink<'_>) -> Result<()> {
-        let event_id = self.submit(text).await?;
+    /// `instruct` overrides the configured voice-style for this one call.
+    /// `None` falls back to the value from [`Config`] set at startup.
+    pub async fn synthesize(
+        &mut self,
+        text: &str,
+        instruct: Option<&str>,
+        sink: &mut Sink<'_>,
+    ) -> Result<()> {
+        let event_id = self.submit(text, instruct.unwrap_or(&self.instruct)).await?;
         let audio_url = self.await_result(&event_id).await?;
         let chunk_bytes = self
             .http
@@ -103,18 +110,19 @@ impl Backend {
         Ok(())
     }
 
-    async fn submit(&self, text: &str) -> Result<String> {
+    async fn submit(&self, text: &str, instruct: &str) -> Result<String> {
         let url = format!("{}/gradio_api/call/run_instruct", self.base_url);
         // Gradio expects `data` positional in declared param order:
         // (text, lang_disp, spk_disp, instruct).
         let body = serde_json::json!({
-            "data": [text, self.language, self.speaker, self.instruct],
+            "data": [text, self.language, self.speaker, instruct],
         });
         info!(
             %url,
             speaker = %self.speaker,
             language = %self.language,
             chars = text.len(),
+            instruct_chars = instruct.len(),
             "qwen3 remote: submitting"
         );
         #[derive(Deserialize)]
