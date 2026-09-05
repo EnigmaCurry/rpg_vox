@@ -13,6 +13,15 @@
 //!                              widget's row + WAV file.
 //!   DELETE /widgets/:id                             → 200 — drop the DB
 //!                              row and the WAV file (idempotent).
+//!   POST /widgets/:id/say                            → { ok, frames } —
+//!                              play the cached WAV through the virtual mic.
+//!                              Blocks until playback finishes so clients can
+//!                              sequence per-clip calls without extra timing.
+//!   GET  /monitor.ws                                 → WebSocket that
+//!                              streams the same PCM going to the pipewire
+//!                              mic, encoded as 20ms Opus frames. One
+//!                              encoder per subscriber; drops-on-lag. See
+//!                              [`crate::monitor`].
 //!   POST /scenes/mix           { scene_name, pause_ms, clip_ids }
 //!                              → audio/flac (Content-Disposition attachment)
 //!                              — concatenates the referenced WAVs with
@@ -48,9 +57,11 @@ use tracing::info;
 use std::sync::Arc;
 
 use crate::chat;
+use crate::monitor;
 use crate::pw_source::{GraphSnapshot, PwClient};
 use crate::settings::{self, SettingsUpdate};
 use crate::store::{Store, UpdateResult};
+use tokio::sync::broadcast;
 
 /// Ceiling for /images POST bodies. Kept above the client's own 10 MB cap
 /// so a slightly-off client sees a friendly server-side error rather than a
@@ -61,7 +72,7 @@ const IMAGE_MAX_BYTES: usize = 12 * 1024 * 1024;
 /// this — image bytes are stored separately under /images and the state
 /// blob only carries their `/images/{id}` src URLs.
 const STATE_MAX_BYTES: usize = 4 * 1024 * 1024;
-use crate::tts::{self, Command, SayRequest, SynthesizeRequest, VoiceOverride};
+use crate::tts::{self, Command, PlayPcmRequest, SayRequest, SynthesizeRequest, VoiceOverride};
 use crate::workflow::{self, Registry};
 
 /// Built by build.rs (`pnpm run build` in crates/rpg_vox/web) into
@@ -71,13 +82,21 @@ use crate::workflow::{self, Registry};
 struct Ui;
 
 #[derive(Clone)]
-struct AppState {
-    tts: Sender<Command>,
-    pw: PwClient,
-    settings: settings::Shared,
-    registry: Arc<Registry>,
-    chat: chat::Client,
-    store: Store,
+pub(crate) struct AppState {
+    pub(crate) tts: Sender<Command>,
+    pub(crate) pw: PwClient,
+    pub(crate) settings: settings::Shared,
+    pub(crate) registry: Arc<Registry>,
+    pub(crate) chat: chat::Client,
+    pub(crate) store: Store,
+    /// Fan-out for the browser monitor tap. `subscribe()` at connect time
+    /// yields a `Receiver<Arc<[f32]>>`; the sender lives inside the tts
+    /// runner so each Sink push mirrors into it (see `tts::Sink::push`).
+    pub(crate) monitor_tap: broadcast::Sender<Arc<[f32]>>,
+    /// Sample rate the monitor tap runs at (matches the pipewire target
+    /// rate). Held in state so the WS handler can bail early if a future
+    /// config picks a non-Opus rate.
+    pub(crate) monitor_sample_rate: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -134,6 +153,8 @@ pub async fn serve(
     registry: Arc<Registry>,
     chat: chat::Client,
     store: Store,
+    monitor_tap: broadcast::Sender<Arc<[f32]>>,
+    monitor_sample_rate: u32,
 ) -> Result<()> {
     let state = AppState {
         tts,
@@ -142,6 +163,8 @@ pub async fn serve(
         registry,
         chat,
         store,
+        monitor_tap,
+        monitor_sample_rate,
     };
     let app = Router::new()
         .route("/", get(index))
@@ -154,6 +177,7 @@ pub async fn serve(
                 .put(widget_update_handler)
                 .delete(widget_delete_handler),
         )
+        .route("/widgets/:id/say", post(widget_say_handler))
         .route("/scenes/mix", post(scene_mix_handler))
         .route(
             "/images",
@@ -170,6 +194,7 @@ pub async fn serve(
                 .layer(DefaultBodyLimit::max(STATE_MAX_BYTES)),
         )
         .route("/healthz", get(|| async { "ok" }))
+        .route("/monitor.ws", get(monitor::ws_handler))
         .route("/pw/graph", get(graph_handler))
         .route(
             "/pw/monitor",
@@ -871,6 +896,143 @@ async fn widget_delete_handler(
             )
                 .into_response()
         }
+    }
+}
+
+/// Play a previously-rendered clip through the pipewire virtual mic. Blocks
+/// until the ring buffer has drained so the response lands when playback has
+/// actually finished (not merely been enqueued). Clients that sequence
+/// multiple clips can therefore just await one call per clip and add a
+/// scene-level pause between them.
+async fn widget_say_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    let row = match state.store.get_widget(id.clone()).await {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(SayResponse {
+                    ok: false,
+                    frames: None,
+                    error: Some(format!("no widget with id {id}")),
+                }),
+            )
+                .into_response();
+        }
+        Err(err) => {
+            tracing::error!(err = %format!("{err:#}"), %id, "store: get failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(SayResponse {
+                    ok: false,
+                    frames: None,
+                    error: Some(format!("store: {err:#}")),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    let path = state.store.clip_path(&id);
+    let wav = match tokio::fs::read(&path).await {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(SayResponse {
+                    ok: false,
+                    frames: None,
+                    error: Some(format!("clip file missing for {id}")),
+                }),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(SayResponse {
+                    ok: false,
+                    frames: None,
+                    error: Some(format!("clip read: {e}")),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    let (sample_rate, pcm_i16) = match decode_wav_pcm16_mono(&wav) {
+        Ok(v) => v,
+        Err(err) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(SayResponse {
+                    ok: false,
+                    frames: None,
+                    error: Some(format!("decode {id}: {err}")),
+                }),
+            )
+                .into_response();
+        }
+    };
+    let _ = row; // metadata is authoritative on the row; decoded rate takes precedence.
+
+    let samples: Vec<f32> = pcm_i16
+        .into_iter()
+        .map(|s| s as f32 / i16::MAX as f32)
+        .collect();
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    if state
+        .tts
+        .send(Command::PlayPcm(PlayPcmRequest {
+            samples,
+            sample_rate,
+            reply: reply_tx,
+        }))
+        .await
+        .is_err()
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(SayResponse {
+                ok: false,
+                frames: None,
+                error: Some("tts task gone".into()),
+            }),
+        )
+            .into_response();
+    }
+
+    match reply_rx.await {
+        Ok(Ok(frames)) => (
+            StatusCode::OK,
+            Json(SayResponse {
+                ok: true,
+                frames: Some(frames),
+                error: None,
+            }),
+        )
+            .into_response(),
+        Ok(Err(err)) => (
+            StatusCode::BAD_GATEWAY,
+            Json(SayResponse {
+                ok: false,
+                frames: None,
+                error: Some(err),
+            }),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(SayResponse {
+                ok: false,
+                frames: None,
+                error: Some("tts task dropped reply channel".into()),
+            }),
+        )
+            .into_response(),
     }
 }
 

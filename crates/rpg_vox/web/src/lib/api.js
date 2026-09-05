@@ -113,6 +113,26 @@ export async function mixScene(sceneName, pauseMs, clipIds) {
   return { blob, filename: match ? match[1] : `${sceneName || 'scene'}.flac` };
 }
 
+/// Play a previously-rendered widget through the pipewire virtual mic. The
+/// server blocks until the ring buffer has drained, so this promise resolves
+/// when audio has actually finished playing — callers can sequence per-clip
+/// calls without extra timing. Pass `{ signal }` to abort mid-playback; note
+/// the server keeps pushing whatever's already been queued (the ring may
+/// still be draining for a moment after the fetch aborts).
+export async function playWidget(id, { signal } = {}) {
+  const r = await fetch(`/widgets/${encodeURIComponent(id)}/say`, {
+    method: 'POST',
+    signal,
+  });
+  const parsed = await r.json().catch(() => null);
+  if (!r.ok || parsed?.ok === false) {
+    const err = new Error(parsed?.error || `HTTP ${r.status}`);
+    err.status = r.status;
+    throw err;
+  }
+  return parsed || {};
+}
+
 export async function deleteWidget(id) {
   const r = await fetch(`/widgets/${encodeURIComponent(id)}`, { method: 'DELETE' });
   const body = await r.json().catch(() => null);

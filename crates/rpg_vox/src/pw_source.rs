@@ -1,6 +1,6 @@
 //! Native PipeWire source node + graph client.
 //!
-//! Runs the PipeWire main loop on a dedicated OS thread. Two things live there:
+//! Runs the PipeWire main loop on a dedicated OS thread. Three things live there:
 //!
 //! 1. A source stream that appears as a stereo `Audio/Source`. Its realtime
 //!    `process` callback drains f32 mono samples from an `rtrb::Consumer` and
@@ -8,12 +8,32 @@
 //!    buffer, emitting silence on underrun. Downstream FX / panning will run
 //!    against the stereo pair.
 //!
-//! 2. A registry listener that tracks the surrounding graph (sinks + our own
+//! 2. Two companion sink streams — one per fixed [`SinkRole`]:
+//!    * `{node_name}-music` (`Audio/Sink`, `media.role = Music`) — stereo
+//!      input is downmixed to mono, pushed into an SPSC ring drained by
+//!      the source callback, which sums it with TTS to build the final
+//!      mic feed. A PA that speaks into Discord.
+//!    * `{node_name}-vox` (`Audio/Sink`, `media.role = Communication`) —
+//!      stereo samples are published to [`Config::input_tap`] for internal
+//!      consumers (future FX chain, recording, an input-side browser
+//!      monitor). Doesn't reach the mic on its own.
+//!
+//!    Each role has its own dedicated node so external apps route by name
+//!    instead of toggling a runtime mode. Nodes always exist even with
+//!    nothing connected — idle nodes are cheap.
+//!
+//!    Two separate nodes (rather than one node with mixed-direction ports)
+//!    is a `pipewire-rs` 0.8 constraint: it doesn't wrap `pw_filter`, which
+//!    is the primitive for a single node with both input and output ports.
+//!    Migration to a filter-based single node is a possible future FFI
+//!    project.
+//!
+//! 3. A registry listener that tracks the surrounding graph (sinks + our own
 //!    ports + all links). The tokio side talks to the pw thread through a
 //!    `pipewire::channel` and gets replies via `tokio::sync::oneshot`.
 
 use anyhow::{Context as _, Result};
-use rtrb::Consumer;
+use rtrb::{Consumer, Producer, RingBuffer};
 use serde::Serialize;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -23,7 +43,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::thread::{self, JoinHandle};
-use tokio::sync::oneshot;
+use tokio::sync::{broadcast, oneshot};
 use tracing::{debug, error, info, warn};
 
 use pipewire as pw;
@@ -52,6 +72,46 @@ use libspa::{
 /// Channel count offered to PipeWire. Mono TTS gets fanned out to L=R here so
 /// downstream FX / panning always operate on a stereo pair.
 const SOURCE_CHANNELS: u32 = 2;
+/// Stereo input on the companion sink node. Matches [`SOURCE_CHANNELS`] so
+/// eventual mix-into-output paths don't need channel-count coercion.
+const SINK_CHANNELS: u32 = 2;
+
+/// Fixed role for a companion sink node. Each role has its own dedicated
+/// PipeWire node so external apps route into the "music" sink when they
+/// want their audio mixed straight into the mic (PA), and into the "vox"
+/// sink when they want it captured for internal processing (FX chain,
+/// recording, etc.). Nodes always exist even with nothing connected —
+/// leaving them idle is cheap.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum SinkRole {
+    /// PA passthrough — downmix stereo to mono, push into the input ring,
+    /// summed with TTS in the source callback.
+    Music,
+    /// Internal processing tap — publish stereo samples to the broadcast
+    /// channel so future consumers (FX, recording, monitor) can subscribe.
+    Vox,
+}
+
+impl SinkRole {
+    fn suffix(self) -> &'static str {
+        match self {
+            Self::Music => "music",
+            Self::Vox => "vox",
+        }
+    }
+    fn description(self) -> &'static str {
+        match self {
+            Self::Music => "music (PA \u{2192} mic)",
+            Self::Vox => "vox (processing)",
+        }
+    }
+    fn media_role(self) -> &'static str {
+        match self {
+            Self::Music => "Music",
+            Self::Vox => "Communication",
+        }
+    }
+}
 
 pub struct Config {
     pub node_name: String,
@@ -61,6 +121,17 @@ pub struct Config {
     /// Exposed in `GraphSnapshot` so the UI can hide the target from the
     /// monitor picker even while a reconnection is still in flight.
     pub auto_patch_target: Option<String>,
+    /// Broadcast sender for the `-vox` sink's processing tap. Consumers
+    /// subscribe on demand; when there are none the send is a cheap no-op.
+    /// Interleaved stereo f32 at `sample_rate` (mirrors the wire format of
+    /// the sink node).
+    pub input_tap: broadcast::Sender<Arc<[f32]>>,
+    /// Broadcast sender for the browser-monitor PCM tap. Fired from the
+    /// source stream's process callback with the mixed (TTS + music-input)
+    /// mono samples that are about to be handed to pipewire — so
+    /// `/monitor.ws` subscribers hear the actual mic feed, not just the TTS
+    /// side of the mix. Zero subscribers makes `send` a cheap no-op.
+    pub monitor_tap: broadcast::Sender<Arc<[f32]>>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -517,13 +588,21 @@ fn run(
     pw::init();
 
     let mainloop = MainLoop::new(None).context("MainLoop::new")?;
-    let context = Context::new(&mainloop).context("Context::new")?;
+    let context = Context::new(&mainloop).context("Context::connect")?;
     let core = context.connect(None).context("Context::connect")?;
 
     let graph: Rc<RefCell<Graph>> = Rc::new(RefCell::new(Graph {
         auto_patch_target: cfg.auto_patch_target.clone(),
         ..Graph::default()
     }));
+
+    // Input passthrough ring. Sized for ~half a second at the target rate:
+    // large enough to absorb sink/source callback tick jitter without piling
+    // up perceivable latency in the mic feed. Mono because the source stream
+    // is fanned out mono → L=R downstream; downmixing at the sink callback
+    // keeps the ring cheap.
+    let input_ring_frames = (cfg.sample_rate as usize / 2).max(1024);
+    let (input_producer, input_consumer) = RingBuffer::<f32>::new(input_ring_frames);
 
     // Registry listener.
     let registry: Registry = core.get_registry().context("get_registry")?;
@@ -550,11 +629,25 @@ fn run(
 
     struct StreamState {
         consumer: Consumer<f32>,
-        underruns: u64,
+        /// Mono drain of the passthrough input ring. When nothing's
+        /// routed to the music sink this stays empty (the sink callback
+        /// doesn't push), so pops return Err and contribute 0 to the sum.
+        input_consumer: Consumer<f32>,
+        /// Browser-monitor PCM tap. Fired after each process() with the
+        /// mono `mixed` samples we just handed pipewire, so subscribers
+        /// hear whatever Discord hears — TTS, music-input passthrough,
+        /// and any FX chain that eventually lands in the source path.
+        monitor_tap: broadcast::Sender<Arc<[f32]>>,
+        /// Frames where every source (TTS + input) was empty. Kept as a
+        /// diagnostic — with input passthrough enabled a "silent" tick is
+        /// the truer signal than a bare TTS-ring underrun.
+        silent_frames: u64,
     }
     let state = StreamState {
         consumer,
-        underruns: 0,
+        input_consumer,
+        monitor_tap: cfg.monitor_tap.clone(),
+        silent_frames: 0,
     };
 
     let graph_stream = graph.clone();
@@ -583,29 +676,41 @@ fn run(
             let capacity_frames = if let Some(slice) = data.data() {
                 let out: &mut [f32] = bytemuck_cast_slice_mut(slice);
                 let frames = out.len() / SOURCE_CHANNELS as usize;
-                let mut written = 0usize;
-                while written < frames {
-                    match state.consumer.pop() {
-                        Ok(sample) => {
-                            let base = written * SOURCE_CHANNELS as usize;
-                            out[base] = sample;
-                            out[base + 1] = sample;
-                            written += 1;
-                        }
-                        Err(_) => break,
+                let mut any_audio = false;
+                // Buffer the mono `mixed` samples so we can broadcast them
+                // to the browser monitor after we've finished the buffer.
+                // Only allocate when at least one subscriber is attached
+                // (atomic load; cheap).
+                let want_tap = state.monitor_tap.receiver_count() > 0;
+                let mut tap_buf: Vec<f32> = if want_tap {
+                    Vec::with_capacity(frames)
+                } else {
+                    Vec::new()
+                };
+                for i in 0..frames {
+                    let tts_sample = state.consumer.pop().unwrap_or(0.0);
+                    // Input samples are already mono-downmixed by the sink
+                    // callback for `-music` (PA). The `-vox` sink doesn't
+                    // touch this ring at all.
+                    let in_sample = state.input_consumer.pop().unwrap_or(0.0);
+                    let mixed = (tts_sample + in_sample).clamp(-1.0, 1.0);
+                    if mixed != 0.0 {
+                        any_audio = true;
+                    }
+                    let base = i * SOURCE_CHANNELS as usize;
+                    out[base] = mixed;
+                    out[base + 1] = mixed;
+                    if want_tap {
+                        tap_buf.push(mixed);
                     }
                 }
-                if written < frames {
-                    let tail = &mut out[(written * SOURCE_CHANNELS as usize)
-                        ..(frames * SOURCE_CHANNELS as usize)];
-                    for s in tail {
-                        *s = 0.0;
-                    }
-                    if written == 0 {
-                        state.underruns = state.underruns.saturating_add(1);
-                        if state.underruns.is_power_of_two() {
-                            debug!(underruns = state.underruns, "audio ring underrun");
-                        }
+                if want_tap && !tap_buf.is_empty() {
+                    let _ = state.monitor_tap.send(Arc::from(tap_buf));
+                }
+                if !any_audio {
+                    state.silent_frames = state.silent_frames.saturating_add(frames as u64);
+                    if state.silent_frames.is_power_of_two() {
+                        debug!(silent_frames = state.silent_frames, "source ticks with no audio");
                     }
                 }
                 frames
@@ -647,6 +752,28 @@ fn run(
         )
         .context("Stream::connect")?;
 
+    // Two companion sink nodes, each with a fixed routing purpose:
+    //   * `-music` → downmix + push into `input_ring` (PA into the mic feed)
+    //   * `-vox`   → publish to the broadcast tap (processing consumers)
+    // Both are kept alive for the pw thread lifetime; dropping either tears
+    // its node down.
+    let (_music_stream, _music_listener) = register_sink_stream(
+        &core,
+        &cfg,
+        SinkRole::Music,
+        Some(input_producer),
+        None,
+    )
+    .context("register music sink stream")?;
+    let (_vox_stream, _vox_listener) = register_sink_stream(
+        &core,
+        &cfg,
+        SinkRole::Vox,
+        None,
+        Some(cfg.input_tap.clone()),
+    )
+    .context("register vox sink stream")?;
+
     // Command receiver, attached to the pw main loop so incoming commands wake
     // the loop and are dispatched on this thread.
     let core_cmd = core.clone();
@@ -680,10 +807,211 @@ fn run(
     Ok(())
 }
 
+/// Register one of the companion `Audio/Sink` nodes. Called twice from
+/// [`run`], once per [`SinkRole`]. Returns the [`Stream`] + its listener so
+/// the caller can bind them to a scope that lives as long as the pw main
+/// loop — dropping either tears the node down.
+///
+/// Routing is fixed per role — no runtime mode toggle — so external apps
+/// simply choose which node to route into (see [`SinkRole`] doc). The
+/// process callback dispatches on the role captured at registration:
+///
+/// * [`SinkRole::Music`] — downmix stereo → mono, push into the input ring
+///   drained by the source callback. Overflow drops the tail of the chunk
+///   (drops-on-lag; we prefer dropped samples to unbounded latency).
+/// * [`SinkRole::Vox`] — publish stereo samples on the broadcast tap for
+///   subscribed consumers. Zero-subscriber send is a cheap no-op.
+fn register_sink_stream(
+    core: &Core,
+    cfg: &Config,
+    role: SinkRole,
+    input_producer: Option<Producer<f32>>,
+    input_tap: Option<broadcast::Sender<Arc<[f32]>>>,
+) -> Result<(Stream, pw::stream::StreamListener<SinkState>)> {
+    let sink_node_name = format!("{}-{}", cfg.node_name, role.suffix());
+    let sink_node_description = format!("{} {}", cfg.node_description, role.description());
+
+    let props = properties! {
+        *keys::MEDIA_TYPE => "Audio",
+        *keys::MEDIA_CATEGORY => "Capture",
+        *keys::MEDIA_ROLE => role.media_role(),
+        *keys::MEDIA_CLASS => "Audio/Sink",
+        *keys::NODE_NAME => sink_node_name.as_str(),
+        *keys::NODE_DESCRIPTION => sink_node_description.as_str(),
+        "node.virtual" => "true",
+    };
+    let stream = Stream::new(core, &sink_node_name, props).context("input Stream::new")?;
+
+    // Enforce the producer/tap invariant here so a caller can't accidentally
+    // give a Music sink no producer or a Vox sink no tap.
+    match role {
+        SinkRole::Music => anyhow::ensure!(
+            input_producer.is_some(),
+            "Music sink requires an input_producer",
+        ),
+        SinkRole::Vox => anyhow::ensure!(
+            input_tap.is_some(),
+            "Vox sink requires an input_tap",
+        ),
+    }
+
+    let state = SinkState {
+        role,
+        producer: input_producer,
+        tap: input_tap,
+        frames_seen: 0,
+        overflow_frames: 0,
+    };
+
+    let listener = stream
+        .add_local_listener_with_user_data::<SinkState>(state)
+        .state_changed(move |_, _, old, new| {
+            info!(?old, ?new, role = ?role, "PipeWire input stream state changed");
+        })
+        .process(|stream, state| {
+            let Some(mut buffer) = stream.dequeue_buffer() else {
+                return;
+            };
+            let datas = buffer.datas_mut();
+            if datas.is_empty() {
+                return;
+            }
+            let data = &mut datas[0];
+            // For capture streams, pipewire populates the buffer BEFORE the
+            // callback and reports the valid range via chunk metadata. The
+            // raw slice from `data()` is the full allocation, which may
+            // contain garbage or stale samples past `offset + size` — reading
+            // that as audio is what caused the "rhythmic clipping" bug.
+            let chunk = data.chunk();
+            let offset = chunk.offset() as usize;
+            let size = chunk.size() as usize;
+            let stride = chunk.stride() as usize;
+            let bytes_per_frame = SINK_CHANNELS as usize * std::mem::size_of::<f32>();
+            // Stride should equal bytes-per-frame for interleaved F32LE; if
+            // pipewire ever hands us something different we bail rather than
+            // guess.
+            if stride != bytes_per_frame {
+                return;
+            }
+            let Some(slice) = data.data() else {
+                return;
+            };
+            let end = offset.saturating_add(size);
+            if end > slice.len() || size == 0 {
+                return;
+            }
+            let valid = &slice[offset..end];
+            let frames = size / bytes_per_frame;
+            if frames == 0 {
+                return;
+            }
+            // SAFETY: pipewire negotiated F32LE with SINK_CHANNELS channels;
+            // the buffer is aligned + sized appropriately.
+            let stereo: &[f32] = bytemuck_cast_slice(valid);
+
+            match state.role {
+                SinkRole::Music => {
+                    // Downmix + push, one frame at a time. Ring is SPSC so
+                    // this is the only writer; overflow (source callback
+                    // hasn't drained) drops the rest of the current chunk.
+                    let producer = state
+                        .producer
+                        .as_mut()
+                        .expect("Music sink registered without producer");
+                    let mut dropped = 0usize;
+                    for f in 0..frames {
+                        let base = f * SINK_CHANNELS as usize;
+                        let mono = 0.5 * stereo[base] + 0.5 * stereo[base + 1];
+                        if producer.push(mono).is_err() {
+                            dropped = frames - f;
+                            break;
+                        }
+                    }
+                    if dropped > 0 {
+                        state.overflow_frames =
+                            state.overflow_frames.saturating_add(dropped as u64);
+                        if state.overflow_frames.is_power_of_two() {
+                            debug!(
+                                dropped = state.overflow_frames,
+                                "music sink ring overflow (source callback behind?)"
+                            );
+                        }
+                    }
+                }
+                SinkRole::Vox => {
+                    // Interleaved stereo, broadcast as-is so downstream FX
+                    // has both channels. `receiver_count` gate keeps the
+                    // Arc allocation out of the callback when nobody's
+                    // subscribed.
+                    let tap = state
+                        .tap
+                        .as_ref()
+                        .expect("Vox sink registered without tap");
+                    if tap.receiver_count() > 0 {
+                        let _ = tap.send(Arc::from(stereo));
+                    }
+                }
+            }
+
+            state.frames_seen = state.frames_seen.saturating_add(frames as u64);
+            if state.frames_seen > 0 && state.frames_seen.is_power_of_two() {
+                debug!(role = ?state.role, frames = state.frames_seen, "input frames processed");
+            }
+        })
+        .register()
+        .context("input Stream::register")?;
+
+    let mut info = AudioInfoRaw::new();
+    info.set_format(AudioFormat::F32LE);
+    info.set_rate(cfg.sample_rate);
+    info.set_channels(SINK_CHANNELS);
+    let obj = Object {
+        type_: libspa::sys::SPA_TYPE_OBJECT_Format,
+        id: libspa::sys::SPA_PARAM_EnumFormat,
+        properties: info.into(),
+    };
+    let values: Vec<u8> =
+        PodSerializer::serialize(std::io::Cursor::new(Vec::new()), &Value::Object(obj))
+            .context("serialize input format pod")?
+            .0
+            .into_inner();
+    let mut params = [Pod::from_bytes(&values).context("input format pod parse")?];
+
+    stream
+        .connect(
+            libspa::utils::Direction::Input,
+            None,
+            StreamFlags::MAP_BUFFERS | StreamFlags::RT_PROCESS,
+            &mut params,
+        )
+        .context("input Stream::connect")?;
+
+    info!(node = %sink_node_name, "PipeWire input sink node started");
+    Ok((stream, listener))
+}
+
+struct SinkState {
+    role: SinkRole,
+    /// Populated for `SinkRole::Music` — mono ring producer drained by the
+    /// source callback. `None` for other roles.
+    producer: Option<Producer<f32>>,
+    /// Populated for `SinkRole::Vox` — broadcast sender for processing
+    /// consumers. `None` for other roles.
+    tap: Option<broadcast::Sender<Arc<[f32]>>>,
+    frames_seen: u64,
+    overflow_frames: u64,
+}
+
 /// Reinterpret a byte slice as an f32 slice. PipeWire aligns buffers for the
 /// negotiated F32LE sample format.
 fn bytemuck_cast_slice_mut(bytes: &mut [u8]) -> &mut [f32] {
     let len = bytes.len() / std::mem::size_of::<f32>();
     let ptr = bytes.as_mut_ptr() as *mut f32;
     unsafe { std::slice::from_raw_parts_mut(ptr, len) }
+}
+
+fn bytemuck_cast_slice(bytes: &[u8]) -> &[f32] {
+    let len = bytes.len() / std::mem::size_of::<f32>();
+    let ptr = bytes.as_ptr() as *const f32;
+    unsafe { std::slice::from_raw_parts(ptr, len) }
 }

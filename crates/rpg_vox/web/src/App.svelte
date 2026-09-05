@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import { route } from './lib/router.js';
   import { startHealthPoll } from './lib/stores.js';
+  import { restoreFromPref as restoreBrowserMonitor } from './lib/browserMonitor.js';
   import Menubar from './components/Menubar.svelte';
   import Projects from './routes/Projects.svelte';
   import Characters from './routes/Characters.svelte';
@@ -30,7 +31,15 @@
     $route === '/scenes' || $route === '/speak',
   );
 
-  onMount(() => { startHealthPoll(); });
+  onMount(() => {
+    startHealthPoll();
+    // Auto-restore the browser monitor if the user had it enabled in a
+    // previous session. Deferred to the first user gesture inside the
+    // helper if the browser blocks AudioContext creation.
+    restoreBrowserMonitor().catch((err) => {
+      console.warn('[monitor] restore failed', err);
+    });
+  });
 </script>
 
 <Menubar />

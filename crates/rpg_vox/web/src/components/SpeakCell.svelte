@@ -1,19 +1,23 @@
 <script>
-  // A single "design a speech clip" cell. Not connected to the mic — the clip
-  // is rendered on the server, streamed to the browser as WAV, cached in a
-  // Blob URL, and played through browser speakers. Sending the clip to
-  // Discord (via the mic) will be a separate action later.
+  // A single "design a speech clip" cell. The clip is rendered on the server,
+  // cached, and — when played — pushed straight into the pipewire virtual mic
+  // so Discord (or any other consumer patched into the source) hears it.
+  // Playback never touches the browser's audio device: the whole point of
+  // this app is to speak into Discord, so keeping one output path avoids
+  // "why can't Discord hear me" surprises.
   //
   // States:
   //   empty     — just the + button
   //   editing   — form is unlocked; play synthesizes
   //   rendering — synthesis in flight; textareas + play locked; guessed bar
-  //   playing   — cached audio playing through <audio>; deterministic bar
-  //   rendered  — locked textareas; play replays cached blob; double-click
+  //   playing   — server is pushing the cached clip through pipewire; the
+  //               deterministic progress bar is driven from wall-clock
+  //               elapsed vs the known clip durationMs
+  //   rendered  — locked textareas; play replays cached clip; double-click
   //               a textarea to edit; if edited, X to cancel back to rendered
 
   import { onDestroy, onMount, tick } from 'svelte';
-  import { createWidget, updateWidget, deleteWidget, fetchWidget } from '../lib/api.js';
+  import { createWidget, updateWidget, deleteWidget, fetchWidget, playWidget } from '../lib/api.js';
   import { estimateMs, recordSample } from '../lib/estimator.js';
 
   // When used inside a Lane, the parent owns the clip's identity and passes
@@ -30,15 +34,16 @@
     startEditing = false,
     onchange = null,
     ondelete = null,
-    // Fired after a successful render so the parent (a Lane) can drive its
-    // own <audio> element for sequential playback. Transient — blob URLs
-    // don't survive reloads, so they're never persisted.
+    // Fired after a successful render or hydration so the parent (a Lane)
+    // can gate scene-level Play/Render on which cells are playable. Payload
+    // is `{ ready, durationMs }` or `null` when the cell becomes unplayable
+    // (deleted, edited-and-not-yet-re-rendered).
     onaudio = null,
     // Called once on mount with a handle the parent can use to drive this
-    // cell from outside — { playToEnd, stop, isReady } — and once on
-    // unmount with `null` so the parent can forget the handle. Enables
-    // scene-level playback to run each cell's own <audio> + progress bar
-    // in sequence instead of a shared player.
+    // cell from outside — { playToEnd, stop, isReady, render, hasText } —
+    // and once on unmount with `null` so the parent can forget the handle.
+    // Enables scene-level playback to run each cell's own play + progress
+    // bar in sequence, all pointing at the same pipewire mic.
     bindPlayer = null,
     // Fired with `true` whenever the cell enters an editing form (fresh
     // typing, or Edit-clicked on a rendered clip) and `false` when it leaves.
@@ -71,7 +76,7 @@
   );
 
   // True while the mount-time fetch is in flight. Guards play/edit so the
-  // user doesn't hit "play" before the blob URL exists.
+  // user doesn't hit "play" before the server has confirmed the clip exists.
   // svelte-ignore state_referenced_locally
   let hydrating = $state(!!initialWidgetId);
   // svelte-ignore state_referenced_locally
@@ -80,14 +85,18 @@
   let styleId = $state(initialStyleId);
   let error = $state('');
 
-  // Snapshot of what produced `blobUrl` — used to detect "dirty" edits and
-  // to revert on cancel. Seeded from initial props so a hydrated cell knows
-  // its "clean" state matches the persisted server row.
+  // Snapshot of what produced the current cached clip — used to detect
+  // "dirty" edits and to revert on cancel. Seeded from initial props so a
+  // hydrated cell knows its "clean" state matches the persisted server row.
   // svelte-ignore state_referenced_locally
   let renderedText = $state(initialWidgetId ? initialText : '');
   // svelte-ignore state_referenced_locally
   let renderedStyleId = $state(initialWidgetId ? initialStyleId : null);
-  let blobUrl = $state(null);
+  // Whether the server currently holds a playable clip for this widget id.
+  // Set by the mount-time metadata fetch and by every successful render;
+  // cleared on delete/reset. Playback goes through /widgets/:id/say (mic),
+  // so we don't need the WAV bytes on the browser side.
+  let ready = $state(false);
   let durationMs = $state(0);   // exact playback duration from server header
   let sampleRate = $state(0);
 
@@ -104,8 +113,11 @@
   let startedAt = 0;
   let estimatedMs = 0;
 
-  let audioEl = $state(null);  // <audio> element bound below
-  let textEl  = $state(null);  // <textarea> for `text`, focused on entry
+  // AbortController for the in-flight /widgets/:id/say fetch, so
+  // stopExternal() (or a delete) can cancel scene playback promptly.
+  let playAbort = null;
+
+  let textEl = $state(null);   // <textarea> for `text`, focused on entry
 
   // Delete button: two-tap confirm. `deleteConfirm=true` swaps the label to
   // "really?" and the second click actually resets the cell. Auto-reverts
@@ -125,27 +137,27 @@
   }
   onDestroy(() => {
     cancelRaf();
-    if (blobUrl) URL.revokeObjectURL(blobUrl);
+    if (playAbort) { try { playAbort.abort(); } catch {} playAbort = null; }
     if (deleteTimer) clearTimeout(deleteTimer);
   });
 
-  // Rehydrate from the server's cached WAV if the parent handed us a
-  // widgetId. The row already carries text/instruct via props (mirrored
-  // through the /state blob the scene store persists), so all we need is
-  // the audio + duration/sample-rate metadata. A 404 means the server-side
-  // row or WAV was lost — drop the stale id and drop back to editing so the
-  // user can re-render.
+  // Rehydrate from the server if the parent handed us a widgetId. The row
+  // already carries text/instruct via props (mirrored through the /state
+  // blob the scene store persists), so all we need to confirm is that the
+  // server still holds the clip and to grab its duration/sample-rate
+  // metadata for the progress bar. A 404 means the row or WAV was lost —
+  // drop the stale id and drop back to editing so the user can re-render.
   onMount(async () => {
     if (!initialWidgetId) return;
     try {
       const result = await fetchWidget(initialWidgetId);
-      blobUrl = URL.createObjectURL(result.blob);
       sampleRate = result.sampleRate || 0;
       durationMs = result.durationMs || 0;
       renderedText = text;
       renderedStyleId = styleId;
+      ready = true;
       hydrating = false;
-      onaudio?.({ blobUrl, durationMs });
+      onaudio?.({ ready: true, durationMs });
     } catch (e) {
       hydrating = false;
       if (e?.status === 404) {
@@ -203,7 +215,7 @@
     onchange(snap);
   });
 
-  const hasClip = $derived(blobUrl !== null);
+  const hasClip = $derived(ready);
   const isDirty = $derived(
     hasClip && (text !== renderedText || styleId !== renderedStyleId)
   );
@@ -269,7 +281,8 @@
 
   function resetToEmpty() {
     cancelRaf();
-    if (blobUrl) { URL.revokeObjectURL(blobUrl); blobUrl = null; }
+    if (playAbort) { try { playAbort.abort(); } catch {} playAbort = null; }
+    ready = false;
     text = '';
     styleId = null;
     renderedText = '';
@@ -280,6 +293,7 @@
     progress = 0;
     error = '';
     state = 'empty';
+    onaudio?.(null);
   }
 
   // ---- Render (server round-trip) ------------------------------------------
@@ -326,22 +340,19 @@
       recordSample(t.length + voiceInstruct.length, elapsedMs);
 
       if (result.id) widgetId = result.id;
-      // Rotate blob URL — release the old one so long sessions don't leak.
-      if (blobUrl) URL.revokeObjectURL(blobUrl);
-      blobUrl = URL.createObjectURL(result.blob);
+      ready = true;
       sampleRate = result.sampleRate || 0;
       durationMs = result.durationMs || 0;
       renderedText = t;
       renderedStyleId = styleId;
-      onaudio?.({ blobUrl, durationMs });
+      onaudio?.({ ready: true, durationMs });
 
       progress = 1;
-      // Brief flash of the filled render bar, then kick playback so the user
-      // hears the freshly-rendered clip without an extra click. The `await
-      // tick()` gap also ensures the <audio> element has picked up the new
-      // blob URL from Svelte's reactive update before we call .play().
       await tick();
       if (autoplay) {
+        // Brief flash of the filled render bar before playback begins so the
+        // user sees the render "complete" before the wall-clock progress
+        // resets to zero for the playback bar.
         setTimeout(() => {
           if (state === 'rendering') play();
         }, 180);
@@ -359,66 +370,58 @@
     }
   }
 
-  // ---- Play (browser <audio>) ----------------------------------------------
+  // ---- Play (through the pipewire virtual mic) ----------------------------
+  // Wall-clock progress: the server plays the cached clip at its known
+  // duration, so we drive the bar from elapsed time here instead of asking
+  // the server for progress. Overshoot is clamped at 1.0 so a slightly-off
+  // durationMs doesn't leave the bar spinning past the end.
   function tickPlay() {
-    if (!audioEl || audioEl.paused || audioEl.ended) { cancelRaf(); return; }
-    // audio.duration is authoritative once metadata loads; server-reported
-    // durationMs is a fallback so the bar starts moving immediately.
-    const total = (audioEl.duration && isFinite(audioEl.duration))
-      ? audioEl.duration * 1000
-      : (durationMs || 1);
-    progress = Math.min((audioEl.currentTime * 1000) / total, 1);
+    if (state !== 'playing') { cancelRaf(); return; }
+    const total = durationMs || 1;
+    const elapsed = performance.now() - startedAt;
+    progress = Math.min(elapsed / total, 1);
     rafId = requestAnimationFrame(tickPlay);
   }
 
   async function play() {
-    if (!blobUrl || !audioEl) return;
+    if (!ready || !widgetId) return;
     error = '';
     state = 'playing';
     progress = 0;
+    startedAt = performance.now();
+    // Fresh AbortController per play so stopExternal() can cancel the current
+    // request without affecting future ones.
+    const ac = new AbortController();
+    playAbort = ac;
+    rafId = requestAnimationFrame(tickPlay);
     try {
-      // On a freshly-loaded blob, currentTime is already 0 but the media may
-      // not be ready yet — setting it can throw InvalidStateError. Wrap so
-      // auto-play after render doesn't fall over. Subsequent replays are on
-      // an already-loaded element and always safe.
-      try { audioEl.currentTime = 0; } catch {}
-      await audioEl.play();
-      rafId = requestAnimationFrame(tickPlay);
+      await playWidget(widgetId, { signal: ac.signal });
     } catch (e) {
+      // AbortError from stopExternal is expected; other errors surface.
+      if (e?.name !== 'AbortError') {
+        error = e.message || 'playback failed';
+      }
+    } finally {
       cancelRaf();
-      state = 'rendered';
       progress = 0;
-      error = e.message || 'playback failed';
+      if (playAbort === ac) playAbort = null;
+      // Only demote if we're still in the playing state; a delete/reset
+      // during playback may have already moved us on.
+      if (state === 'playing') state = 'rendered';
     }
   }
 
-  function onAudioEnded() {
-    cancelRaf();
-    progress = 0;
-    state = 'rendered';
-  }
-
   // ---- External driver (scene playback) -----------------------------------
-  // Kick the cell's own <audio> + progress animation, then resolve when the
-  // clip ends (naturally) or is paused (stopped from outside). The parent
-  // can call `.stop()` to interrupt without waiting for the promise.
+  // Kick playback and resolve when the pipewire drain completes (natural end)
+  // or when stopExternal() aborts the request. The parent can call `.stop()`
+  // to interrupt without waiting for the promise.
   async function playToEnd() {
-    if (!blobUrl || !audioEl) return;
+    if (!ready || !widgetId) return;
     await play();
-    if (!audioEl) return;
-    await new Promise((resolve) => {
-      const cleanup = () => {
-        audioEl?.removeEventListener('ended', cleanup);
-        audioEl?.removeEventListener('pause', cleanup);
-        resolve();
-      };
-      audioEl.addEventListener('ended', cleanup);
-      audioEl.addEventListener('pause', cleanup);
-    });
   }
 
   function stopExternal() {
-    try { audioEl?.pause(); } catch {}
+    if (playAbort) { try { playAbort.abort(); } catch {} }
     cancelRaf();
     progress = 0;
     if (state === 'playing') state = 'rendered';
@@ -428,7 +431,7 @@
     bindPlayer?.({
       playToEnd,
       stop: stopExternal,
-      isReady: () => !!blobUrl,
+      isReady: () => ready && !!widgetId,
       render,
       hasText: () => text.trim().length > 0,
     });
@@ -439,7 +442,7 @@
 
   // ---- Play button router --------------------------------------------------
   // Editing (no clip, or dirty edits): synthesize.
-  // Rendered (locked, clean): replay cached blob.
+  // Rendered (locked, clean): replay cached clip through the mic.
   function onPlayClick() {
     if (state === 'editing') {
       if (hasClip && !isDirty) play();
@@ -620,8 +623,6 @@
       </div>
     {/if}
   {/if}
-
-  <audio bind:this={audioEl} src={blobUrl ?? undefined} onended={onAudioEnded} preload="auto"></audio>
 </div>
 
 <style>
@@ -940,6 +941,4 @@
     border-color: var(--err);
     background: rgba(255, 128, 128, 0.08);
   }
-
-  audio { display: none; }
 </style>

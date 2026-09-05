@@ -22,6 +22,10 @@ pub struct Settings {
     /// Parsed workflow JSON; not exposed over the wire.
     pub workflow_json: Value,
     pub workflow_summary: WorkflowSummary,
+    /// PipeWire `node.name` prefix chosen at startup. Immutable from HTTP;
+    /// exposed to the UI so it can display the derived `-music` / `-vox`
+    /// companion node names accurately.
+    pub node_name: String,
 }
 
 /// Wire type exposed by `GET /settings`.
@@ -30,6 +34,7 @@ pub struct SettingsPublic {
     pub backend: &'static str,
     pub workflow_name: Option<String>,
     pub workflow_summary: WorkflowSummary,
+    pub node_name: String,
 }
 
 impl Settings {
@@ -38,6 +43,7 @@ impl Settings {
             backend: self.backend,
             workflow_name: self.workflow_name.clone(),
             workflow_summary: self.workflow_summary.clone(),
+            node_name: self.node_name.clone(),
         }
     }
 

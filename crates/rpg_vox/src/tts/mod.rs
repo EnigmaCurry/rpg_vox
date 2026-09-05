@@ -25,6 +25,10 @@ pub use comfyui::warmup;
 
 pub struct Config {
     pub target_sample_rate: u32,
+    /// Total slot count of the pipewire ring buffer, used by [`PlayPcm`] to
+    /// detect when the ring has fully drained so callers know audio has
+    /// actually finished playing (not just been enqueued).
+    pub ringbuf_frames: usize,
 }
 
 /// Serialized command stream feeding the single TTS backend. All commands
@@ -36,6 +40,10 @@ pub enum Command {
     /// Synthesize into a PCM buffer and return it to the caller. Nothing
     /// touches the mic. Used by the browser-only Speak widget.
     Synthesize(SynthesizeRequest),
+    /// Push a pre-decoded PCM buffer into the pipewire ring buffer and wait
+    /// until playback finishes. Used to play cached widget clips through
+    /// the mic (Scenes tab).
+    PlayPcm(PlayPcmRequest),
 }
 
 /// Per-request voice overrides. Any field set to `Some` replaces the
@@ -97,6 +105,15 @@ pub struct SynthesizeRequest {
     pub text: String,
     pub voice: VoiceOverride,
     pub reply: oneshot::Sender<Result<SynthesizeOutcome, String>>,
+}
+
+/// Push already-decoded mono PCM into the pipewire ring buffer. The runner
+/// resamples if `sample_rate` differs from the pipewire target, then waits
+/// for the ring to drain so the reply lands when playback is truly over.
+pub struct PlayPcmRequest {
+    pub samples: Vec<f32>,
+    pub sample_rate: u32,
+    pub reply: oneshot::Sender<Result<usize, String>>,
 }
 
 #[derive(Debug)]
@@ -161,6 +178,7 @@ pub async fn run(
         match cmd {
             Command::Say(req) => handle_say(&mut backend, &cfg, &mut producer, req).await,
             Command::Synthesize(req) => handle_synthesize(&mut backend, &cfg, req).await,
+            Command::PlayPcm(req) => handle_play_pcm(&cfg, &mut producer, req).await,
         }
     }
     Ok(())
@@ -202,13 +220,30 @@ async fn handle_say(
                 let (samples, sample_rate) = sink.take_capture();
                 match apply_effects(samples, sample_rate, &voice) {
                     Ok(processed) => {
-                        let pushed =
-                            push_samples_backpressured(producer, &processed).await;
-                        info!(
-                            frames = pushed,
-                            "utterance (with effects) delivered to ring buffer"
-                        );
-                        Ok(pushed)
+                        // Wrap the final push in a Sink for uniformity with
+                        // the no-effects path (both go through the source
+                        // callback where the browser-monitor tap fires).
+                        let mut push_sink = Sink::new(producer, cfg.target_sample_rate);
+                        match push_sink
+                            .push(AudioChunk {
+                                samples: processed,
+                                sample_rate: cfg.target_sample_rate,
+                            })
+                            .await
+                        {
+                            Ok(()) => {
+                                info!(
+                                    frames = push_sink.frames_pushed,
+                                    "utterance (with effects) delivered to ring buffer"
+                                );
+                                Ok(push_sink.frames_pushed)
+                            }
+                            Err(err) => {
+                                let msg = format!("{err:#}");
+                                error!(err = %msg, "effect push failed");
+                                Err(msg)
+                            }
+                        }
                     }
                     Err(err) => {
                         let msg = format!("{err:#}");
@@ -291,6 +326,74 @@ async fn handle_synthesize(backend: &mut Backend, cfg: &Config, req: SynthesizeR
         }
     };
     let _ = reply.send(result);
+}
+
+async fn handle_play_pcm(cfg: &Config, producer: &mut Producer<f32>, req: PlayPcmRequest) {
+    let PlayPcmRequest {
+        samples,
+        sample_rate,
+        reply,
+    } = req;
+    if samples.is_empty() {
+        let _ = reply.send(Ok(0));
+        return;
+    }
+    info!(
+        samples = samples.len(),
+        sample_rate,
+        "playing cached PCM through mic"
+    );
+
+    let pushed = {
+        let mut sink = Sink::new(producer, cfg.target_sample_rate);
+        match sink
+            .push(AudioChunk {
+                samples,
+                sample_rate,
+            })
+            .await
+        {
+            Ok(()) => sink.frames_pushed,
+            Err(err) => {
+                let msg = format!("{err:#}");
+                error!(err = %msg, "cached PCM push failed");
+                let _ = reply.send(Err(msg));
+                return;
+            }
+        }
+    };
+
+    // Wait for the ring buffer to actually drain so the caller learns "done"
+    // when audio has finished playing, not merely been enqueued. Poll rather
+    // than compute-and-sleep because the ring may hold leftover audio from
+    // an earlier /say command (mic path returns after push, not drain).
+    wait_for_ring_empty(producer, cfg.ringbuf_frames, cfg.target_sample_rate).await;
+    info!(frames = pushed, "cached PCM playback finished");
+    let _ = reply.send(Ok(pushed));
+}
+
+/// Block until the pipewire consumer has drained (nearly) every sample from
+/// the ring. Sleep interval scales with how full the ring currently is so we
+/// don't spin, but is capped so we notice the drain finishing promptly.
+///
+/// Takes `&mut` even though `slots()` only needs `&self` because
+/// `rtrb::Producer` is `!Sync` — a shared reference to it isn't `Send` across
+/// `await`, whereas an exclusive reference to a `Send` type is.
+async fn wait_for_ring_empty(producer: &mut Producer<f32>, capacity: usize, sample_rate: u32) {
+    // The ring is "empty" once the producer sees within a frame of the full
+    // capacity as free slots. Slack absorbs small race between the consumer's
+    // atomic write-back and this poll.
+    let empty_threshold = capacity.saturating_sub(64);
+    let rate = sample_rate.max(1) as usize;
+    loop {
+        let free = producer.slots();
+        if free >= empty_threshold {
+            return;
+        }
+        let held = capacity.saturating_sub(free);
+        let ms = ((held * 1000) / rate).clamp(10, 250) as u64;
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+    }
 }
 
 /// Apply per-style pitch shift and/or time stretch to a mono f32 buffer.

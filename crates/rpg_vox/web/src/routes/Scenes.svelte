@@ -85,8 +85,8 @@
   }
 
   function onCellAudio(clipId, payload) {
-    if (payload?.blobUrl) hasAudio[clipId] = true;
-    else                  delete hasAudio[clipId];
+    if (payload?.ready) hasAudio[clipId] = true;
+    else                delete hasAudio[clipId];
   }
 
   function onCellEdit(clipId, isEditing) {

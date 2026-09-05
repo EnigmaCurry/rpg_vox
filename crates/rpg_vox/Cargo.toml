@@ -15,7 +15,12 @@ pipewire.workspace = true
 libspa.workspace = true
 
 tokio.workspace = true
-axum = "0.7"
+# `ws` enables axum's WebSocket extractor used by the browser monitor
+# (Opus-over-WebSocket audio tap).
+axum = { version = "0.7", features = ["ws"] }
+# libopus wrapper for the browser-monitor Opus encoder. The C library is
+# provided by nixpkgs `libopus` (already in shell.nix buildInputs).
+opus = "0.3"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 futures-util = "0.3"

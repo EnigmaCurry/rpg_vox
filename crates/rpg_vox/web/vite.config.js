@@ -7,6 +7,9 @@ const proxy = Object.fromEntries(
   ['/say', '/chat', '/settings', '/workflows', '/workflow', '/pw', '/healthz']
     .map((p) => [p, { target: BACKEND, changeOrigin: false }]),
 );
+// WebSocket path is proxied separately with `ws: true` so vite forwards the
+// upgrade handshake and binary frames to the Rust backend.
+proxy['/monitor.ws'] = { target: BACKEND, changeOrigin: false, ws: true };
 
 export default defineConfig({
   plugins: [svelte()],

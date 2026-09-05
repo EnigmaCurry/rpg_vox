@@ -5,6 +5,7 @@ use tracing::info;
 
 mod chat;
 mod http;
+mod monitor;
 mod pw_source;
 mod settings;
 mod store;
@@ -240,17 +241,38 @@ fn main() -> Result<()> {
         }
     });
 
+    // Broadcast tap for the `-vox` sink's processing consumers (future FX
+    // chain, recording, etc.). Kept alive in main so the channel doesn't
+    // close when no one is subscribed — subscribers can come and go.
+    let (input_tap, _input_keepalive) = tokio::sync::broadcast::channel::<
+        std::sync::Arc<[f32]>,
+    >(32);
+
+    // Browser-monitor tap. Fired by the pw source callback with the mixed
+    // (TTS + music-input) mono samples about to be handed to pipewire, so
+    // `/monitor.ws` subscribers hear what Discord hears. Split off up here
+    // so both the pw thread and the HTTP handlers get a handle before the
+    // tokio runtime starts.
+    let (monitor_tap, _monitor_keepalive) = monitor::channel();
+
     // PipeWire runs its own event loop on a dedicated OS thread.
     let pw_cfg = pw_source::Config {
         node_name: node_name.clone(),
         node_description: node_description.clone(),
         sample_rate: args.sample_rate,
         auto_patch_target: args.auto_link.clone(),
+        input_tap,
+        monitor_tap: monitor_tap.clone(),
     };
     let pw_handle = pw_source::spawn(pw_cfg, consumer)?;
     let pw_client = pw_handle.client.clone();
     let auto_link_client = pw_client.clone();
-    info!(node = %node_name, description = %node_description, "PipeWire source node started");
+    info!(
+        node = %node_name,
+        description = %node_description,
+        "PipeWire source node started (companion sinks: {n}-music, {n}-vox)",
+        n = node_name,
+    );
 
     // Everything else lives on the tokio runtime.
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -311,6 +333,7 @@ fn main() -> Result<()> {
         workflow_name: initial_name,
         workflow_json,
         workflow_summary,
+        node_name: node_name.clone(),
     });
 
     let system_prompt = match std::fs::read_to_string(&args.chat_system_prompt_file) {
@@ -365,6 +388,7 @@ fn main() -> Result<()> {
 
         let tts_cfg = tts::Config {
             target_sample_rate: args.sample_rate,
+            ringbuf_frames,
         };
         let tts_task = tokio::spawn(tts::run(tts_cfg, backend, tts_rx, producer));
 
@@ -376,6 +400,8 @@ fn main() -> Result<()> {
             registry.clone(),
             chat_client.clone(),
             store,
+            monitor_tap,
+            args.sample_rate,
         ));
 
         // Verify + warmup are ComfyUI-specific — skip both entirely when a
