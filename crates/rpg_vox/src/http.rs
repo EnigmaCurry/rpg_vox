@@ -57,6 +57,7 @@ use tracing::info;
 use std::sync::Arc;
 
 use crate::chat;
+use crate::mixer::{AtomicMixer, MixerPatch};
 use crate::monitor;
 use crate::pw_source::{GraphSnapshot, PwClient};
 use crate::settings::{self, SettingsUpdate};
@@ -97,6 +98,9 @@ pub(crate) struct AppState {
     /// rate). Held in state so the WS handler can bail early if a future
     /// config picks a non-Opus rate.
     pub(crate) monitor_sample_rate: u32,
+    /// Shared mixer atomics. `/mixer` reads a snapshot; `PUT /mixer`
+    /// applies a partial patch. Also persisted to sqlite on every update.
+    pub(crate) mixer: Arc<AtomicMixer>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -155,6 +159,7 @@ pub async fn serve(
     store: Store,
     monitor_tap: broadcast::Sender<Arc<[f32]>>,
     monitor_sample_rate: u32,
+    mixer: Arc<AtomicMixer>,
 ) -> Result<()> {
     let state = AppState {
         tts,
@@ -165,6 +170,7 @@ pub async fn serve(
         store,
         monitor_tap,
         monitor_sample_rate,
+        mixer,
     };
     let app = Router::new()
         .route("/", get(index))
@@ -200,6 +206,8 @@ pub async fn serve(
             "/pw/monitor",
             post(monitor_start_handler).delete(monitor_stop_handler),
         )
+        .route("/mixer", get(get_mixer).put(put_mixer))
+        .route("/mixer/levels", get(get_mixer_levels))
         .route("/settings", get(get_settings).post(update_settings))
         .route("/workflows", get(list_workflows))
         .route("/workflow/verify", post(verify_workflow))
@@ -317,6 +325,33 @@ async fn monitor_stop_handler(State(state): State<AppState>) -> impl IntoRespons
         )
             .into_response(),
     }
+}
+
+async fn get_mixer(State(state): State<AppState>) -> impl IntoResponse {
+    (StatusCode::OK, Json(state.mixer.snapshot()))
+}
+
+/// VU-meter poll endpoint. Each call fetch-and-resets the recent peak
+/// atomics so the returned values are the peak magnitudes seen since the
+/// previous poll — miss a tick and you lose that window's data, which is
+/// the right trade for meter animation.
+async fn get_mixer_levels(State(state): State<AppState>) -> impl IntoResponse {
+    (StatusCode::OK, Json(state.mixer.take_levels()))
+}
+
+/// Apply a partial mixer patch and persist the resulting snapshot. Persist
+/// happens after the atomics are updated so the on-disk row always matches
+/// what the pw thread is reading.
+async fn put_mixer(
+    State(state): State<AppState>,
+    Json(patch): Json<MixerPatch>,
+) -> impl IntoResponse {
+    state.mixer.apply(patch);
+    let snap = state.mixer.snapshot();
+    if let Err(err) = state.store.put_mixer(snap).await {
+        tracing::warn!(err = %format!("{err:#}"), "persisting mixer state failed");
+    }
+    (StatusCode::OK, Json(snap)).into_response()
 }
 
 async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {

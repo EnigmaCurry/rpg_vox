@@ -30,10 +30,14 @@ use tracing::{debug, info, warn};
 
 use crate::http::AppState;
 
-/// One 20 ms frame at 48 kHz mono is the sweet spot for Opus latency vs.
-/// packetization overhead, and matches what most WebRTC stacks use. If we
-/// ever change the pipewire target rate this needs to move in step.
-const FRAME_SAMPLES_48K: usize = 960;
+/// Frames (per channel) in one 20 ms Opus packet at 48 kHz. Sweet spot for
+/// Opus latency vs. packetization overhead, and matches most WebRTC stacks.
+/// If we ever change the pipewire target rate this needs to move in step.
+const FRAME_SAMPLES_PER_CHANNEL_48K: usize = 960;
+/// Interleaved sample count in one Opus packet for stereo — 960 frames × 2
+/// channels. `encode_float` takes interleaved samples but reports its
+/// frame_size argument as samples-per-channel.
+const FRAME_SAMPLES_INTERLEAVED_48K: usize = FRAME_SAMPLES_PER_CHANNEL_48K * 2;
 
 /// Broadcast channel capacity in messages. Each message is one PCM chunk
 /// (whatever size the TTS backend emits), so this is a slot count, not a
@@ -83,19 +87,21 @@ async fn run_subscriber(
 
     let mut encoder = opus::Encoder::new(
         48_000,
-        opus::Channels::Mono,
+        opus::Channels::Stereo,
         opus::Application::Audio,
     )?;
     // A little inband FEC helps the browser recover from single-packet loss
     // over the WebSocket. Cheap on the encoder side.
     let _ = encoder.set_inband_fec(true);
-    // 64 kbit/s is more than enough for mono speech; keeps latency low
-    // relative to VBR at the same average bitrate.
-    let _ = encoder.set_bitrate(opus::Bitrate::Bits(64_000));
+    // 96 kbit/s carries stereo speech + light music cleanly at 48 kHz while
+    // staying well under a typical WebSocket's headroom. Bump if the mix
+    // starts including full-band music.
+    let _ = encoder.set_bitrate(opus::Bitrate::Bits(96_000));
 
-    // Rolling PCM buffer — the TTS runner sends chunks of arbitrary length,
-    // we slice them into fixed-size Opus frames here.
-    let mut pcm_buf: Vec<f32> = Vec::with_capacity(FRAME_SAMPLES_48K * 4);
+    // Rolling PCM buffer — the source callback sends chunks of arbitrary
+    // length (interleaved stereo), we slice them into fixed-size Opus
+    // frames here.
+    let mut pcm_buf: Vec<f32> = Vec::with_capacity(FRAME_SAMPLES_INTERLEAVED_48K * 4);
     // Reused encoder output buffer; 4000 bytes is opus's documented max per
     // frame at any supported bitrate.
     let mut opus_out: Vec<u8> = vec![0u8; 4000];
@@ -129,14 +135,14 @@ async fn run_subscriber(
                     Ok(chunk) => {
                         pcm_buf.extend_from_slice(&chunk);
                         // Slice out as many full Opus frames as we've buffered.
-                        while pcm_buf.len() >= FRAME_SAMPLES_48K {
+                        while pcm_buf.len() >= FRAME_SAMPLES_INTERLEAVED_48K {
                             // Encode the head frame in place, then rotate the
                             // remainder to the front. `drain` avoids realloc.
                             let n = encoder.encode_float(
-                                &pcm_buf[..FRAME_SAMPLES_48K],
+                                &pcm_buf[..FRAME_SAMPLES_INTERLEAVED_48K],
                                 &mut opus_out,
                             )?;
-                            pcm_buf.drain(..FRAME_SAMPLES_48K);
+                            pcm_buf.drain(..FRAME_SAMPLES_INTERLEAVED_48K);
                             if socket
                                 .send(Message::Binary(opus_out[..n].to_vec()))
                                 .await
@@ -155,11 +161,11 @@ async fn run_subscriber(
                         pcm_buf.clear();
                         encoder = opus::Encoder::new(
                             48_000,
-                            opus::Channels::Mono,
+                            opus::Channels::Stereo,
                             opus::Application::Audio,
                         )?;
                         let _ = encoder.set_inband_fec(true);
-                        let _ = encoder.set_bitrate(opus::Bitrate::Bits(64_000));
+                        let _ = encoder.set_bitrate(opus::Bitrate::Bits(96_000));
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         info!("monitor tap closed; ending subscriber");

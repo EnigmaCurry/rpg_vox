@@ -23,6 +23,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
+use crate::mixer::MixerState;
+
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS widgets (
     id           TEXT PRIMARY KEY,
@@ -50,6 +52,10 @@ CREATE TABLE IF NOT EXISTS app_state (
 /// table generic-KV lets us stash other server-side prefs here later without
 /// migrating.
 const APP_STATE_KEY: &str = "app";
+
+/// Row key for the persisted mixer JSON. Same KV table as `APP_STATE_KEY`
+/// so the mixer piggybacks on an already-migrated store.
+const MIXER_STATE_KEY: &str = "mixer";
 
 #[derive(Clone)]
 pub struct Store {
@@ -335,6 +341,56 @@ impl Store {
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value,
                                                 updated_at = excluded.updated_at",
                 params![APP_STATE_KEY, value, now],
+            )?;
+            Ok(())
+        })
+        .await
+        .context("db task panicked")??;
+        Ok(())
+    }
+
+    /// Read the persisted mixer state. Returns Ok(None) on a fresh install
+    /// so the caller can fall back to defaults. Malformed JSON is treated
+    /// the same as missing — we log a warning and return None rather than
+    /// booting into a hard error over a settings blob.
+    pub async fn get_mixer(&self) -> Result<Option<MixerState>> {
+        let db = self.db.clone();
+        let raw = tokio::task::spawn_blocking(move || -> Result<Option<String>> {
+            let conn = db.lock().unwrap();
+            let value = conn
+                .query_row(
+                    "SELECT value FROM app_state WHERE key = ?1",
+                    params![MIXER_STATE_KEY],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?;
+            Ok(value)
+        })
+        .await
+        .context("db task panicked")??;
+        Ok(raw.and_then(|text| match serde_json::from_str::<MixerState>(&text) {
+            Ok(s) => Some(s),
+            Err(err) => {
+                tracing::warn!(err = %err, "persisted mixer state didn't parse; using defaults");
+                None
+            }
+        }))
+    }
+
+    /// Upsert the mixer state row. The mixer JSON is small (few dozen
+    /// bytes) so we don't bother with any staleness checks.
+    pub async fn put_mixer(&self, state: MixerState) -> Result<()> {
+        let value = serde_json::to_string(&state).context("serialize mixer state")?;
+        let now = unix_now();
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO app_state (key, value, updated_at)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value,
+                                                updated_at = excluded.updated_at",
+                params![MIXER_STATE_KEY, value, now],
             )?;
             Ok(())
         })

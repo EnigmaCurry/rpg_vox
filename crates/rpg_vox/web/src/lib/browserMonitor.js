@@ -217,24 +217,29 @@ export async function start(statusCb) {
     node = new AudioWorkletNode(ctx, 'monitor-player', {
       numberOfInputs: 0,
       numberOfOutputs: 1,
-      outputChannelCount: [1],
+      outputChannelCount: [2],
     });
     node.connect(ctx.destination);
 
     nextTsUs = 0;
     decoder = new AudioDecoder({
       output: (audioData) => {
-        // Opus frames from the server are mono. Copy the single plane into
-        // a fresh Float32Array (transferable) and hand it to the worklet.
+        // Opus frames from the server are stereo. Copy each plane into its
+        // own Float32Array (both transferable) and hand the pair to the
+        // worklet — pan is preserved because L and R travel independently.
         const nFrames = audioData.numberOfFrames;
-        const buf = new Float32Array(nFrames);
+        const left = new Float32Array(nFrames);
+        const right = new Float32Array(nFrames);
         try {
-          audioData.copyTo(buf, { planeIndex: 0, format: 'f32-planar' });
+          audioData.copyTo(left, { planeIndex: 0, format: 'f32-planar' });
+          audioData.copyTo(right, { planeIndex: 1, format: 'f32-planar' });
         } finally {
           audioData.close();
         }
-        // Transfer the underlying buffer to the worklet to skip a copy.
-        node?.port.postMessage(buf, [buf.buffer]);
+        node?.port.postMessage(
+          { left, right },
+          [left.buffer, right.buffer],
+        );
       },
       error: (err) => {
         console.error('[monitor] AudioDecoder error', err);
@@ -245,7 +250,7 @@ export async function start(statusCb) {
     decoder.configure({
       codec: 'opus',
       sampleRate: OPUS_SAMPLE_RATE,
-      numberOfChannels: 1,
+      numberOfChannels: 2,
     });
 
     const scheme = location.protocol === 'https:' ? 'wss' : 'ws';

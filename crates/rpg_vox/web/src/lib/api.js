@@ -210,3 +210,26 @@ export const stopMonitor    = async ()        => {
   const parsed = await r.json().catch(() => null);
   return { ok: r.ok && parsed?.ok !== false, body: parsed };
 };
+
+// --- Mixer ----------------------------------------------------------------
+//
+// GET /mixer      → full MixerState snapshot ({ tts, music, vox, master }).
+// PUT /mixer      → partial patch; server merges + persists + returns the
+//                   new snapshot. Only the changed field(s) need to be sent
+//                   (e.g. `{ music: { gain: 0.8 } }`).
+
+export const getMixer = () => jsonGet('/mixer');
+export const getMixerLevels = () => jsonGet('/mixer/levels');
+
+export async function updateMixer(patch) {
+  const r = await fetch('/mixer', {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(patch),
+  });
+  if (!r.ok) {
+    const detail = await r.text().catch(() => `HTTP ${r.status}`);
+    throw new Error(detail || `HTTP ${r.status}`);
+  }
+  return await r.json();
+}

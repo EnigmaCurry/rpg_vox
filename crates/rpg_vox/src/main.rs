@@ -5,6 +5,7 @@ use tracing::info;
 
 mod chat;
 mod http;
+mod mixer;
 mod monitor;
 mod pw_source;
 mod settings;
@@ -255,6 +256,11 @@ fn main() -> Result<()> {
     // tokio runtime starts.
     let (monitor_tap, _monitor_keepalive) = monitor::channel();
 
+    // Runtime mixer state. Loaded from the store once the store is open
+    // (below); starts with defaults so the pw thread has something to read
+    // even if persistence fails.
+    let mixer = mixer::AtomicMixer::new(mixer::MixerState::default());
+
     // PipeWire runs its own event loop on a dedicated OS thread.
     let pw_cfg = pw_source::Config {
         node_name: node_name.clone(),
@@ -263,6 +269,7 @@ fn main() -> Result<()> {
         auto_patch_target: args.auto_link.clone(),
         input_tap,
         monitor_tap: monitor_tap.clone(),
+        mixer: mixer.clone(),
     };
     let pw_handle = pw_source::spawn(pw_cfg, consumer)?;
     let pw_client = pw_handle.client.clone();
@@ -383,6 +390,19 @@ fn main() -> Result<()> {
         .with_context(|| format!("opening store at {}", args.data_dir.display()))?;
     info!(data_dir = %args.data_dir.display(), "widget store opened");
 
+    // Restore persisted mixer state before the HTTP server starts serving,
+    // so the first GET already reflects what the user had last session.
+    match rt.block_on(store.get_mixer()) {
+        Ok(Some(state)) => {
+            mixer.apply(mixer::MixerPatch::from(state));
+            info!("mixer state restored from store");
+        }
+        Ok(None) => {}
+        Err(err) => {
+            tracing::warn!(err = %format!("{err:#}"), "reading persisted mixer state failed");
+        }
+    }
+
     let result = rt.block_on(async move {
         let (tts_tx, tts_rx) = mpsc::channel::<tts::Command>(32);
 
@@ -402,6 +422,7 @@ fn main() -> Result<()> {
             store,
             monitor_tap,
             args.sample_rate,
+            mixer.clone(),
         ));
 
         // Verify + warmup are ComfyUI-specific — skip both entirely when a

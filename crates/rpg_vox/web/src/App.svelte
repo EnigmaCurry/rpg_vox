@@ -8,6 +8,7 @@
   import Characters from './routes/Characters.svelte';
   import Scenes from './routes/Scenes.svelte';
   import Chat from './routes/Chat.svelte';
+  import Mixer from './routes/Mixer.svelte';
   import Settings from './routes/Settings.svelte';
   import NotFound from './routes/NotFound.svelte';
 
@@ -20,6 +21,7 @@
     '/scenes':     Scenes,
     '/speak':      Scenes,
     '/chat':       Chat,
+    '/mixer':      Mixer,
     '/settings':   Settings,
   };
 

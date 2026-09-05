@@ -46,6 +46,8 @@ use std::thread::{self, JoinHandle};
 use tokio::sync::{broadcast, oneshot};
 use tracing::{debug, error, info, warn};
 
+use crate::mixer::AtomicMixer;
+
 use pipewire as pw;
 use pw::{
     channel as pw_channel,
@@ -127,11 +129,15 @@ pub struct Config {
     /// the sink node).
     pub input_tap: broadcast::Sender<Arc<[f32]>>,
     /// Broadcast sender for the browser-monitor PCM tap. Fired from the
-    /// source stream's process callback with the mixed (TTS + music-input)
-    /// mono samples that are about to be handed to pipewire — so
-    /// `/monitor.ws` subscribers hear the actual mic feed, not just the TTS
-    /// side of the mix. Zero subscribers makes `send` a cheap no-op.
+    /// source stream's process callback with the final interleaved stereo
+    /// (L, R) frames that are about to be handed to pipewire — so
+    /// `/monitor.ws` subscribers hear the actual mic feed with pan and
+    /// per-strip gain applied. Zero subscribers makes `send` a cheap no-op.
     pub monitor_tap: broadcast::Sender<Arc<[f32]>>,
+    /// Shared mixer state. The source callback reads gain/pan/mute per
+    /// channel every process cycle (lock-free atomics) to compute the
+    /// stereo mic feed.
+    pub mixer: Arc<AtomicMixer>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -596,13 +602,14 @@ fn run(
         ..Graph::default()
     }));
 
-    // Input passthrough ring. Sized for ~half a second at the target rate:
-    // large enough to absorb sink/source callback tick jitter without piling
-    // up perceivable latency in the mic feed. Mono because the source stream
-    // is fanned out mono → L=R downstream; downmixing at the sink callback
-    // keeps the ring cheap.
+    // Passthrough rings, one per companion sink. Sized for ~half a second at
+    // the target rate: large enough to absorb sink/source callback tick jitter
+    // without piling up perceivable latency in the mic feed. Both rings carry
+    // mono downmixed samples — the source callback applies per-strip pan
+    // (constant-power law) to fan mono → stereo before summing with TTS.
     let input_ring_frames = (cfg.sample_rate as usize / 2).max(1024);
-    let (input_producer, input_consumer) = RingBuffer::<f32>::new(input_ring_frames);
+    let (music_producer, music_consumer) = RingBuffer::<f32>::new(input_ring_frames);
+    let (vox_producer, vox_consumer) = RingBuffer::<f32>::new(input_ring_frames);
 
     // Registry listener.
     let registry: Registry = core.get_registry().context("get_registry")?;
@@ -628,24 +635,30 @@ fn run(
     let stream = Stream::new(&core, &cfg.node_name, props).context("Stream::new")?;
 
     struct StreamState {
-        consumer: Consumer<f32>,
-        /// Mono drain of the passthrough input ring. When nothing's
-        /// routed to the music sink this stays empty (the sink callback
-        /// doesn't push), so pops return Err and contribute 0 to the sum.
-        input_consumer: Consumer<f32>,
+        /// Mono TTS drain — the synthesis pipeline's output.
+        tts_consumer: Consumer<f32>,
+        /// Mono music-sink drain. Empty when nobody's routed into the
+        /// `-music` node; pops return Err and contribute 0 to the sum.
+        music_consumer: Consumer<f32>,
+        /// Mono vox-sink drain. Same semantics as music — the sink
+        /// callback downmixes the incoming stereo frame before pushing.
+        vox_consumer: Consumer<f32>,
+        /// Shared mixer atomics. Read per-frame; updates from HTTP are
+        /// picked up on the very next process cycle.
+        mixer: Arc<AtomicMixer>,
         /// Browser-monitor PCM tap. Fired after each process() with the
-        /// mono `mixed` samples we just handed pipewire, so subscribers
-        /// hear whatever Discord hears — TTS, music-input passthrough,
-        /// and any FX chain that eventually lands in the source path.
+        /// final interleaved stereo mic feed (L, R, L, R, ...), so
+        /// subscribers hear exactly what downstream sinks hear — including
+        /// pan and per-strip gain.
         monitor_tap: broadcast::Sender<Arc<[f32]>>,
-        /// Frames where every source (TTS + input) was empty. Kept as a
-        /// diagnostic — with input passthrough enabled a "silent" tick is
-        /// the truer signal than a bare TTS-ring underrun.
+        /// Frames where every source contributed 0. Kept as a diagnostic.
         silent_frames: u64,
     }
     let state = StreamState {
-        consumer,
-        input_consumer,
+        tts_consumer: consumer,
+        music_consumer,
+        vox_consumer,
+        mixer: cfg.mixer.clone(),
         monitor_tap: cfg.monitor_tap.clone(),
         silent_frames: 0,
     };
@@ -676,34 +689,91 @@ fn run(
             let capacity_frames = if let Some(slice) = data.data() {
                 let out: &mut [f32] = bytemuck_cast_slice_mut(slice);
                 let frames = out.len() / SOURCE_CHANNELS as usize;
-                let mut any_audio = false;
-                // Buffer the mono `mixed` samples so we can broadcast them
-                // to the browser monitor after we've finished the buffer.
-                // Only allocate when at least one subscriber is attached
-                // (atomic load; cheap).
+
+                // Snapshot the mixer state once per process() rather than
+                // once per frame. Atomics are cheap but this is still fewer
+                // loads and the mixer never changes mid-buffer meaningfully.
+                let (tts_l, tts_r) = state.mixer.tts.stereo_gains();
+                let (music_l, music_r) = state.mixer.music.stereo_gains();
+                let (vox_l, vox_r) = state.mixer.vox.stereo_gains();
+                let (master_gain, master_muted) = state.mixer.master();
+
+                // Buffer the final stereo mic feed so we can broadcast it to
+                // the browser monitor after we've filled the buffer.
+                // Interleaved [L, R, L, R, ...] so pan is preserved for the
+                // Opus stereo encoder on the other side of the tap. Only
+                // allocate when at least one subscriber is attached.
                 let want_tap = state.monitor_tap.receiver_count() > 0;
                 let mut tap_buf: Vec<f32> = if want_tap {
-                    Vec::with_capacity(frames)
+                    Vec::with_capacity(frames * SOURCE_CHANNELS as usize)
                 } else {
                     Vec::new()
                 };
+
+                // Per-strip peak magnitudes (pre-master) accumulated across
+                // this whole buffer. We update the mixer's atomics once at
+                // the bottom rather than per-frame so the RT hot path only
+                // touches non-atomic locals inside the loop.
+                let mut tts_peak = 0.0f32;
+                let mut music_peak = 0.0f32;
+                let mut vox_peak = 0.0f32;
+                let mut master_l_peak = 0.0f32;
+                let mut master_r_peak = 0.0f32;
+
+                let mut any_audio = false;
                 for i in 0..frames {
-                    let tts_sample = state.consumer.pop().unwrap_or(0.0);
-                    // Input samples are already mono-downmixed by the sink
-                    // callback for `-music` (PA). The `-vox` sink doesn't
-                    // touch this ring at all.
-                    let in_sample = state.input_consumer.pop().unwrap_or(0.0);
-                    let mixed = (tts_sample + in_sample).clamp(-1.0, 1.0);
-                    if mixed != 0.0 {
+                    // Always drain each ring even if muted — otherwise the
+                    // upstream sink callback will spin against a full ring
+                    // and drop input frames instead of just being silenced.
+                    let tts = state.tts_consumer.pop().unwrap_or(0.0);
+                    let music = state.music_consumer.pop().unwrap_or(0.0);
+                    let vox = state.vox_consumer.pop().unwrap_or(0.0);
+
+                    // Per-strip contributions to the mix bus (pre-master).
+                    let tts_l_c = tts * tts_l;
+                    let tts_r_c = tts * tts_r;
+                    let mus_l_c = music * music_l;
+                    let mus_r_c = music * music_r;
+                    let vox_l_c = vox * vox_l;
+                    let vox_r_c = vox * vox_r;
+
+                    // Meter magnitude per strip = max(|L|, |R|) of the
+                    // panned contribution. Matches what a channel VU on a
+                    // physical mixer shows post-fader/pre-master.
+                    tts_peak = tts_peak.max(tts_l_c.abs().max(tts_r_c.abs()));
+                    music_peak = music_peak.max(mus_l_c.abs().max(mus_r_c.abs()));
+                    vox_peak = vox_peak.max(vox_l_c.abs().max(vox_r_c.abs()));
+
+                    let (l, r) = if master_muted {
+                        (0.0, 0.0)
+                    } else {
+                        let l = (tts_l_c + mus_l_c + vox_l_c) * master_gain;
+                        let r = (tts_r_c + mus_r_c + vox_r_c) * master_gain;
+                        (l.clamp(-1.0, 1.0), r.clamp(-1.0, 1.0))
+                    };
+                    master_l_peak = master_l_peak.max(l.abs());
+                    master_r_peak = master_r_peak.max(r.abs());
+
+                    if l != 0.0 || r != 0.0 {
                         any_audio = true;
                     }
                     let base = i * SOURCE_CHANNELS as usize;
-                    out[base] = mixed;
-                    out[base + 1] = mixed;
+                    out[base] = l;
+                    out[base + 1] = r;
                     if want_tap {
-                        tap_buf.push(mixed);
+                        tap_buf.push(l);
+                        tap_buf.push(r);
                     }
                 }
+
+                // Publish the per-buffer peaks to the mixer atomics for
+                // `/mixer/levels`. Cheap: three CAS-loop fetch_max ops plus
+                // two for master, once per cycle rather than per-frame.
+                state.mixer.tts.observe_peak(tts_peak);
+                state.mixer.music.observe_peak(music_peak);
+                state.mixer.vox.observe_peak(vox_peak);
+                state.mixer.observe_master_peak(master_l_peak, master_r_peak);
+
                 if want_tap && !tap_buf.is_empty() {
                     let _ = state.monitor_tap.send(Arc::from(tap_buf));
                 }
@@ -753,15 +823,18 @@ fn run(
         .context("Stream::connect")?;
 
     // Two companion sink nodes, each with a fixed routing purpose:
-    //   * `-music` → downmix + push into `input_ring` (PA into the mic feed)
-    //   * `-vox`   → publish to the broadcast tap (processing consumers)
-    // Both are kept alive for the pw thread lifetime; dropping either tears
-    // its node down.
+    //   * `-music` → downmix + push into music ring (mixed via the mixer's
+    //                music strip in the source callback)
+    //   * `-vox`   → downmix + push into vox ring (mixed via the mixer's
+    //                vox strip) AND publish stereo to the broadcast tap for
+    //                downstream FX / recording consumers
+    // Both streams are kept alive for the pw thread lifetime; dropping
+    // either tears its node down.
     let (_music_stream, _music_listener) = register_sink_stream(
         &core,
         &cfg,
         SinkRole::Music,
-        Some(input_producer),
+        music_producer,
         None,
     )
     .context("register music sink stream")?;
@@ -769,7 +842,7 @@ fn run(
         &core,
         &cfg,
         SinkRole::Vox,
-        None,
+        vox_producer,
         Some(cfg.input_tap.clone()),
     )
     .context("register vox sink stream")?;
@@ -812,20 +885,16 @@ fn run(
 /// the caller can bind them to a scope that lives as long as the pw main
 /// loop — dropping either tears the node down.
 ///
-/// Routing is fixed per role — no runtime mode toggle — so external apps
-/// simply choose which node to route into (see [`SinkRole`] doc). The
-/// process callback dispatches on the role captured at registration:
-///
-/// * [`SinkRole::Music`] — downmix stereo → mono, push into the input ring
-///   drained by the source callback. Overflow drops the tail of the chunk
-///   (drops-on-lag; we prefer dropped samples to unbounded latency).
-/// * [`SinkRole::Vox`] — publish stereo samples on the broadcast tap for
-///   subscribed consumers. Zero-subscriber send is a cheap no-op.
+/// Both roles push a mono downmix of the incoming stereo chunk into their
+/// dedicated SPSC ring; the source callback drains the ring and applies
+/// per-strip pan/gain/mute via the shared mixer state. The Vox sink
+/// additionally publishes the raw stereo interleaved samples on the
+/// broadcast tap for downstream FX / recording consumers.
 fn register_sink_stream(
     core: &Core,
     cfg: &Config,
     role: SinkRole,
-    input_producer: Option<Producer<f32>>,
+    input_producer: Producer<f32>,
     input_tap: Option<broadcast::Sender<Arc<[f32]>>>,
 ) -> Result<(Stream, pw::stream::StreamListener<SinkState>)> {
     let sink_node_name = format!("{}-{}", cfg.node_name, role.suffix());
@@ -842,17 +911,10 @@ fn register_sink_stream(
     };
     let stream = Stream::new(core, &sink_node_name, props).context("input Stream::new")?;
 
-    // Enforce the producer/tap invariant here so a caller can't accidentally
-    // give a Music sink no producer or a Vox sink no tap.
-    match role {
-        SinkRole::Music => anyhow::ensure!(
-            input_producer.is_some(),
-            "Music sink requires an input_producer",
-        ),
-        SinkRole::Vox => anyhow::ensure!(
-            input_tap.is_some(),
-            "Vox sink requires an input_tap",
-        ),
+    // Vox is the only role that needs a broadcast tap; enforce here so a
+    // future refactor can't silently drop the FX/recording feed.
+    if matches!(role, SinkRole::Vox) {
+        anyhow::ensure!(input_tap.is_some(), "Vox sink requires an input_tap");
     }
 
     let state = SinkState {
@@ -909,47 +971,33 @@ fn register_sink_stream(
             // the buffer is aligned + sized appropriately.
             let stereo: &[f32] = bytemuck_cast_slice(valid);
 
-            match state.role {
-                SinkRole::Music => {
-                    // Downmix + push, one frame at a time. Ring is SPSC so
-                    // this is the only writer; overflow (source callback
-                    // hasn't drained) drops the rest of the current chunk.
-                    let producer = state
-                        .producer
-                        .as_mut()
-                        .expect("Music sink registered without producer");
-                    let mut dropped = 0usize;
-                    for f in 0..frames {
-                        let base = f * SINK_CHANNELS as usize;
-                        let mono = 0.5 * stereo[base] + 0.5 * stereo[base + 1];
-                        if producer.push(mono).is_err() {
-                            dropped = frames - f;
-                            break;
-                        }
-                    }
-                    if dropped > 0 {
-                        state.overflow_frames =
-                            state.overflow_frames.saturating_add(dropped as u64);
-                        if state.overflow_frames.is_power_of_two() {
-                            debug!(
-                                dropped = state.overflow_frames,
-                                "music sink ring overflow (source callback behind?)"
-                            );
-                        }
-                    }
+            // Both roles push mono downmix into their ring so the source
+            // callback can apply per-strip pan/gain/mute. Vox also mirrors
+            // the raw stereo frame to the broadcast tap for downstream FX
+            // / recording consumers.
+            let mut dropped = 0usize;
+            for f in 0..frames {
+                let base = f * SINK_CHANNELS as usize;
+                let mono = 0.5 * stereo[base] + 0.5 * stereo[base + 1];
+                if state.producer.push(mono).is_err() {
+                    dropped = frames - f;
+                    break;
                 }
-                SinkRole::Vox => {
-                    // Interleaved stereo, broadcast as-is so downstream FX
-                    // has both channels. `receiver_count` gate keeps the
-                    // Arc allocation out of the callback when nobody's
-                    // subscribed.
-                    let tap = state
-                        .tap
-                        .as_ref()
-                        .expect("Vox sink registered without tap");
-                    if tap.receiver_count() > 0 {
-                        let _ = tap.send(Arc::from(stereo));
-                    }
+            }
+            if dropped > 0 {
+                state.overflow_frames =
+                    state.overflow_frames.saturating_add(dropped as u64);
+                if state.overflow_frames.is_power_of_two() {
+                    debug!(
+                        role = ?state.role,
+                        dropped = state.overflow_frames,
+                        "sink ring overflow (source callback behind?)"
+                    );
+                }
+            }
+            if let Some(tap) = state.tap.as_ref() {
+                if tap.receiver_count() > 0 {
+                    let _ = tap.send(Arc::from(stereo));
                 }
             }
 
@@ -992,11 +1040,11 @@ fn register_sink_stream(
 
 struct SinkState {
     role: SinkRole,
-    /// Populated for `SinkRole::Music` — mono ring producer drained by the
-    /// source callback. `None` for other roles.
-    producer: Option<Producer<f32>>,
-    /// Populated for `SinkRole::Vox` — broadcast sender for processing
-    /// consumers. `None` for other roles.
+    /// Mono ring producer drained by the source callback (populated for
+    /// every role — both music and vox now mix through the source).
+    producer: Producer<f32>,
+    /// Broadcast sender for downstream FX / recording consumers. Only the
+    /// Vox sink attaches one.
     tap: Option<broadcast::Sender<Arc<[f32]>>>,
     frames_seen: u64,
     overflow_frames: u64,

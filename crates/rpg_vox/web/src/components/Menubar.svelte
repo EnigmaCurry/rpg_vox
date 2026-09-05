@@ -9,6 +9,7 @@
     { href: '#/characters', label: 'Characters', match: (r) => r === '/characters' },
     { href: '#/scenes',     label: 'Scenes',     match: (r) => r === '/scenes' || r === '/speak' },
     { href: '#/chat',       label: 'Chat',       match: (r) => r === '/chat' },
+    { href: '#/mixer',      label: 'Mixer',      match: (r) => r === '/mixer' },
     { href: '#/settings',   label: 'Settings',   match: (r) => r === '/settings' },
   ];
 
