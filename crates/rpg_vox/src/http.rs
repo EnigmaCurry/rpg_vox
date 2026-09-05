@@ -13,6 +13,19 @@
 //!                              widget's row + WAV file.
 //!   DELETE /widgets/:id                             → 200 — drop the DB
 //!                              row and the WAV file (idempotent).
+//!   POST /scenes/mix           { scene_name, pause_ms, clip_ids }
+//!                              → audio/flac (Content-Disposition attachment)
+//!                              — concatenates the referenced WAVs with
+//!                              silence gaps and returns a single FLAC.
+//!   POST   /images             raw body + Content-Type: image/* → { id }
+//!                              — stores under data/images/{id}; the client
+//!                              uses `/images/{id}` as the img src.
+//!   GET    /images/:id         → binary + Content-Type from the row.
+//!   DELETE /images/:id         → 200; idempotent.
+//!   GET    /state              → the JSON blob of projects/characters/scenes
+//!                              (or `null` if unset). The client persists all
+//!                              of its non-selection state here.
+//!   PUT    /state              raw JSON body → 204; upserts the blob.
 //!
 //! All three synthesis paths go through the single-threaded TTS runner over
 //! the same mpsc so backend access is serialized. `/widgets/*` additionally
@@ -22,8 +35,8 @@ use anyhow::{Context as _, Result};
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{Path, State},
-    http::{HeaderName, StatusCode, header},
+    extract::{DefaultBodyLimit, Path, State},
+    http::{HeaderMap, HeaderName, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -38,6 +51,16 @@ use crate::chat;
 use crate::pw_source::{GraphSnapshot, PwClient};
 use crate::settings::{self, SettingsUpdate};
 use crate::store::{Store, UpdateResult};
+
+/// Ceiling for /images POST bodies. Kept above the client's own 10 MB cap
+/// so a slightly-off client sees a friendly server-side error rather than a
+/// silent tokio hangup.
+const IMAGE_MAX_BYTES: usize = 12 * 1024 * 1024;
+
+/// Ceiling for /state PUT bodies. Character/scene JSON stays well under
+/// this — image bytes are stored separately under /images and the state
+/// blob only carries their `/images/{id}` src URLs.
+const STATE_MAX_BYTES: usize = 4 * 1024 * 1024;
 use crate::tts::{self, Command, SayRequest, SynthesizeRequest, VoiceOverride};
 use crate::workflow::{self, Registry};
 
@@ -68,6 +91,13 @@ struct SayBody {
     language: Option<String>,
     #[serde(default)]
     instruct: Option<String>,
+    /// Post-processing effects applied to the rendered PCM. Both are
+    /// optional; `None` (or omitted) means identity — no DSP call is made.
+    /// Any backend can use these — pitch/stretch runs after synthesis.
+    #[serde(default)]
+    pitch_semitones: Option<f32>,
+    #[serde(default)]
+    time_ratio: Option<f32>,
 }
 
 /// Coerce empty/whitespace-only strings to `None` so downstream defaults win.
@@ -123,6 +153,21 @@ pub async fn serve(
             axum::routing::get(widget_get_handler)
                 .put(widget_update_handler)
                 .delete(widget_delete_handler),
+        )
+        .route("/scenes/mix", post(scene_mix_handler))
+        .route(
+            "/images",
+            post(image_upload_handler).layer(DefaultBodyLimit::max(IMAGE_MAX_BYTES)),
+        )
+        .route(
+            "/images/:id",
+            axum::routing::get(image_get_handler).delete(image_delete_handler),
+        )
+        .route(
+            "/state",
+            get(state_get_handler)
+                .put(state_put_handler)
+                .layer(DefaultBodyLimit::max(STATE_MAX_BYTES)),
         )
         .route("/healthz", get(|| async { "ok" }))
         .route("/pw/graph", get(graph_handler))
@@ -385,6 +430,8 @@ async fn say_handler(
         speaker: trim_opt(body.speaker),
         language: trim_opt(body.language),
         instruct: trim_opt(body.instruct),
+        pitch_semitones: body.pitch_semitones.unwrap_or(0.0),
+        time_ratio: body.time_ratio.unwrap_or(1.0),
     };
 
     let (reply_tx, reply_rx) = oneshot::channel();
@@ -573,6 +620,11 @@ struct WidgetBody {
     language: Option<String>,
     #[serde(default)]
     instruct: Option<String>,
+    /// Post-processing effects. See [`SayBody`] for units.
+    #[serde(default)]
+    pitch_semitones: Option<f32>,
+    #[serde(default)]
+    time_ratio: Option<f32>,
 }
 
 /// Rendered clip in a form ready to hand to the store + client. Held as
@@ -637,6 +689,8 @@ fn normalize_widget_body(
         speaker: trim_opt(body.speaker),
         language: trim_opt(body.language),
         instruct: trim_opt(body.instruct),
+        pitch_semitones: body.pitch_semitones.unwrap_or(0.0),
+        time_ratio: body.time_ratio.unwrap_or(1.0),
     };
     Ok((text, voice))
 }
@@ -814,6 +868,461 @@ async fn widget_delete_handler(
                     ok: false,
                     error: Some(format!("{err:#}")),
                 }),
+            )
+                .into_response()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// /scenes/mix — concatenate a scene's rendered clips into a single FLAC.
+//
+// Client sends the ordered widgetIds and the per-gap pause. The server reads
+// each clip's on-disk WAV (mono 16-bit PCM at the sample rate stored on the
+// row), stitches them together with `pause_ms` of silence between clips, and
+// encodes the whole thing as FLAC. Sample rates are required to match across
+// clips — this stays true as long as the scene was rendered by a single TTS
+// backend, which is the common case. Mismatches surface a 409 so the caller
+// can prompt the user to re-render.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct SceneMixBody {
+    scene_name: String,
+    #[serde(default)]
+    pause_ms: u32,
+    clip_ids: Vec<String>,
+}
+
+async fn scene_mix_handler(
+    State(state): State<AppState>,
+    Json(body): Json<SceneMixBody>,
+) -> Response {
+    if body.clip_ids.is_empty() {
+        return (StatusCode::BAD_REQUEST, "no clips to mix").into_response();
+    }
+
+    // Read every clip's WAV concurrently; each read is small (a few hundred
+    // KB) so this is fine to spin up N tasks at once.
+    let reads = body.clip_ids.iter().map(|id| {
+        let path = state.store.clip_path(id);
+        let id = id.clone();
+        async move {
+            let bytes = tokio::fs::read(&path)
+                .await
+                .with_context(|| format!("reading clip {id}"))?;
+            Ok::<(String, Vec<u8>), anyhow::Error>((id, bytes))
+        }
+    });
+    let clips = match futures_util::future::try_join_all(reads).await {
+        Ok(v) => v,
+        Err(err) => {
+            return (
+                StatusCode::NOT_FOUND,
+                format!("clip missing: {err:#}"),
+            )
+                .into_response();
+        }
+    };
+
+    // Decode each WAV into (rate, i16 samples). We wrote these files with
+    // `encode_wav_pcm16` above (mono, 16-bit little-endian), so the parse is
+    // trivial. Anything else we haven't produced ourselves.
+    let mut decoded: Vec<(u32, Vec<i16>)> = Vec::with_capacity(clips.len());
+    for (id, bytes) in clips {
+        match decode_wav_pcm16_mono(&bytes) {
+            Ok(pair) => decoded.push(pair),
+            Err(err) => {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("decode {id}: {err}"),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    let sample_rate = decoded[0].0;
+    if let Some((idx, (r, _))) = decoded.iter().enumerate().find(|(_, (r, _))| *r != sample_rate)
+    {
+        return (
+            StatusCode::CONFLICT,
+            format!(
+                "clip {idx} has sample_rate {r} but scene starts at {sample_rate}; \
+                 re-render the scene so every clip matches"
+            ),
+        )
+            .into_response();
+    }
+
+    let gap_samples = ((body.pause_ms as u64 * sample_rate as u64) / 1000) as usize;
+    // Concatenate. FLAC wants i32 samples in host order.
+    let total: usize = decoded.iter().map(|(_, s)| s.len()).sum::<usize>()
+        + gap_samples * decoded.len().saturating_sub(1);
+    let mut mixed: Vec<i32> = Vec::with_capacity(total);
+    for (i, (_, samples)) in decoded.iter().enumerate() {
+        if i > 0 && gap_samples > 0 {
+            mixed.extend(std::iter::repeat(0i32).take(gap_samples));
+        }
+        mixed.extend(samples.iter().map(|s| *s as i32));
+    }
+
+    // FLAC encode. Runs on a blocking pool because encoding a several-second
+    // clip can take tens of milliseconds and we don't want to stall the
+    // tokio reactor.
+    let flac = match tokio::task::spawn_blocking(move || encode_flac_mono_i16(&mixed, sample_rate))
+        .await
+    {
+        Ok(Ok(v)) => v,
+        Ok(Err(err)) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("flac encode: {err}"),
+            )
+                .into_response();
+        }
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "flac encode task panicked",
+            )
+                .into_response();
+        }
+    };
+
+    let filename = scene_mix_filename(&body.scene_name);
+    info!(
+        clips = body.clip_ids.len(),
+        bytes = flac.len(),
+        filename = %filename,
+        "scene mix produced"
+    );
+    (
+        [
+            (header::CONTENT_TYPE, "audio/flac".to_string()),
+            (header::CACHE_CONTROL, "no-store".to_string()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{filename}\""),
+            ),
+        ],
+        Bytes::from(flac),
+    )
+        .into_response()
+}
+
+/// Decode a WAV in our own dialect: mono, 16-bit little-endian PCM. Not a
+/// general WAV parser — just enough to round-trip files produced by
+/// `encode_wav_pcm16`. Returns (sample_rate, samples).
+fn decode_wav_pcm16_mono(bytes: &[u8]) -> Result<(u32, Vec<i16>), String> {
+    if bytes.len() < 44 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return Err("not a RIFF/WAVE file".into());
+    }
+    // Walk chunks after the RIFF header so we don't assume "fmt " lives at
+    // exactly byte 12 (some encoders insert extra chunks or padding).
+    let mut cursor = 12usize;
+    let mut fmt: Option<(u16, u16, u32, u16)> = None; // (format, channels, sample_rate, bits)
+    let mut data: Option<&[u8]> = None;
+    while cursor + 8 <= bytes.len() {
+        let id = &bytes[cursor..cursor + 4];
+        let size = u32::from_le_bytes(bytes[cursor + 4..cursor + 8].try_into().unwrap()) as usize;
+        let body_start = cursor + 8;
+        let body_end = body_start
+            .checked_add(size)
+            .ok_or_else(|| "chunk size overflow".to_string())?;
+        if body_end > bytes.len() {
+            return Err("truncated chunk".into());
+        }
+        match id {
+            b"fmt " => {
+                if size < 16 {
+                    return Err("fmt chunk too small".into());
+                }
+                let b = &bytes[body_start..body_start + 16];
+                fmt = Some((
+                    u16::from_le_bytes([b[0], b[1]]),
+                    u16::from_le_bytes([b[2], b[3]]),
+                    u32::from_le_bytes([b[4], b[5], b[6], b[7]]),
+                    u16::from_le_bytes([b[14], b[15]]),
+                ));
+            }
+            b"data" => {
+                data = Some(&bytes[body_start..body_end]);
+                break;
+            }
+            _ => {}
+        }
+        // Chunks are word-aligned — pad byte if size is odd.
+        cursor = body_end + (size & 1);
+    }
+    let (format, channels, sample_rate, bits) = fmt.ok_or_else(|| "missing fmt chunk".to_string())?;
+    let data = data.ok_or_else(|| "missing data chunk".to_string())?;
+    if format != 1 || channels != 1 || bits != 16 {
+        return Err(format!(
+            "unsupported format: pcm={} channels={} bits={}",
+            format == 1,
+            channels,
+            bits
+        ));
+    }
+    let mut samples = Vec::with_capacity(data.len() / 2);
+    for chunk in data.chunks_exact(2) {
+        samples.push(i16::from_le_bytes([chunk[0], chunk[1]]));
+    }
+    Ok((sample_rate, samples))
+}
+
+/// FLAC-encode a mono i16 PCM buffer. Samples are passed as `i32` (FLAC's
+/// interchange type) even though only the low 16 bits carry data.
+fn encode_flac_mono_i16(samples_i32: &[i32], sample_rate: u32) -> Result<Vec<u8>, String> {
+    use flacenc::bitsink::ByteSink;
+    use flacenc::component::BitRepr;
+    use flacenc::config::Encoder;
+    use flacenc::error::Verify;
+    use flacenc::source::MemSource;
+
+    let config = Encoder::default()
+        .into_verified()
+        .map_err(|e| format!("bad flac config: {e:?}"))?;
+    let source = MemSource::from_samples(samples_i32, 1, 16, sample_rate as usize);
+    let stream = flacenc::encode_with_fixed_block_size(&config, source, config.block_size)
+        .map_err(|e| format!("encode failed: {e:?}"))?;
+    let mut sink = ByteSink::new();
+    stream
+        .write(&mut sink)
+        .map_err(|e| format!("bitstream write failed: {e:?}"))?;
+    Ok(sink.into_inner())
+}
+
+/// Build a `<safe-scene-name>_<utc-timestamp>.flac` filename. Sanitizes the
+/// scene name to a safe subset so the Content-Disposition header stays
+/// well-formed and the file lands on disk without escape issues.
+fn scene_mix_filename(scene_name: &str) -> String {
+    let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string();
+    let mut safe: String = scene_name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else if c.is_whitespace() {
+                '-'
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    // Trim runs of separators and edge separators for readability.
+    while safe.contains("--") {
+        safe = safe.replace("--", "-");
+    }
+    while safe.contains("__") {
+        safe = safe.replace("__", "_");
+    }
+    let safe = safe.trim_matches(|c: char| c == '-' || c == '_').to_string();
+    let safe = if safe.is_empty() { "scene".to_string() } else { safe };
+    format!("{safe}_{ts}.flac")
+}
+
+// ---------------------------------------------------------------------------
+// /images — server-side storage for character avatars + reference pictures.
+//
+// The client uploads raw bytes with a Content-Type header naming the image
+// mime type; the server writes the file under data/images/{id} and records
+// the mime on the sqlite row. Clients then reference the image via a plain
+// `/images/{id}` URL as an <img> src.
+// ---------------------------------------------------------------------------
+
+async fn image_upload_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if body.is_empty() {
+        return (StatusCode::BAD_REQUEST, "empty body").into_response();
+    }
+    let mime = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    if !mime.starts_with("image/") {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Content-Type must be image/*".to_string(),
+        )
+            .into_response();
+    }
+    // Guard the mime column against odd headers with parameters we don't use.
+    // e.g. `image/jpeg; charset=binary` → keep just the type/subtype.
+    let mime_bare = mime.split(';').next().unwrap_or("image/octet-stream").trim();
+
+    match state
+        .store
+        .create_image(mime_bare.to_string(), body.to_vec())
+        .await
+    {
+        Ok(id) => {
+            info!(%id, mime = %mime_bare, bytes = body.len(), "image stored");
+            (
+                StatusCode::CREATED,
+                Json(serde_json::json!({
+                    "id": id,
+                    "mime": mime_bare,
+                    "size": body.len(),
+                    "src": format!("/images/{id}"),
+                })),
+            )
+                .into_response()
+        }
+        Err(err) => {
+            tracing::error!(err = %format!("{err:#}"), "store: image create failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("store: {err:#}"),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn image_get_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    let row = match state.store.get_image(id.clone()).await {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return (StatusCode::NOT_FOUND, format!("no image with id {id}"))
+                .into_response();
+        }
+        Err(err) => {
+            tracing::error!(err = %format!("{err:#}"), %id, "store: image get failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("store: {err:#}"),
+            )
+                .into_response();
+        }
+    };
+    let path = state.store.image_path(&id);
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return (StatusCode::NOT_FOUND, format!("image file missing for {id}"))
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("image read: {e}"),
+            )
+                .into_response();
+        }
+    };
+    // IDs are UUIDs and content is immutable at that id — safe to let the
+    // browser cache aggressively.
+    let _ = row.byte_size;
+    (
+        [
+            (header::CONTENT_TYPE, row.mime),
+            (
+                header::CACHE_CONTROL,
+                "public, max-age=31536000, immutable".to_string(),
+            ),
+        ],
+        Bytes::from(bytes),
+    )
+        .into_response()
+}
+
+async fn image_delete_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    match state.store.delete_image(id.clone()).await {
+        Ok(()) => {
+            info!(%id, "image deleted");
+            (
+                StatusCode::OK,
+                Json(ActionResponse {
+                    ok: true,
+                    error: None,
+                }),
+            )
+                .into_response()
+        }
+        Err(err) => {
+            tracing::error!(err = %format!("{err:#}"), %id, "store: image delete failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ActionResponse {
+                    ok: false,
+                    error: Some(format!("{err:#}")),
+                }),
+            )
+                .into_response()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// /state — server-side persistence for the client's projects/characters/scenes
+// blob. Treated as opaque JSON on the server; the shape is defined by
+// `crates/rpg_vox/web/src/lib/scenes.svelte.js`. The client keeps only UI
+// selection (current project/scene) in localStorage.
+// ---------------------------------------------------------------------------
+
+async fn state_get_handler(State(state): State<AppState>) -> Response {
+    match state.store.get_app_state().await {
+        Ok(Some(raw)) => (
+            [
+                (header::CONTENT_TYPE, "application/json"),
+                (header::CACHE_CONTROL, "no-store"),
+            ],
+            raw,
+        )
+            .into_response(),
+        // Empty state → return literal `null` so the client can distinguish
+        // "server has nothing yet" from "server has an empty object".
+        Ok(None) => (
+            [
+                (header::CONTENT_TYPE, "application/json"),
+                (header::CACHE_CONTROL, "no-store"),
+            ],
+            "null".to_string(),
+        )
+            .into_response(),
+        Err(err) => {
+            tracing::error!(err = %format!("{err:#}"), "store: state get failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("store: {err:#}"),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn state_put_handler(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Response {
+    // Validate JSON shape before persisting so a garbled write doesn't
+    // corrupt the store. Cheap for the sizes we handle (single-digit MB).
+    let text = match std::str::from_utf8(&body) {
+        Ok(s) => s,
+        Err(_) => return (StatusCode::BAD_REQUEST, "body is not utf-8").into_response(),
+    };
+    if serde_json::from_str::<serde_json::Value>(text).is_err() {
+        return (StatusCode::BAD_REQUEST, "body is not valid JSON").into_response();
+    }
+    match state.store.put_app_state(text.to_string()).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(err) => {
+            tracing::error!(err = %format!("{err:#}"), "store: state put failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("store: {err:#}"),
             )
                 .into_response()
         }

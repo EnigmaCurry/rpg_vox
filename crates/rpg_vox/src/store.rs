@@ -3,12 +3,15 @@
 //! Two backing pieces, both under a single `--data-dir` (default `./data`):
 //!
 //! * `data/rpg_vox.sqlite` — one row per widget (id, text, instruct, clip
-//!   metadata). Accessed through rusqlite behind a Mutex; every call is
-//!   wrapped in `spawn_blocking` so the tokio runtime doesn't stall on
-//!   sqlite I/O.
+//!   metadata) and one row per image (id, mime). Accessed through rusqlite
+//!   behind a Mutex; every call is wrapped in `spawn_blocking` so the tokio
+//!   runtime doesn't stall on sqlite I/O.
 //! * `data/clips/{id}.wav` — the rendered PCM as WAV, one file per widget.
 //!   Streamed to the browser on render and deleted alongside the DB row
 //!   on delete.
+//! * `data/images/{id}` — character avatars + reference pictures uploaded
+//!   from the browser. Extension-less because the mime type lives on the
+//!   sqlite row and browsers rely on Content-Type, not the URL suffix.
 //!
 //! No caching layer over sqlite — the widget count in this app is small and
 //! every access is user-triggered, so the extra complexity isn't worth it.
@@ -30,12 +33,29 @@ CREATE TABLE IF NOT EXISTS widgets (
     created_at   INTEGER NOT NULL,
     updated_at   INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS images (
+    id           TEXT PRIMARY KEY,
+    mime         TEXT NOT NULL,
+    byte_size    INTEGER NOT NULL,
+    created_at   INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS app_state (
+    key          TEXT PRIMARY KEY,
+    value        TEXT NOT NULL,
+    updated_at   INTEGER NOT NULL
+);
 "#;
+
+/// Single row key for the whole projects/characters/scenes blob. Keeping the
+/// table generic-KV lets us stash other server-side prefs here later without
+/// migrating.
+const APP_STATE_KEY: &str = "app";
 
 #[derive(Clone)]
 pub struct Store {
     db: Arc<Mutex<Connection>>,
     clips_dir: PathBuf,
+    images_dir: PathBuf,
 }
 
 impl Store {
@@ -47,6 +67,9 @@ impl Store {
         let clips_dir = data_dir.join("clips");
         std::fs::create_dir_all(&clips_dir)
             .with_context(|| format!("creating clips dir {}", clips_dir.display()))?;
+        let images_dir = data_dir.join("images");
+        std::fs::create_dir_all(&images_dir)
+            .with_context(|| format!("creating images dir {}", images_dir.display()))?;
 
         let db_path = data_dir.join("rpg_vox.sqlite");
         let conn = Connection::open(&db_path)
@@ -56,11 +79,16 @@ impl Store {
         Ok(Self {
             db: Arc::new(Mutex::new(conn)),
             clips_dir,
+            images_dir,
         })
     }
 
     pub fn clip_path(&self, id: &str) -> PathBuf {
         self.clips_dir.join(format!("{id}.wav"))
+    }
+
+    pub fn image_path(&self, id: &str) -> PathBuf {
+        self.images_dir.join(id)
     }
 
     /// Look up an existing widget's clip metadata. Returns `Ok(None)` if the
@@ -191,6 +219,129 @@ impl Store {
         }
         Ok(())
     }
+
+    /// Insert a new image row and write its file. Returns the freshly
+    /// assigned id. `mime` is stored so `get_image` can echo it back as the
+    /// Content-Type header without sniffing bytes on every request.
+    pub async fn create_image(&self, mime: String, bytes: Vec<u8>) -> Result<String> {
+        let id = Uuid::new_v4().to_string();
+        let now = unix_now();
+        let byte_size = bytes.len() as i64;
+        let db = self.db.clone();
+        let id_clone = id.clone();
+        let mime_clone = mime.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO images (id, mime, byte_size, created_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![id_clone, mime_clone, byte_size, now],
+            )?;
+            Ok(())
+        })
+        .await
+        .context("db task panicked")??;
+
+        tokio::fs::write(self.image_path(&id), bytes)
+            .await
+            .with_context(|| format!("writing image for {id}"))?;
+
+        Ok(id)
+    }
+
+    /// Look up an image's mime + size. Returns `Ok(None)` for missing rows
+    /// so callers can 404 without an error branch.
+    pub async fn get_image(&self, id: String) -> Result<Option<ImageRow>> {
+        let db = self.db.clone();
+        let id_clone = id.clone();
+        let row = tokio::task::spawn_blocking(move || -> Result<Option<ImageRow>> {
+            let conn = db.lock().unwrap();
+            let row = conn
+                .query_row(
+                    "SELECT mime, byte_size FROM images WHERE id = ?1",
+                    params![id_clone],
+                    |r| {
+                        Ok(ImageRow {
+                            mime: r.get::<_, String>(0)?,
+                            byte_size: r.get::<_, i64>(1)? as u64,
+                        })
+                    },
+                )
+                .optional()?;
+            Ok(row)
+        })
+        .await
+        .context("db task panicked")??;
+        Ok(row)
+    }
+
+    /// Idempotent: unknown id (and missing on-disk file) both return Ok(()).
+    /// Matches `delete_widget` so cascade-delete on the client can fire and
+    /// forget without racing on already-gone ids.
+    pub async fn delete_image(&self, id: String) -> Result<()> {
+        let db = self.db.clone();
+        let id_clone = id.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = db.lock().unwrap();
+            conn.execute("DELETE FROM images WHERE id = ?1", params![id_clone])?;
+            Ok(())
+        })
+        .await
+        .context("db task panicked")??;
+
+        let path = self.image_path(&id);
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                tracing::warn!(id, "image file was already missing on delete");
+            }
+            Err(e) => {
+                return Err(e).with_context(|| format!("removing image for {id}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Read the single app_state JSON blob. Returns Ok(None) if the row
+    /// hasn't been written yet (fresh install) so the caller can decide
+    /// whether to fall back to a legacy source (e.g. localStorage migration).
+    pub async fn get_app_state(&self) -> Result<Option<String>> {
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || -> Result<Option<String>> {
+            let conn = db.lock().unwrap();
+            let value = conn
+                .query_row(
+                    "SELECT value FROM app_state WHERE key = ?1",
+                    params![APP_STATE_KEY],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?;
+            Ok(value)
+        })
+        .await
+        .context("db task panicked")?
+    }
+
+    /// Upsert the app_state JSON blob. The caller has already validated that
+    /// the payload is well-formed JSON; the store treats it as opaque text.
+    pub async fn put_app_state(&self, value: String) -> Result<()> {
+        let now = unix_now();
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO app_state (key, value, updated_at)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value,
+                                                updated_at = excluded.updated_at",
+                params![APP_STATE_KEY, value, now],
+            )?;
+            Ok(())
+        })
+        .await
+        .context("db task panicked")??;
+        Ok(())
+    }
 }
 
 pub enum UpdateResult {
@@ -201,6 +352,11 @@ pub enum UpdateResult {
 pub struct WidgetRow {
     pub sample_rate: u32,
     pub duration_ms: u64,
+}
+
+pub struct ImageRow {
+    pub mime: String,
+    pub byte_size: u64,
 }
 
 fn unix_now() -> i64 {

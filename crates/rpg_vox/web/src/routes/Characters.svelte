@@ -11,10 +11,14 @@
     addCharacterStyle,
     renameCharacterStyle,
     setCharacterStyleInstruct,
+    setCharacterStyleEffect,
     deleteCharacterStyle,
     QWEN3_SPEAKERS,
     QWEN3_LANGUAGES,
+    STYLE_PITCH_RANGE,
+    STYLE_TIME_RANGE,
   } from '../lib/scenes.svelte.js';
+  import { uploadImage } from '../lib/api.js';
 
   const project = $derived(currentProject());
   const characters = $derived(currentProjectCharacters());
@@ -27,8 +31,10 @@
   const DELETE_CONFIRM_MS = 2500;
 
   let uploadErr = $state('');
-  // Cap embedded image size — dataURL bloats localStorage fast at multi-MB.
-  const MAX_IMAGE_BYTES = 2 * 1024 * 1024;
+  // Client-side pre-flight cap. The /images endpoint enforces its own
+  // ceiling; keeping a matching cap here means the user sees the error
+  // instantly instead of after uploading a doomed-to-fail file.
+  const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 
   function onCreate(ev) {
     ev.preventDefault();
@@ -52,6 +58,16 @@
   }
   function onStyleInstructInput(characterId, styleId, ev) {
     setCharacterStyleInstruct(characterId, styleId, ev.currentTarget.value);
+  }
+  function onStylePitchInput(characterId, styleId, ev) {
+    setCharacterStyleEffect(characterId, styleId, {
+      pitchSemitones: ev.currentTarget.valueAsNumber,
+    });
+  }
+  function onStyleTimeInput(characterId, styleId, ev) {
+    setCharacterStyleEffect(characterId, styleId, {
+      timeRatio: ev.currentTarget.valueAsNumber,
+    });
   }
   function onAddStyle(characterId) {
     addCharacterStyle(characterId, 'new style');
@@ -97,16 +113,17 @@
     }, DELETE_CONFIRM_MS);
   }
 
-  async function readAsDataUrl(file) {
-    if (file.size > MAX_IMAGE_BYTES) {
-      throw new Error(`image too large (${(file.size / 1024 / 1024).toFixed(1)} MB > 2 MB limit)`);
+  // Pre-flight validation + upload. Returns `/images/{id}` on success — the
+  // server owns the bytes; the character record only holds the src URL.
+  async function uploadFile(file) {
+    if (!file.type || !file.type.startsWith('image/')) {
+      throw new Error('only image files can be uploaded');
     }
-    return await new Promise((resolve, reject) => {
-      const r = new FileReader();
-      r.onload = () => resolve(r.result);
-      r.onerror = () => reject(new Error('failed to read file'));
-      r.readAsDataURL(file);
-    });
+    if (file.size > MAX_IMAGE_BYTES) {
+      throw new Error(`image too large (${(file.size / 1024 / 1024).toFixed(1)} MB > 10 MB limit)`);
+    }
+    const { src } = await uploadImage(file);
+    return src;
   }
 
   async function onAvatarPick(id, ev) {
@@ -114,8 +131,8 @@
     ev.currentTarget.value = '';
     if (!file) return;
     try {
-      const dataUrl = await readAsDataUrl(file);
-      updateCharacter(id, { avatar: dataUrl });
+      const src = await uploadFile(file);
+      updateCharacter(id, { avatar: src });
     } catch (e) {
       showUploadErr(e.message);
     }
@@ -130,8 +147,8 @@
     ev.currentTarget.value = '';
     for (const file of files) {
       try {
-        const dataUrl = await readAsDataUrl(file);
-        addCharacterPicture(id, dataUrl, file.name);
+        const src = await uploadFile(file);
+        addCharacterPicture(id, src, file.name);
       } catch (e) {
         showUploadErr(e.message);
       }
@@ -258,13 +275,49 @@
                           aria-label="Style name"
                           oninput={(e) => onStyleNameInput(character.id, style.id, e)}
                         />
-                        <textarea
-                          class="style-instruct"
-                          rows="2"
-                          placeholder="e.g. calm, whisper, angry, cheerful"
-                          value={style.instruct}
-                          oninput={(e) => onStyleInstructInput(character.id, style.id, e)}
-                        ></textarea>
+                        <div class="style-body">
+                          <textarea
+                            class="style-instruct"
+                            rows="2"
+                            placeholder="e.g. calm, whisper, angry, cheerful"
+                            value={style.instruct}
+                            oninput={(e) => onStyleInstructInput(character.id, style.id, e)}
+                          ></textarea>
+                          <!-- Post-processing effects. Apply to any backend
+                               (Piper included) since they run on the mono PCM
+                               after synthesis. Identity values (0 / 1) skip
+                               the DSP call on the server. -->
+                          <div class="style-effects">
+                            <label class="fx">
+                              <span>Pitch</span>
+                              <input
+                                type="number"
+                                min={STYLE_PITCH_RANGE.min}
+                                max={STYLE_PITCH_RANGE.max}
+                                step={STYLE_PITCH_RANGE.step}
+                                value={style.pitchSemitones}
+                                oninput={(e) => onStylePitchInput(character.id, style.id, e)}
+                                aria-label="Pitch shift in semitones"
+                                title="Pitch shift in semitones (0 = no change)"
+                              />
+                              <span class="unit">st</span>
+                            </label>
+                            <label class="fx">
+                              <span>Speed</span>
+                              <input
+                                type="number"
+                                min={STYLE_TIME_RANGE.min}
+                                max={STYLE_TIME_RANGE.max}
+                                step={STYLE_TIME_RANGE.step}
+                                value={style.timeRatio}
+                                oninput={(e) => onStyleTimeInput(character.id, style.id, e)}
+                                aria-label="Time stretch ratio"
+                                title="Duration multiplier (1 = no change, 2 = twice as long, 0.5 = half)"
+                              />
+                              <span class="unit">×</span>
+                            </label>
+                          </div>
+                        </div>
                         <button
                           type="button"
                           class="style-del"
@@ -503,7 +556,42 @@
   }
   .style-name:focus,
   .style-instruct:focus { outline: none; border-color: var(--accent); }
-  .style-instruct { resize: vertical; }
+  .style-instruct { resize: vertical; width: 100%; }
+
+  .style-body {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    min-width: 0;
+  }
+  .style-effects {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+  .fx {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 11px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  .fx input {
+    width: 70px;
+    background: rgba(0,0,0,0.35);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 4px 6px;
+    font-size: 12px;
+    font-family: inherit;
+    text-transform: none;
+    letter-spacing: normal;
+  }
+  .fx input:focus { outline: none; border-color: var(--accent); }
+  .fx .unit { text-transform: none; letter-spacing: normal; color: var(--muted); }
   .style-del {
     align-self: stretch;
     background: transparent;

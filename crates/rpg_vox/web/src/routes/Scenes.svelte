@@ -1,6 +1,7 @@
 <script>
   import SceneSidebar from '../components/SceneSidebar.svelte';
   import SpeakCell from '../components/SpeakCell.svelte';
+  import { mixScene } from '../lib/api.js';
   import {
     scenesState,
     addLane,
@@ -41,6 +42,11 @@
   // playback). SpeakCell emits `onaudio` after render or hydration.
   let hasAudio = $state({});
 
+  // Per-clip: is the cell currently showing its editing form? Cells with an
+  // open editor are treated as "not yet rendered" for scene-level Play/Render
+  // gating so the user can't accidentally play a stale blob while typing.
+  let editing = $state({});
+
   // Handles the SpeakCell binds on mount so scene playback can drive each
   // cell's own <audio> + progress animation. Value is null while a cell is
   // between mount and its onMount, or after unmount.
@@ -73,6 +79,7 @@
     if (scene) {
       deleteClip(scene.id, clipId);
       delete hasAudio[clipId];
+      delete editing[clipId];
       delete cellPlayers[clipId];
     }
   }
@@ -80,6 +87,11 @@
   function onCellAudio(clipId, payload) {
     if (payload?.blobUrl) hasAudio[clipId] = true;
     else                  delete hasAudio[clipId];
+  }
+
+  function onCellEdit(clipId, isEditing) {
+    if (isEditing) editing[clipId] = true;
+    else           delete editing[clipId];
   }
 
   function onCellBind(clipId, handle) {
@@ -153,8 +165,81 @@
     currentClipId = null;
   }
 
-  const anyPlayable = $derived(
-    scene ? scene.clips.some((c) => hasAudio[c.id]) : false,
+  // ---- Scene render -------------------------------------------------------
+  // Renders every clip in scene order that doesn't already have a cached
+  // blob. Sequential so the user sees each cell's own progress bar animate
+  // in turn (and to avoid blasting the server with N parallel TTS jobs).
+  // Clips with empty text are skipped — the user has to fill them in before
+  // the scene can be fully rendered.
+  let rendering = $state(false);
+  let renderStopRequested = false;
+
+  async function renderScene() {
+    if (!scene) return;
+    if (rendering) { stopRender(); return; }
+    rendering = true;
+    renderStopRequested = false;
+    for (const clip of scene.clips) {
+      if (renderStopRequested) break;
+      const player = cellPlayers[clip.id];
+      if (!player) continue;
+      // Render if the cell has no cached blob yet, or if the user has the
+      // editor open (potentially dirty text). Skip anything that would just
+      // fail with "text is empty".
+      const needsRender = !player.isReady() || editing[clip.id];
+      if (!needsRender) continue;
+      if (!player.hasText?.()) continue;
+      try {
+        await player.render({ autoplay: false });
+      } catch {
+        // Cell surfaces its own error; keep going so one failure doesn't
+        // block the rest of the scene.
+      }
+    }
+    rendering = false;
+  }
+
+  function stopRender() {
+    renderStopRequested = true;
+    rendering = false;
+  }
+
+  // ---- Scene download -----------------------------------------------------
+  // Ask the server to concatenate every rendered clip in this scene into a
+  // single FLAC (with the scene's own pauseMs of silence between clips) and
+  // stream it back as a file download. Only meaningful when every clip is
+  // rendered — the download button shares its visibility gate with Play.
+  let downloading = $state(false);
+  let downloadErr = $state('');
+
+  async function downloadScene() {
+    if (!scene || downloading) return;
+    downloadErr = '';
+    downloading = true;
+    try {
+      const clipIds = scene.clips.map((c) => c.widgetId).filter(Boolean);
+      const { blob, filename } = await mixScene(scene.name, scene.pauseMs ?? 0, clipIds);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      // Give the browser a beat to start the download before we release the URL.
+      setTimeout(() => URL.revokeObjectURL(url), 4000);
+    } catch (e) {
+      downloadErr = e?.message || 'download failed';
+      setTimeout(() => { downloadErr = ''; }, 4000);
+    } finally {
+      downloading = false;
+    }
+  }
+
+  const allRendered = $derived(
+    scene && scene.clips.length > 0
+      ? scene.clips.every((c) => hasAudio[c.id] && !editing[c.id])
+      : false,
   );
 
   // Grid template: each lane is a fixed-width track; row heights auto-fit
@@ -208,6 +293,8 @@
       speaker: character.voice.speaker,
       language: character.voice.language,
       instruct: style.instruct,
+      pitchSemitones: style.pitchSemitones,
+      timeRatio: style.timeRatio,
     };
   }
 
@@ -254,25 +341,59 @@
               {/each}
             </select>
           </label>
-          <button
-            class="play-scene"
-            onclick={playScene}
-            disabled={!anyPlayable && !playing}
-            title={playing ? 'Stop scene' : (anyPlayable ? 'Play whole scene' : 'Render at least one clip first')}
-          >
-            {#if playing}
-              <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><rect x="6" y="6" width="12" height="12" fill="currentColor"/></svg>
-              <span>Stop</span>
-            {:else}
-              <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M8 5v14l11-7z"/></svg>
-              <span>Play scene</span>
-            {/if}
-          </button>
+          {#if !rendering && (allRendered || playing)}
+            <button
+              class="play-scene"
+              onclick={playScene}
+              title={playing ? 'Stop scene' : 'Play whole scene'}
+            >
+              {#if playing}
+                <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><rect x="6" y="6" width="12" height="12" fill="currentColor"/></svg>
+                <span>Stop</span>
+              {:else}
+                <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M8 5v14l11-7z"/></svg>
+                <span>Play scene</span>
+              {/if}
+            </button>
+            <button
+              class="play-scene download"
+              onclick={downloadScene}
+              disabled={downloading || playing}
+              title={downloading ? 'Building FLAC…' : 'Download scene as a single FLAC file'}
+              aria-label="Download scene as FLAC"
+            >
+              {#if downloading}
+                <span class="spinner" aria-hidden="true"></span>
+                <span>Mixing…</span>
+              {:else}
+                <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M5 20h14v-2H5v2zm7-18-5.5 5.5 1.41 1.41L11 6.83V16h2V6.83l3.09 3.08 1.41-1.41z"/></svg>
+                <span>Download</span>
+              {/if}
+            </button>
+          {:else}
+            <button
+              class="play-scene"
+              onclick={renderScene}
+              disabled={scene.clips.length === 0}
+              title={rendering ? 'Stop rendering' : (scene.clips.length === 0 ? 'Add a clip first' : 'Save and render every clip that is not yet rendered or has open edits')}
+            >
+              {#if rendering}
+                <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><rect x="6" y="6" width="12" height="12" fill="currentColor"/></svg>
+                <span>Stop</span>
+              {:else}
+                <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M12 6V3L8 7l4 4V8c3.31 0 6 2.69 6 6s-2.69 6-6 6-6-2.69-6-6H4c0 4.42 3.58 8 8 8s8-3.58 8-8-3.58-8-8-8z"/></svg>
+                <span>Render scene</span>
+              {/if}
+            </button>
+          {/if}
         </div>
       </div>
 
       {#if laneDeleteErr}
         <div class="lane-err">{laneDeleteErr}</div>
+      {/if}
+      {#if downloadErr}
+        <div class="lane-err">{downloadErr}</div>
       {/if}
 
       <div class="scroll">
@@ -328,6 +449,7 @@
                 onchange={(snap) => onCellChange(clip.id, snap)}
                 ondelete={() => onCellDelete(clip.id)}
                 onaudio={(payload) => onCellAudio(clip.id, payload)}
+                onedit={(isEditing) => onCellEdit(clip.id, isEditing)}
                 bindPlayer={(handle) => onCellBind(clip.id, handle)}
               />
             </div>
@@ -438,6 +560,18 @@
   }
   .play-scene:hover:not(:disabled) { background: rgba(122,162,255,0.22); }
   .play-scene:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  /* Small inline spinner for the "Mixing…" state — keeps the download button
+     from resizing when it flips between icon and progress. */
+  .play-scene .spinner {
+    width: 12px;
+    height: 12px;
+    border: 2px solid rgba(122,162,255,0.35);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.7s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
 
   .lane-err {
     font-size: 12px;

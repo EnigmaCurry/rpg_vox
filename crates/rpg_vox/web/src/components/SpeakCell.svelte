@@ -40,6 +40,11 @@
     // scene-level playback to run each cell's own <audio> + progress bar
     // in sequence instead of a shared player.
     bindPlayer = null,
+    // Fired with `true` whenever the cell enters an editing form (fresh
+    // typing, or Edit-clicked on a rendered clip) and `false` when it leaves.
+    // Lets the parent know a cell is holding unsaved input so scene-level
+    // Play/Render buttons can gate on that.
+    onedit = null,
     // Per-clip voice payload forwarded to the server on render:
     // `{ speaker, language, instruct }`. The parent resolves `instruct` from
     // the character's selected style, so this cell no longer edits it.
@@ -125,11 +130,11 @@
   });
 
   // Rehydrate from the server's cached WAV if the parent handed us a
-  // widgetId. The row already carries text/instruct via props (they mirror
-  // the server row through localStorage), so all we need is the audio +
-  // duration/sample-rate metadata. A 404 means the server-side row or WAV
-  // was lost — drop the stale id and drop back to editing so the user can
-  // re-render.
+  // widgetId. The row already carries text/instruct via props (mirrored
+  // through the /state blob the scene store persists), so all we need is
+  // the audio + duration/sample-rate metadata. A 404 means the server-side
+  // row or WAV was lost — drop the stale id and drop back to editing so the
+  // user can re-render.
   onMount(async () => {
     if (!initialWidgetId) return;
     try {
@@ -171,6 +176,17 @@
       retryConfirm = false;
       if (retryTimer) { clearTimeout(retryTimer); retryTimer = 0; }
     }
+  });
+
+  // Notify the parent whenever this cell enters/leaves the editing form so
+  // scene-level Play/Render buttons can treat an open editor as "dirty".
+  let lastEditEmit = null;
+  $effect(() => {
+    if (!onedit) return;
+    const editing = state === 'editing';
+    if (editing === lastEditEmit) return;
+    lastEditEmit = editing;
+    onedit(editing);
   });
 
   // Notify the parent (a Lane, in Scenes context) whenever the persistable
@@ -274,7 +290,7 @@
     rafId = requestAnimationFrame(tickRender);
   }
 
-  async function render() {
+  async function render({ autoplay = true } = {}) {
     const t = text.trim();
     if (!t) { error = 'text is empty'; return; }
     error = '';
@@ -325,9 +341,16 @@
       // tick()` gap also ensures the <audio> element has picked up the new
       // blob URL from Svelte's reactive update before we call .play().
       await tick();
-      setTimeout(() => {
-        if (state === 'rendering') play();
-      }, 180);
+      if (autoplay) {
+        setTimeout(() => {
+          if (state === 'rendering') play();
+        }, 180);
+      } else {
+        // Bulk-render caller doesn't want auto-play. Settle into the collapsed
+        // rendered state so the next cell's render starts from a stable UI.
+        progress = 0;
+        state = 'rendered';
+      }
     } catch (e) {
       cancelRaf();
       state = hasClip ? 'rendered' : 'editing';
@@ -406,6 +429,8 @@
       playToEnd,
       stop: stopExternal,
       isReady: () => !!blobUrl,
+      render,
+      hasText: () => text.trim().length > 0,
     });
   });
   onDestroy(() => {

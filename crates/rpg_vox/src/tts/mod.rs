@@ -40,13 +40,47 @@ pub enum Command {
 
 /// Per-request voice overrides. Any field set to `Some` replaces the
 /// backend's startup default for the duration of one synth call; `None`
-/// falls back to the backend's configured value. Only [`qwen3`] consumes
-/// these — other backends silently ignore.
-#[derive(Debug, Default, Clone)]
+/// falls back to the backend's configured value.
+///
+/// * `speaker`/`language`/`instruct` are TTS-backend inputs. Only [`qwen3`]
+///   consumes them — other backends silently ignore.
+/// * `pitch_semitones` and `time_ratio` are **post-processing** effects
+///   applied to the rendered PCM by [`apply_effects`]. They work with any
+///   backend. `pitch_semitones = 0.0` and `time_ratio = 1.0` are the
+///   identity and short-circuit the pitch/stretch call.
+#[derive(Debug, Clone)]
 pub struct VoiceOverride {
     pub speaker: Option<String>,
     pub language: Option<String>,
     pub instruct: Option<String>,
+    /// Pitch shift in semitones. Positive raises, negative lowers. Range is
+    /// clamped in [`apply_effects`] so a wild value can't blow up the
+    /// timestretch algorithm.
+    pub pitch_semitones: f32,
+    /// Duration multiplier. 1.0 = unchanged, 2.0 = twice as long (slower
+    /// speech), 0.5 = half as long (faster). Independent of pitch.
+    pub time_ratio: f32,
+}
+
+impl Default for VoiceOverride {
+    fn default() -> Self {
+        Self {
+            speaker: None,
+            language: None,
+            instruct: None,
+            pitch_semitones: 0.0,
+            time_ratio: 1.0,
+        }
+    }
+}
+
+impl VoiceOverride {
+    /// True when both effect knobs sit at their identity values — used to
+    /// skip both the buffering and the DSP call on the common no-effect
+    /// path.
+    pub fn has_audio_effect(&self) -> bool {
+        self.pitch_semitones.abs() > f32::EPSILON || (self.time_ratio - 1.0).abs() > f32::EPSILON
+    }
 }
 
 /// One utterance request: the text to speak plus a channel to report the
@@ -152,19 +186,55 @@ async fn handle_say(
         return;
     }
     info!(backend = backend.kind(), chars = text.len(), "generating speech");
-    let mut sink = Sink::new(producer, cfg.target_sample_rate);
-    let result = match backend
-        .synthesize(&text, &voice, &mut sink)
-        .await
-    {
-        Ok(()) => {
-            info!(frames = sink.frames_pushed, "utterance delivered to ring buffer");
-            Ok(sink.frames_pushed)
+
+    // Two shapes for the mic path:
+    //  * No effects — stream the resampled PCM straight into the ringbuf as
+    //    the backend produces it (unchanged from before styles gained
+    //    effects).
+    //  * With effects — capture the full utterance first, run pitch/time
+    //    through timestretch, then push the processed buffer through the
+    //    producer. Adds latency (whole-utterance) but the algorithms need
+    //    the full signal to do a decent job.
+    let result: Result<usize, String> = if voice.has_audio_effect() {
+        let mut sink = Sink::capture_only(cfg.target_sample_rate);
+        match backend.synthesize(&text, &voice, &mut sink).await {
+            Ok(()) => {
+                let (samples, sample_rate) = sink.take_capture();
+                match apply_effects(samples, sample_rate, &voice) {
+                    Ok(processed) => {
+                        let pushed =
+                            push_samples_backpressured(producer, &processed).await;
+                        info!(
+                            frames = pushed,
+                            "utterance (with effects) delivered to ring buffer"
+                        );
+                        Ok(pushed)
+                    }
+                    Err(err) => {
+                        let msg = format!("{err:#}");
+                        error!(err = %msg, "effect processing failed");
+                        Err(msg)
+                    }
+                }
+            }
+            Err(err) => {
+                let msg = format!("{err:#}");
+                error!(err = %msg, "utterance failed");
+                Err(msg)
+            }
         }
-        Err(err) => {
-            let msg = format!("{err:#}");
-            error!(err = %msg, "utterance failed");
-            Err(msg)
+    } else {
+        let mut sink = Sink::new(producer, cfg.target_sample_rate);
+        match backend.synthesize(&text, &voice, &mut sink).await {
+            Ok(()) => {
+                info!(frames = sink.frames_pushed, "utterance delivered to ring buffer");
+                Ok(sink.frames_pushed)
+            }
+            Err(err) => {
+                let msg = format!("{err:#}");
+                error!(err = %msg, "utterance failed");
+                Err(msg)
+            }
         }
     };
     let _ = reply.send(result);
@@ -194,16 +264,25 @@ async fn handle_synthesize(backend: &mut Backend, cfg: &Config, req: SynthesizeR
     {
         Ok(()) => {
             let (samples, sample_rate) = sink.take_capture();
-            info!(
-                samples = samples.len(),
-                sample_rate,
-                duration_ms = (samples.len() as u64 * 1000) / sample_rate.max(1) as u64,
-                "clip synthesized"
-            );
-            Ok(SynthesizeOutcome {
-                samples,
-                sample_rate,
-            })
+            match apply_effects(samples, sample_rate, &voice) {
+                Ok(samples) => {
+                    info!(
+                        samples = samples.len(),
+                        sample_rate,
+                        duration_ms = (samples.len() as u64 * 1000) / sample_rate.max(1) as u64,
+                        "clip synthesized"
+                    );
+                    Ok(SynthesizeOutcome {
+                        samples,
+                        sample_rate,
+                    })
+                }
+                Err(err) => {
+                    let msg = format!("{err:#}");
+                    error!(err = %msg, "effect processing failed");
+                    Err(msg)
+                }
+            }
         }
         Err(err) => {
             let msg = format!("{err:#}");
@@ -212,6 +291,48 @@ async fn handle_synthesize(backend: &mut Backend, cfg: &Config, req: SynthesizeR
         }
     };
     let _ = reply.send(result);
+}
+
+/// Apply per-style pitch shift and/or time stretch to a mono f32 buffer.
+///
+/// Skips the DSP call entirely when both knobs sit at their identity values
+/// so no-effect styles pay no CPU. Order is pitch first (to keep the
+/// spectral envelope closer to the source), then time stretch. Extreme
+/// values are clamped to avoid handing the algorithm something it can't
+/// meaningfully process — a semitone range of ±24 covers character voices
+/// (chipmunk to demon) and a 0.25×–4× time ratio covers the useful
+/// slow/fast range.
+fn apply_effects(
+    samples: Vec<f32>,
+    sample_rate: u32,
+    voice: &VoiceOverride,
+) -> Result<Vec<f32>> {
+    if !voice.has_audio_effect() || samples.is_empty() {
+        return Ok(samples);
+    }
+    let semitones = voice.pitch_semitones.clamp(-24.0, 24.0);
+    let time_ratio = voice.time_ratio.clamp(0.25, 4.0) as f64;
+
+    // Mono in, mono out. `stretch_ratio` on StretchParams governs the
+    // duration multiplier; for pitch_shift we keep it at 1.0 so pitch is
+    // shifted without also stretching time. See docs.rs/timestretch.
+    let mut buf = samples;
+    if semitones.abs() > f32::EPSILON {
+        let factor = 2f64.powf(semitones as f64 / 12.0);
+        let params = timestretch::StretchParams::new(1.0)
+            .with_sample_rate(sample_rate)
+            .with_channels(1);
+        buf = timestretch::pitch_shift(&buf, &params, factor)
+            .map_err(|e| anyhow::anyhow!("pitch_shift: {e}"))?;
+    }
+    if (time_ratio - 1.0).abs() > f64::EPSILON {
+        let params = timestretch::StretchParams::new(time_ratio)
+            .with_sample_rate(sample_rate)
+            .with_channels(1);
+        buf = timestretch::stretch(&buf, &params)
+            .map_err(|e| anyhow::anyhow!("stretch: {e}"))?;
+    }
+    Ok(buf)
 }
 
 /// The resample-and-push side of the pipeline. Backends push PCM here without

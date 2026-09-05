@@ -39,15 +39,24 @@
 // /widgets/{id}; deleting a scene or project cascades DELETE /widgets/{id}
 // for every rendered clip so backend rows and WAV files don't leak. The
 // backend delete is idempotent, so unknown/already-gone ids no-op safely.
-// Uses Svelte 5
-// `$state` (hence the `.svelte.js` extension) so in-place mutations
-// propagate through the reactivity graph without callers needing to do
-// immutable spreads. Persisted to localStorage on every change via a
-// $effect.root so state survives reloads.
+// Character avatars and reference pictures likewise live server-side under
+// /images/{id}; the character record just stores the src URL.
+//
+// Uses Svelte 5 `$state` (hence the `.svelte.js` extension) so in-place
+// mutations propagate through the reactivity graph without callers needing
+// to do immutable spreads.
+//
+// Persistence split:
+//   - projects / scenes / characters   → server (/state, sqlite blob)
+//   - selectedProjectId / selectedSceneId → localStorage (per-browser prefs)
 
-import { deleteWidget } from './api.js';
+import { deleteWidget, deleteImage, getAppState, putAppState } from './api.js';
 
-const STORAGE_KEY = 'rpg-vox:scenes:v1';   // key retained for continuity
+// Per-browser UI selection only. All shared data lives server-side.
+const SELECTION_KEY = 'rpg-vox:selection:v1';
+// PUT /state debounce — high enough that keystroke storms coalesce, low
+// enough that a browser close/refresh soon after a mutation still catches it.
+const STATE_SAVE_DEBOUNCE_MS = 400;
 
 // Fire DELETE /widgets/{id} for every rendered clip in `scene`, concurrently.
 // Idempotent server-side, so a stale id just no-ops. Returns { failed }
@@ -65,6 +74,40 @@ async function cascadeDeleteSceneWidgets(scene) {
     // callers get an aggregate count for user-facing messaging.
     const first = results.find((r) => r.status === 'rejected');
     console.warn('widget cascade delete: some clips failed', first?.reason);
+  }
+  return { failed };
+}
+
+// Extract the image id from a stored src URL. Server-uploaded images live at
+// `/images/{uuid}`; legacy dataURL avatars (`data:image/...`) have no id and
+// don't need a server-side delete. Returns null when the src isn't a
+// server-hosted image (dataURL, absolute URL, empty).
+function imageIdFromSrc(src) {
+  if (typeof src !== 'string') return null;
+  const m = /^\/images\/([^\/?#]+)$/.exec(src);
+  return m ? m[1] : null;
+}
+
+// Fire DELETE /images/{id} for every server-hosted image referenced by a
+// character (avatar + reference pictures). Same fire-and-forget contract as
+// the widget cascade above: local state is removed regardless of server
+// success, so the user isn't blocked by a flaky network.
+async function cascadeDeleteCharacterImages(character) {
+  const ids = new Set();
+  const avatarId = imageIdFromSrc(character?.avatar);
+  if (avatarId) ids.add(avatarId);
+  for (const pic of character?.pictures ?? []) {
+    const pid = imageIdFromSrc(pic?.dataUrl);
+    if (pid) ids.add(pid);
+  }
+  if (ids.size === 0) return { failed: 0 };
+  const results = await Promise.allSettled(
+    Array.from(ids, (id) => deleteImage(id)),
+  );
+  const failed = results.filter((r) => r.status === 'rejected').length;
+  if (failed > 0) {
+    const first = results.find((r) => r.status === 'rejected');
+    console.warn('image cascade delete: some images failed', first?.reason);
   }
   return { failed };
 }
@@ -98,8 +141,20 @@ export const QWEN3_LANGUAGES = [
   'Spanish', 'Japanese', 'Korean', 'French', 'Russian',
 ];
 
+// Effect defaults live here so every place that constructs or sanitizes a
+// style stays in sync. `pitchSemitones = 0` and `timeRatio = 1` are the
+// identity values the server short-circuits on.
+export const STYLE_PITCH_RANGE = { min: -24, max: 24, step: 1 };
+export const STYLE_TIME_RANGE  = { min: 0.25, max: 4, step: 0.05 };
+
 function makeStyle(name = 'default', instruct = '') {
-  return { id: uuid(), name, instruct };
+  return { id: uuid(), name, instruct, pitchSemitones: 0, timeRatio: 1 };
+}
+
+function clampNumber(value, fallback, min, max) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, n));
 }
 
 function defaultVoice() {
@@ -143,113 +198,219 @@ function migrateScene(scene) {
 export const DEFAULT_PAUSE_MS = 300;
 export const PAUSE_OPTIONS = [0, 150, 300, 500, 1000, 2000];
 
-function load() {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return emptyState();
-    const parsed = JSON.parse(raw);
-    if (!parsed || !Array.isArray(parsed.scenes)) return emptyState();
-    for (const scene of parsed.scenes) migrateScene(scene);
+// Apply the same shape sanitization the old localStorage load used to,
+// against a payload from any source (server /state, legacy localStorage
+// blob, or empty). Returns a fully-populated `{ projects, scenes, characters }`
+// with orphan scenes/characters dropped and character sub-fields backfilled.
+// Selection (`selectedProjectId`/`selectedSceneId`) is handled separately.
+function normalizePayload(parsed) {
+  if (!parsed || typeof parsed !== 'object') {
+    return { projects: [], scenes: [], characters: [] };
+  }
+  const rawScenes = Array.isArray(parsed.scenes) ? parsed.scenes : [];
+  for (const scene of rawScenes) migrateScene(scene);
 
-    let projects = Array.isArray(parsed.projects) ? parsed.projects : [];
-    let selectedProjectId = parsed.selectedProjectId ?? null;
+  let projects = Array.isArray(parsed.projects) ? parsed.projects : [];
 
-    // v2 → v3: any scene missing projectId gets adopted by a Default project.
-    const orphans = parsed.scenes.filter((s) => !s.projectId);
-    if (orphans.length > 0) {
-      let defaultProject = projects.find((p) => p.name === 'Default');
-      if (!defaultProject) {
-        defaultProject = { id: uuid(), name: 'Default' };
-        projects.push(defaultProject);
+  // v2 → v3: any scene missing projectId gets adopted by a Default project.
+  const orphans = rawScenes.filter((s) => !s.projectId);
+  if (orphans.length > 0) {
+    let defaultProject = projects.find((p) => p.name === 'Default');
+    if (!defaultProject) {
+      defaultProject = { id: uuid(), name: 'Default' };
+      projects.push(defaultProject);
+    }
+    for (const s of orphans) s.projectId = defaultProject.id;
+  }
+
+  const validProjectIds = new Set(projects.map((p) => p.id));
+  const scenes = rawScenes.filter((s) => validProjectIds.has(s.projectId));
+
+  const rawChars = Array.isArray(parsed.characters) ? parsed.characters : [];
+  const characters = rawChars
+    .filter((c) => c && validProjectIds.has(c.projectId))
+    .map((c) => {
+      // v3: single voice.instruct string → styles = [{id, name:'default', instruct}].
+      // Existing style arrays are kept as-is (sanitized). Empty/missing → seeded
+      // with an empty "default" so the resolver always has something to return.
+      let styles = Array.isArray(c.voice?.styles)
+        ? c.voice.styles
+            .filter((s) => s && typeof s === 'object')
+            .map((s) => ({
+              id: typeof s.id === 'string' ? s.id : uuid(),
+              name: typeof s.name === 'string' && s.name ? s.name : 'unnamed',
+              instruct: typeof s.instruct === 'string' ? s.instruct : '',
+              // Pre-effects styles are missing these — fall back to identity
+              // values so old projects load with no audio changes.
+              pitchSemitones: clampNumber(
+                s.pitchSemitones,
+                0,
+                STYLE_PITCH_RANGE.min,
+                STYLE_PITCH_RANGE.max,
+              ),
+              timeRatio: clampNumber(
+                s.timeRatio,
+                1,
+                STYLE_TIME_RANGE.min,
+                STYLE_TIME_RANGE.max,
+              ),
+            }))
+        : null;
+      if (!styles || styles.length === 0) {
+        styles = [makeStyle('default', c.voice?.instruct ?? '')];
       }
-      for (const s of orphans) s.projectId = defaultProject.id;
-      if (!selectedProjectId) selectedProjectId = defaultProject.id;
-    }
+      return {
+        id: c.id ?? uuid(),
+        projectId: c.projectId,
+        name: c.name ?? 'Unnamed',
+        voice: {
+          speaker: c.voice?.speaker ?? QWEN3_SPEAKERS[0],
+          language: c.voice?.language ?? QWEN3_LANGUAGES[0],
+          styles,
+        },
+        // `avatar` and `pictures[].dataUrl` are img-src strings. New uploads
+        // land as `/images/{id}`; pre-migration values are `data:image/...`.
+        avatar: typeof c.avatar === 'string' ? c.avatar : null,
+        pictures: Array.isArray(c.pictures)
+          ? c.pictures.filter((p) => p && typeof p.dataUrl === 'string').map((p) => ({
+              id: p.id ?? uuid(),
+              dataUrl: p.dataUrl,
+              name: p.name ?? '',
+            }))
+          : [],
+      };
+    });
 
-    // Drop any scene pointing at a project that no longer exists.
-    const validProjectIds = new Set(projects.map((p) => p.id));
-    const scenes = parsed.scenes.filter((s) => validProjectIds.has(s.projectId));
+  return { projects, scenes, characters };
+}
 
-    // Keep selectedProjectId honest.
-    if (selectedProjectId && !validProjectIds.has(selectedProjectId)) {
-      selectedProjectId = projects[0]?.id ?? null;
-    }
-
-    // Keep selectedSceneId honest — must be a scene in the current project.
-    let selectedSceneId = parsed.selectedSceneId ?? null;
-    if (selectedSceneId) {
-      const scene = scenes.find((s) => s.id === selectedSceneId);
-      if (!scene || scene.projectId !== selectedProjectId) selectedSceneId = null;
-    }
-
-    // Characters: drop any pointing at a project that no longer exists, and
-    // backfill missing sub-fields so older sessions load without null checks.
-    let characters = Array.isArray(parsed.characters) ? parsed.characters : [];
-    characters = characters
-      .filter((c) => c && validProjectIds.has(c.projectId))
-      .map((c) => {
-        // v3: single voice.instruct string → styles = [{id, name:'default', instruct}].
-        // Existing style arrays are kept as-is (sanitized). Empty/missing → seeded
-        // with an empty "default" so the resolver always has something to return.
-        let styles = Array.isArray(c.voice?.styles)
-          ? c.voice.styles
-              .filter((s) => s && typeof s === 'object')
-              .map((s) => ({
-                id: typeof s.id === 'string' ? s.id : uuid(),
-                name: typeof s.name === 'string' && s.name ? s.name : 'unnamed',
-                instruct: typeof s.instruct === 'string' ? s.instruct : '',
-              }))
-          : null;
-        if (!styles || styles.length === 0) {
-          styles = [makeStyle('default', c.voice?.instruct ?? '')];
-        }
-        return {
-          id: c.id ?? uuid(),
-          projectId: c.projectId,
-          name: c.name ?? 'Unnamed',
-          voice: {
-            speaker: c.voice?.speaker ?? QWEN3_SPEAKERS[0],
-            language: c.voice?.language ?? QWEN3_LANGUAGES[0],
-            styles,
-          },
-          avatar: typeof c.avatar === 'string' ? c.avatar : null,
-          pictures: Array.isArray(c.pictures)
-            ? c.pictures.filter((p) => p && typeof p.dataUrl === 'string').map((p) => ({
-                id: p.id ?? uuid(),
-                dataUrl: p.dataUrl,
-                name: p.name ?? '',
-              }))
-            : [],
-        };
-      });
-
-    return { projects, selectedProjectId, scenes, selectedSceneId, characters };
+// Read the per-browser UI selection. Separate from the server-side data so
+// two tabs can watch different projects without fighting over /state.
+function loadSelection() {
+  try {
+    const raw = localStorage.getItem(SELECTION_KEY);
+    if (!raw) return { selectedProjectId: null, selectedSceneId: null };
+    const parsed = JSON.parse(raw);
+    return {
+      selectedProjectId: parsed?.selectedProjectId ?? null,
+      selectedSceneId: parsed?.selectedSceneId ?? null,
+    };
   } catch {
-    return emptyState();
+    return { selectedProjectId: null, selectedSceneId: null };
   }
 }
 
 // Single source of truth for the projects + scenes UI. Everything below
 // reads or mutates this object; deep reactivity means callers see updates
 // without wrapping ceremony.
-export const scenesState = $state(load());
+//
+// Starts empty; hydrateFromServer() (kicked off below) fills it in once the
+// GET /state round-trip lands. The UI shows the "no project selected" hint
+// during that brief gap on cold cache.
+export const scenesState = $state({
+  ...emptyState(),
+  ...loadSelection(),
+  // True after hydrateFromServer resolves — components that need to gate
+  // rendering on real data can watch this. Most UI reads flow naturally
+  // (empty arrays render empty).
+  ready: false,
+});
+
+function dataSnapshot() {
+  return JSON.stringify({
+    projects: scenesState.projects,
+    scenes: scenesState.scenes,
+    characters: scenesState.characters,
+  });
+}
+
+// Serialized snapshot of what the server currently holds. Primed with the
+// initial (empty) scenesState so the very first firing of the auto-save
+// effect sees a no-op diff and doesn't race the async hydrate with a
+// spurious "PUT empty state" that would wipe server data. Kept in sync
+// with the server: bumped after each successful PUT and after hydrate.
+let serverSnapshot = dataSnapshot();
+
+async function hydrateFromServer() {
+  let serverState = null;
+  try {
+    serverState = await getAppState();
+  } catch (e) {
+    console.warn('failed to load /state; starting empty', e);
+  }
+  const normalized = normalizePayload(serverState);
+  scenesState.projects = normalized.projects;
+  scenesState.scenes = normalized.scenes;
+  scenesState.characters = normalized.characters;
+
+  // Validate the current selection against what we ended up with — if the
+  // referenced project or scene isn't there anymore, drop back to safe
+  // defaults instead of leaving the user staring at a broken picker.
+  const validProjectIds = new Set(normalized.projects.map((p) => p.id));
+  if (scenesState.selectedProjectId && !validProjectIds.has(scenesState.selectedProjectId)) {
+    scenesState.selectedProjectId = normalized.projects[0]?.id ?? null;
+  }
+  if (scenesState.selectedSceneId) {
+    const scene = normalized.scenes.find((s) => s.id === scenesState.selectedSceneId);
+    if (!scene || scene.projectId !== scenesState.selectedProjectId) {
+      scenesState.selectedSceneId = null;
+    }
+  }
+  scenesState.ready = true;
+
+  // Prime the diff baseline so the auto-save $effect skips the free PUT of
+  // the state we just GET'd back.
+  serverSnapshot = dataSnapshot();
+}
+
+async function saveNow(serialized) {
+  try {
+    await putAppState(JSON.parse(serialized));
+    serverSnapshot = serialized;
+  } catch (e) {
+    console.warn('failed to persist /state', e);
+  }
+}
+
+let saveTimer = 0;
+let pendingSerialized = null;
+function scheduleSave(serialized) {
+  pendingSerialized = serialized;
+  if (saveTimer) clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    saveTimer = 0;
+    const payload = pendingSerialized;
+    pendingSerialized = null;
+    if (payload != null) saveNow(payload);
+  }, STATE_SAVE_DEBOUNCE_MS);
+}
 
 $effect.root(() => {
+  // Server-side data: debounce so a burst of edits sends one PUT, and skip
+  // entirely if the diff against the last-known-server-state is a no-op.
   $effect(() => {
-    try {
-      const snapshot = JSON.stringify({
-        projects: scenesState.projects,
-        selectedProjectId: scenesState.selectedProjectId,
-        scenes: scenesState.scenes,
-        selectedSceneId: scenesState.selectedSceneId,
-        characters: scenesState.characters,
-      });
-      localStorage.setItem(STORAGE_KEY, snapshot);
-    } catch {
-      // localStorage full or blocked — in-memory state still works.
-    }
+    // Explicitly read every slice we care about so Svelte tracks them.
+    void scenesState.projects;
+    void scenesState.scenes;
+    void scenesState.characters;
+    const current = dataSnapshot();
+    if (current === serverSnapshot) return;
+    scheduleSave(current);
+  });
+
+  // Local-only UI selection: write immediately, no network in the loop.
+  $effect(() => {
+    const sel = {
+      selectedProjectId: scenesState.selectedProjectId,
+      selectedSceneId: scenesState.selectedSceneId,
+    };
+    try { localStorage.setItem(SELECTION_KEY, JSON.stringify(sel)); } catch {}
   });
 });
+
+// Kick the hydration once the module loads. Fire-and-forget — components
+// that render before it resolves see the empty seed above.
+hydrateFromServer();
 
 // ---- Project CRUD ----------------------------------------------------------
 
@@ -288,8 +449,13 @@ export async function deleteProject(id) {
   const idx = scenesState.projects.findIndex((p) => p.id === id);
   if (idx < 0) return { failed: 0 };
   const scenesInProject = scenesState.scenes.filter((s) => s.projectId === id);
-  const results = await Promise.all(scenesInProject.map(cascadeDeleteSceneWidgets));
-  const failed = results.reduce((n, r) => n + r.failed, 0);
+  const charsInProject = scenesState.characters.filter((c) => c.projectId === id);
+  const [widgetResults, imageResults] = await Promise.all([
+    Promise.all(scenesInProject.map(cascadeDeleteSceneWidgets)),
+    Promise.all(charsInProject.map(cascadeDeleteCharacterImages)),
+  ]);
+  const failed = widgetResults.reduce((n, r) => n + r.failed, 0)
+               + imageResults.reduce((n, r) => n + r.failed, 0);
   // Re-lookup — state could have shifted while awaiting the network.
   const projectIdx = scenesState.projects.findIndex((p) => p.id === id);
   if (projectIdx >= 0) scenesState.projects.splice(projectIdx, 1);
@@ -487,7 +653,17 @@ export function updateCharacter(id, patch) {
   const character = scenesState.characters.find((c) => c.id === id);
   if (!character) return;
   if (patch.name !== undefined) character.name = patch.name;
-  if (patch.avatar !== undefined) character.avatar = patch.avatar;
+  if (patch.avatar !== undefined) {
+    // Swapping (or clearing) an avatar orphans the previous server-hosted
+    // image — fire the delete in the background. Legacy dataURL avatars
+    // have no image id and skip this branch.
+    const priorId = imageIdFromSrc(character.avatar);
+    const nextId  = imageIdFromSrc(patch.avatar);
+    if (priorId && priorId !== nextId) {
+      deleteImage(priorId).catch((e) => console.warn('avatar image cleanup failed', e));
+    }
+    character.avatar = patch.avatar;
+  }
   if (patch.voice) {
     // Only merge scalar voice fields — style array edits go through the
     // dedicated addCharacterStyle/renameCharacterStyle/setCharacterStyleInstruct
@@ -525,6 +701,31 @@ export function setCharacterStyleInstruct(characterId, styleId, instruct) {
   if (style) style.instruct = instruct;
 }
 
+/** Patch pitch/time on a style. Values outside the allowed range are clamped
+ *  (rather than rejected) so slider drags and typed input both behave. */
+export function setCharacterStyleEffect(characterId, styleId, patch) {
+  const character = scenesState.characters.find((c) => c.id === characterId);
+  if (!character) return;
+  const style = character.voice.styles.find((s) => s.id === styleId);
+  if (!style) return;
+  if (patch.pitchSemitones !== undefined) {
+    style.pitchSemitones = clampNumber(
+      patch.pitchSemitones,
+      0,
+      STYLE_PITCH_RANGE.min,
+      STYLE_PITCH_RANGE.max,
+    );
+  }
+  if (patch.timeRatio !== undefined) {
+    style.timeRatio = clampNumber(
+      patch.timeRatio,
+      1,
+      STYLE_TIME_RANGE.min,
+      STYLE_TIME_RANGE.max,
+    );
+  }
+}
+
 export function deleteCharacterStyle(characterId, styleId) {
   const character = scenesState.characters.find((c) => c.id === characterId);
   if (!character) return { ok: false, reason: 'character not found' };
@@ -541,28 +742,43 @@ export function deleteCharacterStyle(characterId, styleId) {
  * Effective style for a clip: the character-owned style whose id matches
  * `clip.styleId`, or (legacy fallback) a synthetic style carrying the clip's
  * own persisted `instruct` field, or the character's first style. Callers
- * pass a character (may be null); the return is `{ name, instruct }` — id is
- * omitted because the synthetic fallback has none.
+ * pass a character (may be null); the return is
+ * `{ name, instruct, pitchSemitones, timeRatio }` — id is omitted because
+ * the synthetic fallback has none. Fallbacks default to identity effects.
  */
 export function resolveClipStyle(character, clip) {
-  if (!character) return { name: '', instruct: '' };
+  const empty = { name: '', instruct: '', pitchSemitones: 0, timeRatio: 1 };
+  if (!character) return empty;
   const styles = character.voice.styles || [];
+  const pick = (s) => ({
+    name: s.name,
+    instruct: s.instruct,
+    pitchSemitones: Number.isFinite(s.pitchSemitones) ? s.pitchSemitones : 0,
+    timeRatio:      Number.isFinite(s.timeRatio)      ? s.timeRatio      : 1,
+  });
   if (clip?.styleId) {
     const match = styles.find((s) => s.id === clip.styleId);
-    if (match) return { name: match.name, instruct: match.instruct };
+    if (match) return pick(match);
   }
   // Pre-styles clips may still carry a per-clip instruct override. Honor it
   // so old scenes replay identically until the user re-picks a style.
   if (!clip?.styleId && typeof clip?.instruct === 'string' && clip.instruct !== '') {
-    return { name: '', instruct: clip.instruct };
+    return { ...empty, instruct: clip.instruct };
   }
   const first = styles[0];
-  return first ? { name: first.name, instruct: first.instruct } : { name: '', instruct: '' };
+  return first ? pick(first) : empty;
 }
 
 export function deleteCharacter(id) {
   const idx = scenesState.characters.findIndex((c) => c.id === id);
-  if (idx >= 0) scenesState.characters.splice(idx, 1);
+  if (idx < 0) return;
+  const character = scenesState.characters[idx];
+  // Fire the image cascade in the background so the UI removal doesn't
+  // block on the network — the DELETE is idempotent on the server.
+  cascadeDeleteCharacterImages(character).catch((e) =>
+    console.warn('character image cleanup failed', e),
+  );
+  scenesState.characters.splice(idx, 1);
 }
 
 export function addCharacterPicture(id, dataUrl, name = '') {
@@ -575,7 +791,13 @@ export function removeCharacterPicture(characterId, pictureId) {
   const character = scenesState.characters.find((c) => c.id === characterId);
   if (!character) return;
   const idx = character.pictures.findIndex((p) => p.id === pictureId);
-  if (idx >= 0) character.pictures.splice(idx, 1);
+  if (idx < 0) return;
+  const picture = character.pictures[idx];
+  const imageId = imageIdFromSrc(picture?.dataUrl);
+  if (imageId) {
+    deleteImage(imageId).catch((e) => console.warn('picture image cleanup failed', e));
+  }
+  character.pictures.splice(idx, 1);
 }
 
 export function currentProjectCharacters() {
