@@ -9,6 +9,14 @@
   let status = $state({ text: '', kind: '' });
   let saving = $state(0); // in-flight count so the status can show 'saving…'
 
+  // External Stream/Output/Audio producers visible in the pw graph
+  // (browser tabs, media players, etc.). Populated from /pw/graph and
+  // refreshed on a slow cadence — the graph doesn't churn, and every
+  // route/unroute action refreshes it immediately anyway.
+  let sources = $state([]);
+  let graphTimer = null;
+  const GRAPH_POLL_MS = 2000;
+
   // VU levels — one entry per strip plus master L/R. Fresh peak (from the
   // most recent poll) drives the bar height; peak-hold decays slowly so
   // brief transients stay visible.
@@ -53,9 +61,55 @@
     // /mixer/levels endpoint is independent of the settings snapshot and
     // will start reporting audio the moment it flows.
     startLevelPoll();
+    refreshSources();
+    graphTimer = setInterval(refreshSources, GRAPH_POLL_MS);
   });
 
-  onDestroy(() => stopLevelPoll());
+  onDestroy(() => {
+    stopLevelPoll();
+    if (graphTimer) { clearInterval(graphTimer); graphTimer = null; }
+  });
+
+  async function refreshSources() {
+    try {
+      const g = await api.getGraph();
+      sources = g.sources || [];
+    } catch {
+      // Silent — the mixer status strip already surfaces the health dot's
+      // signal, and this poll is best-effort.
+    }
+  }
+
+  async function routeSource(id, target) {
+    try {
+      await api.linkSource(id, target);
+      status = { text: '', kind: '' };
+    } catch (e) {
+      status = { text: `route failed: ${e.message}`, kind: 'err' };
+    }
+    await refreshSources();
+  }
+
+  async function unrouteSource(id) {
+    try {
+      await api.unlinkSource(id);
+      status = { text: '', kind: '' };
+    } catch (e) {
+      status = { text: `unroute failed: ${e.message}`, kind: 'err' };
+    }
+    await refreshSources();
+  }
+
+  // Display label for a source row. `media.name` is what distinguishes
+  // sibling nodes with the same `application.name` (three Firefox tabs
+  // each labelled with their page title). Fall back through what's
+  // available so nothing renders as a blank row.
+  function sourceLabel(s) {
+    return s.media_name || s.name || `#${s.id}`;
+  }
+  function sourceApp(s) {
+    return s.application_name || s.name || 'audio';
+  }
 
   function startLevelPoll() {
     if (levelTimer) return;
@@ -294,6 +348,62 @@
     </div>
   {/if}
 
+  <div class="sources">
+    <div class="sources-header">
+      <h2>Sources</h2>
+      <div class="hint">
+        route an audio-producing app (browser tab, media player…) into
+        Music or Vox. Default = leave the app's existing pipewire
+        connection (usually your default output) untouched.
+      </div>
+    </div>
+    {#if sources.length === 0}
+      <div class="empty">no external audio producers currently in the graph</div>
+    {:else}
+      <ul class="source-list">
+        {#each sources as s (s.id)}
+          <li class="source-row" class:routed={s.routed_to}>
+            <div class="source-meta">
+              <div class="source-app">{sourceApp(s)}</div>
+              <div class="source-title" title={sourceLabel(s)}>{sourceLabel(s)}</div>
+            </div>
+            <!-- Three-state segmented toggle. `routed_to === null` (i.e.
+                 no link created by rpg_vox for this source) is rendered as
+                 Default — meaning the source keeps whatever pipewire route
+                 the session manager gave it (typically the default sink). -->
+            <div class="source-actions" role="radiogroup" aria-label="{sourceLabel(s)} routing">
+              <button
+                type="button"
+                class="route-btn"
+                class:active={s.routed_to === 'music'}
+                onclick={() => routeSource(s.id, 'music')}
+                role="radio"
+                aria-checked={s.routed_to === 'music'}
+              >Music</button>
+              <button
+                type="button"
+                class="route-btn"
+                class:active={s.routed_to === 'vox'}
+                onclick={() => routeSource(s.id, 'vox')}
+                role="radio"
+                aria-checked={s.routed_to === 'vox'}
+              >Vox</button>
+              <button
+                type="button"
+                class="route-btn"
+                class:active={!s.routed_to}
+                onclick={() => unrouteSource(s.id)}
+                role="radio"
+                aria-checked={!s.routed_to}
+                title="drop rpg_vox's routing link; app keeps its default connection"
+              >Default</button>
+            </div>
+          </li>
+        {/each}
+      </ul>
+    {/if}
+  </div>
+
   <div class="status {status.kind}">{status.text}</div>
 </div>
 
@@ -301,7 +411,95 @@
   .mixer { display: flex; flex-direction: column; gap: 16px; padding: 20px; max-width: 900px; margin: 0 auto; }
   .header { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
   h1 { font-size: 20px; margin: 0; }
+  h2 { font-size: 14px; margin: 0; font-weight: 600; letter-spacing: 0.02em; }
   .hint { color: var(--muted); font-size: 12px; }
+
+  .sources {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .sources-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+  .empty {
+    color: var(--muted);
+    font-size: 12px;
+    padding: 6px 0;
+  }
+  .source-list {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .source-row {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    align-items: center;
+    gap: 12px;
+    padding: 8px 10px;
+    border-radius: 6px;
+    background: rgba(0,0,0,0.15);
+    border: 1px solid var(--border);
+    transition: border-color 0.15s;
+  }
+  .source-row.routed { border-color: rgba(122,162,255,0.5); }
+  .source-meta { min-width: 0; }
+  .source-app {
+    font-size: 11px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  .source-title {
+    font-size: 13px;
+    font-weight: 500;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  /* Segmented control: three flush buttons that visually read as one
+     tri-state toggle. Only outer corners are rounded; inner borders
+     collapse so the active pill looks continuous. */
+  .source-actions {
+    display: flex;
+    flex-shrink: 0;
+    border-radius: 4px;
+    overflow: hidden;
+  }
+  .route-btn {
+    background: transparent;
+    color: var(--text);
+    border: 1px solid var(--border);
+    padding: 4px 12px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    cursor: pointer;
+    min-width: 62px;
+    border-radius: 0;
+    margin-left: -1px;
+  }
+  .route-btn:first-child { margin-left: 0; border-top-left-radius: 4px; border-bottom-left-radius: 4px; }
+  .route-btn:last-child  { border-top-right-radius: 4px; border-bottom-right-radius: 4px; }
+  .route-btn:hover:not(:disabled) { background: rgba(255,255,255,0.05); }
+  .route-btn.active {
+    background: rgba(122,162,255,0.2);
+    border-color: rgba(122,162,255,0.6);
+    color: var(--text);
+    z-index: 1;
+  }
 
   .board {
     display: grid;

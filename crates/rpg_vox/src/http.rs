@@ -59,7 +59,7 @@ use std::sync::Arc;
 use crate::chat;
 use crate::mixer::{AtomicMixer, MixerPatch};
 use crate::monitor;
-use crate::pw_source::{GraphSnapshot, PwClient};
+use crate::pw_source::{GraphSnapshot, PwClient, SinkRole};
 use crate::settings::{self, SettingsUpdate};
 use crate::store::{Store, UpdateResult};
 use tokio::sync::broadcast;
@@ -206,6 +206,14 @@ pub async fn serve(
             "/pw/monitor",
             post(monitor_start_handler).delete(monitor_stop_handler),
         )
+        .route(
+            "/pw/sources/:id/link",
+            post(link_source_handler),
+        )
+        .route(
+            "/pw/sources/:id/unlink",
+            post(unlink_source_handler),
+        )
         .route("/mixer", get(get_mixer).put(put_mixer))
         .route("/mixer/levels", get(get_mixer_levels))
         .route("/settings", get(get_settings).post(update_settings))
@@ -314,6 +322,65 @@ async fn monitor_stop_handler(State(state): State<AppState>) -> impl IntoRespons
                 ok: true,
                 error: None,
             }),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ActionResponse {
+                ok: false,
+                error: Some(err),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct LinkSourceBody {
+    /// "music" or "vox" — the companion sink to route this producer into.
+    target: String,
+}
+
+async fn link_source_handler(
+    State(state): State<AppState>,
+    Path(id): Path<u32>,
+    Json(body): Json<LinkSourceBody>,
+) -> impl IntoResponse {
+    let Some(role) = SinkRole::from_str(&body.target) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ActionResponse {
+                ok: false,
+                error: Some(format!("unknown target `{}` (expected \"music\" or \"vox\")", body.target)),
+            }),
+        )
+            .into_response();
+    };
+    match state.pw.link_source(id, role).await {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(ActionResponse { ok: true, error: None }),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(ActionResponse {
+                ok: false,
+                error: Some(err),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn unlink_source_handler(
+    State(state): State<AppState>,
+    Path(id): Path<u32>,
+) -> impl IntoResponse {
+    match state.pw.unlink_source(id).await {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(ActionResponse { ok: true, error: None }),
         )
             .into_response(),
         Err(err) => (

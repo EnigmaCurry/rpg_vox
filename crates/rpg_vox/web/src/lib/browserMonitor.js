@@ -22,8 +22,24 @@ const OPUS_SAMPLE_RATE = 48000;
 const FRAME_DURATION_US = 20_000; // 20 ms per Opus frame the server sends
 const PREF_KEY = 'rpg_vox.browser_monitor';
 
+// Distinctive title the monitor plants on its own `<audio>` element.
+// Firefox (and other pipewire-pulse-backed browsers) propagate the element's
+// `title` attribute to the pipewire node's `media.name`, which lets the
+// server exclude our own monitor stream from the Mixer's Sources list —
+// otherwise it would sit there begging to be routed into rpg_vox and cause
+// an instant feedback loop. Keep in sync with the constant of the same
+// intent in `crates/rpg_vox/src/pw_source.rs` (BROWSER_MONITOR_STREAM_TITLE).
+const MONITOR_STREAM_TITLE = 'rpg-vox-browser-monitor';
+
 let ctx = null;
 let node = null;
+// Sink node that ferries the AudioWorklet's stereo output into a MediaStream
+// so we can play it via an `<audio>` element whose `title` we control. This
+// replaces the old direct `node.connect(ctx.destination)` route — the direct
+// path produced a pipewire node called "AudioStream" that couldn't be told
+// apart from any other Web Audio stream.
+let mediaSink = null;
+let audioEl = null;
 let ws = null;
 let decoder = null;
 // Monotonic per-frame timestamp for EncodedAudioChunk. AudioDecoder needs
@@ -145,6 +161,15 @@ function installGestureListener(kind) {
     try {
       if (kind === 'resume' && ctx) {
         await ctx.resume();
+        // The <audio> element that holds the pipewire node's identity is
+        // subject to the same autoplay wall as the AudioContext. Resume it
+        // in step so the monitor is actually audible after the gesture, not
+        // just running invisibly on the graph.
+        if (audioEl) {
+          try { await audioEl.play(); } catch (e) {
+            console.warn('[monitor] audio.play() after gesture failed', e);
+          }
+        }
         // Promote state from 'awaiting-gesture' → 'listening' now that
         // the context is really running. The WS `open` handler may have
         // set 'awaiting-gesture'; do it here so the streaming indicator
@@ -219,7 +244,25 @@ export async function start(statusCb) {
       numberOfOutputs: 1,
       outputChannelCount: [2],
     });
-    node.connect(ctx.destination);
+    // Route through a MediaStream + `<audio>` element (with an explicit
+    // `title`) instead of `ctx.destination`. See MONITOR_STREAM_TITLE above.
+    // The <audio> is kept in the DOM (display: none) because some browsers
+    // won't create an audio track for a detached element; still safe to
+    // hide visually since the pipewire node's identity depends on its
+    // title, not on visibility.
+    mediaSink = ctx.createMediaStreamDestination();
+    node.connect(mediaSink);
+    audioEl = document.createElement('audio');
+    audioEl.title = MONITOR_STREAM_TITLE;
+    audioEl.autoplay = true;
+    audioEl.srcObject = mediaSink.stream;
+    audioEl.style.display = 'none';
+    document.body.appendChild(audioEl);
+    // Fire and forget — .play() rejects with NotAllowedError before the
+    // first user gesture in most browsers. That's the same autoplay-policy
+    // wall as ctx.resume(); the same gesture unlocks both, and the gesture
+    // listener installed by restoreFromPref will retry both.
+    audioEl.play().catch(() => {});
 
     nextTsUs = 0;
     decoder = new AudioDecoder({
@@ -315,6 +358,21 @@ export async function stop() {
   if (node) {
     try { node.disconnect(); } catch {}
     node = null;
+  }
+  // Tear the audio element down before closing the context — pausing it and
+  // clearing srcObject lets Firefox release the pipewire node instead of
+  // leaving a lingering "rpg-vox-browser-monitor" stream in the graph. Both
+  // failure modes are handled defensively; DOM removal in particular can
+  // throw if the element was never attached (partial start()).
+  if (audioEl) {
+    try { audioEl.pause(); } catch {}
+    try { audioEl.srcObject = null; } catch {}
+    try { audioEl.remove(); } catch {}
+    audioEl = null;
+  }
+  if (mediaSink) {
+    try { mediaSink.disconnect(); } catch {}
+    mediaSink = null;
   }
   if (ctx) {
     try { await ctx.close(); } catch {}

@@ -211,6 +211,35 @@ export const stopMonitor    = async ()        => {
   return { ok: r.ok && parsed?.ok !== false, body: parsed };
 };
 
+// Route an external Stream/Output/Audio node (e.g. a Firefox tab) into
+// our music or vox companion sink. `target` is "music" or "vox".
+// Server drops any prior link set for the same source before making the
+// new one, so calling `linkSource(id, "vox")` after `linkSource(id, "music")`
+// safely retargets rather than double-feeding.
+export async function linkSource(id, target) {
+  const r = await fetch(`/pw/sources/${encodeURIComponent(id)}/link`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ target }),
+  });
+  const parsed = await r.json().catch(() => null);
+  if (!r.ok || parsed?.ok === false) {
+    throw new Error(parsed?.error || `HTTP ${r.status}`);
+  }
+}
+
+// Drop the link set (if any) we previously created for this source.
+// Idempotent: unrouted sources succeed silently.
+export async function unlinkSource(id) {
+  const r = await fetch(`/pw/sources/${encodeURIComponent(id)}/unlink`, {
+    method: 'POST',
+  });
+  const parsed = await r.json().catch(() => null);
+  if (!r.ok || parsed?.ok === false) {
+    throw new Error(parsed?.error || `HTTP ${r.status}`);
+  }
+}
+
 // --- Mixer ----------------------------------------------------------------
 //
 // GET /mixer      → full MixerState snapshot ({ tts, music, vox, master }).

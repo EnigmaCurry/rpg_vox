@@ -55,6 +55,8 @@ use pw::{
     core::Core,
     keys,
     main_loop::MainLoop,
+    metadata::{Metadata, MetadataListener},
+    node::{Node as PwNode, NodeListener},
     properties::properties,
     registry::{GlobalObject, Registry},
     stream::{Stream, StreamFlags},
@@ -74,6 +76,18 @@ use libspa::{
 /// Channel count offered to PipeWire. Mono TTS gets fanned out to L=R here so
 /// downstream FX / panning always operate on a stereo pair.
 const SOURCE_CHANNELS: u32 = 2;
+
+/// Marker string embedded (via zero-width spaces) in the SPA's
+/// `<title>` element. Firefox propagates `document.title` to the pipewire
+/// node's `media.name` for streams a page creates (Web Audio, MediaStream),
+/// so any pipewire stream whose media.name *contains* this substring is
+/// coming from our own Mixer tab and would produce an immediate feedback
+/// loop if routed into the mix. We match by substring rather than
+/// equality because the marker sits alongside the user-visible title.
+///
+/// Keep in sync with the `<title>` in
+/// `crates/rpg_vox/web/index.html`.
+const BROWSER_MONITOR_STREAM_TITLE: &str = "rpg-vox-browser-monitor";
 /// Stereo input on the companion sink node. Matches [`SOURCE_CHANNELS`] so
 /// eventual mix-into-output paths don't need channel-count coercion.
 const SINK_CHANNELS: u32 = 2;
@@ -85,7 +99,7 @@ const SINK_CHANNELS: u32 = 2;
 /// recording, etc.). Nodes always exist even with nothing connected —
 /// leaving them idle is cheap.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum SinkRole {
+pub enum SinkRole {
     /// PA passthrough — downmix stereo to mono, push into the input ring,
     /// summed with TTS in the source callback.
     Music,
@@ -95,7 +109,7 @@ enum SinkRole {
 }
 
 impl SinkRole {
-    fn suffix(self) -> &'static str {
+    pub fn suffix(self) -> &'static str {
         match self {
             Self::Music => "music",
             Self::Vox => "vox",
@@ -111,6 +125,13 @@ impl SinkRole {
         match self {
             Self::Music => "Music",
             Self::Vox => "Communication",
+        }
+    }
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "music" => Some(Self::Music),
+            "vox" => Some(Self::Vox),
+            _ => None,
         }
     }
 }
@@ -147,6 +168,36 @@ pub struct NodeInfo {
     pub description: String,
 }
 
+/// One `Stream/Output/Audio` node visible in the graph — an app that's
+/// producing audio (a browser tab, a media player, etc.). Split off from
+/// [`NodeInfo`] so the client can render app + per-stream title separately
+/// (crucial when three "Firefox" nodes exist for three different tabs).
+#[derive(Clone, Debug, Serialize)]
+pub struct SourceInfo {
+    pub id: u32,
+    /// `node.name` — usually the app's own tag ("Firefox", "mpv"), often
+    /// non-unique across the graph.
+    pub name: String,
+    /// `application.name` — human-readable app label. Preferred over `name`
+    /// in the UI. Absent for a few oddball producers.
+    pub application_name: Option<String>,
+    /// `media.name` — per-stream label the app sets. For Firefox this is
+    /// the tab title; for mpv it's the file name; for random WebRTC
+    /// streams it's often just "AudioStream".
+    pub media_name: Option<String>,
+    /// `application.icon-name` — freedesktop icon key if the app set one.
+    pub icon_name: Option<String>,
+    /// `application.process.id` — pid of the producing app, when known.
+    /// Handy for grouping streams that all come from the same browser
+    /// process in the UI.
+    pub pid: Option<u32>,
+    /// Which of our companion sinks (if any) this source is currently
+    /// linked to *by us*. Not populated for links that already existed in
+    /// the graph before our routing controls touched them; the UI treats
+    /// "not routed by us" as a clean slate.
+    pub routed_to: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct GraphSnapshot {
     pub own_node_id: Option<u32>,
@@ -158,6 +209,10 @@ pub struct GraphSnapshot {
     /// peer restarts (whereas `auto_patch_sink_id` clears while the peer
     /// is gone).
     pub auto_patch_target: Option<String>,
+    /// External `Stream/Output/Audio` producers currently visible in the
+    /// graph. The Mixer UI lists these so the user can pick which
+    /// same-named tab (e.g. Firefox) to route into which companion sink.
+    pub sources: Vec<SourceInfo>,
 }
 
 pub enum Command {
@@ -171,6 +226,21 @@ pub enum Command {
     },
     StartAutoPatch {
         sink_id: u32,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    /// Link an external `Stream/Output/Audio` node into one of our
+    /// companion sinks. If the source was already routed by us to a
+    /// different (or the same) sink, the previous link set is dropped
+    /// first so we don't double-feed the mix.
+    LinkSourceToSink {
+        source_id: u32,
+        target: SinkRole,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    /// Drop the link set (if any) that we previously created for this
+    /// source. Idempotent: unrouted sources return Ok(()).
+    UnlinkSource {
+        source_id: u32,
         reply: oneshot::Sender<Result<(), String>>,
     },
 }
@@ -213,6 +283,29 @@ impl PwClient {
         self.tx
             .send(Command::StartAutoPatch {
                 sink_id,
+                reply: tx,
+            })
+            .map_err(|_| "pw thread gone".to_string())?;
+        rx.await.map_err(|_| "pw thread dropped reply".to_string())?
+    }
+
+    pub async fn link_source(&self, source_id: u32, target: SinkRole) -> Result<(), String> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(Command::LinkSourceToSink {
+                source_id,
+                target,
+                reply: tx,
+            })
+            .map_err(|_| "pw thread gone".to_string())?;
+        rx.await.map_err(|_| "pw thread dropped reply".to_string())?
+    }
+
+    pub async fn unlink_source(&self, source_id: u32) -> Result<(), String> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(Command::UnlinkSource {
+                source_id,
                 reply: tx,
             })
             .map_err(|_| "pw thread gone".to_string())?;
@@ -273,12 +366,72 @@ struct Graph {
     auto_patch: Option<ActiveLinkSet>,
     /// Configured auto-patch target `node.name`, if any. Set once on startup.
     auto_patch_target: Option<String>,
+    /// `node.name` of our companion `-music` sink. Set once on startup so
+    /// we can look up its id in `nodes` at link time (it appears whenever
+    /// the sink stream registers).
+    music_sink_name: String,
+    /// `node.name` of our companion `-vox` sink. Same as above.
+    vox_sink_name: String,
+    /// External producer sources that the user has routed into one of our
+    /// companion sinks via the Mixer UI. Keyed by the source's node id.
+    /// The routing itself is performed by WirePlumber in response to
+    /// `target.object` metadata writes (see `default_metadata`); this map
+    /// is our local mirror of "which sources we told WP to route where"
+    /// so the Sources snapshot can report `routed_to` back to the client.
+    /// It is *not* the source of truth for the graph — WP is.
+    /// Cleaned up in `on_global_remove` when the source disappears.
+    routed_sources: HashMap<u32, RoutedSource>,
+    /// Bound proxy for the `default` metadata object. Owning this proxy
+    /// keeps the connection open so `set_property` writes actually apply.
+    /// `None` while pipewire hasn't announced the metadata yet — routing
+    /// commands issued before that fail with a clear error, but in
+    /// practice WP is up before we finish enumerating the registry.
+    default_metadata: Option<Metadata>,
+    /// Listener on the `default` metadata. We only need it kept alive so
+    /// the proxy stays subscribed; we don't currently react to WP-side
+    /// property changes (a future refinement could reconcile
+    /// `routed_sources` when an external tool touches the metadata).
+    _default_metadata_listener: Option<MetadataListener>,
+    /// Bound `Node` proxies for the producer streams we care about. The
+    /// initial registry `global` dict only carries a subset of a node's
+    /// properties (`application.name`, `node.name`, `media.class` — but
+    /// *not* `media.name`, which is what distinguishes sibling Firefox
+    /// tabs). Binding a proxy lets us subscribe to `info` events, which
+    /// deliver the full props dict — we merge those into the TrackedNode
+    /// so the Mixer's Sources panel can label rows by tab title.
+    ///
+    /// Both the proxy and its listener must stay alive; dropping either
+    /// severs the subscription. Cleaned up in `on_global_remove`.
+    bound_nodes: HashMap<u32, BoundNode>,
 }
 
 struct TrackedNode {
     name: String,
     description: String,
     media_class: String,
+    application_name: Option<String>,
+    media_name: Option<String>,
+    icon_name: Option<String>,
+    pid: Option<u32>,
+    /// `object.serial` — a per-session stable id that survives node
+    /// renames but is regenerated on process restart. Required as the
+    /// value of the `target.object` metadata key when we want
+    /// WirePlumber to route into one of our sinks (WP's linking policy
+    /// only respects that key when the value is typed as `Spa:Id` and
+    /// carries the target's serial, not its node id or name).
+    object_serial: Option<u32>,
+}
+
+struct RoutedSource {
+    target: SinkRole,
+}
+
+struct BoundNode {
+    /// The bound Node proxy. Held to keep the server-side binding alive
+    /// so `info` events keep flowing.
+    _proxy: PwNode,
+    /// The info listener. Dropping this removes the callback registration.
+    _listener: NodeListener,
 }
 
 struct TrackedPort {
@@ -304,17 +457,6 @@ struct ActiveLinkSet {
 }
 
 impl Graph {
-    fn our_output_port_ids(&self) -> Vec<u32> {
-        let Some(own) = self.own_node_id else {
-            return vec![];
-        };
-        self.ports
-            .iter()
-            .filter(|(_, p)| p.node_id == own && p.direction == PortDirection::Output)
-            .map(|(id, _)| *id)
-            .collect()
-    }
-
     fn sink_input_port_ids(&self, sink_id: u32) -> Vec<u32> {
         self.ports
             .iter()
@@ -358,6 +500,48 @@ impl Graph {
             listeners.sort_by(|a, b| a.description.cmp(&b.description));
         }
 
+        let mut sources: Vec<SourceInfo> = self
+            .nodes
+            .iter()
+            .filter(|(_, n)| n.media_class == "Stream/Output/Audio")
+            // Hide our own browser monitor. Firefox uses document.title as
+            // the pipewire stream's media.name, so we match a substring
+            // marker planted in the SPA's <title> (see index.html).
+            .filter(|(_, n)| {
+                !n.media_name
+                    .as_deref()
+                    .is_some_and(|m| m.contains(BROWSER_MONITOR_STREAM_TITLE))
+            })
+            .map(|(id, n)| SourceInfo {
+                id: *id,
+                name: n.name.clone(),
+                application_name: n.application_name.clone(),
+                media_name: n.media_name.clone(),
+                icon_name: n.icon_name.clone(),
+                pid: n.pid,
+                routed_to: self
+                    .routed_sources
+                    .get(id)
+                    .map(|r| r.target.suffix().to_string()),
+            })
+            .collect();
+        // Group by app name so all Firefox tabs cluster together, then by
+        // media.name so the order is stable across polls (falls back to
+        // node id when both are absent — rare, but keeps ordering total).
+        sources.sort_by(|a, b| {
+            a.application_name
+                .as_deref()
+                .unwrap_or(&a.name)
+                .cmp(b.application_name.as_deref().unwrap_or(&b.name))
+                .then_with(|| {
+                    a.media_name
+                        .as_deref()
+                        .unwrap_or("")
+                        .cmp(b.media_name.as_deref().unwrap_or(""))
+                })
+                .then(a.id.cmp(&b.id))
+        });
+
         GraphSnapshot {
             own_node_id: self.own_node_id,
             sinks,
@@ -365,8 +549,13 @@ impl Graph {
             monitor_sink_id: self.monitor.as_ref().map(|m| m.sink_id),
             auto_patch_sink_id: self.auto_patch.as_ref().map(|p| p.sink_id),
             auto_patch_target: self.auto_patch_target.clone(),
+            sources,
         }
     }
+
+    // (No sink-id lookup helper needed anymore — metadata-based routing
+    // uses the sink's node.name directly, which is stable across
+    // process restarts and doesn't require resolving to a live node id.)
 }
 
 // -----------------------------------------------------------------------------
@@ -377,7 +566,11 @@ fn dict_get<'a>(props: Option<&'a DictRef>, key: &str) -> Option<&'a str> {
     props.and_then(|d| d.get(key))
 }
 
-fn on_global(graph: &Rc<RefCell<Graph>>, obj: &GlobalObject<&DictRef>) {
+fn on_global(
+    graph: &Rc<RefCell<Graph>>,
+    registry: &Rc<Registry>,
+    obj: &GlobalObject<&DictRef>,
+) {
     let id = obj.id;
     match obj.type_ {
         ObjectType::Node => {
@@ -386,14 +579,61 @@ fn on_global(graph: &Rc<RefCell<Graph>>, obj: &GlobalObject<&DictRef>) {
             let description = dict_get(obj.props, *keys::NODE_DESCRIPTION)
                 .unwrap_or(&name)
                 .to_string();
+            // Optional metadata used by the Mixer's Sources panel to
+            // disambiguate same-named nodes (three "Firefox" tabs, etc.).
+            // The initial global carries `application.name` but not
+            // `media.name` — the latter arrives on the node's info event
+            // once we bind (see below).
+            let application_name = dict_get(obj.props, "application.name").map(str::to_string);
+            let media_name = dict_get(obj.props, "media.name").map(str::to_string);
+            let icon_name = dict_get(obj.props, "application.icon-name").map(str::to_string);
+            let pid = dict_get(obj.props, "application.process.id")
+                .and_then(|s| s.parse::<u32>().ok());
+            // `object.serial` is present in the initial global for every
+            // node; capture it here so we can hand it to WP's
+            // `target.object` metadata later without needing to bind and
+            // wait for an info event.
+            let object_serial = dict_get(obj.props, "object.serial")
+                .and_then(|s| s.parse::<u32>().ok());
+            let should_bind = media_class == "Stream/Output/Audio";
             graph.borrow_mut().nodes.insert(
                 id,
                 TrackedNode {
                     name,
                     description,
                     media_class,
+                    application_name,
+                    media_name,
+                    icon_name,
+                    pid,
+                    object_serial,
                 },
             );
+            if should_bind {
+                // Bind a proxy so we can subscribe to the node's info
+                // events, which carry the full property dict (media.name
+                // in particular). Silently ignore bind failures — nodes
+                // occasionally disappear between announcement and bind,
+                // and the initial-dict fields are usable on their own.
+                if let Ok(proxy) = registry.bind::<PwNode, _>(obj) {
+                    let graph_for_info = graph.clone();
+                    let listener = proxy
+                        .add_listener_local()
+                        .info(move |info| {
+                            if let Some(props) = info.props() {
+                                merge_node_info(&graph_for_info, id, props);
+                            }
+                        })
+                        .register();
+                    graph.borrow_mut().bound_nodes.insert(
+                        id,
+                        BoundNode {
+                            _proxy: proxy,
+                            _listener: listener,
+                        },
+                    );
+                }
+            }
         }
         ObjectType::Port => {
             let node_id = dict_get(obj.props, "node.id")
@@ -426,6 +666,24 @@ fn on_global(graph: &Rc<RefCell<Graph>>, obj: &GlobalObject<&DictRef>) {
                 );
             }
         }
+        ObjectType::Metadata => {
+            // Bind the `default` metadata object so we can write
+            // `target.object` on it to drive WirePlumber's routing. Other
+            // metadata objects (settings, sm-settings, ...) are ignored.
+            if dict_get(obj.props, "metadata.name") == Some("default")
+                && graph.borrow().default_metadata.is_none()
+            {
+                if let Ok(proxy) = registry.bind::<Metadata, _>(obj) {
+                    // Keep an (unused) empty listener registered so the
+                    // proxy has a hook installed; some session managers
+                    // consider a proxy without a listener as inactive.
+                    let listener = proxy.add_listener_local().register();
+                    let mut g = graph.borrow_mut();
+                    g.default_metadata = Some(proxy);
+                    g._default_metadata_listener = Some(listener);
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -442,6 +700,39 @@ fn on_global_remove(graph: &Rc<RefCell<Graph>>, id: u32) {
     }
     if g.auto_patch.as_ref().map(|p| p.sink_id) == Some(id) {
         g.auto_patch = None;
+    }
+    // If the vanished node was a user-routed producer (e.g. a Firefox tab
+    // closed), drop the link proxies so we don't hold a stale entry.
+    g.routed_sources.remove(&id);
+    // Drop any bound proxy + info listener for the node.
+    g.bound_nodes.remove(&id);
+}
+
+/// Merge the full props dict (delivered by a node `info` event) into the
+/// already-tracked node. Called at least once per bound node when the
+/// initial info arrives, and again every time the app updates any of its
+/// stream properties (Firefox does this when the tab title changes).
+fn merge_node_info(graph: &Rc<RefCell<Graph>>, id: u32, props: &DictRef) {
+    let mut g = graph.borrow_mut();
+    let Some(node) = g.nodes.get_mut(&id) else {
+        return;
+    };
+    if let Some(v) = props.get("media.name") {
+        node.media_name = Some(v.to_string());
+    }
+    if let Some(v) = props.get("application.name") {
+        node.application_name = Some(v.to_string());
+    }
+    if let Some(v) = props.get("application.icon-name") {
+        node.icon_name = Some(v.to_string());
+    }
+    if let Some(v) = props.get("application.process.id") {
+        if let Ok(p) = v.parse::<u32>() {
+            node.pid = Some(p);
+        }
+    }
+    if let Some(v) = props.get(*keys::NODE_DESCRIPTION) {
+        node.description = v.to_string();
     }
 }
 
@@ -467,22 +758,36 @@ fn handle_command(core: &Core, graph: &Rc<RefCell<Graph>>, cmd: Command) {
             let result = start_auto_patch(core, graph, sink_id);
             let _ = reply.send(result.map_err(|e| format!("{e:#}")));
         }
+        Command::LinkSourceToSink {
+            source_id,
+            target,
+            reply,
+        } => {
+            let result = route_source_via_metadata(graph, source_id, Some(target));
+            let _ = reply.send(result.map_err(|e| format!("{e:#}")));
+        }
+        Command::UnlinkSource { source_id, reply } => {
+            let result = route_source_via_metadata(graph, source_id, None);
+            let _ = reply.send(result.map_err(|e| format!("{e:#}")));
+        }
     }
 }
 
-/// Pair our source's output ports with the sink's input ports and create
-/// one PipeWire link per pair. Port IDs are sorted so pairing is stable
-/// across restarts, and PipeWire assigns port IDs in channel-position order
-/// (FL before FR), so a sorted 1:1 mapping preserves stereo channels.
+/// Pair a source node's output ports with a sink node's input ports and
+/// create one PipeWire link per pair. Port IDs are sorted so pairing is
+/// stable across restarts, and PipeWire assigns port IDs in
+/// channel-position order (FL before FR), so a sorted 1:1 mapping preserves
+/// stereo channels.
 ///
 /// Fallback strategies handle mismatched counts:
 ///   * source=1 → fan out to every sink input (mono source, N-channel sink)
 ///   * sink=1   → fan in every source output to the one sink input
 ///   * N == M   → pair by index
 ///   * mismatch → warn and fan out fully (last-resort mesh)
-fn create_links_to_sink(
+fn create_links(
     core: &Core,
     graph: &Rc<RefCell<Graph>>,
+    source_id: u32,
     sink_id: u32,
 ) -> anyhow::Result<(String, Vec<pipewire::link::Link>)> {
     let g = graph.borrow();
@@ -497,14 +802,21 @@ fn create_links_to_sink(
     );
     let sink_desc = sink.description.clone();
 
-    let own = g
-        .own_node_id
-        .ok_or_else(|| anyhow::anyhow!("own source node not yet registered"))?;
-    let mut out_ports = g.our_output_port_ids();
+    anyhow::ensure!(
+        g.nodes.contains_key(&source_id),
+        "source id {source_id} not in graph"
+    );
+
+    let mut out_ports: Vec<u32> = g
+        .ports
+        .iter()
+        .filter(|(_, p)| p.node_id == source_id && p.direction == PortDirection::Output)
+        .map(|(id, _)| *id)
+        .collect();
     out_ports.sort();
     anyhow::ensure!(
         !out_ports.is_empty(),
-        "our source has no output ports yet — try again in a moment"
+        "source {source_id} has no output ports yet — try again in a moment"
     );
     let mut in_ports = g.sink_input_port_ids(sink_id);
     in_ports.sort();
@@ -536,7 +848,7 @@ fn create_links_to_sink(
     let mut created: Vec<pipewire::link::Link> = Vec::new();
     for (out_port, in_port) in pairs {
         let props = properties! {
-            "link.output.node" => own.to_string(),
+            "link.output.node" => source_id.to_string(),
             "link.output.port" => out_port.to_string(),
             "link.input.node"  => sink_id.to_string(),
             "link.input.port"  => in_port.to_string(),
@@ -545,12 +857,26 @@ fn create_links_to_sink(
         let link: pipewire::link::Link = core
             .create_object("link-factory", &props)
             .with_context(|| {
-                format!("create link {own}:{out_port} -> {sink_id}:{in_port}")
+                format!("create link {source_id}:{out_port} -> {sink_id}:{in_port}")
             })?;
         created.push(link);
     }
 
     Ok((sink_desc, created))
+}
+
+/// Convenience: link our own source node to `sink_id`. Used by the monitor
+/// and auto-patch paths that always originate from our virtual source.
+fn create_links_to_sink(
+    core: &Core,
+    graph: &Rc<RefCell<Graph>>,
+    sink_id: u32,
+) -> anyhow::Result<(String, Vec<pipewire::link::Link>)> {
+    let own = graph
+        .borrow()
+        .own_node_id
+        .ok_or_else(|| anyhow::anyhow!("own source node not yet registered"))?;
+    create_links(core, graph, own, sink_id)
 }
 
 fn start_monitor(
@@ -581,6 +907,84 @@ fn start_auto_patch(
     Ok(())
 }
 
+/// Route an external `Stream/Output/Audio` producer via WirePlumber's
+/// `target.object` metadata. Passing `Some(role)` pins the source to our
+/// music/vox sink; passing `None` clears the pin, letting WP restore its
+/// default routing (typically the default audio sink). WP is responsible
+/// for actually creating/destroying the pipewire links — this is a pure
+/// policy write, so it correctly moves the routing rather than doubling
+/// it up alongside the existing default-sink link (which was the flaw of
+/// the previous "just add another link" implementation).
+///
+/// Value format learned by tracing `pactl move-sink-input`: WP's linking
+/// policy only reacts when the metadata property is typed `Spa:Id` with
+/// the target's `object.serial` (not `node.name`, not `node.id`). We also
+/// write the legacy `target.node` key with the sink's node id — pactl
+/// does the same for compat with older WP releases, and it's cheap.
+fn route_source_via_metadata(
+    graph: &Rc<RefCell<Graph>>,
+    source_id: u32,
+    target: Option<SinkRole>,
+) -> anyhow::Result<()> {
+    let g = graph.borrow();
+    let metadata = g
+        .default_metadata
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("`default` metadata not yet available from pipewire"))?;
+    anyhow::ensure!(
+        g.nodes.contains_key(&source_id),
+        "source id {source_id} not in graph"
+    );
+    match target {
+        Some(role) => {
+            let sink_name = match role {
+                SinkRole::Music => g.music_sink_name.as_str(),
+                SinkRole::Vox => g.vox_sink_name.as_str(),
+            };
+            let (sink_node_id, sink_serial) = g
+                .nodes
+                .iter()
+                .find(|(_, n)| n.media_class == "Audio/Sink" && n.name == sink_name)
+                .and_then(|(id, n)| n.object_serial.map(|s| (*id, s)))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "companion sink `{sink_name}` not yet registered (or missing object.serial)"
+                    )
+                })?;
+            let sink_name = sink_name.to_string();
+            metadata.set_property(
+                source_id,
+                "target.object",
+                Some("Spa:Id"),
+                Some(&sink_serial.to_string()),
+            );
+            metadata.set_property(
+                source_id,
+                "target.node",
+                Some("Spa:Id"),
+                Some(&sink_node_id.to_string()),
+            );
+            drop(g);
+            graph
+                .borrow_mut()
+                .routed_sources
+                .insert(source_id, RoutedSource { target: role });
+            info!(source_id, sink = %sink_name, sink_serial, role = ?role, "routed source via metadata");
+        }
+        None => {
+            // Clearing (value=None) tells WP: no override, fall back to
+            // default sink policy. Both keys are deleted so any stale
+            // legacy `target.node` entry doesn't override the fallback.
+            metadata.set_property(source_id, "target.object", None, None);
+            metadata.set_property(source_id, "target.node", None, None);
+            drop(g);
+            graph.borrow_mut().routed_sources.remove(&source_id);
+            info!(source_id, "cleared source routing (restored to default)");
+        }
+    }
+    Ok(())
+}
+
 // -----------------------------------------------------------------------------
 // PipeWire main-thread entrypoint
 // -----------------------------------------------------------------------------
@@ -599,6 +1003,8 @@ fn run(
 
     let graph: Rc<RefCell<Graph>> = Rc::new(RefCell::new(Graph {
         auto_patch_target: cfg.auto_patch_target.clone(),
+        music_sink_name: format!("{}-{}", cfg.node_name, SinkRole::Music.suffix()),
+        vox_sink_name: format!("{}-{}", cfg.node_name, SinkRole::Vox.suffix()),
         ..Graph::default()
     }));
 
@@ -611,13 +1017,17 @@ fn run(
     let (music_producer, music_consumer) = RingBuffer::<f32>::new(input_ring_frames);
     let (vox_producer, vox_consumer) = RingBuffer::<f32>::new(input_ring_frames);
 
-    // Registry listener.
-    let registry: Registry = core.get_registry().context("get_registry")?;
+    // Registry listener. Wrap the registry in an Rc so both the global
+    // callback (which needs to `bind` new node proxies) and the run-scope
+    // hold on it. The registry itself must outlive `_registry_listener`,
+    // so keep the Rc alive for the whole main-loop scope.
+    let registry: Rc<Registry> = Rc::new(core.get_registry().context("get_registry")?);
     let graph_g = graph.clone();
     let graph_r = graph.clone();
+    let registry_for_globals = registry.clone();
     let _registry_listener = registry
         .add_listener_local()
-        .global(move |obj| on_global(&graph_g, obj))
+        .global(move |obj| on_global(&graph_g, &registry_for_globals, obj))
         .global_remove(move |id| on_global_remove(&graph_r, id))
         .register();
 

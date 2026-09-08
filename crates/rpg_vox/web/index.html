@@ -3,7 +3,15 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>RPG Vox</title>
+    <!-- The trailing text after the visible title is wrapped in zero-width
+         spaces so it doesn't appear in the browser tab. Firefox propagates
+         document.title to the pipewire node's media.name for streams this
+         page creates (Web Audio, MediaStream), and the server matches on
+         this marker substring to exclude our own monitor from the Mixer's
+         Sources list — otherwise routing it would cause instant feedback.
+         Keep the literal `rpg-vox-browser-monitor` in sync with
+         BROWSER_MONITOR_STREAM_TITLE in crates/rpg_vox/src/pw_source.rs. -->
+    <title>RPG Vox&#8203;rpg-vox-browser-monitor&#8203;</title>
   </head>
   <body>
     <div id="app"></div>
