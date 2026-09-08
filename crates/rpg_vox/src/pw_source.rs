@@ -1290,6 +1290,13 @@ fn run(
                 let (music_l, music_r) = state.mixer.music.stereo_gains();
                 let (vox_l, vox_r) = state.mixer.vox.stereo_gains();
                 let (master_gain, master_muted) = state.mixer.master();
+                // Vox is a capture source for STT / recording — its samples
+                // reach that path via the sink's broadcast tap regardless of
+                // this flag. Only its contribution to the mic-feed sum is
+                // gated. Metering (below) still reflects the strip's panned
+                // signal so users can see input level even when the strip
+                // isn't routed out.
+                let vox_out = state.mixer.vox_to_output();
 
                 // Buffer the final stereo mic feed so we can broadcast it to
                 // the browser monitor after we've filled the buffer.
@@ -1350,8 +1357,13 @@ fn run(
                     let (l, r) = if master_muted {
                         (0.0, 0.0)
                     } else {
-                        let l = (tts_l_c + mus_l_c + vox_l_c) * master_gain;
-                        let r = (tts_r_c + mus_r_c + vox_r_c) * master_gain;
+                        let (vox_out_l, vox_out_r) = if vox_out {
+                            (vox_l_c, vox_r_c)
+                        } else {
+                            (0.0, 0.0)
+                        };
+                        let l = (tts_l_c + mus_l_c + vox_out_l) * master_gain;
+                        let r = (tts_r_c + mus_r_c + vox_out_r) * master_gain;
                         (l.clamp(-1.0, 1.0), r.clamp(-1.0, 1.0))
                     };
                     master_l_peak = master_l_peak.max(l.abs());

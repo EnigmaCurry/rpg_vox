@@ -43,7 +43,9 @@
   const strips = $derived([
     { key: 'tts',   label: 'TTS',   sub: 'synth → mic' },
     { key: 'music', label: 'Music', sub: `${nodeName}-music` },
-    { key: 'vox',   label: 'Vox',   sub: `${nodeName}-vox` },
+    // Vox is a capture source for STT / recording by default; the "→ MIC"
+    // toggle below the mute button is what opts it back into the mic feed.
+    { key: 'vox',   label: 'Vox',   sub: `${nodeName}-vox · capture` },
   ]);
 
   const MAX_GAIN = 2.0; // matches mixer::MAX_GAIN on the server
@@ -222,6 +224,15 @@
   function toggleMasterMute() {
     updateMaster('mute', !mixer.master.mute);
   }
+  // Vox default is capture-only (STT / recording tap); this override sums
+  // it into the mic feed like TTS/Music. The strip's gain/pan/mute still
+  // apply — leave them at unity for a literal passthrough.
+  function toggleVoxToOutput() {
+    if (!mixer) return;
+    const next = !mixer.vox_to_output;
+    mixer.vox_to_output = next;
+    push({ vox_to_output: next });
+  }
   function resetStripPan(key) {
     updateStrip(key, 'pan', 0);
   }
@@ -297,6 +308,21 @@
             onclick={() => toggleStripMute(strip.key)}
             aria-pressed={mixer[strip.key].mute}
           >MUTE</button>
+
+          {#if strip.key === 'vox'}
+            <!-- Vox default is capture-only. This override sums it into
+                 the mic feed; the sink's broadcast tap fires either way. -->
+            <button
+              type="button"
+              class="to-mic"
+              class:on={mixer.vox_to_output}
+              onclick={toggleVoxToOutput}
+              aria-pressed={mixer.vox_to_output}
+              title={mixer.vox_to_output
+                ? 'vox is being summed into the mic feed — click to keep it capture-only'
+                : 'vox is capture-only (STT / recording tap) — click to also send it to the mic'}
+            >→ MIC</button>
+          {/if}
         </div>
       {/each}
 
@@ -682,5 +708,26 @@
     background: var(--err);
     color: #0b0d10;
     border-color: var(--err);
+  }
+
+  /* Vox-only "→ MIC" toggle. Reads as an override affordance rather than
+     an emphatic action — same rounded rectangle as MUTE but with the
+     bluish highlight the Sources panel uses for active routing. */
+  .to-mic {
+    padding: 5px 12px;
+    background: transparent;
+    color: var(--muted);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    font-weight: 700;
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    cursor: pointer;
+  }
+  .to-mic:hover { background: rgba(255,255,255,0.05); color: var(--text); }
+  .to-mic.on {
+    background: rgba(122,162,255,0.2);
+    color: var(--text);
+    border-color: rgba(122,162,255,0.6);
   }
 </style>

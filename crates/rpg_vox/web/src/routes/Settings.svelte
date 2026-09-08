@@ -4,12 +4,11 @@
     settings, workflows, graph,
     reloadSettings, reloadWorkflows, reloadGraph,
     startSettingsPoll, stopSettingsPoll,
+    getPwMonitorPref, setPwMonitorPref,
   } from '../lib/stores.js';
   import * as api from '../lib/api.js';
   import * as browserMonitor from '../lib/browserMonitor.js';
   import { monitorState } from '../lib/browserMonitor.js';
-
-  const MONITOR_PREF_KEY = 'rpg_vox.monitor_sink_name';
 
   let status = $state({ text: '', kind: '' });
   let wfBusy = $state(false);
@@ -57,12 +56,14 @@
     if ($settings) selectedWf = $settings.workflow_name || '';
   });
 
-  // First graph after mount: restore the saved monitor sink if nothing's
-  // currently monitored. Match by name (id is ephemeral across sessions).
+  // Fallback restore: App.svelte kicks off the same restore at boot, but if
+  // the saved sink wasn't in the graph by then this effect will pick it up
+  // once it appears (e.g. the user plugged in headphones after launch).
+  // Exits early once the monitor is set by any means.
   $effect(() => {
     const g = $graph;
     if (!g || monitorRestored || g.monitor_sink_id != null) return;
-    const wanted = savedMonitorName();
+    const wanted = getPwMonitorPref();
     if (!wanted) return;
     const match = monitorableFrom(g, $settings?.node_name || '').find((s) => s.name === wanted);
     if (match) {
@@ -70,16 +71,6 @@
       startMonitor(match.id, { restore: true });
     }
   });
-
-  function savedMonitorName() {
-    try { return localStorage.getItem(MONITOR_PREF_KEY); } catch { return null; }
-  }
-  function setSavedMonitorName(name) {
-    try {
-      if (name) localStorage.setItem(MONITOR_PREF_KEY, name);
-      else      localStorage.removeItem(MONITOR_PREF_KEY);
-    } catch {}
-  }
 
   // Sinks the user might reasonably want to monitor rpg_vox with. Excludes:
   //   * the auto-patch target (we're already routing to it)
@@ -164,7 +155,7 @@
       status = { text: `monitor error: ${body?.error || 'unknown'}`, kind: 'err' };
     } else {
       const sink = ($graph?.sinks || []).find((s) => s.id === sinkId);
-      if (sink?.name) setSavedMonitorName(sink.name);
+      if (sink?.name) setPwMonitorPref(sink.name);
       status = {
         text: opts.restore ? `restored monitor: sink #${sinkId}` : `monitoring sink #${sinkId}`,
         kind: 'ok',
@@ -179,7 +170,7 @@
     if (!ok) {
       status = { text: `stop error: ${body?.error || 'unknown'}`, kind: 'err' };
     } else {
-      setSavedMonitorName(null);
+      setPwMonitorPref(null);
       status = { text: 'monitor stopped', kind: 'ok' };
     }
     await reloadGraph();

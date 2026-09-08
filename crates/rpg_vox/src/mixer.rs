@@ -122,6 +122,12 @@ pub struct AtomicMixer {
     pub tts: AtomicChannel,
     pub music: AtomicChannel,
     pub vox: AtomicChannel,
+    /// When false, the vox strip is NOT summed into the mic output. Its
+    /// primary consumer is the `-vox` sink's broadcast tap (speech-to-text,
+    /// recording), so we don't want it echoing into the mic by default.
+    /// Flip to true as an override — the vox strip's gain/pan/mute still
+    /// apply, so "unmodified" playback = leave them at unity.
+    vox_to_output: AtomicBool,
     master_gain: AtomicU32,
     master_mute: AtomicBool,
     /// Master output peaks per side (post-master-gain, post-clip). Same
@@ -136,6 +142,7 @@ impl AtomicMixer {
             tts: AtomicChannel::new(state.tts),
             music: AtomicChannel::new(state.music),
             vox: AtomicChannel::new(state.vox),
+            vox_to_output: AtomicBool::new(state.vox_to_output),
             master_gain: AtomicU32::new(clamp_gain(state.master.gain).to_bits()),
             master_mute: AtomicBool::new(state.master.mute),
             master_peak_l: AtomicU32::new(0),
@@ -148,6 +155,13 @@ impl AtomicMixer {
     #[inline]
     pub fn master(&self) -> (f32, bool) {
         (load_f32(&self.master_gain), self.master_mute.load(RELAXED))
+    }
+
+    /// True when the user has opted the vox strip into the mic output. Read
+    /// once per process cycle by the source callback.
+    #[inline]
+    pub fn vox_to_output(&self) -> bool {
+        self.vox_to_output.load(RELAXED)
     }
 
     /// Observe the recent master output peaks (`|L|`, `|R|`). Called once
@@ -181,6 +195,7 @@ impl AtomicMixer {
             tts: self.tts.snapshot(),
             music: self.music.snapshot(),
             vox: self.vox.snapshot(),
+            vox_to_output: self.vox_to_output.load(RELAXED),
             master: MasterState {
                 gain: load_f32(&self.master_gain),
                 mute: self.master_mute.load(RELAXED),
@@ -199,6 +214,9 @@ impl AtomicMixer {
         }
         if let Some(p) = patch.vox {
             self.vox.apply(p);
+        }
+        if let Some(v) = patch.vox_to_output {
+            self.vox_to_output.store(v, RELAXED);
         }
         if let Some(p) = patch.master {
             if let Some(g) = p.gain {
@@ -248,6 +266,11 @@ pub struct MixerState {
     pub music: ChannelState,
     #[serde(default)]
     pub vox: ChannelState,
+    /// Route the vox strip into the mic output. Off by default — vox is a
+    /// capture source for STT/recording, not something we want echoing back
+    /// to Discord. See [`AtomicMixer::vox_to_output`].
+    #[serde(default)]
+    pub vox_to_output: bool,
     #[serde(default)]
     pub master: MasterState,
 }
@@ -285,6 +308,9 @@ pub struct MixerPatch {
     pub tts: Option<ChannelPatch>,
     pub music: Option<ChannelPatch>,
     pub vox: Option<ChannelPatch>,
+    /// Toggle whether the vox strip contributes to the mic feed. `None`
+    /// leaves the current value untouched.
+    pub vox_to_output: Option<bool>,
     pub master: Option<MasterPatch>,
 }
 
@@ -306,6 +332,7 @@ impl From<MixerState> for MixerPatch {
             tts: Some(s.tts.into()),
             music: Some(s.music.into()),
             vox: Some(s.vox.into()),
+            vox_to_output: Some(s.vox_to_output),
             master: Some(s.master.into()),
         }
     }

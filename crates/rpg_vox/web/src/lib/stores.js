@@ -1,6 +1,21 @@
 import { writable } from 'svelte/store';
 import * as api from './api.js';
 
+// localStorage key for the saved pipewire monitor sink. Colocated here (not
+// in Settings.svelte) so the boot-time restore and the Settings page share
+// exactly one source of truth for the pref.
+export const PW_MONITOR_PREF_KEY = 'rpg_vox.monitor_sink_name';
+
+export function getPwMonitorPref() {
+  try { return localStorage.getItem(PW_MONITOR_PREF_KEY); } catch { return null; }
+}
+export function setPwMonitorPref(name) {
+  try {
+    if (name) localStorage.setItem(PW_MONITOR_PREF_KEY, name);
+    else      localStorage.removeItem(PW_MONITOR_PREF_KEY);
+  } catch {}
+}
+
 // Resident state — survives route changes. Route components pull these and
 // call the reload* helpers on mount.
 
@@ -45,3 +60,45 @@ export async function reloadSettings()    { settings.set(await api.getSettings()
 export async function reloadWorkflows()   { workflows.set(await api.listWorkflows()); }
 export async function reloadGraph()       { graph.set(await api.getGraph()); }
 export async function reloadChatHistory() { chatHistory.set(await api.getChatHistory()); }
+
+// --- Pipewire monitor auto-restore ------------------------------------------
+//
+// Called once from App.svelte on mount so the saved monitor sink reconnects
+// at boot rather than waiting for the user to navigate to Settings. Match by
+// `node.name` because pipewire ids are ephemeral across sessions. The sink
+// may not be present in the very first graph snapshot (registry enumeration
+// takes a tick), so poll briefly before giving up.
+export async function restorePwMonitorFromPref() {
+  const wanted = getPwMonitorPref();
+  if (!wanted) return;
+  // ~3 s total: enough to cover normal startup enumeration without keeping
+  // retries alive long enough to fight a user who navigates to Settings and
+  // clicks Stop before the sink appears.
+  const attempts = 8;
+  const delayMs = 400;
+  for (let i = 0; i < attempts; i++) {
+    let g;
+    try { g = await api.getGraph(); } catch { g = null; }
+    if (g) {
+      graph.set(g);
+      // Someone (a previous restore, another client, a leftover session)
+      // is already monitoring — no work to do.
+      if (g.monitor_sink_id != null) return;
+      const match = (g.sinks || []).find((s) => s.name === wanted);
+      if (match) {
+        try {
+          await api.startMonitor(match.id);
+          // Refresh so the resident graph store reflects the new
+          // monitor_sink_id without waiting for the next Settings poll.
+          await reloadGraph();
+        } catch (err) {
+          console.warn('[pw-monitor] restore failed', err);
+        }
+        return;
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+  }
+  // Sink never appeared — that's fine, Settings.svelte's effect will pick it
+  // up if the user navigates there and the sink shows up later.
+}

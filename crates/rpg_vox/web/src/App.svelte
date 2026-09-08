@@ -1,7 +1,7 @@
 <script>
   import { onMount } from 'svelte';
   import { route } from './lib/router.js';
-  import { startHealthPoll } from './lib/stores.js';
+  import { startHealthPoll, restorePwMonitorFromPref } from './lib/stores.js';
   import { restoreFromPref as restoreBrowserMonitor } from './lib/browserMonitor.js';
   import Menubar from './components/Menubar.svelte';
   import Projects from './routes/Projects.svelte';
@@ -40,6 +40,11 @@
     // helper if the browser blocks AudioContext creation.
     restoreBrowserMonitor().catch((err) => {
       console.warn('[monitor] restore failed', err);
+    });
+    // Auto-restore the pipewire monitor selection so the chosen output sink
+    // hears rpg_vox from app boot rather than only after visiting Settings.
+    restorePwMonitorFromPref().catch((err) => {
+      console.warn('[pw-monitor] restore failed', err);
     });
   });
 </script>
