@@ -100,14 +100,17 @@
     await refreshSources();
   }
 
-  // Display label for a source row. `media.name` is what distinguishes
-  // sibling nodes with the same `application.name` (three Firefox tabs
-  // each labelled with their page title). Fall back through what's
-  // available so nothing renders as a blank row.
+  // Display label for a source row. Streams differ from devices:
+  //   * streams: `media.name` distinguishes siblings of the same
+  //     `application.name` (three Firefox tabs each with their page title);
+  //   * devices: no media.name/application.name, so use the friendly
+  //     `description` ("Blue Yeti") over the raw ALSA `node.name`.
   function sourceLabel(s) {
-    return s.media_name || s.name || `#${s.id}`;
+    if (s.kind === 'device') return s.description || s.name || `#${s.id}`;
+    return s.media_name || s.description || s.name || `#${s.id}`;
   }
   function sourceApp(s) {
+    if (s.kind === 'device') return 'input device';
     return s.application_name || s.name || 'audio';
   }
 
@@ -388,6 +391,11 @@
                 role="radio"
                 aria-checked={s.routed_to === 'vox'}
               >Vox</button>
+              <!-- For streams, "Default" restores WP's normal routing
+                   (typically the default sink). For hardware sources
+                   (mics), we don't want that — nobody wants their mic
+                   mirrored to speakers by default — so the third state
+                   is "Off": simply not fed into rpg_vox at all. -->
               <button
                 type="button"
                 class="route-btn"
@@ -395,8 +403,10 @@
                 onclick={() => unrouteSource(s.id)}
                 role="radio"
                 aria-checked={!s.routed_to}
-                title="drop rpg_vox's routing link; app keeps its default connection"
-              >Default</button>
+                title={s.kind === 'device'
+                  ? 'do not feed this input into rpg_vox'
+                  : "drop rpg_vox's routing link; app keeps its default connection"}
+              >{s.kind === 'device' ? 'Off' : 'Default'}</button>
             </div>
           </li>
         {/each}

@@ -168,33 +168,49 @@ pub struct NodeInfo {
     pub description: String,
 }
 
-/// One `Stream/Output/Audio` node visible in the graph — an app that's
-/// producing audio (a browser tab, a media player, etc.). Split off from
-/// [`NodeInfo`] so the client can render app + per-stream title separately
-/// (crucial when three "Firefox" nodes exist for three different tabs).
+/// An audio producer visible in the graph. Two flavours:
+///   * `kind = "stream"` — `Stream/Output/Audio`, an app's output stream
+///     (Firefox tab, mpv, etc.). Its natural home is the default sink;
+///     rpg_vox can override that with WP metadata.
+///   * `kind = "device"` — `Audio/Source`, a physical capture device (USB
+///     mic, line-in). It has no default sink routing of its own — the UI
+///     treats "unrouted" as *not fed into rpg_vox*, since nobody wants a
+///     mic mirrored to the speakers as a default.
+///
+/// Split off from [`NodeInfo`] so the client can render app + per-stream
+/// title separately (crucial when three "Firefox" nodes exist for three
+/// different tabs).
 #[derive(Clone, Debug, Serialize)]
 pub struct SourceInfo {
     pub id: u32,
-    /// `node.name` — usually the app's own tag ("Firefox", "mpv"), often
-    /// non-unique across the graph.
+    /// `node.name` — usually the app's own tag ("Firefox", "mpv") or, for
+    /// devices, the raw ALSA node name. Often non-unique across the graph.
     pub name: String,
+    /// `node.description` — human-readable label. For devices this is the
+    /// friendly name ("Blue Yeti"); for streams it's often the app name.
+    pub description: String,
+    /// `"stream"` for app outputs, `"device"` for physical capture nodes.
+    /// The Mixer uses this to change the third routing button's semantics
+    /// (streams get "Default" = restore to default sink; devices get "Off"
+    /// = don't feed rpg_vox).
+    pub kind: String,
     /// `application.name` — human-readable app label. Preferred over `name`
-    /// in the UI. Absent for a few oddball producers.
+    /// in the UI for streams. Absent for devices and a few oddball producers.
     pub application_name: Option<String>,
     /// `media.name` — per-stream label the app sets. For Firefox this is
     /// the tab title; for mpv it's the file name; for random WebRTC
-    /// streams it's often just "AudioStream".
+    /// streams it's often just "AudioStream". Absent for devices.
     pub media_name: Option<String>,
     /// `application.icon-name` — freedesktop icon key if the app set one.
     pub icon_name: Option<String>,
     /// `application.process.id` — pid of the producing app, when known.
     /// Handy for grouping streams that all come from the same browser
-    /// process in the UI.
+    /// process in the UI. Absent for devices.
     pub pid: Option<u32>,
     /// Which of our companion sinks (if any) this source is currently
-    /// linked to *by us*. Not populated for links that already existed in
-    /// the graph before our routing controls touched them; the UI treats
-    /// "not routed by us" as a clean slate.
+    /// linked to. Ground truth from the link graph: if the source feeds
+    /// our music/vox sink by any means (this session, a previous run,
+    /// pactl, crosspipe...) that's what the toggle reflects.
     pub routed_to: Option<String>,
 }
 
@@ -372,15 +388,12 @@ struct Graph {
     music_sink_name: String,
     /// `node.name` of our companion `-vox` sink. Same as above.
     vox_sink_name: String,
-    /// External producer sources that the user has routed into one of our
-    /// companion sinks via the Mixer UI. Keyed by the source's node id.
-    /// The routing itself is performed by WirePlumber in response to
-    /// `target.object` metadata writes (see `default_metadata`); this map
-    /// is our local mirror of "which sources we told WP to route where"
-    /// so the Sources snapshot can report `routed_to` back to the client.
-    /// It is *not* the source of truth for the graph — WP is.
-    /// Cleaned up in `on_global_remove` when the source disappears.
-    routed_sources: HashMap<u32, RoutedSource>,
+    // (Routed-source tracking removed: `routed_to` in SourceInfo is now
+    // derived directly from the link graph — see `source_routed_to`.
+    // Metadata cleanup on node disappearance is unconditional because
+    // pipewire recycles node ids, and any stale `target.object` sitting
+    // on a vanished id would silently re-route the next node to inherit
+    // that id.)
     /// Bound proxy for the `default` metadata object. Owning this proxy
     /// keeps the connection open so `set_property` writes actually apply.
     /// `None` while pipewire hasn't announced the metadata yet — routing
@@ -392,6 +405,15 @@ struct Graph {
     /// property changes (a future refinement could reconcile
     /// `routed_sources` when an external tool touches the metadata).
     _default_metadata_listener: Option<MetadataListener>,
+    /// Explicit link sets we've created to route hardware `Audio/Source`
+    /// nodes (USB mics, line-in, ...) into one of our companion sinks.
+    /// Keyed by the source node id so a re-route (Music → Vox) drops the
+    /// prior set before creating the new one, and an Off/unroute simply
+    /// removes the entry. Hardware sources can't be steered with WP's
+    /// `target.object` metadata (that key only affects `Stream/*` policy),
+    /// so we create pipewire links directly — the same mechanism used by
+    /// the debug monitor and auto-patch paths.
+    device_links: HashMap<u32, ActiveLinkSet>,
     /// Bound `Node` proxies for the producer streams we care about. The
     /// initial registry `global` dict only carries a subset of a node's
     /// properties (`application.name`, `node.name`, `media.class` — but
@@ -420,10 +442,6 @@ struct TrackedNode {
     /// only respects that key when the value is typed as `Spa:Id` and
     /// carries the target's serial, not its node id or name).
     object_serial: Option<u32>,
-}
-
-struct RoutedSource {
-    target: SinkRole,
 }
 
 struct BoundNode {
@@ -503,7 +521,13 @@ impl Graph {
         let mut sources: Vec<SourceInfo> = self
             .nodes
             .iter()
-            .filter(|(_, n)| n.media_class == "Stream/Output/Audio")
+            .filter(|(_, n)| {
+                n.media_class == "Stream/Output/Audio" || n.media_class == "Audio/Source"
+            })
+            // Hide our own virtual mic (`Audio/Source`). Routing it into a
+            // companion sink would create a feedback loop — the sink is
+            // summed back into this exact source in the mix callback.
+            .filter(|(id, _)| Some(*id) != self.own_node_id.as_ref())
             // Hide our own browser monitor. Firefox uses document.title as
             // the pipewire stream's media.name, so we match a substring
             // marker planted in the SPA's <title> (see index.html).
@@ -515,14 +539,25 @@ impl Graph {
             .map(|(id, n)| SourceInfo {
                 id: *id,
                 name: n.name.clone(),
+                description: n.description.clone(),
+                kind: if n.media_class == "Audio/Source" {
+                    "device".to_string()
+                } else {
+                    "stream".to_string()
+                },
                 application_name: n.application_name.clone(),
                 media_name: n.media_name.clone(),
                 icon_name: n.icon_name.clone(),
                 pid: n.pid,
-                routed_to: self
-                    .routed_sources
-                    .get(id)
-                    .map(|r| r.target.suffix().to_string()),
+                // Ground truth: derive from actual outgoing links. If the
+                // source is currently wired into one of our companion
+                // sinks — whether by *this* process, a previous run,
+                // pactl, crosspipe, or anything else — that's what the
+                // toggle should reflect. Reading from the local
+                // `routed_sources` map (what *we* set this session) would
+                // desync the UI whenever the routing was established by
+                // something we didn't own.
+                routed_to: self.source_routed_to(*id),
             })
             .collect();
         // Group by app name so all Firefox tabs cluster together, then by
@@ -553,9 +588,37 @@ impl Graph {
         }
     }
 
-    // (No sink-id lookup helper needed anymore — metadata-based routing
-    // uses the sink's node.name directly, which is stable across
-    // process restarts and doesn't require resolving to a live node id.)
+    /// Determine which of our companion sinks (if any) this source is
+    /// currently linked to, by walking the tracked links. Returns the
+    /// role's suffix ("music" / "vox") to serialize straight into the
+    /// SourceInfo's `routed_to` string. Returns `None` for a source
+    /// wired anywhere else (default sink, another app, nowhere).
+    ///
+    /// We check ALL outgoing links — if any of them lands on our sink,
+    /// that counts as "routed to us". Ground-truth semantics: WP may
+    /// briefly leave a stale link in place while it processes a routing
+    /// change, but as soon as the routing has settled the reading here
+    /// matches what the user hears.
+    fn source_routed_to(&self, source_id: u32) -> Option<String> {
+        for link in self.links.values() {
+            if link.output_node != source_id {
+                continue;
+            }
+            // Continue on missing target rather than short-circuit — a
+            // link whose input node isn't in our nodes map yet just
+            // isn't one of ours, so keep scanning the rest.
+            let Some(target) = self.nodes.get(&link.input_node) else {
+                continue;
+            };
+            if target.name == self.music_sink_name {
+                return Some(SinkRole::Music.suffix().to_string());
+            }
+            if target.name == self.vox_sink_name {
+                return Some(SinkRole::Vox.suffix().to_string());
+            }
+        }
+        None
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -701,9 +764,24 @@ fn on_global_remove(graph: &Rc<RefCell<Graph>>, id: u32) {
     if g.auto_patch.as_ref().map(|p| p.sink_id) == Some(id) {
         g.auto_patch = None;
     }
-    // If the vanished node was a user-routed producer (e.g. a Firefox tab
-    // closed), drop the link proxies so we don't hold a stale entry.
-    g.routed_sources.remove(&id);
+    // Drop any device→sink link set whose device disappeared, and any
+    // whose destination sink disappeared. In both cases the link proxies
+    // are already dead (pipewire tore the links when the endpoint went
+    // away); we're just releasing our handles so `routed_to` reads clean.
+    g.device_links.remove(&id);
+    g.device_links.retain(|_, ls| ls.sink_id != id);
+    // Pipewire recycles node ids, and WP's `target.object` metadata is
+    // keyed by subject id — leaving any stale routing keys behind causes
+    // future nodes assigned this id to inherit the old routing, which
+    // manifested as fresh browser-monitor streams silently getting
+    // grabbed by rpg-vox-music after a tab reload. Clear unconditionally:
+    // we don't care whether we set the metadata ourselves, pactl set it,
+    // or crosspipe set it — once the subject is gone, its routing
+    // preferences should not follow the recycled id.
+    if let Some(metadata) = g.default_metadata.as_ref() {
+        metadata.set_property(id, "target.object", None, None);
+        metadata.set_property(id, "target.node", None, None);
+    }
     // Drop any bound proxy + info listener for the node.
     g.bound_nodes.remove(&id);
 }
@@ -712,6 +790,15 @@ fn on_global_remove(graph: &Rc<RefCell<Graph>>, id: u32) {
 /// already-tracked node. Called at least once per bound node when the
 /// initial info arrives, and again every time the app updates any of its
 /// stream properties (Firefox does this when the tab title changes).
+///
+/// Side effect: if the incoming media.name identifies this node as our
+/// own browser-monitor stream, scrub any `target.object`/`target.node`
+/// metadata for it. Pipewire reuses node ids across appearances and WP's
+/// metadata is keyed by subject id, so a reload of the mixer tab can
+/// land the fresh monitor on an id that inherited stale routing from
+/// something the user pinned earlier. We know these streams must never
+/// be routed into our own sinks (they *are* the monitor), so it's safe
+/// to unconditionally clear their overrides here.
 fn merge_node_info(graph: &Rc<RefCell<Graph>>, id: u32, props: &DictRef) {
     let mut g = graph.borrow_mut();
     let Some(node) = g.nodes.get_mut(&id) else {
@@ -733,6 +820,20 @@ fn merge_node_info(graph: &Rc<RefCell<Graph>>, id: u32, props: &DictRef) {
     }
     if let Some(v) = props.get(*keys::NODE_DESCRIPTION) {
         node.description = v.to_string();
+    }
+    // Scrub any stale target.object routing on the browser monitor's
+    // stream. The monitor must never be routed into our own sinks (it
+    // *is* the monitor); this defends against a fresh monitor node
+    // inheriting stale metadata from a recycled id.
+    let is_monitor = node
+        .media_name
+        .as_deref()
+        .is_some_and(|m| m.contains(BROWSER_MONITOR_STREAM_TITLE));
+    if is_monitor {
+        if let Some(metadata) = g.default_metadata.as_ref() {
+            metadata.set_property(id, "target.object", None, None);
+            metadata.set_property(id, "target.node", None, None);
+        }
     }
 }
 
@@ -763,11 +864,27 @@ fn handle_command(core: &Core, graph: &Rc<RefCell<Graph>>, cmd: Command) {
             target,
             reply,
         } => {
-            let result = route_source_via_metadata(graph, source_id, Some(target));
+            let result = match source_kind(graph, source_id) {
+                Ok(SourceKind::Device) => link_device_source(core, graph, source_id, target),
+                Ok(SourceKind::Stream) => {
+                    route_source_via_metadata(graph, source_id, Some(target))
+                }
+                Err(e) => Err(e),
+            };
             let _ = reply.send(result.map_err(|e| format!("{e:#}")));
         }
         Command::UnlinkSource { source_id, reply } => {
-            let result = route_source_via_metadata(graph, source_id, None);
+            let result = match source_kind(graph, source_id) {
+                Ok(SourceKind::Device) => {
+                    // Hardware sources never had metadata written for them
+                    // — "Off" just means: drop the pipewire links we made.
+                    // Idempotent: removing a missing entry is a no-op.
+                    graph.borrow_mut().device_links.remove(&source_id);
+                    Ok(())
+                }
+                Ok(SourceKind::Stream) => route_source_via_metadata(graph, source_id, None),
+                Err(e) => Err(e),
+            };
             let _ = reply.send(result.map_err(|e| format!("{e:#}")));
         }
     }
@@ -907,6 +1024,73 @@ fn start_auto_patch(
     Ok(())
 }
 
+enum SourceKind {
+    /// `Stream/Output/Audio` — routed via WP `target.object` metadata.
+    Stream,
+    /// `Audio/Source` — routed via explicit pipewire link objects, since
+    /// WP's routing policy doesn't apply to hardware capture nodes.
+    Device,
+}
+
+fn source_kind(graph: &Rc<RefCell<Graph>>, source_id: u32) -> anyhow::Result<SourceKind> {
+    let g = graph.borrow();
+    let node = g
+        .nodes
+        .get(&source_id)
+        .ok_or_else(|| anyhow::anyhow!("source id {source_id} not in graph"))?;
+    match node.media_class.as_str() {
+        "Stream/Output/Audio" => Ok(SourceKind::Stream),
+        "Audio/Source" => Ok(SourceKind::Device),
+        other => Err(anyhow::anyhow!(
+            "source id {source_id} has unsupported media.class `{other}`"
+        )),
+    }
+}
+
+/// Route a hardware `Audio/Source` (USB mic, line-in, ...) into one of
+/// our companion sinks by creating pipewire link objects between the
+/// device's capture output ports and the sink's playback input ports.
+///
+/// Additive by design: the device continues to feed anything it was
+/// already connected to (a monitoring app, another consumer). "Off" just
+/// removes these links; it does not touch the device's other routings.
+///
+/// Re-routing (Music → Vox or vice versa) drops the previous link set
+/// before creating the new one — otherwise the device would feed *both*
+/// strips simultaneously, which is never what the user asked for.
+fn link_device_source(
+    core: &Core,
+    graph: &Rc<RefCell<Graph>>,
+    source_id: u32,
+    target: SinkRole,
+) -> anyhow::Result<()> {
+    let sink_id = {
+        let g = graph.borrow();
+        let sink_name = match target {
+            SinkRole::Music => g.music_sink_name.as_str(),
+            SinkRole::Vox => g.vox_sink_name.as_str(),
+        };
+        g.nodes
+            .iter()
+            .find(|(_, n)| n.media_class == "Audio/Sink" && n.name == sink_name)
+            .map(|(id, _)| *id)
+            .ok_or_else(|| {
+                anyhow::anyhow!("companion sink `{sink_name}` not yet registered")
+            })?
+    };
+    // Drop any prior device link set for this source before creating a
+    // new one. Removing the entry drops the Link proxies, which tears
+    // the pipewire links (`object.linger=false` on creation).
+    graph.borrow_mut().device_links.remove(&source_id);
+    let (sink_desc, links) = create_links(core, graph, source_id, sink_id)?;
+    graph
+        .borrow_mut()
+        .device_links
+        .insert(source_id, ActiveLinkSet { sink_id, _links: links });
+    info!(source_id, sink = %sink_desc, role = ?target, "linked device source");
+    Ok(())
+}
+
 /// Route an external `Stream/Output/Audio` producer via WirePlumber's
 /// `target.object` metadata. Passing `Some(role)` pins the source to our
 /// music/vox sink; passing `None` clears the pin, letting WP restore its
@@ -964,11 +1148,6 @@ fn route_source_via_metadata(
                 Some("Spa:Id"),
                 Some(&sink_node_id.to_string()),
             );
-            drop(g);
-            graph
-                .borrow_mut()
-                .routed_sources
-                .insert(source_id, RoutedSource { target: role });
             info!(source_id, sink = %sink_name, sink_serial, role = ?role, "routed source via metadata");
         }
         None => {
@@ -977,8 +1156,6 @@ fn route_source_via_metadata(
             // legacy `target.node` entry doesn't override the fallback.
             metadata.set_property(source_id, "target.object", None, None);
             metadata.set_property(source_id, "target.node", None, None);
-            drop(g);
-            graph.borrow_mut().routed_sources.remove(&source_id);
             info!(source_id, "cleared source routing (restored to default)");
         }
     }
