@@ -224,7 +224,11 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     let ringbuf_frames = (args.sample_rate as f32 * args.ringbuf_seconds) as usize;
-    let (producer, consumer) = rtrb::RingBuffer::<f32>::new(ringbuf_frames);
+    // Stereo frames end-to-end: rings carry `[L, R]` pairs so the source
+    // callback can preserve incoming stereo image (or apply stereo FX in
+    // the future) without ever collapsing to mono. TTS is currently mono,
+    // and is duplicated to L=R at the ring boundary in `tts::Sink`.
+    let (producer, consumer) = rtrb::RingBuffer::<[f32; 2]>::new(ringbuf_frames);
 
     // If RPG_VOX_NAME / --node-name is set, derive the mic-picker label from
     // it too so multi-instance setups show distinct entries; otherwise keep

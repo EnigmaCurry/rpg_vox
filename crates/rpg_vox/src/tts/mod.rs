@@ -172,7 +172,7 @@ pub async fn run(
     cfg: Config,
     mut backend: Backend,
     mut rx: mpsc::Receiver<Command>,
-    mut producer: Producer<f32>,
+    mut producer: Producer<[f32; 2]>,
 ) -> Result<()> {
     while let Some(cmd) = rx.recv().await {
         match cmd {
@@ -187,7 +187,7 @@ pub async fn run(
 async fn handle_say(
     backend: &mut Backend,
     cfg: &Config,
-    producer: &mut Producer<f32>,
+    producer: &mut Producer<[f32; 2]>,
     req: SayRequest,
 ) {
     let SayRequest {
@@ -328,7 +328,7 @@ async fn handle_synthesize(backend: &mut Backend, cfg: &Config, req: SynthesizeR
     let _ = reply.send(result);
 }
 
-async fn handle_play_pcm(cfg: &Config, producer: &mut Producer<f32>, req: PlayPcmRequest) {
+async fn handle_play_pcm(cfg: &Config, producer: &mut Producer<[f32; 2]>, req: PlayPcmRequest) {
     let PlayPcmRequest {
         samples,
         sample_rate,
@@ -379,7 +379,7 @@ async fn handle_play_pcm(cfg: &Config, producer: &mut Producer<f32>, req: PlayPc
 /// Takes `&mut` even though `slots()` only needs `&self` because
 /// `rtrb::Producer` is `!Sync` — a shared reference to it isn't `Send` across
 /// `await`, whereas an exclusive reference to a `Send` type is.
-async fn wait_for_ring_empty(producer: &mut Producer<f32>, capacity: usize, sample_rate: u32) {
+async fn wait_for_ring_empty(producer: &mut Producer<[f32; 2]>, capacity: usize, sample_rate: u32) {
     // The ring is "empty" once the producer sees within a frame of the full
     // capacity as free slots. Slack absorbs small race between the consumer's
     // atomic write-back and this poll.
@@ -447,7 +447,7 @@ fn apply_effects(
 ///   memory for the caller to take. Used by `/synthesize` when the caller
 ///   wants the audio bytes (e.g. to stream to a browser) instead of the mic.
 pub struct Sink<'a> {
-    producer: Option<&'a mut Producer<f32>>,
+    producer: Option<&'a mut Producer<[f32; 2]>>,
     target_rate: u32,
     // (input_rate, resampler). Rebuilt when the incoming rate changes.
     resampler: Option<(u32, SincFixedIn<f32>)>,
@@ -456,7 +456,7 @@ pub struct Sink<'a> {
 }
 
 impl<'a> Sink<'a> {
-    pub fn new(producer: &'a mut Producer<f32>, target_rate: u32) -> Self {
+    pub fn new(producer: &'a mut Producer<[f32; 2]>, target_rate: u32) -> Self {
         Self {
             producer: Some(producer),
             target_rate,
@@ -521,10 +521,19 @@ impl<'a> Sink<'a> {
 /// pipewire consumer has a chance to drain. Never drops audio — a synthesized
 /// utterance is much bigger than the ring, so backpressure is what keeps us
 /// aligned with real-time playback instead of racing ahead and clipping.
-async fn push_samples_backpressured(producer: &mut Producer<f32>, samples: &[f32]) -> usize {
+///
+/// TTS is mono; the ring stores stereo frames. Each mono sample is duplicated
+/// to `[m, m]` so the source callback's per-channel pan (constant-power)
+/// produces the same acoustic result as the original mono-in-stereo-cloth
+/// path did.
+async fn push_samples_backpressured(producer: &mut Producer<[f32; 2]>, samples: &[f32]) -> usize {
     let mut written = 0;
     while written < samples.len() {
-        while written < samples.len() && producer.push(samples[written]).is_ok() {
+        while written < samples.len()
+            && producer
+                .push([samples[written], samples[written]])
+                .is_ok()
+        {
             written += 1;
         }
         if written < samples.len() {

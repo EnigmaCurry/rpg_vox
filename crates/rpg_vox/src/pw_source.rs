@@ -3,20 +3,21 @@
 //! Runs the PipeWire main loop on a dedicated OS thread. Three things live there:
 //!
 //! 1. A source stream that appears as a stereo `Audio/Source`. Its realtime
-//!    `process` callback drains f32 mono samples from an `rtrb::Consumer` and
-//!    duplicates each into both L and R of the negotiated interleaved output
-//!    buffer, emitting silence on underrun. Downstream FX / panning will run
-//!    against the stereo pair.
+//!    `process` callback drains stereo `[L, R]` pairs from three
+//!    `rtrb::Consumer`s (TTS, music, vox), applies per-strip pan/gain/mute
+//!    per-channel, sums them into the negotiated interleaved output buffer,
+//!    and emits silence on underrun. Downstream FX / panning always operate
+//!    on the stereo pair — nothing in the chain collapses to mono.
 //!
 //! 2. Two companion sink streams — one per fixed [`SinkRole`]:
-//!    * `{node_name}-music` (`Audio/Sink`, `media.role = Music`) — stereo
-//!      input is downmixed to mono, pushed into an SPSC ring drained by
-//!      the source callback, which sums it with TTS to build the final
+//!    * `{node_name}-music` (`Audio/Sink`, `media.role = Music`) — each
+//!      incoming stereo frame is pushed verbatim into an SPSC ring drained
+//!      by the source callback, which mixes it with TTS to build the final
 //!      mic feed. A PA that speaks into Discord.
 //!    * `{node_name}-vox` (`Audio/Sink`, `media.role = Communication`) —
-//!      stereo samples are published to [`Config::input_tap`] for internal
-//!      consumers (future FX chain, recording, an input-side browser
-//!      monitor). Doesn't reach the mic on its own.
+//!      same passthrough plus a broadcast tap ([`Config::input_tap`]) of
+//!      the raw interleaved stereo frame for internal consumers (future
+//!      FX chain, recording, an input-side browser monitor).
 //!
 //!    Each role has its own dedicated node so external apps route by name
 //!    instead of toggling a runtime mode. Nodes always exist even with
@@ -344,7 +345,7 @@ impl Handle {
     }
 }
 
-pub fn spawn(cfg: Config, consumer: Consumer<f32>) -> Result<Handle> {
+pub fn spawn(cfg: Config, consumer: Consumer<[f32; 2]>) -> Result<Handle> {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = stop.clone();
     let (cmd_tx, cmd_rx) = pw_channel::channel::<Command>();
@@ -1168,7 +1169,7 @@ fn route_source_via_metadata(
 
 fn run(
     cfg: Config,
-    consumer: Consumer<f32>,
+    consumer: Consumer<[f32; 2]>,
     stop: Arc<AtomicBool>,
     cmd_rx: pw_channel::Receiver<Command>,
 ) -> Result<()> {
@@ -1188,11 +1189,13 @@ fn run(
     // Passthrough rings, one per companion sink. Sized for ~half a second at
     // the target rate: large enough to absorb sink/source callback tick jitter
     // without piling up perceivable latency in the mic feed. Both rings carry
-    // mono downmixed samples — the source callback applies per-strip pan
-    // (constant-power law) to fan mono → stereo before summing with TTS.
+    // stereo pairs — the sink callback pushes each incoming frame verbatim
+    // (no downmix), and the source callback applies per-strip pan
+    // (constant-power law, per-channel) so the stereo image survives from
+    // whatever's feeding the sink all the way to the mic feed.
     let input_ring_frames = (cfg.sample_rate as usize / 2).max(1024);
-    let (music_producer, music_consumer) = RingBuffer::<f32>::new(input_ring_frames);
-    let (vox_producer, vox_consumer) = RingBuffer::<f32>::new(input_ring_frames);
+    let (music_producer, music_consumer) = RingBuffer::<[f32; 2]>::new(input_ring_frames);
+    let (vox_producer, vox_consumer) = RingBuffer::<[f32; 2]>::new(input_ring_frames);
 
     // Registry listener. Wrap the registry in an Rc so both the global
     // callback (which needs to `bind` new node proxies) and the run-scope
@@ -1222,14 +1225,17 @@ fn run(
     let stream = Stream::new(&core, &cfg.node_name, props).context("Stream::new")?;
 
     struct StreamState {
-        /// Mono TTS drain — the synthesis pipeline's output.
-        tts_consumer: Consumer<f32>,
-        /// Mono music-sink drain. Empty when nobody's routed into the
+        /// Stereo TTS drain — the synthesis pipeline's output. TTS is
+        /// currently mono-native and duplicated to L=R at the ring
+        /// boundary (see `tts::push_samples_backpressured`); future
+        /// stereo TTS or FX in the chain can drop straight in.
+        tts_consumer: Consumer<[f32; 2]>,
+        /// Stereo music-sink drain. Empty when nobody's routed into the
         /// `-music` node; pops return Err and contribute 0 to the sum.
-        music_consumer: Consumer<f32>,
-        /// Mono vox-sink drain. Same semantics as music — the sink
-        /// callback downmixes the incoming stereo frame before pushing.
-        vox_consumer: Consumer<f32>,
+        music_consumer: Consumer<[f32; 2]>,
+        /// Stereo vox-sink drain. Same semantics as music — the sink
+        /// callback pushes each incoming stereo frame verbatim.
+        vox_consumer: Consumer<[f32; 2]>,
         /// Shared mixer atomics. Read per-frame; updates from HTTP are
         /// picked up on the very next process cycle.
         mixer: Arc<AtomicMixer>,
@@ -1312,17 +1318,27 @@ fn run(
                     // Always drain each ring even if muted — otherwise the
                     // upstream sink callback will spin against a full ring
                     // and drop input frames instead of just being silenced.
-                    let tts = state.tts_consumer.pop().unwrap_or(0.0);
-                    let music = state.music_consumer.pop().unwrap_or(0.0);
-                    let vox = state.vox_consumer.pop().unwrap_or(0.0);
+                    // Rings carry stereo `[L, R]` pairs; underrun contributes
+                    // silence to both channels.
+                    let [tts_lin, tts_rin] = state.tts_consumer.pop().unwrap_or([0.0, 0.0]);
+                    let [mus_lin, mus_rin] = state.music_consumer.pop().unwrap_or([0.0, 0.0]);
+                    let [vox_lin, vox_rin] = state.vox_consumer.pop().unwrap_or([0.0, 0.0]);
 
                     // Per-strip contributions to the mix bus (pre-master).
-                    let tts_l_c = tts * tts_l;
-                    let tts_r_c = tts * tts_r;
-                    let mus_l_c = music * music_l;
-                    let mus_r_c = music * music_r;
-                    let vox_l_c = vox * vox_l;
-                    let vox_r_c = vox * vox_r;
+                    // Constant-power pan is applied per-channel: the L input
+                    // is attenuated by `l_gain` (= cos(angle)) into the L bus,
+                    // R by `r_gain` (= sin(angle)) into the R bus. At pan=0
+                    // both channels see 0.707 → stereo image preserved (with
+                    // the classic ~3dB center dip). At pan=±1 the opposite
+                    // input's channel is muted. For a mono-duplicated source
+                    // (TTS today) this is identical to the previous mono-in,
+                    // pan-fanned-to-stereo behavior.
+                    let tts_l_c = tts_lin * tts_l;
+                    let tts_r_c = tts_rin * tts_r;
+                    let mus_l_c = mus_lin * music_l;
+                    let mus_r_c = mus_rin * music_r;
+                    let vox_l_c = vox_lin * vox_l;
+                    let vox_r_c = vox_rin * vox_r;
 
                     // Meter magnitude per strip = max(|L|, |R|) of the
                     // panned contribution. Matches what a channel VU on a
@@ -1472,7 +1488,7 @@ fn run(
 /// the caller can bind them to a scope that lives as long as the pw main
 /// loop — dropping either tears the node down.
 ///
-/// Both roles push a mono downmix of the incoming stereo chunk into their
+/// Both roles push each incoming stereo frame verbatim into their
 /// dedicated SPSC ring; the source callback drains the ring and applies
 /// per-strip pan/gain/mute via the shared mixer state. The Vox sink
 /// additionally publishes the raw stereo interleaved samples on the
@@ -1481,7 +1497,7 @@ fn register_sink_stream(
     core: &Core,
     cfg: &Config,
     role: SinkRole,
-    input_producer: Producer<f32>,
+    input_producer: Producer<[f32; 2]>,
     input_tap: Option<broadcast::Sender<Arc<[f32]>>>,
 ) -> Result<(Stream, pw::stream::StreamListener<SinkState>)> {
     let sink_node_name = format!("{}-{}", cfg.node_name, role.suffix());
@@ -1558,15 +1574,15 @@ fn register_sink_stream(
             // the buffer is aligned + sized appropriately.
             let stereo: &[f32] = bytemuck_cast_slice(valid);
 
-            // Both roles push mono downmix into their ring so the source
-            // callback can apply per-strip pan/gain/mute. Vox also mirrors
-            // the raw stereo frame to the broadcast tap for downstream FX
-            // / recording consumers.
+            // Push each incoming stereo frame verbatim so the source
+            // callback can apply per-strip pan/gain/mute without ever
+            // collapsing to mono. Vox also mirrors the raw stereo frame
+            // to the broadcast tap for downstream FX / recording consumers.
             let mut dropped = 0usize;
             for f in 0..frames {
                 let base = f * SINK_CHANNELS as usize;
-                let mono = 0.5 * stereo[base] + 0.5 * stereo[base + 1];
-                if state.producer.push(mono).is_err() {
+                let pair = [stereo[base], stereo[base + 1]];
+                if state.producer.push(pair).is_err() {
                     dropped = frames - f;
                     break;
                 }
@@ -1629,7 +1645,7 @@ struct SinkState {
     role: SinkRole,
     /// Mono ring producer drained by the source callback (populated for
     /// every role — both music and vox now mix through the source).
-    producer: Producer<f32>,
+    producer: Producer<[f32; 2]>,
     /// Broadcast sender for downstream FX / recording consumers. Only the
     /// Vox sink attaches one.
     tap: Option<broadcast::Sender<Arc<[f32]>>>,
