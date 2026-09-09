@@ -64,3 +64,14 @@ uuid = { version = "1", features = ["v4"] }
 # discord_vox crate (cargo forbids two versions of the same links="sqlite3"
 # native lib in one build graph).
 rusqlite = { version = "0.31", features = ["bundled"] }
+
+# Speech-to-text via k2-fsa/sherpa-onnx. We deliberately opt out of the
+# default `static` feature because that would statically link espeak-ng
+# — a symbol conflict with `piper-rs`'s `espeak-rs-sys`, which also
+# statically links its own copy of the same C library. `shared` makes
+# the build.rs download prebuilt .so files and encode an rpath into the
+# binary, so sherpa-onnx keeps its private espeak inside its .so and our
+# binary only sees the C-API surface. Onnxruntime symbol overlap with
+# the `ort` crate above is separately avoided by `ort`'s `load-dynamic`
+# feature (dlopens libonnxruntime at runtime from ORT_DYLIB_PATH).
+sherpa-onnx = { version = "1.13.7", default-features = false, features = ["shared"] }

@@ -12,7 +12,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 const RELAXED: Ordering = Ordering::Relaxed;
 
@@ -134,6 +134,33 @@ pub struct AtomicMixer {
     /// fetch_max / swap-to-reset semantics as `AtomicChannel::peak`.
     master_peak_l: AtomicU32,
     master_peak_r: AtomicU32,
+    /// Monotonic "stop TTS playback" counter. HTTP `POST /playback/stop`
+    /// bumps this via [`Self::request_tts_stop`]; the pipewire callback
+    /// notices the change vs. its last-seen value and pops-and-discards
+    /// every pending frame in the TTS ring, so an in-flight clip actually
+    /// falls silent instead of finishing to drain naturally. The TTS
+    /// runner also reads this on entry and between push chunks so it
+    /// stops loading NEW samples into the (soon-to-be-flushed) ring.
+    /// Counter (rather than a bool) so races between three consumers
+    /// don't lose events — anyone who cares just compares to their last
+    /// snapshot.
+    tts_stop_gen: AtomicU64,
+    /// Monotonic "latest PlayPcm request" counter for latest-wins dedup.
+    /// Every `POST /widgets/:id/say` claims a fresh seq before enqueueing
+    /// its command; the TTS runner's PlayPcm handler skips (replies Ok(0),
+    /// touches nothing) if its seq isn't equal to the current latest —
+    /// meaning another PlayPcm was enqueued behind it in the mpsc. This
+    /// prevents queued clips from playing back one after another when the
+    /// user clicks Play on several clips in quick succession.
+    play_seq: AtomicU64,
+    /// Highest `tts_stop_gen` the pw process callback has already acted on
+    /// (drained the ring for). Published after each drain so the TTS
+    /// runner can wait until a pending stop has been honored before it
+    /// starts pushing a fresh clip — otherwise the runner's pushed samples
+    /// would be drained by the still-pending stop and playback would start
+    /// mid-clip. `AtomicU64` (not Mutex) since it's read/written by the
+    /// audio-thread callback and must stay lock-free.
+    tts_stop_observed_gen: AtomicU64,
 }
 
 impl AtomicMixer {
@@ -147,7 +174,55 @@ impl AtomicMixer {
             master_mute: AtomicBool::new(state.master.mute),
             master_peak_l: AtomicU32::new(0),
             master_peak_r: AtomicU32::new(0),
+            tts_stop_gen: AtomicU64::new(0),
+            play_seq: AtomicU64::new(0),
+            tts_stop_observed_gen: AtomicU64::new(0),
         })
+    }
+
+    /// Bump the TTS-playback stop generation. Any consumer that captured a
+    /// snapshot of [`Self::tts_stop_gen`] before this call will see a newer
+    /// value and can act (flush the ring / bail out of a push loop).
+    #[inline]
+    pub fn request_tts_stop(&self) -> u64 {
+        // fetch_add returns the *previous* value; the new gen is prev + 1.
+        self.tts_stop_gen.fetch_add(1, RELAXED) + 1
+    }
+
+    /// Current stop-generation. Captured at PlayPcm entry and compared
+    /// against later in the TTS runner + the pw process callback.
+    #[inline]
+    pub fn tts_stop_gen(&self) -> u64 {
+        self.tts_stop_gen.load(RELAXED)
+    }
+
+    /// Reserve the next PlayPcm sequence. HTTP handlers call this before
+    /// enqueueing a request; the runner refuses to play any command whose
+    /// seq doesn't match [`Self::latest_play_seq`] at dispatch time.
+    #[inline]
+    pub fn claim_play_seq(&self) -> u64 {
+        self.play_seq.fetch_add(1, RELAXED) + 1
+    }
+
+    /// The most recently claimed play sequence.
+    #[inline]
+    pub fn latest_play_seq(&self) -> u64 {
+        self.play_seq.load(RELAXED)
+    }
+
+    /// Publish that the pw callback has drained the ring for stop-gen up
+    /// to `gen`. Called from the audio thread.
+    #[inline]
+    pub fn set_tts_stop_observed_gen(&self, gen: u64) {
+        self.tts_stop_observed_gen.store(gen, RELAXED);
+    }
+
+    /// Highest stop-gen the pw callback has honored (drained for). The TTS
+    /// runner waits for this to catch up to its own captured stop-gen
+    /// before pushing samples of a fresh clip.
+    #[inline]
+    pub fn tts_stop_observed_gen(&self) -> u64 {
+        self.tts_stop_observed_gen.load(RELAXED)
     }
 
     /// (gain, muted) for the master strip. Muted is a bool because the

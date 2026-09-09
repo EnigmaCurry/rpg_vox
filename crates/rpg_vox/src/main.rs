@@ -10,6 +10,7 @@ mod monitor;
 mod pw_source;
 mod settings;
 mod store;
+mod stt;
 mod tts;
 mod workflow;
 
@@ -208,6 +209,47 @@ struct Args {
         action = clap::ArgAction::Set,
     )]
     chat_disable_thinking: bool,
+
+    /// Path to the SenseVoice ONNX model used to transcribe recordings from
+    /// the vox channel. Grab the int8 bundle with `just download-stt-model`
+    /// (extracts to `models/sense-voice/`). When unset, recordings still
+    /// work — they just won't auto-fill the SpeakCell caption.
+    #[arg(
+        long,
+        env = "RPG_VOX_STT_MODEL",
+        default_value = "models/sense-voice/model.int8.onnx"
+    )]
+    stt_model: std::path::PathBuf,
+
+    /// Tokens file that pairs with `--stt-model`. Same bundle as the model
+    /// file — the int8 sense-voice archive ships both side by side.
+    #[arg(
+        long,
+        env = "RPG_VOX_STT_TOKENS",
+        default_value = "models/sense-voice/tokens.txt"
+    )]
+    stt_tokens: std::path::PathBuf,
+
+    /// SenseVoice language hint. `"auto"` lets the model pick; other
+    /// accepted values are `en`, `zh`, `ja`, `ko`, `yue`.
+    #[arg(long, env = "RPG_VOX_STT_LANGUAGE", default_value = "auto")]
+    stt_language: String,
+
+    /// Threads sherpa-onnx uses for feature extraction + inference. Two is
+    /// fine for widget-length clips on a desktop; raise for longer captures.
+    #[arg(long, env = "RPG_VOX_STT_THREADS", default_value_t = 2)]
+    stt_threads: i32,
+
+    /// Disable STT entirely even when model files are present. Handy for
+    /// benchmarking, or when the recognizer needs to be bypassed without
+    /// deleting the model files.
+    #[arg(
+        long,
+        env = "RPG_VOX_STT_DISABLED",
+        default_value_t = false,
+        action = clap::ArgAction::Set,
+    )]
+    stt_disabled: bool,
 }
 
 fn main() -> Result<()> {
@@ -271,7 +313,7 @@ fn main() -> Result<()> {
         node_description: node_description.clone(),
         sample_rate: args.sample_rate,
         auto_patch_target: args.auto_link.clone(),
-        input_tap,
+        input_tap: input_tap.clone(),
         monitor_tap: monitor_tap.clone(),
         mixer: mixer.clone(),
     };
@@ -394,6 +436,29 @@ fn main() -> Result<()> {
         .with_context(|| format!("opening store at {}", args.data_dir.display()))?;
     info!(data_dir = %args.data_dir.display(), "widget store opened");
 
+    // Speech-to-text. Loaded once at startup; missing model files just
+    // disable the feature (the record flow still saves the WAV, it simply
+    // doesn't auto-fill the SpeakCell caption). --stt-disabled forces None
+    // even when the files exist, which is easier than moving the files
+    // around while benchmarking.
+    let stt_cfg = stt::SttConfig {
+        model: (!args.stt_disabled && args.stt_model.exists())
+            .then(|| args.stt_model.clone()),
+        tokens: (!args.stt_disabled && args.stt_tokens.exists())
+            .then(|| args.stt_tokens.clone()),
+        language: args.stt_language.clone(),
+        num_threads: args.stt_threads,
+    };
+    if args.stt_disabled {
+        info!("STT disabled via --stt-disabled");
+    } else if !args.stt_model.exists() {
+        info!(
+            model = %args.stt_model.display(),
+            "STT model file missing — recording caption won't be auto-filled"
+        );
+    }
+    let stt = stt::open_or_warn(&stt_cfg);
+
     // Restore persisted mixer state before the HTTP server starts serving,
     // so the first GET already reflects what the user had last session.
     match rt.block_on(store.get_mixer()) {
@@ -414,7 +479,7 @@ fn main() -> Result<()> {
             target_sample_rate: args.sample_rate,
             ringbuf_frames,
         };
-        let tts_task = tokio::spawn(tts::run(tts_cfg, backend, tts_rx, producer));
+        let tts_task = tokio::spawn(tts::run(tts_cfg, backend, tts_rx, producer, mixer.clone()));
 
         let http_task = tokio::spawn(http::serve(
             args.bind.clone(),
@@ -427,6 +492,9 @@ fn main() -> Result<()> {
             monitor_tap,
             args.sample_rate,
             mixer.clone(),
+            input_tap,
+            args.sample_rate,
+            stt,
         ));
 
         // Verify + warmup are ComfyUI-specific — skip both entirely when a

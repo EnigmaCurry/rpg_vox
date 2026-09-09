@@ -43,5 +43,18 @@ pkgs.mkShell {
   shellHook = ''
     echo "rpg_vox dev shell: rustc $(rustc --version), pipewire $(${pkgs.pipewire}/bin/pipewire --version | head -1)"
     echo "ORT_DYLIB_PATH=$ORT_DYLIB_PATH"
+    # sherpa-onnx-sys downloads prebuilt shared libs into
+    # target/sherpa-onnx-prebuilt/*/lib and encodes an rpath pointing at
+    # that dir. NixOS's ld-wrapper strips non-/nix/store rpath entries, so
+    # we prepend the same path to LD_LIBRARY_PATH here — the glob picks up
+    # whatever version cargo just downloaded, so bumps of the crate don't
+    # need a matching edit here. Silent if the dir doesn't exist yet
+    # (first build hasn't happened).
+    for _dir in "$PWD"/target/sherpa-onnx-prebuilt/*/lib; do
+      if [ -d "$_dir" ]; then
+        export LD_LIBRARY_PATH="$_dir''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+      fi
+    done
+    unset _dir
   '';
 }

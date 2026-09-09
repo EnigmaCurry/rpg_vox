@@ -1,6 +1,5 @@
 <script>
   import {
-    scenesState,
     currentProject,
     currentProjectCharacters,
     createCharacter,
@@ -8,15 +7,20 @@
     deleteCharacter,
     addCharacterPicture,
     removeCharacterPicture,
-    addCharacterStyle,
-    renameCharacterStyle,
-    setCharacterStyleInstruct,
-    setCharacterStyleEffect,
-    deleteCharacterStyle,
+    addVoiceProfile,
+    renameVoiceProfile,
+    deleteVoiceProfile,
+    addProfileConfig,
+    updateProfileConfig,
+    deleteProfileConfig,
     QWEN3_SPEAKERS,
     QWEN3_LANGUAGES,
-    STYLE_PITCH_RANGE,
-    STYLE_TIME_RANGE,
+    CONFIG_PITCH_RANGE,
+    CONFIG_TIME_RANGE,
+    CONFIG_DETUNE_RANGE,
+    CONFIG_PAN_RANGE,
+    CONFIG_GAIN_DB_RANGE,
+    CONFIG_DELAY_MS_RANGE,
   } from '../lib/scenes.svelte.js';
   import { uploadImage } from '../lib/api.js';
 
@@ -47,54 +51,73 @@
   function onNameInput(id, ev) {
     updateCharacter(id, { name: ev.currentTarget.value });
   }
-  function onSpeakerChange(id, ev) {
-    updateCharacter(id, { voice: { speaker: ev.currentTarget.value } });
+
+  // ---- Voice profiles + configs -------------------------------------------
+  function onProfileNameInput(characterId, profileId, ev) {
+    renameVoiceProfile(characterId, profileId, ev.currentTarget.value);
   }
-  function onLanguageChange(id, ev) {
-    updateCharacter(id, { voice: { language: ev.currentTarget.value } });
+  function onAddProfile(characterId) {
+    addVoiceProfile(characterId, 'new profile');
   }
-  function onStyleNameInput(characterId, styleId, ev) {
-    renameCharacterStyle(characterId, styleId, ev.currentTarget.value);
+  function onAddConfig(characterId, profileId) {
+    addProfileConfig(characterId, profileId);
   }
-  function onStyleInstructInput(characterId, styleId, ev) {
-    setCharacterStyleInstruct(characterId, styleId, ev.currentTarget.value);
-  }
-  function onStylePitchInput(characterId, styleId, ev) {
-    setCharacterStyleEffect(characterId, styleId, {
-      pitchSemitones: ev.currentTarget.valueAsNumber,
+  function onConfigStringInput(characterId, profileId, configId, field, ev) {
+    updateProfileConfig(characterId, profileId, configId, {
+      [field]: ev.currentTarget.value,
     });
   }
-  function onStyleTimeInput(characterId, styleId, ev) {
-    setCharacterStyleEffect(characterId, styleId, {
-      timeRatio: ev.currentTarget.valueAsNumber,
+  function onConfigNumberInput(characterId, profileId, configId, field, ev) {
+    updateProfileConfig(characterId, profileId, configId, {
+      [field]: ev.currentTarget.valueAsNumber,
     });
-  }
-  function onAddStyle(characterId) {
-    addCharacterStyle(characterId, 'new style');
   }
 
-  // Two-tap confirm for style deletes; keyed as `${characterId}:${styleId}`
-  // so multiple armed rows never collide.
-  let styleDeleteArmed = $state(null);
-  let styleDeleteTimer = 0;
-  let styleDeleteErr = $state('');
-  function onDeleteStyle(characterId, styleId) {
-    const key = `${characterId}:${styleId}`;
-    if (styleDeleteArmed === key) {
-      if (styleDeleteTimer) clearTimeout(styleDeleteTimer);
-      styleDeleteArmed = null;
-      const res = deleteCharacterStyle(characterId, styleId);
+  // Two-tap confirm for profile deletes; keyed as `${characterId}:${profileId}`.
+  let profileDeleteArmed = $state(null);
+  let profileDeleteTimer = 0;
+  let profileDeleteErr = $state('');
+  function onDeleteProfile(character, profile) {
+    const key = `${character.id}:${profile.id}`;
+    if (profileDeleteArmed === key) {
+      if (profileDeleteTimer) clearTimeout(profileDeleteTimer);
+      profileDeleteArmed = null;
+      const res = deleteVoiceProfile(character.id, profile.id);
       if (!res.ok) {
-        styleDeleteErr = res.reason;
-        setTimeout(() => { styleDeleteErr = ''; }, 2500);
+        profileDeleteErr = res.reason;
+        setTimeout(() => { profileDeleteErr = ''; }, 2500);
       }
       return;
     }
-    styleDeleteArmed = key;
-    if (styleDeleteTimer) clearTimeout(styleDeleteTimer);
-    styleDeleteTimer = setTimeout(() => {
-      styleDeleteArmed = null;
-      styleDeleteTimer = 0;
+    profileDeleteArmed = key;
+    if (profileDeleteTimer) clearTimeout(profileDeleteTimer);
+    profileDeleteTimer = setTimeout(() => {
+      profileDeleteArmed = null;
+      profileDeleteTimer = 0;
+    }, DELETE_CONFIRM_MS);
+  }
+
+  // Two-tap confirm for config deletes; keyed as `${profileId}:${configId}`.
+  let configDeleteArmed = $state(null);
+  let configDeleteTimer = 0;
+  let configDeleteErr = $state('');
+  function onDeleteConfig(character, profile, config) {
+    const key = `${profile.id}:${config.id}`;
+    if (configDeleteArmed === key) {
+      if (configDeleteTimer) clearTimeout(configDeleteTimer);
+      configDeleteArmed = null;
+      const res = deleteProfileConfig(character.id, profile.id, config.id);
+      if (!res.ok) {
+        configDeleteErr = res.reason;
+        setTimeout(() => { configDeleteErr = ''; }, 2500);
+      }
+      return;
+    }
+    configDeleteArmed = key;
+    if (configDeleteTimer) clearTimeout(configDeleteTimer);
+    configDeleteTimer = setTimeout(() => {
+      configDeleteArmed = null;
+      configDeleteTimer = 0;
     }, DELETE_CONFIRM_MS);
   }
 
@@ -191,7 +214,7 @@
     {#if characters.length === 0}
       <div class="empty">No characters yet — add one above.</div>
     {:else}
-      <ul>
+      <ul class="char-list">
         {#each characters as character (character.id)}
           <li>
             <div class="card">
@@ -228,113 +251,205 @@
                   />
                 </label>
 
-                <div class="voice-row">
-                  <label class="field">
-                    <span>Voice speaker</span>
-                    <select
-                      value={character.voice.speaker}
-                      onchange={(e) => onSpeakerChange(character.id, e)}
-                    >
-                      {#each QWEN3_SPEAKERS as spk}
-                        <option value={spk}>{spk}</option>
-                      {/each}
-                    </select>
-                  </label>
-
-                  <label class="field">
-                    <span>Language</span>
-                    <select
-                      value={character.voice.language}
-                      onchange={(e) => onLanguageChange(character.id, e)}
-                    >
-                      {#each QWEN3_LANGUAGES as lang}
-                        <option value={lang}>{lang}</option>
-                      {/each}
-                    </select>
-                  </label>
-                </div>
-
-                <div class="styles">
-                  <div class="styles-head">
-                    <span>Voice-style instructions</span>
+                <div class="profiles">
+                  <div class="profiles-head">
+                    <span>Voice profiles</span>
                     <button
                       type="button"
                       class="file-btn small"
-                      onclick={() => onAddStyle(character.id)}
-                      title="Add a new voice-style slot"
-                    >+ add style</button>
+                      onclick={() => onAddProfile(character.id)}
+                      title="Add a new voice profile"
+                    >+ add profile</button>
                   </div>
-                  <ul class="style-list">
-                    {#each character.voice.styles as style (style.id)}
-                      <li class="style-row">
-                        <input
-                          class="style-name"
-                          type="text"
-                          value={style.name}
-                          placeholder="style name"
-                          aria-label="Style name"
-                          oninput={(e) => onStyleNameInput(character.id, style.id, e)}
-                        />
-                        <div class="style-body">
-                          <textarea
-                            class="style-instruct"
-                            rows="2"
-                            placeholder="e.g. calm, whisper, angry, cheerful"
-                            value={style.instruct}
-                            oninput={(e) => onStyleInstructInput(character.id, style.id, e)}
-                          ></textarea>
-                          <!-- Post-processing effects. Apply to any backend
-                               (Piper included) since they run on the mono PCM
-                               after synthesis. Identity values (0 / 1) skip
-                               the DSP call on the server. -->
-                          <div class="style-effects">
-                            <label class="fx">
-                              <span>Pitch</span>
-                              <input
-                                type="number"
-                                min={STYLE_PITCH_RANGE.min}
-                                max={STYLE_PITCH_RANGE.max}
-                                step={STYLE_PITCH_RANGE.step}
-                                value={style.pitchSemitones}
-                                oninput={(e) => onStylePitchInput(character.id, style.id, e)}
-                                aria-label="Pitch shift in semitones"
-                                title="Pitch shift in semitones (0 = no change)"
-                              />
-                              <span class="unit">st</span>
-                            </label>
-                            <label class="fx">
-                              <span>Speed</span>
-                              <input
-                                type="number"
-                                min={STYLE_TIME_RANGE.min}
-                                max={STYLE_TIME_RANGE.max}
-                                step={STYLE_TIME_RANGE.step}
-                                value={style.timeRatio}
-                                oninput={(e) => onStyleTimeInput(character.id, style.id, e)}
-                                aria-label="Time stretch ratio"
-                                title="Duration multiplier (1 = no change, 2 = twice as long, 0.5 = half)"
-                              />
-                              <span class="unit">×</span>
-                            </label>
-                          </div>
+
+                  <ul class="profile-list">
+                    {#each character.voiceProfiles as profile (profile.id)}
+                      <li class="profile">
+                        <div class="profile-head">
+                          <input
+                            class="profile-name"
+                            type="text"
+                            value={profile.name}
+                            placeholder="profile name"
+                            aria-label="Profile name"
+                            oninput={(e) => onProfileNameInput(character.id, profile.id, e)}
+                          />
+                          <span class="config-count">
+                            {profile.configs.length}
+                            {profile.configs.length === 1 ? 'voice' : 'voices'}
+                          </span>
+                          <button
+                            type="button"
+                            class="mini-btn"
+                            onclick={() => onAddConfig(character.id, profile.id)}
+                            title="Layer another voice onto this profile (crowd / hive-mind)"
+                          >+ voice</button>
+                          <button
+                            type="button"
+                            class="mini-btn danger"
+                            class:armed={profileDeleteArmed === `${character.id}:${profile.id}`}
+                            class:blocked={character.voiceProfiles.length <= 1}
+                            disabled={character.voiceProfiles.length <= 1}
+                            onclick={() => onDeleteProfile(character, profile)}
+                            title={character.voiceProfiles.length <= 1
+                              ? 'At least one profile is required'
+                              : (profileDeleteArmed === `${character.id}:${profile.id}` ? 'Click again to confirm' : 'Delete profile')}
+                            aria-label="Delete profile"
+                          >×</button>
                         </div>
-                        <button
-                          type="button"
-                          class="style-del"
-                          class:armed={styleDeleteArmed === `${character.id}:${style.id}`}
-                          class:blocked={character.voice.styles.length <= 1}
-                          disabled={character.voice.styles.length <= 1}
-                          onclick={() => onDeleteStyle(character.id, style.id)}
-                          title={character.voice.styles.length <= 1
-                            ? 'At least one style is required'
-                            : (styleDeleteArmed === `${character.id}:${style.id}` ? 'Click again to confirm' : 'Delete style')}
-                          aria-label="Delete style"
-                        >×</button>
+
+                        <ul class="config-list">
+                          {#each profile.configs as config, cfgIdx (config.id)}
+                            <li class="config">
+                              <div class="config-head">
+                                <span class="config-idx">voice {cfgIdx + 1}</span>
+                                <button
+                                  type="button"
+                                  class="mini-btn danger"
+                                  class:armed={configDeleteArmed === `${profile.id}:${config.id}`}
+                                  class:blocked={profile.configs.length <= 1}
+                                  disabled={profile.configs.length <= 1}
+                                  onclick={() => onDeleteConfig(character, profile, config)}
+                                  title={profile.configs.length <= 1
+                                    ? 'A profile needs at least one voice'
+                                    : (configDeleteArmed === `${profile.id}:${config.id}` ? 'Click again to confirm' : 'Delete voice')}
+                                  aria-label="Delete voice"
+                                >×</button>
+                              </div>
+
+                              <div class="config-row">
+                                <label class="field">
+                                  <span>Speaker</span>
+                                  <select
+                                    value={config.speaker}
+                                    onchange={(e) => onConfigStringInput(character.id, profile.id, config.id, 'speaker', e)}
+                                  >
+                                    {#each QWEN3_SPEAKERS as spk}
+                                      <option value={spk}>{spk}</option>
+                                    {/each}
+                                  </select>
+                                </label>
+                                <label class="field">
+                                  <span>Language</span>
+                                  <select
+                                    value={config.language}
+                                    onchange={(e) => onConfigStringInput(character.id, profile.id, config.id, 'language', e)}
+                                  >
+                                    {#each QWEN3_LANGUAGES as lang}
+                                      <option value={lang}>{lang}</option>
+                                    {/each}
+                                  </select>
+                                </label>
+                              </div>
+
+                              <label class="field">
+                                <span>Instruct</span>
+                                <textarea
+                                  class="config-instruct"
+                                  rows="2"
+                                  placeholder="e.g. calm, whisper, angry, cheerful, robotic"
+                                  value={config.instruct}
+                                  oninput={(e) => onConfigStringInput(character.id, profile.id, config.id, 'instruct', e)}
+                                ></textarea>
+                              </label>
+
+                              <div class="config-effects">
+                                <label class="fx">
+                                  <span>Pitch</span>
+                                  <input
+                                    type="number"
+                                    min={CONFIG_PITCH_RANGE.min}
+                                    max={CONFIG_PITCH_RANGE.max}
+                                    step={CONFIG_PITCH_RANGE.step}
+                                    value={config.pitchSemitones}
+                                    oninput={(e) => onConfigNumberInput(character.id, profile.id, config.id, 'pitchSemitones', e)}
+                                    aria-label="Pitch shift in semitones"
+                                    title="Pitch shift in semitones (0 = no change)"
+                                  />
+                                  <span class="unit">st</span>
+                                </label>
+                                <label class="fx">
+                                  <span>Detune</span>
+                                  <input
+                                    type="number"
+                                    min={CONFIG_DETUNE_RANGE.min}
+                                    max={CONFIG_DETUNE_RANGE.max}
+                                    step={CONFIG_DETUNE_RANGE.step}
+                                    value={config.detuneCents}
+                                    oninput={(e) => onConfigNumberInput(character.id, profile.id, config.id, 'detuneCents', e)}
+                                    aria-label="Detune in cents"
+                                    title="Fine pitch offset in cents; added to Pitch. 100 cents = 1 semitone."
+                                  />
+                                  <span class="unit">¢</span>
+                                </label>
+                                <label class="fx">
+                                  <span>Speed</span>
+                                  <input
+                                    type="number"
+                                    min={CONFIG_TIME_RANGE.min}
+                                    max={CONFIG_TIME_RANGE.max}
+                                    step={CONFIG_TIME_RANGE.step}
+                                    value={config.timeRatio}
+                                    oninput={(e) => onConfigNumberInput(character.id, profile.id, config.id, 'timeRatio', e)}
+                                    aria-label="Time stretch ratio"
+                                    title="Duration multiplier (1 = no change, 2 = twice as long, 0.5 = half)"
+                                  />
+                                  <span class="unit">×</span>
+                                </label>
+                                <label class="fx">
+                                  <span>Pan</span>
+                                  <input
+                                    type="number"
+                                    min={CONFIG_PAN_RANGE.min}
+                                    max={CONFIG_PAN_RANGE.max}
+                                    step={CONFIG_PAN_RANGE.step}
+                                    value={config.pan}
+                                    oninput={(e) => onConfigNumberInput(character.id, profile.id, config.id, 'pan', e)}
+                                    aria-label="Stereo pan"
+                                    title="Stereo pan (-1 = full left, 0 = center, +1 = full right)"
+                                  />
+                                  <span class="unit">L↔R</span>
+                                </label>
+                                <label class="fx">
+                                  <span>Gain</span>
+                                  <input
+                                    type="number"
+                                    min={CONFIG_GAIN_DB_RANGE.min}
+                                    max={CONFIG_GAIN_DB_RANGE.max}
+                                    step={CONFIG_GAIN_DB_RANGE.step}
+                                    value={config.gainDb}
+                                    oninput={(e) => onConfigNumberInput(character.id, profile.id, config.id, 'gainDb', e)}
+                                    aria-label="Gain in decibels"
+                                    title="Per-voice level (0 = unity)"
+                                  />
+                                  <span class="unit">dB</span>
+                                </label>
+                                <label class="fx">
+                                  <span>Delay</span>
+                                  <input
+                                    type="number"
+                                    min={CONFIG_DELAY_MS_RANGE.min}
+                                    max={CONFIG_DELAY_MS_RANGE.max}
+                                    step={CONFIG_DELAY_MS_RANGE.step}
+                                    value={config.delayMs}
+                                    oninput={(e) => onConfigNumberInput(character.id, profile.id, config.id, 'delayMs', e)}
+                                    aria-label="Start delay in milliseconds"
+                                    title="Delay this voice's start relative to the profile's mix (ms)"
+                                  />
+                                  <span class="unit">ms</span>
+                                </label>
+                              </div>
+                            </li>
+                          {/each}
+                        </ul>
+                        {#if configDeleteErr}
+                          <div class="err small">{configDeleteErr}</div>
+                        {/if}
                       </li>
                     {/each}
                   </ul>
-                  {#if styleDeleteErr}
-                    <div class="err small">{styleDeleteErr}</div>
+                  {#if profileDeleteErr}
+                    <div class="err small">{profileDeleteErr}</div>
                   {/if}
                 </div>
 
@@ -449,11 +564,14 @@
     border-radius: 6px;
     background: rgba(255,128,128,0.06);
   }
+  .err.small { padding: 4px 8px; font-size: 11px; }
 
   ul {
     list-style: none;
     margin: 0;
     padding: 0;
+  }
+  .char-list {
     display: flex;
     flex-direction: column;
     gap: 10px;
@@ -503,7 +621,8 @@
     letter-spacing: 0.05em;
   }
   .field input,
-  .field select {
+  .field select,
+  .field textarea {
     background: rgba(0,0,0,0.35);
     color: var(--text);
     border: 1px solid var(--border);
@@ -514,16 +633,11 @@
     min-width: 0;
   }
   .field input:focus,
-  .field select:focus { outline: none; border-color: var(--accent); }
+  .field select:focus,
+  .field textarea:focus { outline: none; border-color: var(--accent); }
 
-  .voice-row {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 10px;
-  }
-
-  .styles { display: flex; flex-direction: column; gap: 6px; }
-  .styles-head {
+  .profiles { display: flex; flex-direction: column; gap: 8px; }
+  .profiles-head {
     display: flex;
     justify-content: space-between;
     align-items: center;
@@ -532,19 +646,27 @@
     text-transform: uppercase;
     letter-spacing: 0.05em;
   }
-  .style-list {
+  .profile-list {
     display: flex;
     flex-direction: column;
-    gap: 6px;
+    gap: 8px;
   }
-  .style-row {
-    display: grid;
-    grid-template-columns: 130px 1fr auto;
-    gap: 6px;
-    align-items: start;
+  .profile {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 10px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: rgba(0,0,0,0.15);
   }
-  .style-name,
-  .style-instruct {
+  .profile-head {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+  }
+  .profile-name {
+    flex: 1;
     background: rgba(0,0,0,0.35);
     color: var(--text);
     border: 1px solid var(--border);
@@ -553,18 +675,80 @@
     font-size: 13px;
     font-family: inherit;
     min-width: 0;
+    font-weight: 600;
   }
-  .style-name:focus,
-  .style-instruct:focus { outline: none; border-color: var(--accent); }
-  .style-instruct { resize: vertical; width: 100%; }
+  .profile-name:focus { outline: none; border-color: var(--accent); }
+  .config-count {
+    font-size: 11px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
 
-  .style-body {
+  .mini-btn {
+    background: transparent;
+    color: var(--muted);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 3px 8px;
+    font-size: 11px;
+    font-family: inherit;
+    cursor: pointer;
+  }
+  .mini-btn:hover:not(:disabled) { color: var(--accent); border-color: var(--accent); }
+  .mini-btn.danger:hover:not(:disabled),
+  .mini-btn.danger.armed {
+    color: var(--err);
+    border-color: var(--err);
+    background: rgba(255,128,128,0.10);
+  }
+  .mini-btn.blocked,
+  .mini-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  .config-list {
     display: flex;
     flex-direction: column;
-    gap: 4px;
-    min-width: 0;
+    gap: 8px;
   }
-  .style-effects {
+  .config {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 8px;
+    border: 1px dashed var(--border);
+    border-radius: 6px;
+    background: rgba(0,0,0,0.15);
+  }
+  .config-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .config-idx {
+    font-size: 11px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  .config-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+  }
+  .config-instruct {
+    resize: vertical;
+    width: 100%;
+    background: rgba(0,0,0,0.35);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 8px;
+    font-size: 13px;
+    font-family: inherit;
+  }
+  .config-instruct:focus { outline: none; border-color: var(--accent); }
+
+  .config-effects {
     display: flex;
     gap: 10px;
     flex-wrap: wrap;
@@ -579,7 +763,7 @@
     letter-spacing: 0.05em;
   }
   .fx input {
-    width: 70px;
+    width: 68px;
     background: rgba(0,0,0,0.35);
     color: var(--text);
     border: 1px solid var(--border);
@@ -592,27 +776,6 @@
   }
   .fx input:focus { outline: none; border-color: var(--accent); }
   .fx .unit { text-transform: none; letter-spacing: normal; color: var(--muted); }
-  .style-del {
-    align-self: stretch;
-    background: transparent;
-    color: var(--muted);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    width: 28px;
-    padding: 0;
-    font-size: 16px;
-    line-height: 1;
-    cursor: pointer;
-    font-family: inherit;
-  }
-  .style-del:hover:not(:disabled) { color: var(--err); border-color: var(--err); }
-  .style-del.armed {
-    color: var(--err);
-    border-color: var(--err);
-    background: rgba(255,128,128,0.10);
-  }
-  .style-del.blocked,
-  .style-del:disabled { opacity: 0.4; cursor: not-allowed; }
 
   .pictures { display: flex; flex-direction: column; gap: 6px; }
   .pictures-head {

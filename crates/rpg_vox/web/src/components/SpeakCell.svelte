@@ -17,7 +17,17 @@
   //               a textarea to edit; if edited, X to cancel back to rendered
 
   import { onDestroy, onMount, tick } from 'svelte';
-  import { createWidget, updateWidget, deleteWidget, fetchWidget, playWidget } from '../lib/api.js';
+  import {
+    createWidget,
+    updateWidget,
+    deleteWidget,
+    fetchWidget,
+    playWidget,
+    stopPlayback,
+    startRecording,
+    stopRecording,
+    cancelRecording,
+  } from '../lib/api.js';
   import { estimateMs, recordSample } from '../lib/estimator.js';
 
   // When used inside a Lane, the parent owns the clip's identity and passes
@@ -29,7 +39,7 @@
   // pre-lane behavior with an empty starting state.
   let {
     initialText = '',
-    initialStyleId = null,
+    initialProfileId = null,
     initialWidgetId = null,
     startEditing = false,
     onchange = null,
@@ -50,14 +60,21 @@
     // Lets the parent know a cell is holding unsaved input so scene-level
     // Play/Render buttons can gate on that.
     onedit = null,
-    // Per-clip voice payload forwarded to the server on render:
-    // `{ speaker, language, instruct }`. The parent resolves `instruct` from
-    // the character's selected style, so this cell no longer edits it.
-    voice = {},
-    // Available voice styles for this cell's character: `[{id, name}]`.
-    // Rendered as a dropdown that picks which style's instruction the
-    // server uses. Empty list → dropdown is hidden.
-    styles = [],
+    // Voice-profile payload for this cell's next render: an array of one or
+    // more `{ speaker, language, instruct, pitchSemitones, timeRatio,
+    // detuneCents, pan, gainDb, delayMs }` entries. The parent resolves
+    // this from the character's selected profile; N>1 configs produce a
+    // hive-mind mix on the server.
+    configs = [],
+    // Available voice profiles for this cell's character: `[{id, name}]`.
+    // Rendered as a dropdown that picks which profile the server renders.
+    // Empty list → dropdown is hidden.
+    profiles = [],
+    // Fired just before a user-initiated play kicks off (button click,
+    // hover-play, retry-then-auto-play). NOT fired when scene playback
+    // drives the cell via `playToEnd`. Lets the parent stop an in-flight
+    // scene loop when the user clicks Play on any individual clip.
+    onSoloPlayIntent = null,
   } = $props();
 
   // Starting state:
@@ -82,7 +99,7 @@
   // svelte-ignore state_referenced_locally
   let text = $state(initialText);
   // svelte-ignore state_referenced_locally
-  let styleId = $state(initialStyleId);
+  let profileId = $state(initialProfileId);
   let error = $state('');
 
   // Snapshot of what produced the current cached clip — used to detect
@@ -91,7 +108,7 @@
   // svelte-ignore state_referenced_locally
   let renderedText = $state(initialWidgetId ? initialText : '');
   // svelte-ignore state_referenced_locally
-  let renderedStyleId = $state(initialWidgetId ? initialStyleId : null);
+  let renderedProfileId = $state(initialWidgetId ? initialProfileId : null);
   // Whether the server currently holds a playable clip for this widget id.
   // Set by the mount-time metadata fetch and by every successful render;
   // cleared on delete/reset. Playback goes through /widgets/:id/say (mic),
@@ -112,6 +129,15 @@
   let rafId = 0;
   let startedAt = 0;
   let estimatedMs = 0;
+
+  // Active vox recording session id (state='recording'). Null otherwise.
+  // Set by startRecording; consumed by stopRecording/cancelRecording; also
+  // cleared on destroy so a mid-recording cell teardown doesn't leak a
+  // session on the server.
+  let recordingSessionId = $state(null);
+  // Wall-clock elapsed shown while recording, in ms. Driven by the same
+  // rAF ticker as rendering/playing, so the "meta" line reads live.
+  let recordingElapsedMs = $state(0);
 
   // AbortController for the in-flight /widgets/:id/say fetch, so
   // stopExternal() (or a delete) can cancel scene playback promptly.
@@ -139,6 +165,14 @@
     cancelRaf();
     if (playAbort) { try { playAbort.abort(); } catch {} playAbort = null; }
     if (deleteTimer) clearTimeout(deleteTimer);
+    // Fire-and-forget cancel for an in-flight recording so the server
+    // doesn't hold onto a dangling session buffer if the cell tears down
+    // mid-record (route change, parent lane unmount, etc.).
+    if (recordingSessionId) {
+      const sid = recordingSessionId;
+      recordingSessionId = null;
+      cancelRecording(sid).catch(() => {});
+    }
   });
 
   // Rehydrate from the server if the parent handed us a widgetId. The row
@@ -154,7 +188,7 @@
       sampleRate = result.sampleRate || 0;
       durationMs = result.durationMs || 0;
       renderedText = text;
-      renderedStyleId = styleId;
+      renderedProfileId = profileId;
       ready = true;
       hydrating = false;
       onaudio?.({ ready: true, durationMs });
@@ -208,7 +242,7 @@
   let lastEmit = null;
   $effect(() => {
     if (!onchange) return;
-    const snap = { text, styleId, widgetId };
+    const snap = { text, profileId, widgetId };
     const key = JSON.stringify(snap);
     if (key === lastEmit) return;
     lastEmit = key;
@@ -217,11 +251,16 @@
 
   const hasClip = $derived(ready);
   const isDirty = $derived(
-    hasClip && (text !== renderedText || styleId !== renderedStyleId)
+    hasClip && (text !== renderedText || profileId !== renderedProfileId)
   );
   const progressPct = $derived(`${(progress * 100).toFixed(1)}%`);
 
   async function beginEditing() {
+    // Any playback in flight (this cell or another) should stop before we
+    // drop the user into an edit form — hearing the old take while
+    // rewriting the caption is disorienting. Fire-and-forget so a network
+    // hiccup doesn't block entering the form.
+    stopPlayback().catch(() => {});
     state = 'editing';
     error = '';
     // Textarea only mounts once state flips out of `empty`, so wait a tick
@@ -232,7 +271,7 @@
 
   function cancelEdit() {
     text = renderedText;
-    styleId = renderedStyleId;
+    profileId = renderedProfileId;
     error = '';
     state = 'rendered';
   }
@@ -284,9 +323,9 @@
     if (playAbort) { try { playAbort.abort(); } catch {} playAbort = null; }
     ready = false;
     text = '';
-    styleId = null;
+    profileId = null;
     renderedText = '';
-    renderedStyleId = null;
+    renderedProfileId = null;
     durationMs = 0;
     sampleRate = 0;
     widgetId = null;
@@ -307,12 +346,22 @@
   async function render({ autoplay = true } = {}) {
     const t = text.trim();
     if (!t) { error = 'text is empty'; return; }
+    // Stop any in-flight playback (this cell or another) before kicking off
+    // a fresh synth — the retry mini-button reaches this via onRetryClick,
+    // and a dirty-edit render lands here from the play-button router. In
+    // both cases the user is asking to replace the audio, so keep hearing
+    // the previous take is confusing.
+    stopPlayback().catch(() => {});
     error = '';
     state = 'rendering';
     progress = 0;
     startedAt = performance.now();
-    const voiceInstruct = typeof voice?.instruct === 'string' ? voice.instruct : '';
-    estimatedMs = estimateMs(t.length + voiceInstruct.length);
+    // Estimator input: total prompt length across the profile's layers so a
+    // hive-mind of many configs is billed proportional to its actual work.
+    const instructChars = Array.isArray(configs)
+      ? configs.reduce((n, c) => n + (typeof c?.instruct === 'string' ? c.instruct.length : 0), 0)
+      : 0;
+    estimatedMs = estimateMs(t.length + instructChars);
     rafId = requestAnimationFrame(tickRender);
 
     try {
@@ -321,30 +370,30 @@
       // If we were hydrated with a stale widgetId (server row deleted out
       // from under us — e.g. sqlite wiped), fall back to create so the
       // user's play action still produces a clip.
-      // instruct comes from the character's selected style via `voice`.
+      // Voice layers come from the resolved character profile via `configs`.
       let result;
       try {
         result = widgetId
-          ? await updateWidget(widgetId, t, '', voice)
-          : await createWidget(t, '', voice);
+          ? await updateWidget(widgetId, t, configs)
+          : await createWidget(t, configs);
       } catch (e) {
         if (widgetId && /no widget with id/i.test(e.message || '')) {
           widgetId = null;
-          result = await createWidget(t, '', voice);
+          result = await createWidget(t, configs);
         } else {
           throw e;
         }
       }
       cancelRaf();
       const elapsedMs = performance.now() - startedAt;
-      recordSample(t.length + voiceInstruct.length, elapsedMs);
+      recordSample(t.length + instructChars, elapsedMs);
 
       if (result.id) widgetId = result.id;
       ready = true;
       sampleRate = result.sampleRate || 0;
       durationMs = result.durationMs || 0;
       renderedText = t;
-      renderedStyleId = styleId;
+      renderedProfileId = profileId;
       onaudio?.({ ready: true, durationMs });
 
       progress = 1;
@@ -383,8 +432,15 @@
     rafId = requestAnimationFrame(tickPlay);
   }
 
-  async function play() {
+  async function play({ fromScene = false } = {}) {
     if (!ready || !widgetId) return;
+    // User-initiated plays (button click, hover-play, retry) tell the
+    // parent to abort any in-flight scene playback so the clicked clip
+    // isn't preempted a moment later by the scene loop's next iteration.
+    // Scene-driven plays (playToEnd) skip this so the loop can continue.
+    if (!fromScene) {
+      try { onSoloPlayIntent?.(); } catch {}
+    }
     error = '';
     state = 'playing';
     progress = 0;
@@ -411,17 +467,103 @@
     }
   }
 
+  // ---- Record (capture from the pipewire vox channel) ---------------------
+  // The server subscribes to the `-vox` sink's PCM tap for the duration of
+  // this session and encodes the accumulated samples as a mono 16-bit WAV
+  // on stop — matching the widget clip format so playback, scene mix, and
+  // rehydration all share code with TTS-rendered clips.
+  function tickRecord() {
+    if (state !== 'recording') { cancelRaf(); return; }
+    recordingElapsedMs = performance.now() - startedAt;
+    rafId = requestAnimationFrame(tickRecord);
+  }
+
+  async function startRecord() {
+    error = '';
+    // Trim the caption once here so the server persists the same string
+    // we'll pin as `renderedText` on stop — otherwise trailing whitespace
+    // would make the cell instantly look dirty after saving.
+    const captionAtStart = text.trim();
+    try {
+      const { sessionId } = await startRecording({
+        widgetId: widgetId,
+        text: captionAtStart,
+      });
+      recordingSessionId = sessionId;
+      recordingElapsedMs = 0;
+      startedAt = performance.now();
+      state = 'recording';
+      rafId = requestAnimationFrame(tickRecord);
+    } catch (e) {
+      error = e.message || 'failed to start recording';
+    }
+  }
+
+  async function stopRecord() {
+    if (!recordingSessionId) return;
+    const sid = recordingSessionId;
+    recordingSessionId = null;
+    cancelRaf();
+    try {
+      const result = await stopRecording(sid);
+      widgetId = result.id;
+      sampleRate = result.sampleRate || 0;
+      durationMs = result.durationMs || 0;
+      ready = true;
+      // Prefer the server's transcript when present + non-empty; server
+      // has already persisted whichever it chose as the widget's `text`
+      // column, so mirror that here so renderedText/text stay in sync
+      // and the cell doesn't look dirty right after saving. Fall back to
+      // whatever the user typed (trimmed to match the server side).
+      if (typeof result.transcript === 'string' && result.transcript.length > 0) {
+        text = result.transcript;
+      } else {
+        text = text.trim();
+      }
+      renderedText = text;
+      renderedProfileId = profileId;
+      onaudio?.({ ready: true, durationMs });
+      state = 'rendered';
+      recordingElapsedMs = 0;
+    } catch (e) {
+      state = hasClip ? 'rendered' : 'editing';
+      error = e.message || 'stop recording failed';
+      recordingElapsedMs = 0;
+    }
+  }
+
+  async function cancelRecord() {
+    if (!recordingSessionId) return;
+    const sid = recordingSessionId;
+    recordingSessionId = null;
+    cancelRaf();
+    recordingElapsedMs = 0;
+    state = hasClip ? 'rendered' : 'editing';
+    try {
+      await cancelRecording(sid);
+    } catch (e) {
+      // Cancel is best-effort; server-side session is dropped either way
+      // when the sid is unknown, so surface at debug level only.
+      console.debug('cancel recording failed', e);
+    }
+  }
+
   // ---- External driver (scene playback) -----------------------------------
   // Kick playback and resolve when the pipewire drain completes (natural end)
   // or when stopExternal() aborts the request. The parent can call `.stop()`
   // to interrupt without waiting for the promise.
   async function playToEnd() {
     if (!ready || !widgetId) return;
-    await play();
+    await play({ fromScene: true });
   }
 
   function stopExternal() {
+    // Two-step stop: abort the /say fetch so this client stops awaiting,
+    // AND fire /playback/stop so the server flushes the pipewire ring
+    // and interrupts the TTS runner. Without the second step, audio
+    // already queued in the ring keeps playing for up to ringbuf_seconds.
     if (playAbort) { try { playAbort.abort(); } catch {} }
+    stopPlayback().catch(() => {});
     cancelRaf();
     progress = 0;
     if (state === 'playing') state = 'rendered';
@@ -463,28 +605,86 @@
   const clipMeta = $derived(hasClip ? `${(durationMs / 1000).toFixed(1)}s` : '');
 
   // Dropdown value is always a string (even for the "default" empty selection),
-  // so we normalize null ↔ '' when reading/writing the styleId state.
-  const styleSelectValue = $derived(styleId ?? '');
-  function onStyleSelectChange(ev) {
+  // so we normalize null ↔ '' when reading/writing the profileId state.
+  const profileSelectValue = $derived(profileId ?? '');
+  function onProfileSelectChange(ev) {
     const val = ev.currentTarget.value;
-    styleId = val === '' ? null : val;
+    profileId = val === '' ? null : val;
   }
-  // Show the picker only if the parent handed us any styles.
-  const hasStyles = $derived(Array.isArray(styles) && styles.length > 0);
+  // Show the picker only if the parent handed us any profiles.
+  const hasProfiles = $derived(Array.isArray(profiles) && profiles.length > 0);
 </script>
 
 <div class="cell"
-     class:playing={state === 'playing' || state === 'rendering'}
+     class:playing={state === 'playing' || state === 'rendering' || state === 'recording'}
      class:collapsed={state === 'rendered' || state === 'playing' || (state === 'rendering' && hasClip)}
-     class:form-mode={state === 'editing' || (state === 'rendering' && !hasClip)}>
+     class:form-mode={state === 'editing' || (state === 'rendering' && !hasClip) || state === 'recording'}>
   {#if state === 'empty'}
     <button class="plus" onclick={beginEditing} aria-label="Add speak cell">+</button>
+
+  {:else if state === 'recording'}
+    <!-- Recording form: textarea stays visible (locked) so the caption typed
+         beforehand is still shown, Stop replaces Play, Cancel discards the
+         session. Progress is a wall-clock timer since we don't know a
+         target length. -->
+    <div class="form">
+      <div class="form-left">
+        <textarea
+          class="text"
+          bind:value={text}
+          placeholder="Text to speak…"
+          disabled></textarea>
+      </div>
+
+      <div class="side">
+        <button
+          class="play stop-record"
+          onclick={stopRecord}
+          aria-label="Stop recording"
+          title="Stop recording and save clip">
+          <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+            <rect x="6" y="6" width="12" height="12" rx="1.5" fill="currentColor"/>
+          </svg>
+        </button>
+        <div class="meta">
+          <span class="rec-dot" aria-hidden="true"></span>
+          {(recordingElapsedMs / 1000).toFixed(1)}s
+        </div>
+        <button
+          class="text-btn cancel"
+          onclick={cancelRecord}
+          title="Discard recording">
+          cancel
+        </button>
+      </div>
+    </div>
+
+    {#if error}
+      <div class="err">{error}</div>
+    {/if}
 
   {:else if state === 'rendered' || state === 'playing' || (state === 'rendering' && hasClip)}
     <!-- Collapsed square: shows as much of the spoken text as fits at the
          current size. Font size scales with the container via cqmin so the
          readable-char-count changes with the widget's rendered size. -->
     <div class="clip-text">{text}</div>
+
+    {#if state === 'playing'}
+      <!-- Full-cell stop button so clicking anywhere on a playing clip
+           cancels playback. Sits above .progress (z-index) and reuses
+           stopExternal to abort the /widgets/:id/say fetch and demote to
+           'rendered'. Stop icon fades in on hover so the affordance is
+           discoverable but doesn't clutter the collapsed clip text. -->
+      <button
+        class="stop-overlay"
+        onclick={stopExternal}
+        aria-label="Stop playback"
+        title="Stop playback">
+        <svg class="stop-icon" viewBox="0 0 24 24" aria-hidden="true">
+          <rect x="6" y="6" width="12" height="12" rx="1.5" fill="currentColor"/>
+        </svg>
+      </button>
+    {/if}
 
     {#if state === 'rendered' && !hydrating}
       <div class="hover-actions">
@@ -547,20 +747,20 @@
           placeholder="Text to speak…"
           disabled={state === 'rendering'}></textarea>
 
-        {#if hasStyles}
-          <label class="style-picker">
-            <span>Style</span>
+        {#if hasProfiles}
+          <label class="profile-picker">
+            <span>Profile</span>
             <select
-              value={styleSelectValue}
-              onchange={onStyleSelectChange}
+              value={profileSelectValue}
+              onchange={onProfileSelectChange}
               disabled={state === 'rendering'}
-              aria-label="Voice style"
+              aria-label="Voice profile"
             >
-              <!-- Empty value = "use the character's default style". Keeps
+              <!-- Empty value = "use the character's default profile". Keeps
                    fresh clips silently on the default until the user opts in. -->
               <option value="">(default)</option>
-              {#each styles as st (st.id)}
-                <option value={st.id}>{st.name}</option>
+              {#each profiles as p (p.id)}
+                <option value={p.id}>{p.name}</option>
               {/each}
             </select>
           </label>
@@ -581,6 +781,17 @@
               <path fill="currentColor" d="M8 5v14l11-7z" />
             </svg>
           {/if}
+        </button>
+
+        <button
+          class="play record"
+          onclick={startRecord}
+          disabled={state === 'rendering'}
+          aria-label="Record from vox channel"
+          title="Record audio from the vox channel">
+          <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+            <circle cx="12" cy="12" r="6" fill="currentColor" />
+          </svg>
         </button>
 
         {#if clipMeta && state !== 'rendering'}
@@ -693,6 +904,37 @@
   .cell.collapsed:hover .hover-actions,
   .cell.collapsed:focus-within .hover-actions { opacity: 1; }
 
+  /* Full-cell click target that appears while a clip is playing. The stop
+     icon is faint until hover so the .clip-text stays readable at rest,
+     but the whole square is clickable throughout (the button covers it). */
+  .stop-overlay {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: transparent;
+    border: none;
+    padding: 0;
+    margin: 0;
+    color: var(--accent);
+    cursor: pointer;
+    z-index: 3;
+  }
+  .stop-overlay:hover,
+  .stop-overlay:focus-visible {
+    background: rgba(0, 0, 0, 0.35);
+    outline: none;
+  }
+  .stop-icon {
+    width: 34%;
+    height: 34%;
+    opacity: 0.55;
+    transition: opacity 0.12s ease-in-out;
+  }
+  .stop-overlay:hover .stop-icon,
+  .stop-overlay:focus-visible .stop-icon { opacity: 1; }
+
   /* Primary action: fills most of the cell as a large square target. Grows
      into whatever height flex leaves after the edit button + gap, then the
      aspect-ratio pin makes width match so it stays square regardless of
@@ -802,7 +1044,7 @@
     min-height: 0;
   }
 
-  .style-picker {
+  .profile-picker {
     display: flex;
     align-items: center;
     gap: 6px;
@@ -811,7 +1053,7 @@
     text-transform: uppercase;
     letter-spacing: 0.05em;
   }
-  .style-picker select {
+  .profile-picker select {
     flex: 1;
     min-width: 0;
     text-transform: none;
@@ -825,8 +1067,8 @@
     font-family: inherit;
     cursor: pointer;
   }
-  .style-picker select:focus { outline: none; border-color: var(--accent); }
-  .style-picker select:disabled { opacity: 0.6; cursor: not-allowed; }
+  .profile-picker select:focus { outline: none; border-color: var(--accent); }
+  .profile-picker select:disabled { opacity: 0.6; cursor: not-allowed; }
 
   /* Disabled textareas (rendering state) must look non-interactive: muted
      text, dimmed background, no focus ring. `rendered` collapses the form
@@ -864,6 +1106,40 @@
     display: flex;
     align-items: center;
     justify-content: center;
+  }
+
+  /* Record button: same footprint as Play so the two stack cleanly, tinted
+     red so it's obvious this path bypasses TTS and captures live audio. */
+  .play.record {
+    color: var(--err);
+    background: rgba(255, 128, 128, 0.10);
+    border-color: rgba(255, 128, 128, 0.35);
+  }
+  .play.record:hover:not(:disabled) {
+    background: rgba(255, 128, 128, 0.20);
+    border-color: var(--err);
+  }
+  .play.stop-record {
+    color: var(--err);
+    background: rgba(255, 128, 128, 0.20);
+    border-color: var(--err);
+  }
+
+  /* Pulsing red dot beside the elapsed-time meta line while a recording is
+     in flight — familiar "REC" affordance. */
+  .rec-dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--err);
+    margin-right: 4px;
+    vertical-align: middle;
+    animation: rec-blink 1.1s ease-in-out infinite;
+  }
+  @keyframes rec-blink {
+    0%, 100% { opacity: 1; }
+    50%      { opacity: 0.35; }
   }
 
 

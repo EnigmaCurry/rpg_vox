@@ -14,8 +14,12 @@ async function jsonGet(path) {
   return await r.json();
 }
 
-export const say            = (text, instruct = '') =>
-  jsonPost('/say', instruct ? { text, instruct } : { text });
+// `configs` is a `[{ speaker?, language?, instruct?, pitchSemitones?,
+// timeRatio?, detuneCents?, pan?, gainDb?, delayMs? }, ...]` array — each
+// entry is one voice layer, so >1 config fans out into a hive-mind mix.
+// An empty array falls back to a single default config on the server.
+export const say = (text, configs = []) =>
+  jsonPost('/say', { text, configs });
 
 // --- Speak widget CRUD ------------------------------------------------------
 //
@@ -48,23 +52,11 @@ export async function fetchWidget(id) {
   };
 }
 
-// Voice params: `voice = { speaker, language, instruct, pitchSemitones,
-// timeRatio }` where any subset may be omitted/empty. `instruct` here is the
-// per-clip override; if empty, the server falls back to the character's
-// default (or the process default). Effect fields are only sent when
-// non-identity so the server can short-circuit no-effect renders.
-async function widgetRender(method, path, text, instruct, voice = {}) {
-  const body = { text };
-  const effectiveInstruct = instruct || voice.instruct || '';
-  if (voice.speaker) body.speaker = voice.speaker;
-  if (voice.language) body.language = voice.language;
-  if (effectiveInstruct) body.instruct = effectiveInstruct;
-  if (Number.isFinite(voice.pitchSemitones) && voice.pitchSemitones !== 0) {
-    body.pitch_semitones = voice.pitchSemitones;
-  }
-  if (Number.isFinite(voice.timeRatio) && voice.timeRatio !== 1) {
-    body.time_ratio = voice.timeRatio;
-  }
+// `configs` shape matches `say()` above: array of voice layers, each with
+// optional per-config effect fields. The server sends the same camelCase
+// field names back for the request payload (see ConfigBody in http.rs).
+async function widgetRender(method, path, text, configs = []) {
+  const body = { text, configs };
   const r = await fetch(path, {
     method,
     headers: { 'content-type': 'application/json' },
@@ -83,11 +75,11 @@ async function widgetRender(method, path, text, instruct, voice = {}) {
   };
 }
 
-export const createWidget = (text, instruct = '', voice = {}) =>
-  widgetRender('POST', '/widgets', text, instruct, voice);
+export const createWidget = (text, configs = []) =>
+  widgetRender('POST', '/widgets', text, configs);
 
-export const updateWidget = (id, text, instruct = '', voice = {}) =>
-  widgetRender('PUT', `/widgets/${encodeURIComponent(id)}`, text, instruct, voice);
+export const updateWidget = (id, text, configs = []) =>
+  widgetRender('PUT', `/widgets/${encodeURIComponent(id)}`, text, configs);
 
 /// Ask the server to concatenate a scene's rendered clips into a single FLAC.
 /// Returns `{ blob, filename }` — the filename comes from the server's
@@ -131,6 +123,76 @@ export async function playWidget(id, { signal } = {}) {
     throw err;
   }
   return parsed || {};
+}
+
+// --- Widget recording ------------------------------------------------------
+//
+// Two-phase capture from the pipewire `-vox` sink into a widget clip:
+//   POST   /widgets/record                 → { session_id }
+//   POST   /widgets/record/{sid}/stop      → { id, sample_rate, duration_ms }
+//   DELETE /widgets/record/{sid}           → 200 (cancel without persisting)
+//
+// The stop response mirrors the render endpoints' metadata (widget id +
+// sample rate + duration) so SpeakCell can land the recording in the same
+// `rendered` state a synthesis would produce, sharing all playback code.
+
+export async function startRecording({ widgetId = null, text = '' } = {}) {
+  const body = {};
+  if (widgetId) body.widget_id = widgetId;
+  if (text) body.text = text;
+  const r = await fetch('/widgets/record', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) {
+    const detail = await r.text().catch(() => `HTTP ${r.status}`);
+    throw new Error(detail || `HTTP ${r.status}`);
+  }
+  const parsed = await r.json();
+  return { sessionId: parsed.session_id };
+}
+
+export async function stopRecording(sessionId) {
+  const r = await fetch(`/widgets/record/${encodeURIComponent(sessionId)}/stop`, {
+    method: 'POST',
+  });
+  if (!r.ok) {
+    const detail = await r.text().catch(() => `HTTP ${r.status}`);
+    throw new Error(detail || `HTTP ${r.status}`);
+  }
+  const parsed = await r.json();
+  return {
+    id: parsed.id,
+    sampleRate: parsed.sample_rate,
+    durationMs: parsed.duration_ms,
+    // Present when the server has an STT recognizer loaded; absent
+    // (undefined) when STT is disabled. Caller decides whether to
+    // overwrite the caption textarea.
+    transcript: parsed.transcript,
+  };
+}
+
+export async function cancelRecording(sessionId) {
+  const r = await fetch(`/widgets/record/${encodeURIComponent(sessionId)}`, {
+    method: 'DELETE',
+  });
+  if (!r.ok) {
+    const detail = await r.text().catch(() => `HTTP ${r.status}`);
+    throw new Error(detail || `HTTP ${r.status}`);
+  }
+}
+
+/// Cancel any TTS clip currently draining through the pipewire mic.
+/// Aborting the /widgets/:id/say fetch on its own leaves queued audio
+/// draining out for up to ringbuf_seconds — this bumps the server-side
+/// stop generation so the pipewire callback empties the ring immediately.
+export async function stopPlayback() {
+  const r = await fetch('/playback/stop', { method: 'POST' });
+  if (!r.ok) {
+    const detail = await r.text().catch(() => `HTTP ${r.status}`);
+    throw new Error(detail || `HTTP ${r.status}`);
+  }
 }
 
 export async function deleteWidget(id) {

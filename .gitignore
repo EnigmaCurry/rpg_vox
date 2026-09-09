@@ -9,3 +9,4 @@ recordings
 crates/rpg_vox/dist-ui/
 # Persistent widget store (sqlite + WAV cache).
 data/
+models/

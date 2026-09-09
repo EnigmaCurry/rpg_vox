@@ -1,28 +1,39 @@
 // Client-side store for Project → Scene → Lane / Clip organization,
 // plus per-project Characters.
 //
-// Data shape (v3):
+// Data shape (v4):
 //   project   = { id, name }
 //   character = {
 //     id, projectId, name,
-//     voice: {
-//       speaker, language,
-//       styles: [{ id, name, instruct }], // >=1; first is the fallback "default"
-//     },
+//     voiceProfiles: [{                    // >=1; first is the fallback "default"
+//       id, name,
+//       configs: [{                        // >=1; N>1 = layered hive-mind synth
+//         id,
+//         speaker, language, instruct,     // Qwen3 backend inputs
+//         pitchSemitones, timeRatio,       // post-synthesis DSP (per-config)
+//         detuneCents,                     // fine pitch offset (added to semitones)
+//         pan,                             // -1 = full L, +1 = full R (equal-power)
+//         gainDb,                          // per-voice level in dB
+//         delayMs,                         // start offset in the final mix
+//       }],
+//     }],
 //     avatar: dataUrl | null,
 //     pictures: [{ id, dataUrl, name }],
 //   }
 //   scene     = {
 //     id, name, projectId,
-//     lanes: [{ id, voice }],            // columns; no clips owned here
-//     clips: [{ id, laneId, widgetId, text, styleId }],   // ordered timeline
+//     lanes: [{ id, voice }],              // columns; no clips owned here
+//     clips: [{ id, laneId, widgetId, text, profileId }], // ordered timeline
 //   }
 //
-// Older sessions stored a single `voice.instruct` string on the character and
-// a `clip.instruct` override string on the clip. On load we promote the
-// character's instruct to a "default" style and leave the legacy clip.instruct
-// in place as a resolver fallback so pre-existing clips still render as they
-// did before styles existed.
+// v3 sessions stored `character.voice = { speaker, language, styles[] }` with
+// each style holding an instruct + pitch/time DSP knobs. v4 flattens that into
+// `voiceProfiles[configs[]]`, letting a single profile fan out into multiple
+// concurrent voices for hive-mind / crowd effects. On load, each v3 style
+// becomes a v4 profile with one config carrying the character's old
+// speaker/language plus the style's instruct/pitch/time (new fields default to
+// pan=0, gainDb=0, detuneCents=0, delayMs=0). v2 sessions (single
+// `voice.instruct` string) pass through the v3 promotion first.
 //
 // Projects group scenes; the selected project drives what Scenes.svelte and
 // its sidebar show. Lanes are just column labels + a voice identity. Every
@@ -142,14 +153,15 @@ export const QWEN3_LANGUAGES = [
 ];
 
 // Effect defaults live here so every place that constructs or sanitizes a
-// style stays in sync. `pitchSemitones = 0` and `timeRatio = 1` are the
-// identity values the server short-circuits on.
-export const STYLE_PITCH_RANGE = { min: -24, max: 24, step: 1 };
-export const STYLE_TIME_RANGE  = { min: 0.25, max: 4, step: 0.05 };
-
-function makeStyle(name = 'default', instruct = '') {
-  return { id: uuid(), name, instruct, pitchSemitones: 0, timeRatio: 1 };
-}
+// config stays in sync. `pitchSemitones = 0`, `timeRatio = 1`, `detuneCents = 0`,
+// `pan = 0`, `gainDb = 0`, and `delayMs = 0` are the identity values the server
+// short-circuits on (pitch/time) or treats as neutral (pan/gain/delay).
+export const CONFIG_PITCH_RANGE   = { min: -24,  max: 24,  step: 1 };
+export const CONFIG_TIME_RANGE    = { min: 0.25, max: 4,   step: 0.05 };
+export const CONFIG_DETUNE_RANGE  = { min: -100, max: 100, step: 1 };
+export const CONFIG_PAN_RANGE     = { min: -1,   max: 1,   step: 0.05 };
+export const CONFIG_GAIN_DB_RANGE = { min: -60,  max: 12,  step: 0.5 };
+export const CONFIG_DELAY_MS_RANGE = { min: 0,   max: 5000, step: 10 };
 
 function clampNumber(value, fallback, min, max) {
   const n = Number(value);
@@ -157,11 +169,62 @@ function clampNumber(value, fallback, min, max) {
   return Math.min(max, Math.max(min, n));
 }
 
-function defaultVoice() {
+// Seed a single voice config with the given speaker/language and default
+// (identity) effects. Callers that need a specific instruct/pitch/etc.
+// override the returned fields directly.
+function makeConfig({
+  speaker = QWEN3_SPEAKERS[0],
+  language = QWEN3_LANGUAGES[0],
+  instruct = '',
+  pitchSemitones = 0,
+  timeRatio = 1,
+  detuneCents = 0,
+  pan = 0,
+  gainDb = 0,
+  delayMs = 0,
+} = {}) {
   return {
-    speaker: QWEN3_SPEAKERS[0],
-    language: QWEN3_LANGUAGES[0],
-    styles: [makeStyle('default')],
+    id: uuid(),
+    speaker,
+    language,
+    instruct,
+    pitchSemitones,
+    timeRatio,
+    detuneCents,
+    pan,
+    gainDb,
+    delayMs,
+  };
+}
+
+function makeVoiceProfile(name = 'default', configs = null) {
+  return {
+    id: uuid(),
+    name,
+    configs: configs && configs.length > 0 ? configs : [makeConfig()],
+  };
+}
+
+function defaultVoiceProfiles() {
+  return [makeVoiceProfile('default')];
+}
+
+// Coerce one v4 config-shaped object into a fully-populated config with
+// sanitized numeric fields. Missing fields fall back to identity values so an
+// older or partial payload still loads cleanly.
+function sanitizeConfig(raw) {
+  const c = raw && typeof raw === 'object' ? raw : {};
+  return {
+    id: typeof c.id === 'string' ? c.id : uuid(),
+    speaker: typeof c.speaker === 'string' && c.speaker ? c.speaker : QWEN3_SPEAKERS[0],
+    language: typeof c.language === 'string' && c.language ? c.language : QWEN3_LANGUAGES[0],
+    instruct: typeof c.instruct === 'string' ? c.instruct : '',
+    pitchSemitones: clampNumber(c.pitchSemitones, 0, CONFIG_PITCH_RANGE.min, CONFIG_PITCH_RANGE.max),
+    timeRatio:      clampNumber(c.timeRatio,      1, CONFIG_TIME_RANGE.min,  CONFIG_TIME_RANGE.max),
+    detuneCents:    clampNumber(c.detuneCents,    0, CONFIG_DETUNE_RANGE.min, CONFIG_DETUNE_RANGE.max),
+    pan:            clampNumber(c.pan,            0, CONFIG_PAN_RANGE.min,   CONFIG_PAN_RANGE.max),
+    gainDb:         clampNumber(c.gainDb,         0, CONFIG_GAIN_DB_RANGE.min, CONFIG_GAIN_DB_RANGE.max),
+    delayMs:        clampNumber(c.delayMs,        0, CONFIG_DELAY_MS_RANGE.min, CONFIG_DELAY_MS_RANGE.max),
   };
 }
 
@@ -178,7 +241,9 @@ function migrateScene(scene) {
           laneId: lane.id,
           widgetId: c.widgetId ?? null,
           text: c.text ?? '',
-          styleId: c.styleId ?? null,
+          // v3→v4: styleId is the same UUID as the v4 profile id (migration
+          // in normalizePayload keeps ids stable).
+          profileId: c.profileId ?? c.styleId ?? null,
           // Preserved so the resolver can honor pre-styles overrides.
           instruct: c.instruct ?? '',
         });
@@ -190,7 +255,18 @@ function migrateScene(scene) {
     const validLaneIds = new Set(scene.lanes.map((l) => l.id));
     scene.clips = scene.clips
       .filter((c) => validLaneIds.has(c.laneId))
-      .map((c) => ({ styleId: null, ...c }));
+      .map((c) => ({
+        profileId: c.profileId ?? c.styleId ?? null,
+        ...c,
+        // Ensure profileId wins over any stale spread from styleId.
+        ...(c.profileId ? { profileId: c.profileId } : {}),
+      }))
+      // Drop the deprecated styleId field so it doesn't leak back into
+      // future PUT /state payloads.
+      .map((c) => {
+        const { styleId, ...rest } = c;
+        return rest;
+      });
   }
   if (typeof scene.pauseMs !== 'number') scene.pauseMs = DEFAULT_PAUSE_MS;
 }
@@ -230,44 +306,64 @@ function normalizePayload(parsed) {
   const characters = rawChars
     .filter((c) => c && validProjectIds.has(c.projectId))
     .map((c) => {
-      // v3: single voice.instruct string → styles = [{id, name:'default', instruct}].
-      // Existing style arrays are kept as-is (sanitized). Empty/missing → seeded
-      // with an empty "default" so the resolver always has something to return.
-      let styles = Array.isArray(c.voice?.styles)
-        ? c.voice.styles
+      // v4: already stores voiceProfiles[configs[]]. Sanitize each profile
+      // and its configs so partial/older payloads land in a consistent shape.
+      let voiceProfiles = Array.isArray(c.voiceProfiles)
+        ? c.voiceProfiles
+            .filter((p) => p && typeof p === 'object')
+            .map((p) => {
+              const configs = Array.isArray(p.configs)
+                ? p.configs.filter((cc) => cc && typeof cc === 'object').map(sanitizeConfig)
+                : [];
+              return {
+                id: typeof p.id === 'string' ? p.id : uuid(),
+                name: typeof p.name === 'string' && p.name ? p.name : 'unnamed',
+                configs: configs.length > 0 ? configs : [makeConfig()],
+              };
+            })
+        : null;
+      // v3 → v4 migration: each style becomes a profile with one config
+      // carrying the character's old speaker/language + the style's
+      // instruct/pitch/time. New per-config knobs (detune/pan/gain/delay)
+      // default to their identity values so migrated projects sound the
+      // same as before.
+      if (!voiceProfiles || voiceProfiles.length === 0) {
+        const baseSpeaker = typeof c.voice?.speaker === 'string' && c.voice.speaker
+          ? c.voice.speaker : QWEN3_SPEAKERS[0];
+        const baseLanguage = typeof c.voice?.language === 'string' && c.voice.language
+          ? c.voice.language : QWEN3_LANGUAGES[0];
+        const oldStyles = Array.isArray(c.voice?.styles) ? c.voice.styles : [];
+        if (oldStyles.length > 0) {
+          voiceProfiles = oldStyles
             .filter((s) => s && typeof s === 'object')
             .map((s) => ({
+              // Keep the style id as the profile id so any clip.styleId
+              // still resolves against the migrated profile.
               id: typeof s.id === 'string' ? s.id : uuid(),
               name: typeof s.name === 'string' && s.name ? s.name : 'unnamed',
-              instruct: typeof s.instruct === 'string' ? s.instruct : '',
-              // Pre-effects styles are missing these — fall back to identity
-              // values so old projects load with no audio changes.
-              pitchSemitones: clampNumber(
-                s.pitchSemitones,
-                0,
-                STYLE_PITCH_RANGE.min,
-                STYLE_PITCH_RANGE.max,
-              ),
-              timeRatio: clampNumber(
-                s.timeRatio,
-                1,
-                STYLE_TIME_RANGE.min,
-                STYLE_TIME_RANGE.max,
-              ),
-            }))
-        : null;
-      if (!styles || styles.length === 0) {
-        styles = [makeStyle('default', c.voice?.instruct ?? '')];
+              configs: [sanitizeConfig({
+                speaker: baseSpeaker,
+                language: baseLanguage,
+                instruct: s.instruct,
+                pitchSemitones: s.pitchSemitones,
+                timeRatio: s.timeRatio,
+              })],
+            }));
+        } else {
+          // v2 or fresh: seed a single default profile with one config,
+          // promoting any legacy top-level voice.instruct into it.
+          voiceProfiles = [makeVoiceProfile('default', [sanitizeConfig({
+            speaker: baseSpeaker,
+            language: baseLanguage,
+            instruct: typeof c.voice?.instruct === 'string' ? c.voice.instruct : '',
+          })])];
+        }
       }
       return {
         id: c.id ?? uuid(),
         projectId: c.projectId,
         name: c.name ?? 'Unnamed',
-        voice: {
-          speaker: c.voice?.speaker ?? QWEN3_SPEAKERS[0],
-          language: c.voice?.language ?? QWEN3_LANGUAGES[0],
-          styles,
-        },
+        voiceProfiles,
         // `avatar` and `pictures[].dataUrl` are img-src strings. New uploads
         // land as `/images/{id}`; pre-migration values are `data:image/...`.
         avatar: typeof c.avatar === 'string' ? c.avatar : null,
@@ -606,7 +702,7 @@ export function insertClip(sceneId, laneId, position) {
   if (!scene.lanes.some((l) => l.id === laneId)) return null;
   const id = uuid();
   const clamped = Math.max(0, Math.min(position | 0, scene.clips.length));
-  scene.clips.splice(clamped, 0, { id, laneId, widgetId: null, text: '', styleId: null });
+  scene.clips.splice(clamped, 0, { id, laneId, widgetId: null, text: '', profileId: null });
   return id;
 }
 
@@ -641,7 +737,7 @@ export function createCharacter(name = 'New character') {
     id: uuid(),
     projectId,
     name,
-    voice: defaultVoice(),
+    voiceProfiles: defaultVoiceProfiles(),
     avatar: null,
     pictures: [],
   };
@@ -664,108 +760,144 @@ export function updateCharacter(id, patch) {
     }
     character.avatar = patch.avatar;
   }
-  if (patch.voice) {
-    // Only merge scalar voice fields — style array edits go through the
-    // dedicated addCharacterStyle/renameCharacterStyle/setCharacterStyleInstruct
-    // helpers so we never accidentally clobber the whole list.
-    if (patch.voice.speaker !== undefined) character.voice.speaker = patch.voice.speaker;
-    if (patch.voice.language !== undefined) character.voice.language = patch.voice.language;
-  }
+  // Voice profile / config mutations go through the dedicated helpers below
+  // so bulk edits never accidentally clobber the whole list.
 }
 
-// ---- Character voice styles -----------------------------------------------
+// ---- Character voice profiles + configs ----------------------------------
 //
-// Every character owns >=1 style; the first is the fallback "default" used
-// when a clip has no explicit selection. Deletes are refused if a style is
-// the last one so the resolver never has to invent an empty style.
+// Every character owns >=1 profile; the first is the fallback "default" used
+// when a clip has no explicit selection. Every profile owns >=1 config;
+// synthesizing a profile with N>1 configs fans out into N concurrent Qwen3
+// calls that are mixed together (per-config pan/gain/delay) so a single
+// profile can voice a crowd/hive-mind. Deletes are refused when they'd take
+// either list below its minimum so the resolver never sees an empty shape.
 
-export function addCharacterStyle(characterId, name = 'new style') {
+export function addVoiceProfile(characterId, name = 'new profile') {
   const character = scenesState.characters.find((c) => c.id === characterId);
   if (!character) return null;
-  const style = makeStyle(name, '');
-  character.voice.styles.push(style);
-  return style.id;
+  const profile = makeVoiceProfile(name);
+  character.voiceProfiles.push(profile);
+  return profile.id;
 }
 
-export function renameCharacterStyle(characterId, styleId, name) {
+export function renameVoiceProfile(characterId, profileId, name) {
   const character = scenesState.characters.find((c) => c.id === characterId);
   if (!character) return;
-  const style = character.voice.styles.find((s) => s.id === styleId);
-  if (style) style.name = name;
+  const profile = character.voiceProfiles.find((p) => p.id === profileId);
+  if (profile) profile.name = name;
 }
 
-export function setCharacterStyleInstruct(characterId, styleId, instruct) {
-  const character = scenesState.characters.find((c) => c.id === characterId);
-  if (!character) return;
-  const style = character.voice.styles.find((s) => s.id === styleId);
-  if (style) style.instruct = instruct;
-}
-
-/** Patch pitch/time on a style. Values outside the allowed range are clamped
- *  (rather than rejected) so slider drags and typed input both behave. */
-export function setCharacterStyleEffect(characterId, styleId, patch) {
-  const character = scenesState.characters.find((c) => c.id === characterId);
-  if (!character) return;
-  const style = character.voice.styles.find((s) => s.id === styleId);
-  if (!style) return;
-  if (patch.pitchSemitones !== undefined) {
-    style.pitchSemitones = clampNumber(
-      patch.pitchSemitones,
-      0,
-      STYLE_PITCH_RANGE.min,
-      STYLE_PITCH_RANGE.max,
-    );
-  }
-  if (patch.timeRatio !== undefined) {
-    style.timeRatio = clampNumber(
-      patch.timeRatio,
-      1,
-      STYLE_TIME_RANGE.min,
-      STYLE_TIME_RANGE.max,
-    );
-  }
-}
-
-export function deleteCharacterStyle(characterId, styleId) {
+export function deleteVoiceProfile(characterId, profileId) {
   const character = scenesState.characters.find((c) => c.id === characterId);
   if (!character) return { ok: false, reason: 'character not found' };
-  if (character.voice.styles.length <= 1) {
-    return { ok: false, reason: 'at least one style is required' };
+  if (character.voiceProfiles.length <= 1) {
+    return { ok: false, reason: 'at least one profile is required' };
   }
-  const idx = character.voice.styles.findIndex((s) => s.id === styleId);
-  if (idx < 0) return { ok: false, reason: 'style not found' };
-  character.voice.styles.splice(idx, 1);
+  const idx = character.voiceProfiles.findIndex((p) => p.id === profileId);
+  if (idx < 0) return { ok: false, reason: 'profile not found' };
+  character.voiceProfiles.splice(idx, 1);
+  return { ok: true };
+}
+
+/** Append a new config to a profile. When the profile already has configs,
+ *  the new one clones the last config's speaker/language/instruct so layering
+ *  another voice onto a hive-mind is one click; effect knobs reset to identity
+ *  so the added layer starts neutral. */
+export function addProfileConfig(characterId, profileId) {
+  const character = scenesState.characters.find((c) => c.id === characterId);
+  if (!character) return null;
+  const profile = character.voiceProfiles.find((p) => p.id === profileId);
+  if (!profile) return null;
+  const seed = profile.configs[profile.configs.length - 1];
+  const config = makeConfig(
+    seed
+      ? { speaker: seed.speaker, language: seed.language, instruct: seed.instruct }
+      : {},
+  );
+  profile.configs.push(config);
+  return config.id;
+}
+
+/** Patch any subset of a config's fields. Numeric values are clamped to the
+ *  allowed range; strings are stored as-is. Missing fields are left alone. */
+export function updateProfileConfig(characterId, profileId, configId, patch) {
+  const character = scenesState.characters.find((c) => c.id === characterId);
+  if (!character) return;
+  const profile = character.voiceProfiles.find((p) => p.id === profileId);
+  if (!profile) return;
+  const config = profile.configs.find((c) => c.id === configId);
+  if (!config) return;
+  if (patch.speaker !== undefined) config.speaker = patch.speaker || QWEN3_SPEAKERS[0];
+  if (patch.language !== undefined) config.language = patch.language || QWEN3_LANGUAGES[0];
+  if (patch.instruct !== undefined) config.instruct = String(patch.instruct);
+  if (patch.pitchSemitones !== undefined) {
+    config.pitchSemitones = clampNumber(patch.pitchSemitones, config.pitchSemitones,
+      CONFIG_PITCH_RANGE.min, CONFIG_PITCH_RANGE.max);
+  }
+  if (patch.timeRatio !== undefined) {
+    config.timeRatio = clampNumber(patch.timeRatio, config.timeRatio,
+      CONFIG_TIME_RANGE.min, CONFIG_TIME_RANGE.max);
+  }
+  if (patch.detuneCents !== undefined) {
+    config.detuneCents = clampNumber(patch.detuneCents, config.detuneCents,
+      CONFIG_DETUNE_RANGE.min, CONFIG_DETUNE_RANGE.max);
+  }
+  if (patch.pan !== undefined) {
+    config.pan = clampNumber(patch.pan, config.pan,
+      CONFIG_PAN_RANGE.min, CONFIG_PAN_RANGE.max);
+  }
+  if (patch.gainDb !== undefined) {
+    config.gainDb = clampNumber(patch.gainDb, config.gainDb,
+      CONFIG_GAIN_DB_RANGE.min, CONFIG_GAIN_DB_RANGE.max);
+  }
+  if (patch.delayMs !== undefined) {
+    config.delayMs = clampNumber(patch.delayMs, config.delayMs,
+      CONFIG_DELAY_MS_RANGE.min, CONFIG_DELAY_MS_RANGE.max);
+  }
+}
+
+export function deleteProfileConfig(characterId, profileId, configId) {
+  const character = scenesState.characters.find((c) => c.id === characterId);
+  if (!character) return { ok: false, reason: 'character not found' };
+  const profile = character.voiceProfiles.find((p) => p.id === profileId);
+  if (!profile) return { ok: false, reason: 'profile not found' };
+  if (profile.configs.length <= 1) {
+    return { ok: false, reason: 'at least one config is required' };
+  }
+  const idx = profile.configs.findIndex((c) => c.id === configId);
+  if (idx < 0) return { ok: false, reason: 'config not found' };
+  profile.configs.splice(idx, 1);
   return { ok: true };
 }
 
 /**
- * Effective style for a clip: the character-owned style whose id matches
- * `clip.styleId`, or (legacy fallback) a synthetic style carrying the clip's
- * own persisted `instruct` field, or the character's first style. Callers
- * pass a character (may be null); the return is
- * `{ name, instruct, pitchSemitones, timeRatio }` — id is omitted because
- * the synthetic fallback has none. Fallbacks default to identity effects.
+ * Effective voice profile for a clip: the character-owned profile whose id
+ * matches `clip.profileId`, or the character's first profile as a fallback.
+ * Legacy `clip.instruct` overrides (pre-styles era) are honored by returning
+ * a synthetic single-config profile that carries only the instruct string.
+ * Returns `{ name, configs: [...] }` — id is omitted because synthetic
+ * fallbacks have none. Configs come back sanitized so callers can trust the
+ * numeric ranges.
  */
-export function resolveClipStyle(character, clip) {
-  const empty = { name: '', instruct: '', pitchSemitones: 0, timeRatio: 1 };
+export function resolveClipProfile(character, clip) {
+  const empty = { name: '', configs: [sanitizeConfig()] };
   if (!character) return empty;
-  const styles = character.voice.styles || [];
-  const pick = (s) => ({
-    name: s.name,
-    instruct: s.instruct,
-    pitchSemitones: Number.isFinite(s.pitchSemitones) ? s.pitchSemitones : 0,
-    timeRatio:      Number.isFinite(s.timeRatio)      ? s.timeRatio      : 1,
+  const profiles = character.voiceProfiles || [];
+  const pick = (p) => ({
+    name: p.name,
+    configs: (p.configs || []).map(sanitizeConfig),
   });
-  if (clip?.styleId) {
-    const match = styles.find((s) => s.id === clip.styleId);
+  if (clip?.profileId) {
+    const match = profiles.find((p) => p.id === clip.profileId);
     if (match) return pick(match);
   }
   // Pre-styles clips may still carry a per-clip instruct override. Honor it
-  // so old scenes replay identically until the user re-picks a style.
-  if (!clip?.styleId && typeof clip?.instruct === 'string' && clip.instruct !== '') {
-    return { ...empty, instruct: clip.instruct };
+  // so old scenes replay identically until the user re-picks a profile.
+  if (!clip?.profileId && typeof clip?.instruct === 'string' && clip.instruct !== '') {
+    return { name: '', configs: [sanitizeConfig({ instruct: clip.instruct })] };
   }
-  const first = styles[0];
+  const first = profiles[0];
   return first ? pick(first) : empty;
 }
 

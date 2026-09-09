@@ -46,8 +46,10 @@ run *ARGS:
 # Auto-rebuild + restart on any change under the rpg_vox crate. Watches Rust
 # sources only — for hot-reloading the Svelte UI use `just dev-ui` alongside
 # this in a second terminal (Vite serves at :5173 with /say etc. proxied to
-# the running backend).
-dev *ARGS:
+# the running backend). `download-stt-model` is a dep so a fresh checkout
+# gets the STT model on first `just dev` — the recipe itself no-ops when
+# the files are already there, so the wait only happens once.
+dev *ARGS: download-stt-model
     nix-shell --run "cargo watch -q -c -w crates/rpg_vox/src -w crates/rpg_vox/Cargo.toml -x 'run -p rpg_vox -- {{ARGS}}'"
 
 # Serve the Svelte SPA via Vite on http://127.0.0.1:5173 with hot reload;
@@ -82,6 +84,32 @@ say TEXT bind="127.0.0.1:7331":
 # Verify the rpg_vox source node is visible to PipeWire.
 list-sources:
     pw-cli list-objects Node | grep -A1 -B1 "rpg-vox" || echo "rpg-vox not found — is the bridge running?"
+
+# Download the SenseVoice int8 STT model into models/sense-voice/. Used by
+# /widgets/record to transcribe captured audio into the SpeakCell caption.
+# ~230 MB one-time download from the k2-fsa GitHub release; skipped if
+# the target files already exist.
+download-stt-model:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dest="models/sense-voice"
+    if [ -f "$dest/model.int8.onnx" ] && [ -f "$dest/tokens.txt" ]; then
+      echo "sense-voice model already present at $dest/"
+      exit 0
+    fi
+    mkdir -p models
+    stem="sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17"
+    archive="$stem.tar.bz2"
+    url="https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/$archive"
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" EXIT
+    echo "downloading $archive …"
+    curl -fL --progress-bar -o "$tmp/$archive" "$url"
+    tar -xjf "$tmp/$archive" -C "$tmp"
+    mkdir -p "$dest"
+    cp "$tmp/$stem/model.int8.onnx" "$dest/"
+    cp "$tmp/$stem/tokens.txt" "$dest/"
+    echo "installed sense-voice model → $dest/"
 
 # --- discord_vox (PipeWire sink → Discord voice) ---
 

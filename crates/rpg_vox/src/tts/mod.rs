@@ -1,11 +1,19 @@
 //! Text-to-speech pipeline.
 //!
-//! The runner owns the ring-buffer producer and consumes [`SayRequest`]s from
-//! HTTP. A pluggable [`Backend`] (Piper in-process, or a ComfyUI websocket
-//! session) turns each request into one or more [`AudioChunk`]s at its
-//! native sample rate. The runner's [`Sink`] resamples to the pipewire target
-//! rate and pushes into the ring, so backends don't have to think about
-//! either.
+//! The runner owns the ring-buffer producer and consumes [`Command`]s from
+//! HTTP. Each `/say` or `/widgets` request carries a **voice profile** — a
+//! list of one or more [`VoiceConfig`]s. Each config is a self-contained
+//! recipe (speaker + language + instruct for the TTS backend, plus post-
+//! processing knobs: pitch, detune, time, pan, gain, delay). A pluggable
+//! [`Backend`] renders one config into mono f32 PCM; [`synthesize_profile`]
+//! runs each config in the profile through the backend, applies per-config
+//! DSP, and sums the results into a single stereo buffer at the pipewire
+//! target rate. Profiles with N>1 configs produce a "hive-mind" — N voices
+//! layered with independent pan / gain / delay — from one text prompt.
+//!
+//! The mixed stereo buffer is what feeds both the pipewire mic
+//! (`Command::Say`) and the widget WAV writer (`Command::Synthesize`), so
+//! saved clips preserve pan and layering by construction.
 
 pub mod chunker;
 pub mod comfyui;
@@ -17,9 +25,12 @@ use rtrb::Producer;
 use rubato::{
     Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
 };
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info};
+
+use crate::mixer::AtomicMixer;
 
 pub use comfyui::warmup;
 
@@ -35,42 +46,46 @@ pub struct Config {
 /// share the same backend instance so must run one-at-a-time; the single
 /// mpsc + `while let` in [`run`] provides that.
 pub enum Command {
-    /// Synthesize and push into the pipewire ring buffer (mic path).
+    /// Synthesize a voice profile and push the mixed stereo buffer into the
+    /// pipewire ring buffer (mic path).
     Say(SayRequest),
-    /// Synthesize into a PCM buffer and return it to the caller. Nothing
-    /// touches the mic. Used by the browser-only Speak widget.
+    /// Synthesize a voice profile into a stereo PCM buffer and return it to
+    /// the caller. Nothing touches the mic. Used by the browser-only Speak
+    /// widget.
     Synthesize(SynthesizeRequest),
-    /// Push a pre-decoded PCM buffer into the pipewire ring buffer and wait
-    /// until playback finishes. Used to play cached widget clips through
-    /// the mic (Scenes tab).
+    /// Push a pre-decoded stereo PCM buffer into the pipewire ring buffer
+    /// and wait until playback finishes. Used to play cached widget clips
+    /// through the mic (Scenes tab).
     PlayPcm(PlayPcmRequest),
 }
 
-/// Per-request voice overrides. Any field set to `Some` replaces the
-/// backend's startup default for the duration of one synth call; `None`
-/// falls back to the backend's configured value.
+/// One voice recipe within a profile. A profile with N of these fans out
+/// into N concurrent synth calls that are mixed together per-config
+/// pan/gain/delay in [`synthesize_profile`].
 ///
 /// * `speaker`/`language`/`instruct` are TTS-backend inputs. Only [`qwen3`]
 ///   consumes them — other backends silently ignore.
-/// * `pitch_semitones` and `time_ratio` are **post-processing** effects
-///   applied to the rendered PCM by [`apply_effects`]. They work with any
-///   backend. `pitch_semitones = 0.0` and `time_ratio = 1.0` are the
-///   identity and short-circuit the pitch/stretch call.
+/// * `pitch_semitones` + `detune_cents/100` are combined into a single
+///   pitch shift and applied to the rendered PCM by [`apply_effects`].
+/// * `time_ratio` is a duration multiplier applied after pitch shift.
+/// * `gain_db` scales the mono buffer before the pan/delay mix.
+/// * `pan` positions the voice in the stereo field via equal-power law
+///   (`-1.0` = full L, `+1.0` = full R, `0.0` = center).
+/// * `delay_ms` staggers the voice's start relative to the profile's mix.
 #[derive(Debug, Clone)]
-pub struct VoiceOverride {
+pub struct VoiceConfig {
     pub speaker: Option<String>,
     pub language: Option<String>,
     pub instruct: Option<String>,
-    /// Pitch shift in semitones. Positive raises, negative lowers. Range is
-    /// clamped in [`apply_effects`] so a wild value can't blow up the
-    /// timestretch algorithm.
     pub pitch_semitones: f32,
-    /// Duration multiplier. 1.0 = unchanged, 2.0 = twice as long (slower
-    /// speech), 0.5 = half as long (faster). Independent of pitch.
     pub time_ratio: f32,
+    pub detune_cents: f32,
+    pub pan: f32,
+    pub gain_db: f32,
+    pub delay_ms: f32,
 }
 
-impl Default for VoiceOverride {
+impl Default for VoiceConfig {
     fn default() -> Self {
         Self {
             speaker: None,
@@ -78,50 +93,81 @@ impl Default for VoiceOverride {
             instruct: None,
             pitch_semitones: 0.0,
             time_ratio: 1.0,
+            detune_cents: 0.0,
+            pan: 0.0,
+            gain_db: 0.0,
+            delay_ms: 0.0,
         }
     }
 }
 
-impl VoiceOverride {
-    /// True when both effect knobs sit at their identity values — used to
-    /// skip both the buffering and the DSP call on the common no-effect
-    /// path.
-    pub fn has_audio_effect(&self) -> bool {
-        self.pitch_semitones.abs() > f32::EPSILON || (self.time_ratio - 1.0).abs() > f32::EPSILON
+impl VoiceConfig {
+    /// Build the backend-facing [`VoiceOverride`] for this config. Detune is
+    /// folded into `pitch_semitones` (100 cents = 1 semitone) so the DSP
+    /// pass sees a single combined pitch shift.
+    fn to_voice_override(&self) -> VoiceOverride {
+        VoiceOverride {
+            speaker: self.speaker.clone(),
+            language: self.language.clone(),
+            instruct: self.instruct.clone(),
+            pitch_semitones: self.pitch_semitones + self.detune_cents / 100.0,
+            time_ratio: self.time_ratio,
+        }
     }
 }
 
-/// One utterance request: the text to speak plus a channel to report the
-/// result back to the caller (usually the /say HTTP handler).
+/// Per-request backend voice fields. Assembled from a [`VoiceConfig`] and
+/// forwarded to the backend + DSP passes. Only [`qwen3`] consumes the
+/// speaker/language/instruct fields.
+#[derive(Debug, Clone, Default)]
+pub struct VoiceOverride {
+    pub speaker: Option<String>,
+    pub language: Option<String>,
+    pub instruct: Option<String>,
+    pub pitch_semitones: f32,
+    pub time_ratio: f32,
+}
+
+/// One utterance request: the text to speak, the voice profile to render
+/// (as a list of layered configs), and a channel to report the result back
+/// to the caller (usually the /say HTTP handler).
 pub struct SayRequest {
     pub text: String,
-    pub voice: VoiceOverride,
+    pub configs: Vec<VoiceConfig>,
     pub reply: oneshot::Sender<Result<usize, String>>,
 }
 
-/// Same shape as [`SayRequest`] but the reply carries the raw PCM instead of
-/// a frame count, since nothing plays it back automatically.
+/// Same shape as [`SayRequest`] but the reply carries the raw stereo PCM
+/// instead of a frame count, since nothing plays it back automatically.
 pub struct SynthesizeRequest {
     pub text: String,
-    pub voice: VoiceOverride,
+    pub configs: Vec<VoiceConfig>,
     pub reply: oneshot::Sender<Result<SynthesizeOutcome, String>>,
 }
 
-/// Push already-decoded mono PCM into the pipewire ring buffer. The runner
-/// resamples if `sample_rate` differs from the pipewire target, then waits
-/// for the ring to drain so the reply lands when playback is truly over.
+/// Push already-decoded stereo PCM into the pipewire ring buffer. No
+/// resampling — samples must already sit at the pipewire target rate
+/// (widget WAVs are recorded that way, so this is always true for the
+/// PlayPcm path). The runner waits for the ring to drain so the reply
+/// lands when playback is truly over.
+///
+/// `seq` is the play-sequence claimed by the HTTP handler
+/// ([`AtomicMixer::claim_play_seq`]). If a newer sequence exists by the
+/// time the runner picks this command out of the mpsc, the handler skips
+/// it — implementing latest-wins semantics so back-to-back clip clicks
+/// don't stack up into a queued serial playback.
 pub struct PlayPcmRequest {
-    pub samples: Vec<f32>,
+    pub samples: Vec<[f32; 2]>,
     pub sample_rate: u32,
+    pub seq: u64,
     pub reply: oneshot::Sender<Result<usize, String>>,
 }
 
 #[derive(Debug)]
 pub struct SynthesizeOutcome {
-    /// Mono f32 PCM.
-    pub samples: Vec<f32>,
-    /// The pipewire target rate — captured post-resample so downstream
-    /// consumers get a single, consistent rate no matter which backend spoke.
+    /// Stereo interleaved as pairs, already at [`Self::sample_rate`].
+    pub samples: Vec<[f32; 2]>,
+    /// The pipewire target rate.
     pub sample_rate: u32,
 }
 
@@ -173,12 +219,13 @@ pub async fn run(
     mut backend: Backend,
     mut rx: mpsc::Receiver<Command>,
     mut producer: Producer<[f32; 2]>,
+    mixer: Arc<AtomicMixer>,
 ) -> Result<()> {
     while let Some(cmd) = rx.recv().await {
         match cmd {
             Command::Say(req) => handle_say(&mut backend, &cfg, &mut producer, req).await,
             Command::Synthesize(req) => handle_synthesize(&mut backend, &cfg, req).await,
-            Command::PlayPcm(req) => handle_play_pcm(&cfg, &mut producer, req).await,
+            Command::PlayPcm(req) => handle_play_pcm(&cfg, &mixer, &mut producer, req).await,
         }
     }
     Ok(())
@@ -192,7 +239,7 @@ async fn handle_say(
 ) {
     let SayRequest {
         text,
-        voice,
+        configs,
         reply,
     } = req;
     // Strip <think>…</think> here (not just in /chat) so any path that
@@ -203,73 +250,34 @@ async fn handle_say(
         let _ = reply.send(Err("no speakable content after stripping <think>".into()));
         return;
     }
-    info!(backend = backend.kind(), chars = text.len(), "generating speech");
+    info!(
+        backend = backend.kind(),
+        chars = text.len(),
+        layers = configs.len(),
+        "generating speech"
+    );
 
-    // Two shapes for the mic path:
-    //  * No effects — stream the resampled PCM straight into the ringbuf as
-    //    the backend produces it (unchanged from before styles gained
-    //    effects).
-    //  * With effects — capture the full utterance first, run pitch/time
-    //    through timestretch, then push the processed buffer through the
-    //    producer. Adds latency (whole-utterance) but the algorithms need
-    //    the full signal to do a decent job.
-    let result: Result<usize, String> = if voice.has_audio_effect() {
-        let mut sink = Sink::capture_only(cfg.target_sample_rate);
-        match backend.synthesize(&text, &voice, &mut sink).await {
-            Ok(()) => {
-                let (samples, sample_rate) = sink.take_capture();
-                match apply_effects(samples, sample_rate, &voice) {
-                    Ok(processed) => {
-                        // Wrap the final push in a Sink for uniformity with
-                        // the no-effects path (both go through the source
-                        // callback where the browser-monitor tap fires).
-                        let mut push_sink = Sink::new(producer, cfg.target_sample_rate);
-                        match push_sink
-                            .push(AudioChunk {
-                                samples: processed,
-                                sample_rate: cfg.target_sample_rate,
-                            })
-                            .await
-                        {
-                            Ok(()) => {
-                                info!(
-                                    frames = push_sink.frames_pushed,
-                                    "utterance (with effects) delivered to ring buffer"
-                                );
-                                Ok(push_sink.frames_pushed)
-                            }
-                            Err(err) => {
-                                let msg = format!("{err:#}");
-                                error!(err = %msg, "effect push failed");
-                                Err(msg)
-                            }
-                        }
-                    }
-                    Err(err) => {
-                        let msg = format!("{err:#}");
-                        error!(err = %msg, "effect processing failed");
-                        Err(msg)
-                    }
+    let result: Result<usize, String> = match synthesize_profile(backend, cfg, &configs, &text).await
+    {
+        Ok(stereo) => {
+            let frames = stereo.len();
+            match push_stereo_backpressured(producer, &stereo).await {
+                pushed if pushed == frames => {
+                    info!(frames = pushed, "utterance delivered to ring buffer");
+                    Ok(pushed)
+                }
+                pushed => {
+                    // Backpressured push never gives up on its own, so a short
+                    // count here would only happen if the ring buffer path
+                    // added an early-exit later. Report the actual count.
+                    info!(frames = pushed, wanted = frames, "utterance push short");
+                    Ok(pushed)
                 }
             }
-            Err(err) => {
-                let msg = format!("{err:#}");
-                error!(err = %msg, "utterance failed");
-                Err(msg)
-            }
         }
-    } else {
-        let mut sink = Sink::new(producer, cfg.target_sample_rate);
-        match backend.synthesize(&text, &voice, &mut sink).await {
-            Ok(()) => {
-                info!(frames = sink.frames_pushed, "utterance delivered to ring buffer");
-                Ok(sink.frames_pushed)
-            }
-            Err(err) => {
-                let msg = format!("{err:#}");
-                error!(err = %msg, "utterance failed");
-                Err(msg)
-            }
+        Err(err) => {
+            error!(err = %err, "utterance failed");
+            Err(err)
         }
     };
     let _ = reply.send(result);
@@ -278,7 +286,7 @@ async fn handle_say(
 async fn handle_synthesize(backend: &mut Backend, cfg: &Config, req: SynthesizeRequest) {
     let SynthesizeRequest {
         text,
-        voice,
+        configs,
         reply,
     } = req;
     let text = crate::chat::strip_thinking(&text).trim().to_string();
@@ -289,100 +297,237 @@ async fn handle_synthesize(backend: &mut Backend, cfg: &Config, req: SynthesizeR
     info!(
         backend = backend.kind(),
         chars = text.len(),
+        layers = configs.len(),
         "synthesizing clip (no mic)"
     );
-    // Capture-only sink: pushes nowhere, just accumulates resampled PCM.
-    let mut sink = Sink::capture_only(cfg.target_sample_rate);
-    let result = match backend
-        .synthesize(&text, &voice, &mut sink)
-        .await
-    {
-        Ok(()) => {
-            let (samples, sample_rate) = sink.take_capture();
-            match apply_effects(samples, sample_rate, &voice) {
-                Ok(samples) => {
-                    info!(
-                        samples = samples.len(),
-                        sample_rate,
-                        duration_ms = (samples.len() as u64 * 1000) / sample_rate.max(1) as u64,
-                        "clip synthesized"
-                    );
-                    Ok(SynthesizeOutcome {
-                        samples,
-                        sample_rate,
-                    })
-                }
-                Err(err) => {
-                    let msg = format!("{err:#}");
-                    error!(err = %msg, "effect processing failed");
-                    Err(msg)
-                }
-            }
+    let result = match synthesize_profile(backend, cfg, &configs, &text).await {
+        Ok(samples) => {
+            let sample_rate = cfg.target_sample_rate;
+            info!(
+                frames = samples.len(),
+                sample_rate,
+                duration_ms = (samples.len() as u64 * 1000) / sample_rate.max(1) as u64,
+                "clip synthesized"
+            );
+            Ok(SynthesizeOutcome {
+                samples,
+                sample_rate,
+            })
         }
         Err(err) => {
-            let msg = format!("{err:#}");
-            error!(err = %msg, "clip synthesis failed");
-            Err(msg)
+            error!(err = %err, "clip synthesis failed");
+            Err(err)
         }
     };
     let _ = reply.send(result);
 }
 
-async fn handle_play_pcm(cfg: &Config, producer: &mut Producer<[f32; 2]>, req: PlayPcmRequest) {
+async fn handle_play_pcm(
+    cfg: &Config,
+    mixer: &Arc<AtomicMixer>,
+    producer: &mut Producer<[f32; 2]>,
+    req: PlayPcmRequest,
+) {
     let PlayPcmRequest {
         samples,
         sample_rate,
+        seq,
         reply,
     } = req;
+    // Latest-wins: skip if a newer PlayPcm was claimed after us. Any
+    // superseded request replies cleanly with 0 frames so the HTTP caller
+    // learns it was dropped rather than hanging.
+    if seq != mixer.latest_play_seq() {
+        info!(seq, latest = mixer.latest_play_seq(), "cached PCM playback superseded, skipping");
+        let _ = reply.send(Ok(0));
+        return;
+    }
     if samples.is_empty() {
         let _ = reply.send(Ok(0));
         return;
     }
+    if sample_rate != cfg.target_sample_rate {
+        // Widgets are always saved at the pipewire target rate (see the
+        // /widgets encoder), so a mismatch here means something upstream
+        // changed. Surface it instead of silently pitching the clip.
+        let msg = format!(
+            "PlayPcm sample_rate {} != target {}; refusing to play at wrong pitch",
+            sample_rate, cfg.target_sample_rate
+        );
+        error!(err = %msg, "cached PCM play refused");
+        let _ = reply.send(Err(msg));
+        return;
+    }
     info!(
-        samples = samples.len(),
+        frames = samples.len(),
         sample_rate,
-        "playing cached PCM through mic"
+        "playing cached stereo PCM through mic"
     );
 
-    let pushed = {
-        let mut sink = Sink::new(producer, cfg.target_sample_rate);
-        match sink
-            .push(AudioChunk {
-                samples,
-                sample_rate,
-            })
-            .await
-        {
-            Ok(()) => sink.frames_pushed,
-            Err(err) => {
-                let msg = format!("{err:#}");
-                error!(err = %msg, "cached PCM push failed");
-                let _ = reply.send(Err(msg));
-                return;
-            }
-        }
-    };
+    // Snapshot the stop-generation NOW so a race between HTTP setup and
+    // the push loop can't miss a stop that arrives while we're preparing.
+    let start_gen = mixer.tts_stop_gen();
+    let is_stopped = || mixer.tts_stop_gen() != start_gen;
 
-    // Wait for the ring buffer to actually drain so the caller learns "done"
-    // when audio has finished playing, not merely been enqueued. Poll rather
-    // than compute-and-sleep because the ring may hold leftover audio from
-    // an earlier /say command (mic path returns after push, not drain).
-    wait_for_ring_empty(producer, cfg.ringbuf_frames, cfg.target_sample_rate).await;
-    info!(frames = pushed, "cached PCM playback finished");
-    let _ = reply.send(Ok(pushed));
+    // Wait for the pw callback to actually drain the ring for any pending
+    // stop before we start pushing this clip. Without this wait, a fresh
+    // Play right after a Stop can push samples that then get drained by
+    // the still-pending stop — playback starts mid-clip. Bounded so a
+    // wedged pw thread doesn't stall the runner forever; the fallback
+    // ships-the-clip-anyway matches the pre-race behavior.
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(250);
+    while mixer.tts_stop_observed_gen() < start_gen {
+        if tokio::time::Instant::now() >= deadline {
+            tracing::warn!(
+                start_gen,
+                observed = mixer.tts_stop_observed_gen(),
+                "pw stop-drain sync timed out; playing anyway"
+            );
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    // ~100 ms chunks: fine enough that a user-triggered stop is felt as
+    // "instant" (one chunk boundary + one pipewire cycle = well under
+    // 150 ms), coarse enough that per-chunk atomic loads are noise.
+    let chunk_frames = ((cfg.target_sample_rate as usize) / 10).max(512);
+    let mut frames_pushed = 0usize;
+    for chunk in samples.chunks(chunk_frames) {
+        if is_stopped() {
+            info!(frames = frames_pushed, "cached PCM playback stopped mid-push");
+            break;
+        }
+        let pushed_now =
+            push_stereo_backpressured_until(producer, chunk, &is_stopped).await;
+        frames_pushed += pushed_now;
+        if pushed_now < chunk.len() {
+            // Push aborted mid-chunk because a stop was requested.
+            break;
+        }
+    }
+
+    wait_for_ring_or_stop(
+        producer,
+        cfg.ringbuf_frames,
+        cfg.target_sample_rate,
+        &is_stopped,
+    )
+    .await;
+    if is_stopped() {
+        info!(frames = frames_pushed, "cached PCM playback aborted");
+    } else {
+        info!(frames = frames_pushed, "cached PCM playback finished");
+    }
+    let _ = reply.send(Ok(frames_pushed));
+}
+
+/// Fan a voice profile out into N synth calls, apply each config's DSP, and
+/// sum the results into a single stereo buffer at the pipewire target rate.
+///
+/// Currently sequential: [`Backend::synthesize`] takes `&mut self` and the
+/// enum's variants are stateful, so N Qwen3 calls happen one-after-another.
+/// For a hive-mind of 2–4 layers this is workable; if it becomes a
+/// bottleneck the qwen3 backend's HTTP methods are pure (`&self`) and could
+/// be lifted into a parallel path.
+///
+/// Mix math:
+/// * Per-config linear gain (`10^(gain_db/20)`) is folded into the mono
+///   buffer before layering.
+/// * Delay converts to a sample offset at the target rate.
+/// * Pan uses equal-power law: `l = m·cos((p+1)·π/4)`, `r = m·sin(…)`. `p=0`
+///   yields `l=r=m·√½ ≈ 0.707m`, matching the mono-duplication path's
+///   single-source loudness closely enough that a solo config sounds the
+///   same as the pre-profile pipeline.
+/// * The mix length is `max(delay_i + len_i)` so a delayed layer still fits.
+///   Sums are clamped to ±1.0 at each add.
+async fn synthesize_profile(
+    backend: &mut Backend,
+    cfg: &Config,
+    configs: &[VoiceConfig],
+    text: &str,
+) -> Result<Vec<[f32; 2]>, String> {
+    if configs.is_empty() {
+        return Err("no voice configs in profile".into());
+    }
+    let target_rate = cfg.target_sample_rate;
+
+    // (mono_samples, config_ref). Sample rate is always target_rate because
+    // the capture_only Sink resamples on push.
+    let mut layers: Vec<(Vec<f32>, &VoiceConfig)> = Vec::with_capacity(configs.len());
+    for cc in configs {
+        let voice = cc.to_voice_override();
+        let mut sink = Sink::capture_only(target_rate);
+        backend
+            .synthesize(text, &voice, &mut sink)
+            .await
+            .map_err(|e| format!("{e:#}"))?;
+        let (samples, _rate) = sink.take_capture();
+        let processed = apply_effects(samples, target_rate, voice.pitch_semitones, voice.time_ratio)
+            .map_err(|e| format!("{e:#}"))?;
+        let gain_lin = 10f32.powf(cc.gain_db / 20.0);
+        let with_gain: Vec<f32> = if (gain_lin - 1.0).abs() < f32::EPSILON {
+            processed
+        } else {
+            processed.into_iter().map(|s| s * gain_lin).collect()
+        };
+        layers.push((with_gain, cc));
+    }
+
+    let total_len = layers
+        .iter()
+        .map(|(s, c)| {
+            let delay_samples = delay_ms_to_samples(c.delay_ms, target_rate);
+            delay_samples + s.len()
+        })
+        .max()
+        .unwrap_or(0);
+    let mut mix: Vec<[f32; 2]> = vec![[0.0, 0.0]; total_len];
+    for (samples, cc) in &layers {
+        let (l_gain, r_gain) = pan_gains(cc.pan);
+        let delay_samples = delay_ms_to_samples(cc.delay_ms, target_rate);
+        for (i, &s) in samples.iter().enumerate() {
+            let idx = delay_samples + i;
+            if idx >= mix.len() {
+                break;
+            }
+            let l = (mix[idx][0] + s * l_gain).clamp(-1.0, 1.0);
+            let r = (mix[idx][1] + s * r_gain).clamp(-1.0, 1.0);
+            mix[idx] = [l, r];
+        }
+    }
+    Ok(mix)
+}
+
+fn delay_ms_to_samples(delay_ms: f32, sample_rate: u32) -> usize {
+    if delay_ms <= 0.0 || !delay_ms.is_finite() {
+        return 0;
+    }
+    ((delay_ms / 1000.0) * sample_rate as f32) as usize
+}
+
+/// Equal-power pan. `pan` in `[-1, +1]` — clamped defensively so a bad input
+/// can't produce negative gains.
+fn pan_gains(pan: f32) -> (f32, f32) {
+    let p = pan.clamp(-1.0, 1.0);
+    let angle = (p + 1.0) * std::f32::consts::FRAC_PI_4;
+    (angle.cos(), angle.sin())
 }
 
 /// Block until the pipewire consumer has drained (nearly) every sample from
-/// the ring. Sleep interval scales with how full the ring currently is so we
-/// don't spin, but is capped so we notice the drain finishing promptly.
+/// the ring OR the caller signals stop via `is_stopped`. Sleep interval
+/// scales with how full the ring currently is so we don't spin, but is
+/// capped so we notice both the drain finishing and a late stop promptly.
 ///
 /// Takes `&mut` even though `slots()` only needs `&self` because
 /// `rtrb::Producer` is `!Sync` — a shared reference to it isn't `Send` across
 /// `await`, whereas an exclusive reference to a `Send` type is.
-async fn wait_for_ring_empty(producer: &mut Producer<[f32; 2]>, capacity: usize, sample_rate: u32) {
-    // The ring is "empty" once the producer sees within a frame of the full
-    // capacity as free slots. Slack absorbs small race between the consumer's
-    // atomic write-back and this poll.
+async fn wait_for_ring_or_stop(
+    producer: &mut Producer<[f32; 2]>,
+    capacity: usize,
+    sample_rate: u32,
+    is_stopped: &(dyn Fn() -> bool + Sync),
+) {
     let empty_threshold = capacity.saturating_sub(64);
     let rate = sample_rate.max(1) as usize;
     loop {
@@ -390,16 +535,60 @@ async fn wait_for_ring_empty(producer: &mut Producer<[f32; 2]>, capacity: usize,
         if free >= empty_threshold {
             return;
         }
+        if is_stopped() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            return;
+        }
         let held = capacity.saturating_sub(free);
-        let ms = ((held * 1000) / rate).clamp(10, 250) as u64;
+        let ms = ((held * 1000) / rate).clamp(10, 100) as u64;
         tokio::time::sleep(Duration::from_millis(ms)).await;
     }
 }
 
-/// Apply per-style pitch shift and/or time stretch to a mono f32 buffer.
+/// Push stereo pairs into the ring, awaiting when full. Never drops audio.
+async fn push_stereo_backpressured(
+    producer: &mut Producer<[f32; 2]>,
+    pairs: &[[f32; 2]],
+) -> usize {
+    let mut written = 0;
+    while written < pairs.len() {
+        while written < pairs.len() && producer.push(pairs[written]).is_ok() {
+            written += 1;
+        }
+        if written < pairs.len() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+    written
+}
+
+/// Stereo variant of [`push_stereo_backpressured`] that also stops pushing
+/// when the caller signals stop. Returns the count of pairs that made it
+/// into the ring (may be less than `pairs.len()` on an early stop).
+async fn push_stereo_backpressured_until(
+    producer: &mut Producer<[f32; 2]>,
+    pairs: &[[f32; 2]],
+    is_stopped: &(dyn Fn() -> bool + Sync),
+) -> usize {
+    let mut written = 0;
+    while written < pairs.len() {
+        if is_stopped() {
+            return written;
+        }
+        while written < pairs.len() && producer.push(pairs[written]).is_ok() {
+            written += 1;
+        }
+        if written < pairs.len() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+    written
+}
+
+/// Apply pitch shift and time stretch to a mono f32 buffer.
 ///
 /// Skips the DSP call entirely when both knobs sit at their identity values
-/// so no-effect styles pay no CPU. Order is pitch first (to keep the
+/// so no-effect configs pay no CPU. Order is pitch first (to keep the
 /// spectral envelope closer to the source), then time stretch. Extreme
 /// values are clamped to avoid handing the algorithm something it can't
 /// meaningfully process — a semitone range of ±24 covers character voices
@@ -408,19 +597,19 @@ async fn wait_for_ring_empty(producer: &mut Producer<[f32; 2]>, capacity: usize,
 fn apply_effects(
     samples: Vec<f32>,
     sample_rate: u32,
-    voice: &VoiceOverride,
+    pitch_semitones: f32,
+    time_ratio: f32,
 ) -> Result<Vec<f32>> {
-    if !voice.has_audio_effect() || samples.is_empty() {
+    let no_pitch = pitch_semitones.abs() <= f32::EPSILON;
+    let no_time = (time_ratio - 1.0).abs() <= f32::EPSILON;
+    if (no_pitch && no_time) || samples.is_empty() {
         return Ok(samples);
     }
-    let semitones = voice.pitch_semitones.clamp(-24.0, 24.0);
-    let time_ratio = voice.time_ratio.clamp(0.25, 4.0) as f64;
+    let semitones = pitch_semitones.clamp(-24.0, 24.0);
+    let time_ratio = time_ratio.clamp(0.25, 4.0) as f64;
 
-    // Mono in, mono out. `stretch_ratio` on StretchParams governs the
-    // duration multiplier; for pitch_shift we keep it at 1.0 so pitch is
-    // shifted without also stretching time. See docs.rs/timestretch.
     let mut buf = samples;
-    if semitones.abs() > f32::EPSILON {
+    if !no_pitch {
         let factor = 2f64.powf(semitones as f64 / 12.0);
         let params = timestretch::StretchParams::new(1.0)
             .with_sample_rate(sample_rate)
@@ -428,7 +617,7 @@ fn apply_effects(
         buf = timestretch::pitch_shift(&buf, &params, factor)
             .map_err(|e| anyhow::anyhow!("pitch_shift: {e}"))?;
     }
-    if (time_ratio - 1.0).abs() > f64::EPSILON {
+    if !no_time {
         let params = timestretch::StretchParams::new(time_ratio)
             .with_sample_rate(sample_rate)
             .with_channels(1);
@@ -438,47 +627,37 @@ fn apply_effects(
     Ok(buf)
 }
 
-/// The resample-and-push side of the pipeline. Backends push PCM here without
-/// knowing the pipewire target rate. Two modes:
+/// Capture-only PCM sink. Backends push mono `f32` audio chunks at their
+/// native rate; the sink resamples to the pipewire target rate and buffers
+/// the result in memory. [`synthesize_profile`] takes the captured buffer
+/// per-config for the stereo mix.
 ///
-/// * [`Sink::new`] — pushes into the pipewire producer for real-time
-///   playback (the mic path).
-/// * [`Sink::capture_only`] — has no producer; buffers all pushed PCM into
-///   memory for the caller to take. Used by `/synthesize` when the caller
-///   wants the audio bytes (e.g. to stream to a browser) instead of the mic.
+/// The lifetime is vestigial (nothing borrows across the sink now that the
+/// streaming path is gone) but kept so [`Backend::synthesize`]'s existing
+/// signature `sink: &mut Sink<'_>` doesn't need to change for callers.
 pub struct Sink<'a> {
-    producer: Option<&'a mut Producer<[f32; 2]>>,
+    _marker: std::marker::PhantomData<&'a ()>,
     target_rate: u32,
     // (input_rate, resampler). Rebuilt when the incoming rate changes.
     resampler: Option<(u32, SincFixedIn<f32>)>,
     pub frames_pushed: usize,
-    capture: Option<Vec<f32>>,
+    capture: Vec<f32>,
 }
 
 impl<'a> Sink<'a> {
-    pub fn new(producer: &'a mut Producer<[f32; 2]>, target_rate: u32) -> Self {
-        Self {
-            producer: Some(producer),
-            target_rate,
-            resampler: None,
-            frames_pushed: 0,
-            capture: None,
-        }
-    }
-
     pub fn capture_only(target_rate: u32) -> Self {
         Self {
-            producer: None,
+            _marker: std::marker::PhantomData,
             target_rate,
             resampler: None,
             frames_pushed: 0,
-            capture: Some(Vec::new()),
+            capture: Vec::new(),
         }
     }
 
-    /// Returns (samples, target_rate). Empty Vec if capture was not enabled.
+    /// Returns (samples, target_rate).
     pub fn take_capture(&mut self) -> (Vec<f32>, u32) {
-        (self.capture.take().unwrap_or_default(), self.target_rate)
+        (std::mem::take(&mut self.capture), self.target_rate)
     }
 
     pub async fn push(&mut self, chunk: AudioChunk) -> Result<()> {
@@ -503,46 +682,10 @@ impl<'a> Sink<'a> {
             resample(rs, &samples)?
         };
 
-        if let Some(buf) = self.capture.as_mut() {
-            buf.extend_from_slice(&resampled);
-        }
-        if let Some(producer) = self.producer.as_mut() {
-            self.frames_pushed += push_samples_backpressured(*producer, &resampled).await;
-        } else {
-            // Capture-only sinks track "frames pushed" as capture length so
-            // callers that read the field still get a sensible number.
-            self.frames_pushed += resampled.len();
-        }
+        self.frames_pushed += resampled.len();
+        self.capture.extend_from_slice(&resampled);
         Ok(())
     }
-}
-
-/// Copy `samples` into the ring buffer, awaiting whenever it's full so the
-/// pipewire consumer has a chance to drain. Never drops audio — a synthesized
-/// utterance is much bigger than the ring, so backpressure is what keeps us
-/// aligned with real-time playback instead of racing ahead and clipping.
-///
-/// TTS is mono; the ring stores stereo frames. Each mono sample is duplicated
-/// to `[m, m]` so the source callback's per-channel pan (constant-power)
-/// produces the same acoustic result as the original mono-in-stereo-cloth
-/// path did.
-async fn push_samples_backpressured(producer: &mut Producer<[f32; 2]>, samples: &[f32]) -> usize {
-    let mut written = 0;
-    while written < samples.len() {
-        while written < samples.len()
-            && producer
-                .push([samples[written], samples[written]])
-                .is_ok()
-        {
-            written += 1;
-        }
-        if written < samples.len() {
-            // ~half a frame at 48 kHz per 10 ms of sleep — fine granularity
-            // for keeping the ring topped up without busy-looping.
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    }
-    written
 }
 
 fn build_resampler(input_rate: u32, output_rate: u32) -> Result<SincFixedIn<f32>> {

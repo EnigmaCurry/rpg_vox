@@ -1246,6 +1246,12 @@ fn run(
         monitor_tap: broadcast::Sender<Arc<[f32]>>,
         /// Frames where every source contributed 0. Kept as a diagnostic.
         silent_frames: u64,
+        /// Last observed `mixer.tts_stop_gen`. When the mixer's counter
+        /// advances past this value (from a `POST /playback/stop`), we
+        /// drain any remaining frames out of `tts_consumer` before mixing
+        /// this cycle — so an in-flight clip actually falls silent within
+        /// one pipewire process() interval instead of finishing to drain.
+        last_stop_gen: u64,
     }
     let state = StreamState {
         tts_consumer: consumer,
@@ -1254,6 +1260,7 @@ fn run(
         mixer: cfg.mixer.clone(),
         monitor_tap: cfg.monitor_tap.clone(),
         silent_frames: 0,
+        last_stop_gen: 0,
     };
 
     let graph_stream = graph.clone();
@@ -1278,6 +1285,27 @@ fn run(
             let data = &mut datas[0];
             // Interleaved stereo: each frame is 2 × f32.
             let bytes_per_frame = SOURCE_CHANNELS as usize * std::mem::size_of::<f32>();
+
+            // Honor a pending "stop TTS playback" by draining every frame
+            // sitting in the TTS ring before we mix — the ring may still
+            // hold a couple seconds of pre-queued audio from the current
+            // clip. One drain per gen bump; comparing against last_stop_gen
+            // means multiple cycles between the same stop event only drain
+            // once (subsequent cycles see an empty ring anyway).
+            let stop_gen = state.mixer.tts_stop_gen();
+            if stop_gen != state.last_stop_gen {
+                let mut drained = 0u32;
+                while state.tts_consumer.pop().is_ok() {
+                    drained = drained.saturating_add(1);
+                }
+                state.last_stop_gen = stop_gen;
+                // Publish the honored gen so the TTS runner knows it's
+                // safe to push samples of a fresh clip — pushing before
+                // this update would let a still-pending stop drain the
+                // new clip's frames and playback would start mid-clip.
+                state.mixer.set_tts_stop_observed_gen(stop_gen);
+                debug!(drained, "tts ring drained on stop request");
+            }
 
             let capacity_frames = if let Some(slice) = data.data() {
                 let out: &mut [f32] = bytemuck_cast_slice_mut(slice);

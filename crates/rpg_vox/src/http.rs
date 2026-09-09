@@ -1,14 +1,19 @@
 //! Local HTTP API.
 //!
-//! Two synthesis paths sharing the same TTS backend:
+//! Two synthesis paths sharing the same TTS backend. Both accept a **voice
+//! profile** — a list of one or more `configs`, each carrying its own
+//! speaker/language/instruct + per-voice DSP (pitch, detune, time, pan,
+//! gain, delay). A profile with N configs synthesizes N voices in the same
+//! call and mixes them into one stereo output (hive-mind / crowd).
 //!
-//!   POST /say                  { text, speaker?, language?, instruct? }
+//!   POST /say                  { text, configs: [{...}, ...] }
 //!                              → { ok, frames } — pushes to the virtual
-//!                              mic; used by Chat.
-//!   POST /widgets              { text, speaker?, language?, instruct? }
-//!                              → audio/wav — synthesize, persist a new
-//!                              widget row + WAV in the store, return audio.
-//!   PUT  /widgets/:id          { text, speaker?, language?, instruct? }
+//!                              mic; used by Chat + Scenes.
+//!   POST /widgets              { text, configs: [{...}, ...] }
+//!                              → audio/wav (stereo) — synthesize, persist
+//!                              a new widget row + WAV in the store,
+//!                              return audio.
+//!   PUT  /widgets/:id          { text, configs: [{...}, ...] }
 //!                              → audio/wav — re-synthesize, overwrite the
 //!                              widget's row + WAV file.
 //!   DELETE /widgets/:id                             → 200 — drop the DB
@@ -17,6 +22,22 @@
 //!                              play the cached WAV through the virtual mic.
 //!                              Blocks until playback finishes so clients can
 //!                              sequence per-clip calls without extra timing.
+//!   POST /playback/stop                              → { ok } — cancel
+//!                              any in-flight TTS playback. Flushes the
+//!                              pipewire ring on the next process cycle so
+//!                              audio actually stops (unlike aborting the
+//!                              /say fetch, which leaves queued samples
+//!                              draining out for up to `ringbuf_seconds`).
+//!   POST /widgets/record       { widget_id?, text? } → { session_id } —
+//!                              begins recording from the `-vox` companion
+//!                              sink into an in-memory buffer.
+//!   POST /widgets/record/:sid/stop                   → { id, sampleRate,
+//!                              durationMs } — stops the session, encodes the
+//!                              captured PCM as mono 16-bit WAV, and creates
+//!                              (or updates, when a widget_id was supplied at
+//!                              /record start) the widget row + WAV file.
+//!   DELETE /widgets/record/:sid                      → 200 — cancels a
+//!                              recording session without persisting anything.
 //!   GET  /monitor.ws                                 → WebSocket that
 //!                              streams the same PCM going to the pipewire
 //!                              mic, encoded as 20ms Opus frames. One
@@ -51,9 +72,11 @@ use axum::{
 };
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc::Sender, oneshot};
+use tokio::sync::{Mutex, mpsc::Sender, oneshot};
 use tracing::info;
+use uuid::Uuid;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::chat;
@@ -62,6 +85,7 @@ use crate::monitor;
 use crate::pw_source::{GraphSnapshot, PwClient, SinkRole};
 use crate::settings::{self, SettingsUpdate};
 use crate::store::{Store, UpdateResult};
+use crate::stt::SttHandle;
 use tokio::sync::broadcast;
 
 /// Ceiling for /images POST bodies. Kept above the client's own 10 MB cap
@@ -73,7 +97,7 @@ const IMAGE_MAX_BYTES: usize = 12 * 1024 * 1024;
 /// this — image bytes are stored separately under /images and the state
 /// blob only carries their `/images/{id}` src URLs.
 const STATE_MAX_BYTES: usize = 4 * 1024 * 1024;
-use crate::tts::{self, Command, PlayPcmRequest, SayRequest, SynthesizeRequest, VoiceOverride};
+use crate::tts::{self, Command, PlayPcmRequest, SayRequest, SynthesizeRequest, VoiceConfig};
 use crate::workflow::{self, Registry};
 
 /// Built by build.rs (`pnpm run build` in crates/rpg_vox/web) into
@@ -101,26 +125,90 @@ pub(crate) struct AppState {
     /// Shared mixer atomics. `/mixer` reads a snapshot; `PUT /mixer`
     /// applies a partial patch. Also persisted to sqlite on every update.
     pub(crate) mixer: Arc<AtomicMixer>,
+    /// Fan-out for the `-vox` companion sink's PCM tap. Interleaved stereo
+    /// f32 at [`Self::vox_sample_rate`]. Used by `/widgets/record` to
+    /// capture a widget clip directly from the vox channel instead of TTS.
+    pub(crate) vox_tap: broadcast::Sender<Arc<[f32]>>,
+    /// Sample rate for the vox tap (matches the pipewire target rate).
+    pub(crate) vox_sample_rate: u32,
+    /// In-flight recording sessions keyed by session id. Populated by
+    /// `POST /widgets/record`; consumed by the matching /stop or /cancel.
+    pub(crate) recordings: Arc<Mutex<HashMap<Uuid, RecordingSession>>>,
+    /// Loaded SenseVoice recognizer, or `None` when STT is disabled/missing.
+    /// Consulted by `/widgets/record/:sid/stop` to auto-fill the widget's
+    /// caption with a transcript of what was captured; when `None`, the
+    /// captured WAV is still persisted and the client's provided text is
+    /// used as-is.
+    pub(crate) stt: Option<SttHandle>,
 }
 
-#[derive(Debug, Deserialize)]
-struct SayBody {
+/// One in-flight `/widgets/record` capture. The recording task lives on the
+/// tokio runtime; `stop_tx` signals it to finish (draining the vox tap into
+/// the final WAV), and `result_rx` delivers the accumulated stereo PCM.
+pub(crate) struct RecordingSession {
+    /// Widget metadata the client wants persisted with the recording.
+    widget_id: Option<String>,
     text: String,
-    /// Per-request voice overrides. Only Qwen3 uses them; others ignore.
-    /// Empty strings are coerced to `None` so a UI can send `""` freely.
+    /// Sent to the recording task to signal "stop and hand back the samples".
+    stop_tx: oneshot::Sender<()>,
+    /// Recording task's join handle — held so /cancel can abort the task
+    /// without waiting on it (dropping the handle would detach, not stop).
+    task: tokio::task::JoinHandle<()>,
+    /// Delivered once by the recording task with the accumulated interleaved
+    /// stereo f32 samples. Read only from the /stop handler.
+    result_rx: oneshot::Receiver<Vec<f32>>,
+}
+
+/// One voice recipe in the request payload. All fields are optional; missing
+/// numerics fall back to identity values, missing speaker/language/instruct
+/// fall back to the backend's startup defaults. Field names use camelCase
+/// to match the browser payload verbatim.
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct ConfigBody {
     #[serde(default)]
     speaker: Option<String>,
     #[serde(default)]
     language: Option<String>,
     #[serde(default)]
     instruct: Option<String>,
-    /// Post-processing effects applied to the rendered PCM. Both are
-    /// optional; `None` (or omitted) means identity — no DSP call is made.
-    /// Any backend can use these — pitch/stretch runs after synthesis.
     #[serde(default)]
     pitch_semitones: Option<f32>,
     #[serde(default)]
     time_ratio: Option<f32>,
+    #[serde(default)]
+    detune_cents: Option<f32>,
+    #[serde(default)]
+    pan: Option<f32>,
+    #[serde(default)]
+    gain_db: Option<f32>,
+    #[serde(default)]
+    delay_ms: Option<f32>,
+}
+
+impl ConfigBody {
+    fn into_voice_config(self) -> VoiceConfig {
+        VoiceConfig {
+            speaker: trim_opt(self.speaker),
+            language: trim_opt(self.language),
+            instruct: trim_opt(self.instruct),
+            pitch_semitones: self.pitch_semitones.unwrap_or(0.0),
+            time_ratio: self.time_ratio.unwrap_or(1.0),
+            detune_cents: self.detune_cents.unwrap_or(0.0),
+            pan: self.pan.unwrap_or(0.0),
+            gain_db: self.gain_db.unwrap_or(0.0),
+            delay_ms: self.delay_ms.unwrap_or(0.0),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SayBody {
+    text: String,
+    /// Voice profile — one or more layered configs. Empty (or omitted)
+    /// falls back to a single default config, matching pre-profile behavior.
+    #[serde(default)]
+    configs: Vec<ConfigBody>,
 }
 
 /// Coerce empty/whitespace-only strings to `None` so downstream defaults win.
@@ -129,6 +217,17 @@ fn trim_opt(s: Option<String>) -> Option<String> {
         let t = v.trim().to_string();
         (!t.is_empty()).then_some(t)
     })
+}
+
+/// Turn the request-side `configs` array into a `Vec<VoiceConfig>` ready for
+/// the tts runner. An empty array is coerced to `[VoiceConfig::default()]`
+/// so profile-less callers (chat auto-speak, curl) still get a synth.
+fn configs_or_default(configs: Vec<ConfigBody>) -> Vec<VoiceConfig> {
+    if configs.is_empty() {
+        vec![VoiceConfig::default()]
+    } else {
+        configs.into_iter().map(ConfigBody::into_voice_config).collect()
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -160,6 +259,9 @@ pub async fn serve(
     monitor_tap: broadcast::Sender<Arc<[f32]>>,
     monitor_sample_rate: u32,
     mixer: Arc<AtomicMixer>,
+    vox_tap: broadcast::Sender<Arc<[f32]>>,
+    vox_sample_rate: u32,
+    stt: Option<SttHandle>,
 ) -> Result<()> {
     let state = AppState {
         tts,
@@ -171,6 +273,10 @@ pub async fn serve(
         monitor_tap,
         monitor_sample_rate,
         mixer,
+        vox_tap,
+        vox_sample_rate,
+        recordings: Arc::new(Mutex::new(HashMap::new())),
+        stt,
     };
     let app = Router::new()
         .route("/", get(index))
@@ -184,6 +290,16 @@ pub async fn serve(
                 .delete(widget_delete_handler),
         )
         .route("/widgets/:id/say", post(widget_say_handler))
+        .route("/playback/stop", post(playback_stop_handler))
+        .route("/widgets/record", post(widget_record_start_handler))
+        .route(
+            "/widgets/record/:session_id",
+            axum::routing::delete(widget_record_cancel_handler),
+        )
+        .route(
+            "/widgets/record/:session_id/stop",
+            post(widget_record_stop_handler),
+        )
         .route("/scenes/mix", post(scene_mix_handler))
         .route(
             "/images",
@@ -553,20 +669,14 @@ async fn say_handler(
         )
             .into_response();
     }
-    let voice = VoiceOverride {
-        speaker: trim_opt(body.speaker),
-        language: trim_opt(body.language),
-        instruct: trim_opt(body.instruct),
-        pitch_semitones: body.pitch_semitones.unwrap_or(0.0),
-        time_ratio: body.time_ratio.unwrap_or(1.0),
-    };
+    let configs = configs_or_default(body.configs);
 
     let (reply_tx, reply_rx) = oneshot::channel();
     if state
         .tts
         .send(Command::Say(SayRequest {
             text,
-            voice,
+            configs,
             reply: reply_tx,
         }))
         .await
@@ -713,7 +823,7 @@ fn speak_async(tts: Sender<Command>, text: String) {
         if tts
             .send(Command::Say(SayRequest {
                 text,
-                voice: VoiceOverride::default(),
+                configs: vec![VoiceConfig::default()],
                 reply: tx,
             }))
             .await
@@ -741,17 +851,9 @@ fn speak_async(tts: Sender<Command>, text: String) {
 #[derive(Debug, Deserialize)]
 struct WidgetBody {
     text: String,
+    /// Voice profile — see [`SayBody`] for shape and fallback semantics.
     #[serde(default)]
-    speaker: Option<String>,
-    #[serde(default)]
-    language: Option<String>,
-    #[serde(default)]
-    instruct: Option<String>,
-    /// Post-processing effects. See [`SayBody`] for units.
-    #[serde(default)]
-    pitch_semitones: Option<f32>,
-    #[serde(default)]
-    time_ratio: Option<f32>,
+    configs: Vec<ConfigBody>,
 }
 
 /// Rendered clip in a form ready to hand to the store + client. Held as
@@ -764,20 +866,20 @@ struct RenderedClip {
     duration_ms: u64,
 }
 
-/// Push a synth request through the TTS runner, encode WAV, return it. The
-/// caller decides what to do with the bytes (persist + respond, in the
-/// widget handlers below).
+/// Push a synth request through the TTS runner, encode stereo WAV, return
+/// it. The caller decides what to do with the bytes (persist + respond, in
+/// the widget handlers below).
 async fn render_clip(
     state: &AppState,
     text: String,
-    voice: VoiceOverride,
+    configs: Vec<VoiceConfig>,
 ) -> Result<RenderedClip, (StatusCode, String)> {
     let (reply_tx, reply_rx) = oneshot::channel();
     if state
         .tts
         .send(Command::Synthesize(SynthesizeRequest {
             text,
-            voice,
+            configs,
             reply: reply_tx,
         }))
         .await
@@ -793,7 +895,7 @@ async fn render_clip(
     };
 
     let duration_ms = (outcome.samples.len() as u64 * 1000) / outcome.sample_rate.max(1) as u64;
-    let wav = encode_wav_pcm16(&outcome.samples, outcome.sample_rate);
+    let wav = encode_wav_pcm16_stereo(&outcome.samples, outcome.sample_rate);
     Ok(RenderedClip {
         wav,
         sample_rate: outcome.sample_rate,
@@ -801,25 +903,28 @@ async fn render_clip(
     })
 }
 
-/// Parse+validate a widget body. Empty text is rejected; empty voice fields
-/// are coerced to `None` so the backend falls back to its startup default.
-/// Persisted `instruct` (used later by the store row) is returned alongside
-/// the [`VoiceOverride`] the runner consumes.
-fn normalize_widget_body(
-    body: WidgetBody,
-) -> Result<(String, VoiceOverride), (StatusCode, String)> {
+/// Parse+validate a widget body. Empty text is rejected; missing config
+/// fields fall back to the backend defaults. `persist_instruct` is the
+/// first config's instruct, mirrored into the row's legacy `instruct`
+/// column so callers that still read that column see something sensible.
+struct NormalizedWidget {
+    text: String,
+    configs: Vec<VoiceConfig>,
+    persist_instruct: Option<String>,
+}
+
+fn normalize_widget_body(body: WidgetBody) -> Result<NormalizedWidget, (StatusCode, String)> {
     let text = body.text.trim().to_string();
     if text.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "empty text".into()));
     }
-    let voice = VoiceOverride {
-        speaker: trim_opt(body.speaker),
-        language: trim_opt(body.language),
-        instruct: trim_opt(body.instruct),
-        pitch_semitones: body.pitch_semitones.unwrap_or(0.0),
-        time_ratio: body.time_ratio.unwrap_or(1.0),
-    };
-    Ok((text, voice))
+    let configs = configs_or_default(body.configs);
+    let persist_instruct = configs.first().and_then(|c| c.instruct.clone());
+    Ok(NormalizedWidget {
+        text,
+        configs,
+        persist_instruct,
+    })
 }
 
 /// Build the audio/wav response with the metadata headers the client uses
@@ -848,12 +953,11 @@ async fn widget_create_handler(
     State(state): State<AppState>,
     Json(body): Json<WidgetBody>,
 ) -> Response {
-    let (text, voice) = match normalize_widget_body(body) {
+    let NormalizedWidget { text, configs, persist_instruct } = match normalize_widget_body(body) {
         Ok(t) => t,
         Err((code, msg)) => return (code, msg).into_response(),
     };
-    let persist_instruct = voice.instruct.clone();
-    let clip = match render_clip(&state, text.clone(), voice).await {
+    let clip = match render_clip(&state, text.clone(), configs).await {
         Ok(c) => c,
         Err((code, msg)) => return (code, msg).into_response(),
     };
@@ -889,12 +993,11 @@ async fn widget_update_handler(
     Path(id): Path<String>,
     Json(body): Json<WidgetBody>,
 ) -> Response {
-    let (text, voice) = match normalize_widget_body(body) {
+    let NormalizedWidget { text, configs, persist_instruct } = match normalize_widget_body(body) {
         Ok(t) => t,
         Err((code, msg)) => return (code, msg).into_response(),
     };
-    let persist_instruct = voice.instruct.clone();
-    let clip = match render_clip(&state, text.clone(), voice).await {
+    let clip = match render_clip(&state, text.clone(), configs).await {
         Ok(c) => c,
         Err((code, msg)) => return (code, msg).into_response(),
     };
@@ -1064,7 +1167,7 @@ async fn widget_say_handler(
         }
     };
 
-    let (sample_rate, pcm_i16) = match decode_wav_pcm16_mono(&wav) {
+    let (sample_rate, samples) = match decode_wav_pcm16_stereo_any(&wav) {
         Ok(v) => v,
         Err(err) => {
             return (
@@ -1080,10 +1183,14 @@ async fn widget_say_handler(
     };
     let _ = row; // metadata is authoritative on the row; decoded rate takes precedence.
 
-    let samples: Vec<f32> = pcm_i16
-        .into_iter()
-        .map(|s| s as f32 / i16::MAX as f32)
-        .collect();
+    // Latest-wins: bump the stop-gen so any in-flight clip on the mic
+    // starts bailing NOW, and claim a fresh play seq so any older PlayPcm
+    // still queued in the runner mpsc skips itself on dispatch. Together
+    // these give the user "click a clip → that clip plays, not-plus-a-
+    // queue-of-earlier-clicks" without needing an explicit client-side
+    // stopPlayback() before each play.
+    state.mixer.request_tts_stop();
+    let seq = state.mixer.claim_play_seq();
 
     let (reply_tx, reply_rx) = oneshot::channel();
     if state
@@ -1091,6 +1198,7 @@ async fn widget_say_handler(
         .send(Command::PlayPcm(PlayPcmRequest {
             samples,
             sample_rate,
+            seq,
             reply: reply_tx,
         }))
         .await
@@ -1135,6 +1243,318 @@ async fn widget_say_handler(
             }),
         )
             .into_response(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// /playback/stop — cancel any TTS clip currently playing through the mic.
+//
+// Aborting the `/widgets/:id/say` HTTP request alone isn't enough: by the
+// time the fetch is cancelled the server has already pushed the whole clip
+// into the pipewire ring buffer, so audio keeps draining out for up to
+// ringbuf_seconds. This bumps `mixer.tts_stop_gen`, which two workers watch
+// for: the pipewire process callback drains the TTS ring on the very next
+// cycle, and the TTS runner's PlayPcm handler bails out of its push loop /
+// drain wait. Result: audio is silent within ~one pipewire cycle.
+// ---------------------------------------------------------------------------
+
+async fn playback_stop_handler(State(state): State<AppState>) -> Response {
+    let gen = state.mixer.request_tts_stop();
+    info!(gen, "playback stop requested");
+    (StatusCode::OK, Json(ActionResponse { ok: true, error: None })).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// /widgets/record — capture a widget clip directly from the vox tap.
+//
+// Two-phase HTTP flow (start / stop) so the client controls the recording
+// length interactively — the user hits Record, speaks, then hits Stop. Vox
+// PCM is broadcast at 48 kHz stereo f32 from the pw source callback (see
+// `pw_source.rs`); the recording task subscribes on start and buffers every
+// chunk until /stop signals it to hand back the accumulated samples. /cancel
+// drops the session without persisting.
+//
+// Samples are downmixed L+R → mono and encoded as our existing mono 16-bit
+// WAV so the on-disk clip is indistinguishable from a TTS-rendered widget
+// for downstream consumers (widget_get, widget_say, scenes/mix).
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize, Default)]
+struct RecordStartBody {
+    /// Existing widget row to overwrite (from the SpeakCell's current
+    /// widgetId). When absent the /stop handler creates a new widget row.
+    #[serde(default)]
+    widget_id: Option<String>,
+    /// Client-supplied caption/label. May be empty — recordings don't
+    /// require any text, unlike TTS renders. Stored verbatim on the row.
+    #[serde(default)]
+    text: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct RecordStartResponse {
+    session_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct RecordStopResponse {
+    id: String,
+    sample_rate: u32,
+    duration_ms: u64,
+    /// Transcript produced by the SenseVoice STT pass, if enabled. `None`
+    /// when STT wasn't loaded (missing model or --stt-disabled); the client
+    /// then falls back to whatever it had in the caption textarea. Empty
+    /// string means STT ran but produced no text (silence / non-speech).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transcript: Option<String>,
+}
+
+/// Longest single recording we buffer before the task auto-stops. 5 minutes
+/// at 48 kHz stereo f32 is ~110 MB, which is plenty of headroom for any
+/// scene clip while still capping runaway memory if a client vanishes
+/// between /record and /stop.
+const RECORD_MAX_FRAMES: usize = 48_000 * 60 * 5;
+
+async fn widget_record_start_handler(
+    State(state): State<AppState>,
+    body: Option<Json<RecordStartBody>>,
+) -> Response {
+    // Body is optional so a plain `POST /widgets/record` (no JSON) works
+    // from the client side; empty body just means "new widget, no text".
+    let Json(body) = body.unwrap_or_else(|| Json(RecordStartBody::default()));
+
+    let session_id = Uuid::new_v4();
+    let mut vox_rx = state.vox_tap.subscribe();
+    let (stop_tx, stop_rx) = oneshot::channel::<()>();
+    let (result_tx, result_rx) = oneshot::channel::<Vec<f32>>();
+
+    let task = tokio::spawn(async move {
+        let mut buf: Vec<f32> = Vec::new();
+        tokio::pin!(stop_rx);
+        loop {
+            tokio::select! {
+                _ = &mut stop_rx => break,
+                recv = vox_rx.recv() => {
+                    match recv {
+                        Ok(chunk) => {
+                            if buf.len() >= RECORD_MAX_FRAMES * 2 {
+                                // Hit the ceiling — stop accumulating but
+                                // keep the select alive so /stop still gets
+                                // the buffer we've captured so far.
+                                continue;
+                            }
+                            buf.extend_from_slice(&chunk);
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            // Slow consumer — a chunk was dropped. Live
+                            // recording semantics: skip it and keep going.
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            }
+        }
+        let _ = result_tx.send(buf);
+    });
+
+    let text = body.text.unwrap_or_default();
+    let session = RecordingSession {
+        widget_id: body.widget_id.clone(),
+        text,
+        stop_tx,
+        task,
+        result_rx,
+    };
+    state.recordings.lock().await.insert(session_id, session);
+
+    info!(%session_id, widget_id = ?body.widget_id, "recording session started");
+    (
+        StatusCode::OK,
+        Json(RecordStartResponse {
+            session_id: session_id.to_string(),
+        }),
+    )
+        .into_response()
+}
+
+async fn widget_record_stop_handler(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+) -> Response {
+    let sid = match Uuid::parse_str(&session_id) {
+        Ok(v) => v,
+        Err(_) => return (StatusCode::BAD_REQUEST, "invalid session id").into_response(),
+    };
+    let session = match state.recordings.lock().await.remove(&sid) {
+        Some(s) => s,
+        None => return (StatusCode::NOT_FOUND, "no such recording session").into_response(),
+    };
+    let RecordingSession {
+        widget_id,
+        text,
+        stop_tx,
+        task,
+        result_rx,
+    } = session;
+
+    // Signal the task to stop and await it. Ignore stop_tx send errors — if
+    // the task already exited (e.g. broadcast closed), result_rx still
+    // yields whatever it captured.
+    let _ = stop_tx.send(());
+    let stereo = match result_rx.await {
+        Ok(samples) => samples,
+        Err(_) => {
+            // Task dropped its sender without producing a result — abort to
+            // free the JoinHandle and surface a 500.
+            task.abort();
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "recording task ended without result",
+            )
+                .into_response();
+        }
+    };
+    // Task is done draining; join it so we don't leak the handle.
+    let _ = task.await;
+
+    // Vox tap is interleaved stereo f32 [L,R,L,R,...]. Convert to stereo
+    // pairs so we can encode the widget WAV as stereo (matching the
+    // TTS-render path); keep a mono downmix for the STT recognizer, which
+    // only accepts mono.
+    let pairs: Vec<[f32; 2]> = stereo
+        .chunks_exact(2)
+        .map(|c| [c[0], c[1]])
+        .collect();
+    if pairs.is_empty() {
+        return (StatusCode::BAD_REQUEST, "recording is empty").into_response();
+    }
+    let mono_for_stt: Vec<f32> = pairs.iter().map(|p| (p[0] + p[1]) * 0.5).collect();
+
+    let sample_rate = state.vox_sample_rate;
+    let duration_ms = (pairs.len() as u64 * 1000) / sample_rate.max(1) as u64;
+
+    // Transcribe on a blocking pool if STT is loaded — sherpa-onnx's decode
+    // is CPU-bound (feature extraction + ONNX inference) and can take
+    // hundreds of milliseconds even for short clips, so keep it off the
+    // tokio reactor. The transcript overrides the client-supplied text when
+    // non-empty; otherwise we fall back to what the client typed.
+    let transcript: Option<String> = if let Some(recog) = state.stt.clone() {
+        let mono_for_stt = mono_for_stt.clone();
+        match tokio::task::spawn_blocking(move || recog.transcribe(&mono_for_stt, sample_rate))
+            .await
+        {
+            Ok(Ok(t)) => {
+                info!(
+                    len = t.len(),
+                    duration_ms,
+                    "STT transcript"
+                );
+                Some(t)
+            }
+            Ok(Err(err)) => {
+                tracing::warn!(err = %format!("{err:#}"), "STT failed; falling back to client text");
+                None
+            }
+            Err(_) => {
+                tracing::warn!("STT task panicked; falling back to client text");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // WAV encoding is cheap (linear pass over a Vec) so we do it inline
+    // after the STT pass — no benefit to overlapping the two on this
+    // short clip.
+    let wav = encode_wav_pcm16_stereo(&pairs, sample_rate);
+
+    // Prefer a non-empty transcript over whatever the client typed; both
+    // being empty is fine (widget row's `text` column stores "" cleanly).
+    let persisted_text = match transcript.as_deref() {
+        Some(t) if !t.is_empty() => t.to_string(),
+        _ => text.clone(),
+    };
+
+    let id = if let Some(existing) = widget_id.clone() {
+        match state
+            .store
+            .update_widget(
+                existing.clone(),
+                persisted_text,
+                None,
+                sample_rate,
+                duration_ms,
+                wav,
+            )
+            .await
+        {
+            Ok(UpdateResult::Updated) => existing,
+            Ok(UpdateResult::NotFound) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    format!("no widget with id {existing}"),
+                )
+                    .into_response();
+            }
+            Err(err) => {
+                tracing::error!(err = %format!("{err:#}"), "store: record update failed");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("store: {err:#}"),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        match state
+            .store
+            .create_widget(persisted_text, None, sample_rate, duration_ms, wav)
+            .await
+        {
+            Ok(id) => id,
+            Err(err) => {
+                tracing::error!(err = %format!("{err:#}"), "store: record create failed");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("store: {err:#}"),
+                )
+                    .into_response();
+            }
+        }
+    };
+
+    info!(%id, %session_id, frames = pairs.len(), duration_ms, "recording saved as widget");
+    (
+        StatusCode::OK,
+        Json(RecordStopResponse {
+            id,
+            sample_rate,
+            duration_ms,
+            transcript,
+        }),
+    )
+        .into_response()
+}
+
+async fn widget_record_cancel_handler(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+) -> Response {
+    let sid = match Uuid::parse_str(&session_id) {
+        Ok(v) => v,
+        Err(_) => return (StatusCode::BAD_REQUEST, "invalid session id").into_response(),
+    };
+    match state.recordings.lock().await.remove(&sid) {
+        Some(session) => {
+            // Abort the recording task and drop its buffer without touching
+            // the store. `stop_tx`/`result_rx` are dropped here too, which
+            // shuts down cleanly whether the task reads them or not.
+            session.task.abort();
+            info!(%session_id, "recording session canceled");
+            (StatusCode::OK, Json(ActionResponse { ok: true, error: None })).into_response()
+        }
+        None => (StatusCode::NOT_FOUND, "no such recording session").into_response(),
     }
 }
 
@@ -1189,12 +1609,12 @@ async fn scene_mix_handler(
         }
     };
 
-    // Decode each WAV into (rate, i16 samples). We wrote these files with
-    // `encode_wav_pcm16` above (mono, 16-bit little-endian), so the parse is
-    // trivial. Anything else we haven't produced ourselves.
-    let mut decoded: Vec<(u32, Vec<i16>)> = Vec::with_capacity(clips.len());
+    // Decode each WAV into (rate, stereo pairs). Widget WAVs are stereo
+    // 16-bit LE since the profile-mix rewrite, but the decoder also
+    // accepts pre-existing mono clips by duplicating each sample to L=R.
+    let mut decoded: Vec<(u32, Vec<[f32; 2]>)> = Vec::with_capacity(clips.len());
     for (id, bytes) in clips {
-        match decode_wav_pcm16_mono(&bytes) {
+        match decode_wav_pcm16_stereo_any(&bytes) {
             Ok(pair) => decoded.push(pair),
             Err(err) => {
                 return (
@@ -1219,22 +1639,27 @@ async fn scene_mix_handler(
             .into_response();
     }
 
-    let gap_samples = ((body.pause_ms as u64 * sample_rate as u64) / 1000) as usize;
-    // Concatenate. FLAC wants i32 samples in host order.
-    let total: usize = decoded.iter().map(|(_, s)| s.len()).sum::<usize>()
-        + gap_samples * decoded.len().saturating_sub(1);
-    let mut mixed: Vec<i32> = Vec::with_capacity(total);
-    for (i, (_, samples)) in decoded.iter().enumerate() {
-        if i > 0 && gap_samples > 0 {
-            mixed.extend(std::iter::repeat(0i32).take(gap_samples));
+    let gap_frames = ((body.pause_ms as u64 * sample_rate as u64) / 1000) as usize;
+    // Concatenate. FLAC wants channel-interleaved i32 samples in host order:
+    // [L0, R0, L1, R1, ...] for a 2-channel stream.
+    let total_frames: usize = decoded.iter().map(|(_, s)| s.len()).sum::<usize>()
+        + gap_frames * decoded.len().saturating_sub(1);
+    let mut mixed: Vec<i32> = Vec::with_capacity(total_frames * 2);
+    for (i, (_, pairs)) in decoded.iter().enumerate() {
+        if i > 0 && gap_frames > 0 {
+            // Silent gap: two i32 zeros per frame (L, R).
+            mixed.extend(std::iter::repeat_n(0i32, gap_frames * 2));
         }
-        mixed.extend(samples.iter().map(|s| *s as i32));
+        for [l, r] in pairs.iter() {
+            mixed.push(f32_to_i16_clipped(*l) as i32);
+            mixed.push(f32_to_i16_clipped(*r) as i32);
+        }
     }
 
     // FLAC encode. Runs on a blocking pool because encoding a several-second
     // clip can take tens of milliseconds and we don't want to stall the
     // tokio reactor.
-    let flac = match tokio::task::spawn_blocking(move || encode_flac_mono_i16(&mixed, sample_rate))
+    let flac = match tokio::task::spawn_blocking(move || encode_flac_stereo_i16(&mixed, sample_rate))
         .await
     {
         Ok(Ok(v)) => v,
@@ -1275,10 +1700,13 @@ async fn scene_mix_handler(
         .into_response()
 }
 
-/// Decode a WAV in our own dialect: mono, 16-bit little-endian PCM. Not a
-/// general WAV parser — just enough to round-trip files produced by
-/// `encode_wav_pcm16`. Returns (sample_rate, samples).
-fn decode_wav_pcm16_mono(bytes: &[u8]) -> Result<(u32, Vec<i16>), String> {
+/// Decode a WAV in our dialect (16-bit little-endian PCM, mono or stereo)
+/// into stereo pairs. Not a general WAV parser — just enough to round-trip
+/// files produced by [`encode_wav_pcm16_stereo`] plus legacy mono widget
+/// WAVs from before the profile-mix rewrite. Mono input is duplicated to
+/// L=R so downstream code always sees stereo pairs. Returns (sample_rate,
+/// pairs).
+fn decode_wav_pcm16_stereo_any(bytes: &[u8]) -> Result<(u32, Vec<[f32; 2]>), String> {
     if bytes.len() < 44 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
         return Err("not a RIFF/WAVE file".into());
     }
@@ -1321,7 +1749,7 @@ fn decode_wav_pcm16_mono(bytes: &[u8]) -> Result<(u32, Vec<i16>), String> {
     }
     let (format, channels, sample_rate, bits) = fmt.ok_or_else(|| "missing fmt chunk".to_string())?;
     let data = data.ok_or_else(|| "missing data chunk".to_string())?;
-    if format != 1 || channels != 1 || bits != 16 {
+    if format != 1 || bits != 16 || !(channels == 1 || channels == 2) {
         return Err(format!(
             "unsupported format: pcm={} channels={} bits={}",
             format == 1,
@@ -1329,16 +1757,27 @@ fn decode_wav_pcm16_mono(bytes: &[u8]) -> Result<(u32, Vec<i16>), String> {
             bits
         ));
     }
-    let mut samples = Vec::with_capacity(data.len() / 2);
-    for chunk in data.chunks_exact(2) {
-        samples.push(i16::from_le_bytes([chunk[0], chunk[1]]));
+    let bytes_per_frame = (channels as usize) * 2;
+    let mut pairs = Vec::with_capacity(data.len() / bytes_per_frame);
+    if channels == 1 {
+        for c in data.chunks_exact(2) {
+            let s = i16::from_le_bytes([c[0], c[1]]) as f32 / i16::MAX as f32;
+            pairs.push([s, s]);
+        }
+    } else {
+        for c in data.chunks_exact(4) {
+            let l = i16::from_le_bytes([c[0], c[1]]) as f32 / i16::MAX as f32;
+            let r = i16::from_le_bytes([c[2], c[3]]) as f32 / i16::MAX as f32;
+            pairs.push([l, r]);
+        }
     }
-    Ok((sample_rate, samples))
+    Ok((sample_rate, pairs))
 }
 
-/// FLAC-encode a mono i16 PCM buffer. Samples are passed as `i32` (FLAC's
-/// interchange type) even though only the low 16 bits carry data.
-fn encode_flac_mono_i16(samples_i32: &[i32], sample_rate: u32) -> Result<Vec<u8>, String> {
+/// FLAC-encode a channel-interleaved i16 PCM buffer with 2 channels.
+/// Samples are passed as `i32` (FLAC's interchange type) with layout
+/// `[L0, R0, L1, R1, ...]`; only the low 16 bits carry data.
+fn encode_flac_stereo_i16(samples_i32: &[i32], sample_rate: u32) -> Result<Vec<u8>, String> {
     use flacenc::bitsink::ByteSink;
     use flacenc::component::BitRepr;
     use flacenc::config::Encoder;
@@ -1348,7 +1787,7 @@ fn encode_flac_mono_i16(samples_i32: &[i32], sample_rate: u32) -> Result<Vec<u8>
     let config = Encoder::default()
         .into_verified()
         .map_err(|e| format!("bad flac config: {e:?}"))?;
-    let source = MemSource::from_samples(samples_i32, 1, 16, sample_rate as usize);
+    let source = MemSource::from_samples(samples_i32, 2, 16, sample_rate as usize);
     let stream = flacenc::encode_with_fixed_block_size(&config, source, config.block_size)
         .map_err(|e| format!("encode failed: {e:?}"))?;
     let mut sink = ByteSink::new();
@@ -1593,15 +2032,21 @@ async fn state_put_handler(
     }
 }
 
-/// Encode a mono f32 PCM buffer as a 16-bit little-endian WAV. Handrolled to
-/// avoid pulling in `hound` for one call site. Clips saturating instead of
+/// Clip an f32 sample to ±1.0 and convert to i16. Saturating instead of
 /// wrapping since TTS samples occasionally sit right at ±1.0.
-fn encode_wav_pcm16(samples: &[f32], sample_rate: u32) -> Vec<u8> {
-    let channels: u16 = 1;
+fn f32_to_i16_clipped(s: f32) -> i16 {
+    (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16
+}
+
+/// Encode a stereo f32 PCM buffer as a 16-bit little-endian WAV
+/// (channel-interleaved: `[L0, R0, L1, R1, ...]`). Handrolled to avoid
+/// pulling in `hound` for one call site.
+fn encode_wav_pcm16_stereo(pairs: &[[f32; 2]], sample_rate: u32) -> Vec<u8> {
+    let channels: u16 = 2;
     let bits: u16 = 16;
     let byte_rate = sample_rate * channels as u32 * (bits / 8) as u32;
     let block_align = channels * (bits / 8);
-    let data_bytes: u32 = (samples.len() * 2) as u32;
+    let data_bytes: u32 = (pairs.len() * (channels as usize) * 2) as u32;
     let chunk_size: u32 = 36 + data_bytes;
 
     let mut out = Vec::with_capacity(44 + data_bytes as usize);
@@ -1619,10 +2064,9 @@ fn encode_wav_pcm16(samples: &[f32], sample_rate: u32) -> Vec<u8> {
     out.extend_from_slice(b"data");
     out.extend_from_slice(&data_bytes.to_le_bytes());
 
-    for &s in samples {
-        let clipped = s.clamp(-1.0, 1.0);
-        let i = (clipped * i16::MAX as f32) as i16;
-        out.extend_from_slice(&i.to_le_bytes());
+    for [l, r] in pairs {
+        out.extend_from_slice(&f32_to_i16_clipped(*l).to_le_bytes());
+        out.extend_from_slice(&f32_to_i16_clipped(*r).to_le_bytes());
     }
     out
 }

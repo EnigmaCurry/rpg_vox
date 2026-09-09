@@ -15,7 +15,7 @@
     currentProjectCharacters,
     sceneCharacters,
     getCharacter,
-    resolveClipStyle,
+    resolveClipProfile,
     PAUSE_OPTIONS,
   } from '../lib/scenes.svelte.js';
 
@@ -165,6 +165,14 @@
     currentClipId = null;
   }
 
+  // Any solo Play click inside a SpeakCell fires this. If a scene loop is
+  // running, we bail it — the server already latest-wins the PlayPcm
+  // command, but the loop would otherwise advance and preempt the just-
+  // clicked clip on the next iteration.
+  function onSoloPlayIntent() {
+    if (playing) stopScene();
+  }
+
   // ---- Scene render -------------------------------------------------------
   // Renders every clip in scene order that doesn't already have a cached
   // blob. Sequential so the user sees each cell's own progress bar animate
@@ -279,33 +287,26 @@
     return !!lane.voice && !getCharacter(lane.voice);
   }
 
-  // Voice payload sent to the server for a given clip's next render. The
-  // effective `instruct` comes from the character's selected style (or the
-  // default style if none picked yet). Empty object if the lane has no
-  // valid character — the server then falls back to its startup default.
-  function clipVoicePayload(clip) {
-    if (!scene) return {};
-    const lane = scene.lanes.find((l) => l.id === clip.laneId);
-    const character = lane ? getCharacter(lane.voice) : null;
-    if (!character) return {};
-    const style = resolveClipStyle(character, clip);
-    return {
-      speaker: character.voice.speaker,
-      language: character.voice.language,
-      instruct: style.instruct,
-      pitchSemitones: style.pitchSemitones,
-      timeRatio: style.timeRatio,
-    };
-  }
-
-  // Style choices offered by a clip's SpeakCell dropdown. Empty list if the
-  // lane has no character; the SpeakCell then hides the picker.
-  function clipStyleOptions(clip) {
+  // Voice-profile payload sent to the server for a given clip's next
+  // render — an array of configs (one per layered voice). Speaker/language
+  // now live on each config. Empty array if the lane has no valid character;
+  // the server then falls back to a single default config.
+  function clipConfigsPayload(clip) {
     if (!scene) return [];
     const lane = scene.lanes.find((l) => l.id === clip.laneId);
     const character = lane ? getCharacter(lane.voice) : null;
     if (!character) return [];
-    return character.voice.styles.map((s) => ({ id: s.id, name: s.name }));
+    return resolveClipProfile(character, clip).configs;
+  }
+
+  // Profile choices offered by a clip's SpeakCell dropdown. Empty list if
+  // the lane has no character; the SpeakCell then hides the picker.
+  function clipProfileOptions(clip) {
+    if (!scene) return [];
+    const lane = scene.lanes.find((l) => l.id === clip.laneId);
+    const character = lane ? getCharacter(lane.voice) : null;
+    if (!character) return [];
+    return character.voiceProfiles.map((p) => ({ id: p.id, name: p.name }));
   }
 </script>
 
@@ -441,11 +442,12 @@
             >
               <SpeakCell
                 initialText={clip.text}
-                initialStyleId={clip.styleId ?? null}
+                initialProfileId={clip.profileId ?? null}
                 initialWidgetId={clip.widgetId}
                 startEditing={!clip.text && !clip.widgetId}
-                voice={clipVoicePayload(clip)}
-                styles={clipStyleOptions(clip)}
+                configs={clipConfigsPayload(clip)}
+                profiles={clipProfileOptions(clip)}
+                onSoloPlayIntent={onSoloPlayIntent}
                 onchange={(snap) => onCellChange(clip.id, snap)}
                 ondelete={() => onCellDelete(clip.id)}
                 onaudio={(payload) => onCellAudio(clip.id, payload)}
