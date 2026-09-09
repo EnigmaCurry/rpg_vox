@@ -12,8 +12,6 @@
 use anyhow::{Context as _, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::sync::Arc;
-use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
 #[derive(Clone, Debug)]
@@ -39,11 +37,14 @@ pub struct ChatMessage {
     pub content: String,
 }
 
+/// Stateless LLM wrapper. `history` used to live in the client itself; the
+/// switch to multi-script moved it into the sqlite store so each /scripts
+/// row has its own conversation. Callers now build a `Vec<ChatMessage>`
+/// from the script's stored turns and hand it to `generate_reply`.
 #[derive(Clone)]
 pub struct Client {
     cfg: Config,
     http: reqwest::Client,
-    history: Arc<RwLock<Vec<ChatMessage>>>,
 }
 
 impl Client {
@@ -51,7 +52,6 @@ impl Client {
         Self {
             cfg,
             http: reqwest::Client::new(),
-            history: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -63,26 +63,15 @@ impl Client {
         &self.cfg.base_url
     }
 
-    #[allow(dead_code)]
-    pub async fn history_snapshot(&self) -> Vec<ChatMessage> {
-        self.history.read().await.clone()
-    }
-
-    pub async fn reset(&self) {
-        self.history.write().await.clear();
-    }
-
-    /// Append `user_text`, call the LLM, append the assistant reply, return
-    /// the cleaned reply text.
-    pub async fn send(&self, user_text: String) -> Result<String> {
-        let messages = {
-            let mut hist = self.history.write().await;
-            hist.push(ChatMessage {
-                role: "user".into(),
-                content: user_text,
-            });
-            self.build_messages(&hist)
-        };
+    /// Send a rolling history to the LLM and return the cleaned reply.
+    /// Failures leave the caller's history untouched (nothing is written
+    /// back here) — the caller decides whether to retry or roll back.
+    pub async fn generate_reply(
+        &self,
+        history: Vec<ChatMessage>,
+        system_prompt_override: Option<String>,
+    ) -> Result<String> {
+        let messages = self.build_messages(&history, system_prompt_override.as_deref());
         let raw = self.completion(&messages).await?;
         debug!(bytes = raw.len(), raw = %raw, "chat completion raw content");
         // OpenAI Harmony-format models (gpt-oss and its finetunes like
@@ -96,31 +85,29 @@ impl Client {
         let base = extract_harmony_user_reply(&raw).unwrap_or_else(|| raw.clone());
         let cleaned = strip_thinking(&base).trim().to_string();
         if cleaned.is_empty() {
-            // Rare but possible: model emitted only <think>…</think>, no
-            // content at all, or a chat-template quirk stripped everything.
-            // Log the raw response so it's obvious which; include a preview
-            // in the error message so the user sees it in the UI too.
             warn!(bytes = raw.len(), raw = %raw, "LLM returned empty content after cleanup");
-            self.history.write().await.pop();
             return Err(anyhow!(
                 "LLM returned empty content after cleanup (raw {} bytes: {:?})",
                 raw.len(),
                 if raw.len() > 200 { format!("{}…", &raw[..200]) } else { raw }
             ));
         }
-        self.history.write().await.push(ChatMessage {
-            role: "assistant".into(),
-            content: cleaned.clone(),
-        });
         Ok(cleaned)
     }
 
-    fn build_messages(&self, history: &[ChatMessage]) -> Vec<ChatMessage> {
+    fn build_messages(
+        &self,
+        history: &[ChatMessage],
+        system_prompt_override: Option<&str>,
+    ) -> Vec<ChatMessage> {
         let mut out = Vec::with_capacity(history.len() + 1);
-        if let Some(sys) = &self.cfg.system_prompt {
+        let sys = system_prompt_override
+            .map(|s| s.to_string())
+            .or_else(|| self.cfg.system_prompt.clone());
+        if let Some(s) = sys.filter(|v| !v.trim().is_empty()) {
             out.push(ChatMessage {
                 role: "system".into(),
-                content: sys.clone(),
+                content: s,
             });
         }
         let take = self.cfg.max_history.min(history.len());

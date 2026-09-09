@@ -87,7 +87,7 @@ use anyhow::{Context as _, Result};
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{DefaultBodyLimit, Path, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{HeaderMap, HeaderName, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -107,7 +107,7 @@ use crate::monitor;
 use crate::pw_source::{GraphSnapshot, PwClient, SinkRole};
 use crate::script;
 use crate::settings::{self, SettingsUpdate};
-use crate::store::{DEFAULT_SCRIPT_ID, ScriptBlockRow, ScriptTakeRow, ScriptTurnRow, Store, UpdateResult};
+use crate::store::{AgentField, DEFAULT_AGENT_ID, ScriptBlockRow, ScriptTakeRow, ScriptTurnRow, Store, UpdateResult};
 use crate::stt::SttHandle;
 use tokio::sync::broadcast;
 
@@ -253,6 +253,131 @@ fn configs_or_default(configs: Vec<ConfigBody>) -> Vec<VoiceConfig> {
     }
 }
 
+/// Default voice profile for a Script speech block based on its role.
+/// "character" → the backend's default voice unchanged (the PC's own line).
+/// "narrator"  → the same voice with a DSP shift so the storyteller reads
+/// noticeably different from the PC even when only one Piper model is
+/// loaded: deeper (pitch −3 semitones), slower (0.9×), slightly quieter
+/// (−2 dB) and panned right so both voices don't compete on the same
+/// side of the stereo image. Not a "real" second voice — a full multi-voice
+/// setup would want a separate model per role — but enough to make the
+/// two channels feel like different people at zero configuration.
+fn default_configs_for_role(role: &str) -> Vec<VoiceConfig> {
+    match role {
+        "narrator" => vec![VoiceConfig {
+            pitch_semitones: -3.0,
+            time_ratio: 0.9,
+            gain_db: -2.0,
+            pan: 0.35,
+            ..VoiceConfig::default()
+        }],
+        _ => vec![VoiceConfig::default()],
+    }
+}
+
+/// Voice profile for the "GM proxy": the synthesized reading of a user
+/// turn's text when the user typed instead of recording. Panned LEFT (so
+/// it doesn't collide with the narrator's right-panned position), pitched
+/// UP a bit and read at slightly faster-than-normal cadence so the GM
+/// reads as its own distinct third voice on a single-model piper install.
+fn gm_proxy_configs() -> Vec<VoiceConfig> {
+    vec![VoiceConfig {
+        pitch_semitones: 2.0,
+        time_ratio: 1.05,
+        gain_db: -1.0,
+        pan: -0.3,
+        ..VoiceConfig::default()
+    }]
+}
+
+/// Resolve a character id to the `VoiceConfig`s of its first (default)
+/// voice profile. Reads the app_state JSON blob, walks `characters[]`,
+/// pulls `voiceProfiles[0].configs`, and maps each raw config to a
+/// VoiceConfig using the same identity fallbacks as `ConfigBody`.
+///
+/// Returns `None` if the character can't be found (deleted, wrong project,
+/// or app_state hasn't been written yet), if its profile list is empty, or
+/// on any JSON parse failure — callers fall back to their hardcoded DSP
+/// preset in that case, so a stale slot never blocks synthesis.
+async fn resolve_character_configs(
+    state: &AppState,
+    character_id: &str,
+) -> Option<Vec<VoiceConfig>> {
+    let raw = state.store.get_app_state().await.ok().flatten()?;
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let character = value
+        .get("characters")?
+        .as_array()?
+        .iter()
+        .find(|c| c.get("id").and_then(|v| v.as_str()) == Some(character_id))?;
+    let configs = character
+        .get("voiceProfiles")?
+        .as_array()?
+        .first()?
+        .get("configs")?
+        .as_array()?;
+    let out: Vec<VoiceConfig> = configs
+        .iter()
+        .map(|c| VoiceConfig {
+            speaker: c.get("speaker").and_then(|v| v.as_str())
+                .map(str::to_string).filter(|s| !s.is_empty()),
+            language: c.get("language").and_then(|v| v.as_str())
+                .map(str::to_string).filter(|s| !s.is_empty()),
+            instruct: c.get("instruct").and_then(|v| v.as_str())
+                .map(str::to_string).filter(|s| !s.is_empty()),
+            pitch_semitones: c.get("pitchSemitones").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+            time_ratio:      c.get("timeRatio").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32,
+            detune_cents:    c.get("detuneCents").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+            pan:             c.get("pan").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+            gain_db:         c.get("gainDb").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+            delay_ms:        c.get("delayMs").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+        })
+        .collect();
+    if out.is_empty() { None } else { Some(out) }
+}
+
+/// Render + persist a widget that speaks `text` in the User-slot voice.
+/// When the agent has a `voice_user` character set, we use that character's
+/// first voice profile; otherwise we fall back to the hardcoded GM-proxy
+/// DSP preset. Used by /scripts/:id/user when the user typed a message
+/// without an attached mic recording — this ensures every turn in the
+/// transcript is playable via Play All. On synth failure we return `None`
+/// so the send still succeeds; the user just doesn't get a play button on
+/// that turn.
+async fn synth_gm_proxy_widget(
+    state: &AppState,
+    text: String,
+    user_voice_character: Option<&str>,
+) -> Option<String> {
+    if text.is_empty() {
+        return None;
+    }
+    let configs = match user_voice_character {
+        Some(cid) => resolve_character_configs(state, cid)
+            .await
+            .unwrap_or_else(gm_proxy_configs),
+        None => gm_proxy_configs(),
+    };
+    let clip = match render_clip(state, text.clone(), configs).await {
+        Ok(c) => c,
+        Err((code, msg)) => {
+            tracing::warn!(%code, msg, "user-voice synth failed; user turn will have no audio");
+            return None;
+        }
+    };
+    match state
+        .store
+        .create_widget(text, None, clip.sample_rate, clip.duration_ms, clip.wav)
+        .await
+    {
+        Ok(id) => Some(id),
+        Err(err) => {
+            tracing::warn!(err = %format!("{err:#}"), "GM proxy widget insert failed");
+            None
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct SayResponse {
     ok: bool,
@@ -360,10 +485,17 @@ pub async fn serve(
         .route("/workflows", get(list_workflows))
         .route("/workflow/verify", post(verify_workflow))
         .route("/workflow/warmup", post(warmup_workflow))
+        .route("/scripts", get(scripts_list).post(scripts_create))
         .route(
-            "/script",
-            get(script_get).post(script_send).delete(script_reset),
+            "/scripts/:id",
+            axum::routing::get(script_get)
+                .patch(scripts_rename)
+                .delete(scripts_delete),
         )
+        .route("/scripts/:id/turns", axum::routing::delete(script_reset))
+        .route("/scripts/:id/user", post(script_send_user))
+        .route("/scripts/:id/reply", post(script_send_reply))
+        .route("/scripts/:id/title", post(scripts_generate_title))
         .route(
             "/script/blocks/:id",
             axum::routing::patch(script_block_patch),
@@ -375,6 +507,13 @@ pub async fn serve(
         .route(
             "/script/takes/:id",
             axum::routing::delete(script_take_delete),
+        )
+        .route("/agents", get(agents_list).post(agents_create))
+        .route(
+            "/agents/:id",
+            axum::routing::get(agents_get)
+                .put(agents_update)
+                .delete(agents_delete),
         )
         .with_state(state);
 
@@ -785,6 +924,9 @@ struct ScriptBlock {
     id: String,
     ord: i64,
     text: String,
+    /// "narrator" or "character". Frontend styles the two pill types
+    /// differently; server-side voice profile defaults are role-driven too.
+    role: String,
     selected_take: Option<i64>,
     takes: Vec<ScriptTake>,
 }
@@ -795,6 +937,12 @@ struct ScriptTurn {
     ord: i64,
     role: String,
     content: String,
+    /// Widget attached to this turn — non-null only for user turns entered
+    /// via the mic (voice memo → transcript path). Frontend shows a small
+    /// play button next to the transcript that streams the widget through
+    /// the pipewire virtual mic on click.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    widget_id: Option<String>,
     blocks: Vec<ScriptBlock>,
 }
 
@@ -827,6 +975,7 @@ async fn block_view(store: &Store, row: ScriptBlockRow) -> ScriptBlock {
         id: row.id,
         ord: row.ord,
         text: row.text,
+        role: row.role,
         selected_take: row.selected_take,
         takes,
     }
@@ -842,12 +991,209 @@ async fn turn_view(store: &Store, row: ScriptTurnRow) -> ScriptTurn {
         ord: row.ord,
         role: row.role,
         content: row.content,
+        widget_id: row.widget_id,
         blocks,
     }
 }
 
-async fn script_get(State(state): State<AppState>) -> Response {
-    let row = match state.store.get_script(DEFAULT_SCRIPT_ID.to_string()).await {
+#[derive(Debug, Serialize)]
+struct ScriptSummary {
+    id: String,
+    name: String,
+    created_at: i64,
+    updated_at: i64,
+}
+
+fn summary_view(row: crate::store::ScriptSummaryRow) -> ScriptSummary {
+    ScriptSummary {
+        id: row.id,
+        name: row.name,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+    }
+}
+
+async fn scripts_list(State(state): State<AppState>) -> Response {
+    match state.store.list_scripts().await {
+        Ok(rows) => {
+            let out: Vec<ScriptSummary> = rows.into_iter().map(summary_view).collect();
+            (StatusCode::OK, Json(out)).into_response()
+        }
+        Err(err) => {
+            tracing::error!(err = %format!("{err:#}"), "store: scripts list failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("store: {err:#}")).into_response()
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ScriptCreateBody {
+    #[serde(default)]
+    name: Option<String>,
+}
+
+async fn scripts_create(
+    State(state): State<AppState>,
+    Json(body): Json<ScriptCreateBody>,
+) -> Response {
+    let name = body
+        .name
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "New script".to_string());
+    match state.store.create_script(name).await {
+        Ok(row) => (StatusCode::CREATED, Json(summary_view(row))).into_response(),
+        Err(err) => {
+            tracing::error!(err = %format!("{err:#}"), "store: script create failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("store: {err:#}")).into_response()
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ScriptRenameBody {
+    name: String,
+}
+
+async fn scripts_rename(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<ScriptRenameBody>,
+) -> Response {
+    let name = body.name.trim().to_string();
+    if name.is_empty() {
+        return (StatusCode::BAD_REQUEST, "empty name").into_response();
+    }
+    match state.store.rename_script(id.clone(), name).await {
+        Ok(UpdateResult::Updated) => {
+            (StatusCode::OK, Json(ActionResponse { ok: true, error: None })).into_response()
+        }
+        Ok(UpdateResult::NotFound) => {
+            (StatusCode::NOT_FOUND, format!("no script {id}")).into_response()
+        }
+        Err(err) => {
+            tracing::error!(err = %format!("{err:#}"), %id, "store: script rename failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("store: {err:#}")).into_response()
+        }
+    }
+}
+
+async fn scripts_delete(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    let widget_ids = match state.store.delete_script(id.clone()).await {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::error!(err = %format!("{err:#}"), %id, "store: script delete failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("store: {err:#}"),
+            )
+                .into_response();
+        }
+    };
+    for wid in widget_ids {
+        if let Err(err) = state.store.delete_widget(wid.clone()).await {
+            tracing::warn!(id = %wid, err = %format!("{err:#}"),
+                "widget cleanup failed on script delete");
+        }
+    }
+    (StatusCode::OK, Json(ActionResponse { ok: true, error: None })).into_response()
+}
+
+/// Generate a short LLM-derived title from a script's existing turns and
+/// persist it as the script's name. Client fires this fire-and-forget
+/// after the first assistant reply lands; server-side we're a bit strict
+/// about the output (single line, <= 60 chars, quotes stripped) so a
+/// chatty model can't paste a paragraph in as the title.
+async fn scripts_generate_title(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    let script_row = match state.store.get_script(id.clone()).await {
+        Ok(r) => r,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("store: {err:#}"),
+            )
+                .into_response();
+        }
+    };
+    if script_row.turns.is_empty() {
+        return (StatusCode::BAD_REQUEST, "script has no turns yet").into_response();
+    }
+
+    // Build a tiny "sample" of the conversation for the title prompt so
+    // huge histories don't cost a fortune to summarize. First user turn +
+    // first assistant turn is usually enough context to pick a title.
+    let mut sample: Vec<chat::ChatMessage> = Vec::new();
+    for t in script_row.turns.iter().take(4) {
+        sample.push(chat::ChatMessage {
+            role: t.role.clone(),
+            content: t.content.clone(),
+        });
+    }
+    // Overriding the system prompt entirely so the story's own prompt
+    // (which may tell the model to reply in-character with <speak> tags)
+    // doesn't leak into the title.
+    let title_prompt = concat!(
+        "You are naming a chat conversation. Given the following exchange, ",
+        "reply with ONLY a short title (3–6 words, no quotes, no punctuation ",
+        "at the end, no <speak> tags, no preamble). The title should reflect ",
+        "the scene or topic. Reply with the title only, no explanation."
+    );
+
+    let raw = match state
+        .chat
+        .generate_reply(sample, Some(title_prompt.to_string()))
+        .await
+    {
+        Ok(t) => t,
+        Err(err) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                format!("llm: {err:#}"),
+            )
+                .into_response();
+        }
+    };
+
+    // Post-process: single line, strip quotes / <speak> junk / trailing
+    // punctuation, cap length.
+    let cleaned = raw
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .trim_matches(|c: char| c == '"' || c == '\'' || c == '“' || c == '”')
+        .replace("<speak>", "")
+        .replace("</speak>", "")
+        .trim()
+        .trim_end_matches(|c: char| c == '.' || c == '!' || c == '?')
+        .to_string();
+    let name = if cleaned.chars().count() > 60 {
+        let truncated: String = cleaned.chars().take(60).collect();
+        truncated.trim_end().to_string()
+    } else {
+        cleaned
+    };
+    if name.is_empty() {
+        return (StatusCode::BAD_GATEWAY, "LLM produced an empty title").into_response();
+    }
+
+    if let Err(err) = state.store.rename_script(id.clone(), name.clone()).await {
+        tracing::error!(err = %format!("{err:#}"), %id, "store: rename after title-gen failed");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("store: {err:#}"),
+        )
+            .into_response();
+    }
+
+    (StatusCode::OK, Json(serde_json::json!({ "name": name }))).into_response()
+}
+
+async fn script_get(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    let row = match state.store.get_script(id.clone()).await {
         Ok(r) => r,
         Err(err) => {
             tracing::error!(err = %format!("{err:#}"), "store: script get failed");
@@ -873,33 +1219,84 @@ async fn script_get(State(state): State<AppState>) -> Response {
 }
 
 #[derive(Debug, Deserialize)]
-struct ScriptSendBody {
+struct ScriptSendUserBody {
     text: String,
+    /// Optional widget id (from a `/widgets/record` stop) to attach to the
+    /// user turn. When present, the frontend uses it to render a play
+    /// button next to the user's message so the original audio is
+    /// replayable. When ABSENT, the server synthesizes a User-voice proxy
+    /// clip so every turn is playable.
+    #[serde(default, rename = "widgetId")]
+    widget_id: Option<String>,
+    /// Which agent to consult for the User voice slot. Omitted → use the
+    /// Default agent (which has no slot set → the hardcoded GM-proxy DSP).
+    #[serde(default, rename = "agentId")]
+    agent_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ScriptSendReplyBody {
+    /// Which stored agent's `system_prompt` to use for the LLM call. See
+    /// `script_send_user` for how the picker propagates through the flow.
+    #[serde(default, rename = "agentId")]
+    agent_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
-struct ScriptSendResponse {
+struct ScriptUserResponse {
     user_turn: ScriptTurn,
+}
+
+#[derive(Debug, Serialize)]
+struct ScriptReplyResponse {
     assistant_turn: ScriptTurn,
 }
 
-async fn script_send(
+/// Phase 1 of the /script two-step: persist the user's turn (with an
+/// attached recorded widget or a freshly-synthesized GM voice proxy) and
+/// push the text into the chat client's rolling history so the phase-2
+/// LLM call sees it. Returns as soon as the GM synth (or the trivial
+/// no-synth path) finishes — before the LLM has been called at all — so
+/// the client can begin playing the GM proxy while the reply is still
+/// being generated.
+async fn script_send_user(
     State(state): State<AppState>,
-    Json(body): Json<ScriptSendBody>,
+    Path(script_id): Path<String>,
+    Json(body): Json<ScriptSendUserBody>,
 ) -> Response {
     let text = body.text.trim().to_string();
     if text.is_empty() {
         return (StatusCode::BAD_REQUEST, "empty text").into_response();
     }
 
-    // Persist the user turn before the LLM call so a slow model reply doesn't
-    // leave the user's message stranded in the client's optimistic state.
+    // Resolve the agent's User voice slot up front — a missing agent or an
+    // unresolvable character both fall back to the hardcoded GM-proxy DSP
+    // so nothing about voice-slot lookups can block the send path.
+    let user_voice_character: Option<String> = match body
+        .agent_id
+        .clone()
+        .filter(|s| !s.is_empty())
+    {
+        Some(aid) => match state.store.get_agent(aid).await {
+            Ok(Some(a)) => a.voice_user,
+            _ => None,
+        },
+        None => None,
+    };
+    let user_widget_id = match body.widget_id.clone() {
+        Some(id) => Some(id),
+        None => {
+            synth_gm_proxy_widget(&state, text.clone(), user_voice_character.as_deref()).await
+        }
+    };
+
     let user_row = match state
         .store
         .create_turn(
-            DEFAULT_SCRIPT_ID.to_string(),
+            script_id.clone(),
             "user".into(),
             text.clone(),
+            user_widget_id,
             Vec::new(),
         )
         .await
@@ -914,9 +1311,64 @@ async fn script_send(
                 .into_response();
         }
     };
-    let user_turn = turn_view(&state.store, user_row).await;
+    // No more in-memory history push: the chat client is stateless, so
+    // the /reply handler rebuilds history from stored turns on demand.
 
-    let reply = match state.chat.send(text).await {
+    let user_turn = turn_view(&state.store, user_row).await;
+    (
+        StatusCode::OK,
+        Json(ScriptUserResponse { user_turn }),
+    )
+        .into_response()
+}
+
+/// Phase 2 of the /script two-step: call the LLM against the history the
+/// phase-1 handler just pushed to, parse the reply into narrator/character
+/// regions, persist the assistant turn, and return it. Failure here leaves
+/// the user turn in place — the client can retry this handler without
+/// re-sending the user message.
+async fn script_send_reply(
+    State(state): State<AppState>,
+    Path(script_id): Path<String>,
+    Json(body): Json<ScriptSendReplyBody>,
+) -> Response {
+    let want_agent_id = body
+        .agent_id
+        .clone()
+        .unwrap_or_else(|| DEFAULT_AGENT_ID.to_string());
+    let agent_prompt: Option<String> = match state.store.get_agent(want_agent_id.clone()).await {
+        Ok(Some(a)) => Some(a.system_prompt),
+        Ok(None) => match state.store.get_agent(DEFAULT_AGENT_ID.to_string()).await {
+            Ok(Some(a)) => Some(a.system_prompt),
+            _ => None,
+        },
+        Err(err) => {
+            tracing::warn!(err = %format!("{err:#}"), "agent lookup failed; using default");
+            None
+        }
+    };
+
+    // Reload history from the stored turns rather than a stale in-memory
+    // copy — this is what makes multi-script work with a single chat client.
+    let history: Vec<chat::ChatMessage> = match state.store.get_script(script_id.clone()).await {
+        Ok(row) => row
+            .turns
+            .into_iter()
+            .map(|t| chat::ChatMessage {
+                role: t.role,
+                content: t.content,
+            })
+            .collect(),
+        Err(err) => {
+            tracing::error!(err = %format!("{err:#}"), "store: history rebuild failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("store: {err:#}"),
+            )
+                .into_response();
+        }
+    };
+    let reply = match state.chat.generate_reply(history, agent_prompt).await {
         Ok(r) => r,
         Err(err) => {
             return (
@@ -927,14 +1379,18 @@ async fn script_send(
         }
     };
 
-    let blocks = script::extract_speech_blocks(&reply);
+    let regions: Vec<(String, String)> = script::extract_script_regions(&reply)
+        .into_iter()
+        .map(|(role, text)| (role.as_str().to_string(), text))
+        .collect();
     let assistant_row = match state
         .store
         .create_turn(
-            DEFAULT_SCRIPT_ID.to_string(),
+            script_id.clone(),
             "assistant".into(),
             reply,
-            blocks,
+            None,
+            regions,
         )
         .await
     {
@@ -952,18 +1408,15 @@ async fn script_send(
 
     (
         StatusCode::OK,
-        Json(ScriptSendResponse {
-            user_turn,
-            assistant_turn,
-        }),
+        Json(ScriptReplyResponse { assistant_turn }),
     )
         .into_response()
 }
 
-async fn script_reset(State(state): State<AppState>) -> Response {
+async fn script_reset(State(state): State<AppState>, Path(script_id): Path<String>) -> Response {
     let widget_ids = match state
         .store
-        .clear_script(DEFAULT_SCRIPT_ID.to_string())
+        .clear_script(script_id.clone())
         .await
     {
         Ok(v) => v,
@@ -979,20 +1432,19 @@ async fn script_reset(State(state): State<AppState>) -> Response {
                 .into_response();
         }
     };
-    // WAV files aren't cascaded by sqlite FKs — the FK drops the widget rows,
-    // we clean up the on-disk files here. Best-effort: log and continue on
-    // per-file failure so one stuck file doesn't block the rest.
+    // The FK cascade drops script_speech_blocks + script_speech_takes when
+    // the turn row goes, but the underlying `widgets` rows are NOT cascaded
+    // (the takes → widgets FK is `ON DELETE CASCADE` in the widget→take
+    // direction, not the other way). User-turn widgets are attached via
+    // `widget_id ON DELETE SET NULL`, so those also stay. Delete each
+    // widget explicitly here — that drops the row AND the WAV file, so
+    // Play All doesn't try to replay a dangling clip after a reset.
     for wid in widget_ids {
-        let path = state.store.clip_path(&wid);
-        if let Err(e) = tokio::fs::remove_file(&path).await {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(id = %wid, err = %e, "clip cleanup failed on script reset");
-            }
+        if let Err(err) = state.store.delete_widget(wid.clone()).await {
+            tracing::warn!(id = %wid, err = %format!("{err:#}"),
+                "widget cleanup failed on script reset");
         }
     }
-    // Also reset the in-process LLM history so a fresh conversation starts
-    // clean (the sqlite-backed script view already looks empty).
-    state.chat.reset().await;
     (StatusCode::OK, Json(ActionResponse { ok: true, error: None })).into_response()
 }
 
@@ -1000,6 +1452,10 @@ async fn script_reset(State(state): State<AppState>) -> Response {
 struct ScriptAddTakeBody {
     #[serde(default)]
     configs: Vec<ConfigBody>,
+    /// Which agent's voice slot to consult when `configs` is empty. Absent
+    /// → fall through to the hardcoded role-based DSP preset.
+    #[serde(default, rename = "agentId")]
+    agent_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1016,8 +1472,8 @@ async fn script_block_add_take(
     Path(block_id): Path<String>,
     Json(body): Json<ScriptAddTakeBody>,
 ) -> Response {
-    let text = match state.store.get_block_text(block_id.clone()).await {
-        Ok(Some(t)) => t,
+    let info = match state.store.get_block_info(block_id.clone()).await {
+        Ok(Some(i)) => i,
         Ok(None) => return (StatusCode::NOT_FOUND, format!("no block {block_id}")).into_response(),
         Err(err) => {
             tracing::error!(err = %format!("{err:#}"), %block_id, "store: block lookup failed");
@@ -1028,8 +1484,37 @@ async fn script_block_add_take(
                 .into_response();
         }
     };
+    let text = info.text;
 
-    let configs = configs_or_default(body.configs);
+    // Client-supplied configs win when non-empty (so scene-style profile
+    // overrides still work). When absent, look up the agent's voice slot
+    // for this block's role and use that character's default profile;
+    // fall through to the hardcoded DSP preset when either the agent has
+    // no slot set or the referenced character can't be resolved.
+    let configs = if body.configs.is_empty() {
+        let slot_character: Option<String> = match body
+            .agent_id
+            .clone()
+            .filter(|s| !s.is_empty())
+        {
+            Some(aid) => match state.store.get_agent(aid).await {
+                Ok(Some(a)) => match info.role.as_str() {
+                    "narrator" => a.voice_narrator,
+                    _ => a.voice_character,
+                },
+                _ => None,
+            },
+            None => None,
+        };
+        match slot_character {
+            Some(cid) => resolve_character_configs(&state, &cid)
+                .await
+                .unwrap_or_else(|| default_configs_for_role(&info.role)),
+            None => default_configs_for_role(&info.role),
+        }
+    } else {
+        configs_or_default(body.configs)
+    };
     let persist_instruct = configs.first().and_then(|c| c.instruct.clone());
     let clip = match render_clip(&state, text.clone(), configs).await {
         Ok(c) => c,
@@ -1078,6 +1563,32 @@ async fn script_block_add_take(
                 .into_response();
         }
     };
+
+    // FIFO cap: keep only the 3 most recent takes per block. The `ord`
+    // column still increments monotonically (append_take does
+    // `MAX(ord) + 1`), so the visible take numbers keep growing — the
+    // user can tell they're auditioning e.g. take #7 even though only
+    // takes #5, #6, #7 remain. Cleanup deletes both the DB row and the
+    // widget's WAV file so the on-disk store doesn't grow unbounded.
+    const MAX_TAKES_PER_BLOCK: usize = 3;
+    match state
+        .store
+        .prune_block_takes(block_id.clone(), MAX_TAKES_PER_BLOCK)
+        .await
+    {
+        Ok(pruned) => {
+            for wid in pruned {
+                if let Err(err) = state.store.delete_widget(wid.clone()).await {
+                    tracing::warn!(id = %wid, err = %format!("{err:#}"),
+                        "widget cleanup failed on take prune");
+                }
+            }
+        }
+        Err(err) => {
+            tracing::warn!(err = %format!("{err:#}"), %block_id,
+                "take prune failed; older takes may accumulate");
+        }
+    }
 
     let take = ScriptTake {
         id: take_row.id,
@@ -1128,6 +1639,214 @@ async fn script_block_patch(
                 format!("store: {err:#}"),
             )
                 .into_response()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// /agents — named system-prompt profiles for the /script LLM call.
+// The built-in "Default" agent is seeded on boot from prompts/script.txt
+// and is READ-ONLY (rejects rename + prompt edits + delete). Any other
+// agent is user-created and fully editable.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+struct AgentView {
+    id: String,
+    name: String,
+    system_prompt: String,
+    /// Project the agent belongs to. Null for the built-in Default (which
+    /// shows up in every project's picker).
+    project_id: Option<String>,
+    /// Character ids feeding each voice slot. Null = fall back to the
+    /// hardcoded DSP preset for that role.
+    voice_user: Option<String>,
+    voice_narrator: Option<String>,
+    voice_character: Option<String>,
+    /// Client uses this to hide edit/delete UI on the Default agent.
+    read_only: bool,
+    created_at: i64,
+    updated_at: i64,
+}
+
+fn agent_view(row: crate::store::AgentRow) -> AgentView {
+    let read_only = row.id == DEFAULT_AGENT_ID;
+    AgentView {
+        id: row.id,
+        name: row.name,
+        system_prompt: row.system_prompt,
+        project_id: row.project_id,
+        voice_user: row.voice_user,
+        voice_narrator: row.voice_narrator,
+        voice_character: row.voice_character,
+        read_only,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentListQuery {
+    /// When set, the returned list is filtered to agents in that project
+    /// PLUS the built-in Default (which has NULL project_id and is always
+    /// visible). Omitted → every agent, for admin/debug callers.
+    #[serde(default, rename = "projectId")]
+    project_id: Option<String>,
+}
+
+async fn agents_list(
+    State(state): State<AppState>,
+    Query(q): Query<AgentListQuery>,
+) -> Response {
+    let filter = q.project_id.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    match state.store.list_agents(filter).await {
+        Ok(rows) => {
+            let out: Vec<AgentView> = rows.into_iter().map(agent_view).collect();
+            (StatusCode::OK, Json(out)).into_response()
+        }
+        Err(err) => {
+            tracing::error!(err = %format!("{err:#}"), "store: agents list failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("store: {err:#}")).into_response()
+        }
+    }
+}
+
+async fn agents_get(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    match state.store.get_agent(id.clone()).await {
+        Ok(Some(row)) => (StatusCode::OK, Json(agent_view(row))).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, format!("no agent {id}")).into_response(),
+        Err(err) => {
+            tracing::error!(err = %format!("{err:#}"), %id, "store: agent get failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("store: {err:#}")).into_response()
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentCreateBody {
+    name: String,
+    /// Project the new agent belongs to. Nullable so an admin/CLI caller
+    /// could create a global agent, but the UI always passes the current
+    /// project id.
+    #[serde(default, rename = "projectId")]
+    project_id: Option<String>,
+}
+
+async fn agents_create(
+    State(state): State<AppState>,
+    Json(body): Json<AgentCreateBody>,
+) -> Response {
+    let name = body.name.trim().to_string();
+    if name.is_empty() {
+        return (StatusCode::BAD_REQUEST, "empty name").into_response();
+    }
+    let project_id = body.project_id.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    match state.store.create_agent(name, project_id).await {
+        Ok(row) => (StatusCode::CREATED, Json(agent_view(row))).into_response(),
+        Err(err) => {
+            tracing::error!(err = %format!("{err:#}"), "store: agent create failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("store: {err:#}")).into_response()
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentUpdateBody {
+    #[serde(default)]
+    name: Option<String>,
+    /// Prompt body — client sends this on every autosave keystroke (with
+    /// debouncing), so allow empty strings (a fresh Create leaves it "").
+    #[serde(default, rename = "systemPrompt")]
+    system_prompt: Option<String>,
+    /// Voice slots. Outer `Option` = "leave alone"; inner `Option` = the
+    /// value the caller wants to set (Some(id) = pick that character;
+    /// None = clear the slot back to the DSP-preset fallback). Uses
+    /// `deserialize_with` to distinguish "field absent" from "field: null".
+    #[serde(default, deserialize_with = "deserialize_some", rename = "voiceUser")]
+    voice_user: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_some", rename = "voiceNarrator")]
+    voice_narrator: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_some", rename = "voiceCharacter")]
+    voice_character: Option<Option<String>>,
+}
+
+/// `Option<Option<T>>` serde helper: distinguishes an absent field (outer
+/// None → leave the DB column alone) from `field: null` (outer Some(None) →
+/// clear to NULL). Standard trick — serde's default `Option` deserialize
+/// treats both as None, which would prevent clients from ever clearing a
+/// nullable column.
+fn deserialize_some<'de, T, D>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
+async fn agents_update(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<AgentUpdateBody>,
+) -> Response {
+    // Default agent is immutable — reject with 403 so the client can show
+    // a clear "can't edit Default" affordance rather than silently drop
+    // the change.
+    if id == DEFAULT_AGENT_ID {
+        return (
+            StatusCode::FORBIDDEN,
+            "the Default agent is read-only — create a new agent to customize",
+        )
+            .into_response();
+    }
+    let mut changes: Vec<AgentField> = Vec::new();
+    if let Some(name) = body.name {
+        let trimmed = name.trim().to_string();
+        if !trimmed.is_empty() {
+            changes.push(AgentField::Name(trimmed));
+        }
+    }
+    if let Some(prompt) = body.system_prompt {
+        changes.push(AgentField::SystemPrompt(prompt));
+    }
+    // Normalize the inner Option: empty/whitespace-only strings become None
+    // (= clear the slot) so a client that sends `""` gets the same fallback
+    // behavior as one that sends `null`.
+    let clean = |v: Option<String>| v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    if let Some(v) = body.voice_user { changes.push(AgentField::VoiceUser(clean(v))); }
+    if let Some(v) = body.voice_narrator { changes.push(AgentField::VoiceNarrator(clean(v))); }
+    if let Some(v) = body.voice_character { changes.push(AgentField::VoiceCharacter(clean(v))); }
+    match state.store.update_agent(id.clone(), changes).await {
+        Ok(UpdateResult::Updated) => {
+            (StatusCode::OK, Json(ActionResponse { ok: true, error: None })).into_response()
+        }
+        Ok(UpdateResult::NotFound) => {
+            (StatusCode::NOT_FOUND, format!("no agent {id}")).into_response()
+        }
+        Err(err) => {
+            tracing::error!(err = %format!("{err:#}"), %id, "store: agent update failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("store: {err:#}")).into_response()
+        }
+    }
+}
+
+async fn agents_delete(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    if id == DEFAULT_AGENT_ID {
+        return (
+            StatusCode::FORBIDDEN,
+            "the Default agent is read-only",
+        )
+            .into_response();
+    }
+    match state.store.delete_agent(id.clone()).await {
+        Ok(UpdateResult::Updated) => {
+            (StatusCode::OK, Json(ActionResponse { ok: true, error: None })).into_response()
+        }
+        Ok(UpdateResult::NotFound) => {
+            (StatusCode::NOT_FOUND, format!("no agent {id}")).into_response()
+        }
+        Err(err) => {
+            tracing::error!(err = %format!("{err:#}"), %id, "store: agent delete failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("store: {err:#}")).into_response()
         }
     }
 }

@@ -23,6 +23,21 @@ export const health       = writable('checking');   // 'checking' | 'ok' | 'err'
 export const settings     = writable(null);
 export const workflows    = writable([]);
 export const graph        = writable(null);
+/// Currently-draining clip on the pipewire mic. Any of the play paths
+/// (SpeechInline take, user-memo button, Play All queue) sets this on
+/// start and clears it on end. Consumers use it to (a) paint a linear
+/// progress overlay on their own DOM element, and (b) scroll themselves
+/// into view when they become the active clip. Shape:
+///   { widgetId: string, durationMs: number, startedAt: number }
+/// or null when nothing is playing.
+export const activeClip   = writable(null);
+/// Full list of stored agents (name + system prompt). Refreshed on Script
+/// mount and after every create/edit so the picker and editor always see
+/// the same set.
+export const agents       = writable([]);
+/// All script summaries [{ id, name, updated_at, ... }]. Populated on Script
+/// mount + after every create/rename/delete so the sidebar stays in sync.
+export const scripts      = writable([]);
 /// Full server-side script: `{ id, turns: [{ id, ord, role, content, blocks: [{ id, ord, text, selected_take, takes: [{id,ord,widget_id,sample_rate,duration_ms}] }] }] }`.
 /// Loaded once on Script mount; mutated in place as new turns/takes arrive so
 /// route re-mounts don't refetch (turns won't disappear behind the user's back).
@@ -62,7 +77,9 @@ export function stopSettingsPoll() {
 export async function reloadSettings()    { settings.set(await api.getSettings()); }
 export async function reloadWorkflows()   { workflows.set(await api.listWorkflows()); }
 export async function reloadGraph()       { graph.set(await api.getGraph()); }
-export async function reloadScript()      { script.set(await api.getScript()); }
+export async function reloadScript(id)    { script.set(await api.getScript(id)); }
+export async function reloadScripts()     { scripts.set(await api.listScripts()); }
+export async function reloadAgents(projectId = null) { agents.set(await api.listAgents(projectId)); }
 
 // --- Pipewire monitor auto-restore ------------------------------------------
 //

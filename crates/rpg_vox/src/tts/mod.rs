@@ -34,6 +34,7 @@ use crate::mixer::AtomicMixer;
 
 pub use comfyui::warmup;
 
+#[derive(Clone)]
 pub struct Config {
     pub target_sample_rate: u32,
     /// Total slot count of the pipewire ring buffer, used by [`PlayPcm`] to
@@ -214,18 +215,113 @@ impl Backend {
     }
 }
 
+/// Internal command for the play-side task: either a client-facing
+/// PlayPcm request (from a cached widget) or a Say-synth product forwarded
+/// from the backend task. `SayPush` bypasses the seq/stop semantics of
+/// PlayPcm since Say is a fire-and-drain-in-full path.
+enum PlayCmd {
+    PlayPcm(PlayPcmRequest),
+    SayPush {
+        stereo: Vec<[f32; 2]>,
+        reply: oneshot::Sender<Result<usize, String>>,
+    },
+}
+
 pub async fn run(
+    cfg: Config,
+    backend: Backend,
+    mut rx: mpsc::Receiver<Command>,
+    producer: Producer<[f32; 2]>,
+    mixer: Arc<AtomicMixer>,
+) -> Result<()> {
+    // Three tasks so /script's "render block K+1 while playing block K"
+    // pattern actually pipelines instead of serialising on any single
+    // mpsc:
+    //
+    //   dispatcher-task: drains the PUBLIC `rx` and routes each command
+    //                    to the right internal queue IMMEDIATELY. Fast
+    //                    (single `send().await`) so PlayPcm never sits
+    //                    behind an in-flight Synthesize.
+    //   backend-task:    owns `Backend`, handles Synthesize / Say-synth.
+    //                    Reads from `synth_rx`.
+    //   play-task:       owns `producer`, handles PlayPcm / Say-push.
+    //                    Reads from `play_rx`.
+    //
+    // Say bridges backend → play via `PlayCmd::SayPush`; its oneshot fires
+    // from the play task after the ring push completes, matching the old
+    // combined-runner semantics.
+    let (synth_tx, synth_rx) = mpsc::channel::<Command>(32);
+    let (play_tx, play_rx) = mpsc::channel::<PlayCmd>(32);
+
+    let play_tx_disp = play_tx.clone();
+    let dispatcher = tokio::spawn(async move {
+        while let Some(cmd) = rx.recv().await {
+            match cmd {
+                Command::PlayPcm(req) => {
+                    if play_tx_disp.send(PlayCmd::PlayPcm(req)).await.is_err() {
+                        break;
+                    }
+                }
+                other => {
+                    if synth_tx.send(other).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    let cfg_play = cfg.clone();
+    let mixer_play = mixer.clone();
+    let play_task = tokio::spawn(run_play(cfg_play, mixer_play, producer, play_rx));
+    let cfg_bk = cfg.clone();
+    let backend_task = tokio::spawn(run_backend(cfg_bk, backend, synth_rx, play_tx));
+
+    dispatcher.await?;
+    backend_task.await??;
+    play_task.await??;
+    Ok(())
+}
+
+async fn run_backend(
     cfg: Config,
     mut backend: Backend,
     mut rx: mpsc::Receiver<Command>,
-    mut producer: Producer<[f32; 2]>,
-    mixer: Arc<AtomicMixer>,
+    play_tx: mpsc::Sender<PlayCmd>,
 ) -> Result<()> {
     while let Some(cmd) = rx.recv().await {
         match cmd {
-            Command::Say(req) => handle_say(&mut backend, &cfg, &mut producer, req).await,
+            Command::Say(req) => handle_say(&mut backend, &cfg, &play_tx, req).await,
             Command::Synthesize(req) => handle_synthesize(&mut backend, &cfg, req).await,
-            Command::PlayPcm(req) => handle_play_pcm(&cfg, &mixer, &mut producer, req).await,
+            Command::PlayPcm(req) => {
+                // Route PlayPcm to the dedicated play task so it doesn't
+                // block the backend from processing the next Synthesize.
+                if play_tx.send(PlayCmd::PlayPcm(req)).await.is_err() {
+                    tracing::warn!("play task gone; dropping PlayPcm");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn run_play(
+    cfg: Config,
+    mixer: Arc<AtomicMixer>,
+    mut producer: Producer<[f32; 2]>,
+    mut rx: mpsc::Receiver<PlayCmd>,
+) -> Result<()> {
+    while let Some(cmd) = rx.recv().await {
+        match cmd {
+            PlayCmd::PlayPcm(req) => {
+                handle_play_pcm(&cfg, &mixer, &mut producer, req).await;
+            }
+            PlayCmd::SayPush { stereo, reply } => {
+                let frames = stereo.len();
+                let pushed = push_stereo_backpressured(&mut producer, &stereo).await;
+                info!(pushed, wanted = frames, "Say push delivered to ring");
+                let _ = reply.send(Ok(pushed));
+            }
         }
     }
     Ok(())
@@ -234,7 +330,7 @@ pub async fn run(
 async fn handle_say(
     backend: &mut Backend,
     cfg: &Config,
-    producer: &mut Producer<[f32; 2]>,
+    play_tx: &mpsc::Sender<PlayCmd>,
     req: SayRequest,
 ) {
     let SayRequest {
@@ -257,30 +353,21 @@ async fn handle_say(
         "generating speech"
     );
 
-    let result: Result<usize, String> = match synthesize_profile(backend, cfg, &configs, &text).await
-    {
+    match synthesize_profile(backend, cfg, &configs, &text).await {
         Ok(stereo) => {
-            let frames = stereo.len();
-            match push_stereo_backpressured(producer, &stereo).await {
-                pushed if pushed == frames => {
-                    info!(frames = pushed, "utterance delivered to ring buffer");
-                    Ok(pushed)
-                }
-                pushed => {
-                    // Backpressured push never gives up on its own, so a short
-                    // count here would only happen if the ring buffer path
-                    // added an early-exit later. Report the actual count.
-                    info!(frames = pushed, wanted = frames, "utterance push short");
-                    Ok(pushed)
-                }
+            // Hand off to play task. The reply oneshot fires from THERE
+            // after the ring push completes, so the /say HTTP handler
+            // still gets a single Result and blocks until the audio has
+            // been queued — matching the old combined-runner behavior.
+            if play_tx.send(PlayCmd::SayPush { stereo, reply }).await.is_err() {
+                tracing::warn!("play task gone; Say bridge dropped");
             }
         }
         Err(err) => {
             error!(err = %err, "utterance failed");
-            Err(err)
+            let _ = reply.send(Err(err));
         }
     };
-    let _ = reply.send(result);
 }
 
 async fn handle_synthesize(backend: &mut Backend, cfg: &Config, req: SynthesizeRequest) {

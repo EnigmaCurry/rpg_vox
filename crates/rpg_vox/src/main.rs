@@ -424,7 +424,7 @@ fn main() -> Result<()> {
         base_url: args.chat_base_url.trim_end_matches('/').to_string(),
         model: args.chat_model.clone(),
         api_key: args.chat_api_key.clone(),
-        system_prompt,
+        system_prompt: system_prompt.clone(),
         max_history: args.chat_max_history,
         max_tokens: args.chat_max_tokens,
         disable_thinking: args.chat_disable_thinking,
@@ -446,6 +446,14 @@ fn main() -> Result<()> {
     // hit a foreign-key error on the first user turn of a fresh install.
     rt.block_on(store.ensure_default_script())
         .context("ensuring default script row")?;
+
+    // Seed the built-in "Default" agent from the script prompt file if the
+    // agents table doesn't already carry it. The seed happens once — later
+    // startups won't clobber user edits to Default (if we ever allow them;
+    // for now Default is read-only in the API but future-proof this here).
+    let default_agent_prompt = system_prompt.clone().unwrap_or_default();
+    rt.block_on(store.ensure_default_agent(default_agent_prompt))
+        .context("ensuring default agent row")?;
 
     // Speech-to-text. Loaded once at startup; missing model files just
     // disable the feature (the record flow still saves the WAV, it simply

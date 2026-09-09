@@ -28,7 +28,16 @@
     '/settings':   Settings,
   };
 
-  const View = $derived(routes[$route] ?? NotFound);
+  /// Resolve the view for the current hash route. Supports parameterised
+  /// paths — currently only /script/:id and its /chat alias. The parameter
+  /// itself is read from `$route` inside Script.svelte via a helper, so
+  /// the router doesn't need to hand it down separately.
+  const View = $derived.by(() => {
+    const r = $route;
+    if (r === '/script' || r === '/chat') return Script;
+    if (r.startsWith('/script/') || r.startsWith('/chat/')) return Script;
+    return routes[r] ?? NotFound;
+  });
 
   // The Scenes view is a full-bleed sidebar+lanes layout; other routes keep
   // the narrow centered column. Toggle a class on <main> to switch modes.
@@ -36,7 +45,7 @@
   // full-bleed too rather than centering under the 720px cap.
   const isFullBleed = $derived(
     $route === '/scenes' || $route === '/speak'
-      || $route === '/script' || $route === '/chat',
+      || $route.startsWith('/script') || $route.startsWith('/chat'),
   );
 
   onMount(() => {

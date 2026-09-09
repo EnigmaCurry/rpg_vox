@@ -58,6 +58,7 @@ CREATE TABLE IF NOT EXISTS script_turns (
     ord          INTEGER NOT NULL,
     role         TEXT NOT NULL,
     content      TEXT NOT NULL,
+    widget_id    TEXT REFERENCES widgets(id) ON DELETE SET NULL,
     created_at   INTEGER NOT NULL,
     UNIQUE(script_id, ord)
 );
@@ -66,6 +67,7 @@ CREATE TABLE IF NOT EXISTS script_speech_blocks (
     turn_id       TEXT NOT NULL REFERENCES script_turns(id) ON DELETE CASCADE,
     ord           INTEGER NOT NULL,
     text          TEXT NOT NULL,
+    role          TEXT NOT NULL DEFAULT 'character',
     selected_take INTEGER,
     UNIQUE(turn_id, ord)
 );
@@ -77,11 +79,27 @@ CREATE TABLE IF NOT EXISTS script_speech_takes (
     created_at   INTEGER NOT NULL,
     UNIQUE(block_id, ord)
 );
+CREATE TABLE IF NOT EXISTS agents (
+    id                TEXT PRIMARY KEY,
+    name              TEXT NOT NULL,
+    system_prompt     TEXT NOT NULL,
+    project_id        TEXT,
+    voice_user        TEXT,
+    voice_narrator    TEXT,
+    voice_character   TEXT,
+    created_at        INTEGER NOT NULL,
+    updated_at        INTEGER NOT NULL
+);
 "#;
 
 /// Single hardcoded script id — MVP has one shared conversation, matching
 /// the legacy /chat semantics. Multi-script (per-project) comes later.
 pub const DEFAULT_SCRIPT_ID: &str = "default";
+
+/// Well-known id for the built-in "Default" agent seeded from
+/// prompts/script.txt on first boot. Frontend hard-codes this in the
+/// dropdown so it's always selectable even after user creates others.
+pub const DEFAULT_AGENT_ID: &str = "default";
 
 /// Single row key for the whole projects/characters/scenes blob. Keeping the
 /// table generic-KV lets us stash other server-side prefs here later without
@@ -121,6 +139,44 @@ impl Store {
         conn.execute_batch("PRAGMA foreign_keys = ON;")
             .context("enabling foreign_keys pragma")?;
         conn.execute_batch(SCHEMA).context("applying schema")?;
+
+        // Idempotent per-column migrations. `CREATE TABLE IF NOT EXISTS`
+        // above is a no-op when the table already exists at an older
+        // schema — so any column added after the initial cut needs an
+        // `ALTER TABLE ADD COLUMN` guarded by a `pragma_table_info` probe.
+        // Kept inline (instead of a migrations dir) because the count is
+        // tiny and each one is one line.
+        add_column_if_missing(
+            &conn,
+            "script_speech_blocks",
+            "role",
+            "TEXT NOT NULL DEFAULT 'character'",
+        )
+        .context("migrating role column on script_speech_blocks")?;
+        // User turns can carry an attached widget (a recorded voice memo
+        // captured from the mic before send). Nullable — plain text turns
+        // stay unchanged, and assistant turns never use this column.
+        add_column_if_missing(
+            &conn,
+            "script_turns",
+            "widget_id",
+            "TEXT REFERENCES widgets(id) ON DELETE SET NULL",
+        )
+        .context("migrating widget_id column on script_turns")?;
+        // Agents gained a project scope + per-role voice slots after the
+        // initial cut. All four are nullable — the built-in Default keeps
+        // NULL project_id (global fallback), and unset voice slots fall
+        // back to the hardcoded DSP defaults so pre-migration agents
+        // sound unchanged.
+        for (col, decl) in [
+            ("project_id", "TEXT"),
+            ("voice_user", "TEXT"),
+            ("voice_narrator", "TEXT"),
+            ("voice_character", "TEXT"),
+        ] {
+            add_column_if_missing(&conn, "agents", col, decl)
+                .with_context(|| format!("migrating {col} column on agents"))?;
+        }
 
         Ok(Self {
             db: Arc::new(Mutex::new(conn)),
@@ -466,24 +522,149 @@ impl Store {
         Ok(())
     }
 
-    /// Insert the default script row if it doesn't already exist. Called at
-    /// boot so `/script` endpoints can assume the row is there without a
-    /// nested "create if missing" branch on every write.
+    /// Insert the default script row if the scripts table is entirely
+    /// empty. Called at boot so a fresh install lands with one starter
+    /// script the user can click into. Existing installs already have at
+    /// least one script and this is a no-op.
     pub async fn ensure_default_script(&self) -> Result<()> {
         let now = unix_now();
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || -> Result<()> {
             let conn = db.lock().unwrap();
-            conn.execute(
-                "INSERT OR IGNORE INTO scripts (id, name, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![DEFAULT_SCRIPT_ID, "default", now, now],
-            )?;
+            let count: i64 =
+                conn.query_row("SELECT COUNT(*) FROM scripts", [], |r| r.get(0))?;
+            if count == 0 {
+                conn.execute(
+                    "INSERT INTO scripts (id, name, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![DEFAULT_SCRIPT_ID, "New script", now, now],
+                )?;
+            }
             Ok(())
         })
         .await
         .context("db task panicked")??;
         Ok(())
+    }
+
+    /// List all scripts ordered by most-recently updated first. Small
+    /// projection (id + name + updated_at) — the full turn/block/take
+    /// hydration only happens on demand via `get_script`.
+    pub async fn list_scripts(&self) -> Result<Vec<ScriptSummaryRow>> {
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<ScriptSummaryRow>> {
+            let conn = db.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT id, name, created_at, updated_at
+                   FROM scripts
+                  ORDER BY updated_at DESC",
+            )?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok(ScriptSummaryRow {
+                        id: r.get::<_, String>(0)?,
+                        name: r.get::<_, String>(1)?,
+                        created_at: r.get::<_, i64>(2)?,
+                        updated_at: r.get::<_, i64>(3)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+        .context("db task panicked")?
+    }
+
+    /// Create a new empty script with the given name.
+    pub async fn create_script(&self, name: String) -> Result<ScriptSummaryRow> {
+        let id = Uuid::new_v4().to_string();
+        let now = unix_now();
+        let db = self.db.clone();
+        let id_clone = id.clone();
+        let name_clone = name.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO scripts (id, name, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![id_clone, name_clone, now, now],
+            )?;
+            Ok(())
+        })
+        .await
+        .context("db task panicked")??;
+        Ok(ScriptSummaryRow {
+            id,
+            name,
+            created_at: now,
+            updated_at: now,
+        })
+    }
+
+    /// Rename an existing script. `NotFound` when the id doesn't exist.
+    pub async fn rename_script(&self, id: String, name: String) -> Result<UpdateResult> {
+        let now = unix_now();
+        let db = self.db.clone();
+        let rows = tokio::task::spawn_blocking(move || -> Result<usize> {
+            let conn = db.lock().unwrap();
+            let rows = conn.execute(
+                "UPDATE scripts SET name = ?2, updated_at = ?3 WHERE id = ?1",
+                params![id, name, now],
+            )?;
+            Ok(rows)
+        })
+        .await
+        .context("db task panicked")??;
+        Ok(if rows == 0 {
+            UpdateResult::NotFound
+        } else {
+            UpdateResult::Updated
+        })
+    }
+
+    /// Delete a script and cascade its turns/blocks/takes. Returns the
+    /// widget ids that were attached (user-turn recordings + GM proxies +
+    /// take widgets) so the caller can drop their WAV files. The script
+    /// row itself goes with it (unlike `clear_script`, which keeps the
+    /// row and just wipes contents).
+    pub async fn delete_script(&self, script_id: String) -> Result<Vec<String>> {
+        let db = self.db.clone();
+        let widget_ids = tokio::task::spawn_blocking(move || -> Result<Vec<String>> {
+            let mut conn = db.lock().unwrap();
+            let tx = conn.transaction()?;
+            let mut ids: Vec<String> = Vec::new();
+            {
+                let mut stmt = tx.prepare(
+                    "SELECT t.widget_id
+                       FROM script_speech_takes t
+                       JOIN script_speech_blocks b ON b.id = t.block_id
+                       JOIN script_turns tr        ON tr.id = b.turn_id
+                      WHERE tr.script_id = ?1",
+                )?;
+                let rows = stmt
+                    .query_map(params![script_id], |r| r.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                ids.extend(rows);
+            }
+            {
+                let mut stmt = tx.prepare(
+                    "SELECT widget_id FROM script_turns
+                      WHERE script_id = ?1 AND widget_id IS NOT NULL",
+                )?;
+                let rows = stmt
+                    .query_map(params![script_id], |r| r.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                ids.extend(rows);
+            }
+            // FK cascade on script_turns.script_id drops turns → blocks →
+            // takes when we drop the script row.
+            tx.execute("DELETE FROM scripts WHERE id = ?1", params![script_id])?;
+            tx.commit()?;
+            Ok(ids)
+        })
+        .await
+        .context("db task panicked")??;
+        Ok(widget_ids)
     }
 
     /// Read the full script (turns + blocks + takes) in ordering-stable form.
@@ -493,7 +674,7 @@ impl Store {
         tokio::task::spawn_blocking(move || -> Result<ScriptRow> {
             let conn = db.lock().unwrap();
             let mut turns_stmt = conn.prepare(
-                "SELECT id, ord, role, content FROM script_turns
+                "SELECT id, ord, role, content, widget_id FROM script_turns
                  WHERE script_id = ?1 ORDER BY ord ASC",
             )?;
             let turns_iter = turns_stmt.query_map(params![script_id], |r| {
@@ -502,6 +683,7 @@ impl Store {
                     ord: r.get::<_, i64>(1)?,
                     role: r.get::<_, String>(2)?,
                     content: r.get::<_, String>(3)?,
+                    widget_id: r.get::<_, Option<String>>(4)?,
                     blocks: Vec::new(),
                 })
             })?;
@@ -510,7 +692,7 @@ impl Store {
 
             for turn in turns.iter_mut() {
                 let mut block_stmt = conn.prepare(
-                    "SELECT id, ord, text, selected_take
+                    "SELECT id, ord, text, role, selected_take
                      FROM script_speech_blocks
                      WHERE turn_id = ?1 ORDER BY ord ASC",
                 )?;
@@ -519,7 +701,8 @@ impl Store {
                         id: r.get::<_, String>(0)?,
                         ord: r.get::<_, i64>(1)?,
                         text: r.get::<_, String>(2)?,
-                        selected_take: r.get::<_, Option<i64>>(3)?,
+                        role: r.get::<_, String>(3)?,
+                        selected_take: r.get::<_, Option<i64>>(4)?,
                         takes: Vec::new(),
                     })
                 })?;
@@ -555,12 +738,18 @@ impl Store {
     /// script and return the freshly-created turn row (blocks included, no
     /// takes yet). Called for both user turns (no blocks) and assistant
     /// turns (blocks pre-populated from `<speak>` parsing).
+    ///
+    /// Each entry in `blocks` is `(role, text)` where role is "narrator"
+    /// or "character" — the parser tags prose outside `<speak>` as narrator
+    /// and `<speak>` bodies as character so downstream take rendering can
+    /// pick the right voice profile.
     pub async fn create_turn(
         &self,
         script_id: String,
         role: String,
         content: String,
-        blocks: Vec<String>,
+        widget_id: Option<String>,
+        blocks: Vec<(String, String)>,
     ) -> Result<ScriptTurnRow> {
         let turn_id = Uuid::new_v4().to_string();
         let block_ids: Vec<String> = blocks.iter().map(|_| Uuid::new_v4().to_string()).collect();
@@ -572,6 +761,7 @@ impl Store {
         let content_clone = content.clone();
         let role_clone = role.clone();
         let script_id_clone = script_id.clone();
+        let widget_id_clone = widget_id.clone();
         let (ord, block_rows) = tokio::task::spawn_blocking(
             move || -> Result<(i64, Vec<ScriptBlockRow>)> {
                 let mut conn = db.lock().unwrap();
@@ -583,21 +773,26 @@ impl Store {
                         |r| r.get::<_, i64>(0),
                     )?;
                 tx.execute(
-                    "INSERT INTO script_turns (id, script_id, ord, role, content, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![turn_id_clone, script_id_clone, ord, role_clone, content_clone, now],
+                    "INSERT INTO script_turns
+                       (id, script_id, ord, role, content, widget_id, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![turn_id_clone, script_id_clone, ord, role_clone, content_clone, widget_id_clone, now],
                 )?;
                 let mut block_rows = Vec::with_capacity(blocks_clone.len());
-                for (i, (bid, text)) in block_ids_clone.iter().zip(blocks_clone.iter()).enumerate() {
+                for (i, (bid, (block_role, text))) in
+                    block_ids_clone.iter().zip(blocks_clone.iter()).enumerate()
+                {
                     tx.execute(
-                        "INSERT INTO script_speech_blocks (id, turn_id, ord, text, selected_take)
-                         VALUES (?1, ?2, ?3, ?4, NULL)",
-                        params![bid, turn_id_clone, i as i64, text],
+                        "INSERT INTO script_speech_blocks
+                           (id, turn_id, ord, text, role, selected_take)
+                         VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
+                        params![bid, turn_id_clone, i as i64, text, block_role],
                     )?;
                     block_rows.push(ScriptBlockRow {
                         id: bid.clone(),
                         ord: i as i64,
                         text: text.clone(),
+                        role: block_role.clone(),
                         selected_take: None,
                         takes: Vec::new(),
                     });
@@ -618,6 +813,7 @@ impl Store {
             ord,
             role,
             content,
+            widget_id,
             blocks: block_rows,
         })
     }
@@ -678,6 +874,50 @@ impl Store {
             ord,
             widget_id,
         }))
+    }
+
+    /// Keep only the most recent `keep` takes for a block, deleting the
+    /// older ones. Returns the widget ids of the deleted takes so the
+    /// caller can drop their WAV files + widget rows. `selected_take`
+    /// stays valid because `append_take` always writes it to the newest
+    /// ord — which is by definition never in the pruning window.
+    pub async fn prune_block_takes(
+        &self,
+        block_id: String,
+        keep: usize,
+    ) -> Result<Vec<String>> {
+        let db = self.db.clone();
+        let widget_ids = tokio::task::spawn_blocking(move || -> Result<Vec<String>> {
+            let mut conn = db.lock().unwrap();
+            let tx = conn.transaction()?;
+            // Anything past the newest `keep` (sorted by ord DESC) goes.
+            let mut stmt = tx.prepare(
+                "SELECT id, widget_id
+                   FROM script_speech_takes
+                  WHERE block_id = ?1
+                  ORDER BY ord DESC
+                  LIMIT -1 OFFSET ?2",
+            )?;
+            let victims: Vec<(String, String)> = stmt
+                .query_map(params![block_id, keep as i64], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(stmt);
+            let widget_ids: Vec<String> =
+                victims.iter().map(|(_, w)| w.clone()).collect();
+            for (take_id, _) in &victims {
+                tx.execute(
+                    "DELETE FROM script_speech_takes WHERE id = ?1",
+                    params![take_id],
+                )?;
+            }
+            tx.commit()?;
+            Ok(widget_ids)
+        })
+        .await
+        .context("db task panicked")??;
+        Ok(widget_ids)
     }
 
     /// Set the block's `selected_take`. `selected` is the take ordinal (as
@@ -781,24 +1021,50 @@ impl Store {
     /// script. Returns the list of widget ids that were cascaded so the
     /// caller can drop their WAV files from disk. The script row itself
     /// stays — a fresh conversation starts empty in the same slot.
+    ///
+    /// Collects widget ids from TWO paths so nothing leaks:
+    ///   1. Assistant-turn speech takes (character/narrator TTS clips).
+    ///   2. User-turn `widget_id` (recorded voice memos + GM proxy synths).
+    /// The FK cascade drops the rows, but WAV files live on disk under
+    /// `data/clips/` and the caller has to unlink them explicitly.
     pub async fn clear_script(&self, script_id: String) -> Result<Vec<String>> {
         let db = self.db.clone();
         let widget_ids = tokio::task::spawn_blocking(move || -> Result<Vec<String>> {
             let mut conn = db.lock().unwrap();
             let tx = conn.transaction()?;
-            // Collect widget ids first so we can hand them back for WAV
-            // cleanup — the DELETE below cascades the rows themselves.
-            let mut stmt = tx.prepare(
-                "SELECT t.widget_id
-                   FROM script_speech_takes t
-                   JOIN script_speech_blocks b ON b.id = t.block_id
-                   JOIN script_turns tr        ON tr.id = b.turn_id
-                  WHERE tr.script_id = ?1",
-            )?;
-            let ids: Vec<String> = stmt
-                .query_map(params![script_id], |r| r.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            drop(stmt);
+            let mut ids: Vec<String> = Vec::new();
+
+            // (1) Widgets referenced by assistant-turn speech takes.
+            {
+                let mut stmt = tx.prepare(
+                    "SELECT t.widget_id
+                       FROM script_speech_takes t
+                       JOIN script_speech_blocks b ON b.id = t.block_id
+                       JOIN script_turns tr        ON tr.id = b.turn_id
+                      WHERE tr.script_id = ?1",
+                )?;
+                let rows = stmt
+                    .query_map(params![script_id], |r| r.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                ids.extend(rows);
+            }
+
+            // (2) Widgets attached directly to user turns (recorded voice
+            //     memos + GM proxy synths). `ON DELETE SET NULL` on the FK
+            //     means these DON'T auto-cascade with the turn delete, so
+            //     we hand them back to the caller for widget + WAV cleanup
+            //     via `store.delete_widget` (which drops the row + file).
+            {
+                let mut stmt = tx.prepare(
+                    "SELECT widget_id FROM script_turns
+                      WHERE script_id = ?1 AND widget_id IS NOT NULL",
+                )?;
+                let rows = stmt
+                    .query_map(params![script_id], |r| r.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                ids.extend(rows);
+            }
+
             tx.execute(
                 "DELETE FROM script_turns WHERE script_id = ?1",
                 params![script_id],
@@ -811,23 +1077,286 @@ impl Store {
         Ok(widget_ids)
     }
 
-    /// Look up the on-disk text of a speech block so a `POST .../takes` can
-    /// re-render without the client having to echo the text back.
-    pub async fn get_block_text(&self, block_id: String) -> Result<Option<String>> {
+    /// Look up a block's persisted text + role so `POST .../takes` can
+    /// re-render without the client echoing the text back, and can pick a
+    /// role-appropriate voice profile automatically.
+    pub async fn get_block_info(&self, block_id: String) -> Result<Option<BlockInfo>> {
         let db = self.db.clone();
-        tokio::task::spawn_blocking(move || -> Result<Option<String>> {
+        tokio::task::spawn_blocking(move || -> Result<Option<BlockInfo>> {
             let conn = db.lock().unwrap();
-            let text = conn
+            let row = conn
                 .query_row(
-                    "SELECT text FROM script_speech_blocks WHERE id = ?1",
+                    "SELECT text, role FROM script_speech_blocks WHERE id = ?1",
                     params![block_id],
-                    |r| r.get::<_, String>(0),
+                    |r| {
+                        Ok(BlockInfo {
+                            text: r.get::<_, String>(0)?,
+                            role: r.get::<_, String>(1)?,
+                        })
+                    },
                 )
                 .optional()?;
-            Ok(text)
+            Ok(row)
         })
         .await
         .context("db task panicked")?
+    }
+}
+
+pub struct BlockInfo {
+    pub text: String,
+    pub role: String,
+}
+
+pub struct AgentRow {
+    pub id: String,
+    pub name: String,
+    pub system_prompt: String,
+    /// NULL for the built-in Default agent (shown in every project's list).
+    /// Set for user-created agents so the picker can filter by project.
+    pub project_id: Option<String>,
+    /// Character ids that voice each role's synth. NULL falls back to the
+    /// hardcoded DSP defaults (gm_proxy_configs / default_configs_for_role).
+    pub voice_user: Option<String>,
+    pub voice_narrator: Option<String>,
+    pub voice_character: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// Which patchable field of an agent row is being set. Voice slots use
+/// `Option<Option<String>>` at the API layer (see `update_agent`) so callers
+/// can distinguish "leave alone" from "clear to NULL"; this enum represents
+/// only the fields the caller wants to change.
+pub enum AgentField {
+    Name(String),
+    SystemPrompt(String),
+    VoiceUser(Option<String>),
+    VoiceNarrator(Option<String>),
+    VoiceCharacter(Option<String>),
+}
+
+fn row_to_agent(r: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRow> {
+    Ok(AgentRow {
+        id: r.get::<_, String>(0)?,
+        name: r.get::<_, String>(1)?,
+        system_prompt: r.get::<_, String>(2)?,
+        project_id: r.get::<_, Option<String>>(3)?,
+        voice_user: r.get::<_, Option<String>>(4)?,
+        voice_narrator: r.get::<_, Option<String>>(5)?,
+        voice_character: r.get::<_, Option<String>>(6)?,
+        created_at: r.get::<_, i64>(7)?,
+        updated_at: r.get::<_, i64>(8)?,
+    })
+}
+
+impl Store {
+    /// Sync the built-in "Default" agent from `prompts/script.txt` on
+    /// every boot. Default is read-only in the API — users create their
+    /// own agents to customize — so keeping it locked to the on-disk
+    /// prompt file means file edits (git pulls, local tweaks) actually
+    /// take effect rather than being frozen at first-boot values.
+    /// User-created agents are completely untouched by this.
+    pub async fn ensure_default_agent(&self, seed_prompt: String) -> Result<()> {
+        let now = unix_now();
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = db.lock().unwrap();
+            // Default agent stays project-less (NULL) and voice-less so it
+            // shows up in every project's picker and falls back to the
+            // hardcoded DSP presets. Only refresh name + prompt on boot.
+            conn.execute(
+                "INSERT INTO agents
+                   (id, name, system_prompt, project_id,
+                    voice_user, voice_narrator, voice_character,
+                    created_at, updated_at)
+                 VALUES (?1, ?2, ?3, NULL, NULL, NULL, NULL, ?4, ?5)
+                 ON CONFLICT(id) DO UPDATE SET
+                     name = excluded.name,
+                     system_prompt = excluded.system_prompt,
+                     updated_at = excluded.updated_at",
+                params![DEFAULT_AGENT_ID, "Default", seed_prompt, now, now],
+            )?;
+            Ok(())
+        })
+        .await
+        .context("db task panicked")??;
+        Ok(())
+    }
+
+    /// List agents visible to `project_id`: rows with a matching project plus
+    /// the built-in Default (which has NULL project_id and is always visible).
+    /// Passing `None` returns every agent — useful for admin/debug callers.
+    pub async fn list_agents(&self, project_id: Option<String>) -> Result<Vec<AgentRow>> {
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<AgentRow>> {
+            let conn = db.lock().unwrap();
+            let rows: Vec<AgentRow> = if let Some(pid) = project_id {
+                let mut stmt = conn.prepare(
+                    "SELECT id, name, system_prompt, project_id,
+                            voice_user, voice_narrator, voice_character,
+                            created_at, updated_at
+                       FROM agents
+                      WHERE project_id IS NULL OR project_id = ?2
+                      ORDER BY (id != ?1) ASC, name COLLATE NOCASE ASC",
+                )?;
+                let rows = stmt
+                    .query_map(params![DEFAULT_AGENT_ID, pid], row_to_agent)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                rows
+            } else {
+                let mut stmt = conn.prepare(
+                    "SELECT id, name, system_prompt, project_id,
+                            voice_user, voice_narrator, voice_character,
+                            created_at, updated_at
+                       FROM agents
+                      ORDER BY (id != ?1) ASC, name COLLATE NOCASE ASC",
+                )?;
+                let rows = stmt
+                    .query_map(params![DEFAULT_AGENT_ID], row_to_agent)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                rows
+            };
+            Ok(rows)
+        })
+        .await
+        .context("db task panicked")?
+    }
+
+    pub async fn get_agent(&self, id: String) -> Result<Option<AgentRow>> {
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || -> Result<Option<AgentRow>> {
+            let conn = db.lock().unwrap();
+            let row = conn
+                .query_row(
+                    "SELECT id, name, system_prompt, project_id,
+                            voice_user, voice_narrator, voice_character,
+                            created_at, updated_at
+                       FROM agents WHERE id = ?1",
+                    params![id],
+                    row_to_agent,
+                )
+                .optional()?;
+            Ok(row)
+        })
+        .await
+        .context("db task panicked")?
+    }
+
+    /// Create a new agent with the given name and project. Seeded with the
+    /// Default agent's current system prompt so users don't start from scratch
+    /// — they can then edit anything, including reverting to blank. Voice
+    /// slots start NULL (falling back to the hardcoded DSP presets) until
+    /// the user picks characters in the agent editor.
+    pub async fn create_agent(
+        &self,
+        name: String,
+        project_id: Option<String>,
+    ) -> Result<AgentRow> {
+        let id = Uuid::new_v4().to_string();
+        let now = unix_now();
+        let db = self.db.clone();
+        let id_clone = id.clone();
+        let name_clone = name.clone();
+        let project_clone = project_id.clone();
+        let seed = tokio::task::spawn_blocking(move || -> Result<String> {
+            let conn = db.lock().unwrap();
+            let seed: String = conn
+                .query_row(
+                    "SELECT system_prompt FROM agents WHERE id = ?1",
+                    params![DEFAULT_AGENT_ID],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?
+                .unwrap_or_default();
+            conn.execute(
+                "INSERT INTO agents
+                   (id, name, system_prompt, project_id,
+                    voice_user, voice_narrator, voice_character,
+                    created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, NULL, NULL, NULL, ?5, ?6)",
+                params![id_clone, name_clone, seed, project_clone, now, now],
+            )?;
+            Ok(seed)
+        })
+        .await
+        .context("db task panicked")??;
+        Ok(AgentRow {
+            id,
+            name,
+            system_prompt: seed,
+            project_id,
+            voice_user: None,
+            voice_narrator: None,
+            voice_character: None,
+            created_at: now,
+            updated_at: now,
+        })
+    }
+
+    /// Patch any subset of an agent's fields. Only fields present in
+    /// `changes` are written; voice slots use `Option<Option<String>>` at
+    /// the API layer to distinguish "leave alone" (outer None) from "clear
+    /// to NULL" (outer Some(None)). Returns UpdateResult::NotFound if the
+    /// row doesn't exist.
+    pub async fn update_agent(
+        &self,
+        id: String,
+        changes: Vec<AgentField>,
+    ) -> Result<UpdateResult> {
+        if changes.is_empty() {
+            return Ok(UpdateResult::Updated);
+        }
+        let now = unix_now();
+        let db = self.db.clone();
+        let rows = tokio::task::spawn_blocking(move || -> Result<usize> {
+            let conn = db.lock().unwrap();
+            let mut sets: Vec<&str> = Vec::new();
+            let mut vals: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+            for change in changes {
+                match change {
+                    AgentField::Name(n) => { sets.push("name = ?"); vals.push(Box::new(n)); }
+                    AgentField::SystemPrompt(p) => { sets.push("system_prompt = ?"); vals.push(Box::new(p)); }
+                    AgentField::VoiceUser(v) => { sets.push("voice_user = ?"); vals.push(Box::new(v)); }
+                    AgentField::VoiceNarrator(v) => { sets.push("voice_narrator = ?"); vals.push(Box::new(v)); }
+                    AgentField::VoiceCharacter(v) => { sets.push("voice_character = ?"); vals.push(Box::new(v)); }
+                }
+            }
+            sets.push("updated_at = ?");
+            vals.push(Box::new(now));
+            vals.push(Box::new(id));
+            let sql = format!(
+                "UPDATE agents SET {} WHERE id = ?",
+                sets.join(", "),
+            );
+            let params_refs: Vec<&dyn rusqlite::ToSql> =
+                vals.iter().map(|b| b.as_ref()).collect();
+            let rows = conn.execute(&sql, params_refs.as_slice())?;
+            Ok(rows)
+        })
+        .await
+        .context("db task panicked")??;
+        Ok(if rows == 0 {
+            UpdateResult::NotFound
+        } else {
+            UpdateResult::Updated
+        })
+    }
+
+    pub async fn delete_agent(&self, id: String) -> Result<UpdateResult> {
+        let db = self.db.clone();
+        let rows = tokio::task::spawn_blocking(move || -> Result<usize> {
+            let conn = db.lock().unwrap();
+            let rows = conn.execute("DELETE FROM agents WHERE id = ?1", params![id])?;
+            Ok(rows)
+        })
+        .await
+        .context("db task panicked")??;
+        Ok(if rows == 0 {
+            UpdateResult::NotFound
+        } else {
+            UpdateResult::Updated
+        })
     }
 }
 
@@ -856,6 +1385,10 @@ pub struct ScriptTurnRow {
     pub ord: i64,
     pub role: String,
     pub content: String,
+    /// Attached widget (recorded voice memo) for user turns entered via the
+    /// microphone. Assistant turns leave this null; a user turn typed at the
+    /// keyboard also has null here.
+    pub widget_id: Option<String>,
     pub blocks: Vec<ScriptBlockRow>,
 }
 
@@ -863,6 +1396,11 @@ pub struct ScriptBlockRow {
     pub id: String,
     pub ord: i64,
     pub text: String,
+    /// "narrator" (prose outside `<speak>` — synthesized in the storyteller
+    /// voice) or "character" (`<speak>` body — the PC's in-character line).
+    /// Kept as `String` at this layer so the store doesn't force an enum on
+    /// callers; http.rs and script.rs use a typed `Role` at their edges.
+    pub role: String,
     pub selected_take: Option<i64>,
     pub takes: Vec<ScriptTakeRow>,
 }
@@ -878,9 +1416,39 @@ pub struct DeletedTake {
     pub widget_id: String,
 }
 
+pub struct ScriptSummaryRow {
+    pub id: String,
+    pub name: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
 fn unix_now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// Add `column` to `table` when it isn't already there. `col_def` is the SQL
+/// fragment after the column name (type + constraints + default). Fails on
+/// any error other than "the column exists" — safe to call on every startup.
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    col_def: &str,
+) -> Result<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let existing: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if existing.iter().any(|c| c == column) {
+        return Ok(());
+    }
+    conn.execute(
+        &format!("ALTER TABLE {table} ADD COLUMN {column} {col_def}"),
+        [],
+    )?;
+    Ok(())
 }

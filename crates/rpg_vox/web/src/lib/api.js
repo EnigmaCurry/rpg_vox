@@ -287,24 +287,28 @@ export async function putAppState(state) {
 // PATCH  /script/blocks/:id                 → { selectedTake } — pick a take.
 // DELETE /script/takes/:id                  → drop a take + its widget.
 
-export const getScript      = ()              => jsonGet('/script');
-export const resetScript    = async ()        => {
-  const r = await fetch('/script', { method: 'DELETE' });
-  if (!r.ok) {
-    const detail = await r.text().catch(() => `HTTP ${r.status}`);
-    throw new Error(detail || `HTTP ${r.status}`);
-  }
-};
+// --- Scripts (multi-conversation management) ------------------------------
+//
+// GET    /scripts               → [{ id, name, updated_at, ... }]
+// POST   /scripts { name? }     → { id, name, ... } — created empty
+// GET    /scripts/:id           → full script (turns + blocks + takes)
+// PATCH  /scripts/:id { name }  → rename
+// DELETE /scripts/:id           → delete (cascades everything)
+// DELETE /scripts/:id/turns     → clear turns but keep script
+// POST   /scripts/:id/user      → phase 1 of send
+// POST   /scripts/:id/reply     → phase 2 of send
+// POST   /scripts/:id/title     → LLM-generate a new name from the turns
 
-/// Send the user prompt to the LLM. Server persists both turns and parses
-/// `<speak>` blocks server-side; response is `{ user_turn, assistant_turn }`
-/// with blocks pre-populated (empty takes arrays — client kicks a per-block
-/// /takes render to auto-generate the first take).
-export async function sendToScript(text) {
-  const r = await fetch('/script', {
+export const listScripts    = ()                     => jsonGet('/scripts');
+export const getScript      = (id)                   => jsonGet(`/scripts/${encodeURIComponent(id)}`);
+
+export async function createScript(name = null) {
+  const body = {};
+  if (name) body.name = name;
+  const r = await fetch('/scripts', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ text }),
+    body: JSON.stringify(body),
   });
   if (!r.ok) {
     const detail = await r.text().catch(() => `HTTP ${r.status}`);
@@ -313,14 +317,161 @@ export async function sendToScript(text) {
   return await r.json();
 }
 
+export async function renameScript(id, name) {
+  const r = await fetch(`/scripts/${encodeURIComponent(id)}`, {
+    method: 'PATCH',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ name }),
+  });
+  if (!r.ok) {
+    const detail = await r.text().catch(() => `HTTP ${r.status}`);
+    throw new Error(detail || `HTTP ${r.status}`);
+  }
+}
+
+export async function deleteScript(id) {
+  const r = await fetch(`/scripts/${encodeURIComponent(id)}`, { method: 'DELETE' });
+  if (!r.ok) {
+    const detail = await r.text().catch(() => `HTTP ${r.status}`);
+    throw new Error(detail || `HTTP ${r.status}`);
+  }
+}
+
+export async function resetScript(id) {
+  const r = await fetch(`/scripts/${encodeURIComponent(id)}/turns`, { method: 'DELETE' });
+  if (!r.ok) {
+    const detail = await r.text().catch(() => `HTTP ${r.status}`);
+    throw new Error(detail || `HTTP ${r.status}`);
+  }
+}
+
+/// Ask the server to synthesize a short title from the script's existing
+/// turns and rename the script to it. Returns { name } with the new name.
+/// Best-effort — clients call this fire-and-forget after the first reply
+/// lands and refresh their sidebar on the next tick.
+export async function generateScriptTitle(id) {
+  const r = await fetch(`/scripts/${encodeURIComponent(id)}/title`, {
+    method: 'POST',
+  });
+  if (!r.ok) {
+    const detail = await r.text().catch(() => `HTTP ${r.status}`);
+    throw new Error(detail || `HTTP ${r.status}`);
+  }
+  return await r.json();
+}
+
+/// Phase 1 of the /script two-step. Persists a user turn (with widget or
+/// GM-voice proxy synth) and pushes the text into the LLM history. Returns
+/// as soon as the GM synth finishes so the client can begin playing the
+/// proxy while phase 2 (the LLM call) runs in parallel.
+///
+/// `widgetId` (optional) — from a `/widgets/record` stop response; when
+/// present the server attaches it instead of synthesizing a proxy.
+export async function sendUserTurn(scriptId, text, widgetId = null, agentId = null) {
+  const body = { text };
+  if (widgetId) body.widgetId = widgetId;
+  if (agentId) body.agentId = agentId;
+  const r = await fetch(`/scripts/${encodeURIComponent(scriptId)}/user`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) {
+    const detail = await r.text().catch(() => `HTTP ${r.status}`);
+    throw new Error(detail || `HTTP ${r.status}`);
+  }
+  return await r.json();
+}
+
+/// Phase 2 of the /script two-step. Calls the LLM against the history that
+/// phase 1 populated, persists the assistant turn (with narrator/character
+/// blocks parsed out), returns it.
+///
+/// `agentId` (optional) — which stored agent's system prompt to use for
+/// the LLM call. Missing/unknown ids fall back to the built-in Default.
+export async function sendAssistantReply(scriptId, agentId = null) {
+  const body = {};
+  if (agentId) body.agentId = agentId;
+  const r = await fetch(`/scripts/${encodeURIComponent(scriptId)}/reply`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) {
+    const detail = await r.text().catch(() => `HTTP ${r.status}`);
+    throw new Error(detail || `HTTP ${r.status}`);
+  }
+  return await r.json();
+}
+
+// --- Agents (named system-prompt profiles for /script) --------------------
+//
+// GET    /agents?projectId=X → [{ id, name, system_prompt, project_id,
+//                                voice_user, voice_narrator, voice_character,
+//                                read_only, ... }]
+// GET    /agents/:id         → single agent
+// POST   /agents             → { name, projectId? } — creates blank agent
+// PUT    /agents/:id         → patch (name/systemPrompt/voice*), 403 on Default
+// DELETE /agents/:id         → 200 (or 403 on Default)
+
+/// List agents. `projectId` (optional) filters to that project plus the
+/// built-in Default (which has no project). Omit to fetch every agent.
+export function listAgents(projectId = null) {
+  const path = projectId
+    ? `/agents?projectId=${encodeURIComponent(projectId)}`
+    : '/agents';
+  return jsonGet(path);
+}
+
+export async function createAgent(name, projectId = null) {
+  const body = { name };
+  if (projectId) body.projectId = projectId;
+  const r = await fetch('/agents', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) {
+    const detail = await r.text().catch(() => `HTTP ${r.status}`);
+    throw new Error(detail || `HTTP ${r.status}`);
+  }
+  return await r.json();
+}
+
+/// Patch an agent. `patch` is an object with any subset of:
+///   { name, systemPrompt, voiceUser, voiceNarrator, voiceCharacter }
+/// Voice slots take a character id (string) to set, `null` to clear back
+/// to the DSP-preset fallback, or the field is omitted to leave alone.
+export async function updateAgent(id, patch) {
+  const r = await fetch(`/agents/${encodeURIComponent(id)}`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(patch),
+  });
+  if (!r.ok) {
+    const detail = await r.text().catch(() => `HTTP ${r.status}`);
+    throw new Error(detail || `HTTP ${r.status}`);
+  }
+}
+
+export async function deleteAgent(id) {
+  const r = await fetch(`/agents/${encodeURIComponent(id)}`, { method: 'DELETE' });
+  if (!r.ok) {
+    const detail = await r.text().catch(() => `HTTP ${r.status}`);
+    throw new Error(detail || `HTTP ${r.status}`);
+  }
+}
+
 /// Synthesize a fresh take for a speech block. Server reads the block's
 /// text from its own row so the client only needs the block id + any voice
 /// config layers. Returns the new take (with widget id + duration metadata).
-export async function createTake(blockId, configs = []) {
+export async function createTake(blockId, configs = [], agentId = null) {
+  const body = { configs };
+  if (agentId) body.agentId = agentId;
   const r = await fetch(`/script/blocks/${encodeURIComponent(blockId)}/takes`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ configs }),
+    body: JSON.stringify(body),
   });
   if (!r.ok) {
     const detail = await r.text().catch(() => `HTTP ${r.status}`);
