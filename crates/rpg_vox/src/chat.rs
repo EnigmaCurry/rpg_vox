@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::debug;
+use tracing::{debug, warn};
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -63,6 +63,7 @@ impl Client {
         &self.cfg.base_url
     }
 
+    #[allow(dead_code)]
     pub async fn history_snapshot(&self) -> Vec<ChatMessage> {
         self.history.read().await.clone()
     }
@@ -84,12 +85,28 @@ impl Client {
         };
         let raw = self.completion(&messages).await?;
         debug!(bytes = raw.len(), raw = %raw, "chat completion raw content");
-        let cleaned = strip_thinking(&raw).trim().to_string();
+        // OpenAI Harmony-format models (gpt-oss and its finetunes like
+        // Muse-Glimmer) reply on channels: `to=self<|message|>…<|eom|>`
+        // for their internal scratchpad and `to=user<|message|>…<|eot|>`
+        // for the visible reply. llama.cpp's `--reasoning-format none`
+        // leaves both in `content`. Extract just the user channel here so
+        // the strip_thinking pass below only sees the reply, and the
+        // scratchpad never reaches the UI or TTS. Non-Harmony replies
+        // pass through untouched.
+        let base = extract_harmony_user_reply(&raw).unwrap_or_else(|| raw.clone());
+        let cleaned = strip_thinking(&base).trim().to_string();
         if cleaned.is_empty() {
-            // Rare but possible: model emitted only <think>…</think> or nothing.
-            // Drop the user turn so a retry works cleanly.
+            // Rare but possible: model emitted only <think>…</think>, no
+            // content at all, or a chat-template quirk stripped everything.
+            // Log the raw response so it's obvious which; include a preview
+            // in the error message so the user sees it in the UI too.
+            warn!(bytes = raw.len(), raw = %raw, "LLM returned empty content after cleanup");
             self.history.write().await.pop();
-            return Err(anyhow!("LLM returned empty content"));
+            return Err(anyhow!(
+                "LLM returned empty content after cleanup (raw {} bytes: {:?})",
+                raw.len(),
+                if raw.len() > 200 { format!("{}…", &raw[..200]) } else { raw }
+            ));
         }
         self.history.write().await.push(ChatMessage {
             role: "assistant".into(),
@@ -140,15 +157,85 @@ impl Client {
         }
         let v: Value = serde_json::from_str(&text)
             .with_context(|| format!("parsing LLM response: {}", summarise(&text)))?;
-        // Only `content` is spoken. `reasoning_content` (when the server has
-        // a reasoning parser configured) is intentionally ignored — TTS is
-        // for the answer, not the scratchpad.
         let content = v
             .pointer("/choices/0/message/content")
             .and_then(|c| c.as_str())
             .ok_or_else(|| anyhow!("no choices[0].message.content in response: {v}"))?;
+        // Reasoning-model servers (llama.cpp with `--reasoning-format deepseek`,
+        // vLLM with `--enable-reasoning`, etc.) siphon everything the model
+        // emitted between `<think>` tags into a separate `reasoning_content`
+        // field, leaving `content` empty when the model produced ONLY
+        // reasoning. We deliberately don't fall back to reasoning_content —
+        // that's the scratchpad, not the answer, and rendering it in the
+        // Script UI reads as a wall of stream-of-consciousness. Instead,
+        // surface a specific error so the user knows the fix is server-side.
+        if content.is_empty() {
+            let has_reasoning = v
+                .pointer("/choices/0/message/reasoning_content")
+                .and_then(|c| c.as_str())
+                .map(|s| !s.is_empty())
+                .unwrap_or(false);
+            let finish = v
+                .pointer("/choices/0/finish_reason")
+                .and_then(|c| c.as_str())
+                .unwrap_or("");
+            warn!(
+                envelope = %summarise(&text),
+                finish_reason = finish,
+                has_reasoning,
+                "LLM content was empty"
+            );
+            if has_reasoning {
+                return Err(anyhow!(
+                    "LLM emitted only reasoning (reasoning_content present, content empty). \
+                     Restart llama.cpp with `--reasoning-format none` so `<think>` blocks \
+                     stay in `content` where our own strip pass can drop them, \
+                     or pick a non-reasoning model."
+                ));
+            }
+            if finish == "length" {
+                return Err(anyhow!(
+                    "LLM hit the token cap before producing content \
+                     (finish_reason=length). Raise --chat-max-tokens \
+                     (currently {}) or shorten the system prompt.",
+                    self.cfg.max_tokens
+                ));
+            }
+        }
         Ok(content.to_string())
     }
+}
+
+/// Extract the visible user-facing reply from a Harmony-format response.
+///
+/// Some models (gpt-oss family and finetunes such as Muse-Glimmer) reply
+/// in OpenAI's Harmony chat format with multiple named channels:
+///
+/// * `to=self<|message|>…<|eom|>` — internal scratchpad, must be hidden.
+/// * `<|start|>assistant to=user<|message|>…<|eot|>` — the actual reply.
+///
+/// When llama.cpp runs with `--reasoning-format none` (which we recommend
+/// so the strip-thinking pass sees any `<think>` blocks), the raw channel
+/// markers arrive verbatim in `content`. Find the LAST `to=user<|message|>`
+/// (in case the model narrates multiple internal messages before settling
+/// on the reply) and take everything up to the next end-of-message marker.
+///
+/// Returns `None` when no Harmony markers are found so the caller can pass
+/// the raw content through to the generic strip pipeline.
+pub fn extract_harmony_user_reply(s: &str) -> Option<String> {
+    const MARKER: &str = "to=user<|message|>";
+    let idx = s.rfind(MARKER)?;
+    let start = idx + MARKER.len();
+    let rest = &s[start..];
+    // Any of these mark the end of a Harmony message. Truncate at whichever
+    // appears first — a trailing `<|eot|>` is the norm but a truncated reply
+    // (finish_reason=length) can end with none of them.
+    let end = ["<|eot|>", "<|end|>", "<|eom|>", "<|return|>"]
+        .iter()
+        .filter_map(|tag| rest.find(tag))
+        .min()
+        .unwrap_or(rest.len());
+    Some(rest[..end].trim().to_string())
 }
 
 /// Remove reasoning blocks from an LLM reply.
@@ -234,7 +321,42 @@ fn summarise(body: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::strip_thinking;
+    use super::{extract_harmony_user_reply, strip_thinking};
+
+    #[test]
+    fn harmony_extracts_last_user_message() {
+        let raw = "to=self<|message|>thinking...<|eom|><|start|>assistant to=user<|message|>hello there<|eot|>";
+        assert_eq!(
+            extract_harmony_user_reply(raw).as_deref(),
+            Some("hello there"),
+        );
+    }
+
+    #[test]
+    fn harmony_handles_truncated_end() {
+        // finish_reason=length can chop the trailing <|eot|> — still return
+        // whatever text was captured after the marker.
+        let raw = "to=self<|message|>x<|eom|>to=user<|message|>partial reply";
+        assert_eq!(
+            extract_harmony_user_reply(raw).as_deref(),
+            Some("partial reply"),
+        );
+    }
+
+    #[test]
+    fn harmony_returns_none_for_plain_text() {
+        assert!(extract_harmony_user_reply("just a normal reply").is_none());
+    }
+
+    #[test]
+    fn harmony_prefers_last_user_channel() {
+        // Two `to=user` blocks: take the last one (the model settled on it).
+        let raw = "to=user<|message|>first<|eom|>to=user<|message|>final<|eot|>";
+        assert_eq!(
+            extract_harmony_user_reply(raw).as_deref(),
+            Some("final"),
+        );
+    }
 
     #[test]
     fn strips_single_block() {

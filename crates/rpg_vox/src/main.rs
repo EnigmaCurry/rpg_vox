@@ -8,6 +8,7 @@ mod http;
 mod mixer;
 mod monitor;
 mod pw_source;
+mod script;
 mod settings;
 mod store;
 mod stt;
@@ -178,23 +179,28 @@ struct Args {
     #[arg(long, env = "RPG_VOX_CHAT_API_KEY")]
     chat_api_key: Option<String>,
 
-    /// Path to a file containing the system prompt. Missing file is tolerated
-    /// (the chat runs with no system prompt) so a fresh checkout without the
-    /// default prompts/ dir still boots.
+    /// Path to a file containing the system prompt used by the /script page.
+    /// The default prompt teaches the LLM the `<speak>…</speak>` convention
+    /// so its replies can be split into inline audio widgets. Missing file
+    /// is tolerated (the chat runs with no system prompt) so a fresh
+    /// checkout without the default prompts/ dir still boots.
     #[arg(
         long,
-        env = "RPG_VOX_CHAT_SYSTEM_PROMPT_FILE",
-        default_value = "prompts/default.txt"
+        env = "RPG_VOX_SCRIPT_SYSTEM_PROMPT_FILE",
+        default_value = "prompts/script.txt"
     )]
-    chat_system_prompt_file: String,
+    script_system_prompt_file: String,
 
     /// Cap on the number of non-system messages kept in chat history; older
     /// turns are dropped from the LLM request.
     #[arg(long, env = "RPG_VOX_CHAT_MAX_HISTORY", default_value_t = 40)]
     chat_max_history: usize,
 
-    /// Max tokens generated per chat reply.
-    #[arg(long, env = "RPG_VOX_CHAT_MAX_TOKENS", default_value_t = 512)]
+    /// Max tokens generated per chat reply. 512 is fine for a direct-answer
+    /// model like Qwen3 with thinking disabled; raise for chattier models
+    /// (creative-writing / open-thinking) that emit long preambles before
+    /// reaching an actual reply.
+    #[arg(long, env = "RPG_VOX_CHAT_MAX_TOKENS", default_value_t = 2048)]
     chat_max_tokens: u32,
 
     /// Suppress Qwen3-style reasoning by sending
@@ -389,7 +395,7 @@ fn main() -> Result<()> {
         node_name: node_name.clone(),
     });
 
-    let system_prompt = match std::fs::read_to_string(&args.chat_system_prompt_file) {
+    let system_prompt = match std::fs::read_to_string(&args.script_system_prompt_file) {
         Ok(text) => {
             let trimmed = text.trim().to_string();
             if trimmed.is_empty() {
@@ -400,16 +406,16 @@ fn main() -> Result<()> {
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             tracing::warn!(
-                path = %args.chat_system_prompt_file,
-                "chat system prompt file not found; chat will run without a system prompt"
+                path = %args.script_system_prompt_file,
+                "script system prompt file not found; script will run without a system prompt"
             );
             None
         }
         Err(err) => {
             return Err(err).with_context(|| {
                 format!(
-                    "reading chat system prompt file {}",
-                    args.chat_system_prompt_file
+                    "reading script system prompt file {}",
+                    args.script_system_prompt_file
                 )
             });
         }
@@ -435,6 +441,11 @@ fn main() -> Result<()> {
     let store = store::Store::open(&args.data_dir)
         .with_context(|| format!("opening store at {}", args.data_dir.display()))?;
     info!(data_dir = %args.data_dir.display(), "widget store opened");
+
+    // Make sure the single MVP script row exists so /script handlers never
+    // hit a foreign-key error on the first user turn of a fresh install.
+    rt.block_on(store.ensure_default_script())
+        .context("ensuring default script row")?;
 
     // Speech-to-text. Loaded once at startup; missing model files just
     // disable the feature (the record flow still saves the WAV, it simply

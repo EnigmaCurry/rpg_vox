@@ -7,20 +7,23 @@
   import Projects from './routes/Projects.svelte';
   import Characters from './routes/Characters.svelte';
   import Scenes from './routes/Scenes.svelte';
-  import Chat from './routes/Chat.svelte';
+  import Script from './routes/Script.svelte';
   import Mixer from './routes/Mixer.svelte';
   import Settings from './routes/Settings.svelte';
   import NotFound from './routes/NotFound.svelte';
 
   // Add new experiments here — each is a hash-URL entry mapped to a component.
   // /speak stays as an alias so old bookmarks land on the same page.
+  // /chat aliases to /script so pre-rename bookmarks still land on the new
+  // conversation page.
   const routes = {
     '/':           Projects,
     '/projects':   Projects,
     '/characters': Characters,
     '/scenes':     Scenes,
     '/speak':      Scenes,
-    '/chat':       Chat,
+    '/script':     Script,
+    '/chat':       Script,
     '/mixer':      Mixer,
     '/settings':   Settings,
   };
@@ -29,8 +32,11 @@
 
   // The Scenes view is a full-bleed sidebar+lanes layout; other routes keep
   // the narrow centered column. Toggle a class on <main> to switch modes.
+  // /script and /chat use their own bottom-locked layout so we let them run
+  // full-bleed too rather than centering under the 720px cap.
   const isFullBleed = $derived(
-    $route === '/scenes' || $route === '/speak',
+    $route === '/scenes' || $route === '/speak'
+      || $route === '/script' || $route === '/chat',
   );
 
   onMount(() => {

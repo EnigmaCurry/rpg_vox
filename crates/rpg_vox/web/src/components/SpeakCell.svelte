@@ -20,6 +20,7 @@
   import {
     createWidget,
     updateWidget,
+    updateWidgetText,
     deleteWidget,
     fetchWidget,
     playWidget,
@@ -143,6 +144,19 @@
   // stopExternal() (or a delete) can cancel scene playback promptly.
   let playAbort = null;
 
+  // AbortController for the in-flight render (POST/PUT /widgets). Cancel
+  // discards the response so cancelRender() can revert the cell to its
+  // pre-render state — the server keeps synthesizing, but the client
+  // stops awaiting.
+  let renderAbort = null;
+  // Wall-clock elapsed since the current render started, in ms. Driven
+  // by the same rAF ticker as `progress`, so the timer beneath the
+  // cancel-render bolt reads live.
+  let renderElapsedMs = $state(0);
+  // Wall-clock elapsed since the current playback started, in ms. Fed
+  // by tickPlay so the MM:SS chip on the stop overlay reads live.
+  let playElapsedMs = $state(0);
+
   let textEl = $state(null);   // <textarea> for `text`, focused on entry
 
   // Delete button: two-tap confirm. `deleteConfirm=true` swaps the label to
@@ -164,6 +178,7 @@
   onDestroy(() => {
     cancelRaf();
     if (playAbort) { try { playAbort.abort(); } catch {} playAbort = null; }
+    if (renderAbort) { try { renderAbort.abort(); } catch {} renderAbort = null; }
     if (deleteTimer) clearTimeout(deleteTimer);
     // Fire-and-forget cancel for an in-flight recording so the server
     // doesn't hold onto a dangling session buffer if the cell tears down
@@ -276,6 +291,24 @@
     state = 'rendered';
   }
 
+  // Persist text-only edits without touching the audio. Point of this is
+  // to correct a recording's STT transcript — clicking "save" instead of
+  // "render" keeps the recorded WAV as-is and just updates the caption.
+  async function saveText() {
+    if (!widgetId) return;
+    const t = text.trim();
+    error = '';
+    try {
+      await updateWidgetText(widgetId, t);
+      text = t;
+      renderedText = t;
+      renderedProfileId = profileId;
+      state = 'rendered';
+    } catch (e) {
+      error = e.message || 'save failed';
+    }
+  }
+
   function onRetryClick() {
     if (retryConfirm) {
       if (retryTimer) { clearTimeout(retryTimer); retryTimer = 0; }
@@ -321,6 +354,8 @@
   function resetToEmpty() {
     cancelRaf();
     if (playAbort) { try { playAbort.abort(); } catch {} playAbort = null; }
+    if (renderAbort) { try { renderAbort.abort(); } catch {} renderAbort = null; }
+    renderElapsedMs = 0;
     ready = false;
     text = '';
     profileId = null;
@@ -338,6 +373,7 @@
   // ---- Render (server round-trip) ------------------------------------------
   function tickRender() {
     const elapsed = performance.now() - startedAt;
+    renderElapsedMs = elapsed;
     // Hold at 95% until the response actually lands, then snap to 100.
     progress = Math.min((elapsed / estimatedMs) * 0.95, 0.95);
     rafId = requestAnimationFrame(tickRender);
@@ -355,6 +391,7 @@
     error = '';
     state = 'rendering';
     progress = 0;
+    renderElapsedMs = 0;
     startedAt = performance.now();
     // Estimator input: total prompt length across the profile's layers so a
     // hive-mind of many configs is billed proportional to its actual work.
@@ -363,6 +400,11 @@
       : 0;
     estimatedMs = estimateMs(t.length + instructChars);
     rafId = requestAnimationFrame(tickRender);
+
+    // Fresh AbortController so cancelRender() can drop this specific fetch
+    // without touching future ones.
+    const ac = new AbortController();
+    renderAbort = ac;
 
     try {
       // First render → create (server assigns id). Subsequent renders →
@@ -374,17 +416,19 @@
       let result;
       try {
         result = widgetId
-          ? await updateWidget(widgetId, t, configs)
-          : await createWidget(t, configs);
+          ? await updateWidget(widgetId, t, configs, { signal: ac.signal })
+          : await createWidget(t, configs, { signal: ac.signal });
       } catch (e) {
+        if (e?.name === 'AbortError') throw e;
         if (widgetId && /no widget with id/i.test(e.message || '')) {
           widgetId = null;
-          result = await createWidget(t, configs);
+          result = await createWidget(t, configs, { signal: ac.signal });
         } else {
           throw e;
         }
       }
       cancelRaf();
+      if (renderAbort === ac) renderAbort = null;
       const elapsedMs = performance.now() - startedAt;
       recordSample(t.length + instructChars, elapsedMs);
 
@@ -397,6 +441,7 @@
       onaudio?.({ ready: true, durationMs });
 
       progress = 1;
+      renderElapsedMs = 0;
       await tick();
       if (autoplay) {
         // Brief flash of the filled render bar before playback begins so the
@@ -413,10 +458,30 @@
       }
     } catch (e) {
       cancelRaf();
+      if (renderAbort === ac) renderAbort = null;
+      // AbortError from cancelRender(): the cancel handler already reverted
+      // state + progress; just bail without surfacing an error.
+      if (e?.name === 'AbortError') return;
       state = hasClip ? 'rendered' : 'editing';
       progress = 0;
+      renderElapsedMs = 0;
       error = e.message || 'render failed';
     }
+  }
+
+  // User-initiated cancel of an in-flight render. Aborts the fetch (the
+  // server keeps synthesizing, but we drop the response) and reverts to
+  // whichever state the cell was in before render() flipped it — a prior
+  // cached clip if one existed, or the editing form otherwise. Text and
+  // profile inputs stay so the user can tweak and retry.
+  function cancelRender() {
+    if (state !== 'rendering' || !renderAbort) return;
+    try { renderAbort.abort(); } catch {}
+    renderAbort = null;
+    cancelRaf();
+    progress = 0;
+    renderElapsedMs = 0;
+    state = hasClip ? 'rendered' : 'editing';
   }
 
   // ---- Play (through the pipewire virtual mic) ----------------------------
@@ -428,6 +493,9 @@
     if (state !== 'playing') { cancelRaf(); return; }
     const total = durationMs || 1;
     const elapsed = performance.now() - startedAt;
+    // Clamp the visible timer to the clip's known duration so a slightly
+    // long server-side drain doesn't push MM:SS past the end of the clip.
+    playElapsedMs = Math.min(elapsed, total);
     progress = Math.min(elapsed / total, 1);
     rafId = requestAnimationFrame(tickPlay);
   }
@@ -444,6 +512,7 @@
     error = '';
     state = 'playing';
     progress = 0;
+    playElapsedMs = 0;
     startedAt = performance.now();
     // Fresh AbortController per play so stopExternal() can cancel the current
     // request without affecting future ones.
@@ -460,6 +529,7 @@
     } finally {
       cancelRaf();
       progress = 0;
+      playElapsedMs = 0;
       if (playAbort === ac) playAbort = null;
       // Only demote if we're still in the playing state; a delete/reset
       // during playback may have already moved us on.
@@ -566,6 +636,7 @@
     stopPlayback().catch(() => {});
     cancelRaf();
     progress = 0;
+    playElapsedMs = 0;
     if (state === 'playing') state = 'rendered';
   }
 
@@ -603,6 +674,18 @@
   }
 
   const clipMeta = $derived(hasClip ? `${(durationMs / 1000).toFixed(1)}s` : '');
+
+  // MM:SS for the render timer — long TTS jobs routinely run into minutes,
+  // so seconds-only overflows past 60 and reads as "how long has this been
+  // stuck?" better as a stopwatch than a raw decimal.
+  function formatMMSS(ms) {
+    const total = Math.max(0, Math.floor(ms / 1000));
+    const m = Math.floor(total / 60);
+    const s = total % 60;
+    return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+  }
+  const renderElapsedLabel = $derived(formatMMSS(renderElapsedMs));
+  const playElapsedLabel = $derived(formatMMSS(playElapsedMs));
 
   // Dropdown value is always a string (even for the "default" empty selection),
   // so we normalize null ↔ '' when reading/writing the profileId state.
@@ -683,6 +766,31 @@
         <svg class="stop-icon" viewBox="0 0 24 24" aria-hidden="true">
           <rect x="6" y="6" width="12" height="12" rx="1.5" fill="currentColor"/>
         </svg>
+        <!-- Live MM:SS elapsed. Own dim background chip so it stays legible
+             over the clip text (which is visible at rest, since .stop-overlay
+             only dims on hover). -->
+        <div class="play-timer">{playElapsedLabel}</div>
+      </button>
+    {/if}
+
+    {#if state === 'rendering'}
+      <!-- Retry-triggered render (from the collapsed hover Retry button):
+           the prior clip's text is still shown underneath. Bolt icon sits
+           in a rounded-square underlay that matches .play-hover so both
+           the icon and the MM:SS timer read cleanly regardless of what's
+           printed beneath. Click cancels the fetch and restores the prior
+           cached clip. -->
+      <button
+        class="cancel-render-overlay"
+        onclick={cancelRender}
+        aria-label="Cancel generation"
+        title="Cancel generation">
+        <span class="bolt-box">
+          <svg class="bolt-icon" viewBox="0 0 24 24" aria-hidden="true">
+            <path fill="currentColor" d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/>
+          </svg>
+        </span>
+        <div class="cancel-timer">{renderElapsedLabel}</div>
       </button>
     {/if}
 
@@ -768,20 +876,32 @@
       </div>
 
       <div class="side">
-        <button
-          class="play"
-          onclick={onPlayClick}
-          disabled={state === 'rendering'}
-          aria-label={hasClip && !isDirty ? 'Play' : 'Render'}
-          title={isDirty ? 'Re-render with new text' : hasClip ? 'Play cached clip' : 'Render'}>
-          {#if state === 'rendering'}
-            <span class="spinner" aria-hidden="true"></span>
-          {:else}
+        {#if state === 'rendering'}
+          <!-- Rendering: replace Play with a Cancel-generation button
+               (lightning bolt); wall-clock timer below shows how long
+               the synth has been running. Clicking aborts the fetch and
+               reverts the cell to its pre-render state. -->
+          <button
+            class="play cancel-render"
+            onclick={cancelRender}
+            aria-label="Cancel generation"
+            title="Cancel generation">
+            <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+              <path fill="currentColor" d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/>
+            </svg>
+          </button>
+          <div class="meta timer">{renderElapsedLabel}</div>
+        {:else}
+          <button
+            class="play"
+            onclick={onPlayClick}
+            aria-label={hasClip && !isDirty ? 'Play' : 'Render'}
+            title={isDirty ? 'Re-render with new text' : hasClip ? 'Play cached clip' : 'Render'}>
             <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
               <path fill="currentColor" d="M8 5v14l11-7z" />
             </svg>
-          {/if}
-        </button>
+          </button>
+        {/if}
 
         <button
           class="play record"
@@ -811,6 +931,12 @@
     {#if state === 'editing'}
       <div class="cell-actions">
         {#if hasClip}
+          <button
+            class="text-btn save"
+            onclick={saveText}
+            title="Save edited text without re-rendering audio">
+            save
+          </button>
           <button
             class="text-btn cancel"
             onclick={cancelEdit}
@@ -911,8 +1037,10 @@
     position: absolute;
     inset: 0;
     display: flex;
+    flex-direction: column;
     align-items: center;
     justify-content: center;
+    gap: 6px;
     background: transparent;
     border: none;
     padding: 0;
@@ -934,6 +1062,19 @@
   }
   .stop-overlay:hover .stop-icon,
   .stop-overlay:focus-visible .stop-icon { opacity: 1; }
+  /* Own chip background so the timer stays legible over the clip text
+     at rest — .stop-overlay itself is transparent unless hovered. */
+  .play-timer {
+    padding: 2px 8px;
+    background: rgba(0, 0, 0, 0.55);
+    color: var(--accent);
+    font-size: clamp(11px, 4.5cqmin, 15px);
+    font-variant-numeric: tabular-nums;
+    border-radius: 4px;
+    opacity: 0.9;
+  }
+  .stop-overlay:hover .play-timer,
+  .stop-overlay:focus-visible .play-timer { opacity: 1; }
 
   /* Primary action: fills most of the cell as a large square target. Grows
      into whatever height flex leaves after the edit button + gap, then the
@@ -1125,6 +1266,78 @@
     border-color: var(--err);
   }
 
+  /* Cancel-generation button in form mode: same footprint as Play/Record
+     but tinted amber so it reads as "in progress, click to abort" rather
+     than a normal action. */
+  .play.cancel-render {
+    color: #ffcf5a;
+    background: rgba(255, 207, 90, 0.12);
+    border-color: rgba(255, 207, 90, 0.45);
+  }
+  .play.cancel-render:hover {
+    background: rgba(255, 207, 90, 0.22);
+    border-color: #ffcf5a;
+  }
+
+  /* Full-cell cancel button that overlays the collapsed clip during a
+     retry-triggered render. Persistent dim background so the bolt puck
+     and timer read cleanly on top of the clip text underneath — same
+     approach as .hover-actions. */
+  .cancel-render-overlay {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    padding: 10px;
+    background: rgba(0, 0, 0, 0.55);
+    border: none;
+    margin: 0;
+    color: #ffcf5a;
+    cursor: pointer;
+    z-index: 3;
+  }
+  .cancel-render-overlay:hover,
+  .cancel-render-overlay:focus-visible {
+    background: rgba(0, 0, 0, 0.7);
+    outline: none;
+  }
+  /* Mirrors .play-hover: a tinted rounded square holding the icon so the
+     bolt reads as an actionable button on top of the dim overlay. */
+  .bolt-box {
+    flex: 0 1 auto;
+    width: min(45%, 90px);
+    aspect-ratio: 1 / 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(255, 255, 255, 0.14);
+    border: 1px solid rgba(255, 255, 255, 0.22);
+    border-radius: 8px;
+  }
+  .cancel-render-overlay:hover .bolt-box,
+  .cancel-render-overlay:focus-visible .bolt-box {
+    background: rgba(255, 255, 255, 0.22);
+    border-color: rgba(255, 255, 255, 0.32);
+  }
+  .bolt-icon {
+    width: 55%;
+    height: 55%;
+  }
+  .cancel-timer {
+    font-size: clamp(12px, 5cqmin, 18px);
+    color: var(--text);
+    font-variant-numeric: tabular-nums;
+  }
+  /* Form-mode timer under the side-panel bolt: match the bolt tint so the
+     stopwatch clearly belongs with the cancel affordance above it. */
+  .meta.timer {
+    color: #ffcf5a;
+    font-variant-numeric: tabular-nums;
+  }
+
   /* Pulsing red dot beside the elapsed-time meta line while a recording is
      in flight — familiar "REC" affordance. */
   .rec-dot {
@@ -1209,6 +1422,7 @@
     cursor: pointer;
     font-family: inherit;
   }
+  .text-btn.save:hover     { color: var(--accent); border-color: var(--accent); }
   .text-btn.cancel:hover   { color: var(--text);   border-color: var(--muted); }
   .text-btn.rerender:hover { color: var(--accent); border-color: var(--accent); }
   .text-btn.delete:hover   { color: var(--err);    border-color: var(--err); }

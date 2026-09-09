@@ -23,7 +23,10 @@ export const health       = writable('checking');   // 'checking' | 'ok' | 'err'
 export const settings     = writable(null);
 export const workflows    = writable([]);
 export const graph        = writable(null);
-export const chatHistory  = writable([]);
+/// Full server-side script: `{ id, turns: [{ id, ord, role, content, blocks: [{ id, ord, text, selected_take, takes: [{id,ord,widget_id,sample_rate,duration_ms}] }] }] }`.
+/// Loaded once on Script mount; mutated in place as new turns/takes arrive so
+/// route re-mounts don't refetch (turns won't disappear behind the user's back).
+export const script       = writable(null);
 
 // --- Health poll (started once from App) ------------------------------------
 let healthTimer = null;
@@ -59,7 +62,7 @@ export function stopSettingsPoll() {
 export async function reloadSettings()    { settings.set(await api.getSettings()); }
 export async function reloadWorkflows()   { workflows.set(await api.listWorkflows()); }
 export async function reloadGraph()       { graph.set(await api.getGraph()); }
-export async function reloadChatHistory() { chatHistory.set(await api.getChatHistory()); }
+export async function reloadScript()      { script.set(await api.getScript()); }
 
 // --- Pipewire monitor auto-restore ------------------------------------------
 //

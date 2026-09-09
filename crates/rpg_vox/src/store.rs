@@ -46,7 +46,42 @@ CREATE TABLE IF NOT EXISTS app_state (
     value        TEXT NOT NULL,
     updated_at   INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS scripts (
+    id           TEXT PRIMARY KEY,
+    name         TEXT NOT NULL,
+    created_at   INTEGER NOT NULL,
+    updated_at   INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS script_turns (
+    id           TEXT PRIMARY KEY,
+    script_id    TEXT NOT NULL REFERENCES scripts(id) ON DELETE CASCADE,
+    ord          INTEGER NOT NULL,
+    role         TEXT NOT NULL,
+    content      TEXT NOT NULL,
+    created_at   INTEGER NOT NULL,
+    UNIQUE(script_id, ord)
+);
+CREATE TABLE IF NOT EXISTS script_speech_blocks (
+    id            TEXT PRIMARY KEY,
+    turn_id       TEXT NOT NULL REFERENCES script_turns(id) ON DELETE CASCADE,
+    ord           INTEGER NOT NULL,
+    text          TEXT NOT NULL,
+    selected_take INTEGER,
+    UNIQUE(turn_id, ord)
+);
+CREATE TABLE IF NOT EXISTS script_speech_takes (
+    id           TEXT PRIMARY KEY,
+    block_id     TEXT NOT NULL REFERENCES script_speech_blocks(id) ON DELETE CASCADE,
+    ord          INTEGER NOT NULL,
+    widget_id    TEXT NOT NULL REFERENCES widgets(id) ON DELETE CASCADE,
+    created_at   INTEGER NOT NULL,
+    UNIQUE(block_id, ord)
+);
 "#;
+
+/// Single hardcoded script id — MVP has one shared conversation, matching
+/// the legacy /chat semantics. Multi-script (per-project) comes later.
+pub const DEFAULT_SCRIPT_ID: &str = "default";
 
 /// Single row key for the whole projects/characters/scenes blob. Keeping the
 /// table generic-KV lets us stash other server-side prefs here later without
@@ -80,6 +115,11 @@ impl Store {
         let db_path = data_dir.join("rpg_vox.sqlite");
         let conn = Connection::open(&db_path)
             .with_context(|| format!("opening sqlite at {}", db_path.display()))?;
+        // ON DELETE CASCADE only fires when foreign_keys pragma is on; sqlite
+        // defaults it off per-connection. Set before the schema applies so any
+        // downstream migration can rely on FK checks too.
+        conn.execute_batch("PRAGMA foreign_keys = ON;")
+            .context("enabling foreign_keys pragma")?;
         conn.execute_batch(SCHEMA).context("applying schema")?;
 
         Ok(Self {
@@ -195,6 +235,33 @@ impl Store {
             .await
             .with_context(|| format!("writing clip for {id}"))?;
 
+        Ok(UpdateResult::Updated)
+    }
+
+    /// Update just the widget's `text` column, leaving the WAV and other
+    /// metadata (sample_rate, duration_ms, instruct) untouched. Used by the
+    /// "save" action in the editing form so the user can correct an STT
+    /// transcript without re-synthesizing over a recorded clip.
+    pub async fn update_widget_text(
+        &self,
+        id: String,
+        text: String,
+    ) -> Result<UpdateResult> {
+        let now = unix_now();
+        let db = self.db.clone();
+        let rows = tokio::task::spawn_blocking(move || -> Result<usize> {
+            let conn = db.lock().unwrap();
+            let rows = conn.execute(
+                "UPDATE widgets SET text = ?2, updated_at = ?3 WHERE id = ?1",
+                params![id, text, now],
+            )?;
+            Ok(rows)
+        })
+        .await
+        .context("db task panicked")??;
+        if rows == 0 {
+            return Ok(UpdateResult::NotFound);
+        }
         Ok(UpdateResult::Updated)
     }
 
@@ -398,6 +465,370 @@ impl Store {
         .context("db task panicked")??;
         Ok(())
     }
+
+    /// Insert the default script row if it doesn't already exist. Called at
+    /// boot so `/script` endpoints can assume the row is there without a
+    /// nested "create if missing" branch on every write.
+    pub async fn ensure_default_script(&self) -> Result<()> {
+        let now = unix_now();
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT OR IGNORE INTO scripts (id, name, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![DEFAULT_SCRIPT_ID, "default", now, now],
+            )?;
+            Ok(())
+        })
+        .await
+        .context("db task panicked")??;
+        Ok(())
+    }
+
+    /// Read the full script (turns + blocks + takes) in ordering-stable form.
+    /// Empty script returns Ok with an empty turns list.
+    pub async fn get_script(&self, script_id: String) -> Result<ScriptRow> {
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || -> Result<ScriptRow> {
+            let conn = db.lock().unwrap();
+            let mut turns_stmt = conn.prepare(
+                "SELECT id, ord, role, content FROM script_turns
+                 WHERE script_id = ?1 ORDER BY ord ASC",
+            )?;
+            let turns_iter = turns_stmt.query_map(params![script_id], |r| {
+                Ok(ScriptTurnRow {
+                    id: r.get::<_, String>(0)?,
+                    ord: r.get::<_, i64>(1)?,
+                    role: r.get::<_, String>(2)?,
+                    content: r.get::<_, String>(3)?,
+                    blocks: Vec::new(),
+                })
+            })?;
+            let mut turns: Vec<ScriptTurnRow> =
+                turns_iter.collect::<rusqlite::Result<Vec<_>>>()?;
+
+            for turn in turns.iter_mut() {
+                let mut block_stmt = conn.prepare(
+                    "SELECT id, ord, text, selected_take
+                     FROM script_speech_blocks
+                     WHERE turn_id = ?1 ORDER BY ord ASC",
+                )?;
+                let blocks_iter = block_stmt.query_map(params![turn.id], |r| {
+                    Ok(ScriptBlockRow {
+                        id: r.get::<_, String>(0)?,
+                        ord: r.get::<_, i64>(1)?,
+                        text: r.get::<_, String>(2)?,
+                        selected_take: r.get::<_, Option<i64>>(3)?,
+                        takes: Vec::new(),
+                    })
+                })?;
+                let mut blocks: Vec<ScriptBlockRow> =
+                    blocks_iter.collect::<rusqlite::Result<Vec<_>>>()?;
+                for block in blocks.iter_mut() {
+                    let mut take_stmt = conn.prepare(
+                        "SELECT id, ord, widget_id FROM script_speech_takes
+                         WHERE block_id = ?1 ORDER BY ord ASC",
+                    )?;
+                    let takes_iter = take_stmt.query_map(params![block.id], |r| {
+                        Ok(ScriptTakeRow {
+                            id: r.get::<_, String>(0)?,
+                            ord: r.get::<_, i64>(1)?,
+                            widget_id: r.get::<_, String>(2)?,
+                        })
+                    })?;
+                    block.takes = takes_iter.collect::<rusqlite::Result<Vec<_>>>()?;
+                }
+                turn.blocks = blocks;
+            }
+
+            Ok(ScriptRow {
+                id: script_id,
+                turns,
+            })
+        })
+        .await
+        .context("db task panicked")?
+    }
+
+    /// Append a turn (with any speech blocks parsed from its content) to a
+    /// script and return the freshly-created turn row (blocks included, no
+    /// takes yet). Called for both user turns (no blocks) and assistant
+    /// turns (blocks pre-populated from `<speak>` parsing).
+    pub async fn create_turn(
+        &self,
+        script_id: String,
+        role: String,
+        content: String,
+        blocks: Vec<String>,
+    ) -> Result<ScriptTurnRow> {
+        let turn_id = Uuid::new_v4().to_string();
+        let block_ids: Vec<String> = blocks.iter().map(|_| Uuid::new_v4().to_string()).collect();
+        let now = unix_now();
+        let db = self.db.clone();
+        let turn_id_clone = turn_id.clone();
+        let block_ids_clone = block_ids.clone();
+        let blocks_clone = blocks.clone();
+        let content_clone = content.clone();
+        let role_clone = role.clone();
+        let script_id_clone = script_id.clone();
+        let (ord, block_rows) = tokio::task::spawn_blocking(
+            move || -> Result<(i64, Vec<ScriptBlockRow>)> {
+                let mut conn = db.lock().unwrap();
+                let tx = conn.transaction()?;
+                let ord: i64 = tx
+                    .query_row(
+                        "SELECT COALESCE(MAX(ord), -1) + 1 FROM script_turns WHERE script_id = ?1",
+                        params![script_id_clone],
+                        |r| r.get::<_, i64>(0),
+                    )?;
+                tx.execute(
+                    "INSERT INTO script_turns (id, script_id, ord, role, content, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![turn_id_clone, script_id_clone, ord, role_clone, content_clone, now],
+                )?;
+                let mut block_rows = Vec::with_capacity(blocks_clone.len());
+                for (i, (bid, text)) in block_ids_clone.iter().zip(blocks_clone.iter()).enumerate() {
+                    tx.execute(
+                        "INSERT INTO script_speech_blocks (id, turn_id, ord, text, selected_take)
+                         VALUES (?1, ?2, ?3, ?4, NULL)",
+                        params![bid, turn_id_clone, i as i64, text],
+                    )?;
+                    block_rows.push(ScriptBlockRow {
+                        id: bid.clone(),
+                        ord: i as i64,
+                        text: text.clone(),
+                        selected_take: None,
+                        takes: Vec::new(),
+                    });
+                }
+                tx.execute(
+                    "UPDATE scripts SET updated_at = ?2 WHERE id = ?1",
+                    params![script_id_clone, now],
+                )?;
+                tx.commit()?;
+                Ok((ord, block_rows))
+            },
+        )
+        .await
+        .context("db task panicked")??;
+
+        Ok(ScriptTurnRow {
+            id: turn_id,
+            ord,
+            role,
+            content,
+            blocks: block_rows,
+        })
+    }
+
+    /// Append a take (widget) to a speech block. `selected_take` is bumped to
+    /// the new take's ord so the block auto-adopts the freshly rendered clip.
+    /// Returns the take row.
+    pub async fn append_take(
+        &self,
+        block_id: String,
+        widget_id: String,
+    ) -> Result<Option<ScriptTakeRow>> {
+        let take_id = Uuid::new_v4().to_string();
+        let now = unix_now();
+        let db = self.db.clone();
+        let take_id_clone = take_id.clone();
+        let block_id_clone = block_id.clone();
+        let widget_id_clone = widget_id.clone();
+        let ord_opt = tokio::task::spawn_blocking(move || -> Result<Option<i64>> {
+            let mut conn = db.lock().unwrap();
+            let tx = conn.transaction()?;
+            // Verify the block exists before writing so an orphan take id
+            // isn't silently created against a missing block row.
+            let exists: bool = tx
+                .query_row(
+                    "SELECT 1 FROM script_speech_blocks WHERE id = ?1",
+                    params![block_id_clone],
+                    |_| Ok(true),
+                )
+                .optional()?
+                .unwrap_or(false);
+            if !exists {
+                return Ok(None);
+            }
+            let ord: i64 = tx
+                .query_row(
+                    "SELECT COALESCE(MAX(ord), -1) + 1 FROM script_speech_takes WHERE block_id = ?1",
+                    params![block_id_clone],
+                    |r| r.get::<_, i64>(0),
+                )?;
+            tx.execute(
+                "INSERT INTO script_speech_takes (id, block_id, ord, widget_id, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![take_id_clone, block_id_clone, ord, widget_id_clone, now],
+            )?;
+            tx.execute(
+                "UPDATE script_speech_blocks SET selected_take = ?2 WHERE id = ?1",
+                params![block_id_clone, ord],
+            )?;
+            tx.commit()?;
+            Ok(Some(ord))
+        })
+        .await
+        .context("db task panicked")??;
+
+        Ok(ord_opt.map(|ord| ScriptTakeRow {
+            id: take_id,
+            ord,
+            widget_id,
+        }))
+    }
+
+    /// Set the block's `selected_take`. `selected` is the take ordinal (as
+    /// stored in `script_speech_takes.ord`). Rejects out-of-range values with
+    /// UpdateResult::NotFound so the caller returns a clean 404.
+    pub async fn set_selected_take(
+        &self,
+        block_id: String,
+        selected: i64,
+    ) -> Result<UpdateResult> {
+        let db = self.db.clone();
+        let block_id_clone = block_id.clone();
+        let rows = tokio::task::spawn_blocking(move || -> Result<usize> {
+            let conn = db.lock().unwrap();
+            // Guard against selecting an ord that has no matching take.
+            let exists: bool = conn
+                .query_row(
+                    "SELECT 1 FROM script_speech_takes
+                       WHERE block_id = ?1 AND ord = ?2",
+                    params![block_id_clone, selected],
+                    |_| Ok(true),
+                )
+                .optional()?
+                .unwrap_or(false);
+            if !exists {
+                return Ok(0);
+            }
+            let rows = conn.execute(
+                "UPDATE script_speech_blocks SET selected_take = ?2 WHERE id = ?1",
+                params![block_id_clone, selected],
+            )?;
+            Ok(rows)
+        })
+        .await
+        .context("db task panicked")??;
+        if rows == 0 {
+            return Ok(UpdateResult::NotFound);
+        }
+        Ok(UpdateResult::Updated)
+    }
+
+    /// Delete a take and its widget. Returns the pair (block_id, widget_id)
+    /// so the caller can cascade-delete the widget's WAV. If the take was
+    /// the block's `selected_take`, we shift selection to the highest
+    /// remaining ord (typically the previous take) or NULL if none remain.
+    pub async fn delete_take(&self, take_id: String) -> Result<Option<DeletedTake>> {
+        let db = self.db.clone();
+        let take_id_clone = take_id.clone();
+        let deleted = tokio::task::spawn_blocking(move || -> Result<Option<DeletedTake>> {
+            let mut conn = db.lock().unwrap();
+            let tx = conn.transaction()?;
+            let row: Option<(String, i64, String)> = tx
+                .query_row(
+                    "SELECT block_id, ord, widget_id FROM script_speech_takes WHERE id = ?1",
+                    params![take_id_clone],
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?)),
+                )
+                .optional()?;
+            let Some((block_id, ord, widget_id)) = row else {
+                return Ok(None);
+            };
+            tx.execute(
+                "DELETE FROM script_speech_takes WHERE id = ?1",
+                params![take_id_clone],
+            )?;
+            // Fix up selected_take if it pointed at the deleted ord.
+            let cur_selected: Option<i64> = tx
+                .query_row(
+                    "SELECT selected_take FROM script_speech_blocks WHERE id = ?1",
+                    params![block_id],
+                    |r| r.get::<_, Option<i64>>(0),
+                )
+                .optional()?
+                .flatten();
+            if cur_selected == Some(ord) {
+                let next: Option<i64> = tx
+                    .query_row(
+                        "SELECT MAX(ord) FROM script_speech_takes WHERE block_id = ?1",
+                        params![block_id],
+                        |r| r.get::<_, Option<i64>>(0),
+                    )
+                    .optional()?
+                    .flatten();
+                tx.execute(
+                    "UPDATE script_speech_blocks SET selected_take = ?2 WHERE id = ?1",
+                    params![block_id, next],
+                )?;
+            }
+            tx.commit()?;
+            Ok(Some(DeletedTake {
+                block_id,
+                widget_id,
+            }))
+        })
+        .await
+        .context("db task panicked")??;
+        Ok(deleted)
+    }
+
+    /// Wipe every turn (and cascade-delete every block/take/widget) for a
+    /// script. Returns the list of widget ids that were cascaded so the
+    /// caller can drop their WAV files from disk. The script row itself
+    /// stays — a fresh conversation starts empty in the same slot.
+    pub async fn clear_script(&self, script_id: String) -> Result<Vec<String>> {
+        let db = self.db.clone();
+        let widget_ids = tokio::task::spawn_blocking(move || -> Result<Vec<String>> {
+            let mut conn = db.lock().unwrap();
+            let tx = conn.transaction()?;
+            // Collect widget ids first so we can hand them back for WAV
+            // cleanup — the DELETE below cascades the rows themselves.
+            let mut stmt = tx.prepare(
+                "SELECT t.widget_id
+                   FROM script_speech_takes t
+                   JOIN script_speech_blocks b ON b.id = t.block_id
+                   JOIN script_turns tr        ON tr.id = b.turn_id
+                  WHERE tr.script_id = ?1",
+            )?;
+            let ids: Vec<String> = stmt
+                .query_map(params![script_id], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(stmt);
+            tx.execute(
+                "DELETE FROM script_turns WHERE script_id = ?1",
+                params![script_id],
+            )?;
+            tx.commit()?;
+            Ok(ids)
+        })
+        .await
+        .context("db task panicked")??;
+        Ok(widget_ids)
+    }
+
+    /// Look up the on-disk text of a speech block so a `POST .../takes` can
+    /// re-render without the client having to echo the text back.
+    pub async fn get_block_text(&self, block_id: String) -> Result<Option<String>> {
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || -> Result<Option<String>> {
+            let conn = db.lock().unwrap();
+            let text = conn
+                .query_row(
+                    "SELECT text FROM script_speech_blocks WHERE id = ?1",
+                    params![block_id],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?;
+            Ok(text)
+        })
+        .await
+        .context("db task panicked")?
+    }
 }
 
 pub enum UpdateResult {
@@ -413,6 +844,38 @@ pub struct WidgetRow {
 pub struct ImageRow {
     pub mime: String,
     pub byte_size: u64,
+}
+
+pub struct ScriptRow {
+    pub id: String,
+    pub turns: Vec<ScriptTurnRow>,
+}
+
+pub struct ScriptTurnRow {
+    pub id: String,
+    pub ord: i64,
+    pub role: String,
+    pub content: String,
+    pub blocks: Vec<ScriptBlockRow>,
+}
+
+pub struct ScriptBlockRow {
+    pub id: String,
+    pub ord: i64,
+    pub text: String,
+    pub selected_take: Option<i64>,
+    pub takes: Vec<ScriptTakeRow>,
+}
+
+pub struct ScriptTakeRow {
+    pub id: String,
+    pub ord: i64,
+    pub widget_id: String,
+}
+
+pub struct DeletedTake {
+    pub block_id: String,
+    pub widget_id: String,
 }
 
 fn unix_now() -> i64 {

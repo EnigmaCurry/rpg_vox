@@ -8,7 +8,24 @@
 //!
 //!   POST /say                  { text, configs: [{...}, ...] }
 //!                              → { ok, frames } — pushes to the virtual
-//!                              mic; used by Chat + Scenes.
+//!                              mic; used by Scenes.
+//!   GET    /script                                   → full script state
+//!                              (turns + blocks + takes) for the default
+//!                              script.
+//!   POST   /script            { text } → { turn } — append a user turn,
+//!                              call the LLM, parse `<speak>` blocks, return
+//!                              the new assistant turn (blocks present, no
+//!                              takes yet — the client kicks a per-block
+//!                              /takes render).
+//!   DELETE /script            → 200 — clear every turn (and cascade the
+//!                              per-block widgets/WAVs off disk).
+//!   POST   /script/blocks/:id/takes  { configs? } → { take, widget }
+//!                              — synthesize a fresh take for the block's
+//!                              stored text; auto-selects it.
+//!   PATCH  /script/blocks/:id  { selectedTake }     → 200 — pin the block's
+//!                              chosen take by ord.
+//!   DELETE /script/takes/:id                        → 200 — drop a take
+//!                              (cascades the widget + WAV).
 //!   POST /widgets              { text, configs: [{...}, ...] }
 //!                              → audio/wav (stereo) — synthesize, persist
 //!                              a new widget row + WAV in the store,
@@ -16,6 +33,11 @@
 //!   PUT  /widgets/:id          { text, configs: [{...}, ...] }
 //!                              → audio/wav — re-synthesize, overwrite the
 //!                              widget's row + WAV file.
+//!   PATCH /widgets/:id         { text }
+//!                              → 200 — update just the widget's text
+//!                              column without re-synthesizing. Used to
+//!                              correct an STT transcript on a recorded
+//!                              clip while leaving the audio intact.
 //!   DELETE /widgets/:id                             → 200 — drop the DB
 //!                              row and the WAV file (idempotent).
 //!   POST /widgets/:id/say                            → { ok, frames } —
@@ -83,8 +105,9 @@ use crate::chat;
 use crate::mixer::{AtomicMixer, MixerPatch};
 use crate::monitor;
 use crate::pw_source::{GraphSnapshot, PwClient, SinkRole};
+use crate::script;
 use crate::settings::{self, SettingsUpdate};
-use crate::store::{Store, UpdateResult};
+use crate::store::{DEFAULT_SCRIPT_ID, ScriptBlockRow, ScriptTakeRow, ScriptTurnRow, Store, UpdateResult};
 use crate::stt::SttHandle;
 use tokio::sync::broadcast;
 
@@ -287,6 +310,7 @@ pub async fn serve(
             "/widgets/:id",
             axum::routing::get(widget_get_handler)
                 .put(widget_update_handler)
+                .patch(widget_patch_handler)
                 .delete(widget_delete_handler),
         )
         .route("/widgets/:id/say", post(widget_say_handler))
@@ -337,8 +361,20 @@ pub async fn serve(
         .route("/workflow/verify", post(verify_workflow))
         .route("/workflow/warmup", post(warmup_workflow))
         .route(
-            "/chat",
-            get(chat_history).post(chat_send).delete(chat_reset),
+            "/script",
+            get(script_get).post(script_send).delete(script_reset),
+        )
+        .route(
+            "/script/blocks/:id",
+            axum::routing::patch(script_block_patch),
+        )
+        .route(
+            "/script/blocks/:id/takes",
+            post(script_block_add_take),
+        )
+        .route(
+            "/script/takes/:id",
+            axum::routing::delete(script_take_delete),
         )
         .with_state(state);
 
@@ -724,120 +760,403 @@ async fn say_handler(
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct ChatSendBody {
-    text: String,
-    /// If true (default), the assistant's reply is queued into the TTS path so
-    /// the mic speaks it.
-    #[serde(default = "default_speak")]
-    speak: bool,
-}
+// ---------------------------------------------------------------------------
+// /script — chat-style conversation whose assistant turns can carry inline
+// `<speak>…</speak>` blocks. Each block gets its own persistent row and one
+// or more "takes" (widget clips). The client renders the assistant content
+// as markdown, splicing an inline audio widget in place of each block.
+// ---------------------------------------------------------------------------
 
-fn default_speak() -> bool {
-    true
+#[derive(Debug, Serialize)]
+struct ScriptTake {
+    id: String,
+    ord: i64,
+    widget_id: String,
+    /// Cached clip metadata copied from the widget row so the client can size
+    /// its progress UI without a second /widgets/:id round trip. `None` when
+    /// the widget row was already gone (shouldn't happen in practice, but the
+    /// FK cascade could race with delete).
+    sample_rate: Option<u32>,
+    duration_ms: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
-struct ChatSendResponse {
-    ok: bool,
-    reply: Option<String>,
-    spoken: bool,
-    error: Option<String>,
+struct ScriptBlock {
+    id: String,
+    ord: i64,
+    text: String,
+    selected_take: Option<i64>,
+    takes: Vec<ScriptTake>,
 }
 
-async fn chat_history(State(state): State<AppState>) -> impl IntoResponse {
-    let h = state.chat.history_snapshot().await;
-    (StatusCode::OK, Json(h)).into_response()
+#[derive(Debug, Serialize)]
+struct ScriptTurn {
+    id: String,
+    ord: i64,
+    role: String,
+    content: String,
+    blocks: Vec<ScriptBlock>,
 }
 
-async fn chat_reset(State(state): State<AppState>) -> impl IntoResponse {
-    state.chat.reset().await;
+#[derive(Debug, Serialize)]
+struct ScriptView {
+    id: String,
+    turns: Vec<ScriptTurn>,
+}
+
+async fn take_view(store: &Store, row: ScriptTakeRow) -> ScriptTake {
+    let (sample_rate, duration_ms) = match store.get_widget(row.widget_id.clone()).await {
+        Ok(Some(w)) => (Some(w.sample_rate), Some(w.duration_ms)),
+        _ => (None, None),
+    };
+    ScriptTake {
+        id: row.id,
+        ord: row.ord,
+        widget_id: row.widget_id,
+        sample_rate,
+        duration_ms,
+    }
+}
+
+async fn block_view(store: &Store, row: ScriptBlockRow) -> ScriptBlock {
+    let mut takes = Vec::with_capacity(row.takes.len());
+    for t in row.takes {
+        takes.push(take_view(store, t).await);
+    }
+    ScriptBlock {
+        id: row.id,
+        ord: row.ord,
+        text: row.text,
+        selected_take: row.selected_take,
+        takes,
+    }
+}
+
+async fn turn_view(store: &Store, row: ScriptTurnRow) -> ScriptTurn {
+    let mut blocks = Vec::with_capacity(row.blocks.len());
+    for b in row.blocks {
+        blocks.push(block_view(store, b).await);
+    }
+    ScriptTurn {
+        id: row.id,
+        ord: row.ord,
+        role: row.role,
+        content: row.content,
+        blocks,
+    }
+}
+
+async fn script_get(State(state): State<AppState>) -> Response {
+    let row = match state.store.get_script(DEFAULT_SCRIPT_ID.to_string()).await {
+        Ok(r) => r,
+        Err(err) => {
+            tracing::error!(err = %format!("{err:#}"), "store: script get failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("store: {err:#}"),
+            )
+                .into_response();
+        }
+    };
+    let mut turns = Vec::with_capacity(row.turns.len());
+    for t in row.turns {
+        turns.push(turn_view(&state.store, t).await);
+    }
     (
         StatusCode::OK,
-        Json(ActionResponse {
-            ok: true,
-            error: None,
+        Json(ScriptView {
+            id: row.id,
+            turns,
         }),
     )
         .into_response()
 }
 
-async fn chat_send(
+#[derive(Debug, Deserialize)]
+struct ScriptSendBody {
+    text: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ScriptSendResponse {
+    user_turn: ScriptTurn,
+    assistant_turn: ScriptTurn,
+}
+
+async fn script_send(
     State(state): State<AppState>,
-    Json(body): Json<ChatSendBody>,
-) -> impl IntoResponse {
+    Json(body): Json<ScriptSendBody>,
+) -> Response {
     let text = body.text.trim().to_string();
     if text.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ChatSendResponse {
-                ok: false,
-                reply: None,
-                spoken: false,
-                error: Some("empty text".into()),
-            }),
-        )
-            .into_response();
+        return (StatusCode::BAD_REQUEST, "empty text").into_response();
     }
+
+    // Persist the user turn before the LLM call so a slow model reply doesn't
+    // leave the user's message stranded in the client's optimistic state.
+    let user_row = match state
+        .store
+        .create_turn(
+            DEFAULT_SCRIPT_ID.to_string(),
+            "user".into(),
+            text.clone(),
+            Vec::new(),
+        )
+        .await
+    {
+        Ok(r) => r,
+        Err(err) => {
+            tracing::error!(err = %format!("{err:#}"), "store: user turn insert failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("store: {err:#}"),
+            )
+                .into_response();
+        }
+    };
+    let user_turn = turn_view(&state.store, user_row).await;
 
     let reply = match state.chat.send(text).await {
         Ok(r) => r,
         Err(err) => {
             return (
                 StatusCode::BAD_GATEWAY,
-                Json(ChatSendResponse {
+                format!("llm: {err:#}"),
+            )
+                .into_response();
+        }
+    };
+
+    let blocks = script::extract_speech_blocks(&reply);
+    let assistant_row = match state
+        .store
+        .create_turn(
+            DEFAULT_SCRIPT_ID.to_string(),
+            "assistant".into(),
+            reply,
+            blocks,
+        )
+        .await
+    {
+        Ok(r) => r,
+        Err(err) => {
+            tracing::error!(err = %format!("{err:#}"), "store: assistant turn insert failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("store: {err:#}"),
+            )
+                .into_response();
+        }
+    };
+    let assistant_turn = turn_view(&state.store, assistant_row).await;
+
+    (
+        StatusCode::OK,
+        Json(ScriptSendResponse {
+            user_turn,
+            assistant_turn,
+        }),
+    )
+        .into_response()
+}
+
+async fn script_reset(State(state): State<AppState>) -> Response {
+    let widget_ids = match state
+        .store
+        .clear_script(DEFAULT_SCRIPT_ID.to_string())
+        .await
+    {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::error!(err = %format!("{err:#}"), "store: script clear failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ActionResponse {
                     ok: false,
-                    reply: None,
-                    spoken: false,
                     error: Some(format!("{err:#}")),
                 }),
             )
                 .into_response();
         }
     };
+    // WAV files aren't cascaded by sqlite FKs — the FK drops the widget rows,
+    // we clean up the on-disk files here. Best-effort: log and continue on
+    // per-file failure so one stuck file doesn't block the rest.
+    for wid in widget_ids {
+        let path = state.store.clip_path(&wid);
+        if let Err(e) = tokio::fs::remove_file(&path).await {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(id = %wid, err = %e, "clip cleanup failed on script reset");
+            }
+        }
+    }
+    // Also reset the in-process LLM history so a fresh conversation starts
+    // clean (the sqlite-backed script view already looks empty).
+    state.chat.reset().await;
+    (StatusCode::OK, Json(ActionResponse { ok: true, error: None })).into_response()
+}
 
-    let spoken = if body.speak {
-        speak_async(state.tts.clone(), reply.clone());
-        true
-    } else {
-        false
+#[derive(Debug, Deserialize)]
+struct ScriptAddTakeBody {
+    #[serde(default)]
+    configs: Vec<ConfigBody>,
+}
+
+#[derive(Debug, Serialize)]
+struct ScriptAddTakeResponse {
+    take: ScriptTake,
+    /// Echo of the freshly minted widget's clip metadata so the client can
+    /// wire up its progress bar without a second /widgets/:id call.
+    sample_rate: u32,
+    duration_ms: u64,
+}
+
+async fn script_block_add_take(
+    State(state): State<AppState>,
+    Path(block_id): Path<String>,
+    Json(body): Json<ScriptAddTakeBody>,
+) -> Response {
+    let text = match state.store.get_block_text(block_id.clone()).await {
+        Ok(Some(t)) => t,
+        Ok(None) => return (StatusCode::NOT_FOUND, format!("no block {block_id}")).into_response(),
+        Err(err) => {
+            tracing::error!(err = %format!("{err:#}"), %block_id, "store: block lookup failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("store: {err:#}"),
+            )
+                .into_response();
+        }
     };
 
+    let configs = configs_or_default(body.configs);
+    let persist_instruct = configs.first().and_then(|c| c.instruct.clone());
+    let clip = match render_clip(&state, text.clone(), configs).await {
+        Ok(c) => c,
+        Err((code, msg)) => return (code, msg).into_response(),
+    };
+    let widget_id = match state
+        .store
+        .create_widget(
+            text,
+            persist_instruct,
+            clip.sample_rate,
+            clip.duration_ms,
+            clip.wav.clone(),
+        )
+        .await
+    {
+        Ok(id) => id,
+        Err(err) => {
+            tracing::error!(err = %format!("{err:#}"), "store: create widget failed for take");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("store: {err:#}"),
+            )
+                .into_response();
+        }
+    };
+    let take_row = match state
+        .store
+        .append_take(block_id.clone(), widget_id.clone())
+        .await
+    {
+        Ok(Some(row)) => row,
+        Ok(None) => {
+            // Block vanished between the text lookup and the take insert.
+            // Best-effort cleanup of the widget we just made so we don't
+            // strand the WAV file.
+            let _ = state.store.delete_widget(widget_id).await;
+            return (StatusCode::NOT_FOUND, format!("no block {block_id}")).into_response();
+        }
+        Err(err) => {
+            tracing::error!(err = %format!("{err:#}"), %block_id, "store: append take failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("store: {err:#}"),
+            )
+                .into_response();
+        }
+    };
+
+    let take = ScriptTake {
+        id: take_row.id,
+        ord: take_row.ord,
+        widget_id: take_row.widget_id,
+        sample_rate: Some(clip.sample_rate),
+        duration_ms: Some(clip.duration_ms),
+    };
     (
         StatusCode::OK,
-        Json(ChatSendResponse {
-            ok: true,
-            reply: Some(reply),
-            spoken,
-            error: None,
+        Json(ScriptAddTakeResponse {
+            take,
+            sample_rate: clip.sample_rate,
+            duration_ms: clip.duration_ms,
         }),
     )
         .into_response()
 }
 
-/// Fire-and-forget a TTS request; log any error so the chat HTTP response
-/// isn't held up on audio generation.
-fn speak_async(tts: Sender<Command>, text: String) {
-    tokio::spawn(async move {
-        let (tx, rx) = oneshot::channel();
-        if tts
-            .send(Command::Say(SayRequest {
-                text,
-                configs: vec![VoiceConfig::default()],
-                reply: tx,
-            }))
-            .await
-            .is_err()
-        {
-            tracing::warn!("tts channel closed; chat reply not spoken");
-            return;
+#[derive(Debug, Deserialize)]
+struct ScriptBlockPatchBody {
+    #[serde(rename = "selectedTake")]
+    selected_take: i64,
+}
+
+async fn script_block_patch(
+    State(state): State<AppState>,
+    Path(block_id): Path<String>,
+    Json(body): Json<ScriptBlockPatchBody>,
+) -> Response {
+    match state
+        .store
+        .set_selected_take(block_id.clone(), body.selected_take)
+        .await
+    {
+        Ok(UpdateResult::Updated) => {
+            (StatusCode::OK, Json(ActionResponse { ok: true, error: None })).into_response()
         }
-        match rx.await {
-            Ok(Ok(frames)) => tracing::debug!(frames, "chat reply queued to mic"),
-            Ok(Err(err)) => tracing::warn!(err = %err, "chat reply tts failed"),
-            Err(_) => tracing::warn!("tts dropped reply oneshot"),
+        Ok(UpdateResult::NotFound) => (
+            StatusCode::NOT_FOUND,
+            format!("no take with ord {} on block {block_id}", body.selected_take),
+        )
+            .into_response(),
+        Err(err) => {
+            tracing::error!(err = %format!("{err:#}"), %block_id, "store: selected take update failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("store: {err:#}"),
+            )
+                .into_response()
         }
-    });
+    }
+}
+
+async fn script_take_delete(
+    State(state): State<AppState>,
+    Path(take_id): Path<String>,
+) -> Response {
+    let deleted = match state.store.delete_take(take_id.clone()).await {
+        Ok(Some(d)) => d,
+        Ok(None) => return (StatusCode::NOT_FOUND, format!("no take {take_id}")).into_response(),
+        Err(err) => {
+            tracing::error!(err = %format!("{err:#}"), %take_id, "store: delete take failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("store: {err:#}"),
+            )
+                .into_response();
+        }
+    };
+    // Drop the widget row + WAV file. The FK cascade would already have
+    // dropped the row when we deleted the take, so this is best-effort
+    // cleanup of any stray on-disk WAV. (delete_widget is idempotent on
+    // missing rows.)
+    if let Err(err) = state.store.delete_widget(deleted.widget_id.clone()).await {
+        tracing::warn!(err = %format!("{err:#}"), widget_id = %deleted.widget_id, "widget cleanup after take delete failed");
+    }
+    let _ = deleted.block_id;
+    (StatusCode::OK, Json(ActionResponse { ok: true, error: None })).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -1030,6 +1349,44 @@ async fn widget_update_handler(
 
     info!(%id, "widget updated");
     wav_response(&id, clip)
+}
+
+/// Body for `PATCH /widgets/:id`. Only the caption text is updatable
+/// through this route — everything else (WAV, configs, sample rate)
+/// stays as-is so an STT-corrected recording keeps its audio.
+#[derive(Debug, Deserialize)]
+struct WidgetPatchBody {
+    text: String,
+}
+
+/// Update the widget's caption without touching audio. Empty text is
+/// allowed (recordings don't require a caption, same as at record-stop time).
+async fn widget_patch_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<WidgetPatchBody>,
+) -> Response {
+    let text = body.text.trim().to_string();
+    match state.store.update_widget_text(id.clone(), text).await {
+        Ok(UpdateResult::Updated) => {
+            info!(%id, "widget text updated");
+            (StatusCode::OK, Json(ActionResponse { ok: true, error: None })).into_response()
+        }
+        Ok(UpdateResult::NotFound) => {
+            (StatusCode::NOT_FOUND, format!("no widget with id {id}")).into_response()
+        }
+        Err(err) => {
+            tracing::error!(err = %format!("{err:#}"), %id, "store: text update failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ActionResponse {
+                    ok: false,
+                    error: Some(format!("{err:#}")),
+                }),
+            )
+                .into_response()
+        }
+    }
 }
 
 /// Read a previously-rendered clip back from disk. Used by the client on
@@ -1428,10 +1785,19 @@ async fn widget_record_stop_handler(
     if pairs.is_empty() {
         return (StatusCode::BAD_REQUEST, "recording is empty").into_response();
     }
-    let mono_for_stt: Vec<f32> = pairs.iter().map(|p| (p[0] + p[1]) * 0.5).collect();
 
     let sample_rate = state.vox_sample_rate;
-    let duration_ms = (pairs.len() as u64 * 1000) / sample_rate.max(1) as u64;
+
+    // Trim leading + trailing silence so a hesitant start or a slow finger
+    // on Stop doesn't leave dead air on either end of the saved clip. STT
+    // gets the trimmed audio too so its transcript reflects what actually
+    // plays back.
+    let (trim_start, trim_end) = trim_silence_range(&pairs, sample_rate);
+    let trimmed: &[[f32; 2]] = &pairs[trim_start..trim_end];
+
+    let mono_for_stt: Vec<f32> = trimmed.iter().map(|p| (p[0] + p[1]) * 0.5).collect();
+
+    let duration_ms = (trimmed.len() as u64 * 1000) / sample_rate.max(1) as u64;
 
     // Transcribe on a blocking pool if STT is loaded — sherpa-onnx's decode
     // is CPU-bound (feature extraction + ONNX inference) and can take
@@ -1467,7 +1833,7 @@ async fn widget_record_stop_handler(
     // WAV encoding is cheap (linear pass over a Vec) so we do it inline
     // after the STT pass — no benefit to overlapping the two on this
     // short clip.
-    let wav = encode_wav_pcm16_stereo(&pairs, sample_rate);
+    let wav = encode_wav_pcm16_stereo(trimmed, sample_rate);
 
     // Prefer a non-empty transcript over whatever the client typed; both
     // being empty is fine (widget row's `text` column stores "" cleanly).
@@ -1524,7 +1890,14 @@ async fn widget_record_stop_handler(
         }
     };
 
-    info!(%id, %session_id, frames = pairs.len(), duration_ms, "recording saved as widget");
+    info!(
+        %id,
+        %session_id,
+        raw_frames = pairs.len(),
+        trimmed_frames = trimmed.len(),
+        duration_ms,
+        "recording saved as widget"
+    );
     (
         StatusCode::OK,
         Json(RecordStopResponse {
@@ -2036,6 +2409,33 @@ async fn state_put_handler(
 /// wrapping since TTS samples occasionally sit right at ±1.0.
 fn f32_to_i16_clipped(s: f32) -> i16 {
     (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16
+}
+
+/// Return the `[start, end)` sample range containing all audio above a
+/// silence threshold, with small pre/post rolls preserved so the attack
+/// and decay of speech aren't chopped. Returns the full range when the
+/// whole clip is below threshold — a silent recording stays silent rather
+/// than becoming a zero-length clip.
+fn trim_silence_range(pairs: &[[f32; 2]], sample_rate: u32) -> (usize, usize) {
+    // ~-45 dBFS: above the noise floor of a quiet virtual pipewire sink,
+    // low enough to catch a soft speech onset. If a hot mic pushes the
+    // noise floor above this, the user gets a partial trim rather than
+    // clipped audio — we prefer keeping too much to cutting real speech.
+    const THRESHOLD: f32 = 0.0056;
+    let pre_roll = (sample_rate as usize * 30) / 1000;   // 30 ms head
+    let post_roll = (sample_rate as usize * 120) / 1000; // 120 ms tail
+
+    let is_hot = |p: &[f32; 2]| p[0].abs().max(p[1].abs()) > THRESHOLD;
+    let first = pairs.iter().position(is_hot);
+    let last = pairs.iter().rposition(is_hot);
+    match (first, last) {
+        (Some(f), Some(l)) => {
+            let start = f.saturating_sub(pre_roll);
+            let end = (l + 1 + post_roll).min(pairs.len());
+            (start, end)
+        }
+        _ => (0, pairs.len()),
+    }
 }
 
 /// Encode a stereo f32 PCM buffer as a 16-bit little-endian WAV

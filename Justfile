@@ -85,6 +85,79 @@ say TEXT bind="127.0.0.1:7331":
 list-sources:
     pw-cli list-objects Node | grep -A1 -B1 "rpg-vox" || echo "rpg-vox not found — is the bridge running?"
 
+# --- LLM backend (llama.cpp — feeds /script via OpenAI-compat /v1) ---
+
+# Run llama.cpp's llama-server locally for the /script chat page. Pulls the
+# GGUF from Hugging Face on first launch and serves the OpenAI-compatible
+# API on --host/--port. Defaults match rpg_vox's chat client env
+# (RPG_VOX_CHAT_BASE_URL=http://127.0.0.1:9931/v1 + Muse-Glimmer-30B).
+#
+# Overridable via env (put in .env or export in the shell):
+#   LLAMA_HF_REPO     — Hugging Face repo id
+#   LLAMA_HF_FILE     — file inside the repo (.gguf)
+#   LLAMA_HOST        — bind host (default 127.0.0.1)
+#   LLAMA_PORT        — bind port (default 9931)
+#   LLAMA_GPU_LAYERS  — -ngl value (default "all"; use "0" for CPU-only)
+#   CONTEXT_SIZE      — -c value (default 131072 — tested working on 24GB VRAM)
+#
+# Pins the llama.cpp flake to a specific commit (stored in .llama-cpp.rev)
+# so the ROCm build stays in the /nix/store between runs — otherwise each
+# `nix shell github:ggml-org/llama.cpp#rocm` follows upstream HEAD and
+# recompiles whenever nixpkgs or llama.cpp move. Bump the pin with
+# `just llama_rocm_update`.
+#
+# --reasoning-format=none + --no-reasoning-preserve keep `<think>` blocks
+# inside `content` so rpg_vox's own strip pass handles them. Extra flags
+# are forwarded, e.g. `just llama_rocm --n-cpu-moe 24`.
+llama_rocm *ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    hf_repo="${LLAMA_HF_REPO:-meta-models/Muse-Glimmer-30B-GGUF}"
+    hf_file="${LLAMA_HF_FILE:-Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf}"
+    port="${LLAMA_PORT:-9931}"
+    host="${LLAMA_HOST:-127.0.0.1}"
+    gpu_layers="${LLAMA_GPU_LAYERS:-all}"
+    context_size="${CONTEXT_SIZE:-131072}"
+    lockfile=".llama-cpp.rev"
+    if [[ ! -s "$lockfile" ]]; then
+        echo "resolving latest github:ggml-org/llama.cpp commit (one-time)…"
+        rev=$(nix flake metadata --refresh --no-write-lock-file --json github:ggml-org/llama.cpp | jq -r .locked.rev)
+        if [[ -z "$rev" || "$rev" == "null" ]]; then
+            echo "failed to resolve llama.cpp revision" >&2
+            exit 1
+        fi
+        echo "$rev" > "$lockfile"
+        echo "pinned llama.cpp @ $rev → $lockfile (bump with: just llama_rocm_update)"
+    fi
+    rev=$(cat "$lockfile")
+    echo "llama.cpp (rocm) @ ${rev:0:12}: model=$hf_repo/$hf_file listening on $host:$port (ctx=$context_size)"
+    nix shell --no-write-lock-file "github:ggml-org/llama.cpp/$rev#rocm" -c llama-server \
+        -hf "$hf_repo" \
+        -hff "$hf_file" \
+        --no-mmproj \
+        -ngl "$gpu_layers" \
+        -c "$context_size" \
+        -np 1 \
+        -fa on \
+        --host "$host" \
+        --port "$port" \
+        --reasoning-format none \
+        --no-reasoning-preserve \
+        {{ARGS}}
+
+# Refresh the .llama-cpp.rev pin to the current github:ggml-org/llama.cpp
+# HEAD. Next `just llama_rocm` will fetch + recompile against the new rev.
+llama_rocm_update:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    rev=$(nix flake metadata --refresh --no-write-lock-file --json github:ggml-org/llama.cpp | jq -r .locked.rev)
+    if [[ -z "$rev" || "$rev" == "null" ]]; then
+        echo "failed to resolve llama.cpp revision" >&2
+        exit 1
+    fi
+    echo "$rev" > .llama-cpp.rev
+    echo "pinned llama.cpp @ $rev"
+
 # Download the SenseVoice int8 STT model into models/sense-voice/. Used by
 # /widgets/record to transcribe captured audio into the SpeakCell caption.
 # ~230 MB one-time download from the k2-fsa GitHub release; skipped if
