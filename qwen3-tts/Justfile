@@ -1,0 +1,81 @@
+# Auto-load qwen3-tts/.env into recipe environments AND into env_var()
+# lookups below. Missing .env is silently OK at parse time (env_var_or_default
+# returns "") so the `_env` recipe below can seed it on first run before
+# docker actually needs the connection string.
+set dotenv-load := true
+
+# Docker daemon connection string, threaded through as $DOCKER_HOST so both
+# `docker` and `docker compose` calls in the recipes below pick it up. Value
+# lives in `.env` (populated from `.env-dist`), not hardcoded here — that
+# keeps the deployment target of the maintainer out of the checked-in file.
+export DOCKER_HOST := env_var_or_default("QWEN3_TTS_DOCKER_HOST", "")
+
+default:
+    @just --list
+
+# Seed `.env` from `.env-dist` if the user hasn't created one yet. Runs
+# as a dep of every recipe that shells out to `docker compose`, so a
+# fresh checkout can `just up` without first remembering the `cp` step.
+# Prints a loud reminder when it fires so the placeholder hostnames in
+# `.env-dist` don't quietly ship to Traefik.
+_env:
+    @if [ ! -f .env ]; then \
+        cp .env-dist .env && \
+        echo "" && \
+        echo "⚠  qwen3-tts/.env did not exist — seeded from .env-dist." && \
+        echo "   Edit qwen3-tts/.env now to set your real Traefik hostnames" && \
+        echo "   before running \`just up\` — the .env-dist placeholders point" && \
+        echo "   at example.com and will not route to your host." && \
+        echo "" ; \
+    fi
+
+# Build the image on the remote docker host
+build: _env
+    docker compose build
+
+# Start the service in background
+up: _env
+    docker compose up -d
+
+# Stop and remove containers
+down: _env
+    docker compose down
+
+# Restart the container
+restart: _env
+    docker compose restart
+
+# Tail logs
+logs: _env
+    docker compose logs -f --tail=200
+
+# Interactive bash in one of the qwen3-tts containers.
+# service = presets | clone | design
+shell service="presets": _env
+    docker compose exec {{service}} bash
+
+# Compose service status (all three services)
+status: _env
+    docker compose ps
+
+# Remote container list
+ps:
+    docker ps
+
+# nvidia-smi inside a chosen qwen3-tts container.
+# service = presets | clone | design
+gpu service="presets": _env
+    docker compose exec {{service}} nvidia-smi
+
+# nvidia-smi on the remote host (bypasses docker — talks to the OS directly).
+# Parses the user@host portion out of DOCKER_HOST=ssh://user@host; falls apart
+# for non-ssh docker URLs (unix:///…, tcp://…) since there's no host to
+# reach over ssh in those cases.
+gpu-host: _env
+    #!/usr/bin/env bash
+    set -eu
+    case "$DOCKER_HOST" in
+        ssh://*) ssh "${DOCKER_HOST#ssh://}" nvidia-smi ;;
+        "")      echo "QWEN3_TTS_DOCKER_HOST is empty in qwen3-tts/.env" >&2; exit 1 ;;
+        *)       echo "gpu-host only supports ssh:// DOCKER_HOST (got: $DOCKER_HOST)" >&2; exit 1 ;;
+    esac
