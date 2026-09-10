@@ -1,20 +1,33 @@
 // Client-side store for Project → Scene → Lane / Clip organization,
 // plus per-project Characters.
 //
-// Data shape (v4):
+// Data shape (v5):
 //   project   = { id, name }
 //   character = {
 //     id, projectId, name,
 //     voiceProfiles: [{                    // >=1; first is the fallback "default"
 //       id, name,
+//       mode,                              // 'presets' | 'clone' | 'design'
 //       configs: [{                        // >=1; N>1 = layered hive-mind synth
 //         id,
-//         speaker, language, instruct,     // Qwen3 backend inputs
+//         // Preset-mode fields (unused in clone/design):
+//         speaker, instruct,               // Qwen3 preset-model inputs
+//         // Design-mode field:
+//         description,                     // free-text voice description
+//         // Clone-mode field:
+//         voiceFileId,                     // server-side /voices/{id} ref
+//         // Common across all modes:
+//         language,                        // lang_disp for every Qwen3 endpoint
 //         pitchSemitones, timeRatio,       // post-synthesis DSP (per-config)
 //         detuneCents,                     // fine pitch offset (added to semitones)
 //         pan,                             // -1 = full L, +1 = full R (equal-power)
 //         gainDb,                          // per-voice level in dB
 //         delayMs,                         // start offset in the final mix
+//         doublerSemitones,                // pitched second copy summed in (0 = off)
+//         hpfHz, lpfHz,                    // one-pole bandpass (0 = off, either side)
+//         driveDb,                         // tanh saturation drive in dB (0 = off)
+//         crushBits,                       // bit-crush quantization depth (0 = off)
+//         amRateHz, amDepth,               // amplitude-mod / tremolo (rate 0 = off)
 //       }],
 //     }],
 //     avatar: dataUrl | null,
@@ -153,15 +166,25 @@ export const QWEN3_LANGUAGES = [
 ];
 
 // Effect defaults live here so every place that constructs or sanitizes a
-// config stays in sync. `pitchSemitones = 0`, `timeRatio = 1`, `detuneCents = 0`,
-// `pan = 0`, `gainDb = 0`, and `delayMs = 0` are the identity values the server
-// short-circuits on (pitch/time) or treats as neutral (pan/gain/delay).
-export const CONFIG_PITCH_RANGE   = { min: -24,  max: 24,  step: 1 };
-export const CONFIG_TIME_RANGE    = { min: 0.25, max: 4,   step: 0.05 };
-export const CONFIG_DETUNE_RANGE  = { min: -100, max: 100, step: 1 };
-export const CONFIG_PAN_RANGE     = { min: -1,   max: 1,   step: 0.05 };
-export const CONFIG_GAIN_DB_RANGE = { min: -60,  max: 12,  step: 0.5 };
-export const CONFIG_DELAY_MS_RANGE = { min: 0,   max: 5000, step: 10 };
+// config stays in sync. All-zero identity values (except `timeRatio = 1`)
+// are what the server short-circuits on so an all-defaults config pays
+// no DSP cost. Every knob whose range starts at 0 uses 0 as its "off"
+// sentinel: doubler at 0st is disabled, HPF/LPF at 0 Hz are bypassed,
+// driveDb=0 skips the saturator, crushBits=0 skips the quantizer, and
+// amRateHz=0 or amDepth=0 skips the tremolo pass.
+export const CONFIG_PITCH_RANGE       = { min: -24,  max: 24,   step: 1 };
+export const CONFIG_TIME_RANGE        = { min: 0.25, max: 4,    step: 0.05 };
+export const CONFIG_DETUNE_RANGE      = { min: -100, max: 100,  step: 1 };
+export const CONFIG_PAN_RANGE         = { min: -1,   max: 1,    step: 0.05 };
+export const CONFIG_GAIN_DB_RANGE     = { min: -60,  max: 12,   step: 0.5 };
+export const CONFIG_DELAY_MS_RANGE    = { min: 0,    max: 5000, step: 10 };
+export const CONFIG_DOUBLER_RANGE     = { min: -24,  max: 24,   step: 1 };
+export const CONFIG_HPF_RANGE         = { min: 0,    max: 2000, step: 10 };
+export const CONFIG_LPF_RANGE         = { min: 0,    max: 20000, step: 100 };
+export const CONFIG_DRIVE_DB_RANGE    = { min: 0,    max: 24,   step: 0.5 };
+export const CONFIG_CRUSH_BITS_RANGE  = { min: 0,    max: 16,   step: 1 };
+export const CONFIG_AM_RATE_RANGE     = { min: 0,    max: 200,  step: 1 };
+export const CONFIG_AM_DEPTH_RANGE    = { min: 0,    max: 1,    step: 0.05 };
 
 function clampNumber(value, fallback, min, max) {
   const n = Number(value);
@@ -169,38 +192,65 @@ function clampNumber(value, fallback, min, max) {
   return Math.min(max, Math.max(min, n));
 }
 
+// Enum of voice profile modes. The mode picks which Qwen3 backend the
+// server routes synth through — see http.rs's resolve_character_configs
+// and tts::SynthMode.
+export const VOICE_MODES = ['presets', 'clone', 'design'];
+export const DEFAULT_VOICE_MODE = 'presets';
+
 // Seed a single voice config with the given speaker/language and default
 // (identity) effects. Callers that need a specific instruct/pitch/etc.
-// override the returned fields directly.
+// override the returned fields directly. Mode-specific fields (description,
+// voiceFileId) start empty; the UI populates them when the parent profile
+// switches to a mode that uses them.
 function makeConfig({
   speaker = QWEN3_SPEAKERS[0],
   language = QWEN3_LANGUAGES[0],
   instruct = '',
+  description = '',
+  voiceFileId = null,
   pitchSemitones = 0,
   timeRatio = 1,
   detuneCents = 0,
   pan = 0,
   gainDb = 0,
   delayMs = 0,
+  doublerSemitones = 0,
+  hpfHz = 0,
+  lpfHz = 0,
+  driveDb = 0,
+  crushBits = 0,
+  amRateHz = 0,
+  amDepth = 0,
 } = {}) {
   return {
     id: uuid(),
     speaker,
     language,
     instruct,
+    description,
+    voiceFileId,
     pitchSemitones,
     timeRatio,
     detuneCents,
     pan,
     gainDb,
     delayMs,
+    doublerSemitones,
+    hpfHz,
+    lpfHz,
+    driveDb,
+    crushBits,
+    amRateHz,
+    amDepth,
   };
 }
 
-function makeVoiceProfile(name = 'default', configs = null) {
+function makeVoiceProfile(name = 'default', configs = null, mode = DEFAULT_VOICE_MODE) {
   return {
     id: uuid(),
     name,
+    mode: VOICE_MODES.includes(mode) ? mode : DEFAULT_VOICE_MODE,
     configs: configs && configs.length > 0 ? configs : [makeConfig()],
   };
 }
@@ -219,12 +269,24 @@ function sanitizeConfig(raw) {
     speaker: typeof c.speaker === 'string' && c.speaker ? c.speaker : QWEN3_SPEAKERS[0],
     language: typeof c.language === 'string' && c.language ? c.language : QWEN3_LANGUAGES[0],
     instruct: typeof c.instruct === 'string' ? c.instruct : '',
-    pitchSemitones: clampNumber(c.pitchSemitones, 0, CONFIG_PITCH_RANGE.min, CONFIG_PITCH_RANGE.max),
-    timeRatio:      clampNumber(c.timeRatio,      1, CONFIG_TIME_RANGE.min,  CONFIG_TIME_RANGE.max),
-    detuneCents:    clampNumber(c.detuneCents,    0, CONFIG_DETUNE_RANGE.min, CONFIG_DETUNE_RANGE.max),
-    pan:            clampNumber(c.pan,            0, CONFIG_PAN_RANGE.min,   CONFIG_PAN_RANGE.max),
-    gainDb:         clampNumber(c.gainDb,         0, CONFIG_GAIN_DB_RANGE.min, CONFIG_GAIN_DB_RANGE.max),
-    delayMs:        clampNumber(c.delayMs,        0, CONFIG_DELAY_MS_RANGE.min, CONFIG_DELAY_MS_RANGE.max),
+    // Mode-specific fields default to empty; migrating a legacy profile
+    // (which was implicitly preset-mode) leaves these idle until the user
+    // switches modes.
+    description: typeof c.description === 'string' ? c.description : '',
+    voiceFileId: typeof c.voiceFileId === 'string' && c.voiceFileId ? c.voiceFileId : null,
+    pitchSemitones:   clampNumber(c.pitchSemitones,   0, CONFIG_PITCH_RANGE.min,      CONFIG_PITCH_RANGE.max),
+    timeRatio:        clampNumber(c.timeRatio,        1, CONFIG_TIME_RANGE.min,       CONFIG_TIME_RANGE.max),
+    detuneCents:      clampNumber(c.detuneCents,      0, CONFIG_DETUNE_RANGE.min,     CONFIG_DETUNE_RANGE.max),
+    pan:              clampNumber(c.pan,              0, CONFIG_PAN_RANGE.min,        CONFIG_PAN_RANGE.max),
+    gainDb:           clampNumber(c.gainDb,           0, CONFIG_GAIN_DB_RANGE.min,    CONFIG_GAIN_DB_RANGE.max),
+    delayMs:          clampNumber(c.delayMs,          0, CONFIG_DELAY_MS_RANGE.min,   CONFIG_DELAY_MS_RANGE.max),
+    doublerSemitones: clampNumber(c.doublerSemitones, 0, CONFIG_DOUBLER_RANGE.min,    CONFIG_DOUBLER_RANGE.max),
+    hpfHz:            clampNumber(c.hpfHz,            0, CONFIG_HPF_RANGE.min,        CONFIG_HPF_RANGE.max),
+    lpfHz:            clampNumber(c.lpfHz,            0, CONFIG_LPF_RANGE.min,        CONFIG_LPF_RANGE.max),
+    driveDb:          clampNumber(c.driveDb,          0, CONFIG_DRIVE_DB_RANGE.min,   CONFIG_DRIVE_DB_RANGE.max),
+    crushBits:        clampNumber(c.crushBits,        0, CONFIG_CRUSH_BITS_RANGE.min, CONFIG_CRUSH_BITS_RANGE.max),
+    amRateHz:         clampNumber(c.amRateHz,         0, CONFIG_AM_RATE_RANGE.min,    CONFIG_AM_RATE_RANGE.max),
+    amDepth:          clampNumber(c.amDepth,          0, CONFIG_AM_DEPTH_RANGE.min,   CONFIG_AM_DEPTH_RANGE.max),
   };
 }
 
@@ -315,9 +377,12 @@ function normalizePayload(parsed) {
               const configs = Array.isArray(p.configs)
                 ? p.configs.filter((cc) => cc && typeof cc === 'object').map(sanitizeConfig)
                 : [];
+              // v4 → v5: profile.mode was implicit "presets"; backfill.
+              const mode = VOICE_MODES.includes(p.mode) ? p.mode : DEFAULT_VOICE_MODE;
               return {
                 id: typeof p.id === 'string' ? p.id : uuid(),
                 name: typeof p.name === 'string' && p.name ? p.name : 'unnamed',
+                mode,
                 configs: configs.length > 0 ? configs : [makeConfig()],
               };
             })
@@ -788,6 +853,18 @@ export function renameVoiceProfile(characterId, profileId, name) {
   if (profile) profile.name = name;
 }
 
+/// Change which Qwen3 workflow this profile routes synth through.
+/// Silently no-ops on an unknown mode string so bad input from a stale
+/// UI can't corrupt the store — the picker only surfaces `VOICE_MODES`
+/// entries so this is a belt-and-braces guard.
+export function setVoiceProfileMode(characterId, profileId, mode) {
+  if (!VOICE_MODES.includes(mode)) return;
+  const character = scenesState.characters.find((c) => c.id === characterId);
+  if (!character) return;
+  const profile = character.voiceProfiles.find((p) => p.id === profileId);
+  if (profile) profile.mode = mode;
+}
+
 export function deleteVoiceProfile(characterId, profileId) {
   const character = scenesState.characters.find((c) => c.id === characterId);
   if (!character) return { ok: false, reason: 'character not found' };
@@ -831,6 +908,12 @@ export function updateProfileConfig(characterId, profileId, configId, patch) {
   if (patch.speaker !== undefined) config.speaker = patch.speaker || QWEN3_SPEAKERS[0];
   if (patch.language !== undefined) config.language = patch.language || QWEN3_LANGUAGES[0];
   if (patch.instruct !== undefined) config.instruct = String(patch.instruct);
+  if (patch.description !== undefined) config.description = String(patch.description);
+  if (patch.voiceFileId !== undefined) {
+    config.voiceFileId = typeof patch.voiceFileId === 'string' && patch.voiceFileId
+      ? patch.voiceFileId
+      : null;
+  }
   if (patch.pitchSemitones !== undefined) {
     config.pitchSemitones = clampNumber(patch.pitchSemitones, config.pitchSemitones,
       CONFIG_PITCH_RANGE.min, CONFIG_PITCH_RANGE.max);
@@ -854,6 +937,34 @@ export function updateProfileConfig(characterId, profileId, configId, patch) {
   if (patch.delayMs !== undefined) {
     config.delayMs = clampNumber(patch.delayMs, config.delayMs,
       CONFIG_DELAY_MS_RANGE.min, CONFIG_DELAY_MS_RANGE.max);
+  }
+  if (patch.doublerSemitones !== undefined) {
+    config.doublerSemitones = clampNumber(patch.doublerSemitones, config.doublerSemitones,
+      CONFIG_DOUBLER_RANGE.min, CONFIG_DOUBLER_RANGE.max);
+  }
+  if (patch.hpfHz !== undefined) {
+    config.hpfHz = clampNumber(patch.hpfHz, config.hpfHz,
+      CONFIG_HPF_RANGE.min, CONFIG_HPF_RANGE.max);
+  }
+  if (patch.lpfHz !== undefined) {
+    config.lpfHz = clampNumber(patch.lpfHz, config.lpfHz,
+      CONFIG_LPF_RANGE.min, CONFIG_LPF_RANGE.max);
+  }
+  if (patch.driveDb !== undefined) {
+    config.driveDb = clampNumber(patch.driveDb, config.driveDb,
+      CONFIG_DRIVE_DB_RANGE.min, CONFIG_DRIVE_DB_RANGE.max);
+  }
+  if (patch.crushBits !== undefined) {
+    config.crushBits = clampNumber(patch.crushBits, config.crushBits,
+      CONFIG_CRUSH_BITS_RANGE.min, CONFIG_CRUSH_BITS_RANGE.max);
+  }
+  if (patch.amRateHz !== undefined) {
+    config.amRateHz = clampNumber(patch.amRateHz, config.amRateHz,
+      CONFIG_AM_RATE_RANGE.min, CONFIG_AM_RATE_RANGE.max);
+  }
+  if (patch.amDepth !== undefined) {
+    config.amDepth = clampNumber(patch.amDepth, config.amDepth,
+      CONFIG_AM_DEPTH_RANGE.min, CONFIG_AM_DEPTH_RANGE.max);
   }
 }
 

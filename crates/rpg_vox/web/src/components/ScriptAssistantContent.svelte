@@ -32,6 +32,12 @@
     /// take. Passed through to SpeechInline's createTake calls. Null =
     /// server uses the hardcoded role-based DSP fallback.
     agentId = null,
+    /// `{ narrator: bool, character: bool }` from Script.svelte —
+    /// indicates which block roles the active agent has explicitly
+    /// silenced. SpeechInlines whose block role is silenced skip
+    /// auto-render and hide their manual ⟳ button so the block stays
+    /// text-only.
+    silencedRoles = { narrator: false, character: false },
   } = $props();
 
   marked.setOptions({ gfm: true, breaks: true });
@@ -59,6 +65,7 @@
       {onAutoAdvance}
       {onAutoInterrupt}
       {agentId}
+      silenced={!!(silencedRoles && silencedRoles[b.role])}
     />
     <!-- Zero-width space between adjacent pills so the browser breaks
          between them if they don't fit on one line. -->

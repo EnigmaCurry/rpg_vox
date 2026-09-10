@@ -16,6 +16,7 @@
 //! saved clips preserve pan and layering by construction.
 
 pub mod chunker;
+pub mod clicks;
 pub mod comfyui;
 pub mod piper;
 pub mod qwen3;
@@ -58,6 +59,11 @@ pub enum Command {
     /// and wait until playback finishes. Used to play cached widget clips
     /// through the mic (Scenes tab).
     PlayPcm(PlayPcmRequest),
+    /// Distill a reference audio clip into a compact voice-prompt file via
+    /// the Qwen3 clone deploy's `/save_prompt`. Only supported when the
+    /// active backend is qwen3 AND its clone URL is configured; other
+    /// backends reply with an error.
+    SavePrompt(SavePromptRequest),
 }
 
 /// One voice recipe within a profile. A profile with N of these fans out
@@ -73,10 +79,54 @@ pub enum Command {
 /// * `pan` positions the voice in the stereo field via equal-power law
 ///   (`-1.0` = full L, `+1.0` = full R, `0.0` = center).
 /// * `delay_ms` staggers the voice's start relative to the profile's mix.
+/// Which synthesis workflow to route this config through. Only [`qwen3`]
+/// looks at this — piper/comfyui ignore mode and always synthesize plain
+/// text through their single-model pipeline.
+///
+/// `Preset` uses the top-level `speaker` + `instruct` fields on the parent
+/// [`VoiceConfig`]. `Clone` and `Design` carry mode-specific data inline
+/// because they don't reuse those fields (and hoisting them to the top
+/// level would leak clone-only data into preset paths).
+#[derive(Debug, Clone)]
+pub enum SynthMode {
+    /// Preset speaker enum + optional `instruct` style prompt. Default.
+    Preset,
+    /// 3-second reference-audio clone. `voice_file_bytes` is the compact
+    /// prompt file returned by `/save_prompt`; the HTTP layer pre-loads
+    /// it from `data/voices/{id}.bin` so the backend doesn't need store
+    /// access. `ref_txt` and `use_xvec` were baked into `voice_file_bytes`
+    /// at save-prompt time, so we don't re-send them here.
+    Clone {
+        voice_file_bytes: Vec<u8>,
+        /// Original filename to hint content-type on Gradio upload
+        /// (usually `.bin` or `.pt` depending on Qwen3-TTS version).
+        voice_file_name: String,
+    },
+    /// Voice generated from a free-text description on every request.
+    /// No persistent state on the Qwen3 side — the description IS the
+    /// voice identity.
+    Design {
+        description: String,
+    },
+}
+
+impl Default for SynthMode {
+    fn default() -> Self {
+        Self::Preset
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct VoiceConfig {
+    /// Synthesis mode. Preset uses the fields below; Clone/Design carry
+    /// mode-specific data inside the enum and IGNORE speaker/instruct.
+    pub mode: SynthMode,
+    /// Preset-mode speaker enum. Ignored by Clone/Design.
     pub speaker: Option<String>,
+    /// Language enum — used by ALL modes (every Qwen3 endpoint takes
+    /// `lang_disp`).
     pub language: Option<String>,
+    /// Preset-mode style prompt. Ignored by Clone/Design.
     pub instruct: Option<String>,
     pub pitch_semitones: f32,
     pub time_ratio: f32,
@@ -84,11 +134,35 @@ pub struct VoiceConfig {
     pub pan: f32,
     pub gain_db: f32,
     pub delay_ms: f32,
+    /// Doubler effect: when non-zero, `apply_effects` synthesizes a copy
+    /// of the pitched buffer shifted by this many semitones and mixes it
+    /// into the primary at equal weight — a common vocal "widener"
+    /// (subtle ±3 for chorus, ±12 for octave stacking). Zero disables.
+    pub doubler_semitones: f32,
+    /// One-pole IIR bandpass corners applied to the post-pitch, post-time
+    /// mono buffer. Either side at 0 (or at/above Nyquist) bypasses that
+    /// leg. Together they let a config land the "destroyed vox-caster"
+    /// bandpass with hpf≈250/lpf≈3200.
+    pub hpf_hz: f32,
+    pub lpf_hz: f32,
+    /// tanh saturation drive in dB. Adds harmonics for tube / mechanical
+    /// grit. Zero disables.
+    pub drive_db: f32,
+    /// Effective bit depth for the quantizer. Zero (or ≥16) disables;
+    /// 6–10 gives a crunchy vox-caster edge on hard consonants.
+    pub crush_bits: f32,
+    /// Amplitude modulation / tremolo rate in Hz. Zero disables. Combined
+    /// with a non-zero `am_depth`, multiplies the signal by
+    /// `1 + depth·sin(2π·rate·t)` — ~47 Hz at ~0.3 depth is the Adeptus
+    /// Mechanicum "servo motor buzz" the voice designer targets.
+    pub am_rate_hz: f32,
+    pub am_depth: f32,
 }
 
 impl Default for VoiceConfig {
     fn default() -> Self {
         Self {
+            mode: SynthMode::default(),
             speaker: None,
             language: None,
             instruct: None,
@@ -98,6 +172,13 @@ impl Default for VoiceConfig {
             pan: 0.0,
             gain_db: 0.0,
             delay_ms: 0.0,
+            doubler_semitones: 0.0,
+            hpf_hz: 0.0,
+            lpf_hz: 0.0,
+            drive_db: 0.0,
+            crush_bits: 0.0,
+            am_rate_hz: 0.0,
+            am_depth: 0.0,
         }
     }
 }
@@ -108,6 +189,7 @@ impl VoiceConfig {
     /// pass sees a single combined pitch shift.
     fn to_voice_override(&self) -> VoiceOverride {
         VoiceOverride {
+            mode: self.mode.clone(),
             speaker: self.speaker.clone(),
             language: self.language.clone(),
             instruct: self.instruct.clone(),
@@ -119,9 +201,10 @@ impl VoiceConfig {
 
 /// Per-request backend voice fields. Assembled from a [`VoiceConfig`] and
 /// forwarded to the backend + DSP passes. Only [`qwen3`] consumes the
-/// speaker/language/instruct fields.
+/// mode/speaker/language/instruct fields.
 #[derive(Debug, Clone, Default)]
 pub struct VoiceOverride {
+    pub mode: SynthMode,
     pub speaker: Option<String>,
     pub language: Option<String>,
     pub instruct: Option<String>,
@@ -144,6 +227,33 @@ pub struct SynthesizeRequest {
     pub text: String,
     pub configs: Vec<VoiceConfig>,
     pub reply: oneshot::Sender<Result<SynthesizeOutcome, String>>,
+}
+
+/// One-shot request to have the backend upload a reference audio clip
+/// to its clone Gradio and return the compact voice-prompt file. Bytes
+/// come back through the `reply` oneshot; the caller is responsible for
+/// persisting them (`Store::create_voice`). `filename` is preserved for
+/// round-tripping on future load_prompt_and_gen uploads — Qwen3-TTS
+/// versions differ on whether they return `.bin` or `.pt`.
+pub struct SavePromptRequest {
+    pub reference_wav: Vec<u8>,
+    /// Filename to use on the multipart upload to Gradio. Extension
+    /// affects Gradio's temp path but not correctness — `.wav` is
+    /// always the right hint for audio references.
+    pub reference_wav_name: String,
+    pub ref_txt: String,
+    pub use_xvec: bool,
+    pub reply: oneshot::Sender<Result<SavePromptOutcome, String>>,
+}
+
+#[derive(Debug)]
+pub struct SavePromptOutcome {
+    /// Bytes of the voice-prompt file Gradio produced. Persist under
+    /// `data/voices/{id}.{ext}` — the caller decides the extension by
+    /// looking at `filename` below.
+    pub voice_file_bytes: Vec<u8>,
+    /// Filename Gradio returned (extension baked in). Preserve verbatim.
+    pub filename: String,
 }
 
 /// Push already-decoded stereo PCM into the pipewire ring buffer. No
@@ -225,6 +335,17 @@ enum PlayCmd {
         stereo: Vec<[f32; 2]>,
         reply: oneshot::Sender<Result<usize, String>>,
     },
+    /// One "computer is thinking" click burst, generated by the clicks
+    /// task. Reply fires after the push completes so the generator can
+    /// pace itself against ring drain — no fixed sleep needed, and the
+    /// pipeline naturally back-pressures if the ring is full. Any
+    /// pending stop-gen bump (from a real playback command arriving) is
+    /// honored inside the push so a click never lingers in the ring
+    /// when real audio wants to preempt.
+    ClickBurst {
+        stereo: Vec<[f32; 2]>,
+        reply: oneshot::Sender<()>,
+    },
 }
 
 pub async fn run(
@@ -275,12 +396,83 @@ pub async fn run(
     let mixer_play = mixer.clone();
     let play_task = tokio::spawn(run_play(cfg_play, mixer_play, producer, play_rx));
     let cfg_bk = cfg.clone();
-    let backend_task = tokio::spawn(run_backend(cfg_bk, backend, synth_rx, play_tx));
+    let backend_task = tokio::spawn(run_backend(cfg_bk, backend, synth_rx, play_tx.clone()));
+    // Fill-audio generator. Runs for the whole lifetime of the runner —
+    // polls `mixer.clicks_active()` and sends burst commands into the
+    // shared play channel whenever the wait-fill is enabled. When it's
+    // disabled the task idles cheaply on a short sleep.
+    let cfg_clicks = cfg.clone();
+    let mixer_clicks = mixer.clone();
+    let clicks_task = tokio::spawn(run_clicks(cfg_clicks, mixer_clicks, play_tx));
 
     dispatcher.await?;
     backend_task.await??;
     play_task.await??;
+    clicks_task.await??;
     Ok(())
+}
+
+/// Wait-fill click generator loop. When `mixer.clicks_preset()` is
+/// `Some(preset)`, hands ~120ms bursts of procedural clicks off to the
+/// play task at a pace governed by the ring back-pressure (each burst
+/// awaits its reply before the next is queued). When the mixer's
+/// selection is `None` the loop idles on a short sleep. If the preset
+/// changes mid-run the generator is rebuilt so the new voicing takes
+/// effect at the next burst boundary. Never returns while the play
+/// channel stays open.
+async fn run_clicks(
+    cfg: Config,
+    mixer: Arc<AtomicMixer>,
+    play_tx: mpsc::Sender<PlayCmd>,
+) -> Result<()> {
+    let sr = cfg.target_sample_rate;
+    // 120 ms bursts: short enough that a real playback preemption via
+    // request_tts_stop bounds the click tail to <200 ms in the worst
+    // case (one burst already pushed to the ring gets flushed by the
+    // pw callback within one process cycle).
+    let burst_frames = ((sr as usize) * 120) / 1000;
+    let idle_sleep = Duration::from_millis(50);
+    let mut gen: Option<clicks::ClickGenerator> = None;
+    loop {
+        let selected = mixer.clicks_preset();
+        let Some(preset) = selected else {
+            // Cheap idle: 50 ms poll is imperceptible on the human side
+            // and negligible CPU. Drop any previous generator so the
+            // next "on" transition builds a fresh state — patterns don't
+            // feel copy-pasted across waits.
+            gen = None;
+            tokio::time::sleep(idle_sleep).await;
+            continue;
+        };
+        // First burst OR user swapped presets → new generator.
+        let gref = match gen.as_ref() {
+            Some(g) if g.preset() == preset => gen.as_mut().unwrap(),
+            _ => {
+                gen = Some(clicks::ClickGenerator::new(preset, sr));
+                gen.as_mut().unwrap()
+            }
+        };
+        let mut buf = vec![[0.0f32, 0.0f32]; burst_frames];
+        gref.render_next(&mut buf);
+        let (tx, rx) = oneshot::channel();
+        if play_tx
+            .send(PlayCmd::ClickBurst {
+                stereo: buf,
+                reply: tx,
+            })
+            .await
+            .is_err()
+        {
+            // Play task gone → runner shutting down.
+            return Ok(());
+        }
+        // Await the push completing. If the reply is dropped (play task
+        // gone) we bail out same as above. Ring back-pressure inside the
+        // push handler is what actually paces us.
+        if rx.await.is_err() {
+            return Ok(());
+        }
+    }
 }
 
 async fn run_backend(
@@ -300,9 +492,34 @@ async fn run_backend(
                     tracing::warn!("play task gone; dropping PlayPcm");
                 }
             }
+            Command::SavePrompt(req) => handle_save_prompt(&mut backend, req).await,
         }
     }
     Ok(())
+}
+
+/// Dispatch SavePrompt requests to the active backend. Only qwen3 knows
+/// how — every other backend replies with a clear "not supported" so the
+/// HTTP handler can surface a 400 rather than time out.
+async fn handle_save_prompt(backend: &mut Backend, req: SavePromptRequest) {
+    let SavePromptRequest {
+        reference_wav,
+        reference_wav_name,
+        ref_txt,
+        use_xvec,
+        reply,
+    } = req;
+    let result = match backend {
+        Backend::Qwen3(b) => b
+            .save_prompt(reference_wav, reference_wav_name, ref_txt, use_xvec)
+            .await
+            .map_err(|e| format!("{e:#}")),
+        Backend::Piper(_) | Backend::Comfy(_) => Err(format!(
+            "voice cloning requires the qwen3 backend (currently: {})",
+            backend.kind()
+        )),
+    };
+    let _ = reply.send(result);
 }
 
 async fn run_play(
@@ -322,9 +539,46 @@ async fn run_play(
                 info!(pushed, wanted = frames, "Say push delivered to ring");
                 let _ = reply.send(Ok(pushed));
             }
+            PlayCmd::ClickBurst { stereo, reply } => {
+                handle_click_burst(&mixer, &mut producer, stereo).await;
+                let _ = reply.send(());
+            }
         }
     }
     Ok(())
+}
+
+/// Push a click burst into the ring, honoring both the mixer's preset
+/// selection AND `tts_stop_gen`. Either being flipped mid-push aborts
+/// immediately so a real playback command sitting behind us in the
+/// mpsc doesn't wait for the whole burst before it can preempt.
+async fn handle_click_burst(
+    mixer: &Arc<AtomicMixer>,
+    producer: &mut Producer<[f32; 2]>,
+    stereo: Vec<[f32; 2]>,
+) {
+    // Snapshot the current stop-gen; if it moves while we're pushing the
+    // burst, someone (typically a Say / PlayPcm handler) requested a stop
+    // and we should stop feeding stale filler into the ring.
+    let start_gen = mixer.tts_stop_gen();
+    let is_stopped = || {
+        mixer.tts_stop_gen() != start_gen || mixer.clicks_preset().is_none()
+    };
+    let mut written = 0usize;
+    while written < stereo.len() {
+        if is_stopped() {
+            return;
+        }
+        while written < stereo.len() && producer.push(stereo[written]).is_ok() {
+            written += 1;
+        }
+        if written < stereo.len() {
+            // Ring is full — wait a short beat for the pw callback to
+            // consume, then re-check the stop conditions. 10 ms matches
+            // the granularity used elsewhere in this file.
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
 }
 
 async fn handle_say(
@@ -451,22 +705,18 @@ async fn handle_play_pcm(
         "playing cached stereo PCM through mic"
     );
 
-    // Snapshot the stop-generation NOW so a race between HTTP setup and
-    // the push loop can't miss a stop that arrives while we're preparing.
-    let start_gen = mixer.tts_stop_gen();
-    let is_stopped = || mixer.tts_stop_gen() != start_gen;
-
     // Wait for the pw callback to actually drain the ring for any pending
     // stop before we start pushing this clip. Without this wait, a fresh
     // Play right after a Stop can push samples that then get drained by
     // the still-pending stop — playback starts mid-clip. Bounded so a
     // wedged pw thread doesn't stall the runner forever; the fallback
     // ships-the-clip-anyway matches the pre-race behavior.
+    let sync_target = mixer.tts_stop_gen();
     let deadline = tokio::time::Instant::now() + Duration::from_millis(250);
-    while mixer.tts_stop_observed_gen() < start_gen {
+    while mixer.tts_stop_observed_gen() < sync_target {
         if tokio::time::Instant::now() >= deadline {
             tracing::warn!(
-                start_gen,
+                sync_target,
                 observed = mixer.tts_stop_observed_gen(),
                 "pw stop-drain sync timed out; playing anyway"
             );
@@ -474,6 +724,16 @@ async fn handle_play_pcm(
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
+
+    // Snapshot the stop-generation AFTER the sync. Bumps that arrived
+    // during the sync are already accounted for by the drain — treating
+    // them as "abort this push" would incorrectly cut off the tail of a
+    // clip when a racing POST arrives around the same time as this play
+    // (the /clicks/stop that fires from the client the moment activeClip
+    // becomes a real speech clip is the canonical case). Only bumps that
+    // arrive from HERE on should abort the push mid-clip.
+    let start_gen = mixer.tts_stop_gen();
+    let is_stopped = || mixer.tts_stop_gen() != start_gen;
 
     // ~100 ms chunks: fine enough that a user-triggered stop is felt as
     // "instant" (one chunk boundary + one pipewire cycle = well under
@@ -550,8 +810,26 @@ async fn synthesize_profile(
             .await
             .map_err(|e| format!("{e:#}"))?;
         let (samples, _rate) = sink.take_capture();
-        let processed = apply_effects(samples, target_rate, voice.pitch_semitones, voice.time_ratio)
-            .map_err(|e| format!("{e:#}"))?;
+        let mut processed = apply_effects(
+            samples,
+            target_rate,
+            voice.pitch_semitones,
+            voice.time_ratio,
+            cc.doubler_semitones,
+        )
+        .map_err(|e| format!("{e:#}"))?;
+        apply_fx_chain(
+            &mut processed,
+            target_rate,
+            &FxParams {
+                hpf_hz: cc.hpf_hz,
+                lpf_hz: cc.lpf_hz,
+                drive_db: cc.drive_db,
+                crush_bits: cc.crush_bits,
+                am_rate_hz: cc.am_rate_hz,
+                am_depth: cc.am_depth,
+            },
+        );
         let gain_lin = 10f32.powf(cc.gain_db / 20.0);
         let with_gain: Vec<f32> = if (gain_lin - 1.0).abs() < f32::EPSILON {
             processed
@@ -672,27 +950,35 @@ async fn push_stereo_backpressured_until(
     written
 }
 
-/// Apply pitch shift and time stretch to a mono f32 buffer.
+/// Apply pitch shift, doubler, and time stretch to a mono f32 buffer.
 ///
-/// Skips the DSP call entirely when both knobs sit at their identity values
-/// so no-effect configs pay no CPU. Order is pitch first (to keep the
-/// spectral envelope closer to the source), then time stretch. Extreme
-/// values are clamped to avoid handing the algorithm something it can't
-/// meaningfully process — a semitone range of ±24 covers character voices
-/// (chipmunk to demon) and a 0.25×–4× time ratio covers the useful
-/// slow/fast range.
+/// Skips the DSP call entirely when every knob sits at its identity value
+/// so no-effect configs pay no CPU. Order is:
+///   1. primary pitch shift (keeps the spectral envelope close to source)
+///   2. doubler (adds a pitch-shifted COPY of the primary output summed
+///      back in — sits before time stretch so both voices get the same
+///      timing treatment and stay aligned)
+///   3. time stretch (applied to the combined mono buffer)
+///
+/// Extreme values are clamped so the algorithm never sees something it
+/// can't meaningfully process: ±24 semitones covers chipmunk-to-demon,
+/// 0.25×–4× time ratio covers the useful slow/fast range, and the
+/// doubler uses the same ±24 clamp since it's a pitch shift too.
 fn apply_effects(
     samples: Vec<f32>,
     sample_rate: u32,
     pitch_semitones: f32,
     time_ratio: f32,
+    doubler_semitones: f32,
 ) -> Result<Vec<f32>> {
     let no_pitch = pitch_semitones.abs() <= f32::EPSILON;
     let no_time = (time_ratio - 1.0).abs() <= f32::EPSILON;
-    if (no_pitch && no_time) || samples.is_empty() {
+    let no_doubler = doubler_semitones.abs() <= f32::EPSILON;
+    if (no_pitch && no_time && no_doubler) || samples.is_empty() {
         return Ok(samples);
     }
     let semitones = pitch_semitones.clamp(-24.0, 24.0);
+    let doubler = doubler_semitones.clamp(-24.0, 24.0);
     let time_ratio = time_ratio.clamp(0.25, 4.0) as f64;
 
     let mut buf = samples;
@@ -704,6 +990,30 @@ fn apply_effects(
         buf = timestretch::pitch_shift(&buf, &params, factor)
             .map_err(|e| anyhow::anyhow!("pitch_shift: {e}"))?;
     }
+    if !no_doubler {
+        // Second pitch pass on a copy of the primary output. Summed back
+        // at half gain on each source so the combined signal stays within
+        // ±1.0 for typical inputs — clipping is handled at the final
+        // stereo mix step, but keeping headroom here avoids audible
+        // distortion when the doubled copy correlates strongly with the
+        // primary (small semitone offsets like ±3 for a "wide" chorus).
+        let factor = 2f64.powf(doubler as f64 / 12.0);
+        let params = timestretch::StretchParams::new(1.0)
+            .with_sample_rate(sample_rate)
+            .with_channels(1);
+        let doubled = timestretch::pitch_shift(&buf, &params, factor)
+            .map_err(|e| anyhow::anyhow!("doubler pitch_shift: {e}"))?;
+        // Merge into the longer of the two — pitch_shift usually preserves
+        // length but rounding can drift by a sample or two.
+        let n = buf.len().max(doubled.len());
+        let mut mixed = vec![0.0_f32; n];
+        for (i, m) in mixed.iter_mut().enumerate() {
+            let a = buf.get(i).copied().unwrap_or(0.0);
+            let b = doubled.get(i).copied().unwrap_or(0.0);
+            *m = 0.5 * a + 0.5 * b;
+        }
+        buf = mixed;
+    }
     if !no_time {
         let params = timestretch::StretchParams::new(time_ratio)
             .with_sample_rate(sample_rate)
@@ -712,6 +1022,129 @@ fn apply_effects(
             .map_err(|e| anyhow::anyhow!("stretch: {e}"))?;
     }
     Ok(buf)
+}
+
+/// Grouped parameters for [`apply_fx_chain`]. Kept as a struct so the
+/// caller doesn't hit clippy's `too_many_arguments` lint and so any
+/// future FX knob is a one-field addition instead of another signature
+/// change through the call chain.
+struct FxParams {
+    hpf_hz: f32,
+    lpf_hz: f32,
+    drive_db: f32,
+    crush_bits: f32,
+    am_rate_hz: f32,
+    am_depth: f32,
+}
+
+/// Apply the "FX" chain (bandpass → saturation → bit-crush → AM) in-place
+/// on a mono buffer. Each stage is a no-op when its knob sits at the
+/// identity value so an all-default config still pays only the branch cost.
+///
+/// Order rationale:
+///   1. HPF / LPF — shape the source spectrum before non-linear stages so
+///      the saturator responds to a cleaner input and doesn't smear
+///      distortion into bands we would just filter out anyway.
+///   2. Saturation — tanh drive after filtering keeps the induced
+///      harmonics inside the passband.
+///   3. Bit-crush — quantizes the driven waveform; running it after
+///      saturation lets the crush interact with the already-shaped
+///      dynamic curve for that "vox-caster" edge on consonants.
+///   4. AM (tremolo/motor) — post-saturation so the motor buzz rides
+///      on the already-processed spectrum, not the pre-crunch source.
+fn apply_fx_chain(buf: &mut [f32], sample_rate: u32, p: &FxParams) {
+    if buf.is_empty() {
+        return;
+    }
+    let nyquist = (sample_rate as f32) * 0.5;
+    if p.hpf_hz > 0.0 && p.hpf_hz < nyquist {
+        apply_one_pole_hpf(buf, sample_rate, p.hpf_hz);
+    }
+    if p.lpf_hz > 0.0 && p.lpf_hz < nyquist {
+        apply_one_pole_lpf(buf, sample_rate, p.lpf_hz);
+    }
+    if p.drive_db > 0.0 {
+        apply_saturation(buf, p.drive_db);
+    }
+    if p.crush_bits > 0.0 && p.crush_bits < 16.0 {
+        apply_bit_crush(buf, p.crush_bits);
+    }
+    if p.am_rate_hz > 0.0 && p.am_depth > 0.0 {
+        apply_amplitude_mod(buf, sample_rate, p.am_rate_hz, p.am_depth);
+    }
+}
+
+/// Standard 1-pole low-pass IIR:
+///   y[n] = y[n-1] + α · (x[n] − y[n-1])
+/// with α = dt / (RC + dt), RC = 1 / (2π · fc).
+fn apply_one_pole_lpf(buf: &mut [f32], sample_rate: u32, fc: f32) {
+    let dt = 1.0 / sample_rate as f32;
+    let rc = 1.0 / (2.0 * std::f32::consts::PI * fc);
+    let alpha = dt / (rc + dt);
+    let mut y = 0.0f32;
+    for s in buf.iter_mut() {
+        y += alpha * (*s - y);
+        *s = y;
+    }
+}
+
+/// Standard 1-pole high-pass IIR (complement of the LPF above):
+///   y[n] = α · (y[n-1] + x[n] − x[n-1])
+/// with α = RC / (RC + dt).
+fn apply_one_pole_hpf(buf: &mut [f32], sample_rate: u32, fc: f32) {
+    let dt = 1.0 / sample_rate as f32;
+    let rc = 1.0 / (2.0 * std::f32::consts::PI * fc);
+    let alpha = rc / (rc + dt);
+    let mut prev_x = 0.0f32;
+    let mut prev_y = 0.0f32;
+    for s in buf.iter_mut() {
+        let x = *s;
+        let y = alpha * (prev_y + x - prev_x);
+        prev_x = x;
+        prev_y = y;
+        *s = y;
+    }
+}
+
+/// tanh soft-clipper. Drives the input by `10^(drive_db/20)` before the
+/// non-linearity, then normalizes so a "unity" DC signal of ±1 lands
+/// back near ±1 — keeps average level roughly matched as drive rises.
+fn apply_saturation(buf: &mut [f32], drive_db: f32) {
+    let drive = 10f32.powf(drive_db / 20.0);
+    let norm = drive.tanh().max(1e-6);
+    for s in buf.iter_mut() {
+        *s = (*s * drive).tanh() / norm;
+    }
+}
+
+/// Uniform quantizer at `bits` effective bit depth. Rounds to the nearest
+/// step of `1 / (2^(bits-1))` and clamps into ±1 so a driven signal past
+/// unity doesn't wrap around instead of clipping.
+fn apply_bit_crush(buf: &mut [f32], bits: f32) {
+    let b = bits.clamp(1.0, 16.0);
+    let steps = 2f32.powf(b - 1.0);
+    for s in buf.iter_mut() {
+        let clamped = s.clamp(-1.0, 1.0);
+        *s = (clamped * steps).round() / steps;
+    }
+}
+
+/// Amplitude modulation: `x[n] · (1 + depth · sin(2π·rate·n/fs))`. With
+/// `depth < 1` this is classic tremolo; `depth == 1` becomes a
+/// pseudo-ring-mod (still preserves the fundamental voice, unlike a
+/// true `x · sin(...)` ring mod that would strip the carrier).
+fn apply_amplitude_mod(buf: &mut [f32], sample_rate: u32, rate_hz: f32, depth: f32) {
+    let d = depth.clamp(0.0, 1.0);
+    let phase_inc = 2.0 * std::f32::consts::PI * rate_hz / sample_rate as f32;
+    let mut phase = 0.0f32;
+    for s in buf.iter_mut() {
+        let m = 1.0 + d * phase.sin();
+        *s *= m;
+        phase += phase_inc;
+        if phase > std::f32::consts::TAU {
+            phase -= std::f32::consts::TAU;
+        }
+    }
 }
 
 /// Capture-only PCM sink. Backends push mono `f32` audio chunks at their

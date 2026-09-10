@@ -22,7 +22,7 @@ axum = { version = "0.7", features = ["ws"] }
 # provided by nixpkgs `libopus` (already in shell.nix buildInputs).
 opus = "0.3"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls", "stream"] }
 futures-util = "0.3"
 
 symphonia = { version = "0.5", features = ["wav", "mp3", "flac", "ogg", "vorbis"] }

@@ -10,9 +10,11 @@
     addVoiceProfile,
     renameVoiceProfile,
     deleteVoiceProfile,
+    setVoiceProfileMode,
     addProfileConfig,
     updateProfileConfig,
     deleteProfileConfig,
+    VOICE_MODES,
     QWEN3_SPEAKERS,
     QWEN3_LANGUAGES,
     CONFIG_PITCH_RANGE,
@@ -21,8 +23,23 @@
     CONFIG_PAN_RANGE,
     CONFIG_GAIN_DB_RANGE,
     CONFIG_DELAY_MS_RANGE,
+    CONFIG_DOUBLER_RANGE,
+    CONFIG_HPF_RANGE,
+    CONFIG_LPF_RANGE,
+    CONFIG_DRIVE_DB_RANGE,
+    CONFIG_CRUSH_BITS_RANGE,
+    CONFIG_AM_RATE_RANGE,
+    CONFIG_AM_DEPTH_RANGE,
   } from '../lib/scenes.svelte.js';
-  import { uploadImage } from '../lib/api.js';
+  import { createVoice, deleteVoice, uploadImage, voiceReferenceUrl } from '../lib/api.js';
+  import ProfileTestField from '../components/ProfileTestField.svelte';
+
+  // Human-readable labels for the mode picker. Keys match VOICE_MODES.
+  const MODE_LABELS = {
+    presets: 'Presets — 9 named speakers + style instruction',
+    clone:   'Clone — 3-second reference audio → voice',
+    design:  'Design — free-text voice description',
+  };
 
   const project = $derived(currentProject());
   const characters = $derived(currentProjectCharacters());
@@ -56,6 +73,9 @@
   function onProfileNameInput(characterId, profileId, ev) {
     renameVoiceProfile(characterId, profileId, ev.currentTarget.value);
   }
+  function onProfileModeChange(characterId, profileId, ev) {
+    setVoiceProfileMode(characterId, profileId, ev.currentTarget.value);
+  }
   function onAddProfile(characterId) {
     addVoiceProfile(characterId, 'new profile');
   }
@@ -71,6 +91,87 @@
     updateProfileConfig(characterId, profileId, configId, {
       [field]: ev.currentTarget.valueAsNumber,
     });
+  }
+  function onConfigBoolInput(characterId, profileId, configId, field, ev) {
+    updateProfileConfig(characterId, profileId, configId, {
+      [field]: ev.currentTarget.checked,
+    });
+  }
+
+  // ---- Clone-mode reference audio upload ----------------------------------
+  //
+  // Two-step: the browser picks a wav (or any audio Gradio can decode),
+  // we POST the raw bytes to /voices with the transcription on the query
+  // string, and the server does the Qwen3 save_prompt roundtrip. The
+  // returned voice_id lands on `config.voiceFileId` — that's what
+  // resolve_character_configs later reads on synth. Uploads keyed by
+  // `${profileId}:${configId}` show a pending spinner + errors inline
+  // so multiple configs' uploads don't clobber each other's status.
+  //
+  // Max reference size mirrors the server's 8 MB body cap; anything
+  // bigger errors client-side without round-tripping.
+  const MAX_REFERENCE_BYTES = 8 * 1024 * 1024;
+  let voiceUploadStatus = $state({}); // `${p}:${c}` → {loading?, error?}
+  let voiceUploadErr = $state('');
+
+  function statusKey(profileId, configId) { return `${profileId}:${configId}`; }
+  function setUploadStatus(k, patch) {
+    voiceUploadStatus = { ...voiceUploadStatus, [k]: { ...(voiceUploadStatus[k] ?? {}), ...patch } };
+  }
+  function clearUploadStatus(k) {
+    // eslint-disable-next-line no-unused-vars
+    const { [k]: _, ...rest } = voiceUploadStatus;
+    voiceUploadStatus = rest;
+  }
+
+  async function onReferencePick(character, profile, config, ev) {
+    const file = ev.currentTarget.files?.[0];
+    ev.currentTarget.value = '';
+    if (!file) return;
+    const k = statusKey(profile.id, config.id);
+    if (file.size > MAX_REFERENCE_BYTES) {
+      setUploadStatus(k, { error: `too large (${(file.size / 1024 / 1024).toFixed(1)} MB > 8 MB limit)` });
+      return;
+    }
+    setUploadStatus(k, { loading: true, error: null });
+    // Grab the previous voice id up front so we can delete it AFTER the
+    // new save_prompt succeeds — swapping the id atomically means a
+    // failed upload doesn't leave the config voiceless.
+    const priorVoiceId = config.voiceFileId;
+    // If the user has already typed a transcription, respect it — send
+    // it as ref_txt so STT doesn't overwrite their intent. Otherwise
+    // omit ref_txt entirely and let the server auto-transcribe; the
+    // response includes the STT result which we drop into `description`
+    // for review/edit.
+    const typedRefTxt = String(config.description ?? '').trim();
+    try {
+      const resp = await createVoice(file, {
+        refTxt: typedRefTxt || null,
+        useXvec: true, // TODO: expose a checkbox once we know how it feels in practice
+        filename: file.name,
+      });
+      updateProfileConfig(character.id, profile.id, config.id, {
+        voiceFileId: resp.id,
+        // Sync `description` back to whatever ref_txt actually fed
+        // save_prompt. When we passed a typed value this is a no-op;
+        // when STT filled it in, the user now sees the auto-transcript
+        // and can edit it in place.
+        description: resp.transcript ?? typedRefTxt,
+      });
+      if (priorVoiceId) {
+        deleteVoice(priorVoiceId).catch((e) => console.warn('prior voice cleanup failed', e));
+      }
+      clearUploadStatus(k);
+    } catch (e) {
+      setUploadStatus(k, { loading: false, error: e.message || String(e) });
+    }
+  }
+
+  async function onClearVoice(character, profile, config) {
+    if (!config.voiceFileId) return;
+    const priorVoiceId = config.voiceFileId;
+    updateProfileConfig(character.id, profile.id, config.id, { voiceFileId: null });
+    deleteVoice(priorVoiceId).catch((e) => console.warn('voice cleanup failed', e));
   }
 
   // Two-tap confirm for profile deletes; keyed as `${characterId}:${profileId}`.
@@ -274,6 +375,17 @@
                             aria-label="Profile name"
                             oninput={(e) => onProfileNameInput(character.id, profile.id, e)}
                           />
+                          <label class="mode-picker" title="Which Qwen3 synth workflow to use for this profile">
+                            <span>mode</span>
+                            <select
+                              value={profile.mode}
+                              onchange={(e) => onProfileModeChange(character.id, profile.id, e)}
+                            >
+                              {#each VOICE_MODES as m}
+                                <option value={m} title={MODE_LABELS[m]}>{m}</option>
+                              {/each}
+                            </select>
+                          </label>
                           <span class="config-count">
                             {profile.configs.length}
                             {profile.configs.length === 1 ? 'voice' : 'voices'}
@@ -317,17 +429,52 @@
                                 >×</button>
                               </div>
 
-                              <div class="config-row">
+                              {#if profile.mode === 'presets'}
+                                <div class="config-row">
+                                  <label class="field">
+                                    <span>Speaker</span>
+                                    <select
+                                      value={config.speaker}
+                                      onchange={(e) => onConfigStringInput(character.id, profile.id, config.id, 'speaker', e)}
+                                    >
+                                      {#each QWEN3_SPEAKERS as spk}
+                                        <option value={spk}>{spk}</option>
+                                      {/each}
+                                    </select>
+                                  </label>
+                                  <label class="field">
+                                    <span>Language</span>
+                                    <select
+                                      value={config.language}
+                                      onchange={(e) => onConfigStringInput(character.id, profile.id, config.id, 'language', e)}
+                                    >
+                                      {#each QWEN3_LANGUAGES as lang}
+                                        <option value={lang}>{lang}</option>
+                                      {/each}
+                                    </select>
+                                  </label>
+                                </div>
+
                                 <label class="field">
-                                  <span>Speaker</span>
-                                  <select
-                                    value={config.speaker}
-                                    onchange={(e) => onConfigStringInput(character.id, profile.id, config.id, 'speaker', e)}
-                                  >
-                                    {#each QWEN3_SPEAKERS as spk}
-                                      <option value={spk}>{spk}</option>
-                                    {/each}
-                                  </select>
+                                  <span>Instruct</span>
+                                  <textarea
+                                    class="config-instruct"
+                                    rows="2"
+                                    placeholder="e.g. calm, whisper, angry, cheerful, robotic"
+                                    value={config.instruct}
+                                    oninput={(e) => onConfigStringInput(character.id, profile.id, config.id, 'instruct', e)}
+                                  ></textarea>
+                                </label>
+                              {:else if profile.mode === 'design'}
+                                <label class="field">
+                                  <span>Description</span>
+                                  <textarea
+                                    class="config-instruct"
+                                    rows="3"
+                                    placeholder="e.g. gravelly old sailor with a slight lisp, warm mid-range, slow and deliberate"
+                                    value={config.description}
+                                    oninput={(e) => onConfigStringInput(character.id, profile.id, config.id, 'description', e)}
+                                  ></textarea>
                                 </label>
                                 <label class="field">
                                   <span>Language</span>
@@ -340,111 +487,288 @@
                                     {/each}
                                   </select>
                                 </label>
-                              </div>
+                              {:else if profile.mode === 'clone'}
+                                <!-- Reference-audio clone flow. Upload first,
+                                     let the server run STT and populate the
+                                     transcription — the user then reviews /
+                                     edits it in place. If they'd rather type
+                                     the transcription first, that still
+                                     works: any non-empty description is sent
+                                     as `ref_txt` and short-circuits STT.
+                                     Description field doubles as the ref_txt
+                                     since a clone-mode config only carries
+                                     one free-text slot per mode. -->
+                                <div class="config-row">
+                                  <label class="field">
+                                    <span>Reference audio</span>
+                                    <div class="voice-file-row">
+                                      {#if config.voiceFileId}
+                                        <button
+                                          type="button"
+                                          class="voice-play"
+                                          onclick={(ev) => ev.currentTarget.querySelector('audio').play()}
+                                          title="Play the uploaded reference"
+                                          aria-label="Play the uploaded reference"
+                                        >
+                                          <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true">
+                                            <path fill="currentColor" d="M8 5v14l11-7z"/>
+                                          </svg>
+                                          <audio src={voiceReferenceUrl(config.voiceFileId)} preload="none"></audio>
+                                        </button>
+                                        <span class="voice-file-ok" title="Voice file id: {config.voiceFileId}">
+                                          ✓ saved
+                                        </span>
+                                        <button
+                                          type="button"
+                                          class="link-btn"
+                                          onclick={() => onClearVoice(character, profile, config)}
+                                        >clear</button>
+                                      {:else if voiceUploadStatus[statusKey(profile.id, config.id)]?.loading}
+                                        <span class="voice-file-pending">transcribing + rendering…</span>
+                                      {:else}
+                                        <span class="voice-file-missing">no reference yet</span>
+                                      {/if}
+                                      <label class="file-btn small">
+                                        {config.voiceFileId ? 'replace' : 'upload wav'}
+                                        <input
+                                          type="file"
+                                          accept="audio/*"
+                                          onchange={(e) => onReferencePick(character, profile, config, e)}
+                                        />
+                                      </label>
+                                    </div>
+                                    {#if voiceUploadStatus[statusKey(profile.id, config.id)]?.error}
+                                      <span class="err small">{voiceUploadStatus[statusKey(profile.id, config.id)].error}</span>
+                                    {/if}
+                                  </label>
+                                  <label class="field">
+                                    <span>Language</span>
+                                    <select
+                                      value={config.language}
+                                      onchange={(e) => onConfigStringInput(character.id, profile.id, config.id, 'language', e)}
+                                    >
+                                      {#each QWEN3_LANGUAGES as lang}
+                                        <option value={lang}>{lang}</option>
+                                      {/each}
+                                    </select>
+                                  </label>
+                                </div>
+                                <label class="field">
+                                  <span>Reference transcription</span>
+                                  <textarea
+                                    class="config-instruct"
+                                    rows="2"
+                                    placeholder="Filled in automatically after upload. Type before upload to skip STT."
+                                    value={config.description}
+                                    oninput={(e) => onConfigStringInput(character.id, profile.id, config.id, 'description', e)}
+                                  ></textarea>
+                                </label>
+                              {/if}
 
-                              <label class="field">
-                                <span>Instruct</span>
-                                <textarea
-                                  class="config-instruct"
-                                  rows="2"
-                                  placeholder="e.g. calm, whisper, angry, cheerful, robotic"
-                                  value={config.instruct}
-                                  oninput={(e) => onConfigStringInput(character.id, profile.id, config.id, 'instruct', e)}
-                                ></textarea>
-                              </label>
+                              <details class="config-section">
+                                <summary>Stretch</summary>
+                                <div class="config-effects">
+                                  <label class="fx">
+                                    <span>Pitch</span>
+                                    <input
+                                      type="number"
+                                      min={CONFIG_PITCH_RANGE.min}
+                                      max={CONFIG_PITCH_RANGE.max}
+                                      step={CONFIG_PITCH_RANGE.step}
+                                      value={config.pitchSemitones}
+                                      oninput={(e) => onConfigNumberInput(character.id, profile.id, config.id, 'pitchSemitones', e)}
+                                      aria-label="Pitch shift in semitones"
+                                      title="Pitch shift in semitones (0 = no change)"
+                                    />
+                                    <span class="unit">st</span>
+                                  </label>
+                                  <label class="fx">
+                                    <span>Detune</span>
+                                    <input
+                                      type="number"
+                                      min={CONFIG_DETUNE_RANGE.min}
+                                      max={CONFIG_DETUNE_RANGE.max}
+                                      step={CONFIG_DETUNE_RANGE.step}
+                                      value={config.detuneCents}
+                                      oninput={(e) => onConfigNumberInput(character.id, profile.id, config.id, 'detuneCents', e)}
+                                      aria-label="Detune in cents"
+                                      title="Fine pitch offset in cents; added to Pitch. 100 cents = 1 semitone."
+                                    />
+                                    <span class="unit">¢</span>
+                                  </label>
+                                  <label class="fx">
+                                    <span>Speed</span>
+                                    <input
+                                      type="number"
+                                      min={CONFIG_TIME_RANGE.min}
+                                      max={CONFIG_TIME_RANGE.max}
+                                      step={CONFIG_TIME_RANGE.step}
+                                      value={config.timeRatio}
+                                      oninput={(e) => onConfigNumberInput(character.id, profile.id, config.id, 'timeRatio', e)}
+                                      aria-label="Time stretch ratio"
+                                      title="Duration multiplier (1 = no change, 2 = twice as long, 0.5 = half)"
+                                    />
+                                    <span class="unit">×</span>
+                                  </label>
+                                  <label class="fx">
+                                    <span>Pan</span>
+                                    <input
+                                      type="number"
+                                      min={CONFIG_PAN_RANGE.min}
+                                      max={CONFIG_PAN_RANGE.max}
+                                      step={CONFIG_PAN_RANGE.step}
+                                      value={config.pan}
+                                      oninput={(e) => onConfigNumberInput(character.id, profile.id, config.id, 'pan', e)}
+                                      aria-label="Stereo pan"
+                                      title="Stereo pan (-1 = full left, 0 = center, +1 = full right)"
+                                    />
+                                    <span class="unit">L↔R</span>
+                                  </label>
+                                  <label class="fx">
+                                    <span>Gain</span>
+                                    <input
+                                      type="number"
+                                      min={CONFIG_GAIN_DB_RANGE.min}
+                                      max={CONFIG_GAIN_DB_RANGE.max}
+                                      step={CONFIG_GAIN_DB_RANGE.step}
+                                      value={config.gainDb}
+                                      oninput={(e) => onConfigNumberInput(character.id, profile.id, config.id, 'gainDb', e)}
+                                      aria-label="Gain in decibels"
+                                      title="Per-voice level (0 = unity)"
+                                    />
+                                    <span class="unit">dB</span>
+                                  </label>
+                                  <label class="fx">
+                                    <span>Start</span>
+                                    <input
+                                      type="number"
+                                      min={CONFIG_DELAY_MS_RANGE.min}
+                                      max={CONFIG_DELAY_MS_RANGE.max}
+                                      step={CONFIG_DELAY_MS_RANGE.step}
+                                      value={config.delayMs}
+                                      oninput={(e) => onConfigNumberInput(character.id, profile.id, config.id, 'delayMs', e)}
+                                      aria-label="Start offset in milliseconds"
+                                      title="Nudge this voice's start forward in the profile's mix (ms). Not a delay effect — no repeats, just an offset."
+                                    />
+                                    <span class="unit">ms</span>
+                                  </label>
+                                </div>
+                              </details>
 
-                              <div class="config-effects">
-                                <label class="fx">
-                                  <span>Pitch</span>
-                                  <input
-                                    type="number"
-                                    min={CONFIG_PITCH_RANGE.min}
-                                    max={CONFIG_PITCH_RANGE.max}
-                                    step={CONFIG_PITCH_RANGE.step}
-                                    value={config.pitchSemitones}
-                                    oninput={(e) => onConfigNumberInput(character.id, profile.id, config.id, 'pitchSemitones', e)}
-                                    aria-label="Pitch shift in semitones"
-                                    title="Pitch shift in semitones (0 = no change)"
-                                  />
-                                  <span class="unit">st</span>
-                                </label>
-                                <label class="fx">
-                                  <span>Detune</span>
-                                  <input
-                                    type="number"
-                                    min={CONFIG_DETUNE_RANGE.min}
-                                    max={CONFIG_DETUNE_RANGE.max}
-                                    step={CONFIG_DETUNE_RANGE.step}
-                                    value={config.detuneCents}
-                                    oninput={(e) => onConfigNumberInput(character.id, profile.id, config.id, 'detuneCents', e)}
-                                    aria-label="Detune in cents"
-                                    title="Fine pitch offset in cents; added to Pitch. 100 cents = 1 semitone."
-                                  />
-                                  <span class="unit">¢</span>
-                                </label>
-                                <label class="fx">
-                                  <span>Speed</span>
-                                  <input
-                                    type="number"
-                                    min={CONFIG_TIME_RANGE.min}
-                                    max={CONFIG_TIME_RANGE.max}
-                                    step={CONFIG_TIME_RANGE.step}
-                                    value={config.timeRatio}
-                                    oninput={(e) => onConfigNumberInput(character.id, profile.id, config.id, 'timeRatio', e)}
-                                    aria-label="Time stretch ratio"
-                                    title="Duration multiplier (1 = no change, 2 = twice as long, 0.5 = half)"
-                                  />
-                                  <span class="unit">×</span>
-                                </label>
-                                <label class="fx">
-                                  <span>Pan</span>
-                                  <input
-                                    type="number"
-                                    min={CONFIG_PAN_RANGE.min}
-                                    max={CONFIG_PAN_RANGE.max}
-                                    step={CONFIG_PAN_RANGE.step}
-                                    value={config.pan}
-                                    oninput={(e) => onConfigNumberInput(character.id, profile.id, config.id, 'pan', e)}
-                                    aria-label="Stereo pan"
-                                    title="Stereo pan (-1 = full left, 0 = center, +1 = full right)"
-                                  />
-                                  <span class="unit">L↔R</span>
-                                </label>
-                                <label class="fx">
-                                  <span>Gain</span>
-                                  <input
-                                    type="number"
-                                    min={CONFIG_GAIN_DB_RANGE.min}
-                                    max={CONFIG_GAIN_DB_RANGE.max}
-                                    step={CONFIG_GAIN_DB_RANGE.step}
-                                    value={config.gainDb}
-                                    oninput={(e) => onConfigNumberInput(character.id, profile.id, config.id, 'gainDb', e)}
-                                    aria-label="Gain in decibels"
-                                    title="Per-voice level (0 = unity)"
-                                  />
-                                  <span class="unit">dB</span>
-                                </label>
-                                <label class="fx">
-                                  <span>Delay</span>
-                                  <input
-                                    type="number"
-                                    min={CONFIG_DELAY_MS_RANGE.min}
-                                    max={CONFIG_DELAY_MS_RANGE.max}
-                                    step={CONFIG_DELAY_MS_RANGE.step}
-                                    value={config.delayMs}
-                                    oninput={(e) => onConfigNumberInput(character.id, profile.id, config.id, 'delayMs', e)}
-                                    aria-label="Start delay in milliseconds"
-                                    title="Delay this voice's start relative to the profile's mix (ms)"
-                                  />
-                                  <span class="unit">ms</span>
-                                </label>
-                              </div>
+                              <details class="config-section">
+                                <summary>FX</summary>
+                                <div class="config-effects">
+                                  <label class="fx">
+                                    <span>Doubler</span>
+                                    <input
+                                      type="number"
+                                      min={CONFIG_DOUBLER_RANGE.min}
+                                      max={CONFIG_DOUBLER_RANGE.max}
+                                      step={CONFIG_DOUBLER_RANGE.step}
+                                      value={config.doublerSemitones}
+                                      oninput={(e) => onConfigNumberInput(character.id, profile.id, config.id, 'doublerSemitones', e)}
+                                      aria-label="Doubler pitch offset in semitones"
+                                      title="Mix in a second copy pitch-shifted by this many semitones (0 = disabled; try ±3 for chorus, ±12 for octave stack)"
+                                    />
+                                    <span class="unit">st</span>
+                                  </label>
+                                  <div class="fx-spacer" aria-hidden="true"></div>
+                                  <label class="fx">
+                                    <span>HPF</span>
+                                    <input
+                                      type="number"
+                                      min={CONFIG_HPF_RANGE.min}
+                                      max={CONFIG_HPF_RANGE.max}
+                                      step={CONFIG_HPF_RANGE.step}
+                                      value={config.hpfHz}
+                                      oninput={(e) => onConfigNumberInput(character.id, profile.id, config.id, 'hpfHz', e)}
+                                      aria-label="High-pass cutoff in Hz"
+                                      title="High-pass cutoff in Hz (0 = disabled). Pair with LPF for a bandpass — try 250 Hz for the radio channel."
+                                    />
+                                    <span class="unit">Hz</span>
+                                  </label>
+                                  <label class="fx">
+                                    <span>LPF</span>
+                                    <input
+                                      type="number"
+                                      min={CONFIG_LPF_RANGE.min}
+                                      max={CONFIG_LPF_RANGE.max}
+                                      step={CONFIG_LPF_RANGE.step}
+                                      value={config.lpfHz}
+                                      oninput={(e) => onConfigNumberInput(character.id, profile.id, config.id, 'lpfHz', e)}
+                                      aria-label="Low-pass cutoff in Hz"
+                                      title="Low-pass cutoff in Hz (0 = disabled). Try 3200 Hz for a destroyed-radio timbre, or ~4000 Hz to soften the pitched double."
+                                    />
+                                    <span class="unit">Hz</span>
+                                  </label>
+                                  <label class="fx">
+                                    <span>Drive</span>
+                                    <input
+                                      type="number"
+                                      min={CONFIG_DRIVE_DB_RANGE.min}
+                                      max={CONFIG_DRIVE_DB_RANGE.max}
+                                      step={CONFIG_DRIVE_DB_RANGE.step}
+                                      value={config.driveDb}
+                                      oninput={(e) => onConfigNumberInput(character.id, profile.id, config.id, 'driveDb', e)}
+                                      aria-label="Saturation drive in decibels"
+                                      title="tanh saturation drive in dB (0 = disabled). Adds harmonics — try 6–12 dB for tube grit."
+                                    />
+                                    <span class="unit">dB</span>
+                                  </label>
+                                  <label class="fx">
+                                    <span>Bits</span>
+                                    <input
+                                      type="number"
+                                      min={CONFIG_CRUSH_BITS_RANGE.min}
+                                      max={CONFIG_CRUSH_BITS_RANGE.max}
+                                      step={CONFIG_CRUSH_BITS_RANGE.step}
+                                      value={config.crushBits}
+                                      oninput={(e) => onConfigNumberInput(character.id, profile.id, config.id, 'crushBits', e)}
+                                      aria-label="Bit-crush quantization depth"
+                                      title="Effective bit depth (0 = disabled, 16 = essentially clean, 6–10 = crunchy vox-caster)."
+                                    />
+                                    <span class="unit">bit</span>
+                                  </label>
+                                  <label class="fx">
+                                    <span>AM Rate</span>
+                                    <input
+                                      type="number"
+                                      min={CONFIG_AM_RATE_RANGE.min}
+                                      max={CONFIG_AM_RATE_RANGE.max}
+                                      step={CONFIG_AM_RATE_RANGE.step}
+                                      value={config.amRateHz}
+                                      oninput={(e) => onConfigNumberInput(character.id, profile.id, config.id, 'amRateHz', e)}
+                                      aria-label="Amplitude modulation rate in Hz"
+                                      title="Tremolo / motor-buzz rate in Hz (0 = disabled). ~47 Hz is the classic Adeptus-Mechanicum servo buzz; avoid 50/60 Hz."
+                                    />
+                                    <span class="unit">Hz</span>
+                                  </label>
+                                  <label class="fx">
+                                    <span>AM Depth</span>
+                                    <input
+                                      type="number"
+                                      min={CONFIG_AM_DEPTH_RANGE.min}
+                                      max={CONFIG_AM_DEPTH_RANGE.max}
+                                      step={CONFIG_AM_DEPTH_RANGE.step}
+                                      value={config.amDepth}
+                                      oninput={(e) => onConfigNumberInput(character.id, profile.id, config.id, 'amDepth', e)}
+                                      aria-label="Amplitude modulation depth"
+                                      title="Depth of the AM modulation (0 = disabled, 1 = full ring-mod). 0.2–0.4 gives a subtle motor throb."
+                                    />
+                                    <span class="unit">×</span>
+                                  </label>
+                                </div>
+                              </details>
                             </li>
                           {/each}
                         </ul>
                         {#if configDeleteErr}
                           <div class="err small">{configDeleteErr}</div>
                         {/if}
+                        <ProfileTestField
+                          characterId={character.id}
+                          profileId={profile.id}
+                        />
                       </li>
                     {/each}
                   </ul>
@@ -678,6 +1002,67 @@
     font-weight: 600;
   }
   .profile-name:focus { outline: none; border-color: var(--accent); }
+
+  /* Mode picker in the profile head — small inline select, same visual
+     weight as `.mini-btn` so it doesn't dominate the row. */
+  .mode-picker {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 11px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  .mode-picker select {
+    background: rgba(0,0,0,0.35);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 3px 6px;
+    font-size: 11px;
+    font-family: inherit;
+    text-transform: none;
+    letter-spacing: normal;
+    cursor: pointer;
+  }
+  .mode-picker select:focus { outline: none; border-color: var(--accent); }
+
+  /* Clone-mode reference audio status + upload trigger. */
+  .voice-file-row {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 0;
+    text-transform: none;
+    letter-spacing: normal;
+    font-size: 12px;
+  }
+  .voice-file-ok      { color: var(--accent); font-weight: 500; }
+  .voice-file-pending { color: var(--muted); font-style: italic; }
+  .voice-file-missing { color: var(--muted); }
+  /* Play button for review-listening to the uploaded reference wav.
+     Same footprint as the tiny mini-btn action buttons elsewhere, but
+     accent-tinted so users can tell it's an action, not decoration.
+     The embedded `<audio>` element is invisible — the button drives
+     playback via `querySelector('audio').play()`. */
+  .voice-play {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    padding: 0;
+    color: var(--accent);
+    background: rgba(122, 162, 255, 0.14);
+    border: 1px solid rgba(122, 162, 255, 0.35);
+    border-radius: 50%;
+    cursor: pointer;
+    position: relative;
+  }
+  .voice-play:hover { background: rgba(122, 162, 255, 0.28); border-color: var(--accent); }
+  .voice-play audio { display: none; }
+
   .config-count {
     font-size: 11px;
     color: var(--muted);
@@ -748,22 +1133,70 @@
   }
   .config-instruct:focus { outline: none; border-color: var(--accent); }
 
-  .config-effects {
-    display: flex;
-    gap: 10px;
-    flex-wrap: wrap;
+  /* Collapsible "Stretch" / "FX" groups per config. Native <details> so the
+     browser handles state; the summary chip mimics the .fx label styling so
+     it visually blends with the row above and below. */
+  .config-section {
+    border-top: 1px dashed var(--border);
+    padding-top: 6px;
   }
-  .fx {
-    display: flex;
+  .config-section > summary {
+    cursor: pointer;
+    list-style: none;
+    display: inline-flex;
     align-items: center;
-    gap: 4px;
+    gap: 6px;
+    font-size: 11px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    padding: 2px 0;
+    user-select: none;
+  }
+  .config-section > summary::-webkit-details-marker { display: none; }
+  .config-section > summary::before {
+    content: '▸';
+    font-size: 10px;
+    line-height: 1;
+    color: var(--muted);
+    transition: transform 0.15s ease;
+  }
+  .config-section[open] > summary::before { transform: rotate(90deg); }
+  .config-section > summary:hover { color: var(--accent); }
+  .config-section[open] > summary { color: var(--accent); }
+  .config-section > .config-effects { margin-top: 6px; }
+
+  /* Fixed 2-column grid so meaningful pairs (HPF/LPF, AM Rate/AM Depth)
+     always land on the same row regardless of viewport width. Each .fx
+     cell is itself a 3-column mini-grid (label | number input | unit)
+     so labels, inputs, and units also align across rows even when knobs
+     have different name/unit widths. Solo knobs that don't belong to a
+     pair (Doubler) get a `.fx-spacer` placeholder in the neighbour cell
+     to preserve pair adjacency on the following row — stretching the
+     solo cell across both columns would balloon its label-to-input gap. */
+  .config-effects {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 6px 14px;
+  }
+  .fx-spacer { /* empty grid cell — presence forces the next .fx to row 2 */ }
+  .fx {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 68px 2.5em;
+    align-items: center;
+    gap: 6px;
     font-size: 11px;
     color: var(--muted);
     text-transform: uppercase;
     letter-spacing: 0.05em;
   }
+  .fx > span:first-child {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
   .fx input {
-    width: 68px;
+    width: 100%;
     background: rgba(0,0,0,0.35);
     color: var(--text);
     border: 1px solid var(--border);
@@ -773,6 +1206,7 @@
     font-family: inherit;
     text-transform: none;
     letter-spacing: normal;
+    box-sizing: border-box;
   }
   .fx input:focus { outline: none; border-color: var(--accent); }
   .fx .unit { text-transform: none; letter-spacing: normal; color: var(--muted); }

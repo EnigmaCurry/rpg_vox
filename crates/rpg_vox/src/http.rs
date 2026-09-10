@@ -50,6 +50,12 @@
 //!                              audio actually stops (unlike aborting the
 //!                              /say fetch, which leaves queued samples
 //!                              draining out for up to `ringbuf_seconds`).
+//!   POST /clicks/start · /clicks/stop                → { ok } — toggle
+//!                              the wait-fill "computer is thinking" click
+//!                              bed. Bursts are procedural (see
+//!                              [`crate::tts::clicks`]) and share the TTS
+//!                              ring with speech, so any real playback
+//!                              preempts filler via the same stop-gen path.
 //!   POST /widgets/record       { widget_id?, text? } → { session_id } —
 //!                              begins recording from the `-vox` companion
 //!                              sink into an in-memory buffer.
@@ -108,6 +114,14 @@ use crate::pw_source::{GraphSnapshot, PwClient, SinkRole};
 use crate::script;
 use crate::settings::{self, SettingsUpdate};
 use crate::store::{AgentField, DEFAULT_AGENT_ID, ScriptBlockRow, ScriptTakeRow, ScriptTurnRow, Store, UpdateResult};
+
+/// Sentinel value for an agent voice slot that the user has explicitly
+/// silenced. Distinguished from `NULL` (which means "unset — use the DSP
+/// fallback") so custom agents can opt out of synthesis for a role while
+/// the built-in Default agent's zero-config behavior stays intact. The
+/// client dropdown surfaces it as `— None (silence) —`; character UUIDs
+/// never collide with this literal.
+pub(crate) const VOICE_SILENCE: &str = "__silence__";
 use crate::stt::SttHandle;
 use tokio::sync::broadcast;
 
@@ -207,11 +221,31 @@ struct ConfigBody {
     gain_db: Option<f32>,
     #[serde(default)]
     delay_ms: Option<f32>,
+    #[serde(default)]
+    doubler_semitones: Option<f32>,
+    #[serde(default)]
+    hpf_hz: Option<f32>,
+    #[serde(default)]
+    lpf_hz: Option<f32>,
+    #[serde(default)]
+    drive_db: Option<f32>,
+    #[serde(default)]
+    crush_bits: Option<f32>,
+    #[serde(default)]
+    am_rate_hz: Option<f32>,
+    #[serde(default)]
+    am_depth: Option<f32>,
 }
 
 impl ConfigBody {
     fn into_voice_config(self) -> VoiceConfig {
+        // Client-supplied ConfigBody is always preset-mode. Clone and
+        // Design modes are only reachable through character voice
+        // profiles, resolved by `resolve_character_configs` below with
+        // store access — clients don't carry voice-file bytes over the
+        // wire.
         VoiceConfig {
+            mode: crate::tts::SynthMode::Preset,
             speaker: trim_opt(self.speaker),
             language: trim_opt(self.language),
             instruct: trim_opt(self.instruct),
@@ -221,6 +255,13 @@ impl ConfigBody {
             pan: self.pan.unwrap_or(0.0),
             gain_db: self.gain_db.unwrap_or(0.0),
             delay_ms: self.delay_ms.unwrap_or(0.0),
+            doubler_semitones: self.doubler_semitones.unwrap_or(0.0),
+            hpf_hz: self.hpf_hz.unwrap_or(0.0),
+            lpf_hz: self.lpf_hz.unwrap_or(0.0),
+            drive_db: self.drive_db.unwrap_or(0.0),
+            crush_bits: self.crush_bits.unwrap_or(0.0),
+            am_rate_hz: self.am_rate_hz.unwrap_or(0.0),
+            am_depth: self.am_depth.unwrap_or(0.0),
         }
     }
 }
@@ -290,18 +331,28 @@ fn gm_proxy_configs() -> Vec<VoiceConfig> {
     }]
 }
 
-/// Resolve a character id to the `VoiceConfig`s of its first (default)
-/// voice profile. Reads the app_state JSON blob, walks `characters[]`,
-/// pulls `voiceProfiles[0].configs`, and maps each raw config to a
-/// VoiceConfig using the same identity fallbacks as `ConfigBody`.
+/// Resolve a character id to the `VoiceConfig`s of one of its voice
+/// profiles. Reads the app_state JSON blob, walks `characters[]`, and
+/// selects a profile: `profile_id = Some(id)` picks that specific profile
+/// (used by the Characters-page Test field so each profile is auditable
+/// independently); `None` falls back to `voiceProfiles[0]` (the default
+/// profile every character starts with, used by Script/Scene playback
+/// paths that don't carry a per-profile selection).
+///
+/// The profile-level `mode` dictates which SynthMode variant we build,
+/// per-config `description` / `voiceFileId` fields supply the mode-specific
+/// data.
 ///
 /// Returns `None` if the character can't be found (deleted, wrong project,
-/// or app_state hasn't been written yet), if its profile list is empty, or
-/// on any JSON parse failure — callers fall back to their hardcoded DSP
-/// preset in that case, so a stale slot never blocks synthesis.
+/// or app_state hasn't been written yet), if its profile list is empty, if
+/// a requested `profile_id` doesn't exist, if any clone-mode config's voice
+/// file bytes fail to load, or on any JSON parse failure — callers fall
+/// back to their hardcoded DSP preset in that case, so a stale slot never
+/// blocks synthesis.
 async fn resolve_character_configs(
     state: &AppState,
     character_id: &str,
+    profile_id: Option<&str>,
 ) -> Option<Vec<VoiceConfig>> {
     let raw = state.store.get_app_state().await.ok().flatten()?;
     let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
@@ -310,29 +361,104 @@ async fn resolve_character_configs(
         .as_array()?
         .iter()
         .find(|c| c.get("id").and_then(|v| v.as_str()) == Some(character_id))?;
-    let configs = character
-        .get("voiceProfiles")?
-        .as_array()?
-        .first()?
-        .get("configs")?
-        .as_array()?;
-    let out: Vec<VoiceConfig> = configs
-        .iter()
-        .map(|c| VoiceConfig {
-            speaker: c.get("speaker").and_then(|v| v.as_str())
-                .map(str::to_string).filter(|s| !s.is_empty()),
-            language: c.get("language").and_then(|v| v.as_str())
-                .map(str::to_string).filter(|s| !s.is_empty()),
-            instruct: c.get("instruct").and_then(|v| v.as_str())
-                .map(str::to_string).filter(|s| !s.is_empty()),
-            pitch_semitones: c.get("pitchSemitones").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
-            time_ratio:      c.get("timeRatio").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32,
-            detune_cents:    c.get("detuneCents").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
-            pan:             c.get("pan").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
-            gain_db:         c.get("gainDb").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
-            delay_ms:        c.get("delayMs").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
-        })
-        .collect();
+    let profiles = character.get("voiceProfiles")?.as_array()?;
+    let profile = match profile_id {
+        Some(id) => profiles
+            .iter()
+            .find(|p| p.get("id").and_then(|v| v.as_str()) == Some(id))?,
+        None => profiles.first()?,
+    };
+    let mode_str = profile
+        .get("mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("presets");
+    let configs = profile.get("configs")?.as_array()?;
+
+    let mut out: Vec<VoiceConfig> = Vec::with_capacity(configs.len());
+    for c in configs {
+        let language = c
+            .get("language")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .filter(|s| !s.is_empty());
+        // DSP knobs live on every config regardless of mode — clone/design
+        // outputs still get pitch-shifted / pan'd / delayed / doubled just
+        // like preset.
+        let read_f = |key: &str, default: f32| -> f32 {
+            c.get(key).and_then(|v| v.as_f64()).map(|v| v as f32).unwrap_or(default)
+        };
+        let pitch_semitones = read_f("pitchSemitones", 0.0);
+        let time_ratio      = read_f("timeRatio",      1.0);
+        let detune_cents    = read_f("detuneCents",    0.0);
+        let pan             = read_f("pan",            0.0);
+        let gain_db         = read_f("gainDb",         0.0);
+        let delay_ms        = read_f("delayMs",        0.0);
+        let doubler_semitones = read_f("doublerSemitones", 0.0);
+        let hpf_hz          = read_f("hpfHz",          0.0);
+        let lpf_hz          = read_f("lpfHz",          0.0);
+        let drive_db        = read_f("driveDb",        0.0);
+        let crush_bits      = read_f("crushBits",      0.0);
+        let am_rate_hz      = read_f("amRateHz",       0.0);
+        let am_depth        = read_f("amDepth",        0.0);
+        let (mode, speaker, instruct) = match mode_str {
+            "clone" => {
+                let voice_id = c.get("voiceFileId").and_then(|v| v.as_str())?;
+                let (bytes, filename) = state.store.get_voice_bytes(voice_id.to_string()).await.ok()??;
+                (
+                    crate::tts::SynthMode::Clone {
+                        voice_file_bytes: bytes,
+                        voice_file_name: filename,
+                    },
+                    None,
+                    None,
+                )
+            }
+            "design" => {
+                let description = c
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                    .filter(|s| !s.is_empty())?;
+                (
+                    crate::tts::SynthMode::Design { description },
+                    None,
+                    None,
+                )
+            }
+            // "presets" (default) — legacy JSON that pre-dates the mode
+            // field also lands here since we defaulted to "presets" above.
+            _ => (
+                crate::tts::SynthMode::Preset,
+                c.get("speaker")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                    .filter(|s| !s.is_empty()),
+                c.get("instruct")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                    .filter(|s| !s.is_empty()),
+            ),
+        };
+        out.push(VoiceConfig {
+            mode,
+            speaker,
+            language,
+            instruct,
+            pitch_semitones,
+            time_ratio,
+            detune_cents,
+            pan,
+            gain_db,
+            delay_ms,
+            doubler_semitones,
+            hpf_hz,
+            lpf_hz,
+            drive_db,
+            crush_bits,
+            am_rate_hz,
+            am_depth,
+        });
+    }
     if out.is_empty() { None } else { Some(out) }
 }
 
@@ -352,8 +478,15 @@ async fn synth_gm_proxy_widget(
     if text.is_empty() {
         return None;
     }
+    // Explicit silence sentinel wins: skip synth entirely so the user
+    // turn lands with no attached widget (no play button, nothing to
+    // hear on Play All). Distinct from `None` which means "use the
+    // hardcoded GM-proxy DSP".
+    if user_voice_character == Some(VOICE_SILENCE) {
+        return None;
+    }
     let configs = match user_voice_character {
-        Some(cid) => resolve_character_configs(state, cid)
+        Some(cid) => resolve_character_configs(state, cid, None)
             .await
             .unwrap_or_else(gm_proxy_configs),
         None => gm_proxy_configs(),
@@ -440,6 +573,8 @@ pub async fn serve(
         )
         .route("/widgets/:id/say", post(widget_say_handler))
         .route("/playback/stop", post(playback_stop_handler))
+        .route("/clicks/start", post(clicks_start_handler))
+        .route("/clicks/stop", post(clicks_stop_handler))
         .route("/widgets/record", post(widget_record_start_handler))
         .route(
             "/widgets/record/:session_id",
@@ -457,6 +592,19 @@ pub async fn serve(
         .route(
             "/images/:id",
             axum::routing::get(image_get_handler).delete(image_delete_handler),
+        )
+        // Voice-prompt files (compact speaker embeddings from Qwen3 /save_prompt).
+        // POST accepts multipart form-data (reference wav + metadata) and does the
+        // Gradio roundtrip; body limit sized for a 30s reference at 48kHz stereo
+        // wav (~5 MB), well above the 3-second minimum Qwen3-TTS needs.
+        .route(
+            "/voices",
+            post(voice_create_handler).layer(DefaultBodyLimit::max(8 * 1024 * 1024)),
+        )
+        .route("/voices/:id", axum::routing::delete(voice_delete_handler))
+        .route(
+            "/voices/:id/reference",
+            axum::routing::get(voice_reference_handler),
         )
         .route(
             "/state",
@@ -494,8 +642,13 @@ pub async fn serve(
         )
         .route("/scripts/:id/turns", axum::routing::delete(script_reset))
         .route("/scripts/:id/user", post(script_send_user))
+        .route(
+            "/scripts/:id/turns/:turn_id/edit-user",
+            post(script_edit_user),
+        )
         .route("/scripts/:id/reply", post(script_send_reply))
         .route("/scripts/:id/title", post(scripts_generate_title))
+        .route("/scripts/:id/mix.flac", get(script_mix_handler))
         .route(
             "/script/blocks/:id",
             axum::routing::patch(script_block_patch),
@@ -1322,6 +1475,113 @@ async fn script_send_user(
         .into_response()
 }
 
+#[derive(Debug, Deserialize)]
+struct ScriptEditUserBody {
+    text: String,
+    /// Same semantics as [`ScriptSendUserBody::agent_id`] — picks the User
+    /// voice slot for the freshly synthesized GM proxy widget.
+    #[serde(default, rename = "agentId")]
+    agent_id: Option<String>,
+}
+
+/// Edit a user turn: truncate the transcript from that turn onward
+/// (dropping every later turn's blocks / takes / attached widgets) and
+/// insert a REPLACEMENT user turn with the new text. Semantically this
+/// is "rewind history to before this turn, then re-send it with different
+/// wording" — the client fires `POST /scripts/:id/reply` next to let the
+/// LLM generate a fresh response against the new history.
+///
+/// The original turn's attached widget (recording or old GM proxy) can't
+/// match the new text anymore, so we always synth a fresh GM proxy for
+/// the replacement. Same voice-slot lookup as [`script_send_user`] — an
+/// agent with a User character override wins, otherwise the hardcoded
+/// GM DSP; the silence sentinel produces a widget-less turn.
+async fn script_edit_user(
+    State(state): State<AppState>,
+    Path((script_id, turn_id)): Path<(String, String)>,
+    Json(body): Json<ScriptEditUserBody>,
+) -> Response {
+    let text = body.text.trim().to_string();
+    if text.is_empty() {
+        return (StatusCode::BAD_REQUEST, "empty text").into_response();
+    }
+
+    // Truncate atomically so a racing /reply against the pre-edit history
+    // can't slip in between the delete and the re-insert. `None` = the
+    // turn belongs to a different script (or was already deleted); tell
+    // the caller instead of silently inserting a floating new turn.
+    let cleanup = match state
+        .store
+        .truncate_script_from_turn(script_id.clone(), turn_id.clone())
+        .await
+    {
+        Ok(Some(ids)) => ids,
+        Ok(None) => {
+            return (StatusCode::NOT_FOUND, format!("no turn {turn_id}")).into_response();
+        }
+        Err(err) => {
+            tracing::error!(err = %format!("{err:#}"), %script_id, %turn_id,
+                "store: truncate at turn failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("store: {err:#}"),
+            )
+                .into_response();
+        }
+    };
+    // Fire-and-forget WAV cleanup — same as script_reset. A failed unlink
+    // just leaves an orphan file; the DB rows are already gone.
+    for wid in cleanup {
+        if let Err(err) = state.store.delete_widget(wid.clone()).await {
+            tracing::warn!(id = %wid, err = %format!("{err:#}"),
+                "widget cleanup failed on user-turn edit");
+        }
+    }
+
+    // Same voice-slot resolution + GM proxy synth as script_send_user's
+    // no-widget path. Silence sentinel intentionally omitted from the
+    // agent lookup (the slot lookup returns the sentinel string, which
+    // synth_gm_proxy_widget then honors by returning None).
+    let user_voice_character: Option<String> = match body
+        .agent_id
+        .clone()
+        .filter(|s| !s.is_empty())
+    {
+        Some(aid) => match state.store.get_agent(aid).await {
+            Ok(Some(a)) => a.voice_user,
+            _ => None,
+        },
+        None => None,
+    };
+    let user_widget_id =
+        synth_gm_proxy_widget(&state, text.clone(), user_voice_character.as_deref()).await;
+
+    let user_row = match state
+        .store
+        .create_turn(
+            script_id.clone(),
+            "user".into(),
+            text.clone(),
+            user_widget_id,
+            Vec::new(),
+        )
+        .await
+    {
+        Ok(r) => r,
+        Err(err) => {
+            tracing::error!(err = %format!("{err:#}"), "store: edited user turn insert failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("store: {err:#}"),
+            )
+                .into_response();
+        }
+    };
+
+    let user_turn = turn_view(&state.store, user_row).await;
+    (StatusCode::OK, Json(ScriptUserResponse { user_turn })).into_response()
+}
+
 /// Phase 2 of the /script two-step: call the LLM against the history the
 /// phase-1 handler just pushed to, parse the reply into narrator/character
 /// regions, persist the assistant turn, and return it. Failure here leaves
@@ -1506,11 +1766,15 @@ async fn script_block_add_take(
             },
             None => None,
         };
-        match slot_character {
-            Some(cid) => resolve_character_configs(&state, &cid)
+        // Silence sentinel: caller (usually a manual ⟳ click) still gets
+        // a take rendered, but with the hardcoded DSP fallback rather than
+        // the silenced character. Auto-render / Play All are gated
+        // client-side so those paths honor the silence naturally.
+        match slot_character.as_deref() {
+            Some(VOICE_SILENCE) | None => default_configs_for_role(&info.role),
+            Some(cid) => resolve_character_configs(&state, cid, None)
                 .await
                 .unwrap_or_else(|| default_configs_for_role(&info.role)),
-            None => default_configs_for_role(&info.role),
         }
     } else {
         configs_or_default(body.configs)
@@ -1663,6 +1927,10 @@ struct AgentView {
     voice_user: Option<String>,
     voice_narrator: Option<String>,
     voice_character: Option<String>,
+    /// Wait-fill "computer is thinking" click preset id. Null = no click
+    /// bed during the LLM wait. Currently the only non-null value the
+    /// server accepts is "vintage" — see [`crate::tts::clicks::ClickPreset`].
+    interstitial: Option<String>,
     /// Client uses this to hide edit/delete UI on the Default agent.
     read_only: bool,
     created_at: i64,
@@ -1679,6 +1947,7 @@ fn agent_view(row: crate::store::AgentRow) -> AgentView {
         voice_user: row.voice_user,
         voice_narrator: row.voice_narrator,
         voice_character: row.voice_character,
+        interstitial: row.interstitial,
         read_only,
         created_at: row.created_at,
         updated_at: row.updated_at,
@@ -1768,6 +2037,13 @@ struct AgentUpdateBody {
     voice_narrator: Option<Option<String>>,
     #[serde(default, deserialize_with = "deserialize_some", rename = "voiceCharacter")]
     voice_character: Option<Option<String>>,
+    /// Interstitial click preset id. Same `Option<Option<String>>` shape
+    /// as the voice slots: outer None = leave alone, `Some(None)` = clear
+    /// to NULL, `Some(Some("vintage"))` = set the preset. Unknown preset
+    /// strings are rejected in [`agents_update`] with a 400 so client
+    /// typos surface immediately.
+    #[serde(default, deserialize_with = "deserialize_some")]
+    interstitial: Option<Option<String>>,
 }
 
 /// `Option<Option<T>>` serde helper: distinguishes an absent field (outer
@@ -1815,6 +2091,22 @@ async fn agents_update(
     if let Some(v) = body.voice_user { changes.push(AgentField::VoiceUser(clean(v))); }
     if let Some(v) = body.voice_narrator { changes.push(AgentField::VoiceNarrator(clean(v))); }
     if let Some(v) = body.voice_character { changes.push(AgentField::VoiceCharacter(clean(v))); }
+    if let Some(v) = body.interstitial {
+        let cleaned = clean(v);
+        // Reject unknown preset ids up-front so a client typo returns a
+        // clear 400 instead of getting stored and later ignored by the
+        // runtime (with the user wondering why their bed never plays).
+        if let Some(preset) = cleaned.as_deref() {
+            if crate::tts::clicks::ClickPreset::from_str_id(preset).is_none() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("unknown interstitial preset: {preset}"),
+                )
+                    .into_response();
+            }
+        }
+        changes.push(AgentField::Interstitial(cleaned));
+    }
     match state.store.update_agent(id.clone(), changes).await {
         Ok(UpdateResult::Updated) => {
             (StatusCode::OK, Json(ActionResponse { ok: true, error: None })).into_response()
@@ -1887,11 +2179,26 @@ async fn script_take_delete(
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct WidgetBody {
     text: String,
     /// Voice profile — see [`SayBody`] for shape and fallback semantics.
+    /// Ignored when `character_id` is present: server-side resolution via
+    /// [`resolve_character_configs`] wins so clone / design profiles land
+    /// their correct SynthMode without the client having to know voice-file
+    /// bytes.
     #[serde(default)]
     configs: Vec<ConfigBody>,
+    /// Optional character id. When set, the server resolves this character's
+    /// voice profile (see `profile_id`) and uses those configs; `configs`
+    /// above is discarded. Used by the Characters-page Test field.
+    #[serde(default)]
+    character_id: Option<String>,
+    /// Optional profile id, only meaningful alongside `character_id`. Picks
+    /// which of the character's `voiceProfiles` to render; `None` falls back
+    /// to the first / default profile.
+    #[serde(default)]
+    profile_id: Option<String>,
 }
 
 /// Rendered clip in a form ready to hand to the store + client. Held as
@@ -1951,12 +2258,32 @@ struct NormalizedWidget {
     persist_instruct: Option<String>,
 }
 
-fn normalize_widget_body(body: WidgetBody) -> Result<NormalizedWidget, (StatusCode, String)> {
+async fn normalize_widget_body(
+    state: &AppState,
+    body: WidgetBody,
+) -> Result<NormalizedWidget, (StatusCode, String)> {
     let text = body.text.trim().to_string();
     if text.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "empty text".into()));
     }
-    let configs = configs_or_default(body.configs);
+    // Character-scoped path: the Characters-page Test field sends
+    // characterId (+profileId) so clone/design profiles synth in their
+    // correct mode. A stale or dropped character id short-circuits to a
+    // 400 so the client learns the profile is gone rather than silently
+    // rendering a fallback voice under an unrelated profile.
+    let configs = if let Some(cid) = body.character_id.as_deref() {
+        match resolve_character_configs(state, cid, body.profile_id.as_deref()).await {
+            Some(cfg) => cfg,
+            None => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("could not resolve character {cid} / profile {:?}", body.profile_id),
+                ));
+            }
+        }
+    } else {
+        configs_or_default(body.configs)
+    };
     let persist_instruct = configs.first().and_then(|c| c.instruct.clone());
     Ok(NormalizedWidget {
         text,
@@ -1991,7 +2318,7 @@ async fn widget_create_handler(
     State(state): State<AppState>,
     Json(body): Json<WidgetBody>,
 ) -> Response {
-    let NormalizedWidget { text, configs, persist_instruct } = match normalize_widget_body(body) {
+    let NormalizedWidget { text, configs, persist_instruct } = match normalize_widget_body(&state, body).await {
         Ok(t) => t,
         Err((code, msg)) => return (code, msg).into_response(),
     };
@@ -2031,7 +2358,7 @@ async fn widget_update_handler(
     Path(id): Path<String>,
     Json(body): Json<WidgetBody>,
 ) -> Response {
-    let NormalizedWidget { text, configs, persist_instruct } = match normalize_widget_body(body) {
+    let NormalizedWidget { text, configs, persist_instruct } = match normalize_widget_body(&state, body).await {
         Ok(t) => t,
         Err((code, msg)) => return (code, msg).into_response(),
     };
@@ -2337,6 +2664,71 @@ async fn widget_say_handler(
 async fn playback_stop_handler(State(state): State<AppState>) -> Response {
     let gen = state.mixer.request_tts_stop();
     info!(gen, "playback stop requested");
+    (StatusCode::OK, Json(ActionResponse { ok: true, error: None })).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// /clicks/start · /clicks/stop — wait-fill "computer is thinking" click bed.
+//
+// The Script page flips this on at Send so Discord participants get a soft
+// mechanical clicking cue while the LLM is deliberating, and flips it off
+// when the first assistant speech take begins playback. The generator
+// itself lives in `tts::run_clicks` and pushes bursts into the same ring
+// as speech, so real playback naturally preempts filler via the existing
+// tts_stop_gen path. Off-request bumps the stop-gen so any burst already
+// sitting in the ring gets flushed instead of tailing off audibly.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize, Default)]
+struct ClicksStartBody {
+    /// Preset id (see [`crate::tts::clicks::ClickPreset::from_str_id`]).
+    /// Omitted → default to `"vintage"`. Unknown → 400 so a typo in a
+    /// client build surfaces immediately instead of silently mis-voicing.
+    #[serde(default)]
+    preset: Option<String>,
+}
+
+async fn clicks_start_handler(
+    State(state): State<AppState>,
+    body: Option<Json<ClicksStartBody>>,
+) -> Response {
+    let raw = body
+        .and_then(|Json(b)| b.preset)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "vintage".to_string());
+    let Some(preset) = crate::tts::clicks::ClickPreset::from_str_id(&raw) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ActionResponse {
+                ok: false,
+                error: Some(format!("unknown click preset: {raw}")),
+            }),
+        )
+            .into_response();
+    };
+    state.mixer.set_clicks_preset(Some(preset));
+    info!(preset = %raw, "wait-fill clicks enabled");
+    (StatusCode::OK, Json(ActionResponse { ok: true, error: None })).into_response()
+}
+
+async fn clicks_stop_handler(State(state): State<AppState>) -> Response {
+    // Setting the preset to `None` is enough to stop the generator from
+    // emitting new bursts (see `run_clicks` — it polls this every burst
+    // boundary and idles when unset), and any burst mid-push also bails
+    // via `handle_click_burst`'s is_stopped which watches this same flag.
+    // Deliberately do NOT bump `tts_stop_gen` here: that atomic is what
+    // `handle_play_pcm`'s push loop watches for "abort me mid-clip", and
+    // the Script page fires this endpoint concurrently with the very
+    // first assistant PlayPcm (the activeClip effect races with
+    // playWidget). Bumping was cutting the tail off the first clip on
+    // fresh replies. Any burst already sitting in the ring gets flushed
+    // by the NEXT PlayPcm's own request_tts_stop; a lone stop without a
+    // follow-on play would tail up to ~120 ms of clicks, which no user
+    // flow currently hits (manual cancel paths also fire /playback/stop
+    // or /widgets/:id/say, both of which do drain the ring).
+    state.mixer.set_clicks_preset(None);
+    info!("wait-fill clicks disabled");
     (StatusCode::OK, Json(ActionResponse { ok: true, error: None })).into_response()
 }
 
@@ -2792,6 +3184,188 @@ async fn scene_mix_handler(
         .into_response()
 }
 
+// ---------------------------------------------------------------------------
+// /scripts/:id/mix.flac — concatenate a script's entire audio timeline into a
+// single FLAC download.
+//
+// Walks turns in order and, per turn, includes:
+//   * user turn: the attached widget (recording or GM proxy), if present.
+//   * assistant turn: each block's SELECTED take widget in reading order.
+//     Blocks with no takes yet are skipped — they'd otherwise leave dead
+//     air, and the client already tracks unrendered blocks visually.
+// A fixed short pause is inserted between clips so consecutive turns don't
+// audibly butt up against each other. Same sample-rate constraint as
+// /scenes/mix: every clip in the timeline has to match, otherwise we 409.
+// ---------------------------------------------------------------------------
+
+/// Silence between adjacent clips in the mixed .flac. Tuned to match the
+/// natural rhythm of a scripted conversation: enough that turns don't
+/// slur into each other, short enough that the resulting file plays
+/// tight.
+const SCRIPT_MIX_GAP_MS: u32 = 400;
+
+async fn script_mix_handler(
+    State(state): State<AppState>,
+    Path(script_id): Path<String>,
+) -> Response {
+    let script = match state.store.get_script(script_id.clone()).await {
+        Ok(r) => r,
+        Err(err) => {
+            tracing::error!(err = %format!("{err:#}"), %script_id, "store: script get failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("store: {err:#}"))
+                .into_response();
+        }
+    };
+    let script_name = state
+        .store
+        .get_script_name(script_id.clone())
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+
+    // Walk turns in order, collecting the widget ids that should end up on
+    // the timeline. For assistant blocks we pick the SELECTED take, falling
+    // back to the last take when selection is unset (matches the Play All
+    // logic client-side).
+    let mut widget_ids: Vec<String> = Vec::new();
+    for turn in &script.turns {
+        match turn.role.as_str() {
+            "user" => {
+                if let Some(w) = turn.widget_id.as_ref() {
+                    widget_ids.push(w.clone());
+                }
+            }
+            "assistant" => {
+                for block in &turn.blocks {
+                    if block.takes.is_empty() {
+                        continue;
+                    }
+                    let chosen = block
+                        .selected_take
+                        .and_then(|ord| block.takes.iter().find(|t| t.ord == ord))
+                        .unwrap_or_else(|| block.takes.last().expect("non-empty checked above"));
+                    widget_ids.push(chosen.widget_id.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if widget_ids.is_empty() {
+        return (StatusCode::NOT_FOUND, "script has no audio to mix").into_response();
+    }
+
+    // Read every clip's WAV concurrently — same shape as scene_mix_handler.
+    let reads = widget_ids.iter().map(|id| {
+        let path = state.store.clip_path(id);
+        let id = id.clone();
+        async move {
+            let bytes = tokio::fs::read(&path)
+                .await
+                .with_context(|| format!("reading clip {id}"))?;
+            Ok::<(String, Vec<u8>), anyhow::Error>((id, bytes))
+        }
+    });
+    let clips = match futures_util::future::try_join_all(reads).await {
+        Ok(v) => v,
+        Err(err) => {
+            return (StatusCode::NOT_FOUND, format!("clip missing: {err:#}"))
+                .into_response();
+        }
+    };
+
+    let mut decoded: Vec<(u32, Vec<[f32; 2]>)> = Vec::with_capacity(clips.len());
+    for (id, bytes) in clips {
+        match decode_wav_pcm16_stereo_any(&bytes) {
+            Ok(pair) => decoded.push(pair),
+            Err(err) => {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("decode {id}: {err}"),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    let sample_rate = decoded[0].0;
+    if let Some((idx, (r, _))) = decoded.iter().enumerate().find(|(_, (r, _))| *r != sample_rate)
+    {
+        return (
+            StatusCode::CONFLICT,
+            format!(
+                "clip {idx} has sample_rate {r} but script starts at {sample_rate}; \
+                 re-render so every clip matches"
+            ),
+        )
+            .into_response();
+    }
+
+    let gap_frames = ((SCRIPT_MIX_GAP_MS as u64 * sample_rate as u64) / 1000) as usize;
+    let total_frames: usize = decoded.iter().map(|(_, s)| s.len()).sum::<usize>()
+        + gap_frames * decoded.len().saturating_sub(1);
+    let mut mixed: Vec<i32> = Vec::with_capacity(total_frames * 2);
+    for (i, (_, pairs)) in decoded.iter().enumerate() {
+        if i > 0 && gap_frames > 0 {
+            mixed.extend(std::iter::repeat_n(0i32, gap_frames * 2));
+        }
+        for [l, r] in pairs.iter() {
+            mixed.push(f32_to_i16_clipped(*l) as i32);
+            mixed.push(f32_to_i16_clipped(*r) as i32);
+        }
+    }
+
+    let flac = match tokio::task::spawn_blocking(move || encode_flac_stereo_i16(&mixed, sample_rate))
+        .await
+    {
+        Ok(Ok(v)) => v,
+        Ok(Err(err)) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("flac encode: {err}"),
+            )
+                .into_response();
+        }
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "flac encode task panicked",
+            )
+                .into_response();
+        }
+    };
+
+    // Reuse the scene filename sanitizer so the same character rules apply —
+    // it already handles empty / punctuation-only names by falling back to
+    // "scene". A script-specific fallback would be nicer, but the sanitizer
+    // is private to this file and the fallback isn't user-visible often.
+    let filename = scene_mix_filename(if script_name.is_empty() {
+        "script"
+    } else {
+        &script_name
+    });
+    info!(
+        %script_id,
+        clips = widget_ids.len(),
+        bytes = flac.len(),
+        filename = %filename,
+        "script mix produced"
+    );
+    (
+        [
+            (header::CONTENT_TYPE, "audio/flac".to_string()),
+            (header::CACHE_CONTROL, "no-store".to_string()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{filename}\""),
+            ),
+        ],
+        Bytes::from(flac),
+    )
+        .into_response()
+}
+
 /// Decode a WAV in our dialect (16-bit little-endian PCM, mono or stereo)
 /// into stereo pairs. Not a general WAV parser — just enough to round-trip
 /// files produced by [`encode_wav_pcm16_stereo`] plus legacy mono widget
@@ -3048,6 +3622,255 @@ async fn image_delete_handler(
         }
         Err(err) => {
             tracing::error!(err = %format!("{err:#}"), %id, "store: image delete failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ActionResponse {
+                    ok: false,
+                    error: Some(format!("{err:#}")),
+                }),
+            )
+                .into_response()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// /voices — persistent compact voice-prompt files distilled from a user-
+// supplied reference audio via the Qwen3 clone deploy's `/save_prompt`.
+// Roundtrip: client POSTs the reference wav bytes (raw body) with metadata
+// on the query string; server uploads to Gradio, calls save_prompt, GETs
+// back the tiny voice-prompt file, stores it under `data/voices/{id}` and
+// returns the id. Downstream synth reads the bytes and re-uploads to
+// Gradio's /load_prompt_and_gen on every take (see SynthMode::Clone).
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct VoiceCreateQuery {
+    /// Optional human-transcribed text of the reference wav. When absent
+    /// (or empty), the server runs STT on the uploaded audio and uses
+    /// that instead — the client shows the STT result in the description
+    /// field for the user to review/edit afterward. When present, the
+    /// client's text wins and STT is skipped.
+    #[serde(default)]
+    ref_txt: Option<String>,
+    /// Toggle for Qwen3-TTS-Base's x-vector embedding path. `true` (default)
+    /// uses the x-vector encoder; `false` skips it. Passed straight through
+    /// to save_prompt.
+    #[serde(default = "default_use_xvec")]
+    use_xvec: bool,
+    /// Original filename of the uploaded wav, used verbatim for the
+    /// Gradio multipart upload. Defaults to `reference.wav` since Gradio
+    /// only cares about the extension.
+    #[serde(default = "default_ref_wav_name")]
+    filename: String,
+}
+fn default_use_xvec() -> bool { true }
+fn default_ref_wav_name() -> String { "reference.wav".to_string() }
+
+async fn voice_create_handler(
+    State(state): State<AppState>,
+    Query(q): Query<VoiceCreateQuery>,
+    body: Bytes,
+) -> Response {
+    if body.is_empty() {
+        return (StatusCode::BAD_REQUEST, "empty reference wav body").into_response();
+    }
+
+    // Client-supplied ref_txt wins. When empty, fall through to STT so
+    // the user doesn't have to type the transcription first — they'll
+    // see the STT result populated in the description field afterward
+    // and can correct it there.
+    let typed_ref_txt = q
+        .ref_txt
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let ref_txt = match typed_ref_txt {
+        Some(t) => t,
+        None => {
+            let Some(recog) = state.stt.clone() else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "ref_txt is required (STT is not loaded on this server)",
+                )
+                    .into_response();
+            };
+            // Decode + downmix to mono for the recognizer. The reused
+            // decoder here accepts mono OR stereo PCM16 — the common
+            // case for user-uploaded reference wavs — and rejects
+            // fancier formats (float / 24-bit / mp3) with a clear error
+            // that surfaces to the user as a 400.
+            let (sample_rate, pairs) = match decode_wav_pcm16_stereo_any(&body) {
+                Ok(v) => v,
+                Err(e) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        format!(
+                            "reference wav decode failed ({e}); \
+                             upload PCM16 mono/stereo, or type the transcription manually"
+                        ),
+                    )
+                        .into_response();
+                }
+            };
+            if pairs.is_empty() {
+                return (StatusCode::BAD_REQUEST, "reference wav has no samples").into_response();
+            }
+            let mono: Vec<f32> = pairs.iter().map(|p| (p[0] + p[1]) * 0.5).collect();
+            match tokio::task::spawn_blocking(move || recog.transcribe(&mono, sample_rate)).await {
+                Ok(Ok(t)) => {
+                    let trimmed = t.trim().to_string();
+                    if trimmed.is_empty() {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            "STT produced an empty transcript (silent or non-speech audio?) — type the transcription manually",
+                        )
+                            .into_response();
+                    }
+                    info!(len = trimmed.len(), "STT transcript for reference wav");
+                    trimmed
+                }
+                Ok(Err(err)) => {
+                    tracing::warn!(err = %format!("{err:#}"), "STT failed on reference wav");
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        format!("STT failed ({err:#}); type the transcription manually"),
+                    )
+                        .into_response();
+                }
+                Err(_) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "STT task panicked",
+                    )
+                        .into_response();
+                }
+            }
+        }
+    };
+
+    // Fire the save_prompt command through the tts runner so the qwen3
+    // backend (if active) can do the Gradio roundtrip. Any non-qwen3
+    // backend replies with a clear "not supported" that we forward as a
+    // 400 — the UI hides clone-mode when the backend isn't qwen3, so
+    // reaching this branch means the client raced a settings change.
+    let (reply_tx, reply_rx) = oneshot::channel();
+    let cmd = tts::Command::SavePrompt(tts::SavePromptRequest {
+        reference_wav: body.to_vec(),
+        reference_wav_name: q.filename,
+        ref_txt: ref_txt.clone(),
+        use_xvec: q.use_xvec,
+        reply: reply_tx,
+    });
+    if state.tts.send(cmd).await.is_err() {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "tts runner has shut down",
+        )
+            .into_response();
+    }
+    let outcome = match reply_rx.await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => {
+            return (StatusCode::BAD_GATEWAY, format!("save_prompt: {e}")).into_response();
+        }
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "tts runner dropped the reply channel",
+            )
+                .into_response();
+        }
+    };
+    match state
+        .store
+        .create_voice(
+            outcome.voice_file_bytes.clone(),
+            outcome.filename.clone(),
+            Some(body.to_vec()),
+        )
+        .await
+    {
+        Ok(id) => {
+            info!(
+                %id,
+                bytes = outcome.voice_file_bytes.len(),
+                filename = %outcome.filename,
+                "voice-prompt stored"
+            );
+            (
+                StatusCode::CREATED,
+                Json(serde_json::json!({
+                    "id": id,
+                    "filename": outcome.filename,
+                    "size": outcome.voice_file_bytes.len(),
+                    // Echo back whatever text ended up feeding save_prompt
+                    // (either the client's typed value, or the STT result)
+                    // so the client can populate the description field.
+                    "transcript": ref_txt,
+                })),
+            )
+                .into_response()
+        }
+        Err(err) => {
+            tracing::error!(err = %format!("{err:#}"), "store: voice create failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("store: {err:#}"),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Stream the original reference wav bytes for review playback in the
+/// Characters UI. The saved voice-prompt file is the compact embedding
+/// (~KB) that Qwen3 needs for synth; this endpoint is for humans who
+/// want to hear what they actually uploaded. Response is
+/// `audio/wav`; browsers can hand this straight to a `<audio>` tag.
+async fn voice_reference_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    let path = state.store.voice_reference_path(&id);
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => (
+            [
+                (header::CONTENT_TYPE, "audio/wav".to_string()),
+                (
+                    header::CACHE_CONTROL,
+                    "public, max-age=31536000, immutable".to_string(),
+                ),
+            ],
+            Bytes::from(bytes),
+        )
+            .into_response(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (
+            StatusCode::NOT_FOUND,
+            format!("no reference wav for voice {id}"),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("reference wav read: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+async fn voice_delete_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    match state.store.delete_voice(id.clone()).await {
+        Ok(UpdateResult::Updated) => {
+            info!(%id, "voice deleted");
+            (StatusCode::OK, Json(ActionResponse { ok: true, error: None })).into_response()
+        }
+        Ok(UpdateResult::NotFound) => {
+            (StatusCode::NOT_FOUND, format!("no voice {id}")).into_response()
+        }
+        Err(err) => {
+            tracing::error!(err = %format!("{err:#}"), %id, "store: voice delete failed");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ActionResponse {

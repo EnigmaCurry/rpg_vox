@@ -57,8 +57,13 @@ export async function fetchWidget(id) {
 // field names back for the request payload (see ConfigBody in http.rs).
 // Pass `{ signal }` to abort mid-render; the server keeps synthesizing but
 // the client stops awaiting so the UI can revert to its pre-render state.
-async function widgetRender(method, path, text, configs = [], { signal } = {}) {
+// Pass `{ characterId, profileId }` to have the server resolve the voice
+// profile server-side (correct clone/design mode dispatch) — the `configs`
+// argument is ignored in that case.
+async function widgetRender(method, path, text, configs = [], { signal, characterId, profileId } = {}) {
   const body = { text, configs };
+  if (characterId) body.characterId = characterId;
+  if (profileId) body.profileId = profileId;
   const r = await fetch(path, {
     method,
     headers: { 'content-type': 'application/json' },
@@ -211,6 +216,26 @@ export async function stopPlayback() {
     const detail = await r.text().catch(() => `HTTP ${r.status}`);
     throw new Error(detail || `HTTP ${r.status}`);
   }
+}
+
+/// Toggle the wait-fill "computer is thinking" click bed. Enabled at the
+/// start of a Script send so Discord participants get a soft mechanical
+/// click cue while the LLM is deliberating, disabled once real assistant
+/// speech begins playback. `preset` picks a voicing — currently the
+/// server only knows `"vintage"`; unknown ids come back as 400.
+/// Fire-and-forget: transport errors are swallowed since a failed cue
+/// shouldn't derail the surrounding Send.
+export async function startClicks(preset = 'vintage') {
+  try {
+    await fetch('/clicks/start', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ preset }),
+    });
+  } catch {}
+}
+export async function stopClicks() {
+  try { await fetch('/clicks/stop', { method: 'POST' }); } catch {}
 }
 
 export async function deleteWidget(id) {
@@ -383,6 +408,30 @@ export async function sendUserTurn(scriptId, text, widgetId = null, agentId = nu
   return await r.json();
 }
 
+/// Edit a user turn in place. Server-side this truncates the transcript
+/// from `turnId` onward (dropping every later turn + its widgets), synths
+/// a fresh GM-proxy widget for the new text, and creates a replacement
+/// user turn. Returns the new `user_turn` in the same shape as
+/// `sendUserTurn`. Caller is expected to fire `sendAssistantReply` after
+/// to regenerate the LLM response against the rewound history.
+export async function editUserTurn(scriptId, turnId, text, agentId = null) {
+  const body = { text };
+  if (agentId) body.agentId = agentId;
+  const r = await fetch(
+    `/scripts/${encodeURIComponent(scriptId)}/turns/${encodeURIComponent(turnId)}/edit-user`,
+    {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    },
+  );
+  if (!r.ok) {
+    const detail = await r.text().catch(() => `HTTP ${r.status}`);
+    throw new Error(detail || `HTTP ${r.status}`);
+  }
+  return await r.json();
+}
+
 /// Phase 2 of the /script two-step. Calls the LLM against the history that
 /// phase 1 populated, persists the assistant turn (with narrator/character
 /// blocks parsed out), returns it.
@@ -439,9 +488,13 @@ export async function createAgent(name, projectId = null) {
 }
 
 /// Patch an agent. `patch` is an object with any subset of:
-///   { name, systemPrompt, voiceUser, voiceNarrator, voiceCharacter }
+///   { name, systemPrompt, voiceUser, voiceNarrator, voiceCharacter,
+///     interstitial }
 /// Voice slots take a character id (string) to set, `null` to clear back
 /// to the DSP-preset fallback, or the field is omitted to leave alone.
+/// `interstitial` follows the same tri-state: a preset id string turns
+/// the wait-fill click bed on with that voicing, `null` disables it,
+/// omitting the key leaves the current selection alone.
 export async function updateAgent(id, patch) {
   const r = await fetch(`/agents/${encodeURIComponent(id)}`, {
     method: 'PUT',
@@ -465,6 +518,63 @@ export async function deleteAgent(id) {
 /// Synthesize a fresh take for a speech block. Server reads the block's
 /// text from its own row so the client only needs the block id + any voice
 /// config layers. Returns the new take (with widget id + duration metadata).
+/// Sentinel value the agent-editor dropdown uses to explicitly silence
+/// a role. Mirrored on the server (http.rs::VOICE_SILENCE). Distinct
+/// from the empty-string "unset — use DSP fallback" state, so custom
+/// agents can opt out of TTS for a role while Default's zero-config
+/// fallback stays intact.
+export const VOICE_SILENCE = '__silence__';
+
+// --- Voice-prompt files (Qwen3 clone-mode save_prompt roundtrip) ---------
+//
+// POST /voices  → { id, filename, size, transcript } — server does the
+//                 Gradio round-trip and stores the compact voice-prompt
+//                 file. `transcript` echoes whatever ref_txt actually fed
+//                 save_prompt (either the caller's typed value, or the
+//                 server-side STT result when refTxt was omitted).
+// DELETE /voices/:id → 200 (or 404)
+// GET /voices/:id/reference → the original reference wav bytes, for
+//                             browser-side review playback.
+//
+// The reference wav is sent as the raw request body. `refTxt` is optional
+// — omit to let the server auto-transcribe via STT; include to override
+// with a typed transcription. `filename` is cosmetic (Gradio preserves
+// the extension in the returned temp path).
+
+export async function createVoice(wavBlob, { refTxt = null, useXvec = true, filename = 'reference.wav' } = {}) {
+  const params = new URLSearchParams({
+    use_xvec: useXvec ? 'true' : 'false',
+    filename,
+  });
+  if (refTxt && refTxt.trim()) {
+    params.set('ref_txt', refTxt.trim());
+  }
+  const r = await fetch(`/voices?${params}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/octet-stream' },
+    body: wavBlob,
+  });
+  if (!r.ok) {
+    const detail = await r.text().catch(() => `HTTP ${r.status}`);
+    throw new Error(detail || `HTTP ${r.status}`);
+  }
+  return await r.json();
+}
+
+/// Absolute URL for the reference wav bytes tied to a voice-prompt file
+/// id. Suitable as a `<audio src>` for review playback.
+export function voiceReferenceUrl(voiceId) {
+  return `/voices/${encodeURIComponent(voiceId)}/reference`;
+}
+
+export async function deleteVoice(id) {
+  const r = await fetch(`/voices/${encodeURIComponent(id)}`, { method: 'DELETE' });
+  if (!r.ok) {
+    const detail = await r.text().catch(() => `HTTP ${r.status}`);
+    throw new Error(detail || `HTTP ${r.status}`);
+  }
+}
+
 export async function createTake(blockId, configs = [], agentId = null) {
   const body = { configs };
   if (agentId) body.agentId = agentId;

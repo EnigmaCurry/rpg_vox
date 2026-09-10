@@ -87,8 +87,23 @@ CREATE TABLE IF NOT EXISTS agents (
     voice_user        TEXT,
     voice_narrator    TEXT,
     voice_character   TEXT,
+    -- Wait-fill click preset id (see tts::clicks::ClickPreset). NULL =
+    -- no click bed while the LLM is deliberating; a non-NULL string
+    -- like "vintage" selects a preset. Nullable so existing agents
+    -- default off — quiet-by-default is the least-intrusive migration.
+    interstitial      TEXT,
     created_at        INTEGER NOT NULL,
     updated_at        INTEGER NOT NULL
+);
+-- Compact voice-prompt files (the output of Qwen3 /save_prompt). Bytes on
+-- disk under `data/voices/{id}.bin`; the row is the manifest. `filename`
+-- preserves the extension the Gradio server handed us so we can round-
+-- trip it on future uploads without guessing.
+CREATE TABLE IF NOT EXISTS voices (
+    id           TEXT PRIMARY KEY,
+    filename     TEXT NOT NULL,
+    byte_size    INTEGER NOT NULL,
+    created_at   INTEGER NOT NULL
 );
 "#;
 
@@ -115,6 +130,7 @@ pub struct Store {
     db: Arc<Mutex<Connection>>,
     clips_dir: PathBuf,
     images_dir: PathBuf,
+    voices_dir: PathBuf,
 }
 
 impl Store {
@@ -129,6 +145,9 @@ impl Store {
         let images_dir = data_dir.join("images");
         std::fs::create_dir_all(&images_dir)
             .with_context(|| format!("creating images dir {}", images_dir.display()))?;
+        let voices_dir = data_dir.join("voices");
+        std::fs::create_dir_all(&voices_dir)
+            .with_context(|| format!("creating voices dir {}", voices_dir.display()))?;
 
         let db_path = data_dir.join("rpg_vox.sqlite");
         let conn = Connection::open(&db_path)
@@ -173,6 +192,9 @@ impl Store {
             ("voice_user", "TEXT"),
             ("voice_narrator", "TEXT"),
             ("voice_character", "TEXT"),
+            // Per-agent "computer is thinking" click preset. See the
+            // agents table body above for the semantics.
+            ("interstitial", "TEXT"),
         ] {
             add_column_if_missing(&conn, "agents", col, decl)
                 .with_context(|| format!("migrating {col} column on agents"))?;
@@ -182,6 +204,7 @@ impl Store {
             db: Arc::new(Mutex::new(conn)),
             clips_dir,
             images_dir,
+            voices_dir,
         })
     }
 
@@ -191,6 +214,109 @@ impl Store {
 
     pub fn image_path(&self, id: &str) -> PathBuf {
         self.images_dir.join(id)
+    }
+
+    pub fn voice_path(&self, id: &str) -> PathBuf {
+        self.voices_dir.join(id)
+    }
+
+    /// Path to the original reference wav that produced this voice-prompt
+    /// file. Kept for user review (a play button in the Characters UI so
+    /// people can hear what they uploaded); NEVER used by the synth path.
+    pub fn voice_reference_path(&self, id: &str) -> PathBuf {
+        self.voices_dir.join(format!("{id}.wav"))
+    }
+
+    /// Persist a compact voice-prompt file (bytes returned from Qwen3
+    /// `/save_prompt`) alongside the original reference wav. `filename`
+    /// is preserved verbatim so we can round-trip it on future Gradio
+    /// uploads (the extension matters — .bin vs .pt). `reference_wav`
+    /// is optional: when None we skip writing the review-playback file
+    /// (e.g. an admin-uploaded voice-prompt without an original recording).
+    pub async fn create_voice(
+        &self,
+        bytes: Vec<u8>,
+        filename: String,
+        reference_wav: Option<Vec<u8>>,
+    ) -> Result<String> {
+        let id = Uuid::new_v4().to_string();
+        let now = unix_now();
+        let byte_size = bytes.len() as i64;
+        let db = self.db.clone();
+        let id_clone = id.clone();
+        let filename_clone = filename.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO voices (id, filename, byte_size, created_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![id_clone, filename_clone, byte_size, now],
+            )?;
+            Ok(())
+        })
+        .await
+        .context("db task panicked")??;
+
+        tokio::fs::write(self.voice_path(&id), bytes)
+            .await
+            .with_context(|| format!("writing voice bytes for {id}"))?;
+        if let Some(wav) = reference_wav {
+            tokio::fs::write(self.voice_reference_path(&id), wav)
+                .await
+                .with_context(|| format!("writing reference wav for {id}"))?;
+        }
+
+        Ok(id)
+    }
+
+    /// Read a voice-prompt file back off disk alongside its stored filename.
+    /// Returns `Ok(None)` when the row doesn't exist so callers can
+    /// distinguish "unknown id" from a real I/O error.
+    pub async fn get_voice_bytes(&self, id: String) -> Result<Option<(Vec<u8>, String)>> {
+        let db = self.db.clone();
+        let id_clone = id.clone();
+        let row: Option<String> = tokio::task::spawn_blocking(move || -> Result<Option<String>> {
+            let conn = db.lock().unwrap();
+            let row = conn
+                .query_row(
+                    "SELECT filename FROM voices WHERE id = ?1",
+                    params![id_clone],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?;
+            Ok(row)
+        })
+        .await
+        .context("db task panicked")??;
+        let Some(filename) = row else {
+            return Ok(None);
+        };
+        let bytes = tokio::fs::read(self.voice_path(&id))
+            .await
+            .with_context(|| format!("reading voice bytes for {id}"))?;
+        Ok(Some((bytes, filename)))
+    }
+
+    /// Drop a voice by id: DB row first, then the on-disk file. Missing
+    /// file is not an error (partial state from a crash mid-write); a
+    /// missing row is reported via `UpdateResult::NotFound`.
+    pub async fn delete_voice(&self, id: String) -> Result<UpdateResult> {
+        let db = self.db.clone();
+        let id_clone = id.clone();
+        let rows = tokio::task::spawn_blocking(move || -> Result<usize> {
+            let conn = db.lock().unwrap();
+            let rows = conn.execute("DELETE FROM voices WHERE id = ?1", params![id_clone])?;
+            Ok(rows)
+        })
+        .await
+        .context("db task panicked")??;
+        let _ = tokio::fs::remove_file(self.voice_path(&id)).await;
+        let _ = tokio::fs::remove_file(self.voice_reference_path(&id)).await;
+        Ok(if rows == 0 {
+            UpdateResult::NotFound
+        } else {
+            UpdateResult::Updated
+        })
     }
 
     /// Look up an existing widget's clip metadata. Returns `Ok(None)` if the
@@ -667,6 +793,26 @@ impl Store {
         Ok(widget_ids)
     }
 
+    /// Look up just a script's display name. `Ok(None)` when the id doesn't
+    /// exist. Used by callers that need the name for a filename or heading
+    /// without the cost of hydrating every turn + block + take.
+    pub async fn get_script_name(&self, script_id: String) -> Result<Option<String>> {
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || -> Result<Option<String>> {
+            let conn = db.lock().unwrap();
+            let row = conn
+                .query_row(
+                    "SELECT name FROM scripts WHERE id = ?1",
+                    params![script_id],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?;
+            Ok(row)
+        })
+        .await
+        .context("db task panicked")?
+    }
+
     /// Read the full script (turns + blocks + takes) in ordering-stable form.
     /// Empty script returns Ok with an empty turns list.
     pub async fn get_script(&self, script_id: String) -> Result<ScriptRow> {
@@ -1077,6 +1223,98 @@ impl Store {
         Ok(widget_ids)
     }
 
+    /// Truncate a script at `turn_id`: delete that turn AND every turn with
+    /// a greater `ord` within the same script. Returns the widget ids of
+    /// everything that was cascaded so the caller can drop the WAV files
+    /// (same contract as [`Self::clear_script`]). Ok(None) means the turn
+    /// wasn't found (already deleted, or belongs to a different script) —
+    /// the caller treats that as a NOT_FOUND without touching the store
+    /// further.
+    ///
+    /// Used by the /scripts/:id/turns/:turn_id/edit-user flow so editing an
+    /// earlier user turn rewinds the transcript to that point before the
+    /// re-synth + LLM reply. The turn_id itself is dropped along with its
+    /// followers so the caller can immediately insert a REPLACEMENT user
+    /// turn at the freed ord.
+    pub async fn truncate_script_from_turn(
+        &self,
+        script_id: String,
+        turn_id: String,
+    ) -> Result<Option<Vec<String>>> {
+        let db = self.db.clone();
+        let script_id_clone = script_id.clone();
+        let turn_id_clone = turn_id.clone();
+        tokio::task::spawn_blocking(move || -> Result<Option<Vec<String>>> {
+            let mut conn = db.lock().unwrap();
+            let tx = conn.transaction()?;
+
+            // Resolve the turn's ord. Missing → caller reports 404 and
+            // leaves the script untouched.
+            let ord: Option<i64> = tx
+                .query_row(
+                    "SELECT ord FROM script_turns
+                      WHERE id = ?1 AND script_id = ?2",
+                    params![turn_id_clone, script_id_clone],
+                    |r| r.get::<_, i64>(0),
+                )
+                .optional()?;
+            let Some(cutoff_ord) = ord else {
+                return Ok(None);
+            };
+
+            let mut ids: Vec<String> = Vec::new();
+            // Speech-take widgets for every turn at/after the cutoff. Same
+            // shape as clear_script — narrator/character TTS clips are
+            // linked through script_speech_blocks + script_speech_takes and
+            // have an ON DELETE CASCADE up through the block, but the
+            // widget rows live outside the cascade path.
+            {
+                let mut stmt = tx.prepare(
+                    "SELECT t.widget_id
+                       FROM script_speech_takes t
+                       JOIN script_speech_blocks b ON b.id = t.block_id
+                       JOIN script_turns tr        ON tr.id = b.turn_id
+                      WHERE tr.script_id = ?1 AND tr.ord >= ?2",
+                )?;
+                let rows = stmt
+                    .query_map(params![script_id_clone, cutoff_ord], |r| {
+                        r.get::<_, String>(0)
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                ids.extend(rows);
+            }
+            // User-turn attached widgets (recording + GM proxy synth) —
+            // ON DELETE SET NULL on the FK, so the caller has to unlink.
+            {
+                let mut stmt = tx.prepare(
+                    "SELECT widget_id FROM script_turns
+                      WHERE script_id = ?1 AND ord >= ?2
+                        AND widget_id IS NOT NULL",
+                )?;
+                let rows = stmt
+                    .query_map(params![script_id_clone, cutoff_ord], |r| {
+                        r.get::<_, String>(0)
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                ids.extend(rows);
+            }
+
+            tx.execute(
+                "DELETE FROM script_turns
+                  WHERE script_id = ?1 AND ord >= ?2",
+                params![script_id_clone, cutoff_ord],
+            )?;
+            tx.execute(
+                "UPDATE scripts SET updated_at = ?2 WHERE id = ?1",
+                params![script_id_clone, unix_now()],
+            )?;
+            tx.commit()?;
+            Ok(Some(ids))
+        })
+        .await
+        .context("db task panicked")?
+    }
+
     /// Look up a block's persisted text + role so `POST .../takes` can
     /// re-render without the client echoing the text back, and can pick a
     /// role-appropriate voice profile automatically.
@@ -1120,6 +1358,10 @@ pub struct AgentRow {
     pub voice_user: Option<String>,
     pub voice_narrator: Option<String>,
     pub voice_character: Option<String>,
+    /// Wait-fill "computer is thinking" click preset id. NULL = no click
+    /// bed. See [`crate::tts::clicks::ClickPreset::from_str_id`] for the
+    /// current whitelist of strings the runner accepts.
+    pub interstitial: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -1134,6 +1376,10 @@ pub enum AgentField {
     VoiceUser(Option<String>),
     VoiceNarrator(Option<String>),
     VoiceCharacter(Option<String>),
+    /// Preset id (or None to clear back to "no click bed"). Validated at
+    /// the HTTP layer against [`crate::tts::clicks::ClickPreset::from_str_id`]
+    /// before it reaches the store, so any value here is trusted.
+    Interstitial(Option<String>),
 }
 
 fn row_to_agent(r: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRow> {
@@ -1145,8 +1391,9 @@ fn row_to_agent(r: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRow> {
         voice_user: r.get::<_, Option<String>>(4)?,
         voice_narrator: r.get::<_, Option<String>>(5)?,
         voice_character: r.get::<_, Option<String>>(6)?,
-        created_at: r.get::<_, i64>(7)?,
-        updated_at: r.get::<_, i64>(8)?,
+        interstitial: r.get::<_, Option<String>>(7)?,
+        created_at: r.get::<_, i64>(8)?,
+        updated_at: r.get::<_, i64>(9)?,
     })
 }
 
@@ -1169,8 +1416,9 @@ impl Store {
                 "INSERT INTO agents
                    (id, name, system_prompt, project_id,
                     voice_user, voice_narrator, voice_character,
+                    interstitial,
                     created_at, updated_at)
-                 VALUES (?1, ?2, ?3, NULL, NULL, NULL, NULL, ?4, ?5)
+                 VALUES (?1, ?2, ?3, NULL, NULL, NULL, NULL, NULL, ?4, ?5)
                  ON CONFLICT(id) DO UPDATE SET
                      name = excluded.name,
                      system_prompt = excluded.system_prompt,
@@ -1195,6 +1443,7 @@ impl Store {
                 let mut stmt = conn.prepare(
                     "SELECT id, name, system_prompt, project_id,
                             voice_user, voice_narrator, voice_character,
+                            interstitial,
                             created_at, updated_at
                        FROM agents
                       WHERE project_id IS NULL OR project_id = ?2
@@ -1208,6 +1457,7 @@ impl Store {
                 let mut stmt = conn.prepare(
                     "SELECT id, name, system_prompt, project_id,
                             voice_user, voice_narrator, voice_character,
+                            interstitial,
                             created_at, updated_at
                        FROM agents
                       ORDER BY (id != ?1) ASC, name COLLATE NOCASE ASC",
@@ -1231,6 +1481,7 @@ impl Store {
                 .query_row(
                     "SELECT id, name, system_prompt, project_id,
                             voice_user, voice_narrator, voice_character,
+                            interstitial,
                             created_at, updated_at
                        FROM agents WHERE id = ?1",
                     params![id],
@@ -1273,8 +1524,9 @@ impl Store {
                 "INSERT INTO agents
                    (id, name, system_prompt, project_id,
                     voice_user, voice_narrator, voice_character,
+                    interstitial,
                     created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, NULL, NULL, NULL, ?5, ?6)",
+                 VALUES (?1, ?2, ?3, ?4, NULL, NULL, NULL, NULL, ?5, ?6)",
                 params![id_clone, name_clone, seed, project_clone, now, now],
             )?;
             Ok(seed)
@@ -1289,6 +1541,7 @@ impl Store {
             voice_user: None,
             voice_narrator: None,
             voice_character: None,
+            interstitial: None,
             created_at: now,
             updated_at: now,
         })
@@ -1320,6 +1573,7 @@ impl Store {
                     AgentField::VoiceUser(v) => { sets.push("voice_user = ?"); vals.push(Box::new(v)); }
                     AgentField::VoiceNarrator(v) => { sets.push("voice_narrator = ?"); vals.push(Box::new(v)); }
                     AgentField::VoiceCharacter(v) => { sets.push("voice_character = ?"); vals.push(Box::new(v)); }
+                    AgentField::Interstitial(v) => { sets.push("interstitial = ?"); vals.push(Box::new(v)); }
                 }
             }
             sets.push("updated_at = ?");

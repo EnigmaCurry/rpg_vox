@@ -12,7 +12,9 @@
 
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+
+use crate::tts::clicks::ClickPreset;
 
 const RELAXED: Ordering = Ordering::Relaxed;
 
@@ -161,6 +163,15 @@ pub struct AtomicMixer {
     /// mid-clip. `AtomicU64` (not Mutex) since it's read/written by the
     /// audio-thread callback and must stay lock-free.
     tts_stop_observed_gen: AtomicU64,
+    /// Wait-fill click track selection. `0` = off; any other value
+    /// decodes to a [`ClickPreset`] via [`ClickPreset::from_u8`]. Off by
+    /// default; the Script page sets a preset at Send and clears it
+    /// once the first assistant speech take starts playback. Not
+    /// persisted with the rest of [`MixerState`] — it's transient
+    /// runtime state, same tier as [`Self::tts_stop_gen`] /
+    /// [`Self::play_seq`]. `u8` (not enum-typed atomic) so the RT read
+    /// stays lock-free without pulling in an atomic-cell crate.
+    clicks_preset: AtomicU8,
 }
 
 impl AtomicMixer {
@@ -177,7 +188,27 @@ impl AtomicMixer {
             tts_stop_gen: AtomicU64::new(0),
             play_seq: AtomicU64::new(0),
             tts_stop_observed_gen: AtomicU64::new(0),
+            clicks_preset: AtomicU8::new(0),
         })
+    }
+
+    /// Select the wait-fill preset. `Some(preset)` turns the click bed on
+    /// with that voicing; `None` turns it off. The runner's clicks task
+    /// polls this at every idle tick — flipping to None between bursts
+    /// is enough to stop cleanly. Callers also typically bump
+    /// [`Self::request_tts_stop`] on shutoff so any burst already sitting
+    /// in the pipewire ring is drained instead of tailing off audibly.
+    #[inline]
+    pub fn set_clicks_preset(&self, preset: Option<ClickPreset>) {
+        let v = preset.map(|p| p.as_u8()).unwrap_or(0);
+        self.clicks_preset.store(v, RELAXED);
+    }
+
+    /// Current preset selection. `None` = off. Read by the runner's
+    /// clicks task once per generated burst.
+    #[inline]
+    pub fn clicks_preset(&self) -> Option<ClickPreset> {
+        ClickPreset::from_u8(self.clicks_preset.load(RELAXED))
     }
 
     /// Bump the TTS-playback stop generation. Any consumer that captured a

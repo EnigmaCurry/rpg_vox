@@ -92,10 +92,30 @@ struct Args {
     #[arg(long, env = "RPG_VOX_COMFYUI", default_value = "http://127.0.0.1:8188")]
     comfyui: String,
 
-    /// Base URL of a Qwen3-TTS Gradio deployment (no trailing slash).
-    /// Required when --tts-backend=qwen3; set via CLI or RPG_VOX_QWEN3_URL.
-    #[arg(long, env = "RPG_VOX_QWEN3_URL")]
+    /// Base URL of the "presets" Qwen3-TTS Gradio deployment (Qwen3-TTS-
+    /// CustomVoice model: 9 named speakers + `instruct` style control).
+    /// Required when --tts-backend=qwen3. Legacy alias RPG_VOX_QWEN3_URL
+    /// still accepted below for pre-multi-backend .env files.
+    #[arg(long, env = "RPG_VOX_QWEN3_PRESETS_URL")]
+    qwen3_presets_url: Option<String>,
+
+    /// Legacy single-URL config; treated as the presets URL if the
+    /// dedicated var above is unset. Emits a deprecation warning at
+    /// startup so users know to migrate.
+    #[arg(long, env = "RPG_VOX_QWEN3_URL", hide = true)]
     qwen3_url: Option<String>,
+
+    /// Base URL of the "clone" Qwen3-TTS Gradio deployment (Qwen3-TTS-Base
+    /// model: 3-second reference audio → cloned voice). Optional; clone-mode
+    /// voice profiles fail at synth if this is unset.
+    #[arg(long, env = "RPG_VOX_QWEN3_CLONE_URL")]
+    qwen3_clone_url: Option<String>,
+
+    /// Base URL of the "design" Qwen3-TTS Gradio deployment (Qwen3-TTS-
+    /// VoiceDesign model: voice generated from a free-text description).
+    /// Optional; design-mode voice profiles fail at synth if unset.
+    #[arg(long, env = "RPG_VOX_QWEN3_DESIGN_URL")]
+    qwen3_design_url: Option<String>,
 
     /// Preset speaker on the Qwen3-TTS Gradio app. One of: Serena, Vivian,
     /// Uncle Fu, Ryan, Aiden, Ono Anna, Sohee, Eric, Dylan.
@@ -618,13 +638,27 @@ fn build_backend(args: &Args, settings: settings::Shared) -> Result<tts::Backend
         }
         TtsBackend::Comfyui => Ok(tts::Backend::Comfy(tts::comfyui::Backend::new(settings))),
         TtsBackend::Qwen3 => {
-            let base_url = args.qwen3_url.clone().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "qwen3-tts backend requires --qwen3-url or RPG_VOX_QWEN3_URL"
-                )
-            })?;
+            // Presets URL falls back to the legacy RPG_VOX_QWEN3_URL so
+            // existing .env files keep booting. Emit a deprecation nudge
+            // if we hit that path so users know to migrate.
+            let presets_url = match (&args.qwen3_presets_url, &args.qwen3_url) {
+                (Some(u), _) => u.clone(),
+                (None, Some(u)) => {
+                    tracing::warn!(
+                        "RPG_VOX_QWEN3_URL is deprecated; set RPG_VOX_QWEN3_PRESETS_URL instead"
+                    );
+                    u.clone()
+                }
+                (None, None) => {
+                    return Err(anyhow::anyhow!(
+                        "qwen3-tts backend requires --qwen3-presets-url or RPG_VOX_QWEN3_PRESETS_URL"
+                    ));
+                }
+            };
             let cfg = tts::qwen3::Config {
-                base_url,
+                presets_url,
+                clone_url: args.qwen3_clone_url.clone(),
+                design_url: args.qwen3_design_url.clone(),
                 speaker: args.qwen3_speaker.clone(),
                 language: args.qwen3_language.clone(),
                 instruct: args.qwen3_instruct.clone(),

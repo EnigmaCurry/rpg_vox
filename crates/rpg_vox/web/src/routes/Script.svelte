@@ -21,17 +21,21 @@
     cancelRecording,
     createAgent,
     createScript,
+    deleteAgent,
     deleteWidget,
+    editUserTurn,
     fetchWidget,
     generateScriptTitle,
     playWidget,
-    resetScript,
     sendAssistantReply,
     sendUserTurn,
+    startClicks,
     startRecording,
+    stopClicks,
     stopPlayback,
     stopRecording,
     updateAgent,
+    VOICE_SILENCE,
   } from '../lib/api.js';
   import { navigate, route } from '../lib/router.js';
   import { scrollClipIntoView } from '../lib/scroll.js';
@@ -155,6 +159,15 @@
   // (`autoplayTurnId = null`).
   let autoplayTurnId = $state(null);
   let autoplayOrd = $state(null);
+  /// Turn id that's ARMED for autoplay but not yet playing — we wait
+  /// until every non-silenced block in this turn has landed at least
+  /// one take before promoting it to `autoplayTurnId`. Cheaper on the
+  /// ear than the previous "play A the moment it's ready, gap before B
+  /// while B synthesizes" walk, since the whole reply flows back-to-
+  /// back once playback starts. Cleared on any user-driven cancel so a
+  /// manual interruption during the synth wait doesn't retroactively
+  /// kick off a queue the user has moved on from.
+  let pendingAutoplayTurnId = $state(null);
 
   function advanceAutoplay(_blockId) {
     if (autoplayTurnId === null) return;
@@ -163,7 +176,43 @@
   function cancelAutoplay() {
     autoplayTurnId = null;
     autoplayOrd = null;
+    pendingAutoplayTurnId = null;
   }
+
+  // Wait-fill "computer is thinking" click bed. Flipped on at Send so
+  // Discord participants get a soft mechanical clicking cue while the
+  // LLM roundtrip + first take synth are in flight, flipped off the
+  // instant the first *assistant* speech take begins playback (not the
+  // GM proxy of the user's own line — that's still `activeClip` for a
+  // bit and shouldn't fool the trigger). Persist a fire-and-forget
+  // stopClicks() also on any error/clear/destroy path so a stray Send
+  // that errors mid-flight can't leave the mic clicking indefinitely.
+  let clicksActive = $state(false);
+  /// When set, activeClip landing on THIS widget id is treated as the
+  /// GM proxy readback of the user's typed line and does NOT stop the
+  /// click bed — that read is bracketed by silence on either side but
+  /// filler should resume once it drains. Cleared once we've seen any
+  /// non-GM playback (the assistant speech) or the flow ends.
+  let clicksGmProxyId = $state(null);
+
+  function ensureClicksOff() {
+    if (!clicksActive) return;
+    clicksActive = false;
+    clicksGmProxyId = null;
+    stopClicks();
+  }
+
+  $effect(() => {
+    if (!clicksActive) return;
+    const cur = $activeClip;
+    if (!cur) return;
+    // A GM proxy readback of the user's typed line during the wait
+    // window is expected — don't cut filler off for it. Once GM proxy
+    // finishes, activeClip clears; the next non-GM activeClip is the
+    // actual assistant speech and THAT stops the bed.
+    if (clicksGmProxyId && cur.widgetId === clicksGmProxyId) return;
+    ensureClicksOff();
+  });
 
   // "Play All" walks the entire conversation from the top: each user turn
   // that has an attached voice memo, and each assistant turn's selected
@@ -216,6 +265,9 @@
   function cancelAllSequences() {
     cancelAutoplay();
     if (isPlayingAll) cancelPlayAll();
+    // Any user-driven cancel also stops the wait-fill bed so a manual
+    // click during the LLM wait doesn't leave filler running underneath.
+    ensureClicksOff();
   }
 
   function cancelPlayAll() {
@@ -404,6 +456,17 @@
   );
   const activeAgentReadOnly = $derived(activeAgent?.read_only ?? true);
 
+  // True when the agent has explicitly silenced a role. Gates the client-
+  // side auto-render + Play-All paths so silenced roles produce no takes
+  // at all. Manual ⟳ still works and falls back to the DSP preset (see
+  // http.rs's script_block_add_take); the User voice silence extends
+  // further, since /scripts/:id/user skips synth entirely when silenced.
+  const voiceSilenced = $derived({
+    user:      activeAgent?.voice_user      === VOICE_SILENCE,
+    narrator:  activeAgent?.voice_narrator  === VOICE_SILENCE,
+    character: activeAgent?.voice_character === VOICE_SILENCE,
+  });
+
   // Sync draft from the server-side agent when the SELECTION changes.
   // Guarded by promptDirty so an in-flight edit doesn't get clobbered by
   // a stale reactive read of the agents store.
@@ -465,6 +528,30 @@
       await savePromptDraft();
     }
     selectedAgentId = val;
+  }
+
+  /// Delete the currently-selected agent after confirming with the user.
+  /// Only reachable when the agent is non-default (the built-in Default is
+  /// read-only and hides the button); the server also refuses the delete
+  /// as a belt-and-braces guard. On success we reload the roster and snap
+  /// back to Default so the picker isn't left pointing at a stale id.
+  async function deleteCurrentAgent() {
+    if (!activeAgent || activeAgentReadOnly) return;
+    const name = activeAgent.name || activeAgent.id;
+    // eslint-disable-next-line no-alert
+    if (!confirm(`Delete agent "${name}"? This cannot be undone.`)) return;
+    const id = activeAgent.id;
+    // Cancel any pending autosave so it doesn't race the delete.
+    if (saveTimer) { clearTimeout(saveTimer); saveTimer = 0; }
+    promptDirty = false;
+    saveError = '';
+    try {
+      await deleteAgent(id);
+      selectedAgentId = DEFAULT_AGENT_ID;
+      await reloadAgents(scenesState.selectedProjectId);
+    } catch (e) {
+      saveError = `delete: ${e.message || e}`;
+    }
   }
 
   async function createNewAgentFlow() {
@@ -534,6 +621,25 @@
       );
     } catch (e) {
       saveError = `voice: ${e.message || e}`;
+    }
+  }
+
+  /// Persist a change to the interstitial "wait-fill click bed" selection.
+  /// Empty string = None (no bed); otherwise a preset id string like
+  /// "vintage" that the server validates against its known-preset list.
+  async function onInterstitialChange(ev) {
+    if (!activeAgent || activeAgentReadOnly) return;
+    const raw = ev.currentTarget.value;
+    const preset = raw === '' ? null : raw;
+    const id = activeAgent.id;
+    saveError = '';
+    try {
+      await updateAgent(id, { interstitial: preset });
+      agents.update((list) =>
+        (list || []).map((a) => (a.id === id ? { ...a, interstitial: preset } : a))
+      );
+    } catch (e) {
+      saveError = `interstitial: ${e.message || e}`;
     }
   }
 
@@ -644,6 +750,9 @@
       recordingSessionId = null;
       cancelRecording(sid).catch(() => {});
     }
+    // Tab close / route change mid-wait would otherwise leave the mic
+    // clicking with nobody around to stop it.
+    ensureClicksOff();
   });
 
   function tickRecord() {
@@ -722,6 +831,19 @@
     sending = true;
     error = '';
     const outgoingWidgetId = attachedWidgetId;
+    // Kick the wait-fill click bed BEFORE the fetch so Discord hears
+    // the "thinking" cue immediately, even before the server has parsed
+    // the request. Only if the active agent has an interstitial preset
+    // selected — the default is off, so pre-migration agents (and
+    // anyone who opts out) get the previous silent behavior. Stops
+    // fire from the activeClip effect above when real assistant speech
+    // begins, or from any error/clear path.
+    const interstitialPreset = activeAgent?.interstitial ?? null;
+    if (interstitialPreset) {
+      clicksActive = true;
+      clicksGmProxyId = null;
+      startClicks(interstitialPreset);
+    }
     // Optimistic user turn so the transcript reflects the send immediately
     // — the server-side row lands under the `ord` we don't know yet, so we
     // stash a placeholder id and reconcile on response.
@@ -752,6 +874,12 @@
       const scriptId = currentScriptId;
       const wasNamed = (($scripts ?? []).find((s) => s.id === scriptId)?.name ?? '') !== 'New script';
       const { user_turn } = await sendUserTurn(scriptId, t, outgoingWidgetId, selectedAgentId);
+      // Register the GM proxy widget so the activeClip effect above lets
+      // it play through without stopping the click bed. If sendUserTurn
+      // didn't return a widget (silenced user voice) the id stays null,
+      // meaning the very next activeClip transition stops the filler —
+      // which is what we want, since there's no GM readback to skip past.
+      clicksGmProxyId = user_turn?.widget_id ?? null;
       script.update((s) => {
         const base = s || { id: 'default', turns: [] };
         // Rebuild the order deliberately: real turns first, then the
@@ -792,15 +920,24 @@
         return { ...base, turns };
       });
       latestAssistantId = assistant_turn.id;
-      // Kick autoplay of the assistant blocks. The activeClip gate in
-      // SpeechInline holds this until the GM proxy (or user memo) has
-      // finished draining, so the two don't step on each other.
+      // Arm autoplay for the whole assistant turn. Deferred (via
+      // `pendingAutoplayTurnId`) instead of kicked immediately — the
+      // promotion effect below flips it to the live `autoplayTurnId`
+      // only once every non-silenced block has landed a take, so the
+      // playback walk runs back-to-back through the reply instead of
+      // playing clip A while B/C are still synthesising.
       if (autoRender && (assistant_turn.blocks?.length ?? 0) > 0) {
-        autoplayTurnId = assistant_turn.id;
-        autoplayOrd = 0;
-      } else {
+        pendingAutoplayTurnId = assistant_turn.id;
         autoplayTurnId = null;
         autoplayOrd = null;
+      } else {
+        pendingAutoplayTurnId = null;
+        autoplayTurnId = null;
+        autoplayOrd = null;
+        // No autoplay is going to fire → no activeClip transition is
+        // going to arrive to stop the click bed. Kill it here so the
+        // filler doesn't run indefinitely on a silent reply.
+        ensureClicksOff();
       }
       // First exchange in a fresh "New script" → kick off an LLM title
       // generation. Fire-and-forget: the sidebar reload picks up the new
@@ -827,9 +964,152 @@
         };
       });
       error = `send: ${e.message || e}`;
+      // Send bailed before any playback landed → the activeClip effect
+      // above never fired. Kill the wait-fill so the mic doesn't tick
+      // indefinitely on a failed request.
+      ensureClicksOff();
     } finally {
       sending = false;
       inputEl?.focus();
+    }
+  }
+
+  // --- Edit user turn -----------------------------------------------------
+  //
+  // Click the pencil on a user turn to rewrite it. Save calls
+  // /scripts/:id/turns/:turn_id/edit-user, which truncates the transcript
+  // from that turn onward (dropping every later turn's widgets too) and
+  // inserts a REPLACEMENT user turn with a freshly-synthesized GM proxy.
+  // Then we fire /scripts/:id/reply to regenerate the LLM response
+  // against the rewound history — same UX as a fresh Send from that
+  // point forward, including auto-render + wait-fill clicks if the agent
+  // opts into them.
+  let editingTurnId = $state(null);
+  let editDraft = $state('');
+  let editSaving = $state(false);
+  let editEl = $state(null);
+
+  function startEditTurn(turn) {
+    if (editSaving) return;
+    // Any in-flight autoplay / Play All should end so the edit UI isn't
+    // being spoken over while the user retypes.
+    cancelAllSequences();
+    editingTurnId = turn.id;
+    editDraft = turn.content ?? '';
+    tick().then(() => {
+      editEl?.focus();
+      editEl?.select?.();
+    });
+  }
+
+  function cancelEditTurn() {
+    if (editSaving) return;
+    editingTurnId = null;
+    editDraft = '';
+    inputEl?.focus();
+  }
+
+  async function saveEditTurn() {
+    if (editSaving) return;
+    const turnId = editingTurnId;
+    const text = editDraft.trim();
+    if (!turnId || !text) return;
+    if (!currentScriptId) return;
+    editSaving = true;
+    error = '';
+
+    // Wait-fill click bed for the LLM roundtrip — matches Send. Same
+    // guardrails: only when the active agent opts in via `interstitial`.
+    const interstitialPreset = activeAgent?.interstitial ?? null;
+    if (interstitialPreset) {
+      clicksActive = true;
+      clicksGmProxyId = null;
+      startClicks(interstitialPreset);
+    }
+
+    const scriptId = currentScriptId;
+    try {
+      const { user_turn } = await editUserTurn(scriptId, turnId, text, selectedAgentId);
+      // Splice: keep turns strictly before the edited one, drop everything
+      // from the edited turn onward (matches the server-side truncate),
+      // then append the replacement user turn + a __thinking placeholder
+      // for the reply we're about to request.
+      script.update((s) => {
+        if (!s) return s;
+        const idx = s.turns.findIndex((x) => x.id === turnId);
+        const kept = idx >= 0 ? s.turns.slice(0, idx) : s.turns.slice();
+        kept.push(user_turn);
+        kept.push({
+          id: '__thinking',
+          ord: kept.length,
+          role: 'assistant',
+          content: '…',
+          blocks: [],
+          pending: true,
+        });
+        return { ...s, turns: kept };
+      });
+      clicksGmProxyId = user_turn.widget_id ?? null;
+      // Exit edit mode now so the transcript re-renders around the
+      // replacement turn before the LLM reply lands — the thinking-dots
+      // placeholder is what tells the user "reply in progress".
+      editingTurnId = null;
+      editDraft = '';
+      await tick();
+      scrollBottom();
+
+      // Play the GM proxy of the edited turn if autoRender is on and the
+      // proxy exists — same UX as Send's typed-message path.
+      if (autoRender && user_turn.widget_id) {
+        playUserTurnFireAndForget(user_turn.widget_id);
+      }
+
+      const { assistant_turn } = await sendAssistantReply(scriptId, selectedAgentId);
+      script.update((s) => {
+        if (!s) return s;
+        const turns = s.turns.filter((x) => x.id !== '__thinking');
+        turns.push(assistant_turn);
+        return { ...s, turns };
+      });
+      latestAssistantId = assistant_turn.id;
+      // Same wait-for-all-clips deferral as the Send path — see the
+      // pendingAutoplayTurnId promotion effect below.
+      if (autoRender && (assistant_turn.blocks?.length ?? 0) > 0) {
+        pendingAutoplayTurnId = assistant_turn.id;
+        autoplayTurnId = null;
+        autoplayOrd = null;
+      } else {
+        pendingAutoplayTurnId = null;
+        autoplayTurnId = null;
+        autoplayOrd = null;
+        ensureClicksOff();
+      }
+    } catch (e) {
+      // Drop the thinking placeholder if we already inserted it. The
+      // server-side truncate already happened, so the pre-edit turns
+      // may no longer match what the store holds — reload the script
+      // from the server to resync rather than trying to reconstruct
+      // client-side.
+      script.update((s) => {
+        if (!s) return s;
+        return { ...s, turns: s.turns.filter((x) => x.id !== '__thinking') };
+      });
+      error = `edit: ${e.message || e}`;
+      ensureClicksOff();
+      reloadScript(scriptId).catch(() => {});
+    } finally {
+      editSaving = false;
+      inputEl?.focus();
+    }
+  }
+
+  function onEditKey(e) {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      saveEditTurn();
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      cancelEditTurn();
     }
   }
 
@@ -858,30 +1138,6 @@
         activeClip.update((cur) => (cur?.widgetId === widgetId ? null : cur));
       }
     })();
-  }
-
-  /// Clear the whole conversation AND any current draft (typed text +
-  /// attached voice memo). Confirms first — this is destructive and the
-  /// user has no other undo. The attached widget (if any) is deleted
-  /// server-side so it doesn't linger orphaned.
-  async function clearAll() {
-    if (!confirm('Clear the whole script? This deletes every turn.')) return;
-    if (!currentScriptId) return;
-    try {
-      await resetScript(currentScriptId);
-      script.set({ id: currentScriptId, turns: [] });
-      latestAssistantId = null;
-      cancelAllSequences();
-      // Drop any in-progress draft too — the "clear everything" mental
-      // model would be surprising if the textarea kept its content or
-      // the just-recorded widget stayed attached.
-      input = '';
-      const wid = attachedWidgetId;
-      attachedWidgetId = null;
-      if (wid) deleteWidget(wid).catch(() => {});
-    } catch (e) {
-      error = `clear failed: ${e.message}`;
-    }
   }
 
   function onKey(e) {
@@ -939,6 +1195,36 @@
   }
 
   const turns = $derived($script?.turns ?? []);
+
+  /// Promote a pending autoplay to the live cursor once every non-
+  /// silenced block in the target turn has at least one take. That's
+  /// the "wait for all clips to synth before we start playing any"
+  /// gate — reruns whenever `turns` mutates (a landing take flips a
+  /// block from empty to non-empty) or the silence mask changes.
+  ///
+  /// Silenced blocks are treated as ready immediately: their autoplay
+  /// path advances past them without producing audio, so waiting on
+  /// them would just stall the promotion forever.
+  ///
+  /// If a synth call for one of the blocks fails outright, that block
+  /// stays with `takes = []` and the promotion never fires. The user's
+  /// escape hatch is the ⟳ button on any successful block (which
+  /// cancels autoplay via onAutoInterrupt) — matches the pre-refactor
+  /// escape hatch.
+  $effect(() => {
+    if (!pendingAutoplayTurnId) return;
+    const turn = turns.find((t) => t.id === pendingAutoplayTurnId);
+    if (!turn) return;
+    const blocks = turn.blocks ?? [];
+    if (blocks.length === 0) return;
+    const allReady = blocks.every(
+      (b) => voiceSilenced?.[b.role] || (b.takes?.length ?? 0) > 0,
+    );
+    if (!allReady) return;
+    autoplayTurnId = pendingAutoplayTurnId;
+    autoplayOrd = 0;
+    pendingAutoplayTurnId = null;
+  });
 
   /// Svelte action attached to each user-turn wrapper: subscribes to
   /// activeClip and, when THIS wrapper's widgetId becomes active, kicks
@@ -1042,12 +1328,25 @@
           ? 'The Default agent is read-only. Create a new agent to customize.'
           : 'Write the system prompt this agent will run with…'}
       ></textarea>
+      {#if !activeAgentReadOnly}
+        <div class="agent-editor-danger">
+          <button
+            type="button"
+            class="delete-agent"
+            onclick={deleteCurrentAgent}
+            title="Delete this agent"
+          >
+            Delete agent
+          </button>
+        </div>
+      {/if}
       <!-- Voice slots — three character pickers that steer how each role
            reads aloud on the Script page. Each slot resolves to the picked
            character's first (default) voice profile; unset = keep the
-           hardcoded DSP preset. Read-only alongside the prompt on the
-           Default agent, since Default is cross-project and can't
-           reference any specific project's characters. -->
+           hardcoded DSP preset; "None (silence)" = skip TTS for that role.
+           Read-only alongside the prompt on the Default agent, since
+           Default is cross-project and can't reference any specific
+           project's characters. -->
       <div class="voice-slots">
         <label class="slot">
           <span>User voice</span>
@@ -1058,6 +1357,7 @@
             title="Voice for the LLM reading your typed message back (proxy)"
           >
             <option value="">— DSP default (GM proxy) —</option>
+            <option value={VOICE_SILENCE}>— None (silence) —</option>
             {#each projectCharacters as c (c.id)}
               <option value={c.id}>{c.name}</option>
             {/each}
@@ -1072,6 +1372,7 @@
             title="Voice for prose outside <speak>…</speak> in the assistant reply"
           >
             <option value="">— DSP default (narrator pitch/pan) —</option>
+            <option value={VOICE_SILENCE}>— None (silence) —</option>
             {#each projectCharacters as c (c.id)}
               <option value={c.id}>{c.name}</option>
             {/each}
@@ -1086,9 +1387,26 @@
             title="Voice for lines inside <speak>…</speak> in the assistant reply"
           >
             <option value="">— DSP default (base voice) —</option>
+            <option value={VOICE_SILENCE}>— None (silence) —</option>
             {#each projectCharacters as c (c.id)}
               <option value={c.id}>{c.name}</option>
             {/each}
+          </select>
+        </label>
+        <!-- Wait-fill click bed. Off by default; picking a preset turns
+             it on for every Send with this agent. Adding a preset later
+             is a matter of extending tts::clicks::ClickPreset on the
+             server + adding an <option> here. -->
+        <label class="slot">
+          <span>Interstitial</span>
+          <select
+            value={activeAgent?.interstitial ?? ''}
+            onchange={onInterstitialChange}
+            disabled={activeAgentReadOnly}
+            title="Sound played on Send while the LLM is deliberating, until the first assistant speech take begins."
+          >
+            <option value="">— None —</option>
+            <option value="vintage">Rain drops</option>
           </select>
         </label>
         {#if projectCharacters.length === 0 && !activeAgentReadOnly}
@@ -1115,6 +1433,7 @@
               onAutoAdvance={advanceAutoplay}
               onAutoInterrupt={cancelAllSequences}
               agentId={selectedAgentId}
+              silencedRoles={voiceSilenced}
             />
           {:else if t.pending}
             <!-- Animated typing indicator: three staggered dots so it's
@@ -1126,6 +1445,42 @@
               <span class="dot"></span>
               <span class="dot"></span>
             </span>
+          {:else if editingTurnId === t.id}
+            <!-- Inline edit form: swaps in place of the user-body for the
+                 turn being edited. Save truncates the transcript from
+                 THIS turn onward server-side and re-fires the LLM reply;
+                 Cancel restores the original text without touching the
+                 server. Enter saves, Escape cancels. -->
+            <div class="user-edit">
+              <textarea
+                bind:this={editEl}
+                bind:value={editDraft}
+                onkeydown={onEditKey}
+                rows="2"
+                disabled={editSaving}
+                placeholder="Rewrite this line…"
+              ></textarea>
+              <div class="user-edit-actions">
+                <span class="user-edit-hint">
+                  Saving rewrites this line and regenerates every turn below it.
+                </span>
+                <button
+                  class="secondary"
+                  onclick={cancelEditTurn}
+                  disabled={editSaving}
+                  type="button"
+                >
+                  Cancel
+                </button>
+                <button
+                  onclick={saveEditTurn}
+                  disabled={editSaving || editDraft.trim().length === 0}
+                  type="button"
+                >
+                  {editSaving ? 'Saving…' : 'Save'}
+                </button>
+              </div>
+            </div>
           {:else}
             <span
               class="user-body"
@@ -1146,6 +1501,20 @@
                   </svg>
                 </button>
               {/if}
+              <button
+                class="user-edit-btn"
+                onclick={() => startEditTurn(t)}
+                disabled={editSaving}
+                title="Edit this line (rewrites the reply below)"
+                aria-label="Edit this line"
+              >
+                <svg viewBox="0 0 24 24" width="12" height="12" aria-hidden="true">
+                  <path
+                    fill="currentColor"
+                    d="M3 17.25V21h3.75l11.06-11.06-3.75-3.75L3 17.25zM20.71 7.04a1 1 0 0 0 0-1.41l-2.34-2.34a1 1 0 0 0-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z"
+                  />
+                </svg>
+              </button>
             </span>
           {/if}
         </div>
@@ -1204,6 +1573,25 @@
           <span>Stop</span>
         </button>
       {:else}
+        <!-- Download the entire script as one mixed FLAC. Anchor with
+             `download` attribute so the browser handles it natively;
+             the server sets Content-Disposition with the filename. -->
+        {#if currentScriptId && hasPlayable}
+          <a
+            class="icon-btn"
+            href={`/scripts/${encodeURIComponent(currentScriptId)}/mix.flac`}
+            download
+            title="Download the entire script as one .flac"
+            aria-label="Download script as FLAC"
+          >
+            <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true">
+              <path
+                fill="currentColor"
+                d="M12 3v10.17l3.59-3.58L17 11l-5 5-5-5 1.41-1.41L12 13.17V3h0zM5 19h14v2H5z"
+              />
+            </svg>
+          </a>
+        {/if}
         <!-- Play All walks the whole transcript in order (user memos +
              each assistant block's selected take). Toggles Stop while
              playback is in flight. Disabled when the transcript has no
@@ -1254,10 +1642,6 @@
             <span>Play All</span>
           </button>
         {/if}
-        <!-- Clear always visible in every non-recording state — it wipes
-             the whole conversation (plus any in-progress draft). Send vs
-             Record swap based on whether there's something to send. -->
-        <button class="secondary" onclick={clearAll} title="Clear the whole script">Clear</button>
         {#if isComposed}
           <button onclick={send} disabled={sending}>{sending ? 'Sending…' : 'Send'}</button>
         {:else}
@@ -1609,6 +1993,31 @@
     cursor: not-allowed;
   }
 
+  /* Delete-agent button lives directly below the prompt textarea. Right-
+     aligned so the eye lands on the prompt content first; red-tinted to
+     mark it as a destructive action distinct from the neutral controls
+     elsewhere in the panel. */
+  .agent-editor-danger {
+    display: flex;
+    justify-content: flex-end;
+  }
+  button.delete-agent {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--err);
+    background: rgba(255, 128, 128, 0.10);
+    border: 1px solid rgba(255, 128, 128, 0.35);
+    border-radius: 6px;
+    padding: 4px 10px;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  button.delete-agent:hover {
+    background: rgba(255, 128, 128, 0.22);
+    border-color: var(--err);
+  }
+
   /* Voice-slot row: three character pickers under the prompt textarea.
      Wraps at narrow widths so slots stack instead of overflowing. */
   .voice-slots {
@@ -1758,6 +2167,29 @@
   }
   button.playall.playing:hover .counter { color: var(--text); }
 
+  /* Icon-only affordance in the transport cluster (e.g. download-script).
+     Sized to sit alongside Play All without becoming another labelled
+     button — 28px squarish target, muted default, accent on hover. */
+  .icon-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    padding: 0;
+    color: var(--muted);
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    cursor: pointer;
+    text-decoration: none;
+  }
+  .icon-btn:hover {
+    color: var(--accent);
+    border-color: var(--accent);
+    background: rgba(122, 162, 255, 0.10);
+  }
+
   /* Small play button appended to a user turn that has an attached voice
      memo. Keeps the transcript readable while making the audio a click
      away. */
@@ -1781,6 +2213,72 @@
   button.user-play:hover {
     background: rgba(122, 162, 255, 0.28);
     border-color: var(--accent);
+  }
+
+  /* Pencil button appended to a user turn. Same footprint as user-play
+     but muted by default so it doesn't compete visually with the play
+     button; lights up on hover to signal it's clickable. */
+  button.user-edit-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    padding: 0;
+    margin-left: 4px;
+    color: var(--muted);
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: 50%;
+    cursor: pointer;
+    vertical-align: middle;
+    position: relative;
+    z-index: 2;
+  }
+  button.user-edit-btn:hover:not(:disabled) {
+    color: var(--accent);
+    border-color: var(--accent);
+    background: rgba(122, 162, 255, 0.10);
+  }
+  button.user-edit-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  /* Inline edit form that replaces the user-body when editing. Same
+     max-width the turn container gives us so wrap points stay stable. */
+  .user-edit {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    width: 100%;
+  }
+  .user-edit textarea {
+    width: 100%;
+    min-height: 44px;
+    max-height: 30vh;
+    resize: vertical;
+    font-family: inherit;
+    font-size: 14px;
+    padding: 6px 8px;
+    background: rgba(0, 0, 0, 0.28);
+    color: var(--text);
+    border: 1px solid var(--accent);
+    border-radius: 6px;
+  }
+  .user-edit textarea:focus { outline: none; }
+  .user-edit-actions {
+    display: flex;
+    justify-content: flex-end;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .user-edit-hint {
+    margin-right: auto;
+    color: var(--muted);
+    font-size: 11px;
+    font-style: italic;
   }
 
   /* Wrapper around a user turn's text + play button. Same progress-overlay

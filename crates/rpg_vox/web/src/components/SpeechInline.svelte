@@ -41,6 +41,12 @@
     /// `voice_character` based on this block's role, falling back to the
     /// hardcoded DSP preset). Null = defer entirely to the server fallback.
     agentId = null,
+    /// True when the active agent has explicitly silenced this block's
+    /// role. Suppresses auto-render + hides the render/take buttons so
+    /// the pill renders text-only. Manual synthesis is intentionally
+    /// unreachable in this state — user picks a real voice in the
+    /// agent editor to re-enable.
+    silenced = false,
   } = $props();
 
   let error = $state('');
@@ -77,7 +83,7 @@
     // task while Synthesize on block K+1 runs on the backend task in
     // parallel). Ords rendered ahead of time queue up on the play task
     // in ord order via the autoplay effect below.
-    if (autoRender && !hasTakes && renderingOrd === null) {
+    if (autoRender && !silenced && !hasTakes && renderingOrd === null) {
       renderNewTake({ fromAutoRender: true });
     }
   });
@@ -142,6 +148,16 @@
     if (autoPlayOrd === null || autoPlayOrd === undefined) return;
     if (block?.ord !== autoPlayOrd) return;
     if ($activeClip !== null) return;
+    // Silenced blocks nudge the cursor forward without producing audio
+    // so the assistant-turn's autoplay walk continues past them cleanly.
+    // Without this, an all-silenced assistant turn would auto-render
+    // nothing and then autoplay would stall waiting for a take.
+    if (silenced) {
+      if (autoPlayedOrd === autoPlayOrd) return;
+      autoPlayedOrd = autoPlayOrd;
+      onAutoAdvance?.(block.id);
+      return;
+    }
 
     // Render-first path: no takes, so kick a render. When it lands the
     // effect re-runs into the play branch below. Only trigger once per
@@ -290,7 +306,10 @@
   class="speech"
   class:narrator={role === 'narrator'}
   class:playing={playingOrd !== null}
-  title={block?.text || ''}
+  class:silenced
+  title={silenced
+    ? `${block?.text || ''} (silenced — this role has no voice)`
+    : (block?.text || '')}
   bind:this={rootEl}
 >
   <!-- Linear-swipe progress overlay. Sits above the pill background but
@@ -303,45 +322,49 @@
   {:else}
     <span class="text">&ldquo;{block?.text || ''}&rdquo;</span>
   {/if}
-  {#if hasTakes}
-    {#each takes as t (t.id)}
-      <button
-        class="take"
-        class:selected={t.ord === selectedOrd}
-        class:playing={t.ord === playingOrd}
-        onclick={() => (t.ord === playingOrd ? onStopClick() : playTake(t))}
-        oncontextmenu={(ev) => onDeleteTake(t, ev)}
-        title={t.ord === playingOrd
-          ? `Take ${t.ord + 1} — playing (click to stop)`
-          : `Take ${t.ord + 1} — click to play & select, right-click to delete`}
-      >
-        <!-- Same-sized SVG whether idle (▶) or playing (■) so swapping the
-             icon doesn't reflow the pill. -->
-        {#if t.ord === playingOrd}
-          <svg viewBox="0 0 24 24" class="ico" aria-hidden="true">
-            <rect x="6" y="6" width="12" height="12" rx="1.5" fill="currentColor"/>
-          </svg>
-        {:else}
-          <svg viewBox="0 0 24 24" class="ico" aria-hidden="true">
-            <path fill="currentColor" d="M8 5v14l11-7z" />
-          </svg>
-        {/if}
-        <span class="ord">{t.ord + 1}</span>
-      </button>
-    {/each}
+  <!-- Silenced pills render text-only: no takes, no ⟳, no spinner.
+       User re-enables the role in the agent editor to bring back synth. -->
+  {#if !silenced}
+    {#if hasTakes}
+      {#each takes as t (t.id)}
+        <button
+          class="take"
+          class:selected={t.ord === selectedOrd}
+          class:playing={t.ord === playingOrd}
+          onclick={() => (t.ord === playingOrd ? onStopClick() : playTake(t))}
+          oncontextmenu={(ev) => onDeleteTake(t, ev)}
+          title={t.ord === playingOrd
+            ? `Take ${t.ord + 1} — playing (click to stop)`
+            : `Take ${t.ord + 1} — click to play & select, right-click to delete`}
+        >
+          <!-- Same-sized SVG whether idle (▶) or playing (■) so swapping the
+               icon doesn't reflow the pill. -->
+          {#if t.ord === playingOrd}
+            <svg viewBox="0 0 24 24" class="ico" aria-hidden="true">
+              <rect x="6" y="6" width="12" height="12" rx="1.5" fill="currentColor"/>
+            </svg>
+          {:else}
+            <svg viewBox="0 0 24 24" class="ico" aria-hidden="true">
+              <path fill="currentColor" d="M8 5v14l11-7z" />
+            </svg>
+          {/if}
+          <span class="ord">{t.ord + 1}</span>
+        </button>
+      {/each}
+    {/if}
+    {#if renderingOrd !== null}
+      <span class="spinner" aria-label="rendering" title="Rendering next take…"></span>
+    {/if}
+    <button
+      class="redo"
+      onclick={renderNewTake}
+      disabled={renderingOrd !== null}
+      title={hasTakes ? 'Render another take' : 'Render'}
+      aria-label={hasTakes ? 'Render another take' : 'Render'}
+    >
+      {hasTakes ? '⟳' : '▶'}
+    </button>
   {/if}
-  {#if renderingOrd !== null}
-    <span class="spinner" aria-label="rendering" title="Rendering next take…"></span>
-  {/if}
-  <button
-    class="redo"
-    onclick={renderNewTake}
-    disabled={renderingOrd !== null}
-    title={hasTakes ? 'Render another take' : 'Render'}
-    aria-label={hasTakes ? 'Render another take' : 'Render'}
-  >
-    {hasTakes ? '⟳' : '▶'}
-  </button>
   <!-- The playing take's button doubles as its own Stop: while it's the
        active clip, clicking it invokes onStopClick instead of a re-play.
        Icon swap happens inline in each take button above so nothing shows
@@ -359,7 +382,12 @@
     padding: 3px 6px 3px 8px;
     background: rgba(122, 162, 255, 0.10);
     border: 1px solid rgba(122, 162, 255, 0.28);
-    border-radius: 999px;
+    /* Modest corner radius instead of a full-capsule (999px) — capsule
+       shape is fine for one-liner character quotes but a 999px arc eats
+       into text glyphs at the corners once the pill wraps to multiple
+       lines (worst on narrator prose blocks). Keeps the "rounded pill"
+       feel while leaving the text edges clear. */
+    border-radius: 10px;
     line-height: 1.35;
     /* Wrap the whole pill together — never split "text" from its take
        buttons across lines. */
@@ -375,6 +403,16 @@
   .speech.playing {
     border-color: var(--accent);
   }
+  /* Silenced role: dim the pill + kill the accent tint so it visually
+     recedes to "just text". Cursor keeps the default so it clearly isn't
+     interactive. */
+  .speech.silenced {
+    background: transparent;
+    border-color: var(--border);
+    border-style: dotted;
+    opacity: 0.6;
+  }
+  .speech.silenced .text { color: var(--muted); }
 
   /* Progress overlay: absolutely positioned to cover the pill's full
      padding box, animated via transform: scaleX from 0 → 1.
