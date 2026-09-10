@@ -21,7 +21,7 @@
   } from '../lib/api.js';
   import { scenesState } from '../lib/scenes.svelte.js';
 
-  let { characterId, profileId } = $props();
+  let { characterId, profileId, referenceText = '' } = $props();
 
   // svelte-ignore state_referenced_locally
   let text = $state('');
@@ -68,7 +68,10 @@
   }
 
   async function renderAndPlay() {
-    const t = text.trim();
+    // Empty input falls back to the reference-transcription placeholder so
+    // "hit Play with nothing typed" auditions the same phrase the voice
+    // clone was calibrated against — the fastest apples-to-apples listen.
+    const t = text.trim() || String(referenceText || '').trim();
     if (!t) { error = 'text is empty'; return; }
     if (mode !== 'idle') return;
     error = '';
@@ -79,6 +82,9 @@
     mode = 'rendering';
     const ac = new AbortController();
     renderAbort = ac;
+    // Wall-clock stamp so the perf log below can reject stale records
+    // from an earlier render that snuck in (the ring is process-wide).
+    const renderStartedAt = Date.now();
     try {
       const opts = {
         signal: ac.signal,
@@ -95,6 +101,10 @@
         : await createWidget(t, [], opts);
       if (result.id) widgetId = result.id;
       if (renderAbort === ac) renderAbort = null;
+      // Fire-and-forget: pull the just-completed render's timing tree and
+      // dump a breakdown into the JS console. Runs in parallel with the
+      // playback below so the perf log lands almost immediately.
+      logLatestRenderPerf(renderStartedAt).catch(() => {});
       // Slide straight into playback so the user hears their edit as
       // soon as it's rendered — cache is now valid for the next shift-click.
       mode = 'playing';
@@ -143,6 +153,111 @@
     }
   }
 
+  // ---- perf logging ------------------------------------------------------
+  //
+  // After each fresh render, fetch the most recent RenderRecord from the
+  // server's ring buffer (crates/rpg_vox/src/tts/perf.rs) and pretty-print
+  // a breakdown to the JS console: full span tree + a summary of where the
+  // time went (backend vs FX chain, dominant FX stage). Fire-and-forget —
+  // any network or parse error is swallowed so the audition itself never
+  // reports "perf failed" back to the user.
+
+  async function logLatestRenderPerf(sinceUnixMs) {
+    let record;
+    try {
+      const resp = await fetch('/perf/renders/latest');
+      if (!resp.ok) return;
+      record = await resp.json();
+    } catch {
+      return;
+    }
+    if (!record || typeof record.total_us !== 'number') return;
+    // Ring is process-wide — some other request could have landed a render
+    // between our call to createWidget and our fetch. A short grace window
+    // (250ms of clock drift + network jitter) rejects those.
+    if (record.started_at_unix_ms < sinceUnixMs - 250) {
+      console.warn('[perf] latest render appears stale; skipping analysis', {
+        recordStartedAt: record.started_at_unix_ms,
+        ourStartedAt: sinceUnixMs,
+      });
+      return;
+    }
+
+    const totalUs = record.total_us;
+    const totalMs = totalUs / 1000;
+    const header = `🎙 Test render #${record.id} — ${record.label || '(unlabeled)'} — ${totalMs.toFixed(2)}ms`;
+    /* eslint-disable no-console */
+    console.groupCollapsed(header);
+
+    // Full tree
+    printNode(record.root, totalUs, 0);
+
+    // Roll-up: sum every occurrence of a given span name so a multi-voice
+    // profile's per-voice costs collapse into a single line each.
+    const flat = flattenNodes(record.root);
+    const sumByName = new Map();
+    for (const n of flat) {
+      sumByName.set(n.name, (sumByName.get(n.name) ?? 0) + n.dur_us);
+    }
+    const backend = sumByName.get('backend.synthesize') ?? 0;
+    const dsp = sumByName.get('voice.dsp') ?? 0;
+    const effects = sumByName.get('apply_effects') ?? 0;
+    const fxChain = sumByName.get('apply_fx_chain') ?? 0;
+    const mix = sumByName.get('stereo_mix') ?? 0;
+
+    console.log(
+      `Summary — backend ${pct(backend, totalUs)}, dsp ${pct(dsp, totalUs)} ` +
+      `(effects ${pct(effects, totalUs)}, fx ${pct(fxChain, totalUs)}), ` +
+      `mix ${pct(mix, totalUs)}`
+    );
+
+    // Dominant FX stage across all voices — often the reverb, but the
+    // point is to catch surprises (e.g. saturation being oddly expensive).
+    const fxStages = flat.filter((n) => n.name.startsWith('fx.'));
+    const stageTotals = new Map();
+    for (const n of fxStages) {
+      stageTotals.set(n.name, (stageTotals.get(n.name) ?? 0) + n.dur_us);
+    }
+    if (stageTotals.size > 0) {
+      const stageRows = [...stageTotals.entries()]
+        .map(([name, us]) => ({ stage: name, ms: +(us / 1000).toFixed(2), pct: +((100 * us) / totalUs).toFixed(1) }))
+        .sort((a, b) => b.ms - a.ms);
+      console.log('FX stages (summed across voices):');
+      console.table(stageRows);
+      const dominant = stageRows[0];
+      if (dominant && dominant.pct >= 5) {
+        console.log(`⚠ Dominant FX: ${dominant.stage} at ${dominant.ms}ms (${dominant.pct}%)`);
+      }
+    }
+
+    // The raw record — click to expand and inspect.
+    console.log('Raw record:', record);
+    console.groupEnd();
+    /* eslint-enable no-console */
+  }
+
+  function printNode(node, rootUs, depth) {
+    const ms = (node.dur_us / 1000).toFixed(2);
+    const pctStr = rootUs > 0 ? ((100 * node.dur_us) / rootUs).toFixed(1) : '0.0';
+    const indent = '  '.repeat(depth);
+    // eslint-disable-next-line no-console
+    console.log(`${indent}├ ${node.name.padEnd(26)} ${ms.padStart(9)}ms  (${pctStr.padStart(5)}%)`);
+    for (const child of node.children || []) {
+      printNode(child, rootUs, depth + 1);
+    }
+  }
+
+  function flattenNodes(node, out = []) {
+    out.push(node);
+    for (const child of node.children || []) flattenNodes(child, out);
+    return out;
+  }
+
+  function pct(us, totalUs) {
+    if (!totalUs) return '0.0%';
+    return `${((100 * us) / totalUs).toFixed(1)}%`;
+  }
+
   const playTitle = $derived(
     mode !== 'idle'
       ? 'Stop'
@@ -165,7 +280,7 @@
     <input
       type="text"
       class="test-input"
-      placeholder="Type something to hear this profile speak…"
+      placeholder={referenceText ? referenceText : 'Type something to hear this profile speak…'}
       bind:value={text}
       onkeydown={onKeydown}
       disabled={mode === 'rendering'}
@@ -177,7 +292,7 @@
       class:busy={mode === 'rendering'}
       class:playing={mode === 'playing'}
       onclick={mode === 'idle' ? onPlayClick : onStopClick}
-      disabled={mode === 'idle' && !text.trim()}
+      disabled={mode === 'idle' && !text.trim() && !String(referenceText || '').trim()}
       title={playTitle}
       aria-label={playTitle}
     >

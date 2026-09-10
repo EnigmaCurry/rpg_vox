@@ -182,19 +182,29 @@
   let rendering = $state(false);
   let renderStopRequested = false;
 
-  async function renderScene() {
+  /// Render clips in scene order. By default, skips clips that already
+  /// have a cached blob (fills in the missing ones). With `force: true`,
+  /// re-renders every clip that has text — used by shift-click on the
+  /// play/render button when the user has edited the project dictionary
+  /// or the shared character voices and wants every audio artifact
+  /// regenerated against the new state.
+  async function renderScene({ force = false } = {}) {
     if (!scene) return;
     if (rendering) { stopRender(); return; }
+    // A forced re-render will replay every clip through render — abort any
+    // in-flight playback first so the user isn't hearing a stale take
+    // through the mic while the new synth is running.
+    if (force && playing) stopScene();
     rendering = true;
     renderStopRequested = false;
     for (const clip of scene.clips) {
       if (renderStopRequested) break;
       const player = cellPlayers[clip.id];
       if (!player) continue;
-      // Render if the cell has no cached blob yet, or if the user has the
-      // editor open (potentially dirty text). Skip anything that would just
-      // fail with "text is empty".
-      const needsRender = !player.isReady() || editing[clip.id];
+      // Render if the cell has no cached blob yet, if the user has the
+      // editor open (potentially dirty text), or if force is set. Skip
+      // anything that would just fail with "text is empty".
+      const needsRender = force || !player.isReady() || editing[clip.id];
       if (!needsRender) continue;
       if (!player.hasText?.()) continue;
       try {
@@ -205,6 +215,24 @@
       }
     }
     rendering = false;
+  }
+
+  /// Play-scene button click router. Shift-click forces a full re-render
+  /// of every clip (ignoring the audio cache) — the canonical way to
+  /// refresh a scene after tweaking a character voice, the project
+  /// dictionary, or anything else that changes what synthesis would
+  /// produce for the same text. Plain click keeps the original
+  /// play/stop semantics.
+  function onPlaySceneClick(ev) {
+    if (ev.shiftKey) { renderScene({ force: true }); return; }
+    playScene();
+  }
+
+  /// Render-scene button click router. Plain click fills in only the
+  /// clips that aren't cached; shift-click forces every clip to
+  /// re-render even when its blob is already up to date.
+  function onRenderSceneClick(ev) {
+    renderScene({ force: ev.shiftKey });
   }
 
   function stopRender() {
@@ -345,8 +373,8 @@
           {#if !rendering && (allRendered || playing)}
             <button
               class="play-scene"
-              onclick={playScene}
-              title={playing ? 'Stop scene' : 'Play whole scene'}
+              onclick={onPlaySceneClick}
+              title={playing ? 'Stop scene' : 'Play whole scene (Shift-click to re-render every clip)'}
             >
               {#if playing}
                 <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><rect x="6" y="6" width="12" height="12" fill="currentColor"/></svg>
@@ -374,9 +402,9 @@
           {:else}
             <button
               class="play-scene"
-              onclick={renderScene}
+              onclick={onRenderSceneClick}
               disabled={scene.clips.length === 0}
-              title={rendering ? 'Stop rendering' : (scene.clips.length === 0 ? 'Add a clip first' : 'Save and render every clip that is not yet rendered or has open edits')}
+              title={rendering ? 'Stop rendering' : (scene.clips.length === 0 ? 'Add a clip first' : 'Save and render every clip that is not yet rendered or has open edits (Shift-click to force re-render every clip)')}
             >
               {#if rendering}
                 <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><rect x="6" y="6" width="12" height="12" fill="currentColor"/></svg>

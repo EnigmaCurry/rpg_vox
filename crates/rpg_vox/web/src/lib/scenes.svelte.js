@@ -34,6 +34,10 @@
 //         driveDb,                         // tanh saturation drive in dB (0 = off)
 //         crushBits,                       // bit-crush quantization depth (0 = off)
 //         amRateHz, amDepth,               // amplitude-mod / tremolo (rate 0 = off)
+//         ringHz, ringMix,                 // true ring mod, `x·sin(2πf t)` (hz 0 = off)
+//         reverbMix,                       // Freeverb-lite wet/dry (0 = off)
+//         reverbRoom, reverbDamp,          // reverb feedback + HF damping (0..1)
+//         reverbTailMs,                    // fixed audible tail length ms (fade to 0)
 //       }],
 //     }],
 //     avatar: dataUrl | null,
@@ -204,6 +208,18 @@ export const CONFIG_DRIVE_DB_RANGE    = { min: 0,    max: 24,   step: 0.5 };
 export const CONFIG_CRUSH_BITS_RANGE  = { min: 0,    max: 16,   step: 1 };
 export const CONFIG_AM_RATE_RANGE     = { min: 0,    max: 200,  step: 1 };
 export const CONFIG_AM_DEPTH_RANGE    = { min: 0,    max: 1,    step: 0.05 };
+// Ring modulator: 0 disables. 30–80 Hz = Dalek, 200–600 Hz = clanky computer,
+// 1–3 kHz = glassy inharmonic tinge. `ringMix` crossfades dry↔wet.
+export const CONFIG_RING_HZ_RANGE     = { min: 0,    max: 3000, step: 1 };
+export const CONFIG_RING_MIX_RANGE    = { min: 0,    max: 1,    step: 0.05 };
+// Freeverb-lite reverb. `reverbMix` is wet/dry; `reverbRoom` maps to
+// feedback in [0.7, 0.98]; `reverbDamp` is HF loss in the feedback loop.
+// `reverbTailMs` is the fixed audible tail — the wet fades to 0 across this
+// window regardless of `reverbRoom`, so every clip has the same outro shape.
+export const CONFIG_REVERB_MIX_RANGE  = { min: 0,    max: 1,    step: 0.05 };
+export const CONFIG_REVERB_ROOM_RANGE = { min: 0,    max: 1,    step: 0.05 };
+export const CONFIG_REVERB_DAMP_RANGE = { min: 0,    max: 1,    step: 0.05 };
+export const CONFIG_REVERB_TAIL_RANGE = { min: 0,    max: 3000, step: 50 };
 
 function clampNumber(value, fallback, min, max) {
   const n = Number(value);
@@ -249,6 +265,12 @@ function makeConfig({
   crushBits = 0,
   amRateHz = 0,
   amDepth = 0,
+  ringHz = 0,
+  ringMix = 1,
+  reverbMix = 0,
+  reverbRoom = 0.7,
+  reverbDamp = 0.5,
+  reverbTailMs = 500,
 } = {}) {
   return {
     id: uuid(),
@@ -272,6 +294,12 @@ function makeConfig({
     crushBits,
     amRateHz,
     amDepth,
+    ringHz,
+    ringMix,
+    reverbMix,
+    reverbRoom,
+    reverbDamp,
+    reverbTailMs,
   };
 }
 
@@ -330,6 +358,12 @@ function sanitizeConfig(raw, defaultMode = DEFAULT_VOICE_MODE) {
     crushBits:        clampNumber(c.crushBits,        0, CONFIG_CRUSH_BITS_RANGE.min, CONFIG_CRUSH_BITS_RANGE.max),
     amRateHz:         clampNumber(c.amRateHz,         0, CONFIG_AM_RATE_RANGE.min,    CONFIG_AM_RATE_RANGE.max),
     amDepth:          clampNumber(c.amDepth,          0, CONFIG_AM_DEPTH_RANGE.min,   CONFIG_AM_DEPTH_RANGE.max),
+    ringHz:           clampNumber(c.ringHz,           0,   CONFIG_RING_HZ_RANGE.min,     CONFIG_RING_HZ_RANGE.max),
+    ringMix:          clampNumber(c.ringMix,          1,   CONFIG_RING_MIX_RANGE.min,    CONFIG_RING_MIX_RANGE.max),
+    reverbMix:        clampNumber(c.reverbMix,        0,   CONFIG_REVERB_MIX_RANGE.min,  CONFIG_REVERB_MIX_RANGE.max),
+    reverbRoom:       clampNumber(c.reverbRoom,       0.7, CONFIG_REVERB_ROOM_RANGE.min, CONFIG_REVERB_ROOM_RANGE.max),
+    reverbDamp:       clampNumber(c.reverbDamp,       0.5, CONFIG_REVERB_DAMP_RANGE.min, CONFIG_REVERB_DAMP_RANGE.max),
+    reverbTailMs:     clampNumber(c.reverbTailMs,     500, CONFIG_REVERB_TAIL_RANGE.min, CONFIG_REVERB_TAIL_RANGE.max),
   };
 }
 
@@ -1015,6 +1049,30 @@ export function updateProfileConfig(characterId, profileId, configId, patch) {
   if (patch.amDepth !== undefined) {
     config.amDepth = clampNumber(patch.amDepth, config.amDepth,
       CONFIG_AM_DEPTH_RANGE.min, CONFIG_AM_DEPTH_RANGE.max);
+  }
+  if (patch.ringHz !== undefined) {
+    config.ringHz = clampNumber(patch.ringHz, config.ringHz,
+      CONFIG_RING_HZ_RANGE.min, CONFIG_RING_HZ_RANGE.max);
+  }
+  if (patch.ringMix !== undefined) {
+    config.ringMix = clampNumber(patch.ringMix, config.ringMix,
+      CONFIG_RING_MIX_RANGE.min, CONFIG_RING_MIX_RANGE.max);
+  }
+  if (patch.reverbMix !== undefined) {
+    config.reverbMix = clampNumber(patch.reverbMix, config.reverbMix,
+      CONFIG_REVERB_MIX_RANGE.min, CONFIG_REVERB_MIX_RANGE.max);
+  }
+  if (patch.reverbRoom !== undefined) {
+    config.reverbRoom = clampNumber(patch.reverbRoom, config.reverbRoom,
+      CONFIG_REVERB_ROOM_RANGE.min, CONFIG_REVERB_ROOM_RANGE.max);
+  }
+  if (patch.reverbDamp !== undefined) {
+    config.reverbDamp = clampNumber(patch.reverbDamp, config.reverbDamp,
+      CONFIG_REVERB_DAMP_RANGE.min, CONFIG_REVERB_DAMP_RANGE.max);
+  }
+  if (patch.reverbTailMs !== undefined) {
+    config.reverbTailMs = clampNumber(patch.reverbTailMs, config.reverbTailMs,
+      CONFIG_REVERB_TAIL_RANGE.min, CONFIG_REVERB_TAIL_RANGE.max);
   }
 }
 

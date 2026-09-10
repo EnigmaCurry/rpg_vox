@@ -18,6 +18,7 @@
 pub mod chunker;
 pub mod clicks;
 pub mod comfyui;
+pub mod perf;
 pub mod piper;
 pub mod qwen3;
 
@@ -29,7 +30,7 @@ use rubato::{
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
-use tracing::{error, info};
+use tracing::{Instrument, error, info};
 
 use crate::mixer::AtomicMixer;
 
@@ -179,6 +180,35 @@ pub struct VoiceConfig {
     /// Mechanicum "servo motor buzz" the voice designer targets.
     pub am_rate_hz: f32,
     pub am_depth: f32,
+    /// True ring modulator carrier frequency in Hz (`x · sin(2π·f·t)`).
+    /// Zero disables. 30–80 Hz → Dalek grit, 200–600 Hz → clanky computer
+    /// voice, 1–3 kHz → glassy inharmonic. Distinct from AM which keeps the
+    /// carrier: at `ring_mix == 1.0` the fundamental is fully replaced by
+    /// sum/difference sidebands so the voice becomes metallic and pitchless.
+    pub ring_hz: f32,
+    /// Wet/dry blend for the ring modulator, 0..1. 1.0 = pure ring mod,
+    /// 0.5 keeps half the dry voice so intelligibility survives. Ignored
+    /// when `ring_hz == 0`.
+    pub ring_mix: f32,
+    /// Reverb wet/dry blend, 0..1. Zero disables the reverb entirely (no
+    /// tail is written, no buffer growth). Dry region is
+    /// `(1-mix)·dry + mix·wet`; the tail extension is `wet · fade`.
+    pub reverb_mix: f32,
+    /// Freeverb "room size" — feedback in the parallel comb filters,
+    /// mapped into `[0.7, 0.98]`. Higher = longer natural decay. Doesn't
+    /// change the audible tail length because `reverb_tail_ms` windows
+    /// the wet signal to a fixed duration regardless of feedback.
+    pub reverb_room: f32,
+    /// HF damping inside each comb's feedback loop, 0..1. Zero = bright
+    /// / metallic, 1 = dark / muffled tail.
+    pub reverb_damp: f32,
+    /// Fixed audible tail length in milliseconds. The buffer is grown by
+    /// this many samples past the dry end; the wet output is linearly
+    /// faded from 1→0 across the tail so decay always dies within the
+    /// window regardless of what `reverb_room` is set to. Zero uses the
+    /// default (500ms). Same time for every clip so short and long
+    /// utterances share the same trailing envelope.
+    pub reverb_tail_ms: f32,
 }
 
 impl Default for VoiceConfig {
@@ -200,6 +230,12 @@ impl Default for VoiceConfig {
             crush_bits: 0.0,
             am_rate_hz: 0.0,
             am_depth: 0.0,
+            ring_hz: 0.0,
+            ring_mix: 1.0,
+            reverb_mix: 0.0,
+            reverb_room: 0.7,
+            reverb_damp: 0.5,
+            reverb_tail_ms: 500.0,
         }
     }
 }
@@ -809,6 +845,11 @@ async fn handle_play_pcm(
 ///   same as the pre-profile pipeline.
 /// * The mix length is `max(delay_i + len_i)` so a delayed layer still fits.
 ///   Sums are clamped to ±1.0 at each add.
+#[tracing::instrument(
+    name = "render",
+    skip_all,
+    fields(label = %crate::tts::perf::preview_text(text, configs.len())),
+)]
 async fn synthesize_profile(
     backend: &mut Backend,
     cfg: &Config,
@@ -860,6 +901,7 @@ async fn synthesize_profile(
                 let mut sink = Sink::capture_only(target_rate);
                 backend
                     .synthesize(text, &voice, &mut sink)
+                    .instrument(tracing::info_span!("backend.synthesize", voice = i))
                     .await
                     .map_err(|e| format!("{e:#}"))?;
                 let (samples, _rate) = sink.take_capture();
@@ -877,6 +919,7 @@ async fn synthesize_profile(
 
     for i in 0..configs.len() {
         if let SynthMode::Sample { sample_bytes, sample_file_name } = &configs[i].mode {
+            let _s = tracing::info_span!("sample.decode", voice = i).entered();
             let decoded = decode_and_resample_sample(sample_bytes, target_rate)
                 .map_err(|e| format!("voice {} sample \"{}\": {e}", i + 1, sample_file_name))?;
             let target_len = if max_synth_len > 0 { max_synth_len } else { decoded.len() };
@@ -918,38 +961,78 @@ async fn synthesize_profile(
     // mono buffer, then hand off to the stereo mix. Copy layers run the
     // same pipeline as synth layers — the only thing that differed was
     // where their raw samples came from.
-    let mut layers: Vec<(Vec<f32>, &VoiceConfig)> = Vec::with_capacity(configs.len());
+    //
+    // Parallelized across the tokio blocking pool because every voice's
+    // DSP is pure CPU with zero shared state — the raw buffer + FX
+    // params are owned by their task, and the mix step runs after every
+    // handle joins. On a hive-mind profile with heavy pitch-shift copy
+    // layers this cuts wall-clock DSP time from serial-sum to
+    // longest-single-voice (see /perf/renders trace for the shape).
+    //
+    // Trace spans propagate via a Span::current().clone() into each
+    // closure + `.entered()` on the blocking thread, so /perf still
+    // captures voice.dsp under the render root with correct parenting
+    // even though the work runs off-runtime.
+    let render_span = tracing::Span::current();
+    let mut handles: Vec<tokio::task::JoinHandle<Result<Vec<f32>, String>>> =
+        Vec::with_capacity(configs.len());
     for (i, cc) in configs.iter().enumerate() {
-        let voice = cc.to_voice_override();
         let raw = raws[i].take().unwrap_or_default();
-        let mut processed = apply_effects(
-            raw,
-            target_rate,
-            voice.pitch_semitones,
-            voice.time_ratio,
-        )
-        .map_err(|e| format!("{e:#}"))?;
-        apply_fx_chain(
-            &mut processed,
-            target_rate,
-            &FxParams {
-                hpf_hz: cc.hpf_hz,
-                lpf_hz: cc.lpf_hz,
-                drive_db: cc.drive_db,
-                crush_bits: cc.crush_bits,
-                am_rate_hz: cc.am_rate_hz,
-                am_depth: cc.am_depth,
-            },
-        );
-        let gain_lin = 10f32.powf(cc.gain_db / 20.0);
-        let with_gain: Vec<f32> = if (gain_lin - 1.0).abs() < f32::EPSILON {
-            processed
-        } else {
-            processed.into_iter().map(|s| s * gain_lin).collect()
+        let voice = cc.to_voice_override();
+        let fx = FxParams {
+            hpf_hz: cc.hpf_hz,
+            lpf_hz: cc.lpf_hz,
+            drive_db: cc.drive_db,
+            crush_bits: cc.crush_bits,
+            am_rate_hz: cc.am_rate_hz,
+            am_depth: cc.am_depth,
+            ring_hz: cc.ring_hz,
+            ring_mix: cc.ring_mix,
+            reverb_mix: cc.reverb_mix,
+            reverb_room: cc.reverb_room,
+            reverb_damp: cc.reverb_damp,
+            reverb_tail_ms: cc.reverb_tail_ms,
         };
-        layers.push((with_gain, cc));
+        let gain_db = cc.gain_db;
+        let render_span = render_span.clone();
+        handles.push(tokio::task::spawn_blocking(
+            move || -> Result<Vec<f32>, String> {
+                let _root = render_span.entered();
+                let _voice_span = tracing::info_span!("voice.dsp", voice = i).entered();
+                let mut processed = {
+                    let _s = tracing::info_span!("apply_effects").entered();
+                    apply_effects(
+                        raw,
+                        target_rate,
+                        voice.pitch_semitones,
+                        voice.time_ratio,
+                    )
+                    .map_err(|e| format!("{e:#}"))?
+                };
+                apply_fx_chain(&mut processed, target_rate, &fx);
+                let gain_lin = 10f32.powf(gain_db / 20.0);
+                let with_gain: Vec<f32> = if (gain_lin - 1.0).abs() < f32::EPSILON {
+                    processed
+                } else {
+                    processed.into_iter().map(|s| s * gain_lin).collect()
+                };
+                Ok(with_gain)
+            },
+        ));
     }
 
+    // Join in original config order so `layers[i]` still aligns with
+    // `configs[i]` for the mix step's pan / delay reads. Iterating rather
+    // than try_join_all keeps the error site (JoinError vs DSP Err) obvious.
+    let mut layers: Vec<(Vec<f32>, &VoiceConfig)> = Vec::with_capacity(configs.len());
+    for (i, handle) in handles.into_iter().enumerate() {
+        let samples = handle
+            .await
+            .map_err(|e| format!("voice.dsp task for voice {i} panicked: {e}"))??;
+        layers.push((samples, &configs[i]));
+    }
+
+    let _mix_span = tracing::info_span!("stereo_mix").entered();
     let total_len = layers
         .iter()
         .map(|(s, c)| {
@@ -1120,11 +1203,19 @@ struct FxParams {
     crush_bits: f32,
     am_rate_hz: f32,
     am_depth: f32,
+    ring_hz: f32,
+    ring_mix: f32,
+    reverb_mix: f32,
+    reverb_room: f32,
+    reverb_damp: f32,
+    reverb_tail_ms: f32,
 }
 
-/// Apply the "FX" chain (bandpass → saturation → bit-crush → AM) in-place
-/// on a mono buffer. Each stage is a no-op when its knob sits at the
-/// identity value so an all-default config still pays only the branch cost.
+/// Apply the "FX" chain (bandpass → saturation → bit-crush → AM → ring mod
+/// → reverb) in-place on a mono buffer. Each stage is a no-op when its knob
+/// sits at the identity value so an all-default config still pays only the
+/// branch cost. Takes `&mut Vec<f32>` because the reverb stage may extend
+/// the buffer with a fixed-length tail (see [`apply_reverb`]).
 ///
 /// Order rationale:
 ///   1. HPF / LPF — shape the source spectrum before non-linear stages so
@@ -1137,25 +1228,52 @@ struct FxParams {
 ///      dynamic curve for that "vox-caster" edge on consonants.
 ///   4. AM (tremolo/motor) — post-saturation so the motor buzz rides
 ///      on the already-processed spectrum, not the pre-crunch source.
-fn apply_fx_chain(buf: &mut [f32], sample_rate: u32, p: &FxParams) {
+///   5. Ring mod — after AM so the metallic sidebands are generated
+///      from the already-shaped voice, not the raw source; the two
+///      compose (a slow AM + high ring mod is a valid combo).
+///   6. Reverb — always last so the wet tank captures the fully-
+///      processed dry signal (filters, distortion, and modulation all
+///      audible in the tail).
+fn apply_fx_chain(buf: &mut Vec<f32>, sample_rate: u32, p: &FxParams) {
+    let _fx_span = tracing::info_span!("apply_fx_chain").entered();
     if buf.is_empty() {
         return;
     }
     let nyquist = (sample_rate as f32) * 0.5;
     if p.hpf_hz > 0.0 && p.hpf_hz < nyquist {
+        let _s = tracing::info_span!("fx.hpf").entered();
         apply_one_pole_hpf(buf, sample_rate, p.hpf_hz);
     }
     if p.lpf_hz > 0.0 && p.lpf_hz < nyquist {
+        let _s = tracing::info_span!("fx.lpf").entered();
         apply_one_pole_lpf(buf, sample_rate, p.lpf_hz);
     }
     if p.drive_db > 0.0 {
+        let _s = tracing::info_span!("fx.drive").entered();
         apply_saturation(buf, p.drive_db);
     }
     if p.crush_bits > 0.0 && p.crush_bits < 16.0 {
+        let _s = tracing::info_span!("fx.crush").entered();
         apply_bit_crush(buf, p.crush_bits);
     }
     if p.am_rate_hz > 0.0 && p.am_depth > 0.0 {
+        let _s = tracing::info_span!("fx.am").entered();
         apply_amplitude_mod(buf, sample_rate, p.am_rate_hz, p.am_depth);
+    }
+    if p.ring_hz > 0.0 && p.ring_mix > 0.0 {
+        let _s = tracing::info_span!("fx.ring").entered();
+        apply_ring_mod(buf, sample_rate, p.ring_hz, p.ring_mix);
+    }
+    if p.reverb_mix > 0.0 {
+        let _s = tracing::info_span!("fx.reverb").entered();
+        apply_reverb(
+            buf,
+            sample_rate,
+            p.reverb_mix,
+            p.reverb_room,
+            p.reverb_damp,
+            p.reverb_tail_ms,
+        );
     }
 }
 
@@ -1230,6 +1348,136 @@ fn apply_amplitude_mod(buf: &mut [f32], sample_rate: u32, rate_hz: f32, depth: f
             phase -= std::f32::consts::TAU;
         }
     }
+}
+
+/// True ring modulator: `y = (1 - mix)·x + mix · x · sin(2π·f·t)`. Unlike
+/// [`apply_amplitude_mod`], the carrier is NOT added to 1 — at `mix = 1.0`
+/// the fundamental collapses into sum/difference sidebands and the voice
+/// becomes metallic and pitchless (Dalek / Cylon). `mix < 1.0` keeps a
+/// share of the dry voice so consonants stay intelligible.
+fn apply_ring_mod(buf: &mut [f32], sample_rate: u32, hz: f32, mix: f32) {
+    let m = mix.clamp(0.0, 1.0);
+    let dry = 1.0 - m;
+    let phase_inc = 2.0 * std::f32::consts::PI * hz / sample_rate as f32;
+    let mut phase = 0.0f32;
+    for s in buf.iter_mut() {
+        let x = *s;
+        let wet = x * phase.sin();
+        *s = dry * x + m * wet;
+        phase += phase_inc;
+        if phase > std::f32::consts::TAU {
+            phase -= std::f32::consts::TAU;
+        }
+    }
+}
+
+/// Freeverb-lite: 8 parallel comb filters (LPF in the feedback path) summed
+/// into 4 series Schroeder allpasses. The buffer grows by `tail_ms` samples
+/// past the dry end so the natural decay is audible; the wet component is
+/// linearly faded from 1→0 across that window so the tail dies within
+/// `tail_ms` regardless of how long `room` would let it ring naturally.
+/// A constant tail length keeps the trailing envelope identical for every
+/// utterance — short and long clips share the same "outro."
+///
+/// Delay tunings and gain constants are lifted from Jezar's original
+/// Freeverb (input_gain=0.015, room→feedback maps into [0.7, 0.98],
+/// damp scales into the LPF one-pole coefficient), scaled from the 44.1 kHz
+/// reference to the current sample rate.
+fn apply_reverb(
+    buf: &mut Vec<f32>,
+    sample_rate: u32,
+    mix: f32,
+    room: f32,
+    damp: f32,
+    tail_ms: f32,
+) {
+    let mix = mix.clamp(0.0, 1.0);
+    if mix <= f32::EPSILON || buf.is_empty() {
+        return;
+    }
+    let tail_ms = if tail_ms <= 0.0 { 500.0 } else { tail_ms };
+    let tail_samples = (tail_ms * sample_rate as f32 / 1000.0) as usize;
+    let dry_len = buf.len();
+    let total_len = dry_len + tail_samples;
+
+    let sr_scale = sample_rate as f32 / 44100.0;
+    let comb_tunings: [usize; 8] = [1116, 1188, 1277, 1356, 1422, 1491, 1557, 1617];
+    let allpass_tunings: [usize; 4] = [556, 441, 341, 225];
+
+    let feedback = 0.7 + room.clamp(0.0, 1.0) * 0.28;
+    let damp1 = damp.clamp(0.0, 1.0) * 0.4;
+    let damp2 = 1.0 - damp1;
+    let ap_fb: f32 = 0.5;
+    // Jezar's fixedgain — keeps 8 combs at high feedback from blowing up
+    // on unity input; paired with wet_scale below.
+    let input_gain: f32 = 0.015;
+    // Jezar's scalewet — brings wet output into roughly the same
+    // magnitude as dry so mix acts as a usable crossfader.
+    let wet_scale: f32 = 3.0;
+
+    struct Comb {
+        buf: Vec<f32>,
+        idx: usize,
+        store: f32,
+    }
+    let mut combs: Vec<Comb> = comb_tunings
+        .iter()
+        .map(|&t| Comb {
+            buf: vec![0.0; ((t as f32 * sr_scale) as usize).max(1)],
+            idx: 0,
+            store: 0.0,
+        })
+        .collect();
+
+    struct Allpass {
+        buf: Vec<f32>,
+        idx: usize,
+    }
+    let mut allpasses: Vec<Allpass> = allpass_tunings
+        .iter()
+        .map(|&t| Allpass {
+            buf: vec![0.0; ((t as f32 * sr_scale) as usize).max(1)],
+            idx: 0,
+        })
+        .collect();
+
+    let mut out: Vec<f32> = Vec::with_capacity(total_len);
+    let tail_denom = tail_samples.max(1) as f32;
+    for i in 0..total_len {
+        let dry = if i < dry_len { buf[i] } else { 0.0 };
+        let x = dry * input_gain;
+
+        // 8 parallel combs, each a delay line with a one-pole LPF in
+        // the feedback path (the `store` state).
+        let mut wet = 0.0f32;
+        for c in combs.iter_mut() {
+            let output = c.buf[c.idx];
+            c.store = output * damp2 + c.store * damp1;
+            c.buf[c.idx] = x + c.store * feedback;
+            c.idx = (c.idx + 1) % c.buf.len();
+            wet += output;
+        }
+        // 4 series Schroeder allpasses. Magnitude-preserving; only
+        // diffuses phase so the comb sum stops sounding like a
+        // pitched resonator and starts sounding like a room.
+        for a in allpasses.iter_mut() {
+            let bufout = a.buf[a.idx];
+            let output = -wet + bufout;
+            a.buf[a.idx] = wet + bufout * ap_fb;
+            a.idx = (a.idx + 1) % a.buf.len();
+            wet = output;
+        }
+        let wet_out = wet * wet_scale;
+        let y = if i < dry_len {
+            (1.0 - mix) * dry + mix * wet_out
+        } else {
+            let fade = 1.0 - (i - dry_len) as f32 / tail_denom;
+            mix * wet_out * fade
+        };
+        out.push(y);
+    }
+
+    *buf = out;
 }
 
 /// Decode a user-uploaded sample clip (wav / flac / ogg / mp3 — anything

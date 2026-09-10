@@ -1415,6 +1415,75 @@ impl Store {
         .context("db task panicked")?
     }
 
+    /// Look up a single turn's role, content, and attached widget id.
+    /// Used by the /resynth endpoint to re-drive `synth_gm_proxy_widget`
+    /// against the persisted text without the client echoing it back.
+    /// Returns `None` when the turn belongs to a different script or was
+    /// already deleted.
+    pub async fn get_turn(
+        &self,
+        script_id: String,
+        turn_id: String,
+    ) -> Result<Option<TurnLookup>> {
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || -> Result<Option<TurnLookup>> {
+            let conn = db.lock().unwrap();
+            let row = conn
+                .query_row(
+                    "SELECT role, content, widget_id FROM script_turns
+                      WHERE id = ?1 AND script_id = ?2",
+                    params![turn_id, script_id],
+                    |r| {
+                        Ok(TurnLookup {
+                            role: r.get::<_, String>(0)?,
+                            content: r.get::<_, String>(1)?,
+                            widget_id: r.get::<_, Option<String>>(2)?,
+                        })
+                    },
+                )
+                .optional()?;
+            Ok(row)
+        })
+        .await
+        .context("db task panicked")?
+    }
+
+    /// Swap a turn's attached widget id. Returns [`UpdateResult::NotFound`]
+    /// when the turn doesn't exist for the given script. Caller is
+    /// responsible for deleting the previous widget row (via
+    /// `delete_widget`) — this method only touches the FK.
+    pub async fn set_turn_widget_id(
+        &self,
+        script_id: String,
+        turn_id: String,
+        widget_id: Option<String>,
+    ) -> Result<UpdateResult> {
+        let db = self.db.clone();
+        let script_id_clone = script_id.clone();
+        let turn_id_clone = turn_id.clone();
+        let widget_id_clone = widget_id.clone();
+        tokio::task::spawn_blocking(move || -> Result<UpdateResult> {
+            let mut conn = db.lock().unwrap();
+            let tx = conn.transaction()?;
+            let affected = tx.execute(
+                "UPDATE script_turns SET widget_id = ?3
+                  WHERE id = ?1 AND script_id = ?2",
+                params![turn_id_clone, script_id_clone, widget_id_clone],
+            )?;
+            if affected == 0 {
+                return Ok(UpdateResult::NotFound);
+            }
+            tx.execute(
+                "UPDATE scripts SET updated_at = ?2 WHERE id = ?1",
+                params![script_id_clone, unix_now()],
+            )?;
+            tx.commit()?;
+            Ok(UpdateResult::Updated)
+        })
+        .await
+        .context("db task panicked")?
+    }
+
     /// Look up a block's persisted text + role so `POST .../takes` can
     /// re-render without the client echoing the text back, and can pick a
     /// role-appropriate voice profile automatically.
@@ -1444,6 +1513,15 @@ impl Store {
 pub struct BlockInfo {
     pub text: String,
     pub role: String,
+}
+
+/// Slim projection of a turn row used by the /resynth handler — just the
+/// fields it needs to drive `synth_gm_proxy_widget` and clean up the old
+/// widget row.
+pub struct TurnLookup {
+    pub role: String,
+    pub content: String,
+    pub widget_id: Option<String>,
 }
 
 pub struct AgentRow {

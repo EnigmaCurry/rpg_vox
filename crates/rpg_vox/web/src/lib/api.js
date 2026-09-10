@@ -421,6 +421,32 @@ export async function sendUserTurn(scriptId, text, widgetId = null, agentId = nu
 /// user turn. Returns the new `user_turn` in the same shape as
 /// `sendUserTurn`. Caller is expected to fire `sendAssistantReply` after
 /// to regenerate the LLM response against the rewound history.
+/// Re-synth the GM-proxy widget attached to an existing user turn WITHOUT
+/// truncating the transcript. Server reads the turn's stored text and
+/// regenerates the widget against the current project dictionary + the
+/// agent's User voice slot, deletes the old widget row/WAV, and returns
+/// the new widget id (or null when silenced / empty text). Used by the
+/// Script page's shift-click bulk re-render so user turns pick up the
+/// same voice/dictionary edits as the assistant takes.
+export async function resynthUserTurn(scriptId, turnId, agentId = null, projectId = null) {
+  const body = {};
+  if (agentId) body.agentId = agentId;
+  if (projectId) body.projectId = projectId;
+  const r = await fetch(
+    `/scripts/${encodeURIComponent(scriptId)}/turns/${encodeURIComponent(turnId)}/resynth`,
+    {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    },
+  );
+  if (!r.ok) {
+    const detail = await r.text().catch(() => `HTTP ${r.status}`);
+    throw new Error(detail || `HTTP ${r.status}`);
+  }
+  return await r.json();
+}
+
 export async function editUserTurn(scriptId, turnId, text, agentId = null, projectId = null) {
   const body = { text };
   if (agentId) body.agentId = agentId;

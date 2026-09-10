@@ -28,6 +28,12 @@
     CONFIG_CRUSH_BITS_RANGE,
     CONFIG_AM_RATE_RANGE,
     CONFIG_AM_DEPTH_RANGE,
+    CONFIG_RING_HZ_RANGE,
+    CONFIG_RING_MIX_RANGE,
+    CONFIG_REVERB_MIX_RANGE,
+    CONFIG_REVERB_ROOM_RANGE,
+    CONFIG_REVERB_DAMP_RANGE,
+    CONFIG_REVERB_TAIL_RANGE,
   } from '../lib/scenes.svelte.js';
   import {
     createVoice, deleteVoice, uploadImage, voiceReferenceUrl,
@@ -878,6 +884,90 @@
                                     />
                                     <span class="unit">×</span>
                                   </label>
+                                  <label class="fx">
+                                    <span>Ring</span>
+                                    <input
+                                      type="number"
+                                      min={CONFIG_RING_HZ_RANGE.min}
+                                      max={CONFIG_RING_HZ_RANGE.max}
+                                      step={CONFIG_RING_HZ_RANGE.step}
+                                      value={config.ringHz}
+                                      oninput={(e) => onConfigNumberInput(character.id, profile.id, config.id, 'ringHz', e)}
+                                      aria-label="Ring modulator carrier in Hz"
+                                      title="True ring mod carrier frequency (0 = disabled). 30–80 Hz = Dalek grit, 200–600 Hz = clanky computer, 1–3 kHz = glassy inharmonic. Different from AM: the carrier is NOT preserved so the fundamental collapses into sidebands."
+                                    />
+                                    <span class="unit">Hz</span>
+                                  </label>
+                                  <label class="fx">
+                                    <span>Ring Mix</span>
+                                    <input
+                                      type="number"
+                                      min={CONFIG_RING_MIX_RANGE.min}
+                                      max={CONFIG_RING_MIX_RANGE.max}
+                                      step={CONFIG_RING_MIX_RANGE.step}
+                                      value={config.ringMix}
+                                      oninput={(e) => onConfigNumberInput(character.id, profile.id, config.id, 'ringMix', e)}
+                                      aria-label="Ring modulator wet/dry mix"
+                                      title="Ring mod wet/dry (0 = fully dry, 1 = pure ring mod). 0.5 keeps half the dry voice so consonants stay intelligible."
+                                    />
+                                    <span class="unit">×</span>
+                                  </label>
+                                  <label class="fx">
+                                    <span>Reverb</span>
+                                    <input
+                                      type="number"
+                                      min={CONFIG_REVERB_MIX_RANGE.min}
+                                      max={CONFIG_REVERB_MIX_RANGE.max}
+                                      step={CONFIG_REVERB_MIX_RANGE.step}
+                                      value={config.reverbMix}
+                                      oninput={(e) => onConfigNumberInput(character.id, profile.id, config.id, 'reverbMix', e)}
+                                      aria-label="Reverb wet/dry mix"
+                                      title="Freeverb-lite wet/dry (0 = disabled). Tail extends past the dry end by Tail ms and fades to zero."
+                                    />
+                                    <span class="unit">×</span>
+                                  </label>
+                                  <label class="fx">
+                                    <span>Room</span>
+                                    <input
+                                      type="number"
+                                      min={CONFIG_REVERB_ROOM_RANGE.min}
+                                      max={CONFIG_REVERB_ROOM_RANGE.max}
+                                      step={CONFIG_REVERB_ROOM_RANGE.step}
+                                      value={config.reverbRoom}
+                                      oninput={(e) => onConfigNumberInput(character.id, profile.id, config.id, 'reverbRoom', e)}
+                                      aria-label="Reverb room size"
+                                      title="Feedback in the comb filters, 0..1 → [0.7, 0.98]. Higher = longer natural decay. Doesn't change audible tail length — Tail ms windows the wet regardless."
+                                    />
+                                    <span class="unit">×</span>
+                                  </label>
+                                  <label class="fx">
+                                    <span>Damp</span>
+                                    <input
+                                      type="number"
+                                      min={CONFIG_REVERB_DAMP_RANGE.min}
+                                      max={CONFIG_REVERB_DAMP_RANGE.max}
+                                      step={CONFIG_REVERB_DAMP_RANGE.step}
+                                      value={config.reverbDamp}
+                                      oninput={(e) => onConfigNumberInput(character.id, profile.id, config.id, 'reverbDamp', e)}
+                                      aria-label="Reverb HF damping"
+                                      title="HF damping in the reverb tank (0 = metallic / bright, 1 = dark / muffled)."
+                                    />
+                                    <span class="unit">×</span>
+                                  </label>
+                                  <label class="fx">
+                                    <span>Tail</span>
+                                    <input
+                                      type="number"
+                                      min={CONFIG_REVERB_TAIL_RANGE.min}
+                                      max={CONFIG_REVERB_TAIL_RANGE.max}
+                                      step={CONFIG_REVERB_TAIL_RANGE.step}
+                                      value={config.reverbTailMs}
+                                      oninput={(e) => onConfigNumberInput(character.id, profile.id, config.id, 'reverbTailMs', e)}
+                                      aria-label="Reverb tail length in milliseconds"
+                                      title="Fixed audible tail length (ms). Wet fades to zero across this window so short and long clips share the same outro. Independent of Room feedback."
+                                    />
+                                    <span class="unit">ms</span>
+                                  </label>
                                 </div>
                               </details>
                             </li>
@@ -889,6 +979,11 @@
                         <ProfileTestField
                           characterId={character.id}
                           profileId={profile.id}
+                          referenceText={
+                            (profile.configs || [])
+                              .find((c) => c.mode === 'clone' && String(c.description ?? '').trim())
+                              ?.description?.trim() ?? ''
+                          }
                         />
                       </li>
                     {/each}

@@ -21,12 +21,14 @@
     cancelRecording,
     createAgent,
     createScript,
+    createTake,
     deleteAgent,
     deleteWidget,
     editUserTurn,
     fetchWidget,
     generateScriptTitle,
     playWidget,
+    resynthUserTurn,
     sendAssistantReply,
     sendUserTurn,
     startClicks,
@@ -279,10 +281,149 @@
   }
 
   /// Toggle Play All: if a queue is already running, stop it; otherwise
-  /// kick off a fresh top-of-conversation walk.
-  function togglePlayAll() {
+  /// kick off a fresh top-of-conversation walk. Shift-click on the idle
+  /// button re-renders every assistant take from scratch — the canonical
+  /// escape hatch after editing the project Dictionary, swapping a
+  /// character voice, or otherwise changing what synthesis would produce
+  /// for the transcript's existing text. Ignored while a queue is
+  /// already playing so a slip on the Stop click can't accidentally
+  /// nuke every take.
+  function togglePlayAll(ev) {
+    if (isRerendering) { cancelRerenderAll(); return; }
+    if (ev?.shiftKey && !isPlayingAll) { rerenderAll(); return; }
     if (isPlayingAll) cancelPlayAll();
     else playAll();
+  }
+
+  // ---- Re-render whole transcript ----------------------------------------
+  //
+  // Walks the current script from the top and regenerates every piece of
+  // audio against the current project dictionary + agent voice slots:
+  //   * User turns → POST .../turns/:tid/resynth
+  //     (server re-runs synth_gm_proxy_widget in place, swaps the widget,
+  //     cleans up the prior one). Note: this DOES overwrite recorded user
+  //     memos with GM-proxy synth of their text — the user's ask ("re-
+  //     render everything") is the destructive contract.
+  //   * Assistant blocks → POST /script/blocks/:id/takes
+  //     (server auto-selects the new take; client mirrors it into the
+  //     transcript with the same FIFO cap the manual ⟳ button uses).
+  //
+  // Silenced roles are skipped up front — matches the auto-render gate
+  // in SpeechInline and the /user handler's silence handling.
+  let isRerendering = $state(false);
+  let rerenderStopRequested = false;
+  let rerenderDone = $state(0);
+  let rerenderTotal = $state(0);
+
+  function findBlockById(blockId) {
+    for (const t of turns) {
+      if (!Array.isArray(t.blocks)) continue;
+      for (const b of t.blocks) if (b.id === blockId) return b;
+    }
+    return null;
+  }
+
+  async function rerenderAll() {
+    if (isRerendering) return;
+    // Same "clear any in-flight audio" guard as playAll — the takes about
+    // to be replaced may be mid-playback through the mic, and we don't
+    // want to keep hearing the stale version while the new synth runs.
+    cancelAllSequences();
+    try { await stopPlayback(); } catch {}
+
+    // Snapshot target list up front so mid-loop reactivity to script
+    // updates doesn't reshape it under us. Two shapes:
+    //   { kind: 'user',  turnId, text }
+    //   { kind: 'block', blockId, role }
+    // Empty-text and silenced targets are dropped so the counter matches
+    // what actually gets synthesized.
+    const targets = [];
+    for (const t of turns) {
+      if (t.role === 'user') {
+        if (voiceSilenced.user) continue;
+        if (!t.content || !t.content.trim()) continue;
+        // Only turns that already have an attached widget were audible
+        // before — turns without one stay silent (matches the /user
+        // handler's silence branch).
+        if (!t.widget_id) continue;
+        targets.push({ kind: 'user', turnId: t.id });
+      } else if (t.role === 'assistant' && Array.isArray(t.blocks)) {
+        for (const b of t.blocks) {
+          const silenced = b.role === 'narrator'
+            ? voiceSilenced.narrator
+            : voiceSilenced.character;
+          if (silenced) continue;
+          if (!b.text || !b.text.trim()) continue;
+          targets.push({ kind: 'block', blockId: b.id });
+        }
+      }
+    }
+    if (targets.length === 0) return;
+
+    isRerendering = true;
+    rerenderStopRequested = false;
+    rerenderTotal = targets.length;
+    rerenderDone = 0;
+    error = '';
+    const MAX_TAKES = 3;
+    const currentScript = currentScriptId;
+    try {
+      for (const target of targets) {
+        if (rerenderStopRequested) break;
+        try {
+          if (target.kind === 'user') {
+            const { widgetId } = await resynthUserTurn(
+              currentScript,
+              target.turnId,
+              selectedAgentId,
+              scenesState.selectedProjectId ?? null,
+            );
+            // Mirror the swap into the local script store so the play
+            // button on this turn points at the fresh widget without a
+            // full reload.
+            script.update((s) => {
+              if (!s) return s;
+              const nextTurns = s.turns.map((t) =>
+                t.id === target.turnId ? { ...t, widget_id: widgetId ?? null } : t,
+              );
+              return { ...s, turns: nextTurns };
+            });
+          } else {
+            const { take } = await createTake(
+              target.blockId,
+              [],
+              selectedAgentId,
+              scenesState.selectedProjectId ?? null,
+            );
+            // Re-read the block from the latest turns state — earlier
+            // iterations may have shifted its takes array and we shouldn't
+            // clobber those.
+            const current = findBlockById(target.blockId);
+            if (current) {
+              const kept = [...(current.takes ?? []), take]
+                .sort((a, b) => b.ord - a.ord)
+                .slice(0, MAX_TAKES)
+                .sort((a, b) => a.ord - b.ord);
+              applyBlockChange({
+                ...current,
+                takes: kept,
+                selected_take: take.ord,
+              });
+            }
+          }
+        } catch (e) {
+          console.warn('rerender: target failed', target, e);
+        }
+        rerenderDone += 1;
+      }
+    } finally {
+      isRerendering = false;
+      rerenderStopRequested = false;
+    }
+  }
+
+  function cancelRerenderAll() {
+    rerenderStopRequested = true;
   }
 
   /// Skip to the next clip in the queue. Aborts the current /widgets/:id/say
@@ -1607,8 +1748,19 @@
         <!-- Play All walks the whole transcript in order (user memos +
              each assistant block's selected take). Toggles Stop while
              playback is in flight. Disabled when the transcript has no
-             playable audio yet. -->
-        {#if isPlayingAll}
+             playable audio yet. Shift-click on the idle button re-renders
+             every assistant take from scratch (useful after editing the
+             project Dictionary or swapping a character voice). -->
+        {#if isRerendering}
+          <button
+            class="playall playing"
+            onclick={togglePlayAll}
+            title="Stop re-rendering (already-rendered blocks keep their new takes)"
+          >
+            <span class="spinner" aria-hidden="true"></span>
+            <span class="counter">Re-rendering {Math.min(rerenderDone + 1, rerenderTotal)} / {rerenderTotal}</span>
+          </button>
+        {:else if isPlayingAll}
           <div class="playall-controls">
             <button
               class="playall skip"
@@ -1646,7 +1798,7 @@
             class="playall"
             onclick={togglePlayAll}
             disabled={!hasPlayable}
-            title="Play the entire conversation"
+            title="Play the entire conversation (Shift-click to re-render every assistant take)"
           >
             <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true">
               <path fill="currentColor" d="M8 5v14l11-7z" />
@@ -2178,6 +2330,16 @@
     font-size: 11px;
   }
   button.playall.playing:hover .counter { color: var(--text); }
+  /* Small inline spinner for the "Re-rendering N/M" state. */
+  button.playall .spinner {
+    width: 12px;
+    height: 12px;
+    border: 2px solid rgba(122, 162, 255, 0.35);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: playall-spin 0.7s linear infinite;
+  }
+  @keyframes playall-spin { to { transform: rotate(360deg); } }
 
   /* Icon-only affordance in the transport cluster (e.g. download-script).
      Sized to sit alongside Play All without becoming another labelled

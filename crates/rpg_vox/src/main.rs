@@ -279,14 +279,22 @@ struct Args {
 }
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                // ort spams per-node optimizer info at INFO — pin it to WARN so
-                // the rpg_vox startup log stays readable.
-                tracing_subscriber::EnvFilter::new("info,ort=warn,ort::logging=warn")
-            }),
-        )
+    // Layered subscriber: the same fmt() logger as before, PLUS an in-memory
+    // ring-buffer profiler that captures every `render` span tree from the
+    // TTS pipeline (served under /perf/renders). The env-filter only gates
+    // fmt output — perf sees every span regardless of RUST_LOG so a
+    // production `warn`-level filter still gets us clean render traces.
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        // ort spams per-node optimizer info at INFO — pin it to WARN so
+        // the rpg_vox startup log stays readable.
+        tracing_subscriber::EnvFilter::new("info,ort=warn,ort::logging=warn")
+    });
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer().with_filter(env_filter))
+        .with(crate::tts::perf::RingLayer::new())
         .init();
 
     let args = Args::parse();

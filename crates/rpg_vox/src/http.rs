@@ -233,6 +233,18 @@ struct ConfigBody {
     am_rate_hz: Option<f32>,
     #[serde(default)]
     am_depth: Option<f32>,
+    #[serde(default)]
+    ring_hz: Option<f32>,
+    #[serde(default)]
+    ring_mix: Option<f32>,
+    #[serde(default)]
+    reverb_mix: Option<f32>,
+    #[serde(default)]
+    reverb_room: Option<f32>,
+    #[serde(default)]
+    reverb_damp: Option<f32>,
+    #[serde(default)]
+    reverb_tail_ms: Option<f32>,
 }
 
 impl ConfigBody {
@@ -259,6 +271,12 @@ impl ConfigBody {
             crush_bits: self.crush_bits.unwrap_or(0.0),
             am_rate_hz: self.am_rate_hz.unwrap_or(0.0),
             am_depth: self.am_depth.unwrap_or(0.0),
+            ring_hz: self.ring_hz.unwrap_or(0.0),
+            ring_mix: self.ring_mix.unwrap_or(1.0),
+            reverb_mix: self.reverb_mix.unwrap_or(0.0),
+            reverb_room: self.reverb_room.unwrap_or(0.7),
+            reverb_damp: self.reverb_damp.unwrap_or(0.5),
+            reverb_tail_ms: self.reverb_tail_ms.unwrap_or(500.0),
         }
     }
 }
@@ -540,6 +558,12 @@ async fn resolve_character_configs(
         let crush_bits      = read_f("crushBits",      0.0);
         let am_rate_hz      = read_f("amRateHz",       0.0);
         let am_depth        = read_f("amDepth",        0.0);
+        let ring_hz         = read_f("ringHz",         0.0);
+        let ring_mix        = read_f("ringMix",        1.0);
+        let reverb_mix      = read_f("reverbMix",      0.0);
+        let reverb_room     = read_f("reverbRoom",     0.7);
+        let reverb_damp     = read_f("reverbDamp",     0.5);
+        let reverb_tail_ms  = read_f("reverbTailMs",   500.0);
         // Per-config mode wins over the legacy profile-level mode. Any
         // unknown string falls back to the legacy profile mode, which in
         // turn defaults to "presets" above.
@@ -640,6 +664,12 @@ async fn resolve_character_configs(
             crush_bits,
             am_rate_hz,
             am_depth,
+            ring_hz,
+            ring_mix,
+            reverb_mix,
+            reverb_room,
+            reverb_damp,
+            reverb_tail_ms,
         });
     }
     if out.is_empty() { None } else { Some(out) }
@@ -842,6 +872,10 @@ pub async fn serve(
             "/scripts/:id/turns/:turn_id/edit-user",
             post(script_edit_user),
         )
+        .route(
+            "/scripts/:id/turns/:turn_id/resynth",
+            post(script_resynth_user_turn),
+        )
         .route("/scripts/:id/reply", post(script_send_reply))
         .route("/scripts/:id/title", post(scripts_generate_title))
         .route("/scripts/:id/mix.flac", get(script_mix_handler))
@@ -864,6 +898,17 @@ pub async fn serve(
                 .put(agents_update)
                 .delete(agents_delete),
         )
+        .route("/perf/renders", get(perf_renders_list))
+        // Raw RenderRecord as JSON (small — one tree). Consumed by the
+        // Test-field console-log path in ProfileTestField.svelte.
+        .route("/perf/renders/latest", get(perf_latest_raw))
+        .route("/perf/renders/latest.json", get(perf_latest_chrome))
+        .route("/perf/renders/latest.txt", get(perf_latest_text))
+        // Format lives in its own segment because axum's matchit treats
+        // `:id` as consuming the whole segment (dot included), so
+        // `/perf/renders/:id.json` + `/perf/renders/:id.txt` collide.
+        .route("/perf/renders/:id/chrome.json", get(perf_render_chrome))
+        .route("/perf/renders/:id/text.txt", get(perf_render_text))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&bind)
@@ -927,6 +972,74 @@ async fn graph_handler(State(state): State<AppState>) -> impl IntoResponse {
             }),
         )
             .into_response(),
+    }
+}
+
+// --- Perf ring-buffer endpoints ---
+//
+// These serve whatever the tts::perf::RingLayer has captured for the last N
+// render-span trees. Zero coupling to any request path — the layer collects
+// spans from anywhere in the process; the endpoints just format what's
+// already in memory. See tts::perf for the retention/cost story.
+
+/// GET /perf/renders — JSON list of recent renders (newest last). Small
+/// projection: each entry has id + label + timestamps + total_us + the
+/// full span tree so a browser tool can render the whole flame chart
+/// client-side without a second round trip.
+async fn perf_renders_list() -> impl IntoResponse {
+    Json(crate::tts::perf::snapshot())
+}
+
+/// GET /perf/renders/latest — the newest RenderRecord as raw JSON (tree of
+/// SpanNode). Small — one render, easy for browser JS to walk and log.
+async fn perf_latest_raw() -> Response {
+    match crate::tts::perf::latest() {
+        Some(r) => Json(r).into_response(),
+        None => (StatusCode::NOT_FOUND, "no renders captured yet").into_response(),
+    }
+}
+
+/// GET /perf/renders/latest.json — chrome://tracing / Perfetto /
+/// speedscope-compatible JSON for the most recent render. Drop into
+/// https://ui.perfetto.dev or `speedscope` for the flame chart.
+async fn perf_latest_chrome() -> Response {
+    match crate::tts::perf::latest() {
+        Some(r) => Json(crate::tts::perf::to_chrome_json(&r)).into_response(),
+        None => (StatusCode::NOT_FOUND, "no renders captured yet").into_response(),
+    }
+}
+
+/// GET /perf/renders/latest.txt — indented text tree with per-stage ms and
+/// percentage of total. Fastest way to eyeball what's dominant.
+async fn perf_latest_text() -> Response {
+    match crate::tts::perf::latest() {
+        Some(r) => (
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            crate::tts::perf::to_text(&r),
+        )
+            .into_response(),
+        None => (StatusCode::NOT_FOUND, "no renders captured yet").into_response(),
+    }
+}
+
+/// GET /perf/renders/:id.json — chrome://tracing JSON for a specific
+/// render by id. 404 when it has aged out of the ring.
+async fn perf_render_chrome(Path(id): Path<u64>) -> Response {
+    match crate::tts::perf::get(id) {
+        Some(r) => Json(crate::tts::perf::to_chrome_json(&r)).into_response(),
+        None => (StatusCode::NOT_FOUND, "render id not in ring buffer").into_response(),
+    }
+}
+
+/// GET /perf/renders/:id.txt — text tree for a specific render.
+async fn perf_render_text(Path(id): Path<u64>) -> Response {
+    match crate::tts::perf::get(id) {
+        Some(r) => (
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            crate::tts::perf::to_text(&r),
+        )
+            .into_response(),
+        None => (StatusCode::NOT_FOUND, "render id not in ring buffer").into_response(),
     }
 }
 
@@ -1799,6 +1912,131 @@ async fn script_edit_user(
 
     let user_turn = turn_view(&state.store, user_row).await;
     (StatusCode::OK, Json(ScriptUserResponse { user_turn })).into_response()
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ScriptResynthUserBody {
+    /// Same semantics as [`ScriptSendUserBody::agent_id`] — picks the User
+    /// voice slot used for the fresh GM-proxy synth. Empty/absent falls
+    /// back to the hardcoded DSP fallback.
+    #[serde(default, rename = "agentId")]
+    agent_id: Option<String>,
+    /// Same semantics as [`ScriptSendUserBody::project_id`] — picks the
+    /// TTS dictionary applied to the resynth. Absent → derive from the
+    /// agent's own project when possible.
+    #[serde(default, rename = "projectId")]
+    project_id: Option<String>,
+}
+
+/// Re-synthesize the GM-proxy widget attached to an existing user turn
+/// WITHOUT touching the transcript history. The turn's stored text stays
+/// as-is, but its attached widget is regenerated against the current
+/// project dictionary and the agent's current User voice slot, then the
+/// old widget row + WAV are deleted. Used by the Script page's "shift-
+/// click Play All" bulk re-render so every user turn's audio picks up
+/// the same dictionary/voice edits as the assistant takes it walks.
+///
+/// Silenced or empty text short-circuits with `widgetId: null` — same
+/// contract as `synth_gm_proxy_widget` — and the previous widget is
+/// still cleaned up so the turn ends up with no play button, matching
+/// what a fresh silence-configured send would produce.
+async fn script_resynth_user_turn(
+    State(state): State<AppState>,
+    Path((script_id, turn_id)): Path<(String, String)>,
+    body: Option<Json<ScriptResynthUserBody>>,
+) -> Response {
+    let Json(body) = body.unwrap_or_else(|| Json(ScriptResynthUserBody::default()));
+    let turn = match state
+        .store
+        .get_turn(script_id.clone(), turn_id.clone())
+        .await
+    {
+        Ok(Some(t)) => t,
+        Ok(None) => {
+            return (StatusCode::NOT_FOUND, format!("no turn {turn_id}")).into_response();
+        }
+        Err(err) => {
+            tracing::error!(err = %format!("{err:#}"), %script_id, %turn_id,
+                "store: turn lookup failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("store: {err:#}"),
+            )
+                .into_response();
+        }
+    };
+    if turn.role != "user" {
+        return (
+            StatusCode::BAD_REQUEST,
+            "resynth only applies to user turns",
+        )
+            .into_response();
+    }
+
+    // Same agent + project resolution as script_edit_user / script_send_user
+    // so voice slot silences and dictionary scoping stay consistent.
+    let agent_row = match body.agent_id.clone().filter(|s| !s.is_empty()) {
+        Some(aid) => state.store.get_agent(aid).await.ok().flatten(),
+        None => None,
+    };
+    let user_voice_character: Option<String> =
+        agent_row.as_ref().and_then(|a| a.voice_user.clone());
+    let project_id: Option<String> = body
+        .project_id
+        .clone()
+        .filter(|s| !s.is_empty())
+        .or_else(|| agent_row.as_ref().and_then(|a| a.project_id.clone()));
+
+    let new_widget_id = synth_gm_proxy_widget(
+        &state,
+        turn.content.clone(),
+        user_voice_character.as_deref(),
+        project_id.as_deref(),
+    )
+    .await;
+
+    match state
+        .store
+        .set_turn_widget_id(script_id.clone(), turn_id.clone(), new_widget_id.clone())
+        .await
+    {
+        Ok(UpdateResult::Updated) => {}
+        Ok(UpdateResult::NotFound) => {
+            // Turn vanished between the lookup and the swap. Clean up the
+            // orphan widget we just synth'd so the store doesn't grow.
+            if let Some(wid) = new_widget_id {
+                let _ = state.store.delete_widget(wid).await;
+            }
+            return (StatusCode::NOT_FOUND, format!("no turn {turn_id}")).into_response();
+        }
+        Err(err) => {
+            tracing::error!(err = %format!("{err:#}"), %script_id, %turn_id,
+                "store: turn widget swap failed");
+            if let Some(wid) = new_widget_id {
+                let _ = state.store.delete_widget(wid).await;
+            }
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("store: {err:#}"),
+            )
+                .into_response();
+        }
+    }
+
+    // Clean up the previous widget row + WAV. Idempotent server-side, so
+    // a null prior widget (turn was silenced before) is fine.
+    if let Some(prior) = turn.widget_id {
+        if let Err(err) = state.store.delete_widget(prior.clone()).await {
+            tracing::warn!(id = %prior, err = %format!("{err:#}"),
+                "prior widget cleanup after resynth failed");
+        }
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "widgetId": new_widget_id })),
+    )
+        .into_response()
 }
 
 /// Phase 2 of the /script two-step: call the LLM against the history the
