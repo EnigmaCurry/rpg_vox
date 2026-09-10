@@ -68,7 +68,39 @@ pub struct RenderRecord {
     pub label: String,
     /// Total render duration in microseconds (matches `root.dur_us`).
     pub total_us: u64,
+    /// Number of stereo frames in the mixed audio output. `None` if the
+    /// render span didn't populate the `audio_frames` field (older records
+    /// or a render path that didn't produce a mix). Divide by
+    /// `audio_sample_rate` for seconds of audio.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio_frames: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio_sample_rate: Option<u32>,
     pub root: SpanNode,
+}
+
+impl RenderRecord {
+    /// Rendered audio length in microseconds (frames · 1_000_000 / rate).
+    /// `None` when either field is missing.
+    pub fn audio_us(&self) -> Option<u64> {
+        let frames = self.audio_frames?;
+        let rate = self.audio_sample_rate? as u64;
+        if rate == 0 {
+            return None;
+        }
+        Some(frames.saturating_mul(1_000_000) / rate)
+    }
+
+    /// Realtime multiplier: audio_us / total_us. > 1.0 means we generated
+    /// audio faster than realtime (good — 10s of audio in 2s of wall-clock
+    /// is 5.0×). < 1.0 means the render is slower than realtime.
+    pub fn realtime_multiplier(&self) -> Option<f64> {
+        let a = self.audio_us()? as f64;
+        if self.total_us == 0 {
+            return None;
+        }
+        Some(a / self.total_us as f64)
+    }
 }
 
 /// Per-span state stashed in the Registry so parent/child assembly works
@@ -89,6 +121,11 @@ struct SpanState {
     is_root: bool,
     /// On root: label extracted from the span's `label` field.
     label: Option<String>,
+    /// On root: populated by [`RingLayer::on_record`] when the caller
+    /// calls `Span::current().record("audio_frames", n)` after the mix
+    /// is built. Non-root spans ignore this.
+    audio_frames: Option<u64>,
+    audio_sample_rate: Option<u32>,
     /// Assembled from children as they close, one node per direct child.
     completed_children: Vec<SpanNode>,
 }
@@ -149,8 +186,27 @@ where
             parent_id,
             is_root,
             label,
+            audio_frames: None,
+            audio_sample_rate: None,
             completed_children: Vec::new(),
         });
+    }
+
+    fn on_record(&self, id: &Id, values: &tracing::span::Record<'_>, ctx: Context<'_, S>) {
+        let Some(span) = ctx.span(id) else { return };
+        let mut exts = span.extensions_mut();
+        let Some(state) = exts.get_mut::<SpanState>() else { return };
+        if !state.is_root {
+            return;
+        }
+        let mut v = AudioMetaVisitor::default();
+        values.record(&mut v);
+        if let Some(f) = v.frames {
+            state.audio_frames = Some(f);
+        }
+        if let Some(r) = v.sample_rate {
+            state.audio_sample_rate = Some(r);
+        }
     }
 
     fn on_close(&self, id: Id, ctx: Context<'_, S>) {
@@ -181,6 +237,8 @@ where
                     .unwrap_or(0),
                 label: state.label.unwrap_or_default(),
                 total_us: dur_us,
+                audio_frames: state.audio_frames,
+                audio_sample_rate: state.audio_sample_rate,
                 root: node,
             };
             push_record(record);
@@ -214,6 +272,33 @@ impl field::Visit for LabelVisitor {
             self.label = Some(truncate_label(&format!("{value:?}")));
         }
     }
+}
+
+/// Extracts `audio_frames` + `audio_sample_rate` off subsequent
+/// `Span::record()` calls on the render root. Split from
+/// [`LabelVisitor`] because the fields are declared as `Empty` at span
+/// creation and only get recorded later, after the mix is built.
+#[derive(Default)]
+struct AudioMetaVisitor {
+    frames: Option<u64>,
+    sample_rate: Option<u32>,
+}
+
+impl field::Visit for AudioMetaVisitor {
+    fn record_u64(&mut self, field: &field::Field, value: u64) {
+        match field.name() {
+            "audio_frames" => self.frames = Some(value),
+            "audio_sample_rate" => self.sample_rate = Some(value as u32),
+            _ => {}
+        }
+    }
+    fn record_i64(&mut self, field: &field::Field, value: i64) {
+        if value < 0 {
+            return;
+        }
+        self.record_u64(field, value as u64);
+    }
+    fn record_debug(&mut self, _field: &field::Field, _value: &dyn std::fmt::Debug) {}
 }
 
 fn truncate_label(s: &str) -> String {
@@ -306,6 +391,10 @@ pub fn to_chrome_json(record: &RenderRecord) -> serde_json::Value {
             "id": record.id,
             "label": record.label,
             "started_at_unix_ms": record.started_at_unix_ms,
+            "audio_frames": record.audio_frames,
+            "audio_sample_rate": record.audio_sample_rate,
+            "audio_us": record.audio_us(),
+            "realtime_multiplier": record.realtime_multiplier(),
         },
     })
 }
@@ -320,12 +409,24 @@ pub fn to_text(record: &RenderRecord) -> String {
     } else {
         format!(" — {}", record.label)
     };
+    // Header line: total wall-clock plus (when we have it) the audio length
+    // and realtime multiplier. `4.20s audio, 3.4× realtime` reads at a
+    // glance: "we generated 4.2 seconds of audio in 1.25 seconds of CPU."
+    let audio_tag = match (record.audio_us(), record.realtime_multiplier()) {
+        (Some(a), Some(m)) => format!(
+            " — {:.2}s audio, {:.2}× realtime",
+            a as f64 / 1_000_000.0,
+            m
+        ),
+        _ => String::new(),
+    };
     let _ = writeln!(
         out,
-        "Render #{}{} — total {:.2}ms",
+        "Render #{}{} — {:.2}ms wall-clock{}",
         record.id,
         label,
-        record.total_us as f64 / 1000.0
+        record.total_us as f64 / 1000.0,
+        audio_tag
     );
     walk_text(&record.root, 0, record.total_us, &mut out);
     out

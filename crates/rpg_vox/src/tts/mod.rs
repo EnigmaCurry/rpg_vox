@@ -848,7 +848,13 @@ async fn handle_play_pcm(
 #[tracing::instrument(
     name = "render",
     skip_all,
-    fields(label = %crate::tts::perf::preview_text(text, configs.len())),
+    fields(
+        label = %crate::tts::perf::preview_text(text, configs.len()),
+        // Filled in after the mix is built. Perf's RingLayer catches the
+        // Span::record() calls and stashes them onto the RenderRecord.
+        audio_frames = tracing::field::Empty,
+        audio_sample_rate = tracing::field::Empty,
+    ),
 )]
 async fn synthesize_profile(
     backend: &mut Backend,
@@ -894,6 +900,32 @@ async fn synthesize_profile(
     //       Cycles + missing sources become clear errors.
     let mut raws: Vec<Option<Vec<f32>>> = vec![None; configs.len()];
 
+    // Kick off sample decode + resample tasks BEFORE the backend loop so they
+    // run on the blocking pool concurrently with the (serial, HTTP-bound)
+    // Qwen3 synth. loop_to_length still runs after backend completes because
+    // it needs `max_synth_len`, but the expensive decode + resample step is
+    // now entirely hidden inside the backend's window on any profile with
+    // sample voices. Bytes are cloned into the task because SynthMode's
+    // sample_bytes is behind a `&[VoiceConfig]` borrow — a few MB memcpy
+    // is negligible next to the multi-second backend call it overlaps.
+    let render_span = tracing::Span::current();
+    let mut sample_decode_handles: Vec<
+        Option<tokio::task::JoinHandle<Result<Vec<f32>, String>>>,
+    > = (0..configs.len()).map(|_| None).collect();
+    for (i, cc) in configs.iter().enumerate() {
+        if let SynthMode::Sample { sample_bytes, sample_file_name } = &cc.mode {
+            let bytes = sample_bytes.clone();
+            let name = sample_file_name.clone();
+            let render_span = render_span.clone();
+            sample_decode_handles[i] = Some(tokio::task::spawn_blocking(move || {
+                let _root = render_span.entered();
+                let _s = tracing::info_span!("sample.decode", voice = i).entered();
+                decode_and_resample_sample(&bytes, target_rate)
+                    .map_err(|e| format!("voice {} sample \"{}\": {e}", i + 1, name))
+            }));
+        }
+    }
+
     for i in 0..configs.len() {
         match &configs[i].mode {
             SynthMode::Preset | SynthMode::Clone { .. } | SynthMode::Design { .. } => {
@@ -917,12 +949,17 @@ async fn synthesize_profile(
         .max()
         .unwrap_or(0);
 
-    for i in 0..configs.len() {
-        if let SynthMode::Sample { sample_bytes, sample_file_name } = &configs[i].mode {
-            let _s = tracing::info_span!("sample.decode", voice = i).entered();
-            let decoded = decode_and_resample_sample(sample_bytes, target_rate)
-                .map_err(|e| format!("voice {} sample \"{}\": {e}", i + 1, sample_file_name))?;
+    // Await the sample decoders we launched before backend synth. Under a
+    // heavy-backend profile these have long since finished; under an
+    // all-sample profile the awaits are the actual wait. Then loop each
+    // decoded buffer to the target length (fast — plain memcpy).
+    for (i, handle_opt) in sample_decode_handles.iter_mut().enumerate() {
+        if let Some(handle) = handle_opt.take() {
+            let decoded = handle
+                .await
+                .map_err(|e| format!("sample.decode task for voice {i} panicked: {e}"))??;
             let target_len = if max_synth_len > 0 { max_synth_len } else { decoded.len() };
+            let _s = tracing::info_span!("sample.loop", voice = i).entered();
             raws[i] = Some(loop_to_length(decoded, target_len));
         }
     }
@@ -1055,6 +1092,14 @@ async fn synthesize_profile(
             mix[idx] = [l, r];
         }
     }
+    // Record the generated audio length on the ENCLOSING render span so
+    // /perf can report a realtime multiplier (audio_us / total_us).
+    // Explicit `render_span.record(...)` — not `Span::current()` — because
+    // we're still inside the `stereo_mix` sub-span at this point, and the
+    // fields are only declared on the render root; recording them on the
+    // mix span would silently no-op.
+    render_span.record("audio_frames", mix.len() as u64);
+    render_span.record("audio_sample_rate", target_rate as u64);
     Ok(mix)
 }
 
@@ -1173,19 +1218,29 @@ fn apply_effects(
     let semitones = pitch_semitones.clamp(-24.0, 24.0);
     let time_ratio = time_ratio.clamp(0.25, 4.0) as f64;
 
+    // LowLatency quality mode: skips HPSS (harmonic/percussive source
+    // separation) and adaptive phase-lock switching inside the phase
+    // vocoder. Designed for tiny realtime callbacks but works fine for our
+    // offline batch renders too — trades ~2–4× speedup on long buffers for
+    // slightly more phasy artifacts on sustained vowels. Since the mic
+    // path already speaks over Discord's Opus encoder those artifacts are
+    // near-invisible in practice; if a specific voice starts to sound
+    // hollow, expose a per-config quality knob at that point.
     let mut buf = samples;
     if !no_pitch {
         let factor = 2f64.powf(semitones as f64 / 12.0);
         let params = timestretch::StretchParams::new(1.0)
             .with_sample_rate(sample_rate)
-            .with_channels(1);
+            .with_channels(1)
+            .with_quality_mode(timestretch::QualityMode::LowLatency);
         buf = timestretch::pitch_shift(&buf, &params, factor)
             .map_err(|e| anyhow::anyhow!("pitch_shift: {e}"))?;
     }
     if !no_time {
         let params = timestretch::StretchParams::new(time_ratio)
             .with_sample_rate(sample_rate)
-            .with_channels(1);
+            .with_channels(1)
+            .with_quality_mode(timestretch::QualityMode::LowLatency);
         buf = timestretch::stretch(&buf, &params)
             .map_err(|e| anyhow::anyhow!("stretch: {e}"))?;
     }

@@ -185,7 +185,17 @@
 
     const totalUs = record.total_us;
     const totalMs = totalUs / 1000;
-    const header = `🎙 Test render #${record.id} — ${record.label || '(unlabeled)'} — ${totalMs.toFixed(2)}ms`;
+    // Realtime multiplier: audio-length / wall-clock. > 1.0 means synth
+    // outpaced realtime (10s of audio in 2s = 5.0×). Server may return
+    // camelCase or snake_case depending on serde config — accept both.
+    const audioFrames = record.audio_frames ?? record.audioFrames ?? null;
+    const audioRate = record.audio_sample_rate ?? record.audioSampleRate ?? null;
+    const audioMs = audioFrames && audioRate ? (audioFrames * 1000) / audioRate : null;
+    const rtMult = audioMs != null && totalMs > 0 ? audioMs / totalMs : null;
+    const audioTag = audioMs != null && rtMult != null
+      ? ` — ${(audioMs / 1000).toFixed(2)}s audio, ${rtMult.toFixed(2)}× realtime`
+      : '';
+    const header = `🎙 Test render #${record.id} — ${record.label || '(unlabeled)'} — ${totalMs.toFixed(2)}ms wall${audioTag}`;
     /* eslint-disable no-console */
     console.groupCollapsed(header);
 
