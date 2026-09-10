@@ -367,6 +367,19 @@
     error = '';
     const MAX_TAKES = 3;
     const currentScript = currentScriptId;
+    // Benchmark accumulators. Wall clock covers only the synth loop; user-
+    // turn duration lookups happen after the timer stops so /widgets HEAD
+    // roundtrips don't inflate the reported render time.
+    const benchStart = performance.now();
+    const benchStartWall = new Date();
+    let benchAudioMs = 0;
+    let benchOk = 0;
+    let benchFail = 0;
+    const benchUserWidgetIds = [];
+    console.log(
+      `[bench] rerenderAll: starting at ${benchStartWall.toISOString()} ` +
+        `(${targets.length} clips)`,
+    );
     try {
       for (const target of targets) {
         if (rerenderStopRequested) break;
@@ -388,6 +401,8 @@
               );
               return { ...s, turns: nextTurns };
             });
+            if (widgetId) benchUserWidgetIds.push(widgetId);
+            benchOk += 1;
           } else {
             const { take } = await createTake(
               target.blockId,
@@ -410,12 +425,37 @@
                 selected_take: take.ord,
               });
             }
+            if (take?.duration_ms) benchAudioMs += take.duration_ms;
+            benchOk += 1;
           }
         } catch (e) {
           console.warn('rerender: target failed', target, e);
+          benchFail += 1;
         }
         rerenderDone += 1;
       }
+      const wallMs = performance.now() - benchStart;
+      const stoppedEarly = rerenderStopRequested;
+      // Resolve user-widget durations off the clock so the timer reflects
+      // only synth work. Failures fall back to 0 rather than skewing the
+      // ratio — the log calls out the discrepancy via the clip counters.
+      if (benchUserWidgetIds.length > 0) {
+        const durs = await Promise.all(
+          benchUserWidgetIds.map((id) =>
+            fetchWidget(id).then((w) => w.durationMs || 0).catch(() => 0),
+          ),
+        );
+        benchAudioMs += durs.reduce((a, b) => a + b, 0);
+      }
+      const speedup = wallMs > 0 ? benchAudioMs / wallMs : 0;
+      console.log(
+        `[bench] rerenderAll: wall=${(wallMs / 1000).toFixed(2)}s ` +
+          `audio=${(benchAudioMs / 1000).toFixed(2)}s ` +
+          `speedup=${speedup.toFixed(2)}x ` +
+          `clips=${benchOk}/${targets.length}` +
+          (benchFail ? ` (${benchFail} failed)` : '') +
+          (stoppedEarly ? ' [stopped early]' : ''),
+      );
     } finally {
       isRerendering = false;
       rerenderStopRequested = false;

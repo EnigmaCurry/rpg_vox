@@ -4,29 +4,34 @@
   import { monitorState } from '../lib/browserMonitor.js';
   import HealthDot from './HealthDot.svelte';
 
-  // Menu structure: top-level items may have children.
-  // Clicking a parent with `href` still navigates; children appear in a dropdown.
+  // Menu structure: top-level items are either simple links or dropdown
+  // openers. An item with `children` has no route of its own — its label is
+  // just a menu opener and every destination lives inside the dropdown.
   const items = [
     {
-      href: '#/projects',
       label: 'Project',
-      match: (r) => r === '/' || r === '/projects',
       children: [
+        { href: '#/projects',   label: 'Load',       match: (r) => r === '/' || r === '/projects' },
         { href: '#/characters', label: 'Characters', match: (r) => r === '/characters' },
         { href: '#/dictionary', label: 'Dictionary', match: (r) => r === '/dictionary' },
         { href: '#/scenes',     label: 'Scenes',     match: (r) => r === '/scenes' || r === '/speak' },
-        { href: '#/script',     label: 'Script',     match: (r) => r === '/script' || r === '/chat' },
+        { href: '#/script',     label: 'Scripts',    match: (r) => r === '/script' || r === '/chat' || r.startsWith('/script/') || r.startsWith('/chat/') },
       ],
     },
     { href: '#/mixer',    label: 'Mixer',    match: (r) => r === '/mixer' },
     { href: '#/settings', label: 'Settings', match: (r) => r === '/settings' },
   ];
 
-  // A parent is "active" if it matches OR any of its children match — so the
-  // Project chip stays highlighted while the user is inside Characters/etc.
+  // A parent is "active" when any of its children match — so the Project
+  // chip stays highlighted while the user is inside Characters/Scripts/etc.
   function parentActive(item, r) {
-    if (item.match(r)) return true;
     return item.children?.some((c) => c.match(r)) ?? false;
+  }
+
+  // Label of the currently-routed child, shown as a bold suffix in the
+  // parent pill ("Project: Script"). Null when no child matches.
+  function activeSuffix(item, r) {
+    return item.children?.find((c) => c.match(r))?.label ?? null;
   }
 
   // Open state has two independent sources:
@@ -108,27 +113,23 @@
         onmouseleave={() => handleMouseLeave(i)}
       >
         {#if it.children}
-          <div
+          {@const suffix = activeSuffix(it, $route)}
+          <button
+            type="button"
             class="parent-row"
             class:open={isItemOpen(i)}
             class:active={parentActive(it, $route)}
+            aria-haspopup="menu"
+            aria-expanded={isItemOpen(i)}
+            onclick={(e) => { e.stopPropagation(); toggleOpen(i); }}
           >
-            <a
-              href={it.href}
-              onclick={() => handleLinkClick(i, it.match($route))}
-            >{it.label}</a>
-            <button
-              type="button"
-              class="caret"
-              aria-label="Toggle {it.label} menu"
-              aria-expanded={isItemOpen(i)}
-              onclick={(e) => { e.stopPropagation(); toggleOpen(i); }}
-            >
-              <svg viewBox="0 0 10 6" width="10" height="6" aria-hidden="true">
+            <span class="label">{it.label}{#if suffix}: <strong>{suffix}</strong>{/if}</span>
+            <span class="caret" aria-hidden="true">
+              <svg viewBox="0 0 10 6" width="10" height="6">
                 <path d="M1 1l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
               </svg>
-            </button>
-          </div>
+            </span>
+          </button>
           <ul class="dropdown" class:visible={isItemOpen(i)}>
             {#each it.children as c (c.href)}
               <li>
@@ -214,48 +215,40 @@
     box-shadow: inset 0 -2px 0 var(--accent);
   }
 
-  /* Parent pill (Project). The pill background lives on .parent-row so the
-     link + caret share one continuous shape. Right padding on the row
-     mirrors the 10px left padding inside the <a>, giving the pill a
-     symmetric buffer around its content. */
+  /* Parent pill (Project) is now a single <button> — it only opens the
+     dropdown, never navigates. Reset default button chrome and paint the
+     pill shape here. Symmetric 10px left/right padding gives the label
+     equal breathing room from the pill edges. */
   .parent-row {
     display: inline-flex;
     align-items: center;
+    gap: 6px;
+    padding: 6px 10px;
+    background: transparent;
+    color: var(--muted);
+    border: 0;
     border-radius: 6px;
-    padding-right: 10px;
+    font: inherit;
+    font-size: 14px;
+    cursor: pointer;
   }
-  .parent-row:hover { background: rgba(255,255,255,0.04); }
+  .parent-row:hover { color: var(--text); background: rgba(255,255,255,0.04); }
   .parent-row.active {
+    color: var(--text);
     background: rgba(122,162,255,0.12);
     box-shadow: inset 0 -2px 0 var(--accent);
   }
-  .parent-row > a {
-    display: inline-block;
-    padding: 6px 4px 6px 10px;
-    color: var(--muted);
-    text-decoration: none;
-    font-size: 14px;
-  }
-  .parent-row:hover > a,
-  .parent-row.active > a { color: var(--text); }
+  .parent-row .label { line-height: 1; }
 
-  /* Caret is a pure indicator — no background of its own so it doesn't
-     obscure the pill's right buffer. Rotation follows isItemOpen() so it
-     tracks the true dropdown state (hover-open OR click-open), not just
-     the click. */
+  /* Caret is a pure visual indicator. Rotation follows isItemOpen() so it
+     tracks the true dropdown state (hover-open OR click-open). */
   .caret {
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    background: transparent;
-    border: 0;
-    color: var(--muted);
-    padding: 6px 0;
-    cursor: pointer;
+    color: currentColor;
     transition: transform 0.15s ease;
   }
-  .caret:hover { color: var(--text); background: transparent; }
-  .parent-row.active .caret { color: var(--text); }
   .parent-row.open .caret { transform: rotate(180deg); }
 
   .dropdown {
