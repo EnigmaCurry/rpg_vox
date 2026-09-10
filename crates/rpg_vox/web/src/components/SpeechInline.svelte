@@ -12,6 +12,7 @@
   import { onMount, tick } from 'svelte';
   import { createTake, deleteTake, playWidget, selectTake, stopPlayback } from '../lib/api.js';
   import { activeClip } from '../lib/stores.js';
+  import { scenesState } from '../lib/scenes.svelte.js';
   import { scrollClipIntoView } from '../lib/scroll.js';
 
   let {
@@ -234,7 +235,7 @@
     // the actual ord comes back from the server on success and replaces it.
     renderingOrd = -1;
     try {
-      const { take } = await createTake(block.id, [], agentId);
+      const { take } = await createTake(block.id, [], agentId, scenesState.selectedProjectId ?? null);
       // FIFO cap: mirror the server's `prune_block_takes` (keep 3 most
       // recent). Ords keep monotonically advancing so the button numbers
       // don't renumber — user still sees they're on take #7.

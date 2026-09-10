@@ -6,6 +6,7 @@
   import Menubar from './components/Menubar.svelte';
   import Projects from './routes/Projects.svelte';
   import Characters from './routes/Characters.svelte';
+  import Dictionary from './routes/Dictionary.svelte';
   import Scenes from './routes/Scenes.svelte';
   import Script from './routes/Script.svelte';
   import Mixer from './routes/Mixer.svelte';
@@ -20,6 +21,7 @@
     '/':           Projects,
     '/projects':   Projects,
     '/characters': Characters,
+    '/dictionary': Dictionary,
     '/scenes':     Scenes,
     '/speak':      Scenes,
     '/script':     Script,

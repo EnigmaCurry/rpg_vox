@@ -7,6 +7,7 @@
   const items = [
     { href: '#/projects',   label: 'Projects',   match: (r) => r === '/' || r === '/projects' },
     { href: '#/characters', label: 'Characters', match: (r) => r === '/characters' },
+    { href: '#/dictionary', label: 'Dictionary', match: (r) => r === '/dictionary' },
     { href: '#/scenes',     label: 'Scenes',     match: (r) => r === '/scenes' || r === '/speak' },
     { href: '#/script',     label: 'Script',     match: (r) => r === '/script' || r === '/chat' },
     { href: '#/mixer',      label: 'Mixer',      match: (r) => r === '/mixer' },

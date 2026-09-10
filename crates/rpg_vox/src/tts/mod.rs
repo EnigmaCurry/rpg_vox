@@ -108,6 +108,33 @@ pub enum SynthMode {
     Design {
         description: String,
     },
+    /// No new synth call — reuse the RAW mono synth output of another
+    /// config in the same profile (0-based index). The copy still runs
+    /// through its own pitch / time / FX / gain / pan / delay pipeline,
+    /// so the caller can build a Mechanicum-style pitched-double layer by
+    /// pointing this at the core voice and setting `pitch_semitones = -3`.
+    ///
+    /// The source's own FX chain is NOT inherited — copies see the raw
+    /// synth output, not the post-FX signal — so copy layers can apply
+    /// heavier processing without the source's filters cascading.
+    /// [`synthesize_profile`] resolves dependencies in topological order
+    /// and rejects cycles (self-copy, mutually-copying pairs, ...).
+    Copy {
+        from_index: usize,
+    },
+    /// User-uploaded audio clip looped to fit the profile's target
+    /// duration (the longest synth sibling's length, or the sample's own
+    /// duration when the profile has no synth voices). The looped mono
+    /// buffer then runs through the same pitch / time / FX / gain / pan /
+    /// delay pipeline as every other config, so a servo-motor recording
+    /// becomes a full sound-design layer without extra plumbing.
+    ///
+    /// The HTTP layer preloads the bytes via `Store::get_sample_bytes` so
+    /// the backend doesn't need store access at synth time.
+    Sample {
+        sample_bytes: Vec<u8>,
+        sample_file_name: String,
+    },
 }
 
 impl Default for SynthMode {
@@ -134,11 +161,6 @@ pub struct VoiceConfig {
     pub pan: f32,
     pub gain_db: f32,
     pub delay_ms: f32,
-    /// Doubler effect: when non-zero, `apply_effects` synthesizes a copy
-    /// of the pitched buffer shifted by this many semitones and mixes it
-    /// into the primary at equal weight — a common vocal "widener"
-    /// (subtle ±3 for chorus, ±12 for octave stacking). Zero disables.
-    pub doubler_semitones: f32,
     /// One-pole IIR bandpass corners applied to the post-pitch, post-time
     /// mono buffer. Either side at 0 (or at/above Nyquist) bypasses that
     /// leg. Together they let a config land the "destroyed vox-caster"
@@ -172,7 +194,6 @@ impl Default for VoiceConfig {
             pan: 0.0,
             gain_db: 0.0,
             delay_ms: 0.0,
-            doubler_semitones: 0.0,
             hpf_hz: 0.0,
             lpf_hz: 0.0,
             drive_db: 0.0,
@@ -799,23 +820,113 @@ async fn synthesize_profile(
     }
     let target_rate = cfg.target_sample_rate;
 
-    // (mono_samples, config_ref). Sample rate is always target_rate because
-    // the capture_only Sink resamples on push.
+    // Up-front validation of Copy references. Cheap and turns a
+    // mis-configured profile into a clear error at request time instead
+    // of a mid-synth panic.
+    for (i, cc) in configs.iter().enumerate() {
+        if let SynthMode::Copy { from_index } = &cc.mode {
+            if *from_index >= configs.len() {
+                return Err(format!(
+                    "voice {} copies from voice {} but only {} voices exist in this profile",
+                    i + 1,
+                    *from_index + 1,
+                    configs.len(),
+                ));
+            }
+            if *from_index == i {
+                return Err(format!("voice {} cannot copy from itself", i + 1));
+            }
+        }
+    }
+
+    // Phase 1 collects the RAW mono buffer per config in three sub-passes
+    // so the sample-loop path can size itself against the synth voices'
+    // natural durations:
+    //
+    //   1a. Preset / Clone / Design — run the backend, capture the raw
+    //       synth output.
+    //   1b. Sample — decode + resample + loop to `max(synth_lens)` so
+    //       an atmospheric drone rides for the whole clip. When the
+    //       profile has no synth voices at all, we fall back to each
+    //       sample's natural length so an all-sample profile still plays.
+    //   1c. Copy — in topological dep order, clone the source's raw buffer.
+    //       Cycles + missing sources become clear errors.
+    let mut raws: Vec<Option<Vec<f32>>> = vec![None; configs.len()];
+
+    for i in 0..configs.len() {
+        match &configs[i].mode {
+            SynthMode::Preset | SynthMode::Clone { .. } | SynthMode::Design { .. } => {
+                let voice = configs[i].to_voice_override();
+                let mut sink = Sink::capture_only(target_rate);
+                backend
+                    .synthesize(text, &voice, &mut sink)
+                    .await
+                    .map_err(|e| format!("{e:#}"))?;
+                let (samples, _rate) = sink.take_capture();
+                raws[i] = Some(samples);
+            }
+            _ => {}
+        }
+    }
+
+    let max_synth_len = raws
+        .iter()
+        .filter_map(|r| r.as_ref().map(|s| s.len()))
+        .max()
+        .unwrap_or(0);
+
+    for i in 0..configs.len() {
+        if let SynthMode::Sample { sample_bytes, sample_file_name } = &configs[i].mode {
+            let decoded = decode_and_resample_sample(sample_bytes, target_rate)
+                .map_err(|e| format!("voice {} sample \"{}\": {e}", i + 1, sample_file_name))?;
+            let target_len = if max_synth_len > 0 { max_synth_len } else { decoded.len() };
+            raws[i] = Some(loop_to_length(decoded, target_len));
+        }
+    }
+
+    // Copies-in-dep-order. A pass that resolves at least one copy is
+    // progress; a pass that resolves none while copies remain is a
+    // cycle (mutual copies, N-way loop, or a copy pointing at another
+    // copy whose source is also unresolved).
+    let mut remaining_copies: usize = configs
+        .iter()
+        .filter(|cc| matches!(cc.mode, SynthMode::Copy { .. }))
+        .count();
+    while remaining_copies > 0 {
+        let mut progressed = false;
+        for i in 0..configs.len() {
+            if raws[i].is_some() {
+                continue;
+            }
+            let SynthMode::Copy { from_index } = &configs[i].mode else {
+                continue;
+            };
+            if let Some(src) = raws[*from_index].as_ref() {
+                raws[i] = Some(src.clone());
+                remaining_copies -= 1;
+                progressed = true;
+            }
+        }
+        if !progressed {
+            return Err(
+                "copy cycle detected in voice profile (voices copying from each other)".into(),
+            );
+        }
+    }
+
+    // Phase 2: apply each config's own pitch/time/FX/gain to its raw
+    // mono buffer, then hand off to the stereo mix. Copy layers run the
+    // same pipeline as synth layers — the only thing that differed was
+    // where their raw samples came from.
     let mut layers: Vec<(Vec<f32>, &VoiceConfig)> = Vec::with_capacity(configs.len());
-    for cc in configs {
+    for (i, cc) in configs.iter().enumerate() {
         let voice = cc.to_voice_override();
-        let mut sink = Sink::capture_only(target_rate);
-        backend
-            .synthesize(text, &voice, &mut sink)
-            .await
-            .map_err(|e| format!("{e:#}"))?;
-        let (samples, _rate) = sink.take_capture();
+        let raw = raws[i].take().unwrap_or_default();
         let mut processed = apply_effects(
-            samples,
+            raw,
             target_rate,
             voice.pitch_semitones,
             voice.time_ratio,
-            cc.doubler_semitones,
         )
         .map_err(|e| format!("{e:#}"))?;
         apply_fx_chain(
@@ -950,35 +1061,33 @@ async fn push_stereo_backpressured_until(
     written
 }
 
-/// Apply pitch shift, doubler, and time stretch to a mono f32 buffer.
+/// Apply pitch shift and time stretch to a mono f32 buffer.
 ///
 /// Skips the DSP call entirely when every knob sits at its identity value
 /// so no-effect configs pay no CPU. Order is:
-///   1. primary pitch shift (keeps the spectral envelope close to source)
-///   2. doubler (adds a pitch-shifted COPY of the primary output summed
-///      back in — sits before time stretch so both voices get the same
-///      timing treatment and stay aligned)
-///   3. time stretch (applied to the combined mono buffer)
+///   1. pitch shift (keeps the spectral envelope close to source)
+///   2. time stretch (applied to the pitched buffer)
+///
+/// The old inline "doubler" pass has been replaced by [`SynthMode::Copy`]
+/// configs — a copy layer's own pitch/time/FX/gain now stand in for what
+/// the doubler used to do, giving each doubled voice a full effect chain
+/// instead of a single semitone knob.
 ///
 /// Extreme values are clamped so the algorithm never sees something it
-/// can't meaningfully process: ±24 semitones covers chipmunk-to-demon,
-/// 0.25×–4× time ratio covers the useful slow/fast range, and the
-/// doubler uses the same ±24 clamp since it's a pitch shift too.
+/// can't meaningfully process: ±24 semitones covers chipmunk-to-demon and
+/// 0.25×–4× time ratio covers the useful slow/fast range.
 fn apply_effects(
     samples: Vec<f32>,
     sample_rate: u32,
     pitch_semitones: f32,
     time_ratio: f32,
-    doubler_semitones: f32,
 ) -> Result<Vec<f32>> {
     let no_pitch = pitch_semitones.abs() <= f32::EPSILON;
     let no_time = (time_ratio - 1.0).abs() <= f32::EPSILON;
-    let no_doubler = doubler_semitones.abs() <= f32::EPSILON;
-    if (no_pitch && no_time && no_doubler) || samples.is_empty() {
+    if (no_pitch && no_time) || samples.is_empty() {
         return Ok(samples);
     }
     let semitones = pitch_semitones.clamp(-24.0, 24.0);
-    let doubler = doubler_semitones.clamp(-24.0, 24.0);
     let time_ratio = time_ratio.clamp(0.25, 4.0) as f64;
 
     let mut buf = samples;
@@ -989,30 +1098,6 @@ fn apply_effects(
             .with_channels(1);
         buf = timestretch::pitch_shift(&buf, &params, factor)
             .map_err(|e| anyhow::anyhow!("pitch_shift: {e}"))?;
-    }
-    if !no_doubler {
-        // Second pitch pass on a copy of the primary output. Summed back
-        // at half gain on each source so the combined signal stays within
-        // ±1.0 for typical inputs — clipping is handled at the final
-        // stereo mix step, but keeping headroom here avoids audible
-        // distortion when the doubled copy correlates strongly with the
-        // primary (small semitone offsets like ±3 for a "wide" chorus).
-        let factor = 2f64.powf(doubler as f64 / 12.0);
-        let params = timestretch::StretchParams::new(1.0)
-            .with_sample_rate(sample_rate)
-            .with_channels(1);
-        let doubled = timestretch::pitch_shift(&buf, &params, factor)
-            .map_err(|e| anyhow::anyhow!("doubler pitch_shift: {e}"))?;
-        // Merge into the longer of the two — pitch_shift usually preserves
-        // length but rounding can drift by a sample or two.
-        let n = buf.len().max(doubled.len());
-        let mut mixed = vec![0.0_f32; n];
-        for (i, m) in mixed.iter_mut().enumerate() {
-            let a = buf.get(i).copied().unwrap_or(0.0);
-            let b = doubled.get(i).copied().unwrap_or(0.0);
-            *m = 0.5 * a + 0.5 * b;
-        }
-        buf = mixed;
     }
     if !no_time {
         let params = timestretch::StretchParams::new(time_ratio)
@@ -1145,6 +1230,45 @@ fn apply_amplitude_mod(buf: &mut [f32], sample_rate: u32, rate_hz: f32, depth: f
             phase -= std::f32::consts::TAU;
         }
     }
+}
+
+/// Decode a user-uploaded sample clip (wav / flac / ogg / mp3 — anything
+/// symphonia handles), downmixed to mono, then resampled to the pipewire
+/// target rate. Returns the mono `f32` buffer ready to be looped and fed
+/// into the per-config effect chain.
+fn decode_and_resample_sample(bytes: &[u8], target_rate: u32) -> Result<Vec<f32>, String> {
+    let chunk = comfyui::decode_audio_chunk(bytes)
+        .map_err(|e| format!("decode failed: {e:#}"))?;
+    if chunk.samples.is_empty() {
+        return Err("no audio samples in sample clip".into());
+    }
+    if chunk.sample_rate == target_rate {
+        return Ok(chunk.samples);
+    }
+    let mut rs = build_resampler(chunk.sample_rate, target_rate)
+        .map_err(|e| format!("resampler build failed: {e:#}"))?;
+    resample(&mut rs, &chunk.samples).map_err(|e| format!("resample failed: {e:#}"))
+}
+
+/// Tile a source buffer to a target frame count. Empty source or zero
+/// target returns empty. Longer-than-target truncates. In between, the
+/// source is repeated head-to-tail until the target length is reached —
+/// suitable for atmospheric drones (motor buzz, servo whine) where the
+/// user-supplied clip is a short loopable texture rather than a one-shot.
+fn loop_to_length(src: Vec<f32>, target_len: usize) -> Vec<f32> {
+    if src.is_empty() || target_len == 0 {
+        return Vec::new();
+    }
+    if src.len() >= target_len {
+        return src[..target_len].to_vec();
+    }
+    let mut out = Vec::with_capacity(target_len);
+    while out.len() < target_len {
+        let need = target_len - out.len();
+        let take = need.min(src.len());
+        out.extend_from_slice(&src[..take]);
+    }
+    out
 }
 
 /// Capture-only PCM sink. Backends push mono `f32` audio chunks at their

@@ -873,7 +873,13 @@
       // in the widget store.
       const scriptId = currentScriptId;
       const wasNamed = (($scripts ?? []).find((s) => s.id === scriptId)?.name ?? '') !== 'New script';
-      const { user_turn } = await sendUserTurn(scriptId, t, outgoingWidgetId, selectedAgentId);
+      const { user_turn } = await sendUserTurn(
+        scriptId,
+        t,
+        outgoingWidgetId,
+        selectedAgentId,
+        scenesState.selectedProjectId ?? null,
+      );
       // Register the GM proxy widget so the activeClip effect above lets
       // it play through without stopping the click bed. If sendUserTurn
       // didn't return a widget (silenced user voice) the id stays null,
@@ -1029,7 +1035,13 @@
 
     const scriptId = currentScriptId;
     try {
-      const { user_turn } = await editUserTurn(scriptId, turnId, text, selectedAgentId);
+      const { user_turn } = await editUserTurn(
+        scriptId,
+        turnId,
+        text,
+        selectedAgentId,
+        scenesState.selectedProjectId ?? null,
+      );
       // Splice: keep turns strictly before the edited one, drop everything
       // from the edited turn onward (matches the server-side truncate),
       // then append the replacement user turn + a __thinking placeholder

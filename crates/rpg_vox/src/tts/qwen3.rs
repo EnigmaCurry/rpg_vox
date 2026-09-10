@@ -217,6 +217,25 @@ impl Backend {
                     .await?;
                 (base.to_string(), "load_prompt_and_gen", event_id)
             }
+            SynthMode::Copy { .. } => {
+                // Should never happen: `synthesize_profile` resolves Copy
+                // configs by cloning another config's raw output before
+                // invoking any backend. A live Copy here means the caller
+                // is bypassing `synthesize_profile` — surface it clearly.
+                return Err(anyhow!(
+                    "qwen3 backend cannot synthesize a Copy-mode config directly; \
+                     Copy layers are resolved inside synthesize_profile"
+                ));
+            }
+            SynthMode::Sample { .. } => {
+                // Same rationale as Copy above — Sample-mode configs are
+                // decoded + looped inside `synthesize_profile` and never
+                // reach a backend.
+                return Err(anyhow!(
+                    "qwen3 backend cannot synthesize a Sample-mode config directly; \
+                     Sample layers are resolved inside synthesize_profile"
+                ));
+            }
         };
 
         let audio_url = self.await_result(&base_url, endpoint, &event_id).await?;

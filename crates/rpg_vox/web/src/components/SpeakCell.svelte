@@ -29,6 +29,7 @@
     stopRecording,
     cancelRecording,
   } from '../lib/api.js';
+  import { scenesState } from '../lib/scenes.svelte.js';
   import { estimateMs, recordSample } from '../lib/estimator.js';
 
   // When used inside a Lane, the parent owns the clip's identity and passes
@@ -413,16 +414,20 @@
       // from under us — e.g. sqlite wiped), fall back to create so the
       // user's play action still produces a clip.
       // Voice layers come from the resolved character profile via `configs`.
+      // Pass the currently-loaded project so the server applies its TTS
+      // dictionary to `t` (pronunciation proxies) before synthesis.
+      const projectId = scenesState.selectedProjectId ?? null;
+      const opts = { signal: ac.signal, projectId };
       let result;
       try {
         result = widgetId
-          ? await updateWidget(widgetId, t, configs, { signal: ac.signal })
-          : await createWidget(t, configs, { signal: ac.signal });
+          ? await updateWidget(widgetId, t, configs, opts)
+          : await createWidget(t, configs, opts);
       } catch (e) {
         if (e?.name === 'AbortError') throw e;
         if (widgetId && /no widget with id/i.test(e.message || '')) {
           widgetId = null;
-          result = await createWidget(t, configs, { signal: ac.signal });
+          result = await createWidget(t, configs, opts);
         } else {
           throw e;
         }

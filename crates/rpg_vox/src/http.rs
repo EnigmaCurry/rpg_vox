@@ -222,8 +222,6 @@ struct ConfigBody {
     #[serde(default)]
     delay_ms: Option<f32>,
     #[serde(default)]
-    doubler_semitones: Option<f32>,
-    #[serde(default)]
     hpf_hz: Option<f32>,
     #[serde(default)]
     lpf_hz: Option<f32>,
@@ -255,7 +253,6 @@ impl ConfigBody {
             pan: self.pan.unwrap_or(0.0),
             gain_db: self.gain_db.unwrap_or(0.0),
             delay_ms: self.delay_ms.unwrap_or(0.0),
-            doubler_semitones: self.doubler_semitones.unwrap_or(0.0),
             hpf_hz: self.hpf_hz.unwrap_or(0.0),
             lpf_hz: self.lpf_hz.unwrap_or(0.0),
             drive_db: self.drive_db.unwrap_or(0.0),
@@ -273,6 +270,10 @@ struct SayBody {
     /// falls back to a single default config, matching pre-profile behavior.
     #[serde(default)]
     configs: Vec<ConfigBody>,
+    /// Which project's TTS dictionary to apply before synthesis. Omitted =
+    /// no substitution (external callers with no project context).
+    #[serde(default, rename = "projectId")]
+    project_id: Option<String>,
 }
 
 /// Coerce empty/whitespace-only strings to `None` so downstream defaults win.
@@ -349,6 +350,141 @@ fn gm_proxy_configs() -> Vec<VoiceConfig> {
 /// file bytes fail to load, or on any JSON parse failure — callers fall
 /// back to their hardcoded DSP preset in that case, so a stale slot never
 /// blocks synthesis.
+/// Look up a character's `projectId` from the app_state JSON. Used to
+/// derive the dictionary project for widget renders that carry a
+/// `character_id` but no explicit `projectId`. Returns `None` when the
+/// character (or the app_state blob) is missing / unparseable.
+async fn character_project_id(state: &AppState, character_id: &str) -> Option<String> {
+    let raw = state.store.get_app_state().await.ok().flatten()?;
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    value
+        .get("characters")?
+        .as_array()?
+        .iter()
+        .find(|c| c.get("id").and_then(|v| v.as_str()) == Some(character_id))?
+        .get("projectId")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
+/// Read a project's TTS dictionary from the app_state JSON. Missing project
+/// or malformed entries yield an empty list — dictionary substitution is a
+/// best-effort transform, never a synth-blocking failure.
+async fn load_project_dictionary(
+    state: &AppState,
+    project_id: &str,
+) -> Vec<(String, String)> {
+    let Some(raw) = state.store.get_app_state().await.ok().flatten() else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return Vec::new();
+    };
+    let Some(projects) = value.get("projects").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    let Some(project) = projects
+        .iter()
+        .find(|p| p.get("id").and_then(|v| v.as_str()) == Some(project_id))
+    else {
+        return Vec::new();
+    };
+    let Some(entries) = project.get("dictionary").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .filter_map(|e| {
+            let word = e.get("word").and_then(|v| v.as_str())?.trim().to_string();
+            let pron = e.get("pronunciation").and_then(|v| v.as_str())?.trim().to_string();
+            if word.is_empty() || pron.is_empty() {
+                None
+            } else {
+                Some((word, pron))
+            }
+        })
+        .collect()
+}
+
+/// Case-insensitive whole-word substitution over `text`. Every dictionary
+/// entry `(word, pronunciation)` replaces occurrences of `word` (bounded by
+/// non-alphanumeric characters or string edges) with `pronunciation`
+/// verbatim. Longest words are matched first so a longer entry wins over a
+/// shorter prefix. Preserves the surrounding punctuation and spacing.
+fn apply_dictionary_substitutions(text: &str, entries: &[(String, String)]) -> String {
+    if entries.is_empty() || text.is_empty() {
+        return text.to_string();
+    }
+    let mut prepared: Vec<(String, Vec<char>, &str)> = entries
+        .iter()
+        .filter_map(|(w, p)| {
+            let w_trim = w.trim();
+            let p_trim = p.trim();
+            if w_trim.is_empty() || p_trim.is_empty() {
+                return None;
+            }
+            Some((
+                w_trim.to_lowercase(),
+                w_trim.chars().collect(),
+                p_trim,
+            ))
+        })
+        .collect();
+    if prepared.is_empty() {
+        return text.to_string();
+    }
+    prepared.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0usize;
+    while i < chars.len() {
+        let at_boundary = i == 0 || !chars[i - 1].is_alphanumeric();
+        let mut matched = false;
+        if at_boundary {
+            for (lower_word, wchars, pron) in &prepared {
+                let end = i + wchars.len();
+                if end > chars.len() {
+                    continue;
+                }
+                let slice: String = chars[i..end].iter().collect::<String>().to_lowercase();
+                if slice != *lower_word {
+                    continue;
+                }
+                let after_boundary = end == chars.len() || !chars[end].is_alphanumeric();
+                if !after_boundary {
+                    continue;
+                }
+                out.push_str(pron);
+                i = end;
+                matched = true;
+                break;
+            }
+        }
+        if !matched {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Apply the project's TTS dictionary to `text`. Missing project id or an
+/// empty dictionary short-circuits to the original text. Called immediately
+/// before every synth command so LLM prompts (built from the same source
+/// text) never see the phonetic respellings.
+async fn apply_project_dictionary(
+    state: &AppState,
+    project_id: Option<&str>,
+    text: String,
+) -> String {
+    let Some(pid) = project_id.filter(|s| !s.is_empty()) else {
+        return text;
+    };
+    let entries = load_project_dictionary(state, pid).await;
+    apply_dictionary_substitutions(&text, &entries)
+}
+
 async fn resolve_character_configs(
     state: &AppState,
     character_id: &str,
@@ -368,7 +504,12 @@ async fn resolve_character_configs(
             .find(|p| p.get("id").and_then(|v| v.as_str()) == Some(id))?,
         None => profiles.first()?,
     };
-    let mode_str = profile
+    // Mode moved from profile-level to per-config in v6. Legacy profiles
+    // still carry `profile.mode` (single string) and their configs have no
+    // `mode` field; when we see that shape we fall back to the profile
+    // mode as the default for every config, so an old preset profile
+    // continues to render as preset without a migration write.
+    let legacy_profile_mode = profile
         .get("mode")
         .and_then(|v| v.as_str())
         .unwrap_or("presets");
@@ -381,9 +522,9 @@ async fn resolve_character_configs(
             .and_then(|v| v.as_str())
             .map(str::to_string)
             .filter(|s| !s.is_empty());
-        // DSP knobs live on every config regardless of mode — clone/design
-        // outputs still get pitch-shifted / pan'd / delayed / doubled just
-        // like preset.
+        // DSP knobs live on every config regardless of mode — clone/design/
+        // copy outputs still get pitch-shifted / pan'd / delayed just like
+        // preset.
         let read_f = |key: &str, default: f32| -> f32 {
             c.get(key).and_then(|v| v.as_f64()).map(|v| v as f32).unwrap_or(default)
         };
@@ -393,13 +534,19 @@ async fn resolve_character_configs(
         let pan             = read_f("pan",            0.0);
         let gain_db         = read_f("gainDb",         0.0);
         let delay_ms        = read_f("delayMs",        0.0);
-        let doubler_semitones = read_f("doublerSemitones", 0.0);
         let hpf_hz          = read_f("hpfHz",          0.0);
         let lpf_hz          = read_f("lpfHz",          0.0);
         let drive_db        = read_f("driveDb",        0.0);
         let crush_bits      = read_f("crushBits",      0.0);
         let am_rate_hz      = read_f("amRateHz",       0.0);
         let am_depth        = read_f("amDepth",        0.0);
+        // Per-config mode wins over the legacy profile-level mode. Any
+        // unknown string falls back to the legacy profile mode, which in
+        // turn defaults to "presets" above.
+        let mode_str = c
+            .get("mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or(legacy_profile_mode);
         let (mode, speaker, instruct) = match mode_str {
             "clone" => {
                 let voice_id = c.get("voiceFileId").and_then(|v| v.as_str())?;
@@ -421,6 +568,43 @@ async fn resolve_character_configs(
                     .filter(|s| !s.is_empty())?;
                 (
                     crate::tts::SynthMode::Design { description },
+                    None,
+                    None,
+                )
+            }
+            "copy" => {
+                // 0-based index on the wire; synthesize_profile validates
+                // the range and rejects self-copy / cycles. Missing field
+                // defaults to voice 1 (index 0), matching the UI's default
+                // dropdown selection.
+                let from_index = c
+                    .get("copyFromIndex")
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as usize)
+                    .unwrap_or(0);
+                (
+                    crate::tts::SynthMode::Copy { from_index },
+                    None,
+                    None,
+                )
+            }
+            "sample" => {
+                // Load the raw sample bytes here so the backend never
+                // touches the store. Missing / unknown / undeletable
+                // sample id → drop the whole profile resolution (return
+                // None from the outer fn) so the caller sees a clear 400
+                // instead of a mysteriously-silent Sample layer.
+                let sample_id = c.get("sampleFileId").and_then(|v| v.as_str())?;
+                let (bytes, filename) = state
+                    .store
+                    .get_sample_bytes(sample_id.to_string())
+                    .await
+                    .ok()??;
+                (
+                    crate::tts::SynthMode::Sample {
+                        sample_bytes: bytes,
+                        sample_file_name: filename,
+                    },
                     None,
                     None,
                 )
@@ -450,7 +634,6 @@ async fn resolve_character_configs(
             pan,
             gain_db,
             delay_ms,
-            doubler_semitones,
             hpf_hz,
             lpf_hz,
             drive_db,
@@ -474,6 +657,7 @@ async fn synth_gm_proxy_widget(
     state: &AppState,
     text: String,
     user_voice_character: Option<&str>,
+    project_id: Option<&str>,
 ) -> Option<String> {
     if text.is_empty() {
         return None;
@@ -491,7 +675,7 @@ async fn synth_gm_proxy_widget(
             .unwrap_or_else(gm_proxy_configs),
         None => gm_proxy_configs(),
     };
-    let clip = match render_clip(state, text.clone(), configs).await {
+    let clip = match render_clip(state, text.clone(), configs, project_id).await {
         Ok(c) => c,
         Err((code, msg)) => {
             tracing::warn!(%code, msg, "user-voice synth failed; user turn will have no audio");
@@ -605,6 +789,18 @@ pub async fn serve(
         .route(
             "/voices/:id/reference",
             axum::routing::get(voice_reference_handler),
+        )
+        // Raw sample clips for SynthMode::Sample. Same 8 MB cap as voices;
+        // stores the bytes verbatim without any Qwen3 processing so any
+        // codec symphonia can decode (wav / flac / ogg / mp3) is accepted.
+        .route(
+            "/samples",
+            post(sample_create_handler).layer(DefaultBodyLimit::max(8 * 1024 * 1024)),
+        )
+        .route("/samples/:id", axum::routing::delete(sample_delete_handler))
+        .route(
+            "/samples/:id/audio",
+            axum::routing::get(sample_audio_handler),
         )
         .route(
             "/state",
@@ -997,6 +1193,7 @@ async fn say_handler(
         )
             .into_response();
     }
+    let text = apply_project_dictionary(&state, body.project_id.as_deref(), text).await;
     let configs = configs_or_default(body.configs);
 
     let (reply_tx, reply_rx) = oneshot::channel();
@@ -1385,6 +1582,11 @@ struct ScriptSendUserBody {
     /// Default agent (which has no slot set → the hardcoded GM-proxy DSP).
     #[serde(default, rename = "agentId")]
     agent_id: Option<String>,
+    /// Project whose TTS dictionary applies to the GM-proxy synth. Client
+    /// sends the currently loaded project; server falls back to the
+    /// agent's own `project_id` when absent.
+    #[serde(default, rename = "projectId")]
+    project_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1424,22 +1626,30 @@ async fn script_send_user(
 
     // Resolve the agent's User voice slot up front — a missing agent or an
     // unresolvable character both fall back to the hardcoded GM-proxy DSP
-    // so nothing about voice-slot lookups can block the send path.
-    let user_voice_character: Option<String> = match body
-        .agent_id
-        .clone()
-        .filter(|s| !s.is_empty())
-    {
-        Some(aid) => match state.store.get_agent(aid).await {
-            Ok(Some(a)) => a.voice_user,
-            _ => None,
-        },
+    // so nothing about voice-slot lookups can block the send path. Also
+    // grab the agent's project_id as the dictionary fallback when the
+    // client didn't send an explicit projectId.
+    let agent_row = match body.agent_id.clone().filter(|s| !s.is_empty()) {
+        Some(aid) => state.store.get_agent(aid).await.ok().flatten(),
         None => None,
     };
+    let user_voice_character: Option<String> =
+        agent_row.as_ref().and_then(|a| a.voice_user.clone());
+    let project_id: Option<String> = body
+        .project_id
+        .clone()
+        .filter(|s| !s.is_empty())
+        .or_else(|| agent_row.as_ref().and_then(|a| a.project_id.clone()));
     let user_widget_id = match body.widget_id.clone() {
         Some(id) => Some(id),
         None => {
-            synth_gm_proxy_widget(&state, text.clone(), user_voice_character.as_deref()).await
+            synth_gm_proxy_widget(
+                &state,
+                text.clone(),
+                user_voice_character.as_deref(),
+                project_id.as_deref(),
+            )
+            .await
         }
     };
 
@@ -1482,6 +1692,10 @@ struct ScriptEditUserBody {
     /// voice slot for the freshly synthesized GM proxy widget.
     #[serde(default, rename = "agentId")]
     agent_id: Option<String>,
+    /// Same semantics as [`ScriptSendUserBody::project_id`] — picks the
+    /// TTS dictionary applied to the fresh GM proxy synth.
+    #[serde(default, rename = "projectId")]
+    project_id: Option<String>,
 }
 
 /// Edit a user turn: truncate the transcript from that turn onward
@@ -1542,19 +1756,24 @@ async fn script_edit_user(
     // no-widget path. Silence sentinel intentionally omitted from the
     // agent lookup (the slot lookup returns the sentinel string, which
     // synth_gm_proxy_widget then honors by returning None).
-    let user_voice_character: Option<String> = match body
-        .agent_id
-        .clone()
-        .filter(|s| !s.is_empty())
-    {
-        Some(aid) => match state.store.get_agent(aid).await {
-            Ok(Some(a)) => a.voice_user,
-            _ => None,
-        },
+    let agent_row = match body.agent_id.clone().filter(|s| !s.is_empty()) {
+        Some(aid) => state.store.get_agent(aid).await.ok().flatten(),
         None => None,
     };
-    let user_widget_id =
-        synth_gm_proxy_widget(&state, text.clone(), user_voice_character.as_deref()).await;
+    let user_voice_character: Option<String> =
+        agent_row.as_ref().and_then(|a| a.voice_user.clone());
+    let project_id: Option<String> = body
+        .project_id
+        .clone()
+        .filter(|s| !s.is_empty())
+        .or_else(|| agent_row.as_ref().and_then(|a| a.project_id.clone()));
+    let user_widget_id = synth_gm_proxy_widget(
+        &state,
+        text.clone(),
+        user_voice_character.as_deref(),
+        project_id.as_deref(),
+    )
+    .await;
 
     let user_row = match state
         .store
@@ -1716,6 +1935,11 @@ struct ScriptAddTakeBody {
     /// → fall through to the hardcoded role-based DSP preset.
     #[serde(default, rename = "agentId")]
     agent_id: Option<String>,
+    /// Which project's TTS dictionary to apply to the block text before
+    /// synthesis. Absent → falls back to the agent's own `project_id`, and
+    /// finally to no substitution when neither is known (Default agent).
+    #[serde(default, rename = "projectId")]
+    project_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1746,26 +1970,26 @@ async fn script_block_add_take(
     };
     let text = info.text;
 
+    // Fetch the agent once — its voice slot picks the config, and its
+    // `project_id` is the dictionary fallback when the client didn't send
+    // an explicit `projectId` in the body.
+    let agent_row = match body.agent_id.clone().filter(|s| !s.is_empty()) {
+        Some(aid) => state.store.get_agent(aid).await.ok().flatten(),
+        None => None,
+    };
+
     // Client-supplied configs win when non-empty (so scene-style profile
     // overrides still work). When absent, look up the agent's voice slot
     // for this block's role and use that character's default profile;
     // fall through to the hardcoded DSP preset when either the agent has
     // no slot set or the referenced character can't be resolved.
     let configs = if body.configs.is_empty() {
-        let slot_character: Option<String> = match body
-            .agent_id
-            .clone()
-            .filter(|s| !s.is_empty())
-        {
-            Some(aid) => match state.store.get_agent(aid).await {
-                Ok(Some(a)) => match info.role.as_str() {
-                    "narrator" => a.voice_narrator,
-                    _ => a.voice_character,
-                },
-                _ => None,
-            },
-            None => None,
-        };
+        let slot_character: Option<String> = agent_row
+            .as_ref()
+            .and_then(|a| match info.role.as_str() {
+                "narrator" => a.voice_narrator.clone(),
+                _ => a.voice_character.clone(),
+            });
         // Silence sentinel: caller (usually a manual ⟳ click) still gets
         // a take rendered, but with the hardcoded DSP fallback rather than
         // the silenced character. Auto-render / Play All are gated
@@ -1779,8 +2003,12 @@ async fn script_block_add_take(
     } else {
         configs_or_default(body.configs)
     };
+    let project_id = body
+        .project_id
+        .clone()
+        .or_else(|| agent_row.as_ref().and_then(|a| a.project_id.clone()));
     let persist_instruct = configs.first().and_then(|c| c.instruct.clone());
-    let clip = match render_clip(&state, text.clone(), configs).await {
+    let clip = match render_clip(&state, text.clone(), configs, project_id.as_deref()).await {
         Ok(c) => c,
         Err((code, msg)) => return (code, msg).into_response(),
     };
@@ -2199,6 +2427,12 @@ struct WidgetBody {
     /// to the first / default profile.
     #[serde(default)]
     profile_id: Option<String>,
+    /// Which project's TTS dictionary to apply. Client passes the currently
+    /// selected project so raw-config renders (no character) still get the
+    /// substitution. When absent and `character_id` is present, the server
+    /// falls back to that character's own projectId.
+    #[serde(default)]
+    project_id: Option<String>,
 }
 
 /// Rendered clip in a form ready to hand to the store + client. Held as
@@ -2214,11 +2448,17 @@ struct RenderedClip {
 /// Push a synth request through the TTS runner, encode stereo WAV, return
 /// it. The caller decides what to do with the bytes (persist + respond, in
 /// the widget handlers below).
+///
+/// `project_id` is the project whose TTS dictionary should be applied to
+/// `text` before synthesis. Pass `None` to skip substitution (external
+/// callers with no project context).
 async fn render_clip(
     state: &AppState,
     text: String,
     configs: Vec<VoiceConfig>,
+    project_id: Option<&str>,
 ) -> Result<RenderedClip, (StatusCode, String)> {
+    let text = apply_project_dictionary(state, project_id, text).await;
     let (reply_tx, reply_rx) = oneshot::channel();
     if state
         .tts
@@ -2256,6 +2496,10 @@ struct NormalizedWidget {
     text: String,
     configs: Vec<VoiceConfig>,
     persist_instruct: Option<String>,
+    /// Project whose TTS dictionary applies to `text`. Derived from the
+    /// body's explicit `projectId` first, then the character's own
+    /// `projectId` when only `characterId` was sent.
+    project_id: Option<String>,
 }
 
 async fn normalize_widget_body(
@@ -2285,10 +2529,18 @@ async fn normalize_widget_body(
         configs_or_default(body.configs)
     };
     let persist_instruct = configs.first().and_then(|c| c.instruct.clone());
+    let project_id = match body.project_id.filter(|s| !s.is_empty()) {
+        Some(pid) => Some(pid),
+        None => match body.character_id.as_deref() {
+            Some(cid) => character_project_id(state, cid).await,
+            None => None,
+        },
+    };
     Ok(NormalizedWidget {
         text,
         configs,
         persist_instruct,
+        project_id,
     })
 }
 
@@ -2318,11 +2570,11 @@ async fn widget_create_handler(
     State(state): State<AppState>,
     Json(body): Json<WidgetBody>,
 ) -> Response {
-    let NormalizedWidget { text, configs, persist_instruct } = match normalize_widget_body(&state, body).await {
+    let NormalizedWidget { text, configs, persist_instruct, project_id } = match normalize_widget_body(&state, body).await {
         Ok(t) => t,
         Err((code, msg)) => return (code, msg).into_response(),
     };
-    let clip = match render_clip(&state, text.clone(), configs).await {
+    let clip = match render_clip(&state, text.clone(), configs, project_id.as_deref()).await {
         Ok(c) => c,
         Err((code, msg)) => return (code, msg).into_response(),
     };
@@ -2358,11 +2610,11 @@ async fn widget_update_handler(
     Path(id): Path<String>,
     Json(body): Json<WidgetBody>,
 ) -> Response {
-    let NormalizedWidget { text, configs, persist_instruct } = match normalize_widget_body(&state, body).await {
+    let NormalizedWidget { text, configs, persist_instruct, project_id } = match normalize_widget_body(&state, body).await {
         Ok(t) => t,
         Err((code, msg)) => return (code, msg).into_response(),
     };
-    let clip = match render_clip(&state, text.clone(), configs).await {
+    let clip = match render_clip(&state, text.clone(), configs, project_id.as_deref()).await {
         Ok(c) => c,
         Err((code, msg)) => return (code, msg).into_response(),
     };
@@ -3871,6 +4123,128 @@ async fn voice_delete_handler(
         }
         Err(err) => {
             tracing::error!(err = %format!("{err:#}"), %id, "store: voice delete failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ActionResponse {
+                    ok: false,
+                    error: Some(format!("{err:#}")),
+                }),
+            )
+                .into_response()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// /samples — raw audio clips for SynthMode::Sample layers. Distinct from
+// /voices: bytes are stored verbatim without any Qwen3 processing, so any
+// codec symphonia handles (wav / flac / ogg / mp3) can back a Sample voice.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct SampleCreateQuery {
+    /// Original filename hint (used in the response so the client UI can
+    /// show it back to the user). Optional; falls back to "sample.wav" so
+    /// a curl POST without ?filename= still succeeds.
+    #[serde(default = "default_sample_name")]
+    filename: String,
+}
+
+fn default_sample_name() -> String { "sample.wav".to_string() }
+
+async fn sample_create_handler(
+    State(state): State<AppState>,
+    Query(q): Query<SampleCreateQuery>,
+    body: Bytes,
+) -> Response {
+    if body.is_empty() {
+        return (StatusCode::BAD_REQUEST, "empty sample body").into_response();
+    }
+    let size = body.len();
+    match state.store.create_sample(body.to_vec(), q.filename.clone()).await {
+        Ok(id) => {
+            info!(%id, bytes = size, filename = %q.filename, "sample stored");
+            (
+                StatusCode::CREATED,
+                Json(serde_json::json!({
+                    "id": id,
+                    "filename": q.filename,
+                    "size": size,
+                })),
+            )
+                .into_response()
+        }
+        Err(err) => {
+            tracing::error!(err = %format!("{err:#}"), "store: sample create failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("store: {err:#}"),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Stream the sample's raw bytes back for browser preview playback.
+/// The MIME type is a best-effort guess based on the filename suffix;
+/// unknown extensions fall through as `application/octet-stream` and
+/// still play in most browsers via `<audio>` because the file magic
+/// tells the decoder what it is.
+async fn sample_audio_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    // Look up the filename first so we can pick a Content-Type; a missing
+    // row → 404, matching /voices/:id/reference semantics.
+    let filename = match state.store.get_sample_bytes(id.clone()).await {
+        Ok(Some((_, name))) => name,
+        Ok(None) => return (StatusCode::NOT_FOUND, format!("no sample {id}")).into_response(),
+        Err(err) => {
+            tracing::error!(err = %format!("{err:#}"), %id, "sample audio read failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("store: {err:#}")).into_response();
+        }
+    };
+    let bytes = match tokio::fs::read(state.store.sample_path(&id)).await {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return (StatusCode::NOT_FOUND, format!("no sample file for {id}")).into_response();
+        }
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("sample read: {e}")).into_response();
+        }
+    };
+    let content_type = match filename.rsplit('.').next().unwrap_or("").to_ascii_lowercase().as_str() {
+        "wav" => "audio/wav",
+        "flac" => "audio/flac",
+        "ogg" | "oga" => "audio/ogg",
+        "mp3" => "audio/mpeg",
+        "m4a" | "aac" => "audio/mp4",
+        _ => "application/octet-stream",
+    };
+    (
+        [
+            (header::CONTENT_TYPE, content_type.to_string()),
+            (header::CACHE_CONTROL, "public, max-age=31536000, immutable".to_string()),
+        ],
+        Bytes::from(bytes),
+    )
+        .into_response()
+}
+
+async fn sample_delete_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    match state.store.delete_sample(id.clone()).await {
+        Ok(UpdateResult::Updated) => {
+            info!(%id, "sample deleted");
+            (StatusCode::OK, Json(ActionResponse { ok: true, error: None })).into_response()
+        }
+        Ok(UpdateResult::NotFound) => {
+            (StatusCode::NOT_FOUND, format!("no sample {id}")).into_response()
+        }
+        Err(err) => {
+            tracing::error!(err = %format!("{err:#}"), %id, "store: sample delete failed");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ActionResponse {

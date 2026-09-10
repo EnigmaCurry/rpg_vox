@@ -2,20 +2,27 @@
 // plus per-project Characters.
 //
 // Data shape (v5):
-//   project   = { id, name }
+//   project   = {
+//     id, name,
+//     dictionary: [{ id, word, pronunciation }],  // TTS pronunciation proxies
+//   }
 //   character = {
 //     id, projectId, name,
 //     voiceProfiles: [{                    // >=1; first is the fallback "default"
 //       id, name,
-//       mode,                              // 'presets' | 'clone' | 'design'
 //       configs: [{                        // >=1; N>1 = layered hive-mind synth
 //         id,
-//         // Preset-mode fields (unused in clone/design):
+//         mode,                            // 'presets' | 'clone' | 'design' | 'copy'
+//         // Preset-mode fields (unused in clone/design/copy):
 //         speaker, instruct,               // Qwen3 preset-model inputs
 //         // Design-mode field:
 //         description,                     // free-text voice description
 //         // Clone-mode field:
 //         voiceFileId,                     // server-side /voices/{id} ref
+//         // Copy-mode field:
+//         copyFromIndex,                   // 0-based index of the source voice
+//         // Sample-mode field:
+//         sampleFileId,                    // server-side /samples/{id} ref
 //         // Common across all modes:
 //         language,                        // lang_disp for every Qwen3 endpoint
 //         pitchSemitones, timeRatio,       // post-synthesis DSP (per-config)
@@ -23,7 +30,6 @@
 //         pan,                             // -1 = full L, +1 = full R (equal-power)
 //         gainDb,                          // per-voice level in dB
 //         delayMs,                         // start offset in the final mix
-//         doublerSemitones,                // pitched second copy summed in (0 = off)
 //         hpfHz, lpfHz,                    // one-pole bandpass (0 = off, either side)
 //         driveDb,                         // tanh saturation drive in dB (0 = off)
 //         crushBits,                       // bit-crush quantization depth (0 = off)
@@ -155,6 +161,20 @@ function emptyState() {
   };
 }
 
+// Coerce an unknown value into the canonical dictionary shape. Entries
+// missing either field are dropped so the server never sees a half-populated
+// row that would replace a word with nothing.
+function sanitizeDictionary(raw) {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter((e) => e && typeof e === 'object')
+    .map((e) => ({
+      id: typeof e.id === 'string' && e.id ? e.id : uuid(),
+      word: typeof e.word === 'string' ? e.word : '',
+      pronunciation: typeof e.pronunciation === 'string' ? e.pronunciation : '',
+    }));
+}
+
 // Qwen3-TTS enum vocab, mirrored from crates/rpg_vox/src/tts/qwen3.rs.
 export const QWEN3_SPEAKERS = [
   'Serena', 'Vivian', 'Uncle Fu', 'Ryan', 'Aiden',
@@ -169,16 +189,15 @@ export const QWEN3_LANGUAGES = [
 // config stays in sync. All-zero identity values (except `timeRatio = 1`)
 // are what the server short-circuits on so an all-defaults config pays
 // no DSP cost. Every knob whose range starts at 0 uses 0 as its "off"
-// sentinel: doubler at 0st is disabled, HPF/LPF at 0 Hz are bypassed,
-// driveDb=0 skips the saturator, crushBits=0 skips the quantizer, and
-// amRateHz=0 or amDepth=0 skips the tremolo pass.
+// sentinel: HPF/LPF at 0 Hz are bypassed, driveDb=0 skips the saturator,
+// crushBits=0 skips the quantizer, and amRateHz=0 or amDepth=0 skips the
+// tremolo pass.
 export const CONFIG_PITCH_RANGE       = { min: -24,  max: 24,   step: 1 };
 export const CONFIG_TIME_RANGE        = { min: 0.25, max: 4,    step: 0.05 };
 export const CONFIG_DETUNE_RANGE      = { min: -100, max: 100,  step: 1 };
 export const CONFIG_PAN_RANGE         = { min: -1,   max: 1,    step: 0.05 };
 export const CONFIG_GAIN_DB_RANGE     = { min: -60,  max: 12,   step: 0.5 };
 export const CONFIG_DELAY_MS_RANGE    = { min: 0,    max: 5000, step: 10 };
-export const CONFIG_DOUBLER_RANGE     = { min: -24,  max: 24,   step: 1 };
 export const CONFIG_HPF_RANGE         = { min: 0,    max: 2000, step: 10 };
 export const CONFIG_LPF_RANGE         = { min: 0,    max: 20000, step: 100 };
 export const CONFIG_DRIVE_DB_RANGE    = { min: 0,    max: 24,   step: 0.5 };
@@ -192,10 +211,16 @@ function clampNumber(value, fallback, min, max) {
   return Math.min(max, Math.max(min, n));
 }
 
-// Enum of voice profile modes. The mode picks which Qwen3 backend the
-// server routes synth through — see http.rs's resolve_character_configs
-// and tts::SynthMode.
-export const VOICE_MODES = ['presets', 'clone', 'design'];
+// Enum of per-config voice modes.
+// * `presets` / `clone` / `design` — synthesize speech via Qwen3, see
+//   resolve_character_configs and tts::SynthMode.
+// * `copy` — reuse another config's raw synth output; the copy still runs
+//   its own pitch/time/FX/gain chain, so a Mechanicum-style pitched double
+//   is just "copy voice 1 with pitch = -3".
+// * `sample` — loop a user-uploaded audio clip for the profile's duration
+//   and run the same FX chain on top. Used for machine drones, ambience,
+//   any non-speech texture that layers under the voice.
+export const VOICE_MODES = ['presets', 'clone', 'design', 'copy', 'sample'];
 export const DEFAULT_VOICE_MODE = 'presets';
 
 // Seed a single voice config with the given speaker/language and default
@@ -204,18 +229,20 @@ export const DEFAULT_VOICE_MODE = 'presets';
 // voiceFileId) start empty; the UI populates them when the parent profile
 // switches to a mode that uses them.
 function makeConfig({
+  mode = DEFAULT_VOICE_MODE,
   speaker = QWEN3_SPEAKERS[0],
   language = QWEN3_LANGUAGES[0],
   instruct = '',
   description = '',
   voiceFileId = null,
+  sampleFileId = null,
+  copyFromIndex = 0,
   pitchSemitones = 0,
   timeRatio = 1,
   detuneCents = 0,
   pan = 0,
   gainDb = 0,
   delayMs = 0,
-  doublerSemitones = 0,
   hpfHz = 0,
   lpfHz = 0,
   driveDb = 0,
@@ -225,18 +252,20 @@ function makeConfig({
 } = {}) {
   return {
     id: uuid(),
+    mode: VOICE_MODES.includes(mode) ? mode : DEFAULT_VOICE_MODE,
     speaker,
     language,
     instruct,
     description,
     voiceFileId,
+    sampleFileId,
+    copyFromIndex,
     pitchSemitones,
     timeRatio,
     detuneCents,
     pan,
     gainDb,
     delayMs,
-    doublerSemitones,
     hpfHz,
     lpfHz,
     driveDb,
@@ -246,11 +275,10 @@ function makeConfig({
   };
 }
 
-function makeVoiceProfile(name = 'default', configs = null, mode = DEFAULT_VOICE_MODE) {
+function makeVoiceProfile(name = 'default', configs = null) {
   return {
     id: uuid(),
     name,
-    mode: VOICE_MODES.includes(mode) ? mode : DEFAULT_VOICE_MODE,
     configs: configs && configs.length > 0 ? configs : [makeConfig()],
   };
 }
@@ -259,13 +287,27 @@ function defaultVoiceProfiles() {
   return [makeVoiceProfile('default')];
 }
 
-// Coerce one v4 config-shaped object into a fully-populated config with
-// sanitized numeric fields. Missing fields fall back to identity values so an
-// older or partial payload still loads cleanly.
-function sanitizeConfig(raw) {
+// Coerce one config-shaped object into a fully-populated config with
+// sanitized numeric fields. Missing fields fall back to identity values so
+// an older or partial payload still loads cleanly.
+//
+// `defaultMode` is the mode a raw config falls back to when it doesn't
+// carry its own `mode` field. Used during the v5→v6 migration to push
+// the old profile-level mode into every config so legacy profiles keep
+// synthesizing under their original mode without an explicit write.
+function sanitizeConfig(raw, defaultMode = DEFAULT_VOICE_MODE) {
   const c = raw && typeof raw === 'object' ? raw : {};
+  const mode = VOICE_MODES.includes(c.mode)
+    ? c.mode
+    : (VOICE_MODES.includes(defaultMode) ? defaultMode : DEFAULT_VOICE_MODE);
+  // `copyFromIndex` is 0-based on the wire; only meaningful when mode is
+  // 'copy'. We keep it around for other modes too so toggling into copy
+  // doesn't reset the selection; it just gets ignored server-side.
+  const rawCopyIdx = Number(c.copyFromIndex);
+  const copyFromIndex = Number.isInteger(rawCopyIdx) && rawCopyIdx >= 0 ? rawCopyIdx : 0;
   return {
     id: typeof c.id === 'string' ? c.id : uuid(),
+    mode,
     speaker: typeof c.speaker === 'string' && c.speaker ? c.speaker : QWEN3_SPEAKERS[0],
     language: typeof c.language === 'string' && c.language ? c.language : QWEN3_LANGUAGES[0],
     instruct: typeof c.instruct === 'string' ? c.instruct : '',
@@ -274,13 +316,14 @@ function sanitizeConfig(raw) {
     // switches modes.
     description: typeof c.description === 'string' ? c.description : '',
     voiceFileId: typeof c.voiceFileId === 'string' && c.voiceFileId ? c.voiceFileId : null,
+    sampleFileId: typeof c.sampleFileId === 'string' && c.sampleFileId ? c.sampleFileId : null,
+    copyFromIndex,
     pitchSemitones:   clampNumber(c.pitchSemitones,   0, CONFIG_PITCH_RANGE.min,      CONFIG_PITCH_RANGE.max),
     timeRatio:        clampNumber(c.timeRatio,        1, CONFIG_TIME_RANGE.min,       CONFIG_TIME_RANGE.max),
     detuneCents:      clampNumber(c.detuneCents,      0, CONFIG_DETUNE_RANGE.min,     CONFIG_DETUNE_RANGE.max),
     pan:              clampNumber(c.pan,              0, CONFIG_PAN_RANGE.min,        CONFIG_PAN_RANGE.max),
     gainDb:           clampNumber(c.gainDb,           0, CONFIG_GAIN_DB_RANGE.min,    CONFIG_GAIN_DB_RANGE.max),
     delayMs:          clampNumber(c.delayMs,          0, CONFIG_DELAY_MS_RANGE.min,   CONFIG_DELAY_MS_RANGE.max),
-    doublerSemitones: clampNumber(c.doublerSemitones, 0, CONFIG_DOUBLER_RANGE.min,    CONFIG_DOUBLER_RANGE.max),
     hpfHz:            clampNumber(c.hpfHz,            0, CONFIG_HPF_RANGE.min,        CONFIG_HPF_RANGE.max),
     lpfHz:            clampNumber(c.lpfHz,            0, CONFIG_LPF_RANGE.min,        CONFIG_LPF_RANGE.max),
     driveDb:          clampNumber(c.driveDb,          0, CONFIG_DRIVE_DB_RANGE.min,   CONFIG_DRIVE_DB_RANGE.max),
@@ -348,14 +391,17 @@ function normalizePayload(parsed) {
   const rawScenes = Array.isArray(parsed.scenes) ? parsed.scenes : [];
   for (const scene of rawScenes) migrateScene(scene);
 
-  let projects = Array.isArray(parsed.projects) ? parsed.projects : [];
+  let projects = (Array.isArray(parsed.projects) ? parsed.projects : []).map((p) => ({
+    ...p,
+    dictionary: sanitizeDictionary(p?.dictionary),
+  }));
 
   // v2 → v3: any scene missing projectId gets adopted by a Default project.
   const orphans = rawScenes.filter((s) => !s.projectId);
   if (orphans.length > 0) {
     let defaultProject = projects.find((p) => p.name === 'Default');
     if (!defaultProject) {
-      defaultProject = { id: uuid(), name: 'Default' };
+      defaultProject = { id: uuid(), name: 'Default', dictionary: [] };
       projects.push(defaultProject);
     }
     for (const s of orphans) s.projectId = defaultProject.id;
@@ -368,22 +414,27 @@ function normalizePayload(parsed) {
   const characters = rawChars
     .filter((c) => c && validProjectIds.has(c.projectId))
     .map((c) => {
-      // v4: already stores voiceProfiles[configs[]]. Sanitize each profile
+      // v4+: already stores voiceProfiles[configs[]]. Sanitize each profile
       // and its configs so partial/older payloads land in a consistent shape.
+      //
+      // v5 → v6: mode used to live on the profile; now every config carries
+      // its own. `sanitizeConfig(cc, p.mode)` seeds each config's `mode` from
+      // the legacy profile-level field so an old preset/clone/design profile
+      // renders identically after load without an explicit migration write.
       let voiceProfiles = Array.isArray(c.voiceProfiles)
         ? c.voiceProfiles
             .filter((p) => p && typeof p === 'object')
             .map((p) => {
+              const legacyMode = VOICE_MODES.includes(p.mode) ? p.mode : DEFAULT_VOICE_MODE;
               const configs = Array.isArray(p.configs)
-                ? p.configs.filter((cc) => cc && typeof cc === 'object').map(sanitizeConfig)
+                ? p.configs
+                    .filter((cc) => cc && typeof cc === 'object')
+                    .map((cc) => sanitizeConfig(cc, legacyMode))
                 : [];
-              // v4 → v5: profile.mode was implicit "presets"; backfill.
-              const mode = VOICE_MODES.includes(p.mode) ? p.mode : DEFAULT_VOICE_MODE;
               return {
                 id: typeof p.id === 'string' ? p.id : uuid(),
                 name: typeof p.name === 'string' && p.name ? p.name : 'unnamed',
-                mode,
-                configs: configs.length > 0 ? configs : [makeConfig()],
+                configs: configs.length > 0 ? configs : [makeConfig({ mode: legacyMode })],
               };
             })
         : null;
@@ -576,7 +627,7 @@ hydrateFromServer();
 // ---- Project CRUD ----------------------------------------------------------
 
 export function createProject(name = 'Untitled project') {
-  const project = { id: uuid(), name };
+  const project = { id: uuid(), name, dictionary: [] };
   scenesState.projects.push(project);
   scenesState.selectedProjectId = project.id;
   scenesState.selectedSceneId = null;
@@ -853,18 +904,6 @@ export function renameVoiceProfile(characterId, profileId, name) {
   if (profile) profile.name = name;
 }
 
-/// Change which Qwen3 workflow this profile routes synth through.
-/// Silently no-ops on an unknown mode string so bad input from a stale
-/// UI can't corrupt the store — the picker only surfaces `VOICE_MODES`
-/// entries so this is a belt-and-braces guard.
-export function setVoiceProfileMode(characterId, profileId, mode) {
-  if (!VOICE_MODES.includes(mode)) return;
-  const character = scenesState.characters.find((c) => c.id === characterId);
-  if (!character) return;
-  const profile = character.voiceProfiles.find((p) => p.id === profileId);
-  if (profile) profile.mode = mode;
-}
-
 export function deleteVoiceProfile(characterId, profileId) {
   const character = scenesState.characters.find((c) => c.id === characterId);
   if (!character) return { ok: false, reason: 'character not found' };
@@ -905,6 +944,9 @@ export function updateProfileConfig(characterId, profileId, configId, patch) {
   if (!profile) return;
   const config = profile.configs.find((c) => c.id === configId);
   if (!config) return;
+  if (patch.mode !== undefined && VOICE_MODES.includes(patch.mode)) {
+    config.mode = patch.mode;
+  }
   if (patch.speaker !== undefined) config.speaker = patch.speaker || QWEN3_SPEAKERS[0];
   if (patch.language !== undefined) config.language = patch.language || QWEN3_LANGUAGES[0];
   if (patch.instruct !== undefined) config.instruct = String(patch.instruct);
@@ -913,6 +955,18 @@ export function updateProfileConfig(characterId, profileId, configId, patch) {
     config.voiceFileId = typeof patch.voiceFileId === 'string' && patch.voiceFileId
       ? patch.voiceFileId
       : null;
+  }
+  if (patch.sampleFileId !== undefined) {
+    config.sampleFileId = typeof patch.sampleFileId === 'string' && patch.sampleFileId
+      ? patch.sampleFileId
+      : null;
+  }
+  if (patch.copyFromIndex !== undefined) {
+    const n = Number(patch.copyFromIndex);
+    // Range check happens against the profile's actual config count at
+    // synthesis time; here we only guard against negatives / NaN so the
+    // stored value stays a valid array index candidate.
+    config.copyFromIndex = Number.isInteger(n) && n >= 0 ? n : 0;
   }
   if (patch.pitchSemitones !== undefined) {
     config.pitchSemitones = clampNumber(patch.pitchSemitones, config.pitchSemitones,
@@ -937,10 +991,6 @@ export function updateProfileConfig(characterId, profileId, configId, patch) {
   if (patch.delayMs !== undefined) {
     config.delayMs = clampNumber(patch.delayMs, config.delayMs,
       CONFIG_DELAY_MS_RANGE.min, CONFIG_DELAY_MS_RANGE.max);
-  }
-  if (patch.doublerSemitones !== undefined) {
-    config.doublerSemitones = clampNumber(patch.doublerSemitones, config.doublerSemitones,
-      CONFIG_DOUBLER_RANGE.min, CONFIG_DOUBLER_RANGE.max);
   }
   if (patch.hpfHz !== undefined) {
     config.hpfHz = clampNumber(patch.hpfHz, config.hpfHz,
@@ -1047,4 +1097,53 @@ export function currentProjectCharacters() {
   const pid = scenesState.selectedProjectId;
   if (!pid) return [];
   return scenesState.characters.filter((c) => c.projectId === pid);
+}
+
+// ---- Project dictionary (TTS pronunciation proxies) ----------------------
+//
+// Each project carries a list of `{ word, pronunciation }` pairs. The server
+// applies these as case-insensitive whole-word substitutions to any text
+// bound for the TTS backend, so a mispronounced word like "Omnisiah" can be
+// re-spelled phonetically ("OmniSighYa") for synthesis without leaking that
+// respelling into any text sent to the LLM. Storage rides along in the
+// existing project JSON (persisted via PUT /state).
+
+function projectById(id) {
+  return scenesState.projects.find((p) => p.id === id) ?? null;
+}
+
+function ensureDictionary(project) {
+  if (!Array.isArray(project.dictionary)) project.dictionary = [];
+  return project.dictionary;
+}
+
+export function currentProjectDictionary() {
+  const project = projectById(scenesState.selectedProjectId);
+  if (!project) return [];
+  return ensureDictionary(project);
+}
+
+export function addDictionaryEntry(projectId, word = '', pronunciation = '') {
+  const project = projectById(projectId);
+  if (!project) return null;
+  const entry = { id: uuid(), word, pronunciation };
+  ensureDictionary(project).push(entry);
+  return entry.id;
+}
+
+export function updateDictionaryEntry(projectId, entryId, patch) {
+  const project = projectById(projectId);
+  if (!project) return;
+  const entry = ensureDictionary(project).find((e) => e.id === entryId);
+  if (!entry) return;
+  if (patch.word !== undefined) entry.word = String(patch.word);
+  if (patch.pronunciation !== undefined) entry.pronunciation = String(patch.pronunciation);
+}
+
+export function removeDictionaryEntry(projectId, entryId) {
+  const project = projectById(projectId);
+  if (!project) return;
+  const dict = ensureDictionary(project);
+  const idx = dict.findIndex((e) => e.id === entryId);
+  if (idx >= 0) dict.splice(idx, 1);
 }

@@ -18,8 +18,13 @@ async function jsonGet(path) {
 // timeRatio?, detuneCents?, pan?, gainDb?, delayMs? }, ...]` array — each
 // entry is one voice layer, so >1 config fans out into a hive-mind mix.
 // An empty array falls back to a single default config on the server.
-export const say = (text, configs = []) =>
-  jsonPost('/say', { text, configs });
+// `projectId` (optional) selects which project's TTS dictionary applies
+// before synthesis; omit to skip dictionary substitution entirely.
+export const say = (text, configs = [], projectId = null) => {
+  const body = { text, configs };
+  if (projectId) body.projectId = projectId;
+  return jsonPost('/say', body);
+};
 
 // --- Speak widget CRUD ------------------------------------------------------
 //
@@ -60,10 +65,11 @@ export async function fetchWidget(id) {
 // Pass `{ characterId, profileId }` to have the server resolve the voice
 // profile server-side (correct clone/design mode dispatch) — the `configs`
 // argument is ignored in that case.
-async function widgetRender(method, path, text, configs = [], { signal, characterId, profileId } = {}) {
+async function widgetRender(method, path, text, configs = [], { signal, characterId, profileId, projectId } = {}) {
   const body = { text, configs };
   if (characterId) body.characterId = characterId;
   if (profileId) body.profileId = profileId;
+  if (projectId) body.projectId = projectId;
   const r = await fetch(path, {
     method,
     headers: { 'content-type': 'application/json' },
@@ -392,10 +398,11 @@ export async function generateScriptTitle(id) {
 ///
 /// `widgetId` (optional) — from a `/widgets/record` stop response; when
 /// present the server attaches it instead of synthesizing a proxy.
-export async function sendUserTurn(scriptId, text, widgetId = null, agentId = null) {
+export async function sendUserTurn(scriptId, text, widgetId = null, agentId = null, projectId = null) {
   const body = { text };
   if (widgetId) body.widgetId = widgetId;
   if (agentId) body.agentId = agentId;
+  if (projectId) body.projectId = projectId;
   const r = await fetch(`/scripts/${encodeURIComponent(scriptId)}/user`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -414,9 +421,10 @@ export async function sendUserTurn(scriptId, text, widgetId = null, agentId = nu
 /// user turn. Returns the new `user_turn` in the same shape as
 /// `sendUserTurn`. Caller is expected to fire `sendAssistantReply` after
 /// to regenerate the LLM response against the rewound history.
-export async function editUserTurn(scriptId, turnId, text, agentId = null) {
+export async function editUserTurn(scriptId, turnId, text, agentId = null, projectId = null) {
   const body = { text };
   if (agentId) body.agentId = agentId;
+  if (projectId) body.projectId = projectId;
   const r = await fetch(
     `/scripts/${encodeURIComponent(scriptId)}/turns/${encodeURIComponent(turnId)}/edit-user`,
     {
@@ -575,9 +583,49 @@ export async function deleteVoice(id) {
   }
 }
 
-export async function createTake(blockId, configs = [], agentId = null) {
+// --- Sample clips (raw audio for SynthMode::Sample layers) ---------------
+//
+// POST /samples          → { id, filename, size } — raw audio bytes go in
+//                          the body, ?filename= carries the display name.
+//                          Any codec symphonia can decode (wav / flac /
+//                          ogg / mp3) is accepted.
+// GET  /samples/:id/audio → the original bytes back for review playback.
+// DELETE /samples/:id     → drop the row + on-disk file.
+//
+// Distinct from /voices — samples never go through Qwen3's save_prompt,
+// so they can be servo motors, machine chatter, any non-speech texture.
+
+export async function createSample(blob, { filename = 'sample.wav' } = {}) {
+  const params = new URLSearchParams({ filename });
+  const r = await fetch(`/samples?${params}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/octet-stream' },
+    body: blob,
+  });
+  if (!r.ok) {
+    const detail = await r.text().catch(() => `HTTP ${r.status}`);
+    throw new Error(detail || `HTTP ${r.status}`);
+  }
+  return await r.json();
+}
+
+/// Absolute URL for a sample's audio bytes. Suitable as an `<audio src>`.
+export function sampleAudioUrl(sampleId) {
+  return `/samples/${encodeURIComponent(sampleId)}/audio`;
+}
+
+export async function deleteSample(id) {
+  const r = await fetch(`/samples/${encodeURIComponent(id)}`, { method: 'DELETE' });
+  if (!r.ok) {
+    const detail = await r.text().catch(() => `HTTP ${r.status}`);
+    throw new Error(detail || `HTTP ${r.status}`);
+  }
+}
+
+export async function createTake(blockId, configs = [], agentId = null, projectId = null) {
   const body = { configs };
   if (agentId) body.agentId = agentId;
+  if (projectId) body.projectId = projectId;
   const r = await fetch(`/script/blocks/${encodeURIComponent(blockId)}/takes`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },

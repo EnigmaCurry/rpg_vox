@@ -105,6 +105,17 @@ CREATE TABLE IF NOT EXISTS voices (
     byte_size    INTEGER NOT NULL,
     created_at   INTEGER NOT NULL
 );
+-- Raw audio clips used as source material for SynthMode::Sample layers
+-- (motor drones, machine chatter, ambience). Distinct from `voices` — we
+-- store the exact bytes the user uploaded and never run them through the
+-- Qwen3 save_prompt pipeline. `filename` keeps the original name so a
+-- download / re-upload roundtrips cleanly.
+CREATE TABLE IF NOT EXISTS samples (
+    id           TEXT PRIMARY KEY,
+    filename     TEXT NOT NULL,
+    byte_size    INTEGER NOT NULL,
+    created_at   INTEGER NOT NULL
+);
 "#;
 
 /// Single hardcoded script id — MVP has one shared conversation, matching
@@ -131,6 +142,7 @@ pub struct Store {
     clips_dir: PathBuf,
     images_dir: PathBuf,
     voices_dir: PathBuf,
+    samples_dir: PathBuf,
 }
 
 impl Store {
@@ -148,6 +160,9 @@ impl Store {
         let voices_dir = data_dir.join("voices");
         std::fs::create_dir_all(&voices_dir)
             .with_context(|| format!("creating voices dir {}", voices_dir.display()))?;
+        let samples_dir = data_dir.join("samples");
+        std::fs::create_dir_all(&samples_dir)
+            .with_context(|| format!("creating samples dir {}", samples_dir.display()))?;
 
         let db_path = data_dir.join("rpg_vox.sqlite");
         let conn = Connection::open(&db_path)
@@ -205,6 +220,7 @@ impl Store {
             clips_dir,
             images_dir,
             voices_dir,
+            samples_dir,
         })
     }
 
@@ -312,6 +328,90 @@ impl Store {
         .context("db task panicked")??;
         let _ = tokio::fs::remove_file(self.voice_path(&id)).await;
         let _ = tokio::fs::remove_file(self.voice_reference_path(&id)).await;
+        Ok(if rows == 0 {
+            UpdateResult::NotFound
+        } else {
+            UpdateResult::Updated
+        })
+    }
+
+    /// Path to a raw sample clip on disk. The `.bin` extension isn't
+    /// content-typed here — the actual codec is decided at decode time by
+    /// symphonia (wav / flac / ogg / mp3 all work). We keep the extension
+    /// out of the on-disk name so callers don't have to preserve it just
+    /// to serve the file back later.
+    pub fn sample_path(&self, id: &str) -> PathBuf {
+        self.samples_dir.join(id)
+    }
+
+    /// Persist a raw sample clip. Unlike `create_voice`, nothing on the
+    /// backend interprets the bytes — the clip is opaque input for
+    /// SynthMode::Sample layers.
+    pub async fn create_sample(&self, bytes: Vec<u8>, filename: String) -> Result<String> {
+        let id = Uuid::new_v4().to_string();
+        let now = unix_now();
+        let byte_size = bytes.len() as i64;
+        let db = self.db.clone();
+        let id_clone = id.clone();
+        let filename_clone = filename.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO samples (id, filename, byte_size, created_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![id_clone, filename_clone, byte_size, now],
+            )?;
+            Ok(())
+        })
+        .await
+        .context("db task panicked")??;
+
+        tokio::fs::write(self.sample_path(&id), bytes)
+            .await
+            .with_context(|| format!("writing sample bytes for {id}"))?;
+        Ok(id)
+    }
+
+    /// Read sample bytes back off disk with the stored filename (for
+    /// resolving SynthMode::Sample configs into a preloaded synth mode).
+    /// Returns `Ok(None)` when the row doesn't exist so callers can tell
+    /// "unknown id" from an I/O failure.
+    pub async fn get_sample_bytes(&self, id: String) -> Result<Option<(Vec<u8>, String)>> {
+        let db = self.db.clone();
+        let id_clone = id.clone();
+        let row: Option<String> = tokio::task::spawn_blocking(move || -> Result<Option<String>> {
+            let conn = db.lock().unwrap();
+            let row = conn
+                .query_row(
+                    "SELECT filename FROM samples WHERE id = ?1",
+                    params![id_clone],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?;
+            Ok(row)
+        })
+        .await
+        .context("db task panicked")??;
+        let Some(filename) = row else {
+            return Ok(None);
+        };
+        let bytes = tokio::fs::read(self.sample_path(&id))
+            .await
+            .with_context(|| format!("reading sample bytes for {id}"))?;
+        Ok(Some((bytes, filename)))
+    }
+
+    pub async fn delete_sample(&self, id: String) -> Result<UpdateResult> {
+        let db = self.db.clone();
+        let id_clone = id.clone();
+        let rows = tokio::task::spawn_blocking(move || -> Result<usize> {
+            let conn = db.lock().unwrap();
+            let rows = conn.execute("DELETE FROM samples WHERE id = ?1", params![id_clone])?;
+            Ok(rows)
+        })
+        .await
+        .context("db task panicked")??;
+        let _ = tokio::fs::remove_file(self.sample_path(&id)).await;
         Ok(if rows == 0 {
             UpdateResult::NotFound
         } else {

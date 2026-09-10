@@ -19,6 +19,7 @@
     deleteWidget,
     stopPlayback,
   } from '../lib/api.js';
+  import { scenesState } from '../lib/scenes.svelte.js';
 
   let { characterId, profileId } = $props();
 
@@ -83,6 +84,9 @@
         signal: ac.signal,
         characterId,
         profileId,
+        // Explicit projectId so the server picks the right TTS dictionary
+        // even before it has to look up the character's own projectId.
+        projectId: scenesState.selectedProjectId ?? null,
       };
       // Configs are ignored server-side when characterId is present, but
       // the schema still expects the field to exist so send an empty list.

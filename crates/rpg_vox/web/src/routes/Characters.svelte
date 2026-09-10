@@ -10,7 +10,6 @@
     addVoiceProfile,
     renameVoiceProfile,
     deleteVoiceProfile,
-    setVoiceProfileMode,
     addProfileConfig,
     updateProfileConfig,
     deleteProfileConfig,
@@ -23,7 +22,6 @@
     CONFIG_PAN_RANGE,
     CONFIG_GAIN_DB_RANGE,
     CONFIG_DELAY_MS_RANGE,
-    CONFIG_DOUBLER_RANGE,
     CONFIG_HPF_RANGE,
     CONFIG_LPF_RANGE,
     CONFIG_DRIVE_DB_RANGE,
@@ -31,14 +29,22 @@
     CONFIG_AM_RATE_RANGE,
     CONFIG_AM_DEPTH_RANGE,
   } from '../lib/scenes.svelte.js';
-  import { createVoice, deleteVoice, uploadImage, voiceReferenceUrl } from '../lib/api.js';
+  import {
+    createVoice, deleteVoice, uploadImage, voiceReferenceUrl,
+    createSample, deleteSample, sampleAudioUrl,
+  } from '../lib/api.js';
   import ProfileTestField from '../components/ProfileTestField.svelte';
 
-  // Human-readable labels for the mode picker. Keys match VOICE_MODES.
+  // Human-readable labels for the per-config mode picker. Keys match
+  // VOICE_MODES. Copy voices reuse another config's raw synth output so
+  // this profile can stack a "core" voice with a pitched double / motor
+  // buzz layer without spending extra TTS calls on the copy.
   const MODE_LABELS = {
     presets: 'Presets — 9 named speakers + style instruction',
     clone:   'Clone — 3-second reference audio → voice',
     design:  'Design — free-text voice description',
+    copy:    'Copy — reuse another voice’s raw synth output',
+    sample:  'Sample — loop an uploaded audio clip (drones, machines, ambience)',
   };
 
   const project = $derived(currentProject());
@@ -72,9 +78,6 @@
   // ---- Voice profiles + configs -------------------------------------------
   function onProfileNameInput(characterId, profileId, ev) {
     renameVoiceProfile(characterId, profileId, ev.currentTarget.value);
-  }
-  function onProfileModeChange(characterId, profileId, ev) {
-    setVoiceProfileMode(characterId, profileId, ev.currentTarget.value);
   }
   function onAddProfile(characterId) {
     addVoiceProfile(characterId, 'new profile');
@@ -172,6 +175,60 @@
     const priorVoiceId = config.voiceFileId;
     updateProfileConfig(character.id, profile.id, config.id, { voiceFileId: null });
     deleteVoice(priorVoiceId).catch((e) => console.warn('voice cleanup failed', e));
+  }
+
+  // ---- Sample-mode raw audio upload ---------------------------------------
+  //
+  // Same UX shape as the clone-mode uploader above, but the server just
+  // stores the bytes verbatim under `data/samples/{id}` — no STT roundtrip,
+  // no Qwen3 save_prompt. The returned id lands on `config.sampleFileId` so
+  // resolve_character_configs picks the clip up on synth. Status is keyed
+  // by the same `${profileId}:${configId}` scheme so multi-config uploads
+  // don't overwrite each other's spinner / error.
+  const MAX_SAMPLE_BYTES = 8 * 1024 * 1024;
+  let sampleUploadStatus = $state({}); // `${p}:${c}` → {loading?, error?}
+
+  function setSampleStatus(k, patch) {
+    sampleUploadStatus = { ...sampleUploadStatus, [k]: { ...(sampleUploadStatus[k] ?? {}), ...patch } };
+  }
+  function clearSampleStatus(k) {
+    // eslint-disable-next-line no-unused-vars
+    const { [k]: _, ...rest } = sampleUploadStatus;
+    sampleUploadStatus = rest;
+  }
+
+  async function onSamplePick(character, profile, config, ev) {
+    const file = ev.currentTarget.files?.[0];
+    ev.currentTarget.value = '';
+    if (!file) return;
+    const k = statusKey(profile.id, config.id);
+    if (file.size > MAX_SAMPLE_BYTES) {
+      setSampleStatus(k, { error: `too large (${(file.size / 1024 / 1024).toFixed(1)} MB > 8 MB limit)` });
+      return;
+    }
+    setSampleStatus(k, { loading: true, error: null });
+    // Swap the sample id atomically so a failed upload doesn't leave the
+    // config with a dangling id or a half-deleted server row.
+    const priorSampleId = config.sampleFileId;
+    try {
+      const resp = await createSample(file, { filename: file.name });
+      updateProfileConfig(character.id, profile.id, config.id, {
+        sampleFileId: resp.id,
+      });
+      if (priorSampleId) {
+        deleteSample(priorSampleId).catch((e) => console.warn('prior sample cleanup failed', e));
+      }
+      clearSampleStatus(k);
+    } catch (e) {
+      setSampleStatus(k, { loading: false, error: e.message || String(e) });
+    }
+  }
+
+  async function onClearSample(character, profile, config) {
+    if (!config.sampleFileId) return;
+    const priorSampleId = config.sampleFileId;
+    updateProfileConfig(character.id, profile.id, config.id, { sampleFileId: null });
+    deleteSample(priorSampleId).catch((e) => console.warn('sample cleanup failed', e));
   }
 
   // Two-tap confirm for profile deletes; keyed as `${characterId}:${profileId}`.
@@ -375,17 +432,6 @@
                             aria-label="Profile name"
                             oninput={(e) => onProfileNameInput(character.id, profile.id, e)}
                           />
-                          <label class="mode-picker" title="Which Qwen3 synth workflow to use for this profile">
-                            <span>mode</span>
-                            <select
-                              value={profile.mode}
-                              onchange={(e) => onProfileModeChange(character.id, profile.id, e)}
-                            >
-                              {#each VOICE_MODES as m}
-                                <option value={m} title={MODE_LABELS[m]}>{m}</option>
-                              {/each}
-                            </select>
-                          </label>
                           <span class="config-count">
                             {profile.configs.length}
                             {profile.configs.length === 1 ? 'voice' : 'voices'}
@@ -415,6 +461,17 @@
                             <li class="config">
                               <div class="config-head">
                                 <span class="config-idx">voice {cfgIdx + 1}</span>
+                                <label class="mode-picker" title="How this voice renders. Copy borrows another voice's raw synth output — no extra TTS call, but you can still run this voice's own pitch/FX/gain on the copy.">
+                                  <span>mode</span>
+                                  <select
+                                    value={config.mode}
+                                    onchange={(e) => onConfigStringInput(character.id, profile.id, config.id, 'mode', e)}
+                                  >
+                                    {#each VOICE_MODES as m}
+                                      <option value={m} title={MODE_LABELS[m]}>{m}</option>
+                                    {/each}
+                                  </select>
+                                </label>
                                 <button
                                   type="button"
                                   class="mini-btn danger"
@@ -429,7 +486,7 @@
                                 >×</button>
                               </div>
 
-                              {#if profile.mode === 'presets'}
+                              {#if config.mode === 'presets'}
                                 <div class="config-row">
                                   <label class="field">
                                     <span>Speaker</span>
@@ -465,7 +522,7 @@
                                     oninput={(e) => onConfigStringInput(character.id, profile.id, config.id, 'instruct', e)}
                                   ></textarea>
                                 </label>
-                              {:else if profile.mode === 'design'}
+                              {:else if config.mode === 'design'}
                                 <label class="field">
                                   <span>Description</span>
                                   <textarea
@@ -487,7 +544,7 @@
                                     {/each}
                                   </select>
                                 </label>
-                              {:else if profile.mode === 'clone'}
+                              {:else if config.mode === 'clone'}
                                 <!-- Reference-audio clone flow. Upload first,
                                      let the server run STT and populate the
                                      transcription — the user then reviews /
@@ -562,6 +619,85 @@
                                     value={config.description}
                                     oninput={(e) => onConfigStringInput(character.id, profile.id, config.id, 'description', e)}
                                   ></textarea>
+                                </label>
+                              {:else if config.mode === 'copy'}
+                                <!-- Copy mode: no synth call for this voice. Pick which
+                                     sibling voice to reuse; the copy still runs through
+                                     its own Stretch + FX + gain chain, so a pitched
+                                     double is "copy voice 1 with pitch = -3". Selecting
+                                     this voice itself, or a voice that transitively
+                                     copies back to this one, will be rejected at
+                                     synthesis time. -->
+                                <label class="field">
+                                  <span>Copy from</span>
+                                  <select
+                                    value={String(config.copyFromIndex ?? 0)}
+                                    onchange={(e) => updateProfileConfig(character.id, profile.id, config.id, { copyFromIndex: Number(e.currentTarget.value) })}
+                                    disabled={profile.configs.length <= 1}
+                                    title={profile.configs.length <= 1
+                                      ? 'Add another voice to this profile before switching a voice to Copy mode'
+                                      : 'Which sibling voice to reuse the raw synth output of'}
+                                  >
+                                    {#each profile.configs as srcCfg, srcIdx (srcCfg.id)}
+                                      <option
+                                        value={String(srcIdx)}
+                                        disabled={srcIdx === cfgIdx}
+                                        title={srcIdx === cfgIdx ? 'A voice cannot copy from itself' : ''}
+                                      >
+                                        voice {srcIdx + 1}{srcIdx === cfgIdx ? ' (self — invalid)' : ''}
+                                      </option>
+                                    {/each}
+                                  </select>
+                                </label>
+                              {:else if config.mode === 'sample'}
+                                <!-- Sample mode: upload a wav / flac / mp3 / ogg. The
+                                     server stores the raw bytes and the synth pipeline
+                                     decodes + loops the clip to match the longest
+                                     synth sibling's duration (or its own natural
+                                     length if the profile has no synth voices). The
+                                     usual Stretch + FX + gain chain runs on top so
+                                     you can HPF/LPF/drive/AM the clip like any voice. -->
+                                <label class="field">
+                                  <span>Sample audio</span>
+                                  <div class="voice-file-row">
+                                    {#if config.sampleFileId}
+                                      <button
+                                        type="button"
+                                        class="voice-play"
+                                        onclick={(ev) => ev.currentTarget.querySelector('audio').play()}
+                                        title="Play the uploaded sample"
+                                        aria-label="Play the uploaded sample"
+                                      >
+                                        <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true">
+                                          <path fill="currentColor" d="M8 5v14l11-7z"/>
+                                        </svg>
+                                        <audio src={sampleAudioUrl(config.sampleFileId)} preload="none"></audio>
+                                      </button>
+                                      <span class="voice-file-ok" title="Sample file id: {config.sampleFileId}">
+                                        ✓ saved
+                                      </span>
+                                      <button
+                                        type="button"
+                                        class="link-btn"
+                                        onclick={() => onClearSample(character, profile, config)}
+                                      >clear</button>
+                                    {:else if sampleUploadStatus[statusKey(profile.id, config.id)]?.loading}
+                                      <span class="voice-file-pending">uploading…</span>
+                                    {:else}
+                                      <span class="voice-file-missing">no sample yet</span>
+                                    {/if}
+                                    <label class="file-btn small">
+                                      {config.sampleFileId ? 'replace' : 'upload audio'}
+                                      <input
+                                        type="file"
+                                        accept="audio/*"
+                                        onchange={(e) => onSamplePick(character, profile, config, e)}
+                                      />
+                                    </label>
+                                  </div>
+                                  {#if sampleUploadStatus[statusKey(profile.id, config.id)]?.error}
+                                    <span class="err small">{sampleUploadStatus[statusKey(profile.id, config.id)].error}</span>
+                                  {/if}
                                 </label>
                               {/if}
 
@@ -658,21 +794,6 @@
                               <details class="config-section">
                                 <summary>FX</summary>
                                 <div class="config-effects">
-                                  <label class="fx">
-                                    <span>Doubler</span>
-                                    <input
-                                      type="number"
-                                      min={CONFIG_DOUBLER_RANGE.min}
-                                      max={CONFIG_DOUBLER_RANGE.max}
-                                      step={CONFIG_DOUBLER_RANGE.step}
-                                      value={config.doublerSemitones}
-                                      oninput={(e) => onConfigNumberInput(character.id, profile.id, config.id, 'doublerSemitones', e)}
-                                      aria-label="Doubler pitch offset in semitones"
-                                      title="Mix in a second copy pitch-shifted by this many semitones (0 = disabled; try ±3 for chorus, ±12 for octave stack)"
-                                    />
-                                    <span class="unit">st</span>
-                                  </label>
-                                  <div class="fx-spacer" aria-hidden="true"></div>
                                   <label class="fx">
                                     <span>HPF</span>
                                     <input
@@ -1170,16 +1291,14 @@
      always land on the same row regardless of viewport width. Each .fx
      cell is itself a 3-column mini-grid (label | number input | unit)
      so labels, inputs, and units also align across rows even when knobs
-     have different name/unit widths. Solo knobs that don't belong to a
-     pair (Doubler) get a `.fx-spacer` placeholder in the neighbour cell
-     to preserve pair adjacency on the following row — stretching the
-     solo cell across both columns would balloon its label-to-input gap. */
+     have different name/unit widths. With Doubler gone the FX grid is a
+     clean 3×2 (HPF/LPF, Drive/Bits, AM Rate/AM Depth) so no spacer cell
+     is needed anymore. */
   .config-effects {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 6px 14px;
   }
-  .fx-spacer { /* empty grid cell — presence forces the next .fx to row 2 */ }
   .fx {
     display: grid;
     grid-template-columns: minmax(0, 1fr) 68px 2.5em;
