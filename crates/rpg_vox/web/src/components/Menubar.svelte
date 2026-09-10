@@ -4,15 +4,82 @@
   import { monitorState } from '../lib/browserMonitor.js';
   import HealthDot from './HealthDot.svelte';
 
+  // Menu structure: top-level items may have children.
+  // Clicking a parent with `href` still navigates; children appear in a dropdown.
   const items = [
-    { href: '#/projects',   label: 'Projects',   match: (r) => r === '/' || r === '/projects' },
-    { href: '#/characters', label: 'Characters', match: (r) => r === '/characters' },
-    { href: '#/dictionary', label: 'Dictionary', match: (r) => r === '/dictionary' },
-    { href: '#/scenes',     label: 'Scenes',     match: (r) => r === '/scenes' || r === '/speak' },
-    { href: '#/script',     label: 'Script',     match: (r) => r === '/script' || r === '/chat' },
-    { href: '#/mixer',      label: 'Mixer',      match: (r) => r === '/mixer' },
-    { href: '#/settings',   label: 'Settings',   match: (r) => r === '/settings' },
+    {
+      href: '#/projects',
+      label: 'Project',
+      match: (r) => r === '/' || r === '/projects',
+      children: [
+        { href: '#/characters', label: 'Characters', match: (r) => r === '/characters' },
+        { href: '#/dictionary', label: 'Dictionary', match: (r) => r === '/dictionary' },
+        { href: '#/scenes',     label: 'Scenes',     match: (r) => r === '/scenes' || r === '/speak' },
+        { href: '#/script',     label: 'Script',     match: (r) => r === '/script' || r === '/chat' },
+      ],
+    },
+    { href: '#/mixer',    label: 'Mixer',    match: (r) => r === '/mixer' },
+    { href: '#/settings', label: 'Settings', match: (r) => r === '/settings' },
   ];
+
+  // A parent is "active" if it matches OR any of its children match — so the
+  // Project chip stays highlighted while the user is inside Characters/etc.
+  function parentActive(item, r) {
+    if (item.match(r)) return true;
+    return item.children?.some((c) => c.match(r)) ?? false;
+  }
+
+  // Open state has two independent sources:
+  //  - openIndex: click-toggled via the caret. Sticky until closed.
+  //  - hoveredIndex: set on mouseenter, cleared on mouseleave. Ephemeral.
+  // We intentionally do NOT use CSS :hover to open the dropdown. After a
+  // link click the cursor is still over the item, and browsers can dispatch
+  // stray hover events during click/navigation — that would pop the menu
+  // back open. Requiring a fresh mouseenter guarantees the cursor actually
+  // left and returned before we reopen.
+  let openIndex = $state(-1);
+  let hoveredIndex = $state(-1);
+
+  // After a link click, block the next mouseenter for that item until the
+  // cursor leaves. Without this, the cursor is still hovering the item and
+  // would immediately re-open the dropdown on the next mousemove.
+  let suppressedIndex = $state(-1);
+
+  function isItemOpen(i) {
+    return openIndex === i || hoveredIndex === i;
+  }
+
+  function toggleOpen(i) {
+    openIndex = openIndex === i ? -1 : i;
+  }
+
+  function closeAll() {
+    openIndex = -1;
+  }
+
+  function handleLinkClick(i, sameRoute) {
+    // Clicking a link that points at the page you're already on isn't a
+    // navigation — force the dropdown open and clear any prior suppression
+    // (e.g. left over from the click that landed you on this route while
+    // still hovering the button). It will close naturally on mouseleave.
+    if (sameRoute) {
+      suppressedIndex = -1;
+      hoveredIndex = i;
+      return;
+    }
+    openIndex = -1;
+    hoveredIndex = -1;
+    suppressedIndex = i;
+  }
+
+  function handleMouseEnter(i) {
+    if (suppressedIndex !== i) hoveredIndex = i;
+  }
+
+  function handleMouseLeave(i) {
+    if (hoveredIndex === i) hoveredIndex = -1;
+    if (suppressedIndex === i) suppressedIndex = -1;
+  }
 
   const currentProject = $derived(
     scenesState.selectedProjectId
@@ -28,12 +95,54 @@
   const awaitingGesture = $derived($monitorState === 'awaiting-gesture');
 </script>
 
+<svelte:window onclick={closeAll} />
+
 <nav class="menubar">
   <a class="brand" href="#/">RPG Vox</a>
   <ul>
-    {#each items as it (it.href)}
-      <li>
-        <a href={it.href} class:active={it.match($route)}>{it.label}</a>
+    {#each items as it, i (it.href)}
+      <li
+        class="menu-item"
+        class:has-children={!!it.children}
+        onmouseenter={() => handleMouseEnter(i)}
+        onmouseleave={() => handleMouseLeave(i)}
+      >
+        {#if it.children}
+          <div
+            class="parent-row"
+            class:open={isItemOpen(i)}
+            class:active={parentActive(it, $route)}
+          >
+            <a
+              href={it.href}
+              onclick={() => handleLinkClick(i, it.match($route))}
+            >{it.label}</a>
+            <button
+              type="button"
+              class="caret"
+              aria-label="Toggle {it.label} menu"
+              aria-expanded={isItemOpen(i)}
+              onclick={(e) => { e.stopPropagation(); toggleOpen(i); }}
+            >
+              <svg viewBox="0 0 10 6" width="10" height="6" aria-hidden="true">
+                <path d="M1 1l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+            </button>
+          </div>
+          <ul class="dropdown" class:visible={isItemOpen(i)}>
+            {#each it.children as c (c.href)}
+              <li>
+                <a
+                  href={c.href}
+                  class:active={c.match($route)}
+                  onclick={() => handleLinkClick(i, c.match($route))}
+                >{c.label}</a>
+              </li>
+            {/each}
+          </ul>
+        {:else}
+          <a href={it.href} class:active={it.match($route)}>{it.label}</a>
+        {/if}
       </li>
     {/each}
   </ul>
@@ -85,7 +194,12 @@
     gap: 4px;
     flex: 1;
   }
-  li a {
+  .menu-item {
+    position: relative;
+  }
+
+  /* Simple (childless) top-level items — Mixer, Settings. */
+  .menu-item > a {
     display: inline-block;
     padding: 6px 10px;
     color: var(--muted);
@@ -93,12 +207,101 @@
     border-radius: 6px;
     font-size: 14px;
   }
-  li a:hover { color: var(--text); background: rgba(255,255,255,0.04); }
-  li a.active {
+  .menu-item > a:hover { color: var(--text); background: rgba(255,255,255,0.04); }
+  .menu-item > a.active {
     color: var(--text);
     background: rgba(122,162,255,0.12);
     box-shadow: inset 0 -2px 0 var(--accent);
   }
+
+  /* Parent pill (Project). The pill background lives on .parent-row so the
+     link + caret share one continuous shape. Right padding on the row
+     mirrors the 10px left padding inside the <a>, giving the pill a
+     symmetric buffer around its content. */
+  .parent-row {
+    display: inline-flex;
+    align-items: center;
+    border-radius: 6px;
+    padding-right: 10px;
+  }
+  .parent-row:hover { background: rgba(255,255,255,0.04); }
+  .parent-row.active {
+    background: rgba(122,162,255,0.12);
+    box-shadow: inset 0 -2px 0 var(--accent);
+  }
+  .parent-row > a {
+    display: inline-block;
+    padding: 6px 4px 6px 10px;
+    color: var(--muted);
+    text-decoration: none;
+    font-size: 14px;
+  }
+  .parent-row:hover > a,
+  .parent-row.active > a { color: var(--text); }
+
+  /* Caret is a pure indicator — no background of its own so it doesn't
+     obscure the pill's right buffer. Rotation follows isItemOpen() so it
+     tracks the true dropdown state (hover-open OR click-open), not just
+     the click. */
+  .caret {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background: transparent;
+    border: 0;
+    color: var(--muted);
+    padding: 6px 0;
+    cursor: pointer;
+    transition: transform 0.15s ease;
+  }
+  .caret:hover { color: var(--text); background: transparent; }
+  .parent-row.active .caret { color: var(--text); }
+  .parent-row.open .caret { transform: rotate(180deg); }
+
+  .dropdown {
+    display: none;
+    position: absolute;
+    top: 100%;
+    left: 0;
+    margin: 4px 0 0 0;
+    padding: 4px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.35);
+    min-width: 160px;
+    flex-direction: column;
+    gap: 2px;
+    z-index: 11;
+  }
+  .dropdown.visible { display: flex; }
+  /* Transparent bridge over the 4px gap between the parent chip and the
+     dropdown, so the cursor can travel down without triggering mouseleave
+     on the .menu-item. Without it the dropdown snaps shut mid-travel. */
+  .dropdown::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: -6px;
+    height: 6px;
+  }
+  .dropdown li { width: 100%; }
+  .dropdown a {
+    display: block;
+    padding: 6px 10px;
+    color: var(--muted);
+    text-decoration: none;
+    border-radius: 6px;
+    font-size: 14px;
+    white-space: nowrap;
+  }
+  .dropdown a:hover { color: var(--text); background: rgba(255,255,255,0.04); }
+  .dropdown a.active {
+    color: var(--text);
+    background: rgba(122,162,255,0.12);
+  }
+
   .status {
     display: flex;
     align-items: center;
