@@ -1,19 +1,17 @@
 name: qwen3-tts
 
-# Three qwen-tts-demo containers, one per model. The demo binary picks its
-# UI (preset speakers vs reference-audio clone vs text-described voice
-# design) from the model class it loads, so "swap modes" = "swap the
-# container behind a different hostname". All three share one image build
-# and one HF cache volume — different models land in different repo
-# subdirs so concurrent downloads don't collide.
+# Three vllm-omni containers, one per Qwen3-TTS variant. Each serves an
+# OpenAI-compatible /v1/audio/speech (+ /v1/audio/voices for the clone
+# container). Model class is picked at server start via QWEN_TTS_MODEL;
+# swapping "modes" = swapping the container behind a different hostname.
 #
-# GPU footprint is small (each 1.7B checkpoint is ~4 GB bf16 + a few GB of
-# KV/activations); an RTX PRO 6000 has plenty of room to keep all three
-# hot. Cold-swapping would save maybe 8 GB of VRAM but reintroduces the
-# reload penalty this design is meant to avoid.
+# GPU footprint per container: ~4 GB bf16 weights + a KV budget shaped by
+# `max_num_seqs` in the bundled deploy YAML (default 64/stage,
+# gpu_memory_utilization: 0.3 each). An RTX PRO 6000 (96 GB) keeps all
+# three hot with room to spare.
 #
 # Hostname config lives in `.env` (gitignored) — copy `.env-dist` and fill
-# in your Traefik-routable hostnames. Compose auto-loads `.env` from THIS
+# in Traefik-routable hostnames. Compose auto-loads `.env` from THIS
 # directory when you run `docker compose` from here; from elsewhere use
 # `docker compose --env-file qwen3-tts/.env -f qwen3-tts/docker-compose.yml`.
 
@@ -21,16 +19,15 @@ x-common: &common
   build:
     context: .
     dockerfile: Dockerfile
-    args:
-      BUILD_FLASH_ATTN: "1"
-  image: qwen-tts:latest
+  image: qwen-tts-vllm:latest
   restart: unless-stopped
   # NixOS host uses CDI for GPU passthrough (no legacy nvidia runtime).
   devices:
     - nvidia.com/gpu=all
-  # One HF cache across all three services: each model's weights live at
-  # `/models/<repo>/…` — no filename collisions, and any shared submodule
-  # is fetched once.
+  # One HF cache + one speakers dir across all three services. Model
+  # weights land in `/models/<repo>/…`; uploaded voice clones land in
+  # `/models/speakers/*.safetensors` (see SPEAKER_SAMPLES_DIR in the
+  # Dockerfile). Everything survives container recreation via this volume.
   volumes:
     - qwen3-tts-models:/models
   shm_size: "8gb"
@@ -38,19 +35,16 @@ x-common: &common
 x-common-env: &common-env
   HF_HOME: /models
   HUGGINGFACE_HUB_CACHE: /models
-  HF_HUB_ENABLE_HF_TRANSFER: "1"
+  # Xet-based fast transfer (replaces deprecated HF_HUB_ENABLE_HF_TRANSFER).
+  HF_XET_HIGH_PERFORMANCE: "1"
   # Every container binds 8000 inside its own network namespace; Traefik
-  # differentiates by Host() header, so no per-service port juggling.
+  # routes by Host() header, so no per-service port juggling.
   QWEN_TTS_PORT: "8000"
-  QWEN_TTS_DTYPE: bfloat16
-  QWEN_TTS_FLASH_ATTN: "1"
-  QWEN_TTS_CONCURRENCY: "4"
 
 services:
   # Preset speakers (Serena / Vivian / Ryan / …) + free-text `instruct`
   # style control. Original hostname preserved so existing rpg_vox voice
-  # profiles keep resolving without any app-side change until the multi-
-  # backend work in rpg_vox lands.
+  # profiles keep resolving without any app-side change.
   presets:
     <<: *common
     environment:
@@ -64,8 +58,10 @@ services:
       traefik.http.middlewares.qwen3-tts-presets-ipallowlist.ipallowlist.sourcerange: 0.0.0.0/0
       traefik.http.services.qwen3-tts-presets.loadbalancer.server.port: "8000"
 
-  # 3-second reference-audio voice clone (Base model). Browser mic capture
-  # requires HTTPS on the client side — Traefik handles that already.
+  # 3-second reference-audio voice clone (Base model). Uploaded voices
+  # persist as .safetensors under /models/speakers via SPEAKER_SAMPLES_DIR
+  # so they survive container/image rebuilds; browser mic capture needs
+  # HTTPS on the client side — Traefik handles that already.
   clone:
     <<: *common
     environment:
@@ -81,7 +77,7 @@ services:
 
   # Voice generated from a free-text description ("gravelly old sailor,
   # slight lisp, warm mid-range"). No reference audio needed — the
-  # description is what shapes timbre.
+  # description shapes timbre.
   design:
     <<: *common
     environment:

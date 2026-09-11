@@ -28,6 +28,7 @@
     fetchWidget,
     generateScriptTitle,
     playWidget,
+    rerenderAllStream,
     resynthUserTurn,
     sendAssistantReply,
     sendUserTurn,
@@ -314,6 +315,10 @@
   let rerenderStopRequested = false;
   let rerenderDone = $state(0);
   let rerenderTotal = $state(0);
+  /// AbortController for the in-flight /rerender-all SSE fetch, so a
+  /// cancel click stops the client-side stream immediately. Server-side
+  /// tasks already in flight continue and their results are discarded.
+  let rerenderAbortController = null;
 
   function findBlockById(blockId) {
     for (const t of turns) {
@@ -333,8 +338,8 @@
 
     // Snapshot target list up front so mid-loop reactivity to script
     // updates doesn't reshape it under us. Two shapes:
-    //   { kind: 'user',  turnId, text }
-    //   { kind: 'block', blockId, role }
+    //   { kind: 'user',  turnId }
+    //   { kind: 'block', blockId }
     // Empty-text and silenced targets are dropped so the counter matches
     // what actually gets synthesized.
     const targets = [];
@@ -342,10 +347,12 @@
       if (t.role === 'user') {
         if (voiceSilenced.user) continue;
         if (!t.content || !t.content.trim()) continue;
-        // Only turns that already have an attached widget were audible
-        // before — turns without one stay silent (matches the /user
-        // handler's silence branch).
-        if (!t.widget_id) continue;
+        // NOTE: we intentionally do NOT filter on `t.widget_id` here.
+        // Any user turn with non-empty text and a non-silenced voice
+        // slot gets synthesized — matches the "rerender everything
+        // against current settings" intent. Also serves as the recovery
+        // path for turns whose widgets got dropped by a prior failed
+        // batch run (see rerender_user_turn_inline in http.rs).
         targets.push({ kind: 'user', turnId: t.id });
       } else if (t.role === 'assistant' && Array.isArray(t.blocks)) {
         for (const b of t.blocks) {
@@ -367,77 +374,130 @@
     error = '';
     const MAX_TAKES = 3;
     const currentScript = currentScriptId;
-    // Benchmark accumulators. Wall clock covers only the synth loop; user-
-    // turn duration lookups happen after the timer stops so /widgets HEAD
-    // roundtrips don't inflate the reported render time.
+    // Benchmark accumulators. Wall clock spans the whole SSE stream
+    // (which now bounds the whole rerender wall time, not one clip at a
+    // time). User-turn duration lookups still happen after the timer
+    // stops so /widgets HEADs don't inflate the reported render time.
+    //
+    // Extra metrics for the batched/streaming path:
+    //   ttfc         — time from start to first completed item. Sets the
+    //                  earliest moment playback could theoretically begin.
+    //   steady_rtf   — audio-ms produced after TTFC / wall-ms after TTFC.
+    //                  Green-light for smooth playback is > 1.5x realtime.
+    //   worst_clip   — max(wall_ms/audio_ms) across per-item events. Any
+    //                  clip > 1.0 becomes a play-cursor stall point.
+    //                  Only block items contribute (user turns don't ship
+    //                  audio duration inline).
     const benchStart = performance.now();
     const benchStartWall = new Date();
     let benchAudioMs = 0;
     let benchOk = 0;
     let benchFail = 0;
     const benchUserWidgetIds = [];
+    let firstItemAt = null;
+    let firstItemAudioMs = 0;
+    let worstClipRtf = 0;
     console.log(
       `[bench] rerenderAll: starting at ${benchStartWall.toISOString()} ` +
-        `(${targets.length} clips)`,
+        `(${targets.length} clips, batched via /rerender-all)`,
     );
+
+    rerenderAbortController = new AbortController();
     try {
-      for (const target of targets) {
-        if (rerenderStopRequested) break;
-        try {
-          if (target.kind === 'user') {
-            const { widgetId } = await resynthUserTurn(
-              currentScript,
-              target.turnId,
-              selectedAgentId,
-              scenesState.selectedProjectId ?? null,
-            );
-            // Mirror the swap into the local script store so the play
-            // button on this turn points at the fresh widget without a
-            // full reload.
-            script.update((s) => {
-              if (!s) return s;
-              const nextTurns = s.turns.map((t) =>
-                t.id === target.turnId ? { ...t, widget_id: widgetId ?? null } : t,
-              );
-              return { ...s, turns: nextTurns };
-            });
-            if (widgetId) benchUserWidgetIds.push(widgetId);
+      await rerenderAllStream(currentScript, {
+        agentId: selectedAgentId,
+        projectId: scenesState.selectedProjectId ?? null,
+        targets: targets.map((t) =>
+          t.kind === 'user'
+            ? { kind: 'user', turnId: t.turnId }
+            : { kind: 'block', blockId: t.blockId },
+        ),
+        signal: rerenderAbortController.signal,
+        onStart(_ev) {
+          // Server may report a slightly different total (though we sent
+          // the list, so it should match) — trust ours.
+        },
+        onItem(ev) {
+          if (firstItemAt === null) {
+            firstItemAt = performance.now();
+            firstItemAudioMs = benchAudioMs;
+          }
+          const target = targets[ev.index];
+          if (!target) {
+            console.warn('rerenderAll: item event with out-of-range index', ev);
+            return;
+          }
+          if (ev.ok) {
+            if (ev.kind === 'user') {
+              const widgetId = ev.widgetId ?? null;
+              // Mirror the swap into the local script store so the play
+              // button on this turn points at the fresh widget without a
+              // full reload.
+              script.update((s) => {
+                if (!s) return s;
+                const nextTurns = s.turns.map((t) =>
+                  t.id === target.turnId ? { ...t, widget_id: widgetId } : t,
+                );
+                return { ...s, turns: nextTurns };
+              });
+              if (widgetId) benchUserWidgetIds.push(widgetId);
+            } else {
+              const take = ev.take;
+              // Re-read the block from the latest turns state — earlier
+              // items may have shifted its takes array (out-of-order
+              // completion is common now) and we shouldn't clobber those.
+              const current = findBlockById(target.blockId);
+              if (current && take) {
+                const kept = [...(current.takes ?? []), take]
+                  .sort((a, b) => b.ord - a.ord)
+                  .slice(0, MAX_TAKES)
+                  .sort((a, b) => a.ord - b.ord);
+                applyBlockChange({
+                  ...current,
+                  takes: kept,
+                  selected_take: take.ord,
+                });
+              }
+              if (take?.duration_ms) {
+                benchAudioMs += take.duration_ms;
+                if (ev.wall_ms && take.duration_ms > 0) {
+                  const rtf = ev.wall_ms / take.duration_ms;
+                  if (rtf > worstClipRtf) worstClipRtf = rtf;
+                }
+              }
+            }
             benchOk += 1;
           } else {
-            const { take } = await createTake(
-              target.blockId,
-              [],
-              selectedAgentId,
-              scenesState.selectedProjectId ?? null,
-            );
-            // Re-read the block from the latest turns state — earlier
-            // iterations may have shifted its takes array and we shouldn't
-            // clobber those.
-            const current = findBlockById(target.blockId);
-            if (current) {
-              const kept = [...(current.takes ?? []), take]
-                .sort((a, b) => b.ord - a.ord)
-                .slice(0, MAX_TAKES)
-                .sort((a, b) => a.ord - b.ord);
-              applyBlockChange({
-                ...current,
-                takes: kept,
-                selected_take: take.ord,
-              });
+            // Look up the actual text so the console message points at
+            // the failing clip in human-readable form, not just an id.
+            let snippet = '';
+            if (ev.kind === 'user') {
+              const t = turns.find((x) => x.id === target.turnId);
+              snippet = (t?.content || '').slice(0, 80);
+            } else if (ev.kind === 'block') {
+              const b = findBlockById(target.blockId);
+              snippet = (b?.text || '').slice(0, 80);
             }
-            if (take?.duration_ms) benchAudioMs += take.duration_ms;
-            benchOk += 1;
+            console.error(
+              `[rerenderAll] clip ${ev.index + 1}/${targets.length} (${ev.kind}) FAILED: ${ev.error || 'no error message'}` +
+                (snippet ? ` — "${snippet}${snippet.length >= 80 ? '…' : ''}"` : ''),
+              { target, ev },
+            );
+            benchFail += 1;
           }
-        } catch (e) {
-          console.warn('rerender: target failed', target, e);
-          benchFail += 1;
-        }
-        rerenderDone += 1;
-      }
+          rerenderDone += 1;
+        },
+        onComplete(_summary) {
+          // Server-side aggregate timings available in _summary
+          // (wall_ms, task_succeeded, task_failed) — useful when
+          // reconciling client-vs-server wall clocks if the stream
+          // stalls or the browser is throttled.
+        },
+      });
       const wallMs = performance.now() - benchStart;
       const stoppedEarly = rerenderStopRequested;
       // Resolve user-widget durations off the clock so the timer reflects
-      // only synth work. Failures fall back to 0 rather than skewing the
+      // only render work. Failures fall back to 0 rather than skewing the
       // ratio — the log calls out the discrepancy via the clip counters.
       if (benchUserWidgetIds.length > 0) {
         const durs = await Promise.all(
@@ -448,22 +508,43 @@
         benchAudioMs += durs.reduce((a, b) => a + b, 0);
       }
       const speedup = wallMs > 0 ? benchAudioMs / wallMs : 0;
-      console.log(
+      const ttfcMs = firstItemAt !== null ? firstItemAt - benchStart : 0;
+      const steadyWallMs = firstItemAt !== null ? wallMs - ttfcMs : 0;
+      const steadyAudioMs = benchAudioMs - firstItemAudioMs;
+      const steadyRtf = steadyWallMs > 0 ? steadyAudioMs / steadyWallMs : 0;
+      const summary =
         `[bench] rerenderAll: wall=${(wallMs / 1000).toFixed(2)}s ` +
-          `audio=${(benchAudioMs / 1000).toFixed(2)}s ` +
-          `speedup=${speedup.toFixed(2)}x ` +
-          `clips=${benchOk}/${targets.length}` +
-          (benchFail ? ` (${benchFail} failed)` : '') +
-          (stoppedEarly ? ' [stopped early]' : ''),
-      );
+        `audio=${(benchAudioMs / 1000).toFixed(2)}s ` +
+        `speedup=${speedup.toFixed(2)}x ` +
+        `ttfc=${(ttfcMs / 1000).toFixed(2)}s ` +
+        `steady=${steadyRtf.toFixed(2)}x ` +
+        `worst_clip_rtf=${worstClipRtf.toFixed(2)} ` +
+        `clips=${benchOk}/${targets.length}` +
+        (benchFail ? ` (${benchFail} failed)` : '') +
+        (stoppedEarly ? ' [stopped early]' : '');
+      // Escalate to error when any clip failed so the summary shows up
+      // red in the console alongside the per-clip [rerenderAll] errors.
+      if (benchFail > 0) console.error(summary);
+      else console.log(summary);
+    } catch (e) {
+      if (e?.name === 'AbortError') {
+        console.log('[bench] rerenderAll: aborted by user');
+      } else {
+        console.error('rerenderAll: stream failed', e);
+        error = String(e?.message || e);
+      }
     } finally {
       isRerendering = false;
       rerenderStopRequested = false;
+      rerenderAbortController = null;
     }
   }
 
   function cancelRerenderAll() {
     rerenderStopRequested = true;
+    if (rerenderAbortController) {
+      try { rerenderAbortController.abort(); } catch {}
+    }
   }
 
   /// Skip to the next clip in the queue. Aborts the current /widgets/:id/say
@@ -2353,6 +2434,22 @@
     background: rgba(122, 162, 255, 0.28);
     border-color: var(--accent);
   }
+  /* During actual playback (not re-rendering), the middle transport
+     button is a Stop / cancel. Red-tint it so the destructive affordance
+     reads at a glance — matches the record/stop convention above.
+     Scoped under .playall-controls so the re-render spinner button
+     stays accent-blue. */
+  .playall-controls button.playall.playing {
+    color: var(--err);
+    background: rgba(255, 128, 128, 0.15);
+    border-color: rgba(255, 128, 128, 0.45);
+  }
+  .playall-controls button.playall.playing:hover {
+    background: rgba(255, 128, 128, 0.25);
+    border-color: var(--err);
+  }
+  .playall-controls button.playall.playing .counter { color: var(--muted); }
+  .playall-controls button.playall.playing:hover .counter { color: var(--err); }
   /* During playback the Play All button becomes a mini transport control:
      [◀◀] [Stop  X / Y clips] [▶▶]. Tight gap so it reads as one unit. */
   .playall-controls {

@@ -29,7 +29,20 @@ use rubato::{
 };
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Semaphore, mpsc, oneshot};
+
+/// Upper bound on concurrent in-flight `Command::Synthesize` calls against
+/// the Qwen3 backend. The stateless HTTP shape of vLLM-Omni's
+/// `/v1/audio/speech` means each synth request is independent, so the tts
+/// runner can spawn per-request tasks instead of serializing them behind a
+/// single `&mut Backend`. Bounded here so a burst of rerender-all requests
+/// can't fan out into hundreds of concurrent HTTP calls; picked to sit at
+/// or under the shipped vLLM-Omni `max_num_seqs: 64` per stage, above the
+/// 10-sequence benchmark sweet spot, and well within reqwest's default
+/// connection pool. Not env-configurable yet — tune via a rebuild if the
+/// throughput sweep suggests a different knee.
+pub const MAX_CONCURRENT_QWEN3_SYNTH: usize = 16;
+
 use tracing::{Instrument, error, info};
 
 use crate::mixer::AtomicMixer;
@@ -92,16 +105,15 @@ pub enum Command {
 pub enum SynthMode {
     /// Preset speaker enum + optional `instruct` style prompt. Default.
     Preset,
-    /// 3-second reference-audio clone. `voice_file_bytes` is the compact
-    /// prompt file returned by `/save_prompt`; the HTTP layer pre-loads
-    /// it from `data/voices/{id}.bin` so the backend doesn't need store
-    /// access. `ref_txt` and `use_xvec` were baked into `voice_file_bytes`
-    /// at save-prompt time, so we don't re-send them here.
+    /// Reference-audio clone. `voice_name` is the name the caller
+    /// registered with vLLM-Omni via `POST /v1/audio/voices` (the sample
+    /// and its ref_text/embedding live on the server side under
+    /// `SPEAKER_SAMPLES_DIR`). Per-synth request the backend just names
+    /// this voice with `task_type=Base` — no bytes flow through the tts
+    /// runner. The HTTP layer verifies the voice exists in the local
+    /// manifest before constructing this variant.
     Clone {
-        voice_file_bytes: Vec<u8>,
-        /// Original filename to hint content-type on Gradio upload
-        /// (usually `.bin` or `.pt` depending on Qwen3-TTS version).
-        voice_file_name: String,
+        voice_name: String,
     },
     /// Voice generated from a free-text description on every request.
     /// No persistent state on the Qwen3 side — the description IS the
@@ -286,31 +298,28 @@ pub struct SynthesizeRequest {
     pub reply: oneshot::Sender<Result<SynthesizeOutcome, String>>,
 }
 
-/// One-shot request to have the backend upload a reference audio clip
-/// to its clone Gradio and return the compact voice-prompt file. Bytes
-/// come back through the `reply` oneshot; the caller is responsible for
-/// persisting them (`Store::create_voice`). `filename` is preserved for
-/// round-tripping on future load_prompt_and_gen uploads — Qwen3-TTS
-/// versions differ on whether they return `.bin` or `.pt`.
+/// One-shot request to have the backend register a reference audio
+/// clip with vLLM-Omni's `POST /v1/audio/voices`. The caller mints
+/// `voice_id` up front (a UUID) and passes it through so it doubles as
+/// the vLLM-Omni voice name — no round-trip needed to learn what the
+/// server called it. On success the server persists a `.safetensors`
+/// under `SPEAKER_SAMPLES_DIR` and the voice is addressable by name
+/// from `POST /v1/audio/speech {voice: <voice_id>, task_type: "Base"}`.
 pub struct SavePromptRequest {
+    /// Caller-minted voice id. Reused verbatim as the vLLM-Omni voice
+    /// name — the Base container's LRU keys on this string.
+    pub voice_id: String,
     pub reference_wav: Vec<u8>,
-    /// Filename to use on the multipart upload to Gradio. Extension
-    /// affects Gradio's temp path but not correctness — `.wav` is
-    /// always the right hint for audio references.
-    pub reference_wav_name: String,
     pub ref_txt: String,
-    pub use_xvec: bool,
     pub reply: oneshot::Sender<Result<SavePromptOutcome, String>>,
 }
 
 #[derive(Debug)]
 pub struct SavePromptOutcome {
-    /// Bytes of the voice-prompt file Gradio produced. Persist under
-    /// `data/voices/{id}.{ext}` — the caller decides the extension by
-    /// looking at `filename` below.
-    pub voice_file_bytes: Vec<u8>,
-    /// Filename Gradio returned (extension baked in). Preserve verbatim.
-    pub filename: String,
+    /// Voice name the server confirmed on the way back. Equals the
+    /// caller's `voice_id` on success — returned as its own field so
+    /// the wire contract stays explicit even if the two ever diverge.
+    pub voice_name: String,
 }
 
 /// Push already-decoded stereo PCM into the pipewire ring buffer. No
@@ -538,10 +547,53 @@ async fn run_backend(
     mut rx: mpsc::Receiver<Command>,
     play_tx: mpsc::Sender<PlayCmd>,
 ) -> Result<()> {
+    // Bounded fan-out for Qwen3 Synthesize. Say (mic path — must serialize
+    // against the pipewire ring buffer) and non-Qwen3 backends (Piper /
+    // ComfyUI carry heavier per-instance state) stay inline; only widget-
+    // WAV synth against the stateless Qwen3 HTTP backend spawns.
+    // Permit acquisition happens BEFORE spawn, so a full permit set naturally
+    // back-pressures the mpsc through the recv loop instead of piling up
+    // hundreds of waiting spawned tasks.
+    let synth_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_QWEN3_SYNTH));
+
     while let Some(cmd) = rx.recv().await {
         match cmd {
             Command::Say(req) => handle_say(&mut backend, &cfg, &play_tx, req).await,
-            Command::Synthesize(req) => handle_synthesize(&mut backend, &cfg, req).await,
+            Command::Synthesize(req) => {
+                // Extract a cloneable snapshot of the qwen3 backend in a
+                // scoped match so the immutable borrow of `backend` is
+                // released before the else branch's `&mut backend` call.
+                let qwen3_clone = match &backend {
+                    Backend::Qwen3(qb) => Some(qb.clone()),
+                    _ => None,
+                };
+                if let Some(qb) = qwen3_clone {
+                    // Await the permit here (not inside the spawn) so a
+                    // saturated pool blocks the recv loop rather than
+                    // accumulating an unbounded backlog of "waiting"
+                    // tasks. Semaphore.acquire_owned only errors if the
+                    // sem was closed — we never close it, so unwrap is
+                    // load-bearing (bug-severity if it panics).
+                    let permit = synth_semaphore
+                        .clone()
+                        .acquire_owned()
+                        .await
+                        .expect("qwen3 synth semaphore unexpectedly closed");
+                    let cfg_clone = cfg.clone();
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        // Wrap the cloned inner in a fresh Backend enum so
+                        // the shared handle_synthesize signature (&mut
+                        // Backend) works unchanged. The cloned enum is
+                        // fully owned by this task — no cross-task shared
+                        // state.
+                        let mut local = Backend::Qwen3(qb);
+                        handle_synthesize(&mut local, &cfg_clone, req).await;
+                    });
+                } else {
+                    handle_synthesize(&mut backend, &cfg, req).await;
+                }
+            }
             Command::PlayPcm(req) => {
                 // Route PlayPcm to the dedicated play task so it doesn't
                 // block the backend from processing the next Synthesize.
@@ -552,6 +604,10 @@ async fn run_backend(
             Command::SavePrompt(req) => handle_save_prompt(&mut backend, req).await,
         }
     }
+    // Any spawned Synthesize tasks still in flight when rx closes will
+    // finish independently; their reply oneshots keep them alive until
+    // vLLM-Omni responds. On drop the reply channel errors out to the
+    // HTTP caller as a 500 — acceptable during shutdown.
     Ok(())
 }
 
@@ -560,15 +616,14 @@ async fn run_backend(
 /// HTTP handler can surface a 400 rather than time out.
 async fn handle_save_prompt(backend: &mut Backend, req: SavePromptRequest) {
     let SavePromptRequest {
+        voice_id,
         reference_wav,
-        reference_wav_name,
         ref_txt,
-        use_xvec,
         reply,
     } = req;
     let result = match backend {
         Backend::Qwen3(b) => b
-            .save_prompt(reference_wav, reference_wav_name, ref_txt, use_xvec)
+            .save_prompt(voice_id, reference_wav, ref_txt)
             .await
             .map_err(|e| format!("{e:#}")),
         Backend::Piper(_) | Backend::Comfy(_) => Err(format!(

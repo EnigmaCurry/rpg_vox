@@ -1,60 +1,70 @@
-//! Remote Qwen3-TTS backend over the Gradio HTTP API.
+//! Remote Qwen3-TTS backend against vLLM-Omni's OpenAI-compatible speech API.
 //!
-//! Talks to a Gradio deployment of Qwen3-TTS (see the `/run_instruct`
-//! endpoint) — inference happens on the remote GPU box, we just marshal
-//! text in and WAV bytes out. No candle, no local model weights.
+//! Each container in `qwen3-tts/docker-compose.yml` serves a single model
+//! variant behind its own hostname; this backend holds one URL per variant
+//! and routes the request based on the [`SynthMode`] the caller picked:
 //!
-//! Gradio's HTTP call flow is a two-hop:
+//! * [`SynthMode::Preset`] → presets URL, `{voice, [instructions]}`.
+//! * [`SynthMode::Design`] → design URL, `task_type=VoiceDesign` +
+//!   `instructions` (the free-text description).
+//! * [`SynthMode::Clone`]  → clone URL, `voice=<name>` + `task_type=Base`.
+//!   The voice must have been pre-registered via [`Backend::save_prompt`].
 //!
-//! 1. `POST {base}/gradio_api/call/run_instruct` with body
-//!    `{"data": [text, language, speaker, instruct]}`. Returns
-//!    `{"event_id": "<id>"}`.
-//! 2. `GET {base}/gradio_api/call/run_instruct/{event_id}` opens an SSE
-//!    stream. We ignore `generating`/`heartbeat` frames and read the
-//!    `complete` frame's JSON payload — a `[audio_file_object, status_str]`
-//!    tuple where the audio object has a `url` (absolute) or `path`
-//!    (relative under `/gradio_api/file=`).
-//! 3. `GET {audio_url}` returns the WAV bytes; we decode via the shared
-//!    [`super::comfyui::decode_audio_chunk`] and push one [`AudioChunk`]
-//!    to the runner [`Sink`], which handles resampling to the pipewire
-//!    target rate.
+//! Endpoint: `POST /v1/audio/speech` returns the whole WAV as one binary
+//! response (Content-Type: audio/wav). No streaming, no chunking, no SSE
+//! — a single request-per-utterance flow that the shared decoder can
+//! ingest via [`super::comfyui::decode_audio_chunk`]. First-audio latency
+//! = server synth wall time + one HTTP roundtrip; on this GPU that's
+//! sub-second warm even for multi-sentence input (RTF ~0.1).
 //!
-//! No client-side chunking — the remote returns the full utterance as one
-//! WAV, and per-call round-trip overhead dominates for short text. First-
-//! audio latency = remote synthesis time + one HTTP fetch.
+//! Voice cloning uses `POST /v1/audio/voices` (multipart) to upload the
+//! reference wav ONCE. The vLLM-Omni server persists it under
+//! `SPEAKER_SAMPLES_DIR` and thereafter accepts the caller-chosen name
+//! in place of per-request `ref_audio` bytes. Storage is server-side by
+//! design — the rpg_vox `data/voices/` dir keeps only the original wav
+//! for the "listen to what you uploaded" UI, no per-voice `.bin` blob.
 
 use anyhow::{Context, Result, anyhow};
-use futures_util::StreamExt as _;
 use reqwest::Client as HttpClient;
 use serde::Deserialize;
+use serde_json::json;
 use std::time::Duration;
 use tracing::{debug, info};
 
 use super::{Sink, SavePromptOutcome, SynthMode, VoiceOverride, comfyui::decode_audio_chunk};
 
 pub struct Config {
-    /// Gradio base URL of the Qwen3-TTS-CustomVoice deploy (preset speakers
-    /// + instruct-style control). Required — this is the "always available"
-    /// mode; clone/design fall back to it if their dedicated URLs are unset.
+    /// Base URL of the CustomVoice (presets) deploy — always required.
+    /// Serves the preset speakers (Ryan/Serena/Vivian/…) plus `instructions`
+    /// style modulation. Clone / Design fall through to a clear "backend
+    /// not configured" error at synth time when their URLs are unset;
+    /// silently swapping to the presets URL would produce the wrong voice.
     pub presets_url: String,
-    /// Optional Qwen3-TTS-Base deploy URL (3-second reference-audio clone).
-    /// When None, clone-mode configs synth via the presets URL and get a
-    /// preset voice instead.
+    /// Optional Base deploy URL (3-second reference-audio clone).
     pub clone_url: Option<String>,
-    /// Optional Qwen3-TTS-VoiceDesign deploy URL. When None, design-mode
-    /// configs synth via the presets URL.
+    /// Optional VoiceDesign deploy URL (voice from free-text description).
     pub design_url: Option<String>,
-    /// One of: Serena, Vivian, Uncle Fu, Ryan, Aiden, Ono Anna, Sohee, Eric, Dylan.
+    /// Default preset speaker name (e.g. `"ryan"`). Used when a per-call
+    /// [`VoiceOverride`] doesn't specify one.
     pub speaker: String,
-    /// One of: Auto, Chinese, English, German, Italian, Portuguese, Spanish,
-    /// Japanese, Korean, French, Russian.
+    /// Default language, e.g. `"English"`. Every mode passes this through.
     pub language: String,
-    /// Optional voice-style instruction. Empty string is accepted.
+    /// Default `instructions` payload for Preset mode (voice style prompt).
+    /// Empty string is fine — Qwen3-TTS-CustomVoice accepts an empty
+    /// instructions field.
     pub instruct: String,
-    /// Per-request timeout. Sized for remote GPU synthesis of long utterances.
+    /// Per-request timeout. Sized for cold-start synth of long utterances
+    /// on the remote GPU (first call after container boot can take 20s+
+    /// while Stage-0 captures CUDA graphs).
     pub request_timeout: Duration,
 }
 
+/// `Clone` is cheap: `reqwest::Client` is `Arc<Inner>` under the hood,
+/// so clones share the connection pool + TLS state. All other fields are
+/// small `String`s. Cloneability is what lets the tts runner spawn
+/// concurrent per-request tasks against a single backend without a
+/// shared `Mutex` gate.
+#[derive(Clone)]
 pub struct Backend {
     http: HttpClient,
     presets_url: String,
@@ -103,17 +113,13 @@ impl Backend {
         })
     }
 
-    /// Route text through the mode-appropriate Gradio endpoint:
+    /// Route text through the mode-appropriate vLLM-Omni deploy. All three
+    /// paths hit the same endpoint (`/v1/audio/speech`) — only the request
+    /// body and the target host change.
     ///
-    /// * [`SynthMode::Preset`] → `run_instruct` on the presets URL, with
-    ///   optional per-call speaker/language/instruct overrides.
-    /// * [`SynthMode::Design`] → `run_voice_design` on the design URL.
-    /// * [`SynthMode::Clone`]  → upload the compact voice-prompt file to
-    ///   the clone URL's `/upload`, then `load_prompt_and_gen`.
-    ///
-    /// Clone/Design require their dedicated URL to be configured — falling
-    /// back to the presets URL would silently swap voices, which is worse
-    /// than a clear "backend not configured" error at synth time.
+    /// Clone / Design require their dedicated URL to be configured;
+    /// falling back to the presets URL would silently render the wrong
+    /// voice, so an unconfigured URL surfaces as a clear error instead.
     pub async fn synthesize(
         &mut self,
         text: &str,
@@ -126,7 +132,7 @@ impl Backend {
             .unwrap_or(&self.language)
             .to_string();
 
-        let (base_url, endpoint, event_id) = match &voice.mode {
+        let (base_url, body) = match &voice.mode {
             SynthMode::Preset => {
                 let speaker = voice.speaker.as_deref().unwrap_or(&self.speaker);
                 let instruct = voice.instruct.as_deref().unwrap_or(&self.instruct);
@@ -138,16 +144,16 @@ impl Backend {
                     instruct_chars = instruct.len(),
                     "qwen3 remote: submitting"
                 );
-                let event_id = self
-                    .submit_call(
-                        &self.presets_url,
-                        "run_instruct",
-                        // Gradio expects `data` positional in declared param
-                        // order: (text, lang_disp, spk_disp, instruct).
-                        serde_json::json!([text, language, speaker, instruct]),
-                    )
-                    .await?;
-                (self.presets_url.clone(), "run_instruct", event_id)
+                let mut body = json!({
+                    "input": text,
+                    "voice": speaker,
+                    "language": language,
+                    "response_format": "wav",
+                });
+                if !instruct.is_empty() {
+                    body["instructions"] = json!(instruct);
+                }
+                (self.presets_url.clone(), body)
             }
             SynthMode::Design { description } => {
                 let base = self.design_url.as_deref().ok_or_else(|| {
@@ -162,75 +168,54 @@ impl Backend {
                     design_chars = description.len(),
                     "qwen3 remote: submitting"
                 );
-                let event_id = self
-                    .submit_call(
-                        base,
-                        "run_voice_design",
-                        // Endpoint sig: (text, lang_disp, design).
-                        serde_json::json!([text, language, description]),
-                    )
-                    .await?;
-                (base.to_string(), "run_voice_design", event_id)
+                // VoiceDesign carries the free-text description in the
+                // `instructions` field — same slot the CustomVoice model
+                // uses for style modulation. `task_type` MUST be sent
+                // explicitly ("Other omitted values select CustomVoice;
+                // VoiceDesign must be specified explicitly" per the API
+                // reference).
+                let body = json!({
+                    "input": text,
+                    "task_type": "VoiceDesign",
+                    "instructions": description,
+                    "language": language,
+                    "response_format": "wav",
+                });
+                (base.to_string(), body)
             }
-            SynthMode::Clone {
-                voice_file_bytes,
-                voice_file_name,
-            } => {
+            SynthMode::Clone { voice_name } => {
                 let base = self.clone_url.as_deref().ok_or_else(|| {
                     anyhow!(
                         "voice profile is set to Clone mode but RPG_VOX_QWEN3_CLONE_URL is not configured"
                     )
                 })?;
-                // Upload the compact voice-prompt file so Gradio has a
-                // path we can reference in the /call body. Gradio /tmp
-                // eviction is on its background sweeper (see earlier
-                // analysis) — no cleanup call needed on our side.
-                let uploaded_path = self
-                    .upload_file(base, voice_file_name, voice_file_bytes.clone())
-                    .await?;
                 info!(
                     mode = "clone",
+                    %voice_name,
                     %language,
-                    %uploaded_path,
-                    voice_file_bytes = voice_file_bytes.len(),
                     chars = text.len(),
                     "qwen3 remote: submitting"
                 );
-                let event_id = self
-                    .submit_call(
-                        base,
-                        "load_prompt_and_gen",
-                        // Endpoint sig: (file_obj, text, lang_disp).
-                        // File params in modern Gradio APIs go as an object
-                        // with `path` + gradio.FileData meta so the server
-                        // reconstructs the FileData wrapper.
-                        serde_json::json!([
-                            {
-                                "path": uploaded_path,
-                                "orig_name": voice_file_name,
-                                "meta": {"_type": "gradio.FileData"},
-                            },
-                            text,
-                            language,
-                        ]),
-                    )
-                    .await?;
-                (base.to_string(), "load_prompt_and_gen", event_id)
+                // `task_type=Base` is required on the Base container to
+                // reach the ICL path; the voice name resolves against
+                // the server-side speaker registry (populated by
+                // [`Self::save_prompt`]).
+                let body = json!({
+                    "input": text,
+                    "voice": voice_name,
+                    "task_type": "Base",
+                    "language": language,
+                    "response_format": "wav",
+                });
+                (base.to_string(), body)
             }
             SynthMode::Copy { .. } => {
-                // Should never happen: `synthesize_profile` resolves Copy
-                // configs by cloning another config's raw output before
-                // invoking any backend. A live Copy here means the caller
-                // is bypassing `synthesize_profile` — surface it clearly.
                 return Err(anyhow!(
                     "qwen3 backend cannot synthesize a Copy-mode config directly; \
                      Copy layers are resolved inside synthesize_profile"
                 ));
             }
             SynthMode::Sample { .. } => {
-                // Same rationale as Copy above — Sample-mode configs are
-                // decoded + looped inside `synthesize_profile` and never
-                // reach a backend.
                 return Err(anyhow!(
                     "qwen3 backend cannot synthesize a Sample-mode config directly; \
                      Sample layers are resolved inside synthesize_profile"
@@ -238,21 +223,28 @@ impl Backend {
             }
         };
 
-        let audio_url = self.await_result(&base_url, endpoint, &event_id).await?;
-        let chunk_bytes = self
+        let url = format!("{base_url}/v1/audio/speech");
+        let resp = self
             .http
-            .get(&audio_url)
+            .post(&url)
+            .json(&body)
             .send()
             .await
-            .with_context(|| format!("GET {audio_url}"))?
-            .error_for_status()
-            .with_context(|| format!("GET {audio_url}"))?
+            .with_context(|| format!("POST {url}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(anyhow!(
+                "vllm-omni /v1/audio/speech returned {status}: {body_text}"
+            ));
+        }
+        let wav_bytes = resp
             .bytes()
             .await
             .context("reading qwen3 audio response body")?;
-        info!(bytes = chunk_bytes.len(), "qwen3 remote: fetched audio");
+        info!(bytes = wav_bytes.len(), "qwen3 remote: fetched audio");
 
-        let chunk = decode_audio_chunk(&chunk_bytes).context("decoding qwen3 audio")?;
+        let chunk = decode_audio_chunk(&wav_bytes).context("decoding qwen3 audio")?;
         let dur_s = chunk.samples.len() as f32 / chunk.sample_rate as f32;
         info!(
             samples = chunk.samples.len(),
@@ -264,231 +256,97 @@ impl Backend {
         Ok(())
     }
 
-    /// Distill a reference wav into a compact voice-prompt file via the
-    /// clone deploy's `/save_prompt`. Returns the raw bytes of the voice
-    /// file plus the filename Gradio gave it (extension baked in).
+    /// Register a reference audio clip with the Base container so future
+    /// synth requests can address the voice by `name` instead of shipping
+    /// `ref_audio` bytes every call.
     ///
-    /// Only reachable when the clone URL was configured at startup — the
-    /// runner dispatcher checks the active backend variant before this
-    /// method is called, so the None branch below is a safety net for
-    /// runtime config changes we don't yet support.
+    /// The vLLM-Omni server persists an extracted `.safetensors` under
+    /// `SPEAKER_SAMPLES_DIR` (bounded by `SPEAKER_MAX_UPLOADED=1000`);
+    /// once uploaded, `POST /v1/audio/speech {voice: <name>, task_type: "Base"}`
+    /// looks it up straight from the LRU without redoing feature extraction.
+    ///
+    /// `voice_id` is the caller-minted name (a UUID from rpg_vox's store)
+    /// — reused verbatim so the local DB row's primary key doubles as the
+    /// server-side speaker key. `consent` is required by the API; we fill
+    /// it with a synthetic marker since rpg_vox voices are always self-
+    /// serve (the operator uploads their own reference, no external
+    /// speaker's consent to track).
     pub async fn save_prompt(
         &self,
+        voice_id: String,
         reference_wav: Vec<u8>,
-        reference_wav_name: String,
         ref_txt: String,
-        use_xvec: bool,
     ) -> Result<SavePromptOutcome> {
         let base = self.clone_url.as_deref().ok_or_else(|| {
-            anyhow!("RPG_VOX_QWEN3_CLONE_URL is not configured; cannot save voice prompt")
+            anyhow!("RPG_VOX_QWEN3_CLONE_URL is not configured; cannot register voice")
         })?;
         info!(
             %base,
+            %voice_id,
             wav_bytes = reference_wav.len(),
             ref_txt_chars = ref_txt.len(),
-            %use_xvec,
-            "qwen3 remote: save_prompt starting"
+            "qwen3 remote: uploading voice sample"
         );
-        let uploaded_wav = self
-            .upload_file(base, &reference_wav_name, reference_wav)
-            .await?;
-        let event_id = self
-            .submit_call(
-                base,
-                "save_prompt",
-                serde_json::json!([
-                    {
-                        "path": uploaded_wav,
-                        "orig_name": reference_wav_name,
-                        "meta": {"_type": "gradio.FileData"},
-                    },
-                    ref_txt,
-                    use_xvec,
-                ]),
-            )
-            .await?;
-        let voice_file_url = self.await_result(base, "save_prompt", &event_id).await?;
-        let voice_file_bytes = self
-            .http
-            .get(&voice_file_url)
-            .send()
-            .await
-            .with_context(|| format!("GET {voice_file_url}"))?
-            .error_for_status()
-            .with_context(|| format!("GET {voice_file_url}"))?
-            .bytes()
-            .await
-            .context("reading qwen3 voice-prompt response body")?
-            .to_vec();
-        // Filename is the last path segment of the URL (strip query if any).
-        // Gradio URLs are `https://…/gradio_api/file=/tmp/gradio/hash/foo.bin`;
-        // we want `foo.bin` so the extension propagates through storage +
-        // future uploads.
-        let filename = voice_file_url
-            .rsplit('/')
-            .next()
-            .and_then(|s| s.split('?').next())
-            .unwrap_or("voice.bin")
-            .to_string();
-        info!(
-            bytes = voice_file_bytes.len(),
-            %filename,
-            "qwen3 remote: save_prompt complete"
-        );
-        Ok(SavePromptOutcome {
-            voice_file_bytes,
-            filename,
-        })
-    }
-
-    /// Push a file into a Gradio deploy's `/gradio_api/upload` endpoint and
-    /// return the server-side path we can then reference in a `/call/`
-    /// body. `filename` is used as the multipart part filename; Gradio
-    /// preserves the extension in the returned temp path.
-    async fn upload_file(
-        &self,
-        base_url: &str,
-        filename: &str,
-        bytes: Vec<u8>,
-    ) -> Result<String> {
-        let url = format!("{base_url}/gradio_api/upload");
-        let form = reqwest::multipart::Form::new().part(
-            "files",
-            reqwest::multipart::Part::bytes(bytes)
-                .file_name(filename.to_string())
-                .mime_str("application/octet-stream")
-                .context("setting upload part mime")?,
-        );
+        let url = format!("{base}/v1/audio/voices");
+        let form = reqwest::multipart::Form::new()
+            .text("name", voice_id.clone())
+            .text("consent", format!("rpg_vox:{voice_id}"))
+            .text("ref_text", ref_txt)
+            .part(
+                "audio_sample",
+                reqwest::multipart::Part::bytes(reference_wav)
+                    .file_name("reference.wav")
+                    .mime_str("audio/wav")
+                    .context("setting audio_sample mime")?,
+            );
         let resp = self
             .http
             .post(&url)
             .multipart(form)
             .send()
             .await
-            .with_context(|| format!("POST {url}"))?
-            .error_for_status()
             .with_context(|| format!("POST {url}"))?;
-        let paths: Vec<String> = resp
-            .json()
-            .await
-            .context("parsing gradio /upload response (expected string array)")?;
-        paths
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow!("gradio /upload returned empty array"))
-    }
-
-    /// Generic POST to `/gradio_api/call/{endpoint}` — returns the event id
-    /// that the SSE loop in [`Self::await_result`] then polls.
-    async fn submit_call(
-        &self,
-        base_url: &str,
-        endpoint: &str,
-        data: serde_json::Value,
-    ) -> Result<String> {
-        let url = format!("{base_url}/gradio_api/call/{endpoint}");
-        let body = serde_json::json!({ "data": data });
+        let status = resp.status();
+        let body_text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(anyhow!(
+                "vllm-omni /v1/audio/voices returned {status}: {body_text}"
+            ));
+        }
+        // Parse the {"success": true, "voice": {"name": ..., ...}} envelope
+        // to double-check the server echoed back the name we chose. Any
+        // mismatch is treated as a hard error — if the server renames
+        // voices we'd otherwise silently orphan the local row.
         #[derive(Deserialize)]
-        struct CallResp {
-            event_id: String,
+        struct VoiceEnvelope {
+            success: bool,
+            voice: Option<VoiceEcho>,
+            #[serde(default)]
+            error: Option<serde_json::Value>,
         }
-        let resp = self
-            .http
-            .post(&url)
-            .json(&body)
-            .send()
-            .await
-            .with_context(|| format!("POST {url}"))?
-            .error_for_status()
-            .with_context(|| format!("POST {url}"))?;
-        let event_id = resp
-            .json::<CallResp>()
-            .await
-            .context("parsing gradio /call response (expected {event_id: ...})")?
-            .event_id;
-        debug!(%event_id, %endpoint, "qwen3 remote: got event_id");
-        Ok(event_id)
-    }
-
-    async fn await_result(&self, base_url: &str, endpoint: &str, event_id: &str) -> Result<String> {
-        let url = format!("{base_url}/gradio_api/call/{endpoint}/{event_id}");
-        let resp = self
-            .http
-            .get(&url)
-            .send()
-            .await
-            .with_context(|| format!("GET {url}"))?
-            .error_for_status()
-            .with_context(|| format!("GET {url}"))?;
-
-        let mut stream = resp.bytes_stream();
-        let mut buf = Vec::<u8>::new();
-        let mut current_event = String::new();
-
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.context("qwen3 SSE stream error")?;
-            buf.extend_from_slice(&chunk);
-
-            while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
-                let raw: Vec<u8> = buf.drain(..=nl).collect();
-                let line = std::str::from_utf8(&raw[..raw.len().saturating_sub(1)])
-                    .unwrap_or("")
-                    .trim_end_matches('\r');
-
-                if line.is_empty() {
-                    // End of an SSE event. Keep current_event around only until
-                    // the next event's data arrives; Gradio always pairs event/
-                    // data, so this is safe to clear here.
-                    current_event.clear();
-                    continue;
-                }
-                if let Some(name) = line.strip_prefix("event:") {
-                    current_event = name.trim().to_string();
-                    debug!(event = %current_event, "qwen3 SSE event");
-                } else if let Some(payload) = line.strip_prefix("data:") {
-                    let payload = payload.trim_start();
-                    match current_event.as_str() {
-                        "complete" => {
-                            return parse_complete_payload(payload, base_url);
-                        }
-                        "error" => {
-                            return Err(anyhow!("qwen3 remote error event: {payload}"));
-                        }
-                        // Progress-only frames — Gradio emits "generating",
-                        // "heartbeat", and empty-name keepalives during long
-                        // synthesis. Log at debug and keep waiting.
-                        _ => {
-                            debug!(event = %current_event, len = payload.len(), "qwen3 SSE data");
-                        }
-                    }
-                }
-            }
+        #[derive(Deserialize)]
+        struct VoiceEcho {
+            name: String,
         }
-        Err(anyhow!(
-            "qwen3 remote: SSE stream ended without a `complete` event"
-        ))
+        let parsed: VoiceEnvelope = serde_json::from_str(&body_text).with_context(|| {
+            format!("parsing /v1/audio/voices envelope: {body_text}")
+        })?;
+        if !parsed.success {
+            return Err(anyhow!(
+                "vllm-omni /v1/audio/voices reported failure: {:?}",
+                parsed.error
+            ));
+        }
+        let echoed = parsed
+            .voice
+            .ok_or_else(|| anyhow!("/v1/audio/voices success=true but voice field missing"))?
+            .name;
+        if echoed != voice_id {
+            return Err(anyhow!(
+                "vllm-omni echoed voice name {echoed:?} but we requested {voice_id:?}"
+            ));
+        }
+        debug!(voice_name = %echoed, "qwen3 remote: voice registered");
+        Ok(SavePromptOutcome { voice_name: echoed })
     }
-}
-
-fn parse_complete_payload(payload: &str, base_url: &str) -> Result<String> {
-    let val: serde_json::Value = serde_json::from_str(payload)
-        .with_context(|| format!("parsing qwen3 complete-event JSON: {payload}"))?;
-    let arr = val
-        .as_array()
-        .ok_or_else(|| anyhow!("qwen3 complete payload not a JSON array: {payload}"))?;
-    let file = arr
-        .first()
-        .ok_or_else(|| anyhow!("qwen3 complete payload is empty: {payload}"))?;
-
-    // Newer Gradio: absolute `url`. Older / self-hosted variants: `path`
-    // relative to /gradio_api/file=.
-    if let Some(url) = file.get("url").and_then(|v| v.as_str()) {
-        return Ok(url.to_string());
-    }
-    if let Some(path) = file.get("path").and_then(|v| v.as_str()) {
-        return Ok(format!("{base_url}/gradio_api/file={path}"));
-    }
-    Err(anyhow!(
-        "qwen3 complete payload had no `url` or `path` field: {payload}"
-    ))
 }

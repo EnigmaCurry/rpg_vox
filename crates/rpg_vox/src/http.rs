@@ -95,12 +95,16 @@ use axum::{
     body::Bytes,
     extract::{DefaultBodyLimit, Path, Query, State},
     http::{HeaderMap, HeaderName, StatusCode, header},
-    response::{IntoResponse, Response},
+    response::{
+        IntoResponse, Response,
+        sse::{Event as SseEventFrame, KeepAlive, Sse},
+    },
     routing::{get, post},
 };
+use futures_util::stream::{self, Stream};
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, mpsc::Sender, oneshot};
+use tokio::sync::{Mutex, Semaphore, mpsc, mpsc::Sender, oneshot};
 use tracing::info;
 use uuid::Uuid;
 
@@ -113,7 +117,7 @@ use crate::monitor;
 use crate::pw_source::{GraphSnapshot, PwClient, SinkRole};
 use crate::script;
 use crate::settings::{self, SettingsUpdate};
-use crate::store::{AgentField, DEFAULT_AGENT_ID, ScriptBlockRow, ScriptTakeRow, ScriptTurnRow, Store, UpdateResult};
+use crate::store::{AgentField, AgentRow, DEFAULT_AGENT_ID, ScriptBlockRow, ScriptTakeRow, ScriptTurnRow, Store, UpdateResult};
 
 /// Sentinel value for an agent voice slot that the user has explicitly
 /// silenced. Distinguished from `NULL` (which means "unset — use the DSP
@@ -573,12 +577,17 @@ async fn resolve_character_configs(
             .unwrap_or(legacy_profile_mode);
         let (mode, speaker, instruct) = match mode_str {
             "clone" => {
+                // Voice id is the vLLM-Omni server-side voice name. We
+                // only verify it's in our manifest (the server holds the
+                // actual embedding); no bytes flow through the tts runner
+                // — clone synth becomes a single JSON POST with the name.
                 let voice_id = c.get("voiceFileId").and_then(|v| v.as_str())?;
-                let (bytes, filename) = state.store.get_voice_bytes(voice_id.to_string()).await.ok()??;
+                if !state.store.voice_exists(voice_id.to_string()).await.ok()? {
+                    return None;
+                }
                 (
                     crate::tts::SynthMode::Clone {
-                        voice_file_bytes: bytes,
-                        voice_file_name: filename,
+                        voice_name: voice_id.to_string(),
                     },
                     None,
                     None,
@@ -875,6 +884,10 @@ pub async fn serve(
         .route(
             "/scripts/:id/turns/:turn_id/resynth",
             post(script_resynth_user_turn),
+        )
+        .route(
+            "/scripts/:id/rerender-all",
+            post(script_rerender_all),
         )
         .route("/scripts/:id/reply", post(script_send_reply))
         .route("/scripts/:id/title", post(scripts_generate_title))
@@ -2336,6 +2349,376 @@ async fn script_block_add_take(
         }),
     )
         .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// /scripts/:id/rerender-all — batch re-synthesis of every target in the
+// script via one client call. Server iterates the target list with a
+// bounded semaphore (16 concurrent), delegating each item to the existing
+// single-target code paths' guts (inlined here to keep the batch loop
+// self-contained and its errors surfaceable as per-item SSE events rather
+// than short-circuiting the whole run). Progress streams as SSE:
+//
+//   event: start    data: {"total": N}
+//   event: item     data: {"index":k, "kind":..., ok:true/false, ...}
+//   event: complete data: {"succeeded":..., "failed":..., "wall_ms":...}
+//
+// The client's for-loop over resynth/take endpoints used to serialize the
+// whole render behind one HTTP + one tts::Command at a time; now the tts
+// runner (see MAX_CONCURRENT_QWEN3_SYNTH) spawns per-request Qwen3 calls
+// so the vLLM-Omni scheduler can actually batch. Items complete out of
+// order — each carries its own `index` so the client can reorder for
+// playback without waiting for the whole batch to finish.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct RerenderTarget {
+    /// `"user"` (user turn — GM-proxy synth) or `"block"` (assistant block
+    /// — new take). Anything else surfaces as a per-item error.
+    kind: String,
+    #[serde(rename = "turnId", default)]
+    turn_id: Option<String>,
+    #[serde(rename = "blockId", default)]
+    block_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RerenderAllBody {
+    #[serde(default, rename = "agentId")]
+    agent_id: Option<String>,
+    #[serde(default, rename = "projectId")]
+    project_id: Option<String>,
+    targets: Vec<RerenderTarget>,
+}
+
+/// Concurrent user-turn resynth. Inlines `script_resynth_user_turn`'s
+/// core work sans HTTP-response wrapping, so per-item errors can be sent
+/// as SSE events instead of aborting the whole batch.
+async fn rerender_user_turn_inline(
+    state: &AppState,
+    script_id: &str,
+    turn_id: &str,
+    agent_row: Option<&AgentRow>,
+    body_project_id: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    let turn = state
+        .store
+        .get_turn(script_id.to_string(), turn_id.to_string())
+        .await
+        .map_err(|e| format!("store: turn lookup: {e:#}"))?
+        .ok_or_else(|| format!("no turn {turn_id}"))?;
+    if turn.role != "user" {
+        return Err("resynth only applies to user turns".into());
+    }
+    let user_voice_character: Option<String> =
+        agent_row.and_then(|a| a.voice_user.clone());
+    let project_id: Option<String> = body_project_id
+        .map(str::to_string)
+        .or_else(|| agent_row.and_then(|a| a.project_id.clone()));
+
+    let new_widget_id = synth_gm_proxy_widget(
+        state,
+        turn.content.clone(),
+        user_voice_character.as_deref(),
+        project_id.as_deref(),
+    )
+    .await;
+
+    // If synth produced nothing we do NOT touch the DB — a transient
+    // failure under concurrent load shouldn't cost the user an audio
+    // clip they already had. This is a deliberate divergence from the
+    // single-target script_resynth_user_turn handler, which clears the
+    // widget on failure. Surfacing the error via SSE lets the client
+    // show it without losing state.
+    let Some(new_id) = new_widget_id else {
+        return Err("synth produced no widget (silence or transient failure); prior widget preserved".into());
+    };
+
+    match state
+        .store
+        .set_turn_widget_id(
+            script_id.to_string(),
+            turn_id.to_string(),
+            Some(new_id.clone()),
+        )
+        .await
+    {
+        Ok(UpdateResult::Updated) => {}
+        Ok(UpdateResult::NotFound) => {
+            let _ = state.store.delete_widget(new_id).await;
+            return Err(format!("no turn {turn_id}"));
+        }
+        Err(err) => {
+            let _ = state.store.delete_widget(new_id).await;
+            return Err(format!("store: turn widget swap: {err:#}"));
+        }
+    }
+
+    // Only remove the prior widget AFTER the new one is safely persisted
+    // on the turn — same ordering as the single-target handler, so a mid-
+    // op crash can leak an unreferenced row but never leaves the turn
+    // pointing at a deleted widget.
+    if let Some(prior) = turn.widget_id {
+        if let Err(err) = state.store.delete_widget(prior.clone()).await {
+            tracing::warn!(id = %prior, err = %format!("{err:#}"),
+                "prior widget cleanup after rerender-all resynth failed");
+        }
+    }
+
+    Ok(serde_json::json!({
+        "widgetId": new_id,
+    }))
+}
+
+/// Concurrent block-take render. Inlines `script_block_add_take`'s core
+/// work using the agent's default voice slot (no client-supplied config
+/// overrides — batch rerender always uses the current defaults, matching
+/// what the browser's per-item POSTs used to send).
+async fn rerender_block_inline(
+    state: &AppState,
+    block_id: &str,
+    agent_row: Option<&AgentRow>,
+    body_project_id: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    let info = state
+        .store
+        .get_block_info(block_id.to_string())
+        .await
+        .map_err(|e| format!("store: block lookup: {e:#}"))?
+        .ok_or_else(|| format!("no block {block_id}"))?;
+    let text = info.text;
+
+    // Same slot-lookup path as script_block_add_take with an empty
+    // configs body: agent's role-appropriate voice slot wins, silence
+    // sentinel or unset falls back to the hardcoded DSP for the role.
+    let slot_character: Option<String> = agent_row
+        .and_then(|a| match info.role.as_str() {
+            "narrator" => a.voice_narrator.clone(),
+            _ => a.voice_character.clone(),
+        });
+    let configs = match slot_character.as_deref() {
+        Some(VOICE_SILENCE) | None => default_configs_for_role(&info.role),
+        Some(cid) => resolve_character_configs(state, cid, None)
+            .await
+            .unwrap_or_else(|| default_configs_for_role(&info.role)),
+    };
+    let project_id = body_project_id
+        .map(str::to_string)
+        .or_else(|| agent_row.and_then(|a| a.project_id.clone()));
+    let persist_instruct = configs.first().and_then(|c| c.instruct.clone());
+
+    let clip = render_clip(state, text.clone(), configs, project_id.as_deref())
+        .await
+        .map_err(|(_code, msg)| msg)?;
+    let widget_id = state
+        .store
+        .create_widget(
+            text,
+            persist_instruct,
+            clip.sample_rate,
+            clip.duration_ms,
+            clip.wav.clone(),
+        )
+        .await
+        .map_err(|e| format!("store: create widget: {e:#}"))?;
+    let take_row = match state
+        .store
+        .append_take(block_id.to_string(), widget_id.clone())
+        .await
+    {
+        Ok(Some(row)) => row,
+        Ok(None) => {
+            let _ = state.store.delete_widget(widget_id).await;
+            return Err(format!("no block {block_id}"));
+        }
+        Err(err) => {
+            return Err(format!("store: append take: {err:#}"));
+        }
+    };
+
+    // FIFO cap on takes per block — same 3-cap constant the single-take
+    // handler uses. Duplicated intentionally to keep this helper
+    // standalone; the value is small enough that DRY-ing across two
+    // sites would trade clarity for one avoided literal.
+    const MAX_TAKES_PER_BLOCK: usize = 3;
+    if let Ok(pruned) = state
+        .store
+        .prune_block_takes(block_id.to_string(), MAX_TAKES_PER_BLOCK)
+        .await
+    {
+        for wid in pruned {
+            let _ = state.store.delete_widget(wid).await;
+        }
+    }
+
+    Ok(serde_json::json!({
+        "take": {
+            "id": take_row.id,
+            "ord": take_row.ord,
+            "widget_id": take_row.widget_id,
+            "sample_rate": clip.sample_rate,
+            "duration_ms": clip.duration_ms,
+        },
+        "sample_rate": clip.sample_rate,
+        "duration_ms": clip.duration_ms,
+    }))
+}
+
+/// SSE-streamed batch rerender. Spawns per-target tasks bounded by a
+/// semaphore matching the tts runner's Qwen3 concurrency limit, so the
+/// vLLM-Omni scheduler sees a steady 16-way saturation instead of a
+/// serial trickle.
+async fn script_rerender_all(
+    State(state): State<AppState>,
+    Path(script_id): Path<String>,
+    Json(body): Json<RerenderAllBody>,
+) -> Sse<impl Stream<Item = Result<SseEventFrame, std::convert::Infallible>>> {
+    // Resolve agent + project once so per-item tasks don't each re-hit the
+    // store. Cloneable so every spawned task gets an owned copy.
+    let agent_row = match body.agent_id.as_deref().filter(|s| !s.is_empty()) {
+        Some(aid) => state.store.get_agent(aid.to_string()).await.ok().flatten(),
+        None => None,
+    };
+    let body_project_id = body.project_id.clone().filter(|s| !s.is_empty());
+
+    let total = body.targets.len();
+    let (tx, rx) = mpsc::channel::<SseEventFrame>(64);
+    // Cap in-flight tasks at the tts runner's per-backend limit so the
+    // work here doesn't oversubscribe the mpsc between us and the tts
+    // runner (the runner then oversubscribes vLLM-Omni's scheduler).
+    let semaphore = Arc::new(Semaphore::new(crate::tts::MAX_CONCURRENT_QWEN3_SYNTH));
+    let start_wall = std::time::Instant::now();
+
+    // Spawner task: sends `start`, fans out per-target tasks, waits for
+    // all replies, sends `complete`. Runs independently of the response
+    // path so we can return the SSE stream to axum immediately and the
+    // client starts consuming events as they land.
+    let script_id_clone = script_id.clone();
+    tokio::spawn(async move {
+        // start
+        let _ = tx
+            .send(
+                SseEventFrame::default()
+                    .event("start")
+                    .data(serde_json::json!({ "total": total }).to_string()),
+            )
+            .await;
+
+        let mut handles = Vec::with_capacity(total);
+        for (index, target) in body.targets.into_iter().enumerate() {
+            let permit = match semaphore.clone().acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => break,
+            };
+            let state = state.clone();
+            let tx = tx.clone();
+            let agent_row = agent_row.clone();
+            let body_project_id = body_project_id.clone();
+            let script_id = script_id_clone.clone();
+            handles.push(tokio::spawn(async move {
+                let _permit = permit;
+                let item_start = std::time::Instant::now();
+                let (ok, payload) = match target.kind.as_str() {
+                    "user" => match target.turn_id.as_deref() {
+                        Some(tid) => match rerender_user_turn_inline(
+                            &state,
+                            &script_id,
+                            tid,
+                            agent_row.as_ref(),
+                            body_project_id.as_deref(),
+                        )
+                        .await
+                        {
+                            Ok(v) => (true, v),
+                            Err(msg) => (false, serde_json::json!({ "error": msg })),
+                        },
+                        None => (false, serde_json::json!({ "error": "user target missing turnId" })),
+                    },
+                    "block" => match target.block_id.as_deref() {
+                        Some(bid) => match rerender_block_inline(
+                            &state,
+                            bid,
+                            agent_row.as_ref(),
+                            body_project_id.as_deref(),
+                        )
+                        .await
+                        {
+                            Ok(v) => (true, v),
+                            Err(msg) => (false, serde_json::json!({ "error": msg })),
+                        },
+                        None => (false, serde_json::json!({ "error": "block target missing blockId" })),
+                    },
+                    other => (
+                        false,
+                        serde_json::json!({ "error": format!("unknown target kind: {other}") }),
+                    ),
+                };
+                let wall_ms = item_start.elapsed().as_millis() as u64;
+                let mut event = serde_json::json!({
+                    "index": index,
+                    "kind": target.kind,
+                    "ok": ok,
+                    "wall_ms": wall_ms,
+                });
+                // Merge payload fields into the event so per-kind data
+                // (widgetId / take / error) rides alongside the framing
+                // fields without a nested object.
+                if let Some(obj) = payload.as_object() {
+                    if let Some(merged) = event.as_object_mut() {
+                        for (k, v) in obj {
+                            merged.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+                let _ = tx
+                    .send(
+                        SseEventFrame::default()
+                            .event("item")
+                            .data(event.to_string()),
+                    )
+                    .await;
+            }));
+        }
+
+        // Wait for everything before emitting `complete`. Failed joins
+        // are counted as failures — we can't tell what index panicked
+        // from here so the aggregate `failed` count includes them.
+        let mut succeeded = 0u64;
+        let mut failed = 0u64;
+        for h in handles {
+            match h.await {
+                Ok(()) => succeeded += 1,
+                Err(_) => failed += 1,
+            }
+        }
+        // NB: succeeded/failed above counts task completions, not the
+        // per-item ok flag. The client already has per-item outcomes from
+        // the item events; this is a diagnostic sanity check.
+        let wall_ms = start_wall.elapsed().as_millis() as u64;
+        let _ = tx
+            .send(
+                SseEventFrame::default()
+                    .event("complete")
+                    .data(
+                        serde_json::json!({
+                            "total": total,
+                            "task_succeeded": succeeded,
+                            "task_failed": failed,
+                            "wall_ms": wall_ms,
+                        })
+                        .to_string(),
+                    ),
+            )
+            .await;
+        // Drop tx → stream closes on the client side.
+    });
+
+    // 15 s keepalive comment; browsers close idle SSE at ~30 s
+    // otherwise. Doesn't affect our per-item event cadence.
+    Sse::new(stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|ev| (Ok(ev), rx))
+    }))
+    .keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(15)))
 }
 
 #[derive(Debug, Deserialize)]
@@ -4125,13 +4508,15 @@ async fn image_delete_handler(
 }
 
 // ---------------------------------------------------------------------------
-// /voices — persistent compact voice-prompt files distilled from a user-
-// supplied reference audio via the Qwen3 clone deploy's `/save_prompt`.
-// Roundtrip: client POSTs the reference wav bytes (raw body) with metadata
-// on the query string; server uploads to Gradio, calls save_prompt, GETs
-// back the tiny voice-prompt file, stores it under `data/voices/{id}` and
-// returns the id. Downstream synth reads the bytes and re-uploads to
-// Gradio's /load_prompt_and_gen on every take (see SynthMode::Clone).
+// /voices — voice-clone registrations against vLLM-Omni's speaker
+// registry. Roundtrip: client POSTs the reference wav bytes (raw body)
+// with metadata on the query string; server mints a UUID up front and
+// forwards it as the voice name to `POST /v1/audio/voices` on the Base
+// container. On success the local DB row + reference wav land under
+// `data/voices/{id}.wav` (kept only for the "listen to what you uploaded"
+// UI) and the id is returned. Downstream synth just POSTs
+// `{voice: <id>, task_type: "Base"}` — no bytes ever flow through the
+// tts runner after the initial upload (see SynthMode::Clone).
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
@@ -4143,19 +4528,7 @@ struct VoiceCreateQuery {
     /// client's text wins and STT is skipped.
     #[serde(default)]
     ref_txt: Option<String>,
-    /// Toggle for Qwen3-TTS-Base's x-vector embedding path. `true` (default)
-    /// uses the x-vector encoder; `false` skips it. Passed straight through
-    /// to save_prompt.
-    #[serde(default = "default_use_xvec")]
-    use_xvec: bool,
-    /// Original filename of the uploaded wav, used verbatim for the
-    /// Gradio multipart upload. Defaults to `reference.wav` since Gradio
-    /// only cares about the extension.
-    #[serde(default = "default_ref_wav_name")]
-    filename: String,
 }
-fn default_use_xvec() -> bool { true }
-fn default_ref_wav_name() -> String { "reference.wav".to_string() }
 
 async fn voice_create_handler(
     State(state): State<AppState>,
@@ -4238,17 +4611,24 @@ async fn voice_create_handler(
         }
     };
 
+    // Mint the id here so it doubles as the vLLM-Omni voice name. The
+    // tts runner uploads under that name; on success we write the local
+    // DB row + reference wav. If registration fails we never touch the
+    // store, so a rejected upload leaves no orphan on the rpg_vox side.
+    let voice_id = uuid::Uuid::new_v4().to_string();
+    let ref_wav_bytes = body.to_vec();
+
     // Fire the save_prompt command through the tts runner so the qwen3
-    // backend (if active) can do the Gradio roundtrip. Any non-qwen3
-    // backend replies with a clear "not supported" that we forward as a
-    // 400 — the UI hides clone-mode when the backend isn't qwen3, so
-    // reaching this branch means the client raced a settings change.
+    // backend (if active) can hit /v1/audio/voices on the clone
+    // container. Any non-qwen3 backend replies with a clear "not
+    // supported" that we forward as a 400 — the UI hides clone-mode
+    // when the backend isn't qwen3, so reaching this branch means the
+    // client raced a settings change.
     let (reply_tx, reply_rx) = oneshot::channel();
     let cmd = tts::Command::SavePrompt(tts::SavePromptRequest {
-        reference_wav: body.to_vec(),
-        reference_wav_name: q.filename,
+        voice_id: voice_id.clone(),
+        reference_wav: ref_wav_bytes.clone(),
         ref_txt: ref_txt.clone(),
-        use_xvec: q.use_xvec,
         reply: reply_tx,
     });
     if state.tts.send(cmd).await.is_err() {
@@ -4273,26 +4653,19 @@ async fn voice_create_handler(
     };
     match state
         .store
-        .create_voice(
-            outcome.voice_file_bytes.clone(),
-            outcome.filename.clone(),
-            Some(body.to_vec()),
-        )
+        .create_voice(outcome.voice_name.clone(), Some(ref_wav_bytes))
         .await
     {
         Ok(id) => {
             info!(
                 %id,
-                bytes = outcome.voice_file_bytes.len(),
-                filename = %outcome.filename,
-                "voice-prompt stored"
+                voice_name = %outcome.voice_name,
+                "voice registered with vllm-omni + local manifest updated"
             );
             (
                 StatusCode::CREATED,
                 Json(serde_json::json!({
                     "id": id,
-                    "filename": outcome.filename,
-                    "size": outcome.voice_file_bytes.len(),
                     // Echo back whatever text ended up feeding save_prompt
                     // (either the client's typed value, or the STT result)
                     // so the client can populate the description field.

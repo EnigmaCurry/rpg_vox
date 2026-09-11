@@ -447,6 +447,89 @@ export async function resynthUserTurn(scriptId, turnId, agentId = null, projectI
   return await r.json();
 }
 
+/// Kick off a server-side batch rerender of every target in `targets` and
+/// invoke the callbacks as SSE events stream in. Server bounds concurrency
+/// at MAX_CONCURRENT_QWEN3_SYNTH (16) so the vLLM-Omni scheduler stays
+/// saturated instead of trickling one clip at a time.
+///
+/// Signature intentionally callback-based (not async-iterator) so the
+/// caller can update Svelte reactive state directly in the item handler
+/// without wrapping in a generator boundary.
+///
+/// The returned promise resolves when the stream ends normally, rejects
+/// if the initial POST fails. Individual per-item failures surface via
+/// `onItem` with `ok: false` + `error` and don't reject the outer promise.
+///
+/// `signal` is an optional AbortSignal — abort mid-stream cancels the
+/// client-side reader; server-side tasks already in flight continue to
+/// completion (their results are just discarded).
+export async function rerenderAllStream(scriptId, {
+  agentId = null,
+  projectId = null,
+  targets,
+  onStart = null,
+  onItem = null,
+  onComplete = null,
+  signal = null,
+} = {}) {
+  const body = { targets };
+  if (agentId) body.agentId = agentId;
+  if (projectId) body.projectId = projectId;
+  const r = await fetch(
+    `/scripts/${encodeURIComponent(scriptId)}/rerender-all`,
+    {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', accept: 'text/event-stream' },
+      body: JSON.stringify(body),
+      signal,
+    },
+  );
+  if (!r.ok) {
+    const detail = await r.text().catch(() => `HTTP ${r.status}`);
+    throw new Error(detail || `HTTP ${r.status}`);
+  }
+  const reader = r.body.getReader();
+  const decoder = new TextDecoder('utf-8');
+  // Simple SSE frame parser: split on double-newlines, then per frame
+  // gather event/data lines. Enough for our server's shape (one event
+  // per frame, one data line per frame). Not a general-purpose SSE
+  // implementation — no `id:` or `retry:` handling.
+  let buf = '';
+  const flushFrame = (frame) => {
+    let ev = 'message';
+    const dataLines = [];
+    for (const line of frame.split('\n')) {
+      if (line.startsWith('event:')) ev = line.slice(6).trim();
+      else if (line.startsWith('data:')) dataLines.push(line.slice(5).trim());
+      // `:` prefix = keepalive comment, ignored
+    }
+    if (dataLines.length === 0) return;
+    let payload;
+    try {
+      payload = JSON.parse(dataLines.join('\n'));
+    } catch (e) {
+      console.warn('rerenderAllStream: bad JSON in SSE frame', ev, e);
+      return;
+    }
+    if (ev === 'start' && onStart) onStart(payload);
+    else if (ev === 'item' && onItem) onItem(payload);
+    else if (ev === 'complete' && onComplete) onComplete(payload);
+  };
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let sep;
+    while ((sep = buf.indexOf('\n\n')) !== -1) {
+      const frame = buf.slice(0, sep);
+      buf = buf.slice(sep + 2);
+      if (frame.trim()) flushFrame(frame);
+    }
+  }
+  // Flush any trailing frame without a terminating blank line
+  if (buf.trim()) flushFrame(buf);
+}
+
 export async function editUserTurn(scriptId, turnId, text, agentId = null, projectId = null) {
   const body = { text };
   if (agentId) body.agentId = agentId;

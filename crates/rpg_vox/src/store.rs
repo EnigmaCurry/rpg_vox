@@ -95,10 +95,14 @@ CREATE TABLE IF NOT EXISTS agents (
     created_at        INTEGER NOT NULL,
     updated_at        INTEGER NOT NULL
 );
--- Compact voice-prompt files (the output of Qwen3 /save_prompt). Bytes on
--- disk under `data/voices/{id}.bin`; the row is the manifest. `filename`
--- preserves the extension the Gradio server handed us so we can round-
--- trip it on future uploads without guessing.
+-- Voice-clone manifest. Since we moved to vLLM-Omni server-side named
+-- voices, the row exists purely to (a) confirm an id was registered
+-- with the Base server and (b) enumerate registrations from the local
+-- side. The server holds the actual embedding under
+-- `SPEAKER_SAMPLES_DIR`; `id` doubles as the vLLM-Omni voice name.
+-- `filename` and `byte_size` are vestigial (kept to avoid a schema
+-- migration on existing installs) — `filename` is always empty and
+-- `byte_size` records the original reference wav's size for reference.
 CREATE TABLE IF NOT EXISTS voices (
     id           TEXT PRIMARY KEY,
     filename     TEXT NOT NULL,
@@ -232,50 +236,41 @@ impl Store {
         self.images_dir.join(id)
     }
 
-    pub fn voice_path(&self, id: &str) -> PathBuf {
-        self.voices_dir.join(id)
-    }
-
-    /// Path to the original reference wav that produced this voice-prompt
-    /// file. Kept for user review (a play button in the Characters UI so
-    /// people can hear what they uploaded); NEVER used by the synth path.
+    /// Path to the original reference wav that was uploaded to register
+    /// this voice. Kept for user review (a play button in the Characters
+    /// UI so people can hear what they uploaded); NEVER used by the
+    /// synth path — the vLLM-Omni server holds the extracted embedding
+    /// and addresses it by voice name.
     pub fn voice_reference_path(&self, id: &str) -> PathBuf {
         self.voices_dir.join(format!("{id}.wav"))
     }
 
-    /// Persist a compact voice-prompt file (bytes returned from Qwen3
-    /// `/save_prompt`) alongside the original reference wav. `filename`
-    /// is preserved verbatim so we can round-trip it on future Gradio
-    /// uploads (the extension matters — .bin vs .pt). `reference_wav`
-    /// is optional: when None we skip writing the review-playback file
-    /// (e.g. an admin-uploaded voice-prompt without an original recording).
+    /// Record that a voice was registered with the vLLM-Omni Base server
+    /// under the caller-minted `id` (used verbatim as the server-side
+    /// speaker name). `reference_wav` is optional and only kept locally
+    /// so the operator can play back what they uploaded — the actual
+    /// embedding lives on the server.
     pub async fn create_voice(
         &self,
-        bytes: Vec<u8>,
-        filename: String,
+        id: String,
         reference_wav: Option<Vec<u8>>,
     ) -> Result<String> {
-        let id = Uuid::new_v4().to_string();
         let now = unix_now();
-        let byte_size = bytes.len() as i64;
+        let byte_size = reference_wav.as_ref().map(|w| w.len() as i64).unwrap_or(0);
         let db = self.db.clone();
         let id_clone = id.clone();
-        let filename_clone = filename.clone();
         tokio::task::spawn_blocking(move || -> Result<()> {
             let conn = db.lock().unwrap();
             conn.execute(
                 "INSERT INTO voices (id, filename, byte_size, created_at)
                  VALUES (?1, ?2, ?3, ?4)",
-                params![id_clone, filename_clone, byte_size, now],
+                params![id_clone, "", byte_size, now],
             )?;
             Ok(())
         })
         .await
         .context("db task panicked")??;
 
-        tokio::fs::write(self.voice_path(&id), bytes)
-            .await
-            .with_context(|| format!("writing voice bytes for {id}"))?;
         if let Some(wav) = reference_wav {
             tokio::fs::write(self.voice_reference_path(&id), wav)
                 .await
@@ -285,37 +280,36 @@ impl Store {
         Ok(id)
     }
 
-    /// Read a voice-prompt file back off disk alongside its stored filename.
-    /// Returns `Ok(None)` when the row doesn't exist so callers can
-    /// distinguish "unknown id" from a real I/O error.
-    pub async fn get_voice_bytes(&self, id: String) -> Result<Option<(Vec<u8>, String)>> {
+    /// Confirm a voice id exists in the local manifest. The id doubles
+    /// as the vLLM-Omni voice name, so a `true` return means the caller
+    /// can build [`SynthMode::Clone { voice_name: id }`] directly.
+    /// Returns `Ok(false)` for unknown ids so callers can distinguish
+    /// "unknown voice" from a real I/O error.
+    pub async fn voice_exists(&self, id: String) -> Result<bool> {
         let db = self.db.clone();
         let id_clone = id.clone();
-        let row: Option<String> = tokio::task::spawn_blocking(move || -> Result<Option<String>> {
+        tokio::task::spawn_blocking(move || -> Result<bool> {
             let conn = db.lock().unwrap();
             let row = conn
                 .query_row(
-                    "SELECT filename FROM voices WHERE id = ?1",
+                    "SELECT 1 FROM voices WHERE id = ?1",
                     params![id_clone],
-                    |r| r.get::<_, String>(0),
+                    |_| Ok(()),
                 )
                 .optional()?;
-            Ok(row)
+            Ok(row.is_some())
         })
         .await
-        .context("db task panicked")??;
-        let Some(filename) = row else {
-            return Ok(None);
-        };
-        let bytes = tokio::fs::read(self.voice_path(&id))
-            .await
-            .with_context(|| format!("reading voice bytes for {id}"))?;
-        Ok(Some((bytes, filename)))
+        .context("db task panicked")?
     }
 
-    /// Drop a voice by id: DB row first, then the on-disk file. Missing
+    /// Drop a voice by id: DB row first, then the reference wav. Missing
     /// file is not an error (partial state from a crash mid-write); a
     /// missing row is reported via `UpdateResult::NotFound`.
+    ///
+    /// The vLLM-Omni server keeps its copy of the embedding until its
+    /// own LRU evicts (`SPEAKER_MAX_UPLOADED`); orphan cleanup on that
+    /// side is a follow-up if we ever churn voices faster than the cap.
     pub async fn delete_voice(&self, id: String) -> Result<UpdateResult> {
         let db = self.db.clone();
         let id_clone = id.clone();
@@ -326,7 +320,6 @@ impl Store {
         })
         .await
         .context("db task panicked")??;
-        let _ = tokio::fs::remove_file(self.voice_path(&id)).await;
         let _ = tokio::fs::remove_file(self.voice_reference_path(&id)).await;
         Ok(if rows == 0 {
             UpdateResult::NotFound
@@ -1524,6 +1517,7 @@ pub struct TurnLookup {
     pub widget_id: Option<String>,
 }
 
+#[derive(Clone)]
 pub struct AgentRow {
     pub id: String,
     pub name: String,
