@@ -37,7 +37,10 @@
 //         ringHz, ringMix,                 // true ring mod, `x·sin(2πf t)` (hz 0 = off)
 //         reverbMix,                       // Freeverb-lite wet/dry (0 = off)
 //         reverbRoom, reverbDamp,          // reverb feedback + HF damping (0..1)
-//         reverbTailMs,                    // fixed audible tail length ms (fade to 0)
+//         fadeMs,                          // symmetric linear fade-in/out (0 = off)
+//                                          // pads sample buffers by 2× and shifts
+//                                          // TTS voices in the same profile so they
+//                                          // sit inside the sample's steady middle.
 //       }],
 //     }],
 //     avatar: dataUrl | null,
@@ -214,12 +217,15 @@ export const CONFIG_RING_HZ_RANGE     = { min: 0,    max: 3000, step: 1 };
 export const CONFIG_RING_MIX_RANGE    = { min: 0,    max: 1,    step: 0.05 };
 // Freeverb-lite reverb. `reverbMix` is wet/dry; `reverbRoom` maps to
 // feedback in [0.7, 0.98]; `reverbDamp` is HF loss in the feedback loop.
-// `reverbTailMs` is the fixed audible tail — the wet fades to 0 across this
-// window regardless of `reverbRoom`, so every clip has the same outro shape.
+// The audible reverb tail is a fixed 500 ms internal window regardless of
+// `reverbRoom`, so every clip has the same outro shape.
 export const CONFIG_REVERB_MIX_RANGE  = { min: 0,    max: 1,    step: 0.05 };
 export const CONFIG_REVERB_ROOM_RANGE = { min: 0,    max: 1,    step: 0.05 };
 export const CONFIG_REVERB_DAMP_RANGE = { min: 0,    max: 1,    step: 0.05 };
-export const CONFIG_REVERB_TAIL_RANGE = { min: 0,    max: 3000, step: 50 };
+// Symmetric linear fade-in/fade-out envelope in ms. Meaningful on sample-
+// mode voices to smooth abrupt drone start/stop; when set, any TTS voices
+// in the same profile automatically shift into the sample's steady region.
+export const CONFIG_FADE_MS_RANGE     = { min: 0,    max: 3000, step: 50 };
 
 function clampNumber(value, fallback, min, max) {
   const n = Number(value);
@@ -270,7 +276,7 @@ function makeConfig({
   reverbMix = 0,
   reverbRoom = 0.7,
   reverbDamp = 0.5,
-  reverbTailMs = 500,
+  fadeMs = 0,
 } = {}) {
   return {
     id: uuid(),
@@ -299,7 +305,7 @@ function makeConfig({
     reverbMix,
     reverbRoom,
     reverbDamp,
-    reverbTailMs,
+    fadeMs,
   };
 }
 
@@ -363,7 +369,7 @@ function sanitizeConfig(raw, defaultMode = DEFAULT_VOICE_MODE) {
     reverbMix:        clampNumber(c.reverbMix,        0,   CONFIG_REVERB_MIX_RANGE.min,  CONFIG_REVERB_MIX_RANGE.max),
     reverbRoom:       clampNumber(c.reverbRoom,       0.7, CONFIG_REVERB_ROOM_RANGE.min, CONFIG_REVERB_ROOM_RANGE.max),
     reverbDamp:       clampNumber(c.reverbDamp,       0.5, CONFIG_REVERB_DAMP_RANGE.min, CONFIG_REVERB_DAMP_RANGE.max),
-    reverbTailMs:     clampNumber(c.reverbTailMs,     500, CONFIG_REVERB_TAIL_RANGE.min, CONFIG_REVERB_TAIL_RANGE.max),
+    fadeMs:           clampNumber(c.fadeMs,           0,   CONFIG_FADE_MS_RANGE.min,     CONFIG_FADE_MS_RANGE.max),
   };
 }
 
@@ -950,21 +956,13 @@ export function deleteVoiceProfile(characterId, profileId) {
   return { ok: true };
 }
 
-/** Append a new config to a profile. When the profile already has configs,
- *  the new one clones the last config's speaker/language/instruct so layering
- *  another voice onto a hive-mind is one click; effect knobs reset to identity
- *  so the added layer starts neutral. */
+/** Append a new default-valued config to a profile. */
 export function addProfileConfig(characterId, profileId) {
   const character = scenesState.characters.find((c) => c.id === characterId);
   if (!character) return null;
   const profile = character.voiceProfiles.find((p) => p.id === profileId);
   if (!profile) return null;
-  const seed = profile.configs[profile.configs.length - 1];
-  const config = makeConfig(
-    seed
-      ? { speaker: seed.speaker, language: seed.language, instruct: seed.instruct }
-      : {},
-  );
+  const config = makeConfig();
   profile.configs.push(config);
   return config.id;
 }
@@ -1070,9 +1068,9 @@ export function updateProfileConfig(characterId, profileId, configId, patch) {
     config.reverbDamp = clampNumber(patch.reverbDamp, config.reverbDamp,
       CONFIG_REVERB_DAMP_RANGE.min, CONFIG_REVERB_DAMP_RANGE.max);
   }
-  if (patch.reverbTailMs !== undefined) {
-    config.reverbTailMs = clampNumber(patch.reverbTailMs, config.reverbTailMs,
-      CONFIG_REVERB_TAIL_RANGE.min, CONFIG_REVERB_TAIL_RANGE.max);
+  if (patch.fadeMs !== undefined) {
+    config.fadeMs = clampNumber(patch.fadeMs, config.fadeMs,
+      CONFIG_FADE_MS_RANGE.min, CONFIG_FADE_MS_RANGE.max);
   }
 }
 

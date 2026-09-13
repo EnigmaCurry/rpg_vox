@@ -283,15 +283,19 @@
 
   /// Toggle Play All: if a queue is already running, stop it; otherwise
   /// kick off a fresh top-of-conversation walk. Shift-click on the idle
-  /// button re-renders every assistant take from scratch — the canonical
-  /// escape hatch after editing the project Dictionary, swapping a
-  /// character voice, or otherwise changing what synthesis would produce
-  /// for the transcript's existing text. Ignored while a queue is
-  /// already playing so a slip on the Stop click can't accidentally
-  /// nuke every take.
-  function togglePlayAll(ev) {
+  /// button re-renders every assistant take from scratch and then plays
+  /// the transcript — the canonical escape hatch after editing the
+  /// project Dictionary, swapping a character voice, or otherwise
+  /// changing what synthesis would produce for the transcript's existing
+  /// text. Ignored while a queue is already playing so a slip on the
+  /// Stop click can't accidentally nuke every take.
+  async function togglePlayAll(ev) {
     if (isRerendering) { cancelRerenderAll(); return; }
-    if (ev?.shiftKey && !isPlayingAll) { rerenderAll(); return; }
+    if (ev?.shiftKey && !isPlayingAll) {
+      const ok = await rerenderAll();
+      if (ok) playAll();
+      return;
+    }
     if (isPlayingAll) cancelPlayAll();
     else playAll();
   }
@@ -329,7 +333,7 @@
   }
 
   async function rerenderAll() {
-    if (isRerendering) return;
+    if (isRerendering) return false;
     // Same "clear any in-flight audio" guard as playAll — the takes about
     // to be replaced may be mid-playback through the mic, and we don't
     // want to keep hearing the stale version while the new synth runs.
@@ -365,7 +369,7 @@
         }
       }
     }
-    if (targets.length === 0) return;
+    if (targets.length === 0) return false;
 
     isRerendering = true;
     rerenderStopRequested = false;
@@ -526,6 +530,9 @@
       // red in the console alongside the per-clip [rerenderAll] errors.
       if (benchFail > 0) console.error(summary);
       else console.log(summary);
+      // Captured before finally resets rerenderStopRequested — JS keeps
+      // this return value even though the finally block runs after.
+      return !stoppedEarly;
     } catch (e) {
       if (e?.name === 'AbortError') {
         console.log('[bench] rerenderAll: aborted by user');
@@ -533,6 +540,7 @@
         console.error('rerenderAll: stream failed', e);
         error = String(e?.message || e);
       }
+      return false;
     } finally {
       isRerendering = false;
       rerenderStopRequested = false;

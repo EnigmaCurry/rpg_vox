@@ -33,7 +33,7 @@
     CONFIG_REVERB_MIX_RANGE,
     CONFIG_REVERB_ROOM_RANGE,
     CONFIG_REVERB_DAMP_RANGE,
-    CONFIG_REVERB_TAIL_RANGE,
+    CONFIG_FADE_MS_RANGE,
   } from '../lib/scenes.svelte.js';
   import {
     createVoice, deleteVoice, uploadImage, voiceReferenceUrl,
@@ -955,16 +955,16 @@
                                     <span class="unit">×</span>
                                   </label>
                                   <label class="fx">
-                                    <span>Tail</span>
+                                    <span>Fade</span>
                                     <input
                                       type="number"
-                                      min={CONFIG_REVERB_TAIL_RANGE.min}
-                                      max={CONFIG_REVERB_TAIL_RANGE.max}
-                                      step={CONFIG_REVERB_TAIL_RANGE.step}
-                                      value={config.reverbTailMs}
-                                      oninput={(e) => onConfigNumberInput(character.id, profile.id, config.id, 'reverbTailMs', e)}
-                                      aria-label="Reverb tail length in milliseconds"
-                                      title="Fixed audible tail length (ms). Wet fades to zero across this window so short and long clips share the same outro. Independent of Room feedback."
+                                      min={CONFIG_FADE_MS_RANGE.min}
+                                      max={CONFIG_FADE_MS_RANGE.max}
+                                      step={CONFIG_FADE_MS_RANGE.step}
+                                      value={config.fadeMs}
+                                      oninput={(e) => onConfigNumberInput(character.id, profile.id, config.id, 'fadeMs', e)}
+                                      aria-label="Symmetric fade-in / fade-out length in milliseconds"
+                                      title="Symmetric linear fade-in and fade-out (ms). Meant for sample-mode drones so they don't click at start/stop. When set on any voice in the profile, TTS voices automatically start after the fade-in and end before the fade-out — the sample envelope wraps the spoken audio."
                                     />
                                     <span class="unit">ms</span>
                                   </label>

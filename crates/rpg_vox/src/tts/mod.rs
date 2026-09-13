@@ -207,20 +207,21 @@ pub struct VoiceConfig {
     /// `(1-mix)·dry + mix·wet`; the tail extension is `wet · fade`.
     pub reverb_mix: f32,
     /// Freeverb "room size" — feedback in the parallel comb filters,
-    /// mapped into `[0.7, 0.98]`. Higher = longer natural decay. Doesn't
-    /// change the audible tail length because `reverb_tail_ms` windows
-    /// the wet signal to a fixed duration regardless of feedback.
+    /// mapped into `[0.7, 0.98]`. Higher = longer natural decay. The
+    /// audible tail is windowed to a fixed 500ms internally so decay
+    /// always dies within the same duration regardless of feedback.
     pub reverb_room: f32,
     /// HF damping inside each comb's feedback loop, 0..1. Zero = bright
     /// / metallic, 1 = dark / muffled tail.
     pub reverb_damp: f32,
-    /// Fixed audible tail length in milliseconds. The buffer is grown by
-    /// this many samples past the dry end; the wet output is linearly
-    /// faded from 1→0 across the tail so decay always dies within the
-    /// window regardless of what `reverb_room` is set to. Zero uses the
-    /// default (500ms). Same time for every clip so short and long
-    /// utterances share the same trailing envelope.
-    pub reverb_tail_ms: f32,
+    /// Symmetric linear amplitude fade applied at the start AND end of
+    /// the final mono buffer, in milliseconds. Zero disables. Primary
+    /// use is smoothing the abrupt starts/ends of looped `Sample` drones
+    /// (motor buzz, atmospheric texture) so they don't click when the
+    /// clip begins or ends. Clamped at runtime so a fade longer than
+    /// half the buffer just meets in the middle (triangular envelope)
+    /// instead of overlapping.
+    pub fade_ms: f32,
 }
 
 impl Default for VoiceConfig {
@@ -247,7 +248,7 @@ impl Default for VoiceConfig {
             reverb_mix: 0.0,
             reverb_room: 0.7,
             reverb_damp: 0.5,
-            reverb_tail_ms: 500.0,
+            fade_ms: 0.0,
         }
     }
 }
@@ -1004,16 +1005,58 @@ async fn synthesize_profile(
         .max()
         .unwrap_or(0);
 
+    // Profile-level fade envelope. `fade_ms` is per-voice in the config,
+    // but the profile takes the MAX so every sample voice shares one
+    // envelope shape AND any TTS voice can shift out of the fade region
+    // to sit inside the sample's steady middle:
+    //
+    //   sample:  [fade_in][────── steady ──────][fade_out]
+    //   TTS:              [── speech ──]
+    //
+    // With profile_fade_samples > 0, sample buffers grow by 2× that pad
+    // so the extra head/tail slots hold the fade ramps; non-sample voices
+    // shift into the mix by the same pad so their speech lands in the
+    // steady middle.
+    let profile_fade_ms = configs
+        .iter()
+        .map(|c| c.fade_ms.max(0.0))
+        .fold(0.0f32, f32::max);
+    let profile_fade_samples = (profile_fade_ms * target_rate as f32 / 1000.0) as usize;
+
+    // Voice i is "sample-aligned" if it's Sample-mode or a Copy chain
+    // terminating in one. Sample-aligned voices carry the fade envelope
+    // (extended buffer, apply_fade); everyone else shifts by
+    // profile_fade_samples in the mix. Walks the chain iteratively with
+    // a step cap so a mis-configured cycle can't loop forever (the
+    // dedicated cycle check below still runs).
+    let resolves_to_sample = |start: usize| -> bool {
+        let mut i = start;
+        for _ in 0..configs.len() {
+            match &configs[i].mode {
+                SynthMode::Sample { .. } => return true,
+                SynthMode::Copy { from_index } => i = *from_index,
+                _ => return false,
+            }
+        }
+        false
+    };
+    let is_sample_aligned: Vec<bool> =
+        (0..configs.len()).map(resolves_to_sample).collect();
+
     // Await the sample decoders we launched before backend synth. Under a
     // heavy-backend profile these have long since finished; under an
     // all-sample profile the awaits are the actual wait. Then loop each
-    // decoded buffer to the target length (fast — plain memcpy).
+    // decoded buffer to the target length (fast — plain memcpy). Length
+    // is padded by 2× profile_fade_samples so the fade ramps have room
+    // without eating into either the TTS-alignment window or an
+    // all-sample profile's natural playback.
     for (i, handle_opt) in sample_decode_handles.iter_mut().enumerate() {
         if let Some(handle) = handle_opt.take() {
             let decoded = handle
                 .await
                 .map_err(|e| format!("sample.decode task for voice {i} panicked: {e}"))??;
-            let target_len = if max_synth_len > 0 { max_synth_len } else { decoded.len() };
+            let base_target = if max_synth_len > 0 { max_synth_len } else { decoded.len() };
+            let target_len = base_target + 2 * profile_fade_samples;
             let _s = tracing::info_span!("sample.loop", voice = i).entered();
             raws[i] = Some(loop_to_length(decoded, target_len));
         }
@@ -1083,9 +1126,15 @@ async fn synthesize_profile(
             reverb_mix: cc.reverb_mix,
             reverb_room: cc.reverb_room,
             reverb_damp: cc.reverb_damp,
-            reverb_tail_ms: cc.reverb_tail_ms,
         };
         let gain_db = cc.gain_db;
+        // Only sample-aligned voices carry the fade envelope. Non-sample
+        // voices instead get shifted in the mix (see stereo_mix below)
+        // so their speech falls inside the sample's steady region.
+        // Applied post-effects but pre-FX so reverb tails naturally past
+        // the faded end instead of stacking a second fade on the same
+        // samples.
+        let fade_samples = if is_sample_aligned[i] { profile_fade_samples } else { 0 };
         let render_span = render_span.clone();
         handles.push(tokio::task::spawn_blocking(
             move || -> Result<Vec<f32>, String> {
@@ -1101,6 +1150,10 @@ async fn synthesize_profile(
                     )
                     .map_err(|e| format!("{e:#}"))?
                 };
+                if fade_samples > 0 {
+                    let _s = tracing::info_span!("apply_fade").entered();
+                    apply_fade(&mut processed, fade_samples);
+                }
                 apply_fx_chain(&mut processed, target_rate, &fx);
                 let gain_lin = 10f32.powf(gain_db / 20.0);
                 let with_gain: Vec<f32> = if (gain_lin - 1.0).abs() < f32::EPSILON {
@@ -1116,27 +1169,31 @@ async fn synthesize_profile(
     // Join in original config order so `layers[i]` still aligns with
     // `configs[i]` for the mix step's pan / delay reads. Iterating rather
     // than try_join_all keeps the error site (JoinError vs DSP Err) obvious.
-    let mut layers: Vec<(Vec<f32>, &VoiceConfig)> = Vec::with_capacity(configs.len());
+    // The extra `usize` is the fade-alignment offset: non-sample voices
+    // shift by profile_fade_samples so their speech lands inside the
+    // sample's steady middle; sample-aligned voices start at 0.
+    let mut layers: Vec<(Vec<f32>, &VoiceConfig, usize)> = Vec::with_capacity(configs.len());
     for (i, handle) in handles.into_iter().enumerate() {
         let samples = handle
             .await
             .map_err(|e| format!("voice.dsp task for voice {i} panicked: {e}"))??;
-        layers.push((samples, &configs[i]));
+        let base_offset = if is_sample_aligned[i] { 0 } else { profile_fade_samples };
+        layers.push((samples, &configs[i], base_offset));
     }
 
     let _mix_span = tracing::info_span!("stereo_mix").entered();
     let total_len = layers
         .iter()
-        .map(|(s, c)| {
+        .map(|(s, c, base)| {
             let delay_samples = delay_ms_to_samples(c.delay_ms, target_rate);
-            delay_samples + s.len()
+            base + delay_samples + s.len()
         })
         .max()
         .unwrap_or(0);
     let mut mix: Vec<[f32; 2]> = vec![[0.0, 0.0]; total_len];
-    for (samples, cc) in &layers {
+    for (samples, cc, base) in &layers {
         let (l_gain, r_gain) = pan_gains(cc.pan);
-        let delay_samples = delay_ms_to_samples(cc.delay_ms, target_rate);
+        let delay_samples = delay_ms_to_samples(cc.delay_ms, target_rate) + base;
         for (i, &s) in samples.iter().enumerate() {
             let idx = delay_samples + i;
             if idx >= mix.len() {
@@ -1318,7 +1375,6 @@ struct FxParams {
     reverb_mix: f32,
     reverb_room: f32,
     reverb_damp: f32,
-    reverb_tail_ms: f32,
 }
 
 /// Apply the "FX" chain (bandpass → saturation → bit-crush → AM → ring mod
@@ -1376,14 +1432,7 @@ fn apply_fx_chain(buf: &mut Vec<f32>, sample_rate: u32, p: &FxParams) {
     }
     if p.reverb_mix > 0.0 {
         let _s = tracing::info_span!("fx.reverb").entered();
-        apply_reverb(
-            buf,
-            sample_rate,
-            p.reverb_mix,
-            p.reverb_room,
-            p.reverb_damp,
-            p.reverb_tail_ms,
-        );
+        apply_reverb(buf, sample_rate, p.reverb_mix, p.reverb_room, p.reverb_damp);
     }
 }
 
@@ -1482,31 +1531,25 @@ fn apply_ring_mod(buf: &mut [f32], sample_rate: u32, hz: f32, mix: f32) {
 }
 
 /// Freeverb-lite: 8 parallel comb filters (LPF in the feedback path) summed
-/// into 4 series Schroeder allpasses. The buffer grows by `tail_ms` samples
-/// past the dry end so the natural decay is audible; the wet component is
-/// linearly faded from 1→0 across that window so the tail dies within
-/// `tail_ms` regardless of how long `room` would let it ring naturally.
-/// A constant tail length keeps the trailing envelope identical for every
-/// utterance — short and long clips share the same "outro."
+/// into 4 series Schroeder allpasses. The buffer grows by a fixed
+/// [`REVERB_TAIL_MS`] past the dry end so the natural decay is audible;
+/// the wet component is linearly faded from 1→0 across that window so the
+/// tail dies within that duration regardless of how long `room` would let
+/// it ring naturally. A constant tail length keeps the trailing envelope
+/// identical for every utterance — short and long clips share the same
+/// "outro."
 ///
 /// Delay tunings and gain constants are lifted from Jezar's original
 /// Freeverb (input_gain=0.015, room→feedback maps into [0.7, 0.98],
 /// damp scales into the LPF one-pole coefficient), scaled from the 44.1 kHz
 /// reference to the current sample rate.
-fn apply_reverb(
-    buf: &mut Vec<f32>,
-    sample_rate: u32,
-    mix: f32,
-    room: f32,
-    damp: f32,
-    tail_ms: f32,
-) {
+const REVERB_TAIL_MS: f32 = 500.0;
+fn apply_reverb(buf: &mut Vec<f32>, sample_rate: u32, mix: f32, room: f32, damp: f32) {
     let mix = mix.clamp(0.0, 1.0);
     if mix <= f32::EPSILON || buf.is_empty() {
         return;
     }
-    let tail_ms = if tail_ms <= 0.0 { 500.0 } else { tail_ms };
-    let tail_samples = (tail_ms * sample_rate as f32 / 1000.0) as usize;
+    let tail_samples = (REVERB_TAIL_MS * sample_rate as f32 / 1000.0) as usize;
     let dry_len = buf.len();
     let total_len = dry_len + tail_samples;
 
@@ -1588,6 +1631,29 @@ fn apply_reverb(
     }
 
     *buf = out;
+}
+
+/// Symmetric linear amplitude fade at both ends of the mono buffer. The
+/// requested window is clamped to at most half the buffer so an oversized
+/// value on a short clip meets in the middle as a triangle rather than
+/// double-attenuating the middle samples. Purpose: kill the click at the
+/// start and end of looped `Sample` drones (motor buzz, atmospheric
+/// texture) whose waveform doesn't naturally land on zero crossings at
+/// the buffer boundaries. The caller pre-converts ms to samples because
+/// the coordination that pairs this envelope with the TTS mix offset
+/// lives in `synthesize_profile`.
+fn apply_fade(buf: &mut [f32], fade_samples: usize) {
+    if buf.is_empty() || fade_samples == 0 {
+        return;
+    }
+    let fade_samples = fade_samples.min(buf.len() / 2).max(1);
+    let denom = fade_samples as f32;
+    for i in 0..fade_samples {
+        let g = (i + 1) as f32 / denom;
+        buf[i] *= g;
+        let j = buf.len() - 1 - i;
+        buf[j] *= g;
+    }
 }
 
 /// Decode a user-uploaded sample clip (wav / flac / ogg / mp3 — anything

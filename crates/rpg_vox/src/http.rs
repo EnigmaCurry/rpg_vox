@@ -248,7 +248,7 @@ struct ConfigBody {
     #[serde(default)]
     reverb_damp: Option<f32>,
     #[serde(default)]
-    reverb_tail_ms: Option<f32>,
+    fade_ms: Option<f32>,
 }
 
 impl ConfigBody {
@@ -280,7 +280,7 @@ impl ConfigBody {
             reverb_mix: self.reverb_mix.unwrap_or(0.0),
             reverb_room: self.reverb_room.unwrap_or(0.7),
             reverb_damp: self.reverb_damp.unwrap_or(0.5),
-            reverb_tail_ms: self.reverb_tail_ms.unwrap_or(500.0),
+            fade_ms: self.fade_ms.unwrap_or(0.0),
         }
     }
 }
@@ -567,7 +567,7 @@ async fn resolve_character_configs(
         let reverb_mix      = read_f("reverbMix",      0.0);
         let reverb_room     = read_f("reverbRoom",     0.7);
         let reverb_damp     = read_f("reverbDamp",     0.5);
-        let reverb_tail_ms  = read_f("reverbTailMs",   500.0);
+        let fade_ms         = read_f("fadeMs",         0.0);
         // Per-config mode wins over the legacy profile-level mode. Any
         // unknown string falls back to the legacy profile mode, which in
         // turn defaults to "presets" above.
@@ -678,7 +678,7 @@ async fn resolve_character_configs(
             reverb_mix,
             reverb_room,
             reverb_damp,
-            reverb_tail_ms,
+            fade_ms,
         });
     }
     if out.is_empty() { None } else { Some(out) }
