@@ -506,6 +506,15 @@
     playingTimeMs = 0;
     clipAudioEl.play().catch((e) => console.warn('clip play failed', e));
     ensureRaf();
+    // Completed (saved) recordings: also copy the transcript text so
+    // clicking a clip serves as one-click preview + grab. Skipped for
+    // the in-flight active recording where the user is usually still
+    // capturing rather than harvesting text.
+    const isSaved =
+      recordingId != null && state?.activeRecording?.id !== recordingId;
+    if (isSaved) {
+      void copyEntryText(entry);
+    }
   }
 
   function stopPlayback() {
@@ -889,6 +898,7 @@
   <div
     class="clip-btn"
     class:playing={isClipPlayingNow(entry)}
+    class:copied={copiedEntryId === entry.id}
     class:tts={channel === 'TTS'}
   >
     {#if isClipPlayingNow(entry)}
@@ -1441,6 +1451,14 @@
   .clip-btn.playing {
     border-color: rgba(122,162,255,0.6);
     box-shadow: 0 0 0 1px rgba(122,162,255,0.35);
+  }
+  /* Brief green outline pulse on saved-recording clips whose text was
+     just copied to the clipboard. Uses a distinct color from
+     `.playing` so both cues can co-exist when a click both plays and
+     copies. */
+  .clip-btn.copied {
+    border-color: rgba(46, 204, 74, 0.55);
+    box-shadow: 0 0 0 1px rgba(46, 204, 74, 0.25);
   }
   .clip-btn.tts { background: rgba(255,204,102,0.06); }
   /* Animated fill: absolute overlay behind the button content whose
