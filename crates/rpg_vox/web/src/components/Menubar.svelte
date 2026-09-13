@@ -19,6 +19,7 @@
       ],
     },
     { href: '#/mixer',    label: 'Mixer',    match: (r) => r === '/mixer' },
+    { href: '#/record',   label: 'Record',   match: (r) => r === '/record' },
     { href: '#/settings', label: 'Settings', match: (r) => r === '/settings' },
   ];
 

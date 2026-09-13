@@ -1,7 +1,7 @@
 <script>
   import { onMount } from 'svelte';
   import { route } from './lib/router.js';
-  import { startHealthPoll, restorePwMonitorFromPref } from './lib/stores.js';
+  import { startHealthPoll, startRecordingPoll, restorePwMonitorFromPref } from './lib/stores.js';
   import { restoreFromPref as restoreBrowserMonitor } from './lib/browserMonitor.js';
   import Menubar from './components/Menubar.svelte';
   import Projects from './routes/Projects.svelte';
@@ -10,6 +10,7 @@
   import Scenes from './routes/Scenes.svelte';
   import Script from './routes/Script.svelte';
   import Mixer from './routes/Mixer.svelte';
+  import Record from './routes/Record.svelte';
   import Settings from './routes/Settings.svelte';
   import NotFound from './routes/NotFound.svelte';
 
@@ -27,6 +28,7 @@
     '/script':     Script,
     '/chat':       Script,
     '/mixer':      Mixer,
+    '/record':     Record,
     '/settings':   Settings,
   };
 
@@ -47,11 +49,13 @@
   // full-bleed too rather than centering under the 720px cap.
   const isFullBleed = $derived(
     $route === '/scenes' || $route === '/speak'
+      || $route === '/record'
       || $route.startsWith('/script') || $route.startsWith('/chat'),
   );
 
   onMount(() => {
     startHealthPoll();
+    startRecordingPoll();
     // Auto-restore the browser monitor if the user had it enabled in a
     // previous session. Deferred to the first user gesture inside the
     // helper if the browser blocks AudioContext creation.

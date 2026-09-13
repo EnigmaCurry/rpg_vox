@@ -20,6 +20,14 @@ export function setPwMonitorPref(name) {
 // call the reload* helpers on mount.
 
 export const health       = writable('checking');   // 'checking' | 'ok' | 'err'
+/// Cross-route recording status. Set by the poll loop below whenever
+/// GET /record's `activeRecording` field changes shape. Consumers can
+/// subscribe from anywhere (Menubar, Record page, future badges) without
+/// each one running its own poll timer. Shape when recording:
+///   { active: true, id, name, startedAt, durationMs }
+/// Shape when idle:
+///   { active: false }
+export const recordingStatus = writable({ active: false });
 export const settings     = writable(null);
 export const workflows    = writable([]);
 export const graph        = writable(null);
@@ -57,6 +65,40 @@ export function startHealthPoll() {
   };
   tick();
   healthTimer = setInterval(tick, 5000);
+}
+
+// --- Recording status poll (started once from App) --------------------------
+//
+// One second is fast enough for the Menubar's hh:mm timer to feel live and
+// for the RECORDING banner to appear promptly after Start/Stop; slower
+// than that would let the timer visibly lag the wall clock. The Record
+// page still polls faster on its own for the transcript list — this
+// timer is only for the cross-route status header.
+let recordingTimer = null;
+export function startRecordingPoll() {
+  if (recordingTimer) return;
+  const tick = async () => {
+    let state = null;
+    try {
+      state = await api.getRecordState();
+    } catch {
+      return; // keep the previous value; network hiccup is transient
+    }
+    const ar = state?.activeRecording ?? null;
+    if (!ar) {
+      recordingStatus.set({ active: false });
+      return;
+    }
+    recordingStatus.set({
+      active: true,
+      id: ar.id,
+      name: ar.name,
+      startedAt: (ar.created_at ?? ar.createdAt) ?? null,
+      durationMs: ar.duration_ms ?? ar.durationMs ?? 0,
+    });
+  };
+  tick();
+  recordingTimer = setInterval(tick, 1000);
 }
 
 // --- Settings panel poll (only while /settings is mounted) ------------------

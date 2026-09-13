@@ -3,7 +3,7 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
 use clap::Parser;
@@ -125,6 +125,31 @@ struct Args {
     /// Queryable with `sqlite3`; a proper API is planned.
     #[arg(long, env = "DISCORD_VOX_METADATA_DB")]
     metadata_db: Option<PathBuf>,
+
+    /// Base URL of an rpg_vox instance to feed speaker-attribution hints
+    /// to. When set, discord_vox fires `POST {url}/record/hint` on every
+    /// Discord speaking event so rpg_vox can attribute VAD-detected
+    /// utterances on a pre-mixed vox channel to a specific Discord user.
+    /// Leave unset to disable hint sending entirely (feature is opt-in
+    /// — rpg_vox is an optional peer).
+    #[arg(long, env = "DISCORD_VOX_RPG_VOX_URL")]
+    rpg_vox_url: Option<String>,
+
+    /// Optional Vox channel selector to include in each hint (one of
+    /// `vox`, `vox2`, ..., matching rpg_vox's pipewire node suffixes).
+    /// Omit when the bot's mic feed is routed into whatever vox channel
+    /// the user happened to pick — rpg_vox then treats the hint as
+    /// applying to any slot.
+    #[arg(long, env = "DISCORD_VOX_RPG_VOX_CHANNEL")]
+    rpg_vox_channel: Option<String>,
+
+    /// Per-user throttle in milliseconds for outbound hints. VoiceTick
+    /// fires every 20 ms; without a throttle we'd hammer rpg_vox with
+    /// 50 identical hints/second per active speaker. 500 ms keeps the
+    /// ring fresh (rpg_vox's finalize lookup window is 5 s) without
+    /// being noisy.
+    #[arg(long, env = "DISCORD_VOX_RPG_VOX_HINT_INTERVAL_MS", default_value_t = 500)]
+    rpg_vox_hint_interval_ms: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -247,6 +272,112 @@ impl MediaSource for PcmSource {
     }
 }
 
+/// Sends "who's talking" hints to a peer rpg_vox instance so it can
+/// attribute VAD-detected utterances on a pre-mixed vox channel back
+/// to a specific Discord user.
+///
+/// The client shares its `display_names` cache with the existing
+/// SpeakingStateUpdate → fetch_display_name flow — that path already
+/// resolves the guild nickname / global name for each SSRC it sees, so
+/// hooking in there gives us a free per-user name lookup with the same
+/// invalidation semantics (updated whenever Discord fires a fresh
+/// speaking-state for a user).
+///
+/// Per-user throttled so a 20 ms VoiceTick loop doesn't hammer rpg_vox
+/// with 50 hints/second per active speaker. rpg_vox's finalize lookup
+/// window (5 s) means even a slow cadence keeps attribution accurate.
+struct HintClient {
+    http: reqwest::Client,
+    endpoint: String,
+    channel: Option<String>,
+    interval: Duration,
+    /// Last successful hint dispatch per user id — throttle gate.
+    last_sent: Mutex<HashMap<u64, Instant>>,
+    /// UserId → resolved display name. Populated by the SpeakingStateUpdate
+    /// path's async fetch; consulted on every VoiceTick before sending.
+    display_names: Arc<Mutex<HashMap<u64, String>>>,
+}
+
+impl HintClient {
+    /// Build the client from CLI config. Returns `None` when the rpg_vox
+    /// URL is unset (feature disabled). Trailing slashes on the base URL
+    /// are trimmed so `http://host:7331` and `http://host:7331/` both work.
+    fn from_args(
+        rpg_vox_url: Option<&str>,
+        channel: Option<&str>,
+        interval_ms: u64,
+    ) -> Option<Arc<Self>> {
+        let base = rpg_vox_url?.trim_end_matches('/').to_string();
+        let endpoint = format!("{base}/record/hint");
+        // Short connect + total timeout — hint delivery is a nicety, not
+        // a critical path, and we don't want a hung POST to leak tasks.
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .ok()?;
+        Some(Arc::new(Self {
+            http,
+            endpoint,
+            channel: channel.map(str::to_string),
+            interval: Duration::from_millis(interval_ms),
+            last_sent: Mutex::new(HashMap::new()),
+            display_names: Arc::new(Mutex::new(HashMap::new())),
+        }))
+    }
+
+    /// Cache a freshly-resolved display name so subsequent hints for
+    /// this user id can include it. Called from the same async task
+    /// that populates the recorder's display-name map.
+    fn note_display_name(&self, uid: u64, name: &str) {
+        self.display_names
+            .lock()
+            .unwrap()
+            .insert(uid, name.to_string());
+    }
+
+    /// Dispatch a hint for `uid` if the throttle window has elapsed
+    /// and we have a display name cached. Silently skips otherwise —
+    /// a missing name usually means the SpeakingStateUpdate fetch is
+    /// still in flight; a following VoiceTick will pick it up.
+    ///
+    /// Fire-and-forget: the actual POST runs on a detached task so
+    /// VoiceTick's 20 ms cadence isn't gated on network latency.
+    fn maybe_send(&self, uid: u64) {
+        let now = Instant::now();
+        {
+            let mut ls = self.last_sent.lock().unwrap();
+            if let Some(t) = ls.get(&uid) {
+                if now.duration_since(*t) < self.interval {
+                    return;
+                }
+            }
+            ls.insert(uid, now);
+        }
+        let speaker = match self.display_names.lock().unwrap().get(&uid).cloned() {
+            Some(name) => name,
+            None => return,
+        };
+        let http = self.http.clone();
+        let endpoint = self.endpoint.clone();
+        let channel = self.channel.clone();
+        tokio::spawn(async move {
+            let body = match channel {
+                Some(ch) => serde_json::json!({ "speaker": speaker, "channel": ch }),
+                None => serde_json::json!({ "speaker": speaker }),
+            };
+            match http.post(&endpoint).json(&body).send().await {
+                Ok(r) if r.status().is_success() => {}
+                Ok(r) => {
+                    tracing::debug!(status = %r.status(), "rpg_vox rejected speaker hint");
+                }
+                Err(err) => {
+                    tracing::debug!(err = %err, "rpg_vox hint POST failed");
+                }
+            }
+        });
+    }
+}
+
 struct Handler {
     guild_id: GuildId,
     channel_id: ChannelId,
@@ -274,6 +405,10 @@ struct Handler {
     /// VoiceTick routing can look up which user an incoming SSRC belongs
     /// to. Shared with both VoiceReceiver clones.
     ssrc_map: Arc<Mutex<HashMap<u32, u64>>>,
+    /// Optional speaker-hint client. `None` disables the feature entirely;
+    /// Some(...) posts hints to a peer rpg_vox instance on every
+    /// VoiceTick where a user has decoded audio.
+    hint_client: Option<Arc<HintClient>>,
     /// True iff we currently believe we are connected to the voice channel.
     joined: AtomicBool,
     /// Serialises reconcile() so overlapping voice_state_update events can't
@@ -345,15 +480,20 @@ impl Handler {
             None
         };
 
-        // Register receive-side event handlers whenever we need decoded voice
-        // (recording, per-user audio outputs, or both). Without either, the
-        // songbird DecodeMode is DEFAULT (Decrypt only) and no decoded PCM
-        // would arrive anyway.
-        let need_receiver = rec.is_some() || !self.audio_outputs.is_empty();
+        // Register receive-side event handlers whenever any downstream
+        // consumer needs the events: recording, per-user audio outputs,
+        // or the rpg_vox hint client (which needs SpeakingStateUpdate
+        // for name resolution and VoiceTick for the per-frame speaker
+        // set). Without any of these, the songbird DecodeMode is
+        // DEFAULT (Decrypt only) and no decoded PCM would arrive anyway.
+        let need_receiver = rec.is_some()
+            || !self.audio_outputs.is_empty()
+            || self.hint_client.is_some();
         if need_receiver {
             let mut driver = call.lock().await;
             driver.remove_all_global_events();
             let recorder_arc = rec.as_ref().map(Arc::clone);
+            let hint_client_arc = self.hint_client.as_ref().map(Arc::clone);
             let make_receiver = || VoiceReceiver {
                 recorder: recorder_arc.as_ref().map(Arc::clone),
                 guild_id: self.guild_id,
@@ -361,6 +501,7 @@ impl Handler {
                 metadata: self.metadata.clone(),
                 audio_outputs: Arc::clone(&self.audio_outputs),
                 ssrc_map: Arc::clone(&self.ssrc_map),
+                hint_client: hint_client_arc.as_ref().map(Arc::clone),
             };
             driver.add_global_event(CoreEvent::SpeakingStateUpdate.into(), make_receiver());
             driver.add_global_event(CoreEvent::VoiceTick.into(), make_receiver());
@@ -490,6 +631,7 @@ struct VoiceReceiver {
     metadata: Option<Arc<metadata::MetadataDb>>,
     audio_outputs: Arc<HashMap<u64, Arc<Mutex<rtrb::Producer<f32>>>>>,
     ssrc_map: Arc<Mutex<HashMap<u32, u64>>>,
+    hint_client: Option<Arc<HintClient>>,
 }
 
 #[async_trait]
@@ -509,12 +651,20 @@ impl VoiceEventHandler for VoiceReceiver {
                     let recorder = self.recorder.as_ref().map(Arc::clone);
                     let guild_id = self.guild_id;
                     let metadata = self.metadata.clone();
+                    let hint_client = self.hint_client.as_ref().map(Arc::clone);
                     tokio::spawn(async move {
                         if let Some(name) =
                             fetch_display_name(&http, guild_id, uid, metadata.as_deref()).await
                         {
                             if let Some(rec) = &recorder {
                                 rec.note_display_name(uid, &name);
+                            }
+                            // Share the resolved name with the hint
+                            // client so subsequent VoiceTick fires can
+                            // include the user's readable label instead
+                            // of just their user id.
+                            if let Some(hc) = &hint_client {
+                                hc.note_display_name(uid, &name);
                             }
                         }
                     });
@@ -526,6 +676,23 @@ impl VoiceEventHandler for VoiceReceiver {
                     .iter()
                     .filter_map(|(&ssrc, data)| data.decoded_voice.as_deref().map(|d| (ssrc, d)))
                     .collect();
+
+                // Fire speaker hints for every user with decoded audio
+                // this tick. The hint client throttles per-user so
+                // ~20 ms VoiceTick cadence doesn't fan out into a POST
+                // storm. Unknown SSRCs (no SpeakingStateUpdate yet) are
+                // skipped; the next VoiceTick after the mapping
+                // arrives will pick them up.
+                if let Some(hc) = &self.hint_client {
+                    if !pcm.is_empty() {
+                        let ssrc_map = self.ssrc_map.lock().unwrap();
+                        for &ssrc in pcm.keys() {
+                            if let Some(&uid) = ssrc_map.get(&ssrc) {
+                                hc.maybe_send(uid);
+                            }
+                        }
+                    }
+                }
                 // Extracting the raw Opus payload from an RTP packet Discord
                 // handed us requires three trims:
                 //   1. RTP header (via rtp.payload()).
@@ -795,6 +962,20 @@ async fn main() -> Result<()> {
     }
     let audio_outputs = Arc::new(audio_outputs);
 
+    let hint_client = HintClient::from_args(
+        args.rpg_vox_url.as_deref(),
+        args.rpg_vox_channel.as_deref(),
+        args.rpg_vox_hint_interval_ms,
+    );
+    if let Some(hc) = &hint_client {
+        info!(
+            endpoint = %hc.endpoint,
+            channel = ?hc.channel,
+            interval_ms = args.rpg_vox_hint_interval_ms,
+            "rpg_vox hint client configured",
+        );
+    }
+
     let handler = Handler {
         guild_id: GuildId::new(args.guild_id),
         channel_id: ChannelId::new(args.channel_id),
@@ -812,15 +993,19 @@ async fn main() -> Result<()> {
         notice_message: Mutex::new(None),
         audio_outputs: Arc::clone(&audio_outputs),
         ssrc_map: Arc::new(Mutex::new(HashMap::new())),
+        hint_client,
         joined: AtomicBool::new(false),
         reconcile: AsyncMutex::new(()),
     };
 
     let intents = GatewayIntents::GUILDS | GatewayIntents::GUILD_VOICE_STATES;
 
-    // Enable DecodeMode::Decode whenever we need decoded PCM downstream
-    // (recording or any audio output route).
-    let want_decode = recording || !audio_outputs.is_empty();
+    // Enable DecodeMode::Decode whenever any downstream consumer needs
+    // decoded PCM: recording, per-user audio outputs, or the rpg_vox
+    // hint client (which flags a user as "speaking now" based on
+    // `decoded_voice.is_some()` per VoiceTick).
+    let want_decode =
+        recording || !audio_outputs.is_empty() || args.rpg_vox_url.is_some();
     let songbird_config = if want_decode {
         SongbirdConfig::default().decode_mode(DecodeMode::Decode(DecodeConfig::default()))
     } else {

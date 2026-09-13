@@ -8,6 +8,7 @@ mod http;
 mod mixer;
 mod monitor;
 mod pw_source;
+mod record;
 mod script;
 mod settings;
 mod store;
@@ -276,6 +277,17 @@ struct Args {
         action = clap::ArgAction::Set,
     )]
     stt_disabled: bool,
+
+    /// Number of Vox channels to pre-allocate. Each slot creates its own
+    /// pipewire sink (`-vox`, `-vox2`, ...), broadcast tap, mixer strip,
+    /// and (when enabled + STT is loaded) VAD/STT worker. Fixed at boot;
+    /// changing this restarts the process with a rescaled mixer state.
+    #[arg(
+        long,
+        env = "RPG_VOX_VOX_SLOTS",
+        default_value_t = crate::mixer::DEFAULT_VOX_SLOTS
+    )]
+    vox_slots: usize,
 }
 
 fn main() -> Result<()> {
@@ -322,12 +334,20 @@ fn main() -> Result<()> {
         }
     });
 
-    // Broadcast tap for the `-vox` sink's processing consumers (future FX
-    // chain, recording, etc.). Kept alive in main so the channel doesn't
-    // close when no one is subscribed — subscribers can come and go.
-    let (input_tap, _input_keepalive) = tokio::sync::broadcast::channel::<
-        std::sync::Arc<[f32]>,
-    >(32);
+    // One broadcast tap per Vox slot. Keepalive receivers hold the
+    // channels open when the record worker isn't subscribed yet (or when
+    // slots are disabled) so the pw thread's send stays a cheap no-op
+    // rather than a Closed error.
+    let vox_slot_count = args.vox_slots.max(1);
+    let mut vox_taps: Vec<tokio::sync::broadcast::Sender<std::sync::Arc<[f32]>>> =
+        Vec::with_capacity(vox_slot_count);
+    let mut _vox_keepalives: Vec<tokio::sync::broadcast::Receiver<std::sync::Arc<[f32]>>> =
+        Vec::with_capacity(vox_slot_count);
+    for _ in 0..vox_slot_count {
+        let (tx, rx) = tokio::sync::broadcast::channel::<std::sync::Arc<[f32]>>(32);
+        vox_taps.push(tx);
+        _vox_keepalives.push(rx);
+    }
 
     // Browser-monitor tap. Fired by the pw source callback with the mixed
     // (TTS + music-input) mono samples about to be handed to pipewire, so
@@ -336,10 +356,10 @@ fn main() -> Result<()> {
     // tokio runtime starts.
     let (monitor_tap, _monitor_keepalive) = monitor::channel();
 
-    // Runtime mixer state. Loaded from the store once the store is open
-    // (below); starts with defaults so the pw thread has something to read
-    // even if persistence fails.
-    let mixer = mixer::AtomicMixer::new(mixer::MixerState::default());
+    // Runtime mixer state. Booted with defaults so the pw thread has
+    // something to read; persisted state is folded in as a patch below
+    // once the store is open.
+    let mixer = mixer::AtomicMixer::new(mixer::MixerState::with_slot_count(vox_slot_count));
 
     // PipeWire runs its own event loop on a dedicated OS thread.
     let pw_cfg = pw_source::Config {
@@ -347,17 +367,19 @@ fn main() -> Result<()> {
         node_description: node_description.clone(),
         sample_rate: args.sample_rate,
         auto_patch_target: args.auto_link.clone(),
-        input_tap: input_tap.clone(),
+        input_taps: vox_taps.clone(),
         monitor_tap: monitor_tap.clone(),
         mixer: mixer.clone(),
     };
     let pw_handle = pw_source::spawn(pw_cfg, consumer)?;
     let pw_client = pw_handle.client.clone();
     let auto_link_client = pw_client.clone();
+    let device_routing_client = pw_client.clone();
     info!(
         node = %node_name,
         description = %node_description,
-        "PipeWire source node started (companion sinks: {n}-music, {n}-vox)",
+        vox_slots = vox_slot_count,
+        "PipeWire source node started (companion sinks: {n}-music, {n}-vox[1..N])",
         n = node_name,
     );
 
@@ -506,10 +528,19 @@ fn main() -> Result<()> {
     }
     let stt = stt::open_or_warn(&stt_cfg);
 
+    // Shared live-transcription state for the Record tab. Channel names
+    // come from the mixer's per-slot state now (persisted alongside gain
+    // / pan / mute), so RecordState just needs a handle to the mixer.
+    let record_state = record::RecordState::new(args.sample_rate, mixer.clone());
+
     // Restore persisted mixer state before the HTTP server starts serving,
     // so the first GET already reflects what the user had last session.
+    // Migrate the legacy single-vox JSON shape and rescale the slot array
+    // if the operator changed RPG_VOX_VOX_SLOTS since the last boot.
     match rt.block_on(store.get_mixer()) {
-        Ok(Some(state)) => {
+        Ok(Some(mut state)) => {
+            state.migrate();
+            state.resize_for(vox_slot_count);
             mixer.apply(mixer::MixerPatch::from(state));
             info!("mixer state restored from store");
         }
@@ -519,6 +550,21 @@ fn main() -> Result<()> {
         }
     }
 
+    // Load persisted device routings (mic → vox2, etc.) before the reconciler
+    // task starts so the first pass already sees the pins the user set last
+    // session. Empty map on error; a garbled row shouldn't block boot.
+    let device_routings = std::sync::Arc::new(http::DeviceRoutings::new(
+        rt.block_on(store.get_device_routings())
+            .unwrap_or_else(|err| {
+                tracing::warn!(err = %format!("{err:#}"), "reading persisted device routings failed");
+                Default::default()
+            }),
+    ));
+    info!(
+        pins = device_routings.lock().unwrap().len(),
+        "device routings restored from store"
+    );
+
     let result = rt.block_on(async move {
         let (tts_tx, tts_rx) = mpsc::channel::<tts::Command>(32);
 
@@ -527,6 +573,25 @@ fn main() -> Result<()> {
             ringbuf_frames,
         };
         let tts_task = tokio::spawn(tts::run(tts_cfg, backend, tts_rx, producer, mixer.clone()));
+
+        // Spawn one streaming STT worker per Vox slot before the HTTP
+        // server starts serving so early clients see transcripts as soon
+        // as `/record` responds. `spawn_worker` no-ops when `stt` is
+        // `None`. Each worker checks the slot's `enabled` flag on every
+        // chunk so disabled slots stay silent without a per-slot task
+        // lifecycle to manage.
+        record::spawn_worker(
+            stt.clone(),
+            vox_taps.clone(),
+            args.sample_rate,
+            record_state.clone(),
+        );
+
+        // Captures the mixed mic feed into every in-flight recording's
+        // silence-gated mixed track. Runs continuously — the worker
+        // short-circuits when nothing's being recorded so idle mode is
+        // free.
+        record::spawn_mixed_worker(monitor_tap.clone(), record_state.clone());
 
         let http_task = tokio::spawn(http::serve(
             args.bind.clone(),
@@ -539,9 +604,21 @@ fn main() -> Result<()> {
             monitor_tap,
             args.sample_rate,
             mixer.clone(),
-            input_tap,
+            vox_taps,
             args.sample_rate,
             stt,
+            record_state,
+            device_routings.clone(),
+        ));
+
+        // Reconcile persisted device pins against the live pw graph. Handles
+        // three cases uniformly: first-boot restore (device present at boot),
+        // hot-plug (mic unplugged and later reattached), and external
+        // interference (someone routed a pinned device somewhere else with
+        // pactl). See `reconcile_device_routings` for the polling shape.
+        tokio::spawn(reconcile_device_routings(
+            device_routing_client,
+            device_routings.clone(),
         ));
 
         // Verify + warmup are ComfyUI-specific — skip both entirely when a
@@ -675,6 +752,68 @@ fn build_backend(args: &Args, settings: settings::Shared) -> Result<tts::Backend
             let backend = tts::qwen3::Backend::new(cfg)
                 .context("configuring remote qwen3-tts backend")?;
             Ok(tts::Backend::Qwen3(backend))
+        }
+    }
+}
+
+/// Reconcile persisted hardware-input pins against the live PipeWire
+/// graph. For each visible `Audio/Source` device whose `node.name` is in
+/// the persisted map, re-issue `link_source` if the current routing
+/// doesn't already match. Runs for the process lifetime on the same
+/// ~500ms cadence as [`auto_link`] so hot-plug and external interference
+/// are self-healing without a per-device task lifecycle.
+///
+/// The map is cloned per tick (it's tiny) so the mutex is never held
+/// across the pw round-trip. A missing device is just skipped — it'll be
+/// picked up on the tick after it reappears.
+async fn reconcile_device_routings(
+    pw: pw_source::PwClient,
+    prefs: std::sync::Arc<http::DeviceRoutings>,
+) {
+    use pw_source::SinkRole;
+    let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        interval.tick().await;
+        let pins = {
+            let m = prefs.lock().expect("device_routings mutex poisoned");
+            if m.is_empty() {
+                continue;
+            }
+            m.clone()
+        };
+        let snap = match pw.snapshot().await {
+            Ok(s) => s,
+            Err(err) => {
+                tracing::warn!(err = %err, "device-routing reconciler snapshot failed");
+                continue;
+            }
+        };
+        for source in &snap.sources {
+            if source.kind != "device" {
+                continue;
+            }
+            let Some(want) = pins.get(&source.name) else {
+                continue;
+            };
+            // Already routed to the desired target — nothing to do. This
+            // is the common case after the initial link lands.
+            if source.routed_to.as_deref() == Some(want.as_str()) {
+                continue;
+            }
+            let Some(role) = SinkRole::from_str(want) else {
+                tracing::warn!(target = %want, device = %source.name, "invalid saved routing target — skipping");
+                continue;
+            };
+            match pw.link_source(source.id, role).await {
+                Ok(()) => info!(device = %source.name, target = %want, "restored device routing"),
+                Err(err) => tracing::warn!(
+                    device = %source.name,
+                    target = %want,
+                    err = %err,
+                    "restoring device routing failed; will retry"
+                ),
+            }
         }
     }
 }

@@ -120,6 +120,19 @@ CREATE TABLE IF NOT EXISTS samples (
     byte_size    INTEGER NOT NULL,
     created_at   INTEGER NOT NULL
 );
+-- Saved recordings from the Record tab. `transcript` is a JSON array of
+-- utterance entries produced by the streaming STT worker; the raw stereo
+-- audio lives at `data/recordings/{id}.wav`. Transcript-only recordings
+-- (created if STT is disabled) still get a WAV so the operator can replay
+-- what was captured.
+CREATE TABLE IF NOT EXISTS recordings (
+    id           TEXT PRIMARY KEY,
+    name         TEXT NOT NULL,
+    created_at   INTEGER NOT NULL,
+    duration_ms  INTEGER NOT NULL,
+    sample_rate  INTEGER NOT NULL,
+    transcript   TEXT NOT NULL
+);
 "#;
 
 /// Single hardcoded script id — MVP has one shared conversation, matching
@@ -140,6 +153,16 @@ const APP_STATE_KEY: &str = "app";
 /// so the mixer piggybacks on an already-migrated store.
 const MIXER_STATE_KEY: &str = "mixer";
 
+/// Row key for persisted hardware-input routings. Value is a JSON object
+/// mapping a device's stable pipewire `node.name` (e.g. an ALSA
+/// `alsa_input.usb-...` string) to a companion-sink selector string
+/// parseable by `SinkRole::from_str` ("music", "vox", "vox2", ...). The
+/// reconciler task in `main.rs` walks this map on a slow tick and re-links
+/// any listed device whose current graph routing doesn't match, so a mic
+/// pinned to Vox 2 today lands back on Vox 2 after a reboot or replug.
+const DEVICE_ROUTINGS_KEY: &str = "device_routings";
+
+
 #[derive(Clone)]
 pub struct Store {
     db: Arc<Mutex<Connection>>,
@@ -147,6 +170,7 @@ pub struct Store {
     images_dir: PathBuf,
     voices_dir: PathBuf,
     samples_dir: PathBuf,
+    recordings_dir: PathBuf,
 }
 
 impl Store {
@@ -167,6 +191,9 @@ impl Store {
         let samples_dir = data_dir.join("samples");
         std::fs::create_dir_all(&samples_dir)
             .with_context(|| format!("creating samples dir {}", samples_dir.display()))?;
+        let recordings_dir = data_dir.join("recordings");
+        std::fs::create_dir_all(&recordings_dir)
+            .with_context(|| format!("creating recordings dir {}", recordings_dir.display()))?;
 
         let db_path = data_dir.join("rpg_vox.sqlite");
         let conn = Connection::open(&db_path)
@@ -225,6 +252,7 @@ impl Store {
             images_dir,
             voices_dir,
             samples_dir,
+            recordings_dir,
         })
     }
 
@@ -432,6 +460,27 @@ impl Store {
                 )
                 .optional()?;
             Ok(row)
+        })
+        .await
+        .context("db task panicked")??;
+        Ok(row)
+    }
+
+    /// Just the widget's stored text — used by the recording log when
+    /// TTS playback lands during an active recording so the entry
+    /// carries what was said, not just a link to the audio.
+    pub async fn get_widget_text(&self, id: String) -> Result<Option<String>> {
+        let db = self.db.clone();
+        let row = tokio::task::spawn_blocking(move || -> Result<Option<String>> {
+            let conn = db.lock().unwrap();
+            let text = conn
+                .query_row(
+                    "SELECT text FROM widgets WHERE id = ?1",
+                    params![id],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?;
+            Ok(text)
         })
         .await
         .context("db task panicked")??;
@@ -733,6 +782,61 @@ impl Store {
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value,
                                                 updated_at = excluded.updated_at",
                 params![MIXER_STATE_KEY, value, now],
+            )?;
+            Ok(())
+        })
+        .await
+        .context("db task panicked")??;
+        Ok(())
+    }
+
+    /// Read the persisted device-routing map (device `node.name` → target
+    /// selector). Returns an empty map when the row is absent (fresh
+    /// install) or when the JSON fails to parse — the caller treats both
+    /// as "no pins" rather than aborting boot over a settings blob.
+    pub async fn get_device_routings(&self) -> Result<std::collections::BTreeMap<String, String>> {
+        let db = self.db.clone();
+        let raw = tokio::task::spawn_blocking(move || -> Result<Option<String>> {
+            let conn = db.lock().unwrap();
+            let value = conn
+                .query_row(
+                    "SELECT value FROM app_state WHERE key = ?1",
+                    params![DEVICE_ROUTINGS_KEY],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?;
+            Ok(value)
+        })
+        .await
+        .context("db task panicked")??;
+        Ok(raw
+            .and_then(|text| match serde_json::from_str::<std::collections::BTreeMap<String, String>>(&text) {
+                Ok(m) => Some(m),
+                Err(err) => {
+                    tracing::warn!(err = %err, "persisted device routings didn't parse; using empty map");
+                    None
+                }
+            })
+            .unwrap_or_default())
+    }
+
+    /// Upsert the device-routing map. Whole-blob replace matches the
+    /// mixer's semantics — the map is tiny (a handful of entries at most).
+    pub async fn put_device_routings(
+        &self,
+        map: &std::collections::BTreeMap<String, String>,
+    ) -> Result<()> {
+        let value = serde_json::to_string(map).context("serialize device routings")?;
+        let now = unix_now();
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO app_state (key, value, updated_at)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value,
+                                                updated_at = excluded.updated_at",
+                params![DEVICE_ROUTINGS_KEY, value, now],
             )?;
             Ok(())
         })
@@ -1784,6 +1888,209 @@ impl Store {
             UpdateResult::Updated
         })
     }
+
+    pub fn recording_path(&self, id: &str) -> PathBuf {
+        self.recordings_dir.join(format!("{id}.wav"))
+    }
+
+    /// Sidecar path for the silence-gated *mixed* mic feed. Written
+    /// alongside the per-slot WAV by [`Self::create_recording`]; served
+    /// by `/record/recordings/:id/mixed`. Sidecar rather than a second
+    /// DB column so it can be an ordinary WAV file the operator can
+    /// grab straight off disk if they need to.
+    pub fn recording_mixed_path(&self, id: &str) -> PathBuf {
+        self.recordings_dir.join(format!("{id}-mixed.wav"))
+    }
+
+    /// Persist a finished recording bucket: DB row + on-disk WAV(s).
+    /// Called by `POST /record/recordings/:id/stop` once the streaming
+    /// worker has drained the active bucket into an owned buffer.
+    /// `mixed_wav_bytes` may be empty (nothing cleared the silence gate
+    /// during the session) — in that case the sidecar file is skipped
+    /// so a stat on disk cleanly says "no mixed track".
+    pub async fn create_recording(
+        &self,
+        id: String,
+        name: String,
+        sample_rate: u32,
+        duration_ms: u64,
+        transcript_json: String,
+        wav_bytes: Vec<u8>,
+        mixed_wav_bytes: Vec<u8>,
+    ) -> Result<()> {
+        let now = unix_now();
+        let db = self.db.clone();
+        let id_clone = id.clone();
+        let name_clone = name.clone();
+        let transcript_clone = transcript_json.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO recordings
+                   (id, name, created_at, duration_ms, sample_rate, transcript)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    id_clone,
+                    name_clone,
+                    now,
+                    duration_ms as i64,
+                    sample_rate as i64,
+                    transcript_clone,
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+        .context("db task panicked")??;
+        tokio::fs::write(self.recording_path(&id), wav_bytes)
+            .await
+            .with_context(|| format!("writing recording wav for {id}"))?;
+        if !mixed_wav_bytes.is_empty() {
+            tokio::fs::write(self.recording_mixed_path(&id), mixed_wav_bytes)
+                .await
+                .with_context(|| format!("writing recording mixed wav for {id}"))?;
+        }
+        Ok(())
+    }
+
+    pub async fn list_recordings(&self) -> Result<Vec<RecordingRow>> {
+        let db = self.db.clone();
+        let rows = tokio::task::spawn_blocking(move || -> Result<Vec<RecordingRow>> {
+            let conn = db.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT id, name, created_at, duration_ms, sample_rate, transcript
+                   FROM recordings
+                  ORDER BY created_at DESC",
+            )?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok(RecordingRow {
+                        id: r.get(0)?,
+                        name: r.get(1)?,
+                        created_at: r.get(2)?,
+                        duration_ms: r.get::<_, i64>(3)? as u64,
+                        sample_rate: r.get::<_, i64>(4)? as u32,
+                        transcript_json: r.get(5)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+        .context("db task panicked")??;
+        Ok(rows)
+    }
+
+    pub async fn rename_recording(
+        &self,
+        id: String,
+        name: String,
+    ) -> Result<UpdateResult> {
+        let db = self.db.clone();
+        let rows = tokio::task::spawn_blocking(move || -> Result<usize> {
+            let conn = db.lock().unwrap();
+            let rows = conn.execute(
+                "UPDATE recordings SET name = ?2 WHERE id = ?1",
+                params![id, name],
+            )?;
+            Ok(rows)
+        })
+        .await
+        .context("db task panicked")??;
+        Ok(if rows == 0 {
+            UpdateResult::NotFound
+        } else {
+            UpdateResult::Updated
+        })
+    }
+
+    /// Update the `text` field of one entry inside a saved recording's
+    /// transcript JSON. Returns `NotFound` when either the recording row
+    /// or the entry id doesn't exist so the HTTP handler can pick the
+    /// right status code. The JSON is treated as a `Vec<Value>` so
+    /// unknown / future fields on entries survive an edit round-trip
+    /// (nothing gets silently dropped by a stricter Rust struct).
+    pub async fn update_recording_entry_text(
+        &self,
+        recording_id: String,
+        entry_id: String,
+        text: String,
+    ) -> Result<UpdateResult> {
+        let text = text.trim().to_string();
+        if text.is_empty() {
+            return Ok(UpdateResult::NotFound);
+        }
+        let db = self.db.clone();
+        let recording_id_clone = recording_id.clone();
+        tokio::task::spawn_blocking(move || -> Result<UpdateResult> {
+            let conn = db.lock().unwrap();
+            let raw: Option<String> = conn
+                .query_row(
+                    "SELECT transcript FROM recordings WHERE id = ?1",
+                    params![recording_id_clone],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?;
+            let Some(raw) = raw else {
+                return Ok(UpdateResult::NotFound);
+            };
+            let mut entries: Vec<serde_json::Value> = serde_json::from_str(&raw)
+                .context("parsing recording transcript JSON")?;
+            let mut hit = false;
+            for entry in entries.iter_mut() {
+                let matches = entry
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s == entry_id)
+                    .unwrap_or(false);
+                if matches {
+                    if let Some(obj) = entry.as_object_mut() {
+                        obj.insert("text".to_string(), serde_json::Value::String(text.clone()));
+                        hit = true;
+                    }
+                    break;
+                }
+            }
+            if !hit {
+                return Ok(UpdateResult::NotFound);
+            }
+            let updated = serde_json::to_string(&entries)
+                .context("serializing updated transcript")?;
+            let rows = conn.execute(
+                "UPDATE recordings SET transcript = ?2 WHERE id = ?1",
+                params![recording_id_clone, updated],
+            )?;
+            Ok(if rows == 0 {
+                UpdateResult::NotFound
+            } else {
+                UpdateResult::Updated
+            })
+        })
+        .await
+        .context("db task panicked")?
+    }
+
+    pub async fn delete_recording(&self, id: String) -> Result<UpdateResult> {
+        let db = self.db.clone();
+        let id_clone = id.clone();
+        let rows = tokio::task::spawn_blocking(move || -> Result<usize> {
+            let conn = db.lock().unwrap();
+            let rows = conn.execute(
+                "DELETE FROM recordings WHERE id = ?1",
+                params![id_clone],
+            )?;
+            Ok(rows)
+        })
+        .await
+        .context("db task panicked")??;
+        let _ = tokio::fs::remove_file(self.recording_path(&id)).await;
+        let _ = tokio::fs::remove_file(self.recording_mixed_path(&id)).await;
+        Ok(if rows == 0 {
+            UpdateResult::NotFound
+        } else {
+            UpdateResult::Updated
+        })
+    }
 }
 
 pub enum UpdateResult {
@@ -1840,6 +2147,18 @@ pub struct ScriptTakeRow {
 pub struct DeletedTake {
     pub block_id: String,
     pub widget_id: String,
+}
+
+pub struct RecordingRow {
+    pub id: String,
+    pub name: String,
+    pub created_at: i64,
+    pub duration_ms: u64,
+    pub sample_rate: u32,
+    /// JSON array of transcript entries as produced by the streaming worker.
+    /// Kept opaque at the store layer so the HTTP handler can pass it through
+    /// unchanged in its response body without a round-trip parse.
+    pub transcript_json: String,
 }
 
 pub struct ScriptSummaryRow {

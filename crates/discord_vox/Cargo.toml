@@ -59,3 +59,10 @@ clap = { workspace = true, features = ["env"] }
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+# HTTP client for firing POST /record/hint at rpg_vox on Discord speaking
+# events. rustls-tls avoids a system OpenSSL dep; `json` pulls in the
+# lightweight serde_json path used to serialize hint bodies. Same
+# feature set as rpg_vox uses to keep the shared build cache warm.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde_json = { workspace = true }

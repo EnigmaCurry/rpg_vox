@@ -108,8 +108,16 @@ use tokio::sync::{Mutex, Semaphore, mpsc, mpsc::Sender, oneshot};
 use tracing::info;
 use uuid::Uuid;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+
+/// Persisted pin map: hardware-input `node.name` → target selector string
+/// (`SinkRole::suffix()` output, e.g. `"music"` / `"vox"` / `"vox2"`).
+/// Shared between the HTTP link/unlink handlers (which write the pins) and
+/// the boot-time reconciler task in `main.rs` (which reads them to re-link
+/// devices as they appear in the pw graph). Wrapped in `std::sync::Mutex`
+/// because operations never cross await points and the map is tiny.
+pub(crate) type DeviceRoutings = std::sync::Mutex<BTreeMap<String, String>>;
 
 use crate::chat;
 use crate::mixer::{AtomicMixer, MixerPatch};
@@ -126,6 +134,7 @@ use crate::store::{AgentField, AgentRow, DEFAULT_AGENT_ID, ScriptBlockRow, Scrip
 /// client dropdown surfaces it as `— None (silence) —`; character UUIDs
 /// never collide with this literal.
 pub(crate) const VOICE_SILENCE: &str = "__silence__";
+use crate::record::{RecordState, TranscriptEntry};
 use crate::stt::SttHandle;
 use tokio::sync::broadcast;
 
@@ -166,11 +175,13 @@ pub(crate) struct AppState {
     /// Shared mixer atomics. `/mixer` reads a snapshot; `PUT /mixer`
     /// applies a partial patch. Also persisted to sqlite on every update.
     pub(crate) mixer: Arc<AtomicMixer>,
-    /// Fan-out for the `-vox` companion sink's PCM tap. Interleaved stereo
-    /// f32 at [`Self::vox_sample_rate`]. Used by `/widgets/record` to
-    /// capture a widget clip directly from the vox channel instead of TTS.
-    pub(crate) vox_tap: broadcast::Sender<Arc<[f32]>>,
-    /// Sample rate for the vox tap (matches the pipewire target rate).
+    /// One broadcast sender per Vox slot (length matches the mixer's
+    /// slot count). Interleaved stereo f32 at [`Self::vox_sample_rate`].
+    /// `/widgets/record` subscribes to slot 0 (the historical single-vox
+    /// channel) to keep the existing SpeakCell record button behaviour;
+    /// the streaming worker subscribes to all of them.
+    pub(crate) vox_taps: Vec<broadcast::Sender<Arc<[f32]>>>,
+    /// Sample rate for every vox tap (matches the pipewire target rate).
     pub(crate) vox_sample_rate: u32,
     /// In-flight recording sessions keyed by session id. Populated by
     /// `POST /widgets/record`; consumed by the matching /stop or /cancel.
@@ -181,6 +192,15 @@ pub(crate) struct AppState {
     /// captured WAV is still persisted and the client's provided text is
     /// used as-is.
     pub(crate) stt: Option<SttHandle>,
+    /// Shared live-transcription state for the Record tab. Also written to
+    /// by the streaming worker spawned in `main`.
+    pub(crate) record: RecordState,
+    /// Sticky routings for hardware `Audio/Source` producers. Read+cloned
+    /// by the reconciler task in `main.rs` on each tick; written by
+    /// `link_source_handler` / `unlink_source_handler` when the user pins
+    /// or unpins a device on the Mixer's Sources panel. Persisted to sqlite
+    /// under the `device_routings` key by the handler after every write.
+    pub(crate) device_routings: Arc<DeviceRoutings>,
 }
 
 /// One in-flight `/widgets/record` capture. The recording task lives on the
@@ -763,9 +783,11 @@ pub async fn serve(
     monitor_tap: broadcast::Sender<Arc<[f32]>>,
     monitor_sample_rate: u32,
     mixer: Arc<AtomicMixer>,
-    vox_tap: broadcast::Sender<Arc<[f32]>>,
+    vox_taps: Vec<broadcast::Sender<Arc<[f32]>>>,
     vox_sample_rate: u32,
     stt: Option<SttHandle>,
+    record: RecordState,
+    device_routings: Arc<DeviceRoutings>,
 ) -> Result<()> {
     let state = AppState {
         tts,
@@ -777,10 +799,12 @@ pub async fn serve(
         monitor_tap,
         monitor_sample_rate,
         mixer,
-        vox_tap,
+        vox_taps,
         vox_sample_rate,
         recordings: Arc::new(Mutex::new(HashMap::new())),
         stt,
+        record,
+        device_routings,
     };
     let app = Router::new()
         .route("/", get(index))
@@ -807,6 +831,50 @@ pub async fn serve(
             "/widgets/record/:session_id/stop",
             post(widget_record_stop_handler),
         )
+        .route("/record", get(record_state_handler))
+        .route(
+            "/record/recordings",
+            get(recordings_list_handler).post(record_start_handler),
+        )
+        .route(
+            "/record/recordings/:id",
+            axum::routing::delete(record_delete_handler)
+                .patch(record_rename_handler),
+        )
+        .route(
+            "/record/recordings/:id/stop",
+            post(record_stop_handler),
+        )
+        .route(
+            "/record/recordings/:id/audio",
+            get(record_audio_handler),
+        )
+        .route(
+            "/record/recordings/:id/mixed",
+            get(record_mixed_audio_handler),
+        )
+        .route(
+            "/record/recordings/:id/archive",
+            get(record_archive_handler),
+        )
+        .route(
+            "/record/recordings/:id/segment",
+            get(record_segment_handler),
+        )
+        .route(
+            "/record/recordings/:id/entries/:entry_id",
+            axum::routing::patch(record_saved_entry_patch_handler),
+        )
+        .route(
+            "/record/entries/:entry_id",
+            axum::routing::patch(record_live_entry_patch_handler),
+        )
+        .route(
+            "/record/buffer",
+            axum::routing::delete(record_buffer_clear_handler),
+        )
+        .route("/record/playback", post(record_playback_handler))
+        .route("/record/hint", post(record_hint_handler))
         .route("/scenes/mix", post(scene_mix_handler))
         .route(
             "/images",
@@ -1123,11 +1191,16 @@ async fn link_source_handler(
             .into_response();
     };
     match state.pw.link_source(id, role).await {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(ActionResponse { ok: true, error: None }),
-        )
-            .into_response(),
+        Ok(()) => {
+            if let Some(name) = device_node_name(&state, id).await {
+                persist_device_routing(&state, name, Some(role.suffix())).await;
+            }
+            (
+                StatusCode::OK,
+                Json(ActionResponse { ok: true, error: None }),
+            )
+                .into_response()
+        }
         Err(err) => (
             StatusCode::BAD_REQUEST,
             Json(ActionResponse {
@@ -1143,12 +1216,22 @@ async fn unlink_source_handler(
     State(state): State<AppState>,
     Path(id): Path<u32>,
 ) -> impl IntoResponse {
+    // Snapshot the device name BEFORE the unlink call — a device that
+    // disappears simultaneously (e.g. the mic was unplugged and the UI
+    // "Off" click landed in the same window) is still in the graph until
+    // the pw thread processes the removal. Missing = stream source, skip.
+    let device_name = device_node_name(&state, id).await;
     match state.pw.unlink_source(id).await {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(ActionResponse { ok: true, error: None }),
-        )
-            .into_response(),
+        Ok(()) => {
+            if let Some(name) = device_name {
+                persist_device_routing(&state, name, None).await;
+            }
+            (
+                StatusCode::OK,
+                Json(ActionResponse { ok: true, error: None }),
+            )
+                .into_response()
+        }
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ActionResponse {
@@ -1157,6 +1240,46 @@ async fn unlink_source_handler(
             }),
         )
             .into_response(),
+    }
+}
+
+/// Return the source's stable `node.name` iff it's a hardware device.
+/// Stream sources return `None` — their routings aren't persisted because
+/// the source itself (a Firefox tab, an mpv invocation) doesn't survive a
+/// restart. Missing id → `None`, so the caller no-ops silently.
+async fn device_node_name(state: &AppState, source_id: u32) -> Option<String> {
+    let snap = state.pw.snapshot().await.ok()?;
+    let src = snap.sources.iter().find(|s| s.id == source_id)?;
+    (src.kind == "device").then(|| src.name.clone())
+}
+
+/// Update the in-memory device-routing map and write the whole map back to
+/// sqlite. `target = Some(selector)` upserts; `None` removes the entry so
+/// the reconciler stops trying to re-establish it. Persistence failures
+/// are logged but not surfaced — the pin is at worst forgotten on the next
+/// restart, which is strictly better than failing the routing itself.
+async fn persist_device_routing(
+    state: &AppState,
+    node_name: String,
+    target: Option<String>,
+) {
+    let snapshot = {
+        let mut map = state
+            .device_routings
+            .lock()
+            .expect("device_routings mutex poisoned");
+        match target {
+            Some(sel) => {
+                map.insert(node_name, sel);
+            }
+            None => {
+                map.remove(&node_name);
+            }
+        }
+        map.clone()
+    };
+    if let Err(err) = state.store.put_device_routings(&snapshot).await {
+        tracing::warn!(err = %format!("{err:#}"), "persisting device routings failed");
     }
 }
 
@@ -1181,7 +1304,7 @@ async fn put_mixer(
 ) -> impl IntoResponse {
     state.mixer.apply(patch);
     let snap = state.mixer.snapshot();
-    if let Err(err) = state.store.put_mixer(snap).await {
+    if let Err(err) = state.store.put_mixer(snap.clone()).await {
         tracing::warn!(err = %format!("{err:#}"), "persisting mixer state failed");
     }
     (StatusCode::OK, Json(snap)).into_response()
@@ -1321,6 +1444,16 @@ async fn say_handler(
     }
     let text = apply_project_dictionary(&state, body.project_id.as_deref(), text).await;
     let configs = configs_or_default(body.configs);
+
+    // Log the /say into the active recording (text only — /say synthesizes
+    // live and doesn't persist a widget, so there's no cached WAV url to
+    // point at). The user still gets the utterance in the transcript;
+    // for playback they'd need to hear the actual mic feed or re-run
+    // the /say call. Silent no-op when nothing is being recorded.
+    if state.record.is_recording() {
+        info!(channel = "TTS", text = %text, "recording: /say played");
+        state.record.push_tts(text.clone(), None);
+    }
 
     let (reply_tx, reply_rx) = oneshot::channel();
     if state
@@ -3468,6 +3601,22 @@ async fn widget_say_handler(
     state.mixer.request_tts_stop();
     let seq = state.mixer.claim_play_seq();
 
+    // Log the playback into the active recording (if any) BEFORE we
+    // dispatch. This way the transcript entry appears the instant Play
+    // is clicked rather than after playback completes — the widget URL
+    // is stable, and the entry's text mirrors what the user asked to
+    // hear regardless of whether they hit Stop mid-clip.
+    if state.record.is_recording() {
+        if let Ok(Some(text)) = state.store.get_widget_text(id.clone()).await {
+            let trimmed = text.trim().to_string();
+            if !trimmed.is_empty() {
+                let audio_url = format!("/widgets/{}", id);
+                info!(channel = "TTS", widget = %id, text = %trimmed, "recording: TTS played");
+                state.record.push_tts(trimmed, Some(audio_url));
+            }
+        }
+    }
+
     let (reply_tx, reply_rx) = oneshot::channel();
     if state
         .tts
@@ -3665,7 +3814,14 @@ async fn widget_record_start_handler(
     let Json(body) = body.unwrap_or_else(|| Json(RecordStartBody::default()));
 
     let session_id = Uuid::new_v4();
-    let mut vox_rx = state.vox_tap.subscribe();
+    // Keep listening on slot 0 for back-compat with the existing SpeakCell
+    // recorder — that flow predates multi-vox and always used the single
+    // `-vox` sink. Future work could let the client pick a slot.
+    let mut vox_rx = state
+        .vox_taps
+        .first()
+        .expect("at least one vox slot")
+        .subscribe();
     let (stop_tx, stop_rx) = oneshot::channel::<()>();
     let (result_tx, result_rx) = oneshot::channel::<Vec<f32>>();
 
@@ -3913,6 +4069,776 @@ async fn widget_record_cancel_handler(
         }
         None => (StatusCode::NOT_FOUND, "no such recording session").into_response(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// /record — background transcription + named recording buckets.
+//
+// The streaming worker (see `crate::record`) subscribes to the same vox_tap
+// used by /widgets/record and continuously drops utterance transcripts into
+// a shared state. In Not-Recording mode they land in a rolling 50 KB
+// buffer; in Recording mode they also land in a named bucket that persists
+// to sqlite + a WAV file on stop.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+struct RecordingSummary {
+    id: String,
+    name: String,
+    created_at: i64,
+    duration_ms: u64,
+    sample_rate: u32,
+    entries: Vec<TranscriptEntry>,
+    audio_url: String,
+}
+
+async fn record_state_handler(State(state): State<AppState>) -> Response {
+    let snap = state.record.snapshot();
+    let recordings = match state.store.list_recordings().await {
+        Ok(rows) => rows
+            .into_iter()
+            .map(|r| {
+                let entries: Vec<TranscriptEntry> =
+                    serde_json::from_str(&r.transcript_json).unwrap_or_default();
+                RecordingSummary {
+                    audio_url: format!("/record/recordings/{}/audio", r.id),
+                    id: r.id,
+                    name: r.name,
+                    created_at: r.created_at,
+                    duration_ms: r.duration_ms,
+                    sample_rate: r.sample_rate,
+                    entries,
+                }
+            })
+            .collect::<Vec<_>>(),
+        Err(err) => {
+            tracing::warn!(err = %format!("{err:#}"), "listing recordings failed");
+            Vec::new()
+        }
+    };
+    Json(serde_json::json!({
+        "mode": snap.mode,
+        "buffer": snap.buffer,
+        "bufferBytes": snap.buffer_bytes,
+        "bufferMaxBytes": snap.buffer_max_bytes,
+        "activeRecording": snap.active_recording,
+        "channelNames": snap.channel_names,
+        "sttEnabled": state.stt.is_some(),
+        "sampleRate": state.record.sample_rate(),
+        "recordings": recordings,
+    }))
+    .into_response()
+}
+
+async fn recordings_list_handler(State(state): State<AppState>) -> Response {
+    match state.store.list_recordings().await {
+        Ok(rows) => {
+            let out: Vec<RecordingSummary> = rows
+                .into_iter()
+                .map(|r| {
+                    let entries: Vec<TranscriptEntry> =
+                        serde_json::from_str(&r.transcript_json).unwrap_or_default();
+                    RecordingSummary {
+                        audio_url: format!("/record/recordings/{}/audio", r.id),
+                        id: r.id,
+                        name: r.name,
+                        created_at: r.created_at,
+                        duration_ms: r.duration_ms,
+                        sample_rate: r.sample_rate,
+                        entries,
+                    }
+                })
+                .collect();
+            Json(out).into_response()
+        }
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("list recordings: {err:#}"),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct RecordStartBodyRoute {
+    #[serde(default)]
+    name: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct RecordStartResponseRoute {
+    id: String,
+}
+
+async fn record_start_handler(
+    State(state): State<AppState>,
+    body: Option<Json<RecordStartBodyRoute>>,
+) -> Response {
+    let Json(body) = body.unwrap_or_else(|| Json(RecordStartBodyRoute::default()));
+    let name = body.name.unwrap_or_default();
+    match state.record.start_recording(name) {
+        Ok(id) => (
+            StatusCode::OK,
+            Json(RecordStartResponseRoute { id }),
+        )
+            .into_response(),
+        Err(msg) => (StatusCode::CONFLICT, msg).into_response(),
+    }
+}
+
+async fn record_stop_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    let Some(taken) = state.record.take_active(&id) else {
+        return (StatusCode::NOT_FOUND, "no matching active recording").into_response();
+    };
+    let sample_rate = taken.sample_rate;
+    let duration_ms = taken.duration_ms();
+    // Vox tap is interleaved stereo f32; group into pairs for the encoder.
+    let pairs: Vec<[f32; 2]> = taken
+        .audio
+        .chunks_exact(2)
+        .map(|c| [c[0], c[1]])
+        .collect();
+    let wav = encode_wav_pcm16_stereo(&pairs, sample_rate);
+    // Silence-gated mixed mic feed. Encoded as a sidecar WAV so the
+    // "▶ Mixed" and archive-download endpoints can serve it straight off
+    // disk without re-mixing. Empty means the gate never opened —
+    // create_recording just skips writing the sidecar in that case.
+    let mixed_pairs: Vec<[f32; 2]> = taken
+        .mixed_audio
+        .chunks_exact(2)
+        .map(|c| [c[0], c[1]])
+        .collect();
+    let mixed_wav = if mixed_pairs.is_empty() {
+        Vec::new()
+    } else {
+        encode_wav_pcm16_stereo(&mixed_pairs, sample_rate)
+    };
+    let transcript_json = serde_json::to_string(&taken.entries).unwrap_or_else(|_| "[]".into());
+    let rec_id = taken.id.clone();
+    match state
+        .store
+        .create_recording(
+            rec_id.clone(),
+            taken.name.clone(),
+            sample_rate,
+            duration_ms,
+            transcript_json,
+            wav,
+            mixed_wav,
+        )
+        .await
+    {
+        Ok(()) => {
+            info!(id = %rec_id, name = %taken.name, duration_ms, "recording saved");
+            Json(serde_json::json!({
+                "id": rec_id,
+                "name": taken.name,
+                "createdAt": taken.created_at,
+                "durationMs": duration_ms,
+                "sampleRate": sample_rate,
+                "entries": taken.entries,
+                "audioUrl": format!("/record/recordings/{}/audio", rec_id),
+            }))
+            .into_response()
+        }
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("persist recording: {err:#}"),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RecordingRenameBody {
+    name: String,
+}
+
+/// Rename a recording. Applies to whichever backing store owns it:
+///   * The currently-active (in-flight) recording lives in RAM under
+///     [`RecordState`]. Renaming it updates the ActiveRecording name
+///     so the pane header, sidebar, and eventual persisted row all
+///     see the new label.
+///   * A saved recording is renamed in sqlite.
+///
+/// Try the RAM path first; if the id doesn't match anything active,
+/// fall through to the store. Empty names collapse to a stable
+/// "Untitled recording" so a fumbled rename can't leave a blank row.
+async fn record_rename_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<RecordingRenameBody>,
+) -> Response {
+    let name = body.name.trim().to_string();
+    let name = if name.is_empty() { "Untitled recording".to_string() } else { name };
+    if state.record.rename_active(&id, name.clone()) {
+        return Json(serde_json::json!({ "id": id, "name": name })).into_response();
+    }
+    match state.store.rename_recording(id.clone(), name.clone()).await {
+        Ok(crate::store::UpdateResult::Updated) => {
+            Json(serde_json::json!({ "id": id, "name": name })).into_response()
+        }
+        Ok(crate::store::UpdateResult::NotFound) => {
+            (StatusCode::NOT_FOUND, "no such recording").into_response()
+        }
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("rename: {err:#}"),
+        )
+            .into_response(),
+    }
+}
+
+/// Body for the click-to-correct transcript edit endpoints. Only `text` is
+/// mutable — timestamps, channel labels, and audio offsets stay pinned to
+/// what the VAD captured at record time.
+#[derive(Debug, Deserialize)]
+struct EntryTextPatch {
+    text: String,
+}
+
+/// Correct a transcript entry in the RAM state — either the rolling
+/// ephemeral buffer or the in-flight active recording. `RecordState::
+/// update_entry_text` handles both containers under one lock and mirrors
+/// buffer→active edits so an entry that lives in both views stays
+/// consistent. 404 when the id belongs to a saved recording (the caller
+/// should use the `/recordings/:id/entries/:entry_id` path for those).
+async fn record_live_entry_patch_handler(
+    State(state): State<AppState>,
+    Path(entry_id): Path<String>,
+    Json(body): Json<EntryTextPatch>,
+) -> Response {
+    if body.text.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "text is required").into_response();
+    }
+    if state.record.update_entry_text(&entry_id, body.text) {
+        (
+            StatusCode::OK,
+            Json(ActionResponse { ok: true, error: None }),
+        )
+            .into_response()
+    } else {
+        (StatusCode::NOT_FOUND, "no such live entry").into_response()
+    }
+}
+
+/// Correct a transcript entry inside a **saved** recording. Persists to
+/// sqlite by rewriting the recording's transcript JSON blob. Empty text
+/// is rejected upfront so the edit path never zeroes out an entry.
+async fn record_saved_entry_patch_handler(
+    State(state): State<AppState>,
+    Path((recording_id, entry_id)): Path<(String, String)>,
+    Json(body): Json<EntryTextPatch>,
+) -> Response {
+    if body.text.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "text is required").into_response();
+    }
+    match state
+        .store
+        .update_recording_entry_text(recording_id, entry_id, body.text)
+        .await
+    {
+        Ok(crate::store::UpdateResult::Updated) => (
+            StatusCode::OK,
+            Json(ActionResponse { ok: true, error: None }),
+        )
+            .into_response(),
+        Ok(crate::store::UpdateResult::NotFound) => {
+            (StatusCode::NOT_FOUND, "no such recording or entry").into_response()
+        }
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("update transcript: {err:#}"),
+        )
+            .into_response(),
+    }
+}
+
+/// Clear the rolling ephemeral live buffer. The in-flight active recording
+/// (if any) is untouched — clearing the Live pane must never wipe a
+/// session that's still capturing.
+async fn record_buffer_clear_handler(State(state): State<AppState>) -> Response {
+    state.record.clear_buffer();
+    (
+        StatusCode::OK,
+        Json(ActionResponse { ok: true, error: None }),
+    )
+        .into_response()
+}
+
+async fn record_delete_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    // Cancel the in-flight bucket first (idempotent — returns false when
+    // the id doesn't match). Then drop the persisted row + WAV if one
+    // exists. Either path (or both, on a race) returns 200.
+    let cancelled = state.record.cancel_active(&id);
+    match state.store.delete_recording(id.clone()).await {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(ActionResponse { ok: true, error: None }),
+        )
+            .into_response(),
+        Err(err) => {
+            if cancelled {
+                (StatusCode::OK, Json(ActionResponse { ok: true, error: None }))
+                    .into_response()
+            } else {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("delete recording: {err:#}"),
+                )
+                    .into_response()
+            }
+        }
+    }
+}
+
+async fn record_audio_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    // In-flight recording wins: encode the current in-memory mix as WAV
+    // so the "play from here" flow works mid-record without waiting for
+    // Stop. Cache-control is no-store either way since the in-flight
+    // audio grows continuously.
+    if let Some((pairs, sr)) = state.record.active_audio(&id) {
+        let wav = encode_wav_pcm16_stereo(&pairs, sr);
+        return (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "audio/wav"),
+                (header::CACHE_CONTROL, "no-store"),
+            ],
+            wav,
+        )
+            .into_response();
+    }
+    let path = state.store.recording_path(&id);
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "audio/wav"),
+                (header::CACHE_CONTROL, "no-store"),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            (StatusCode::NOT_FOUND, "recording audio missing").into_response()
+        }
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("read recording: {err}"),
+        )
+            .into_response(),
+    }
+}
+
+/// Silence-gated mixed mic feed. Same RAM-first / disk-fallback pattern
+/// as [`record_audio_handler`]. 404 when a saved recording has no mixed
+/// sidecar (the gate never opened during the session).
+async fn record_mixed_audio_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    if let Some((pairs, sr)) = state.record.active_mixed_audio(&id) {
+        if pairs.is_empty() {
+            return (StatusCode::NOT_FOUND, "no mixed audio captured yet").into_response();
+        }
+        let wav = encode_wav_pcm16_stereo(&pairs, sr);
+        return (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "audio/wav"),
+                (header::CACHE_CONTROL, "no-store"),
+            ],
+            wav,
+        )
+            .into_response();
+    }
+    let path = state.store.recording_mixed_path(&id);
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "audio/wav"),
+                (header::CACHE_CONTROL, "no-store"),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            (StatusCode::NOT_FOUND, "mixed audio missing").into_response()
+        }
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("read mixed audio: {err}"),
+        )
+            .into_response(),
+    }
+}
+
+/// Bundle a saved recording into a zip: transcript.json + mixed.wav +
+/// per-utterance clips/&lt;entry_id&gt;.wav extracted from the per-slot WAV.
+/// Only serves saved recordings — in-flight recordings can be downloaded
+/// after stop. The zip is built entirely in memory (recordings cap at
+/// ~700 MB per-slot, so a stereo 16-bit encode caps at ~350 MB per
+/// track — fits comfortably in RAM for a personal-tool workload).
+async fn record_archive_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    // Refuse to archive an in-flight recording — the audio is still
+    // growing and the transcript may still gain entries.
+    if state.record.is_recording()
+        && state
+            .record
+            .active_audio(&id)
+            .is_some()
+    {
+        return (
+            StatusCode::CONFLICT,
+            "stop the recording before downloading its archive",
+        )
+            .into_response();
+    }
+    let rows = match state.store.list_recordings().await {
+        Ok(r) => r,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("list recordings: {err:#}"),
+            )
+                .into_response();
+        }
+    };
+    let Some(row) = rows.into_iter().find(|r| r.id == id) else {
+        return (StatusCode::NOT_FOUND, "no such recording").into_response();
+    };
+    let audio_path = state.store.recording_path(&id);
+    let mixed_path = state.store.recording_mixed_path(&id);
+    let audio_bytes = match tokio::fs::read(&audio_path).await {
+        Ok(b) => b,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("read recording wav: {err}"),
+            )
+                .into_response();
+        }
+    };
+    let mixed_bytes = tokio::fs::read(&mixed_path).await.ok(); // None if sidecar missing
+
+    let name = row.name.clone();
+    let entries: Vec<crate::record::TranscriptEntry> =
+        serde_json::from_str(&row.transcript_json).unwrap_or_default();
+    let sample_rate = row.sample_rate;
+
+    // Build the zip on a blocking pool — the per-utterance decode is a
+    // few KB per WAV but adds up on long recordings, and we don't want
+    // to block the runtime.
+    let zip_bytes = match tokio::task::spawn_blocking(move || {
+        build_recording_archive(&name, sample_rate, &entries, &audio_bytes, mixed_bytes.as_deref())
+    })
+    .await
+    {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(err)) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("build archive: {err:#}"),
+            )
+                .into_response();
+        }
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "archive task panicked",
+            )
+                .into_response();
+        }
+    };
+    let filename = sanitize_filename(&row.name);
+    let disposition = format!("attachment; filename=\"{filename}.zip\"");
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "application/zip".to_string()),
+            (header::CONTENT_DISPOSITION, disposition),
+            (header::CACHE_CONTROL, "no-store".to_string()),
+        ],
+        zip_bytes,
+    )
+        .into_response()
+}
+
+/// Sanitize a user-provided recording name into a filesystem-friendly
+/// slug for the Content-Disposition filename. Whitespace collapses to
+/// dashes; anything outside the safe set is dropped. Empty result
+/// falls back to "recording".
+fn sanitize_filename(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for ch in name.chars() {
+        if ch.is_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
+            out.push(ch);
+        } else if ch.is_whitespace() {
+            out.push('-');
+        }
+    }
+    if out.is_empty() {
+        "recording".to_string()
+    } else {
+        out
+    }
+}
+
+/// Zip up the archive contents. Layout:
+///   * `transcript.json` — the entries array (pretty-printed for
+///     grep-ability).
+///   * `mixed.wav` — the silence-gated mic feed (omitted if the sidecar
+///     was missing).
+///   * `audio.wav` — the full per-slot recorded audio (untrimmed).
+///   * `clips/{entry.id}.wav` — one WAV per entry that has an audio
+///     range (audio_start_ms + audio_duration_ms), sliced from the
+///     per-slot WAV. TTS entries and entries missing a range are
+///     represented in the transcript only.
+///
+/// Uses `stored` compression method — WAVs and JSON are near-random or
+/// small enough that deflate wouldn't buy much, and stored avoids
+/// pulling in miniz/zstd.
+fn build_recording_archive(
+    name: &str,
+    sample_rate: u32,
+    entries: &[crate::record::TranscriptEntry],
+    audio_wav_bytes: &[u8],
+    mixed_wav_bytes: Option<&[u8]>,
+) -> anyhow::Result<Vec<u8>> {
+    use std::io::{Cursor, Write};
+    use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
+
+    let mut buf: Vec<u8> = Vec::with_capacity(audio_wav_bytes.len() + 4096);
+    {
+        let mut zip = ZipWriter::new(Cursor::new(&mut buf));
+        let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+
+        let transcript = serde_json::json!({
+            "name": name,
+            "sample_rate": sample_rate,
+            "entries": entries,
+        });
+        let transcript_pretty = serde_json::to_vec_pretty(&transcript)?;
+        zip.start_file("transcript.json", opts)?;
+        zip.write_all(&transcript_pretty)?;
+
+        zip.start_file("audio.wav", opts)?;
+        zip.write_all(audio_wav_bytes)?;
+
+        if let Some(mixed) = mixed_wav_bytes {
+            zip.start_file("mixed.wav", opts)?;
+            zip.write_all(mixed)?;
+        }
+
+        // Decode the per-slot WAV once so per-entry slicing doesn't
+        // re-parse the header 100 times. The WAV was written by
+        // encode_wav_pcm16_stereo — 16-bit PCM stereo — so we can trust
+        // the sample_rate row on the recording and just carve the PCM.
+        if let Some(pcm) = decode_pcm16_stereo(audio_wav_bytes) {
+            for entry in entries {
+                let (Some(start_ms), Some(dur_ms)) = (entry.audio_start_ms, entry.audio_duration_ms)
+                else {
+                    continue;
+                };
+                if dur_ms == 0 {
+                    continue;
+                }
+                let start_frame = (start_ms as usize) * sample_rate as usize / 1000;
+                let end_frame = start_frame + (dur_ms as usize) * sample_rate as usize / 1000;
+                let end_frame = end_frame.min(pcm.len());
+                if start_frame >= end_frame {
+                    continue;
+                }
+                let clip_wav = encode_wav_pcm16_stereo(&pcm[start_frame..end_frame], sample_rate);
+                let path = format!("clips/{}.wav", entry.id);
+                zip.start_file(&path, opts)?;
+                zip.write_all(&clip_wav)?;
+            }
+        }
+        zip.finish()?;
+    }
+    Ok(buf)
+}
+
+/// Minimal RIFF/WAVE reader for the 16-bit PCM stereo files produced by
+/// [`encode_wav_pcm16_stereo`]. Returns interleaved `[l, r]` pairs.
+/// Returns `None` if the bytes don't parse — the archive endpoint then
+/// skips per-entry clip extraction but still ships the full audio.wav.
+fn decode_pcm16_stereo(bytes: &[u8]) -> Option<Vec<[f32; 2]>> {
+    // Header layout (assumed, matches our encoder):
+    //   0..4   "RIFF"
+    //   8..12  "WAVE"
+    //   12..16 "fmt "
+    //   36..40 "data"
+    //   40..44 data length
+    //   44..   PCM samples (little-endian i16)
+    if bytes.len() < 44
+        || &bytes[0..4] != b"RIFF"
+        || &bytes[8..12] != b"WAVE"
+        || &bytes[36..40] != b"data"
+    {
+        return None;
+    }
+    let data_len = u32::from_le_bytes(bytes[40..44].try_into().ok()?) as usize;
+    let end = 44usize.checked_add(data_len)?.min(bytes.len());
+    let samples = &bytes[44..end];
+    let mut out = Vec::with_capacity(samples.len() / 4);
+    for pair in samples.chunks_exact(4) {
+        let l = i16::from_le_bytes([pair[0], pair[1]]) as f32 / i16::MAX as f32;
+        let r = i16::from_le_bytes([pair[2], pair[3]]) as f32 / i16::MAX as f32;
+        out.push([l, r]);
+    }
+    Some(out)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SegmentQuery {
+    start_ms: u64,
+    duration_ms: u64,
+}
+
+/// Slice a range out of a recording's audio and return it as a mini WAV.
+/// Serves the currently-active recording from RAM (letting the UI replay
+/// utterance clips mid-record) and saved recordings from disk. Both paths
+/// end up encoding a fresh 16-bit stereo WAV so the client's `<audio>`
+/// element gets a self-contained playable blob.
+async fn record_segment_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<SegmentQuery>,
+) -> Response {
+    // Active recording (RAM) wins over disk: while the recording is
+    // in-flight, only the RAM buffer is complete.
+    if let Some((pairs, sr)) = state.record.active_audio_segment(&id, q.start_ms, q.duration_ms) {
+        let wav = encode_wav_pcm16_stereo(&pairs, sr);
+        return (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "audio/wav"),
+                (header::CACHE_CONTROL, "no-store"),
+            ],
+            wav,
+        )
+            .into_response();
+    }
+    let path = state.store.recording_path(&id);
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(b) => b,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return (StatusCode::NOT_FOUND, "recording not found").into_response();
+        }
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("read recording: {err}"),
+            )
+                .into_response();
+        }
+    };
+    let (sr, pairs) = match decode_wav_pcm16_stereo_any(&bytes) {
+        Ok(v) => v,
+        Err(err) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("decode recording: {err}"),
+            )
+                .into_response();
+        }
+    };
+    let start_frame = (q.start_ms * sr as u64 / 1000) as usize;
+    let n_frames = (q.duration_ms * sr as u64 / 1000) as usize;
+    if start_frame >= pairs.len() || n_frames == 0 {
+        return (StatusCode::BAD_REQUEST, "segment out of range").into_response();
+    }
+    let end_frame = start_frame.saturating_add(n_frames).min(pairs.len());
+    let wav = encode_wav_pcm16_stereo(&pairs[start_frame..end_frame], sr);
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "audio/wav"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        wav,
+    )
+        .into_response()
+}
+
+// Channel rename now happens by PUT /mixer with a `vox` slot patch that
+// carries a `name` — no dedicated endpoint. The persisted mixer state
+// carries the names across restarts.
+
+#[derive(Debug, Deserialize)]
+struct PlaybackBody {
+    active: bool,
+}
+
+/// Client toggles this at the start/end of every "play from here"
+/// session so the server can tag any VAD-produced vox entry captured
+/// while playback is in flight with `during_playback: true`. Prevents
+/// the log from confusing mic-picked-up-your-own-speakers with live
+/// speech. Idempotent — POSTing the same value twice is fine.
+async fn record_playback_handler(
+    State(state): State<AppState>,
+    Json(body): Json<PlaybackBody>,
+) -> Response {
+    state.record.set_playback_active(body.active);
+    Json(serde_json::json!({ "active": body.active })).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct HintBody {
+    speaker: String,
+    /// Optional Vox channel selector — one of `"vox"`, `"vox2"`, ...
+    /// matching the pipewire node suffix. Omit to have the hint apply
+    /// to any slot (useful when the caller doesn't know which Vox
+    /// channel their audio was routed into).
+    #[serde(default)]
+    channel: Option<String>,
+}
+
+/// External processes (Discord bots, VoIP bridges, etc.) call this
+/// whenever they detect a new talker on a shared / pre-mixed Vox
+/// channel. Server keeps a bounded rolling ring of hints; every VAD
+/// utterance finalize consults it to attribute the entry to a
+/// specific speaker BEFORE the transcript row is logged. Hints do
+/// NOT trigger recording — VAD transients still control that — so a
+/// spurious or delayed hint just misses the attribution window, it
+/// can never fabricate an entry.
+async fn record_hint_handler(
+    State(state): State<AppState>,
+    Json(body): Json<HintBody>,
+) -> Response {
+    let slot = match body.channel.as_deref() {
+        None => None,
+        Some(s) => match SinkRole::from_str(s) {
+            Some(SinkRole::Vox(i)) => Some(i),
+            _ => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("unknown channel `{s}` (expected `vox`, `vox2`, ...)"),
+                )
+                    .into_response();
+            }
+        },
+    };
+    state.record.push_hint(body.speaker.clone(), slot);
+    tracing::debug!(speaker = %body.speaker, slot = ?slot, "speaker hint received");
+    Json(ActionResponse { ok: true, error: None }).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -4245,7 +5171,7 @@ async fn script_mix_handler(
 /// WAVs from before the profile-mix rewrite. Mono input is duplicated to
 /// L=R so downstream code always sees stereo pairs. Returns (sample_rate,
 /// pairs).
-fn decode_wav_pcm16_stereo_any(bytes: &[u8]) -> Result<(u32, Vec<[f32; 2]>), String> {
+pub(crate) fn decode_wav_pcm16_stereo_any(bytes: &[u8]) -> Result<(u32, Vec<[f32; 2]>), String> {
     if bytes.len() < 44 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
         return Err("not a RIFF/WAVE file".into());
     }
@@ -4934,7 +5860,7 @@ async fn state_put_handler(
 
 /// Clip an f32 sample to ±1.0 and convert to i16. Saturating instead of
 /// wrapping since TTS samples occasionally sit right at ±1.0.
-fn f32_to_i16_clipped(s: f32) -> i16 {
+pub(crate) fn f32_to_i16_clipped(s: f32) -> i16 {
     (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16
 }
 
@@ -4968,7 +5894,7 @@ fn trim_silence_range(pairs: &[[f32; 2]], sample_rate: u32) -> (usize, usize) {
 /// Encode a stereo f32 PCM buffer as a 16-bit little-endian WAV
 /// (channel-interleaved: `[L0, R0, L1, R1, ...]`). Handrolled to avoid
 /// pulling in `hound` for one call site.
-fn encode_wav_pcm16_stereo(pairs: &[[f32; 2]], sample_rate: u32) -> Vec<u8> {
+pub(crate) fn encode_wav_pcm16_stereo(pairs: &[[f32; 2]], sample_rate: u32) -> Vec<u8> {
     let channels: u16 = 2;
     let bits: u16 = 16;
     let byte_rate = sample_rate * channels as u32 * (bits / 8) as u32;

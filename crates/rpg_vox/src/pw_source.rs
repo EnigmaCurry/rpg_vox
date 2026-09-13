@@ -106,34 +106,53 @@ pub enum SinkRole {
     Music,
     /// Internal processing tap — publish stereo samples to the broadcast
     /// channel so future consumers (FX, recording, monitor) can subscribe.
-    Vox,
+    /// The wrapped `usize` is the 0-based slot index (see the vox slot
+    /// array in [`crate::mixer::AtomicMixer`]). Slot 0 is the historical
+    /// single `-vox` sink; further slots become `-vox2`, `-vox3`, ...
+    Vox(usize),
 }
 
 impl SinkRole {
-    pub fn suffix(self) -> &'static str {
+    /// PipeWire node-name suffix. Slot 0 keeps the historical `vox`
+    /// suffix (so existing routings survive the multi-vox refactor);
+    /// slots ≥1 get numbered suffixes.
+    pub fn suffix(self) -> String {
         match self {
-            Self::Music => "music",
-            Self::Vox => "vox",
+            Self::Music => "music".to_string(),
+            Self::Vox(0) => "vox".to_string(),
+            Self::Vox(i) => format!("vox{}", i + 1),
         }
     }
-    fn description(self) -> &'static str {
+    fn description(self) -> String {
         match self {
-            Self::Music => "music (PA \u{2192} mic)",
-            Self::Vox => "vox (processing)",
+            Self::Music => "music (PA \u{2192} mic)".to_string(),
+            Self::Vox(i) => format!("vox {} (processing)", i + 1),
         }
     }
     fn media_role(self) -> &'static str {
         match self {
             Self::Music => "Music",
-            Self::Vox => "Communication",
+            Self::Vox(_) => "Communication",
         }
     }
+    /// Parse a target selector string from an HTTP body. `"music"`, the
+    /// bare `"vox"` (alias for slot 0), or `"vox<N>"` where N is 1-based
+    /// (so `"vox1"` = slot 0, `"vox2"` = slot 1, ...).
     pub fn from_str(s: &str) -> Option<Self> {
-        match s {
-            "music" => Some(Self::Music),
-            "vox" => Some(Self::Vox),
-            _ => None,
+        if s == "music" {
+            return Some(Self::Music);
         }
+        if s == "vox" {
+            return Some(Self::Vox(0));
+        }
+        if let Some(rest) = s.strip_prefix("vox") {
+            if let Ok(n) = rest.parse::<usize>() {
+                if n >= 1 {
+                    return Some(Self::Vox(n - 1));
+                }
+            }
+        }
+        None
     }
 }
 
@@ -145,11 +164,11 @@ pub struct Config {
     /// Exposed in `GraphSnapshot` so the UI can hide the target from the
     /// monitor picker even while a reconnection is still in flight.
     pub auto_patch_target: Option<String>,
-    /// Broadcast sender for the `-vox` sink's processing tap. Consumers
-    /// subscribe on demand; when there are none the send is a cheap no-op.
-    /// Interleaved stereo f32 at `sample_rate` (mirrors the wire format of
-    /// the sink node).
-    pub input_tap: broadcast::Sender<Arc<[f32]>>,
+    /// One broadcast sender per Vox slot (length = mixer's slot count).
+    /// Each slot's sink callback publishes its interleaved stereo f32
+    /// frames to its corresponding tap. Consumers subscribe on demand;
+    /// zero subscribers makes send a cheap no-op.
+    pub input_taps: Vec<broadcast::Sender<Arc<[f32]>>>,
     /// Broadcast sender for the browser-monitor PCM tap. Fired from the
     /// source stream's process callback with the final interleaved stereo
     /// (L, R) frames that are about to be handed to pipewire — so
@@ -387,8 +406,9 @@ struct Graph {
     /// we can look up its id in `nodes` at link time (it appears whenever
     /// the sink stream registers).
     music_sink_name: String,
-    /// `node.name` of our companion `-vox` sink. Same as above.
-    vox_sink_name: String,
+    /// `node.name` of each companion Vox sink, indexed by slot. Fixed for
+    /// the process lifetime.
+    vox_sink_names: Vec<String>,
     // (Routed-source tracking removed: `routed_to` in SourceInfo is now
     // derived directly from the link graph — see `source_routed_to`.
     // Metadata cleanup on node disappearance is unconditional because
@@ -612,10 +632,17 @@ impl Graph {
                 continue;
             };
             if target.name == self.music_sink_name {
-                return Some(SinkRole::Music.suffix().to_string());
+                return Some(SinkRole::Music.suffix());
             }
-            if target.name == self.vox_sink_name {
-                return Some(SinkRole::Vox.suffix().to_string());
+            // Match any of our Vox sinks; return the slot-index-typed
+            // suffix so the client can tell which channel this source
+            // is currently feeding.
+            if let Some(slot) = self
+                .vox_sink_names
+                .iter()
+                .position(|n| n == &target.name)
+            {
+                return Some(SinkRole::Vox(slot).suffix());
             }
         }
         None
@@ -1067,9 +1094,13 @@ fn link_device_source(
 ) -> anyhow::Result<()> {
     let sink_id = {
         let g = graph.borrow();
-        let sink_name = match target {
+        let sink_name: &str = match target {
             SinkRole::Music => g.music_sink_name.as_str(),
-            SinkRole::Vox => g.vox_sink_name.as_str(),
+            SinkRole::Vox(i) => g
+                .vox_sink_names
+                .get(i)
+                .map(|s| s.as_str())
+                .ok_or_else(|| anyhow::anyhow!("vox slot {i} out of range"))?,
         };
         g.nodes
             .iter()
@@ -1122,9 +1153,13 @@ fn route_source_via_metadata(
     );
     match target {
         Some(role) => {
-            let sink_name = match role {
+            let sink_name: &str = match role {
                 SinkRole::Music => g.music_sink_name.as_str(),
-                SinkRole::Vox => g.vox_sink_name.as_str(),
+                SinkRole::Vox(i) => g
+                    .vox_sink_names
+                    .get(i)
+                    .map(|s| s.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("vox slot {i} out of range"))?,
             };
             let (sink_node_id, sink_serial) = g
                 .nodes
@@ -1179,23 +1214,42 @@ fn run(
     let context = Context::new(&mainloop).context("Context::connect")?;
     let core = context.connect(None).context("Context::connect")?;
 
+    let slot_count = cfg.mixer.vox_slot_count();
+    anyhow::ensure!(
+        cfg.input_taps.len() == slot_count,
+        "input_taps length ({}) must match mixer vox slot count ({slot_count})",
+        cfg.input_taps.len(),
+    );
+    let vox_sink_names: Vec<String> = (0..slot_count)
+        .map(|i| format!("{}-{}", cfg.node_name, SinkRole::Vox(i).suffix()))
+        .collect();
     let graph: Rc<RefCell<Graph>> = Rc::new(RefCell::new(Graph {
         auto_patch_target: cfg.auto_patch_target.clone(),
         music_sink_name: format!("{}-{}", cfg.node_name, SinkRole::Music.suffix()),
-        vox_sink_name: format!("{}-{}", cfg.node_name, SinkRole::Vox.suffix()),
+        vox_sink_names: vox_sink_names.clone(),
         ..Graph::default()
     }));
 
     // Passthrough rings, one per companion sink. Sized for ~half a second at
     // the target rate: large enough to absorb sink/source callback tick jitter
-    // without piling up perceivable latency in the mic feed. Both rings carry
+    // without piling up perceivable latency in the mic feed. Rings carry
     // stereo pairs — the sink callback pushes each incoming frame verbatim
     // (no downmix), and the source callback applies per-strip pan
     // (constant-power law, per-channel) so the stereo image survives from
     // whatever's feeding the sink all the way to the mic feed.
     let input_ring_frames = (cfg.sample_rate as usize / 2).max(1024);
     let (music_producer, music_consumer) = RingBuffer::<[f32; 2]>::new(input_ring_frames);
-    let (vox_producer, vox_consumer) = RingBuffer::<[f32; 2]>::new(input_ring_frames);
+    // One ring per vox slot. Producer stays on the pw thread inside the
+    // sink callback closure; consumer moves into the source callback's
+    // StreamState. Kept in matching order across the vec so `vox_consumers[i]`
+    // drains what `vox_producers[i]` fills.
+    let mut vox_producers: Vec<rtrb::Producer<[f32; 2]>> = Vec::with_capacity(slot_count);
+    let mut vox_consumers: Vec<rtrb::Consumer<[f32; 2]>> = Vec::with_capacity(slot_count);
+    for _ in 0..slot_count {
+        let (p, c) = RingBuffer::<[f32; 2]>::new(input_ring_frames);
+        vox_producers.push(p);
+        vox_consumers.push(c);
+    }
 
     // Registry listener. Wrap the registry in an Rc so both the global
     // callback (which needs to `bind` new node proxies) and the run-scope
@@ -1233,9 +1287,10 @@ fn run(
         /// Stereo music-sink drain. Empty when nobody's routed into the
         /// `-music` node; pops return Err and contribute 0 to the sum.
         music_consumer: Consumer<[f32; 2]>,
-        /// Stereo vox-sink drain. Same semantics as music — the sink
-        /// callback pushes each incoming stereo frame verbatim.
-        vox_consumer: Consumer<[f32; 2]>,
+        /// Stereo drain per Vox slot. Index matches the mixer's slot
+        /// array. Length fixed for process lifetime — the callback
+        /// iterates `&mut vox_consumers` without any synchronization.
+        vox_consumers: Vec<Consumer<[f32; 2]>>,
         /// Shared mixer atomics. Read per-frame; updates from HTTP are
         /// picked up on the very next process cycle.
         mixer: Arc<AtomicMixer>,
@@ -1256,7 +1311,7 @@ fn run(
     let state = StreamState {
         tts_consumer: consumer,
         music_consumer,
-        vox_consumer,
+        vox_consumers,
         mixer: cfg.mixer.clone(),
         monitor_tap: cfg.monitor_tap.clone(),
         silent_frames: 0,
@@ -1316,21 +1371,27 @@ fn run(
                 // loads and the mixer never changes mid-buffer meaningfully.
                 let (tts_l, tts_r) = state.mixer.tts.stereo_gains();
                 let (music_l, music_r) = state.mixer.music.stereo_gains();
-                let (vox_l, vox_r) = state.mixer.vox.stereo_gains();
                 let (master_gain, master_muted) = state.mixer.master();
-                // Vox is a capture source for STT / recording — its samples
-                // reach that path via the sink's broadcast tap regardless of
-                // this flag. Only its contribution to the mic-feed sum is
-                // gated. Metering (below) still reflects the strip's panned
-                // signal so users can see input level even when the strip
-                // isn't routed out.
-                let vox_out = state.mixer.vox_to_output();
+
+                // Per-vox-slot snapshot: (l_gain, r_gain, enabled,
+                // to_output). Enabled=false forces the strip to contribute
+                // nothing to peaks or mix; to_output only gates its
+                // contribution to the master bus (metering still runs so
+                // the user sees the input level even for capture-only
+                // slots). Order matches state.vox_consumers so the mix
+                // loop can index by slot.
+                let slot_count = state.vox_consumers.len();
+                let mut vox_state: [(f32, f32, bool, bool); 16] =
+                    [(0.0, 0.0, false, false); 16];
+                let effective_slots = slot_count.min(16);
+                for i in 0..effective_slots {
+                    let slot = &state.mixer.vox[i];
+                    let (l, r) = slot.channel.stereo_gains();
+                    vox_state[i] = (l, r, slot.enabled(), slot.to_output());
+                }
 
                 // Buffer the final stereo mic feed so we can broadcast it to
                 // the browser monitor after we've filled the buffer.
-                // Interleaved [L, R, L, R, ...] so pan is preserved for the
-                // Opus stereo encoder on the other side of the tap. Only
-                // allocate when at least one subscriber is attached.
                 let want_tap = state.monitor_tap.receiver_count() > 0;
                 let mut tap_buf: Vec<f32> = if want_tap {
                     Vec::with_capacity(frames * SOURCE_CHANNELS as usize)
@@ -1338,13 +1399,9 @@ fn run(
                     Vec::new()
                 };
 
-                // Per-strip peak magnitudes (pre-master) accumulated across
-                // this whole buffer. We update the mixer's atomics once at
-                // the bottom rather than per-frame so the RT hot path only
-                // touches non-atomic locals inside the loop.
                 let mut tts_peak = 0.0f32;
                 let mut music_peak = 0.0f32;
-                let mut vox_peak = 0.0f32;
+                let mut vox_peaks: [f32; 16] = [0.0; 16];
                 let mut master_l_peak = 0.0f32;
                 let mut master_r_peak = 0.0f32;
 
@@ -1353,45 +1410,45 @@ fn run(
                     // Always drain each ring even if muted — otherwise the
                     // upstream sink callback will spin against a full ring
                     // and drop input frames instead of just being silenced.
-                    // Rings carry stereo `[L, R]` pairs; underrun contributes
-                    // silence to both channels.
                     let [tts_lin, tts_rin] = state.tts_consumer.pop().unwrap_or([0.0, 0.0]);
                     let [mus_lin, mus_rin] = state.music_consumer.pop().unwrap_or([0.0, 0.0]);
-                    let [vox_lin, vox_rin] = state.vox_consumer.pop().unwrap_or([0.0, 0.0]);
 
-                    // Per-strip contributions to the mix bus (pre-master).
-                    // Constant-power pan is applied per-channel: the L input
-                    // is attenuated by `l_gain` (= cos(angle)) into the L bus,
-                    // R by `r_gain` (= sin(angle)) into the R bus. At pan=0
-                    // both channels see 0.707 → stereo image preserved (with
-                    // the classic ~3dB center dip). At pan=±1 the opposite
-                    // input's channel is muted. For a mono-duplicated source
-                    // (TTS today) this is identical to the previous mono-in,
-                    // pan-fanned-to-stereo behavior.
                     let tts_l_c = tts_lin * tts_l;
                     let tts_r_c = tts_rin * tts_r;
                     let mus_l_c = mus_lin * music_l;
                     let mus_r_c = mus_rin * music_r;
-                    let vox_l_c = vox_lin * vox_l;
-                    let vox_r_c = vox_rin * vox_r;
 
-                    // Meter magnitude per strip = max(|L|, |R|) of the
-                    // panned contribution. Matches what a channel VU on a
-                    // physical mixer shows post-fader/pre-master.
                     tts_peak = tts_peak.max(tts_l_c.abs().max(tts_r_c.abs()));
                     music_peak = music_peak.max(mus_l_c.abs().max(mus_r_c.abs()));
-                    vox_peak = vox_peak.max(vox_l_c.abs().max(vox_r_c.abs()));
+
+                    // Drain + mix every vox slot's ring. Disabled slots
+                    // still drain (so upstream sinks don't stall) but
+                    // don't contribute to peaks or the mix.
+                    let mut vox_sum_l = 0.0f32;
+                    let mut vox_sum_r = 0.0f32;
+                    for slot_i in 0..effective_slots {
+                        let [vox_lin, vox_rin] = state.vox_consumers[slot_i]
+                            .pop()
+                            .unwrap_or([0.0, 0.0]);
+                        let (vl, vr, enabled, to_out) = vox_state[slot_i];
+                        if !enabled {
+                            continue;
+                        }
+                        let vox_l_c = vox_lin * vl;
+                        let vox_r_c = vox_rin * vr;
+                        vox_peaks[slot_i] = vox_peaks[slot_i]
+                            .max(vox_l_c.abs().max(vox_r_c.abs()));
+                        if to_out {
+                            vox_sum_l += vox_l_c;
+                            vox_sum_r += vox_r_c;
+                        }
+                    }
 
                     let (l, r) = if master_muted {
                         (0.0, 0.0)
                     } else {
-                        let (vox_out_l, vox_out_r) = if vox_out {
-                            (vox_l_c, vox_r_c)
-                        } else {
-                            (0.0, 0.0)
-                        };
-                        let l = (tts_l_c + mus_l_c + vox_out_l) * master_gain;
-                        let r = (tts_r_c + mus_r_c + vox_out_r) * master_gain;
+                        let l = (tts_l_c + mus_l_c + vox_sum_l) * master_gain;
+                        let r = (tts_r_c + mus_r_c + vox_sum_r) * master_gain;
                         (l.clamp(-1.0, 1.0), r.clamp(-1.0, 1.0))
                     };
                     master_l_peak = master_l_peak.max(l.abs());
@@ -1409,12 +1466,13 @@ fn run(
                     }
                 }
 
-                // Publish the per-buffer peaks to the mixer atomics for
-                // `/mixer/levels`. Cheap: three CAS-loop fetch_max ops plus
-                // two for master, once per cycle rather than per-frame.
                 state.mixer.tts.observe_peak(tts_peak);
                 state.mixer.music.observe_peak(music_peak);
-                state.mixer.vox.observe_peak(vox_peak);
+                for slot_i in 0..effective_slots {
+                    state.mixer.vox[slot_i]
+                        .channel
+                        .observe_peak(vox_peaks[slot_i]);
+                }
                 state.mixer.observe_master_peak(master_l_peak, master_r_peak);
 
                 if want_tap && !tap_buf.is_empty() {
@@ -1465,14 +1523,10 @@ fn run(
         )
         .context("Stream::connect")?;
 
-    // Two companion sink nodes, each with a fixed routing purpose:
-    //   * `-music` → downmix + push into music ring (mixed via the mixer's
-    //                music strip in the source callback)
-    //   * `-vox`   → downmix + push into vox ring (mixed via the mixer's
-    //                vox strip) AND publish stereo to the broadcast tap for
-    //                downstream FX / recording consumers
-    // Both streams are kept alive for the pw thread lifetime; dropping
-    // either tears its node down.
+    // Companion sink nodes: one `-music` sink plus one per vox slot.
+    // Each is kept alive for the pw thread lifetime; dropping a stream
+    // tears its node down. Vox sinks publish stereo to their per-slot
+    // broadcast tap in addition to filling the mix ring.
     let (_music_stream, _music_listener) = register_sink_stream(
         &core,
         &cfg,
@@ -1481,14 +1535,23 @@ fn run(
         None,
     )
     .context("register music sink stream")?;
-    let (_vox_stream, _vox_listener) = register_sink_stream(
-        &core,
-        &cfg,
-        SinkRole::Vox,
-        vox_producer,
-        Some(cfg.input_tap.clone()),
-    )
-    .context("register vox sink stream")?;
+    let mut _vox_streams: Vec<(Stream, pw::stream::StreamListener<SinkState>)> =
+        Vec::with_capacity(slot_count);
+    for (i, (producer, tap)) in vox_producers
+        .into_iter()
+        .zip(cfg.input_taps.iter().cloned())
+        .enumerate()
+    {
+        let (stream, listener) = register_sink_stream(
+            &core,
+            &cfg,
+            SinkRole::Vox(i),
+            producer,
+            Some(tap),
+        )
+        .with_context(|| format!("register vox sink stream (slot {i})"))?;
+        _vox_streams.push((stream, listener));
+    }
 
     // Command receiver, attached to the pw main loop so incoming commands wake
     // the loop and are dispatched on this thread.
@@ -1554,9 +1617,10 @@ fn register_sink_stream(
     };
     let stream = Stream::new(core, &sink_node_name, props).context("input Stream::new")?;
 
-    // Vox is the only role that needs a broadcast tap; enforce here so a
-    // future refactor can't silently drop the FX/recording feed.
-    if matches!(role, SinkRole::Vox) {
+    // Every Vox slot's sink needs a broadcast tap so downstream
+    // recording / FX consumers can subscribe. Enforce here so a future
+    // refactor can't silently drop the tap for one slot.
+    if matches!(role, SinkRole::Vox(_)) {
         anyhow::ensure!(input_tap.is_some(), "Vox sink requires an input_tap");
     }
 

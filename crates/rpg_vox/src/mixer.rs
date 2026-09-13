@@ -1,17 +1,29 @@
 //! Runtime mixer state for the pipewire source.
 //!
-//! Three input strips (TTS, music-sink, vox-sink) plus a master. Each strip
-//! carries a linear gain (0..2), a constant-power pan (-1..+1) and a mute
-//! flag; the master carries gain + mute only. Values are read from the
-//! realtime source callback, so state lives in atomics — `Arc<AtomicMixer>`
-//! is cheap to clone, lock-free to read, and lock-free to update from HTTP.
+//! Three strip families plus a master:
+//!
+//! * `tts` — synthesized speech from the tokio TTS runner.
+//! * `music` — the `-music` companion sink.
+//! * `vox`  — an operator-configured **array** of Vox channels (the count
+//!   is fixed at boot from `RPG_VOX_VOX_SLOTS`, default 4). Each slot has
+//!   its own display name, gain/pan/mute, and `to_output` gate so several
+//!   independent capture sources (Discord user A vs. B, a couple mics on
+//!   the same table, etc.) can be routed and transcribed independently.
+//!
+//! Values are read from the realtime source callback, so state lives in
+//! atomics — `Arc<AtomicMixer>` is cheap to clone, lock-free to read from
+//! the RT thread, and lock-free to update from HTTP. The vox slot count is
+//! fixed for the lifetime of the process (a `Box<[VoxSlot]>` never
+//! reallocates), so the callback can `for slot in &mixer.vox` without
+//! taking a lock — only the *contents* of each slot mutate.
 //!
 //! Persisted through the existing sqlite `app_state` KV table (see
 //! [`crate::store::Store::get_mixer`]/`put_mixer`). Loaded once at startup
 //! and re-applied whenever the HTTP endpoint accepts a patch.
 
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use crate::tts::clicks::ClickPreset;
@@ -22,6 +34,11 @@ const RELAXED: Ordering = Ordering::Relaxed;
 /// modest here means the constant-power pan curve never turns a nominal
 /// unity signal into hard-clipping output on its own.
 pub const MAX_GAIN: f32 = 2.0;
+
+/// Default vox slot count. Overridable at boot via `RPG_VOX_VOX_SLOTS`
+/// (see main.rs). Not a const-generic because we want runtime
+/// configurability without a rebuild.
+pub const DEFAULT_VOX_SLOTS: usize = 4;
 
 fn clamp_gain(v: f32) -> f32 {
     v.clamp(0.0, MAX_GAIN)
@@ -117,19 +134,97 @@ impl AtomicChannel {
     }
 }
 
+/// One Vox slot. Combines the strip audio parameters with the metadata
+/// (enable flag, display name, `to_output` gate) that used to live on the
+/// AtomicMixer proper. Held inside a `Box<[VoxSlot]>` so the RT callback
+/// can iterate without allocating or locking — only the atomics inside
+/// each slot mutate over the process lifetime.
+#[derive(Debug)]
+pub struct VoxSlot {
+    pub channel: AtomicChannel,
+    /// Slot is "hot" for the record pipeline + mic-feed inclusion. A
+    /// disabled slot still exists as a pipewire sink (so routing doesn't
+    /// get lost on toggle) but its samples aren't summed into the master
+    /// bus and no VAD worker is spawned for it.
+    enabled: AtomicBool,
+    /// Sum this slot into the master mic feed. Independent of `enabled` —
+    /// the "→ MIC" toggle in the mixer maps to this. Vox slots default
+    /// off so they capture-only unless the user opts one back into the
+    /// output.
+    to_output: AtomicBool,
+    /// Display name for this slot (shown in the mixer strip label + on
+    /// every transcript entry produced from this slot). Behind a mutex
+    /// because the RT audio thread never reads the name — only the HTTP
+    /// layer and the VAD worker do — so lock contention is a non-issue.
+    name: Mutex<String>,
+}
+
+impl VoxSlot {
+    fn new(state: VoxSlotState) -> Self {
+        Self {
+            channel: AtomicChannel::new(state.channel),
+            enabled: AtomicBool::new(state.enabled),
+            to_output: AtomicBool::new(state.to_output),
+            name: Mutex::new(state.name),
+        }
+    }
+
+    #[inline]
+    pub fn enabled(&self) -> bool {
+        self.enabled.load(RELAXED)
+    }
+
+    #[inline]
+    pub fn to_output(&self) -> bool {
+        self.to_output.load(RELAXED)
+    }
+
+    pub fn name(&self) -> String {
+        self.name.lock().expect("vox slot name mutex poisoned").clone()
+    }
+
+    pub fn set_name(&self, name: String) {
+        *self.name.lock().expect("vox slot name mutex poisoned") = name;
+    }
+
+    pub fn snapshot(&self) -> VoxSlotState {
+        VoxSlotState {
+            enabled: self.enabled(),
+            to_output: self.to_output(),
+            name: self.name(),
+            channel: self.channel.snapshot(),
+        }
+    }
+
+    fn apply(&self, patch: VoxSlotPatch) {
+        if let Some(e) = patch.enabled {
+            self.enabled.store(e, RELAXED);
+        }
+        if let Some(v) = patch.to_output {
+            self.to_output.store(v, RELAXED);
+        }
+        if let Some(n) = patch.name {
+            let n = n.trim().to_string();
+            if !n.is_empty() {
+                self.set_name(n);
+            }
+        }
+        if let Some(c) = patch.channel {
+            self.channel.apply(c);
+        }
+    }
+}
+
 /// Full mixer state. `Arc<Self>` is handed to the pipewire source thread,
 /// the HTTP layer and the persistence layer — clones are cheap.
 #[derive(Debug)]
 pub struct AtomicMixer {
     pub tts: AtomicChannel,
     pub music: AtomicChannel,
-    pub vox: AtomicChannel,
-    /// When false, the vox strip is NOT summed into the mic output. Its
-    /// primary consumer is the `-vox` sink's broadcast tap (speech-to-text,
-    /// recording), so we don't want it echoing into the mic by default.
-    /// Flip to true as an override — the vox strip's gain/pan/mute still
-    /// apply, so "unmodified" playback = leave them at unity.
-    vox_to_output: AtomicBool,
+    /// Vox slot array. Length fixed for the process lifetime — the
+    /// realtime callback iterates `&*vox` without any synchronization.
+    /// Access individual slots via [`Self::vox_slot`] or iterate directly.
+    pub vox: Box<[VoxSlot]>,
     master_gain: AtomicU32,
     master_mute: AtomicBool,
     /// Master output peaks per side (post-master-gain, post-clip). Same
@@ -148,39 +243,28 @@ pub struct AtomicMixer {
     /// snapshot.
     tts_stop_gen: AtomicU64,
     /// Monotonic "latest PlayPcm request" counter for latest-wins dedup.
-    /// Every `POST /widgets/:id/say` claims a fresh seq before enqueueing
-    /// its command; the TTS runner's PlayPcm handler skips (replies Ok(0),
-    /// touches nothing) if its seq isn't equal to the current latest —
-    /// meaning another PlayPcm was enqueued behind it in the mpsc. This
-    /// prevents queued clips from playing back one after another when the
-    /// user clicks Play on several clips in quick succession.
     play_seq: AtomicU64,
     /// Highest `tts_stop_gen` the pw process callback has already acted on
     /// (drained the ring for). Published after each drain so the TTS
     /// runner can wait until a pending stop has been honored before it
-    /// starts pushing a fresh clip — otherwise the runner's pushed samples
-    /// would be drained by the still-pending stop and playback would start
-    /// mid-clip. `AtomicU64` (not Mutex) since it's read/written by the
-    /// audio-thread callback and must stay lock-free.
+    /// starts pushing a fresh clip.
     tts_stop_observed_gen: AtomicU64,
     /// Wait-fill click track selection. `0` = off; any other value
-    /// decodes to a [`ClickPreset`] via [`ClickPreset::from_u8`]. Off by
-    /// default; the Script page sets a preset at Send and clears it
-    /// once the first assistant speech take starts playback. Not
-    /// persisted with the rest of [`MixerState`] — it's transient
-    /// runtime state, same tier as [`Self::tts_stop_gen`] /
-    /// [`Self::play_seq`]. `u8` (not enum-typed atomic) so the RT read
-    /// stays lock-free without pulling in an atomic-cell crate.
+    /// decodes to a [`ClickPreset`] via [`ClickPreset::from_u8`].
     clicks_preset: AtomicU8,
 }
 
 impl AtomicMixer {
     pub fn new(state: MixerState) -> Arc<Self> {
+        let vox: Box<[VoxSlot]> = state
+            .vox
+            .into_iter()
+            .map(VoxSlot::new)
+            .collect();
         Arc::new(Self {
             tts: AtomicChannel::new(state.tts),
             music: AtomicChannel::new(state.music),
-            vox: AtomicChannel::new(state.vox),
-            vox_to_output: AtomicBool::new(state.vox_to_output),
+            vox,
             master_gain: AtomicU32::new(clamp_gain(state.master.gain).to_bits()),
             master_mute: AtomicBool::new(state.master.mute),
             master_peak_l: AtomicU32::new(0),
@@ -192,87 +276,66 @@ impl AtomicMixer {
         })
     }
 
+    /// Reference to a vox slot by index. Returns `None` for out-of-range
+    /// indices so patch handlers can 404 instead of panicking on a
+    /// client-side typo.
+    #[inline]
+    pub fn vox_slot(&self, index: usize) -> Option<&VoxSlot> {
+        self.vox.get(index)
+    }
+
+    pub fn vox_slot_count(&self) -> usize {
+        self.vox.len()
+    }
+
     /// Select the wait-fill preset. `Some(preset)` turns the click bed on
-    /// with that voicing; `None` turns it off. The runner's clicks task
-    /// polls this at every idle tick — flipping to None between bursts
-    /// is enough to stop cleanly. Callers also typically bump
-    /// [`Self::request_tts_stop`] on shutoff so any burst already sitting
-    /// in the pipewire ring is drained instead of tailing off audibly.
+    /// with that voicing; `None` turns it off.
     #[inline]
     pub fn set_clicks_preset(&self, preset: Option<ClickPreset>) {
         let v = preset.map(|p| p.as_u8()).unwrap_or(0);
         self.clicks_preset.store(v, RELAXED);
     }
 
-    /// Current preset selection. `None` = off. Read by the runner's
-    /// clicks task once per generated burst.
     #[inline]
     pub fn clicks_preset(&self) -> Option<ClickPreset> {
         ClickPreset::from_u8(self.clicks_preset.load(RELAXED))
     }
 
-    /// Bump the TTS-playback stop generation. Any consumer that captured a
-    /// snapshot of [`Self::tts_stop_gen`] before this call will see a newer
-    /// value and can act (flush the ring / bail out of a push loop).
     #[inline]
     pub fn request_tts_stop(&self) -> u64 {
-        // fetch_add returns the *previous* value; the new gen is prev + 1.
         self.tts_stop_gen.fetch_add(1, RELAXED) + 1
     }
 
-    /// Current stop-generation. Captured at PlayPcm entry and compared
-    /// against later in the TTS runner + the pw process callback.
     #[inline]
     pub fn tts_stop_gen(&self) -> u64 {
         self.tts_stop_gen.load(RELAXED)
     }
 
-    /// Reserve the next PlayPcm sequence. HTTP handlers call this before
-    /// enqueueing a request; the runner refuses to play any command whose
-    /// seq doesn't match [`Self::latest_play_seq`] at dispatch time.
     #[inline]
     pub fn claim_play_seq(&self) -> u64 {
         self.play_seq.fetch_add(1, RELAXED) + 1
     }
 
-    /// The most recently claimed play sequence.
     #[inline]
     pub fn latest_play_seq(&self) -> u64 {
         self.play_seq.load(RELAXED)
     }
 
-    /// Publish that the pw callback has drained the ring for stop-gen up
-    /// to `gen`. Called from the audio thread.
     #[inline]
     pub fn set_tts_stop_observed_gen(&self, gen: u64) {
         self.tts_stop_observed_gen.store(gen, RELAXED);
     }
 
-    /// Highest stop-gen the pw callback has honored (drained for). The TTS
-    /// runner waits for this to catch up to its own captured stop-gen
-    /// before pushing samples of a fresh clip.
     #[inline]
     pub fn tts_stop_observed_gen(&self) -> u64 {
         self.tts_stop_observed_gen.load(RELAXED)
     }
 
-    /// (gain, muted) for the master strip. Muted is a bool because the
-    /// source callback short-circuits the whole frame when true.
     #[inline]
     pub fn master(&self) -> (f32, bool) {
         (load_f32(&self.master_gain), self.master_mute.load(RELAXED))
     }
 
-    /// True when the user has opted the vox strip into the mic output. Read
-    /// once per process cycle by the source callback.
-    #[inline]
-    pub fn vox_to_output(&self) -> bool {
-        self.vox_to_output.load(RELAXED)
-    }
-
-    /// Observe the recent master output peaks (`|L|`, `|R|`). Called once
-    /// per process cycle from the RT source callback with the maxima seen
-    /// over that buffer.
     #[inline]
     pub fn observe_master_peak(&self, left: f32, right: f32) {
         if left.is_finite() && left > 0.0 {
@@ -290,7 +353,7 @@ impl AtomicMixer {
         LevelsSnapshot {
             tts: self.tts.take_peak(),
             music: self.music.take_peak(),
-            vox: self.vox.take_peak(),
+            vox: self.vox.iter().map(|s| s.channel.take_peak()).collect(),
             master_l: f32::from_bits(self.master_peak_l.swap(0, RELAXED)),
             master_r: f32::from_bits(self.master_peak_r.swap(0, RELAXED)),
         }
@@ -300,17 +363,22 @@ impl AtomicMixer {
         MixerState {
             tts: self.tts.snapshot(),
             music: self.music.snapshot(),
-            vox: self.vox.snapshot(),
-            vox_to_output: self.vox_to_output.load(RELAXED),
+            vox: self.vox.iter().map(|s| s.snapshot()).collect(),
             master: MasterState {
                 gain: load_f32(&self.master_gain),
                 mute: self.master_mute.load(RELAXED),
             },
+            legacy_vox: None,
+            legacy_vox_to_output: None,
         }
     }
 
     /// Apply a partial patch. Missing fields keep their current value so the
     /// client can nudge a single knob without echoing full state back.
+    ///
+    /// Vox slot patches arrive as a map keyed by stringified index — this
+    /// lets the client patch several slots in one PUT (rarely useful) but
+    /// keeps the common case of "one slider moved" a 1-entry map.
     pub fn apply(&self, patch: MixerPatch) {
         if let Some(p) = patch.tts {
             self.tts.apply(p);
@@ -318,11 +386,14 @@ impl AtomicMixer {
         if let Some(p) = patch.music {
             self.music.apply(p);
         }
-        if let Some(p) = patch.vox {
-            self.vox.apply(p);
-        }
-        if let Some(v) = patch.vox_to_output {
-            self.vox_to_output.store(v, RELAXED);
+        if let Some(slots) = patch.vox {
+            for (key, slot_patch) in slots {
+                if let Ok(idx) = key.parse::<usize>() {
+                    if let Some(slot) = self.vox.get(idx) {
+                        slot.apply(slot_patch);
+                    }
+                }
+            }
         }
         if let Some(p) = patch.master {
             if let Some(g) = p.gain {
@@ -364,34 +435,119 @@ impl Default for MasterState {
     }
 }
 
-#[derive(Copy, Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct VoxSlotState {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub to_output: bool,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub channel: ChannelState,
+}
+
+impl VoxSlotState {
+    /// Boot-time defaults for slot `index`. Slot 0 is enabled by default
+    /// (the historical single Vox channel); every other slot ships
+    /// disabled. Display names read "Vox 1", "Vox 2", ... consistently
+    /// so a mixer with the first slot renamed looks the same shape as
+    /// a mixer with the third slot renamed — the user can override any
+    /// slot's name from the mixer strip.
+    pub fn boot_default(index: usize) -> Self {
+        Self {
+            enabled: index == 0,
+            to_output: false,
+            name: format!("Vox {}", index + 1),
+            channel: ChannelState::default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MixerState {
     #[serde(default)]
     pub tts: ChannelState,
     #[serde(default)]
     pub music: ChannelState,
+    /// Vox slots — as many as the process was booted with
+    /// (`RPG_VOX_VOX_SLOTS`). The persisted JSON is authoritative for
+    /// **length** on restart — if the operator changes the env var, the
+    /// loader rescales the array in [`MixerState::resize_for`] before
+    /// building the AtomicMixer.
     #[serde(default)]
-    pub vox: ChannelState,
-    /// Route the vox strip into the mic output. Off by default — vox is a
-    /// capture source for STT/recording, not something we want echoing back
-    /// to Discord. See [`AtomicMixer::vox_to_output`].
-    #[serde(default)]
-    pub vox_to_output: bool,
+    pub vox: Vec<VoxSlotState>,
     #[serde(default)]
     pub master: MasterState,
+    /// Legacy field: single-vox `vox_to_output` toggle from before slots
+    /// existed. Migrated into `vox[0].to_output` in [`Self::migrate`] on
+    /// load. Kept as `#[serde(default)]` so old JSON parses cleanly.
+    #[serde(default, skip_serializing)]
+    legacy_vox_to_output: Option<bool>,
+    /// Legacy single-vox channel from before slots. Migrated into
+    /// `vox[0].channel` when present.
+    #[serde(default, skip_serializing, rename = "legacyVox")]
+    legacy_vox: Option<ChannelState>,
+}
+
+impl Default for MixerState {
+    fn default() -> Self {
+        Self::with_slot_count(DEFAULT_VOX_SLOTS)
+    }
+}
+
+impl MixerState {
+    pub fn with_slot_count(n: usize) -> Self {
+        Self {
+            tts: ChannelState::default(),
+            music: ChannelState::default(),
+            vox: (0..n).map(VoxSlotState::boot_default).collect(),
+            master: MasterState::default(),
+            legacy_vox_to_output: None,
+            legacy_vox: None,
+        }
+    }
+
+    /// Resize the vox slot list to `n` after loading. Preserves existing
+    /// slot contents up to min(current, n) and appends fresh boot defaults
+    /// beyond that. Shrinking drops the trailing slots.
+    pub fn resize_for(&mut self, n: usize) {
+        if self.vox.len() < n {
+            for i in self.vox.len()..n {
+                self.vox.push(VoxSlotState::boot_default(i));
+            }
+        } else if self.vox.len() > n {
+            self.vox.truncate(n);
+        }
+    }
+
+    /// One-shot migration for pre-slots JSON: fold legacy `vox` and
+    /// `vox_to_output` into slot 0. Safe to call unconditionally — it's
+    /// a no-op when the fields aren't set.
+    pub fn migrate(&mut self) {
+        if self.vox.is_empty() {
+            self.vox.push(VoxSlotState::boot_default(0));
+        }
+        if let Some(v) = self.legacy_vox.take() {
+            self.vox[0].channel = v;
+        }
+        if let Some(v) = self.legacy_vox_to_output.take() {
+            self.vox[0].to_output = v;
+        }
+    }
 }
 
 /// Snapshot returned by `GET /mixer/levels`. Every field is a peak
 /// magnitude in `[0, 1]` (or slightly beyond, since summing multiple
 /// strips can transiently push a strip peak past 1.0 before the master
-/// clamp — useful signal for the UI). Per-strip peaks are the max of
-/// `|L|`/`|R|` for that strip's contribution to the mix bus (pre-master);
-/// `master_l` / `master_r` are the post-master clamped output peaks.
-#[derive(Copy, Clone, Debug, Default, Serialize)]
+/// clamp — useful signal for the UI).
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct LevelsSnapshot {
     pub tts: f32,
     pub music: f32,
-    pub vox: f32,
+    /// Per-vox-slot peaks, indexed by slot. Length matches the mixer's
+    /// slot count.
+    pub vox: Vec<f32>,
     pub master_l: f32,
     pub master_r: f32,
 }
@@ -409,14 +565,24 @@ pub struct MasterPatch {
     pub mute: Option<bool>,
 }
 
-#[derive(Copy, Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct VoxSlotPatch {
+    pub enabled: Option<bool>,
+    #[serde(rename = "toOutput", alias = "to_output")]
+    pub to_output: Option<bool>,
+    pub name: Option<String>,
+    #[serde(flatten)]
+    pub channel: Option<ChannelPatch>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
 pub struct MixerPatch {
     pub tts: Option<ChannelPatch>,
     pub music: Option<ChannelPatch>,
-    pub vox: Option<ChannelPatch>,
-    /// Toggle whether the vox strip contributes to the mic feed. `None`
-    /// leaves the current value untouched.
-    pub vox_to_output: Option<bool>,
+    /// Map of slot index (stringified) → per-slot patch. The wire format
+    /// looks like `{ "vox": { "0": { "gain": 0.8 }, "2": { "name": "Alice" } } }`.
+    /// Common case is a single-entry map (one slider dragged).
+    pub vox: Option<BTreeMap<String, VoxSlotPatch>>,
     pub master: Option<MasterPatch>,
 }
 
@@ -434,11 +600,26 @@ impl From<MasterState> for MasterPatch {
 
 impl From<MixerState> for MixerPatch {
     fn from(s: MixerState) -> Self {
+        let vox = s
+            .vox
+            .into_iter()
+            .enumerate()
+            .map(|(i, slot)| {
+                (
+                    i.to_string(),
+                    VoxSlotPatch {
+                        enabled: Some(slot.enabled),
+                        to_output: Some(slot.to_output),
+                        name: Some(slot.name),
+                        channel: Some(slot.channel.into()),
+                    },
+                )
+            })
+            .collect();
         Self {
             tts: Some(s.tts.into()),
             music: Some(s.music.into()),
-            vox: Some(s.vox.into()),
-            vox_to_output: Some(s.vox_to_output),
+            vox: Some(vox),
             master: Some(s.master.into()),
         }
     }

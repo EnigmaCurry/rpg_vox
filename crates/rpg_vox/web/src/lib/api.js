@@ -823,6 +823,170 @@ export async function unlinkSource(id) {
 //                   new snapshot. Only the changed field(s) need to be sent
 //                   (e.g. `{ music: { gain: 0.8 } }`).
 
+// --- Record (live transcription + named recording buckets) ---------------
+//
+// GET  /record                        → { mode, buffer, activeRecording,
+//                                        recordings, sttEnabled, ... }
+// POST /record/recordings { name }    → { id }
+// POST /record/recordings/:id/stop    → { id, name, durationMs, entries, ... }
+// DELETE /record/recordings/:id       → 200 (idempotent — cancels active or
+//                                        drops a saved one)
+// GET /record/recordings/:id/audio    → audio/wav bytes
+//
+// The rolling Not-Recording buffer is trimmed FIFO once its total text
+// exceeds ~50 KB, so the UI can render `buffer` verbatim without any
+// client-side windowing. The `activeRecording` object is `null` when the
+// worker is in Not-Recording mode.
+
+export const getRecordState = () => jsonGet('/record');
+
+export async function startNewRecording(name = '') {
+  const body = name ? { name } : {};
+  const r = await fetch('/record/recordings', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) {
+    const detail = await r.text().catch(() => `HTTP ${r.status}`);
+    throw new Error(detail || `HTTP ${r.status}`);
+  }
+  return await r.json();
+}
+
+export async function stopNewRecording(id) {
+  const r = await fetch(`/record/recordings/${encodeURIComponent(id)}/stop`, {
+    method: 'POST',
+  });
+  if (!r.ok) {
+    const detail = await r.text().catch(() => `HTTP ${r.status}`);
+    throw new Error(detail || `HTTP ${r.status}`);
+  }
+  return await r.json();
+}
+
+export async function renameSavedRecording(id, name) {
+  const r = await fetch(`/record/recordings/${encodeURIComponent(id)}`, {
+    method: 'PATCH',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ name }),
+  });
+  if (!r.ok) {
+    const detail = await r.text().catch(() => `HTTP ${r.status}`);
+    throw new Error(detail || `HTTP ${r.status}`);
+  }
+  return await r.json();
+}
+
+export async function deleteSavedRecording(id) {
+  const r = await fetch(`/record/recordings/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+  });
+  if (!r.ok) {
+    const detail = await r.text().catch(() => `HTTP ${r.status}`);
+    throw new Error(detail || `HTTP ${r.status}`);
+  }
+}
+
+export function recordingAudioUrl(id) {
+  return `/record/recordings/${encodeURIComponent(id)}/audio`;
+}
+
+/// URL for the silence-gated *mixed* mic-feed WAV — the full rpg_vox
+/// output (TTS + music + all vox slots) as downstream sinks heard it,
+/// with quiet stretches trimmed. Same RAM-first fallback as the per-slot
+/// audio endpoint, so in-flight recordings can preview mid-record.
+export function recordingMixedUrl(id) {
+  return `/record/recordings/${encodeURIComponent(id)}/mixed`;
+}
+
+/// URL for the downloadable archive (transcript.json + audio.wav +
+/// mixed.wav + clips/*.wav). Only valid for saved recordings — the
+/// server 409s if the id is still in flight.
+export function recordingArchiveUrl(id) {
+  return `/record/recordings/${encodeURIComponent(id)}/archive`;
+}
+
+/// Tell the server that a "play from here" session is starting or
+/// ending. VAD entries captured while active are stamped with
+/// `during_playback: true` so the transcript can distinguish live
+/// speech from mic-picked-up speaker output. Fire-and-forget — a
+/// dropped call just means the tag is missing (log gets slightly
+/// noisier, nothing breaks).
+export async function setRecordPlayback(active) {
+  try {
+    await fetch('/record/playback', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ active: !!active }),
+    });
+  } catch {}
+}
+
+/// Wipe the rolling ephemeral live buffer without touching the in-flight
+/// active recording. Idempotent — an already-empty buffer just returns ok.
+export async function clearLiveBuffer() {
+  const r = await fetch('/record/buffer', { method: 'DELETE' });
+  if (!r.ok) {
+    const detail = await r.text().catch(() => `HTTP ${r.status}`);
+    throw new Error(detail || `HTTP ${r.status}`);
+  }
+}
+
+/// Correct the text of a transcript entry that lives in the RAM state —
+/// either the rolling ephemeral buffer or the in-flight active recording.
+/// Server 404s if the id belongs to a saved recording — call
+/// `updateSavedRecordingEntry` for those.
+export async function updateLiveRecordingEntry(entryId, text) {
+  const r = await fetch(`/record/entries/${encodeURIComponent(entryId)}`, {
+    method: 'PATCH',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ text }),
+  });
+  if (!r.ok) {
+    const detail = await r.text().catch(() => `HTTP ${r.status}`);
+    throw new Error(detail || `HTTP ${r.status}`);
+  }
+  return await r.json();
+}
+
+/// Correct the text of a transcript entry inside a saved recording.
+/// Persists to sqlite; the change is visible in subsequent polls.
+export async function updateSavedRecordingEntry(recordingId, entryId, text) {
+  const r = await fetch(
+    `/record/recordings/${encodeURIComponent(recordingId)}/entries/${encodeURIComponent(entryId)}`,
+    {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ text }),
+    },
+  );
+  if (!r.ok) {
+    const detail = await r.text().catch(() => `HTTP ${r.status}`);
+    throw new Error(detail || `HTTP ${r.status}`);
+  }
+  return await r.json();
+}
+
+/// Absolute URL for a sub-range of a recording, encoded as a mini WAV.
+/// The endpoint transparently reads from RAM when `id` matches the
+/// currently-active in-flight recording (so mid-record utterance playback
+/// works) and falls back to disk otherwise.
+export function recordingSegmentUrl(id, startMs, durationMs) {
+  const params = new URLSearchParams({
+    startMs: String(startMs),
+    durationMs: String(durationMs),
+  });
+  return `/record/recordings/${encodeURIComponent(id)}/segment?${params}`;
+}
+
+/// Rename or otherwise patch a single Vox slot. Delegates to the mixer
+/// PUT — a slot patch is `{ vox: { "<slot>": { name?, enabled?, ... } } }`.
+/// Convenience wrapper for the common one-slot rename.
+export async function patchVoxSlot(slot, patch) {
+  return updateMixer({ vox: { [String(slot)]: patch } });
+}
+
 export const getMixer = () => jsonGet('/mixer');
 export const getMixerLevels = () => jsonGet('/mixer/levels');
 

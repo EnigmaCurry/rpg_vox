@@ -32,6 +32,12 @@ rubato = "0.15"
 # libFLAC bindings to keep the NixOS build free of an extra C dep.
 flacenc = "0.5"
 
+# Zip encoder for the "download recording archive" endpoint. `default-
+# features = false` skips optional compression backends (deflate, bzip2,
+# zstd) since we bundle already-compressed WAVs and a tiny JSON — stored
+# entries are fine and keep the dep footprint small.
+zip = { version = "2", default-features = false }
+
 # Timestamp formatting for the scene download filename. UTC only — the
 # server doesn't take a locale.
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
