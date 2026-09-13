@@ -1738,12 +1738,6 @@ impl VadWorker {
                         // applies inside `finalize_partial` — a junk
                         // decode removes the row rather than promoting
                         // it.
-                        info!(
-                            channel = %state.channel_name(slot),
-                            speaker = ?speaker,
-                            text = %trimmed,
-                            "offline STT final (replacing streaming partial)"
-                        );
                         state.finalize_partial(
                             &entry_id,
                             slot,
@@ -1756,12 +1750,6 @@ impl VadWorker {
                     } else if trimmed.chars().any(|c| c.is_alphanumeric())
                         && !is_false_positive(&trimmed)
                     {
-                        info!(
-                            channel = %state.channel_name(slot),
-                            speaker = ?speaker,
-                            text = %trimmed,
-                            "offline STT transcript"
-                        );
                         state.push_transcript(
                             slot,
                             trimmed,
@@ -1769,12 +1757,6 @@ impl VadWorker {
                             Some(duration_ms),
                             speaker,
                             Some(start_wall_ms),
-                        );
-                    } else if !trimmed.is_empty() {
-                        debug!(
-                            channel = %state.channel_name(slot),
-                            text = %trimmed,
-                            "offline STT dropped as false-positive"
                         );
                     }
                 }

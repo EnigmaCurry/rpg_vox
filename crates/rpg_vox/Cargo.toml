@@ -81,3 +81,7 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 # the `ort` crate above is separately avoided by `ort`'s `load-dynamic`
 # feature (dlopens libonnxruntime at runtime from ORT_DYLIB_PATH).
 sherpa-onnx = { version = "1.13.7", default-features = false, features = ["shared"] }
+
+# Just used for the pipe/dup2 dance that filters sherpa-onnx's C++ stderr
+# noise ("Creating a resampler:" every utterance) out of our logs.
+libc = "0.2"

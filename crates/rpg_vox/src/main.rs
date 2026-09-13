@@ -11,6 +11,7 @@ mod pw_source;
 mod record;
 mod script;
 mod settings;
+mod stderr_filter;
 mod store;
 mod stt;
 mod tts;
@@ -334,6 +335,13 @@ struct Args {
 }
 
 fn main() -> Result<()> {
+    // Filter sherpa-onnx's "Creating a resampler:" banner (fprintf'd
+    // directly to stderr by the C++ library, once per offline decode) out
+    // of stderr before tracing grabs it, so the terminal stays readable
+    // during recording. Returns the pre-swap TTY state so ANSI colors
+    // still get enabled even though the post-swap fd 2 is a pipe.
+    let stderr_was_tty = stderr_filter::install();
+
     // Layered subscriber: the same fmt() logger as before, PLUS an in-memory
     // ring-buffer profiler that captures every `render` span tree from the
     // TTS pipeline (served under /perf/renders). The env-filter only gates
@@ -348,7 +356,11 @@ fn main() -> Result<()> {
         tracing_subscriber::EnvFilter::new("info,ort=warn,ort::logging=warn")
     });
     tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer().with_filter(env_filter))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(stderr_was_tty)
+                .with_filter(env_filter),
+        )
         .with(crate::tts::perf::RingLayer::new())
         .init();
 

@@ -50,10 +50,10 @@
     overflow-wrap: anywhere;
   }
   /* Provisional entries are streaming-STT partials — italic + slightly
-     dimmed so viewers can tell the text may still be revised. Only the
-     latest (bottom-of-page) entry ever renders as provisional; older
-     entries display the offline-corrected text once it arrives, and
-     drop back to non-italic in the process. */
+     dimmed so viewers can tell the text may still be revised. Any entry
+     without an offline-corrected `finalText` renders as provisional;
+     as soon as the corrected pass lands (on any entry, latest or not)
+     the italic drops and the corrected text takes over. */
   .line.provisional .text { font-style: italic; opacity: 0.9; }
   .who {
     display: block;
@@ -117,18 +117,23 @@
   const IDLE_CLEAR_MS = 30000;
 
   /**
-   * page[] — entries currently on the visible page (top-to-bottom in
-   * arrival order). Each entry caches both the streaming (provisional)
-   * text and the offline-corrected (final) text so the render pass can
-   * pick which to show based on position:
-   *   - latest entry (last in `page`)    → provisional text if any,
-   *                                        else corrected text
-   *   - every other entry (older)        → corrected text if any,
-   *                                        else provisional text
-   * That's why the same entry_id can broadcast a `provisional=true`
-   * partial followed by a `provisional=false` final and we keep both
-   * — the final replaces the visible text only after the entry moves
-   * out of the latest slot.
+   * page[] — entries currently on the visible page, kept sorted by
+   * ascending `startWallMs` so top-to-bottom is oldest-to-newest
+   * regardless of arrival order (two overlapping slots or a delayed
+   * offline final can otherwise splice entries in the wrong sequence).
+   * Each entry caches both the streaming (provisional) text and the
+   * offline-corrected (final) text. The render pass always prefers
+   * the final text once it exists (regardless of the entry's position)
+   * and falls back to the provisional streaming text until the offline
+   * pass lands. Any entry still showing provisional text renders as
+   * italic + dimmed so viewers can tell it may still be revised.
+   *
+   * The same entry_id can broadcast a `provisional=true` partial
+   * followed by a `provisional=false` final; keeping both texts means
+   * the streaming hypothesis stays visible while the offline decode
+   * runs, then swaps to the corrected text as soon as the final
+   * arrives — including on the newest entry, which is the common case
+   * once the user stops talking.
    */
   let page = [];
   let idleTimer = null;
@@ -142,30 +147,28 @@
     }, IDLE_CLEAR_MS);
   }
 
-  function textFor(entry, isLatest) {
-    if (isLatest) return entry.provisionalText || entry.finalText || "";
+  function textFor(entry) {
     return entry.finalText || entry.provisionalText || "";
   }
 
-  function makeLine(entry, isLatest) {
+  function makeLine(entry) {
     const line = document.createElement("div");
-    const showAsProvisional = isLatest && !!entry.provisionalText;
+    const showAsProvisional = !entry.finalText && !!entry.provisionalText;
     line.className = "line" + (showAsProvisional ? " provisional" : "");
     const who = document.createElement("span");
     who.className = "who";
     who.textContent = entry.who;
     const text = document.createElement("span");
     text.className = "text";
-    text.textContent = textFor(entry, isLatest);
+    text.textContent = textFor(entry);
     line.append(who, text);
     return line;
   }
 
   function render() {
     stage.replaceChildren();
-    const lastIdx = page.length - 1;
-    for (let i = 0; i < page.length; i++) {
-      stage.append(makeLine(page[i], i === lastIdx));
+    for (const entry of page) {
+      stage.append(makeLine(entry));
     }
   }
 
@@ -175,16 +178,38 @@
     return stage.scrollHeight <= stage.clientHeight + 1;
   }
 
+  /** Insert `entry` into `page` at the position that keeps it sorted
+   *  by ascending `startWallMs`. Entries without a startWallMs sort
+   *  as if 0 (treated as older than everything else, which is safe:
+   *  they're pre-migration data that shouldn't be interleaved with
+   *  live ones). */
+  function insertOrdered(entry) {
+    const key = entry.startWallMs || 0;
+    let i = page.length;
+    while (i > 0 && (page[i - 1].startWallMs || 0) > key) {
+      i--;
+    }
+    page.splice(i, 0, entry);
+  }
+
   /**
    * Merge one incoming SSE `entry` event into the visible page. The
    * event carries either a provisional (streaming partial) or a final
    * (offline SenseVoice) text for `evt.id` — we upsert-by-id so the
    * partial → final swap on the backend lands on the same page slot.
    *
+   * Insertion is ordered by `startWallMs` so a delayed offline final
+   * (for an utterance that started earlier on another slot) drops
+   * into the correct chronological slot rather than appearing at the
+   * bottom.
+   *
    * On overflow (new entry pushes past the stage bottom, or a growing
    * partial does), we page-break: clear the page and restart at the
-   * top with just this entry. That's the "clears and starts filling
-   * again" behaviour.
+   * top with just the chronologically-newest entry so the "current"
+   * utterance stays visible. A stale delayed final that overflows on
+   * its own arrival simply falls off the page here — the alternative
+   * (booting the current live utterance to make room for a correction
+   * of an old one) is worse.
    */
   function upsertEntry(evt) {
     const idx = evt.id ? page.findIndex((e) => e.id === evt.id) : -1;
@@ -198,7 +223,7 @@
       }
       render();
       if (!fits()) {
-        page = [existing];
+        page = [page[page.length - 1]];
         render();
       }
       return;
@@ -208,11 +233,12 @@
       who: evt.who,
       provisionalText: evt.provisional ? evt.text : null,
       finalText: evt.provisional ? null : evt.text,
+      startWallMs: evt.startWallMs || 0,
     };
-    page.push(entry);
+    insertOrdered(entry);
     render();
     if (!fits()) {
-      page = [entry];
+      page = [page[page.length - 1]];
       render();
     }
   }
@@ -256,6 +282,7 @@
         who: (data.who || "").trim() || "unknown",
         text: data.text.trim(),
         provisional: !!data.provisional,
+        startWallMs: Number(data.start_wall_ms) || 0,
       });
       scheduleIdleClear();
     });

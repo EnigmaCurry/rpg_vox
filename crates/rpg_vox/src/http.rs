@@ -4899,11 +4899,18 @@ async fn obs_subtitles_stream(
                     // Speaker preference: hinted name wins; otherwise fall
                     // back to the vox channel name captured at push time.
                     let who = entry.speaker.clone().unwrap_or_else(|| entry.channel.clone());
+                    // start_wall_ms carries the utterance's true start
+                    // moment (VAD speech-start). The OBS client uses it
+                    // to order entries chronologically instead of by
+                    // arrival — otherwise two overlapping slots, or a
+                    // delayed offline final landing after a page-break
+                    // clear, can splice entries in the wrong sequence.
                     let payload = serde_json::json!({
                         "id": entry.id,
                         "who": who,
                         "text": entry.text,
                         "provisional": entry.provisional,
+                        "start_wall_ms": entry.start_wall_ms,
                     });
                     if tx
                         .send(

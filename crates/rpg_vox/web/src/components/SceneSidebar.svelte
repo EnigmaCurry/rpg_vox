@@ -9,6 +9,7 @@
     currentProject,
     currentProjectCharacters,
   } from '../lib/scenes.svelte.js';
+  import { createSidebarDrawer } from '../lib/sidebarDrawer.svelte.js';
 
   // Two-click confirm on delete, per-scene id. Rename is inline via a
   // dblclick → contenteditable-ish pattern using a text input.
@@ -82,16 +83,32 @@
     if (e.key === 'Enter') { e.preventDefault(); commitRename(); }
     else if (e.key === 'Escape') { e.preventDefault(); cancelRename(); }
   }
+
+  // Below the 1080px breakpoint the sidebar collapses to a hamburger
+  // drawer; selecting a scene or hitting `+` dismisses it.
+  const drawer = createSidebarDrawer();
+  const selectAndClose = drawer.wrap(onSelect);
+  const newAndClose = drawer.wrap(onNew);
 </script>
 
-<aside class="sidebar">
+{#if drawer.isMobile && !drawer.open}
+  <button
+    type="button"
+    class="drawer-hamburger"
+    onclick={() => drawer.setOpen(true)}
+    aria-label="Open scenes menu"
+    aria-expanded="false"
+  >☰</button>
+{/if}
+
+<aside class="sidebar" class:drawer={drawer.isMobile} class:open={drawer.open}>
   <div class="head">
     <span class="title" title={project?.name ?? ''}>
       {project ? project.name : 'No project'}
     </span>
     <button
       class="new-btn"
-      onclick={onNew}
+      onclick={newAndClose}
       disabled={!canCreateScene}
       title={!hasProject ? 'Load a project first' : (!hasCharacter ? 'Add a character first' : 'New scene')}
     >+</button>
@@ -116,7 +133,7 @@
           <button
             type="button"
             class="pick"
-            onclick={() => onSelect(scene.id)}
+            onclick={() => selectAndClose(scene.id)}
             aria-current={scenesState.selectedSceneId === scene.id}
           >
             {#if renamingId === scene.id}
@@ -153,6 +170,15 @@
     </ul>
   {/if}
 </aside>
+
+{#if drawer.isMobile && drawer.open}
+  <button
+    type="button"
+    class="drawer-backdrop"
+    onclick={() => drawer.close()}
+    aria-label="Close scenes menu"
+  ></button>
+{/if}
 
 <style>
   .sidebar {

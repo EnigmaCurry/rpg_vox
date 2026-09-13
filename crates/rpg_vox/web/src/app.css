@@ -17,7 +17,13 @@ body {
   font: 15px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
   background: var(--bg);
   color: var(--text);
+  /* Flex column so full-bleed routes (Record, Scenes, Script) can take
+     exactly the space left by the Menubar without hardcoding its pixel
+     height. Non-full-bleed routes still overflow body normally because
+     `main` doesn't set flex-grow and body's height isn't clamped. */
   min-height: 100vh;
+  display: flex;
+  flex-direction: column;
 }
 
 button {
@@ -69,4 +75,99 @@ hr {
   gap: 10px;
   align-items: center;
   justify-content: space-between;
+}
+
+/* Menubar height, shared with the sidebar drawers so their hamburger
+   buttons anchor right below it. Approximate: 10px vertical padding *
+   2 + 15px * 1.4 line-height + 1px border. Kept as a CSS variable so
+   any future menubar-height tweak flows to all consumers. */
+:root {
+  --menubar-height: 44px;
+}
+
+/* Shared mobile-drawer visuals for the left-rail sidebars (Recordings,
+   Scenes, Scripts). Each sidebar renders a `.drawer-hamburger`, a
+   `.drawer-backdrop`, and applies `.drawer` (+ optional `.open`) to its
+   `<aside>` root when the (max-width: 1079px) breakpoint hits. The
+   sidebars keep their existing 240px flex-child layout above that
+   width — these rules only apply inside the media query below.
+
+   z-index scheme (below the sticky Menubar's 10 so we never cover
+   navigation): backdrop 8, drawer 9, hamburger 11 (kept above the
+   drawer so tapping it still toggles when the drawer is open). */
+.drawer-hamburger {
+  display: none;
+}
+.drawer-backdrop {
+  display: none;
+}
+
+@media (max-width: 1079px) {
+  .drawer-hamburger {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    position: fixed;
+    top: var(--menubar-height);
+    left: 0;
+    width: 34px;
+    height: 34px;
+    padding: 0;
+    background: var(--panel);
+    color: var(--text);
+    /* Flush to the top-left corner — no top/left border or rounding so
+       the button reads as a hard-anchored corner tab rather than a
+       floating chip. */
+    border: 1px solid var(--border);
+    border-top: none;
+    border-left: none;
+    border-radius: 0 0 6px 0;
+    font-size: 18px;
+    line-height: 1;
+    cursor: pointer;
+    z-index: 11;
+  }
+  .drawer-hamburger:hover { background: rgba(255,255,255,0.05); }
+
+  /* Selectors are `aside.sidebar.drawer[.open]` (specificity 0,2,1 /
+     0,3,1) so they beat each sidebar component's scoped `.sidebar`
+     rule (0,2,0) — the per-component width/flex would otherwise
+     override the drawer positioning. */
+  aside.sidebar.drawer {
+    position: fixed;
+    top: var(--menubar-height);
+    left: 0;
+    bottom: 0;
+    width: 260px;
+    max-width: 85vw;
+    /* Slide the drawer off to the left when closed; a transform is
+       cheap to animate and doesn't disturb the surrounding flex row. */
+    transform: translateX(-100%);
+    transition: transform 0.18s ease-out;
+    z-index: 9;
+    /* Overlay drawers get a shadow so they read as elevated over the
+       page content behind the backdrop. */
+    box-shadow: 4px 0 16px rgba(0, 0, 0, 0.4);
+    /* Above-1080 sidebars are ~240px flex children of a row layout;
+       collapsing that flex slot when the drawer is fixed keeps the
+       main content full-width. */
+    flex: 0 0 auto;
+  }
+  aside.sidebar.drawer.open {
+    transform: translateX(0);
+  }
+
+  .drawer-backdrop {
+    display: block;
+    position: fixed;
+    top: var(--menubar-height);
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(0, 0, 0, 0.5);
+    border: none;
+    padding: 0;
+    cursor: default;
+    z-index: 8;
+  }
 }

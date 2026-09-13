@@ -24,26 +24,114 @@
   const POLL_MS = 500;
   let timer = null;
 
-  // Autoscroll bookkeeping for the live transcript div. See onLiveScroll.
-  let liveScroller = $state(null);
+  // Autoscroll — targets the *page* (browser window scrollbar), because
+  // the Record layout is designed so the page itself is the only
+  // scroller.
+  //
+  // Design:
+  //   * `stickToBottom` — did the user's last scroll leave them near the
+  //     bottom? Recomputed on every scroll event, so scrollbar drags and
+  //     touch flings are captured just like wheel/keyboard.
+  //   * ResizeObserver on <body> — the *only* trigger for a snap. Fires
+  //     exactly when scrollable content grows (new log rows, cell
+  //     reflow, viewport resize). No rAF heartbeat: constantly writing
+  //     scrollTop every frame overrode manual scroll attempts before the
+  //     browser could settle them, which is why the scrollbar felt
+  //     un-draggable.
+  //   * `cooldownEnd` — after any user-initiated scroll, RO snaps are
+  //     paused for a short window so a mid-scroll transcript growth
+  //     doesn't yank the page back to the bottom under the user's
+  //     finger.
+  //   * `lastWriteTarget` — remembers what scrollTop we most recently
+  //     wrote so the corresponding scroll event can be distinguished
+  //     from a genuine user scroll (which is what starts the cooldown).
+  //
+  // Threshold is a pixel distance — "well clear of the bottom" should
+  // mean the same movement regardless of how much history has piled up.
   let stickToBottom = $state(true);
-  const STICK_THRESHOLD = 0.05;
-  let lastEntryId = null;
-  let lastEntryCount = 0;
+  const STICK_THRESHOLD_PX = 200;
+  const USER_SCROLL_COOLDOWN_MS = 800;
+  let cooldownEnd = 0;
+  let lastWriteTarget = -1;
 
-  function onLiveScroll(e) {
-    const el = e.currentTarget;
-    const total = el.scrollHeight - el.clientHeight;
-    if (total <= 0) { stickToBottom = true; return; }
-    const remaining = (total - el.scrollTop) / total;
-    stickToBottom = remaining <= STICK_THRESHOLD;
+  function docMetrics() {
+    const doc = document.scrollingElement || document.documentElement;
+    return {
+      doc,
+      scrollTop: doc.scrollTop,
+      scrollHeight: doc.scrollHeight,
+      clientHeight: doc.clientHeight,
+    };
   }
 
-  async function maybeSnapToBottom() {
-    if (!liveScroller || !stickToBottom) return;
-    await tick();
-    liveScroller.scrollTop = liveScroller.scrollHeight;
+  function onWindowScroll() {
+    const { scrollTop, scrollHeight, clientHeight } = docMetrics();
+    const total = scrollHeight - clientHeight;
+    const isProgrammatic = Math.abs(scrollTop - lastWriteTarget) < 2;
+    // Consume the pending target so a later user-initiated scroll to a
+    // different position doesn't get misread as programmatic.
+    lastWriteTarget = -1;
+    if (!isProgrammatic) {
+      cooldownEnd = performance.now() + USER_SCROLL_COOLDOWN_MS;
+    }
+    stickToBottom = total <= 0 || (total - scrollTop) <= STICK_THRESHOLD_PX;
   }
+
+  function snapToBottom() {
+    const { doc, scrollHeight, clientHeight } = docMetrics();
+    const target = scrollHeight - clientHeight;
+    if (target <= 0) return;
+    lastWriteTarget = target;
+    doc.scrollTop = target;
+  }
+
+  function isFollowingPane() {
+    // Auto-pin behavior is meaningful only where new content keeps
+    // arriving — the ephemeral live buffer and the in-flight active
+    // recording. Saved recordings are frozen; yanking the user to the
+    // end of a completed transcript isn't useful.
+    return selected === 'live' || selected === 'active';
+  }
+
+  $effect(() => {
+    window.addEventListener('scroll', onWindowScroll, { passive: true });
+    const ro = new ResizeObserver(() => {
+      // Skip the snap for a beat after any user scroll gesture so
+      // dragging/wheel/touch stays under the user's control.
+      if (performance.now() < cooldownEnd) return;
+      // Playback drives its own scroll (bringing the current clip into
+      // view); an autoscroll-to-bottom during playback would fight it
+      // and yank the user away from what's playing.
+      if (playbackMode != null) return;
+      if (!isFollowingPane()) return;
+      if (stickToBottom) snapToBottom();
+    });
+    ro.observe(document.body);
+    // Initial snap if we mount on a following pane with content already
+    // past the viewport.
+    queueMicrotask(() => {
+      if (!isFollowingPane()) return;
+      if (stickToBottom) snapToBottom();
+    });
+    return () => {
+      window.removeEventListener('scroll', onWindowScroll);
+      ro.disconnect();
+    };
+  });
+
+  // Navigation intent: switching to live/active means "I want to follow
+  // the current transcription" — re-arm the bottom-pin. Switching to a
+  // saved recording means "I'm reviewing something finished" — start at
+  // the top of its log and disable the pin.
+  $effect(() => {
+    const cur = selected;
+    if (cur === 'live' || cur === 'active') {
+      stickToBottom = true;
+    } else {
+      stickToBottom = false;
+      queueMicrotask(() => { window.scrollTo({ top: 0, behavior: 'auto' }); });
+    }
+  });
 
   onMount(async () => {
     await refresh();
@@ -84,20 +172,6 @@
       !state.recordings.some((r) => r.id === selected)
     ) {
       selected = 'live';
-    }
-
-    // Autoscroll the transcript pane if we're actually looking at one
-    // with live-changing entries (buffer or active bucket).
-    const entries = selected === 'active'
-      ? state.activeRecording?.entries ?? []
-      : selected === 'live'
-        ? state.buffer
-        : [];
-    const latestId = entries.length ? entries[entries.length - 1].id : null;
-    if (latestId !== lastEntryId || entries.length !== lastEntryCount) {
-      lastEntryId = latestId;
-      lastEntryCount = entries.length;
-      maybeSnapToBottom();
     }
   }
 
@@ -197,11 +271,13 @@
 
   // ---- Row grouping for the columns-per-channel log table ----
   //
-  // Entries whose wall-clock ranges overlap or fall within CLUSTER_GAP_MS
-  // of each other get merged into one row. A large gap between clusters
-  // (≥ SILENCE_ROW_MIN_MS) inserts a silence row with an empty channels
-  // area — its master column play button seeks the mixed track to the
-  // next speech row's mixedStart, i.e. "skip the silence".
+  // Every entry is its own row: same-channel repeats always start a new
+  // row so no cell ever stacks multiple clips. Entries from *different*
+  // channels that fall within CLUSTER_GAP_MS may still share a row, so
+  // overlapping speakers stay visually aligned. A gap ≥ SILENCE_ROW_MIN_MS
+  // between rows inserts a silence row with an empty channels area — its
+  // master column play button seeks the mixed track to the next speech
+  // row's audioStart, i.e. "skip the silence".
   const CLUSTER_GAP_MS = 500;
   const SILENCE_ROW_MIN_MS = 3000;
 
@@ -218,6 +294,7 @@
     const rows = [];
     let cluster = [];
     let clusterEnd = 0;
+    let clusterChannels = new Set();
     const flush = () => {
       if (!cluster.length) return;
       const wallStart = Math.min(...cluster.map(entryEpochMs));
@@ -245,31 +322,37 @@
         byChannel,
       });
       cluster = [];
+      clusterChannels = new Set();
+      clusterEnd = 0;
     };
     for (const e of sorted) {
       const eStart = entryEpochMs(e);
-      if (!cluster.length || eStart - clusterEnd <= CLUSTER_GAP_MS) {
-        cluster.push(e);
-        clusterEnd = Math.max(clusterEnd, entryEndMs(e));
-      } else {
-        const gap = eStart - clusterEnd;
-        const prev = cluster[cluster.length - 1];
-        const prevAudioEnd = (prev.audio_start_ms ?? 0) + (prev.audio_duration_ms ?? 0);
-        const prevEnd = clusterEnd;
-        flush();
-        if (gap >= SILENCE_ROW_MIN_MS) {
-          rows.push({
-            kind: 'silence',
-            wallStart: prevEnd,
-            wallEnd: eStart,
-            audioStart: prevAudioEnd,
-            entries: [],
-            byChannel: {},
-          });
+      const key = e.channel || 'Unknown';
+      // Split when: gap exceeds CLUSTER_GAP_MS, OR this channel already
+      // has a clip in the current cluster (one clip per cell rule).
+      if (cluster.length > 0) {
+        const tooFar = eStart - clusterEnd > CLUSTER_GAP_MS;
+        const dupChannel = clusterChannels.has(key);
+        if (tooFar || dupChannel) {
+          const prev = cluster[cluster.length - 1];
+          const prevAudioEnd = (prev.audio_start_ms ?? 0) + (prev.audio_duration_ms ?? 0);
+          const prevEnd = clusterEnd;
+          flush();
+          if (tooFar && eStart - prevEnd >= SILENCE_ROW_MIN_MS) {
+            rows.push({
+              kind: 'silence',
+              wallStart: prevEnd,
+              wallEnd: eStart,
+              audioStart: prevAudioEnd,
+              entries: [],
+              byChannel: {},
+            });
+          }
         }
-        cluster = [e];
-        clusterEnd = entryEndMs(e);
       }
+      cluster.push(e);
+      clusterChannels.add(key);
+      clusterEnd = Math.max(clusterEnd, entryEndMs(e));
     }
     flush();
     return rows;
@@ -323,6 +406,22 @@
   let playingTimeMs = $state(0);          // ms — master timeline in 'master' mode, clip offset in 'clip' mode
   let masterAudioEl = $state(null);       // hidden <audio> for the silence-gated mixed track
   let clipAudioEl = $state(null);         // hidden <audio> for one-shot per-entry segment playback
+  // Duration mirrors of the two audio elements. Reading `.duration` off
+  // the DOM directly isn't reactive, so a template value that depends
+  // on it stays stale until *some other* reactive dep changes. Copying
+  // duration into `$state` via the audio element's own events makes
+  // downstream computations (Stop button swipe) update the instant the
+  // metadata for a freshly-loaded track becomes known.
+  let masterDurationMs = $state(0);
+  let clipDurationMs = $state(0);
+  const refreshMasterDuration = () => {
+    const d = masterAudioEl?.duration;
+    masterDurationMs = Number.isFinite(d) ? d * 1000 : 0;
+  };
+  const refreshClipDuration = () => {
+    const d = clipAudioEl?.duration;
+    clipDurationMs = Number.isFinite(d) ? d * 1000 : 0;
+  };
   // 'master' when the mixed track is playing (auto-advances through rows);
   // 'clip' when a single per-channel utterance is playing (no advance).
   // null when nothing is playing. Drives which element the rAF loop
@@ -372,6 +471,38 @@
     if (!state || playingRecordingId == null) return null;
     if (state.activeRecording?.id === playingRecordingId) return state.activeRecording;
     return state.recordings?.find((r) => r.id === playingRecordingId) ?? null;
+  }
+
+  /// Resolve a recording by id from the current state snapshot,
+  /// checking both the in-flight active bucket and the saved list.
+  function findRecording(id) {
+    if (!state || id == null) return null;
+    if (state.activeRecording?.id === id) return state.activeRecording;
+    return state.recordings?.find((r) => r.id === id) ?? null;
+  }
+
+  /// Audio-timeline offset of the first transcribed utterance in a
+  /// recording, or 0 if none yet. Used by "Play All" so playback skips
+  /// any leading silence / untranscribed audio and starts on the first
+  /// clip the user can actually read along with.
+  function firstTranscribedAudioStart(rec) {
+    if (!rec) return 0;
+    const rows = computeRows(rec.entries);
+    for (const row of rows) {
+      if (row.kind === 'speech' && row.audioStart != null) return row.audioStart;
+    }
+    return 0;
+  }
+
+  /// Playback progress (0..1) for the Stop button's swipe fill. In
+  /// master mode this is elapsed / total on the mixed-track element;
+  /// in clip mode it's elapsed / clip duration. Both `playingTimeMs`
+  /// and the duration mirrors are `$state`, so the swipe updates
+  /// reactively the instant metadata arrives on a first-play load.
+  function stopBtnProgress() {
+    const durMs = playbackMode === 'clip' ? clipDurationMs : masterDurationMs;
+    if (!durMs) return 0;
+    return Math.max(0, Math.min(1, playingTimeMs / durMs));
   }
 
   /// If the master playhead has been sitting in a silence gap between
@@ -430,9 +561,35 @@
     playingClipId = null;
     playingRecordingId = recordingId;
     playingTimeMs = startMs;
-    const seekAndPlay = () => {
-      try { masterAudioEl.currentTime = Math.max(0, startMs) / 1000; } catch {}
+    // On a fresh load, `loadedmetadata` fires at readyState=1 (HAVE_METADATA)
+    // — the browser knows the duration but hasn't buffered any audio
+    // data yet. Setting `currentTime` at that moment schedules a seek
+    // but `play()` fired in the same tick can start before the seek
+    // has actually landed, so the first Play All would start from 0
+    // instead of the requested `startMs`. Wait for the `seeked` event
+    // to fire before starting playback so `startMs` always sticks.
+    const startPlay = () => {
       masterAudioEl.play().catch((e) => console.warn('master play failed', e));
+    };
+    const seekAndPlay = () => {
+      const targetSec = Math.max(0, startMs) / 1000;
+      // Seek is a no-op when we're already there — skip the wait for
+      // 'seeked' (it wouldn't fire) and just play.
+      if (Math.abs(masterAudioEl.currentTime - targetSec) < 0.05) {
+        startPlay();
+        return;
+      }
+      const onSeeked = () => {
+        masterAudioEl.removeEventListener('seeked', onSeeked);
+        startPlay();
+      };
+      masterAudioEl.addEventListener('seeked', onSeeked);
+      try {
+        masterAudioEl.currentTime = targetSec;
+      } catch {
+        masterAudioEl.removeEventListener('seeked', onSeeked);
+        startPlay();
+      }
     };
     if (masterAudioEl.readyState >= 1) {
       seekAndPlay();
@@ -510,6 +667,40 @@
     playingTimeMs = 0;
     playbackMode = null;
   }
+
+  // Which entry the log should currently be scrolled to — for clip
+  // playback it's the picked clip; for master playback it's whichever
+  // entry the master playhead is inside right now (recomputed as the
+  // playhead crosses entry boundaries). Null when nothing is playing.
+  const currentPlayingEntryId = $derived.by(() => {
+    if (playbackMode === 'clip') return playingClipId;
+    if (playbackMode === 'master') {
+      const rec = currentPlayingRecording();
+      if (!rec) return null;
+      for (const e of rec.entries ?? []) {
+        if (e.audio_start_ms == null || e.audio_duration_ms == null) continue;
+        const start = e.audio_start_ms;
+        const end = start + e.audio_duration_ms;
+        if (playingTimeMs >= start && playingTimeMs < end) return e.id;
+      }
+    }
+    return null;
+  });
+
+  // Scroll the currently-playing clip into view when it starts. `nearest`
+  // means we only move the page when the clip is actually off-screen —
+  // if it's already visible (typical during continuous master playback
+  // through consecutive rows), this is a no-op.
+  $effect(() => {
+    const id = currentPlayingEntryId;
+    if (id == null) return;
+    // Wait a frame so the just-mounted `.playing` class + any layout
+    // change (sticky pane-head, etc.) settles before we measure.
+    requestAnimationFrame(() => {
+      const el = document.querySelector(`[data-entry-id="${id}"]`);
+      if (el) el.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    });
+  });
 
   // ---- Progress predicates for the swipe animation ----
 
@@ -780,6 +971,42 @@
     else if (e.key === 'Escape') { e.preventDefault(); cancelActiveRename(); }
   }
 
+  // Same click-to-rename affordance for saved (already-completed)
+  // recordings so users don't have to hunt for the sidebar's ✎ to fix
+  // a name they only noticed was wrong after opening the recording.
+  // Server-side, `renameRecording` routes saved ids to sqlite through
+  // the same PATCH endpoint the active rename uses.
+  let renamingSaved = $state(false);
+  let savedRenameText = $state('');
+  let savedRenameEl = $state(null);
+
+  async function beginSavedRename() {
+    const rec = selectedSaved;
+    if (!rec) return;
+    savedRenameText = rec.name;
+    renamingSaved = true;
+    await tick();
+    savedRenameEl?.focus();
+    savedRenameEl?.select();
+  }
+
+  async function commitSavedRename() {
+    if (!renamingSaved) return;
+    const rec = selectedSaved;
+    renamingSaved = false;
+    if (!rec) return;
+    const name = savedRenameText.trim();
+    if (!name || name === rec.name) return;
+    await renameRecording(rec.id, name);
+  }
+
+  function cancelSavedRename() { renamingSaved = false; }
+
+  function onSavedRenameKey(e) {
+    if (e.key === 'Enter') { e.preventDefault(); commitSavedRename(); }
+    else if (e.key === 'Escape') { e.preventDefault(); cancelSavedRename(); }
+  }
+
   const isRecording = $derived(state?.mode === 'recording');
   const bufferPct = $derived(
     state ? Math.min(100, (state.bufferBytes / state.bufferMaxBytes) * 100) : 0,
@@ -796,12 +1023,17 @@
 {#snippet hiddenAudios()}
   <!-- Both audio elements are hidden — playback is driven entirely by
        the ▶ buttons in the log table. Master (mixed track) auto-advances
-       through subsequent rows; Clip (per-entry segment) is one-shot. -->
+       through subsequent rows; Clip (per-entry segment) is one-shot.
+       `ondurationchange` + `onloadedmetadata` mirror the browser's
+       duration into `$state` so the Stop button's swipe fill reacts
+       the moment metadata for a fresh track arrives. -->
   <audio
     bind:this={masterAudioEl}
     onplay={onPlaybackPlay}
     onpause={onPlaybackPause}
     onended={onPlaybackEnded}
+    ondurationchange={refreshMasterDuration}
+    onloadedmetadata={refreshMasterDuration}
     preload="none"
   ></audio>
   <audio
@@ -809,6 +1041,8 @@
     onplay={onPlaybackPlay}
     onpause={onPlaybackPause}
     onended={onPlaybackEnded}
+    ondurationchange={refreshClipDuration}
+    onloadedmetadata={refreshClipDuration}
     preload="none"
   ></audio>
 {/snippet}
@@ -820,13 +1054,16 @@
       class="topbar-btn stop"
       onclick={stopPlayback}
       title="Stop playback"
-    >■ Stop</button>
+    >
+      <div class="stop-fill" style="width: {stopBtnProgress() * 100}%" aria-hidden="true"></div>
+      <span class="stop-label">■ Stop</span>
+    </button>
   {:else}
     <button
       type="button"
       class="topbar-btn"
-      onclick={() => playMasterAtMs(recordingId, 0)}
-      title="Play the recording from the beginning"
+      onclick={() => playMasterAtMs(recordingId, firstTranscribedAudioStart(findRecording(recordingId)))}
+      title="Play the recording from the first transcribed clip"
     >▶ Play All</button>
   {/if}
 {/snippet}
@@ -836,7 +1073,7 @@
   {@const channels = extractChannels(recording.entries, canonicalChannels)}
   {@const epoch = recordingEpochMs(recording)}
   {@const recId = recording.id}
-  <div class="log-scroller" bind:this={liveScroller} onscroll={onLiveScroll}>
+  <div class="log-scroller">
     <table class="log-table">
       <thead>
         <tr>
@@ -882,6 +1119,7 @@
 {#snippet clipCell(entry, channel, recId)}
   <div
     class="clip-btn"
+    data-entry-id={entry.id}
     class:playing={isClipPlayingNow(entry)}
     class:copied={copiedEntryId === entry.id}
     class:tts={channel === 'TTS'}
@@ -908,8 +1146,8 @@
       <button
         type="button"
         class="clip-text"
-        title="Click to play · double-click to edit"
-        onclick={() => playClip(entry, recId)}
+        title={isClipPlayingNow(entry) ? 'Click to stop · double-click to edit' : 'Click to play · double-click to edit'}
+        onclick={() => isClipPlayingNow(entry) ? stopPlayback() : playClip(entry, recId)}
         ondblclick={() => beginEditEntry(entry)}
       >{entry.text}</button>
     {/if}
@@ -971,11 +1209,7 @@
           nothing spoken yet — the {channelFallback} channel is quiet
         </div>
       {:else}
-        <ul
-          class="entries"
-          bind:this={liveScroller}
-          onscroll={onLiveScroll}
-        >
+        <ul class="entries">
           {#each state.buffer as e (e.id)}
             <li class:copied={copiedEntryId === e.id} class:provisional={e.provisional}>
               <span class="channel-tag">{e.channel || channelFallback}</span>
@@ -1036,21 +1270,41 @@
         {@render logTable(state.activeRecording, state.channelNames ?? [])}
       {/if}
     {:else if selectedSaved}
-      <!-- Saved recording detail. -->
-      <div class="pane-head">
-        <h1>{selectedSaved.name}</h1>
-        <div class="hint">
-          {fmtTime(selectedSaved.created_at)} · {fmtDur(selectedSaved.duration_ms)}
-          · {selectedSaved.entries.length} utterances
-        </div>
+      <!-- Saved recording detail. Kept as a single-line top-aligned bar
+           so it doesn't push the log down. Non-essential meta (created
+           timestamp, utterance count) is dropped in favor of duration
+           only, which is what actually matters when scrubbing playback.
+           Title is click-to-rename — server routes the PATCH through
+           the same endpoint the active recording uses. -->
+      <div class="pane-head saved">
+        {#if renamingSaved}
+          <input
+            class="saved-title-rename"
+            type="text"
+            bind:this={savedRenameEl}
+            bind:value={savedRenameText}
+            onkeydown={onSavedRenameKey}
+            onblur={commitSavedRename}
+            aria-label="Rename recording"
+          />
+        {:else}
+          <button
+            type="button"
+            class="saved-title"
+            title="Click to rename"
+            onclick={beginSavedRename}
+          >{selectedSaved.name}</button>
+        {/if}
+        <span class="saved-meta">{fmtDur(selectedSaved.duration_ms)}</span>
         <div class="head-actions">
           {@render playAllBtn(selectedSaved.id)}
           <a
-            class="download-btn"
+            class="download-btn icon"
             href={api.recordingArchiveUrl(selectedSaved.id)}
             download
             title="Download a zip with transcript.json, mixed.wav, audio.wav, and per-utterance clips"
-          >⤓ Download archive</a>
+            aria-label="Download archive"
+          >⤓</a>
         </div>
       </div>
       {@render hiddenAudios()}
@@ -1068,9 +1322,7 @@
 <style>
   .record-shell {
     display: flex;
-    align-items: stretch;
-    height: calc(100vh - 46px);
-    min-height: 0;
+    align-items: flex-start;
   }
   .main {
     flex: 1;
@@ -1079,17 +1331,100 @@
     flex-direction: column;
     padding: 16px 20px;
     gap: 14px;
-    overflow: hidden;
   }
 
+  /* Pinned pane header so the recording title, timer, and Stop/Play
+     controls stay reachable no matter how far the log has scrolled.
+     `top` anchors just below the sticky Menubar. An opaque background
+     is essential — otherwise log rows would visibly slide *through* the
+     header as they scroll. On mobile the header carves out room for
+     the fixed hamburger (34px wide + a little breathing room). */
   .pane-head {
+    position: sticky;
+    top: var(--menubar-height);
+    z-index: 5;
     display: flex;
     justify-content: space-between;
     align-items: baseline;
     gap: 12px;
     flex-wrap: wrap;
+    padding: 10px 4px;
+    background: var(--bg);
+    border-bottom: 1px solid var(--border);
+  }
+  @media (max-width: 1079px) {
+    .pane-head { padding-left: 44px; }
   }
   .pane-head h1 { font-size: 20px; margin: 0; }
+
+  /* Saved-recording variant: single top-aligned row, title truncates
+     with ellipsis before wrapping, minimal meta (duration only), and
+     the action buttons stay pinned to the right at a fixed size so the
+     header doesn't grow past one line. */
+  .pane-head.saved {
+    align-items: center;
+    flex-wrap: nowrap;
+    padding: 6px 4px;
+  }
+  /* Same 44px left inset as the other pane-head variants get in the
+     shared mobile rule — the `padding` shorthand above wipes it out on
+     the saved variant, so reinstate it here so the title clears the
+     fixed hamburger instead of hiding under it. */
+  @media (max-width: 1079px) {
+    .pane-head.saved { padding-left: 44px; }
+  }
+  .pane-head.saved .saved-title {
+    font-size: 15px;
+    font-weight: 600;
+    margin: 0;
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    /* Reset the base button styling so this reads as a title, not a
+       CTA. Hover reveals the rename affordance. */
+    background: transparent;
+    color: var(--text);
+    border: 1px dashed transparent;
+    padding: 2px 6px;
+    text-align: left;
+    cursor: pointer;
+    font-family: inherit;
+    line-height: 1.2;
+  }
+  .pane-head.saved .saved-title:hover {
+    border-color: var(--border);
+    background: rgba(255,255,255,0.03);
+  }
+  .pane-head.saved .saved-title-rename {
+    flex: 1 1 auto;
+    min-width: 0;
+    font-size: 15px;
+    font-weight: 600;
+    background: rgba(0,0,0,0.35);
+    color: var(--text);
+    border: 1px solid var(--accent);
+    border-radius: 4px;
+    padding: 2px 6px;
+    line-height: 1.2;
+    font-family: inherit;
+  }
+  .pane-head.saved .saved-meta {
+    color: var(--muted);
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+    flex-shrink: 0;
+    white-space: nowrap;
+  }
+  .pane-head.saved .head-actions { flex-shrink: 0; }
+  /* Icon-only download variant — the full "Download archive" label
+     bloats the single-line header; keep the affordance as a compact
+     glyph with the descriptive text moved to `title=`. */
+  .download-btn.icon {
+    padding: 4px 8px;
+    font-size: 14px;
+  }
   .hint { color: var(--muted); font-size: 12px; }
   .stt-off { color: var(--err); font-weight: 500; }
 
@@ -1106,9 +1441,17 @@
 
   .pane-head.active {
     padding: 10px 14px;
-    background: rgba(255, 80, 80, 0.06);
+    /* Layer the red REC tint over an opaque bg so this variant is also
+       fully opaque while still reading tinted (rgba alone would show
+       scrolling log content through the sticky header). */
+    background:
+      linear-gradient(rgba(255, 80, 80, 0.06), rgba(255, 80, 80, 0.06)),
+      var(--bg);
     border: 1px solid rgba(255, 80, 80, 0.4);
     border-radius: 10px;
+  }
+  @media (max-width: 1079px) {
+    .pane-head.active { padding-left: 44px; }
   }
   .active-title { display: flex; align-items: center; gap: 12px; min-width: 0; }
   .active-name-btn {
@@ -1218,8 +1561,38 @@
     background: rgba(255,92,92,0.14);
     color: #ffbdbd;
     border-color: rgba(255,92,92,0.5);
+    /* Establish a positioning + clipping context for the fill overlay
+       so it can sweep across the button width without leaking past the
+       border-radius. */
+    position: relative;
+    overflow: hidden;
   }
   .topbar-btn.stop:hover { background: rgba(255,92,92,0.24); }
+  /* Swipe overlay showing playback progress (0..1 of the full track
+     when master mode, or the current clip in clip mode). Same shape as
+     `.clip-fill` but red-tinted to match the Stop button. */
+  .stop-fill {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    background: linear-gradient(
+      to right,
+      rgba(255, 92, 92, 0.28),
+      rgba(255, 92, 92, 0.5)
+    );
+    border-right: 1px solid rgba(255, 92, 92, 0.85);
+    pointer-events: none;
+    z-index: 0;
+    /* Small transition smooths out the per-frame width updates so the
+       swipe reads as a continuous sweep even though we're stepping
+       from rAF ticks. */
+    transition: width 60ms linear;
+  }
+  .stop-label {
+    position: relative;
+    z-index: 1;
+  }
 
   ul.entries {
     list-style: none;
@@ -1228,10 +1601,6 @@
     display: flex;
     flex-direction: column;
     gap: 6px;
-    overflow-y: auto;
-    scrollbar-gutter: stable;
-    min-height: 0;
-    flex: 1;
   }
   ul.entries li {
     display: grid;
@@ -1244,6 +1613,11 @@
     align-items: baseline;
     position: relative;
     overflow: hidden;
+    /* Column-flex parents default children to flex-shrink: 1. Without
+       this, once the buffer exceeds the pane height each row squeezes
+       and its text is clipped by the overflow: hidden above, instead
+       of the list scrolling. */
+    flex-shrink: 0;
   }
   .channel-tag {
     font-size: 10px;
@@ -1340,10 +1714,6 @@
 
   /* ---- Log table (columns-per-channel view) ---- */
   .log-scroller {
-    flex: 1;
-    min-height: 0;
-    overflow: auto;
-    scrollbar-gutter: stable;
     background: var(--panel);
     border: 1px solid var(--border);
     border-radius: 8px;
@@ -1354,10 +1724,7 @@
     font-size: 12px;
   }
   .log-table thead {
-    position: sticky;
-    top: 0;
     background: var(--panel);
-    z-index: 2;
   }
   .log-table th {
     text-align: left;

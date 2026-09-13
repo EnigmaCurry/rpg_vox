@@ -87,26 +87,6 @@
     if (currentScriptId) saveStickyScriptId(currentScriptId);
   });
 
-  // Responsive sidebar. `narrow` tracks viewport width via matchMedia;
-  // when narrow, the sidebar is hidden by default and re-openable via the
-  // top-left hamburger. On wider screens the sidebar is always visible
-  // and the hamburger doesn't render.
-  const NARROW_MQ = '(max-width: 720px)';
-  let narrow = $state(false);
-  let sidebarOpen = $state(true);
-  $effect(() => {
-    if (typeof window === 'undefined') return;
-    const mq = window.matchMedia(NARROW_MQ);
-    const sync = () => {
-      narrow = mq.matches;
-      if (!mq.matches) sidebarOpen = true;
-      else             sidebarOpen = false;
-    };
-    sync();
-    mq.addEventListener('change', sync);
-    return () => mq.removeEventListener('change', sync);
-  });
-
   let input = $state('');
   let sending = $state(false);
   let error = $state('');
@@ -1558,28 +1538,15 @@
 </script>
 
 <!-- Two-pane layout: sidebar (script list) + main (transcript + input).
-     The sidebar collapses at narrow widths; a hamburger in the top-left of
-     the main pane re-opens it. `sidebarOpen` is derived from viewport
-     width by default but overridden by the toggle. -->
-<div class="script-shell" class:sidebar-open={sidebarOpen}>
+     Under 1080px the sidebar collapses into a shared hamburger drawer
+     (see sidebarDrawer.svelte.js); on wider screens the sidebar is
+     always visible in the flex row. -->
+<div class="script-shell">
   <ScriptSidebar
     currentScriptId={currentScriptId}
     onchange={onSidebarSelect}
-    onCollapse={narrow ? () => sidebarOpen = false : null}
   />
   <div class="script">
-    {#if narrow && !sidebarOpen}
-      <button
-        class="hamburger"
-        onclick={() => sidebarOpen = true}
-        aria-label="Show script sidebar"
-        title="Show script sidebar"
-      >
-        <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
-          <path fill="currentColor" d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/>
-        </svg>
-      </button>
-    {/if}
     {#if editAgent}
     <!-- System-prompt editor panel. Occupies the top ~half of the
          viewport; the transcript below shrinks to accommodate it. Draft
@@ -1964,12 +1931,12 @@
 </div><!-- .script-shell -->
 
 <style>
-  /* Top-level shell: sidebar (fixed width) + main. Full viewport minus
-     the sticky menubar so the input stays pinned at the bottom. */
+  /* Top-level shell: sidebar (fixed width) + main. Fills the space left
+     over from the Menubar (main.full-bleed is a flex child of body). */
   .script-shell {
     display: grid;
     grid-template-columns: 240px 1fr;
-    height: calc(100vh - 52px);
+    height: 100%;
     width: 100%;
   }
   .script {
@@ -1987,46 +1954,12 @@
     width: 100%;
   }
 
-  /* Hamburger button pinned to the top-left of the main column when the
-     sidebar is collapsed. Visible only on narrow screens. */
-  .hamburger {
-    position: absolute;
-    left: 4px;
-    top: 4px;
-    width: 30px;
-    height: 30px;
-    padding: 0;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    background: var(--panel);
-    color: var(--muted);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    cursor: pointer;
-    z-index: 5;
-  }
-  .hamburger:hover { color: var(--text); border-color: var(--accent); }
-
-  /* At narrow widths the sidebar disappears from the grid (single-column)
-     and the main pane fills the viewport. When toggled open, the sidebar
-     overlays the main pane with a fixed-position slide-in from the left. */
-  @media (max-width: 720px) {
+  /* Under 1080px the sidebar becomes a fixed-position drawer (shared
+     drawer CSS in app.css), so the grid becomes a single column and
+     the main pane fills the viewport. */
+  @media (max-width: 1079px) {
     .script-shell {
       grid-template-columns: 1fr;
-    }
-    .script-shell > :global(aside.sidebar) {
-      display: none;
-    }
-    .script-shell.sidebar-open > :global(aside.sidebar) {
-      display: flex;
-      position: fixed;
-      left: 0;
-      top: 52px;
-      bottom: 0;
-      width: 240px;
-      z-index: 10;
-      box-shadow: 4px 0 20px rgba(0, 0, 0, 0.4);
     }
   }
 

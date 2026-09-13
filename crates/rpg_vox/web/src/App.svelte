@@ -52,6 +52,9 @@
       || $route === '/record'
       || $route.startsWith('/script') || $route.startsWith('/chat'),
   );
+  // Record grows tall and uses the page scrollbar instead of an inner
+  // one, unlike other full-bleed routes which cap at viewport height.
+  const isPageScroll = $derived($route === '/record');
 
   onMount(() => {
     startHealthPoll();
@@ -72,7 +75,7 @@
 
 <Menubar />
 
-<main class:full-bleed={isFullBleed}>
+<main class:full-bleed={isFullBleed} class:page-scroll={isPageScroll}>
   {#key $route}
     <View />
   {/key}
@@ -88,5 +91,20 @@
     max-width: none;
     margin: 0;
     padding: 0;
+    /* Fill the viewport space left by the Menubar (body is a flex column).
+       min-height:0 lets inner scrollers actually scroll instead of pushing
+       body past 100vh, and overflow:hidden keeps the body scrollbar off. */
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+  }
+  /* Record uses the *page* scrollbar as its only scrollbar (log grows
+     tall and pushes body past 100vh instead of clipping into an inner
+     scroller). The route-scoped override relaxes the bounds that other
+     full-bleed routes rely on. */
+  main.page-scroll {
+    flex: 1 0 auto;
+    overflow: visible;
+    min-height: 0;
   }
 </style>

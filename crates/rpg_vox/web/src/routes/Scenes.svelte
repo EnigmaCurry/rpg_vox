@@ -521,7 +521,7 @@
   .page {
     display: flex;
     gap: 0;
-    height: calc(100vh - 46px);
+    height: 100%;
     min-height: 0;
     align-items: stretch;
   }

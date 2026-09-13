@@ -7,11 +7,11 @@
   import { navigate } from '../lib/router.js';
   import { scripts } from '../lib/stores.js';
   import { createScript, deleteScript, renameScript } from '../lib/api.js';
+  import { createSidebarDrawer } from '../lib/sidebarDrawer.svelte.js';
 
   let {
     currentScriptId = null,
     onchange = null,
-    onCollapse = null,
   } = $props();
 
   let renamingId = $state(null);
@@ -108,22 +108,31 @@
       deleteArmTimer = 0;
     }, DELETE_CONFIRM_MS);
   }
+
+  // Below 1080px collapse into a hamburger drawer. Selecting a script
+  // (which triggers a hash-navigate) or hitting `+` dismisses it.
+  const drawer = createSidebarDrawer();
+  const selectAndClose = drawer.wrap(selectScript);
+  const newAndClose = drawer.wrap(onNew);
 </script>
 
-<aside class="sidebar">
+{#if drawer.isMobile && !drawer.open}
+  <button
+    type="button"
+    class="drawer-hamburger"
+    onclick={() => drawer.setOpen(true)}
+    aria-label="Open scripts menu"
+    aria-expanded="false"
+  >☰</button>
+{/if}
+
+<aside class="sidebar" class:drawer={drawer.isMobile} class:open={drawer.open}>
   <header>
     <span class="title">Scripts</span>
     <div class="hdr-actions">
-      <button class="new" onclick={onNew} disabled={creating} title="Create a new script">
+      <button class="new" onclick={newAndClose} disabled={creating} title="Create a new script">
         +
       </button>
-      {#if onCollapse}
-        <button class="collapse" onclick={onCollapse} title="Hide sidebar" aria-label="Hide sidebar">
-          <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true">
-            <path fill="currentColor" d="M15.41 16.59L10.83 12l4.58-4.59L14 6l-6 6 6 6z"/>
-          </svg>
-        </button>
-      {/if}
     </div>
   </header>
 
@@ -143,7 +152,7 @@
         {:else}
           <button
             class="row-select"
-            onclick={() => selectScript(s.id)}
+            onclick={() => selectAndClose(s.id)}
             ondblclick={(e) => startRename(s, e)}
             title="Open this script (double-click to rename)"
           >
@@ -181,6 +190,15 @@
   </ul>
 </aside>
 
+{#if drawer.isMobile && drawer.open}
+  <button
+    type="button"
+    class="drawer-backdrop"
+    onclick={() => drawer.close()}
+    aria-label="Close scripts menu"
+  ></button>
+{/if}
+
 <style>
   .sidebar {
     display: flex;
@@ -209,7 +227,7 @@
     align-items: center;
     gap: 6px;
   }
-  button.new, button.collapse {
+  button.new {
     width: 24px;
     height: 24px;
     padding: 0;
@@ -223,7 +241,7 @@
     cursor: pointer;
     font-size: 14px;
   }
-  button.new:hover:not(:disabled), button.collapse:hover {
+  button.new:hover:not(:disabled) {
     color: var(--accent);
     border-color: var(--accent);
   }

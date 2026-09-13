@@ -1,9 +1,16 @@
 <script>
+  import { createSidebarDrawer } from '../lib/sidebarDrawer.svelte.js';
+
   // The Record page's left rail. Modelled on SceneSidebar / ScriptSidebar:
   // inline rename via ✎ or dblclick, two-click delete on ×, "+ new" in
   // the header. The parent (Record.svelte) owns the state (recordings
   // list, current selection, active-recording bucket) and passes callbacks
   // in so this component doesn't fetch anything itself.
+  //
+  // Under 1080px the sidebar collapses into a fixed hamburger button at
+  // the top-left; tapping it slides the sidebar in as a drawer. Any
+  // navigation choice (select row, new recording) auto-dismisses; the
+  // backdrop and Escape also close it. See `sidebarDrawer.svelte.js`.
   //
   // Three kinds of sidebar entries, in this order:
   //   1. "Live buffer" — always at the top, always selectable. Renders
@@ -101,14 +108,28 @@
     const s = total % 60;
     return `${m}:${s.toString().padStart(2, '0')}`;
   }
+
+  const drawer = createSidebarDrawer();
+  const selectAndClose = drawer.wrap((key) => onSelect?.(key));
+  const newAndClose = drawer.wrap(() => onNewRecording?.());
 </script>
 
-<aside class="sidebar">
+{#if drawer.isMobile && !drawer.open}
+  <button
+    type="button"
+    class="drawer-hamburger"
+    onclick={() => drawer.setOpen(true)}
+    aria-label="Open recordings menu"
+    aria-expanded="false"
+  >☰</button>
+{/if}
+
+<aside class="sidebar" class:drawer={drawer.isMobile} class:open={drawer.open}>
   <div class="head">
     <span class="title">Recordings</span>
     <button
       class="new-btn"
-      onclick={() => onNewRecording?.()}
+      onclick={newAndClose}
       disabled={activeRecording != null}
       title={activeRecording != null ? 'Stop the current recording first' : 'New recording'}
     >+</button>
@@ -119,7 +140,7 @@
       <button
         type="button"
         class="pick"
-        onclick={() => onSelect?.('live')}
+        onclick={() => selectAndClose('live')}
         aria-current={isSelected('live')}
       >
         <span class="icon" aria-hidden="true">≡</span>
@@ -141,7 +162,7 @@
         <button
           type="button"
           class="pick"
-          onclick={() => onSelect?.('active')}
+          onclick={() => selectAndClose('active')}
           aria-current={isSelected('active')}
         >
           <span class="rec-dot" aria-hidden="true"></span>
@@ -181,7 +202,7 @@
           <button
             type="button"
             class="pick"
-            onclick={() => onSelect?.(rec.id)}
+            onclick={() => selectAndClose(rec.id)}
             aria-current={isSelected(rec.id)}
           >
             {#if renamingId === rec.id}
@@ -221,6 +242,15 @@
     {/if}
   </ul>
 </aside>
+
+{#if drawer.isMobile && drawer.open}
+  <button
+    type="button"
+    class="drawer-backdrop"
+    onclick={() => drawer.close()}
+    aria-label="Close recordings menu"
+  ></button>
+{/if}
 
 <style>
   .sidebar {
