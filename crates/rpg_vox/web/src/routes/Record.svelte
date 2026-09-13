@@ -365,12 +365,62 @@
   // and plays from there ("skip the silence"). Last-row silence just
   // stops.
 
+  // Cap on how long a stretch of silence is allowed to play during
+  // master playback before the playhead auto-advances to the next
+  // speech row. Prevents the "Play All" flow from sitting through a
+  // long dead-air section captured between two clusters of speech.
+  const MAX_MASTER_SILENCE_MS = 5000;
+
   function tickPlayhead() {
     const el = playbackMode === 'clip' ? clipAudioEl : masterAudioEl;
     if (el && !el.paused) {
       playingTimeMs = el.currentTime * 1000;
+      if (playbackMode === 'master') maybeSilenceSkip();
     }
     rafId = requestAnimationFrame(tickPlayhead);
+  }
+
+  /// Locate whichever recording the master player is currently reading
+  /// from. Only used for the silence-skip lookup; returns null if the
+  /// id doesn't match anything on the state snapshot.
+  function currentPlayingRecording() {
+    if (!state || playingRecordingId == null) return null;
+    if (state.activeRecording?.id === playingRecordingId) return state.activeRecording;
+    return state.recordings?.find((r) => r.id === playingRecordingId) ?? null;
+  }
+
+  /// If the master playhead has been sitting in a silence gap between
+  /// two speech rows for longer than [`MAX_MASTER_SILENCE_MS`], seek
+  /// straight to the next speech row's `audioStart`. `computeRows` is
+  /// cheap for our data volumes so we just recompute per rAF; if the
+  /// row list grows very large this can be memoized behind a $derived.
+  function maybeSilenceSkip() {
+    if (!masterAudioEl) return;
+    const rec = currentPlayingRecording();
+    if (!rec) return;
+    const rows = computeRows(rec.entries).filter(
+      (r) => r.kind === 'speech' && r.audioStart != null,
+    );
+    if (rows.length < 2) return;
+    // Find the last speech row whose start is at or before the playhead.
+    let curIdx = -1;
+    for (let i = 0; i < rows.length; i++) {
+      if (rows[i].audioStart <= playingTimeMs) curIdx = i;
+      else break;
+    }
+    if (curIdx < 0 || curIdx >= rows.length - 1) return;
+    const cur = rows[curIdx];
+    const next = rows[curIdx + 1];
+    // audio.wav is wall-clock aligned, so the current row's audio
+    // range covers exactly its wall-clock duration.
+    const curEndMs = cur.audioStart + (cur.wallEnd - cur.wallStart);
+    if (
+      playingTimeMs > curEndMs + MAX_MASTER_SILENCE_MS &&
+      playingTimeMs < next.audioStart
+    ) {
+      try { masterAudioEl.currentTime = next.audioStart / 1000; } catch {}
+      playingTimeMs = next.audioStart;
+    }
   }
 
   function ensureRaf() {
@@ -469,14 +519,43 @@
 
   // ---- Progress predicates for the swipe animation ----
 
+  /// An entry's clip button is "playing" when its audio range covers
+  /// the current playhead — true for both explicit clip playback
+  /// (`playbackMode === 'clip'`) and continuous master playback
+  /// (`playbackMode === 'master'`), where the master playhead can
+  /// naturally pass through many entries in sequence. Entries without
+  /// an audio range (e.g. TTS) can't be located on the master timeline
+  /// and are only "playing" during their own explicit clip playback.
   function isClipPlayingNow(entry) {
-    return playbackMode === 'clip' && playingClipId === entry.id;
+    if (playbackMode === 'clip') return playingClipId === entry.id;
+    if (playbackMode === 'master') {
+      if (entry.audio_start_ms == null || entry.audio_duration_ms == null) return false;
+      const start = entry.audio_start_ms;
+      const end = start + entry.audio_duration_ms;
+      return playingTimeMs >= start && playingTimeMs < end;
+    }
+    return false;
   }
   function clipProgress(entry) {
-    if (!isClipPlayingNow(entry)) return 0;
     const dur = entry.audio_duration_ms;
     if (!dur) return 0;
-    return Math.max(0, Math.min(1, playingTimeMs / dur));
+    if (playbackMode === 'clip' && playingClipId === entry.id) {
+      // Clip mode: playingTimeMs is the clip element's currentTime,
+      // starting at 0 for the segment.
+      return Math.max(0, Math.min(1, playingTimeMs / dur));
+    }
+    if (
+      playbackMode === 'master' &&
+      entry.audio_start_ms != null &&
+      isClipPlayingNow(entry)
+    ) {
+      // Master mode: playingTimeMs is a position on the per-slot audio
+      // timeline, so the fill maps to how far the master playhead has
+      // travelled into this specific entry's range.
+      const elapsed = playingTimeMs - entry.audio_start_ms;
+      return Math.max(0, Math.min(1, elapsed / dur));
+    }
+    return 0;
   }
 
   /// A speech row is "master-playing" when the per-slot audio playhead
@@ -498,6 +577,47 @@
     }
     return playingTimeMs >= row.audioStart && playingTimeMs < end;
   }
+  /// Silence rows are "master-playing" while the playhead sits in the
+  /// gap between the previous speech row's audio end and the next
+  /// speech row's audio start — the same window `maybeSilenceSkip`
+  /// watches. Returns false for anything outside master playback so
+  /// silence rows are quiet by default.
+  function isSilenceRowPlaying(row, rows) {
+    if (playbackMode !== 'master' || row.kind !== 'silence') return false;
+    const idx = rows.indexOf(row);
+    const prev = prevSpeechRow(rows, idx);
+    const next = nextSpeechRow(rows, idx);
+    if (!prev || !next) return false;
+    const prevEnd = prev.audioStart + (prev.wallEnd - prev.wallStart);
+    return playingTimeMs >= prevEnd && playingTimeMs < next.audioStart;
+  }
+  /// Progress across a silence-row's swipe animation, normalised to
+  /// [`MAX_MASTER_SILENCE_MS`] so the fill has a consistent visual
+  /// meaning: "how close are we to the auto-skip cutoff". Shorter
+  /// silences (< 5s) simply never reach 100% before playback moves on;
+  /// longer silences fill to 100% just as the skip fires.
+  function silenceRowProgress(row, rows) {
+    if (!isSilenceRowPlaying(row, rows)) return 0;
+    const idx = rows.indexOf(row);
+    const prev = prevSpeechRow(rows, idx);
+    if (!prev) return 0;
+    const prevEnd = prev.audioStart + (prev.wallEnd - prev.wallStart);
+    const elapsed = playingTimeMs - prevEnd;
+    return Math.max(0, Math.min(1, elapsed / MAX_MASTER_SILENCE_MS));
+  }
+  function prevSpeechRow(rows, fromIdx) {
+    for (let i = fromIdx - 1; i >= 0; i--) {
+      if (rows[i].kind === 'speech' && rows[i].audioStart != null) return rows[i];
+    }
+    return null;
+  }
+  function nextSpeechRow(rows, fromIdx) {
+    for (let i = fromIdx + 1; i < rows.length; i++) {
+      if (rows[i].kind === 'speech' && rows[i].audioStart != null) return rows[i];
+    }
+    return null;
+  }
+
   function rowMasterProgress(row, rows) {
     if (!isRowMasterPlaying(row, rows)) return 0;
     const idx = rows.indexOf(row);
@@ -738,7 +858,12 @@
           <tr class:silence={row.kind === 'silence'}>
             <td class="col-ts">
               {#if row.kind === 'silence'}
-                <span class="silence-tag">silence · {Math.round((row.wallEnd - row.wallStart) / 1000)}s</span>
+                <span class="silence-tag" class:playing={isSilenceRowPlaying(row, rows)}>
+                  {#if isSilenceRowPlaying(row, rows)}
+                    <div class="clip-fill" style="width: {silenceRowProgress(row, rows) * 100}%" aria-hidden="true"></div>
+                  {/if}
+                  <span class="silence-text">silence · {Math.round((row.wallEnd - row.wallStart) / 1000)}s</span>
+                </span>
               {:else}
                 {fmtRelMs(row.wallStart, epoch)} – {fmtRelMs(row.wallEnd, epoch)}
               {/if}
@@ -1278,6 +1403,23 @@
     background: rgba(255,255,255,0.05);
     padding: 2px 6px;
     border-radius: 3px;
+    /* Positioned so the .clip-fill overlay (below) can sit behind the
+       text and sweep left→right during master playback. */
+    position: relative;
+    overflow: hidden;
+  }
+  .silence-tag.playing {
+    color: var(--text);
+    background: rgba(122,162,255,0.14);
+  }
+  .silence-tag .clip-fill {
+    /* Reuse the same swipe visual as clip-btn / master-btn so the
+       animation reads as "same kind of playhead". */
+    z-index: 0;
+  }
+  .silence-tag .silence-text {
+    position: relative;
+    z-index: 1;
   }
 
   /* Clip cell — one per entry, stacked when a row has multiple entries
