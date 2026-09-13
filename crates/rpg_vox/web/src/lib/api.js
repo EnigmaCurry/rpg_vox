@@ -907,22 +907,6 @@ export function recordingArchiveUrl(id) {
   return `/record/recordings/${encodeURIComponent(id)}/archive`;
 }
 
-/// Tell the server that a "play from here" session is starting or
-/// ending. VAD entries captured while active are stamped with
-/// `during_playback: true` so the transcript can distinguish live
-/// speech from mic-picked-up speaker output. Fire-and-forget — a
-/// dropped call just means the tag is missing (log gets slightly
-/// noisier, nothing breaks).
-export async function setRecordPlayback(active) {
-  try {
-    await fetch('/record/playback', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ active: !!active }),
-    });
-  } catch {}
-}
-
 /// Wipe the rolling ephemeral live buffer without touching the in-flight
 /// active recording. Idempotent — an already-empty buffer just returns ok.
 export async function clearLiveBuffer() {

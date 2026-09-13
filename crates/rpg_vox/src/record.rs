@@ -21,7 +21,6 @@
 //! recognizer additions can drop in without further wiring.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -143,14 +142,6 @@ pub struct TranscriptEntry {
     /// `<src>` directly and ignores `audio_start_ms` / `audio_duration_ms`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_url: Option<String>,
-    /// True when the client had signalled a playback session was
-    /// underway (`POST /record/playback { active: true }`) at the time
-    /// this entry was captured. Vox entries with this flag are almost
-    /// certainly the mic re-picking up its own speakers rather than a
-    /// live utterance — the UI grays them and prepends a "PLAYBACK
-    /// ECHO?" tag so they never get confused with actual speech.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub during_playback: bool,
     /// Best-guess speaker identity, resolved from the recent hint ring
     /// at utterance-finalize time (see [`RecordState::resolve_speaker`]).
     /// Populated only for vox entries when a matching hint exists; TTS
@@ -235,11 +226,23 @@ struct ActiveRecording {
     /// close the current speech window.
     mixed_last_hot_ms: u64,
     sample_rate: u32,
-    /// Wall-clock start of the recording. Every incoming chunk is
-    /// positioned in the audio buffer by `(Instant::now() - start) *
-    /// sample_rate`, so slots stay in sync even when only one is
-    /// receiving data at a given moment.
+    /// Wall-clock start of the recording. Used ONLY to anchor a slot's
+    /// first chunk into the shared timeline — thereafter each slot
+    /// advances by its own chunk length via [`slot_cursors`]. Using
+    /// wall-clock for every push produced audible doubling when the
+    /// tokio broadcast fired two chunks in one wake (both computed the
+    /// same `elapsed_secs`, so the second one landed under the first
+    /// and the `+=` mix summed the sample with itself).
     started_at: Instant,
+    /// Per-slot next-write cursor in mono frames of the shared audio
+    /// timeline. `None` until that slot has received its first chunk
+    /// (which anchors it via wall-clock). After that, each chunk
+    /// advances the cursor by exactly `chunk.len() / 2` frames so
+    /// contiguous chunks from the same slot land contiguously — no
+    /// self-overlap regardless of scheduling jitter. Cross-slot
+    /// alignment still works because each slot's first-chunk anchor is
+    /// independent.
+    slot_cursors: Vec<Option<u64>>,
 }
 
 impl ActiveRecording {
@@ -333,12 +336,6 @@ pub struct RecordState {
     /// capture time so historical entries keep their at-capture label
     /// even after a subsequent rename.
     mixer: Arc<AtomicMixer>,
-    /// Client-signalled "playback in flight" flag. Bumped by
-    /// `POST /record/playback` when the browser starts / stops playing
-    /// audio for the user; every transcript entry captured while true
-    /// gets marked as a possible playback echo so live speech and
-    /// mic-picked-up-your-own-speakers can be told apart in the log.
-    playback_active: Arc<AtomicBool>,
     /// Bounded ring of recent speaker hints from external sources (e.g.
     /// discord_vox POSTing to /record/hint). Consulted at every VAD
     /// finalize to attribute utterances on a shared / pre-mixed vox
@@ -359,7 +356,6 @@ impl RecordState {
             })),
             sample_rate,
             mixer,
-            playback_active: Arc::new(AtomicBool::new(false)),
             hints: Arc::new(Mutex::new(VecDeque::with_capacity(HINT_RING_CAPACITY))),
         }
     }
@@ -410,14 +406,6 @@ impl RecordState {
             return Some(hint.speaker.clone());
         }
         None
-    }
-
-    pub fn set_playback_active(&self, active: bool) {
-        self.playback_active.store(active, Ordering::Relaxed);
-    }
-
-    pub fn is_playback_active(&self) -> bool {
-        self.playback_active.load(Ordering::Relaxed)
     }
 
     pub fn sample_rate(&self) -> u32 {
@@ -562,6 +550,7 @@ impl RecordState {
             return Err("a recording is already in progress");
         }
         let id = Uuid::new_v4().to_string();
+        let slot_count = self.mixer.vox_slot_count();
         g.active = Some(ActiveRecording {
             id: id.clone(),
             name,
@@ -574,6 +563,7 @@ impl RecordState {
             mixed_last_hot_ms: 0,
             sample_rate: self.sample_rate,
             started_at: Instant::now(),
+            slot_cursors: vec![None; slot_count],
         });
         Ok(id)
     }
@@ -739,7 +729,6 @@ impl RecordState {
             return;
         }
         let channel = self.channel_name(slot);
-        let during_playback = self.is_playback_active();
         let entry = TranscriptEntry {
             id: Uuid::new_v4().to_string(),
             created_at: unix_now(),
@@ -748,7 +737,6 @@ impl RecordState {
             audio_start_ms,
             audio_duration_ms,
             audio_url: None,
-            during_playback,
             speaker,
             start_wall_ms,
             // Filled in per-snapshot for the active recording (see
@@ -796,10 +784,6 @@ impl RecordState {
             audio_start_ms: None,
             audio_duration_ms: None,
             audio_url,
-            // TTS entries always originate from an explicit /widgets/say
-            // (or /say) call — not from the mic — so the playback-echo
-            // ambiguity doesn't apply.
-            during_playback: false,
             // Speaker hints are about who's talking on a vox channel; a
             // TTS entry's "speaker" is implicitly the TTS engine, so
             // leaving this None keeps the label from being misleading.
@@ -907,26 +891,47 @@ impl RecordState {
         true
     }
 
-    fn push_audio(&self, chunk: &[f32]) -> Option<u64> {
+    fn push_audio(&self, slot: usize, chunk: &[f32]) -> Option<u64> {
         let mut g = self.inner.lock().expect("record state mutex poisoned");
         let active = g.active.as_mut()?;
-        // Cap in frames; convert to interleaved-sample cap.
         let max_samples = RECORDING_MAX_FRAMES * 2;
         let sample_rate = active.sample_rate;
-        let elapsed_secs = active.started_at.elapsed().as_secs_f64();
-        // Target position in frames (stereo pairs). Round to avoid
-        // fractional drift over long recordings.
-        let target_frame = (elapsed_secs * sample_rate as f64).round() as usize;
-        let target_offset = (target_frame * 2).min(max_samples);
+        // stereo interleaved f32 → chunk_frames = pairs written per push.
+        let chunk_frames = (chunk.len() / 2) as u64;
+        if chunk_frames == 0 {
+            return None;
+        }
+        // Grow `slot_cursors` on demand — the mixer's slot count is
+        // fixed for the process lifetime but `push_audio` should be
+        // resilient to a caller who passes an out-of-range slot.
+        if slot >= active.slot_cursors.len() {
+            active.slot_cursors.resize(slot + 1, None);
+        }
+        // Anchor on first chunk: wall-clock position where this slot
+        // begins contributing. Later chunks ignore wall-clock and
+        // advance strictly by their length, so tokio scheduling
+        // jitter can't cause two consecutive chunks to overlap and
+        // double-sum with themselves.
+        let target_frame = match active.slot_cursors[slot] {
+            Some(cur) => cur,
+            None => {
+                let elapsed_secs = active.started_at.elapsed().as_secs_f64();
+                (elapsed_secs * sample_rate as f64).max(0.0).round() as u64
+            }
+        };
+        let target_offset = ((target_frame as usize) * 2).min(max_samples);
         // Silence-fill up to the target if the buffer is shorter — a
         // slot may be the only one active and we haven't padded yet.
         if active.audio.len() < target_offset {
             active.audio.resize(target_offset, 0.0);
         }
-        // Sum in as many chunk samples as fit under the cap. Overwrite
-        // samples that already exist at target_offset (other slots' or
-        // earlier catch-up padding) with a saturating add so overlapping
-        // speech mixes rather than replacing.
+        // Sum this chunk into the buffer. Positions past the current
+        // buffer end are pushed (extending it); positions inside get
+        // summed with whatever's already there — that's how a second
+        // slot's speech mixes with a first slot's at the same
+        // wall-clock moment. Contiguous same-slot writes never sum
+        // with themselves because the cursor always sits at (or past)
+        // this slot's previous end.
         let end = (target_offset + chunk.len()).min(max_samples);
         let take = end.saturating_sub(target_offset);
         for i in 0..take {
@@ -937,7 +942,12 @@ impl RecordState {
                 active.audio[dst_idx] += chunk[i];
             }
         }
-        Some(target_frame as u64)
+        // Advance the slot's cursor by the frames we actually wrote
+        // (may be short if we hit the RAM cap). Next chunk lands
+        // exactly here — no jitter, no overlap with ourselves.
+        let written_frames = (take / 2) as u64;
+        active.slot_cursors[slot] = Some(target_frame + written_frames);
+        Some(target_frame)
     }
 }
 
@@ -1398,7 +1408,7 @@ pub fn spawn_worker(
                             // the VAD (for the rolling ephemeral buffer)
                             // but the utterance offsets it stamps have
                             // no recording to seek into.
-                            let timeline_frame = state.push_audio(&chunk);
+                            let timeline_frame = state.push_audio(slot, &chunk);
                             worker.process_chunk(&chunk, timeline_frame);
                         }
                     }

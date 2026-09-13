@@ -21,12 +21,6 @@
   let selected = $state('live');
   let previouslyActive = false;
 
-  // Text field for the "New recording" name prompt shown when the user
-  // clicks the + in the sidebar.
-  let name = $state('');
-  let showNewForm = $state(false);
-  let newFormEl = $state(null);
-
   const POLL_MS = 500;
   let timer = null;
 
@@ -59,9 +53,6 @@
   onDestroy(() => {
     if (timer) { clearInterval(timer); timer = null; }
     if (rafId) { cancelAnimationFrame(rafId); rafId = 0; }
-    // Best-effort: clear the server's playback flag if we were in a
-    // playback session when the user navigated away. Fire-and-forget.
-    if (playingRecordingId !== null) api.setRecordPlayback(false);
   });
 
   async function refresh() {
@@ -110,22 +101,15 @@
     }
   }
 
+  // Start recording immediately with the server-assigned default name
+  // ("Recording <timestamp>"). The user can click-to-rename in the
+  // active pane header once the bucket is live — no prompt in the way
+  // between "I want to record" and "recording is happening".
   async function beginNewRecording() {
-    showNewForm = true;
-    await tick();
-    newFormEl?.focus();
-  }
-  function cancelNewRecording() {
-    showNewForm = false;
-    name = '';
-  }
-  async function submitNewRecording() {
     if (busy) return;
     busy = true;
     try {
-      await api.startNewRecording(name.trim());
-      name = '';
-      showNewForm = false;
+      await api.startNewRecording('');
       selected = 'active';
       await refresh();
     } catch (e) {
@@ -242,10 +226,6 @@
   function entryEndMs(e) {
     return entryEpochMs(e) + (e.audio_duration_ms ?? 0);
   }
-  function entryMixedEnd(e) {
-    return (e.mixed_start_ms ?? 0) + (e.audio_duration_ms ?? 0);
-  }
-
   function computeRows(entries) {
     const sorted = [...(entries ?? [])].sort(
       (a, b) => entryEpochMs(a) - entryEpochMs(b),
@@ -257,10 +237,15 @@
       if (!cluster.length) return;
       const wallStart = Math.min(...cluster.map(entryEpochMs));
       const wallEnd = Math.max(...cluster.map(entryEndMs));
-      const mixedVals = cluster
-        .map((e) => e.mixed_start_ms)
+      // Per-slot audio timeline (audio.wav) — silence-padded so it's
+      // aligned with wall clock. Master playback seeks here because
+      // audio.wav is always populated (even for vox slots set to
+      // capture-only, i.e. to_output=false — the silence-gated mixed
+      // feed skips those and would be empty in that common case).
+      const audioVals = cluster
+        .map((e) => e.audio_start_ms)
         .filter((v) => v != null);
-      const mixedStart = mixedVals.length ? Math.min(...mixedVals) : null;
+      const audioStart = audioVals.length ? Math.min(...audioVals) : null;
       const byChannel = {};
       for (const e of cluster) {
         const key = e.channel || 'Unknown';
@@ -270,7 +255,7 @@
         kind: 'speech',
         wallStart,
         wallEnd,
-        mixedStart,
+        audioStart,
         entries: cluster.slice(),
         byChannel,
       });
@@ -284,7 +269,7 @@
       } else {
         const gap = eStart - clusterEnd;
         const prev = cluster[cluster.length - 1];
-        const prevMixedEnd = entryMixedEnd(prev);
+        const prevAudioEnd = (prev.audio_start_ms ?? 0) + (prev.audio_duration_ms ?? 0);
         const prevEnd = clusterEnd;
         flush();
         if (gap >= SILENCE_ROW_MIN_MS) {
@@ -292,7 +277,7 @@
             kind: 'silence',
             wallStart: prevEnd,
             wallEnd: eStart,
-            mixedStart: prevMixedEnd,
+            audioStart: prevAudioEnd,
             entries: [],
             byChannel: {},
           });
@@ -395,7 +380,12 @@
   async function playMasterAtMs(recordingId, startMs) {
     await tick();
     if (!masterAudioEl) return;
-    const wantSrc = api.recordingMixedUrl(recordingId);
+    // Use the per-slot recording (audio.wav). It's the source of
+    // truth for "everything captured this session" — every entry's
+    // audio_start_ms is a position within it, so the row's audioStart
+    // seeks correctly regardless of whether the vox slots were routed
+    // to the mic feed.
+    const wantSrc = api.recordingAudioUrl(recordingId);
     if (!masterAudioEl.src.endsWith(wantSrc)) {
       masterAudioEl.src = wantSrc;
       masterAudioEl.load();
@@ -415,23 +405,22 @@
       masterAudioEl.addEventListener('loadedmetadata', seekAndPlay, { once: true });
     }
     ensureRaf();
-    api.setRecordPlayback(true);
   }
 
   /// Master-column click for a row. Speech rows seek to their own
-  /// `mixedStart`; silence rows jump to the next speech row's
-  /// `mixedStart` so the user can use the master column as a
+  /// `audioStart`; silence rows jump to the next speech row's
+  /// `audioStart` so the user can use the master column as a
   /// scrub-forward affordance without waiting through dead air.
   function playMasterFromRow(row, rows, recordingId) {
     if (row.kind === 'speech') {
-      if (row.mixedStart != null) playMasterAtMs(recordingId, row.mixedStart);
+      if (row.audioStart != null) playMasterAtMs(recordingId, row.audioStart);
       return;
     }
-    // Silence row: find the next speech row and jump to its mixedStart.
+    // Silence row: find the next speech row and jump to its audioStart.
     const idx = rows.indexOf(row);
     for (let i = idx + 1; i < rows.length; i++) {
-      if (rows[i].kind === 'speech' && rows[i].mixedStart != null) {
-        playMasterAtMs(recordingId, rows[i].mixedStart);
+      if (rows[i].kind === 'speech' && rows[i].audioStart != null) {
+        playMasterAtMs(recordingId, rows[i].audioStart);
         return;
       }
     }
@@ -467,7 +456,6 @@
     playingTimeMs = 0;
     clipAudioEl.play().catch((e) => console.warn('clip play failed', e));
     ensureRaf();
-    api.setRecordPlayback(true);
   }
 
   function stopPlayback() {
@@ -477,7 +465,6 @@
     playingClipId = null;
     playingTimeMs = 0;
     playbackMode = null;
-    api.setRecordPlayback(false);
   }
 
   // ---- Progress predicates for the swipe animation ----
@@ -492,31 +479,32 @@
     return Math.max(0, Math.min(1, playingTimeMs / dur));
   }
 
-  /// A speech row is "master-playing" when the mixed-track playhead is
-  /// within `[row.mixedStart, next-speech-row.mixedStart)`. Silence rows
-  /// have zero-length windows so this is always false for them; the
-  /// visual jumps directly from one speech row to the next during
-  /// continuous master playback.
+  /// A speech row is "master-playing" when the per-slot audio playhead
+  /// is within `[row.audioStart, next-speech-row.audioStart)`. Silence
+  /// rows are never "playing" because their master ▶ scrubs forward
+  /// rather than playing anything itself; during continuous master
+  /// playback the visual jumps directly from one speech row to the
+  /// next as `currentTime` crosses each boundary.
   function isRowMasterPlaying(row, rows) {
     if (playbackMode !== 'master' || row.kind !== 'speech') return false;
-    if (row.mixedStart == null) return false;
+    if (row.audioStart == null) return false;
     const idx = rows.indexOf(row);
     let end = Infinity;
     for (let i = idx + 1; i < rows.length; i++) {
-      if (rows[i].kind === 'speech' && rows[i].mixedStart != null) {
-        end = rows[i].mixedStart;
+      if (rows[i].kind === 'speech' && rows[i].audioStart != null) {
+        end = rows[i].audioStart;
         break;
       }
     }
-    return playingTimeMs >= row.mixedStart && playingTimeMs < end;
+    return playingTimeMs >= row.audioStart && playingTimeMs < end;
   }
   function rowMasterProgress(row, rows) {
     if (!isRowMasterPlaying(row, rows)) return 0;
     const idx = rows.indexOf(row);
     let end = null;
     for (let i = idx + 1; i < rows.length; i++) {
-      if (rows[i].kind === 'speech' && rows[i].mixedStart != null) {
-        end = rows[i].mixedStart;
+      if (rows[i].kind === 'speech' && rows[i].audioStart != null) {
+        end = rows[i].audioStart;
         break;
       }
     }
@@ -525,28 +513,25 @@
       // Fall back to the row's own wall-clock duration as the master
       // slice length; caps progress at 1.0 once currentTime overshoots.
       const dur = Math.max(1, row.wallEnd - row.wallStart);
-      const elapsed = playingTimeMs - row.mixedStart;
+      const elapsed = playingTimeMs - row.audioStart;
       return Math.max(0, Math.min(1, elapsed / dur));
     }
-    const elapsed = playingTimeMs - row.mixedStart;
-    const dur = Math.max(1, end - row.mixedStart);
+    const elapsed = playingTimeMs - row.audioStart;
+    const dur = Math.max(1, end - row.audioStart);
     return Math.max(0, Math.min(1, elapsed / dur));
   }
 
   function onPlaybackEnded() {
     playingRecordingId = null;
     playingTimeMs = 0;
-    api.setRecordPlayback(false);
   }
 
   function onPlaybackPause() {
-    // User hit the native controls' pause. Clear playback flag but
-    // keep the currently-highlighted position so they can resume.
-    api.setRecordPlayback(false);
+    // No-op — kept as an event target so any future pause-specific
+    // side-effect can hook in without threading a new handler.
   }
 
   function onPlaybackPlay() {
-    api.setRecordPlayback(true);
     ensureRaf();
   }
 
@@ -569,6 +554,27 @@
   let editText = $state('');
   let editInputEl = $state(null);
   let editSaving = $state(false);
+
+  // Live-buffer entries are click-to-copy (no editing). `copiedEntryId`
+  // pulses briefly on the just-copied row so the user gets visual
+  // confirmation without a modal or toast. Cleared by a timer.
+  let copiedEntryId = $state(null);
+  let copyClearTimer = 0;
+  const COPY_FEEDBACK_MS = 900;
+
+  async function copyEntryText(entry) {
+    try {
+      await navigator.clipboard.writeText(entry.text);
+      copiedEntryId = entry.id;
+      if (copyClearTimer) clearTimeout(copyClearTimer);
+      copyClearTimer = setTimeout(() => {
+        copiedEntryId = null;
+        copyClearTimer = 0;
+      }, COPY_FEEDBACK_MS);
+    } catch (e) {
+      err = `copy failed: ${e.message}`;
+    }
+  }
 
   async function beginEditEntry(entry) {
     if (editSaving) return;
@@ -693,14 +699,21 @@
   ></audio>
 {/snippet}
 
-{#snippet playbackBar()}
-  {#if playingRecordingId != null}
-    <div class="playback-bar">
-      <span class="playhead">
-        ▶ {playbackMode === 'master' ? 'master' : 'clip'} — {fmtDur(playingTimeMs)}
-      </span>
-      <button type="button" class="ghost" onclick={stopPlayback}>Stop playback</button>
-    </div>
+{#snippet playAllBtn(recordingId)}
+  {#if playbackMode != null && playingRecordingId === recordingId}
+    <button
+      type="button"
+      class="topbar-btn stop"
+      onclick={stopPlayback}
+      title="Stop playback"
+    >■ Stop</button>
+  {:else}
+    <button
+      type="button"
+      class="topbar-btn"
+      onclick={() => playMasterAtMs(recordingId, 0)}
+      title="Play the recording from the beginning"
+    >▶ Play All</button>
   {/if}
 {/snippet}
 
@@ -751,7 +764,6 @@
   <div
     class="clip-btn"
     class:playing={isClipPlayingNow(entry)}
-    class:echo={entry.during_playback && !entry.audio_url}
     class:tts={channel === 'TTS'}
   >
     {#if isClipPlayingNow(entry)}
@@ -759,9 +771,6 @@
     {/if}
     {#if entry.speaker}
       <span class="speaker-tag" title="Speaker attribution">{entry.speaker}</span>
-    {/if}
-    {#if entry.during_playback && !entry.audio_url}
-      <span class="echo-hint" title="Captured while playback was active — likely mic echo, not live speech.">echo?</span>
     {/if}
     {#if editingEntryId === entry.id}
       <input
@@ -807,7 +816,7 @@
     recordings={state?.recordings ?? []}
     activeRecording={state?.activeRecording ?? null}
     {selected}
-    onSelect={(k) => { selected = k; showNewForm = false; }}
+    onSelect={(k) => { selected = k; }}
     onNewRecording={beginNewRecording}
     onRename={renameRecording}
     onDelete={deleteSavedFromSidebar}
@@ -821,25 +830,6 @@
 
     {#if !state}
       <div class="empty">loading…</div>
-    {:else if showNewForm}
-      <form class="new-recording" onsubmit={(e) => { e.preventDefault(); submitNewRecording(); }}>
-        <label for="new-recording-name">Name for this recording (optional)</label>
-        <input
-          id="new-recording-name"
-          type="text"
-          bind:this={newFormEl}
-          bind:value={name}
-          disabled={busy}
-          placeholder="e.g. Session 3 — the tomb"
-          onkeydown={(e) => { if (e.key === 'Escape') { e.preventDefault(); cancelNewRecording(); } }}
-        />
-        <div class="new-actions">
-          <button type="button" class="ghost" onclick={cancelNewRecording} disabled={busy}>Cancel</button>
-          <button type="submit" class="primary" disabled={busy}>
-            {busy ? 'Starting…' : 'Start Recording'}
-          </button>
-        </div>
-      </form>
     {:else if selected === 'live'}
       <!-- Rolling ephemeral buffer view. -->
       <div class="pane-head">
@@ -866,27 +856,17 @@
           onscroll={onLiveScroll}
         >
           {#each state.buffer as e (e.id)}
-            <li>
+            <li class:copied={copiedEntryId === e.id}>
               <span class="channel-tag">{e.channel || channelFallback}</span>
               <span class="ts">{fmtTime(e.created_at)}</span>
-              {#if editingEntryId === e.id}
-                <input
-                  class="text-edit"
-                  type="text"
-                  bind:this={editInputEl}
-                  bind:value={editText}
-                  disabled={editSaving}
-                  onkeydown={(ev) => onEditKey(ev, e, null)}
-                  onblur={() => commitEditEntry(e, null)}
-                  aria-label="Correct transcript"
-                />
-              {:else}
-                <button
-                  type="button"
-                  class="text text-btn"
-                  title="Click to correct this transcript"
-                  onclick={() => beginEditEntry(e)}
-                >{e.text}</button>
+              <button
+                type="button"
+                class="text text-btn"
+                title={copiedEntryId === e.id ? 'Copied!' : 'Click to copy transcript'}
+                onclick={() => copyEntryText(e)}
+              >{e.text}</button>
+              {#if copiedEntryId === e.id}
+                <span class="copy-flag" aria-live="polite">copied ✓</span>
               {/if}
             </li>
           {/each}
@@ -922,6 +902,7 @@
           <span class="active-time">{fmtDur(state.activeRecording.duration_ms ?? 0)}</span>
         </div>
         <div class="active-actions">
+          {@render playAllBtn(state.activeRecording.id)}
           <button type="button" class="danger" disabled={busy} onclick={discardRecording}>
             Discard
           </button>
@@ -930,7 +911,6 @@
           </button>
         </div>
       </div>
-      {@render playbackBar()}
       {@render hiddenAudios()}
       {#if state.activeRecording.entries.length === 0}
         <div class="empty pane-empty">listening…</div>
@@ -945,14 +925,16 @@
           {fmtTime(selectedSaved.created_at)} · {fmtDur(selectedSaved.duration_ms)}
           · {selectedSaved.entries.length} utterances
         </div>
-        <a
-          class="download-btn"
-          href={api.recordingArchiveUrl(selectedSaved.id)}
-          download
-          title="Download a zip with transcript.json, mixed.wav, audio.wav, and per-utterance clips"
-        >⤓ Download archive</a>
+        <div class="head-actions">
+          {@render playAllBtn(selectedSaved.id)}
+          <a
+            class="download-btn"
+            href={api.recordingArchiveUrl(selectedSaved.id)}
+            download
+            title="Download a zip with transcript.json, mixed.wav, audio.wav, and per-utterance clips"
+          >⤓ Download archive</a>
+        </div>
       </div>
-      {@render playbackBar()}
       {@render hiddenAudios()}
       {#if selectedSaved.entries.length === 0}
         <div class="empty pane-empty">no transcript for this recording</div>
@@ -1003,29 +985,6 @@
     border-radius: 6px;
     font-size: 12px;
   }
-
-  .new-recording {
-    display: flex;
-    flex-direction: column;
-    gap: 10px;
-    background: var(--panel);
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    padding: 20px;
-    max-width: 520px;
-    margin: auto;
-  }
-  .new-recording label { color: var(--muted); font-size: 12px; }
-  .new-recording input[type="text"] {
-    background: rgba(0,0,0,0.2);
-    color: var(--text);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    padding: 8px 10px;
-    font-size: 14px;
-    font-family: inherit;
-  }
-  .new-actions { display: flex; justify-content: flex-end; gap: 8px; }
 
   .pane-head.active {
     padding: 10px 14px;
@@ -1117,6 +1076,32 @@
     white-space: nowrap;
   }
   .download-btn:hover { background: rgba(122,162,255,0.12); }
+  .head-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-shrink: 0;
+  }
+  /* Play All / Stop button — lives in the pane top bar so its
+     presence doesn't shift the log table around when playback starts. */
+  .topbar-btn {
+    background: rgba(122,162,255,0.12);
+    color: var(--text);
+    border: 1px solid rgba(122,162,255,0.4);
+    padding: 4px 12px;
+    font-size: 12px;
+    font-weight: 600;
+    border-radius: 4px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .topbar-btn:hover { background: rgba(122,162,255,0.22); }
+  .topbar-btn.stop {
+    background: rgba(255,92,92,0.14);
+    color: #ffbdbd;
+    border-color: rgba(255,92,92,0.5);
+  }
+  .topbar-btn.stop:hover { background: rgba(255,92,92,0.24); }
 
   ul.entries {
     list-style: none;
@@ -1163,25 +1148,6 @@
     border-radius: 3px;
     white-space: nowrap;
   }
-  .playback-bar {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 6px 12px;
-    background: rgba(122,162,255,0.12);
-    border: 1px solid rgba(122,162,255,0.35);
-    border-radius: 6px;
-    font-size: 12px;
-    color: var(--text);
-  }
-  .playhead {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    color: var(--accent);
-    font-weight: 600;
-    font-variant-numeric: tabular-nums;
-  }
   .ts {
     color: var(--muted);
     font-size: 11px;
@@ -1211,21 +1177,22 @@
     white-space: normal;
   }
   .text-btn:hover { border-color: rgba(122,162,255,0.4); background: rgba(122,162,255,0.06); }
-  .text-edit {
-    grid-column: 3;
-    background: rgba(0,0,0,0.35);
-    color: var(--text);
-    border: 1px solid rgba(122,162,255,0.6);
-    border-radius: 4px;
-    padding: 3px 6px;
-    font: inherit;
-    font-size: 13px;
-    line-height: 1.4;
-    min-width: 0;
-    width: 100%;
-    box-sizing: border-box;
+  /* Transient "copied ✓" pulse on the just-clicked live-buffer row. The
+     copy-flag chip fades in beside the text, and the whole LI briefly
+     lights up so the click lands unambiguously. */
+  ul.entries li.copied { background: rgba(46, 204, 74, 0.14); }
+  .copy-flag {
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: #b7f0c4;
+    background: rgba(46, 204, 74, 0.18);
+    padding: 2px 6px;
+    border-radius: 3px;
+    white-space: nowrap;
+    align-self: center;
   }
-
   button {
     padding: 6px 14px;
     background: transparent;
@@ -1250,11 +1217,6 @@
     border-color: rgba(255,92,92,0.5);
   }
   button.danger:hover:not(:disabled) { background: rgba(255,92,92,0.12); }
-  button.ghost {
-    background: transparent;
-    color: var(--muted);
-    border-color: var(--border);
-  }
 
   /* ---- Log table (columns-per-channel view) ---- */
   .log-scroller {
@@ -1339,7 +1301,6 @@
     box-shadow: 0 0 0 1px rgba(122,162,255,0.35);
   }
   .clip-btn.tts { background: rgba(255,204,102,0.06); }
-  .clip-btn.echo { opacity: 0.55; }
   /* Animated fill: absolute overlay behind the button content whose
      width is bound to per-clip playback progress and updated per rAF
      tick. Content is promoted with `position: relative` to sit above. */
@@ -1390,15 +1351,6 @@
     min-width: 0;
     width: 100%;
     box-sizing: border-box;
-  }
-  .echo-hint {
-    font-size: 10px;
-    color: #ff9a5c;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-    background: rgba(255,154,92,0.15);
-    padding: 1px 4px;
-    border-radius: 3px;
   }
 
   /* Master cell — the ▶ that plays the mixed audio from this row's

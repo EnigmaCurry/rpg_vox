@@ -873,7 +873,6 @@ pub async fn serve(
             "/record/buffer",
             axum::routing::delete(record_buffer_clear_handler),
         )
-        .route("/record/playback", post(record_playback_handler))
         .route("/record/hint", post(record_hint_handler))
         .route("/scenes/mix", post(scene_mix_handler))
         .route(
@@ -4223,6 +4222,11 @@ async fn record_stop_handler(
         .create_recording(
             rec_id.clone(),
             taken.name.clone(),
+            // Preserve the recording's actual start time so per-entry
+            // `start_wall_ms` values stay relative to a consistent
+            // epoch across the save boundary — otherwise the client
+            // would render every row's timestamp as "0:00 – 0:00".
+            taken.created_at,
             sample_rate,
             duration_ms,
             transcript_json,
@@ -4781,24 +4785,6 @@ async fn record_segment_handler(
 // Channel rename now happens by PUT /mixer with a `vox` slot patch that
 // carries a `name` — no dedicated endpoint. The persisted mixer state
 // carries the names across restarts.
-
-#[derive(Debug, Deserialize)]
-struct PlaybackBody {
-    active: bool,
-}
-
-/// Client toggles this at the start/end of every "play from here"
-/// session so the server can tag any VAD-produced vox entry captured
-/// while playback is in flight with `during_playback: true`. Prevents
-/// the log from confusing mic-picked-up-your-own-speakers with live
-/// speech. Idempotent — POSTing the same value twice is fine.
-async fn record_playback_handler(
-    State(state): State<AppState>,
-    Json(body): Json<PlaybackBody>,
-) -> Response {
-    state.record.set_playback_active(body.active);
-    Json(serde_json::json!({ "active": body.active })).into_response()
-}
 
 #[derive(Debug, Deserialize)]
 struct HintBody {

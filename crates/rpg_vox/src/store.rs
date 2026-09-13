@@ -1905,6 +1905,15 @@ impl Store {
     /// Persist a finished recording bucket: DB row + on-disk WAV(s).
     /// Called by `POST /record/recordings/:id/stop` once the streaming
     /// worker has drained the active bucket into an owned buffer.
+    ///
+    /// `created_at` must be the recording's **start** time (unix
+    /// seconds), not "now": every transcript entry carries a
+    /// `start_wall_ms` in unix millis, and the client renders relative
+    /// timestamps as `(entry.start_wall_ms - recording.created_at *
+    /// 1000)`. If we stamped `unix_now()` here (i.e. stop time), that
+    /// subtraction goes negative and the client clamps every row to
+    /// "0:00 – 0:00".
+    ///
     /// `mixed_wav_bytes` may be empty (nothing cleared the silence gate
     /// during the session) — in that case the sidecar file is skipped
     /// so a stat on disk cleanly says "no mixed track".
@@ -1912,13 +1921,13 @@ impl Store {
         &self,
         id: String,
         name: String,
+        created_at: i64,
         sample_rate: u32,
         duration_ms: u64,
         transcript_json: String,
         wav_bytes: Vec<u8>,
         mixed_wav_bytes: Vec<u8>,
     ) -> Result<()> {
-        let now = unix_now();
         let db = self.db.clone();
         let id_clone = id.clone();
         let name_clone = name.clone();
@@ -1932,7 +1941,7 @@ impl Store {
                 params![
                     id_clone,
                     name_clone,
-                    now,
+                    created_at,
                     duration_ms as i64,
                     sample_rate as i64,
                     transcript_clone,
