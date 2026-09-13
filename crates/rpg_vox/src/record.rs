@@ -30,7 +30,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::mixer::AtomicMixer;
-use crate::stt::SttHandle;
+use crate::stt::{StreamingSession, StreamingSttHandle, SttHandle};
 
 /// Hard cap on the rolling Not-Recording buffer. Old entries drop FIFO when
 /// the running total of `entry.text.len()` exceeds this. 50 KB ≈ a few
@@ -169,6 +169,16 @@ pub struct TranscriptEntry {
     /// mixed track is the one playing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mixed_start_ms: Option<u64>,
+    /// True while this entry is a live streaming-recognition partial and
+    /// the utterance hasn't been closed by VAD yet. Clients render
+    /// provisional entries with a dimmed / italic style so it's obvious
+    /// the text may still be revised. Cleared to `false` when the final
+    /// decode replaces the entry, and defaults to `false` for entries
+    /// pushed by legacy paths (offline SenseVoice finalize, TTS logs)
+    /// so nothing in the persisted history is silently marked
+    /// provisional after the fact.
+    #[serde(default)]
+    pub provisional: bool,
 }
 
 /// One contiguous stretch of non-silent audio written into the mixed
@@ -344,10 +354,38 @@ pub struct RecordState {
     /// tokio worker tasks; both paths are short so contention is
     /// negligible.
     hints: Arc<Mutex<VecDeque<SpeakerHint>>>,
+    /// Fan-out for the OBS subtitles overlay: finalized vox transcript
+    /// entries (only while a recording is active) plus explicit
+    /// recording-active state transitions so the overlay can swap
+    /// between the caption view and the "suspended" placeholder as
+    /// soon as recording is started or stopped. Send failures (no
+    /// subscribers) are ignored — this is a fire-and-forget channel.
+    subtitles: broadcast::Sender<SubtitleEvent>,
+}
+
+/// Events fanned out to OBS subtitle overlay subscribers.
+///
+/// * `Entry` — upsert-by-id semantics. Fires both for streaming
+///   partials (with `provisional=true`) and for the polished final
+///   that replaces them (`provisional=false`). A client keyed by
+///   `entry.id` renders each event as either "new" or "update text
+///   for existing".
+/// * `EntryRemove` — pull an already-broadcast entry off the overlay,
+///   used when a streaming partial's final decode matched the
+///   false-positive filter and we don't want the stale partial to
+///   linger.
+/// * `RecordingActive` — swap between the caption view and the
+///   "suspended" placeholder without waiting for a poll.
+#[derive(Debug, Clone)]
+pub enum SubtitleEvent {
+    Entry(TranscriptEntry),
+    EntryRemove(String),
+    RecordingActive(bool),
 }
 
 impl RecordState {
     pub fn new(sample_rate: u32, mixer: Arc<AtomicMixer>) -> Self {
+        let (subtitles, _) = broadcast::channel::<SubtitleEvent>(32);
         Self {
             inner: Arc::new(Mutex::new(Inner {
                 buffer: Vec::new(),
@@ -357,7 +395,18 @@ impl RecordState {
             sample_rate,
             mixer,
             hints: Arc::new(Mutex::new(VecDeque::with_capacity(HINT_RING_CAPACITY))),
+            subtitles,
         }
+    }
+
+    /// Subscribe to the OBS subtitles fan-out. Yields finalized vox
+    /// entries (only while a named recording is in flight) plus
+    /// recording-active state transitions. Broadcast lag drops the
+    /// oldest queued event; OBS overlays only care about the newest
+    /// text and the current state, both of which the caller can
+    /// re-derive on lag via [`Self::is_recording`].
+    pub fn subscribe_subtitles(&self) -> broadcast::Receiver<SubtitleEvent> {
+        self.subtitles.subscribe()
     }
 
     /// Record a "who's speaking" hint. `slot = None` means the hint
@@ -565,6 +614,8 @@ impl RecordState {
             started_at: Instant::now(),
             slot_cursors: vec![None; slot_count],
         });
+        drop(g);
+        let _ = self.subtitles.send(SubtitleEvent::RecordingActive(true));
         Ok(id)
     }
 
@@ -584,6 +635,10 @@ impl RecordState {
             return None;
         }
         let mut active = g.active.take()?;
+        // Emit the state transition immediately so any OBS overlay
+        // subscribers flip to the suspended placeholder without waiting
+        // for the encode / persist pipeline below to finish.
+        let _ = self.subtitles.send(SubtitleEvent::RecordingActive(false));
         // Close any still-open speech window at "now" so wall_to_mixed_ms
         // yields a definite value rather than pinning to Instant-based
         // extrapolation. Without this, the last entry recorded right
@@ -705,6 +760,8 @@ impl RecordState {
             return false;
         }
         g.active = None;
+        drop(g);
+        let _ = self.subtitles.send(SubtitleEvent::RecordingActive(false));
         true
     }
 
@@ -715,7 +772,8 @@ impl RecordState {
     ///
     /// Skips entries with no alphanumeric content — SenseVoice sometimes
     /// resolves a marginal segment to just "." or "。" which is meaningless
-    /// as a transcript and would pollute the UI + logs.
+    /// as a transcript and would pollute the UI + logs. Also drops known
+    /// single-word false-positive transcripts (see [`is_false_positive`]).
     fn push_transcript(
         &self,
         slot: usize,
@@ -726,6 +784,9 @@ impl RecordState {
         start_wall_ms: Option<u64>,
     ) {
         if !text.chars().any(|c| c.is_alphanumeric()) {
+            return;
+        }
+        if is_false_positive(&text) {
             return;
         }
         let channel = self.channel_name(slot);
@@ -742,6 +803,7 @@ impl RecordState {
             // Filled in per-snapshot for the active recording (see
             // snapshot()) and stamped permanently at stop time.
             mixed_start_ms: None,
+            provisional: false,
         };
         let mut g = self.inner.lock().expect("record state mutex poisoned");
         // Rolling buffer: insert at the position that keeps entries sorted
@@ -755,8 +817,251 @@ impl RecordState {
             let dropped = g.buffer.remove(0);
             g.buffer_bytes = g.buffer_bytes.saturating_sub(dropped.text.len());
         }
+        let recording = g.active.is_some();
         if let Some(active) = g.active.as_mut() {
-            insert_ordered(&mut active.entries, entry);
+            insert_ordered(&mut active.entries, entry.clone());
+        }
+        drop(g);
+        if recording {
+            let _ = self.subtitles.send(SubtitleEvent::Entry(entry));
+        }
+    }
+
+    /// Insert or update a streaming-partial transcript entry keyed by
+    /// `entry_id`. If an entry with that id already exists (in either
+    /// the rolling buffer or the active recording's entries), its text
+    /// is replaced in place; otherwise a new entry is created.
+    /// Broadcasts a [`SubtitleEvent::Entry`] with `provisional = true`
+    /// so subscribers can render mid-utterance updates.
+    ///
+    /// No false-positive filter here — partials should show the live
+    /// hypothesis even if it briefly matches a filter phrase; the
+    /// filter runs only at [`Self::finalize_transcript`] time when the
+    /// final text is what we're deciding about.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn upsert_partial(
+        &self,
+        entry_id: &str,
+        slot: usize,
+        text: String,
+        audio_start_ms: Option<u64>,
+        audio_duration_ms: Option<u64>,
+        speaker: Option<String>,
+        start_wall_ms: Option<u64>,
+    ) {
+        let trimmed = text.trim().to_string();
+        if trimmed.is_empty() {
+            return;
+        }
+        let channel = self.channel_name(slot);
+        let mut g = self.inner.lock().expect("record state mutex poisoned");
+        // Update-in-place if the id is already present. Adjust the
+        // rolling-buffer byte counter by the length delta so the cap
+        // math stays correct across a partial's text growth.
+        let mut updated_entry: Option<TranscriptEntry> = None;
+        let mut buffer_delta: Option<(usize, usize)> = None;
+        for entry in g.buffer.iter_mut() {
+            if entry.id == entry_id {
+                let old_len = entry.text.len();
+                entry.text = trimmed.clone();
+                entry.channel = channel.clone();
+                entry.audio_start_ms = audio_start_ms;
+                entry.audio_duration_ms = audio_duration_ms;
+                entry.speaker = speaker.clone();
+                entry.start_wall_ms = start_wall_ms;
+                entry.provisional = true;
+                buffer_delta = Some((old_len, entry.text.len()));
+                updated_entry = Some(entry.clone());
+                break;
+            }
+        }
+        if let Some((old, new)) = buffer_delta {
+            if new >= old {
+                g.buffer_bytes += new - old;
+            } else {
+                g.buffer_bytes = g.buffer_bytes.saturating_sub(old - new);
+            }
+        }
+        // Mirror the update into the active recording if present.
+        if let Some(active) = g.active.as_mut() {
+            for entry in active.entries.iter_mut() {
+                if entry.id == entry_id {
+                    entry.text = trimmed.clone();
+                    entry.channel = channel.clone();
+                    entry.audio_start_ms = audio_start_ms;
+                    entry.audio_duration_ms = audio_duration_ms;
+                    entry.speaker = speaker.clone();
+                    entry.start_wall_ms = start_wall_ms;
+                    entry.provisional = true;
+                    if updated_entry.is_none() {
+                        updated_entry = Some(entry.clone());
+                    }
+                    break;
+                }
+            }
+        }
+        let entry = updated_entry.unwrap_or_else(|| {
+            let entry = TranscriptEntry {
+                id: entry_id.to_string(),
+                created_at: unix_now(),
+                text: trimmed,
+                channel,
+                audio_start_ms,
+                audio_duration_ms,
+                audio_url: None,
+                speaker,
+                start_wall_ms,
+                mixed_start_ms: None,
+                provisional: true,
+            };
+            g.buffer_bytes += entry.text.len();
+            insert_ordered(&mut g.buffer, entry.clone());
+            while g.buffer_bytes > BUFFER_MAX_BYTES && g.buffer.len() > 1 {
+                let dropped = g.buffer.remove(0);
+                g.buffer_bytes = g.buffer_bytes.saturating_sub(dropped.text.len());
+            }
+            if let Some(active) = g.active.as_mut() {
+                insert_ordered(&mut active.entries, entry.clone());
+            }
+            entry
+        });
+        let recording = g.active.is_some();
+        drop(g);
+        if recording {
+            let _ = self.subtitles.send(SubtitleEvent::Entry(entry));
+        }
+    }
+
+    /// Close out a streaming partial with its polished final text.
+    /// Runs the same false-positive filter that `push_transcript`
+    /// applies: if the final text matches, the partial is *removed*
+    /// (from buffer, active, and via a `SubtitleEvent::EntryRemove`)
+    /// rather than promoted. Otherwise the entry is updated in place
+    /// with `provisional = false` and rebroadcast as a final.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn finalize_partial(
+        &self,
+        entry_id: &str,
+        slot: usize,
+        text: String,
+        audio_start_ms: Option<u64>,
+        audio_duration_ms: Option<u64>,
+        speaker: Option<String>,
+        start_wall_ms: Option<u64>,
+    ) {
+        let trimmed = text.trim().to_string();
+        let is_junk = trimmed.is_empty()
+            || !trimmed.chars().any(|c| c.is_alphanumeric())
+            || is_false_positive(&trimmed);
+        if is_junk {
+            // Remove any existing partial rather than leaving stale text.
+            self.remove_entry(entry_id);
+            return;
+        }
+        let channel = self.channel_name(slot);
+        let mut g = self.inner.lock().expect("record state mutex poisoned");
+        let mut finalized: Option<TranscriptEntry> = None;
+        let mut buffer_delta: Option<(usize, usize)> = None;
+        for entry in g.buffer.iter_mut() {
+            if entry.id == entry_id {
+                let old_len = entry.text.len();
+                entry.text = trimmed.clone();
+                entry.channel = channel.clone();
+                entry.audio_start_ms = audio_start_ms;
+                entry.audio_duration_ms = audio_duration_ms;
+                entry.speaker = speaker.clone();
+                entry.start_wall_ms = start_wall_ms;
+                entry.provisional = false;
+                buffer_delta = Some((old_len, entry.text.len()));
+                finalized = Some(entry.clone());
+                break;
+            }
+        }
+        if let Some((old, new)) = buffer_delta {
+            if new >= old {
+                g.buffer_bytes += new - old;
+            } else {
+                g.buffer_bytes = g.buffer_bytes.saturating_sub(old - new);
+            }
+        }
+        if let Some(active) = g.active.as_mut() {
+            for entry in active.entries.iter_mut() {
+                if entry.id == entry_id {
+                    entry.text = trimmed.clone();
+                    entry.channel = channel.clone();
+                    entry.audio_start_ms = audio_start_ms;
+                    entry.audio_duration_ms = audio_duration_ms;
+                    entry.speaker = speaker.clone();
+                    entry.start_wall_ms = start_wall_ms;
+                    entry.provisional = false;
+                    if finalized.is_none() {
+                        finalized = Some(entry.clone());
+                    }
+                    break;
+                }
+            }
+        }
+        // No partial ever landed (fast utterance with no partial
+        // emitted yet, or the entry aged out of the rolling cap
+        // between partial and final). Insert as a fresh final so the
+        // transcript isn't missing an utterance.
+        let entry = finalized.unwrap_or_else(|| {
+            let entry = TranscriptEntry {
+                id: entry_id.to_string(),
+                created_at: unix_now(),
+                text: trimmed,
+                channel,
+                audio_start_ms,
+                audio_duration_ms,
+                audio_url: None,
+                speaker,
+                start_wall_ms,
+                mixed_start_ms: None,
+                provisional: false,
+            };
+            g.buffer_bytes += entry.text.len();
+            insert_ordered(&mut g.buffer, entry.clone());
+            while g.buffer_bytes > BUFFER_MAX_BYTES && g.buffer.len() > 1 {
+                let dropped = g.buffer.remove(0);
+                g.buffer_bytes = g.buffer_bytes.saturating_sub(dropped.text.len());
+            }
+            if let Some(active) = g.active.as_mut() {
+                insert_ordered(&mut active.entries, entry.clone());
+            }
+            entry
+        });
+        let recording = g.active.is_some();
+        drop(g);
+        if recording {
+            let _ = self.subtitles.send(SubtitleEvent::Entry(entry));
+        }
+    }
+
+    /// Delete a transcript entry by id from both the rolling buffer
+    /// and the active recording, and broadcast a
+    /// [`SubtitleEvent::EntryRemove`] so overlay subscribers drop it
+    /// from their view. Used when a streaming partial's final text
+    /// turned out to be a false-positive filter match.
+    pub fn remove_entry(&self, entry_id: &str) {
+        let mut g = self.inner.lock().expect("record state mutex poisoned");
+        let mut found = false;
+        if let Some(pos) = g.buffer.iter().position(|e| e.id == entry_id) {
+            let dropped = g.buffer.remove(pos);
+            g.buffer_bytes = g.buffer_bytes.saturating_sub(dropped.text.len());
+            found = true;
+        }
+        if let Some(active) = g.active.as_mut() {
+            if let Some(pos) = active.entries.iter().position(|e| e.id == entry_id) {
+                active.entries.remove(pos);
+                found = true;
+            }
+        }
+        let recording = g.active.is_some();
+        drop(g);
+        if found && recording {
+            let _ = self
+                .subtitles
+                .send(SubtitleEvent::EntryRemove(entry_id.to_string()));
         }
     }
 
@@ -794,6 +1099,7 @@ impl RecordState {
             // beside vox entries at the right chronological spot.
             start_wall_ms: Some(unix_now_ms()),
             mixed_start_ms: None,
+            provisional: false,
         };
         if let Some(active) = g.active.as_mut() {
             insert_ordered(&mut active.entries, entry);
@@ -972,6 +1278,17 @@ impl TakenRecording {
     }
 }
 
+/// Known SenseVoice single-word false-positive outputs. When the model
+/// is handed a short, marginal segment (a mic bump, a Discord notification
+/// chirp, one syllable of background noise) it often "hallucinates" one
+/// of these very short bookend phrases. A real utterance of just "I." or
+/// "The." isn't meaningful without the rest of the sentence, so the
+/// operator loses nothing by dropping them. Matched exactly (trimmed);
+/// broader stop-lists risk swallowing legitimate one-word replies.
+fn is_false_positive(text: &str) -> bool {
+    matches!(text.trim(), "I." | "The.")
+}
+
 fn audio_duration_ms(interleaved_len: usize, sample_rate: u32) -> u64 {
     if sample_rate == 0 {
         return 0;
@@ -1023,6 +1340,38 @@ fn insert_ordered(entries: &mut Vec<TranscriptEntry>, entry: TranscriptEntry) {
     entries.insert(idx, entry);
 }
 
+/// Commands crossing the async → blocking boundary for one slot's
+/// streaming decoder. See [`run_streaming_decoder`].
+enum StreamCmd {
+    /// Begin a new utterance. Any prior stream state is reset first.
+    Start(StreamStart),
+    /// Append one chunk of the current utterance's mono audio. Ignored
+    /// when no `Start` has landed yet.
+    Feed(Arc<[f32]>),
+    /// Close the current utterance's sherpa stream state so the next
+    /// `Start` begins clean. Does NOT emit a final — the async VAD
+    /// worker owns re-transcription via the offline SenseVoice model
+    /// (higher accuracy on the full-clip decode) and pushes the
+    /// polished final itself via [`RecordState::finalize_partial`],
+    /// which replaces whatever provisional partial the streaming
+    /// decoder last broadcast.
+    EndUtterance,
+    /// Discard the current utterance without emitting a final —
+    /// removes any partial rows already broadcast for its `entry_id`.
+    /// Used when the VAD closes a too-short utterance we've decided
+    /// to drop as noise.
+    Discard,
+}
+
+/// Metadata captured at speech-start time. `entry_id` is generated by
+/// the VAD worker so partials + the eventual final share one row.
+struct StreamStart {
+    entry_id: String,
+    slot: usize,
+    audio_start_ms: Option<u64>,
+    start_wall_ms: Option<u64>,
+}
+
 /// Streaming state machine — voiced vs. unvoiced, plus enough context to
 /// carry pre-roll audio into the recognizer when speech starts. Runs at
 /// windowed granularity so the RMS check reflects speech energy over
@@ -1033,6 +1382,16 @@ struct VadWorker {
     sample_rate: u32,
     stt: SttHandle,
     state: RecordState,
+    /// mpsc sender to the per-slot blocking streaming decoder thread.
+    /// `None` when streaming STT wasn't configured; VAD falls back to
+    /// the offline SenseVoice finalize path (same behaviour as pre-
+    /// streaming). Present = every speech-start / chunk / finalize
+    /// event is mirrored into the streaming pipeline for live partials.
+    streaming_tx: Option<std::sync::mpsc::SyncSender<StreamCmd>>,
+    /// Id assigned at the current utterance's speech-start. Reused by
+    /// every partial emission so upsert-by-id works, then dropped at
+    /// finalize/discard time.
+    current_entry_id: Option<String>,
     window_samples: usize,
     /// Mono samples buffered until we've got a full window's worth.
     scratch: Vec<f32>,
@@ -1060,6 +1419,10 @@ struct VadWorker {
     /// into `utterance`. This is the utterance's start position in the
     /// recording's shared timeline.
     utterance_start_frame: u64,
+    /// Wall-clock unix ms at speech-start. Used as the entry's
+    /// `start_wall_ms` sort key so partials land at their true position
+    /// in the log instead of jumping around as more text arrives.
+    utterance_start_wall_ms: u64,
     /// Counters used purely for log breadcrumbs. Reset every second so a
     /// long-running process's log stays terse but you can still see the
     /// worker is alive + roughly how many chunks/windows it's seeing.
@@ -1070,7 +1433,13 @@ struct VadWorker {
 }
 
 impl VadWorker {
-    fn new(slot: usize, sample_rate: u32, stt: SttHandle, state: RecordState) -> Self {
+    fn new(
+        slot: usize,
+        sample_rate: u32,
+        stt: SttHandle,
+        state: RecordState,
+        streaming_tx: Option<std::sync::mpsc::SyncSender<StreamCmd>>,
+    ) -> Self {
         let window_samples =
             ((sample_rate as u64 * VAD_WINDOW_MS as u64) / 1000).max(1) as usize;
         let pre_roll_capacity = (sample_rate as u64 * VAD_PRE_ROLL_MS as u64 / 1000) as usize;
@@ -1079,6 +1448,8 @@ impl VadWorker {
             sample_rate,
             stt,
             state,
+            streaming_tx,
+            current_entry_id: None,
             window_samples,
             scratch: Vec::with_capacity(window_samples * 2),
             utterance: Vec::new(),
@@ -1089,6 +1460,7 @@ impl VadWorker {
             chunk_start_frame: 0,
             chunk_offset_frames: 0,
             utterance_start_frame: 0,
+            utterance_start_wall_ms: 0,
             log_windows: 0,
             log_hot: 0,
             log_max_rms: 0.0,
@@ -1186,6 +1558,16 @@ impl VadWorker {
 
         if self.speaking {
             self.utterance.extend_from_slice(window);
+            // Mirror this window into the streaming decoder if
+            // configured. Sherpa consumes any chunk size, so per-
+            // window (~20 ms) is fine — the blocking decoder can
+            // saturate a core if needed and its mpsc channel absorbs
+            // bursts. `try_send` avoids blocking the tokio task on
+            // channel-full; a dropped feed just means one 20ms slice
+            // is skipped from the sherpa input, which is imperceptible.
+            if let Some(tx) = &self.streaming_tx {
+                let _ = tx.try_send(StreamCmd::Feed(Arc::from(window.to_vec())));
+            }
             if hot {
                 self.silence_windows = 0;
             } else {
@@ -1227,6 +1609,7 @@ impl VadWorker {
                     // don't underflow.
                     self.utterance_start_frame = end_frame
                         .saturating_sub(self.utterance.len() as u64);
+                    self.utterance_start_wall_ms = unix_now_ms();
                     debug!(
                         channel = %self.state.channel_name(self.slot),
                         rms,
@@ -1234,6 +1617,26 @@ impl VadWorker {
                         start_frame = self.utterance_start_frame,
                         "vad: speaking",
                     );
+                    // Kick off a streaming session for this utterance.
+                    // The pre-roll (already in `utterance`) is sent as
+                    // the first Feed so sherpa sees the syllable
+                    // attack, matching what the offline path decodes.
+                    if let Some(tx) = &self.streaming_tx {
+                        let entry_id = Uuid::new_v4().to_string();
+                        self.current_entry_id = Some(entry_id.clone());
+                        let start_ms = self.utterance_start_frame * 1000
+                            / self.sample_rate as u64;
+                        let _ = tx.try_send(StreamCmd::Start(StreamStart {
+                            entry_id,
+                            slot: self.slot,
+                            audio_start_ms: Some(start_ms),
+                            start_wall_ms: Some(self.utterance_start_wall_ms),
+                        }));
+                        if !self.utterance.is_empty() {
+                            let pre: Arc<[f32]> = Arc::from(self.utterance.clone());
+                            let _ = tx.try_send(StreamCmd::Feed(pre));
+                        }
+                    }
                 }
             } else {
                 self.voiced_windows = 0;
@@ -1241,18 +1644,29 @@ impl VadWorker {
         }
     }
 
-    /// Close the current utterance: hand it to sherpa-onnx on a blocking
-    /// pool and, when text comes back, post to shared state. Non-blocking
-    /// here so the VAD loop can start the next utterance immediately even
-    /// while the previous decode is still running.
+    /// Close the current utterance. The streaming decoder (if configured)
+    /// has been broadcasting live partials for the in-flight text, but
+    /// the offline SenseVoice model produces a materially more accurate
+    /// full-clip decode — so at close time we throw away the streaming
+    /// final and run offline STT over the accumulated samples, then push
+    /// its output as the entry's polished text.
+    ///
+    /// * Streaming enabled — send an `EndUtterance` to reset the
+    ///   per-slot sherpa session (so the next `Start` begins clean),
+    ///   then run offline SenseVoice and replace the provisional
+    ///   partial via `state.finalize_partial(entry_id, ...)`.
+    /// * Streaming disabled — same offline decode, pushed via
+    ///   `state.push_transcript(...)` because there's no partial row
+    ///   to replace. Matches the pre-streaming behaviour.
     fn finalize_utterance(&mut self, reason: &'static str) {
         let samples = std::mem::take(&mut self.utterance);
         let start_frame = self.utterance_start_frame;
+        let start_wall_ms = self.utterance_start_wall_ms;
+        let current_entry_id = self.current_entry_id.take();
         self.speaking = false;
         self.silence_windows = 0;
         self.voiced_windows = 0;
         self.pre_roll.clear();
-        let stt = self.stt.clone();
         let sr = self.sample_rate;
         let state = self.state.clone();
         let slot = self.slot;
@@ -1266,6 +1680,15 @@ impl VadWorker {
                 reason, len,
                 "vad: dropping tiny utterance"
             );
+            // Also discard the streaming session's in-flight state so
+            // its next Start begins clean, and remove any partial rows
+            // we broadcast for this now-abandoned utterance.
+            if let Some(tx) = &self.streaming_tx {
+                let _ = tx.try_send(StreamCmd::Discard);
+            }
+            if let Some(id) = &current_entry_id {
+                state.remove_entry(id);
+            }
             return;
         }
         let start_ms = start_frame * 1000 / sr as u64;
@@ -1277,35 +1700,67 @@ impl VadWorker {
         // be determined by relative timing at the END of each clip".
         let end_instant = Instant::now();
         let speaker = state.resolve_speaker(slot, end_instant);
-        // Wall-clock start = now (end of utterance ≈ finalize entry)
-        // minus the utterance's audio duration. Used as the transcript
-        // sort key so a long clip whose STT is still decoding when a
-        // shorter, later-started clip finishes still lands above the
-        // shorter one in the log.
-        let start_wall_ms = unix_now_ms().saturating_sub(duration_ms);
         debug!(
             channel = %state.channel_name(slot),
             reason, len, start_ms, duration_ms,
             speaker = ?speaker,
             "vad: finalizing utterance"
         );
+
+        // Reset the streaming sherpa session so the next Start begins
+        // clean. The last streaming partial stays visible (still
+        // provisional) until the offline decode below replaces it.
+        if let Some(tx) = &self.streaming_tx {
+            let _ = tx.try_send(StreamCmd::EndUtterance);
+        }
+
+        // Offline SenseVoice re-transcribe. Fires-and-forgets so the
+        // VAD loop can start the next utterance immediately; the
+        // callback lands the polished text via either
+        // `finalize_partial` (streaming path — replaces the row keyed
+        // by entry_id) or `push_transcript` (streaming disabled —
+        // insert as a fresh row).
+        let stt = self.stt.clone();
+        let start_wall_ms = if start_wall_ms == 0 {
+            unix_now_ms().saturating_sub(duration_ms)
+        } else {
+            start_wall_ms
+        };
         tokio::spawn(async move {
             let res = tokio::task::spawn_blocking(move || stt.transcribe(&samples, sr)).await;
             match res {
                 Ok(Ok(text)) => {
                     let trimmed = text.trim().to_string();
-                    // Filter transcripts that decode to only punctuation
-                    // ("." / "。") — SenseVoice sometimes lands there on a
-                    // marginal clip and it's noise as far as the UI + log
-                    // are concerned. `push_transcript` re-runs this same
-                    // check but we short-circuit here to avoid the
-                    // "streaming STT transcript" log line entirely.
-                    if trimmed.chars().any(|c| c.is_alphanumeric()) {
+                    if let Some(entry_id) = current_entry_id {
+                        // Streaming path: replace the provisional row
+                        // (id-keyed) with the offline final. The same
+                        // false-positive filter as `push_transcript`
+                        // applies inside `finalize_partial` — a junk
+                        // decode removes the row rather than promoting
+                        // it.
                         info!(
                             channel = %state.channel_name(slot),
                             speaker = ?speaker,
                             text = %trimmed,
-                            "streaming STT transcript"
+                            "offline STT final (replacing streaming partial)"
+                        );
+                        state.finalize_partial(
+                            &entry_id,
+                            slot,
+                            trimmed,
+                            Some(start_ms),
+                            Some(duration_ms),
+                            speaker,
+                            Some(start_wall_ms),
+                        );
+                    } else if trimmed.chars().any(|c| c.is_alphanumeric())
+                        && !is_false_positive(&trimmed)
+                    {
+                        info!(
+                            channel = %state.channel_name(slot),
+                            speaker = ?speaker,
+                            text = %trimmed,
+                            "offline STT transcript"
                         );
                         state.push_transcript(
                             slot,
@@ -1315,17 +1770,107 @@ impl VadWorker {
                             speaker,
                             Some(start_wall_ms),
                         );
+                    } else if !trimmed.is_empty() {
+                        debug!(
+                            channel = %state.channel_name(slot),
+                            text = %trimmed,
+                            "offline STT dropped as false-positive"
+                        );
                     }
                 }
                 Ok(Err(err)) => {
-                    warn!(err = %format!("{err:#}"), "streaming STT decode failed");
+                    warn!(err = %format!("{err:#}"), "offline STT decode failed");
                 }
                 Err(_) => {
-                    warn!("streaming STT task panicked");
+                    warn!("offline STT task panicked");
                 }
             }
         });
     }
+}
+
+/// Per-slot blocking loop that owns the [`StreamingSession`]. Runs on
+/// `spawn_blocking` so its synchronous sherpa calls don't stall async
+/// tokio workers. Commands arrive via `std::sync::mpsc` from the async
+/// VAD worker.
+///
+/// One utterance = one `Start` + zero-or-more `Feed`s + one
+/// `EndUtterance` (or `Discard`). Partial hypotheses are pushed via
+/// `state.upsert_partial` after each Feed that materially changes the
+/// text; on `EndUtterance` the sherpa stream is reset but no final is
+/// emitted — the async VAD worker owns re-transcription via the
+/// offline (higher-accuracy) SenseVoice model and replaces the last
+/// partial itself.
+fn run_streaming_decoder(
+    session: StreamingSession,
+    rx: std::sync::mpsc::Receiver<StreamCmd>,
+    state: RecordState,
+    sample_rate: u32,
+) {
+    let mut current: Option<StreamStart> = None;
+    let mut last_partial = String::new();
+    let mut last_emit = Instant::now();
+    // Minimum wall-clock time between partial broadcasts. Keeps SSE
+    // fan-out and the recording snapshot polls from thrashing when the
+    // recognizer emits token-per-chunk; ~150 ms feels responsive but
+    // stays comfortably under the client's ~500 ms poll cadence.
+    let min_emit_interval = std::time::Duration::from_millis(150);
+    while let Ok(cmd) = rx.recv() {
+        match cmd {
+            StreamCmd::Start(start) => {
+                session.reset();
+                last_partial.clear();
+                last_emit = Instant::now();
+                current = Some(start);
+            }
+            StreamCmd::Feed(samples) => {
+                let Some(start) = current.as_ref() else { continue; };
+                session.feed(&samples, sample_rate);
+                let text = session.current_text();
+                if text.is_empty() {
+                    continue;
+                }
+                let now = Instant::now();
+                let changed = text != last_partial;
+                let debounce_ok = now.duration_since(last_emit) >= min_emit_interval
+                    || last_partial.is_empty();
+                if changed && debounce_ok {
+                    state.upsert_partial(
+                        &start.entry_id,
+                        start.slot,
+                        text.clone(),
+                        start.audio_start_ms,
+                        None, // duration not yet known
+                        None, // speaker resolved at finalize
+                        start.start_wall_ms,
+                    );
+                    last_partial = text;
+                    last_emit = now;
+                }
+            }
+            StreamCmd::EndUtterance => {
+                if current.take().is_some() {
+                    // Just reset the stream; discard whatever text the
+                    // online decoder would have produced — the async
+                    // side is running offline SenseVoice over the full
+                    // utterance and its output will replace the last
+                    // provisional partial we broadcast.
+                    session.reset();
+                }
+                last_partial.clear();
+                last_emit = Instant::now();
+            }
+            StreamCmd::Discard => {
+                session.reset();
+                if let Some(start) = current.take() {
+                    state.remove_entry(&start.entry_id);
+                }
+                last_partial.clear();
+                last_emit = Instant::now();
+            }
+        }
+    }
+    info!("streaming decoder channel closed; exiting");
 }
 
 /// Spawn one streaming VAD worker per Vox slot. Each worker subscribes to
@@ -1374,6 +1919,7 @@ pub fn spawn_mixed_worker(
 
 pub fn spawn_worker(
     stt: Option<SttHandle>,
+    streaming: Option<StreamingSttHandle>,
     vox_taps: Vec<broadcast::Sender<Arc<[f32]>>>,
     sample_rate: u32,
     state: RecordState,
@@ -1385,10 +1931,38 @@ pub fn spawn_worker(
     for (slot, tap) in vox_taps.into_iter().enumerate() {
         let mut rx = tap.subscribe();
         let stt = stt.clone();
+        let streaming = streaming.clone();
         let state = state.clone();
         tokio::spawn(async move {
-            let mut worker = VadWorker::new(slot, sample_rate, stt, state.clone());
-            info!(slot, sample_rate, "record streaming worker started");
+            // Spin up the per-slot blocking decoder if streaming is
+            // configured. Bounded mpsc so a stalled decoder can't
+            // buffer unbounded audio — `try_send` on the async side
+            // drops on backpressure, which is the right trade-off for
+            // real-time text (an occasional missed 20 ms sherpa feed
+            // is imperceptible in the final transcript).
+            let streaming_tx = streaming.map(|handle| {
+                let (tx, rx) = std::sync::mpsc::sync_channel::<StreamCmd>(256);
+                let session = handle.new_session();
+                let state = state.clone();
+                tokio::task::spawn_blocking(move || {
+                    run_streaming_decoder(session, rx, state, sample_rate);
+                });
+                tx
+            });
+            let has_streaming = streaming_tx.is_some();
+            let mut worker = VadWorker::new(
+                slot,
+                sample_rate,
+                stt,
+                state.clone(),
+                streaming_tx,
+            );
+            info!(
+                slot,
+                sample_rate,
+                streaming = has_streaming,
+                "record streaming worker started"
+            );
             loop {
                 match rx.recv().await {
                     Ok(chunk) => {
@@ -1414,6 +1988,15 @@ pub fn spawn_worker(
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         warn!(slot, missed = n, "record worker lagged on vox tap");
+                        // Discard any in-flight streaming state too, so
+                        // sherpa doesn't glue post-lag audio onto the
+                        // pre-lag partial and produce a garbled entry.
+                        if let Some(tx) = &worker.streaming_tx {
+                            let _ = tx.try_send(StreamCmd::Discard);
+                        }
+                        if let Some(id) = worker.current_entry_id.take() {
+                            worker.state.remove_entry(&id);
+                        }
                         worker.utterance.clear();
                         worker.scratch.clear();
                         worker.speaking = false;

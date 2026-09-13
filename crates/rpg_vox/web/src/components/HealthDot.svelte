@@ -45,11 +45,11 @@
 </script>
 
 {#if recording}
-  <span class="recording" title={$recordingStatus.name}>
+  <a class="recording" href="#/record" title={`Open recording — ${$recordingStatus.name ?? ''}`.trim()}>
     <span class="rec-dot" aria-hidden="true"></span>
     <span class="rec-label">RECORDING</span>
     <span class="rec-time">{fmtHhMm(elapsedMs)}</span>
-  </span>
+  </a>
 {:else}
   <span class="health {$health}">
     {label}{#if streaming}<span class="streaming"> · streaming</span>{/if}
@@ -80,6 +80,16 @@
     border-radius: 12px;
     border: 1px solid rgba(255,80,80,0.5);
     background: rgba(255,80,80,0.08);
+    text-decoration: none;
+    cursor: pointer;
+  }
+  .recording:hover {
+    background: rgba(255,80,80,0.16);
+    border-color: rgba(255,80,80,0.7);
+  }
+  .recording:focus-visible {
+    outline: 2px solid var(--err);
+    outline-offset: 2px;
   }
   .rec-dot {
     width: 8px;

@@ -22,6 +22,7 @@ use std::sync::Arc;
 use anyhow::{Context as _, Result, anyhow};
 use sherpa_onnx::{
     OfflineRecognizer, OfflineRecognizerConfig, OfflineSenseVoiceModelConfig,
+    OnlineRecognizer, OnlineRecognizerConfig, OnlineStream,
 };
 use tracing::{info, warn};
 
@@ -135,6 +136,212 @@ pub fn open_or_warn(cfg: &SttConfig) -> Option<SttHandle> {
         Ok(handle) => handle,
         Err(err) => {
             warn!(err = %format!("{err:#}"), "STT disabled — failed to load recognizer");
+            None
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Streaming (online) recognizer — used by the Record page's live transcript
+// so text appears word-by-word instead of after silence closes each turn.
+// ---------------------------------------------------------------------------
+
+/// Paths + tuning for a streaming Zipformer transducer. Three ONNX files
+/// (encoder/decoder/joiner) plus the shared `tokens.txt`. Any of the
+/// standard sherpa-onnx streaming Zipformer bundles works; the
+/// English-only 20M variant is small and fast enough for real-time on
+/// modest CPUs, the bilingual/multilingual variants trade size for
+/// broader language coverage.
+#[derive(Clone, Debug)]
+pub struct StreamingSttConfig {
+    pub encoder: Option<PathBuf>,
+    pub decoder: Option<PathBuf>,
+    pub joiner: Option<PathBuf>,
+    pub tokens: Option<PathBuf>,
+    pub num_threads: i32,
+}
+
+impl Default for StreamingSttConfig {
+    fn default() -> Self {
+        Self {
+            encoder: None,
+            decoder: None,
+            joiner: None,
+            tokens: None,
+            num_threads: 2,
+        }
+    }
+}
+
+/// Cloneable handle to a loaded streaming recognizer. The wrapped
+/// `OnlineRecognizer` is `Send + Sync` per sherpa-onnx's own
+/// annotations, so multiple slot workers can hand it stream references
+/// concurrently.
+#[derive(Clone)]
+pub struct StreamingSttHandle {
+    inner: Arc<OnlineRecognizer>,
+}
+
+impl StreamingSttHandle {
+    /// Load the streaming recognizer from disk. `Ok(None)` when *all*
+    /// paths are unset (streaming STT explicitly disabled — the
+    /// Record page falls back to offline SenseVoice for finals in
+    /// that case, matching pre-streaming behaviour). Missing files
+    /// with any path set is a hard error to surface typos loudly at
+    /// startup.
+    pub fn open(cfg: &StreamingSttConfig) -> Result<Option<Self>> {
+        let any_set = cfg.encoder.is_some()
+            || cfg.decoder.is_some()
+            || cfg.joiner.is_some()
+            || cfg.tokens.is_some();
+        if !any_set {
+            info!("streaming STT disabled (no --streaming-stt-* paths configured)");
+            return Ok(None);
+        }
+        let encoder = cfg
+            .encoder
+            .as_ref()
+            .context("streaming STT encoder path required")?;
+        let decoder = cfg
+            .decoder
+            .as_ref()
+            .context("streaming STT decoder path required")?;
+        let joiner = cfg
+            .joiner
+            .as_ref()
+            .context("streaming STT joiner path required")?;
+        let tokens = cfg
+            .tokens
+            .as_ref()
+            .context("streaming STT tokens path required")?;
+        for (label, p) in [
+            ("encoder", encoder),
+            ("decoder", decoder),
+            ("joiner", joiner),
+            ("tokens", tokens),
+        ] {
+            if !p.is_file() {
+                return Err(anyhow!(
+                    "streaming STT {label} file not found: {}",
+                    p.display()
+                ));
+            }
+        }
+
+        let mut config = OnlineRecognizerConfig::default();
+        config.model_config.transducer.encoder =
+            Some(encoder.to_string_lossy().into_owned());
+        config.model_config.transducer.decoder =
+            Some(decoder.to_string_lossy().into_owned());
+        config.model_config.transducer.joiner =
+            Some(joiner.to_string_lossy().into_owned());
+        config.model_config.tokens = Some(tokens.to_string_lossy().into_owned());
+        config.model_config.num_threads = cfg.num_threads;
+        config.decoding_method = Some("greedy_search".into());
+        // Sherpa's built-in endpointer. Our VAD still owns the outer
+        // "is the user speaking" decision (it feeds this recognizer
+        // and drives the recording's audio timeline), so these
+        // thresholds are only a safety net for when the VAD's
+        // silence-end threshold hasn't fired yet but the model
+        // already sees a long trailing pause. Values match the
+        // sherpa demo defaults.
+        config.enable_endpoint = true;
+        config.rule1_min_trailing_silence = 2.4;
+        config.rule2_min_trailing_silence = 1.2;
+        config.rule3_min_utterance_length = 20.0;
+
+        let recognizer = OnlineRecognizer::create(&config).ok_or_else(|| {
+            anyhow!("sherpa-onnx failed to create streaming recognizer (bad model paths?)")
+        })?;
+        info!(
+            encoder = %encoder.display(),
+            threads = cfg.num_threads,
+            "streaming STT recognizer loaded (Zipformer transducer)"
+        );
+        Ok(Some(Self { inner: Arc::new(recognizer) }))
+    }
+
+    /// Open a fresh per-utterance session. Each Vox slot's VAD worker
+    /// owns one session for its lifetime and calls
+    /// [`StreamingSession::reset`] between utterances — the underlying
+    /// sherpa `OnlineStream` is stateful, so sessions should not be
+    /// shared across slots.
+    pub fn new_session(&self) -> StreamingSession {
+        let stream = self.inner.create_stream();
+        StreamingSession {
+            recognizer: self.inner.clone(),
+            stream,
+        }
+    }
+}
+
+/// Per-worker streaming decode session. Holds the recognizer's stream
+/// state and a back-reference to the shared recognizer for its
+/// decode/reset/is_endpoint calls.
+///
+/// All operations are synchronous and call into blocking C code —
+/// callers are expected to run this on a dedicated thread (e.g. via
+/// `tokio::task::spawn_blocking`) rather than on an async runtime
+/// worker, otherwise per-chunk decode will stall other tasks.
+pub struct StreamingSession {
+    recognizer: Arc<OnlineRecognizer>,
+    stream: OnlineStream,
+}
+
+impl StreamingSession {
+    /// Feed one chunk of mono f32 PCM at `sample_rate`, then run
+    /// as many decode steps as the recognizer says it has audio for.
+    /// After this call, [`Self::current_text`] reflects the most
+    /// recent partial hypothesis.
+    pub fn feed(&self, samples: &[f32], sample_rate: u32) {
+        if samples.is_empty() {
+            return;
+        }
+        self.stream.accept_waveform(sample_rate as i32, samples);
+        while self.recognizer.is_ready(&self.stream) {
+            self.recognizer.decode(&self.stream);
+        }
+    }
+
+    /// Current partial hypothesis. Trimmed. Empty string when the
+    /// recognizer has nothing yet (e.g. only silence fed so far).
+    pub fn current_text(&self) -> String {
+        self.recognizer
+            .get_result(&self.stream)
+            .map(|r| r.text.trim().to_string())
+            .unwrap_or_default()
+    }
+
+    /// True when sherpa's endpointer thinks the current utterance has
+    /// ended (long trailing silence per the configured rules). VAD
+    /// finalization typically fires first, so this is mostly a fallback.
+    #[allow(dead_code)]
+    pub fn is_endpoint(&self) -> bool {
+        self.recognizer.is_endpoint(&self.stream)
+    }
+
+    /// Drop the current utterance's decode state so the next Start
+    /// begins clean. Called both when a too-short utterance is
+    /// discarded and at normal utterance-close — we do not use the
+    /// streaming decoder's final text (the caller re-transcribes with
+    /// the offline SenseVoice model for higher accuracy), so a full
+    /// flush would just waste CPU.
+    pub fn reset(&self) {
+        self.recognizer.reset(&self.stream);
+    }
+}
+
+/// Same non-fatal loader idiom as [`open_or_warn`] but for the streaming
+/// recognizer. When streaming is unavailable the Record page falls back
+/// to the offline SenseVoice path.
+pub fn open_streaming_or_warn(cfg: &StreamingSttConfig) -> Option<StreamingSttHandle> {
+    match StreamingSttHandle::open(cfg) {
+        Ok(handle) => handle,
+        Err(err) => {
+            warn!(
+                err = %format!("{err:#}"),
+                "streaming STT disabled — failed to load recognizer"
+            );
             None
         }
     }

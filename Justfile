@@ -46,10 +46,10 @@ run *ARGS:
 # Auto-rebuild + restart on any change under the rpg_vox crate. Watches Rust
 # sources only — for hot-reloading the Svelte UI use `just dev-ui` alongside
 # this in a second terminal (Vite serves at :5173 with /say etc. proxied to
-# the running backend). `download-stt-model` is a dep so a fresh checkout
-# gets the STT model on first `just dev` — the recipe itself no-ops when
-# the files are already there, so the wait only happens once.
-dev *ARGS: download-stt-model
+# the running backend). Both model recipes are deps so a fresh checkout
+# gets the STT + streaming-STT models on first `just dev`; each recipe
+# no-ops when the files are already there, so the wait only happens once.
+dev *ARGS: download-stt-model download-streaming-stt-model
     nix-shell --run "cargo watch -q -c -w crates/rpg_vox/src -w crates/rpg_vox/Cargo.toml -x 'run -p rpg_vox -- {{ARGS}}'"
 
 # Serve the Svelte SPA via Vite on http://127.0.0.1:5173 with hot reload;
@@ -183,6 +183,39 @@ download-stt-model:
     cp "$tmp/$stem/model.int8.onnx" "$dest/"
     cp "$tmp/$stem/tokens.txt" "$dest/"
     echo "installed sense-voice model → $dest/"
+
+# Download the streaming Zipformer transducer into models/streaming-zipformer/.
+# Powers the Record page's live word-by-word transcript so text streams as
+# it's spoken (see crates/rpg_vox/src/stt.rs :: StreamingSttHandle). Uses
+# the small English 20M int8 bundle (~40 MB) which is CPU-friendly enough
+# for real-time on a laptop; swap for a larger bundle by editing this
+# recipe or by pointing --streaming-stt-* CLI flags at your own files.
+# Files are renamed on install to match the CLI defaults so no extra
+# flags are needed.
+download-streaming-stt-model:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dest="models/streaming-zipformer"
+    if [ -f "$dest/encoder.onnx" ] && [ -f "$dest/decoder.onnx" ] \
+       && [ -f "$dest/joiner.onnx" ]  && [ -f "$dest/tokens.txt" ]; then
+      echo "streaming-zipformer model already present at $dest/"
+      exit 0
+    fi
+    mkdir -p models
+    stem="sherpa-onnx-streaming-zipformer-en-20M-2023-02-17"
+    archive="$stem.tar.bz2"
+    url="https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/$archive"
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" EXIT
+    echo "downloading $archive …"
+    curl -fL --progress-bar -o "$tmp/$archive" "$url"
+    tar -xjf "$tmp/$archive" -C "$tmp"
+    mkdir -p "$dest"
+    cp "$tmp/$stem/encoder-epoch-99-avg-1.int8.onnx" "$dest/encoder.onnx"
+    cp "$tmp/$stem/decoder-epoch-99-avg-1.onnx"      "$dest/decoder.onnx"
+    cp "$tmp/$stem/joiner-epoch-99-avg-1.int8.onnx"  "$dest/joiner.onnx"
+    cp "$tmp/$stem/tokens.txt"                       "$dest/tokens.txt"
+    echo "installed streaming-zipformer model → $dest/"
 
 # --- discord_vox (PipeWire sink → Discord voice) ---
 

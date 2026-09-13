@@ -278,6 +278,49 @@ struct Args {
     )]
     stt_disabled: bool,
 
+    /// Streaming Zipformer transducer files — encoder / decoder / joiner /
+    /// tokens. Any of the sherpa-onnx streaming Zipformer bundles works;
+    /// the English 20M variant is small enough to run comfortably on
+    /// a laptop CPU. All four paths must exist for streaming STT to
+    /// engage; when any is missing (or --streaming-stt-disabled is set)
+    /// the Record page falls back to the offline SenseVoice finalize
+    /// path.
+    #[arg(
+        long,
+        env = "RPG_VOX_STREAMING_STT_ENCODER",
+        default_value = "models/streaming-zipformer/encoder.onnx"
+    )]
+    streaming_stt_encoder: std::path::PathBuf,
+    #[arg(
+        long,
+        env = "RPG_VOX_STREAMING_STT_DECODER",
+        default_value = "models/streaming-zipformer/decoder.onnx"
+    )]
+    streaming_stt_decoder: std::path::PathBuf,
+    #[arg(
+        long,
+        env = "RPG_VOX_STREAMING_STT_JOINER",
+        default_value = "models/streaming-zipformer/joiner.onnx"
+    )]
+    streaming_stt_joiner: std::path::PathBuf,
+    #[arg(
+        long,
+        env = "RPG_VOX_STREAMING_STT_TOKENS",
+        default_value = "models/streaming-zipformer/tokens.txt"
+    )]
+    streaming_stt_tokens: std::path::PathBuf,
+
+    #[arg(long, env = "RPG_VOX_STREAMING_STT_THREADS", default_value_t = 2)]
+    streaming_stt_threads: i32,
+
+    #[arg(
+        long,
+        env = "RPG_VOX_STREAMING_STT_DISABLED",
+        default_value_t = false,
+        action = clap::ArgAction::Set,
+    )]
+    streaming_stt_disabled: bool,
+
     /// Number of Vox channels to pre-allocate. Each slot creates its own
     /// pipewire sink (`-vox`, `-vox2`, ...), broadcast tap, mixer strip,
     /// and (when enabled + STT is loaded) VAD/STT worker. Fixed at boot;
@@ -528,6 +571,34 @@ fn main() -> Result<()> {
     }
     let stt = stt::open_or_warn(&stt_cfg);
 
+    // Streaming Zipformer for the Record page's live transcript. All four
+    // files must exist to engage; a missing set drops back to the offline
+    // SenseVoice finalize path silently (info-logged for troubleshooting).
+    let streaming_all_present = args.streaming_stt_encoder.is_file()
+        && args.streaming_stt_decoder.is_file()
+        && args.streaming_stt_joiner.is_file()
+        && args.streaming_stt_tokens.is_file();
+    let streaming_cfg = stt::StreamingSttConfig {
+        encoder: (!args.streaming_stt_disabled && streaming_all_present)
+            .then(|| args.streaming_stt_encoder.clone()),
+        decoder: (!args.streaming_stt_disabled && streaming_all_present)
+            .then(|| args.streaming_stt_decoder.clone()),
+        joiner: (!args.streaming_stt_disabled && streaming_all_present)
+            .then(|| args.streaming_stt_joiner.clone()),
+        tokens: (!args.streaming_stt_disabled && streaming_all_present)
+            .then(|| args.streaming_stt_tokens.clone()),
+        num_threads: args.streaming_stt_threads,
+    };
+    if args.streaming_stt_disabled {
+        info!("streaming STT disabled via --streaming-stt-disabled");
+    } else if !streaming_all_present {
+        info!(
+            encoder = %args.streaming_stt_encoder.display(),
+            "streaming STT model bundle incomplete — Record page will use offline SenseVoice"
+        );
+    }
+    let streaming_stt = stt::open_streaming_or_warn(&streaming_cfg);
+
     // Shared live-transcription state for the Record tab. Channel names
     // come from the mixer's per-slot state now (persisted alongside gain
     // / pan / mute), so RecordState just needs a handle to the mixer.
@@ -582,6 +653,7 @@ fn main() -> Result<()> {
         // lifecycle to manage.
         record::spawn_worker(
             stt.clone(),
+            streaming_stt.clone(),
             vox_taps.clone(),
             args.sample_rate,
             record_state.clone(),

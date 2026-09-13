@@ -71,6 +71,18 @@
 //!                              mic, encoded as 20ms Opus frames. One
 //!                              encoder per subscriber; drops-on-lag. See
 //!                              [`crate::monitor`].
+//!   GET  /obs/subtitles                              → standalone HTML
+//!                              overlay for an OBS Browser Source. Shows
+//!                              the last 1–2 finalized vox utterances in
+//!                              large font, labeled by hinted speaker (or
+//!                              the Vox channel name as a fallback). Only
+//!                              renders while a named recording is in
+//!                              flight; otherwise stays blank.
+//!   GET  /obs/subtitles.sse                          → SSE stream feeding
+//!                              the overlay page. Emits one `entry` event
+//!                              per finalized vox utterance (recording-
+//!                              active only). No history — subscribers
+//!                              see whatever lands after they connect.
 //!   POST /scenes/mix           { scene_name, pause_ms, clip_ids }
 //!                              → audio/flac (Content-Disposition attachment)
 //!                              — concatenates the referenced WAVs with
@@ -874,6 +886,8 @@ pub async fn serve(
             axum::routing::delete(record_buffer_clear_handler),
         )
         .route("/record/hint", post(record_hint_handler))
+        .route("/obs/subtitles", get(obs_subtitles_page))
+        .route("/obs/subtitles.sse", get(obs_subtitles_stream))
         .route("/scenes/mix", post(scene_mix_handler))
         .route(
             "/images",
@@ -4825,6 +4839,138 @@ async fn record_hint_handler(
     state.record.push_hint(body.speaker.clone(), slot);
     tracing::debug!(speaker = %body.speaker, slot = ?slot, "speaker hint received");
     Json(ActionResponse { ok: true, error: None }).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// /obs/subtitles — standalone overlay page for an OBS Browser Source.
+//
+// The HTML is served inline (no build step, no SPA dependency) so an OBS
+// user can just paste the URL into a Browser Source with a transparent
+// background and get big-font "who just said what" captions overlaid on
+// the stream. Subtitles only flow while a named recording is in flight —
+// idle vox transcripts stay off the overlay entirely.
+// ---------------------------------------------------------------------------
+
+/// Minimal HTML/CSS/JS for the OBS overlay. Uses the SSE stream at
+/// `/obs/subtitles.sse` to append new entries and prune to the last two;
+/// when a single line is very long it pushes the older line off so the
+/// overlay stays legible. Transparent background so it composes over
+/// whatever's beneath it in OBS.
+const OBS_SUBTITLES_HTML: &str = include_str!("obs_subtitles.html");
+
+async fn obs_subtitles_page() -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        OBS_SUBTITLES_HTML,
+    )
+        .into_response()
+}
+
+async fn obs_subtitles_stream(
+    State(state): State<AppState>,
+) -> Sse<impl Stream<Item = Result<SseEventFrame, std::convert::Infallible>>> {
+    // Subscribe BEFORE snapshotting is_recording so we don't miss a
+    // transition that fires between the snapshot and the subscribe.
+    // Worst case is a duplicate `status` event with the same value,
+    // which the client renders idempotently.
+    let mut rx = state.record.subscribe_subtitles();
+    let initial_active = state.record.is_recording();
+    let (tx, out_rx) = mpsc::channel::<SseEventFrame>(16);
+    let record_state = state.record.clone();
+    tokio::spawn(async move {
+        // Prime the overlay with the current recording state so a fresh
+        // page load renders the right view (captions vs "suspended")
+        // immediately, without waiting for the next transition.
+        let _ = tx
+            .send(
+                SseEventFrame::default()
+                    .event("status")
+                    .data(
+                        serde_json::json!({ "recording": initial_active }).to_string(),
+                    ),
+            )
+            .await;
+        loop {
+            match rx.recv().await {
+                Ok(crate::record::SubtitleEvent::Entry(entry)) => {
+                    // Speaker preference: hinted name wins; otherwise fall
+                    // back to the vox channel name captured at push time.
+                    let who = entry.speaker.clone().unwrap_or_else(|| entry.channel.clone());
+                    let payload = serde_json::json!({
+                        "id": entry.id,
+                        "who": who,
+                        "text": entry.text,
+                        "provisional": entry.provisional,
+                    });
+                    if tx
+                        .send(
+                            SseEventFrame::default()
+                                .event("entry")
+                                .data(payload.to_string()),
+                        )
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                Ok(crate::record::SubtitleEvent::EntryRemove(id)) => {
+                    // Fired when a streaming partial's final decoded to a
+                    // false-positive filter match — pull it off the
+                    // overlay so the stale text doesn't linger.
+                    if tx
+                        .send(
+                            SseEventFrame::default()
+                                .event("remove")
+                                .data(serde_json::json!({ "id": id }).to_string()),
+                        )
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                Ok(crate::record::SubtitleEvent::RecordingActive(active)) => {
+                    if tx
+                        .send(
+                            SseEventFrame::default()
+                                .event("status")
+                                .data(
+                                    serde_json::json!({ "recording": active }).to_string(),
+                                ),
+                        )
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    // Re-emit the current state after lag so a subscriber
+                    // that missed a start/stop transition can resync
+                    // without waiting for the next real event.
+                    let active = record_state.is_recording();
+                    let _ = tx
+                        .send(
+                            SseEventFrame::default()
+                                .event("status")
+                                .data(
+                                    serde_json::json!({ "recording": active }).to_string(),
+                                ),
+                        )
+                        .await;
+                }
+                Err(broadcast::error::RecvError::Closed) => return,
+            }
+        }
+    });
+    Sse::new(stream::unfold(out_rx, |mut rx| async move {
+        rx.recv().await.map(|ev| (Ok(ev), rx))
+    }))
+    .keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(15)))
 }
 
 // ---------------------------------------------------------------------------

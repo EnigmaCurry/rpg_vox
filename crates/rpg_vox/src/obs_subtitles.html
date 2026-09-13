@@ -1,0 +1,311 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="color-scheme" content="dark">
+<title>rpg_vox subtitles</title>
+<style>
+  :root { color-scheme: dark; }
+  /* !important resists OBS's Browser Source injected CSS
+     (`body { margin: 0px auto }`), plus a font-family override in
+     some builds. */
+  html, body {
+    margin: 0 !important;
+    padding: 0 !important;
+    background: transparent;
+    color: #ffffff;
+    font-family: sans-serif;
+    -webkit-font-smoothing: antialiased;
+    overflow: hidden;
+    width: 100%;
+    height: 100%;
+  }
+  /* position: fixed anchors both views to the viewport regardless of
+     whether OBS/CEF has laid out body with unexpected margins or auto
+     centering. `inset: 0` = fill viewport.
+     Layout: text is right-aligned and packed toward the top so a new
+     clip starts in the upper-right corner and subsequent clips flow
+     downward. When the accumulated height would spill past the bottom,
+     the JS clears the page and restarts at the top with the newest
+     clip — see the render()/fits() pair. */
+  #stage {
+    position: fixed;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-start;
+    align-items: stretch;
+    padding: 3vh 3vw;
+    gap: 1.6vh;
+    box-sizing: border-box;
+    overflow: hidden;
+    text-align: right;
+    font-size: clamp(28px, 4.5vh, 72px);
+    line-height: 1.15;
+  }
+  .line {
+    text-shadow:
+      0 0 12px rgba(0, 0, 0, 0.85),
+      0 3px 6px rgba(0, 0, 0, 0.9);
+    overflow-wrap: anywhere;
+  }
+  /* Provisional entries are streaming-STT partials — italic + slightly
+     dimmed so viewers can tell the text may still be revised. Only the
+     latest (bottom-of-page) entry ever renders as provisional; older
+     entries display the offline-corrected text once it arrives, and
+     drop back to non-italic in the process. */
+  .line.provisional .text { font-style: italic; opacity: 0.9; }
+  .who {
+    display: block;
+    font-weight: 800;
+    letter-spacing: 0.04em;
+    color: #ffd166;
+    text-transform: uppercase;
+    font-size: 0.5em;
+    margin-bottom: 0.1em;
+  }
+  .text {
+    display: block;
+    font-weight: 600;
+  }
+  #suspended {
+    position: fixed;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 4vh 6vw;
+    box-sizing: border-box;
+    text-align: center;
+    font-size: clamp(24px, 5vh, 96px);
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: rgba(255, 255, 255, 0.55);
+    text-shadow:
+      0 0 12px rgba(0, 0, 0, 0.85),
+      0 3px 6px rgba(0, 0, 0, 0.9);
+    line-height: 1.1;
+  }
+  #suspended .label {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4em;
+    white-space: nowrap;
+  }
+  #suspended .dot {
+    display: inline-block;
+    width: 0.7em;
+    height: 0.7em;
+    border-radius: 50%;
+    background: rgba(255, 90, 90, 0.85);
+    box-shadow: 0 0 12px rgba(255, 90, 90, 0.55);
+    flex-shrink: 0;
+  }
+  body.recording #suspended { display: none; }
+  body:not(.recording) #stage { display: none; }
+</style>
+</head>
+<body>
+  <div id="stage"></div>
+  <div id="suspended"><span class="label"><span class="dot"></span><span class="text">Recording suspended</span></span></div>
+<script>
+(() => {
+  const stage = document.getElementById("stage");
+  // Clear the visible page after this long with no new events. Keeps
+  // stale text off-screen without wiping mid-conversation pauses.
+  const IDLE_CLEAR_MS = 30000;
+
+  /**
+   * page[] — entries currently on the visible page (top-to-bottom in
+   * arrival order). Each entry caches both the streaming (provisional)
+   * text and the offline-corrected (final) text so the render pass can
+   * pick which to show based on position:
+   *   - latest entry (last in `page`)    → provisional text if any,
+   *                                        else corrected text
+   *   - every other entry (older)        → corrected text if any,
+   *                                        else provisional text
+   * That's why the same entry_id can broadcast a `provisional=true`
+   * partial followed by a `provisional=false` final and we keep both
+   * — the final replaces the visible text only after the entry moves
+   * out of the latest slot.
+   */
+  let page = [];
+  let idleTimer = null;
+
+  function scheduleIdleClear() {
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => {
+      page = [];
+      render();
+      idleTimer = null;
+    }, IDLE_CLEAR_MS);
+  }
+
+  function textFor(entry, isLatest) {
+    if (isLatest) return entry.provisionalText || entry.finalText || "";
+    return entry.finalText || entry.provisionalText || "";
+  }
+
+  function makeLine(entry, isLatest) {
+    const line = document.createElement("div");
+    const showAsProvisional = isLatest && !!entry.provisionalText;
+    line.className = "line" + (showAsProvisional ? " provisional" : "");
+    const who = document.createElement("span");
+    who.className = "who";
+    who.textContent = entry.who;
+    const text = document.createElement("span");
+    text.className = "text";
+    text.textContent = textFor(entry, isLatest);
+    line.append(who, text);
+    return line;
+  }
+
+  function render() {
+    stage.replaceChildren();
+    const lastIdx = page.length - 1;
+    for (let i = 0; i < page.length; i++) {
+      stage.append(makeLine(page[i], i === lastIdx));
+    }
+  }
+
+  /** True when the accumulated content fits inside the stage's box. */
+  function fits() {
+    // 1px tolerance for sub-pixel layout rounding.
+    return stage.scrollHeight <= stage.clientHeight + 1;
+  }
+
+  /**
+   * Merge one incoming SSE `entry` event into the visible page. The
+   * event carries either a provisional (streaming partial) or a final
+   * (offline SenseVoice) text for `evt.id` — we upsert-by-id so the
+   * partial → final swap on the backend lands on the same page slot.
+   *
+   * On overflow (new entry pushes past the stage bottom, or a growing
+   * partial does), we page-break: clear the page and restart at the
+   * top with just this entry. That's the "clears and starts filling
+   * again" behaviour.
+   */
+  function upsertEntry(evt) {
+    const idx = evt.id ? page.findIndex((e) => e.id === evt.id) : -1;
+    if (idx >= 0) {
+      const existing = page[idx];
+      existing.who = evt.who || existing.who;
+      if (evt.provisional) {
+        existing.provisionalText = evt.text;
+      } else {
+        existing.finalText = evt.text;
+      }
+      render();
+      if (!fits()) {
+        page = [existing];
+        render();
+      }
+      return;
+    }
+    const entry = {
+      id: evt.id,
+      who: evt.who,
+      provisionalText: evt.provisional ? evt.text : null,
+      finalText: evt.provisional ? null : evt.text,
+    };
+    page.push(entry);
+    render();
+    if (!fits()) {
+      page = [entry];
+      render();
+    }
+  }
+
+  function removeEntry(id) {
+    if (!id) return;
+    const before = page.length;
+    page = page.filter((e) => e.id !== id);
+    if (page.length !== before) render();
+  }
+
+  function setRecording(active) {
+    const was = document.body.classList.contains("recording");
+    document.body.classList.toggle("recording", !!active);
+    if (!active) {
+      // Wipe the caption stack the moment recording stops so a resume
+      // doesn't briefly show leftover text from the previous session.
+      page = [];
+      if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
+    }
+    if (was !== !!active) scheduleRefit();
+    else refit();
+  }
+
+  function connect() {
+    const src = new EventSource("/obs/subtitles.sse");
+    src.addEventListener("status", (ev) => {
+      let data;
+      try { data = JSON.parse(ev.data); } catch { return; }
+      setRecording(!!(data && data.recording));
+    });
+    src.addEventListener("entry", (ev) => {
+      let data;
+      try { data = JSON.parse(ev.data); } catch { return; }
+      if (!data || !data.text) return;
+      if (!document.body.classList.contains("recording")) {
+        setRecording(true);
+      }
+      upsertEntry({
+        id: data.id || null,
+        who: (data.who || "").trim() || "unknown",
+        text: data.text.trim(),
+        provisional: !!data.provisional,
+      });
+      scheduleIdleClear();
+    });
+    src.addEventListener("remove", (ev) => {
+      let data;
+      try { data = JSON.parse(ev.data); } catch { return; }
+      if (!data || !data.id) return;
+      removeEntry(data.id);
+    });
+    src.onerror = () => {
+      // Browser reconnects EventSource on its own; on reconnect the
+      // server re-sends the initial `status` so we stay in sync.
+    };
+  }
+
+  // Refit on any container size change. `resize` alone fires dozens of
+  // times per drag with often-stale layout state, so wrap it in a
+  // ResizeObserver + rAF for a single fit per animation frame with
+  // guaranteed post-layout dimensions. On resize-driven overflow we
+  // trim from the front (drop oldest until it fits) rather than
+  // clearing entirely — preserves more context than a page-break would.
+  let refitRaf = null;
+  function scheduleRefit() {
+    if (refitRaf) return;
+    refitRaf = requestAnimationFrame(() => {
+      refitRaf = null;
+      refit();
+    });
+  }
+  function refit() {
+    render();
+    while (page.length > 1 && !fits()) {
+      page = page.slice(1);
+      render();
+    }
+  }
+  // Observe BOTH the documentElement (viewport-shaped) and #stage /
+  // #suspended themselves. OBS's CEF has been observed to fire body
+  // observations at the wrong time on initial load, and it doesn't
+  // always fire a window `resize` when the Browser Source is resized
+  // through the OBS scene UI — but observing the fixed-positioned
+  // overlay elements (whose size == viewport) picks that up reliably.
+  const ro = new ResizeObserver(scheduleRefit);
+  ro.observe(document.documentElement);
+  ro.observe(stage);
+  ro.observe(document.getElementById("suspended"));
+  window.addEventListener("resize", scheduleRefit);
+  refit();
+  connect();
+})();
+</script>
+</body>
+</html>

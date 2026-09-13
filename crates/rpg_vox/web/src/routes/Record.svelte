@@ -136,21 +136,6 @@
     }
   }
 
-  async function discardRecording() {
-    if (busy || !state?.activeRecording) return;
-    if (!confirm('Discard this recording without saving?')) return;
-    busy = true;
-    try {
-      await api.deleteSavedRecording(state.activeRecording.id);
-      selected = 'live';
-      await refresh();
-    } catch (e) {
-      err = e.message;
-    } finally {
-      busy = false;
-    }
-  }
-
   async function renameRecording(id, name) {
     if (busy) return;
     busy = true;
@@ -900,6 +885,7 @@
     class:playing={isClipPlayingNow(entry)}
     class:copied={copiedEntryId === entry.id}
     class:tts={channel === 'TTS'}
+    class:provisional={entry.provisional}
   >
     {#if isClipPlayingNow(entry)}
       <div class="clip-fill" style="width: {clipProgress(entry) * 100}%" aria-hidden="true"></div>
@@ -991,7 +977,7 @@
           onscroll={onLiveScroll}
         >
           {#each state.buffer as e (e.id)}
-            <li class:copied={copiedEntryId === e.id}>
+            <li class:copied={copiedEntryId === e.id} class:provisional={e.provisional}>
               <span class="channel-tag">{e.channel || channelFallback}</span>
               <span class="ts">{fmtTime(e.created_at)}</span>
               <button
@@ -1038,9 +1024,6 @@
         </div>
         <div class="active-actions">
           {@render playAllBtn(state.activeRecording.id)}
-          <button type="button" class="danger" disabled={busy} onclick={discardRecording}>
-            Discard
-          </button>
           <button type="button" class="primary" disabled={busy} onclick={stopRecording}>
             Stop &amp; Save
           </button>
@@ -1316,6 +1299,8 @@
      copy-flag chip fades in beside the text, and the whole LI briefly
      lights up so the click lands unambiguously. */
   ul.entries li.copied { background: rgba(46, 204, 74, 0.14); }
+  ul.entries li.provisional { opacity: 0.7; }
+  ul.entries li.provisional .text { font-style: italic; }
   .copy-flag {
     font-size: 10px;
     font-weight: 700;
@@ -1461,6 +1446,12 @@
     box-shadow: 0 0 0 1px rgba(46, 204, 74, 0.25);
   }
   .clip-btn.tts { background: rgba(255,204,102,0.06); }
+  /* Streaming-STT partials: italic + dimmed so a mid-utterance
+     hypothesis is visually distinct from the polished final. The
+     final decode replaces the entry in place (same id) and clears
+     this class in the next poll. */
+  .clip-btn.provisional { opacity: 0.72; background: rgba(80,140,220,0.05); }
+  .clip-btn.provisional .clip-text { font-style: italic; }
   /* Animated fill: absolute overlay behind the button content whose
      width is bound to per-clip playback progress and updated per rAF
      tick. Content is promoted with `position: relative` to sit above. */
