@@ -57,7 +57,12 @@ dev *ARGS: download-stt-model download-streaming-stt-model
     #!/usr/bin/env bash
     set -euo pipefail
     trap 'kill $(jobs -p) 2>/dev/null || true' EXIT INT TERM
-    nix-shell --run "cargo watch -q -c -w crates/rpg_vox/src -w crates/rpg_vox/Cargo.toml -x 'run -p rpg_vox -- {{ARGS}}'" &
+    printf '\n\033[1;32m▶ rpg_vox dev\033[0m — open \033[1;36mhttp://127.0.0.1:5173\033[0m in your browser\n'
+    printf '   • :5173 → Vite dev server. Svelte edits hot-reload here. API is proxied to :7331.\n'
+    printf '   • :7331 → Rust backend + embedded prod SPA. Only refreshes on Rust rebuild + reload.\n\n'
+    # `cargo watch` without `-c` so the banner + Vite'\''s "ready" line stay
+    # visible instead of getting cleared on every Rust rebuild.
+    nix-shell --run "cargo watch -q -w crates/rpg_vox/src -w crates/rpg_vox/Cargo.toml -x 'run -p rpg_vox -- {{ARGS}}'" &
     nix-shell --run "cd crates/rpg_vox/web && pnpm install && pnpm run dev" &
     wait -n
 

@@ -3,9 +3,38 @@ import { svelte } from '@sveltejs/vite-plugin-svelte';
 
 const BACKEND = process.env.RPG_VOX_BACKEND || 'http://127.0.0.1:7331';
 
+// Every backend prefix exposed by crates/rpg_vox/src/http.rs. Vite serves
+// the SPA at :5173 and forwards these paths through to the Rust backend on
+// :7331. Anything the SPA fetches that isn't listed here gets Vite's own
+// SPA fallback (index.html) instead — which then fails `r.json()` with an
+// "unexpected character '<'" error. When you add a new route on the Rust
+// side, add its top-level prefix here.
+const BACKEND_ROUTES = [
+  '/agents',
+  '/chat',
+  '/clicks',
+  '/healthz',
+  '/images',
+  '/mixer',
+  '/perf',
+  '/playback',
+  '/pw',
+  '/record',
+  '/samples',
+  '/say',
+  '/scenes',
+  '/script',
+  '/scripts',
+  '/settings',
+  '/state',
+  '/voices',
+  '/widgets',
+  '/workflow',
+  '/workflows',
+];
+
 const proxy = Object.fromEntries(
-  ['/say', '/chat', '/settings', '/workflows', '/workflow', '/pw', '/healthz']
-    .map((p) => [p, { target: BACKEND, changeOrigin: false }]),
+  BACKEND_ROUTES.map((p) => [p, { target: BACKEND, changeOrigin: false }]),
 );
 // WebSocket path is proxied separately with `ws: true` so vite forwards the
 // upgrade handshake and binary frames to the Rust backend.

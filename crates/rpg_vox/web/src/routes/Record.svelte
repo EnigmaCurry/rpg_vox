@@ -1351,7 +1351,9 @@
            eating vertical space during a long transcript scroll. -->
       <div bind:this={liveHeadSentinel} class="head-sentinel"></div>
       <div class="pane-head live" class:compact={liveHeadCompact}>
-        <h1>Ephemeral live transcript (buffered; not recorded)
+        <h1 title="Ephemeral live transcript (buffered; not recorded)">
+          <span class="live-title-long">Ephemeral live transcript (buffered; not recorded)</span>
+          <span class="live-title-short">Live transcript</span>
           {#if !state.sttEnabled}
             <span class="stt-off"> · STT disabled</span>
           {/if}
@@ -1548,13 +1550,34 @@
   }
   /* Live pane variant: the buffer meter lives INSIDE the sticky header
      (instead of floating below it in the scroll flow), so the "how full
-     is the ring buffer" readout stays visible regardless of scroll. */
+     is the ring buffer" readout stays visible regardless of scroll.
+     Locked to a single row (no `flex-wrap`) so the title, meter, and
+     Record button never wrap on narrow / low-res screens — the h1
+     shrinks and ellipsizes instead. Hover the title to see the full
+     text; on very narrow widths the h1 swaps to a short label. */
   .pane-head.live {
     align-items: center;
+    flex-wrap: nowrap;
+    min-width: 0;
+  }
+  .pane-head.live h1 {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  /* Swap the long title for a short one below ~560px viewport so the
+     meter + Record affordance keep useful width on low-res screens. */
+  .live-title-short { display: none; }
+  @media (max-width: 560px) {
+    .live-title-long { display: none; }
+    .live-title-short { display: inline; }
   }
   .pane-head.live .buf-meter {
     margin-left: auto;
-    flex: 0 0 auto;
+    flex: 0 1 220px;
+    min-width: 60px;
   }
   /* Start-recording affordance pinned to the far-right corner of the
      sticky header. Deliberately understated in its resting state — a
