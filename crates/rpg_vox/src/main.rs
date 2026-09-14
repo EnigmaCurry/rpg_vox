@@ -409,7 +409,19 @@ fn main() -> Result<()> {
     // `/monitor.ws` subscribers hear what Discord hears. Split off up here
     // so both the pw thread and the HTTP handlers get a handle before the
     // tokio runtime starts.
-    let (monitor_tap, _monitor_keepalive) = monitor::channel();
+    //
+    // The initial Receiver returned by `broadcast::channel` is dropped
+    // immediately: keeping it alive as a keepalive would pin
+    // `receiver_count()` at ≥ 1 forever, forcing the RT source callback
+    // into its "someone's listening" branch (Vec::with_capacity +
+    // Arc::from every pipewire cycle). At a 256-frame quantum that's
+    // enough allocator hitching to accumulate tens of xruns/sec —
+    // audible as periodic clicks in any local monitor sink. The RT side
+    // ignores `send()`'s Err(SendError) result, so an empty subscriber
+    // set is harmless; real subscribers (browser `/monitor.ws`, the
+    // per-recording mixed worker in `RecordState::start_recording`)
+    // opt in on demand via `subscribe()`.
+    let (monitor_tap, _) = monitor::channel();
 
     // Runtime mixer state. Booted with defaults so the pw thread has
     // something to read; persisted state is folded in as a patch below
@@ -614,7 +626,8 @@ fn main() -> Result<()> {
     // Shared live-transcription state for the Record tab. Channel names
     // come from the mixer's per-slot state now (persisted alongside gain
     // / pan / mute), so RecordState just needs a handle to the mixer.
-    let record_state = record::RecordState::new(args.sample_rate, mixer.clone());
+    let record_state =
+        record::RecordState::new(args.sample_rate, mixer.clone(), monitor_tap.clone());
 
     // Restore persisted mixer state before the HTTP server starts serving,
     // so the first GET already reflects what the user had last session.
@@ -670,12 +683,6 @@ fn main() -> Result<()> {
             args.sample_rate,
             record_state.clone(),
         );
-
-        // Captures the mixed mic feed into every in-flight recording's
-        // silence-gated mixed track. Runs continuously — the worker
-        // short-circuits when nothing's being recorded so idle mode is
-        // free.
-        record::spawn_mixed_worker(monitor_tap.clone(), record_state.clone());
 
         let http_task = tokio::spawn(http::serve(
             args.bind.clone(),

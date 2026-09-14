@@ -404,6 +404,88 @@ fn gm_proxy_configs() -> Vec<VoiceConfig> {
 /// file bytes fail to load, or on any JSON parse failure — callers fall
 /// back to their hardcoded DSP preset in that case, so a stale slot never
 /// blocks synthesis.
+/// Derive a human-readable voice label from a resolved profile — the
+/// character's name, optionally suffixed with the profile name when the
+/// character has more than one profile so an "Alice · shout" clip is
+/// distinguishable from an "Alice · whisper" one. Returns `None` if the
+/// character can't be found; falls back to the character name alone
+/// when the profile has no explicit `name` field. Used at widget
+/// create/update time to stamp the row's `voice_label` so the Record
+/// page TTS log can name the voice for cached playback.
+async fn character_voice_label(
+    state: &AppState,
+    character_id: &str,
+    profile_id: Option<&str>,
+) -> Option<String> {
+    let raw = state.store.get_app_state().await.ok().flatten()?;
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let character = value
+        .get("characters")?
+        .as_array()?
+        .iter()
+        .find(|c| c.get("id").and_then(|v| v.as_str()) == Some(character_id))?;
+    let char_name = character
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .filter(|s| !s.is_empty());
+    let profiles = character.get("voiceProfiles").and_then(|v| v.as_array());
+    let profile_name = profiles.and_then(|arr| {
+        let profile = match profile_id {
+            Some(id) => arr
+                .iter()
+                .find(|p| p.get("id").and_then(|v| v.as_str()) == Some(id))?,
+            None => arr.first()?,
+        };
+        // Only tack on the profile name when the character has multiple
+        // profiles; otherwise "Alice · Default" is just noise.
+        let has_alternatives = arr.len() > 1;
+        if !has_alternatives {
+            return None;
+        }
+        profile
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .filter(|s| !s.is_empty())
+    });
+    match (char_name, profile_name) {
+        (Some(c), Some(p)) => Some(format!("{c} · {p}")),
+        (Some(c), None) => Some(c),
+        (None, Some(p)) => Some(p),
+        (None, None) => None,
+    }
+}
+
+/// Best-effort voice label for raw-config renders (no `character_id`).
+/// Reads the first non-empty identifying field on the first config's
+/// synth mode — a Piper voice name for Preset, the registered voice
+/// name for Clone, the (truncated) description for Design, the sample
+/// filename for Sample. Returns `None` when nothing identifiable is
+/// present so callers don't stamp an entry with a bare "Preset" tag.
+fn voice_label_from_configs(configs: &[VoiceConfig]) -> Option<String> {
+    let first = configs.first()?;
+    let raw = match &first.mode {
+        crate::tts::SynthMode::Preset => first.speaker.clone().unwrap_or_default(),
+        crate::tts::SynthMode::Clone { voice_name } => voice_name.clone(),
+        crate::tts::SynthMode::Design { description } => {
+            // Free-text description can be a paragraph; snip so the label
+            // stays legible next to the transcript.
+            const MAX_DESC: usize = 40;
+            if description.chars().count() > MAX_DESC {
+                let head: String = description.chars().take(MAX_DESC).collect();
+                format!("{head}…")
+            } else {
+                description.clone()
+            }
+        }
+        crate::tts::SynthMode::Sample { sample_file_name, .. } => sample_file_name.clone(),
+        crate::tts::SynthMode::Copy { .. } => String::new(),
+    };
+    let trimmed = raw.trim().to_string();
+    (!trimmed.is_empty()).then_some(trimmed)
+}
+
 /// Look up a character's `projectId` from the app_state JSON. Used to
 /// derive the dictionary project for widget renders that carry a
 /// `character_id` but no explicit `projectId`. Returns `None` when the
@@ -753,12 +835,21 @@ async fn synth_gm_proxy_widget(
             return None;
         }
     };
+    let voice_label = match user_voice_character {
+        Some(cid) => character_voice_label(state, cid, None).await,
+        None => None,
+    };
     match state
         .store
         .create_widget(text, None, clip.sample_rate, clip.duration_ms, clip.wav)
         .await
     {
-        Ok(id) => Some(id),
+        Ok(id) => {
+            if let Err(err) = state.store.set_widget_voice_label(id.clone(), voice_label).await {
+                tracing::warn!(%id, err = %format!("{err:#}"), "store: voice_label stamp failed");
+            }
+            Some(id)
+        }
         Err(err) => {
             tracing::warn!(err = %format!("{err:#}"), "GM proxy widget insert failed");
             None
@@ -1457,16 +1548,16 @@ async fn say_handler(
     }
     let text = apply_project_dictionary(&state, body.project_id.as_deref(), text).await;
     let configs = configs_or_default(body.configs);
+    let voice_label = voice_label_from_configs(&configs);
 
-    // Log the /say into the active recording (text only — /say synthesizes
-    // live and doesn't persist a widget, so there's no cached WAV url to
-    // point at). The user still gets the utterance in the transcript;
-    // for playback they'd need to hear the actual mic feed or re-run
-    // the /say call. Silent no-op when nothing is being recorded.
-    if state.record.is_recording() {
-        info!(channel = "TTS", text = %text, "recording: /say played");
-        state.record.push_tts(text.clone(), None);
-    }
+    // Log the /say into the Record page transcript. `push_tts` always
+    // appends to the rolling live buffer and mirrors into the active
+    // recording when one is in flight. Text only — /say synthesizes
+    // live and doesn't persist a widget, so there's no cached WAV url
+    // to point at; for playback the user would need to hear the mic
+    // feed or re-run the /say call.
+    info!(channel = "TTS", voice = ?voice_label, text = %text, "tts: /say played");
+    state.record.push_tts(text.clone(), None, voice_label);
 
     let (reply_tx, reply_rx) = oneshot::channel();
     if state
@@ -2380,13 +2471,13 @@ async fn script_block_add_take(
     // for this block's role and use that character's default profile;
     // fall through to the hardcoded DSP preset when either the agent has
     // no slot set or the referenced character can't be resolved.
+    let slot_character: Option<String> = agent_row
+        .as_ref()
+        .and_then(|a| match info.role.as_str() {
+            "narrator" => a.voice_narrator.clone(),
+            _ => a.voice_character.clone(),
+        });
     let configs = if body.configs.is_empty() {
-        let slot_character: Option<String> = agent_row
-            .as_ref()
-            .and_then(|a| match info.role.as_str() {
-                "narrator" => a.voice_narrator.clone(),
-                _ => a.voice_character.clone(),
-            });
         // Silence sentinel: caller (usually a manual ⟳ click) still gets
         // a take rendered, but with the hardcoded DSP fallback rather than
         // the silenced character. Auto-render / Play All are gated
@@ -2400,6 +2491,15 @@ async fn script_block_add_take(
     } else {
         configs_or_default(body.configs)
     };
+    // Voice tag stamped on the take's widget so the Record page TTS log
+    // names the speaker on playback. Prefer the slot's character name;
+    // fall back to whatever the config layer identifies (raw preset
+    // renders) if the slot is empty or client sent explicit configs.
+    let voice_label = match slot_character.as_deref() {
+        Some(cid) if cid != VOICE_SILENCE => character_voice_label(&state, cid, None).await,
+        _ => None,
+    }
+    .or_else(|| voice_label_from_configs(&configs));
     let project_id = body
         .project_id
         .clone()
@@ -2430,6 +2530,9 @@ async fn script_block_add_take(
                 .into_response();
         }
     };
+    if let Err(err) = state.store.set_widget_voice_label(widget_id.clone(), voice_label).await {
+        tracing::warn!(id = %widget_id, err = %format!("{err:#}"), "store: voice_label stamp failed");
+    }
     let take_row = match state
         .store
         .append_take(block_id.clone(), widget_id.clone())
@@ -2648,6 +2751,11 @@ async fn rerender_block_inline(
             .await
             .unwrap_or_else(|| default_configs_for_role(&info.role)),
     };
+    let voice_label = match slot_character.as_deref() {
+        Some(cid) if cid != VOICE_SILENCE => character_voice_label(state, cid, None).await,
+        _ => None,
+    }
+    .or_else(|| voice_label_from_configs(&configs));
     let project_id = body_project_id
         .map(str::to_string)
         .or_else(|| agent_row.and_then(|a| a.project_id.clone()));
@@ -2667,6 +2775,9 @@ async fn rerender_block_inline(
         )
         .await
         .map_err(|e| format!("store: create widget: {e:#}"))?;
+    if let Err(err) = state.store.set_widget_voice_label(widget_id.clone(), voice_label).await {
+        tracing::warn!(id = %widget_id, err = %format!("{err:#}"), "store: voice_label stamp failed");
+    }
     let take_row = match state
         .store
         .append_take(block_id.to_string(), widget_id.clone())
@@ -3267,6 +3378,12 @@ struct NormalizedWidget {
     /// body's explicit `projectId` first, then the character's own
     /// `projectId` when only `characterId` was sent.
     project_id: Option<String>,
+    /// Human-readable tag for the voice/profile that will render this
+    /// widget. Stamped onto the widget row so the Record page TTS log
+    /// can name the voice when the cached clip is later replayed.
+    /// `None` when nothing identifiable is on the request (raw preset
+    /// config with no speaker string, or Copy mode).
+    voice_label: Option<String>,
 }
 
 async fn normalize_widget_body(
@@ -3303,11 +3420,19 @@ async fn normalize_widget_body(
             None => None,
         },
     };
+    // Character-scoped renders name the character (+ profile disambig
+    // when they have multiple); raw config renders fall back to a
+    // best-effort tag pulled from the first config's synth mode.
+    let voice_label = match body.character_id.as_deref() {
+        Some(cid) => character_voice_label(state, cid, body.profile_id.as_deref()).await,
+        None => voice_label_from_configs(&configs),
+    };
     Ok(NormalizedWidget {
         text,
         configs,
         persist_instruct,
         project_id,
+        voice_label,
     })
 }
 
@@ -3337,7 +3462,7 @@ async fn widget_create_handler(
     State(state): State<AppState>,
     Json(body): Json<WidgetBody>,
 ) -> Response {
-    let NormalizedWidget { text, configs, persist_instruct, project_id } = match normalize_widget_body(&state, body).await {
+    let NormalizedWidget { text, configs, persist_instruct, project_id, voice_label } = match normalize_widget_body(&state, body).await {
         Ok(t) => t,
         Err((code, msg)) => return (code, msg).into_response(),
     };
@@ -3367,6 +3492,13 @@ async fn widget_create_handler(
                 .into_response();
         }
     };
+    // Stamp the voice tag as a follow-up write so the create_widget
+    // signature stays stable for every other caller. A failure here is
+    // logged but not fatal — the clip is already persisted, and a
+    // missing tag just leaves the Record log showing a bare "TTS".
+    if let Err(err) = state.store.set_widget_voice_label(id.clone(), voice_label).await {
+        tracing::warn!(%id, err = %format!("{err:#}"), "store: voice_label stamp failed");
+    }
 
     info!(%id, "widget created");
     wav_response(&id, clip)
@@ -3377,7 +3509,7 @@ async fn widget_update_handler(
     Path(id): Path<String>,
     Json(body): Json<WidgetBody>,
 ) -> Response {
-    let NormalizedWidget { text, configs, persist_instruct, project_id } = match normalize_widget_body(&state, body).await {
+    let NormalizedWidget { text, configs, persist_instruct, project_id, voice_label } = match normalize_widget_body(&state, body).await {
         Ok(t) => t,
         Err((code, msg)) => return (code, msg).into_response(),
     };
@@ -3410,6 +3542,9 @@ async fn widget_update_handler(
             )
                 .into_response();
         }
+    }
+    if let Err(err) = state.store.set_widget_voice_label(id.clone(), voice_label).await {
+        tracing::warn!(%id, err = %format!("{err:#}"), "store: voice_label stamp failed");
     }
 
     info!(%id, "widget updated");
@@ -3614,19 +3749,19 @@ async fn widget_say_handler(
     state.mixer.request_tts_stop();
     let seq = state.mixer.claim_play_seq();
 
-    // Log the playback into the active recording (if any) BEFORE we
-    // dispatch. This way the transcript entry appears the instant Play
-    // is clicked rather than after playback completes — the widget URL
-    // is stable, and the entry's text mirrors what the user asked to
-    // hear regardless of whether they hit Stop mid-clip.
-    if state.record.is_recording() {
-        if let Ok(Some(text)) = state.store.get_widget_text(id.clone()).await {
-            let trimmed = text.trim().to_string();
-            if !trimmed.is_empty() {
-                let audio_url = format!("/widgets/{}", id);
-                info!(channel = "TTS", widget = %id, text = %trimmed, "recording: TTS played");
-                state.record.push_tts(trimmed, Some(audio_url));
-            }
+    // Log the playback into the Record page transcript BEFORE we
+    // dispatch, so the entry appears the instant Play is clicked rather
+    // than after playback completes. `push_tts` always writes to the
+    // rolling live buffer and mirrors into the active recording when
+    // one is in flight — the widget URL is stable, and the entry's
+    // text mirrors what the user asked to hear regardless of whether
+    // they hit Stop mid-clip.
+    if let Ok(Some((text, voice_label))) = state.store.get_widget_tts_meta(id.clone()).await {
+        let trimmed = text.trim().to_string();
+        if !trimmed.is_empty() {
+            let audio_url = format!("/widgets/{}", id);
+            info!(channel = "TTS", widget = %id, voice = ?voice_label, text = %trimmed, "tts: widget played");
+            state.record.push_tts(trimmed, Some(audio_url), voice_label);
         }
     }
 

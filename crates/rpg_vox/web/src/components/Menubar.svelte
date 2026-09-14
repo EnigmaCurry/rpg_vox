@@ -175,7 +175,10 @@
     display: flex;
     align-items: center;
     gap: 20px;
-    padding: 10px 20px;
+    /* Zero vertical padding — the menu items themselves carry
+       6px top/bottom, which is enough click target. Kept horizontal
+       padding so the brand + last item don't collide with the edge. */
+    padding: 0 20px;
     background: var(--panel);
     border-bottom: 1px solid var(--border);
     position: sticky;

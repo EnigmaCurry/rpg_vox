@@ -218,6 +218,13 @@ impl Store {
             "TEXT NOT NULL DEFAULT 'character'",
         )
         .context("migrating role column on script_speech_blocks")?;
+        // Human-readable voice tag for the widget — the character/profile
+        // that rendered it, or a short mode-derived label for raw config
+        // renders. Consumed by the Record page TTS log so a "TTS" row
+        // shows *which* voice actually spoke, not just that a voice did.
+        // Nullable so pre-migration widgets keep behaving (no tag).
+        add_column_if_missing(&conn, "widgets", "voice_label", "TEXT")
+            .context("migrating voice_label column on widgets")?;
         // User turns can carry an attached widget (a recorded voice memo
         // captured from the mic before send). Nullable — plain text turns
         // stay unchanged, and assistant turns never use this column.
@@ -466,25 +473,55 @@ impl Store {
         Ok(row)
     }
 
-    /// Just the widget's stored text — used by the recording log when
-    /// TTS playback lands during an active recording so the entry
-    /// carries what was said, not just a link to the audio.
-    pub async fn get_widget_text(&self, id: String) -> Result<Option<String>> {
+    /// The widget's stored text + optional voice label — used by the
+    /// recording log when TTS playback lands so the transcript entry
+    /// carries what was said and which voice said it, not just a link
+    /// to the audio. Returns `None` when the widget doesn't exist;
+    /// `voice_label` is `None` for widgets rendered before the column
+    /// migration or without a resolvable character/config.
+    pub async fn get_widget_tts_meta(
+        &self,
+        id: String,
+    ) -> Result<Option<(String, Option<String>)>> {
         let db = self.db.clone();
-        let row = tokio::task::spawn_blocking(move || -> Result<Option<String>> {
+        let row = tokio::task::spawn_blocking(move || -> Result<Option<(String, Option<String>)>> {
             let conn = db.lock().unwrap();
-            let text = conn
+            let row = conn
                 .query_row(
-                    "SELECT text FROM widgets WHERE id = ?1",
+                    "SELECT text, voice_label FROM widgets WHERE id = ?1",
                     params![id],
-                    |r| r.get::<_, String>(0),
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
                 )
                 .optional()?;
-            Ok(text)
+            Ok(row)
         })
         .await
         .context("db task panicked")??;
         Ok(row)
+    }
+
+    /// Stamp a widget with a human-readable voice tag. Called after
+    /// create/update by the http layer once the caller-facing voice
+    /// (character + profile, or a mode-derived label) has been
+    /// resolved. Silently no-ops when the id doesn't exist so a race
+    /// with delete doesn't error.
+    pub async fn set_widget_voice_label(
+        &self,
+        id: String,
+        voice_label: Option<String>,
+    ) -> Result<()> {
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "UPDATE widgets SET voice_label = ?2 WHERE id = ?1",
+                params![id, voice_label],
+            )?;
+            Ok(())
+        })
+        .await
+        .context("db task panicked")??;
+        Ok(())
     }
 
     /// Create a new widget row and write its WAV. Returns the freshly

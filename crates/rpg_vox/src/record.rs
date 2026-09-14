@@ -253,6 +253,25 @@ struct ActiveRecording {
     /// alignment still works because each slot's first-chunk anchor is
     /// independent.
     slot_cursors: Vec<Option<u64>>,
+    /// Aborts the mixed-audio worker task on drop. `start_recording`
+    /// spawns one dedicated subscriber for this recording; when the
+    /// recording is finalized (or the ActiveRecording is otherwise
+    /// dropped) the guard fires and the broadcast receiver goes away,
+    /// dropping `monitor_tap.receiver_count()` back to zero so the RT
+    /// producer skips its per-callback allocation in idle mode.
+    _mixed_task: MixedWorkerGuard,
+}
+
+/// Drop-guard around the mixed-audio worker's abort handle. Aborting is
+/// idempotent — a task that already finished (or was never started) is
+/// unaffected — so this can live inside `ActiveRecording` without
+/// worrying about which teardown path drops the outer struct.
+struct MixedWorkerGuard(tokio::task::AbortHandle);
+
+impl Drop for MixedWorkerGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 impl ActiveRecording {
@@ -361,6 +380,14 @@ pub struct RecordState {
     /// soon as recording is started or stopped. Send failures (no
     /// subscribers) are ignored — this is a fire-and-forget channel.
     subtitles: broadcast::Sender<SubtitleEvent>,
+    /// Post-mix mic feed. `start_recording` subscribes here to capture
+    /// the silence-gated mixed track for the in-flight recording; the
+    /// subscription is dropped when the recording finalizes so the RT
+    /// producer sees `receiver_count == 0` in idle mode and skips the
+    /// per-callback heap allocation that feeds this tap. Held on
+    /// `RecordState` so per-recording worker spawns can pick it up
+    /// without extra plumbing through the HTTP handlers.
+    monitor_tap: broadcast::Sender<Arc<[f32]>>,
 }
 
 /// Events fanned out to OBS subtitle overlay subscribers.
@@ -384,7 +411,11 @@ pub enum SubtitleEvent {
 }
 
 impl RecordState {
-    pub fn new(sample_rate: u32, mixer: Arc<AtomicMixer>) -> Self {
+    pub fn new(
+        sample_rate: u32,
+        mixer: Arc<AtomicMixer>,
+        monitor_tap: broadcast::Sender<Arc<[f32]>>,
+    ) -> Self {
         let (subtitles, _) = broadcast::channel::<SubtitleEvent>(32);
         Self {
             inner: Arc::new(Mutex::new(Inner {
@@ -396,6 +427,7 @@ impl RecordState {
             mixer,
             hints: Arc::new(Mutex::new(VecDeque::with_capacity(HINT_RING_CAPACITY))),
             subtitles,
+            monitor_tap,
         }
     }
 
@@ -600,6 +632,39 @@ impl RecordState {
         }
         let id = Uuid::new_v4().to_string();
         let slot_count = self.mixer.vox_slot_count();
+        // Subscribe to the monitor tap ONLY for the lifetime of this
+        // recording. Keeping a subscriber alive between recordings
+        // forces the RT source callback into its "someone's listening"
+        // branch which allocates `Vec::with_capacity` + `Arc::from` per
+        // pipewire cycle — enough at a 256-frame quantum to accumulate
+        // tens of xruns/sec (audible as periodic clicks in any local
+        // monitor sink).
+        let mut rx = self.monitor_tap.subscribe();
+        let worker_state = self.clone();
+        let recording_id = id.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(chunk) => {
+                        worker_state.push_mixed_audio(&chunk);
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        warn!(
+                            recording = %recording_id,
+                            missed = n,
+                            "record mixed worker lagged on monitor tap",
+                        );
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        info!(
+                            recording = %recording_id,
+                            "monitor tap closed; record mixed worker exiting",
+                        );
+                        return;
+                    }
+                }
+            }
+        });
         g.active = Some(ActiveRecording {
             id: id.clone(),
             name,
@@ -613,6 +678,7 @@ impl RecordState {
             sample_rate: self.sample_rate,
             started_at: Instant::now(),
             slot_cursors: vec![None; slot_count],
+            _mixed_task: MixedWorkerGuard(handle.abort_handle()),
         });
         drop(g);
         let _ = self.subtitles.send(SubtitleEvent::RecordingActive(true));
@@ -1065,22 +1131,18 @@ impl RecordState {
         }
     }
 
-    /// Log a TTS playback into the active recording, if any. Text is the
-    /// utterance; `audio_url` (e.g. `/widgets/<id>`) points at the cached
-    /// clip so playback survives the recording even though TTS audio
-    /// doesn't flow through the vox tap. When no recording is active
-    /// this is a no-op — the rolling ephemeral buffer is exclusively
-    /// for VAD-detected vox utterances so it doesn't get cluttered
-    /// with every TTS click made outside a session.
+    /// Log a TTS playback into the rolling ephemeral buffer, and into
+    /// the active recording when one is in flight. Text is the utterance;
+    /// `audio_url` (e.g. `/widgets/<id>`) points at the cached clip so
+    /// playback survives the recording even though TTS audio doesn't
+    /// flow through the vox tap. `voice_label` is a human-readable tag
+    /// for the voice/profile that spoke — rendered inline with the TTS
+    /// channel tag so the log tells you *which* voice it was.
     ///
-    /// Returns `true` if the entry was actually appended (a recording
-    /// was active), so callers can decide whether to bother building
-    /// the `audio_url` at all.
-    pub fn push_tts(&self, text: String, audio_url: Option<String>) -> bool {
-        let mut g = self.inner.lock().expect("record state mutex poisoned");
-        if g.active.is_none() {
-            return false;
-        }
+    /// Always appends to the buffer so the Live view shows every TTS
+    /// clip the user hears — including clips played with no recording
+    /// active. Buffer trimming follows the same FIFO cap as vox entries.
+    pub fn push_tts(&self, text: String, audio_url: Option<String>, voice_label: Option<String>) {
         let entry = TranscriptEntry {
             id: Uuid::new_v4().to_string(),
             created_at: unix_now(),
@@ -1089,10 +1151,13 @@ impl RecordState {
             audio_start_ms: None,
             audio_duration_ms: None,
             audio_url,
-            // Speaker hints are about who's talking on a vox channel; a
-            // TTS entry's "speaker" is implicitly the TTS engine, so
-            // leaving this None keeps the label from being misleading.
-            speaker: None,
+            // Reuses the same `speaker` field vox entries use for hint
+            // attribution — the Record UI already renders it inline with
+            // the channel tag, so no extra field is needed.
+            speaker: voice_label.and_then(|s| {
+                let t = s.trim().to_string();
+                (!t.is_empty()).then_some(t)
+            }),
             // TTS is logged the moment the play call fires, so "now" is
             // the utterance's start on the same wall-clock the vox VAD
             // stamps into its entries — insert_ordered slots this in
@@ -1101,15 +1166,21 @@ impl RecordState {
             mixed_start_ms: None,
             provisional: false,
         };
+        let mut g = self.inner.lock().expect("record state mutex poisoned");
+        g.buffer_bytes += entry.text.len();
+        insert_ordered(&mut g.buffer, entry.clone());
+        while g.buffer_bytes > BUFFER_MAX_BYTES && g.buffer.len() > 1 {
+            let dropped = g.buffer.remove(0);
+            g.buffer_bytes = g.buffer_bytes.saturating_sub(dropped.text.len());
+        }
         if let Some(active) = g.active.as_mut() {
             insert_ordered(&mut active.entries, entry);
         }
-        true
     }
 
     /// Whether a recording is currently in flight. Cheap — one mutex
-    /// lock, no allocation. Callers use this to skip building a widget
-    /// audio_url when there's nowhere for it to land.
+    /// lock, no allocation. Used by the streaming STT gate and the OBS
+    /// subtitles subscription to key off the active/idle transition.
     pub fn is_recording(&self) -> bool {
         self.inner
             .lock()
@@ -1868,37 +1939,6 @@ fn run_streaming_decoder(
 ///
 /// Silently no-ops when `stt` is `None` so callers can wire this in
 /// unconditionally.
-/// Subscribe to the mixed mic-feed tap and, whenever a recording is in
-/// flight, push each chunk through the silence gate into the active
-/// recording's `mixed_audio`. Runs for the process lifetime; short-
-/// circuits (skips the gate work entirely) when no recording is active.
-pub fn spawn_mixed_worker(
-    monitor_tap: broadcast::Sender<Arc<[f32]>>,
-    state: RecordState,
-) {
-    let mut rx = monitor_tap.subscribe();
-    tokio::spawn(async move {
-        info!("record mixed-audio worker started");
-        loop {
-            match rx.recv().await {
-                Ok(chunk) => {
-                    if !state.is_recording() {
-                        continue;
-                    }
-                    state.push_mixed_audio(&chunk);
-                }
-                Err(broadcast::error::RecvError::Lagged(n)) => {
-                    warn!(missed = n, "record mixed worker lagged on monitor tap");
-                }
-                Err(broadcast::error::RecvError::Closed) => {
-                    info!("monitor tap closed; record mixed worker exiting");
-                    return;
-                }
-            }
-        }
-    });
-}
-
 pub fn spawn_worker(
     stt: Option<SttHandle>,
     streaming: Option<StreamingSttHandle>,

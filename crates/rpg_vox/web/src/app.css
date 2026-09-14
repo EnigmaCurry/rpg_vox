@@ -78,11 +78,12 @@ hr {
 }
 
 /* Menubar height, shared with the sidebar drawers so their hamburger
-   buttons anchor right below it. Approximate: 10px vertical padding *
-   2 + 15px * 1.4 line-height + 1px border. Kept as a CSS variable so
-   any future menubar-height tweak flows to all consumers. */
+   buttons anchor right below it. Approximate: 0 vertical padding + 6px
+   item padding × 2 + 15px × 1.4 line-height + 1px border ≈ 34px.
+   Kept as a CSS variable so any future menubar-height tweak flows to
+   all consumers. */
 :root {
-  --menubar-height: 44px;
+  --menubar-height: 32px;
 }
 
 /* Shared mobile-drawer visuals for the left-rail sidebars (Recordings,

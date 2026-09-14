@@ -21,8 +21,13 @@ clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# PipeWire native client. Both crates register nodes in-process.
-pipewire = "0.8"
+# PipeWire native client. Both crates register nodes in-process. The
+# `v0_3_49` feature enables `Buffer::requested()`, which lets the source
+# stream fill exactly the frame count PipeWire is asking for this cycle
+# instead of the whole `max_size` allocation — matches the driver's
+# quantum and avoids buffer/quantum misalignment when the source is
+# linked to a live hardware sink (e.g. local monitor speakers).
+pipewire = { version = "0.8", features = ["v0_3_49"] }
 libspa = "0.8"
 
 # Realtime-safe SPSC ring buffer for audio samples.

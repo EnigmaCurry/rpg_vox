@@ -255,6 +255,45 @@
     const d = new Date(secs * 1000);
     return d.toLocaleString();
   }
+  // Terse form for the linear-log timestamp line: just HH:MM. The full
+  // date + time from `fmtTime` sits in the row's `title` tooltip so
+  // hovering still exposes the exact moment when needed.
+  function fmtTimeCompact(secs) {
+    if (!secs) return '';
+    const d = new Date(secs * 1000);
+    return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  }
+  // UTC-only compact time (HH:MMZ). Used in the recording linear-log
+  // avatar so the recorded moment is unambiguous across time zones —
+  // handy when a session is shared with people elsewhere or the same
+  // recording is reviewed on a machine in a different locale.
+  function fmtTimeUtcCompact(secs) {
+    if (!secs) return '';
+    const iso = new Date(secs * 1000).toISOString();
+    return `${iso.slice(11, 16)}Z`;
+  }
+  // Single-letter placeholder derived from the pill text so an avatar
+  // that isn't yet wired to a real portrait still reads as
+  // recognizably that voice/channel. Trims leading punctuation so a
+  // profile like " · echo" doesn't render as "·".
+  function initialFrom(label) {
+    if (!label) return '?';
+    const clean = label.trim().replace(/^[^\p{L}\p{N}]+/u, '');
+    const first = clean.charAt(0);
+    return first ? first.toUpperCase() : '?';
+  }
+  // Stable HSL background from any string. Same voice profile always
+  // gets the same tint across sessions, and two different profiles
+  // reliably render as distinct colors — quick visual differentiation
+  // in a long transcript without needing per-character metadata.
+  function avatarTint(label) {
+    if (!label) return 'hsl(210 20% 30%)';
+    let h = 0;
+    for (let i = 0; i < label.length; i++) {
+      h = (h * 31 + label.charCodeAt(i)) >>> 0;
+    }
+    return `hsl(${h % 360} 45% 32%)`;
+  }
 
   function fmtDur(ms) {
     if (!ms) return '0:00';
@@ -1011,6 +1050,53 @@
   const bufferPct = $derived(
     state ? Math.min(100, (state.bufferBytes / state.bufferMaxBytes) * 100) : 0,
   );
+
+  // Active/saved recording log view. Two modes:
+  //   * 'columns' — the default columns-per-channel table with a
+  //     master column, silence rows, and per-row playback.
+  //   * 'linear'  — a chronological list styled like the live buffer.
+  //     Same play + edit affordances, but flat.
+  // Persisted per-browser so the choice sticks across reloads. Applies
+  // to both the in-flight recording banner AND the saved-recording
+  // detail pane so the two views feel consistent.
+  const RECORD_LOG_VIEW_KEY = 'rpg_vox.record.log_view';
+  function loadRecordLogView() {
+    try {
+      const v = localStorage.getItem(RECORD_LOG_VIEW_KEY);
+      return v === 'linear' ? 'linear' : 'columns';
+    } catch {
+      return 'columns';
+    }
+  }
+  let recordLogView = $state(loadRecordLogView());
+  $effect(() => {
+    try { localStorage.setItem(RECORD_LOG_VIEW_KEY, recordLogView); } catch {}
+  });
+
+  // Sticky-header collapse: an IntersectionObserver watches a 1px
+  // sentinel placed just above the live pane's header. When the user
+  // scrolls the sentinel past the top of the viewport (accounting for
+  // the pinned Menubar via `rootMargin`), the header enters `compact`
+  // mode — smaller title, tighter padding — so the buffer meter and
+  // any pinned controls stay visible without the title hogging the
+  // top strip on a long transcript scroll.
+  let liveHeadSentinel = $state(null);
+  let liveHeadCompact = $state(false);
+  $effect(() => {
+    if (!liveHeadSentinel) return;
+    const menuVar = getComputedStyle(document.documentElement)
+      .getPropertyValue('--menubar-height')
+      .trim();
+    const menuPx = parseInt(menuVar, 10) || 0;
+    const io = new IntersectionObserver(
+      ([entry]) => {
+        liveHeadCompact = !entry.isIntersecting;
+      },
+      { rootMargin: `-${menuPx}px 0px 0px 0px`, threshold: 0 },
+    );
+    io.observe(liveHeadSentinel);
+    return () => io.disconnect();
+  });
   // Currently-selected saved recording (when `selected` is an id).
   const selectedSaved = $derived(
     state && selected !== 'live' && selected !== 'active'
@@ -1068,6 +1154,31 @@
   {/if}
 {/snippet}
 
+{#snippet viewToggleBtn()}
+  <!-- Two-position pill toggle. Highlights the active mode; clicking
+       the OTHER label flips the view. Shared between the active-
+       recording banner and (potentially) the saved-recording pane so
+       both places stay in sync via the same persisted `recordLogView`. -->
+  <div class="view-toggle" role="group" aria-label="Log view">
+    <button
+      type="button"
+      class="view-toggle-btn"
+      class:active={recordLogView === 'columns'}
+      onclick={() => (recordLogView = 'columns')}
+      title="Show as columns per channel"
+      aria-pressed={recordLogView === 'columns'}
+    >⋮⋮</button>
+    <button
+      type="button"
+      class="view-toggle-btn"
+      class:active={recordLogView === 'linear'}
+      onclick={() => (recordLogView = 'linear')}
+      title="Show as a chronological list"
+      aria-pressed={recordLogView === 'linear'}
+    >≡</button>
+  </div>
+{/snippet}
+
 {#snippet logTable(recording, canonicalChannels)}
   {@const rows = computeRows(recording.entries)}
   {@const channels = extractChannels(recording.entries, canonicalChannels)}
@@ -1114,6 +1225,49 @@
       </tbody>
     </table>
   </div>
+{/snippet}
+
+{#snippet linearLog(recording, canonicalChannels)}
+  {@const recId = recording.id}
+  {@const fallback = canonicalChannels[0] ?? 'Vox 1'}
+  <!-- Chronological list of every entry, styled like the ephemeral
+       live buffer. Skips the master column and silence rows (those are
+       only meaningful in the timeline-oriented columns view) and reuses
+       `clipCell` so per-entry play + edit still work — including the
+       playing/copied/provisional state classes. Labels are grouped in
+       a `.row-labels` div so grid-template-areas can pin channel +
+       speaker on top and the timestamp beneath, with the text spanning
+       both rows on the right. -->
+  <ul class="entries linear-log">
+    {#each recording.entries as e (e.id)}
+      {@const ch = e.channel || fallback}
+      {@const isTts = ch === 'TTS'}
+      <!-- Title for the avatar: voice profile for TTS (falls back to
+           "TTS" for older widgets whose voice_label column is unset),
+           speaker attribution (if any) for vox, else the slot name. -->
+      {@const title = isTts
+        ? (e.speaker || 'TTS')
+        : (e.speaker || ch)}
+      {@const channelType = isTts ? 'TTS' : 'VOX'}
+      <li class:playing={isClipPlayingNow(e)} class:provisional={e.provisional}>
+        <!-- Compact portrait avatar with everything needed to identify
+             the speaker at a glance. Uniform fixed-width so the
+             transcript text on the right lines up across every row.
+             Avatar image is a placeholder (initial letter over a
+             deterministic tint) until per-entry avatar metadata is
+             wired through the recording pipeline. -->
+        <div class="entry-avatar" title={fmtTime(e.created_at)}>
+          <div class="avatar-portrait" style="background: {avatarTint(title)}">
+            <span class="avatar-initial">{initialFrom(title)}</span>
+          </div>
+          <span class="avatar-type" class:tts={isTts}>{channelType}</span>
+          <span class="avatar-title" title={title}>{title}</span>
+          <span class="avatar-ts">{fmtTimeUtcCompact(e.created_at)}</span>
+        </div>
+        {@render clipCell(e, ch, recId)}
+      </li>
+    {/each}
+  </ul>
 {/snippet}
 
 {#snippet clipCell(entry, channel, recId)}
@@ -1190,19 +1344,37 @@
     {#if !state}
       <div class="empty">loading…</div>
     {:else if selected === 'live'}
-      <!-- Rolling ephemeral buffer view. -->
-      <div class="pane-head">
-        <h1>Ephemeral live transcript (buffered; not recorded)</h1>
-        <div class="hint">
-          background live transcription from the Vox channel · trims oldest
-          entries once the buffer hits {fmtBytes(state.bufferMaxBytes)}
+      <!-- Rolling ephemeral buffer view. Sentinel is a 1px shim sitting
+           just above the sticky header so IntersectionObserver can flip
+           the header into its `compact` mode the moment scroll pins it
+           to the top. Keeps the buffer meter visible without the title
+           eating vertical space during a long transcript scroll. -->
+      <div bind:this={liveHeadSentinel} class="head-sentinel"></div>
+      <div class="pane-head live" class:compact={liveHeadCompact}>
+        <h1>Ephemeral live transcript (buffered; not recorded)
           {#if !state.sttEnabled}
             <span class="stt-off"> · STT disabled</span>
           {/if}
+        </h1>
+        <div
+          class="buf-meter"
+          title="{fmtBytes(state.bufferBytes)} of {fmtBytes(state.bufferMaxBytes)}"
+        >
+          <div class="buf-fill" style="width: {bufferPct}%"></div>
         </div>
-      </div>
-      <div class="buf-meter" title="{fmtBytes(state.bufferBytes)} of {fmtBytes(state.bufferMaxBytes)}">
-        <div class="buf-fill" style="width: {bufferPct}%"></div>
+        <button
+          type="button"
+          class="live-rec-btn"
+          disabled={busy || state.activeRecording != null}
+          title={state.activeRecording != null
+            ? 'Stop the current recording first'
+            : 'Start a new recording'}
+          aria-label="Start a new recording"
+          onclick={beginNewRecording}
+        >
+          <span class="live-rec-dot" aria-hidden="true"></span>
+          <span class="live-rec-label">Record</span>
+        </button>
       </div>
       {#if state.buffer.length === 0}
         <div class="empty pane-empty">
@@ -1213,6 +1385,9 @@
           {#each state.buffer as e (e.id)}
             <li class:copied={copiedEntryId === e.id} class:provisional={e.provisional}>
               <span class="channel-tag">{e.channel || channelFallback}</span>
+              {#if e.speaker}
+                <span class="speaker-tag" title="Voice / profile">{e.speaker}</span>
+              {/if}
               <span class="ts">{fmtTime(e.created_at)}</span>
               <button
                 type="button"
@@ -1257,6 +1432,7 @@
           <span class="active-time">{fmtDur(state.activeRecording.duration_ms ?? 0)}</span>
         </div>
         <div class="active-actions">
+          {@render viewToggleBtn()}
           {@render playAllBtn(state.activeRecording.id)}
           <button type="button" class="primary" disabled={busy} onclick={stopRecording}>
             Stop &amp; Save
@@ -1266,6 +1442,8 @@
       {@render hiddenAudios()}
       {#if state.activeRecording.entries.length === 0}
         <div class="empty pane-empty">listening…</div>
+      {:else if recordLogView === 'linear'}
+        {@render linearLog(state.activeRecording, state.channelNames ?? [])}
       {:else}
         {@render logTable(state.activeRecording, state.channelNames ?? [])}
       {/if}
@@ -1329,8 +1507,11 @@
     min-width: 0;
     display: flex;
     flex-direction: column;
-    padding: 16px 20px;
-    gap: 14px;
+    /* Tight vertical rhythm so the log gets as many lines as
+       possible on a 720p screen. Horizontal padding stays generous
+       for readability. */
+    padding: 4px 16px 6px;
+    gap: 6px;
   }
 
   /* Pinned pane header so the recording title, timer, and Stop/Play
@@ -1345,17 +1526,90 @@
     z-index: 5;
     display: flex;
     justify-content: space-between;
-    align-items: baseline;
+    align-items: center;
     gap: 12px;
     flex-wrap: wrap;
-    padding: 10px 4px;
+    padding: 4px 4px;
     background: var(--bg);
     border-bottom: 1px solid var(--border);
+    transition: padding 0.15s ease;
   }
+  /* 1px shim above the sticky header — IntersectionObserver watches
+     whether this element is still visible in the scroll port to detect
+     when the header has stuck. Negative margin keeps it from adding
+     layout height. */
+  .head-sentinel {
+    height: 1px;
+    margin: -1px 0 0 0;
+    pointer-events: none;
+  }
+  /* Live pane variant: the buffer meter lives INSIDE the sticky header
+     (instead of floating below it in the scroll flow), so the "how full
+     is the ring buffer" readout stays visible regardless of scroll. */
+  .pane-head.live {
+    align-items: center;
+  }
+  .pane-head.live .buf-meter {
+    margin-left: auto;
+    flex: 0 0 auto;
+  }
+  /* Start-recording affordance pinned to the far-right corner of the
+     sticky header. Visually related to the active pane's `.rec-badge`
+     (same pulsing red dot) so the color language is consistent across
+     "record" and "recording in progress" states — but rendered as a
+     button so it reads as clickable rather than a status indicator.
+     Disabled when an active recording already exists; matches the
+     sidebar `+` button's guard so both entry points behave the same. */
+  .pane-head.live .live-rec-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    border: 1px solid rgba(255,92,92,0.5);
+    border-radius: 999px;
+    background: rgba(255,92,92,0.08);
+    color: #ff8a8a;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    flex: 0 0 auto;
+    transition: background 0.15s ease, border-color 0.15s ease;
+  }
+  .pane-head.live .live-rec-btn:hover:not(:disabled) {
+    background: rgba(255,92,92,0.18);
+    border-color: rgba(255,92,92,0.8);
+  }
+  .pane-head.live .live-rec-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+  .live-rec-dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #ff5c5c;
+    box-shadow: 0 0 6px rgba(255,92,92,0.6);
+    animation: rec-pulse 1.5s ease-in-out infinite;
+  }
+  /* Compact-header form: drop the label so the button becomes a
+     circular red dot in the corner. Preserves the affordance without
+     eating horizontal space next to the meter on a scrolled page. */
+  .pane-head.compact .live-rec-btn { padding: 3px 6px; }
+  .pane-head.compact .live-rec-label { display: none; }
+  /* Compact form — activated once the header is pinned to the top. Just
+     enough shrink to reclaim ~half the vertical footprint without
+     ellipsizing the title. The h1 stays legible; only the padding and
+     font-size dial back. */
+  .pane-head.compact {
+    padding-top: 2px;
+    padding-bottom: 2px;
+  }
+  .pane-head.compact h1 { font-size: 12px; }
   @media (max-width: 1079px) {
     .pane-head { padding-left: 44px; }
   }
-  .pane-head h1 { font-size: 20px; margin: 0; }
+  .pane-head h1 { font-size: 16px; margin: 0; line-height: 1.2; }
 
   /* Saved-recording variant: single top-aligned row, title truncates
      with ellipsis before wrapping, minimal meta (duration only), and
@@ -1425,8 +1679,7 @@
     padding: 4px 8px;
     font-size: 14px;
   }
-  .hint { color: var(--muted); font-size: 12px; }
-  .stt-off { color: var(--err); font-weight: 500; }
+  .stt-off { color: var(--err); font-weight: 500; font-size: 12px; }
 
   .empty { color: var(--muted); font-size: 13px; padding: 6px 0; }
   .pane-empty { padding: 24px 0; text-align: center; }
@@ -1485,6 +1738,142 @@
   }
   .active-time { color: var(--muted); font-variant-numeric: tabular-nums; font-size: 13px; }
   .active-actions { display: flex; gap: 8px; flex-shrink: 0; }
+
+  /* Segmented toggle for switching the recording log between the
+     columns-per-channel table and a chronological linear list. Lives
+     in the active-actions strip alongside Play All / Stop so both
+     entry points to the log's presentation live in the same header. */
+  .view-toggle {
+    display: inline-flex;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    overflow: hidden;
+    align-self: center;
+  }
+  .view-toggle-btn {
+    background: transparent;
+    color: var(--muted);
+    border: none;
+    padding: 4px 10px;
+    font-size: 14px;
+    line-height: 1;
+    cursor: pointer;
+    min-width: 32px;
+  }
+  .view-toggle-btn:hover:not(.active) {
+    background: rgba(255,255,255,0.04);
+    color: var(--text);
+  }
+  .view-toggle-btn.active {
+    background: rgba(122,162,255,0.2);
+    color: var(--accent);
+  }
+  .view-toggle-btn + .view-toggle-btn { border-left: 1px solid var(--border); }
+
+  /* Linear-log flavor of the entry list. Uniform portrait avatar box
+     on the left carries the type + title + timestamp, transcript text
+     fills the rest. The fixed avatar width is what makes text on
+     every row line up flush at the same left edge. */
+  ul.entries.linear-log li {
+    grid-template-columns: var(--linear-avatar-w) 1fr;
+    grid-template-rows: auto;
+    align-items: stretch;
+    gap: 8px;
+    padding: 2px 4px;
+  }
+  ul.entries.linear-log {
+    /* Single knob for the whole log's avatar width so a tweak keeps
+       every row aligned. Sized to fit "· shout"-length profile names
+       without wrapping mid-word too aggressively. */
+    --linear-avatar-w: 72px;
+  }
+  .entry-avatar {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 1px;
+    padding: 2px 3px;
+    background: rgba(0, 0, 0, 0.28);
+    border: 1px solid rgba(255, 255, 255, 0.05);
+    border-radius: 5px;
+    text-align: center;
+    overflow: hidden;
+    min-width: 0;
+  }
+  .avatar-portrait {
+    width: 32px;
+    height: 32px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: rgba(255, 255, 255, 0.9);
+    font-size: 15px;
+    font-weight: 600;
+    line-height: 1;
+    /* Subtle inner ring so the portrait reads as a distinct chip
+       against the row's own dark background. */
+    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.08);
+    user-select: none;
+  }
+  .avatar-initial {
+    letter-spacing: 0;
+  }
+  .avatar-type {
+    font-size: 8px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--accent);
+    line-height: 1;
+  }
+  .avatar-type.tts { color: #ffcc66; }
+  .avatar-title {
+    font-size: 9px;
+    line-height: 1.15;
+    color: var(--text);
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    padding: 0 2px;
+  }
+  .avatar-ts {
+    font-size: 8px;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+    line-height: 1;
+  }
+  ul.entries.linear-log .clip-btn {
+    /* The avatar is column 1; the text belongs in the 1fr second
+       column. Explicit pin (rather than relying on auto-place) so a
+       future addition of any extra child never shoves the text out
+       from under the transcript column. */
+    grid-column: 2;
+    align-self: center;
+    background: transparent;
+    border-color: transparent;
+    padding: 2px 4px;
+    margin-bottom: 0;
+    min-width: 0;
+  }
+  ul.entries.linear-log li.playing .clip-btn {
+    border-color: rgba(122,162,255,0.6);
+    box-shadow: 0 0 0 1px rgba(122,162,255,0.35);
+    background: rgba(0,0,0,0.2);
+  }
+  /* `clipCell` renders its own inline speaker-tag inside the clip-btn
+     for the columns view. In the linear log we surface it up-front in
+     `.row-labels`, so hide the duplicate to avoid showing the voice
+     name twice per row. */
+  ul.entries.linear-log .clip-btn > .speaker-tag { display: none; }
+  /* Tighter line-height inside the linear log so multi-line transcript
+     text doesn't waste vertical space between wrapped lines — the row
+     height is already dominated by the avatar box, no reason for the
+     text to add breathing room on top of that. */
+  ul.entries.linear-log .clip-text {
+    line-height: 1.25;
+  }
   .rec-badge {
     display: inline-flex;
     align-items: center;
@@ -1600,14 +1989,14 @@
     margin: 0;
     display: flex;
     flex-direction: column;
-    gap: 6px;
+    gap: 2px;
   }
   ul.entries li {
     display: grid;
     grid-template-columns: max-content max-content 1fr;
     grid-template-rows: auto auto;
-    gap: 4px 10px;
-    padding: 6px 8px;
+    gap: 2px 8px;
+    padding: 3px 6px;
     border-radius: 4px;
     background: rgba(0,0,0,0.15);
     align-items: baseline;

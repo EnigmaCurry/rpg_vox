@@ -1333,6 +1333,13 @@ fn run(
             let Some(mut buffer) = stream.dequeue_buffer() else {
                 return;
             };
+            // Frames the graph wants us to produce this cycle (samples per
+            // channel). Zero on legacy servers or when the graph hasn't
+            // published a request — we fall back to filling `max_size` in
+            // that case. Read BEFORE `datas_mut()` because `Buffer::requested`
+            // takes `&self` and would conflict with the `&mut` reborrow the
+            // slice hand-off produces on some rustc versions.
+            let requested_frames = buffer.requested() as usize;
             let datas = buffer.datas_mut();
             if datas.is_empty() {
                 return;
@@ -1364,7 +1371,25 @@ fn run(
 
             let capacity_frames = if let Some(slice) = data.data() {
                 let out: &mut [f32] = bytemuck_cast_slice_mut(slice);
-                let frames = out.len() / SOURCE_CHANNELS as usize;
+                let max_frames = out.len() / SOURCE_CHANNELS as usize;
+                // Honor the graph's request when present so downstream
+                // consumers (especially a live hardware sink linked as a
+                // local monitor) get exactly the buffer size their driver
+                // cycle expects. Filling `max_frames` produced far more
+                // audio than the ~256-frame Yealink quantum could consume
+                // in one period — PipeWire fanned each big buffer across
+                // many driver cycles, and any misalignment showed up as
+                // xruns (audible clicks in the local monitor). Cap by
+                // `max_frames` so a bogus `requested` can't overrun the
+                // allocation; treat zero as "produce as much as fits" so
+                // the fallback matches the legacy behavior on servers
+                // that don't publish a request.
+                let frames = if requested_frames > 0 {
+                    requested_frames.min(max_frames)
+                } else {
+                    max_frames
+                };
+                let out = &mut out[..frames * SOURCE_CHANNELS as usize];
 
                 // Snapshot the mixer state once per process() rather than
                 // once per frame. Atomics are cheap but this is still fewer
