@@ -1425,7 +1425,7 @@
             <button
               type="button"
               class="active-name-btn"
-              title="Click to rename this recording"
+              title={state.activeRecording.name}
               onclick={beginActiveRename}
             >{state.activeRecording.name}</button>
           {/if}
@@ -1469,12 +1469,13 @@
           <button
             type="button"
             class="saved-title"
-            title="Click to rename"
+            title={selectedSaved.name}
             onclick={beginSavedRename}
           >{selectedSaved.name}</button>
         {/if}
         <span class="saved-meta">{fmtDur(selectedSaved.duration_ms)}</span>
         <div class="head-actions">
+          {@render viewToggleBtn()}
           {@render playAllBtn(selectedSaved.id)}
           <a
             class="download-btn icon"
@@ -1488,6 +1489,8 @@
       {@render hiddenAudios()}
       {#if selectedSaved.entries.length === 0}
         <div class="empty pane-empty">no transcript for this recording</div>
+      {:else if recordLogView === 'linear'}
+        {@render linearLog(selectedSaved, state.channelNames ?? [])}
       {:else}
         {@render logTable(selectedSaved, state.channelNames ?? [])}
       {/if}
@@ -1554,30 +1557,33 @@
     flex: 0 0 auto;
   }
   /* Start-recording affordance pinned to the far-right corner of the
-     sticky header. Visually related to the active pane's `.rec-badge`
-     (same pulsing red dot) so the color language is consistent across
-     "record" and "recording in progress" states — but rendered as a
-     button so it reads as clickable rather than a status indicator.
-     Disabled when an active recording already exists; matches the
-     sidebar `+` button's guard so both entry points behave the same. */
+     sticky header. Deliberately understated in its resting state — a
+     small red dot as an icon, muted border, no glow, no animation — so
+     it reads as "start a recording" rather than "recording is live."
+     The actual `.rec-badge` in the active pane owns the pulse + filled
+     red styling; this button brightens on hover to signal intent
+     without borrowing that language. Disabled when an active recording
+     already exists; matches the sidebar `+` button's guard so both
+     entry points behave the same. */
   .pane-head.live .live-rec-btn {
     display: inline-flex;
     align-items: center;
     gap: 6px;
     padding: 4px 10px;
-    border: 1px solid rgba(255,92,92,0.5);
+    border: 1px solid rgba(255,255,255,0.15);
     border-radius: 999px;
-    background: rgba(255,92,92,0.08);
-    color: #ff8a8a;
+    background: transparent;
+    color: var(--fg-2, #cfd3d8);
     font-size: 12px;
     font-weight: 600;
     cursor: pointer;
     flex: 0 0 auto;
-    transition: background 0.15s ease, border-color 0.15s ease;
+    transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
   }
   .pane-head.live .live-rec-btn:hover:not(:disabled) {
-    background: rgba(255,92,92,0.18);
-    border-color: rgba(255,92,92,0.8);
+    background: rgba(255,92,92,0.1);
+    border-color: rgba(255,92,92,0.55);
+    color: #ff8a8a;
   }
   .pane-head.live .live-rec-btn:disabled {
     opacity: 0.4;
@@ -1589,8 +1595,7 @@
     height: 8px;
     border-radius: 50%;
     background: #ff5c5c;
-    box-shadow: 0 0 6px rgba(255,92,92,0.6);
-    animation: rec-pulse 1.5s ease-in-out infinite;
+    opacity: 0.75;
   }
   /* Compact-header form: drop the label so the button becomes a
      circular red dot in the corner. Preserves the affordance without

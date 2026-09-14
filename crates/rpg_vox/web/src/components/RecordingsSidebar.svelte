@@ -178,6 +178,7 @@
           {:else}
             <span
               class="name"
+              title={activeRecording.name}
               ondblclick={(e) => beginRename(activeRecording, e)}
               role="presentation"
             >{activeRecording.name}</span>
@@ -217,6 +218,7 @@
             {:else}
               <span
                 class="name"
+                title={rec.name}
                 ondblclick={(e) => beginRename(rec, e)}
                 role="presentation"
               >{rec.name}</span>
