@@ -43,14 +43,23 @@ test:
 run *ARGS:
     nix-shell --run "cargo run -p rpg_vox --release -- {{ARGS}}"
 
-# Auto-rebuild + restart on any change under the rpg_vox crate. Watches Rust
-# sources only — for hot-reloading the Svelte UI use `just dev-ui` alongside
-# this in a second terminal (Vite serves at :5173 with /say etc. proxied to
-# the running backend). Both model recipes are deps so a fresh checkout
-# gets the STT + streaming-STT models on first `just dev`; each recipe
-# no-ops when the files are already there, so the wait only happens once.
+# Auto-rebuild + restart on any change under the rpg_vox crate, AND serve the
+# Svelte SPA via Vite with hot-reload — both in one terminal. Point your
+# browser at http://127.0.0.1:5173 for the dev UI: Vite HMR picks up .svelte
+# edits instantly (no rebuild), and API requests (/say, /chat, /monitor.ws,
+# etc.) are proxied to the rpg_vox backend on :7331 which cargo-watch rebuilds
+# on Rust changes. Ctrl-C tears down both children. Both model recipes are
+# deps so a fresh checkout gets the STT + streaming-STT models on first `just
+# dev`; each recipe no-ops when the files are already there, so the wait only
+# happens once. If you'd rather run the pieces separately, `just dev-ui` and
+# a manual `cargo run` still work.
 dev *ARGS: download-stt-model download-streaming-stt-model
-    nix-shell --run "cargo watch -q -c -w crates/rpg_vox/src -w crates/rpg_vox/Cargo.toml -x 'run -p rpg_vox -- {{ARGS}}'"
+    #!/usr/bin/env bash
+    set -euo pipefail
+    trap 'kill $(jobs -p) 2>/dev/null || true' EXIT INT TERM
+    nix-shell --run "cargo watch -q -c -w crates/rpg_vox/src -w crates/rpg_vox/Cargo.toml -x 'run -p rpg_vox -- {{ARGS}}'" &
+    nix-shell --run "cd crates/rpg_vox/web && pnpm install && pnpm run dev" &
+    wait -n
 
 # Serve the Svelte SPA via Vite on http://127.0.0.1:5173 with hot reload;
 # API requests (/say, /chat, /settings, /pw/*, /healthz, /workflows,
