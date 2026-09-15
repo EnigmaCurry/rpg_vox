@@ -67,6 +67,16 @@ pub const PARAGRAPH_GAP_MS: u64 = 6_000;
 /// paragraph-block width.
 pub const PARAGRAPH_SOFT_MAX_WORDS: usize = 400;
 
+/// Hard cap on paragraph length (in words). Once a paragraph exceeds
+/// this on the next clip finalize, it force-closes regardless of
+/// whether a natural boundary (silence-close, pass-3 punctuation) was
+/// available. Prevents non-stop-speech scenarios (McKenna monologue
+/// where every clip is a VAD max-length rollover with no perceptible
+/// pauses) from producing endless single-block paragraphs. Set at 2×
+/// the soft cap so the preferred natural-boundary path still gets
+/// several clips' worth of headroom before the hard fallback fires.
+pub const PARAGRAPH_HARD_MAX_WORDS: usize = 800;
+
 /// Longest single named recording we buffer in RAM before force-closing it.
 /// 30 min at 48 kHz stereo f32 ≈ 690 MB — big but survivable, and past that
 /// the operator almost certainly forgot to stop.
@@ -1486,6 +1496,65 @@ impl RecordState {
         let harden_prev = new_paragraph.is_some() && !recording && !self.llm_when_idle();
         if harden_prev {
             harden_prev_paragraph(&mut *g, ChannelKind::Vox(slot));
+        }
+        // Second, independent soft-cap trigger: VAD silence-close (a
+        // real user pause, not a max-length rollover) at word count ≥
+        // `PARAGRAPH_SOFT_MAX_WORDS`. This fires regardless of whether
+        // pass 3 has run. In non-stop-speech mode the pass-3 window
+        // often exceeds the audio-span budget and skips — leaving the
+        // pass-3-based soft-cap dormant. This one uses a signal that
+        // doesn't need pass 3: the clip's own duration. Anything
+        // strictly under `VAD_MAX_UTTERANCE_MS` came from VAD's
+        // silence-end trigger (user paused ≥ VAD_SILENCE_END_MS),
+        // which is a natural sentence boundary in practice. Skips
+        // LLM-authored paragraphs (`pass4_ran`) — LLM owns structural
+        // breaks there. Only meaningful for the paragraph the current
+        // clip just landed in; that's `paragraph_id`.
+        let silence_closed = audio_duration_ms
+            .map(|d| d < VAD_MAX_UTTERANCE_MS as u64)
+            .unwrap_or(true);
+        // Two-tier soft-cap: at the soft threshold, only close on a
+        // natural boundary (silence-close). At the hard threshold,
+        // force-close regardless — this handles non-stop-speech where
+        // no silence-close ever fires (VAD keeps hitting max-length
+        // rollovers with no perceptible pauses).
+        let mark_paragraph_closed = |g_inner: &mut Inner, log_reason: &str| {
+            if let Some(ch) = g_inner
+                .channels
+                .iter_mut()
+                .find(|c| c.kind == ChannelKind::Vox(slot))
+            {
+                if let Some(p) = ch.paragraphs.iter_mut().find(|p| p.id == paragraph_id) {
+                    if !p.pass4_ran && !p.closed {
+                        p.closed = true;
+                        debug!(
+                            paragraph = %paragraph_id,
+                            words = count_words(&p.text),
+                            reason = log_reason,
+                            "soft-cap: paragraph closed"
+                        );
+                    }
+                }
+            }
+            if let Some(active) = g_inner.active.as_mut() {
+                if let Some(p) = active.paragraphs.iter_mut().find(|p| p.id == paragraph_id) {
+                    if !p.pass4_ran && !p.closed {
+                        p.closed = true;
+                    }
+                }
+            }
+        };
+        let cur_words = g
+            .channels
+            .iter()
+            .find(|c| c.kind == ChannelKind::Vox(slot))
+            .and_then(|c| c.paragraphs.iter().find(|p| p.id == paragraph_id))
+            .map(|p| count_words(&p.text))
+            .unwrap_or(0);
+        if cur_words >= PARAGRAPH_HARD_MAX_WORDS {
+            mark_paragraph_closed(&mut *g, "hard-cap");
+        } else if silence_closed && cur_words >= PARAGRAPH_SOFT_MAX_WORDS {
+            mark_paragraph_closed(&mut *g, "silence-close");
         }
         drop(g);
         // Snapshot whether a fresh paragraph was opened (which happens
