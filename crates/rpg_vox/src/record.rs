@@ -1150,6 +1150,13 @@ impl RecordState {
             slot_cursors: vec![None; slot_count],
             _mixed_task: MixedWorkerGuard(handle.abort_handle()),
         });
+        // Recording started → clear the ephemeral live-pane paragraphs
+        // so the operator has a clean slate. Anything spoken from now
+        // on lands in the fresh active bucket and the (now-empty)
+        // channel logs in lockstep.
+        for ch in g.channels.iter_mut() {
+            ch.paragraphs.clear();
+        }
         drop(g);
         let _ = self.subtitles.send(SubtitleEvent::RecordingActive(true));
         Ok(id)
@@ -1202,6 +1209,14 @@ impl RecordState {
             for (clip, mixed) in paragraph.clips.iter_mut().zip(clip_stamps) {
                 clip.mixed_start_ms = mixed;
             }
+        }
+        // Recording finished → clear the ephemeral live-pane buffer.
+        // The saved recording carries its own paragraph list to disk;
+        // the per-channel logs would otherwise linger showing stale
+        // paragraphs across sessions. Deliberately after we've drained
+        // `active` so the returned `TakenRecording` is intact.
+        for ch in g.channels.iter_mut() {
+            ch.paragraphs.clear();
         }
         Some(TakenRecording {
             id: active.id,
@@ -1358,6 +1373,16 @@ impl RecordState {
             mirror_upsert_into_active(active, &paragraph_id, &upserted_clip, &new_paragraph);
         }
         let recording = g.active.is_some();
+        // Live-buffer + LLM-off: no further pass-4 work is planned for
+        // the previous paragraph on this channel, so treat the moment
+        // it closes (silence >6 s → new paragraph opens) as terminal.
+        // Flip it to `hardened` so the UI's state dot goes grey. During
+        // a named recording the LLM runs regardless of the toggle;
+        // hardening is its job in that mode.
+        let harden_prev = new_paragraph.is_some() && !recording && !self.llm_when_idle();
+        if harden_prev {
+            harden_prev_paragraph(&mut *g, ChannelKind::Vox(slot));
+        }
         drop(g);
         if recording {
             if let Some(p) = new_paragraph {
@@ -1419,6 +1444,14 @@ impl RecordState {
             mirror_upsert_into_active(active, &paragraph_id, &finalized_clip, &new_paragraph);
         }
         let recording = g.active.is_some();
+        // Live-buffer + LLM-off: harden the previous paragraph on this
+        // channel now that a new one has opened. Rationale in
+        // `upsert_provisional_clip` above. Under the same lock so the
+        // UI's next poll observes a coherent state.
+        let harden_prev = new_paragraph.is_some() && !recording && !self.llm_when_idle();
+        if harden_prev {
+            harden_prev_paragraph(&mut *g, ChannelKind::Vox(slot));
+        }
         drop(g);
         // Snapshot whether a fresh paragraph was opened (which happens
         // only when the prior paragraph's last clip was > PARAGRAPH_GAP_MS
@@ -2133,8 +2166,20 @@ fn upsert_clip_into_channel(
     // First: if the clip id already exists in any paragraph on this
     // channel, mutate in place. This is the streaming-partial → final
     // handoff plus the pass-1 partial-growth case.
+    //
+    // Guard: once a clip has been finalized (`provisional=false` — set
+    // by `finalize_clip`), any subsequent provisional update is a stale
+    // partial. This happens when the streaming decoder's mpsc still has
+    // queued `Feed` commands for a clip whose offline SenseVoice
+    // decode won the race and already landed `finalize_clip`. Ignoring
+    // stale partials keeps the polished text and the state indicator
+    // from regressing back to "streaming".
     for paragraph in ch.paragraphs.iter_mut() {
         if let Some(clip) = paragraph.clips.iter_mut().find(|c| c.id == clip_id) {
+            if provisional && !clip.provisional {
+                let unchanged = clip.clone();
+                return (None, unchanged, paragraph.id.clone());
+            }
             clip.text = text.to_string();
             clip.audio_start_ms = audio_start_ms;
             clip.audio_duration_ms = audio_duration_ms;
@@ -2243,6 +2288,27 @@ fn mirror_upsert_into_active(
         paragraph.rebuild();
         return;
     }
+}
+
+/// Mark the second-to-last paragraph on the given Vox channel as
+/// hardened. Called from `upsert_provisional_clip` /
+/// `finalize_clip` when a new paragraph has just been pushed and the
+/// operator is in live-buffer + LLM-off mode: the just-closed
+/// paragraph won't see any more processing, so surface that finality
+/// via the UI's state dot.
+///
+/// No-op when the channel has fewer than two paragraphs (nothing to
+/// harden yet). We don't mirror into `active` here — this path only
+/// runs when `!is_recording()`, so `active` is `None` by construction.
+fn harden_prev_paragraph(inner: &mut Inner, kind: ChannelKind) {
+    let Some(ch) = inner.channel_mut(kind) else {
+        return;
+    };
+    let n = ch.paragraphs.len();
+    if n < 2 {
+        return;
+    }
+    ch.paragraphs[n - 2].hardened = true;
 }
 
 /// Known SenseVoice single-word false-positive outputs. When the model

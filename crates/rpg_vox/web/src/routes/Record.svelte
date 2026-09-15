@@ -1061,10 +1061,15 @@
   // boolean (returned as .inflight below) so any state can pulse when
   // background work is touching this block.
   function paragraphState(p) {
-    if ((p.clips ?? []).some((c) => c.provisional)) return 'streaming';
+    const clips = p.clips ?? [];
+    if (clips.some((c) => c.provisional)) return 'streaming';
     if (p.hardened) return 'hardened';
     if (p.pass4_ran) return 'reorganized';
-    if (p.pass3_ran) return 'condensed';
+    // Pass 3 requires 2+ finalized clips (nothing to reconsolidate on
+    // a single clip). A single-clip paragraph is terminal by
+    // construction — display it as condensed to match multi-clip
+    // paragraphs that went through pass 3.
+    if (p.pass3_ran || clips.length === 1) return 'condensed';
     return 'finalized';
   }
   function paragraphInflight(p) {

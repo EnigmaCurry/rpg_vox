@@ -72,7 +72,7 @@ impl Client {
         system_prompt_override: Option<String>,
     ) -> Result<String> {
         let messages = self.build_messages(&history, system_prompt_override.as_deref());
-        let raw = self.completion(&messages, None).await?;
+        let raw = self.completion(&messages, None, None).await?;
         debug!(bytes = raw.len(), raw = %raw, "chat completion raw content");
         // OpenAI Harmony-format models (gpt-oss and its finetunes like
         // Muse-Glimmer) reply on channels: `to=self<|message|>…<|eom|>`
@@ -101,6 +101,12 @@ impl Client {
     /// (grammar-constrained decoding). `disable_thinking` is passed
     /// through as configured — the caller may want reasoning + JSON.
     ///
+    /// `max_tokens` overrides the client's configured cap for just this
+    /// call. Structured-output responses (e.g. an array of paragraph
+    /// objects) commonly need more headroom than a single-turn reply,
+    /// and callers who know they're emitting long JSON should pass a
+    /// higher value here rather than raising the global CLI flag.
+    ///
     /// Returns the parsed JSON value on success; on JSON parse failure
     /// includes the raw content (truncated to 400 chars) in the error.
     pub async fn generate_reply_json(
@@ -108,6 +114,7 @@ impl Client {
         history: Vec<ChatMessage>,
         system_prompt_override: Option<String>,
         json_schema: Value,
+        max_tokens: Option<u32>,
     ) -> Result<Value> {
         let messages = self.build_messages(&history, system_prompt_override.as_deref());
         let response_format = serde_json::json!({
@@ -118,7 +125,9 @@ impl Client {
                 "schema": json_schema,
             }
         });
-        let raw = self.completion(&messages, Some(response_format)).await?;
+        let raw = self
+            .completion(&messages, Some(response_format), max_tokens)
+            .await?;
         debug!(bytes = raw.len(), raw = %raw, "chat json completion raw content");
         let base = extract_harmony_user_reply(&raw).unwrap_or_else(|| raw.clone());
         let cleaned = strip_thinking(&base).trim().to_string();
@@ -180,15 +189,17 @@ impl Client {
         &self,
         messages: &[ChatMessage],
         response_format: Option<Value>,
+        max_tokens_override: Option<u32>,
     ) -> Result<String> {
         let url = format!(
             "{}/chat/completions",
             self.cfg.base_url.trim_end_matches('/')
         );
+        let max_tokens = max_tokens_override.unwrap_or(self.cfg.max_tokens);
         let mut body = serde_json::json!({
             "model": self.cfg.model,
             "messages": messages,
-            "max_tokens": self.cfg.max_tokens,
+            "max_tokens": max_tokens,
             "stream": false,
         });
         if self.cfg.disable_thinking {
@@ -254,6 +265,28 @@ impl Client {
                      (finish_reason=length). Raise --chat-max-tokens \
                      (currently {}) or shorten the system prompt.",
                     self.cfg.max_tokens
+                ));
+            }
+        } else {
+            // Content is non-empty but may still have been truncated
+            // mid-reply. Surface `finish_reason=length` as a hard
+            // error so downstream JSON / TTS parsing doesn't fail with
+            // a cryptic message. The operator's fix is the same: raise
+            // the cap. `max_tokens` is the value actually sent for
+            // this call (may be a per-call override, not the config
+            // default).
+            let finish = v
+                .pointer("/choices/0/finish_reason")
+                .and_then(|c| c.as_str())
+                .unwrap_or("");
+            if finish == "length" {
+                return Err(anyhow!(
+                    "LLM response was truncated mid-reply \
+                     (finish_reason=length, max_tokens={}). \
+                     Raise --chat-max-tokens for the CLI, or the \
+                     per-call cap in the caller (paragraph scheduler \
+                     uses paragraph::LLM_MAX_TOKENS).",
+                    max_tokens
                 ));
             }
         }

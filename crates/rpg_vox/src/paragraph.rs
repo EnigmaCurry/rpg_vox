@@ -51,6 +51,15 @@ pub const LLM_WORD_TRIGGER: u32 = 40;
 /// Total wall-clock duration (ms) of unassigned-to-hot material that
 /// triggers an LLM call.
 pub const LLM_AUDIO_TRIGGER_MS: u64 = 15_000;
+/// Per-call token cap for pass-4 responses. The LLM emits a JSON
+/// array of paragraph objects (up to 4 in the "grew" case) — each
+/// object carries a paragraph's full prose plus its `end_clip` UUID.
+/// A single ~200-word paragraph is roughly 300 tokens; four of them
+/// plus JSON scaffolding and any Harmony wrappers the model may emit
+/// runs well past the default `chat_max_tokens=2048`. Give the pass-4
+/// path its own headroom so truncated responses (finish_reason=length,
+/// mid-string JSON) don't kill the cycle.
+pub const LLM_MAX_TOKENS: u32 = 6_144;
 
 /// One trigger fired by `finalize_clip` (or by a silence-gap paragraph
 /// close) at the per-channel scheduler task. `Wake` says "consider
@@ -286,7 +295,12 @@ async fn run_once(
 
     // First attempt.
     let attempt = chat
-        .generate_reply_json(history.clone(), Some(SYSTEM_PROMPT.into()), schema.clone())
+        .generate_reply_json(
+            history.clone(),
+            Some(SYSTEM_PROMPT.into()),
+            schema.clone(),
+            Some(LLM_MAX_TOKENS),
+        )
         .await;
     let output_paragraphs = match parse_and_validate(attempt, &snapshot) {
         Ok(paragraphs) => paragraphs,
@@ -299,7 +313,12 @@ async fn run_once(
                  Return a valid JSON array matching the schema."
             );
             let retry = chat
-                .generate_reply_json(history, Some(addendum), response_schema())
+                .generate_reply_json(
+                    history,
+                    Some(addendum),
+                    response_schema(),
+                    Some(LLM_MAX_TOKENS),
+                )
                 .await;
             match parse_and_validate(retry, &snapshot) {
                 Ok(paragraphs) => paragraphs,
