@@ -777,6 +777,7 @@ fn apply_diff(
             pass3_ran,
             pass4_ran: true,
             pass3_inflight: false,
+            closed: false,
         });
         prev_cut = Some(cut);
     }
@@ -823,6 +824,7 @@ mod tests {
                 provisional: false,
                 audio_url: None,
                 mixed_start_ms: None,
+                pass3_ran: false,
             })
             .collect();
         let start = clips.first().map(|c| c.start_wall_ms).unwrap_or(0);
@@ -844,6 +846,7 @@ mod tests {
             pass3_ran: false,
             pass4_ran: false,
             pass3_inflight: false,
+            closed: false,
         }
     }
 

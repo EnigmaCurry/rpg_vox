@@ -50,6 +50,23 @@ use crate::stt::{StreamingSession, StreamingSttHandle, SttHandle};
 /// the growing one.
 pub const PARAGRAPH_GAP_MS: u64 = 6_000;
 
+/// Soft cap on paragraph length (in words). Once a paragraph exceeds
+/// this AND its most recent clip ends on a sentence-terminating
+/// punctuation mark, the next clip on the channel opens a fresh
+/// paragraph. Prevents runaway "one giant block" paragraphs during
+/// non-stop speech (McKenna case). The cut is always between clips,
+/// so the new paragraph's `start_wall_ms` is the exact timestamp of
+/// its first clip — no timing guesswork. If the most recent clip
+/// doesn't end on a sentence marker (SenseVoice occasionally omits
+/// punctuation), the paragraph keeps growing until a punctuated clip
+/// lands. Absolutely no mid-clip cuts.
+///
+/// Tuned for "long dense paragraphs, but not off-the-page long" —
+/// ~400 words is ~2-3 minutes of continuous speech and reads as a
+/// full screen of prose without vertical overflow at the current
+/// paragraph-block width.
+pub const PARAGRAPH_SOFT_MAX_WORDS: usize = 400;
+
 /// Longest single named recording we buffer in RAM before force-closing it.
 /// 30 min at 48 kHz stereo f32 ≈ 690 MB — big but survivable, and past that
 /// the operator almost certainly forgot to stop.
@@ -174,6 +191,15 @@ pub struct ClipRef {
     pub audio_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mixed_start_ms: Option<u64>,
+    /// True once this specific clip's text has been rewritten by pass 3
+    /// (boundary re-transcription of a rolling multi-clip window through
+    /// SenseVoice). Read by the paragraph soft-cap check so we only cut
+    /// a paragraph at a clip whose trailing punctuation reflects a real
+    /// sentence end, not the fake period SenseVoice always tacks onto
+    /// its per-clip decodes. Preserved across LLM diff cycles since the
+    /// LLM only rewrites paragraph text, not per-clip text.
+    #[serde(default)]
+    pub pass3_ran: bool,
 }
 
 /// A run of same-channel clips grouped by silence-gap. Stage 1 keeps
@@ -208,6 +234,15 @@ pub struct Paragraph {
     /// for this paragraph. Cleared on completion or abort. Not persisted.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub pass3_inflight: bool,
+    /// Soft-cap boundary marker. Set by the pass-3 completion path when
+    /// a paragraph exceeds `PARAGRAPH_SOFT_MAX_WORDS` AND its most
+    /// recent pass-3-authored clip ends on a sentence-terminating
+    /// punctuation mark. The next clip arriving on the channel treats
+    /// this like a silence-gap break and opens a fresh paragraph, even
+    /// though no real silence occurred. Prevents runaway one-block
+    /// paragraphs on non-stop speech without touching clip timing.
+    #[serde(default)]
+    pub closed: bool,
 }
 
 impl Paragraph {
@@ -1552,6 +1587,11 @@ impl RecordState {
             provisional: false,
             audio_url,
             mixed_start_ms: None,
+            // TTS text is authoritative — no re-transcription happens,
+            // but the punctuation is already real. Mark pass3_ran=true
+            // so the paragraph soft-cap treats TTS trailing punctuation
+            // as reliable.
+            pass3_ran: true,
         };
         let speaker = voice_label.and_then(|s| {
             let t = s.trim().to_string();
@@ -1575,6 +1615,7 @@ impl RecordState {
             pass3_ran: true,
             pass4_ran: true,
             pass3_inflight: false,
+            closed: false,
         };
         let mut g = self.inner.lock().expect("record state mutex poisoned");
         if let Some(ch) = g.channel_mut(ChannelKind::Tts) {
@@ -1849,31 +1890,19 @@ impl RecordState {
                 return;
             };
             let paragraph = &g.channels[ci].paragraphs[pi];
-            // Skip paragraphs whose clips are all still provisional or
-            // that have fewer than 2 finalized clips — nothing to
-            // reconsolidate.
-            let finalized_count = paragraph.clips.iter().filter(|c| !c.provisional).count();
-            if finalized_count < 2 {
-                return;
-            }
-            // Take the last N clips (N=3) that have a known duration.
-            // Then trim from the oldest until total duration ≤
-            // BOUNDARY_MAX_WINDOW_MS.
-            let all_clips: Vec<&ClipRef> = paragraph
+            // Collect this paragraph's finalized clips with known
+            // duration, tagged with the owning paragraph id. Take the
+            // most recent up to N=3.
+            let mut window: Vec<(String, String, u64, u64, String, bool)> = paragraph
                 .clips
                 .iter()
                 .filter(|c| c.audio_duration_ms.is_some())
-                .collect();
-            if all_clips.len() < 2 {
-                return;
-            }
-            let take = all_clips.len().min(3);
-            let mut window: Vec<(String, u64, u64, String, bool)> = all_clips
-                [all_clips.len() - take..]
-                .iter()
+                .rev()
+                .take(3)
                 .map(|c| {
                     (
                         c.id.clone(),
+                        paragraph.id.clone(),
                         c.start_wall_ms,
                         c.audio_duration_ms.unwrap_or(0),
                         c.text.clone(),
@@ -1881,20 +1910,100 @@ impl RecordState {
                     )
                 })
                 .collect();
-            // Any provisional in the window? Skip — a fresh pass 2 is
-            // still landing, its update will schedule us again.
-            if window.iter().any(|(_, _, _, _, prov)| *prov) {
+            window.reverse();
+            // Cross-paragraph borrow: when the current paragraph is
+            // short (typically because a soft-cap close just opened it
+            // with its first clip), reach back into the PREVIOUS
+            // paragraph on the same channel and pull its last
+            // finalized clip into the window. This lets pass 3
+            // re-transcribe across the paragraph seam and fix the
+            // classic mid-sentence split ("just a little peace." /
+            // "Mine would be…" → "…just a little peace of mind would
+            // be…"). Only borrow when:
+            //   (a) the current paragraph has fewer than 2 clips (so
+            //       pass 3 wouldn't otherwise run), and
+            //   (b) the resulting WALL-CLOCK audio span fits inside
+            //       `BOUNDARY_MAX_WINDOW_MS`. The span includes any
+            //       silence between the borrowed clip and the current
+            //       one; feeding SenseVoice 25+ seconds of audio
+            //       degrades quickly and can DROP content entirely
+            //       (visible to the operator as "words being eaten"
+            //       across the seam). If the seam is too wide, skip
+            //       the borrow — the paragraphs will keep their
+            //       per-clip pass-2 text at the boundary, which is
+            //       just the pre-fix "seam mistranscription" behavior.
+            if window.len() < 2 {
+                if let Some(prev_idx) = pi.checked_sub(1) {
+                    if let Some(prev_p) = g.channels[ci].paragraphs.get(prev_idx) {
+                        if let Some(prev_last) = prev_p
+                            .clips
+                            .iter()
+                            .rev()
+                            .find(|c| c.audio_duration_ms.is_some() && !c.provisional)
+                        {
+                            let cur_end = window
+                                .last()
+                                .map(|(_, _, s, d, _, _)| s.saturating_add(*d))
+                                .unwrap_or(0);
+                            let span = cur_end.saturating_sub(prev_last.start_wall_ms);
+                            if span <= BOUNDARY_MAX_WINDOW_MS {
+                                window.insert(
+                                    0,
+                                    (
+                                        prev_last.id.clone(),
+                                        prev_p.id.clone(),
+                                        prev_last.start_wall_ms,
+                                        prev_last.audio_duration_ms.unwrap_or(0),
+                                        prev_last.text.clone(),
+                                        false,
+                                    ),
+                                );
+                            } else {
+                                debug!(
+                                    paragraph = %paragraph_id,
+                                    span_ms = span,
+                                    limit_ms = BOUNDARY_MAX_WINDOW_MS,
+                                    "pass3: cross-paragraph borrow declined (audio span too long)"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            // Still not enough context? Nothing to reconsolidate.
+            if window.len() < 2 {
                 return;
             }
-            // Trim from oldest until total ≤ BOUNDARY_MAX_WINDOW_MS.
-            while window.len() > 2 {
-                let total: u64 = window.iter().map(|(_, _, d, _, _)| *d).sum();
-                if total <= BOUNDARY_MAX_WINDOW_MS {
-                    break;
-                }
+            // Any provisional in the window? Skip — a fresh pass 2 is
+            // still landing, its update will schedule us again.
+            if window.iter().any(|(_, _, _, _, _, prov)| *prov) {
+                return;
+            }
+            // Trim from oldest until the WALL-CLOCK audio span fits
+            // inside `BOUNDARY_MAX_WINDOW_MS`. Using wall span (not the
+            // sum of clip durations) accounts for silence between
+            // clips — feeding SenseVoice more than ~25 s of audio can
+            // degrade the decode and drop content. Never trim past a
+            // 2-clip minimum; if a 2-clip window still exceeds the
+            // budget, abort rather than emit a garbage split.
+            let window_span = |w: &Vec<(String, String, u64, u64, String, bool)>| -> u64 {
+                let Some(first) = w.first() else { return 0 };
+                let Some(last) = w.last() else { return 0 };
+                last.2.saturating_add(last.3).saturating_sub(first.2)
+            };
+            while window.len() > 2 && window_span(&window) > BOUNDARY_MAX_WINDOW_MS {
                 window.remove(0);
             }
-            let total: u64 = window.iter().map(|(_, _, d, _, _)| *d).sum();
+            if window_span(&window) > BOUNDARY_MAX_WINDOW_MS {
+                debug!(
+                    paragraph = %paragraph_id,
+                    span_ms = window_span(&window),
+                    limit_ms = BOUNDARY_MAX_WINDOW_MS,
+                    "pass3: window audio span exceeds budget after trimming — skipping"
+                );
+                return;
+            }
+            let total: u64 = window.iter().map(|(_, _, _, d, _, _)| *d).sum();
             if total == 0 {
                 return;
             }
@@ -1907,10 +2016,10 @@ impl RecordState {
             }
             g.boundary_last_fire_ms.insert(paragraph_id.clone(), now_ms);
             // Compute wall range: [first.start_wall_ms, last.start_wall_ms + last.duration_ms].
-            let range_start = window.first().map(|w| w.1).unwrap_or(0);
+            let range_start = window.first().map(|w| w.2).unwrap_or(0);
             let range_end = window
                 .last()
-                .map(|(_, s, d, _, _)| s.saturating_add(*d))
+                .map(|(_, _, s, d, _, _)| s.saturating_add(*d))
                 .unwrap_or(0);
             // Fetch samples now — the ring lives on the same lock, so
             // grabbing them here keeps the async task purely CPU-bound.
@@ -1954,13 +2063,16 @@ impl RecordState {
             // Proportional split: assign per-clip text ranges from the
             // returned string based on each clip's duration ratio,
             // snapping cut points to the nearest whitespace.
-            let clip_ids: Vec<String> = window.iter().map(|(id, _, _, _, _)| id.clone()).collect();
-            let durations: Vec<u64> = window.iter().map(|(_, _, d, _, _)| *d).collect();
+            let clip_refs: Vec<(String, String)> = window
+                .iter()
+                .map(|(cid, pid, _, _, _, _)| (cid.clone(), pid.clone()))
+                .collect();
+            let durations: Vec<u64> = window.iter().map(|(_, _, _, d, _, _)| *d).collect();
             let split_texts = split_boundary_text(&text, &durations);
-            let clip_count = clip_ids.len();
+            let clip_count = clip_refs.len();
             // Reacquire lock + re-validate.
             let mut g = state.inner.lock().expect("record state mutex poisoned");
-            // Locate paragraph again — may have moved.
+            // Locate the trigger paragraph — may have moved.
             let mut hit: Option<(usize, usize)> = None;
             for (ci, ch) in g.channels.iter().enumerate() {
                 if let Some(pi) = ch
@@ -1977,61 +2089,128 @@ impl RecordState {
                     paragraph = %paragraph_id_for_task,
                     "pass3: paragraph gone during decode — discarded"
                 );
-                // No paragraph to clear inflight on; drop the lock and
-                // return. (If a same-id paragraph got recreated in the
-                // meantime, its new inflight flag started fresh at
-                // false, so nothing to do here.)
                 return;
             };
-            // Every clip must still exist and be non-provisional.
-            {
-                let paragraph = &g.channels[ci].paragraphs[pi];
-                let ok = clip_ids.iter().all(|cid| {
-                    paragraph
-                        .clips
-                        .iter()
-                        .any(|c| c.id == *cid && !c.provisional)
-                });
-                if !ok {
-                    debug!(
-                        paragraph = %paragraph_id_for_task,
-                        "pass3: clip set changed during decode — discarded"
-                    );
-                    g.channels[ci].paragraphs[pi].pass3_inflight = false;
-                    return;
-                }
+            // Every clip must still exist and be non-provisional in
+            // its expected paragraph. Cross-paragraph windows count too.
+            let clips_still_valid = clip_refs.iter().all(|(cid, pid)| {
+                g.channels[ci]
+                    .paragraphs
+                    .iter()
+                    .any(|p| {
+                        p.id == *pid
+                            && p.clips.iter().any(|c| c.id == *cid && !c.provisional)
+                    })
+            });
+            if !clips_still_valid {
+                debug!(
+                    paragraph = %paragraph_id_for_task,
+                    "pass3: clip set changed during decode — discarded"
+                );
+                g.channels[ci].paragraphs[pi].pass3_inflight = false;
+                return;
             }
-            // Apply the split.
-            let mut updated_clips: Vec<ClipRef> = Vec::with_capacity(clip_count);
+            // Apply the split. Walk each clip ref, find its paragraph,
+            // update the clip's text + pass3_ran, and rebuild any
+            // paragraph touched (there can be up to two: the current
+            // one plus the previous one via cross-paragraph borrow).
+            let mut updated_clips: Vec<(String, ClipRef)> = Vec::with_capacity(clip_count);
+            let mut touched_paragraph_ids: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
             let paragraph_snapshot: Option<Paragraph>;
             {
-                let paragraph = &mut g.channels[ci].paragraphs[pi];
-                for (cid, new_text) in clip_ids.iter().zip(split_texts.iter()) {
-                    if let Some(clip) = paragraph.clips.iter_mut().find(|c| c.id == *cid) {
-                        clip.text = new_text.clone();
-                        updated_clips.push(clip.clone());
+                for ((cid, pid), new_text) in clip_refs.iter().zip(split_texts.iter()) {
+                    if let Some(p) = g.channels[ci]
+                        .paragraphs
+                        .iter_mut()
+                        .find(|p| p.id == *pid)
+                    {
+                        if let Some(clip) = p.clips.iter_mut().find(|c| c.id == *cid) {
+                            clip.text = new_text.clone();
+                            clip.pass3_ran = true;
+                            updated_clips.push((pid.clone(), clip.clone()));
+                        }
+                        touched_paragraph_ids.insert(pid.clone());
                     }
                 }
-                paragraph.rebuild();
-                paragraph.pass3_ran = true;
+                // Rebuild every touched paragraph and evaluate the
+                // soft-cap only on the trigger paragraph (the one we
+                // were originally scheduled for). Previous paragraph
+                // was already closed; its text/end refresh is enough.
+                for p in g.channels[ci].paragraphs.iter_mut() {
+                    if touched_paragraph_ids.contains(&p.id) {
+                        p.rebuild();
+                        p.pass3_ran = true;
+                    }
+                }
+                let paragraph = &mut g.channels[ci].paragraphs[pi];
                 paragraph.pass3_inflight = false;
+                // Soft-cap evaluation. Runs on the pass-3-authored text
+                // (so trailing punctuation is real, not SenseVoice's
+                // per-clip fake period). Looks at the LAST clip that
+                // just got a pass-3 rewrite — if IT ends on a sentence
+                // and the paragraph is now big enough, mark the whole
+                // paragraph "closed" so the next incoming clip opens a
+                // fresh one. Skipped for LLM-authored paragraphs
+                // (`pass4_ran`) — the LLM owns structural breaks in
+                // that mode.
+                if !paragraph.pass4_ran
+                    && !paragraph.closed
+                    && count_words(&paragraph.text) >= PARAGRAPH_SOFT_MAX_WORDS
+                {
+                    let last_pass3_ends_sentence = paragraph
+                        .clips
+                        .iter()
+                        .rev()
+                        .find(|c| c.pass3_ran)
+                        .map(|c| ends_on_sentence(&c.text))
+                        .unwrap_or(false);
+                    if last_pass3_ends_sentence {
+                        paragraph.closed = true;
+                        debug!(
+                            paragraph = %paragraph_id_for_task,
+                            words = count_words(&paragraph.text),
+                            "pass3: soft-cap hit — paragraph marked closed"
+                        );
+                    }
+                }
                 paragraph_snapshot = Some(paragraph.clone());
             }
-            // Mirror into the active recording.
+            // Mirror into the active recording. Walk all touched
+            // paragraphs (may be more than one when we borrowed from
+            // the previous paragraph across a soft-cap boundary).
+            let mut active_snapshots: Vec<Paragraph> = Vec::new();
             if let Some(active) = g.active.as_mut() {
-                if let Some(mirror) = active
-                    .paragraphs
-                    .iter_mut()
-                    .find(|p| p.id == paragraph_id_for_task)
-                {
-                    for (cid, new_text) in clip_ids.iter().zip(split_texts.iter()) {
-                        if let Some(clip) = mirror.clips.iter_mut().find(|c| c.id == *cid) {
+                for ((cid, pid), new_text) in clip_refs.iter().zip(split_texts.iter()) {
+                    if let Some(mirror) = active
+                        .paragraphs
+                        .iter_mut()
+                        .find(|p| p.id == *pid)
+                    {
+                        if let Some(clip) =
+                            mirror.clips.iter_mut().find(|c| c.id == *cid)
+                        {
                             clip.text = new_text.clone();
+                            clip.pass3_ran = true;
                         }
                     }
-                    mirror.rebuild();
-                    mirror.pass3_ran = true;
-                    mirror.pass3_inflight = false;
+                }
+                for touched_pid in &touched_paragraph_ids {
+                    if let Some(mirror) = active
+                        .paragraphs
+                        .iter_mut()
+                        .find(|p| p.id == *touched_pid)
+                    {
+                        mirror.rebuild();
+                        mirror.pass3_ran = true;
+                        if touched_pid == &paragraph_id_for_task {
+                            mirror.pass3_inflight = false;
+                            if let Some(snap) = &paragraph_snapshot {
+                                mirror.closed = snap.closed;
+                            }
+                        }
+                        active_snapshots.push(mirror.clone());
+                    }
                 }
             }
             let recording = g.active.is_some();
@@ -2042,14 +2221,24 @@ impl RecordState {
                 "pass3: applied boundary re-transcription"
             );
             if recording {
-                for clip in updated_clips {
+                for (pid, clip) in updated_clips {
                     let _ = state.subtitles.send(SubtitleEvent::ClipUpsert {
-                        paragraph_id: paragraph_id_for_task.clone(),
+                        paragraph_id: pid,
                         clip,
                     });
                 }
                 if let Some(p) = paragraph_snapshot {
                     let _ = state.subtitles.send(SubtitleEvent::ParagraphUpsert(p));
+                }
+                // Also broadcast any OTHER touched paragraphs (the
+                // previous-paragraph cross-boundary case) so subscribers
+                // see the updated text on the previous block.
+                for snap in active_snapshots {
+                    if snap.id != paragraph_id_for_task {
+                        let _ = state
+                            .subtitles
+                            .send(SubtitleEvent::ParagraphUpsert(snap));
+                    }
                 }
             }
         });
@@ -2193,18 +2382,40 @@ fn upsert_clip_into_channel(
     // Otherwise: decide append vs new paragraph. New paragraph fires
     // when the channel is empty OR the previous paragraph's last clip
     // ended more than PARAGRAPH_GAP_MS before this new clip's start.
+    //
+    // Subtlety: on continuous speech that trips VAD's max-length
+    // (`VAD_MAX_UTTERANCE_MS`), the next clip's provisional partial can
+    // arrive BEFORE the previous clip's offline STT finalize task fills
+    // in `audio_duration_ms`. Naïvely treating a None duration as zero
+    // duration would make the gap look 15+ seconds long — and every
+    // max-length rollover would spuriously open a new paragraph mid-
+    // monologue. When the previous clip is still provisional, bound
+    // last_end conservatively by assuming the utterance ran up to its
+    // VAD max length. Real silence longer than PARAGRAPH_GAP_MS still
+    // opens a new paragraph (gap > VAD_MAX + PARAGRAPH_GAP_MS).
     let need_new = match ch.paragraphs.last() {
         None => true,
-        Some(last_p) => match last_p.clips.last() {
-            None => true,
-            Some(last_clip) => {
-                let last_end = last_clip
-                    .audio_duration_ms
-                    .map(|d| last_clip.start_wall_ms.saturating_add(d))
-                    .unwrap_or(last_clip.start_wall_ms);
-                start_wall_ms.saturating_sub(last_end) > PARAGRAPH_GAP_MS
+        Some(last_p) => {
+            if last_p.closed {
+                // Soft-cap was hit in the pass-3 completion path; treat
+                // any new clip on this channel as a fresh paragraph.
+                true
+            } else {
+                match last_p.clips.last() {
+                    None => true,
+                    Some(last_clip) => {
+                        let last_end = match last_clip.audio_duration_ms {
+                            Some(d) => last_clip.start_wall_ms.saturating_add(d),
+                            None if last_clip.provisional => last_clip
+                                .start_wall_ms
+                                .saturating_add(VAD_MAX_UTTERANCE_MS as u64),
+                            None => last_clip.start_wall_ms,
+                        };
+                        start_wall_ms.saturating_sub(last_end) > PARAGRAPH_GAP_MS
+                    }
+                }
             }
-        },
+        }
     };
     let clip = ClipRef {
         id: clip_id.to_string(),
@@ -2215,6 +2426,7 @@ fn upsert_clip_into_channel(
         provisional,
         audio_url: None,
         mixed_start_ms: None,
+        pass3_ran: false,
     };
     if need_new {
         // First-clip speaker attribution stays on the paragraph for its
@@ -2234,6 +2446,7 @@ fn upsert_clip_into_channel(
             pass3_ran: false,
             pass4_ran: false,
             pass3_inflight: false,
+            closed: false,
         };
         paragraph.rebuild();
         ch.paragraphs.push(paragraph.clone());
@@ -2323,6 +2536,27 @@ fn harden_prev_paragraph(inner: &mut Inner, kind: ChannelKind) {
 /// of marginal segments; those are dropped by a length heuristic when
 /// the text is a single "word" (no whitespace) with no Latin letters
 /// and at most two script characters.
+/// Count whitespace-separated words in `text`. Used by the paragraph
+/// soft-cap check to decide when a paragraph is big enough that a
+/// sentence-boundary break would improve readability. Cheap linear
+/// scan; the soft-cap runs at most once per clip finalize.
+fn count_words(text: &str) -> usize {
+    text.split_whitespace().count()
+}
+
+/// True when `text`'s last non-whitespace character is a
+/// sentence-terminating punctuation mark. Handles the standard ASCII
+/// set (`.`, `!`, `?`) plus the fullwidth CJK equivalents SenseVoice
+/// emits on Chinese / Japanese output. Used by the paragraph soft-cap
+/// to only cut at real sentence ends after pass 3 has consolidated
+/// the trailing clip.
+fn ends_on_sentence(text: &str) -> bool {
+    matches!(
+        text.trim_end().chars().last(),
+        Some('.' | '!' | '?' | '。' | '！' | '？'),
+    )
+}
+
 fn is_false_positive(text: &str) -> bool {
     let trimmed = text.trim();
     if matches!(trimmed, "I." | "The.") {
