@@ -8,13 +8,23 @@
 //!
 //! Two modes, controlled by [`RecordState`]:
 //!
-//! * **Not Recording** — every utterance is appended to a rolling in-memory
-//!   buffer capped at [`BUFFER_MAX_BYTES`]. Oldest entries are dropped FIFO
-//!   when the cap is exceeded, so the buffer never grows unbounded.
+//! * **Not Recording** — every clip is appended to a rolling per-channel
+//!   paragraph log; each channel is capped at [`CHANNEL_PARAGRAPH_CAP`]
+//!   paragraphs and older paragraphs drop FIFO when the cap is exceeded.
 //! * **Recording** — a named "bucket" is created on `POST /record/recordings`.
-//!   Every subsequent utterance is written to both the rolling buffer AND
-//!   the active bucket, and every raw stereo audio chunk is also appended to
-//!   the bucket so the eventual `/stop` can persist a WAV + transcript.
+//!   Every subsequent clip is written to both the per-channel logs AND the
+//!   active bucket, and every raw stereo audio chunk is also appended to the
+//!   bucket so the eventual `/stop` can persist a WAV + paragraph JSON.
+//!
+//! Paragraph model (Stage 1 of the paragraph refactor):
+//!   * Each channel (one per Vox slot + one TTS pseudo-channel) has an
+//!     ordered `Vec<Paragraph>`. A paragraph is a growing run of
+//!     [`ClipRef`]s that were captured on the same channel within
+//!     [`PARAGRAPH_GAP_MS`] of each other. Once the gap between a new clip
+//!     and the previous clip's end exceeds that threshold a new paragraph
+//!     opens.
+//!   * `Paragraph.text` is a naïve space-join of its clips' texts (Stage
+//!     1 has no LLM reorganization — pass 3 + pass 4 land in later stages).
 //!
 //! When STT is disabled at startup no worker spawns and no transcripts land;
 //! the record HTTP endpoints still work (the UI stays empty) so future
@@ -32,16 +42,21 @@ use uuid::Uuid;
 use crate::mixer::AtomicMixer;
 use crate::stt::{StreamingSession, StreamingSttHandle, SttHandle};
 
-/// Hard cap on the rolling Not-Recording buffer. Old entries drop FIFO when
-/// the running total of `entry.text.len()` exceeds this. 50 KB ≈ a few
-/// minutes of steady talking — plenty of scrollback without leaking RAM if
-/// the app is left running for hours.
-pub const BUFFER_MAX_BYTES: usize = 50 * 1024;
+/// Silence gap (ms) that forces a paragraph break on a given channel. A
+/// new clip whose start is more than this far past the previous clip's end
+/// (on the same channel) starts a fresh paragraph instead of appending to
+/// the growing one.
+pub const PARAGRAPH_GAP_MS: u64 = 6_000;
 
 /// Longest single named recording we buffer in RAM before force-closing it.
 /// 30 min at 48 kHz stereo f32 ≈ 690 MB — big but survivable, and past that
 /// the operator almost certainly forgot to stop.
 const RECORDING_MAX_FRAMES: usize = 48_000 * 60 * 30;
+
+/// Cap on paragraphs kept per channel outside of a named recording. Older
+/// paragraphs drop FIFO when this is exceeded so the rolling per-channel
+/// log can't grow unbounded across a long-running session.
+const CHANNEL_PARAGRAPH_CAP: usize = 200;
 
 /// RMS floor for the mixed-mic gate. Below this the chunk is treated as
 /// silence and may be trimmed out of the recorded mixed track (subject
@@ -99,6 +114,11 @@ const HINT_LOOKUP_WINDOW: Duration = Duration::from_secs(5);
 /// speaking event fired on their side.
 const HINT_LOOKUP_FUTURE_SLOP: Duration = Duration::from_millis(500);
 
+/// Pseudo-channel name used for TTS paragraphs. Every TTS clip lands on
+/// this channel regardless of which voice profile spoke — the UI keys off
+/// it to render TTS separately from vox capture channels.
+pub const TTS_CHANNEL_NAME: &str = "TTS";
+
 /// One "who's talking" hint from an external source. `slot = None`
 /// means the hint applies to any Vox channel (caller doesn't know
 /// which one their audio lands on); `Some(i)` scopes it to that
@@ -110,80 +130,83 @@ pub struct SpeakerHint {
     pub received_at: Instant,
 }
 
-/// One transcript row. `text` is whatever the recognizer produced (empty
-/// utterances are dropped upstream so this is always non-empty at write
-/// time — but stored `String` for later editability without a rebuild).
-///
-/// `channel` is the human-readable name of the audio channel this
-/// utterance came from — snapshot at capture time so a later rename
-/// doesn't retroactively relabel historical entries.
-///
-/// `audio_start_ms` + `audio_duration_ms` are only populated when the
-/// utterance was captured *during a named recording*. They index into the
-/// recording's audio timeline so the client can pull a WAV of the exact
-/// clip that produced the transcript (useful for confirming or correcting
-/// bad transcriptions).
+/// Which channel a [`Paragraph`] belongs to. `Vox(slot)` is a specific
+/// mixer capture slot; `Tts` is the TTS pseudo-channel that hosts every
+/// TTS playback as a single-clip paragraph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelKind {
+    Vox(usize),
+    Tts,
+}
+
+/// One clip (a VAD-closed utterance, or a TTS playback) inside a
+/// [`Paragraph`]. `text` is whatever the recognizer produced (or the TTS
+/// text for TTS clips). `provisional=true` while a streaming partial is
+/// still growing; flips to false when the offline SenseVoice final lands.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TranscriptEntry {
+pub struct ClipRef {
     pub id: String,
-    /// Unix epoch seconds. Used by the UI purely as a display timestamp.
-    pub created_at: i64,
-    pub text: String,
-    #[serde(default)]
-    pub channel: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_start_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_duration_ms: Option<u64>,
-    /// External audio URL (e.g. `/widgets/<id>`) for entries whose clip
-    /// isn't stored inline in the recording's own audio buffer — namely
-    /// TTS entries, whose audio came out through the mic feed rather
-    /// than the vox tap. When set, the client uses this as the audio
-    /// `<src>` directly and ignores `audio_start_ms` / `audio_duration_ms`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub audio_url: Option<String>,
-    /// Best-guess speaker identity, resolved from the recent hint ring
-    /// at utterance-finalize time (see [`RecordState::resolve_speaker`]).
-    /// Populated only for vox entries when a matching hint exists; TTS
-    /// entries and unmatched vox utterances leave this `None`. UI
-    /// renders it inline with the channel tag so a pre-mixed channel
-    /// still tells you who was talking.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub speaker: Option<String>,
-    /// Wall-clock unix milliseconds of when this utterance actually
-    /// **started** (as opposed to `created_at`, which is the finalize /
-    /// STT-decode moment). Populated for both vox (VAD-derived: end
-    /// minus duration) and TTS entries. Used as the sort key when
-    /// inserting into the transcript so a long clip whose STT decode
-    /// finishes after a short clip that started later still appears
-    /// above the short clip — matching the audible order rather than
-    /// the finalize order.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub start_wall_ms: Option<u64>,
-    /// Position of this entry's start in the *mixed* recording timeline
-    /// (silence-trimmed final mic feed). Distinct from `audio_start_ms`,
-    /// which is the position in the per-slot recording. Computed on the
-    /// fly for the active recording (via [`ActiveRecording::wall_to_mixed_ms`])
-    /// and stamped permanently on entries when the recording is stopped
-    /// and persisted. Used by the client's playhead animation when the
-    /// mixed track is the one playing.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mixed_start_ms: Option<u64>,
-    /// True while this entry is a live streaming-recognition partial and
-    /// the utterance hasn't been closed by VAD yet. Clients render
-    /// provisional entries with a dimmed / italic style so it's obvious
-    /// the text may still be revised. Cleared to `false` when the final
-    /// decode replaces the entry, and defaults to `false` for entries
-    /// pushed by legacy paths (offline SenseVoice finalize, TTS logs)
-    /// so nothing in the persisted history is silently marked
-    /// provisional after the fact.
+    pub start_wall_ms: u64,
+    pub text: String,
     #[serde(default)]
     pub provisional: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mixed_start_ms: Option<u64>,
+}
+
+/// A run of same-channel clips grouped by silence-gap. Stage 1 keeps
+/// `text` as a naive space-join of `clips[].text`; later stages will let
+/// the LLM reshape paragraph text. `hardened=false` for vox paragraphs
+/// throughout Stage 1 — paragraph hardening is a Stage 3 concern.
+/// TTS single-clip paragraphs are hardened immediately.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Paragraph {
+    pub id: String,
+    pub channel: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speaker: Option<String>,
+    pub hardened: bool,
+    pub text: String,
+    pub raw_text: String,
+    pub clips: Vec<ClipRef>,
+    pub start_wall_ms: u64,
+    pub end_wall_ms: u64,
+    pub created_at: i64,
+}
+
+impl Paragraph {
+    /// Recompute `text` + `raw_text` + `end_wall_ms` from the current
+    /// clip list. Empty clips (post-filter drops) collapse the paragraph
+    /// to empty strings; the caller is expected to remove such paragraphs.
+    fn rebuild(&mut self) {
+        let joined = self
+            .clips
+            .iter()
+            .map(|c| c.text.as_str())
+            .filter(|t| !t.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        self.text = joined.clone();
+        self.raw_text = joined;
+        if let Some(last) = self.clips.last() {
+            let end = last
+                .audio_duration_ms
+                .map(|d| last.start_wall_ms.saturating_add(d))
+                .unwrap_or(last.start_wall_ms);
+            self.end_wall_ms = end;
+        }
+    }
 }
 
 /// One contiguous stretch of non-silent audio written into the mixed
 /// track. Recorded as we go so any wall-clock timestamp (e.g. a
-/// transcript entry's `start_wall_ms`) can be mapped to a position in
+/// clip's `start_wall_ms`) can be mapped to a position in
 /// the trimmed mixed timeline: within the window it's linear, in the
 /// gaps between windows the mapping stays pinned to the previous
 /// window's end.
@@ -208,7 +231,10 @@ struct ActiveRecording {
     id: String,
     name: String,
     created_at: i64,
-    entries: Vec<TranscriptEntry>,
+    /// Paragraphs captured during this recording window, ordered by
+    /// arrival on any channel. When a clip finalizes inside a paragraph
+    /// that already exists in `paragraphs`, the update mirrors here by id.
+    paragraphs: Vec<Paragraph>,
     /// Interleaved stereo f32 samples at `sample_rate`. Grown as chunks
     /// arrive from every enabled slot's tap — each slot's chunk is
     /// **summed** into this shared buffer at its wall-clock offset so
@@ -310,14 +336,36 @@ impl ActiveRecording {
     }
 }
 
+/// One channel's paragraph log. Vox slots each get one; TTS gets a
+/// dedicated pseudo-channel at the trailing index.
+struct ChannelState {
+    kind: ChannelKind,
+    /// Channel display name snapshotted at boot from the mixer. Stage 1
+    /// still reads the live mixer name inside `snapshot()` so the UI
+    /// picks up renames without a restart — this field is retained as a
+    /// stable label for Stages 2/3 (LLM scheduler + audio ring) which
+    /// will key logs and worker tasks by it.
+    #[allow(dead_code)]
+    channel_name: String,
+    paragraphs: Vec<Paragraph>,
+}
+
+/// Serialized shape of one channel's paragraphs for the `/record`
+/// snapshot. The channel name at snapshot time is a live read of the
+/// mixer (so a rename shows up immediately in the UI) — historical
+/// paragraphs keep the name that was captured at push time.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChannelParagraphs {
+    pub channel: String,
+    pub paragraphs: Vec<Paragraph>,
+}
+
 /// Snapshot payload for `GET /record`. Serde-serialized directly; no
 /// intermediate DTO. Fields match what the Svelte page expects.
 #[derive(Debug, Clone, Serialize)]
 pub struct RecordStateSnapshot {
     pub mode: &'static str,
-    pub buffer: Vec<TranscriptEntry>,
-    pub buffer_bytes: usize,
-    pub buffer_max_bytes: usize,
+    pub paragraphs_by_channel: Vec<ChannelParagraphs>,
     /// `None` when the process is in Not Recording mode. Serialized as
     /// `null` on the wire; the UI keys off it to switch the top-of-page
     /// affordances.
@@ -332,7 +380,7 @@ pub struct ActiveRecordingSnapshot {
     pub id: String,
     pub name: String,
     pub created_at: i64,
-    pub entries: Vec<TranscriptEntry>,
+    pub paragraphs: Vec<Paragraph>,
     /// Approximate seconds captured so far, computed from the audio buffer
     /// length. Rough enough to drive a live "recording: 0:42" counter.
     pub duration_ms: u64,
@@ -343,11 +391,19 @@ pub struct ActiveRecordingSnapshot {
 }
 
 struct Inner {
-    /// Rolling most-recent-first-append log. Front = oldest; back = newest.
-    buffer: Vec<TranscriptEntry>,
-    /// Running sum of entry byte-lengths so we don't recompute for every trim.
-    buffer_bytes: usize,
+    /// One entry per vox slot (indexed by slot) followed by one trailing
+    /// entry for the TTS pseudo-channel. Initialized once at construction
+    /// time; the vector's shape is stable for the process's lifetime.
+    channels: Vec<ChannelState>,
     active: Option<ActiveRecording>,
+}
+
+impl Inner {
+    /// Find the channel state for the given kind. Returns `None` when the
+    /// slot index is out of range — an unusual case but not fatal.
+    fn channel_mut(&mut self, kind: ChannelKind) -> Option<&mut ChannelState> {
+        self.channels.iter_mut().find(|c| c.kind == kind)
+    }
 }
 
 /// Clonable handle to the shared record state. Cheap to clone — one `Arc`
@@ -361,9 +417,9 @@ pub struct RecordState {
     /// threading it through every call site.
     sample_rate: u32,
     /// Shared mixer atomics — the authoritative source for every Vox
-    /// slot's display name. Snapshots go onto each transcript entry at
-    /// capture time so historical entries keep their at-capture label
-    /// even after a subsequent rename.
+    /// slot's display name. Snapshots go onto each paragraph at capture
+    /// time so historical entries keep their at-capture label even after
+    /// a subsequent rename.
     mixer: Arc<AtomicMixer>,
     /// Bounded ring of recent speaker hints from external sources (e.g.
     /// discord_vox POSTing to /record/hint). Consulted at every VAD
@@ -373,12 +429,12 @@ pub struct RecordState {
     /// tokio worker tasks; both paths are short so contention is
     /// negligible.
     hints: Arc<Mutex<VecDeque<SpeakerHint>>>,
-    /// Fan-out for the OBS subtitles overlay: finalized vox transcript
-    /// entries (only while a recording is active) plus explicit
-    /// recording-active state transitions so the overlay can swap
-    /// between the caption view and the "suspended" placeholder as
-    /// soon as recording is started or stopped. Send failures (no
-    /// subscribers) are ignored — this is a fire-and-forget channel.
+    /// Fan-out for the OBS subtitles overlay: paragraph/clip changes
+    /// (only while a recording is active) plus explicit recording-active
+    /// state transitions so the overlay can swap between the caption
+    /// view and the "suspended" placeholder as soon as recording is
+    /// started or stopped. Send failures (no subscribers) are ignored —
+    /// this is a fire-and-forget channel.
     subtitles: broadcast::Sender<SubtitleEvent>,
     /// Post-mix mic feed. `start_recording` subscribes here to capture
     /// the silence-gated mixed track for the in-flight recording; the
@@ -392,21 +448,28 @@ pub struct RecordState {
 
 /// Events fanned out to OBS subtitle overlay subscribers.
 ///
-/// * `Entry` — upsert-by-id semantics. Fires both for streaming
-///   partials (with `provisional=true`) and for the polished final
-///   that replaces them (`provisional=false`). A client keyed by
-///   `entry.id` renders each event as either "new" or "update text
-///   for existing".
-/// * `EntryRemove` — pull an already-broadcast entry off the overlay,
-///   used when a streaming partial's final decode matched the
-///   false-positive filter and we don't want the stale partial to
-///   linger.
+/// * `ParagraphUpsert` — a paragraph appeared or its text/clip list
+///   changed. Overlay subscribers key by paragraph id.
+/// * `ParagraphRemove` — paragraph deleted (e.g. all clips filtered out
+///   as false positives).
+/// * `ClipUpsert` — one clip inside a paragraph changed (streaming
+///   partial or finalized). Carries the parent paragraph id so overlays
+///   that render per-clip can update in place.
+/// * `ClipRemove` — clip gone (removed after a false-positive filter).
 /// * `RecordingActive` — swap between the caption view and the
 ///   "suspended" placeholder without waiting for a poll.
 #[derive(Debug, Clone)]
 pub enum SubtitleEvent {
-    Entry(TranscriptEntry),
-    EntryRemove(String),
+    ParagraphUpsert(Paragraph),
+    ParagraphRemove(String),
+    ClipUpsert {
+        paragraph_id: String,
+        clip: ClipRef,
+    },
+    ClipRemove {
+        paragraph_id: String,
+        clip_id: String,
+    },
     RecordingActive(bool),
 }
 
@@ -416,11 +479,32 @@ impl RecordState {
         mixer: Arc<AtomicMixer>,
         monitor_tap: broadcast::Sender<Arc<[f32]>>,
     ) -> Self {
-        let (subtitles, _) = broadcast::channel::<SubtitleEvent>(32);
+        let (subtitles, _) = broadcast::channel::<SubtitleEvent>(64);
+        // Initialize one ChannelState per configured Vox slot plus a
+        // trailing TTS pseudo-channel. The vector's shape is stable for
+        // the process's lifetime so downstream code can rely on indexing
+        // by slot.
+        let slot_count = mixer.vox_slot_count();
+        let mut channels = Vec::with_capacity(slot_count + 1);
+        for slot in 0..slot_count {
+            let name = mixer
+                .vox_slot(slot)
+                .map(|s| s.name())
+                .unwrap_or_else(|| format!("Vox {}", slot + 1));
+            channels.push(ChannelState {
+                kind: ChannelKind::Vox(slot),
+                channel_name: name,
+                paragraphs: Vec::new(),
+            });
+        }
+        channels.push(ChannelState {
+            kind: ChannelKind::Tts,
+            channel_name: TTS_CHANNEL_NAME.to_string(),
+            paragraphs: Vec::new(),
+        });
         Self {
             inner: Arc::new(Mutex::new(Inner {
-                buffer: Vec::new(),
-                buffer_bytes: 0,
+                channels,
                 active: None,
             })),
             sample_rate,
@@ -431,8 +515,8 @@ impl RecordState {
         }
     }
 
-    /// Subscribe to the OBS subtitles fan-out. Yields finalized vox
-    /// entries (only while a named recording is in flight) plus
+    /// Subscribe to the OBS subtitles fan-out. Yields paragraph/clip
+    /// changes (only while a named recording is in flight) plus
     /// recording-active state transitions. Broadcast lag drops the
     /// oldest queued event; OBS overlays only care about the newest
     /// text and the current state, both of which the caller can
@@ -466,8 +550,8 @@ impl RecordState {
     /// `slot` at approximately `when`. Walks the ring newest-first,
     /// picks the first hint whose scope matches the slot (or is scope-
     /// less) and whose `received_at` is inside the lookup window.
-    /// Returns `None` when no hint is applicable — the transcript entry
-    /// then just carries its channel tag without a speaker label.
+    /// Returns `None` when no hint is applicable — the paragraph then
+    /// just carries its channel tag without a speaker label.
     pub fn resolve_speaker(&self, slot: usize, when: Instant) -> Option<String> {
         let g = self.hints.lock().expect("hint ring mutex poisoned");
         let earliest = when.checked_sub(HINT_LOOKUP_WINDOW)?;
@@ -494,7 +578,7 @@ impl RecordState {
     }
 
     /// Display name for a specific vox slot. Falls back to
-    /// `"Vox <slot+1>"` for out-of-range indices so transcript entries
+    /// `"Vox <slot+1>"` for out-of-range indices so paragraph entries
     /// always carry a label consistent with the mixer's boot defaults.
     pub fn channel_name(&self, slot: usize) -> String {
         self.mixer
@@ -507,17 +591,18 @@ impl RecordState {
         let g = self.inner.lock().expect("record state mutex poisoned");
         let mode = if g.active.is_some() { "recording" } else { "idle" };
         let active_recording = g.active.as_ref().map(|a| {
-            // Project each entry with a freshly-computed `mixed_start_ms`
-            // so the client's mixed-audio playhead can highlight the
-            // right entry even mid-recording, before any of this is
-            // stamped into the persisted transcript at stop time.
-            let entries: Vec<TranscriptEntry> = a
-                .entries
+            // Project each paragraph with freshly-computed
+            // `mixed_start_ms` values so the client's mixed-audio
+            // playhead can highlight the right clip even mid-recording,
+            // before any of this is stamped into the persisted paragraph
+            // JSON at stop time.
+            let paragraphs: Vec<Paragraph> = a
+                .paragraphs
                 .iter()
-                .map(|e| {
-                    let mut out = e.clone();
-                    if let Some(wall) = e.start_wall_ms {
-                        out.mixed_start_ms = a.wall_to_mixed_ms(wall);
+                .map(|p| {
+                    let mut out = p.clone();
+                    for clip in out.clips.iter_mut() {
+                        clip.mixed_start_ms = a.wall_to_mixed_ms(clip.start_wall_ms);
                     }
                     out
                 })
@@ -526,21 +611,37 @@ impl RecordState {
                 id: a.id.clone(),
                 name: a.name.clone(),
                 created_at: a.created_at,
-                entries,
+                paragraphs,
                 duration_ms: audio_duration_ms(a.audio.len(), a.sample_rate),
                 mixed_duration_ms: audio_duration_ms(a.mixed_audio.len(), a.sample_rate),
             }
         });
-        // Channel names for every configured slot — the UI uses these
-        // as the master list of channels, keying its per-channel rendering.
+        // Live channel-name read from the mixer for the master list.
         let channel_names: Vec<String> = (0..self.mixer.vox_slot_count())
             .map(|i| self.channel_name(i))
             .collect();
+        // Build per-channel paragraph lists in the same order as
+        // `channels` — vox slots first, TTS last.
+        let paragraphs_by_channel: Vec<ChannelParagraphs> = g
+            .channels
+            .iter()
+            .map(|c| {
+                // Use the live channel name for the wrapper (so a
+                // rename shows up), but leave the paragraphs' embedded
+                // channel field pinned to what was captured at push time.
+                let channel_name = match c.kind {
+                    ChannelKind::Vox(slot) => self.channel_name(slot),
+                    ChannelKind::Tts => TTS_CHANNEL_NAME.to_string(),
+                };
+                ChannelParagraphs {
+                    channel: channel_name,
+                    paragraphs: c.paragraphs.clone(),
+                }
+            })
+            .collect();
         RecordStateSnapshot {
             mode,
-            buffer: g.buffer.clone(),
-            buffer_bytes: g.buffer_bytes,
-            buffer_max_bytes: BUFFER_MAX_BYTES,
+            paragraphs_by_channel,
             active_recording,
             channel_names,
         }
@@ -669,7 +770,7 @@ impl RecordState {
             id: id.clone(),
             name,
             created_at: unix_now(),
-            entries: Vec::new(),
+            paragraphs: Vec::new(),
             audio: Vec::new(),
             mixed_audio: Vec::new(),
             mixed_map: Vec::new(),
@@ -686,14 +787,14 @@ impl RecordState {
     }
 
     /// Take the in-flight recording out of state. Caller (the /stop handler)
-    /// then encodes both WAVs and hands the transcript JSON to the store.
+    /// then encodes both WAVs and hands the paragraph JSON to the store.
     /// Returns `None` when nothing is active OR when the id doesn't match
     /// the current bucket — race-safe against a double-stop.
     ///
     /// Before draining, close any still-open speech window in the mixed
-    /// map and stamp each entry with its final `mixed_start_ms` so the
-    /// persisted transcript can drive the mixed-audio playhead without
-    /// needing to re-derive the map at read time.
+    /// map and stamp each clip with its final `mixed_start_ms` so the
+    /// persisted paragraph JSON can drive the mixed-audio playhead
+    /// without needing to re-derive the map at read time.
     pub fn take_active(&self, id: &str) -> Option<TakenRecording> {
         let mut g = self.inner.lock().expect("record state mutex poisoned");
         let active_id_matches = g.active.as_ref().map(|a| a.id == id).unwrap_or(false);
@@ -707,7 +808,7 @@ impl RecordState {
         let _ = self.subtitles.send(SubtitleEvent::RecordingActive(false));
         // Close any still-open speech window at "now" so wall_to_mixed_ms
         // yields a definite value rather than pinning to Instant-based
-        // extrapolation. Without this, the last entry recorded right
+        // extrapolation. Without this, the last clip recorded right
         // before stop would land at wall_ms > wall_end_ms and get pinned
         // to the window's end instead of its real position.
         if let Some(last) = active.mixed_map.last_mut() {
@@ -715,84 +816,88 @@ impl RecordState {
                 last.wall_end_ms = unix_now_ms();
             }
         }
-        // Collect the mapped values first so the &active borrow releases
-        // before the &mut active.entries iteration below (the borrow
-        // checker isn't smart enough to see that wall_to_mixed_ms only
-        // reads mixed_map, not entries).
-        let mapped: Vec<Option<u64>> = active
-            .entries
+        // Stamp each clip's mixed_start_ms in place before draining.
+        // We snapshot the map first so the &active borrow releases
+        // before iterating paragraphs mutably.
+        let stamps: Vec<Vec<Option<u64>>> = active
+            .paragraphs
             .iter()
-            .map(|e| e.start_wall_ms.and_then(|w| active.wall_to_mixed_ms(w)))
+            .map(|p| {
+                p.clips
+                    .iter()
+                    .map(|c| active.wall_to_mixed_ms(c.start_wall_ms))
+                    .collect()
+            })
             .collect();
-        for (entry, mixed) in active.entries.iter_mut().zip(mapped) {
-            entry.mixed_start_ms = mixed;
+        for (paragraph, clip_stamps) in active.paragraphs.iter_mut().zip(stamps) {
+            for (clip, mixed) in paragraph.clips.iter_mut().zip(clip_stamps) {
+                clip.mixed_start_ms = mixed;
+            }
         }
         Some(TakenRecording {
             id: active.id,
             name: active.name,
             created_at: active.created_at,
-            entries: active.entries,
+            paragraphs: active.paragraphs,
             audio: active.audio,
             mixed_audio: active.mixed_audio,
             sample_rate: active.sample_rate,
         })
     }
 
-    /// Empty the rolling ephemeral buffer. Does NOT touch the in-flight
+    /// Empty every channel's paragraph log. Does NOT touch the in-flight
     /// active recording — clearing what the user is looking at on the
     /// Live pane must never wipe a session that's still capturing.
-    pub fn clear_buffer(&self) {
+    pub fn clear_channels(&self) {
         let mut g = self.inner.lock().expect("record state mutex poisoned");
-        g.buffer.clear();
-        g.buffer_bytes = 0;
+        for ch in g.channels.iter_mut() {
+            ch.paragraphs.clear();
+        }
     }
 
-    /// Update the text on a transcript entry that lives in either the
-    /// rolling ephemeral buffer or the currently-active recording.
-    /// Returns `true` when a matching entry was found and mutated. Empty
-    /// / whitespace-only text is rejected — the caller preserves the
-    /// original rather than silently blanking a row.
+    /// Update the text on a clip that lives anywhere in the channel
+    /// paragraph logs or the currently-active recording. Returns `true`
+    /// when a matching clip was found and mutated. Empty / whitespace-
+    /// only text is rejected — the caller preserves the original rather
+    /// than silently blanking a clip.
     ///
-    /// The `text` field is the only thing the "correct my transcription"
-    /// flow needs; length rebalancing on the rolling buffer's byte total
-    /// keeps its cap semantics intact after an edit that grows or
-    /// shrinks the entry.
-    pub fn update_entry_text(&self, entry_id: &str, text: String) -> bool {
+    /// Rebuilds the containing paragraph's `text`/`raw_text` after the
+    /// edit and broadcasts a [`SubtitleEvent::ClipUpsert`] so overlay
+    /// subscribers pick up the change.
+    pub fn update_clip_text(&self, clip_id: &str, text: String) -> bool {
         let text = text.trim().to_string();
         if text.is_empty() {
             return false;
         }
         let mut g = self.inner.lock().expect("record state mutex poisoned");
-        // Buffer edit: mutate text in place, adjust byte total by the
-        // delta. Splitting the read of the new length from the mutable
-        // borrow keeps the borrow checker happy without an extra clone.
-        let mut buffer_hit = false;
-        let mut delta: (usize, usize) = (0, 0); // (old_len, new_len)
-        for entry in g.buffer.iter_mut() {
-            if entry.id == entry_id {
-                delta = (entry.text.len(), text.len());
-                entry.text = text.clone();
-                buffer_hit = true;
+        let mut updated_pair: Option<(String, ClipRef)> = None;
+        for ch in g.channels.iter_mut() {
+            let hit = update_clip_in_paragraphs(&mut ch.paragraphs, clip_id, &text);
+            if let Some((pid, clip)) = hit {
+                updated_pair = Some((pid, clip));
                 break;
             }
         }
-        if buffer_hit {
-            g.buffer_bytes = g
-                .buffer_bytes
-                .saturating_sub(delta.0)
-                .saturating_add(delta.1);
-        }
-        // Mirror buffer→active so an entry that lives in BOTH views
-        // (a VAD utterance captured mid-record) stays consistent.
+        // Mirror the same edit into the active recording's paragraph list.
         if let Some(active) = g.active.as_mut() {
-            for entry in active.entries.iter_mut() {
-                if entry.id == entry_id {
-                    entry.text = text.clone();
-                    return true;
+            if let Some(pair) = update_clip_in_paragraphs(&mut active.paragraphs, clip_id, &text) {
+                if updated_pair.is_none() {
+                    updated_pair = Some(pair);
                 }
             }
         }
-        buffer_hit
+        let recording = g.active.is_some();
+        drop(g);
+        if let Some((paragraph_id, clip)) = updated_pair {
+            if recording {
+                let _ = self
+                    .subtitles
+                    .send(SubtitleEvent::ClipUpsert { paragraph_id, clip });
+            }
+            true
+        } else {
+            false
+        }
     }
 
     /// Rename the in-flight recording if `id` matches the active one.
@@ -831,350 +936,232 @@ impl RecordState {
         true
     }
 
-    /// Append a completed utterance. Fires from the streaming worker after
-    /// each VAD-closed segment. Always pushes to the rolling buffer; also
-    /// pushes to the active bucket when one exists (with the audio-range
-    /// metadata so the client can replay the clip that produced the text).
-    ///
-    /// Skips entries with no alphanumeric content — SenseVoice sometimes
-    /// resolves a marginal segment to just "." or "。" which is meaningless
-    /// as a transcript and would pollute the UI + logs. Also drops known
-    /// single-word false-positive transcripts (see [`is_false_positive`]).
-    fn push_transcript(
-        &self,
-        slot: usize,
-        text: String,
-        audio_start_ms: Option<u64>,
-        audio_duration_ms: Option<u64>,
-        speaker: Option<String>,
-        start_wall_ms: Option<u64>,
-    ) {
-        if !text.chars().any(|c| c.is_alphanumeric()) {
-            return;
-        }
-        if is_false_positive(&text) {
-            return;
-        }
-        let channel = self.channel_name(slot);
-        let entry = TranscriptEntry {
-            id: Uuid::new_v4().to_string(),
-            created_at: unix_now(),
-            text,
-            channel,
-            audio_start_ms,
-            audio_duration_ms,
-            audio_url: None,
-            speaker,
-            start_wall_ms,
-            // Filled in per-snapshot for the active recording (see
-            // snapshot()) and stamped permanently at stop time.
-            mixed_start_ms: None,
-            provisional: false,
-        };
-        let mut g = self.inner.lock().expect("record state mutex poisoned");
-        // Rolling buffer: insert at the position that keeps entries sorted
-        // by wall-clock start time (see `insert_ordered`). Two slots'
-        // utterances that finalized out-of-order relative to when they
-        // started still land in the right sequence in the log. Trim from
-        // the front — position 0 is the oldest by construction.
-        g.buffer_bytes += entry.text.len();
-        insert_ordered(&mut g.buffer, entry.clone());
-        while g.buffer_bytes > BUFFER_MAX_BYTES && g.buffer.len() > 1 {
-            let dropped = g.buffer.remove(0);
-            g.buffer_bytes = g.buffer_bytes.saturating_sub(dropped.text.len());
-        }
-        let recording = g.active.is_some();
-        if let Some(active) = g.active.as_mut() {
-            insert_ordered(&mut active.entries, entry.clone());
-        }
-        drop(g);
-        if recording {
-            let _ = self.subtitles.send(SubtitleEvent::Entry(entry));
-        }
-    }
-
-    /// Insert or update a streaming-partial transcript entry keyed by
-    /// `entry_id`. If an entry with that id already exists (in either
-    /// the rolling buffer or the active recording's entries), its text
-    /// is replaced in place; otherwise a new entry is created.
-    /// Broadcasts a [`SubtitleEvent::Entry`] with `provisional = true`
-    /// so subscribers can render mid-utterance updates.
+    /// Pass 1 upsert: a streaming partial (or an initial insertion) for
+    /// `clip_id` on the given `slot`. Opens a new paragraph if the last
+    /// clip on this channel ended more than [`PARAGRAPH_GAP_MS`] before
+    /// `start_wall_ms` — otherwise appends (or updates in place) inside
+    /// the current growing paragraph. Broadcasts [`SubtitleEvent::
+    /// ClipUpsert`] (and [`SubtitleEvent::ParagraphUpsert`] on the paragraph
+    /// creation path) so subscribers see mid-utterance updates.
     ///
     /// No false-positive filter here — partials should show the live
-    /// hypothesis even if it briefly matches a filter phrase; the
-    /// filter runs only at [`Self::finalize_transcript`] time when the
-    /// final text is what we're deciding about.
+    /// hypothesis even if it briefly matches a filter phrase; the filter
+    /// runs only at [`Self::finalize_clip`] time when the final text is
+    /// what we're deciding about.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn upsert_partial(
+    pub fn upsert_provisional_clip(
         &self,
-        entry_id: &str,
         slot: usize,
+        clip_id: &str,
         text: String,
         audio_start_ms: Option<u64>,
         audio_duration_ms: Option<u64>,
         speaker: Option<String>,
-        start_wall_ms: Option<u64>,
+        start_wall_ms: u64,
     ) {
         let trimmed = text.trim().to_string();
         if trimmed.is_empty() {
             return;
         }
-        let channel = self.channel_name(slot);
+        let channel_name = self.channel_name(slot);
         let mut g = self.inner.lock().expect("record state mutex poisoned");
-        // Update-in-place if the id is already present. Adjust the
-        // rolling-buffer byte counter by the length delta so the cap
-        // math stays correct across a partial's text growth.
-        let mut updated_entry: Option<TranscriptEntry> = None;
-        let mut buffer_delta: Option<(usize, usize)> = None;
-        for entry in g.buffer.iter_mut() {
-            if entry.id == entry_id {
-                let old_len = entry.text.len();
-                entry.text = trimmed.clone();
-                entry.channel = channel.clone();
-                entry.audio_start_ms = audio_start_ms;
-                entry.audio_duration_ms = audio_duration_ms;
-                entry.speaker = speaker.clone();
-                entry.start_wall_ms = start_wall_ms;
-                entry.provisional = true;
-                buffer_delta = Some((old_len, entry.text.len()));
-                updated_entry = Some(entry.clone());
-                break;
-            }
-        }
-        if let Some((old, new)) = buffer_delta {
-            if new >= old {
-                g.buffer_bytes += new - old;
-            } else {
-                g.buffer_bytes = g.buffer_bytes.saturating_sub(old - new);
-            }
-        }
-        // Mirror the update into the active recording if present.
-        if let Some(active) = g.active.as_mut() {
-            for entry in active.entries.iter_mut() {
-                if entry.id == entry_id {
-                    entry.text = trimmed.clone();
-                    entry.channel = channel.clone();
-                    entry.audio_start_ms = audio_start_ms;
-                    entry.audio_duration_ms = audio_duration_ms;
-                    entry.speaker = speaker.clone();
-                    entry.start_wall_ms = start_wall_ms;
-                    entry.provisional = true;
-                    if updated_entry.is_none() {
-                        updated_entry = Some(entry.clone());
-                    }
-                    break;
-                }
-            }
-        }
-        let entry = updated_entry.unwrap_or_else(|| {
-            let entry = TranscriptEntry {
-                id: entry_id.to_string(),
-                created_at: unix_now(),
-                text: trimmed,
-                channel,
+        let (new_paragraph, upserted_clip, paragraph_id) = {
+            let Some(ch) = g.channel_mut(ChannelKind::Vox(slot)) else {
+                return;
+            };
+            upsert_clip_into_channel(
+                ch,
+                clip_id,
+                &trimmed,
                 audio_start_ms,
                 audio_duration_ms,
-                audio_url: None,
-                speaker,
+                &speaker,
                 start_wall_ms,
-                mixed_start_ms: None,
-                provisional: true,
-            };
-            g.buffer_bytes += entry.text.len();
-            insert_ordered(&mut g.buffer, entry.clone());
-            while g.buffer_bytes > BUFFER_MAX_BYTES && g.buffer.len() > 1 {
-                let dropped = g.buffer.remove(0);
-                g.buffer_bytes = g.buffer_bytes.saturating_sub(dropped.text.len());
-            }
-            if let Some(active) = g.active.as_mut() {
-                insert_ordered(&mut active.entries, entry.clone());
-            }
-            entry
-        });
+                &channel_name,
+                true,
+            )
+        };
+        // Mirror into the active recording if one is running. We look up
+        // by paragraph_id — if it wasn't there yet, clone the paragraph
+        // over verbatim (single-clip insert); otherwise apply the clip
+        // upsert to the existing mirror.
+        if let Some(active) = g.active.as_mut() {
+            mirror_upsert_into_active(active, &paragraph_id, &upserted_clip, &new_paragraph);
+        }
         let recording = g.active.is_some();
         drop(g);
         if recording {
-            let _ = self.subtitles.send(SubtitleEvent::Entry(entry));
+            if let Some(p) = new_paragraph {
+                let _ = self.subtitles.send(SubtitleEvent::ParagraphUpsert(p));
+            }
+            let _ = self.subtitles.send(SubtitleEvent::ClipUpsert {
+                paragraph_id,
+                clip: upserted_clip,
+            });
         }
     }
 
-    /// Close out a streaming partial with its polished final text.
-    /// Runs the same false-positive filter that `push_transcript`
-    /// applies: if the final text matches, the partial is *removed*
-    /// (from buffer, active, and via a `SubtitleEvent::EntryRemove`)
-    /// rather than promoted. Otherwise the entry is updated in place
-    /// with `provisional = false` and rebroadcast as a final.
+    /// Pass 2 finalize: the offline SenseVoice text for `clip_id`. Runs
+    /// the same [`is_false_positive`] filter that the legacy
+    /// `push_transcript` applied: if the final text matches, the clip is
+    /// removed from its paragraph (and the paragraph itself if it now has
+    /// zero clips). Otherwise the clip is set to `provisional=false`, the
+    /// paragraph is rebuilt, and a `ClipUpsert` fires.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn finalize_partial(
+    pub fn finalize_clip(
         &self,
-        entry_id: &str,
         slot: usize,
+        clip_id: &str,
         text: String,
         audio_start_ms: Option<u64>,
         audio_duration_ms: Option<u64>,
         speaker: Option<String>,
-        start_wall_ms: Option<u64>,
+        start_wall_ms: u64,
     ) {
         let trimmed = text.trim().to_string();
         let is_junk = trimmed.is_empty()
             || !trimmed.chars().any(|c| c.is_alphanumeric())
             || is_false_positive(&trimmed);
         if is_junk {
-            // Remove any existing partial rather than leaving stale text.
-            self.remove_entry(entry_id);
+            // Drop any provisional clip that was already broadcast; keep
+            // its paragraph if it still has other surviving clips.
+            self.remove_clip(clip_id);
             return;
         }
-        let channel = self.channel_name(slot);
+        let channel_name = self.channel_name(slot);
         let mut g = self.inner.lock().expect("record state mutex poisoned");
-        let mut finalized: Option<TranscriptEntry> = None;
-        let mut buffer_delta: Option<(usize, usize)> = None;
-        for entry in g.buffer.iter_mut() {
-            if entry.id == entry_id {
-                let old_len = entry.text.len();
-                entry.text = trimmed.clone();
-                entry.channel = channel.clone();
-                entry.audio_start_ms = audio_start_ms;
-                entry.audio_duration_ms = audio_duration_ms;
-                entry.speaker = speaker.clone();
-                entry.start_wall_ms = start_wall_ms;
-                entry.provisional = false;
-                buffer_delta = Some((old_len, entry.text.len()));
-                finalized = Some(entry.clone());
-                break;
-            }
-        }
-        if let Some((old, new)) = buffer_delta {
-            if new >= old {
-                g.buffer_bytes += new - old;
-            } else {
-                g.buffer_bytes = g.buffer_bytes.saturating_sub(old - new);
-            }
-        }
-        if let Some(active) = g.active.as_mut() {
-            for entry in active.entries.iter_mut() {
-                if entry.id == entry_id {
-                    entry.text = trimmed.clone();
-                    entry.channel = channel.clone();
-                    entry.audio_start_ms = audio_start_ms;
-                    entry.audio_duration_ms = audio_duration_ms;
-                    entry.speaker = speaker.clone();
-                    entry.start_wall_ms = start_wall_ms;
-                    entry.provisional = false;
-                    if finalized.is_none() {
-                        finalized = Some(entry.clone());
-                    }
-                    break;
-                }
-            }
-        }
-        // No partial ever landed (fast utterance with no partial
-        // emitted yet, or the entry aged out of the rolling cap
-        // between partial and final). Insert as a fresh final so the
-        // transcript isn't missing an utterance.
-        let entry = finalized.unwrap_or_else(|| {
-            let entry = TranscriptEntry {
-                id: entry_id.to_string(),
-                created_at: unix_now(),
-                text: trimmed,
-                channel,
+        let (new_paragraph, finalized_clip, paragraph_id) = {
+            let Some(ch) = g.channel_mut(ChannelKind::Vox(slot)) else {
+                return;
+            };
+            upsert_clip_into_channel(
+                ch,
+                clip_id,
+                &trimmed,
                 audio_start_ms,
                 audio_duration_ms,
-                audio_url: None,
-                speaker,
+                &speaker,
                 start_wall_ms,
-                mixed_start_ms: None,
-                provisional: false,
-            };
-            g.buffer_bytes += entry.text.len();
-            insert_ordered(&mut g.buffer, entry.clone());
-            while g.buffer_bytes > BUFFER_MAX_BYTES && g.buffer.len() > 1 {
-                let dropped = g.buffer.remove(0);
-                g.buffer_bytes = g.buffer_bytes.saturating_sub(dropped.text.len());
-            }
-            if let Some(active) = g.active.as_mut() {
-                insert_ordered(&mut active.entries, entry.clone());
-            }
-            entry
-        });
+                &channel_name,
+                false,
+            )
+        };
+        if let Some(active) = g.active.as_mut() {
+            mirror_upsert_into_active(active, &paragraph_id, &finalized_clip, &new_paragraph);
+        }
         let recording = g.active.is_some();
         drop(g);
         if recording {
-            let _ = self.subtitles.send(SubtitleEvent::Entry(entry));
+            if let Some(p) = new_paragraph {
+                let _ = self.subtitles.send(SubtitleEvent::ParagraphUpsert(p));
+            }
+            let _ = self.subtitles.send(SubtitleEvent::ClipUpsert {
+                paragraph_id,
+                clip: finalized_clip,
+            });
         }
     }
 
-    /// Delete a transcript entry by id from both the rolling buffer
-    /// and the active recording, and broadcast a
-    /// [`SubtitleEvent::EntryRemove`] so overlay subscribers drop it
-    /// from their view. Used when a streaming partial's final text
-    /// turned out to be a false-positive filter match.
-    pub fn remove_entry(&self, entry_id: &str) {
+    /// Remove a clip by id from every channel + the active recording,
+    /// and broadcast `ClipRemove` (or `ParagraphRemove` if that clip was
+    /// the last one in its paragraph). Used when a streaming partial's
+    /// final matched the false-positive filter, or when the operator
+    /// deletes a clip explicitly.
+    pub fn remove_clip(&self, clip_id: &str) {
         let mut g = self.inner.lock().expect("record state mutex poisoned");
-        let mut found = false;
-        if let Some(pos) = g.buffer.iter().position(|e| e.id == entry_id) {
-            let dropped = g.buffer.remove(pos);
-            g.buffer_bytes = g.buffer_bytes.saturating_sub(dropped.text.len());
-            found = true;
-        }
-        if let Some(active) = g.active.as_mut() {
-            if let Some(pos) = active.entries.iter().position(|e| e.id == entry_id) {
-                active.entries.remove(pos);
-                found = true;
+        let mut hit: Option<RemoveOutcome> = None;
+        for ch in g.channels.iter_mut() {
+            if let Some(outcome) = remove_clip_from_paragraphs(&mut ch.paragraphs, clip_id) {
+                hit = Some(outcome);
+                break;
             }
+        }
+        // Mirror the same removal into the active recording's paragraphs.
+        // We take the outcome from the channel side if we had one;
+        // otherwise fall back to whatever the active recording produces.
+        let active_outcome = g
+            .active
+            .as_mut()
+            .and_then(|a| remove_clip_from_paragraphs(&mut a.paragraphs, clip_id));
+        if hit.is_none() {
+            hit = active_outcome;
         }
         let recording = g.active.is_some();
         drop(g);
-        if found && recording {
-            let _ = self
-                .subtitles
-                .send(SubtitleEvent::EntryRemove(entry_id.to_string()));
+        let Some(outcome) = hit else {
+            return;
+        };
+        if !recording {
+            return;
+        }
+        match outcome {
+            RemoveOutcome::ClipGone {
+                paragraph_id,
+                clip_id,
+            } => {
+                let _ = self.subtitles.send(SubtitleEvent::ClipRemove {
+                    paragraph_id,
+                    clip_id,
+                });
+            }
+            RemoveOutcome::ParagraphGone(pid) => {
+                let _ = self.subtitles.send(SubtitleEvent::ParagraphRemove(pid));
+            }
         }
     }
 
-    /// Log a TTS playback into the rolling ephemeral buffer, and into
-    /// the active recording when one is in flight. Text is the utterance;
-    /// `audio_url` (e.g. `/widgets/<id>`) points at the cached clip so
-    /// playback survives the recording even though TTS audio doesn't
-    /// flow through the vox tap. `voice_label` is a human-readable tag
-    /// for the voice/profile that spoke — rendered inline with the TTS
-    /// channel tag so the log tells you *which* voice it was.
+    /// Log a TTS playback as a single-clip paragraph on the TTS
+    /// pseudo-channel. `hardened=true` immediately — TTS text is already
+    /// LLM-authored and never re-transcribed in later stages.
     ///
-    /// Always appends to the buffer so the Live view shows every TTS
-    /// clip the user hears — including clips played with no recording
-    /// active. Buffer trimming follows the same FIFO cap as vox entries.
-    pub fn push_tts(&self, text: String, audio_url: Option<String>, voice_label: Option<String>) {
-        let entry = TranscriptEntry {
+    /// Always appends to the TTS channel's paragraph log so the Live
+    /// view shows every TTS clip the user hears — including clips
+    /// played with no recording active.
+    pub fn push_tts_paragraph(
+        &self,
+        text: String,
+        audio_url: Option<String>,
+        voice_label: Option<String>,
+    ) {
+        let clip = ClipRef {
             id: Uuid::new_v4().to_string(),
-            created_at: unix_now(),
-            text,
-            channel: "TTS".to_string(),
             audio_start_ms: None,
             audio_duration_ms: None,
-            audio_url,
-            // Reuses the same `speaker` field vox entries use for hint
-            // attribution — the Record UI already renders it inline with
-            // the channel tag, so no extra field is needed.
-            speaker: voice_label.and_then(|s| {
-                let t = s.trim().to_string();
-                (!t.is_empty()).then_some(t)
-            }),
-            // TTS is logged the moment the play call fires, so "now" is
-            // the utterance's start on the same wall-clock the vox VAD
-            // stamps into its entries — insert_ordered slots this in
-            // beside vox entries at the right chronological spot.
-            start_wall_ms: Some(unix_now_ms()),
-            mixed_start_ms: None,
+            start_wall_ms: unix_now_ms(),
+            text: text.clone(),
             provisional: false,
+            audio_url,
+            mixed_start_ms: None,
+        };
+        let speaker = voice_label.and_then(|s| {
+            let t = s.trim().to_string();
+            (!t.is_empty()).then_some(t)
+        });
+        let paragraph = Paragraph {
+            id: Uuid::new_v4().to_string(),
+            channel: TTS_CHANNEL_NAME.to_string(),
+            speaker,
+            hardened: true,
+            text: text.clone(),
+            raw_text: text,
+            clips: vec![clip],
+            start_wall_ms: unix_now_ms(),
+            end_wall_ms: unix_now_ms(),
+            created_at: unix_now(),
         };
         let mut g = self.inner.lock().expect("record state mutex poisoned");
-        g.buffer_bytes += entry.text.len();
-        insert_ordered(&mut g.buffer, entry.clone());
-        while g.buffer_bytes > BUFFER_MAX_BYTES && g.buffer.len() > 1 {
-            let dropped = g.buffer.remove(0);
-            g.buffer_bytes = g.buffer_bytes.saturating_sub(dropped.text.len());
+        if let Some(ch) = g.channel_mut(ChannelKind::Tts) {
+            ch.paragraphs.push(paragraph.clone());
+            trim_channel_cap(ch);
         }
+        // Mirror into the active recording if one is running.
         if let Some(active) = g.active.as_mut() {
-            insert_ordered(&mut active.entries, entry);
+            active.paragraphs.push(paragraph.clone());
+        }
+        let recording = g.active.is_some();
+        drop(g);
+        if recording {
+            let _ = self.subtitles.send(SubtitleEvent::ParagraphUpsert(paragraph));
         }
     }
 
@@ -1335,7 +1322,7 @@ pub struct TakenRecording {
     pub id: String,
     pub name: String,
     pub created_at: i64,
-    pub entries: Vec<TranscriptEntry>,
+    pub paragraphs: Vec<Paragraph>,
     pub audio: Vec<f32>,
     /// Interleaved stereo mixed track, silence-gated. May be empty if
     /// nothing above the gate threshold ever landed while recording.
@@ -1349,15 +1336,232 @@ impl TakenRecording {
     }
 }
 
+/// Outcome of a clip removal in a paragraph list. The caller uses this to
+/// pick between broadcasting a `ClipRemove` (paragraph still exists) or
+/// `ParagraphRemove` (last clip in the paragraph fell out).
+enum RemoveOutcome {
+    ClipGone {
+        paragraph_id: String,
+        clip_id: String,
+    },
+    ParagraphGone(String),
+}
+
+/// Locate `clip_id` inside a paragraph list, replace its text, rebuild
+/// the paragraph, and return `(paragraph_id, new clip)` on hit. `None`
+/// when the clip id isn't present.
+fn update_clip_in_paragraphs(
+    paragraphs: &mut [Paragraph],
+    clip_id: &str,
+    text: &str,
+) -> Option<(String, ClipRef)> {
+    for paragraph in paragraphs.iter_mut() {
+        if let Some(clip) = paragraph.clips.iter_mut().find(|c| c.id == clip_id) {
+            clip.text = text.to_string();
+            let updated = clip.clone();
+            paragraph.rebuild();
+            return Some((paragraph.id.clone(), updated));
+        }
+    }
+    None
+}
+
+/// Locate `clip_id` inside a paragraph list and remove it, dropping the
+/// entire paragraph if that leaves it empty. Returns the outcome so the
+/// caller can broadcast the right event.
+fn remove_clip_from_paragraphs(
+    paragraphs: &mut Vec<Paragraph>,
+    clip_id: &str,
+) -> Option<RemoveOutcome> {
+    for (pidx, paragraph) in paragraphs.iter_mut().enumerate() {
+        if let Some(cidx) = paragraph.clips.iter().position(|c| c.id == clip_id) {
+            paragraph.clips.remove(cidx);
+            if paragraph.clips.is_empty() {
+                let pid = paragraph.id.clone();
+                paragraphs.remove(pidx);
+                return Some(RemoveOutcome::ParagraphGone(pid));
+            }
+            paragraph.rebuild();
+            return Some(RemoveOutcome::ClipGone {
+                paragraph_id: paragraph.id.clone(),
+                clip_id: clip_id.to_string(),
+            });
+        }
+    }
+    None
+}
+
+/// Trim `ch.paragraphs` back to the FIFO cap. Called after every append
+/// so a long idle process can't accumulate unbounded paragraphs.
+fn trim_channel_cap(ch: &mut ChannelState) {
+    while ch.paragraphs.len() > CHANNEL_PARAGRAPH_CAP {
+        ch.paragraphs.remove(0);
+    }
+}
+
+/// Core upsert helper shared by pass-1 (`upsert_provisional_clip`) and
+/// pass-2 (`finalize_clip`). Handles paragraph gap detection, in-place
+/// clip updates by id, and paragraph creation when the gap trips or the
+/// channel is empty.
+///
+/// Returns:
+///   * `Option<Paragraph>` — populated when a fresh paragraph was
+///     opened, so the caller can broadcast a `ParagraphUpsert`.
+///   * `ClipRef` — the (possibly-updated) clip, ready to broadcast in a
+///     `ClipUpsert`.
+///   * `String` — the paragraph id owning that clip.
+#[allow(clippy::too_many_arguments)]
+fn upsert_clip_into_channel(
+    ch: &mut ChannelState,
+    clip_id: &str,
+    text: &str,
+    audio_start_ms: Option<u64>,
+    audio_duration_ms: Option<u64>,
+    speaker: &Option<String>,
+    start_wall_ms: u64,
+    channel_name: &str,
+    provisional: bool,
+) -> (Option<Paragraph>, ClipRef, String) {
+    // First: if the clip id already exists in any paragraph on this
+    // channel, mutate in place. This is the streaming-partial → final
+    // handoff plus the pass-1 partial-growth case.
+    for paragraph in ch.paragraphs.iter_mut() {
+        if let Some(clip) = paragraph.clips.iter_mut().find(|c| c.id == clip_id) {
+            clip.text = text.to_string();
+            clip.audio_start_ms = audio_start_ms;
+            clip.audio_duration_ms = audio_duration_ms;
+            clip.start_wall_ms = start_wall_ms;
+            clip.provisional = provisional;
+            let updated = clip.clone();
+            paragraph.rebuild();
+            return (None, updated, paragraph.id.clone());
+        }
+    }
+    // Otherwise: decide append vs new paragraph. New paragraph fires
+    // when the channel is empty OR the previous paragraph's last clip
+    // ended more than PARAGRAPH_GAP_MS before this new clip's start.
+    let need_new = match ch.paragraphs.last() {
+        None => true,
+        Some(last_p) => match last_p.clips.last() {
+            None => true,
+            Some(last_clip) => {
+                let last_end = last_clip
+                    .audio_duration_ms
+                    .map(|d| last_clip.start_wall_ms.saturating_add(d))
+                    .unwrap_or(last_clip.start_wall_ms);
+                start_wall_ms.saturating_sub(last_end) > PARAGRAPH_GAP_MS
+            }
+        },
+    };
+    let clip = ClipRef {
+        id: clip_id.to_string(),
+        audio_start_ms,
+        audio_duration_ms,
+        start_wall_ms,
+        text: text.to_string(),
+        provisional,
+        audio_url: None,
+        mixed_start_ms: None,
+    };
+    if need_new {
+        // First-clip speaker attribution stays on the paragraph for its
+        // lifetime; subsequent clips don't override it. Per-channel = one
+        // speaker in Stage 1.
+        let mut paragraph = Paragraph {
+            id: Uuid::new_v4().to_string(),
+            channel: channel_name.to_string(),
+            speaker: speaker.clone(),
+            hardened: false,
+            text: String::new(),
+            raw_text: String::new(),
+            clips: vec![clip.clone()],
+            start_wall_ms,
+            end_wall_ms: start_wall_ms,
+            created_at: unix_now(),
+        };
+        paragraph.rebuild();
+        ch.paragraphs.push(paragraph.clone());
+        trim_channel_cap(ch);
+        // Re-locate the paragraph we just pushed (trim_channel_cap may
+        // have shifted indices) so we return the canonical stored copy.
+        let stored = ch
+            .paragraphs
+            .last()
+            .cloned()
+            .unwrap_or_else(|| paragraph.clone());
+        let pid = stored.id.clone();
+        (Some(stored), clip, pid)
+    } else {
+        let last = ch.paragraphs.last_mut().expect("checked above");
+        last.clips.push(clip.clone());
+        last.rebuild();
+        (None, clip, last.id.clone())
+    }
+}
+
+/// Mirror an upsert (either an existing-clip edit or a fresh paragraph)
+/// into the active recording's paragraph list.
+///
+/// * `new_paragraph = Some(_)` means the caller just opened a fresh
+///   paragraph on the channel side; clone it into `active.paragraphs`.
+/// * `new_paragraph = None` means the clip landed inside an existing
+///   paragraph on the channel side — find that paragraph by id in the
+///   active recording (mirroring an earlier push) and update/append the
+///   clip there. If the paragraph isn't mirrored yet (rare — an edit to
+///   a paragraph that started before this recording), the clip is
+///   dropped for the active view.
+fn mirror_upsert_into_active(
+    active: &mut ActiveRecording,
+    paragraph_id: &str,
+    clip: &ClipRef,
+    new_paragraph: &Option<Paragraph>,
+) {
+    if let Some(p) = new_paragraph {
+        active.paragraphs.push(p.clone());
+        return;
+    }
+    for paragraph in active.paragraphs.iter_mut() {
+        if paragraph.id != paragraph_id {
+            continue;
+        }
+        if let Some(existing) = paragraph.clips.iter_mut().find(|c| c.id == clip.id) {
+            *existing = clip.clone();
+        } else {
+            paragraph.clips.push(clip.clone());
+        }
+        paragraph.rebuild();
+        return;
+    }
+}
+
 /// Known SenseVoice single-word false-positive outputs. When the model
 /// is handed a short, marginal segment (a mic bump, a Discord notification
 /// chirp, one syllable of background noise) it often "hallucinates" one
 /// of these very short bookend phrases. A real utterance of just "I." or
 /// "The." isn't meaningful without the rest of the sentence, so the
-/// operator loses nothing by dropping them. Matched exactly (trimmed);
-/// broader stop-lists risk swallowing legitimate one-word replies.
+/// operator loses nothing by dropping them. English matches are exact
+/// (trimmed); broader stop-lists risk swallowing legitimate one-word
+/// replies. For non-Latin scripts SenseVoice hallucinates short
+/// interjection characters (e.g. `啊。`, `嗯`, `哦.`) on the same kinds
+/// of marginal segments; those are dropped by a length heuristic when
+/// the text is a single "word" (no whitespace) with no Latin letters
+/// and at most two script characters.
 fn is_false_positive(text: &str) -> bool {
-    matches!(text.trim(), "I." | "The.")
+    let trimmed = text.trim();
+    if matches!(trimmed, "I." | "The.") {
+        return true;
+    }
+    if trimmed.chars().any(char::is_whitespace) {
+        return false;
+    }
+    if trimmed.chars().any(|c| c.is_ascii_alphabetic()) {
+        return false;
+    }
+    let content_chars = trimmed
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .count();
+    content_chars > 0 && content_chars <= 2
 }
 
 fn audio_duration_ms(interleaved_len: usize, sample_rate: u32) -> u64 {
@@ -1375,40 +1579,12 @@ fn unix_now() -> i64 {
         .unwrap_or(0)
 }
 
-/// Millisecond-precision unix wall-clock timestamp. Used as the
-/// transcript sort key so cross-channel utterances land in the log in
-/// the order they *started*, not the order their VAD/STT decode
-/// finished.
+/// Millisecond-precision unix wall-clock timestamp.
 fn unix_now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
-}
-
-/// Ordering key for a transcript entry — millisecond wall-clock of when
-/// the utterance actually started. Falls back to `created_at * 1000`
-/// for entries that pre-date the `start_wall_ms` field (e.g. saved
-/// recordings from an older build) so mixed-vintage transcripts still
-/// sort into a stable order.
-fn entry_order_key(entry: &TranscriptEntry) -> u64 {
-    entry
-        .start_wall_ms
-        .unwrap_or_else(|| (entry.created_at.max(0) as u64).saturating_mul(1000))
-}
-
-/// Insert `entry` into `entries` at the position that keeps the vector
-/// sorted by `entry_order_key`. Scans from the tail (the common case
-/// is "new entry belongs at or near the end") and preserves relative
-/// order for ties — so two utterances that started at the same instant
-/// keep the order they were pushed in.
-fn insert_ordered(entries: &mut Vec<TranscriptEntry>, entry: TranscriptEntry) {
-    let key = entry_order_key(&entry);
-    let mut idx = entries.len();
-    while idx > 0 && entry_order_key(&entries[idx - 1]) > key {
-        idx -= 1;
-    }
-    entries.insert(idx, entry);
 }
 
 /// Commands crossing the async → blocking boundary for one slot's
@@ -1423,24 +1599,24 @@ enum StreamCmd {
     /// `Start` begins clean. Does NOT emit a final — the async VAD
     /// worker owns re-transcription via the offline SenseVoice model
     /// (higher accuracy on the full-clip decode) and pushes the
-    /// polished final itself via [`RecordState::finalize_partial`],
+    /// polished final itself via [`RecordState::finalize_clip`],
     /// which replaces whatever provisional partial the streaming
     /// decoder last broadcast.
     EndUtterance,
     /// Discard the current utterance without emitting a final —
-    /// removes any partial rows already broadcast for its `entry_id`.
+    /// removes any partial rows already broadcast for its `clip_id`.
     /// Used when the VAD closes a too-short utterance we've decided
     /// to drop as noise.
     Discard,
 }
 
-/// Metadata captured at speech-start time. `entry_id` is generated by
+/// Metadata captured at speech-start time. `clip_id` is generated by
 /// the VAD worker so partials + the eventual final share one row.
 struct StreamStart {
-    entry_id: String,
+    clip_id: String,
     slot: usize,
     audio_start_ms: Option<u64>,
-    start_wall_ms: Option<u64>,
+    start_wall_ms: u64,
 }
 
 /// Streaming state machine — voiced vs. unvoiced, plus enough context to
@@ -1462,7 +1638,7 @@ struct VadWorker {
     /// Id assigned at the current utterance's speech-start. Reused by
     /// every partial emission so upsert-by-id works, then dropped at
     /// finalize/discard time.
-    current_entry_id: Option<String>,
+    current_clip_id: Option<String>,
     window_samples: usize,
     /// Mono samples buffered until we've got a full window's worth.
     scratch: Vec<f32>,
@@ -1490,9 +1666,9 @@ struct VadWorker {
     /// into `utterance`. This is the utterance's start position in the
     /// recording's shared timeline.
     utterance_start_frame: u64,
-    /// Wall-clock unix ms at speech-start. Used as the entry's
-    /// `start_wall_ms` sort key so partials land at their true position
-    /// in the log instead of jumping around as more text arrives.
+    /// Wall-clock unix ms at speech-start. Used as the paragraph's
+    /// start_wall_ms so partials land at their true position in the log
+    /// instead of jumping around as more text arrives.
     utterance_start_wall_ms: u64,
     /// Counters used purely for log breadcrumbs. Reset every second so a
     /// long-running process's log stays terse but you can still see the
@@ -1520,7 +1696,7 @@ impl VadWorker {
             stt,
             state,
             streaming_tx,
-            current_entry_id: None,
+            current_clip_id: None,
             window_samples,
             scratch: Vec::with_capacity(window_samples * 2),
             utterance: Vec::new(),
@@ -1693,15 +1869,15 @@ impl VadWorker {
                     // the first Feed so sherpa sees the syllable
                     // attack, matching what the offline path decodes.
                     if let Some(tx) = &self.streaming_tx {
-                        let entry_id = Uuid::new_v4().to_string();
-                        self.current_entry_id = Some(entry_id.clone());
+                        let clip_id = Uuid::new_v4().to_string();
+                        self.current_clip_id = Some(clip_id.clone());
                         let start_ms = self.utterance_start_frame * 1000
                             / self.sample_rate as u64;
                         let _ = tx.try_send(StreamCmd::Start(StreamStart {
-                            entry_id,
+                            clip_id,
                             slot: self.slot,
                             audio_start_ms: Some(start_ms),
-                            start_wall_ms: Some(self.utterance_start_wall_ms),
+                            start_wall_ms: self.utterance_start_wall_ms,
                         }));
                         if !self.utterance.is_empty() {
                             let pre: Arc<[f32]> = Arc::from(self.utterance.clone());
@@ -1720,20 +1896,14 @@ impl VadWorker {
     /// the offline SenseVoice model produces a materially more accurate
     /// full-clip decode — so at close time we throw away the streaming
     /// final and run offline STT over the accumulated samples, then push
-    /// its output as the entry's polished text.
-    ///
-    /// * Streaming enabled — send an `EndUtterance` to reset the
-    ///   per-slot sherpa session (so the next `Start` begins clean),
-    ///   then run offline SenseVoice and replace the provisional
-    ///   partial via `state.finalize_partial(entry_id, ...)`.
-    /// * Streaming disabled — same offline decode, pushed via
-    ///   `state.push_transcript(...)` because there's no partial row
-    ///   to replace. Matches the pre-streaming behaviour.
+    /// its output via `state.finalize_clip(...)` (pass 2). If streaming
+    /// wasn't configured, no provisional clip exists — the finalize call
+    /// will create one directly.
     fn finalize_utterance(&mut self, reason: &'static str) {
         let samples = std::mem::take(&mut self.utterance);
         let start_frame = self.utterance_start_frame;
         let start_wall_ms = self.utterance_start_wall_ms;
-        let current_entry_id = self.current_entry_id.take();
+        let current_clip_id = self.current_clip_id.take();
         self.speaking = false;
         self.silence_windows = 0;
         self.voiced_windows = 0;
@@ -1757,8 +1927,8 @@ impl VadWorker {
             if let Some(tx) = &self.streaming_tx {
                 let _ = tx.try_send(StreamCmd::Discard);
             }
-            if let Some(id) = &current_entry_id {
-                state.remove_entry(id);
+            if let Some(id) = &current_clip_id {
+                state.remove_clip(id);
             }
             return;
         }
@@ -1787,49 +1957,34 @@ impl VadWorker {
 
         // Offline SenseVoice re-transcribe. Fires-and-forgets so the
         // VAD loop can start the next utterance immediately; the
-        // callback lands the polished text via either
-        // `finalize_partial` (streaming path — replaces the row keyed
-        // by entry_id) or `push_transcript` (streaming disabled —
-        // insert as a fresh row).
+        // callback lands the polished text via `finalize_clip`.
+        // Whether or not a streaming partial exists for this clip,
+        // `finalize_clip` upserts by id: an existing provisional row is
+        // updated in place, otherwise a new final clip is inserted.
         let stt = self.stt.clone();
         let start_wall_ms = if start_wall_ms == 0 {
             unix_now_ms().saturating_sub(duration_ms)
         } else {
             start_wall_ms
         };
+        // If no streaming clip id was assigned (streaming disabled), mint
+        // one now so `finalize_clip` has a stable key. The clip lands as
+        // a fresh final in whatever paragraph the gap logic picks.
+        let clip_id = current_clip_id.unwrap_or_else(|| Uuid::new_v4().to_string());
         tokio::spawn(async move {
             let res = tokio::task::spawn_blocking(move || stt.transcribe(&samples, sr)).await;
             match res {
                 Ok(Ok(text)) => {
                     let trimmed = text.trim().to_string();
-                    if let Some(entry_id) = current_entry_id {
-                        // Streaming path: replace the provisional row
-                        // (id-keyed) with the offline final. The same
-                        // false-positive filter as `push_transcript`
-                        // applies inside `finalize_partial` — a junk
-                        // decode removes the row rather than promoting
-                        // it.
-                        state.finalize_partial(
-                            &entry_id,
-                            slot,
-                            trimmed,
-                            Some(start_ms),
-                            Some(duration_ms),
-                            speaker,
-                            Some(start_wall_ms),
-                        );
-                    } else if trimmed.chars().any(|c| c.is_alphanumeric())
-                        && !is_false_positive(&trimmed)
-                    {
-                        state.push_transcript(
-                            slot,
-                            trimmed,
-                            Some(start_ms),
-                            Some(duration_ms),
-                            speaker,
-                            Some(start_wall_ms),
-                        );
-                    }
+                    state.finalize_clip(
+                        slot,
+                        &clip_id,
+                        trimmed,
+                        Some(start_ms),
+                        Some(duration_ms),
+                        speaker,
+                        start_wall_ms,
+                    );
                 }
                 Ok(Err(err)) => {
                     warn!(err = %format!("{err:#}"), "offline STT decode failed");
@@ -1849,11 +2004,11 @@ impl VadWorker {
 ///
 /// One utterance = one `Start` + zero-or-more `Feed`s + one
 /// `EndUtterance` (or `Discard`). Partial hypotheses are pushed via
-/// `state.upsert_partial` after each Feed that materially changes the
-/// text; on `EndUtterance` the sherpa stream is reset but no final is
-/// emitted — the async VAD worker owns re-transcription via the
+/// `state.upsert_provisional_clip` after each Feed that materially
+/// changes the text; on `EndUtterance` the sherpa stream is reset but no
+/// final is emitted — the async VAD worker owns re-transcription via the
 /// offline (higher-accuracy) SenseVoice model and replaces the last
-/// partial itself.
+/// partial itself via `state.finalize_clip`.
 fn run_streaming_decoder(
     session: StreamingSession,
     rx: std::sync::mpsc::Receiver<StreamCmd>,
@@ -1888,9 +2043,9 @@ fn run_streaming_decoder(
                 let debounce_ok = now.duration_since(last_emit) >= min_emit_interval
                     || last_partial.is_empty();
                 if changed && debounce_ok {
-                    state.upsert_partial(
-                        &start.entry_id,
+                    state.upsert_provisional_clip(
                         start.slot,
+                        &start.clip_id,
                         text.clone(),
                         start.audio_start_ms,
                         None, // duration not yet known
@@ -1916,7 +2071,7 @@ fn run_streaming_decoder(
             StreamCmd::Discard => {
                 session.reset();
                 if let Some(start) = current.take() {
-                    state.remove_entry(&start.entry_id);
+                    state.remove_clip(&start.clip_id);
                 }
                 last_partial.clear();
                 last_emit = Instant::now();
@@ -2016,8 +2171,8 @@ pub fn spawn_worker(
                         if let Some(tx) = &worker.streaming_tx {
                             let _ = tx.try_send(StreamCmd::Discard);
                         }
-                        if let Some(id) = worker.current_entry_id.take() {
-                            worker.state.remove_entry(&id);
+                        if let Some(id) = worker.current_clip_id.take() {
+                            worker.state.remove_clip(&id);
                         }
                         worker.utterance.clear();
                         worker.scratch.clear();

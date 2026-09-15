@@ -146,7 +146,7 @@ use crate::store::{AgentField, AgentRow, DEFAULT_AGENT_ID, ScriptBlockRow, Scrip
 /// client dropdown surfaces it as `— None (silence) —`; character UUIDs
 /// never collide with this literal.
 pub(crate) const VOICE_SILENCE: &str = "__silence__";
-use crate::record::{RecordState, TranscriptEntry};
+use crate::record::{Paragraph, RecordState};
 use crate::stt::SttHandle;
 use tokio::sync::broadcast;
 
@@ -965,12 +965,12 @@ pub async fn serve(
             get(record_segment_handler),
         )
         .route(
-            "/record/recordings/:id/entries/:entry_id",
-            axum::routing::patch(record_saved_entry_patch_handler),
+            "/record/recordings/:id/clips/:clip_id",
+            axum::routing::patch(record_saved_clip_patch_handler),
         )
         .route(
-            "/record/entries/:entry_id",
-            axum::routing::patch(record_live_entry_patch_handler),
+            "/record/clips/:clip_id",
+            axum::routing::patch(record_live_clip_patch_handler),
         )
         .route(
             "/record/buffer",
@@ -1557,7 +1557,7 @@ async fn say_handler(
     // to point at; for playback the user would need to hear the mic
     // feed or re-run the /say call.
     info!(channel = "TTS", voice = ?voice_label, text = %text, "tts: /say played");
-    state.record.push_tts(text.clone(), None, voice_label);
+    state.record.push_tts_paragraph(text.clone(), None, voice_label);
 
     let (reply_tx, reply_rx) = oneshot::channel();
     if state
@@ -3761,7 +3761,9 @@ async fn widget_say_handler(
         if !trimmed.is_empty() {
             let audio_url = format!("/widgets/{}", id);
             info!(channel = "TTS", widget = %id, voice = ?voice_label, text = %trimmed, "tts: widget played");
-            state.record.push_tts(trimmed, Some(audio_url), voice_label);
+            state
+                .record
+                .push_tts_paragraph(trimmed, Some(audio_url), voice_label);
         }
     }
 
@@ -4236,7 +4238,7 @@ struct RecordingSummary {
     created_at: i64,
     duration_ms: u64,
     sample_rate: u32,
-    entries: Vec<TranscriptEntry>,
+    paragraphs: Vec<Paragraph>,
     audio_url: String,
 }
 
@@ -4246,8 +4248,8 @@ async fn record_state_handler(State(state): State<AppState>) -> Response {
         Ok(rows) => rows
             .into_iter()
             .map(|r| {
-                let entries: Vec<TranscriptEntry> =
-                    serde_json::from_str(&r.transcript_json).unwrap_or_default();
+                let paragraphs: Vec<Paragraph> =
+                    serde_json::from_str(&r.paragraphs_json).unwrap_or_default();
                 RecordingSummary {
                     audio_url: format!("/record/recordings/{}/audio", r.id),
                     id: r.id,
@@ -4255,7 +4257,7 @@ async fn record_state_handler(State(state): State<AppState>) -> Response {
                     created_at: r.created_at,
                     duration_ms: r.duration_ms,
                     sample_rate: r.sample_rate,
-                    entries,
+                    paragraphs,
                 }
             })
             .collect::<Vec<_>>(),
@@ -4266,9 +4268,7 @@ async fn record_state_handler(State(state): State<AppState>) -> Response {
     };
     Json(serde_json::json!({
         "mode": snap.mode,
-        "buffer": snap.buffer,
-        "bufferBytes": snap.buffer_bytes,
-        "bufferMaxBytes": snap.buffer_max_bytes,
+        "paragraphsByChannel": snap.paragraphs_by_channel,
         "activeRecording": snap.active_recording,
         "channelNames": snap.channel_names,
         "sttEnabled": state.stt.is_some(),
@@ -4284,8 +4284,8 @@ async fn recordings_list_handler(State(state): State<AppState>) -> Response {
             let out: Vec<RecordingSummary> = rows
                 .into_iter()
                 .map(|r| {
-                    let entries: Vec<TranscriptEntry> =
-                        serde_json::from_str(&r.transcript_json).unwrap_or_default();
+                    let paragraphs: Vec<Paragraph> =
+                        serde_json::from_str(&r.paragraphs_json).unwrap_or_default();
                     RecordingSummary {
                         audio_url: format!("/record/recordings/{}/audio", r.id),
                         id: r.id,
@@ -4293,7 +4293,7 @@ async fn recordings_list_handler(State(state): State<AppState>) -> Response {
                         created_at: r.created_at,
                         duration_ms: r.duration_ms,
                         sample_rate: r.sample_rate,
-                        entries,
+                        paragraphs,
                     }
                 })
                 .collect();
@@ -4364,21 +4364,22 @@ async fn record_stop_handler(
     } else {
         encode_wav_pcm16_stereo(&mixed_pairs, sample_rate)
     };
-    let transcript_json = serde_json::to_string(&taken.entries).unwrap_or_else(|_| "[]".into());
+    let paragraphs_json =
+        serde_json::to_string(&taken.paragraphs).unwrap_or_else(|_| "[]".into());
     let rec_id = taken.id.clone();
     match state
         .store
         .create_recording(
             rec_id.clone(),
             taken.name.clone(),
-            // Preserve the recording's actual start time so per-entry
+            // Preserve the recording's actual start time so per-clip
             // `start_wall_ms` values stay relative to a consistent
             // epoch across the save boundary — otherwise the client
             // would render every row's timestamp as "0:00 – 0:00".
             taken.created_at,
             sample_rate,
             duration_ms,
-            transcript_json,
+            paragraphs_json,
             wav,
             mixed_wav,
         )
@@ -4392,7 +4393,7 @@ async fn record_stop_handler(
                 "createdAt": taken.created_at,
                 "durationMs": duration_ms,
                 "sampleRate": sample_rate,
-                "entries": taken.entries,
+                "paragraphs": taken.paragraphs,
                 "audioUrl": format!("/record/recordings/{}/audio", rec_id),
             }))
             .into_response()
@@ -4445,53 +4446,55 @@ async fn record_rename_handler(
     }
 }
 
-/// Body for the click-to-correct transcript edit endpoints. Only `text` is
+/// Body for the click-to-correct clip edit endpoints. Only `text` is
 /// mutable — timestamps, channel labels, and audio offsets stay pinned to
 /// what the VAD captured at record time.
 #[derive(Debug, Deserialize)]
-struct EntryTextPatch {
+struct ClipTextPatch {
     text: String,
 }
 
-/// Correct a transcript entry in the RAM state — either the rolling
-/// ephemeral buffer or the in-flight active recording. `RecordState::
-/// update_entry_text` handles both containers under one lock and mirrors
-/// buffer→active edits so an entry that lives in both views stays
+/// Correct a clip in the RAM state — either an active paragraph on any
+/// channel or a clip inside the currently-active recording.
+/// `RecordState::update_clip_text` walks both containers under one lock
+/// and mirrors the edit so a clip that lives in both views stays
 /// consistent. 404 when the id belongs to a saved recording (the caller
-/// should use the `/recordings/:id/entries/:entry_id` path for those).
-async fn record_live_entry_patch_handler(
+/// should use the `/recordings/:id/clips/:clip_id` path for those).
+async fn record_live_clip_patch_handler(
     State(state): State<AppState>,
-    Path(entry_id): Path<String>,
-    Json(body): Json<EntryTextPatch>,
+    Path(clip_id): Path<String>,
+    Json(body): Json<ClipTextPatch>,
 ) -> Response {
     if body.text.trim().is_empty() {
         return (StatusCode::BAD_REQUEST, "text is required").into_response();
     }
-    if state.record.update_entry_text(&entry_id, body.text) {
+    if state.record.update_clip_text(&clip_id, body.text) {
         (
             StatusCode::OK,
             Json(ActionResponse { ok: true, error: None }),
         )
             .into_response()
     } else {
-        (StatusCode::NOT_FOUND, "no such live entry").into_response()
+        (StatusCode::NOT_FOUND, "no such live clip").into_response()
     }
 }
 
-/// Correct a transcript entry inside a **saved** recording. Persists to
-/// sqlite by rewriting the recording's transcript JSON blob. Empty text
-/// is rejected upfront so the edit path never zeroes out an entry.
-async fn record_saved_entry_patch_handler(
+/// Correct a clip inside a **saved** recording. Persists to sqlite by
+/// rewriting the recording's paragraphs JSON blob (walking each
+/// paragraph's `clips` array to find the matching id and rebuilding
+/// paragraph text after the edit). Empty text is rejected upfront so
+/// the edit path never zeroes out a clip.
+async fn record_saved_clip_patch_handler(
     State(state): State<AppState>,
-    Path((recording_id, entry_id)): Path<(String, String)>,
-    Json(body): Json<EntryTextPatch>,
+    Path((recording_id, clip_id)): Path<(String, String)>,
+    Json(body): Json<ClipTextPatch>,
 ) -> Response {
     if body.text.trim().is_empty() {
         return (StatusCode::BAD_REQUEST, "text is required").into_response();
     }
     match state
         .store
-        .update_recording_entry_text(recording_id, entry_id, body.text)
+        .update_recording_clip_text(recording_id, clip_id, body.text)
         .await
     {
         Ok(crate::store::UpdateResult::Updated) => (
@@ -4500,21 +4503,21 @@ async fn record_saved_entry_patch_handler(
         )
             .into_response(),
         Ok(crate::store::UpdateResult::NotFound) => {
-            (StatusCode::NOT_FOUND, "no such recording or entry").into_response()
+            (StatusCode::NOT_FOUND, "no such recording or clip").into_response()
         }
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("update transcript: {err:#}"),
+            format!("update paragraphs: {err:#}"),
         )
             .into_response(),
     }
 }
 
-/// Clear the rolling ephemeral live buffer. The in-flight active recording
+/// Clear every channel's paragraph log. The in-flight active recording
 /// (if any) is untouched — clearing the Live pane must never wipe a
 /// session that's still capturing.
 async fn record_buffer_clear_handler(State(state): State<AppState>) -> Response {
-    state.record.clear_buffer();
+    state.record.clear_channels();
     (
         StatusCode::OK,
         Json(ActionResponse { ok: true, error: None }),
@@ -4689,15 +4692,15 @@ async fn record_archive_handler(
     let mixed_bytes = tokio::fs::read(&mixed_path).await.ok(); // None if sidecar missing
 
     let name = row.name.clone();
-    let entries: Vec<crate::record::TranscriptEntry> =
-        serde_json::from_str(&row.transcript_json).unwrap_or_default();
+    let paragraphs: Vec<crate::record::Paragraph> =
+        serde_json::from_str(&row.paragraphs_json).unwrap_or_default();
     let sample_rate = row.sample_rate;
 
     // Build the zip on a blocking pool — the per-utterance decode is a
     // few KB per WAV but adds up on long recordings, and we don't want
     // to block the runtime.
     let zip_bytes = match tokio::task::spawn_blocking(move || {
-        build_recording_archive(&name, sample_rate, &entries, &audio_bytes, mixed_bytes.as_deref())
+        build_recording_archive(&name, sample_rate, &paragraphs, &audio_bytes, mixed_bytes.as_deref())
     })
     .await
     {
@@ -4752,15 +4755,15 @@ fn sanitize_filename(name: &str) -> String {
 }
 
 /// Zip up the archive contents. Layout:
-///   * `transcript.json` — the entries array (pretty-printed for
-///     grep-ability).
+///   * `paragraphs.json` — the paragraph array (pretty-printed for
+///     grep-ability). Each paragraph carries an inline `clips` array.
 ///   * `mixed.wav` — the silence-gated mic feed (omitted if the sidecar
 ///     was missing).
 ///   * `audio.wav` — the full per-slot recorded audio (untrimmed).
-///   * `clips/{entry.id}.wav` — one WAV per entry that has an audio
-///     range (audio_start_ms + audio_duration_ms), sliced from the
-///     per-slot WAV. TTS entries and entries missing a range are
-///     represented in the transcript only.
+///   * `clips/{clip.id}.wav` — one WAV per clip (across all paragraphs)
+///     that has an audio range (audio_start_ms + audio_duration_ms),
+///     sliced from the per-slot WAV. TTS clips and clips missing a
+///     range are represented in the paragraph JSON only.
 ///
 /// Uses `stored` compression method — WAVs and JSON are near-random or
 /// small enough that deflate wouldn't buy much, and stored avoids
@@ -4768,7 +4771,7 @@ fn sanitize_filename(name: &str) -> String {
 fn build_recording_archive(
     name: &str,
     sample_rate: u32,
-    entries: &[crate::record::TranscriptEntry],
+    paragraphs: &[crate::record::Paragraph],
     audio_wav_bytes: &[u8],
     mixed_wav_bytes: Option<&[u8]>,
 ) -> anyhow::Result<Vec<u8>> {
@@ -4780,14 +4783,14 @@ fn build_recording_archive(
         let mut zip = ZipWriter::new(Cursor::new(&mut buf));
         let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
 
-        let transcript = serde_json::json!({
+        let manifest = serde_json::json!({
             "name": name,
             "sample_rate": sample_rate,
-            "entries": entries,
+            "paragraphs": paragraphs,
         });
-        let transcript_pretty = serde_json::to_vec_pretty(&transcript)?;
-        zip.start_file("transcript.json", opts)?;
-        zip.write_all(&transcript_pretty)?;
+        let manifest_pretty = serde_json::to_vec_pretty(&manifest)?;
+        zip.start_file("paragraphs.json", opts)?;
+        zip.write_all(&manifest_pretty)?;
 
         zip.start_file("audio.wav", opts)?;
         zip.write_all(audio_wav_bytes)?;
@@ -4797,29 +4800,33 @@ fn build_recording_archive(
             zip.write_all(mixed)?;
         }
 
-        // Decode the per-slot WAV once so per-entry slicing doesn't
-        // re-parse the header 100 times. The WAV was written by
+        // Decode the per-slot WAV once so per-clip slicing doesn't
+        // re-parse the header N times. The WAV was written by
         // encode_wav_pcm16_stereo — 16-bit PCM stereo — so we can trust
         // the sample_rate row on the recording and just carve the PCM.
         if let Some(pcm) = decode_pcm16_stereo(audio_wav_bytes) {
-            for entry in entries {
-                let (Some(start_ms), Some(dur_ms)) = (entry.audio_start_ms, entry.audio_duration_ms)
-                else {
-                    continue;
-                };
-                if dur_ms == 0 {
-                    continue;
+            for paragraph in paragraphs {
+                for clip in &paragraph.clips {
+                    let (Some(start_ms), Some(dur_ms)) =
+                        (clip.audio_start_ms, clip.audio_duration_ms)
+                    else {
+                        continue;
+                    };
+                    if dur_ms == 0 {
+                        continue;
+                    }
+                    let start_frame = (start_ms as usize) * sample_rate as usize / 1000;
+                    let end_frame = start_frame + (dur_ms as usize) * sample_rate as usize / 1000;
+                    let end_frame = end_frame.min(pcm.len());
+                    if start_frame >= end_frame {
+                        continue;
+                    }
+                    let clip_wav =
+                        encode_wav_pcm16_stereo(&pcm[start_frame..end_frame], sample_rate);
+                    let path = format!("clips/{}.wav", clip.id);
+                    zip.start_file(&path, opts)?;
+                    zip.write_all(&clip_wav)?;
                 }
-                let start_frame = (start_ms as usize) * sample_rate as usize / 1000;
-                let end_frame = start_frame + (dur_ms as usize) * sample_rate as usize / 1000;
-                let end_frame = end_frame.min(pcm.len());
-                if start_frame >= end_frame {
-                    continue;
-                }
-                let clip_wav = encode_wav_pcm16_stereo(&pcm[start_frame..end_frame], sample_rate);
-                let path = format!("clips/{}.wav", entry.id);
-                zip.start_file(&path, opts)?;
-                zip.write_all(&clip_wav)?;
             }
         }
         zip.finish()?;
@@ -5030,27 +5037,25 @@ async fn obs_subtitles_stream(
             .await;
         loop {
             match rx.recv().await {
-                Ok(crate::record::SubtitleEvent::Entry(entry)) => {
-                    // Speaker preference: hinted name wins; otherwise fall
-                    // back to the vox channel name captured at push time.
-                    let who = entry.speaker.clone().unwrap_or_else(|| entry.channel.clone());
-                    // start_wall_ms carries the utterance's true start
-                    // moment (VAD speech-start). The OBS client uses it
-                    // to order entries chronologically instead of by
-                    // arrival — otherwise two overlapping slots, or a
-                    // delayed offline final landing after a page-break
-                    // clear, can splice entries in the wrong sequence.
+                Ok(crate::record::SubtitleEvent::ParagraphUpsert(paragraph)) => {
+                    let who = paragraph
+                        .speaker
+                        .clone()
+                        .unwrap_or_else(|| paragraph.channel.clone());
                     let payload = serde_json::json!({
-                        "id": entry.id,
+                        "id": paragraph.id,
+                        "channel": paragraph.channel,
                         "who": who,
-                        "text": entry.text,
-                        "provisional": entry.provisional,
-                        "start_wall_ms": entry.start_wall_ms,
+                        "text": paragraph.text,
+                        "hardened": paragraph.hardened,
+                        "start_wall_ms": paragraph.start_wall_ms,
+                        "end_wall_ms": paragraph.end_wall_ms,
+                        "clips": paragraph.clips,
                     });
                     if tx
                         .send(
                             SseEventFrame::default()
-                                .event("entry")
+                                .event("paragraphUpsert")
                                 .data(payload.to_string()),
                         )
                         .await
@@ -5059,15 +5064,49 @@ async fn obs_subtitles_stream(
                         return;
                     }
                 }
-                Ok(crate::record::SubtitleEvent::EntryRemove(id)) => {
-                    // Fired when a streaming partial's final decoded to a
-                    // false-positive filter match — pull it off the
-                    // overlay so the stale text doesn't linger.
+                Ok(crate::record::SubtitleEvent::ParagraphRemove(id)) => {
                     if tx
                         .send(
                             SseEventFrame::default()
-                                .event("remove")
+                                .event("paragraphRemove")
                                 .data(serde_json::json!({ "id": id }).to_string()),
+                        )
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                Ok(crate::record::SubtitleEvent::ClipUpsert { paragraph_id, clip }) => {
+                    let payload = serde_json::json!({
+                        "paragraph_id": paragraph_id,
+                        "clip": clip,
+                    });
+                    if tx
+                        .send(
+                            SseEventFrame::default()
+                                .event("clipUpsert")
+                                .data(payload.to_string()),
+                        )
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                Ok(crate::record::SubtitleEvent::ClipRemove {
+                    paragraph_id,
+                    clip_id,
+                }) => {
+                    let payload = serde_json::json!({
+                        "paragraph_id": paragraph_id,
+                        "clip_id": clip_id,
+                    });
+                    if tx
+                        .send(
+                            SseEventFrame::default()
+                                .event("clipRemove")
+                                .data(payload.to_string()),
                         )
                         .await
                         .is_err()

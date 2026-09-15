@@ -120,18 +120,24 @@ CREATE TABLE IF NOT EXISTS samples (
     byte_size    INTEGER NOT NULL,
     created_at   INTEGER NOT NULL
 );
--- Saved recordings from the Record tab. `transcript` is a JSON array of
--- utterance entries produced by the streaming STT worker; the raw stereo
--- audio lives at `data/recordings/{id}.wav`. Transcript-only recordings
--- (created if STT is disabled) still get a WAV so the operator can replay
--- what was captured.
+-- Saved recordings from the Record tab. `paragraphs` is a JSON array of
+-- Paragraph objects (each with an inline `clips` array) produced by the
+-- streaming STT worker; the raw stereo audio lives at
+-- `data/recordings/{id}.wav`. Transcript-only recordings (created if STT
+-- is disabled) still get a WAV so the operator can replay what was
+-- captured.
+--
+-- NOTE: `CREATE TABLE IF NOT EXISTS` is a no-op on existing databases —
+-- if this project was previously running with the older `transcript`
+-- column, delete `data/rpg_vox.sqlite` for the schema change to take
+-- effect. Stage 1 has no migration code.
 CREATE TABLE IF NOT EXISTS recordings (
     id           TEXT PRIMARY KEY,
     name         TEXT NOT NULL,
     created_at   INTEGER NOT NULL,
     duration_ms  INTEGER NOT NULL,
     sample_rate  INTEGER NOT NULL,
-    transcript   TEXT NOT NULL
+    paragraphs   TEXT NOT NULL
 );
 "#;
 
@@ -1944,12 +1950,11 @@ impl Store {
     /// worker has drained the active bucket into an owned buffer.
     ///
     /// `created_at` must be the recording's **start** time (unix
-    /// seconds), not "now": every transcript entry carries a
-    /// `start_wall_ms` in unix millis, and the client renders relative
-    /// timestamps as `(entry.start_wall_ms - recording.created_at *
-    /// 1000)`. If we stamped `unix_now()` here (i.e. stop time), that
-    /// subtraction goes negative and the client clamps every row to
-    /// "0:00 – 0:00".
+    /// seconds), not "now": every clip carries a `start_wall_ms` in
+    /// unix millis, and the client renders relative timestamps as
+    /// `(clip.start_wall_ms - recording.created_at * 1000)`. If we
+    /// stamped `unix_now()` here (i.e. stop time), that subtraction
+    /// goes negative and the client clamps every row to "0:00 – 0:00".
     ///
     /// `mixed_wav_bytes` may be empty (nothing cleared the silence gate
     /// during the session) — in that case the sidecar file is skipped
@@ -1961,19 +1966,19 @@ impl Store {
         created_at: i64,
         sample_rate: u32,
         duration_ms: u64,
-        transcript_json: String,
+        paragraphs_json: String,
         wav_bytes: Vec<u8>,
         mixed_wav_bytes: Vec<u8>,
     ) -> Result<()> {
         let db = self.db.clone();
         let id_clone = id.clone();
         let name_clone = name.clone();
-        let transcript_clone = transcript_json.clone();
+        let paragraphs_clone = paragraphs_json.clone();
         tokio::task::spawn_blocking(move || -> Result<()> {
             let conn = db.lock().unwrap();
             conn.execute(
                 "INSERT INTO recordings
-                   (id, name, created_at, duration_ms, sample_rate, transcript)
+                   (id, name, created_at, duration_ms, sample_rate, paragraphs)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     id_clone,
@@ -1981,7 +1986,7 @@ impl Store {
                     created_at,
                     duration_ms as i64,
                     sample_rate as i64,
-                    transcript_clone,
+                    paragraphs_clone,
                 ],
             )?;
             Ok(())
@@ -2004,7 +2009,7 @@ impl Store {
         let rows = tokio::task::spawn_blocking(move || -> Result<Vec<RecordingRow>> {
             let conn = db.lock().unwrap();
             let mut stmt = conn.prepare(
-                "SELECT id, name, created_at, duration_ms, sample_rate, transcript
+                "SELECT id, name, created_at, duration_ms, sample_rate, paragraphs
                    FROM recordings
                   ORDER BY created_at DESC",
             )?;
@@ -2016,7 +2021,7 @@ impl Store {
                         created_at: r.get(2)?,
                         duration_ms: r.get::<_, i64>(3)? as u64,
                         sample_rate: r.get::<_, i64>(4)? as u32,
-                        transcript_json: r.get(5)?,
+                        paragraphs_json: r.get(5)?,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2050,16 +2055,19 @@ impl Store {
         })
     }
 
-    /// Update the `text` field of one entry inside a saved recording's
-    /// transcript JSON. Returns `NotFound` when either the recording row
-    /// or the entry id doesn't exist so the HTTP handler can pick the
-    /// right status code. The JSON is treated as a `Vec<Value>` so
-    /// unknown / future fields on entries survive an edit round-trip
-    /// (nothing gets silently dropped by a stricter Rust struct).
-    pub async fn update_recording_entry_text(
+    /// Update the `text` field of one clip inside a saved recording's
+    /// paragraphs JSON. Walks each paragraph's `clips` array to find the
+    /// matching clip id, updates its text, rebuilds the paragraph's
+    /// `text` (naïve space-join of clip texts, matching Stage 1
+    /// behavior), and writes back. Returns `NotFound` when either the
+    /// recording row or the clip id doesn't exist so the HTTP handler
+    /// can pick the right status code. Unknown / future fields on
+    /// paragraphs and clips survive the round-trip since we work through
+    /// `serde_json::Value`.
+    pub async fn update_recording_clip_text(
         &self,
         recording_id: String,
-        entry_id: String,
+        clip_id: String,
         text: String,
     ) -> Result<UpdateResult> {
         let text = text.trim().to_string();
@@ -2072,7 +2080,7 @@ impl Store {
             let conn = db.lock().unwrap();
             let raw: Option<String> = conn
                 .query_row(
-                    "SELECT transcript FROM recordings WHERE id = ?1",
+                    "SELECT paragraphs FROM recordings WHERE id = ?1",
                     params![recording_id_clone],
                     |r| r.get::<_, String>(0),
                 )
@@ -2080,30 +2088,64 @@ impl Store {
             let Some(raw) = raw else {
                 return Ok(UpdateResult::NotFound);
             };
-            let mut entries: Vec<serde_json::Value> = serde_json::from_str(&raw)
-                .context("parsing recording transcript JSON")?;
+            let mut paragraphs: Vec<serde_json::Value> = serde_json::from_str(&raw)
+                .context("parsing recording paragraphs JSON")?;
             let mut hit = false;
-            for entry in entries.iter_mut() {
-                let matches = entry
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s == entry_id)
-                    .unwrap_or(false);
-                if matches {
-                    if let Some(obj) = entry.as_object_mut() {
+            'outer: for paragraph in paragraphs.iter_mut() {
+                let Some(clips) = paragraph.get_mut("clips").and_then(|v| v.as_array_mut()) else {
+                    continue;
+                };
+                for clip in clips.iter_mut() {
+                    let matches = clip
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s == clip_id)
+                        .unwrap_or(false);
+                    if !matches {
+                        continue;
+                    }
+                    if let Some(obj) = clip.as_object_mut() {
                         obj.insert("text".to_string(), serde_json::Value::String(text.clone()));
                         hit = true;
                     }
-                    break;
+                    break 'outer;
                 }
             }
             if !hit {
                 return Ok(UpdateResult::NotFound);
             }
-            let updated = serde_json::to_string(&entries)
-                .context("serializing updated transcript")?;
+            // Rebuild the containing paragraph's text as a naïve
+            // space-join of its clips' texts, matching the in-memory
+            // Stage 1 `Paragraph::rebuild` behaviour.
+            for paragraph in paragraphs.iter_mut() {
+                let joined = paragraph
+                    .get("clips")
+                    .and_then(|v| v.as_array())
+                    .map(|clips| {
+                        clips
+                            .iter()
+                            .filter_map(|c| c.get("text").and_then(|t| t.as_str()))
+                            .filter(|t| !t.is_empty())
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    });
+                if let Some(joined) = joined {
+                    if let Some(obj) = paragraph.as_object_mut() {
+                        obj.insert(
+                            "text".to_string(),
+                            serde_json::Value::String(joined.clone()),
+                        );
+                        obj.insert(
+                            "raw_text".to_string(),
+                            serde_json::Value::String(joined),
+                        );
+                    }
+                }
+            }
+            let updated = serde_json::to_string(&paragraphs)
+                .context("serializing updated paragraphs")?;
             let rows = conn.execute(
-                "UPDATE recordings SET transcript = ?2 WHERE id = ?1",
+                "UPDATE recordings SET paragraphs = ?2 WHERE id = ?1",
                 params![recording_id_clone, updated],
             )?;
             Ok(if rows == 0 {
@@ -2201,10 +2243,11 @@ pub struct RecordingRow {
     pub created_at: i64,
     pub duration_ms: u64,
     pub sample_rate: u32,
-    /// JSON array of transcript entries as produced by the streaming worker.
-    /// Kept opaque at the store layer so the HTTP handler can pass it through
-    /// unchanged in its response body without a round-trip parse.
-    pub transcript_json: String,
+    /// JSON array of `Paragraph` objects as produced by the streaming
+    /// worker. Kept opaque at the store layer so the HTTP handler can
+    /// pass it through unchanged in its response body without a
+    /// round-trip parse.
+    pub paragraphs_json: String,
 }
 
 pub struct ScriptSummaryRow {

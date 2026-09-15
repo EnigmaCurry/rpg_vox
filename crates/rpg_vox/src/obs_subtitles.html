@@ -115,148 +115,131 @@
   // Clear the visible page after this long with no new events. Keeps
   // stale text off-screen without wiping mid-conversation pauses.
   const IDLE_CLEAR_MS = 30000;
+  // Stage 1 overlay: show the last N paragraphs in order of arrival.
+  // A future pass will restore multi-line ordering, provisional
+  // styling, etc. — for now we just render paragraph text keyed by
+  // paragraph id.
+  const MAX_PARAGRAPHS = 2;
 
   /**
-   * page[] — entries currently on the visible page, kept sorted by
-   * ascending `startWallMs` so top-to-bottom is oldest-to-newest
-   * regardless of arrival order (two overlapping slots or a delayed
-   * offline final can otherwise splice entries in the wrong sequence).
-   * Each entry caches both the streaming (provisional) text and the
-   * offline-corrected (final) text. The render pass always prefers
-   * the final text once it exists (regardless of the entry's position)
-   * and falls back to the provisional streaming text until the offline
-   * pass lands. Any entry still showing provisional text renders as
-   * italic + dimmed so viewers can tell it may still be revised.
-   *
-   * The same entry_id can broadcast a `provisional=true` partial
-   * followed by a `provisional=false` final; keeping both texts means
-   * the streaming hypothesis stays visible while the offline decode
-   * runs, then swaps to the corrected text as soon as the final
-   * arrives — including on the newest entry, which is the common case
-   * once the user stops talking.
+   * paragraphs — Map<id, {id, who, text, hardened, startWallMs}>,
+   * insertion-ordered by arrival. `render()` truncates to the last
+   * MAX_PARAGRAPHS entries.
    */
-  let page = [];
+  const paragraphs = new Map();
   let idleTimer = null;
 
   function scheduleIdleClear() {
     if (idleTimer) clearTimeout(idleTimer);
     idleTimer = setTimeout(() => {
-      page = [];
+      paragraphs.clear();
       render();
       idleTimer = null;
     }, IDLE_CLEAR_MS);
   }
 
-  function textFor(entry) {
-    return entry.finalText || entry.provisionalText || "";
-  }
-
-  function makeLine(entry) {
+  function makeLine(paragraph) {
     const line = document.createElement("div");
-    const showAsProvisional = !entry.finalText && !!entry.provisionalText;
+    // In Stage 1 paragraphs are only "provisional" in the sense that
+    // any of their clips are still streaming partials. Render any
+    // paragraph whose text is non-empty; italicize if !hardened and
+    // some clip is provisional.
+    const anyProvisional =
+      Array.isArray(paragraph.clips) && paragraph.clips.some((c) => c && c.provisional);
+    const showAsProvisional = !paragraph.hardened && anyProvisional;
     line.className = "line" + (showAsProvisional ? " provisional" : "");
     const who = document.createElement("span");
     who.className = "who";
-    who.textContent = entry.who;
+    who.textContent = paragraph.who || "";
     const text = document.createElement("span");
     text.className = "text";
-    text.textContent = textFor(entry);
+    text.textContent = paragraph.text || "";
     line.append(who, text);
     return line;
   }
 
   function render() {
     stage.replaceChildren();
-    for (const entry of page) {
-      stage.append(makeLine(entry));
+    const ordered = Array.from(paragraphs.values());
+    const shown = ordered.slice(Math.max(0, ordered.length - MAX_PARAGRAPHS));
+    for (const p of shown) {
+      if (!p.text) continue;
+      stage.append(makeLine(p));
+    }
+    // Overflow trim: drop from the front until it fits or we're down
+    // to a single paragraph. Cheap because MAX_PARAGRAPHS is tiny.
+    while (stage.children.length > 1 && !fits()) {
+      stage.firstElementChild.remove();
     }
   }
 
   /** True when the accumulated content fits inside the stage's box. */
   function fits() {
-    // 1px tolerance for sub-pixel layout rounding.
     return stage.scrollHeight <= stage.clientHeight + 1;
   }
 
-  /** Insert `entry` into `page` at the position that keeps it sorted
-   *  by ascending `startWallMs`. Entries without a startWallMs sort
-   *  as if 0 (treated as older than everything else, which is safe:
-   *  they're pre-migration data that shouldn't be interleaved with
-   *  live ones). */
-  function insertOrdered(entry) {
-    const key = entry.startWallMs || 0;
-    let i = page.length;
-    while (i > 0 && (page[i - 1].startWallMs || 0) > key) {
-      i--;
-    }
-    page.splice(i, 0, entry);
-  }
-
-  /**
-   * Merge one incoming SSE `entry` event into the visible page. The
-   * event carries either a provisional (streaming partial) or a final
-   * (offline SenseVoice) text for `evt.id` — we upsert-by-id so the
-   * partial → final swap on the backend lands on the same page slot.
-   *
-   * Insertion is ordered by `startWallMs` so a delayed offline final
-   * (for an utterance that started earlier on another slot) drops
-   * into the correct chronological slot rather than appearing at the
-   * bottom.
-   *
-   * On overflow (new entry pushes past the stage bottom, or a growing
-   * partial does), we page-break: clear the page and restart at the
-   * top with just the chronologically-newest entry so the "current"
-   * utterance stays visible. A stale delayed final that overflows on
-   * its own arrival simply falls off the page here — the alternative
-   * (booting the current live utterance to make room for a correction
-   * of an old one) is worse.
-   */
-  function upsertEntry(evt) {
-    const idx = evt.id ? page.findIndex((e) => e.id === evt.id) : -1;
-    if (idx >= 0) {
-      const existing = page[idx];
-      existing.who = evt.who || existing.who;
-      if (evt.provisional) {
-        existing.provisionalText = evt.text;
-      } else {
-        existing.finalText = evt.text;
-      }
-      render();
-      if (!fits()) {
-        page = [page[page.length - 1]];
-        render();
-      }
-      return;
-    }
-    const entry = {
+  function paragraphUpsert(evt) {
+    if (!evt || !evt.id) return;
+    const existing = paragraphs.get(evt.id) || {};
+    // Preserve insertion order: setting an existing key doesn't move
+    // it in a Map, which is exactly what we want.
+    paragraphs.set(evt.id, {
       id: evt.id,
-      who: evt.who,
-      provisionalText: evt.provisional ? evt.text : null,
-      finalText: evt.provisional ? null : evt.text,
-      startWallMs: evt.startWallMs || 0,
-    };
-    insertOrdered(entry);
+      who: (evt.who || existing.who || "").trim() || "unknown",
+      text: (evt.text ?? existing.text ?? "").trim(),
+      hardened: !!evt.hardened,
+      clips: Array.isArray(evt.clips) ? evt.clips : existing.clips || [],
+      startWallMs: Number(evt.start_wall_ms) || existing.startWallMs || 0,
+    });
     render();
-    if (!fits()) {
-      page = [page[page.length - 1]];
-      render();
-    }
+    scheduleIdleClear();
   }
 
-  function removeEntry(id) {
+  function paragraphRemove(id) {
     if (!id) return;
-    const before = page.length;
-    page = page.filter((e) => e.id !== id);
-    if (page.length !== before) render();
+    if (paragraphs.delete(id)) render();
+  }
+
+  function clipUpsert(evt) {
+    if (!evt || !evt.paragraph_id || !evt.clip) return;
+    const p = paragraphs.get(evt.paragraph_id);
+    if (!p) return;
+    // Merge the clip into the paragraph's clips array by id so a
+    // paragraphUpsert doesn't need to fire on every partial update.
+    const clips = Array.isArray(p.clips) ? p.clips.slice() : [];
+    const idx = clips.findIndex((c) => c && c.id === evt.clip.id);
+    if (idx >= 0) clips[idx] = evt.clip;
+    else clips.push(evt.clip);
+    // Rebuild paragraph text as a naïve space-join, matching the
+    // Stage 1 backend behavior.
+    const text = clips
+      .map((c) => (c && c.text) ? c.text : "")
+      .filter((t) => t !== "")
+      .join(" ");
+    paragraphs.set(evt.paragraph_id, { ...p, clips, text });
+    render();
+    scheduleIdleClear();
+  }
+
+  function clipRemove(evt) {
+    if (!evt || !evt.paragraph_id || !evt.clip_id) return;
+    const p = paragraphs.get(evt.paragraph_id);
+    if (!p || !Array.isArray(p.clips)) return;
+    const clips = p.clips.filter((c) => c && c.id !== evt.clip_id);
+    if (clips.length === p.clips.length) return;
+    const text = clips
+      .map((c) => (c && c.text) ? c.text : "")
+      .filter((t) => t !== "")
+      .join(" ");
+    paragraphs.set(evt.paragraph_id, { ...p, clips, text });
+    render();
   }
 
   function setRecording(active) {
     const was = document.body.classList.contains("recording");
     document.body.classList.toggle("recording", !!active);
     if (!active) {
-      // Wipe the caption stack the moment recording stops so a resume
-      // doesn't briefly show leftover text from the previous session.
-      page = [];
+      paragraphs.clear();
       if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
     }
     if (was !== !!active) scheduleRefit();
@@ -270,27 +253,30 @@
       try { data = JSON.parse(ev.data); } catch { return; }
       setRecording(!!(data && data.recording));
     });
-    src.addEventListener("entry", (ev) => {
+    src.addEventListener("paragraphUpsert", (ev) => {
       let data;
       try { data = JSON.parse(ev.data); } catch { return; }
-      if (!data || !data.text) return;
+      if (!data) return;
       if (!document.body.classList.contains("recording")) {
         setRecording(true);
       }
-      upsertEntry({
-        id: data.id || null,
-        who: (data.who || "").trim() || "unknown",
-        text: data.text.trim(),
-        provisional: !!data.provisional,
-        startWallMs: Number(data.start_wall_ms) || 0,
-      });
-      scheduleIdleClear();
+      paragraphUpsert(data);
     });
-    src.addEventListener("remove", (ev) => {
+    src.addEventListener("paragraphRemove", (ev) => {
       let data;
       try { data = JSON.parse(ev.data); } catch { return; }
       if (!data || !data.id) return;
-      removeEntry(data.id);
+      paragraphRemove(data.id);
+    });
+    src.addEventListener("clipUpsert", (ev) => {
+      let data;
+      try { data = JSON.parse(ev.data); } catch { return; }
+      clipUpsert(data);
+    });
+    src.addEventListener("clipRemove", (ev) => {
+      let data;
+      try { data = JSON.parse(ev.data); } catch { return; }
+      clipRemove(data);
     });
     src.onerror = () => {
       // Browser reconnects EventSource on its own; on reconnect the
@@ -314,10 +300,7 @@
   }
   function refit() {
     render();
-    while (page.length > 1 && !fits()) {
-      page = page.slice(1);
-      render();
-    }
+    // render() already trims from the front to fit; nothing extra to do.
   }
   // Observe BOTH the documentElement (viewport-shaped) and #stage /
   // #suspended themselves. OBS's CEF has been observed to fire body
