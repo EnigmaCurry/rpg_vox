@@ -30,7 +30,7 @@
 //! the record HTTP endpoints still work (the UI stays empty) so future
 //! recognizer additions can drop in without further wiring.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -52,6 +52,20 @@ pub const PARAGRAPH_GAP_MS: u64 = 6_000;
 /// 30 min at 48 kHz stereo f32 ≈ 690 MB — big but survivable, and past that
 /// the operator almost certainly forgot to stop.
 const RECORDING_MAX_FRAMES: usize = 48_000 * 60 * 30;
+
+/// Retention window for the per-slot mono audio ring. Big enough to cover
+/// the last few clips plus a safety margin so pass 3 can re-transcribe
+/// the last 2–3 clips without ever missing audio. 90 s at 48 kHz mono
+/// f32 ≈ 17 MB per slot — well within budget for the small vox slot
+/// count.
+const AUDIO_RING_RETENTION_MS: u64 = 90_000;
+/// Cap on how many mono samples a pass-3 window may cover. SenseVoice
+/// degrades on inputs much longer than ~25 s; keep the window under it.
+const BOUNDARY_MAX_WINDOW_MS: u64 = 25_000;
+/// Minimum wall-clock gap between successive pass-3 fires per paragraph.
+/// Cheap safety net so a rapid succession of `finalize_clip` calls
+/// doesn't stack blocking STT decodes on the spawn_blocking pool.
+const BOUNDARY_DEBOUNCE_MS: u64 = 500;
 
 /// Cap on paragraphs kept per channel outside of a named recording. Older
 /// paragraphs drop FIFO when this is exceeded so the rolling per-channel
@@ -204,6 +218,144 @@ impl Paragraph {
     }
 }
 
+/// Per-channel bounded ring of mono audio, used by pass-3 boundary
+/// re-transcription. Populated unconditionally from every incoming vox
+/// chunk (regardless of the enable flag or recording state) so a
+/// paragraph consolidation always has audio to draw from, even in the
+/// ephemeral (not-recording) case.
+///
+/// The ring keeps at least [`AUDIO_RING_RETENTION_MS`] of audio at
+/// `sample_rate`; older samples get popped off the front once retention
+/// is exceeded and `head_wall_ms` advances to keep the wall-clock
+/// mapping accurate.
+///
+/// On a `broadcast::Lagged` (or any other observed discontinuity) the
+/// ring is marked `lagged` — while set, [`Self::samples_between`]
+/// returns `None` because we can't guarantee contiguity across the gap.
+/// The flag clears on the next push, which also re-anchors the ring.
+struct SlotAudioRing {
+    /// Mono f32 samples, oldest-first. Capacity chosen so retention ≥
+    /// AUDIO_RING_RETENTION_MS at sample_rate.
+    samples: VecDeque<f32>,
+    sample_rate: u32,
+    /// Wall-clock unix-ms of the sample that would be at index 0 if the
+    /// ring were reindexed from zero. Advances as older samples get
+    /// popped off the front. `None` until the first push lands.
+    head_wall_ms: Option<u64>,
+    /// Set to `true` on a broadcast::Lagged (or any other discontinuity).
+    /// While `true`, `samples_between` returns None regardless of range
+    /// because we can't guarantee the ring is contiguous. Cleared on
+    /// clear() or once we've observed a fresh anchor.
+    lagged: bool,
+}
+
+impl SlotAudioRing {
+    fn new(sample_rate: u32) -> Self {
+        // Reserve enough space that steady-state pushes never realloc.
+        let cap = if sample_rate == 0 {
+            0
+        } else {
+            ((sample_rate as u64 * AUDIO_RING_RETENTION_MS) / 1000) as usize
+        };
+        Self {
+            samples: VecDeque::with_capacity(cap),
+            sample_rate,
+            head_wall_ms: None,
+            lagged: false,
+        }
+    }
+
+    /// Push a new mono chunk. Establishes head_wall_ms on the first push,
+    /// trims old samples once retention is exceeded (advancing head_wall_ms
+    /// proportionally). Clears the `lagged` flag if set — the new push
+    /// re-anchors the ring.
+    fn push(&mut self, chunk: &[f32], wall_now_ms: u64) {
+        if self.sample_rate == 0 || chunk.is_empty() {
+            return;
+        }
+        let chunk_ms = ((chunk.len() as u64) * 1000) / self.sample_rate as u64;
+        if self.head_wall_ms.is_none() || self.lagged {
+            // First push, or first push after a lag — re-anchor so the
+            // head reflects the wall-clock of the sample that will sit
+            // at index 0 after this push lands.
+            //
+            // Simpler shape than the plan's "end-of-chunk anchor" wording:
+            // set head_wall_ms so that after appending this chunk, the
+            // sample at index `samples.len()` (past the tail) corresponds
+            // to `wall_now_ms`. Equivalently, head = wall_now_ms - chunk_ms.
+            self.samples.clear();
+            self.head_wall_ms = Some(wall_now_ms.saturating_sub(chunk_ms));
+            self.lagged = false;
+        }
+        self.samples.extend(chunk.iter().copied());
+        // Trim retention. Keep at most AUDIO_RING_RETENTION_MS of samples;
+        // advance head_wall_ms by the number of samples we drop.
+        let max_samples =
+            ((self.sample_rate as u64 * AUDIO_RING_RETENTION_MS) / 1000) as usize;
+        if self.samples.len() > max_samples {
+            let drop = self.samples.len() - max_samples;
+            self.samples.drain(..drop);
+            let drop_ms = ((drop as u64) * 1000) / self.sample_rate as u64;
+            if let Some(head) = self.head_wall_ms.as_mut() {
+                *head = head.saturating_add(drop_ms);
+            }
+        }
+    }
+
+    /// Mark the ring as post-Lagged. Subsequent samples_between() returns
+    /// None until the next push re-anchors. Simplest: clear the ring so
+    /// stale samples can't be quietly returned as if contiguous.
+    fn on_lagged(&mut self) {
+        self.clear();
+        self.lagged = true;
+    }
+
+    /// Explicit clear (used by on_lagged and by future callers).
+    fn clear(&mut self) {
+        self.samples.clear();
+        self.head_wall_ms = None;
+        self.lagged = false;
+    }
+
+    /// Return the mono samples covering `[start_wall_ms, end_wall_ms]`
+    /// inclusive on both edges. Returns `None` when the range crosses a
+    /// discontinuity, predates the retained head, is entirely past the
+    /// tail, or has `start > end`.
+    fn samples_between(&self, start_wall_ms: u64, end_wall_ms: u64) -> Option<Vec<f32>> {
+        if self.lagged || self.sample_rate == 0 || start_wall_ms > end_wall_ms {
+            return None;
+        }
+        let head = self.head_wall_ms?;
+        if start_wall_ms < head {
+            // Requested window predates what we still have.
+            return None;
+        }
+        let sr = self.sample_rate as u64;
+        // Convert the requested wall range to sample indices relative to
+        // the ring's head.
+        let start_idx = (((start_wall_ms - head) * sr) / 1000) as usize;
+        // End is inclusive: include the sample at end_wall_ms itself.
+        let end_idx = ((((end_wall_ms - head) * sr) / 1000) as usize).saturating_add(1);
+        if start_idx >= self.samples.len() {
+            return None;
+        }
+        let end_idx = end_idx.min(self.samples.len());
+        if end_idx <= start_idx {
+            return None;
+        }
+        // VecDeque may be split across two contiguous slices — collect
+        // via iter().skip/take rather than assuming a single slice.
+        let out: Vec<f32> = self
+            .samples
+            .iter()
+            .skip(start_idx)
+            .take(end_idx - start_idx)
+            .copied()
+            .collect();
+        Some(out)
+    }
+}
+
 /// One contiguous stretch of non-silent audio written into the mixed
 /// track. Recorded as we go so any wall-clock timestamp (e.g. a
 /// clip's `start_wall_ms`) can be mapped to a position in
@@ -348,6 +500,13 @@ struct ChannelState {
     #[allow(dead_code)]
     channel_name: String,
     paragraphs: Vec<Paragraph>,
+    /// Per-channel ambient audio ring for pass-3 boundary re-transcription.
+    /// Fed from the same broadcast::Recv loop that drives VAD. Populated
+    /// unconditionally (not gated on named-recording state) so paragraph
+    /// consolidation works in the ephemeral case too. TTS channels
+    /// never receive audio pushes — the ring stays empty and pass 3
+    /// short-circuits when it can't get samples.
+    audio_ring: SlotAudioRing,
 }
 
 /// Serialized shape of one channel's paragraphs for the `/record`
@@ -396,6 +555,13 @@ struct Inner {
     /// time; the vector's shape is stable for the process's lifetime.
     channels: Vec<ChannelState>,
     active: Option<ActiveRecording>,
+    /// Per-paragraph wall-clock timestamp of the last pass-3 fire.
+    /// Consulted by `schedule_boundary_retranscribe` to skip runs that
+    /// would fire within [`BOUNDARY_DEBOUNCE_MS`] of the previous one.
+    /// Entries are keyed by paragraph id — a paragraph that's since been
+    /// removed leaves a stale entry behind (harmless; cheap and self-
+    /// bounded by the paragraph cap).
+    boundary_last_fire_ms: HashMap<String, u64>,
 }
 
 impl Inner {
@@ -444,6 +610,12 @@ pub struct RecordState {
     /// `RecordState` so per-recording worker spawns can pick it up
     /// without extra plumbing through the HTTP handlers.
     monitor_tap: broadcast::Sender<Arc<[f32]>>,
+    /// Offline SenseVoice handle. Held here so pass-3 boundary
+    /// re-transcription in [`Self::schedule_boundary_retranscribe`] can
+    /// call `stt.transcribe` from a spawned task without threading the
+    /// handle through the record HTTP surface. `None` when STT was
+    /// disabled at startup — pass 3 short-circuits.
+    stt: Option<SttHandle>,
 }
 
 /// Events fanned out to OBS subtitle overlay subscribers.
@@ -478,6 +650,7 @@ impl RecordState {
         sample_rate: u32,
         mixer: Arc<AtomicMixer>,
         monitor_tap: broadcast::Sender<Arc<[f32]>>,
+        stt: Option<SttHandle>,
     ) -> Self {
         let (subtitles, _) = broadcast::channel::<SubtitleEvent>(64);
         // Initialize one ChannelState per configured Vox slot plus a
@@ -495,23 +668,29 @@ impl RecordState {
                 kind: ChannelKind::Vox(slot),
                 channel_name: name,
                 paragraphs: Vec::new(),
+                audio_ring: SlotAudioRing::new(sample_rate),
             });
         }
+        // TTS channel ring is unused (TTS clips never feed audio) but we
+        // still allocate it with the same rate for shape consistency.
         channels.push(ChannelState {
             kind: ChannelKind::Tts,
             channel_name: TTS_CHANNEL_NAME.to_string(),
             paragraphs: Vec::new(),
+            audio_ring: SlotAudioRing::new(sample_rate),
         });
         Self {
             inner: Arc::new(Mutex::new(Inner {
                 channels,
                 active: None,
+                boundary_last_fire_ms: HashMap::new(),
             })),
             sample_rate,
             mixer,
             hints: Arc::new(Mutex::new(VecDeque::with_capacity(HINT_RING_CAPACITY))),
             subtitles,
             monitor_tap,
+            stt,
         }
     }
 
@@ -1056,10 +1235,14 @@ impl RecordState {
                 let _ = self.subtitles.send(SubtitleEvent::ParagraphUpsert(p));
             }
             let _ = self.subtitles.send(SubtitleEvent::ClipUpsert {
-                paragraph_id,
+                paragraph_id: paragraph_id.clone(),
                 clip: finalized_clip,
             });
         }
+        // Pass 3 — boundary re-transcription. Fires unconditionally on
+        // every clip finalize; the schedule fn itself handles
+        // debouncing, TTS filtering, and window trimming.
+        self.schedule_boundary_retranscribe(paragraph_id);
     }
 
     /// Remove a clip by id from every channel + the active recording,
@@ -1313,6 +1496,275 @@ impl RecordState {
         active.slot_cursors[slot] = Some(target_frame + written_frames);
         Some(target_frame)
     }
+
+    /// Downmix and push a stereo interleaved chunk into the given vox
+    /// slot's audio ring. Called from `spawn_worker`'s recv loop on every
+    /// incoming chunk (regardless of the slot's enable flag) so pass-3
+    /// boundary re-transcription has audio available even when the
+    /// operator toggles enable mid-utterance or nothing is recording.
+    fn push_slot_audio(&self, slot: usize, stereo_chunk: &[f32]) {
+        if stereo_chunk.is_empty() {
+            return;
+        }
+        // Downmix to mono up front so we don't hold the lock across the
+        // allocation.
+        let mut mono = Vec::with_capacity(stereo_chunk.len() / 2);
+        for pair in stereo_chunk.chunks_exact(2) {
+            mono.push((pair[0] + pair[1]) * 0.5);
+        }
+        let now_ms = unix_now_ms();
+        let mut g = self.inner.lock().expect("record state mutex poisoned");
+        if let Some(ch) = g.channel_mut(ChannelKind::Vox(slot)) {
+            ch.audio_ring.push(&mono, now_ms);
+        }
+    }
+
+    /// Mark the given vox slot's audio ring as post-lagged. Subsequent
+    /// `samples_between` calls return `None` until the next push
+    /// re-anchors the ring. Called from `spawn_worker` on a
+    /// `broadcast::Lagged` so pass 3 can't quietly hand SenseVoice a
+    /// buffer with a hidden gap.
+    fn mark_slot_lagged(&self, slot: usize) {
+        let mut g = self.inner.lock().expect("record state mutex poisoned");
+        if let Some(ch) = g.channel_mut(ChannelKind::Vox(slot)) {
+            ch.audio_ring.on_lagged();
+        }
+    }
+
+    /// Schedule a pass-3 boundary re-transcription for `paragraph_id`.
+    /// Runs asynchronously — the caller drops the state lock before
+    /// invoking this. Behavior:
+    ///
+    ///   1. Snapshot the paragraph + owning channel under a short lock.
+    ///   2. Skip TTS paragraphs (their text is already LLM-authored).
+    ///   3. Skip paragraphs with fewer than 2 finalized clips — nothing
+    ///      to consolidate.
+    ///   4. Trim the window (last N=3 clips) until total duration ≤
+    ///      [`BOUNDARY_MAX_WINDOW_MS`].
+    ///   5. Debounce per-paragraph via
+    ///      [`Inner::boundary_last_fire_ms`] — skip if the last fire
+    ///      was less than [`BOUNDARY_DEBOUNCE_MS`] ago.
+    ///   6. Fetch the mono samples from the slot's ring; skip if the
+    ///      requested window predates retention or crosses a lag gap.
+    ///   7. `spawn_blocking` SenseVoice; on success proportionally split
+    ///      the returned text back to the window's clips, snapping cut
+    ///      points to nearest whitespace.
+    ///   8. Reacquire the lock, re-validate the window (paragraph +
+    ///      clip ids still exist, all still `provisional=false`), apply
+    ///      the update, rebuild paragraph text, and broadcast
+    ///      `ClipUpsert` for each updated clip if a recording is active.
+    ///
+    /// Never returns errors — logs a `debug` breadcrumb on discard and
+    /// a `warn` on STT failure.
+    fn schedule_boundary_retranscribe(&self, paragraph_id: String) {
+        let Some(stt) = self.stt.clone() else {
+            // STT disabled at startup — pass 3 is a no-op.
+            return;
+        };
+        // Snapshot window under the lock.
+        let sr = self.sample_rate;
+        let snapshot = {
+            let mut g = self.inner.lock().expect("record state mutex poisoned");
+            // Locate the paragraph and its owning channel index.
+            let mut hit: Option<(usize, usize)> = None;
+            for (ci, ch) in g.channels.iter().enumerate() {
+                if let Some(pi) = ch.paragraphs.iter().position(|p| p.id == paragraph_id) {
+                    hit = Some((ci, pi));
+                    break;
+                }
+            }
+            let Some((ci, pi)) = hit else {
+                return; // paragraph vanished (race) — nothing to do
+            };
+            // TTS paragraphs skip pass 3 entirely.
+            let ChannelKind::Vox(slot) = g.channels[ci].kind else {
+                return;
+            };
+            let paragraph = &g.channels[ci].paragraphs[pi];
+            // Skip paragraphs whose clips are all still provisional or
+            // that have fewer than 2 finalized clips — nothing to
+            // reconsolidate.
+            let finalized_count = paragraph.clips.iter().filter(|c| !c.provisional).count();
+            if finalized_count < 2 {
+                return;
+            }
+            // Take the last N clips (N=3) that have a known duration.
+            // Then trim from the oldest until total duration ≤
+            // BOUNDARY_MAX_WINDOW_MS.
+            let all_clips: Vec<&ClipRef> = paragraph
+                .clips
+                .iter()
+                .filter(|c| c.audio_duration_ms.is_some())
+                .collect();
+            if all_clips.len() < 2 {
+                return;
+            }
+            let take = all_clips.len().min(3);
+            let mut window: Vec<(String, u64, u64, String, bool)> = all_clips
+                [all_clips.len() - take..]
+                .iter()
+                .map(|c| {
+                    (
+                        c.id.clone(),
+                        c.start_wall_ms,
+                        c.audio_duration_ms.unwrap_or(0),
+                        c.text.clone(),
+                        c.provisional,
+                    )
+                })
+                .collect();
+            // Any provisional in the window? Skip — a fresh pass 2 is
+            // still landing, its update will schedule us again.
+            if window.iter().any(|(_, _, _, _, prov)| *prov) {
+                return;
+            }
+            // Trim from oldest until total ≤ BOUNDARY_MAX_WINDOW_MS.
+            while window.len() > 2 {
+                let total: u64 = window.iter().map(|(_, _, d, _, _)| *d).sum();
+                if total <= BOUNDARY_MAX_WINDOW_MS {
+                    break;
+                }
+                window.remove(0);
+            }
+            let total: u64 = window.iter().map(|(_, _, d, _, _)| *d).sum();
+            if total == 0 {
+                return;
+            }
+            // Debounce per paragraph.
+            let now_ms = unix_now_ms();
+            if let Some(last) = g.boundary_last_fire_ms.get(&paragraph_id) {
+                if now_ms.saturating_sub(*last) < BOUNDARY_DEBOUNCE_MS {
+                    return;
+                }
+            }
+            g.boundary_last_fire_ms.insert(paragraph_id.clone(), now_ms);
+            // Compute wall range: [first.start_wall_ms, last.start_wall_ms + last.duration_ms].
+            let range_start = window.first().map(|w| w.1).unwrap_or(0);
+            let range_end = window
+                .last()
+                .map(|(_, s, d, _, _)| s.saturating_add(*d))
+                .unwrap_or(0);
+            // Fetch samples now — the ring lives on the same lock, so
+            // grabbing them here keeps the async task purely CPU-bound.
+            let samples = g.channels[ci]
+                .audio_ring
+                .samples_between(range_start, range_end);
+            (slot, window, samples)
+        };
+        let (slot, window, samples) = snapshot;
+        let Some(samples) = samples else {
+            debug!(
+                paragraph = %paragraph_id,
+                slot,
+                "pass3: audio ring window unavailable — skipping"
+            );
+            return;
+        };
+        let state = self.clone();
+        let paragraph_id_for_task = paragraph_id;
+        tokio::spawn(async move {
+            let res =
+                tokio::task::spawn_blocking(move || stt.transcribe(&samples, sr)).await;
+            let text = match res {
+                Ok(Ok(t)) => t.trim().to_string(),
+                Ok(Err(err)) => {
+                    warn!(err = %format!("{err:#}"), "pass3: STT decode failed");
+                    return;
+                }
+                Err(_) => {
+                    warn!("pass3: STT task panicked");
+                    return;
+                }
+            };
+            // Proportional split: assign per-clip text ranges from the
+            // returned string based on each clip's duration ratio,
+            // snapping cut points to the nearest whitespace.
+            let clip_ids: Vec<String> = window.iter().map(|(id, _, _, _, _)| id.clone()).collect();
+            let durations: Vec<u64> = window.iter().map(|(_, _, d, _, _)| *d).collect();
+            let split_texts = split_boundary_text(&text, &durations);
+            let clip_count = clip_ids.len();
+            // Reacquire lock + re-validate.
+            let mut g = state.inner.lock().expect("record state mutex poisoned");
+            // Locate paragraph again — may have moved.
+            let mut hit: Option<(usize, usize)> = None;
+            for (ci, ch) in g.channels.iter().enumerate() {
+                if let Some(pi) = ch
+                    .paragraphs
+                    .iter()
+                    .position(|p| p.id == paragraph_id_for_task)
+                {
+                    hit = Some((ci, pi));
+                    break;
+                }
+            }
+            let Some((ci, pi)) = hit else {
+                debug!(
+                    paragraph = %paragraph_id_for_task,
+                    "pass3: paragraph gone during decode — discarded"
+                );
+                return;
+            };
+            // Every clip must still exist and be non-provisional.
+            {
+                let paragraph = &g.channels[ci].paragraphs[pi];
+                let ok = clip_ids.iter().all(|cid| {
+                    paragraph
+                        .clips
+                        .iter()
+                        .any(|c| c.id == *cid && !c.provisional)
+                });
+                if !ok {
+                    debug!(
+                        paragraph = %paragraph_id_for_task,
+                        "pass3: clip set changed during decode — discarded"
+                    );
+                    return;
+                }
+            }
+            // Apply the split.
+            let mut updated_clips: Vec<ClipRef> = Vec::with_capacity(clip_count);
+            {
+                let paragraph = &mut g.channels[ci].paragraphs[pi];
+                for (cid, new_text) in clip_ids.iter().zip(split_texts.iter()) {
+                    if let Some(clip) = paragraph.clips.iter_mut().find(|c| c.id == *cid) {
+                        clip.text = new_text.clone();
+                        updated_clips.push(clip.clone());
+                    }
+                }
+                paragraph.rebuild();
+            }
+            // Mirror into the active recording.
+            if let Some(active) = g.active.as_mut() {
+                if let Some(mirror) = active
+                    .paragraphs
+                    .iter_mut()
+                    .find(|p| p.id == paragraph_id_for_task)
+                {
+                    for (cid, new_text) in clip_ids.iter().zip(split_texts.iter()) {
+                        if let Some(clip) = mirror.clips.iter_mut().find(|c| c.id == *cid) {
+                            clip.text = new_text.clone();
+                        }
+                    }
+                    mirror.rebuild();
+                }
+            }
+            let recording = g.active.is_some();
+            drop(g);
+            debug!(
+                paragraph = %paragraph_id_for_task,
+                clips = clip_count,
+                "pass3: applied boundary re-transcription"
+            );
+            if recording {
+                for clip in updated_clips {
+                    let _ = state.subtitles.send(SubtitleEvent::ClipUpsert {
+                        paragraph_id: paragraph_id_for_task.clone(),
+                        clip,
+                    });
+                }
+            }
+        });
+    }
 }
 
 /// Result of `RecordState::take_active`. Owned buffers so the caller can
@@ -1562,6 +2014,91 @@ fn is_false_positive(text: &str) -> bool {
         .filter(|c| c.is_alphanumeric())
         .count();
     content_chars > 0 && content_chars <= 2
+}
+
+/// Proportional split of a pass-3 result string across the window's
+/// clips by duration ratio. Cut points snap to the nearest whitespace
+/// so multi-char words never split across two clips. `durations` and
+/// the returned Vec have the same length; a run of empty durations or
+/// an empty `text` collapses every slot to `""` (the caller then
+/// leaves clip text untouched at rebuild time — the resulting empty
+/// paragraph would get pruned by later stages).
+fn split_boundary_text(text: &str, durations: &[u64]) -> Vec<String> {
+    let n = durations.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let text = text.trim();
+    if text.is_empty() {
+        return vec![String::new(); n];
+    }
+    let total: u64 = durations.iter().sum();
+    if total == 0 {
+        // No duration info — dump everything into the last clip.
+        let mut out = vec![String::new(); n];
+        out[n - 1] = text.to_string();
+        return out;
+    }
+    // Work in char indices (not byte indices) so multi-byte UTF-8 is
+    // handled correctly. `char_positions` is the byte offset of each
+    // char, plus a trailing sentinel at `text.len()`.
+    let char_positions: Vec<usize> = text
+        .char_indices()
+        .map(|(i, _)| i)
+        .chain(std::iter::once(text.len()))
+        .collect();
+    let total_chars = char_positions.len() - 1;
+    // Nearest-whitespace snap: find the closest whitespace char to
+    // `target_char_idx`, searching outward up to `half_word_width`
+    // chars in either direction. Returns a char index (into
+    // `char_positions`) suitable for slicing.
+    let half_word_width = ((total_chars as u64) / (n as u64 * 2)).max(1) as usize;
+    let chars: Vec<char> = text.chars().collect();
+    let snap_to_whitespace = |target: usize| -> usize {
+        if target == 0 || target >= total_chars {
+            return target.min(total_chars);
+        }
+        // Prefer the closest whitespace within the half-word window.
+        for d in 0..=half_word_width {
+            let left = target.saturating_sub(d);
+            let right = (target + d).min(total_chars);
+            // A char index `i` sits on a whitespace boundary when
+            // chars[i-1] is whitespace (i.e. the split-before happens
+            // at start of a non-space run).
+            if left > 0 && chars[left - 1].is_whitespace() {
+                return left;
+            }
+            if right < total_chars && chars[right - 1].is_whitespace() {
+                return right;
+            }
+            if right == total_chars {
+                return right;
+            }
+        }
+        target.min(total_chars)
+    };
+    let mut out: Vec<String> = Vec::with_capacity(n);
+    let mut prev_char_end = 0usize;
+    let mut acc: u64 = 0;
+    for (i, dur) in durations.iter().enumerate() {
+        let text_slice = if i + 1 == n {
+            // Last clip: whatever remains.
+            let start_byte = char_positions[prev_char_end];
+            text[start_byte..].trim().to_string()
+        } else {
+            acc = acc.saturating_add(*dur);
+            let frac_end =
+                ((acc as f64 / total as f64) * total_chars as f64).round() as usize;
+            let frac_end = frac_end.min(total_chars);
+            let char_end = snap_to_whitespace(frac_end).max(prev_char_end);
+            let start_byte = char_positions[prev_char_end];
+            let end_byte = char_positions[char_end];
+            prev_char_end = char_end;
+            text[start_byte..end_byte].trim().to_string()
+        };
+        out.push(text_slice);
+    }
+    out
 }
 
 fn audio_duration_ms(interleaved_len: usize, sample_rate: u32) -> u64 {
@@ -2143,6 +2680,12 @@ pub fn spawn_worker(
             loop {
                 match rx.recv().await {
                     Ok(chunk) => {
+                        // Feed the per-slot audio ring unconditionally,
+                        // even for disabled slots. Pass 3 wants an
+                        // ambient audio history so paragraph
+                        // consolidation still works if the operator
+                        // toggles enable mid-utterance.
+                        state.push_slot_audio(slot, &chunk);
                         // Only the enabled slot(s) contribute audio to the
                         // active recording — otherwise a disabled capture
                         // channel would leak into every named recording.
@@ -2174,6 +2717,10 @@ pub fn spawn_worker(
                         if let Some(id) = worker.current_clip_id.take() {
                             worker.state.remove_clip(&id);
                         }
+                        // Also mark the audio ring as post-lagged so a
+                        // pass-3 request can't stitch pre- and post-lag
+                        // audio into one buffer with a hidden gap.
+                        state.mark_slot_lagged(slot);
                         worker.utterance.clear();
                         worker.scratch.clear();
                         worker.speaking = false;

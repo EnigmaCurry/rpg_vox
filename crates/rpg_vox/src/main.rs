@@ -626,8 +626,12 @@ fn main() -> Result<()> {
     // Shared live-transcription state for the Record tab. Channel names
     // come from the mixer's per-slot state now (persisted alongside gain
     // / pan / mute), so RecordState just needs a handle to the mixer.
-    let record_state =
-        record::RecordState::new(args.sample_rate, mixer.clone(), monitor_tap.clone());
+    let record_state = record::RecordState::new(
+        args.sample_rate,
+        mixer.clone(),
+        monitor_tap.clone(),
+        stt.clone(),
+    );
 
     // Restore persisted mixer state before the HTTP server starts serving,
     // so the first GET already reflects what the user had last session.
