@@ -31,7 +31,7 @@
 //! recognizer additions can drop in without further wiring.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -40,6 +40,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::mixer::AtomicMixer;
+use crate::paragraph::LlmScheduler;
 use crate::stt::{StreamingSession, StreamingSttHandle, SttHandle};
 
 /// Silence gap (ms) that forces a paragraph break on a given channel. A
@@ -616,6 +617,13 @@ pub struct RecordState {
     /// handle through the record HTTP surface. `None` when STT was
     /// disabled at startup — pass 3 short-circuits.
     stt: Option<SttHandle>,
+    /// Pass-4 LLM scheduler. Set post-construction by main.rs after
+    /// both `RecordState` and the chat client are available. `finalize_
+    /// clip` fans out wake / forced-break triggers here so the per-
+    /// channel LLM task can consider re-organizing the hot zone.
+    /// `OnceLock` (not `Mutex<Option<..>>`) because the set is a
+    /// one-shot at startup — no need to re-wire midflight.
+    llm_scheduler: Arc<OnceLock<LlmScheduler>>,
 }
 
 /// Events fanned out to OBS subtitle overlay subscribers.
@@ -691,7 +699,112 @@ impl RecordState {
             subtitles,
             monitor_tap,
             stt,
+            llm_scheduler: Arc::new(OnceLock::new()),
         }
+    }
+
+    /// Register the pass-4 LLM scheduler. Called once by main.rs after
+    /// the chat client + RecordState are both available. Silently no-ops
+    /// on repeated calls (OnceLock semantics).
+    pub fn set_llm_scheduler(&self, sched: LlmScheduler) {
+        let _ = self.llm_scheduler.set(sched);
+    }
+
+    /// Fire a `Wake` trigger at the LLM scheduler for the given channel.
+    /// No-op when the scheduler wasn't registered (chat client / STT
+    /// disabled at startup) or for the TTS pseudo-channel (never
+    /// re-organized).
+    pub(crate) fn wake_llm(&self, kind: ChannelKind) {
+        let Some(sched) = self.llm_scheduler.get() else {
+            return;
+        };
+        if let ChannelKind::Vox(slot) = kind {
+            sched.wake(slot);
+        }
+    }
+
+    /// Fire a `ForcedBreak` trigger — the previous paragraph on this
+    /// channel just closed due to a > PARAGRAPH_GAP_MS silence gap, so
+    /// the LLM should re-organize soon regardless of debounce.
+    pub(crate) fn forced_break(&self, kind: ChannelKind) {
+        let Some(sched) = self.llm_scheduler.get() else {
+            return;
+        };
+        if let ChannelKind::Vox(slot) = kind {
+            sched.forced_break(slot);
+        }
+    }
+
+    /// Snapshot the paragraph list for a given Vox slot. Used by
+    /// `paragraph::LlmScheduler` under a short lock; returned data is
+    /// owned so the LLM decode step never holds the state mutex.
+    pub(crate) fn snapshot_channel_paragraphs(
+        &self,
+        slot: usize,
+    ) -> Option<Vec<Paragraph>> {
+        let g = self.inner.lock().expect("record state mutex poisoned");
+        g.channels
+            .iter()
+            .find(|c| c.kind == ChannelKind::Vox(slot))
+            .map(|c| c.paragraphs.clone())
+    }
+
+    /// Apply an LLM diff to a Vox slot's paragraph list. Replaces the
+    /// tail of the paragraph vector (from `first_replaced_index`
+    /// onwards) with `new_tail`. Broadcasts `ParagraphUpsert` for every
+    /// paragraph in `new_tail` and `ParagraphRemove` for every id in
+    /// `removed_ids` (paragraphs that were merged away). Only fires SSE
+    /// events if a named recording is active — matches `finalize_clip`'s
+    /// guard.
+    ///
+    /// Returns `true` when the diff landed, `false` when the slot was
+    /// out of range (which should never happen in practice).
+    pub(crate) fn apply_llm_diff(
+        &self,
+        slot: usize,
+        first_replaced_index: usize,
+        new_tail: Vec<Paragraph>,
+        removed_ids: Vec<String>,
+    ) -> bool {
+        let mut g = self.inner.lock().expect("record state mutex poisoned");
+        let Some(ch) = g.channels.iter_mut().find(|c| c.kind == ChannelKind::Vox(slot)) else {
+            return false;
+        };
+        if first_replaced_index > ch.paragraphs.len() {
+            return false;
+        }
+        ch.paragraphs.truncate(first_replaced_index);
+        for p in &new_tail {
+            ch.paragraphs.push(p.clone());
+        }
+        trim_channel_cap(ch);
+        // Mirror into the active recording by id.
+        if let Some(active) = g.active.as_mut() {
+            for pid in &removed_ids {
+                if let Some(pos) = active.paragraphs.iter().position(|p| p.id == *pid) {
+                    active.paragraphs.remove(pos);
+                }
+            }
+            for p in &new_tail {
+                if let Some(existing) = active.paragraphs.iter_mut().find(|q| q.id == p.id) {
+                    *existing = p.clone();
+                } else {
+                    active.paragraphs.push(p.clone());
+                }
+            }
+        }
+        let recording = g.active.is_some();
+        drop(g);
+        if !recording {
+            return true;
+        }
+        for pid in removed_ids {
+            let _ = self.subtitles.send(SubtitleEvent::ParagraphRemove(pid));
+        }
+        for p in new_tail {
+            let _ = self.subtitles.send(SubtitleEvent::ParagraphUpsert(p));
+        }
+        true
     }
 
     /// Subscribe to the OBS subtitles fan-out. Yields paragraph/clip
@@ -1230,6 +1343,11 @@ impl RecordState {
         }
         let recording = g.active.is_some();
         drop(g);
+        // Snapshot whether a fresh paragraph was opened (which happens
+        // only when the prior paragraph's last clip was > PARAGRAPH_GAP_MS
+        // ago on this channel — i.e. a silence-closed boundary). We use
+        // this AFTER dropping the lock to fire a ForcedBreak trigger.
+        let forced_break_needed = new_paragraph.is_some();
         if recording {
             if let Some(p) = new_paragraph {
                 let _ = self.subtitles.send(SubtitleEvent::ParagraphUpsert(p));
@@ -1243,6 +1361,15 @@ impl RecordState {
         // every clip finalize; the schedule fn itself handles
         // debouncing, TTS filtering, and window trimming.
         self.schedule_boundary_retranscribe(paragraph_id);
+        // Pass 4 — LLM hot-zone reorganization. Always Wake on finalize;
+        // the scheduler task itself decides whether the word/audio
+        // thresholds warrant a call. Silence-closed boundaries also fire
+        // a ForcedBreak so a queued call goes out soon regardless of the
+        // debounce ceiling.
+        if forced_break_needed {
+            self.forced_break(ChannelKind::Vox(slot));
+        }
+        self.wake_llm(ChannelKind::Vox(slot));
     }
 
     /// Remove a clip by id from every channel + the active recording,

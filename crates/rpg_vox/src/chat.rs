@@ -72,7 +72,7 @@ impl Client {
         system_prompt_override: Option<String>,
     ) -> Result<String> {
         let messages = self.build_messages(&history, system_prompt_override.as_deref());
-        let raw = self.completion(&messages).await?;
+        let raw = self.completion(&messages, None).await?;
         debug!(bytes = raw.len(), raw = %raw, "chat completion raw content");
         // OpenAI Harmony-format models (gpt-oss and its finetunes like
         // Muse-Glimmer) reply on channels: `to=self<|message|>…<|eom|>`
@@ -95,6 +95,51 @@ impl Client {
         Ok(cleaned)
     }
 
+    /// Same as [`Self::generate_reply`] but constrains the model output to
+    /// a JSON schema via the OpenAI-standard `response_format` field.
+    /// llama.cpp's OpenAI-compatible server honors this on recent builds
+    /// (grammar-constrained decoding). `disable_thinking` is passed
+    /// through as configured — the caller may want reasoning + JSON.
+    ///
+    /// Returns the parsed JSON value on success; on JSON parse failure
+    /// includes the raw content (truncated to 400 chars) in the error.
+    pub async fn generate_reply_json(
+        &self,
+        history: Vec<ChatMessage>,
+        system_prompt_override: Option<String>,
+        json_schema: Value,
+    ) -> Result<Value> {
+        let messages = self.build_messages(&history, system_prompt_override.as_deref());
+        let response_format = serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {
+                "name": "paragraphs",
+                "strict": true,
+                "schema": json_schema,
+            }
+        });
+        let raw = self.completion(&messages, Some(response_format)).await?;
+        debug!(bytes = raw.len(), raw = %raw, "chat json completion raw content");
+        let base = extract_harmony_user_reply(&raw).unwrap_or_else(|| raw.clone());
+        let cleaned = strip_thinking(&base).trim().to_string();
+        if cleaned.is_empty() {
+            warn!(bytes = raw.len(), raw = %raw, "LLM returned empty JSON content after cleanup");
+            return Err(anyhow!(
+                "LLM returned empty JSON content after cleanup (raw {} bytes: {:?})",
+                raw.len(),
+                if raw.len() > 200 { format!("{}…", &raw[..200]) } else { raw }
+            ));
+        }
+        serde_json::from_str::<Value>(&cleaned).map_err(|err| {
+            let preview: String = if cleaned.len() > 400 {
+                format!("{}…", &cleaned[..400])
+            } else {
+                cleaned.clone()
+            };
+            anyhow!("LLM JSON parse failed ({err}): raw={preview}")
+        })
+    }
+
     fn build_messages(
         &self,
         history: &[ChatMessage],
@@ -115,7 +160,11 @@ impl Client {
         out
     }
 
-    async fn completion(&self, messages: &[ChatMessage]) -> Result<String> {
+    async fn completion(
+        &self,
+        messages: &[ChatMessage],
+        response_format: Option<Value>,
+    ) -> Result<String> {
         let url = format!(
             "{}/chat/completions",
             self.cfg.base_url.trim_end_matches('/')
@@ -131,6 +180,9 @@ impl Client {
             // chat template so the `<think>\n` prefix is not injected.
             body["chat_template_kwargs"] =
                 serde_json::json!({ "enable_thinking": false });
+        }
+        if let Some(rf) = response_format {
+            body["response_format"] = rf;
         }
         let mut req = self.http.post(&url).json(&body);
         if let Some(key) = &self.cfg.api_key {
@@ -408,5 +460,25 @@ mod tests {
         // the leading whitespace after stripping.
         let out = strip_thinking("thoughts</think>final answer");
         assert_eq!(out, "final answer");
+    }
+
+    #[test]
+    fn json_envelope_survives_strip_pipeline() {
+        // Simulate a llama.cpp reply where the model emitted `<think>`
+        // reasoning followed by a Harmony `to=user` channel wrapping a
+        // JSON array. The `generate_reply_json` cleanup pipeline —
+        // Harmony extract → strip_thinking → trim — should leave clean
+        // JSON parseable by serde_json.
+        let raw = "to=self<|message|>plan the split<|eom|>\
+                   <|start|>assistant to=user<|message|>\
+                   <think>double-check ids</think>\
+                   [{\"end_clip\":\"c1\",\"text\":\"hello world\"}]\
+                   <|eot|>";
+        let base = extract_harmony_user_reply(raw).unwrap();
+        let cleaned = strip_thinking(&base).trim().to_string();
+        let parsed: serde_json::Value = serde_json::from_str(&cleaned)
+            .expect("cleaned JSON should parse");
+        assert_eq!(parsed[0]["end_clip"].as_str(), Some("c1"));
+        assert_eq!(parsed[0]["text"].as_str(), Some("hello world"));
     }
 }

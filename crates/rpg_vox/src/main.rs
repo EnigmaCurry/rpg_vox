@@ -7,6 +7,7 @@ mod chat;
 mod http;
 mod mixer;
 mod monitor;
+mod paragraph;
 mod pw_source;
 mod record;
 mod script;
@@ -687,6 +688,26 @@ fn main() -> Result<()> {
             args.sample_rate,
             record_state.clone(),
         );
+
+        // Pass-4 LLM hot-zone reorganizer. One long-lived task per vox
+        // slot; each debounces + serializes LLM calls for its own
+        // channel. Skipped when STT is disabled at startup (nothing
+        // would ever fire it) — matching the existing streaming-worker
+        // guard pattern above. The chat client is always configured
+        // (it's built unconditionally further up), so we key the
+        // spawn purely on STT availability.
+        if stt.is_some() {
+            let vox_slots = vox_taps.len();
+            let sched = paragraph::spawn(
+                record_state.clone(),
+                chat_client.clone(),
+                vox_slots,
+            );
+            record_state.set_llm_scheduler(sched);
+            info!(vox_slots, "paragraph LLM scheduler started");
+        } else {
+            info!("paragraph LLM scheduler not started (STT disabled)");
+        }
 
         let http_task = tokio::spawn(http::serve(
             args.bind.clone(),
