@@ -976,6 +976,10 @@ pub async fn serve(
             "/record/buffer",
             axum::routing::delete(record_buffer_clear_handler),
         )
+        .route(
+            "/record/llm-when-idle",
+            axum::routing::put(record_llm_when_idle_handler),
+        )
         .route("/record/hint", post(record_hint_handler))
         .route("/obs/subtitles", get(obs_subtitles_page))
         .route("/obs/subtitles.sse", get(obs_subtitles_stream))
@@ -4274,6 +4278,7 @@ async fn record_state_handler(State(state): State<AppState>) -> Response {
         "sttEnabled": state.stt.is_some(),
         "sampleRate": state.record.sample_rate(),
         "recordings": recordings,
+        "llmWhenIdle": snap.llm_when_idle,
     }))
     .into_response()
 }
@@ -4521,6 +4526,30 @@ async fn record_buffer_clear_handler(State(state): State<AppState>) -> Response 
     (
         StatusCode::OK,
         Json(ActionResponse { ok: true, error: None }),
+    )
+        .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct LlmWhenIdleBody {
+    enabled: bool,
+}
+
+/// Toggle the "reinterpret with LLM in live mode" runtime flag. The
+/// frontend persists this to localStorage and posts here on every
+/// change plus on mount, so the server just mirrors the last write.
+/// When `false` (the default) and no named recording is active,
+/// `paragraph::run_once` short-circuits and the live buffer stays as
+/// a plain per-clip transcript. During a named recording the flag is
+/// ignored — the LLM always runs.
+async fn record_llm_when_idle_handler(
+    State(state): State<AppState>,
+    Json(body): Json<LlmWhenIdleBody>,
+) -> Response {
+    state.record.set_llm_when_idle(body.enabled);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "llmWhenIdle": body.enabled })),
     )
         .into_response()
 }

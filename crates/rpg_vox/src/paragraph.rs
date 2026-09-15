@@ -232,6 +232,15 @@ async fn run_once(
     slot: usize,
     forced: bool,
 ) -> LlmOutcome {
+    // Live-buffer gate: while no named recording is active, only run
+    // when the operator has explicitly opted in via the "Reinterpret
+    // with LLM" checkbox on the live pane. Default is off — the live
+    // buffer stays as a plain per-clip transcript otherwise. When a
+    // recording is active, LLM cycles run regardless of this flag.
+    if !record.is_recording() && !record.llm_when_idle() {
+        return LlmOutcome::Skipped("live buffer, llm disabled");
+    }
+
     // Snapshot channel state under the state lock, then drop it before
     // any async work.
     let snapshot = {
@@ -269,6 +278,12 @@ async fn run_once(
     }];
     let schema = response_schema();
 
+    // Flip the per-channel inflight flag on so the snapshot's
+    // `channel.llm_inflight` reads true for the UI's "reorganizing…"
+    // pulse. Guard drops it back to false on any exit path (fire,
+    // skip, or abort) via its Drop impl.
+    let _inflight_guard = LlmInflightGuard::new(record.clone(), slot);
+
     // First attempt.
     let attempt = chat
         .generate_reply_json(history.clone(), Some(SYSTEM_PROMPT.into()), schema.clone())
@@ -301,6 +316,28 @@ async fn run_once(
     // clamping the truncation index.
     apply_diff(record, slot, &snapshot, output_paragraphs);
     LlmOutcome::Fired
+}
+
+/// Scope guard that flips a channel's `llm_inflight` flag on
+/// construction and off on drop. Ensures the snapshot's
+/// "reorganizing…" indicator clears on every exit path from
+/// `run_once`, including panics.
+struct LlmInflightGuard {
+    record: RecordState,
+    slot: usize,
+}
+
+impl LlmInflightGuard {
+    fn new(record: RecordState, slot: usize) -> Self {
+        record.set_llm_inflight(slot, true);
+        Self { record, slot }
+    }
+}
+
+impl Drop for LlmInflightGuard {
+    fn drop(&mut self) {
+        self.record.set_llm_inflight(self.slot, false);
+    }
 }
 
 /// Hardcoded system prompt. No CLI knob in Stage 3.
@@ -672,18 +709,25 @@ fn apply_diff(
         } else {
             Uuid::new_v4().to_string()
         };
-        // Speaker + channel + created_at snapshot from the position's
-        // old paragraph if available; otherwise from the first hot
-        // paragraph (all clips share a channel).
+        // Speaker + channel + created_at + pass3_ran carry over from the
+        // paragraph at this hot-zone position, if any. New paragraphs
+        // created by an LLM split start fresh (pass3_ran=false) so the
+        // next clip finalize on them fires a fresh pass 3. pass4_ran is
+        // always true here — every output of apply_diff is LLM-authored.
         let template = snapshot
             .hot
             .get(i)
             .or_else(|| snapshot.hot.first())
             .cloned();
-        let (channel, speaker, created_at) = if let Some(t) = template {
-            (t.channel, t.speaker, t.created_at)
+        let (channel, speaker, created_at, pass3_ran) = if let Some(t) = template {
+            let carry_pass3 = if i < old_hot_len.min(new_len) {
+                t.pass3_ran
+            } else {
+                false
+            };
+            (t.channel, t.speaker, t.created_at, carry_pass3)
         } else {
-            ("".to_string(), None, 0)
+            ("".to_string(), None, 0, false)
         };
         // Hardened iff this paragraph will scroll out of the new hot
         // zone. In the "grew" case, all but the last HOT_ZONE_N harden.
@@ -711,6 +755,9 @@ fn apply_diff(
             start_wall_ms,
             end_wall_ms,
             created_at,
+            pass3_ran,
+            pass4_ran: true,
+            pass3_inflight: false,
         });
         prev_cut = Some(cut);
     }
@@ -775,6 +822,9 @@ mod tests {
             start_wall_ms: start,
             end_wall_ms: end,
             created_at: 0,
+            pass3_ran: false,
+            pass4_ran: false,
+            pass3_inflight: false,
         }
     }
 

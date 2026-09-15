@@ -31,6 +31,7 @@
 //! recognizer additions can drop in without further wiring.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -193,6 +194,20 @@ pub struct Paragraph {
     pub start_wall_ms: u64,
     pub end_wall_ms: u64,
     pub created_at: i64,
+    /// True once pass-3 boundary re-transcription has completed at
+    /// least one cycle for this paragraph. Persisted so a re-loaded
+    /// recording keeps its "condensed" status.
+    #[serde(default)]
+    pub pass3_ran: bool,
+    /// True once the LLM has emitted this paragraph (pass 4). Preserved
+    /// across further LLM cycles; a paragraph split into new siblings
+    /// starts fresh (false) so the new paragraphs get their own state.
+    #[serde(default)]
+    pub pass4_ran: bool,
+    /// Transient: set while a pass-3 spawn_blocking decode is in flight
+    /// for this paragraph. Cleared on completion or abort. Not persisted.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pass3_inflight: bool,
 }
 
 impl Paragraph {
@@ -508,6 +523,11 @@ struct ChannelState {
     /// never receive audio pushes — the ring stays empty and pass 3
     /// short-circuits when it can't get samples.
     audio_ring: SlotAudioRing,
+    /// Transient flag set by the LLM scheduler task while a pass-4
+    /// (hot-zone reorganization) call is in flight for this channel.
+    /// The UI reads it out of the snapshot to pulse a "reorganizing…"
+    /// indicator on the channel's non-hardened paragraphs.
+    llm_inflight: bool,
 }
 
 /// Serialized shape of one channel's paragraphs for the `/record`
@@ -518,6 +538,11 @@ struct ChannelState {
 pub struct ChannelParagraphs {
     pub channel: String,
     pub paragraphs: Vec<Paragraph>,
+    /// True while a pass-4 (LLM) call is in flight for this channel.
+    /// The UI pulses the reorganizing indicator on non-hardened
+    /// paragraphs when this is true. Vox-only; TTS channel stays false.
+    #[serde(default)]
+    pub llm_inflight: bool,
 }
 
 /// Snapshot payload for `GET /record`. Serde-serialized directly; no
@@ -533,6 +558,9 @@ pub struct RecordStateSnapshot {
     /// Display names for every configured vox slot, indexed 0..N. The UI
     /// uses this as the canonical channel list.
     pub channel_names: Vec<String>,
+    /// Whether pass-4 LLM cycles run while no named recording is active.
+    /// Off by default; the UI toggles it via `PUT /record/llm-when-idle`.
+    pub llm_when_idle: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -624,6 +652,14 @@ pub struct RecordState {
     /// `OnceLock` (not `Mutex<Option<..>>`) because the set is a
     /// one-shot at startup — no need to re-wire midflight.
     llm_scheduler: Arc<OnceLock<LlmScheduler>>,
+    /// Runtime toggle: when `false` (the default), pass-4 LLM cycles
+    /// are skipped while no named recording is active — the live
+    /// buffer stays as a plain per-clip transcript. Flipping to `true`
+    /// lets the LLM reorganize live-mode paragraphs too. Toggled by
+    /// the UI via `PUT /record/llm-when-idle`; the Svelte page
+    /// mirrors the value in localStorage and posts it on every
+    /// change / on mount, so the server just reflects the last-writer.
+    llm_when_idle: Arc<AtomicBool>,
 }
 
 /// Events fanned out to OBS subtitle overlay subscribers.
@@ -677,6 +713,7 @@ impl RecordState {
                 channel_name: name,
                 paragraphs: Vec::new(),
                 audio_ring: SlotAudioRing::new(sample_rate),
+                llm_inflight: false,
             });
         }
         // TTS channel ring is unused (TTS clips never feed audio) but we
@@ -686,6 +723,7 @@ impl RecordState {
             channel_name: TTS_CHANNEL_NAME.to_string(),
             paragraphs: Vec::new(),
             audio_ring: SlotAudioRing::new(sample_rate),
+            llm_inflight: false,
         });
         Self {
             inner: Arc::new(Mutex::new(Inner {
@@ -700,7 +738,21 @@ impl RecordState {
             monitor_tap,
             stt,
             llm_scheduler: Arc::new(OnceLock::new()),
+            llm_when_idle: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Whether the pass-4 LLM should run when no named recording is
+    /// active. Read by `paragraph::run_once` at the top of each cycle.
+    pub fn llm_when_idle(&self) -> bool {
+        self.llm_when_idle.load(Ordering::Relaxed)
+    }
+
+    /// Set the "reinterpret with LLM (live)" runtime toggle. Called by
+    /// the HTTP layer on every UI change; the frontend persists the
+    /// choice in localStorage so the server just mirrors last-writer.
+    pub fn set_llm_when_idle(&self, enabled: bool) {
+        self.llm_when_idle.store(enabled, Ordering::Relaxed);
     }
 
     /// Register the pass-4 LLM scheduler. Called once by main.rs after
@@ -733,6 +785,29 @@ impl RecordState {
         if let ChannelKind::Vox(slot) = kind {
             sched.forced_break(slot);
         }
+    }
+
+    /// Flip the transient `llm_inflight` flag on a channel. Called by
+    /// the LLM scheduler task around the actual chat completion call so
+    /// the snapshot exposes an accurate "reorganizing…" indicator to
+    /// the UI. Also broadcasts a per-paragraph `ParagraphUpsert` for
+    /// every non-hardened paragraph on the channel while a recording is
+    /// active, so SSE overlays without polling still see the state
+    /// change ripple.
+    pub(crate) fn set_llm_inflight(&self, slot: usize, inflight: bool) {
+        let mut g = self.inner.lock().expect("record state mutex poisoned");
+        let Some(ch) = g.channels.iter_mut().find(|c| c.kind == ChannelKind::Vox(slot)) else {
+            return;
+        };
+        if ch.llm_inflight == inflight {
+            return;
+        }
+        ch.llm_inflight = inflight;
+        // No SSE fanout here — the UI polls /record every 500 ms and
+        // channel.llm_inflight is exposed in `ChannelParagraphs`.
+        // Overlays that need push-based updates can add a channel-level
+        // event later; the LLM cycle is short enough (seconds) that
+        // polling already gives good responsiveness.
     }
 
     /// Snapshot the paragraph list for a given Vox slot. Used by
@@ -928,6 +1003,7 @@ impl RecordState {
                 ChannelParagraphs {
                     channel: channel_name,
                     paragraphs: c.paragraphs.clone(),
+                    llm_inflight: c.llm_inflight,
                 }
             })
             .collect();
@@ -936,6 +1012,7 @@ impl RecordState {
             paragraphs_by_channel,
             active_recording,
             channel_names,
+            llm_when_idle: self.llm_when_idle(),
         }
     }
 
@@ -1458,6 +1535,13 @@ impl RecordState {
             start_wall_ms: unix_now_ms(),
             end_wall_ms: unix_now_ms(),
             created_at: unix_now(),
+            // TTS paragraphs are authoritative on arrival: no
+            // re-transcription happens, and the LLM never touches them.
+            // Treat both as "already run" so the UI shows them as
+            // fully-processed hardened blocks straight away.
+            pass3_ran: true,
+            pass4_ran: true,
+            pass3_inflight: false,
         };
         let mut g = self.inner.lock().expect("record state mutex poisoned");
         if let Some(ch) = g.channel_mut(ChannelKind::Tts) {
@@ -1683,6 +1767,30 @@ impl RecordState {
     ///
     /// Never returns errors — logs a `debug` breadcrumb on discard and
     /// a `warn` on STT failure.
+    /// Clear the transient pass-3 inflight flag on `paragraph_id` in
+    /// both the channel state and the active recording (if mirrored).
+    /// Used from early-return branches inside the spawned pass-3 task
+    /// so the UI's "condensing…" indicator doesn't get stuck on when
+    /// the decode aborts before writing anything.
+    fn clear_pass3_inflight(&self, paragraph_id: &str) {
+        let mut g = self.inner.lock().expect("record state mutex poisoned");
+        for ch in g.channels.iter_mut() {
+            if let Some(p) = ch.paragraphs.iter_mut().find(|p| p.id == paragraph_id) {
+                p.pass3_inflight = false;
+                break;
+            }
+        }
+        if let Some(active) = g.active.as_mut() {
+            if let Some(p) = active
+                .paragraphs
+                .iter_mut()
+                .find(|p| p.id == paragraph_id)
+            {
+                p.pass3_inflight = false;
+            }
+        }
+    }
+
     fn schedule_boundary_retranscribe(&self, paragraph_id: String) {
         let Some(stt) = self.stt.clone() else {
             // STT disabled at startup — pass 3 is a no-op.
@@ -1776,6 +1884,10 @@ impl RecordState {
             let samples = g.channels[ci]
                 .audio_ring
                 .samples_between(range_start, range_end);
+            // Flip the transient inflight flag on so the UI can surface a
+            // "condensing…" pulse. Cleared in every early-return branch
+            // below and after the blocking decode returns.
+            g.channels[ci].paragraphs[pi].pass3_inflight = true;
             (slot, window, samples)
         };
         let (slot, window, samples) = snapshot;
@@ -1785,6 +1897,7 @@ impl RecordState {
                 slot,
                 "pass3: audio ring window unavailable — skipping"
             );
+            self.clear_pass3_inflight(&paragraph_id);
             return;
         };
         let state = self.clone();
@@ -1796,10 +1909,12 @@ impl RecordState {
                 Ok(Ok(t)) => t.trim().to_string(),
                 Ok(Err(err)) => {
                     warn!(err = %format!("{err:#}"), "pass3: STT decode failed");
+                    state.clear_pass3_inflight(&paragraph_id_for_task);
                     return;
                 }
                 Err(_) => {
                     warn!("pass3: STT task panicked");
+                    state.clear_pass3_inflight(&paragraph_id_for_task);
                     return;
                 }
             };
@@ -1829,6 +1944,10 @@ impl RecordState {
                     paragraph = %paragraph_id_for_task,
                     "pass3: paragraph gone during decode — discarded"
                 );
+                // No paragraph to clear inflight on; drop the lock and
+                // return. (If a same-id paragraph got recreated in the
+                // meantime, its new inflight flag started fresh at
+                // false, so nothing to do here.)
                 return;
             };
             // Every clip must still exist and be non-provisional.
@@ -1845,11 +1964,13 @@ impl RecordState {
                         paragraph = %paragraph_id_for_task,
                         "pass3: clip set changed during decode — discarded"
                     );
+                    g.channels[ci].paragraphs[pi].pass3_inflight = false;
                     return;
                 }
             }
             // Apply the split.
             let mut updated_clips: Vec<ClipRef> = Vec::with_capacity(clip_count);
+            let paragraph_snapshot: Option<Paragraph>;
             {
                 let paragraph = &mut g.channels[ci].paragraphs[pi];
                 for (cid, new_text) in clip_ids.iter().zip(split_texts.iter()) {
@@ -1859,6 +1980,9 @@ impl RecordState {
                     }
                 }
                 paragraph.rebuild();
+                paragraph.pass3_ran = true;
+                paragraph.pass3_inflight = false;
+                paragraph_snapshot = Some(paragraph.clone());
             }
             // Mirror into the active recording.
             if let Some(active) = g.active.as_mut() {
@@ -1873,6 +1997,8 @@ impl RecordState {
                         }
                     }
                     mirror.rebuild();
+                    mirror.pass3_ran = true;
+                    mirror.pass3_inflight = false;
                 }
             }
             let recording = g.active.is_some();
@@ -1888,6 +2014,9 @@ impl RecordState {
                         paragraph_id: paragraph_id_for_task.clone(),
                         clip,
                     });
+                }
+                if let Some(p) = paragraph_snapshot {
+                    let _ = state.subtitles.send(SubtitleEvent::ParagraphUpsert(p));
                 }
             }
         });
@@ -2057,6 +2186,9 @@ fn upsert_clip_into_channel(
             start_wall_ms,
             end_wall_ms: start_wall_ms,
             created_at: unix_now(),
+            pass3_ran: false,
+            pass4_ran: false,
+            pass3_inflight: false,
         };
         paragraph.rebuild();
         ch.paragraphs.push(paragraph.clone());

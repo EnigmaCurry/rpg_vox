@@ -130,14 +130,30 @@ impl Client {
                 if raw.len() > 200 { format!("{}…", &raw[..200]) } else { raw }
             ));
         }
-        serde_json::from_str::<Value>(&cleaned).map_err(|err| {
-            let preview: String = if cleaned.len() > 400 {
-                format!("{}…", &cleaned[..400])
-            } else {
-                cleaned.clone()
-            };
-            anyhow!("LLM JSON parse failed ({err}): raw={preview}")
-        })
+        // First try the cleaned string as-is. If that fails, walk it
+        // for the first balanced JSON array/object — recovers when a
+        // Harmony-format model emits the schema-constrained payload
+        // inside `to=self<|message|>` (which our extract_harmony_user_reply
+        // skips because it looks for `to=user`) or wraps the JSON with
+        // any other noise the strip pipeline didn't recognize.
+        match serde_json::from_str::<Value>(&cleaned) {
+            Ok(v) => Ok(v),
+            Err(direct_err) => {
+                if let Some(span) = extract_first_json(&cleaned) {
+                    if let Ok(v) = serde_json::from_str::<Value>(span) {
+                        return Ok(v);
+                    }
+                }
+                let preview: String = if cleaned.len() > 400 {
+                    format!("{}…", &cleaned[..400])
+                } else {
+                    cleaned.clone()
+                };
+                Err(anyhow!(
+                    "LLM JSON parse failed ({direct_err}): raw={preview}"
+                ))
+            }
+        }
     }
 
     fn build_messages(
@@ -346,6 +362,55 @@ pub fn strip_thinking(s: &str) -> String {
     result
 }
 
+/// Find the first balanced JSON array or object in `s` and return its
+/// substring. Tracks bracket depth while respecting quoted strings and
+/// backslash escapes, so structural characters inside string literals
+/// don't throw off the count. Returns `None` when no complete
+/// expression is found (either no opener present, or the input is
+/// truncated mid-value).
+///
+/// Used as a fallback in `generate_reply_json` when the Harmony /
+/// think-strip pipeline leaves stray wrapper text next to the JSON —
+/// e.g. `to=self<|message|>[…]<|eom|>` when the model emits the
+/// structured payload in the reasoning channel instead of the user
+/// channel.
+fn extract_first_json(s: &str) -> Option<&str> {
+    let bytes = s.as_bytes();
+    let start = bytes
+        .iter()
+        .position(|b| *b == b'[' || *b == b'{')?;
+    let open = bytes[start];
+    let close = if open == b'[' { b']' } else { b'}' };
+    let mut depth: i32 = 0;
+    let mut in_str = false;
+    let mut escape = false;
+    for i in start..bytes.len() {
+        let b = bytes[i];
+        if in_str {
+            if escape {
+                escape = false;
+            } else if b == b'\\' {
+                escape = true;
+            } else if b == b'"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_str = true,
+            x if x == open => depth += 1,
+            x if x == close => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&s[start..=i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn summarise(body: &str) -> String {
     let flat: String = body
         .chars()
@@ -360,7 +425,36 @@ fn summarise(body: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_harmony_user_reply, strip_thinking};
+    use super::{extract_first_json, extract_harmony_user_reply, strip_thinking};
+
+    #[test]
+    fn extracts_json_from_wrong_harmony_channel() {
+        // Model emitted the schema-constrained payload inside `to=self`
+        // instead of `to=user`, so extract_harmony_user_reply returned
+        // None and the raw string still has Harmony wrappers. The
+        // scan-for-first-JSON fallback in generate_reply_json needs to
+        // recover the array anyway.
+        let raw = "to=self<|message|>[{\"end_clip\":\"c1\",\"text\":\"hi\"}]<|eom|>";
+        let span = extract_first_json(raw).expect("should find the array");
+        let parsed: serde_json::Value = serde_json::from_str(span).expect("valid json");
+        assert_eq!(parsed[0]["end_clip"].as_str(), Some("c1"));
+    }
+
+    #[test]
+    fn extract_first_json_handles_strings_with_brackets() {
+        // A `]` inside a string literal must not close the outer array.
+        let raw = "noise before [{\"text\":\"has ] inside\"},{\"text\":\"ok\"}] trailing";
+        let span = extract_first_json(raw).expect("should find the array");
+        let parsed: serde_json::Value = serde_json::from_str(span).expect("valid json");
+        assert_eq!(parsed.as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn extract_first_json_none_when_truncated() {
+        // No matching close bracket: never returns a partial span.
+        assert!(extract_first_json("prefix [{\"a\":1},").is_none());
+    }
+
 
     #[test]
     fn harmony_extracts_last_user_message() {

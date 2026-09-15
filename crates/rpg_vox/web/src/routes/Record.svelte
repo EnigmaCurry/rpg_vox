@@ -22,6 +22,23 @@
   let err = $state(null);
   let busy = $state(false);
 
+  // "Reinterpret with LLM" toggle for the live pane. Off by default.
+  // The value is authoritative on the client (localStorage) — the
+  // server just mirrors last-writer. onMount reads localStorage and
+  // POSTs once so a fresh server picks up the operator's preference;
+  // every checkbox change POSTs the new value. During a named
+  // recording the server ignores this flag and always runs the LLM.
+  const LLM_WHEN_IDLE_KEY = 'rpgvox.llmWhenIdle';
+  let llmWhenIdle = $state(false);
+  async function onLlmWhenIdleChange() {
+    try {
+      localStorage.setItem(LLM_WHEN_IDLE_KEY, llmWhenIdle ? '1' : '0');
+      await api.setLlmWhenIdle(llmWhenIdle);
+    } catch (e) {
+      console.warn('llm-when-idle put failed', e);
+    }
+  }
+
   // Selected sidebar item: 'live' (rolling buffer), 'active' (in-flight
   // recording), or a recording id (saved). Recording auto-selects to
   // 'active' on start; stop drops back to 'live' unless the user is
@@ -142,6 +159,21 @@
   });
 
   onMount(async () => {
+    // Restore the "Reinterpret with LLM" toggle from localStorage
+    // before the first poll so the checkbox reflects the persisted
+    // choice, and POST it once so the server (which just restarted
+    // and defaults to off) picks it up. Failures are non-fatal —
+    // worst case the server stays at its default until the user
+    // clicks the box.
+    try {
+      const stored = localStorage.getItem(LLM_WHEN_IDLE_KEY);
+      llmWhenIdle = stored === '1' || stored === 'true';
+      await api.setLlmWhenIdle(llmWhenIdle);
+    } catch (e) {
+      // Non-fatal — the checkbox still works; server just misses
+      // the initial sync.
+      console.warn('llm-when-idle init failed', e);
+    }
     await refresh();
     timer = setInterval(refresh, POLL_MS);
   });
@@ -1011,6 +1043,42 @@
     );
     return { id: null, paragraphs, created_at: 0 };
   });
+
+  // Map channel name → llm_inflight flag from the current snapshot.
+  // Used by paragraphState to pulse the state dot on non-hardened
+  // paragraphs while a pass-4 LLM call is in flight on their channel.
+  // TTS channel is always false server-side.
+  const channelInflight = $derived.by(() => {
+    const out = {};
+    for (const ch of state?.paragraphsByChannel ?? []) {
+      out[ch.channel] = !!ch.llm_inflight;
+    }
+    return out;
+  });
+
+  // Compute the 5-state label for a paragraph. Rendered as a colored
+  // dot in the paragraph header. The `pulsing` overlay is a separate
+  // boolean (returned as .inflight below) so any state can pulse when
+  // background work is touching this block.
+  function paragraphState(p) {
+    if ((p.clips ?? []).some((c) => c.provisional)) return 'streaming';
+    if (p.hardened) return 'hardened';
+    if (p.pass4_ran) return 'reorganized';
+    if (p.pass3_ran) return 'condensed';
+    return 'finalized';
+  }
+  function paragraphInflight(p) {
+    if (p.pass3_inflight) return true;
+    if (!p.hardened && channelInflight[p.channel || channelFallback]) return true;
+    return false;
+  }
+  const STATE_LABELS = {
+    streaming: 'Streaming — clips still landing',
+    finalized: 'Finalized — pass 3 pending',
+    condensed: 'Condensed — boundary re-transcribed',
+    reorganized: 'Reorganized — LLM rewrote this paragraph',
+    hardened: 'Hardened — scrolled out of the LLM hot zone',
+  };
 </script>
 
 {#snippet hiddenAudios()}
@@ -1062,49 +1130,55 @@
 {/snippet}
 
 {#snippet clipStrip(p, recId)}
-  <!-- Compact per-clip button strip pinned beneath each paragraph's
-       prose. One chip per clip. Chip label is the clip's offset from
-       the paragraph's start (e.g. "0:03") — for a single-clip TTS
+  <!-- Compact per-clip strip pinned beneath each paragraph's prose.
+       One chip per clip. Chip label is the clip's offset from the
+       paragraph's start (e.g. "0:03") — for a single-clip TTS
        paragraph we show a bare ▸ instead, since the offset would
-       always be 0:00. Chip is disabled in the live pane for vox clips
-       (recId == null && !clip.audio_url) because the segment endpoint
-       is per-saved-recording only — see risk 1 in the plan. -->
+       always be 0:00. Live pane vox clips are transcript-only by
+       design (no per-slot audio endpoint) — those render as
+       passive tick marks instead of playable chips. -->
   <div class="clip-strip">
     {#each p.clips ?? [] as clip (clip.id)}
-      {@const disabled = recId == null && !clip.audio_url}
       {@const isTts = !!clip.audio_url}
+      {@const playable = recId != null || isTts}
       {@const soloTts = isTts && (p.clips?.length ?? 0) === 1}
-      <button
-        type="button"
-        class="clip-chip"
-        class:playing={playingClipId === clip.id}
-        class:provisional={clip.provisional}
-        class:tts={isTts}
-        {disabled}
-        title={disabled
-          ? 'Clip audio only available after saving'
-          : (clip.text || 'Play clip')}
-        onclick={() => {
-          if (disabled) return;
-          if (playingClipId === clip.id) { stopPlayback(); return; }
-          playClip(
-            {
-              id: clip.id,
-              audio_url: clip.audio_url,
-              audio_start_ms: clip.audio_start_ms,
-              audio_duration_ms: clip.audio_duration_ms,
-            },
-            recId,
-          );
-        }}
-      >
-        {#if playingClipId === clip.id}
-          <div class="clip-fill" style="width: {clipDurationMs ? Math.min(1, playingTimeMs / clipDurationMs) * 100 : 0}%" aria-hidden="true"></div>
-        {/if}
-        <span class="clip-chip-label">
-          {#if soloTts}▸{:else}{fmtRelMs((clip.start_wall_ms ?? 0) - (p.start_wall_ms ?? 0))}{/if}
+      {#if playable}
+        <button
+          type="button"
+          class="clip-chip"
+          class:playing={playingClipId === clip.id}
+          class:provisional={clip.provisional}
+          class:tts={isTts}
+          title={clip.text || 'Play clip'}
+          onclick={() => {
+            if (playingClipId === clip.id) { stopPlayback(); return; }
+            playClip(
+              {
+                id: clip.id,
+                audio_url: clip.audio_url,
+                audio_start_ms: clip.audio_start_ms,
+                audio_duration_ms: clip.audio_duration_ms,
+              },
+              recId,
+            );
+          }}
+        >
+          {#if playingClipId === clip.id}
+            <div class="clip-fill" style="width: {clipDurationMs ? Math.min(1, playingTimeMs / clipDurationMs) * 100 : 0}%" aria-hidden="true"></div>
+          {/if}
+          <span class="clip-chip-label">
+            {#if soloTts}▸{:else}{fmtRelMs((clip.start_wall_ms ?? 0) - (p.start_wall_ms ?? 0))}{/if}
+          </span>
+        </button>
+      {:else}
+        <span
+          class="clip-tick"
+          class:provisional={clip.provisional}
+          title={clip.text || ''}
+        >
+          {fmtRelMs((clip.start_wall_ms ?? 0) - (p.start_wall_ms ?? 0))}
         </span>
-      </button>
+      {/if}
     {/each}
   </div>
 {/snippet}
@@ -1114,6 +1188,8 @@
   {@const isTts = ch === 'TTS'}
   {@const title = isTts ? (p.speaker || 'TTS') : (p.speaker || ch)}
   {@const channelType = isTts ? 'TTS' : 'VOX'}
+  {@const pstate = paragraphState(p)}
+  {@const pulsing = paragraphInflight(p)}
   <div
     class="paragraph-block"
     class:playing={currentPlayingParagraphId === p.id}
@@ -1127,6 +1203,12 @@
         <span class="avatar-type" class:tts={isTts}>{channelType}</span>
         <span class="avatar-title" title={title}>{title}</span>
       </div>
+      <span
+        class="state-dot state-{pstate}"
+        class:pulsing
+        title={STATE_LABELS[pstate]}
+        aria-label={pstate}
+      ></span>
       <span class="paragraph-ts" title={fmtTime(p.created_at)}>
         {fmtWallTime(p.start_wall_ms)}
       </span>
@@ -1256,6 +1338,17 @@
             <span class="stt-off"> · STT disabled</span>
           {/if}
         </h1>
+        <label
+          class="llm-toggle"
+          title="Off (default): the live pane is a plain per-clip transcript. On: the LLM reinterprets paragraphs as they land, using GPU time. Ignored during a named recording — the LLM always runs there."
+        >
+          <input
+            type="checkbox"
+            bind:checked={llmWhenIdle}
+            onchange={onLlmWhenIdleChange}
+          />
+          <span>Reinterpret with LLM</span>
+        </label>
         <button
           type="button"
           class="live-rec-btn"
@@ -1436,6 +1529,38 @@
   /* Start-recording affordance pinned to the far-right corner of the
      sticky header. Deliberately understated in its resting state — a
      small red dot as an icon, muted border, no glow, no animation. */
+  /* "Reinterpret with LLM" checkbox — sits between the title and the
+     Record button. `margin-left: auto` on this element pushes the
+     Record button flush right; the toggle stays packed to the left of
+     it so the compact header still fits on narrow widths. */
+  .pane-head.live .llm-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 8px;
+    border-radius: 999px;
+    color: var(--muted);
+    font-size: 12px;
+    cursor: pointer;
+    flex: 0 0 auto;
+    margin-left: auto;
+    user-select: none;
+  }
+  .pane-head.live .llm-toggle:hover {
+    color: var(--text);
+  }
+  .pane-head.live .llm-toggle input[type="checkbox"] {
+    margin: 0;
+    accent-color: rgba(122,162,255,0.8);
+  }
+  .pane-head.live.compact .llm-toggle {
+    /* In the compact (scrolled) header the space is tight; drop the
+       label but keep the checkbox so the toggle is still available. */
+    padding: 3px 4px;
+  }
+  .pane-head.live.compact .llm-toggle span {
+    display: none;
+  }
   .pane-head.live .live-rec-btn {
     display: inline-flex;
     align-items: center;
@@ -1449,7 +1574,6 @@
     font-weight: 600;
     cursor: pointer;
     flex: 0 0 auto;
-    margin-left: auto;
     transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
   }
   .pane-head.live .live-rec-btn:hover:not(:disabled) {
@@ -1795,6 +1919,36 @@
     white-space: nowrap;
     margin-left: auto;
   }
+  /* State indicator: a small colored circle in the paragraph header
+     showing the paragraph's current processing state.
+       streaming   — red    (clips still landing)
+       finalized   — orange (pass 2 done, pass 3 hasn't fired)
+       condensed   — amber  (pass 3 boundary re-transcribe done)
+       reorganized — yellow (LLM has rewritten this paragraph, still in hot zone)
+       hardened    — grey   (scrolled out of hot zone, immutable)
+     The `pulsing` overlay class animates opacity while background
+     work is touching this paragraph (pass-3 decode in flight, or the
+     channel's LLM cycle is running on its hot zone). */
+  .state-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--muted);
+    flex-shrink: 0;
+    box-shadow: 0 0 0 1px rgba(0,0,0,0.35);
+  }
+  .state-dot.state-streaming   { background: #e35555; }
+  .state-dot.state-finalized   { background: #e68a3a; }
+  .state-dot.state-condensed   { background: #d4b93a; }
+  .state-dot.state-reorganized { background: #e0c02a; }
+  .state-dot.state-hardened    { background: #888888; }
+  .state-dot.pulsing {
+    animation: state-dot-pulse 1.2s ease-in-out infinite;
+  }
+  @keyframes state-dot-pulse {
+    0%, 100% { opacity: 1; box-shadow: 0 0 0 1px rgba(0,0,0,0.35); }
+    50%      { opacity: 0.35; box-shadow: 0 0 0 4px rgba(255,255,255,0.08); }
+  }
   .paragraph-text {
     display: block;
     width: 100%;
@@ -1873,6 +2027,28 @@
   .clip-chip-label {
     position: relative;
     z-index: 1;
+  }
+
+  /* Passive clip marker for the live pane, where per-clip audio has
+     nowhere to come from. Same label shape as a chip so users can
+     still see the LLM's paragraph boundaries at a glance, but no
+     button semantics, no hover, no cursor. */
+  .clip-tick {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 40px;
+    padding: 2px 8px;
+    color: var(--muted);
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+    line-height: 1.2;
+    opacity: 0.55;
+    user-select: none;
+  }
+  .clip-tick.provisional {
+    font-style: italic;
+    opacity: 0.4;
   }
 
   /* Animated fill: absolute overlay behind the chip content whose
