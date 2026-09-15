@@ -5,11 +5,19 @@
 
   // Server-side state, refreshed every POLL_MS. Structure:
   //   { mode: 'idle' | 'recording',
-  //     buffer: TranscriptEntry[],   bufferBytes, bufferMaxBytes,
-  //     activeRecording: { id, name, entries, created_at, duration_ms } | null,
-  //     recordings: [{ id, name, entries, duration_ms, ... }],
-  //     channelNames: string[],  // display names per Vox slot
+  //     paragraphsByChannel: [{ channel, paragraphs: Paragraph[] }],
+  //     activeRecording: { id, name, paragraphs, created_at, duration_ms,
+  //                        mixed_duration_ms } | null,
+  //     recordings: [{ id, name, paragraphs, duration_ms, sample_rate,
+  //                    audio_url, created_at }],
+  //     channelNames: string[],  // display names per Vox slot (canonical
+  //                              //   channel order)
   //     sttEnabled: bool, sampleRate: number }
+  //
+  // Paragraph = { id, channel, speaker?, hardened, text, raw_text,
+  //               clips: ClipRef[], start_wall_ms, end_wall_ms, created_at }
+  // ClipRef   = { id, audio_start_ms?, audio_duration_ms?, start_wall_ms,
+  //               text, provisional, audio_url?, mixed_start_ms? }
   let state = $state(null);
   let err = $state(null);
   let busy = $state(false);
@@ -255,22 +263,16 @@
     const d = new Date(secs * 1000);
     return d.toLocaleString();
   }
-  // Terse form for the linear-log timestamp line: just HH:MM. The full
-  // date + time from `fmtTime` sits in the row's `title` tooltip so
-  // hovering still exposes the exact moment when needed.
-  function fmtTimeCompact(secs) {
-    if (!secs) return '';
-    const d = new Date(secs * 1000);
-    return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-  }
-  // UTC-only compact time (HH:MMZ). Used in the recording linear-log
-  // avatar so the recorded moment is unambiguous across time zones —
-  // handy when a session is shared with people elsewhere or the same
-  // recording is reviewed on a machine in a different locale.
-  function fmtTimeUtcCompact(secs) {
-    if (!secs) return '';
-    const iso = new Date(secs * 1000).toISOString();
-    return `${iso.slice(11, 16)}Z`;
+  // Wall-clock ms → local HH:MM:SS. Used inside a paragraph header so
+  // the moment the paragraph started reading is at a glance.
+  function fmtWallTime(ms) {
+    if (!ms) return '';
+    const d = new Date(ms);
+    return d.toLocaleTimeString([], {
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+    });
   }
   // Single-letter placeholder derived from the pill text so an avatar
   // that isn't yet wired to a real portrait still reads as
@@ -303,117 +305,46 @@
     return `${m}:${s.toString().padStart(2, '0')}`;
   }
 
-  function fmtBytes(n) {
-    if (n < 1024) return `${n} B`;
-    return `${(n / 1024).toFixed(1)} KB`;
+  // Compact "M:SS" for an elapsed millisecond count. Used to label each
+  // clip chip with its offset from the parent paragraph's start.
+  function fmtRelMs(ms) {
+    const rel = Math.max(0, Math.floor((ms ?? 0) / 1000));
+    const m = Math.floor(rel / 60);
+    const s = rel % 60;
+    return `${m}:${s.toString().padStart(2, '0')}`;
   }
 
-  // ---- Row grouping for the columns-per-channel log table ----
+  // ---- Paragraph clustering ----
   //
-  // Every entry is its own row: same-channel repeats always start a new
-  // row so no cell ever stacks multiple clips. Entries from *different*
-  // channels that fall within CLUSTER_GAP_MS may still share a row, so
-  // overlapping speakers stay visually aligned. A gap ≥ SILENCE_ROW_MIN_MS
-  // between rows inserts a silence row with an empty channels area — its
-  // master column play button seeks the mixed track to the next speech
-  // row's audioStart, i.e. "skip the silence".
-  const CLUSTER_GAP_MS = 500;
+  // Sort paragraphs by wall-clock start, then sweep: any paragraph
+  // whose start falls at or before the current cluster's running end
+  // is absorbed into the cluster (row spans multiple channels).
+  // Otherwise the cluster flushes as a speech row, an optional silence
+  // row is inserted if the gap ≥ SILENCE_ROW_MIN_MS, and the paragraph
+  // seeds the next cluster.
+  //
+  // Row shape:
+  //   {
+  //     kind: 'speech' | 'silence',
+  //     wallStart, wallEnd,
+  //     audioStart: number | null,   // min clip.audio_start_ms across
+  //                                  //   the cluster (null for TTS-only
+  //                                  //   or missing audio_start_ms)
+  //     byChannel: Record<string, Paragraph[]>,
+  //     channels: string[]           // canonical-ordered, TTS at end
+  //   }
   const SILENCE_ROW_MIN_MS = 3000;
 
-  function entryEpochMs(e) {
-    return e.start_wall_ms ?? (e.created_at ? e.created_at * 1000 : 0);
-  }
-  function entryEndMs(e) {
-    return entryEpochMs(e) + (e.audio_duration_ms ?? 0);
-  }
-  function computeRows(entries) {
-    const sorted = [...(entries ?? [])].sort(
-      (a, b) => entryEpochMs(a) - entryEpochMs(b),
-    );
-    const rows = [];
-    let cluster = [];
-    let clusterEnd = 0;
-    let clusterChannels = new Set();
-    const flush = () => {
-      if (!cluster.length) return;
-      const wallStart = Math.min(...cluster.map(entryEpochMs));
-      const wallEnd = Math.max(...cluster.map(entryEndMs));
-      // Per-slot audio timeline (audio.wav) — silence-padded so it's
-      // aligned with wall clock. Master playback seeks here because
-      // audio.wav is always populated (even for vox slots set to
-      // capture-only, i.e. to_output=false — the silence-gated mixed
-      // feed skips those and would be empty in that common case).
-      const audioVals = cluster
-        .map((e) => e.audio_start_ms)
-        .filter((v) => v != null);
-      const audioStart = audioVals.length ? Math.min(...audioVals) : null;
-      const byChannel = {};
-      for (const e of cluster) {
-        const key = e.channel || 'Unknown';
-        (byChannel[key] ??= []).push(e);
-      }
-      rows.push({
-        kind: 'speech',
-        wallStart,
-        wallEnd,
-        audioStart,
-        entries: cluster.slice(),
-        byChannel,
-      });
-      cluster = [];
-      clusterChannels = new Set();
-      clusterEnd = 0;
-    };
-    for (const e of sorted) {
-      const eStart = entryEpochMs(e);
-      const key = e.channel || 'Unknown';
-      // Split when: gap exceeds CLUSTER_GAP_MS, OR this channel already
-      // has a clip in the current cluster (one clip per cell rule).
-      if (cluster.length > 0) {
-        const tooFar = eStart - clusterEnd > CLUSTER_GAP_MS;
-        const dupChannel = clusterChannels.has(key);
-        if (tooFar || dupChannel) {
-          const prev = cluster[cluster.length - 1];
-          const prevAudioEnd = (prev.audio_start_ms ?? 0) + (prev.audio_duration_ms ?? 0);
-          const prevEnd = clusterEnd;
-          flush();
-          if (tooFar && eStart - prevEnd >= SILENCE_ROW_MIN_MS) {
-            rows.push({
-              kind: 'silence',
-              wallStart: prevEnd,
-              wallEnd: eStart,
-              audioStart: prevAudioEnd,
-              entries: [],
-              byChannel: {},
-            });
-          }
-        }
-      }
-      cluster.push(e);
-      clusterChannels.add(key);
-      clusterEnd = Math.max(clusterEnd, entryEndMs(e));
-    }
-    flush();
-    return rows;
-  }
-
-  // Union of channel names in the entries, biased to `canonical` order
-  // (from state.channelNames), and with TTS pushed to the end so it
-  // reads as "spoken" columns on the left, then the synth column, then
-  // Master.
-  function extractChannels(entries, canonical = []) {
-    const seen = new Set();
+  // Union of channel names in the paragraph set, intersected with the
+  // canonical list (from state.channelNames) so we never emit an empty
+  // column. `TTS` moves to the end so vox reads left, synth right.
+  function orderChannels(clusterChannelSet, canonical = []) {
     const cols = [];
     for (const c of canonical) {
-      if (!seen.has(c)) {
-        seen.add(c);
-        cols.push(c);
-      }
+      if (clusterChannelSet.has(c)) cols.push(c);
     }
-    for (const e of entries ?? []) {
-      if (!e.channel || seen.has(e.channel)) continue;
-      seen.add(e.channel);
-      cols.push(e.channel);
+    for (const c of clusterChannelSet) {
+      if (!cols.includes(c)) cols.push(c);
     }
     const tts = cols.indexOf('TTS');
     if (tts >= 0) {
@@ -423,17 +354,110 @@
     return cols;
   }
 
-  // Wall-clock unix ms → "M:SS" relative to the recording's epoch. Used
-  // for the leftmost timestamp column in the log table.
-  function fmtRelMs(ms, epochMs) {
-    const rel = Math.max(0, Math.floor((ms - epochMs) / 1000));
-    const m = Math.floor(rel / 60);
-    const s = rel % 60;
-    return `${m}:${s.toString().padStart(2, '0')}`;
+  // Precompute per-paragraph audio range on the paragraph object itself
+  // so the rAF loop's O(1) lookup stays O(1). `audioStart`/`audioEnd`
+  // are keyed on the per-slot audio.wav timeline (via clip.audio_start_ms
+  // + audio_duration_ms). Paragraphs with no positioned clip (TTS-only)
+  // get `audioStart = null` and won't be highlighted during master
+  // playback.
+  function paragraphAudioRange(p) {
+    let start = null;
+    let end = null;
+    for (const c of p.clips ?? []) {
+      const s = c.audio_start_ms;
+      const d = c.audio_duration_ms;
+      if (s == null) continue;
+      if (start == null || s < start) start = s;
+      const e = s + (d ?? 0);
+      if (end == null || e > end) end = e;
+    }
+    return { audioStart: start, audioEnd: end };
   }
 
-  function recordingEpochMs(rec) {
-    return rec?.created_at ? rec.created_at * 1000 : 0;
+  function computeClusters(paragraphs, canonical = []) {
+    const sorted = [...(paragraphs ?? [])].sort(
+      (a, b) => (a.start_wall_ms ?? 0) - (b.start_wall_ms ?? 0),
+    );
+    const rows = [];
+    let cluster = [];
+    let clusterEnd = 0;
+    const flush = () => {
+      if (!cluster.length) return;
+      const byChannel = {};
+      const chSet = new Set();
+      let audioStart = null;
+      let wallStart = Infinity;
+      let wallEnd = 0;
+      for (const p of cluster) {
+        const key = p.channel || 'Unknown';
+        (byChannel[key] ??= []).push(p);
+        chSet.add(key);
+        if ((p.start_wall_ms ?? 0) < wallStart) wallStart = p.start_wall_ms ?? 0;
+        if ((p.end_wall_ms ?? 0) > wallEnd) wallEnd = p.end_wall_ms ?? 0;
+        const range = paragraphAudioRange(p);
+        if (range.audioStart != null) {
+          if (audioStart == null || range.audioStart < audioStart) {
+            audioStart = range.audioStart;
+          }
+        }
+      }
+      rows.push({
+        kind: 'speech',
+        wallStart,
+        wallEnd,
+        audioStart,
+        byChannel,
+        channels: orderChannels(chSet, canonical),
+      });
+      cluster = [];
+      clusterEnd = 0;
+    };
+    for (const p of sorted) {
+      const pStart = p.start_wall_ms ?? 0;
+      const pEnd = p.end_wall_ms ?? pStart;
+      if (cluster.length === 0) {
+        cluster.push(p);
+        clusterEnd = pEnd;
+        continue;
+      }
+      if (pStart <= clusterEnd) {
+        // Overlaps → same cluster row.
+        cluster.push(p);
+        if (pEnd > clusterEnd) clusterEnd = pEnd;
+        continue;
+      }
+      // Gap: flush current cluster; conditionally emit silence.
+      const gap = pStart - clusterEnd;
+      const prevEnd = clusterEnd;
+      // audio-timeline end of the just-closed cluster's last paragraph,
+      // if any of the cluster's paragraphs had audio positioning. Used
+      // as the silence row's audio anchor so a click on the silence row
+      // can jump the master playhead across the gap.
+      let prevAudioEnd = null;
+      for (const p2 of cluster) {
+        const range = paragraphAudioRange(p2);
+        if (range.audioEnd != null) {
+          if (prevAudioEnd == null || range.audioEnd > prevAudioEnd) {
+            prevAudioEnd = range.audioEnd;
+          }
+        }
+      }
+      flush();
+      if (gap >= SILENCE_ROW_MIN_MS) {
+        rows.push({
+          kind: 'silence',
+          wallStart: prevEnd,
+          wallEnd: pStart,
+          audioStart: prevAudioEnd,
+          byChannel: {},
+          channels: [],
+        });
+      }
+      cluster.push(p);
+      clusterEnd = pEnd;
+    }
+    flush();
+    return rows;
   }
 
   // Chronological playback state. One shared <audio> element per pane
@@ -444,7 +468,7 @@
   let playingRecordingId = $state(null); // which recording is currently sounding
   let playingTimeMs = $state(0);          // ms — master timeline in 'master' mode, clip offset in 'clip' mode
   let masterAudioEl = $state(null);       // hidden <audio> for the silence-gated mixed track
-  let clipAudioEl = $state(null);         // hidden <audio> for one-shot per-entry segment playback
+  let clipAudioEl = $state(null);         // hidden <audio> for one-shot per-clip segment playback
   // Duration mirrors of the two audio elements. Reading `.duration` off
   // the DOM directly isn't reactive, so a template value that depends
   // on it stays stale until *some other* reactive dep changes. Copying
@@ -462,31 +486,27 @@
     clipDurationMs = Number.isFinite(d) ? d * 1000 : 0;
   };
   // 'master' when the mixed track is playing (auto-advances through rows);
-  // 'clip' when a single per-channel utterance is playing (no advance).
+  // 'clip' when a single per-channel clip is playing (no advance).
   // null when nothing is playing. Drives which element the rAF loop
   // samples and which row/clip button lights up.
   let playbackMode = $state(null);
-  // Which entry id is playing under 'clip' mode. Only set when
+  // Which clip id is playing under 'clip' mode. Only set when
   // playbackMode === 'clip'.
   let playingClipId = $state(null);
   let rafId = 0;
 
   // ---- Master vs clip playback ----
   //
-  // Master: click the ▶ in a row's Master column. Seeks the (hidden)
-  // mixed-track element to that row's `mixedStart` and lets it play
-  // straight through — subsequent rows highlight naturally as the
-  // playhead crosses their mixedStart boundaries. Silence rows have
-  // mixedStart == prev row's mixed_end, so continuous master playback
-  // skips right past them.
+  // Master: click a row's ▶. Seeks the (hidden) per-slot audio element
+  // to that row's `audioStart` and lets it play straight through —
+  // subsequent rows highlight naturally as the playhead crosses their
+  // `audioStart` boundaries. Silence rows have no play affordance of
+  // their own; continuous master playback either falls through them or
+  // triggers the silence-skip cutoff.
   //
-  // Clip: click a per-channel cell's ▶. Fetches just that entry's
+  // Clip: click a per-paragraph clip chip. Fetches just that clip's
   // audio segment via /record/recordings/:id/segment and plays it in a
-  // second hidden element. No auto-advance — one utterance, done.
-  //
-  // A silence row's ▶ seeks master to the next speech row's mixedStart
-  // and plays from there ("skip the silence"). Last-row silence just
-  // stops.
+  // second hidden element. No auto-advance — one segment, done.
 
   // Cap on how long a stretch of silence is allowed to play during
   // master playback before the playhead auto-advances to the next
@@ -523,18 +543,19 @@
   /// Audio-timeline offset of the first transcribed utterance in a
   /// recording, or 0 if none yet. Used by "Play All" so playback skips
   /// any leading silence / untranscribed audio and starts on the first
-  /// clip the user can actually read along with.
+  /// paragraph the user can actually read along with.
   function firstTranscribedAudioStart(rec) {
     if (!rec) return 0;
-    const rows = computeRows(rec.entries);
-    for (const row of rows) {
-      if (row.kind === 'speech' && row.audioStart != null) return row.audioStart;
+    for (const p of rec.paragraphs ?? []) {
+      for (const c of p.clips ?? []) {
+        if (c.audio_start_ms != null) return c.audio_start_ms;
+      }
     }
     return 0;
   }
 
   /// Playback progress (0..1) for the Stop button's swipe fill. In
-  /// master mode this is elapsed / total on the mixed-track element;
+  /// master mode this is elapsed / total on the per-slot audio element;
   /// in clip mode it's elapsed / clip duration. Both `playingTimeMs`
   /// and the duration mirrors are `$state`, so the swipe updates
   /// reactively the instant metadata arrives on a first-play load.
@@ -546,14 +567,12 @@
 
   /// If the master playhead has been sitting in a silence gap between
   /// two speech rows for longer than [`MAX_MASTER_SILENCE_MS`], seek
-  /// straight to the next speech row's `audioStart`. `computeRows` is
-  /// cheap for our data volumes so we just recompute per rAF; if the
-  /// row list grows very large this can be memoized behind a $derived.
+  /// straight to the next speech row's `audioStart`.
   function maybeSilenceSkip() {
     if (!masterAudioEl) return;
     const rec = currentPlayingRecording();
     if (!rec) return;
-    const rows = computeRows(rec.entries).filter(
+    const rows = computeClusters(rec.paragraphs, state?.channelNames ?? []).filter(
       (r) => r.kind === 'speech' && r.audioStart != null,
     );
     if (rows.length < 2) return;
@@ -585,8 +604,8 @@
   async function playMasterAtMs(recordingId, startMs) {
     await tick();
     if (!masterAudioEl) return;
-    // Use the per-slot recording (audio.wav). It's the source of
-    // truth for "everything captured this session" — every entry's
+    // Use the per-slot recording (audio.wav). It's the source of truth
+    // for "everything captured this session" — every clip's
     // audio_start_ms is a position within it, so the row's audioStart
     // seeks correctly regardless of whether the vox slots were routed
     // to the mic feed.
@@ -612,8 +631,6 @@
     };
     const seekAndPlay = () => {
       const targetSec = Math.max(0, startMs) / 1000;
-      // Seek is a no-op when we're already there — skip the wait for
-      // 'seeked' (it wouldn't fire) and just play.
       if (Math.abs(masterAudioEl.currentTime - targetSec) < 0.05) {
         startPlay();
         return;
@@ -659,21 +676,31 @@
     stopPlayback();
   }
 
-  /// One-shot playback of a single utterance segment. Uses the segment
-  /// endpoint so we get an isolated mini-WAV rather than seeking a big
-  /// track. TTS entries have their own `audio_url` (the cached widget
-  /// clip) — same element, different source.
-  async function playClip(entry, recordingId) {
+  /// One-shot playback of a single clip's audio. Accepts a partial
+  /// clip descriptor so callers can pass an isolated `{ id, audio_url }`
+  /// (for TTS widgets) or a `{ id, audio_start_ms, audio_duration_ms }`
+  /// pair (for saved-recording vox segments).
+  ///
+  /// **Risk 1 (live-pane vox):** the segment endpoint only exists on
+  /// `/record/recordings/:id/segment` — there is no per-slot ring
+  /// endpoint. Live-pane vox clips (recId == null && !audio_url) simply
+  /// have no server-serveable audio and the chip is disabled at the
+  /// callsite.
+  async function playClip(clipLike, recordingId) {
     await tick();
     if (!clipAudioEl) return;
     let src;
-    if (entry.audio_url) {
-      src = entry.audio_url;
-    } else if (entry.audio_start_ms != null && entry.audio_duration_ms != null) {
+    if (clipLike.audio_url) {
+      src = clipLike.audio_url;
+    } else if (
+      recordingId != null &&
+      clipLike.audio_start_ms != null &&
+      clipLike.audio_duration_ms != null
+    ) {
       src = api.recordingSegmentUrl(
         recordingId,
-        entry.audio_start_ms,
-        entry.audio_duration_ms,
+        clipLike.audio_start_ms,
+        clipLike.audio_duration_ms,
       );
     } else {
       return;
@@ -682,20 +709,11 @@
     clipAudioEl.load();
     if (masterAudioEl && !masterAudioEl.paused) masterAudioEl.pause();
     playbackMode = 'clip';
-    playingClipId = entry.id;
+    playingClipId = clipLike.id;
     playingRecordingId = recordingId;
     playingTimeMs = 0;
     clipAudioEl.play().catch((e) => console.warn('clip play failed', e));
     ensureRaf();
-    // Completed (saved) recordings: also copy the transcript text so
-    // clicking a clip serves as one-click preview + grab. Skipped for
-    // the in-flight active recording where the user is usually still
-    // capturing rather than harvesting text.
-    const isSaved =
-      recordingId != null && state?.activeRecording?.id !== recordingId;
-    if (isSaved) {
-      void copyEntryText(entry);
-    }
   }
 
   function stopPlayback() {
@@ -707,87 +725,62 @@
     playbackMode = null;
   }
 
-  // Which entry the log should currently be scrolled to — for clip
-  // playback it's the picked clip; for master playback it's whichever
-  // entry the master playhead is inside right now (recomputed as the
-  // playhead crosses entry boundaries). Null when nothing is playing.
-  const currentPlayingEntryId = $derived.by(() => {
-    if (playbackMode === 'clip') return playingClipId;
+  // Which paragraph the log should currently highlight — for clip
+  // playback it's the paragraph owning the clip; for master playback
+  // it's whichever paragraph's [audioStart, audioEnd] contains the
+  // master playhead, falling back to nearest previous.
+  const currentPlayingParagraphId = $derived.by(() => {
+    if (playbackMode === 'clip') {
+      const rec = currentPlayingRecording();
+      if (!rec) return null;
+      for (const p of rec.paragraphs ?? []) {
+        for (const c of p.clips ?? []) {
+          if (c.id === playingClipId) return p.id;
+        }
+      }
+      return null;
+    }
     if (playbackMode === 'master') {
       const rec = currentPlayingRecording();
       if (!rec) return null;
-      for (const e of rec.entries ?? []) {
-        if (e.audio_start_ms == null || e.audio_duration_ms == null) continue;
-        const start = e.audio_start_ms;
-        const end = start + e.audio_duration_ms;
-        if (playingTimeMs >= start && playingTimeMs < end) return e.id;
+      let nearest = null;
+      let nearestStart = -Infinity;
+      for (const p of rec.paragraphs ?? []) {
+        const { audioStart, audioEnd } = paragraphAudioRange(p);
+        if (audioStart == null) continue;
+        if (playingTimeMs >= audioStart && (audioEnd == null || playingTimeMs < audioEnd)) {
+          return p.id;
+        }
+        if (audioStart <= playingTimeMs && audioStart > nearestStart) {
+          nearestStart = audioStart;
+          nearest = p.id;
+        }
       }
+      return nearest;
     }
     return null;
   });
 
-  // Scroll the currently-playing clip into view when it starts. `nearest`
-  // means we only move the page when the clip is actually off-screen —
-  // if it's already visible (typical during continuous master playback
-  // through consecutive rows), this is a no-op.
+  // Scroll the currently-playing paragraph into view when it starts.
+  // `nearest` means we only move the page when the paragraph is
+  // actually off-screen — if it's already visible (typical during
+  // continuous master playback through consecutive rows), this is a
+  // no-op.
   $effect(() => {
-    const id = currentPlayingEntryId;
+    const id = currentPlayingParagraphId;
     if (id == null) return;
     // Wait a frame so the just-mounted `.playing` class + any layout
     // change (sticky pane-head, etc.) settles before we measure.
     requestAnimationFrame(() => {
-      const el = document.querySelector(`[data-entry-id="${id}"]`);
+      const el = document.querySelector(`[data-paragraph-id="${id}"]`);
       if (el) el.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
     });
   });
 
   // ---- Progress predicates for the swipe animation ----
 
-  /// An entry's clip button is "playing" when its audio range covers
-  /// the current playhead — true for both explicit clip playback
-  /// (`playbackMode === 'clip'`) and continuous master playback
-  /// (`playbackMode === 'master'`), where the master playhead can
-  /// naturally pass through many entries in sequence. Entries without
-  /// an audio range (e.g. TTS) can't be located on the master timeline
-  /// and are only "playing" during their own explicit clip playback.
-  function isClipPlayingNow(entry) {
-    if (playbackMode === 'clip') return playingClipId === entry.id;
-    if (playbackMode === 'master') {
-      if (entry.audio_start_ms == null || entry.audio_duration_ms == null) return false;
-      const start = entry.audio_start_ms;
-      const end = start + entry.audio_duration_ms;
-      return playingTimeMs >= start && playingTimeMs < end;
-    }
-    return false;
-  }
-  function clipProgress(entry) {
-    const dur = entry.audio_duration_ms;
-    if (!dur) return 0;
-    if (playbackMode === 'clip' && playingClipId === entry.id) {
-      // Clip mode: playingTimeMs is the clip element's currentTime,
-      // starting at 0 for the segment.
-      return Math.max(0, Math.min(1, playingTimeMs / dur));
-    }
-    if (
-      playbackMode === 'master' &&
-      entry.audio_start_ms != null &&
-      isClipPlayingNow(entry)
-    ) {
-      // Master mode: playingTimeMs is a position on the per-slot audio
-      // timeline, so the fill maps to how far the master playhead has
-      // travelled into this specific entry's range.
-      const elapsed = playingTimeMs - entry.audio_start_ms;
-      return Math.max(0, Math.min(1, elapsed / dur));
-    }
-    return 0;
-  }
-
   /// A speech row is "master-playing" when the per-slot audio playhead
-  /// is within `[row.audioStart, next-speech-row.audioStart)`. Silence
-  /// rows are never "playing" because their master ▶ scrubs forward
-  /// rather than playing anything itself; during continuous master
-  /// playback the visual jumps directly from one speech row to the
-  /// next as `currentTime` crosses each boundary.
+  /// is within `[row.audioStart, next-speech-row.audioStart)`.
   function isRowMasterPlaying(row, rows) {
     if (playbackMode !== 'master' || row.kind !== 'speech') return false;
     if (row.audioStart == null) return false;
@@ -804,8 +797,7 @@
   /// Silence rows are "master-playing" while the playhead sits in the
   /// gap between the previous speech row's audio end and the next
   /// speech row's audio start — the same window `maybeSilenceSkip`
-  /// watches. Returns false for anything outside master playback so
-  /// silence rows are quiet by default.
+  /// watches.
   function isSilenceRowPlaying(row, rows) {
     if (playbackMode !== 'master' || row.kind !== 'silence') return false;
     const idx = rows.indexOf(row);
@@ -817,9 +809,7 @@
   }
   /// Progress across a silence-row's swipe animation, normalised to
   /// [`MAX_MASTER_SILENCE_MS`] so the fill has a consistent visual
-  /// meaning: "how close are we to the auto-skip cutoff". Shorter
-  /// silences (< 5s) simply never reach 100% before playback moves on;
-  /// longer silences fill to 100% just as the skip fires.
+  /// meaning: "how close are we to the auto-skip cutoff".
   function silenceRowProgress(row, rows) {
     if (!isSilenceRowPlaying(row, rows)) return 0;
     const idx = rows.indexOf(row);
@@ -889,30 +879,21 @@
     }
   });
 
-  // Click-to-correct transcript entries. One entry is editable at a time
-  // (across all three panes) so the UI never has to reason about parallel
-  // edits. Enter/blur commits, Escape cancels. The edit runs optimistically
-  // — local state is updated immediately for feel, then reconciled with
-  // the server response on the next refresh.
-  let editingEntryId = $state(null);
-  let editText = $state('');
-  let editInputEl = $state(null);
-  let editSaving = $state(false);
-
-  // Live-buffer entries are click-to-copy (no editing). `copiedEntryId`
-  // pulses briefly on the just-copied row so the user gets visual
-  // confirmation without a modal or toast. Cleared by a timer.
-  let copiedEntryId = $state(null);
+  // Paragraph click → copy the full paragraph text to the clipboard.
+  // `copiedParagraphId` pulses briefly on the just-copied block so the
+  // user gets visual confirmation without a modal or toast. Cleared by
+  // a timer.
+  let copiedParagraphId = $state(null);
   let copyClearTimer = 0;
   const COPY_FEEDBACK_MS = 900;
 
-  async function copyEntryText(entry) {
+  async function copyParagraphText(p) {
     try {
-      await navigator.clipboard.writeText(entry.text);
-      copiedEntryId = entry.id;
+      await navigator.clipboard.writeText(p.text ?? '');
+      copiedParagraphId = p.id;
       if (copyClearTimer) clearTimeout(copyClearTimer);
       copyClearTimer = setTimeout(() => {
-        copiedEntryId = null;
+        copiedParagraphId = null;
         copyClearTimer = 0;
       }, COPY_FEEDBACK_MS);
     } catch (e) {
@@ -920,66 +901,8 @@
     }
   }
 
-  async function beginEditEntry(entry) {
-    if (editSaving) return;
-    editingEntryId = entry.id;
-    editText = entry.text;
-    await tick();
-    editInputEl?.focus();
-    editInputEl?.select();
-  }
-
-  function cancelEditEntry() {
-    editingEntryId = null;
-    editText = '';
-  }
-
-  // `recordingId` = null for entries in the live buffer or the active
-  // (in-flight) recording — those live in RAM. Pass the recording id for
-  // entries in a saved recording so we hit the sqlite-backed endpoint.
-  async function commitEditEntry(entry, recordingId) {
-    if (editingEntryId !== entry.id || editSaving) return;
-    const next = editText.trim();
-    // Blank cancels rather than deleting — that's what the server would
-    // reject anyway, and it matches the "clicked by mistake" intent.
-    if (!next || next === entry.text) {
-      cancelEditEntry();
-      return;
-    }
-    editSaving = true;
-    const prev = entry.text;
-    entry.text = next; // optimistic
-    try {
-      if (recordingId) {
-        await api.updateSavedRecordingEntry(recordingId, entry.id, next);
-      } else {
-        await api.updateLiveRecordingEntry(entry.id, next);
-      }
-      editingEntryId = null;
-      editText = '';
-      await refresh();
-    } catch (e) {
-      entry.text = prev; // revert
-      err = `couldn't save edit: ${e.message}`;
-    } finally {
-      editSaving = false;
-    }
-  }
-
-  function onEditKey(e, entry, recordingId) {
-    if (e.key === 'Enter') {
-      e.preventDefault();
-      commitEditEntry(entry, recordingId);
-    } else if (e.key === 'Escape') {
-      e.preventDefault();
-      cancelEditEntry();
-    }
-  }
-
   // Inline rename for the in-flight recording's pane header. Click the
-  // name to enter edit mode; Enter/blur commits, Escape cancels. Uses
-  // the same PATCH endpoint as saved recordings — the server routes
-  // active-id patches to RAM state, saved-id patches to sqlite.
+  // name to enter edit mode; Enter/blur commits, Escape cancels.
   let renamingActive = $state(false);
   let activeRenameText = $state('');
   let activeRenameEl = $state(null);
@@ -1013,8 +936,6 @@
   // Same click-to-rename affordance for saved (already-completed)
   // recordings so users don't have to hunt for the sidebar's ✎ to fix
   // a name they only noticed was wrong after opening the recording.
-  // Server-side, `renameRecording` routes saved ids to sqlite through
-  // the same PATCH endpoint the active rename uses.
   let renamingSaved = $state(false);
   let savedRenameText = $state('');
   let savedRenameEl = $state(null);
@@ -1046,40 +967,13 @@
     else if (e.key === 'Escape') { e.preventDefault(); cancelSavedRename(); }
   }
 
-  const isRecording = $derived(state?.mode === 'recording');
-  const bufferPct = $derived(
-    state ? Math.min(100, (state.bufferBytes / state.bufferMaxBytes) * 100) : 0,
-  );
-
-  // Active/saved recording log view. Two modes:
-  //   * 'columns' — the default columns-per-channel table with a
-  //     master column, silence rows, and per-row playback.
-  //   * 'linear'  — a chronological list styled like the live buffer.
-  //     Same play + edit affordances, but flat.
-  // Persisted per-browser so the choice sticks across reloads. Applies
-  // to both the in-flight recording banner AND the saved-recording
-  // detail pane so the two views feel consistent.
-  const RECORD_LOG_VIEW_KEY = 'rpg_vox.record.log_view';
-  function loadRecordLogView() {
-    try {
-      const v = localStorage.getItem(RECORD_LOG_VIEW_KEY);
-      return v === 'linear' ? 'linear' : 'columns';
-    } catch {
-      return 'columns';
-    }
-  }
-  let recordLogView = $state(loadRecordLogView());
-  $effect(() => {
-    try { localStorage.setItem(RECORD_LOG_VIEW_KEY, recordLogView); } catch {}
-  });
-
   // Sticky-header collapse: an IntersectionObserver watches a 1px
   // sentinel placed just above the live pane's header. When the user
   // scrolls the sentinel past the top of the viewport (accounting for
   // the pinned Menubar via `rootMargin`), the header enters `compact`
-  // mode — smaller title, tighter padding — so the buffer meter and
-  // any pinned controls stay visible without the title hogging the
-  // top strip on a long transcript scroll.
+  // mode — smaller title, tighter padding — so any pinned controls
+  // stay visible without the title hogging the top strip on a long
+  // transcript scroll.
   let liveHeadSentinel = $state(null);
   let liveHeadCompact = $state(false);
   $effect(() => {
@@ -1097,6 +991,7 @@
     io.observe(liveHeadSentinel);
     return () => io.disconnect();
   });
+
   // Currently-selected saved recording (when `selected` is an id).
   const selectedSaved = $derived(
     state && selected !== 'live' && selected !== 'active'
@@ -1104,15 +999,27 @@
       : null,
   );
   const channelFallback = $derived(state?.channelNames?.[0] ?? 'Vox 1');
+
+  // Flatten the live pane's per-channel paragraph groups into a single
+  // list for the shared cluster renderer. Wrapped in a synthesized
+  // recording-like object so `clusterList` can operate uniformly across
+  // live / active / saved.
+  const liveRecording = $derived.by(() => {
+    if (!state) return null;
+    const paragraphs = (state.paragraphsByChannel ?? []).flatMap(
+      (x) => x.paragraphs ?? [],
+    );
+    return { id: null, paragraphs, created_at: 0 };
+  });
 </script>
 
 {#snippet hiddenAudios()}
   <!-- Both audio elements are hidden — playback is driven entirely by
-       the ▶ buttons in the log table. Master (mixed track) auto-advances
-       through subsequent rows; Clip (per-entry segment) is one-shot.
-       `ondurationchange` + `onloadedmetadata` mirror the browser's
-       duration into `$state` so the Stop button's swipe fill reacts
-       the moment metadata for a fresh track arrives. -->
+       the clip chips + row master ▶ buttons. Master (per-slot audio)
+       auto-advances through subsequent rows; Clip (single-segment) is
+       one-shot. `ondurationchange` + `onloadedmetadata` mirror the
+       browser's duration into `$state` so the Stop button's swipe fill
+       reacts the moment metadata for a fresh track arrives. -->
   <audio
     bind:this={masterAudioEl}
     onplay={onPlaybackPlay}
@@ -1154,174 +1061,166 @@
   {/if}
 {/snippet}
 
-{#snippet viewToggleBtn()}
-  <!-- Two-position pill toggle. Highlights the active mode; clicking
-       the OTHER label flips the view. Shared between the active-
-       recording banner and (potentially) the saved-recording pane so
-       both places stay in sync via the same persisted `recordLogView`. -->
-  <div class="view-toggle" role="group" aria-label="Log view">
-    <button
-      type="button"
-      class="view-toggle-btn"
-      class:active={recordLogView === 'columns'}
-      onclick={() => (recordLogView = 'columns')}
-      title="Show as columns per channel"
-      aria-pressed={recordLogView === 'columns'}
-    >⋮⋮</button>
-    <button
-      type="button"
-      class="view-toggle-btn"
-      class:active={recordLogView === 'linear'}
-      onclick={() => (recordLogView = 'linear')}
-      title="Show as a chronological list"
-      aria-pressed={recordLogView === 'linear'}
-    >≡</button>
-  </div>
-{/snippet}
-
-{#snippet logTable(recording, canonicalChannels)}
-  {@const rows = computeRows(recording.entries)}
-  {@const channels = extractChannels(recording.entries, canonicalChannels)}
-  {@const epoch = recordingEpochMs(recording)}
-  {@const recId = recording.id}
-  <div class="log-scroller">
-    <table class="log-table">
-      <thead>
-        <tr>
-          <th class="col-ts">time</th>
-          {#each channels as ch (ch)}
-            <th class="col-ch" class:tts-col={ch === 'TTS'}>{ch}</th>
-          {/each}
-          <th class="col-master">Master</th>
-        </tr>
-      </thead>
-      <tbody>
-        {#each rows as row, i (row.kind + ':' + row.wallStart)}
-          <tr class:silence={row.kind === 'silence'}>
-            <td class="col-ts">
-              {#if row.kind === 'silence'}
-                <span class="silence-tag" class:playing={isSilenceRowPlaying(row, rows)}>
-                  {#if isSilenceRowPlaying(row, rows)}
-                    <div class="clip-fill" style="width: {silenceRowProgress(row, rows) * 100}%" aria-hidden="true"></div>
-                  {/if}
-                  <span class="silence-text">silence · {Math.round((row.wallEnd - row.wallStart) / 1000)}s</span>
-                </span>
-              {:else}
-                {fmtRelMs(row.wallStart, epoch)} – {fmtRelMs(row.wallEnd, epoch)}
-              {/if}
-            </td>
-            {#each channels as ch (ch)}
-              <td class="col-ch">
-                {#each row.byChannel[ch] ?? [] as e (e.id)}
-                  {@render clipCell(e, ch, recId)}
-                {/each}
-              </td>
-            {/each}
-            <td class="col-master">
-              {@render masterCell(row, rows, recId)}
-            </td>
-          </tr>
-        {/each}
-      </tbody>
-    </table>
-  </div>
-{/snippet}
-
-{#snippet linearLog(recording, canonicalChannels)}
-  {@const recId = recording.id}
-  {@const fallback = canonicalChannels[0] ?? 'Vox 1'}
-  <!-- Chronological list of every entry, styled like the ephemeral
-       live buffer. Skips the master column and silence rows (those are
-       only meaningful in the timeline-oriented columns view) and reuses
-       `clipCell` so per-entry play + edit still work — including the
-       playing/copied/provisional state classes. Labels are grouped in
-       a `.row-labels` div so grid-template-areas can pin channel +
-       speaker on top and the timestamp beneath, with the text spanning
-       both rows on the right. -->
-  <ul class="entries linear-log">
-    {#each recording.entries as e (e.id)}
-      {@const ch = e.channel || fallback}
-      {@const isTts = ch === 'TTS'}
-      <!-- Title for the avatar: voice profile for TTS (falls back to
-           "TTS" for older widgets whose voice_label column is unset),
-           speaker attribution (if any) for vox, else the slot name. -->
-      {@const title = isTts
-        ? (e.speaker || 'TTS')
-        : (e.speaker || ch)}
-      {@const channelType = isTts ? 'TTS' : 'VOX'}
-      <li class:playing={isClipPlayingNow(e)} class:provisional={e.provisional}>
-        <!-- Compact portrait avatar with everything needed to identify
-             the speaker at a glance. Uniform fixed-width so the
-             transcript text on the right lines up across every row.
-             Avatar image is a placeholder (initial letter over a
-             deterministic tint) until per-entry avatar metadata is
-             wired through the recording pipeline. -->
-        <div class="entry-avatar" title={fmtTime(e.created_at)}>
-          <div class="avatar-portrait" style="background: {avatarTint(title)}">
-            <span class="avatar-initial">{initialFrom(title)}</span>
-          </div>
-          <span class="avatar-type" class:tts={isTts}>{channelType}</span>
-          <span class="avatar-title" title={title}>{title}</span>
-          <span class="avatar-ts">{fmtTimeUtcCompact(e.created_at)}</span>
-        </div>
-        {@render clipCell(e, ch, recId)}
-      </li>
-    {/each}
-  </ul>
-{/snippet}
-
-{#snippet clipCell(entry, channel, recId)}
-  <div
-    class="clip-btn"
-    data-entry-id={entry.id}
-    class:playing={isClipPlayingNow(entry)}
-    class:copied={copiedEntryId === entry.id}
-    class:tts={channel === 'TTS'}
-    class:provisional={entry.provisional}
-  >
-    {#if isClipPlayingNow(entry)}
-      <div class="clip-fill" style="width: {clipProgress(entry) * 100}%" aria-hidden="true"></div>
-    {/if}
-    {#if entry.speaker}
-      <span class="speaker-tag" title="Speaker attribution">{entry.speaker}</span>
-    {/if}
-    {#if editingEntryId === entry.id}
-      <input
-        class="clip-edit"
-        type="text"
-        bind:this={editInputEl}
-        bind:value={editText}
-        disabled={editSaving}
-        onkeydown={(ev) => onEditKey(ev, entry, recId === state?.activeRecording?.id ? null : recId)}
-        onblur={() => commitEditEntry(entry, recId === state?.activeRecording?.id ? null : recId)}
-        aria-label="Correct transcript"
-      />
-    {:else}
+{#snippet clipStrip(p, recId)}
+  <!-- Compact per-clip button strip pinned beneath each paragraph's
+       prose. One chip per clip. Chip label is the clip's offset from
+       the paragraph's start (e.g. "0:03") — for a single-clip TTS
+       paragraph we show a bare ▸ instead, since the offset would
+       always be 0:00. Chip is disabled in the live pane for vox clips
+       (recId == null && !clip.audio_url) because the segment endpoint
+       is per-saved-recording only — see risk 1 in the plan. -->
+  <div class="clip-strip">
+    {#each p.clips ?? [] as clip (clip.id)}
+      {@const disabled = recId == null && !clip.audio_url}
+      {@const isTts = !!clip.audio_url}
+      {@const soloTts = isTts && (p.clips?.length ?? 0) === 1}
       <button
         type="button"
-        class="clip-text"
-        title={isClipPlayingNow(entry) ? 'Click to stop · double-click to edit' : 'Click to play · double-click to edit'}
-        onclick={() => isClipPlayingNow(entry) ? stopPlayback() : playClip(entry, recId)}
-        ondblclick={() => beginEditEntry(entry)}
-      >{entry.text}</button>
-    {/if}
+        class="clip-chip"
+        class:playing={playingClipId === clip.id}
+        class:provisional={clip.provisional}
+        class:tts={isTts}
+        {disabled}
+        title={disabled
+          ? 'Clip audio only available after saving'
+          : (clip.text || 'Play clip')}
+        onclick={() => {
+          if (disabled) return;
+          if (playingClipId === clip.id) { stopPlayback(); return; }
+          playClip(
+            {
+              id: clip.id,
+              audio_url: clip.audio_url,
+              audio_start_ms: clip.audio_start_ms,
+              audio_duration_ms: clip.audio_duration_ms,
+            },
+            recId,
+          );
+        }}
+      >
+        {#if playingClipId === clip.id}
+          <div class="clip-fill" style="width: {clipDurationMs ? Math.min(1, playingTimeMs / clipDurationMs) * 100 : 0}%" aria-hidden="true"></div>
+        {/if}
+        <span class="clip-chip-label">
+          {#if soloTts}▸{:else}{fmtRelMs((clip.start_wall_ms ?? 0) - (p.start_wall_ms ?? 0))}{/if}
+        </span>
+      </button>
+    {/each}
   </div>
 {/snippet}
 
-{#snippet masterCell(row, rows, recId)}
-  <button
-    type="button"
-    class="master-btn"
-    class:playing={isRowMasterPlaying(row, rows)}
-    class:silence={row.kind === 'silence'}
-    onclick={() => playMasterFromRow(row, rows, recId)}
-    title={row.kind === 'silence' ? 'Skip silence — jump master to next row' : 'Play the mixed audio from here'}
+{#snippet paragraphBlock(p, recId)}
+  {@const ch = p.channel || channelFallback}
+  {@const isTts = ch === 'TTS'}
+  {@const title = isTts ? (p.speaker || 'TTS') : (p.speaker || ch)}
+  {@const channelType = isTts ? 'TTS' : 'VOX'}
+  <div
+    class="paragraph-block"
+    class:playing={currentPlayingParagraphId === p.id}
+    class:provisional={!p.hardened && (p.clips ?? []).some((c) => c.provisional)}
   >
-    {#if isRowMasterPlaying(row, rows)}
-      <div class="clip-fill" style="width: {rowMasterProgress(row, rows) * 100}%" aria-hidden="true"></div>
-    {/if}
-    <span class="master-glyph">▶</span>
-  </button>
+    <div class="paragraph-head">
+      <div class="entry-avatar" title={fmtTime(p.created_at)}>
+        <div class="avatar-portrait" style="background: {avatarTint(title)}">
+          <span class="avatar-initial">{initialFrom(title)}</span>
+        </div>
+        <span class="avatar-type" class:tts={isTts}>{channelType}</span>
+        <span class="avatar-title" title={title}>{title}</span>
+      </div>
+      <span class="paragraph-ts" title={fmtTime(p.created_at)}>
+        {fmtWallTime(p.start_wall_ms)}
+      </span>
+    </div>
+    <button
+      type="button"
+      class="paragraph-text"
+      data-paragraph-id={p.id}
+      class:copied={copiedParagraphId === p.id}
+      title={copiedParagraphId === p.id ? 'Copied!' : 'Click to copy paragraph text'}
+      onclick={() => copyParagraphText(p)}
+    >{p.text || ''}</button>
+    {@render clipStrip(p, recId)}
+  </div>
+{/snippet}
+
+{#snippet clusterList(recording, canonicalChannels)}
+  {@const rows = computeClusters(recording.paragraphs, canonicalChannels)}
+  {@const recId = recording.id}
+  {#if rows.length === 0}
+    <div class="empty pane-empty">no transcript yet</div>
+  {:else}
+    <ol class="clusters">
+      {#each rows as row (row.kind + ':' + row.wallStart)}
+        <li>
+          {#if row.kind === 'silence'}
+            <div class="cluster silence-row">
+              <button
+                type="button"
+                class="silence-tag master-btn silence"
+                class:playing={isSilenceRowPlaying(row, rows)}
+                onclick={() => recId != null && playMasterFromRow(row, rows, recId)}
+                title={recId != null
+                  ? 'Skip silence — jump master to next row'
+                  : 'Silence gap (live view — no master audio yet)'}
+                disabled={recId == null}
+              >
+                {#if isSilenceRowPlaying(row, rows)}
+                  <div class="clip-fill" style="width: {silenceRowProgress(row, rows) * 100}%" aria-hidden="true"></div>
+                {/if}
+                <span class="silence-text">silence · {Math.max(0, Math.round((row.wallEnd - row.wallStart) / 1000))}s</span>
+              </button>
+            </div>
+          {:else if row.channels.length === 1}
+            {@const ch = row.channels[0]}
+            <div class="cluster full">
+              {#if recId != null && row.audioStart != null}
+                <button
+                  type="button"
+                  class="master-btn row-master"
+                  class:playing={isRowMasterPlaying(row, rows)}
+                  onclick={() => playMasterFromRow(row, rows, recId)}
+                  title="Play the recording from here"
+                >
+                  {#if isRowMasterPlaying(row, rows)}
+                    <div class="clip-fill" style="width: {rowMasterProgress(row, rows) * 100}%" aria-hidden="true"></div>
+                  {/if}
+                  <span class="master-glyph">▶</span>
+                </button>
+              {/if}
+              {#each row.byChannel[ch] ?? [] as p (p.id)}
+                {@render paragraphBlock(p, recId)}
+              {/each}
+            </div>
+          {:else}
+            <div class="cluster split" style="grid-template-columns: repeat({row.channels.length}, 1fr)">
+              {#if recId != null && row.audioStart != null}
+                <button
+                  type="button"
+                  class="master-btn row-master row-master-split"
+                  class:playing={isRowMasterPlaying(row, rows)}
+                  onclick={() => playMasterFromRow(row, rows, recId)}
+                  title="Play the recording from here"
+                  style="grid-column: 1 / -1;"
+                >
+                  {#if isRowMasterPlaying(row, rows)}
+                    <div class="clip-fill" style="width: {rowMasterProgress(row, rows) * 100}%" aria-hidden="true"></div>
+                  {/if}
+                  <span class="master-glyph">▶</span>
+                </button>
+              {/if}
+              {#each row.channels as ch (ch)}
+                <div class="cluster-col">
+                  {#each row.byChannel[ch] ?? [] as p (p.id)}
+                    {@render paragraphBlock(p, recId)}
+                  {/each}
+                </div>
+              {/each}
+            </div>
+          {/if}
+        </li>
+      {/each}
+    </ol>
+  {/if}
 {/snippet}
 
 <div class="record-shell">
@@ -1344,11 +1243,10 @@
     {#if !state}
       <div class="empty">loading…</div>
     {:else if selected === 'live'}
-      <!-- Rolling ephemeral buffer view. Sentinel is a 1px shim sitting
+      <!-- Rolling ephemeral live view. Sentinel is a 1px shim sitting
            just above the sticky header so IntersectionObserver can flip
            the header into its `compact` mode the moment scroll pins it
-           to the top. Keeps the buffer meter visible without the title
-           eating vertical space during a long transcript scroll. -->
+           to the top. -->
       <div bind:this={liveHeadSentinel} class="head-sentinel"></div>
       <div class="pane-head live" class:compact={liveHeadCompact}>
         <h1 title="Ephemeral live transcript (buffered; not recorded)">
@@ -1358,12 +1256,6 @@
             <span class="stt-off"> · STT disabled</span>
           {/if}
         </h1>
-        <div
-          class="buf-meter"
-          title="{fmtBytes(state.bufferBytes)} of {fmtBytes(state.bufferMaxBytes)}"
-        >
-          <div class="buf-fill" style="width: {bufferPct}%"></div>
-        </div>
         <button
           type="button"
           class="live-rec-btn"
@@ -1378,31 +1270,13 @@
           <span class="live-rec-label">Record</span>
         </button>
       </div>
-      {#if state.buffer.length === 0}
+      {@render hiddenAudios()}
+      {#if !liveRecording || liveRecording.paragraphs.length === 0}
         <div class="empty pane-empty">
           nothing spoken yet — the {channelFallback} channel is quiet
         </div>
       {:else}
-        <ul class="entries">
-          {#each state.buffer as e (e.id)}
-            <li class:copied={copiedEntryId === e.id} class:provisional={e.provisional}>
-              <span class="channel-tag">{e.channel || channelFallback}</span>
-              {#if e.speaker}
-                <span class="speaker-tag" title="Voice / profile">{e.speaker}</span>
-              {/if}
-              <span class="ts">{fmtTime(e.created_at)}</span>
-              <button
-                type="button"
-                class="text text-btn"
-                title={copiedEntryId === e.id ? 'Copied!' : 'Click to copy transcript'}
-                onclick={() => copyEntryText(e)}
-              >{e.text}</button>
-              {#if copiedEntryId === e.id}
-                <span class="copy-flag" aria-live="polite">copied ✓</span>
-              {/if}
-            </li>
-          {/each}
-        </ul>
+        {@render clusterList(liveRecording, state.channelNames ?? [])}
       {/if}
     {:else if selected === 'active' && state.activeRecording}
       <!-- Live view of the in-flight recording bucket. Name is
@@ -1434,7 +1308,6 @@
           <span class="active-time">{fmtDur(state.activeRecording.duration_ms ?? 0)}</span>
         </div>
         <div class="active-actions">
-          {@render viewToggleBtn()}
           {@render playAllBtn(state.activeRecording.id)}
           <button type="button" class="primary" disabled={busy} onclick={stopRecording}>
             Stop &amp; Save
@@ -1442,20 +1315,14 @@
         </div>
       </div>
       {@render hiddenAudios()}
-      {#if state.activeRecording.entries.length === 0}
+      {#if (state.activeRecording.paragraphs ?? []).length === 0}
         <div class="empty pane-empty">listening…</div>
-      {:else if recordLogView === 'linear'}
-        {@render linearLog(state.activeRecording, state.channelNames ?? [])}
       {:else}
-        {@render logTable(state.activeRecording, state.channelNames ?? [])}
+        {@render clusterList(state.activeRecording, state.channelNames ?? [])}
       {/if}
     {:else if selectedSaved}
       <!-- Saved recording detail. Kept as a single-line top-aligned bar
-           so it doesn't push the log down. Non-essential meta (created
-           timestamp, utterance count) is dropped in favor of duration
-           only, which is what actually matters when scrubbing playback.
-           Title is click-to-rename — server routes the PATCH through
-           the same endpoint the active recording uses. -->
+           so it doesn't push the log down. Title is click-to-rename. -->
       <div class="pane-head saved">
         {#if renamingSaved}
           <input
@@ -1477,7 +1344,6 @@
         {/if}
         <span class="saved-meta">{fmtDur(selectedSaved.duration_ms)}</span>
         <div class="head-actions">
-          {@render viewToggleBtn()}
           {@render playAllBtn(selectedSaved.id)}
           <a
             class="download-btn icon"
@@ -1489,12 +1355,10 @@
         </div>
       </div>
       {@render hiddenAudios()}
-      {#if selectedSaved.entries.length === 0}
+      {#if (selectedSaved.paragraphs ?? []).length === 0}
         <div class="empty pane-empty">no transcript for this recording</div>
-      {:else if recordLogView === 'linear'}
-        {@render linearLog(selectedSaved, state.channelNames ?? [])}
       {:else}
-        {@render logTable(selectedSaved, state.channelNames ?? [])}
+        {@render clusterList(selectedSaved, state.channelNames ?? [])}
       {/if}
     {:else}
       <div class="empty pane-empty">Select a recording from the sidebar.</div>
@@ -1548,13 +1412,9 @@
     margin: -1px 0 0 0;
     pointer-events: none;
   }
-  /* Live pane variant: the buffer meter lives INSIDE the sticky header
-     (instead of floating below it in the scroll flow), so the "how full
-     is the ring buffer" readout stays visible regardless of scroll.
-     Locked to a single row (no `flex-wrap`) so the title, meter, and
-     Record button never wrap on narrow / low-res screens — the h1
-     shrinks and ellipsizes instead. Hover the title to see the full
-     text; on very narrow widths the h1 swaps to a short label. */
+  /* Live pane variant: locked to a single row (no `flex-wrap`) so the
+     title and Record button never wrap on narrow / low-res screens —
+     the h1 shrinks and ellipsizes instead. */
   .pane-head.live {
     align-items: center;
     flex-wrap: nowrap;
@@ -1567,27 +1427,15 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  /* Swap the long title for a short one below ~560px viewport so the
-     meter + Record affordance keep useful width on low-res screens. */
+  /* Swap the long title for a short one below ~560px viewport. */
   .live-title-short { display: none; }
   @media (max-width: 560px) {
     .live-title-long { display: none; }
     .live-title-short { display: inline; }
   }
-  .pane-head.live .buf-meter {
-    margin-left: auto;
-    flex: 0 1 220px;
-    min-width: 60px;
-  }
   /* Start-recording affordance pinned to the far-right corner of the
      sticky header. Deliberately understated in its resting state — a
-     small red dot as an icon, muted border, no glow, no animation — so
-     it reads as "start a recording" rather than "recording is live."
-     The actual `.rec-badge` in the active pane owns the pulse + filled
-     red styling; this button brightens on hover to signal intent
-     without borrowing that language. Disabled when an active recording
-     already exists; matches the sidebar `+` button's guard so both
-     entry points behave the same. */
+     small red dot as an icon, muted border, no glow, no animation. */
   .pane-head.live .live-rec-btn {
     display: inline-flex;
     align-items: center;
@@ -1601,6 +1449,7 @@
     font-weight: 600;
     cursor: pointer;
     flex: 0 0 auto;
+    margin-left: auto;
     transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
   }
   .pane-head.live .live-rec-btn:hover:not(:disabled) {
@@ -1621,14 +1470,10 @@
     opacity: 0.75;
   }
   /* Compact-header form: drop the label so the button becomes a
-     circular red dot in the corner. Preserves the affordance without
-     eating horizontal space next to the meter on a scrolled page. */
+     circular red dot in the corner. */
   .pane-head.compact .live-rec-btn { padding: 3px 6px; }
   .pane-head.compact .live-rec-label { display: none; }
-  /* Compact form — activated once the header is pinned to the top. Just
-     enough shrink to reclaim ~half the vertical footprint without
-     ellipsizing the title. The h1 stays legible; only the padding and
-     font-size dial back. */
+  /* Compact form — activated once the header is pinned to the top. */
   .pane-head.compact {
     padding-top: 2px;
     padding-bottom: 2px;
@@ -1639,19 +1484,12 @@
   }
   .pane-head h1 { font-size: 16px; margin: 0; line-height: 1.2; }
 
-  /* Saved-recording variant: single top-aligned row, title truncates
-     with ellipsis before wrapping, minimal meta (duration only), and
-     the action buttons stay pinned to the right at a fixed size so the
-     header doesn't grow past one line. */
+  /* Saved-recording variant. */
   .pane-head.saved {
     align-items: center;
     flex-wrap: nowrap;
     padding: 6px 4px;
   }
-  /* Same 44px left inset as the other pane-head variants get in the
-     shared mobile rule — the `padding` shorthand above wipes it out on
-     the saved variant, so reinstate it here so the title clears the
-     fixed hamburger instead of hiding under it. */
   @media (max-width: 1079px) {
     .pane-head.saved { padding-left: 44px; }
   }
@@ -1664,8 +1502,6 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    /* Reset the base button styling so this reads as a title, not a
-       CTA. Hover reveals the rename affordance. */
     background: transparent;
     color: var(--text);
     border: 1px dashed transparent;
@@ -1700,9 +1536,6 @@
     white-space: nowrap;
   }
   .pane-head.saved .head-actions { flex-shrink: 0; }
-  /* Icon-only download variant — the full "Download archive" label
-     bloats the single-line header; keep the affordance as a compact
-     glyph with the descriptive text moved to `title=`. */
   .download-btn.icon {
     padding: 4px 8px;
     font-size: 14px;
@@ -1722,9 +1555,6 @@
 
   .pane-head.active {
     padding: 10px 14px;
-    /* Layer the red REC tint over an opaque bg so this variant is also
-       fully opaque while still reading tinted (rgba alone would show
-       scrolling log content through the sticky header). */
     background:
       linear-gradient(rgba(255, 80, 80, 0.06), rgba(255, 80, 80, 0.06)),
       var(--bg);
@@ -1767,141 +1597,6 @@
   .active-time { color: var(--muted); font-variant-numeric: tabular-nums; font-size: 13px; }
   .active-actions { display: flex; gap: 8px; flex-shrink: 0; }
 
-  /* Segmented toggle for switching the recording log between the
-     columns-per-channel table and a chronological linear list. Lives
-     in the active-actions strip alongside Play All / Stop so both
-     entry points to the log's presentation live in the same header. */
-  .view-toggle {
-    display: inline-flex;
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    overflow: hidden;
-    align-self: center;
-  }
-  .view-toggle-btn {
-    background: transparent;
-    color: var(--muted);
-    border: none;
-    padding: 4px 10px;
-    font-size: 14px;
-    line-height: 1;
-    cursor: pointer;
-    min-width: 32px;
-  }
-  .view-toggle-btn:hover:not(.active) {
-    background: rgba(255,255,255,0.04);
-    color: var(--text);
-  }
-  .view-toggle-btn.active {
-    background: rgba(122,162,255,0.2);
-    color: var(--accent);
-  }
-  .view-toggle-btn + .view-toggle-btn { border-left: 1px solid var(--border); }
-
-  /* Linear-log flavor of the entry list. Uniform portrait avatar box
-     on the left carries the type + title + timestamp, transcript text
-     fills the rest. The fixed avatar width is what makes text on
-     every row line up flush at the same left edge. */
-  ul.entries.linear-log li {
-    grid-template-columns: var(--linear-avatar-w) 1fr;
-    grid-template-rows: auto;
-    align-items: stretch;
-    gap: 8px;
-    padding: 2px 4px;
-  }
-  ul.entries.linear-log {
-    /* Single knob for the whole log's avatar width so a tweak keeps
-       every row aligned. Sized to fit "· shout"-length profile names
-       without wrapping mid-word too aggressively. */
-    --linear-avatar-w: 72px;
-  }
-  .entry-avatar {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 1px;
-    padding: 2px 3px;
-    background: rgba(0, 0, 0, 0.28);
-    border: 1px solid rgba(255, 255, 255, 0.05);
-    border-radius: 5px;
-    text-align: center;
-    overflow: hidden;
-    min-width: 0;
-  }
-  .avatar-portrait {
-    width: 32px;
-    height: 32px;
-    border-radius: 50%;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    color: rgba(255, 255, 255, 0.9);
-    font-size: 15px;
-    font-weight: 600;
-    line-height: 1;
-    /* Subtle inner ring so the portrait reads as a distinct chip
-       against the row's own dark background. */
-    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.08);
-    user-select: none;
-  }
-  .avatar-initial {
-    letter-spacing: 0;
-  }
-  .avatar-type {
-    font-size: 8px;
-    font-weight: 700;
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-    color: var(--accent);
-    line-height: 1;
-  }
-  .avatar-type.tts { color: #ffcc66; }
-  .avatar-title {
-    font-size: 9px;
-    line-height: 1.15;
-    color: var(--text);
-    max-width: 100%;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    padding: 0 2px;
-  }
-  .avatar-ts {
-    font-size: 8px;
-    color: var(--muted);
-    font-variant-numeric: tabular-nums;
-    line-height: 1;
-  }
-  ul.entries.linear-log .clip-btn {
-    /* The avatar is column 1; the text belongs in the 1fr second
-       column. Explicit pin (rather than relying on auto-place) so a
-       future addition of any extra child never shoves the text out
-       from under the transcript column. */
-    grid-column: 2;
-    align-self: center;
-    background: transparent;
-    border-color: transparent;
-    padding: 2px 4px;
-    margin-bottom: 0;
-    min-width: 0;
-  }
-  ul.entries.linear-log li.playing .clip-btn {
-    border-color: rgba(122,162,255,0.6);
-    box-shadow: 0 0 0 1px rgba(122,162,255,0.35);
-    background: rgba(0,0,0,0.2);
-  }
-  /* `clipCell` renders its own inline speaker-tag inside the clip-btn
-     for the columns view. In the linear log we surface it up-front in
-     `.row-labels`, so hide the duplicate to avoid showing the voice
-     name twice per row. */
-  ul.entries.linear-log .clip-btn > .speaker-tag { display: none; }
-  /* Tighter line-height inside the linear log so multi-line transcript
-     text doesn't waste vertical space between wrapped lines — the row
-     height is already dominated by the avatar box, no reason for the
-     text to add breathing room on top of that. */
-  ul.entries.linear-log .clip-text {
-    line-height: 1.25;
-  }
   .rec-badge {
     display: inline-flex;
     align-items: center;
@@ -1927,20 +1622,6 @@
     50%      { opacity: 1;    transform: scale(1.15); }
   }
 
-  .buf-meter {
-    width: 100%;
-    max-width: 320px;
-    height: 6px;
-    border-radius: 3px;
-    background: rgba(0,0,0,0.3);
-    overflow: hidden;
-  }
-  .buf-fill {
-    height: 100%;
-    background: linear-gradient(to right, #2ecc4a, #f2c94c 80%, #ff5c5c 100%);
-    transition: width 0.2s linear;
-  }
-
   .download-btn {
     background: transparent;
     color: var(--accent);
@@ -1961,7 +1642,7 @@
     flex-shrink: 0;
   }
   /* Play All / Stop button — lives in the pane top bar so its
-     presence doesn't shift the log table around when playback starts. */
+     presence doesn't shift the log around when playback starts. */
   .topbar-btn {
     background: rgba(122,162,255,0.12);
     color: var(--text);
@@ -1978,16 +1659,11 @@
     background: rgba(255,92,92,0.14);
     color: #ffbdbd;
     border-color: rgba(255,92,92,0.5);
-    /* Establish a positioning + clipping context for the fill overlay
-       so it can sweep across the button width without leaking past the
-       border-radius. */
     position: relative;
     overflow: hidden;
   }
   .topbar-btn.stop:hover { background: rgba(255,92,92,0.24); }
-  /* Swipe overlay showing playback progress (0..1 of the full track
-     when master mode, or the current clip in clip mode). Same shape as
-     `.clip-fill` but red-tinted to match the Stop button. */
+  /* Swipe overlay showing playback progress. */
   .stop-fill {
     position: absolute;
     top: 0;
@@ -2001,9 +1677,6 @@
     border-right: 1px solid rgba(255, 92, 92, 0.85);
     pointer-events: none;
     z-index: 0;
-    /* Small transition smooths out the per-frame width updates so the
-       swipe reads as a continuous sweep even though we're stepping
-       from rAF ticks. */
     transition: width 60ms linear;
   }
   .stop-label {
@@ -2011,99 +1684,6 @@
     z-index: 1;
   }
 
-  ul.entries {
-    list-style: none;
-    padding: 0;
-    margin: 0;
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-  }
-  ul.entries li {
-    display: grid;
-    grid-template-columns: max-content max-content 1fr;
-    grid-template-rows: auto auto;
-    gap: 2px 8px;
-    padding: 3px 6px;
-    border-radius: 4px;
-    background: rgba(0,0,0,0.15);
-    align-items: baseline;
-    position: relative;
-    overflow: hidden;
-    /* Column-flex parents default children to flex-shrink: 1. Without
-       this, once the buffer exceeds the pane height each row squeezes
-       and its text is clipped by the overflow: hidden above, instead
-       of the list scrolling. */
-    flex-shrink: 0;
-  }
-  .channel-tag {
-    font-size: 10px;
-    font-weight: 700;
-    letter-spacing: 0.04em;
-    text-transform: uppercase;
-    color: var(--accent);
-    background: rgba(122,162,255,0.12);
-    padding: 2px 6px;
-    border-radius: 3px;
-    white-space: nowrap;
-  }
-  .speaker-tag {
-    font-size: 10px;
-    font-weight: 700;
-    letter-spacing: 0.02em;
-    color: #b7f0c4;
-    background: rgba(46, 204, 74, 0.15);
-    padding: 2px 6px;
-    border-radius: 3px;
-    white-space: nowrap;
-  }
-  .ts {
-    color: var(--muted);
-    font-size: 11px;
-    font-variant-numeric: tabular-nums;
-    white-space: nowrap;
-  }
-  .text {
-    font-size: 13px;
-    line-height: 1.4;
-    word-break: break-word;
-  }
-  .text-btn {
-    background: transparent;
-    color: var(--text);
-    border: 1px dashed transparent;
-    padding: 2px 6px;
-    margin: -2px -6px;
-    font: inherit;
-    font-size: 13px;
-    line-height: 1.4;
-    text-align: left;
-    cursor: text;
-    border-radius: 3px;
-    grid-column: 3;
-    min-width: 0;
-    word-break: break-word;
-    white-space: normal;
-  }
-  .text-btn:hover { border-color: rgba(122,162,255,0.4); background: rgba(122,162,255,0.06); }
-  /* Transient "copied ✓" pulse on the just-clicked live-buffer row. The
-     copy-flag chip fades in beside the text, and the whole LI briefly
-     lights up so the click lands unambiguously. */
-  ul.entries li.copied { background: rgba(46, 204, 74, 0.14); }
-  ul.entries li.provisional { opacity: 0.7; }
-  ul.entries li.provisional .text { font-style: italic; }
-  .copy-flag {
-    font-size: 10px;
-    font-weight: 700;
-    letter-spacing: 0.04em;
-    text-transform: uppercase;
-    color: #b7f0c4;
-    background: rgba(46, 204, 74, 0.18);
-    padding: 2px 6px;
-    border-radius: 3px;
-    white-space: nowrap;
-    align-self: center;
-  }
   button {
     padding: 6px 14px;
     background: transparent;
@@ -2122,123 +1702,182 @@
     border-color: rgba(122,162,255,0.6);
   }
   button.primary:hover:not(:disabled) { background: rgba(122,162,255,0.3); }
-  button.danger {
-    background: transparent;
-    color: var(--err);
-    border-color: rgba(255,92,92,0.5);
-  }
-  button.danger:hover:not(:disabled) { background: rgba(255,92,92,0.12); }
 
-  /* ---- Log table (columns-per-channel view) ---- */
-  .log-scroller {
+  /* ---- Paragraph cluster layout ----
+     One <li> per cluster. Speech clusters become either a full-width
+     column (single participating channel) or a grid split into N equal
+     columns (one per channel actively speaking during the cluster).
+     Silence clusters are a single lozenge showing the gap length + a
+     master-scrub affordance. */
+  ol.clusters {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  ol.clusters > li {
+    display: block;
+    padding: 0;
+  }
+  .cluster {
     background: var(--panel);
     border: 1px solid var(--border);
     border-radius: 8px;
-  }
-  .log-table {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 12px;
-  }
-  .log-table thead {
-    background: var(--panel);
-  }
-  .log-table th {
-    text-align: left;
     padding: 8px 10px;
+    display: block;
+    min-width: 0;
+  }
+  .cluster.split {
+    display: grid;
+    gap: 10px;
+    align-items: start;
+  }
+  .cluster-col {
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 0 4px;
+    border-right: 1px dashed rgba(255,255,255,0.06);
+  }
+  .cluster.split .cluster-col:last-child { border-right: none; }
+  /* Silence cluster: single lozenge lozenge affordance. */
+  .cluster.silence-row {
+    display: flex;
+    padding: 6px 10px;
+    background: transparent;
+    border-color: transparent;
+  }
+  .row-master {
+    /* Small ▶ pinned in the cluster header so a click plays from the
+       cluster's audioStart onward. Absent when the cluster has no
+       positioned audio (live pane or TTS-only). */
+    float: right;
+    margin-left: 8px;
+    margin-bottom: 4px;
+  }
+  .row-master-split {
+    float: none;
+    margin: 0 0 8px 0;
+    justify-self: start;
+  }
+
+  /* Paragraph block: avatar header + prose button + clip strip. */
+  .paragraph-block {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 4px 0;
+    min-width: 0;
+  }
+  .paragraph-block + .paragraph-block {
+    border-top: 1px solid rgba(255,255,255,0.04);
+    padding-top: 8px;
+  }
+  .paragraph-block.playing .paragraph-text {
+    border-color: rgba(122,162,255,0.6);
+    background: rgba(122,162,255,0.06);
+  }
+  .paragraph-block.provisional { opacity: 0.78; }
+  .paragraph-block.provisional .paragraph-text { font-style: italic; }
+  .paragraph-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+  }
+  .paragraph-ts {
+    color: var(--muted);
     font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    color: var(--muted);
-    font-weight: 600;
-    border-bottom: 1px solid var(--border);
-  }
-  .log-table th.tts-col { color: #f2c94c; }
-  .log-table td {
-    padding: 6px 8px;
-    vertical-align: top;
-    border-bottom: 1px solid rgba(255,255,255,0.03);
-  }
-  .log-table tbody tr:hover td { background: rgba(255,255,255,0.02); }
-  .log-table tbody tr.silence td { opacity: 0.65; }
-  .col-ts {
-    width: 110px;
-    color: var(--muted);
     font-variant-numeric: tabular-nums;
     white-space: nowrap;
+    margin-left: auto;
   }
-  .col-ch { min-width: 120px; }
-  .col-master {
-    width: 56px;
-    text-align: center;
-    padding-right: 12px;
+  .paragraph-text {
+    display: block;
+    width: 100%;
+    background: transparent;
+    color: var(--text);
+    border: 1px dashed transparent;
+    padding: 4px 6px;
+    font: inherit;
+    font-size: 14px;
+    line-height: 1.45;
+    text-align: left;
+    cursor: pointer;
+    border-radius: 4px;
+    min-width: 0;
+    word-break: break-word;
+    white-space: normal;
   }
-  .silence-tag {
-    display: inline-block;
-    font-size: 10px;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    color: var(--muted);
-    background: rgba(255,255,255,0.05);
-    padding: 2px 6px;
-    border-radius: 3px;
-    /* Positioned so the .clip-fill overlay (below) can sit behind the
-       text and sweep left→right during master playback. */
+  .paragraph-text:hover {
+    border-color: rgba(122,162,255,0.4);
+    background: rgba(122,162,255,0.06);
+  }
+  .paragraph-text.copied {
+    border-color: rgba(46, 204, 74, 0.55);
+    background: rgba(46, 204, 74, 0.12);
+  }
+
+  /* Clip strip — a compact row of chips below each paragraph. */
+  .clip-strip {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    padding: 0 6px;
+  }
+  .clip-chip {
     position: relative;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 40px;
+    padding: 2px 8px;
+    background: rgba(122,162,255,0.08);
+    color: var(--accent);
+    border: 1px solid rgba(122,162,255,0.3);
+    border-radius: 999px;
+    font: inherit;
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+    line-height: 1.2;
+    cursor: pointer;
     overflow: hidden;
   }
-  .silence-tag.playing {
+  .clip-chip:hover:not(:disabled) {
+    background: rgba(122,162,255,0.16);
     color: var(--text);
-    background: rgba(122,162,255,0.14);
   }
-  .silence-tag .clip-fill {
-    /* Reuse the same swipe visual as clip-btn / master-btn so the
-       animation reads as "same kind of playhead". */
-    z-index: 0;
+  .clip-chip:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
   }
-  .silence-tag .silence-text {
+  .clip-chip.tts {
+    background: rgba(255,204,102,0.08);
+    color: #ffcc66;
+    border-color: rgba(255,204,102,0.4);
+  }
+  .clip-chip.tts:hover:not(:disabled) {
+    background: rgba(255,204,102,0.16);
+  }
+  .clip-chip.playing {
+    border-color: rgba(122,162,255,0.75);
+    box-shadow: 0 0 0 1px rgba(122,162,255,0.35);
+  }
+  .clip-chip.provisional {
+    font-style: italic;
+    opacity: 0.7;
+  }
+  .clip-chip-label {
     position: relative;
     z-index: 1;
   }
 
-  /* Clip cell — one per entry, stacked when a row has multiple entries
-     from the same channel. The text button is the primary click target
-     (click = play, dblclick = edit). */
-  .clip-btn {
-    position: relative;
-    display: flex;
-    align-items: center;
-    gap: 4px;
-    padding: 4px 6px;
-    margin-bottom: 3px;
-    border-radius: 4px;
-    background: rgba(0,0,0,0.2);
-    border: 1px solid rgba(255,255,255,0.04);
-    overflow: hidden;
-  }
-  .clip-btn:last-child { margin-bottom: 0; }
-  .clip-btn.playing {
-    border-color: rgba(122,162,255,0.6);
-    box-shadow: 0 0 0 1px rgba(122,162,255,0.35);
-  }
-  /* Brief green outline pulse on saved-recording clips whose text was
-     just copied to the clipboard. Uses a distinct color from
-     `.playing` so both cues can co-exist when a click both plays and
-     copies. */
-  .clip-btn.copied {
-    border-color: rgba(46, 204, 74, 0.55);
-    box-shadow: 0 0 0 1px rgba(46, 204, 74, 0.25);
-  }
-  .clip-btn.tts { background: rgba(255,204,102,0.06); }
-  /* Streaming-STT partials: italic + dimmed so a mid-utterance
-     hypothesis is visually distinct from the polished final. The
-     final decode replaces the entry in place (same id) and clears
-     this class in the next poll. */
-  .clip-btn.provisional { opacity: 0.72; background: rgba(80,140,220,0.05); }
-  .clip-btn.provisional .clip-text { font-style: italic; }
-  /* Animated fill: absolute overlay behind the button content whose
+  /* Animated fill: absolute overlay behind the chip content whose
      width is bound to per-clip playback progress and updated per rAF
-     tick. Content is promoted with `position: relative` to sit above. */
+     tick. */
   .clip-fill {
     position: absolute;
     top: 0;
@@ -2253,52 +1892,93 @@
     pointer-events: none;
     z-index: 0;
   }
-  .clip-btn > *:not(.clip-fill) {
+
+  /* Avatar chip — voice/channel identity for the paragraph header. */
+  .entry-avatar {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 2px 6px;
+    background: rgba(0, 0, 0, 0.28);
+    border: 1px solid rgba(255, 255, 255, 0.05);
+    border-radius: 5px;
+    text-align: left;
+    overflow: hidden;
+    min-width: 0;
+  }
+  .avatar-portrait {
+    width: 22px;
+    height: 22px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: rgba(255, 255, 255, 0.9);
+    font-size: 12px;
+    font-weight: 600;
+    line-height: 1;
+    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.08);
+    user-select: none;
+    flex-shrink: 0;
+  }
+  .avatar-initial {
+    letter-spacing: 0;
+  }
+  .avatar-type {
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--accent);
+    line-height: 1;
+  }
+  .avatar-type.tts { color: #ffcc66; }
+  .avatar-title {
+    font-size: 11px;
+    line-height: 1.15;
+    color: var(--text);
+    max-width: 14ch;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  /* Silence tag — used in silence-row clusters. */
+  .silence-tag {
+    display: inline-block;
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--muted);
+    background: rgba(255,255,255,0.05);
+    padding: 4px 10px;
+    border-radius: 4px;
+    position: relative;
+    overflow: hidden;
+    cursor: pointer;
+  }
+  .silence-tag.playing {
+    color: var(--text);
+    background: rgba(122,162,255,0.14);
+  }
+  .silence-tag .clip-fill {
+    z-index: 0;
+  }
+  .silence-text {
     position: relative;
     z-index: 1;
   }
-  .clip-text {
-    flex: 1;
-    background: transparent;
-    color: var(--text);
-    border: none;
-    padding: 0;
-    font: inherit;
-    font-size: 12px;
-    line-height: 1.4;
-    text-align: left;
-    cursor: pointer;
-    min-width: 0;
-    word-break: break-word;
-    white-space: normal;
-  }
-  .clip-text:hover { color: var(--accent); }
-  .clip-edit {
-    flex: 1;
-    background: rgba(0,0,0,0.35);
-    color: var(--text);
-    border: 1px solid rgba(122,162,255,0.6);
-    border-radius: 3px;
-    padding: 2px 4px;
-    font: inherit;
-    font-size: 12px;
-    line-height: 1.4;
-    min-width: 0;
-    width: 100%;
-    box-sizing: border-box;
-  }
 
-  /* Master cell — the ▶ that plays the mixed audio from this row's
-     mixedStart onward (auto-advances through remaining rows). Uses the
-     same animated fill machinery as clip buttons. */
+  /* Master row button — the ▶ that plays the per-slot audio from the
+     cluster's audioStart onward. */
   .master-btn {
     position: relative;
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    width: 44px;
-    height: 26px;
-    padding: 0;
+    min-width: 44px;
+    height: 24px;
+    padding: 0 8px;
     background: rgba(122,162,255,0.12);
     color: var(--accent);
     border: 1px solid rgba(122,162,255,0.4);
@@ -2306,7 +1986,8 @@
     cursor: pointer;
     overflow: hidden;
   }
-  .master-btn:hover { background: rgba(122,162,255,0.22); }
+  .master-btn:hover:not(:disabled) { background: rgba(122,162,255,0.22); }
+  .master-btn:disabled { opacity: 0.4; cursor: not-allowed; }
   .master-btn.silence {
     background: rgba(255,255,255,0.03);
     border-color: rgba(255,255,255,0.1);

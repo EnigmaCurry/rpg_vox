@@ -825,18 +825,33 @@ export async function unlinkSource(id) {
 
 // --- Record (live transcription + named recording buckets) ---------------
 //
-// GET  /record                        → { mode, buffer, activeRecording,
-//                                        recordings, sttEnabled, ... }
+// GET  /record                        → {
+//   mode: 'idle' | 'recording',
+//   paragraphsByChannel: [{ channel, paragraphs: Paragraph[] }],
+//   activeRecording: null | { id, name, created_at, paragraphs, duration_ms,
+//                             mixed_duration_ms },
+//   channelNames: string[],
+//   sttEnabled: bool,
+//   sampleRate: number,
+//   recordings: [{ id, name, created_at, duration_ms, sample_rate,
+//                  paragraphs, audio_url }]
+// }
+//
+// Paragraph = { id, channel, speaker?, hardened, text, raw_text,
+//               clips: ClipRef[], start_wall_ms, end_wall_ms, created_at }
+// ClipRef   = { id, audio_start_ms?, audio_duration_ms?, start_wall_ms,
+//               text, provisional, audio_url?, mixed_start_ms? }
+//
 // POST /record/recordings { name }    → { id }
-// POST /record/recordings/:id/stop    → { id, name, durationMs, entries, ... }
+// POST /record/recordings/:id/stop    → { id, name, durationMs, paragraphs, ... }
 // DELETE /record/recordings/:id       → 200 (idempotent — cancels active or
 //                                        drops a saved one)
 // GET /record/recordings/:id/audio    → audio/wav bytes
 //
-// The rolling Not-Recording buffer is trimmed FIFO once its total text
-// exceeds ~50 KB, so the UI can render `buffer` verbatim without any
-// client-side windowing. The `activeRecording` object is `null` when the
-// worker is in Not-Recording mode.
+// The rolling live paragraph list is trimmed FIFO once its total text
+// grows beyond the buffer cap, so the UI can render `paragraphsByChannel`
+// verbatim without any client-side windowing. `activeRecording` is `null`
+// when the worker is in Not-Recording mode.
 
 export const getRecordState = () => jsonGet('/record');
 
@@ -917,12 +932,12 @@ export async function clearLiveBuffer() {
   }
 }
 
-/// Correct the text of a transcript entry that lives in the RAM state —
-/// either the rolling ephemeral buffer or the in-flight active recording.
-/// Server 404s if the id belongs to a saved recording — call
-/// `updateSavedRecordingEntry` for those.
-export async function updateLiveRecordingEntry(entryId, text) {
-  const r = await fetch(`/record/entries/${encodeURIComponent(entryId)}`, {
+/// Correct the text of a transcript clip that lives in the RAM state —
+/// either the rolling ephemeral live pane or the in-flight active
+/// recording. Server 404s if the id belongs to a saved recording — call
+/// `updateSavedRecordingClip` for those.
+export async function updateLiveRecordingClip(clipId, text) {
+  const r = await fetch(`/record/clips/${encodeURIComponent(clipId)}`, {
     method: 'PATCH',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ text }),
@@ -934,11 +949,11 @@ export async function updateLiveRecordingEntry(entryId, text) {
   return await r.json();
 }
 
-/// Correct the text of a transcript entry inside a saved recording.
+/// Correct the text of a transcript clip inside a saved recording.
 /// Persists to sqlite; the change is visible in subsequent polls.
-export async function updateSavedRecordingEntry(recordingId, entryId, text) {
+export async function updateSavedRecordingClip(recordingId, clipId, text) {
   const r = await fetch(
-    `/record/recordings/${encodeURIComponent(recordingId)}/entries/${encodeURIComponent(entryId)}`,
+    `/record/recordings/${encodeURIComponent(recordingId)}/clips/${encodeURIComponent(clipId)}`,
     {
       method: 'PATCH',
       headers: { 'content-type': 'application/json' },
