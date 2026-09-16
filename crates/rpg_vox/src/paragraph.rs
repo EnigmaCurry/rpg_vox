@@ -241,6 +241,15 @@ async fn run_once(
     slot: usize,
     forced: bool,
 ) -> LlmOutcome {
+    // Pass 4 short-circuit: skip the LLM call entirely. Paragraphs
+    // stay as pass 2 / pass 3 authored them (no proofreading, no
+    // LLM-driven paragraph splits/merges). Unused-args suppression
+    // keeps the surrounding signature stable so re-enabling is a
+    // one-line revert.
+    let _ = (record, chat, slot, forced);
+    return LlmOutcome::Skipped("pass 4 disabled (passthrough)");
+
+    #[allow(unreachable_code)]
     // Live-buffer gate: while no named recording is active, only run
     // when the operator has explicitly opted in via the "Reinterpret
     // with LLM" checkbox on the live pane. Default is off — the live
