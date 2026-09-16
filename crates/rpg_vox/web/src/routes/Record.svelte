@@ -158,6 +158,7 @@
     if (timer) { clearInterval(timer); timer = null; }
     if (nowTimer) { clearInterval(nowTimer); nowTimer = null; }
     if (rafId) { cancelAnimationFrame(rafId); rafId = 0; }
+    if (flashClearTimer) { clearTimeout(flashClearTimer); flashClearTimer = 0; }
   });
 
   async function refresh() {
@@ -1021,28 +1022,6 @@
     }
   });
 
-  // Paragraph click → copy the full paragraph text to the clipboard.
-  // `copiedParagraphId` pulses briefly on the just-copied block so the
-  // user gets visual confirmation without a modal or toast. Cleared by
-  // a timer.
-  let copiedParagraphId = $state(null);
-  let copyClearTimer = 0;
-  const COPY_FEEDBACK_MS = 900;
-
-  async function copyParagraphText(p) {
-    try {
-      await navigator.clipboard.writeText(p.text ?? '');
-      copiedParagraphId = p.id;
-      if (copyClearTimer) clearTimeout(copyClearTimer);
-      copyClearTimer = setTimeout(() => {
-        copiedParagraphId = null;
-        copyClearTimer = 0;
-      }, COPY_FEEDBACK_MS);
-    } catch (e) {
-      err = `copy failed: ${e.message}`;
-    }
-  }
-
   // Timestamp click → copy the full local timestamp string and briefly
   // swap the label to "copied" so the user sees the click landed. Keyed
   // by whatever id the clicker passed in (paragraph id or clip id) so
@@ -1062,6 +1041,330 @@
     } catch (e) {
       err = `copy failed: ${e.message}`;
     }
+  }
+
+  // Two forms of the record-log action toolbar. When the mouseup lands
+  // with a real text selection inside a paragraph/clip, `selTool` floats
+  // next to the cursor. When the mouseup lands inside a paragraph/clip
+  // *without* a selection (a plain click), `inlineTool` renders inline
+  // at the end of that paragraph/clip and wraps under it on a new line.
+  // Only one of the two is visible at a time.
+  let selTool = $state({ visible: false, x: 0, y: 0, text: '' });
+  let inlineTool = $state({ key: null, text: '' });
+  // Brief background flash on the just-copied paragraph/clip text so
+  // the user sees the copy landed. Keyed by the same `p:<id>` or
+  // `clip:<id>` string used by `inlineTool.key`.
+  let flashKey = $state(null);
+  let flashClearTimer = 0;
+  const FLASH_MS = 700;
+
+  function selectionInsideRecordText() {
+    const sel = window.getSelection?.();
+    if (!sel || sel.rangeCount === 0) return null;
+    const text = sel.toString();
+    if (!text.trim()) return null;
+    const anchor = sel.anchorNode;
+    let el = anchor?.nodeType === 3 ? anchor.parentElement : anchor;
+    while (el) {
+      const cl = el.classList;
+      if (cl && (cl.contains('paragraph-text') || cl.contains('clip-cell-text'))) {
+        return text;
+      }
+      el = el.parentElement;
+    }
+    return null;
+  }
+
+  const TOOLBAR_SEL = '.selection-toolbar, .inline-selection-toolbar, .paragraph-editor';
+
+  function onDocMouseUp(ev) {
+    // Ignore mouseups that end on either toolbar or inside an open
+    // editor — the respective button click handlers own that path,
+    // and a mouseup after typing into the textarea shouldn't reopen
+    // a selection toolbar.
+    if (ev.target?.closest?.(TOOLBAR_SEL)) return;
+    // When an editor is open, mouseups elsewhere in the pane must not
+    // spawn either toolbar — the editor owns the interaction until
+    // the user Applies or Cancels.
+    if (editing.hostKey) return;
+    // Selection is not always finalized synchronously on mouseup in
+    // every browser; let it settle a tick before reading it.
+    queueMicrotask(() => {
+      const text = selectionInsideRecordText();
+      if (text) {
+        selTool.text = text;
+        selTool.x = ev.clientX + 8;
+        selTool.y = ev.clientY + 4;
+        selTool.visible = true;
+        inlineTool.key = null;
+        return;
+      }
+      selTool.visible = false;
+      const host = ev.target?.closest?.('.paragraph-text, .clip-cell-text');
+      if (host && host.dataset.toolKey) {
+        inlineTool.key = host.dataset.toolKey;
+        // Prefer the currently-rendered text (which reflects any prior
+        // edits applied on top of `p.text`) over the raw transcription
+        // stored in data-tool-text. Copy of what the user sees; Edit
+        // of a previously-edited paragraph then targets the visible
+        // replacement rather than the untouched original.
+        inlineTool.text = host.textContent ?? host.dataset.toolText ?? '';
+      } else {
+        inlineTool.key = null;
+      }
+    });
+  }
+
+  function onDocMouseDown(ev) {
+    if (ev.target?.closest?.(TOOLBAR_SEL)) return;
+    selTool.visible = false;
+    inlineTool.key = null;
+  }
+
+  $effect(() => {
+    document.addEventListener('mouseup', onDocMouseUp);
+    document.addEventListener('mousedown', onDocMouseDown, true);
+    return () => {
+      document.removeEventListener('mouseup', onDocMouseUp);
+      document.removeEventListener('mousedown', onDocMouseDown, true);
+    };
+  });
+
+  async function selToolCopy() {
+    try {
+      await navigator.clipboard.writeText(selTool.text);
+    } catch (e) {
+      err = `copy failed: ${e.message}`;
+    }
+    selTool.visible = false;
+    window.getSelection?.()?.removeAllRanges();
+  }
+
+  function selToolEdit() {
+    const sel = window.getSelection?.();
+    if (!sel || sel.rangeCount === 0) { selTool.visible = false; return; }
+    const range = sel.getRangeAt(0);
+    const startEl = range.startContainer?.nodeType === 3
+      ? range.startContainer.parentElement
+      : range.startContainer;
+    const host = startEl?.closest?.('.paragraph-text, .clip-cell-text');
+    if (!host) { selTool.visible = false; return; }
+    // Derive `before` / `after` from DOM ranges over the rendered
+    // host — necessary when the host contains prior hand-edited spans
+    // whose text differs from the raw `p.text` transcription. The
+    // excerpt itself comes from the selection's own toString().
+    const beforeRange = document.createRange();
+    beforeRange.selectNodeContents(host);
+    try { beforeRange.setEnd(range.startContainer, range.startOffset); }
+    catch { selTool.visible = false; return; }
+    const before = beforeRange.toString();
+    const afterRange = document.createRange();
+    afterRange.selectNodeContents(host);
+    try { afterRange.setStart(range.endContainer, range.endOffset); }
+    catch { selTool.visible = false; return; }
+    const after = afterRange.toString();
+    const excerpt = sel.toString();
+    if (!excerpt) { selTool.visible = false; return; }
+    const paragraphId = host.classList.contains('paragraph-text')
+      ? host.dataset.paragraphId
+      : host.closest('.clip-cell-row')?.dataset.paragraphId;
+    if (!paragraphId) { selTool.visible = false; return; }
+    openEditor({
+      hostKey: host.dataset.toolKey,
+      paragraphId,
+      before,
+      excerpt,
+      after,
+    });
+    selTool.visible = false;
+    window.getSelection?.()?.removeAllRanges();
+  }
+
+  async function inlineToolCopy() {
+    const key = inlineTool.key;
+    try {
+      await navigator.clipboard.writeText(inlineTool.text);
+      flashKey = key;
+      if (flashClearTimer) clearTimeout(flashClearTimer);
+      flashClearTimer = setTimeout(() => {
+        flashKey = null;
+        flashClearTimer = 0;
+      }, FLASH_MS);
+    } catch (e) {
+      err = `copy failed: ${e.message}`;
+    }
+    inlineTool.key = null;
+  }
+
+  function inlineToolEdit() {
+    const key = inlineTool.key;
+    const excerpt = inlineTool.text;
+    if (!key || !excerpt) { inlineTool.key = null; return; }
+    // Look up the paragraph id from whichever host currently carries
+    // this tool-key. `.paragraph-text` has data-paragraph-id directly;
+    // `.clip-cell-text` sits inside a row that does.
+    const host = document.querySelector(`[data-tool-key="${cssEscape(key)}"]`);
+    const paragraphId = host?.classList?.contains('paragraph-text')
+      ? host.dataset.paragraphId
+      : host?.closest?.('.clip-cell-row')?.dataset.paragraphId;
+    if (!paragraphId) { inlineTool.key = null; return; }
+    openEditor({
+      hostKey: key,
+      paragraphId,
+      before: '',
+      excerpt,
+      after: '',
+    });
+    inlineTool.key = null;
+  }
+
+  // CSS.escape is widely available; the fallback covers the id/uuid
+  // characters our tool keys actually use.
+  function cssEscape(s) {
+    if (typeof CSS !== 'undefined' && typeof CSS.escape === 'function') return CSS.escape(s);
+    return String(s).replace(/["\\]/g, '\\$&');
+  }
+
+  // Inline text editor state. `hostKey` matches the `data-tool-key` of
+  // the paragraph-text / clip-cell-text host and drives which host
+  // renders the textarea in place of the excerpt. `before` + `excerpt`
+  // + `after` reproduce the original host text; on Apply we POST the
+  // (excerpt → draft) pair as a `ParagraphEdit` patch and let the
+  // display path substring-replace it back in with a green underline.
+  let editing = $state({
+    hostKey: null,
+    paragraphId: null,
+    before: '',
+    excerpt: '',
+    after: '',
+    draft: '',
+    saving: false,
+  });
+  let editingTextareaEl = $state(null);
+
+  async function openEditor(seed) {
+    editing.hostKey = seed.hostKey;
+    editing.paragraphId = seed.paragraphId;
+    editing.before = seed.before;
+    editing.excerpt = seed.excerpt;
+    editing.after = seed.after;
+    editing.draft = seed.excerpt;
+    editing.saving = false;
+    await tick();
+    autoSizeEditor();
+    editingTextareaEl?.focus();
+    editingTextareaEl?.select();
+  }
+
+  // Grow the textarea to fit its current content. Called on open so
+  // the initial size mirrors the excerpt (a one-liner opens compact,
+  // a paragraph opens tall), and on every input so the field expands
+  // as the user types. `height=auto` first resets any prior inline
+  // height so scrollHeight reads a truthful measurement.
+  function autoSizeEditor() {
+    const el = editingTextareaEl;
+    if (!el) return;
+    el.style.height = 'auto';
+    el.style.height = `${el.scrollHeight}px`;
+  }
+
+  function resetEditing() {
+    editing.hostKey = null;
+    editing.paragraphId = null;
+    editing.before = '';
+    editing.excerpt = '';
+    editing.after = '';
+    editing.draft = '';
+    editing.saving = false;
+  }
+
+  async function commitEdit() {
+    if (!editing.paragraphId || editing.saving) return;
+    const original = editing.excerpt;
+    const replacement = editing.draft;
+    if (replacement === original || replacement.trim() === '') {
+      resetEditing();
+      return;
+    }
+    editing.saving = true;
+    const paragraphId = editing.paragraphId;
+    try {
+      const savedId =
+        selected !== 'live' && selected !== 'active' ? selectedSaved?.id ?? null : null;
+      if (savedId) {
+        await api.addSavedParagraphEdit(savedId, paragraphId, original, replacement);
+      } else {
+        await api.addLiveParagraphEdit(paragraphId, original, replacement);
+      }
+      // Pull the fresh state so the new edit + its green underline
+      // land before the editor closes — avoids a flash of unedited
+      // text between the request completing and the next poll tick.
+      await refresh().catch(() => {});
+    } catch (e) {
+      err = `edit failed: ${e.message}`;
+    } finally {
+      resetEditing();
+    }
+  }
+
+  function cancelEdit() {
+    resetEditing();
+  }
+
+  function onEditKey(e) {
+    if (e.key === 'Enter' && !e.shiftKey && !e.ctrlKey && !e.metaKey) {
+      e.preventDefault();
+      commitEdit();
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      cancelEdit();
+    }
+  }
+
+  // Apply a paragraph's edit overlay to a piece of text (the paragraph
+  // text or one of its clips' texts) and return a run of `[text,
+  // edited]` segments. Each edit is a first-occurrence substring swap
+  // of `original` → `replacement` applied sequentially to a running
+  // "current text" string with a parallel `edited` bitmap. Sequential
+  // application (rather than treating edits as independent patches on
+  // the original transcription) is what lets a follow-up edit target
+  // a previous replacement's text: at the moment we search for the
+  // new edit's `original`, that replacement is already sitting in
+  // `cur`. Multi-segment spans (a selection that straddled a prior
+  // replacement boundary) also just work because we search the flat
+  // string, not a segments list.
+  //
+  // Edits whose `original` is no longer present in `cur` (an LLM
+  // rewrite drifted the text away) are silently orphaned.
+  function editedSegments(text, edits) {
+    let cur = text ?? '';
+    let marks = new Uint8Array(cur.length);
+    for (const edit of edits ?? []) {
+      const original = edit?.original ?? '';
+      if (!original) continue;
+      const idx = cur.indexOf(original);
+      if (idx === -1) continue;
+      const replacement = edit.replacement ?? '';
+      const beforeLen = idx;
+      const afterStart = idx + original.length;
+      const newMarks = new Uint8Array(beforeLen + replacement.length + (cur.length - afterStart));
+      newMarks.set(marks.subarray(0, beforeLen), 0);
+      newMarks.fill(1, beforeLen, beforeLen + replacement.length);
+      newMarks.set(marks.subarray(afterStart), beforeLen + replacement.length);
+      cur = cur.slice(0, idx) + replacement + cur.slice(afterStart);
+      marks = newMarks;
+    }
+    const segs = [];
+    let i = 0;
+    while (i < cur.length) {
+      let j = i;
+      const m = marks[i];
+      while (j < cur.length && marks[j] === m) j++;
+      segs.push({ text: cur.slice(i, j), edited: m === 1 });
+      i = j;
+    }
+    if (segs.length === 0) segs.push({ text: '', edited: false });
+    return segs;
   }
 
   // Inline rename for the in-flight recording's pane header. Click the
@@ -1310,6 +1613,87 @@
   </div>
 {/snippet}
 
+{#snippet displayText(text, edits)}
+  {#each editedSegments(text, edits) as seg}
+    {#if seg.edited}<span class="hand-edited">{seg.text}</span>{:else}{seg.text}{/if}
+  {/each}
+{/snippet}
+
+{#snippet paragraphEditor()}
+  <span class="paragraph-editor" contenteditable="false">
+    <textarea
+      bind:this={editingTextareaEl}
+      bind:value={editing.draft}
+      onkeydown={onEditKey}
+      oninput={autoSizeEditor}
+      class="edit-field"
+      rows="1"
+      disabled={editing.saving}
+      aria-label="Edit excerpt"
+    ></textarea>
+    <span class="edit-actions">
+      <button
+        type="button"
+        class="sel-btn edit-apply"
+        title="Apply edit (Enter)"
+        aria-label="Apply edit"
+        onclick={commitEdit}
+        disabled={editing.saving}
+      >
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <polyline points="4 12 10 18 20 6"></polyline>
+        </svg>
+      </button>
+      <button
+        type="button"
+        class="sel-btn edit-cancel"
+        title="Cancel edit (Esc)"
+        aria-label="Cancel edit"
+        onclick={cancelEdit}
+        disabled={editing.saving}
+      >
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M6 6l12 12M6 18L18 6"></path>
+        </svg>
+      </button>
+    </span>
+  </span>
+{/snippet}
+
+{#snippet inlineToolbar()}
+  <span
+    class="inline-selection-toolbar"
+    role="toolbar"
+    aria-label="Text actions"
+    contenteditable="false"
+  >
+    <button
+      type="button"
+      class="sel-btn"
+      title="Copy text"
+      aria-label="Copy text"
+      onclick={inlineToolCopy}
+    >
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+        <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+      </svg>
+    </button>
+    <button
+      type="button"
+      class="sel-btn"
+      title="Edit text"
+      aria-label="Edit text"
+      onclick={inlineToolEdit}
+    >
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path>
+        <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path>
+      </svg>
+    </button>
+  </span>
+{/snippet}
+
 {#snippet paragraphBlock(p, recId)}
   {@const ch = p.channel || channelFallback}
   {@const isTts = ch === 'TTS'}
@@ -1355,14 +1739,14 @@
         {/if}
       </button>
     </div>
-    <button
-      type="button"
+    <div
       class="paragraph-text"
       data-paragraph-id={p.id}
-      class:copied={copiedParagraphId === p.id}
-      title={copiedParagraphId === p.id ? 'Copied!' : 'Click to copy paragraph text'}
-      onclick={() => copyParagraphText(p)}
-    >{p.text || ''}</button>
+      data-tool-key="p:{p.id}"
+      data-tool-text={p.text || ''}
+      class:flash-copied={flashKey === `p:${p.id}`}
+      class:editing={editing.hostKey === `p:${p.id}`}
+    >{#if editing.hostKey === `p:${p.id}`}{editing.before}{@render paragraphEditor()}{editing.after}{:else}{@render displayText(p.text || '', p.edits)}{#if inlineTool.key === `p:${p.id}`}{@render inlineToolbar()}{/if}{/if}</div>
     {@render clipStrip(p, recId)}
   </div>
 {/snippet}
@@ -1445,14 +1829,15 @@
         {:else}
           <span class="clip-cell-tick" aria-hidden="true">·</span>
         {/if}
-        <button
-          type="button"
+        <div
           class="clip-cell-text"
           class:provisional={clip.provisional}
-          class:copied={copiedParagraphId === p.id}
-          title={copiedParagraphId === p.id ? 'Copied!' : 'Click to copy paragraph text'}
-          onclick={() => copyParagraphText(p)}
-        >{clip.text || ''}</button>
+          data-tool-key="clip:{clip.id}"
+          data-tool-text={clip.text || ''}
+          data-paragraph-id={p.id}
+          class:flash-copied={flashKey === `clip:${clip.id}`}
+          class:editing={editing.hostKey === `clip:${clip.id}`}
+        >{#if editing.hostKey === `clip:${clip.id}`}{editing.before}{@render paragraphEditor()}{editing.after}{:else}{@render displayText(clip.text || '', p.edits)}{#if inlineTool.key === `clip:${clip.id}`}{@render inlineToolbar()}{/if}{/if}</div>
         <button
           type="button"
           class="clip-cell-ts"
@@ -1704,6 +2089,40 @@
     {/if}
   </div>
 </div>
+
+{#if selTool.visible}
+  <div
+    class="selection-toolbar"
+    style="left: {selTool.x}px; top: {selTool.y}px;"
+    role="toolbar"
+    aria-label="Selection actions"
+  >
+    <button
+      type="button"
+      class="sel-btn"
+      title="Copy selection"
+      aria-label="Copy selection"
+      onclick={selToolCopy}
+    >
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+        <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+      </svg>
+    </button>
+    <button
+      type="button"
+      class="sel-btn"
+      title="Edit selection"
+      aria-label="Edit selection"
+      onclick={selToolEdit}
+    >
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path>
+        <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path>
+      </svg>
+    </button>
+  </div>
+{/if}
 
 <style>
   .record-shell {
@@ -2213,26 +2632,14 @@
   .clip-cell-text {
     flex: 1 1 auto;
     min-width: 0;
-    background: transparent;
     color: var(--text);
-    border: 1px dashed transparent;
     padding: 2px 6px;
-    font: inherit;
     font-size: 14px;
     line-height: 1.4;
     text-align: left;
-    cursor: pointer;
-    border-radius: 4px;
     word-break: break-word;
     white-space: normal;
-  }
-  .clip-cell-text:hover {
-    border-color: rgba(122,162,255,0.4);
-    background: rgba(122,162,255,0.06);
-  }
-  .clip-cell-text.copied {
-    border-color: rgba(46, 204, 74, 0.55);
-    background: rgba(46, 204, 74, 0.12);
+    user-select: text;
   }
   .clip-cell-ts {
     flex: 0 0 auto;
@@ -2263,7 +2670,6 @@
     padding-top: 8px;
   }
   .paragraph-block.playing .paragraph-text {
-    border-color: rgba(122,162,255,0.6);
     background: rgba(122,162,255,0.06);
   }
   .paragraph-block.provisional { opacity: 0.78; }
@@ -2346,27 +2752,16 @@
   .paragraph-text {
     display: block;
     width: 100%;
-    background: transparent;
     color: var(--text);
-    border: 1px dashed transparent;
     padding: 4px 6px;
-    font: inherit;
     font-size: 14px;
     line-height: 1.45;
     text-align: left;
-    cursor: pointer;
     border-radius: 4px;
     min-width: 0;
     word-break: break-word;
     white-space: normal;
-  }
-  .paragraph-text:hover {
-    border-color: rgba(122,162,255,0.4);
-    background: rgba(122,162,255,0.06);
-  }
-  .paragraph-text.copied {
-    border-color: rgba(46, 204, 74, 0.55);
-    background: rgba(46, 204, 74, 0.12);
+    user-select: text;
   }
 
   /* Clip strip — a compact row of chips below each paragraph. */
@@ -2568,4 +2963,139 @@
     z-index: 1;
   }
   .master-glyph { font-size: 12px; }
+
+  /* Floating toolbar shown next to the cursor after a mouseup that
+     ends a text selection inside a record-log paragraph or clip. */
+  .selection-toolbar {
+    position: fixed;
+    z-index: 1000;
+    display: inline-flex;
+    gap: 2px;
+    padding: 3px;
+    background: rgba(20, 22, 28, 0.96);
+    border: 1px solid rgba(255,255,255,0.14);
+    border-radius: 6px;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+    user-select: none;
+  }
+  .sel-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 24px;
+    background: transparent;
+    color: var(--text);
+    border: 0;
+    border-radius: 4px;
+    cursor: pointer;
+    padding: 0;
+  }
+  .sel-btn:hover {
+    background: rgba(122,162,255,0.16);
+    color: var(--accent);
+  }
+
+  /* Inline variant shown at the end of a paragraph or clip text when
+     the user mouseups without a text selection. Flows inline so it
+     sits at the end of the last text line and wraps under the
+     paragraph when there is no room. */
+  .inline-selection-toolbar {
+    display: inline-flex;
+    gap: 2px;
+    padding: 2px;
+    margin-left: 6px;
+    vertical-align: middle;
+    background: rgba(20, 22, 28, 0.9);
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 5px;
+    user-select: none;
+  }
+  .inline-selection-toolbar .sel-btn {
+    width: 20px;
+    height: 20px;
+  }
+
+  /* Copy-confirmation flash for the whole-paragraph / whole-clip copy
+     path. The `flash-copied` class is applied for FLASH_MS ms so the
+     user sees the copy landed. */
+  @keyframes flash-copied-anim {
+    0%   { background: rgba(46, 204, 74, 0.28); }
+    100% { background: transparent; }
+  }
+  .paragraph-text.flash-copied,
+  .clip-cell-text.flash-copied {
+    animation: flash-copied-anim 0.7s ease-out;
+  }
+
+  /* Inline text editor. The excerpt gets extracted out of the flow
+     and replaced by a `<span class="paragraph-editor">` that carries
+     the textarea + Apply/Cancel buttons. `display: block` so the
+     editor always breaks to its own line inside the paragraph text —
+     matches the "interstitial line-breaking" behavior requested for
+     the edit affordance. */
+  .paragraph-editor {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px;
+    margin: 4px 0;
+    user-select: text;
+  }
+  .paragraph-text.editing,
+  .clip-cell-text.editing {
+    border: 1px solid rgba(122,162,255,0.35);
+    padding: 4px 6px;
+    border-radius: 4px;
+  }
+  .edit-field {
+    flex: 1 1 240px;
+    min-width: 0;
+    padding: 4px 6px;
+    background: rgba(20, 22, 28, 0.9);
+    color: var(--text);
+    border: 1px solid rgba(255,255,255,0.14);
+    border-radius: 4px;
+    font: inherit;
+    font-size: 14px;
+    line-height: 1.4;
+    resize: vertical;
+    overflow: hidden;
+    box-sizing: border-box;
+  }
+  .edit-field:focus {
+    outline: none;
+    border-color: rgba(122,162,255,0.65);
+    box-shadow: 0 0 0 1px rgba(122,162,255,0.35);
+  }
+  .edit-actions {
+    display: inline-flex;
+    gap: 2px;
+  }
+  .edit-apply {
+    color: rgb(90, 220, 120);
+  }
+  .edit-apply:hover:not(:disabled) {
+    background: rgba(90, 220, 120, 0.16);
+    color: rgb(120, 240, 150);
+  }
+  .edit-cancel {
+    color: rgb(230, 120, 120);
+  }
+  .edit-cancel:hover:not(:disabled) {
+    background: rgba(230, 120, 120, 0.16);
+    color: rgb(250, 150, 150);
+  }
+  .sel-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  /* Hand-edited slice of a paragraph or clip text. The underline
+     signals that this run originated from a user correction rather
+     than the transcription. */
+  .hand-edited {
+    border-bottom: 1.5px solid rgb(90, 220, 120);
+    padding-bottom: 0;
+  }
 </style>

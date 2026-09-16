@@ -977,6 +977,14 @@ pub async fn serve(
             axum::routing::patch(record_live_clip_patch_handler),
         )
         .route(
+            "/record/paragraphs/:paragraph_id/edits",
+            post(record_live_paragraph_edit_handler),
+        )
+        .route(
+            "/record/recordings/:id/paragraphs/:paragraph_id/edits",
+            post(record_saved_paragraph_edit_handler),
+        )
+        .route(
             "/record/buffer",
             axum::routing::delete(record_buffer_clear_handler),
         )
@@ -4593,6 +4601,70 @@ async fn record_saved_clip_patch_handler(
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("update paragraphs: {err:#}"),
+        )
+            .into_response(),
+    }
+}
+
+/// Body for the paragraph-edit patch endpoints. Both fields are
+/// required — an edit is a `original` → `replacement` mapping. The
+/// backend never mutates paragraph text; edits ride alongside as an
+/// overlay the client applies at render time.
+#[derive(Debug, Deserialize)]
+struct ParagraphEditPatch {
+    original: String,
+    replacement: String,
+}
+
+/// Append a paragraph-edit patch on a live paragraph (either a channel
+/// log paragraph or a paragraph inside the active recording).
+async fn record_live_paragraph_edit_handler(
+    State(state): State<AppState>,
+    Path(paragraph_id): Path<String>,
+    Json(body): Json<ParagraphEditPatch>,
+) -> Response {
+    if body.original.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "original is required").into_response();
+    }
+    match state
+        .record
+        .add_paragraph_edit(&paragraph_id, body.original, body.replacement)
+    {
+        Some(edit) => (StatusCode::OK, Json(edit)).into_response(),
+        None => (StatusCode::NOT_FOUND, "no such live paragraph").into_response(),
+    }
+}
+
+/// Append a paragraph-edit patch on a paragraph inside a saved
+/// recording. Persists to sqlite alongside the existing paragraphs
+/// JSON.
+async fn record_saved_paragraph_edit_handler(
+    State(state): State<AppState>,
+    Path((recording_id, paragraph_id)): Path<(String, String)>,
+    Json(body): Json<ParagraphEditPatch>,
+) -> Response {
+    if body.original.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "original is required").into_response();
+    }
+    match state
+        .store
+        .add_recording_paragraph_edit(recording_id, paragraph_id, body.original.clone(), body.replacement.clone())
+        .await
+    {
+        Ok(Some((id, created_at))) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "id": id,
+                "original": body.original,
+                "replacement": body.replacement,
+                "created_at": created_at,
+            })),
+        )
+            .into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "no such recording or paragraph").into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("add paragraph edit: {err:#}"),
         )
             .into_response(),
     }

@@ -2207,6 +2207,82 @@ impl Store {
         .context("db task panicked")?
     }
 
+    /// Append a user-authored correction patch to a paragraph inside a
+    /// saved recording. Loads the paragraphs JSON, walks it for the
+    /// matching id, appends `{id, original, replacement, created_at}` to
+    /// `edits` (initializing the array if it's missing on legacy rows),
+    /// and writes back. Never touches paragraph `text`/`raw_text` — the
+    /// client applies edits at render time. Returns the newly minted
+    /// edit id + created_at so the client can insert it into its local
+    /// state without a full refetch.
+    pub async fn add_recording_paragraph_edit(
+        &self,
+        recording_id: String,
+        paragraph_id: String,
+        original: String,
+        replacement: String,
+    ) -> Result<Option<(String, i64)>> {
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || -> Result<Option<(String, i64)>> {
+            let conn = db.lock().unwrap();
+            let raw: Option<String> = conn
+                .query_row(
+                    "SELECT paragraphs FROM recordings WHERE id = ?1",
+                    params![recording_id],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?;
+            let Some(raw) = raw else {
+                return Ok(None);
+            };
+            let mut paragraphs: Vec<serde_json::Value> = serde_json::from_str(&raw)
+                .context("parsing recording paragraphs JSON")?;
+            let edit_id = Uuid::new_v4().to_string();
+            let created_at = unix_now();
+            let mut hit = false;
+            for p in paragraphs.iter_mut() {
+                let matches = p
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s == paragraph_id)
+                    .unwrap_or(false);
+                if !matches {
+                    continue;
+                }
+                let Some(obj) = p.as_object_mut() else { continue };
+                let entry = obj
+                    .entry("edits".to_string())
+                    .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+                if let Some(arr) = entry.as_array_mut() {
+                    arr.push(serde_json::json!({
+                        "id": edit_id,
+                        "original": original,
+                        "replacement": replacement,
+                        "created_at": created_at,
+                    }));
+                    hit = true;
+                }
+                break;
+            }
+            if !hit {
+                return Ok(None);
+            }
+            let updated = serde_json::to_string(&paragraphs)
+                .context("serializing updated paragraphs")?;
+            let rows = conn.execute(
+                "UPDATE recordings SET paragraphs = ?2 WHERE id = ?1",
+                params![recording_id, updated],
+            )?;
+            if rows == 0 {
+                Ok(None)
+            } else {
+                Ok(Some((edit_id, created_at)))
+            }
+        })
+        .await
+        .context("db task panicked")?
+    }
+
     pub async fn delete_recording(&self, id: String) -> Result<UpdateResult> {
         let db = self.db.clone();
         let id_clone = id.clone();

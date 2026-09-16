@@ -993,6 +993,44 @@ export async function updateSavedRecordingClip(recordingId, clipId, text) {
   return await r.json();
 }
 
+/// Append a paragraph-edit patch to a live paragraph (channel log or
+/// active recording). Server never mutates the transcription; it just
+/// stores an `original` → `replacement` overlay the client applies at
+/// render time. Returns the newly-minted `{id, original, replacement,
+/// created_at}`.
+export async function addLiveParagraphEdit(paragraphId, original, replacement) {
+  const r = await fetch(
+    `/record/paragraphs/${encodeURIComponent(paragraphId)}/edits`,
+    {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ original, replacement }),
+    },
+  );
+  if (!r.ok) {
+    const detail = await r.text().catch(() => `HTTP ${r.status}`);
+    throw new Error(detail || `HTTP ${r.status}`);
+  }
+  return await r.json();
+}
+
+/// Same, for a paragraph inside a saved recording. Persists to sqlite.
+export async function addSavedParagraphEdit(recordingId, paragraphId, original, replacement) {
+  const r = await fetch(
+    `/record/recordings/${encodeURIComponent(recordingId)}/paragraphs/${encodeURIComponent(paragraphId)}/edits`,
+    {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ original, replacement }),
+    },
+  );
+  if (!r.ok) {
+    const detail = await r.text().catch(() => `HTTP ${r.status}`);
+    throw new Error(detail || `HTTP ${r.status}`);
+  }
+  return await r.json();
+}
+
 /// Absolute URL for a sub-range of a recording, encoded as a mini WAV.
 /// The endpoint transparently reads from RAM when `id` matches the
 /// currently-active in-flight recording (so mid-record utterance playback

@@ -234,6 +234,23 @@ pub struct ClipRef {
     pub pass4_ran: bool,
 }
 
+/// One user-authored correction stored as a patch on top of the
+/// paragraph transcription. Never mutates `Paragraph::text` /
+/// `raw_text` — the client applies the patch at render time by
+/// substring-replacing `original` with `replacement` and painting the
+/// swap with a green underline. When the underlying transcription
+/// drifts (LLM rewrites, pass-3 boundaries) the edit is silently
+/// orphaned if `original` no longer occurs in `text`. We preserve
+/// orphans so a subsequent revision that re-introduces the original
+/// phrasing picks the edit back up.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParagraphEdit {
+    pub id: String,
+    pub original: String,
+    pub replacement: String,
+    pub created_at: i64,
+}
+
 /// A run of same-channel clips grouped by silence-gap. Stage 1 keeps
 /// `text` as a naive space-join of `clips[].text`; later stages will let
 /// the LLM reshape paragraph text. `hardened=false` for vox paragraphs
@@ -275,6 +292,10 @@ pub struct Paragraph {
     /// paragraphs on non-stop speech without touching clip timing.
     #[serde(default)]
     pub closed: bool,
+    /// User-authored corrections stored as an overlay on top of the
+    /// transcription. See [`ParagraphEdit`] for the semantics.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub edits: Vec<ParagraphEdit>,
 }
 
 impl Paragraph {
@@ -1546,6 +1567,49 @@ impl RecordState {
         }
     }
 
+    /// Append a user-authored correction patch to a paragraph. Mirrors
+    /// the edit onto both the channel-log copy and the active-recording
+    /// copy so the two views stay in lockstep. Returns the newly-minted
+    /// [`ParagraphEdit`] (with its assigned id and timestamp) when a
+    /// paragraph with the given id was found; `None` when the paragraph
+    /// belongs to a saved recording (caller should use the sqlite
+    /// path).
+    pub fn add_paragraph_edit(
+        &self,
+        paragraph_id: &str,
+        original: String,
+        replacement: String,
+    ) -> Option<ParagraphEdit> {
+        let edit = ParagraphEdit {
+            id: Uuid::new_v4().to_string(),
+            original,
+            replacement,
+            created_at: unix_now(),
+        };
+        let mut g = self.inner.lock().expect("record state mutex poisoned");
+        let mut hit = false;
+        for ch in g.channels.iter_mut() {
+            for p in ch.paragraphs.iter_mut() {
+                if p.id == paragraph_id {
+                    p.edits.push(edit.clone());
+                    hit = true;
+                    break;
+                }
+            }
+            if hit { break; }
+        }
+        if let Some(active) = g.active.as_mut() {
+            for p in active.paragraphs.iter_mut() {
+                if p.id == paragraph_id {
+                    p.edits.push(edit.clone());
+                    hit = true;
+                    break;
+                }
+            }
+        }
+        if hit { Some(edit) } else { None }
+    }
+
     /// Rename the in-flight recording if `id` matches the active one.
     /// Returns `true` when the rename landed, `false` when nothing was
     /// active or the id didn't match — the HTTP handler then falls
@@ -1905,6 +1969,7 @@ impl RecordState {
             pass4_ran: true,
             pass3_inflight: false,
             closed: false,
+            edits: Vec::new(),
         };
         let mut g = self.inner.lock().expect("record state mutex poisoned");
         if let Some(ch) = g.channel_mut(ChannelKind::Tts) {
@@ -2873,6 +2938,7 @@ fn upsert_clip_into_channel(
             pass4_ran: false,
             pass3_inflight: false,
             closed: false,
+            edits: Vec::new(),
         };
         paragraph.rebuild();
         ch.paragraphs.push(paragraph.clone());
