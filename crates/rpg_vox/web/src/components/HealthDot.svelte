@@ -1,6 +1,7 @@
 <script>
   import { health, recordingStatus, pingStats, pingBad } from '../lib/stores.js';
-  import { monitorState, monitorPref } from '../lib/browserMonitor.js';
+  import { monitorState, monitorPref, monitorStats } from '../lib/browserMonitor.js';
+  import { navigate } from '../lib/router.js';
 
   const label = $derived({ checking: 'checking…', ok: 'online', err: 'offline' }[$health] || '');
   // Only decorate with "streaming" when the app is healthy AND the browser
@@ -14,16 +15,66 @@
   const lagging = $derived(
     $monitorPref && ($monitorState === 'latency-paused' || ($pingBad && $health === 'ok'))
   );
-  // Tooltip text for the "streaming" decorator — pulls from the live ping
-  // store so hovering always shows the most recent measurement, not stale
-  // data captured at mount time.
-  const streamingTitle = $derived(
-    $pingStats.sampled
-      ? ($pingStats.err
-          ? 'streaming — /healthz not responding'
-          : `streaming — ping ${$pingStats.lastMs.toFixed(0)} ms (avg ${$pingStats.avgMs.toFixed(0)} ms)`)
-      : 'streaming'
-  );
+  // Tooltip text for the "streaming" decorator — surfaces the AudioWorklet's
+  // live buffer depth (with peak + target for context) and the current ping
+  // average so hovering shows both the audio queue and the network round-trip
+  // that drives auto-pause.
+  const streamingTitle = $derived.by(() => {
+    const buf = `buffer ${Math.round($monitorStats.depthMs)} ms `
+      + `(peak ${Math.round($monitorStats.peakMs)} ms, target ${Math.round($monitorStats.targetMs)} ms)`;
+    let ping;
+    if (!$pingStats.sampled) ping = 'ping —';
+    else if ($pingStats.err) ping = 'ping no response';
+    else ping = `ping ${Math.round($pingStats.lastMs)} ms (avg ${Math.round($pingStats.avgMs)} ms)`;
+    return `streaming — ${buf} · ${ping}`;
+  });
+
+  // Flash a "copied" pill for ~900 ms after a successful clipboard write, so
+  // the click has visible feedback without a heavier toast system.
+  let copiedFlash = $state(false);
+  let copiedTimer = null;
+
+  async function onStreamingClick() {
+    try {
+      await navigator.clipboard?.writeText(streamingTitle);
+      copiedFlash = true;
+      clearTimeout(copiedTimer);
+      copiedTimer = setTimeout(() => { copiedFlash = false; }, 900);
+    } catch {}
+    navigate('/mixer');
+    // Mixer mounts asynchronously after the hashchange, and continues to
+    // reflow as sinks/sources/PipeWire graph render — the anchor's absolute
+    // page position keeps drifting for hundreds of ms. Poll rAF: re-scroll
+    // whenever the anchor's page-space top has moved, and only stop once
+    // it's held steady for a run of frames (or the settle budget elapses).
+    // `behavior: 'auto'` (instant) avoids fighting an in-flight smooth
+    // animation while we're chasing a moving target.
+    const SETTLE_MS = 2500;
+    const STABLE_FRAMES = 10;
+    const startedAt = performance.now();
+    let lastPageY = null;
+    let stable = 0;
+    const tick = () => {
+      const el = document.getElementById('web-monitor');
+      const nowMs = performance.now();
+      if (!el) {
+        if (nowMs - startedAt < SETTLE_MS) requestAnimationFrame(tick);
+        return;
+      }
+      const pageY = el.getBoundingClientRect().top + window.scrollY;
+      if (lastPageY !== null && Math.abs(pageY - lastPageY) < 0.5) {
+        stable++;
+      } else {
+        stable = 0;
+        el.scrollIntoView({ block: 'start', behavior: 'auto' });
+      }
+      lastPageY = pageY;
+      if (stable < STABLE_FRAMES && nowMs - startedAt < SETTLE_MS) {
+        requestAnimationFrame(tick);
+      }
+    };
+    requestAnimationFrame(tick);
+  }
   const laggingMs = $derived(
     $pingStats.sampled && !$pingStats.err ? Math.round($pingStats.avgMs) : null
   );
@@ -71,7 +122,7 @@
   </a>
 {:else}
   <span class="health {$health}">
-    {label}{#if lagging}<span class="lagging" title="Web Monitor auto-paused — waiting for ping to recover"> · LAGGING{#if laggingMs != null} {laggingMs}ms{:else if $pingStats.err} · no response{/if}</span>{:else if streaming}<span class="streaming" title={streamingTitle}> · streaming</span>{/if}
+    {label}{#if lagging}<span class="lagging" title="Web Monitor auto-paused — waiting for ping to recover"> · LAGGING{#if laggingMs != null} {laggingMs}ms{:else if $pingStats.err} · no response{/if}</span>{:else if streaming}<button type="button" class="streaming" title={streamingTitle} onclick={onStreamingClick}> · {copiedFlash ? 'copied stats' : 'streaming'}</button>{/if}
   </span>
 {/if}
 
@@ -85,6 +136,18 @@
   .streaming {
     color: var(--accent);
     font-weight: 500;
+    background: transparent;
+    border: none;
+    padding: 0;
+    margin: 0;
+    font: inherit;
+    cursor: pointer;
+  }
+  .streaming:hover { text-decoration: underline; }
+  .streaming:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+    border-radius: 2px;
   }
   /* Auto-paused because ping crossed the threshold. Yellow so it reads as
      a warning (not an error, since the pref is still on and we'll come

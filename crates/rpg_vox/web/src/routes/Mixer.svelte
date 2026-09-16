@@ -577,7 +577,7 @@
     {/if}
   </div>
 
-  <section class="io-panel">
+  <section id="web-monitor" class="io-panel" style="scroll-margin-top: 60px">
     <div class="subhead"><span>Web monitor</span>
       <span class="note">piped directly into your browser — listen from anywhere</span>
     </div>

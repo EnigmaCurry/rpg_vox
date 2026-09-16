@@ -357,7 +357,7 @@
   //     byChannel: Record<string, Paragraph[]>,
   //     channels: string[]           // canonical-ordered, TTS at end
   //   }
-  const SILENCE_ROW_MIN_MS = 3000;
+  const SILENCE_ROW_MIN_MS = 5 * 60 * 1000;
 
   // Union of channel names in the paragraph set, intersected with the
   // canonical list (from state.channelNames) so we never emit an empty
@@ -1562,7 +1562,7 @@
                 {#if isSilenceRowPlaying(row, rows)}
                   <div class="clip-fill" style="width: {silenceRowProgress(row, rows) * 100}%" aria-hidden="true"></div>
                 {/if}
-                silence · {Math.max(0, Math.round((row.wallEnd - row.wallStart) / 1000))}s
+                silence · {fmtRelMs(row.wallEnd - row.wallStart)}
               </button>
             </div>
           {:else if row.channels.length === 1}
