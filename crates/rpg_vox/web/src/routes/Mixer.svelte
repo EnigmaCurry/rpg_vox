@@ -1,7 +1,15 @@
 <script>
   import { onMount, onDestroy } from 'svelte';
   import * as api from '../lib/api.js';
-  import { settings } from '../lib/stores.js';
+  import {
+    settings,
+    graph,
+    reloadGraph,
+    getPwMonitorPref,
+    setPwMonitorPref,
+  } from '../lib/stores.js';
+  import * as browserMonitor from '../lib/browserMonitor.js';
+  import { monitorState } from '../lib/browserMonitor.js';
 
   // Mixer state mirror. Populated from GET /mixer on mount; every knob
   // change PUTs a partial patch and adopts the server's echoed snapshot.
@@ -11,11 +19,40 @@
   let saving = $state(0); // in-flight count so the status can show 'saving…'
 
   // External Stream/Output/Audio producers visible in the pw graph
-  // (browser tabs, media players, etc.). Populated from /pw/graph and
+  // (browser tabs, media players, etc.), and the pipewire sinks the user
+  // can pin the local monitor to. Both come from the shared `graph` store,
   // refreshed on a slow cadence.
-  let sources = $state([]);
+  const sources = $derived($graph?.sources ?? []);
   let graphTimer = null;
   const GRAPH_POLL_MS = 2000;
+
+  // Local monitor state — mirrors the Settings-page controls that used to
+  // live under /settings. Persisted to localStorage via getPwMonitorPref /
+  // setPwMonitorPref; App.svelte re-applies the pref at boot.
+  let monitorRestored = false;
+  let monitorStatus = $state({ text: '', kind: '' });
+  let browserMonitorBusy = $state(false);
+  let browserMonitorError = $state('');
+  const browserMonitorSupported = browserMonitor.isSupported();
+  const browserMonitorOn = $derived(
+    $monitorState === 'listening'
+      || $monitorState === 'connecting'
+      || $monitorState === 'awaiting-gesture',
+  );
+
+  // Sinks the user might reasonably want to monitor rpg_vox with. Excludes:
+  //   * the auto-patch target (we're already routing to it)
+  //   * our own companion sinks (`{node_name}-music`, `{node_name}-vox`)
+  function monitorableFrom(g, ownPrefix) {
+    const skip = ownPrefix ? `${ownPrefix}-` : null;
+    return g.sinks.filter((s) =>
+      s.id !== g.auto_patch_sink_id
+      && s.name !== g.auto_patch_target
+      && (!skip || !s.name.startsWith(skip))
+    );
+  }
+  const ownNodePrefix = $derived($settings?.node_name || '');
+  const monitorable = $derived($graph ? monitorableFrom($graph, ownNodePrefix) : []);
 
   // VU levels. tts/music/master_l/master_r are scalars; vox is an array
   // (one entry per slot) so the levels shape mirrors the mixer state.
@@ -54,8 +91,8 @@
       status = { text: `load error: ${e.message}`, kind: 'err' };
     }
     startLevelPoll();
-    refreshSources();
-    graphTimer = setInterval(refreshSources, GRAPH_POLL_MS);
+    refreshGraph();
+    graphTimer = setInterval(refreshGraph, GRAPH_POLL_MS);
   });
 
   onDestroy(() => {
@@ -63,11 +100,78 @@
     if (graphTimer) { clearInterval(graphTimer); graphTimer = null; }
   });
 
-  async function refreshSources() {
+  async function refreshGraph() {
+    try { await reloadGraph(); } catch {}
+  }
+
+  // Fallback restore: App.svelte kicks off the same restore at boot, but if
+  // the saved sink wasn't in the graph by then this effect will pick it up
+  // once it appears (e.g. the user plugged in headphones after launch).
+  $effect(() => {
+    const g = $graph;
+    if (!g || monitorRestored || g.monitor_sink_id != null) return;
+    const wanted = getPwMonitorPref();
+    if (!wanted) return;
+    const match = monitorableFrom(g, ownNodePrefix).find((s) => s.name === wanted);
+    if (match) {
+      monitorRestored = true;
+      startMonitor(match.id, { restore: true });
+    }
+  });
+
+  async function startMonitor(sinkId, opts = {}) {
+    monitorRestored = true;
+    const { ok, body } = await api.startMonitor(sinkId);
+    if (!ok) {
+      monitorStatus = { text: `monitor error: ${body?.error || 'unknown'}`, kind: 'err' };
+    } else {
+      const sink = ($graph?.sinks || []).find((s) => s.id === sinkId);
+      if (sink?.name) setPwMonitorPref(sink.name);
+      monitorStatus = {
+        text: opts.restore ? `restored monitor: sink #${sinkId}` : `monitoring sink #${sinkId}`,
+        kind: 'ok',
+      };
+    }
+    await reloadGraph();
+  }
+
+  async function stopMonitor() {
+    monitorRestored = true;
+    const { ok, body } = await api.stopMonitor();
+    if (!ok) {
+      monitorStatus = { text: `stop error: ${body?.error || 'unknown'}`, kind: 'err' };
+    } else {
+      setPwMonitorPref(null);
+      monitorStatus = { text: 'monitor stopped', kind: 'ok' };
+    }
+    await reloadGraph();
+  }
+
+  async function toggleBrowserMonitor(ev) {
+    const wantOn = ev.currentTarget.checked;
+    browserMonitorBusy = true;
+    browserMonitorError = '';
     try {
-      const g = await api.getGraph();
-      sources = g.sources || [];
-    } catch {}
+      if (wantOn) {
+        browserMonitor.persistPref(true);
+        await browserMonitor.start((s) => {
+          if (s.state === 'error') {
+            browserMonitorError = s.detail || 'monitor error';
+          }
+        });
+        monitorStatus = { text: 'browser monitor on', kind: 'ok' };
+      } else {
+        browserMonitor.persistPref(false);
+        await browserMonitor.stop();
+        monitorStatus = { text: 'browser monitor off', kind: 'ok' };
+      }
+    } catch (e) {
+      browserMonitor.persistPref(false);
+      browserMonitorError = e?.message || 'monitor failed';
+      monitorStatus = { text: `browser monitor: ${browserMonitorError}`, kind: 'err' };
+    } finally {
+      browserMonitorBusy = false;
+    }
   }
 
   async function routeSource(id, target) {
@@ -77,7 +181,7 @@
     } catch (e) {
       status = { text: `route failed: ${e.message}`, kind: 'err' };
     }
-    await refreshSources();
+    await refreshGraph();
   }
 
   async function unrouteSource(id) {
@@ -87,7 +191,7 @@
     } catch (e) {
       status = { text: `unroute failed: ${e.message}`, kind: 'err' };
     }
-    await refreshSources();
+    await refreshGraph();
   }
 
   function sourceLabel(s) {
@@ -459,7 +563,90 @@
     {/if}
   </div>
 
+  <section class="io-panel">
+    <div class="subhead"><span>Local monitor</span></div>
+    <div class="sink-list">
+      <label class="sink browser-monitor" title="Stream the tap into this browser tab (does not affect other clients)">
+        <input
+          type="checkbox"
+          checked={browserMonitorOn}
+          disabled={!browserMonitorSupported || browserMonitorBusy}
+          onchange={toggleBrowserMonitor}>
+        <span>Web browser (this tab)</span>
+        <span class="id">
+          {#if !browserMonitorSupported}
+            unsupported
+          {:else if browserMonitorBusy}
+            …
+          {:else if $monitorState === 'awaiting-gesture'}
+            click to start
+          {:else if browserMonitorOn}
+            listening
+          {:else}
+            off
+          {/if}
+        </span>
+      </label>
+      {#if browserMonitorError}
+        <div class="monitor-err">{browserMonitorError}</div>
+      {/if}
+
+      {#if monitorable.length === 0}
+        <div class="empty">no pipewire sinks available</div>
+      {:else}
+        {#each monitorable as s (s.id)}
+          <label class="sink">
+            <input
+              type="radio"
+              name="monitor-sink"
+              value={s.id}
+              checked={$graph?.monitor_sink_id === s.id}
+              onchange={() => startMonitor(s.id)}>
+            <span>{s.description || s.name}</span>
+            <span class="id">#{s.id}</span>
+          </label>
+        {/each}
+      {/if}
+    </div>
+    <div class="actions">
+      {#if $graph?.monitor_sink_id != null}
+        <button class="secondary" onclick={stopMonitor}>Stop pipewire monitor</button>
+      {/if}
+      <button class="secondary" onclick={refreshGraph}>Refresh</button>
+    </div>
+  </section>
+
+  <section class="io-panel">
+    <div class="subhead"><span>Input nodes</span>
+      <span class="note">routing is fixed per node — pick one in your app / Helvum</span>
+    </div>
+    <div class="sink-list">
+      <div class="sink">
+        <span><code>{$settings?.node_name || 'rpg-vox'}-music</code></span>
+        <span class="id">PA → mixed into mic feed</span>
+      </div>
+      <div class="sink">
+        <span><code>{$settings?.node_name || 'rpg-vox'}-vox</code></span>
+        <span class="id">processing tap (FX / recording)</span>
+      </div>
+    </div>
+  </section>
+
+  <section class="io-panel">
+    <div class="subhead"><span>Who's listening</span></div>
+    <div class="listeners">
+      {#if !$graph || $graph.listeners.length === 0}
+        <div class="empty">nobody</div>
+      {:else}
+        {#each $graph.listeners as l (l.id)}
+          <div class="listener">{l.description || l.name}  ·  #{l.id}</div>
+        {/each}
+      {/if}
+    </div>
+  </section>
+
   <div class="status {status.kind}">{status.text}</div>
+  <div class="status {monitorStatus.kind}">{monitorStatus.text}</div>
 </div>
 
 <style>
@@ -716,4 +903,44 @@
     color: #b7f0c4;
     border-color: rgba(46, 204, 74, 0.55);
   }
+
+  .io-panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .subhead {
+    display: flex;
+    justify-content: space-between;
+    font-weight: 600;
+    font-size: 14px;
+  }
+  .note { color: var(--muted); font-weight: 400; font-size: 12px; }
+  .actions { display: flex; gap: 8px; margin-top: 4px; }
+  .sink-list, .listeners { display: flex; flex-direction: column; gap: 4px; }
+  .sink {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 10px;
+    background: rgba(0,0,0,0.15);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 13px;
+  }
+  .sink input { width: auto; }
+  .sink .id { color: var(--muted); margin-left: auto; font-variant-numeric: tabular-nums; }
+  .listener {
+    padding: 6px 10px;
+    background: rgba(0,0,0,0.15);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-size: 13px;
+  }
+  .monitor-err { color: var(--err); font-size: 12px; padding: 2px 10px; }
 </style>

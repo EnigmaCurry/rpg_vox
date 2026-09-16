@@ -29,7 +29,6 @@ export const health       = writable('checking');   // 'checking' | 'ok' | 'err'
 ///   { active: false }
 export const recordingStatus = writable({ active: false });
 export const settings     = writable(null);
-export const workflows    = writable([]);
 export const graph        = writable(null);
 /// Currently-draining clip on the pipewire mic. Any of the play paths
 /// (SpeechInline take, user-memo button, Play All queue) sets this on
@@ -101,23 +100,8 @@ export function startRecordingPoll() {
   recordingTimer = setInterval(tick, 1000);
 }
 
-// --- Settings panel poll (only while /settings is mounted) ------------------
-let settingsTimer = null;
-export function startSettingsPoll() {
-  if (settingsTimer) return;
-  const tick = () => {
-    reloadGraph().catch(() => {});
-    reloadSettings().catch(() => {});
-  };
-  settingsTimer = setInterval(tick, 3000);
-}
-export function stopSettingsPoll() {
-  if (settingsTimer) { clearInterval(settingsTimer); settingsTimer = null; }
-}
-
 // --- Reload helpers ---------------------------------------------------------
 export async function reloadSettings()    { settings.set(await api.getSettings()); }
-export async function reloadWorkflows()   { workflows.set(await api.listWorkflows()); }
 export async function reloadGraph()       { graph.set(await api.getGraph()); }
 export async function reloadScript(id)    { script.set(await api.getScript(id)); }
 export async function reloadScripts()     { scripts.set(await api.listScripts()); }

@@ -16,11 +16,11 @@
         { href: '#/dictionary', label: 'Dictionary', match: (r) => r === '/dictionary' },
         { href: '#/scenes',     label: 'Scenes',     match: (r) => r === '/scenes' || r === '/speak' },
         { href: '#/script',     label: 'Scripts',    match: (r) => r === '/script' || r === '/chat' || r.startsWith('/script/') || r.startsWith('/chat/') },
+        { href: '#/settings',   label: 'Settings',   match: (r) => r === '/settings' },
       ],
     },
     { href: '#/mixer',    label: 'Mixer',    match: (r) => r === '/mixer' },
     { href: '#/record',   label: 'Record',   match: (r) => r === '/record' },
-    { href: '#/settings', label: 'Settings', match: (r) => r === '/settings' },
   ];
 
   // A parent is "active" when any of its children match — so the Project

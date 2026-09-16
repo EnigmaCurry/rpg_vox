@@ -1,7 +1,12 @@
 <script>
   import { onMount } from 'svelte';
   import { route } from './lib/router.js';
-  import { startHealthPoll, startRecordingPoll, restorePwMonitorFromPref } from './lib/stores.js';
+  import {
+    startHealthPoll,
+    startRecordingPoll,
+    reloadSettings,
+    restorePwMonitorFromPref,
+  } from './lib/stores.js';
   import { restoreFromPref as restoreBrowserMonitor } from './lib/browserMonitor.js';
   import Menubar from './components/Menubar.svelte';
   import Projects from './routes/Projects.svelte';
@@ -59,6 +64,12 @@
   onMount(() => {
     startHealthPoll();
     startRecordingPoll();
+    // Prime the settings store so `$settings.node_name` is populated for
+    // pages that reference it (Mixer's Input Nodes labels, etc.). Static
+    // after startup, so no polling needed.
+    reloadSettings().catch((err) => {
+      console.warn('[settings] initial load failed', err);
+    });
     // Auto-restore the browser monitor if the user had it enabled in a
     // previous session. Deferred to the first user gesture inside the
     // helper if the browser blocks AudioContext creation.
