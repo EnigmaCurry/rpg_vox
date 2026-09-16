@@ -985,6 +985,14 @@ pub async fn serve(
             post(record_saved_paragraph_edit_handler),
         )
         .route(
+            "/record/paragraphs/:paragraph_id",
+            axum::routing::delete(record_live_paragraph_delete_handler),
+        )
+        .route(
+            "/record/recordings/:id/paragraphs/:paragraph_id",
+            axum::routing::delete(record_saved_paragraph_delete_handler),
+        )
+        .route(
             "/record/buffer",
             axum::routing::delete(record_buffer_clear_handler),
         )
@@ -4665,6 +4673,49 @@ async fn record_saved_paragraph_edit_handler(
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("add paragraph edit: {err:#}"),
+        )
+            .into_response(),
+    }
+}
+
+/// Soft-delete a paragraph in the live state (channel log + active
+/// recording). 404 when the id doesn't match a live paragraph — the
+/// caller should try the saved-recording endpoint instead.
+async fn record_live_paragraph_delete_handler(
+    State(state): State<AppState>,
+    Path(paragraph_id): Path<String>,
+) -> Response {
+    if state.record.delete_paragraph(&paragraph_id) {
+        (
+            StatusCode::OK,
+            Json(ActionResponse { ok: true, error: None }),
+        )
+            .into_response()
+    } else {
+        (StatusCode::NOT_FOUND, "no such live paragraph").into_response()
+    }
+}
+
+/// Soft-delete a paragraph inside a saved recording. Persists to
+/// sqlite.
+async fn record_saved_paragraph_delete_handler(
+    State(state): State<AppState>,
+    Path((recording_id, paragraph_id)): Path<(String, String)>,
+) -> Response {
+    match state
+        .store
+        .delete_recording_paragraph(recording_id, paragraph_id)
+        .await
+    {
+        Ok(true) => (
+            StatusCode::OK,
+            Json(ActionResponse { ok: true, error: None }),
+        )
+            .into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "no such recording or paragraph").into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("delete paragraph: {err:#}"),
         )
             .into_response(),
     }

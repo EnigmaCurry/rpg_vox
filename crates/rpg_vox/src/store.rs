@@ -2283,6 +2283,59 @@ impl Store {
         .context("db task panicked")?
     }
 
+    /// Soft-delete a paragraph inside a saved recording. Walks the
+    /// paragraphs JSON to find the matching id, sets `deleted: true`,
+    /// and writes back. Returns `Ok(true)` on hit, `Ok(false)` when
+    /// the paragraph (or the recording) doesn't exist.
+    pub async fn delete_recording_paragraph(
+        &self,
+        recording_id: String,
+        paragraph_id: String,
+    ) -> Result<bool> {
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || -> Result<bool> {
+            let conn = db.lock().unwrap();
+            let raw: Option<String> = conn
+                .query_row(
+                    "SELECT paragraphs FROM recordings WHERE id = ?1",
+                    params![recording_id],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?;
+            let Some(raw) = raw else { return Ok(false) };
+            let mut paragraphs: Vec<serde_json::Value> = serde_json::from_str(&raw)
+                .context("parsing recording paragraphs JSON")?;
+            let mut hit = false;
+            for p in paragraphs.iter_mut() {
+                let matches = p
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s == paragraph_id)
+                    .unwrap_or(false);
+                if !matches {
+                    continue;
+                }
+                if let Some(obj) = p.as_object_mut() {
+                    obj.insert("deleted".to_string(), serde_json::Value::Bool(true));
+                    hit = true;
+                }
+                break;
+            }
+            if !hit {
+                return Ok(false);
+            }
+            let updated = serde_json::to_string(&paragraphs)
+                .context("serializing updated paragraphs")?;
+            conn.execute(
+                "UPDATE recordings SET paragraphs = ?2 WHERE id = ?1",
+                params![recording_id, updated],
+            )?;
+            Ok(true)
+        })
+        .await
+        .context("db task panicked")?
+    }
+
     pub async fn delete_recording(&self, id: String) -> Result<UpdateResult> {
         let db = self.db.clone();
         let id_clone = id.clone();

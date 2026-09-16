@@ -159,6 +159,7 @@
     if (nowTimer) { clearInterval(nowTimer); nowTimer = null; }
     if (rafId) { cancelAnimationFrame(rafId); rafId = 0; }
     if (flashClearTimer) { clearTimeout(flashClearTimer); flashClearTimer = 0; }
+    if (trashArmTimer) { clearTimeout(trashArmTimer); trashArmTimer = 0; }
   });
 
   async function refresh() {
@@ -401,9 +402,9 @@
   }
 
   function computeClusters(paragraphs, canonical = []) {
-    const sorted = [...(paragraphs ?? [])].sort(
-      (a, b) => (a.start_wall_ms ?? 0) - (b.start_wall_ms ?? 0),
-    );
+    const sorted = [...(paragraphs ?? [])]
+      .filter((p) => !p?.deleted)
+      .sort((a, b) => (a.start_wall_ms ?? 0) - (b.start_wall_ms ?? 0));
     const rows = [];
     let cluster = [];
     let clusterEnd = 0;
@@ -1101,7 +1102,31 @@
         return;
       }
       selTool.visible = false;
-      const host = ev.target?.closest?.('.paragraph-text, .clip-cell-text');
+      // Widen the click target: anywhere inside a .paragraph-block,
+      // .clip-cell-block, or the surrounding cluster padding counts
+      // as "clicked this paragraph/clip", except when the click
+      // landed on an interactive descendant (buttons, links, form
+      // controls) which own their own handling. If the direct target
+      // isn't a text host, we fish it out of successively wider
+      // enclosing wrappers, and only accept a wrapper that contains
+      // an unambiguous single text host (so split clusters with
+      // multiple paragraphs stay quiet on their shared padding).
+      let host = ev.target?.closest?.('.paragraph-text, .clip-cell-text');
+      if (!host && !ev.target?.closest?.('button, a, input, textarea, select, label, .entry-avatar, .clip-tick')) {
+        const scopes = [
+          ev.target?.closest?.('.paragraph-block, .clip-cell-block'),
+          ev.target?.closest?.('.cluster'),
+          ev.target?.closest?.('ol.clusters > li'),
+        ];
+        for (const scope of scopes) {
+          if (!scope) continue;
+          const hosts = scope.querySelectorAll('.paragraph-text, .clip-cell-text');
+          if (hosts.length === 1) {
+            host = hosts[0];
+            break;
+          }
+        }
+      }
       if (host && host.dataset.toolKey) {
         inlineTool.key = host.dataset.toolKey;
         // Prefer the currently-rendered text (which reflects any prior
@@ -1110,16 +1135,39 @@
         // of a previously-edited paragraph then targets the visible
         // replacement rather than the untouched original.
         inlineTool.text = host.textContent ?? host.dataset.toolText ?? '';
+        // Auto-copy on single click — the toolbar stays visible so the
+        // user can still hit Edit/Trash afterwards.
+        autoCopyOnClick(inlineTool.text, inlineTool.key);
       } else {
         inlineTool.key = null;
       }
     });
   }
 
+  // Fire-and-forget clipboard write + flash indicator triggered by a
+  // background click on a paragraph/clip block. Separated from the
+  // toolbar's Copy button so the toolbar remains visible after the
+  // auto-copy (the button-driven copy dismisses the toolbar).
+  async function autoCopyOnClick(text, key) {
+    if (!text || !key) return;
+    try {
+      await navigator.clipboard.writeText(text);
+      flashKey = key;
+      if (flashClearTimer) clearTimeout(flashClearTimer);
+      flashClearTimer = setTimeout(() => {
+        flashKey = null;
+        flashClearTimer = 0;
+      }, FLASH_MS);
+    } catch (e) {
+      err = `copy failed: ${e.message}`;
+    }
+  }
+
   function onDocMouseDown(ev) {
     if (ev.target?.closest?.(TOOLBAR_SEL)) return;
     selTool.visible = false;
     inlineTool.key = null;
+    clearTrashArm();
   }
 
   $effect(() => {
@@ -1132,6 +1180,7 @@
   });
 
   async function selToolCopy() {
+    clearTrashArm();
     const hostKey = selTool.hostKey;
     try {
       await navigator.clipboard.writeText(selTool.text);
@@ -1151,6 +1200,7 @@
   }
 
   function selToolEdit() {
+    clearTrashArm();
     const sel = window.getSelection?.();
     if (!sel || sel.rangeCount === 0) { selTool.visible = false; return; }
     const range = sel.getRangeAt(0);
@@ -1191,6 +1241,7 @@
   }
 
   async function inlineToolCopy() {
+    clearTrashArm();
     const key = inlineTool.key;
     try {
       await navigator.clipboard.writeText(inlineTool.text);
@@ -1206,7 +1257,117 @@
     inlineTool.key = null;
   }
 
+  // Two-click confirm state for the destructive trash actions. Any
+  // action taken while `trashArmed === scope` executes the delete;
+  // otherwise the first click arms the button and a 2-second timer
+  // resets it. `scope` is 'sel' for the floating selection toolbar,
+  // 'inline' for the paragraph-scoped inline toolbar.
+  let trashArmed = $state(null);
+  let trashArmTimer = 0;
+  const TRASH_ARM_MS = 2000;
+  function armTrash(scope) {
+    trashArmed = scope;
+    if (trashArmTimer) clearTimeout(trashArmTimer);
+    trashArmTimer = setTimeout(() => {
+      trashArmed = null;
+      trashArmTimer = 0;
+    }, TRASH_ARM_MS);
+  }
+  function clearTrashArm() {
+    trashArmed = null;
+    if (trashArmTimer) { clearTimeout(trashArmTimer); trashArmTimer = 0; }
+  }
+
+  // Delete a selection: send an edit with an empty replacement, which
+  // the substring-replace renderer then applies as a straight
+  // deletion. Reuses the same overlay endpoint so history / undelete
+  // remain uniform. Two-click confirm.
+  async function selToolTrash() {
+    if (trashArmed !== 'sel') {
+      armTrash('sel');
+      return;
+    }
+    clearTrashArm();
+    const hostKey = selTool.hostKey;
+    const excerpt = selTool.text;
+    if (!excerpt) { selTool.visible = false; return; }
+    // Resolve the paragraph id via the DOM (the host that owns the
+    // selection). Prefer the live selection; fall back to a lookup by
+    // stashed hostKey when it's been cleared.
+    let paragraphId = null;
+    const sel = window.getSelection?.();
+    if (sel && sel.rangeCount > 0) {
+      const anchor = sel.anchorNode;
+      let el = anchor?.nodeType === 3 ? anchor.parentElement : anchor;
+      while (el) {
+        if (el.classList?.contains?.('paragraph-text')) {
+          paragraphId = el.dataset?.paragraphId ?? null;
+          break;
+        }
+        if (el.classList?.contains?.('clip-cell-text')) {
+          paragraphId = el.closest?.('.clip-cell-row')?.dataset?.paragraphId ?? null;
+          break;
+        }
+        el = el.parentElement;
+      }
+    }
+    if (!paragraphId && hostKey) {
+      const host = document.querySelector(`[data-tool-key="${cssEscape(hostKey)}"]`);
+      paragraphId = host?.classList?.contains?.('paragraph-text')
+        ? host?.dataset?.paragraphId
+        : host?.closest?.('.clip-cell-row')?.dataset?.paragraphId;
+    }
+    selTool.visible = false;
+    window.getSelection?.()?.removeAllRanges();
+    if (!paragraphId) return;
+    try {
+      const savedId =
+        selected !== 'live' && selected !== 'active' ? selectedSaved?.id ?? null : null;
+      if (savedId) {
+        await api.addSavedParagraphEdit(savedId, paragraphId, excerpt, '');
+      } else {
+        await api.addLiveParagraphEdit(paragraphId, excerpt, '');
+      }
+      await refresh().catch(() => {});
+    } catch (e) {
+      err = `delete failed: ${e.message}`;
+    }
+  }
+
+  // Delete a whole paragraph (and its container in the log view).
+  // Two-click confirm. Uses the DELETE endpoint which flips
+  // `paragraph.deleted = true` on the backend; the client filters
+  // deleted paragraphs out of `computeClusters` so the row vanishes.
+  async function inlineToolTrash() {
+    if (trashArmed !== 'inline') {
+      armTrash('inline');
+      return;
+    }
+    clearTrashArm();
+    const key = inlineTool.key;
+    if (!key) return;
+    const host = document.querySelector(`[data-tool-key="${cssEscape(key)}"]`);
+    const paragraphId = host?.classList?.contains?.('paragraph-text')
+      ? host?.dataset?.paragraphId
+      : host?.closest?.('.clip-cell-row')?.dataset?.paragraphId;
+    inlineTool.key = null;
+    if (!paragraphId) return;
+    try {
+      const savedId =
+        selected !== 'live' && selected !== 'active' ? selectedSaved?.id ?? null : null;
+      if (savedId) {
+        await api.deleteSavedParagraph(savedId, paragraphId);
+      } else {
+        await api.deleteLiveParagraph(paragraphId);
+      }
+      await refresh().catch(() => {});
+    } catch (e) {
+      err = `delete failed: ${e.message}`;
+    }
+  }
+
   function inlineToolEdit() {
+    clearTrashArm();
     const key = inlineTool.key;
     const excerpt = inlineTool.text;
     if (!key || !excerpt) { inlineTool.key = null; return; }
@@ -1701,6 +1862,22 @@
         <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path>
       </svg>
     </button>
+    <button
+      type="button"
+      class="sel-btn trash-btn"
+      class:armed={trashArmed === 'inline'}
+      title={trashArmed === 'inline' ? 'Click again to delete paragraph' : 'Delete paragraph'}
+      aria-label={trashArmed === 'inline' ? 'Confirm delete paragraph' : 'Delete paragraph'}
+      onclick={inlineToolTrash}
+    >
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <polyline points="3 6 5 6 21 6"></polyline>
+        <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"></path>
+        <path d="M10 11v6"></path>
+        <path d="M14 11v6"></path>
+        <path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"></path>
+      </svg>
+    </button>
   </span>
 {/snippet}
 
@@ -2129,6 +2306,22 @@
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
         <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path>
         <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path>
+      </svg>
+    </button>
+    <button
+      type="button"
+      class="sel-btn trash-btn"
+      class:armed={trashArmed === 'sel'}
+      title={trashArmed === 'sel' ? 'Click again to delete selection' : 'Delete selection'}
+      aria-label={trashArmed === 'sel' ? 'Confirm delete selection' : 'Delete selection'}
+      onclick={selToolTrash}
+    >
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <polyline points="3 6 5 6 21 6"></polyline>
+        <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"></path>
+        <path d="M10 11v6"></path>
+        <path d="M14 11v6"></path>
+        <path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"></path>
       </svg>
     </button>
   </div>
@@ -3004,6 +3197,23 @@
   .sel-btn:hover {
     background: rgba(122,162,255,0.16);
     color: var(--accent);
+  }
+  /* Destructive action — trash icon is always red-tinted; when armed
+     (first click waiting for the second-click confirm), it flips to
+     a solid red backdrop so the user sees the confirm mode. */
+  .trash-btn {
+    color: rgb(230, 120, 120);
+  }
+  .trash-btn:hover:not(:disabled) {
+    background: rgba(230, 120, 120, 0.16);
+    color: rgb(250, 150, 150);
+  }
+  .trash-btn.armed {
+    background: rgba(230, 60, 60, 0.85);
+    color: #fff;
+  }
+  .trash-btn.armed:hover {
+    background: rgba(230, 60, 60, 1);
   }
 
   /* Inline variant shown at the end of a paragraph or clip text when

@@ -296,6 +296,12 @@ pub struct Paragraph {
     /// transcription. See [`ParagraphEdit`] for the semantics.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub edits: Vec<ParagraphEdit>,
+    /// Soft-delete flag set by the trash-can affordance in the UI.
+    /// The paragraph stays in the underlying store (so an undelete
+    /// path is trivially available later), but the client skips it
+    /// when rendering the transcript log.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub deleted: bool,
 }
 
 impl Paragraph {
@@ -1610,6 +1616,35 @@ impl RecordState {
         if hit { Some(edit) } else { None }
     }
 
+    /// Soft-delete a paragraph — flip its `deleted` flag in both the
+    /// per-channel log and the active recording (if present). Returns
+    /// `true` when a matching paragraph was found. Existing edits and
+    /// clip references are preserved so an undelete path is a
+    /// straightforward flip.
+    pub fn delete_paragraph(&self, paragraph_id: &str) -> bool {
+        let mut g = self.inner.lock().expect("record state mutex poisoned");
+        let mut hit = false;
+        for ch in g.channels.iter_mut() {
+            for p in ch.paragraphs.iter_mut() {
+                if p.id == paragraph_id {
+                    p.deleted = true;
+                    hit = true;
+                    break;
+                }
+            }
+        }
+        if let Some(active) = g.active.as_mut() {
+            for p in active.paragraphs.iter_mut() {
+                if p.id == paragraph_id {
+                    p.deleted = true;
+                    hit = true;
+                    break;
+                }
+            }
+        }
+        hit
+    }
+
     /// Rename the in-flight recording if `id` matches the active one.
     /// Returns `true` when the rename landed, `false` when nothing was
     /// active or the id didn't match — the HTTP handler then falls
@@ -1970,6 +2005,7 @@ impl RecordState {
             pass3_inflight: false,
             closed: false,
             edits: Vec::new(),
+            deleted: false,
         };
         let mut g = self.inner.lock().expect("record state mutex poisoned");
         if let Some(ch) = g.channel_mut(ChannelKind::Tts) {
@@ -2939,6 +2975,7 @@ fn upsert_clip_into_channel(
             pass3_inflight: false,
             closed: false,
             edits: Vec::new(),
+            deleted: false,
         };
         paragraph.rebuild();
         ch.paragraphs.push(paragraph.clone());

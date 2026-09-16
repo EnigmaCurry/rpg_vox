@@ -1031,6 +1031,31 @@ export async function addSavedParagraphEdit(recordingId, paragraphId, original, 
   return await r.json();
 }
 
+/// Soft-delete a paragraph in the live state (channel log + active
+/// recording).
+export async function deleteLiveParagraph(paragraphId) {
+  const r = await fetch(
+    `/record/paragraphs/${encodeURIComponent(paragraphId)}`,
+    { method: 'DELETE' },
+  );
+  if (!r.ok) {
+    const detail = await r.text().catch(() => `HTTP ${r.status}`);
+    throw new Error(detail || `HTTP ${r.status}`);
+  }
+}
+
+/// Soft-delete a paragraph inside a saved recording.
+export async function deleteSavedParagraph(recordingId, paragraphId) {
+  const r = await fetch(
+    `/record/recordings/${encodeURIComponent(recordingId)}/paragraphs/${encodeURIComponent(paragraphId)}`,
+    { method: 'DELETE' },
+  );
+  if (!r.ok) {
+    const detail = await r.text().catch(() => `HTTP ${r.status}`);
+    throw new Error(detail || `HTTP ${r.status}`);
+  }
+}
+
 /// Absolute URL for a sub-range of a recording, encoded as a mini WAV.
 /// The endpoint transparently reads from RAM when `id` matches the
 /// currently-active in-flight recording (so mid-record utterance playback
