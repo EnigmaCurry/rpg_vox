@@ -1,4 +1,4 @@
-import { writable } from 'svelte/store';
+import { writable, derived } from 'svelte/store';
 import * as api from './api.js';
 
 // localStorage key for the saved pipewire monitor sink. Colocated here (not
@@ -50,20 +50,79 @@ export const scripts      = writable([]);
 /// route re-mounts don't refetch (turns won't disappear behind the user's back).
 export const script       = writable(null);
 
-// --- Health poll (started once from App) ------------------------------------
+// --- Health + ping poll (started once from App) -----------------------------
+//
+// One /healthz probe drives both the online/offline indicator and the ping
+// meter — no need to double the request rate. The ping side feeds the
+// browser-monitor auto-pause: if the rolling average RTT stays above
+// PING_DISABLE_MS for PING_BAD_STREAK consecutive samples, `pingBad`
+// flips true and the Web Monitor stops until the link recovers, without
+// touching the user's pref.
+export const PING_INTERVAL_MS = 2000;
+export const PING_HISTORY = 5;
+export const PING_DISABLE_MS = 500;
+export const PING_BAD_STREAK = 3;
+
+const pingHistory = [];
+let pingBadStreak = 0;
+
+export const pingStats = writable({
+  lastMs: 0,
+  avgMs: 0,
+  sampled: false,
+  err: false,
+  badStreak: 0,
+});
+
+export const pingBad = derived(
+  pingStats,
+  (s) => s.sampled && s.badStreak >= PING_BAD_STREAK,
+);
+
+function recordPingOk(rtt) {
+  pingHistory.push(rtt);
+  while (pingHistory.length > PING_HISTORY) pingHistory.shift();
+  const avg = pingHistory.reduce((a, b) => a + b, 0) / pingHistory.length;
+  if (avg > PING_DISABLE_MS) pingBadStreak++;
+  else pingBadStreak = 0;
+  pingStats.set({
+    lastMs: rtt,
+    avgMs: avg,
+    sampled: true,
+    err: false,
+    badStreak: pingBadStreak,
+  });
+}
+
+function recordPingErr() {
+  // Total failure is at least as bad as high latency — count it toward the
+  // streak so persistent /healthz failures also trip the auto-pause path.
+  pingBadStreak++;
+  pingStats.update((s) => ({ ...s, sampled: true, err: true, badStreak: pingBadStreak }));
+}
+
 let healthTimer = null;
 export function startHealthPoll() {
   if (healthTimer) return;
   const tick = async () => {
+    const t0 = performance.now();
     try {
-      const r = await fetch('/healthz');
-      health.set(r.ok ? 'ok' : 'err');
+      const r = await fetch('/healthz', { cache: 'no-store' });
+      const rtt = performance.now() - t0;
+      if (r.ok) {
+        health.set('ok');
+        recordPingOk(rtt);
+      } else {
+        health.set('err');
+        recordPingErr();
+      }
     } catch {
       health.set('err');
+      recordPingErr();
     }
   };
   tick();
-  healthTimer = setInterval(tick, 5000);
+  healthTimer = setInterval(tick, PING_INTERVAL_MS);
 }
 
 // --- Recording status poll (started once from App) --------------------------

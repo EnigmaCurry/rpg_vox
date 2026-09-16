@@ -1,6 +1,6 @@
 <script>
-  import { health, recordingStatus } from '../lib/stores.js';
-  import { monitorState } from '../lib/browserMonitor.js';
+  import { health, recordingStatus, pingStats, pingBad } from '../lib/stores.js';
+  import { monitorState, monitorPref } from '../lib/browserMonitor.js';
 
   const label = $derived({ checking: 'checking…', ok: 'online', err: 'offline' }[$health] || '');
   // Only decorate with "streaming" when the app is healthy AND the browser
@@ -8,6 +8,25 @@
   // monitor state ('connecting', 'error', 'stopped') is quiet — no need to
   // clutter the menubar with transient states.
   const streaming = $derived($health === 'ok' && $monitorState === 'listening');
+  // Auto-paused because the ping meter tripped. Shown to the user as a
+  // yellow "LAGGING Xms" so they know why the browser monitor went silent
+  // — the pref is still on and we'll auto-resume when the link recovers.
+  const lagging = $derived(
+    $monitorPref && ($monitorState === 'latency-paused' || ($pingBad && $health === 'ok'))
+  );
+  // Tooltip text for the "streaming" decorator — pulls from the live ping
+  // store so hovering always shows the most recent measurement, not stale
+  // data captured at mount time.
+  const streamingTitle = $derived(
+    $pingStats.sampled
+      ? ($pingStats.err
+          ? 'streaming — /healthz not responding'
+          : `streaming — ping ${$pingStats.lastMs.toFixed(0)} ms (avg ${$pingStats.avgMs.toFixed(0)} ms)`)
+      : 'streaming'
+  );
+  const laggingMs = $derived(
+    $pingStats.sampled && !$pingStats.err ? Math.round($pingStats.avgMs) : null
+  );
 
   // When a recording is active, the health chip is replaced by a red
   // pulsing dot + "RECORDING" + running duration (hh:mm). Tracks the
@@ -52,7 +71,7 @@
   </a>
 {:else}
   <span class="health {$health}">
-    {label}{#if streaming}<span class="streaming"> · streaming</span>{/if}
+    {label}{#if lagging}<span class="lagging" title="Web Monitor auto-paused — waiting for ping to recover"> · LAGGING{#if laggingMs != null} {laggingMs}ms{:else if $pingStats.err} · no response{/if}</span>{:else if streaming}<span class="streaming" title={streamingTitle}> · streaming</span>{/if}
   </span>
 {/if}
 
@@ -66,6 +85,16 @@
   .streaming {
     color: var(--accent);
     font-weight: 500;
+  }
+  /* Auto-paused because ping crossed the threshold. Yellow so it reads as
+     a warning (not an error, since the pref is still on and we'll come
+     back automatically) and tabular-nums keeps the ms figure from jittering
+     the header width as the value updates every ~2 s. */
+  .lagging {
+    color: #e0b400;
+    font-weight: 600;
+    letter-spacing: 0.03em;
+    font-variant-numeric: tabular-nums;
   }
 
   .recording {

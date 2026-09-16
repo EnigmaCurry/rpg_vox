@@ -9,7 +9,14 @@
     setPwMonitorPref,
   } from '../lib/stores.js';
   import * as browserMonitor from '../lib/browserMonitor.js';
-  import { monitorState } from '../lib/browserMonitor.js';
+  import { monitorState, monitorStats, monitorPref } from '../lib/browserMonitor.js';
+  import {
+    pingStats,
+    pingBad,
+    PING_DISABLE_MS,
+    PING_BAD_STREAK,
+    PING_INTERVAL_MS,
+  } from '../lib/stores.js';
 
   // Mixer state mirror. Populated from GET /mixer on mount; every knob
   // change PUTs a partial patch and adopts the server's echoed snapshot.
@@ -34,11 +41,10 @@
   let browserMonitorBusy = $state(false);
   let browserMonitorError = $state('');
   const browserMonitorSupported = browserMonitor.isSupported();
-  const browserMonitorOn = $derived(
-    $monitorState === 'listening'
-      || $monitorState === 'connecting'
-      || $monitorState === 'awaiting-gesture',
-  );
+  // "Latency paused" = the monitor is auto-paused by the global ping
+  // subscription in browserMonitor.js. Derived here for message text; the
+  // pref (user intent) stays on throughout, so the checkbox stays checked.
+  const latencyPaused = $derived($monitorState === 'latency-paused' || ($monitorPref && $pingBad));
 
   // Sinks the user might reasonably want to monitor rpg_vox with. Excludes:
   //   * the auto-patch target (we're already routing to it)
@@ -154,19 +160,27 @@
     try {
       if (wantOn) {
         browserMonitor.persistPref(true);
-        await browserMonitor.start((s) => {
-          if (s.state === 'error') {
-            browserMonitorError = s.detail || 'monitor error';
-          }
-        });
-        monitorStatus = { text: 'browser monitor on', kind: 'ok' };
+        if ($pingBad) {
+          // Pref is now on; the global pingBad subscription will fire
+          // start() when latency recovers. Don't start now — the buffer
+          // can't hide the current RTT.
+          monitorStatus = { text: 'browser monitor queued — waiting for latency to recover', kind: 'ok' };
+        } else {
+          await browserMonitor.start((s) => {
+            if (s.state === 'error') {
+              browserMonitorError = s.detail || 'monitor error';
+            }
+          });
+          monitorStatus = { text: 'browser monitor on', kind: 'ok' };
+        }
       } else {
         browserMonitor.persistPref(false);
         await browserMonitor.stop();
         monitorStatus = { text: 'browser monitor off', kind: 'ok' };
       }
     } catch (e) {
-      browserMonitor.persistPref(false);
+      // Keep the pref set — user intent survives a transient start
+      // failure. The pingBad subscribe / next reload will retry.
       browserMonitorError = e?.message || 'monitor failed';
       monitorStatus = { text: `browser monitor: ${browserMonitorError}`, kind: 'err' };
     } finally {
@@ -571,7 +585,7 @@
       <label class="sink browser-monitor" title="Stream the tap into this browser tab (does not affect other clients)">
         <input
           type="checkbox"
-          checked={browserMonitorOn}
+          checked={$monitorPref}
           disabled={!browserMonitorSupported || browserMonitorBusy}
           onchange={toggleBrowserMonitor}>
         <span>Web browser (this tab)</span>
@@ -580,10 +594,16 @@
             unsupported
           {:else if browserMonitorBusy}
             …
+          {:else if latencyPaused}
+            paused — high latency
           {:else if $monitorState === 'awaiting-gesture'}
             click to start
-          {:else if browserMonitorOn}
+          {:else if $monitorState === 'listening'}
             listening
+          {:else if $monitorState === 'connecting'}
+            connecting…
+          {:else if $monitorPref}
+            starting…
           {:else}
             off
           {/if}
@@ -592,6 +612,33 @@
       {#if browserMonitorError}
         <div class="monitor-err">{browserMonitorError}</div>
       {/if}
+      {#if latencyPaused}
+        <div class="monitor-err">
+          {#if $pingStats.err}
+            no response from server — Web Monitor paused; will resume when the connection recovers
+          {:else}
+            sustained latency too high (avg {$pingStats.avgMs.toFixed(0)} ms &gt; {PING_DISABLE_MS} ms) — Web Monitor paused; will resume when the connection improves
+          {/if}
+        </div>
+      {/if}
+      {#if $monitorState !== 'stopped' && !latencyPaused}
+        <div class="monitor-stats" title="Web monitor buffer diagnostics — depth is the current worklet ring backlog; target adapts up on underrun and decays back on quiet; catch-ups count how many times we skipped forward to stay in sync with real-time">
+          depth {$monitorStats.depthMs.toFixed(0)} ms
+          · target {$monitorStats.targetMs.toFixed(0)} ms
+          · peak {$monitorStats.peakMs.toFixed(0)} ms
+          · catch-ups {$monitorStats.catchupEvents}{#if $monitorStats.catchupEvents > 0} ({$monitorStats.catchupDroppedMs.toFixed(0)} ms dropped){/if}
+          · underruns {$monitorStats.underrunBlocks}
+        </div>
+      {/if}
+      <div class="monitor-stats" class:err={$pingBad} title="HTTP round-trip to /healthz — probed globally every {(PING_INTERVAL_MS / 1000).toFixed(0)} s. Web Monitor auto-pauses once the rolling average stays above {PING_DISABLE_MS} ms for {PING_BAD_STREAK} samples in a row (~{(PING_BAD_STREAK * PING_INTERVAL_MS / 1000).toFixed(0)} s), and auto-resumes once it recovers.">
+        {#if !$pingStats.sampled}
+          ping …
+        {:else if $pingStats.err}
+          ping · no response
+        {:else}
+          ping {$pingStats.lastMs.toFixed(0)} ms (avg {$pingStats.avgMs.toFixed(0)} ms)
+        {/if}
+      </div>
     </div>
   </section>
 
@@ -952,4 +999,6 @@
     font-size: 13px;
   }
   .monitor-err { color: var(--err); font-size: 12px; padding: 2px 10px; }
+  .monitor-stats { color: var(--muted); font-size: 11px; padding: 2px 10px; font-variant-numeric: tabular-nums; }
+  .monitor-stats.err { color: var(--err); }
 </style>

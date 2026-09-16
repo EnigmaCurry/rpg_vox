@@ -15,8 +15,9 @@
 // Web Codecs AudioDecoder is required (Chrome 94+, Firefox 130+, Safari
 // 16.4+). `isSupported()` lets callers gate the UI without racing on start.
 
-import { writable } from 'svelte/store';
+import { writable, get } from 'svelte/store';
 import workletUrl from './monitor-player.worklet.js?url';
+import { pingBad } from './stores.js';
 
 const OPUS_SAMPLE_RATE = 48000;
 const FRAME_DURATION_US = 20_000; // 20 ms per Opus frame the server sends
@@ -50,14 +51,43 @@ let onStatus = null;
 /// Reactive state for the monitor. Written whenever the socket / decoder
 /// transitions so shared UI (HealthDot, Settings, Menubar) can observe
 /// without wiring up its own status callback. Values:
-///   'stopped'          — nothing running
+///   'stopped'          — nothing running (user turned it off)
 ///   'connecting'       — start() in flight (or WS opening)
 ///   'listening'        — WS open AND AudioContext running
 ///   'awaiting-gesture' — WS open but AudioContext still suspended;
 ///                        needs a user click/keydown to resume. UI can
 ///                        surface a prompt in this state.
+///   'latency-paused'   — auto-paused because average RTT crossed the
+///                        `pingBad` threshold. The user's pref is preserved
+///                        and we'll auto-resume when latency recovers.
 ///   'error'            — WS or decoder failed
 export const monitorState = writable('stopped');
+
+/// User intent (persisted to localStorage). Separate from `monitorState`
+/// because the runtime state can transiently be `stopped`/`latency-paused`
+/// while the user still wants the monitor on — the checkbox should stay
+/// checked in those cases so the UI reflects intent, not incidental
+/// runtime state.
+export const monitorPref = writable(readPrefRaw());
+function readPrefRaw() {
+  try { return localStorage.getItem(PREF_KEY) === 'on'; } catch { return false; }
+}
+
+/// Live buffer diagnostics from the AudioWorklet — depth in ms tells you
+/// whether we're accumulating a backlog somewhere upstream, catch-up
+/// counters tell you how many times the worklet had to skip forward to
+/// stay in sync. Emitted roughly every 250 ms while the context is
+/// running; frozen (not zeroed) while suspended so the last-known values
+/// remain visible.
+const EMPTY_STATS = Object.freeze({
+  depthMs: 0,
+  peakMs: 0,
+  targetMs: 0,
+  underrunBlocks: 0,
+  catchupEvents: 0,
+  catchupDroppedMs: 0,
+});
+export const monitorStats = writable(EMPTY_STATS);
 
 // Session-scoped latch: once the user has performed the gesture that
 // unlocked Web Audio, browsers remember that for the rest of the tab's
@@ -94,22 +124,20 @@ function onCtxStateChange() {
 }
 
 /// Persist the desired on/off state so the monitor auto-restores on the
-/// next page load. Called from the toggle handler in Settings, not from
-/// start/stop directly — that way an involuntary stop (server closed the
-/// socket, decoder error) doesn't clear the user's intent.
+/// next page load. Called from the toggle handler, not from start/stop
+/// directly — an involuntary stop (server closed the socket, decoder
+/// error, ping-bad auto-pause) must not clear the user's intent. Also
+/// pushes into the reactive `monitorPref` store so bound UI updates.
 export function persistPref(on) {
   try {
     if (on) localStorage.setItem(PREF_KEY, 'on');
     else localStorage.removeItem(PREF_KEY);
   } catch {}
+  monitorPref.set(!!on);
 }
 
 function readPref() {
-  try {
-    return localStorage.getItem(PREF_KEY) === 'on';
-  } catch {
-    return false;
-  }
+  return readPrefRaw();
 }
 
 /// Called once on app load. If the user previously turned the monitor on,
@@ -244,6 +272,20 @@ export async function start(statusCb) {
       numberOfOutputs: 1,
       outputChannelCount: [2],
     });
+    monitorStats.set(EMPTY_STATS);
+    node.port.onmessage = (ev) => {
+      const msg = ev.data;
+      if (msg?.type !== 'stats') return;
+      const rate = ctx?.sampleRate || OPUS_SAMPLE_RATE;
+      monitorStats.set({
+        depthMs: (msg.depthFrames / rate) * 1000,
+        peakMs: (msg.peakFrames / rate) * 1000,
+        targetMs: (msg.targetFrames / rate) * 1000,
+        underrunBlocks: msg.underrunBlocks,
+        catchupEvents: msg.catchupEvents,
+        catchupDroppedMs: (msg.catchupDroppedFrames / rate) * 1000,
+      });
+    };
     // Route through a MediaStream + `<audio>` element (with an explicit
     // `title`) instead of `ctx.destination`. See MONITOR_STREAM_TITLE above.
     // The <audio> is kept in the DOM (display: none) because some browsers
@@ -346,7 +388,11 @@ export async function start(statusCb) {
   }
 }
 
-export async function stop() {
+/// Tear down all runtime resources without touching the state store. The
+/// two entry points that need this — `stop()` (user turned it off) and
+/// the latency-pause path — differ only in the state they transition to
+/// after teardown.
+async function teardown() {
   if (ws) {
     try { ws.close(); } catch {}
     ws = null;
@@ -379,10 +425,53 @@ export async function stop() {
     ctx = null;
   }
   nextTsUs = 0;
+  monitorStats.set(EMPTY_STATS);
+}
+
+export async function stop() {
+  await teardown();
   setState('stopped');
   onStatus?.({ state: 'stopped' });
   onStatus = null;
 }
+
+// Latch so overlapping ping transitions don't race each other into a
+// half-torn-down state. Only meaningful inside the pingBad subscription.
+let latencyPausing = false;
+
+/// Subscribe to the global ping meter and auto-pause / auto-resume the
+/// monitor based on measured RTT. The user's pref (localStorage +
+/// `monitorPref`) is never touched here — this is a transient runtime
+/// pause, not a state change the user asked for.
+function tryLatencyResume() {
+  // Common path used by both the pingBad=false transition and the
+  // post-teardown re-check: only start if the user still wants it and
+  // we're not currently running or tearing down.
+  if (!readPref() || ctx || latencyPausing) return;
+  if (get(pingBad)) return; // ping flipped bad again while we were checking
+  restoreFromPref().catch((err) => {
+    console.warn('[monitor] latency-resume failed', err);
+  });
+}
+
+pingBad.subscribe(async (bad) => {
+  if (bad) {
+    if (!ctx || latencyPausing) return;
+    latencyPausing = true;
+    try {
+      await teardown();
+      setState('latency-paused');
+    } finally {
+      latencyPausing = false;
+    }
+    // Ping may have recovered while we were tearing down — the subscribe
+    // callback that fired for that transition would have seen `!ctx` false
+    // (we hadn't nulled it yet) and bailed out, so check once more here.
+    tryLatencyResume();
+  } else {
+    tryLatencyResume();
+  }
+});
 
 export function isRunning() {
   return !!ctx;
