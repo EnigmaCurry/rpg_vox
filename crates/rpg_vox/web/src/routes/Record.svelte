@@ -1049,7 +1049,7 @@
   // *without* a selection (a plain click), `inlineTool` renders inline
   // at the end of that paragraph/clip and wraps under it on a new line.
   // Only one of the two is visible at a time.
-  let selTool = $state({ visible: false, x: 0, y: 0, text: '' });
+  let selTool = $state({ visible: false, x: 0, y: 0, text: '', hostKey: null });
   let inlineTool = $state({ key: null, text: '' });
   // Brief background flash on the just-copied paragraph/clip text so
   // the user sees the copy landed. Keyed by the same `p:<id>` or
@@ -1068,7 +1068,7 @@
     while (el) {
       const cl = el.classList;
       if (cl && (cl.contains('paragraph-text') || cl.contains('clip-cell-text'))) {
-        return text;
+        return { text, hostKey: el.dataset?.toolKey ?? null };
       }
       el = el.parentElement;
     }
@@ -1090,9 +1090,10 @@
     // Selection is not always finalized synchronously on mouseup in
     // every browser; let it settle a tick before reading it.
     queueMicrotask(() => {
-      const text = selectionInsideRecordText();
-      if (text) {
-        selTool.text = text;
+      const hit = selectionInsideRecordText();
+      if (hit) {
+        selTool.text = hit.text;
+        selTool.hostKey = hit.hostKey;
         selTool.x = ev.clientX + 8;
         selTool.y = ev.clientY + 4;
         selTool.visible = true;
@@ -1131,8 +1132,17 @@
   });
 
   async function selToolCopy() {
+    const hostKey = selTool.hostKey;
     try {
       await navigator.clipboard.writeText(selTool.text);
+      if (hostKey) {
+        flashKey = hostKey;
+        if (flashClearTimer) clearTimeout(flashClearTimer);
+        flashClearTimer = setTimeout(() => {
+          flashKey = null;
+          flashClearTimer = 0;
+        }, FLASH_MS);
+      }
     } catch (e) {
       err = `copy failed: ${e.message}`;
     }
