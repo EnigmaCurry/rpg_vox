@@ -61,11 +61,9 @@ pub const PARAGRAPH_GAP_MS: u64 = 6_000;
 /// punctuation), the paragraph keeps growing until a punctuated clip
 /// lands. Absolutely no mid-clip cuts.
 ///
-/// Tuned for "long dense paragraphs, but not off-the-page long" —
-/// ~400 words is ~2-3 minutes of continuous speech and reads as a
-/// full screen of prose without vertical overflow at the current
-/// paragraph-block width.
-pub const PARAGRAPH_SOFT_MAX_WORDS: usize = 400;
+/// Tuned for short readable paragraphs — ~100 words is a few
+/// sentences, breaks cleanly on the next natural pause.
+pub const PARAGRAPH_SOFT_MAX_WORDS: usize = 100;
 
 /// Hard cap on paragraph length (in words). Once a paragraph exceeds
 /// this on the next clip finalize, it force-closes regardless of
@@ -75,7 +73,7 @@ pub const PARAGRAPH_SOFT_MAX_WORDS: usize = 400;
 /// pauses) from producing endless single-block paragraphs. Set at 2×
 /// the soft cap so the preferred natural-boundary path still gets
 /// several clips' worth of headroom before the hard fallback fires.
-pub const PARAGRAPH_HARD_MAX_WORDS: usize = 800;
+pub const PARAGRAPH_HARD_MAX_WORDS: usize = 200;
 
 /// Longest single named recording we buffer in RAM before force-closing it.
 /// 30 min at 48 kHz stereo f32 ≈ 690 MB — big but survivable, and past that
