@@ -413,6 +413,21 @@
     const rows = [];
     let cluster = [];
     let clusterEnd = 0;
+    // An in-flight (not-yet-hardened) paragraph's `end_wall_ms` only
+    // reflects clips that have already finished transcribing. During
+    // live recording, a brief utterance on another channel can arrive
+    // *after* the in-flight paragraph's last-transcribed clip ended
+    // but *before* its next clip lands — with plain `end_wall_ms` the
+    // two would land in separate clusters (utterance shows below,
+    // then snaps into the same cluster once the next clip transcribes).
+    // Extending non-hardened paragraphs' effective end to "now"
+    // avoids that flicker and shows the utterance in the correct
+    // cluster from the moment it appears.
+    const nowMs = Date.now();
+    const effectiveEnd = (p) => {
+      const base = p.end_wall_ms ?? 0;
+      return p.hardened ? base : Math.max(base, nowMs);
+    };
     const flush = () => {
       if (!cluster.length) return;
       const byChannel = {};
@@ -433,20 +448,99 @@
           }
         }
       }
+      const channels = orderChannels(chSet, canonical);
+      // For split clusters (multiple participating channels), break each
+      // paragraph into per-clip entries and place them in wall-clock
+      // start-time order. This lets a brief utterance on one channel
+      // land visually *between* two clips of a longer paragraph on
+      // another channel — aligned with the timestamp of the specific
+      // clip it overlaps, rather than pushed below the whole paragraph.
+      // Single-channel clusters (.cluster.full) still render one unified
+      // paragraph block since there's no cross-channel alignment to
+      // achieve.
+      const orderedClips = [];
+      for (const p of cluster) {
+        const clipList = p.clips ?? [];
+        const colIndex = channels.indexOf(p.channel || 'Unknown');
+        if (clipList.length === 0) {
+          orderedClips.push({
+            p,
+            clip: null,
+            colIndex,
+            cStart: p.start_wall_ms ?? wallStart,
+            isFirstOfP: true,
+            isLastOfP: true,
+          });
+          continue;
+        }
+        for (let ci = 0; ci < clipList.length; ci++) {
+          const clip = clipList[ci];
+          orderedClips.push({
+            p,
+            clip,
+            colIndex,
+            cStart: clip.start_wall_ms ?? p.start_wall_ms ?? wallStart,
+            isFirstOfP: ci === 0,
+            isLastOfP: ci === clipList.length - 1,
+          });
+        }
+      }
+      orderedClips.sort((a, b) => a.cStart - b.cStart);
+      // Slot assignment: temporally-overlapping clips on *different*
+      // channels share a grid row so a brief utterance on Vox1 that
+      // arrives during Vox2's still-recording clip lands beside it —
+      // not below. A provisional clip's effective end is stretched to
+      // `now` so overlapping utterances share its row even before
+      // its audio_duration_ms is known / transcription finalizes.
+      // Same-channel clips never share a slot (would collide in the
+      // same grid column).
+      let currentSlot = null;
+      let numSlots = 0;
+      for (const entry of orderedClips) {
+        const cStart = entry.cStart;
+        const cDur = entry.clip?.audio_duration_ms ?? 0;
+        const rawEnd = cStart + cDur;
+        const isProvisional = !!entry.clip?.provisional;
+        const cEnd = isProvisional ? Math.max(rawEnd, nowMs) : rawEnd;
+        const ch = entry.p.channel || 'Unknown';
+        const canJoin =
+          currentSlot &&
+          cStart <= currentSlot.maxEnd &&
+          !currentSlot.channelsUsed.has(ch);
+        if (!canJoin) {
+          numSlots += 1;
+          currentSlot = {
+            slotIdx: numSlots,
+            maxEnd: cEnd,
+            channelsUsed: new Set([ch]),
+          };
+        } else {
+          currentSlot.maxEnd = Math.max(currentSlot.maxEnd, cEnd);
+          currentSlot.channelsUsed.add(ch);
+        }
+        entry.slotIdx = currentSlot.slotIdx;
+      }
+      const orderedParagraphs = cluster.map((p) => ({
+        p,
+        colIndex: channels.indexOf(p.channel || 'Unknown'),
+      }));
       rows.push({
         kind: 'speech',
         wallStart,
         wallEnd,
         audioStart,
         byChannel,
-        channels: orderChannels(chSet, canonical),
+        channels,
+        orderedParagraphs,
+        orderedClips,
+        numSlots,
       });
       cluster = [];
       clusterEnd = 0;
     };
     for (const p of sorted) {
       const pStart = p.start_wall_ms ?? 0;
-      const pEnd = p.end_wall_ms ?? pStart;
+      const pEnd = effectiveEnd(p);
       if (cluster.length === 0) {
         cluster.push(p);
         clusterEnd = pEnd;
@@ -1254,6 +1348,100 @@
   </div>
 {/snippet}
 
+{#snippet clipCell(entry, recId)}
+  <!-- One clip = one row in a split cluster. The paragraph head only
+       renders on the first clip of a paragraph; subsequent clips are
+       "continuation" cells that visually group via a shared left rule.
+       The clip's *own* text is shown (not the joined paragraph text) so
+       an overlapping utterance on another channel can slot in at the
+       right vertical position for the specific clip it overlaps. -->
+  {@const { p, clip, isFirstOfP, isLastOfP } = entry}
+  {@const ch = p.channel || channelFallback}
+  {@const isTts = ch === 'TTS'}
+  {@const title = isTts ? (p.speaker || 'TTS') : (p.speaker || ch)}
+  {@const channelType = isTts ? 'TTS' : 'VOX'}
+  {@const pstate = paragraphState(p)}
+  {@const pulsing = paragraphInflight(p)}
+  {@const harden_secs = hardenCountdownSec(p)}
+  {@const isTtsClip = !!(clip && clip.audio_url)}
+  {@const playable = clip && (recId != null || isTtsClip)}
+  <div
+    class="clip-cell-block"
+    class:first-of-paragraph={isFirstOfP}
+    class:last-of-paragraph={isLastOfP}
+    class:tts={isTts}
+    class:playing={currentPlayingParagraphId === p.id}
+    class:provisional={!p.hardened && clip && clip.provisional}
+  >
+    {#if isFirstOfP}
+      <div class="paragraph-head clip-cell-head">
+        <div class="entry-avatar" title={fmtTime(p.created_at)}>
+          <div class="avatar-portrait" style="background: {avatarTint(title)}">
+            <span class="avatar-initial">{initialFrom(title)}</span>
+          </div>
+          <span class="avatar-type" class:tts={isTts}>{channelType}</span>
+          <span class="avatar-title" title={title}>{title}</span>
+        </div>
+        <span
+          class="state-dot state-{pstate}"
+          class:pulsing
+          title={STATE_LABELS[pstate]}
+          aria-label={pstate}
+        ></span>
+        {#if harden_secs != null}
+          <span class="harden-countdown" title="Auto-hardens in {harden_secs}s">
+            {harden_secs}s
+          </span>
+        {/if}
+      </div>
+    {/if}
+    {#if clip}
+      <div class="clip-cell-row" data-paragraph-id={p.id}>
+        {#if playable}
+          <button
+            type="button"
+            class="clip-cell-play"
+            class:playing={playingClipId === clip.id}
+            class:provisional={clip.provisional}
+            class:tts={isTtsClip}
+            title={clip.text || 'Play clip'}
+            onclick={() => {
+              if (playingClipId === clip.id) { stopPlayback(); return; }
+              playClip(
+                {
+                  id: clip.id,
+                  audio_url: clip.audio_url,
+                  audio_start_ms: clip.audio_start_ms,
+                  audio_duration_ms: clip.audio_duration_ms,
+                },
+                recId,
+              );
+            }}
+          >
+            {#if playingClipId === clip.id}
+              <div class="clip-fill" style="width: {clipDurationMs ? Math.min(1, playingTimeMs / clipDurationMs) * 100 : 0}%" aria-hidden="true"></div>
+            {/if}
+            <span class="clip-cell-play-glyph">▸</span>
+          </button>
+        {:else}
+          <span class="clip-cell-tick" aria-hidden="true">·</span>
+        {/if}
+        <button
+          type="button"
+          class="clip-cell-text"
+          class:provisional={clip.provisional}
+          class:copied={copiedParagraphId === p.id}
+          title={copiedParagraphId === p.id ? 'Copied!' : 'Click to copy paragraph text'}
+          onclick={() => copyParagraphText(p)}
+        >{clip.text || ''}</button>
+        <span class="clip-cell-ts" title={fmtTime(p.created_at)}>
+          {fmtWallTime(clip.start_wall_ms ?? p.start_wall_ms)}
+        </span>
+      </div>
+    {/if}
+  </div>
+{/snippet}
+
 {#snippet clusterList(recording, canonicalChannels)}
   {@const rows = computeClusters(recording.paragraphs, canonicalChannels)}
   {@const recId = recording.id}
@@ -1303,15 +1491,25 @@
               {/each}
             </div>
           {:else}
+            {@const hasMasterBtn = recId != null && row.audioStart != null}
+            {@const clipRowStart = hasMasterBtn ? 2 : 1}
+            {@const totalRows = (hasMasterBtn ? 1 : 0) + row.numSlots}
             <div class="cluster split" style="grid-template-columns: repeat({row.channels.length}, 1fr)">
-              {#if recId != null && row.audioStart != null}
+              {#each Array.from({ length: Math.max(0, row.channels.length - 1) }) as _, dividerIdx}
+                <div
+                  class="column-divider"
+                  style="grid-column: {dividerIdx + 1}; grid-row: 1 / span {totalRows};"
+                  aria-hidden="true"
+                ></div>
+              {/each}
+              {#if hasMasterBtn}
                 <button
                   type="button"
                   class="master-btn row-master row-master-split"
                   class:playing={isRowMasterPlaying(row, rows)}
                   onclick={() => playMasterFromRow(row, rows, recId)}
                   title="Play the recording from here"
-                  style="grid-column: 1 / -1;"
+                  style="grid-column: 1 / -1; grid-row: 1;"
                 >
                   {#if isRowMasterPlaying(row, rows)}
                     <div class="clip-fill" style="width: {rowMasterProgress(row, rows) * 100}%" aria-hidden="true"></div>
@@ -1319,11 +1517,12 @@
                   <span class="master-glyph">▶</span>
                 </button>
               {/if}
-              {#each row.channels as ch (ch)}
-                <div class="cluster-col">
-                  {#each row.byChannel[ch] ?? [] as p (p.id)}
-                    {@render paragraphBlock(p, recId)}
-                  {/each}
+              {#each row.orderedClips as entry (entry.clip ? entry.clip.id : `${entry.p.id}-empty`)}
+                <div
+                  class="cluster-cell"
+                  style="grid-column: {entry.colIndex + 1}; grid-row: {clipRowStart + entry.slotIdx - 1};"
+                >
+                  {@render clipCell(entry, recId)}
                 </div>
               {/each}
             </div>
@@ -1884,18 +2083,30 @@
   }
   .cluster.split {
     display: grid;
-    gap: 10px;
+    row-gap: 2px;
+    column-gap: 10px;
     align-items: start;
   }
-  .cluster-col {
+  /* Each paragraph in the split cluster gets a distinct grid row so
+     scanning top-to-bottom follows wall-clock start-time order across
+     channels. Note: this does not proportionally align brief utterances
+     inside a longer paragraph's rendered time span — that would require
+     per-clip cells (see the message thread in git for context). */
+  .cluster-cell {
     min-width: 0;
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
     padding: 0 4px;
-    border-right: 1px dashed rgba(255,255,255,0.06);
   }
-  .cluster.split .cluster-col:last-child { border-right: none; }
+  /* Full-height vertical guide between channel columns. Rendered as
+     a grid item spanning every row of the cluster so the dashed rule
+     is continuous regardless of which rows actually have content in
+     the adjacent column. */
+  .column-divider {
+    border-right: 1px dashed rgba(255,255,255,0.06);
+    pointer-events: none;
+    align-self: stretch;
+    justify-self: end;
+    width: 0;
+  }
   /* Silence cluster: single lozenge lozenge affordance. */
   .cluster.silence-row {
     display: flex;
@@ -1915,6 +2126,134 @@
     float: none;
     margin: 0 0 8px 0;
     justify-self: start;
+  }
+
+  /* ---- Per-clip cell (split cluster only) ----
+     Each clip of a paragraph becomes its own row in the grid so that a
+     brief utterance on another channel can occupy the row that matches
+     its wall-clock time — sitting between two clips of an overlapping
+     longer paragraph rather than pushed below the whole paragraph.
+     Consecutive clips of the same paragraph are visually linked by a
+     shared left rule. */
+  .clip-cell-block {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 2px 6px 2px 8px;
+    border-left: 2px solid rgba(122,162,255,0.28);
+    border-radius: 0 4px 4px 0;
+    min-width: 0;
+  }
+  .clip-cell-block.tts {
+    border-left-color: rgba(255,204,102,0.4);
+  }
+  .clip-cell-block.first-of-paragraph {
+    padding-top: 6px;
+    margin-top: 4px;
+  }
+  .clip-cell-block.last-of-paragraph {
+    padding-bottom: 4px;
+    margin-bottom: 4px;
+  }
+  .clip-cell-block.playing {
+    background: rgba(122,162,255,0.06);
+  }
+  .clip-cell-block.provisional {
+    opacity: 0.78;
+  }
+  .clip-cell-block.provisional .clip-cell-text {
+    font-style: italic;
+  }
+  .clip-cell-head {
+    margin-bottom: 2px;
+  }
+  .clip-cell-row {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    min-width: 0;
+  }
+  .clip-cell-play {
+    position: relative;
+    flex: 0 0 auto;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 22px;
+    height: 20px;
+    padding: 0 6px;
+    background: rgba(122,162,255,0.08);
+    color: var(--accent);
+    border: 1px solid rgba(122,162,255,0.3);
+    border-radius: 999px;
+    font: inherit;
+    font-size: 11px;
+    line-height: 1;
+    cursor: pointer;
+    overflow: hidden;
+  }
+  .clip-cell-play:hover:not(:disabled) {
+    background: rgba(122,162,255,0.16);
+    color: var(--text);
+  }
+  .clip-cell-play.tts {
+    background: rgba(255,204,102,0.08);
+    color: #ffcc66;
+    border-color: rgba(255,204,102,0.4);
+  }
+  .clip-cell-play.tts:hover:not(:disabled) {
+    background: rgba(255,204,102,0.16);
+  }
+  .clip-cell-play.playing {
+    border-color: rgba(122,162,255,0.75);
+    box-shadow: 0 0 0 1px rgba(122,162,255,0.35);
+  }
+  .clip-cell-play.provisional {
+    font-style: italic;
+    opacity: 0.7;
+  }
+  .clip-cell-play-glyph {
+    position: relative;
+    z-index: 1;
+  }
+  .clip-cell-tick {
+    flex: 0 0 auto;
+    display: inline-block;
+    width: 22px;
+    text-align: center;
+    color: var(--muted);
+    opacity: 0.55;
+  }
+  .clip-cell-text {
+    flex: 1 1 auto;
+    min-width: 0;
+    background: transparent;
+    color: var(--text);
+    border: 1px dashed transparent;
+    padding: 2px 6px;
+    font: inherit;
+    font-size: 14px;
+    line-height: 1.4;
+    text-align: left;
+    cursor: pointer;
+    border-radius: 4px;
+    word-break: break-word;
+    white-space: normal;
+  }
+  .clip-cell-text:hover {
+    border-color: rgba(122,162,255,0.4);
+    background: rgba(122,162,255,0.06);
+  }
+  .clip-cell-text.copied {
+    border-color: rgba(46, 204, 74, 0.55);
+    background: rgba(46, 204, 74, 0.12);
+  }
+  .clip-cell-ts {
+    flex: 0 0 auto;
+    color: var(--muted);
+    font-size: 10px;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
   }
 
   /* Paragraph block: avatar header + prose button + clip strip. */
