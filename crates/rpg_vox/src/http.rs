@@ -146,7 +146,7 @@ use crate::store::{AgentField, AgentRow, DEFAULT_AGENT_ID, ScriptBlockRow, Scrip
 /// client dropdown surfaces it as `— None (silence) —`; character UUIDs
 /// never collide with this literal.
 pub(crate) const VOICE_SILENCE: &str = "__silence__";
-use crate::record::{Paragraph, RecordState};
+use crate::record::{Paragraph, RecordPlayback, RecordPlaybackMode, RecordState};
 use crate::stt::SttHandle;
 use tokio::sync::broadcast;
 
@@ -963,6 +963,10 @@ pub async fn serve(
         .route(
             "/record/recordings/:id/segment",
             get(record_segment_handler),
+        )
+        .route(
+            "/record/recordings/:id/playback",
+            post(record_playback_handler),
         )
         .route(
             "/record/recordings/:id/clips/:clip_id",
@@ -3897,6 +3901,13 @@ async fn widget_say_handler(
 
 async fn playback_stop_handler(State(state): State<AppState>) -> Response {
     let gen = state.mixer.request_tts_stop();
+    // Any record-playback tracker is no longer meaningful — the ring will
+    // be drained on the next process cycle, so the position we'd report
+    // is frozen at "wherever it was when Stop hit". Clearing it now makes
+    // the /record snapshot immediately return `playback: null` so the UI
+    // reverts to idle without waiting for the runner to detect the seq
+    // change on a future PlayPcm dispatch.
+    state.record.end_playback();
     info!(gen, "playback stop requested");
     (StatusCode::OK, Json(ActionResponse { ok: true, error: None })).into_response()
 }
@@ -4328,6 +4339,16 @@ async fn record_state_handler(State(state): State<AppState>) -> Response {
             Vec::new()
         }
     };
+    let playback = state.record.playback_snapshot().map(|p| {
+        serde_json::json!({
+            "recordingId": p.recording_id,
+            "clipId": p.clip_id,
+            "mode": p.mode,
+            "positionMs": p.position_ms,
+            "durationMs": p.duration_ms,
+            "sampleTimeMs": p.sample_time_ms,
+        })
+    });
     Json(serde_json::json!({
         "mode": snap.mode,
         "paragraphsByChannel": snap.paragraphs_by_channel,
@@ -4337,6 +4358,7 @@ async fn record_state_handler(State(state): State<AppState>) -> Response {
         "sampleRate": state.record.sample_rate(),
         "recordings": recordings,
         "llmWhenIdle": snap.llm_when_idle,
+        "playback": playback,
     }))
     .into_response()
 }
@@ -5023,6 +5045,207 @@ async fn record_segment_handler(
         wav,
     )
         .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// POST /record/recordings/:id/playback — play a recording (or one clip)
+// through the mixer so downstream sinks / the virtual mic hear it.
+//
+// The old flow served a WAV to the browser's <audio> element. That plays
+// on the user's local speakers only — Discord never hears it, so playback
+// audition doesn't reflect what a call participant will experience. This
+// endpoint decodes the same audio server-side and pushes it through the
+// existing widget_say pipeline (PlayPcm → tts runner → pw_source ring),
+// so the mic actually carries the sound.
+//
+// Query params:
+//   * `startMs`     — offset into the recording's audio.wav where playback
+//                     begins. Omit / 0 for "from the top".
+//   * `durationMs`  — length of the slice. Omit for "play to end".
+//   * `clipId`      — opaque client-side clip identifier; echoed back in
+//                     the /record snapshot so the UI can light the right
+//                     chip. Presence also selects the "clip" playback mode
+//                     (single-shot, no auto-advance) instead of "master".
+//   * `widgetId`    — when set, play the referenced widget's cached clip
+//                     WAV instead of a slice of the recording's audio.wav.
+//                     Used for TTS clips in a recording transcript (their
+//                     audio lives in `/widgets/{id}` rather than being
+//                     captured back into the vox-slot recording). `startMs`
+//                     / `durationMs` are ignored in this mode — the whole
+//                     widget clip plays. The tracker still uses the path's
+//                     recording id, so the browser's UI matches the
+//                     playing chip to the right recording pane.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RecordPlaybackQuery {
+    #[serde(default)]
+    start_ms: u64,
+    #[serde(default)]
+    duration_ms: Option<u64>,
+    #[serde(default)]
+    clip_id: Option<String>,
+    #[serde(default)]
+    widget_id: Option<String>,
+}
+
+async fn record_playback_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<RecordPlaybackQuery>,
+) -> Response {
+    // Two source modes: widget WAV (TTS clip audio) vs. slice of the
+    // recording's audio.wav. Widget branch mirrors widget_say_handler's
+    // read/decode without the transcript-append side effect — the clip
+    // is already logged in the transcript from the original playback.
+    let (sample_rate, mut pairs) = if let Some(widget_id) = q.widget_id.as_deref() {
+        let path = state.store.clip_path(widget_id);
+        let bytes = match tokio::fs::read(&path).await {
+            Ok(b) => b,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    format!("widget clip missing for {widget_id}"),
+                )
+                    .into_response();
+            }
+            Err(err) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("read widget clip: {err}"),
+                )
+                    .into_response();
+            }
+        };
+        match decode_wav_pcm16_stereo_any(&bytes) {
+            Ok((sr, p)) => (sr, p),
+            Err(err) => {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("decode widget clip: {err}"),
+                )
+                    .into_response();
+            }
+        }
+    } else if let Some((p, sr)) = state.record.active_audio(&id) {
+        (sr, p)
+    } else {
+        let path = state.store.recording_path(&id);
+        let bytes = match tokio::fs::read(&path).await {
+            Ok(b) => b,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return (StatusCode::NOT_FOUND, "recording not found").into_response();
+            }
+            Err(err) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("read recording: {err}"),
+                )
+                    .into_response();
+            }
+        };
+        match decode_wav_pcm16_stereo_any(&bytes) {
+            Ok((sr, p)) => (sr, p),
+            Err(err) => {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("decode recording: {err}"),
+                )
+                    .into_response();
+            }
+        }
+    };
+
+    // Widget mode plays the full clip — startMs/durationMs are ignored so
+    // a client mistake can't trim off the head or tail of a cached TTS
+    // utterance. Recording mode honors the requested slice.
+    if q.widget_id.is_none() {
+        let start_frame = (q.start_ms * sample_rate as u64 / 1000) as usize;
+        if start_frame >= pairs.len() {
+            return (StatusCode::BAD_REQUEST, "startMs past end of recording").into_response();
+        }
+        let end_frame = match q.duration_ms {
+            Some(d) => {
+                let n = (d * sample_rate as u64 / 1000) as usize;
+                start_frame.saturating_add(n).min(pairs.len())
+            }
+            None => pairs.len(),
+        };
+        // In-place trim: `pairs` is a local Vec so a drain avoids a full copy.
+        pairs.drain(end_frame..);
+        pairs.drain(..start_frame);
+    }
+    let total_frames = pairs.len() as u64;
+
+    // Refuse to submit an empty burst — the mixer would treat it as
+    // "immediately done", and reporting a 0/0 progress bar just visually
+    // flickers. A client-side range typo shouldn't silently play nothing.
+    if total_frames == 0 {
+        return (StatusCode::BAD_REQUEST, "empty playback range").into_response();
+    }
+
+    // Same preemption pattern as widget_say_handler: bump the stop-gen
+    // so any prior burst starts draining out of the ring, then claim a
+    // fresh play_seq so an older still-queued PlayPcm skips itself when
+    // the runner picks it up.
+    state.mixer.request_tts_stop();
+    let seq = state.mixer.claim_play_seq();
+    let burst_start_frames = state.mixer.tts_frames_played();
+
+    let mode = if q.clip_id.is_some() {
+        RecordPlaybackMode::Clip
+    } else {
+        RecordPlaybackMode::Master
+    };
+    state.record.begin_playback(RecordPlayback {
+        recording_id: id.clone(),
+        clip_id: q.clip_id.clone(),
+        mode,
+        play_seq: seq,
+        burst_start_frames,
+        total_frames,
+        sample_rate,
+        // Master playback surfaces its offset in the position field so the
+        // UI's highlight lines up with the recording's own audio timeline;
+        // clip playback anchors at 0 (the chip's swipe fill is scaled to
+        // clip length, not the parent recording).
+        start_offset_ms: if matches!(mode, RecordPlaybackMode::Master) {
+            q.start_ms
+        } else {
+            0
+        },
+    });
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    if state
+        .tts
+        .send(Command::PlayPcm(PlayPcmRequest {
+            samples: pairs,
+            sample_rate,
+            seq,
+            reply: reply_tx,
+        }))
+        .await
+        .is_err()
+    {
+        state.record.end_playback();
+        return (StatusCode::SERVICE_UNAVAILABLE, "tts task gone").into_response();
+    }
+    // Detach: HTTP returns as soon as the burst is queued so the client
+    // can update its UI immediately. A background task drains the reply
+    // channel purely for logging — dropping it here would still work
+    // (the runner discards send failures), but the log line is useful.
+    tokio::spawn(async move {
+        match reply_rx.await {
+            Ok(Ok(frames)) => info!(frames, "record playback burst finished"),
+            Ok(Err(err)) => tracing::warn!(err = %err, "record playback burst failed"),
+            Err(_) => tracing::warn!("record playback reply channel dropped"),
+        }
+    });
+
+    info!(recording = %id, start_ms = q.start_ms, mode = mode.as_str(), "record playback started");
+    (StatusCode::OK, Json(ActionResponse { ok: true, error: None })).into_response()
 }
 
 // Channel rename now happens by PUT /mixer with a `vox` slot patch that

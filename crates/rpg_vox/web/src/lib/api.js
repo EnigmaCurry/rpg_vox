@@ -1005,6 +1005,35 @@ export function recordingSegmentUrl(id, startMs, durationMs) {
   return `/record/recordings/${encodeURIComponent(id)}/segment?${params}`;
 }
 
+/// Fire a server-side playback of a recording (or clip within it) through
+/// the mixer, so the audio actually reaches the PipeWire virtual mic —
+/// unlike the old `<audio>` path, which only played on the user's local
+/// speakers. Returns immediately once the burst is queued; the /record
+/// snapshot's `playback` field then reports live position for the UI.
+///
+/// Modes:
+///   * Master playback:  omit `clipId`, pass `startMs` (defaults to 0).
+///   * Vox clip:         pass `startMs` + `durationMs` + `clipId`.
+///   * TTS widget clip:  pass `widgetId` + `clipId` (server ignores start/
+///                       duration; widget WAV plays as one shot).
+export async function playRecording(id, opts = {}) {
+  const params = new URLSearchParams();
+  if (opts.startMs != null) params.set('startMs', String(opts.startMs));
+  if (opts.durationMs != null) params.set('durationMs', String(opts.durationMs));
+  if (opts.clipId != null) params.set('clipId', String(opts.clipId));
+  if (opts.widgetId != null) params.set('widgetId', String(opts.widgetId));
+  const url = `/record/recordings/${encodeURIComponent(id)}/playback?${params}`;
+  const r = await fetch(url, { method: 'POST' });
+  if (!r.ok) {
+    const detail = await r.text().catch(() => `HTTP ${r.status}`);
+    throw new Error(detail || `HTTP ${r.status}`);
+  }
+}
+
+// stopPlayback is defined earlier in this file — the same endpoint
+// (/playback/stop) covers TTS-say, cached-clip, AND recording playback
+// since the mixer has one PCM ring for all three.
+
 /// Rename or otherwise patch a single Vox slot. Delegates to the mixer
 /// PUT — a slot patch is `{ vox: { "<slot>": { name?, enabled?, ... } } }`.
 /// Convenience wrapper for the common one-slot rename.

@@ -727,6 +727,79 @@ pub struct RecordState {
     /// mirrors the value in localStorage and posts it on every
     /// change / on mount, so the server just reflects the last-writer.
     llm_when_idle: Arc<AtomicBool>,
+    /// Currently-active server-driven playback of a saved recording (or
+    /// segment) through the mixer, or `None` when nothing recording-
+    /// related is sounding. Written by `begin_playback` /
+    /// `end_playback`; read by `playback_snapshot` to synthesize a
+    /// live-position field for `GET /record`. Held behind its own mutex
+    /// (rather than folded into `Inner`) so a user hammering the Play
+    /// button doesn't lock the transcription hot path even briefly.
+    playback: Arc<Mutex<Option<RecordPlayback>>>,
+}
+
+/// Playback mode for a server-driven recording playback. Master plays
+/// the full audio.wav from a start offset; Clip plays a single segment
+/// starting at zero. Kept explicit rather than folded into `clip_id`
+/// so the client can style the two affordances differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordPlaybackMode {
+    Master,
+    Clip,
+}
+
+impl RecordPlaybackMode {
+    #[inline]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Master => "master",
+            Self::Clip => "clip",
+        }
+    }
+}
+
+/// Live state for one server-driven recording playback. Position is
+/// derived by subtracting `burst_start_frames` from the mixer's running
+/// pop counter — the mixer only knows "N frames of the current PCM
+/// burst have played", so pinning which recording that burst belongs
+/// to has to live here.
+#[derive(Debug, Clone)]
+pub struct RecordPlayback {
+    pub recording_id: String,
+    pub clip_id: Option<String>,
+    pub mode: RecordPlaybackMode,
+    /// PlayPcm sequence claimed at burst dispatch. If the mixer's
+    /// `latest_play_seq()` diverges, some newer playback has taken
+    /// over — the position we'd report would be for a different burst,
+    /// so treat it as inactive.
+    pub play_seq: u64,
+    /// Value of `mixer.tts_frames_played()` at burst start. All
+    /// positions are computed as `current - burst_start_frames`.
+    pub burst_start_frames: u64,
+    /// Total stereo frames in this burst — used both to cap the
+    /// reported position and to compute a duration_ms for the client.
+    pub total_frames: u64,
+    pub sample_rate: u32,
+    /// For master playback, the audio-timeline offset the burst starts
+    /// at (i.e. what the client asked for as `startMs`). Position
+    /// reported to the client is offset by this so it lines up with
+    /// the recording's own audio timeline. Clip playback anchors at 0.
+    pub start_offset_ms: u64,
+}
+
+/// Serialized playback state for `GET /record`. `None` when nothing is
+/// currently playing. `sample_time_ms` is a wall-clock stamp of when
+/// the snapshot was measured so the client can interpolate forward
+/// smoothly between polls without needing per-frame updates from the
+/// server.
+#[derive(Debug, Clone, Serialize)]
+pub struct RecordPlaybackSnapshot {
+    pub recording_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clip_id: Option<String>,
+    pub mode: &'static str,
+    pub position_ms: u64,
+    pub duration_ms: u64,
+    pub sample_time_ms: u64,
 }
 
 /// Events fanned out to OBS subtitle overlay subscribers.
@@ -806,7 +879,66 @@ impl RecordState {
             stt,
             llm_scheduler: Arc::new(OnceLock::new()),
             llm_when_idle: Arc::new(AtomicBool::new(false)),
+            playback: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Register a new server-driven playback burst. Called by the HTTP
+    /// handler *after* it has already bumped `tts_stop_gen` (preempting
+    /// any previous burst), claimed a fresh `play_seq`, and snapshotted
+    /// `mixer.tts_frames_played()` — so the exact atomic-ordering is
+    /// visible at the call site, not obscured behind this helper.
+    pub fn begin_playback(&self, p: RecordPlayback) {
+        let mut guard = self.playback.lock().expect("playback mutex poisoned");
+        *guard = Some(p);
+    }
+
+    /// Drop the current playback tracker. Called both when the user
+    /// explicitly stops and when the snapshot function decides the
+    /// burst is over (seq mismatch or position past end).
+    pub fn end_playback(&self) {
+        let mut guard = self.playback.lock().expect("playback mutex poisoned");
+        *guard = None;
+    }
+
+    /// Compute a snapshot of the current playback, if any. Auto-clears
+    /// the tracker when the burst has completed (position >= duration)
+    /// or been superseded (play_seq mismatch) so the client eventually
+    /// sees `playback: null` without a separate reaper task.
+    pub fn playback_snapshot(&self) -> Option<RecordPlaybackSnapshot> {
+        let mut guard = self.playback.lock().expect("playback mutex poisoned");
+        let Some(p) = guard.as_ref() else {
+            return None;
+        };
+        let latest_seq = self.mixer.latest_play_seq();
+        if p.play_seq != latest_seq {
+            *guard = None;
+            return None;
+        }
+        let played = self
+            .mixer
+            .tts_frames_played()
+            .saturating_sub(p.burst_start_frames)
+            .min(p.total_frames);
+        let sample_rate = p.sample_rate.max(1) as u64;
+        let duration_ms = p.total_frames * 1000 / sample_rate;
+        let position_ms = p.start_offset_ms + played * 1000 / sample_rate;
+        let done = played >= p.total_frames;
+        let snap = RecordPlaybackSnapshot {
+            recording_id: p.recording_id.clone(),
+            clip_id: p.clip_id.clone(),
+            mode: p.mode.as_str(),
+            position_ms,
+            duration_ms: p.start_offset_ms + duration_ms,
+            sample_time_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+        };
+        if done {
+            *guard = None;
+        }
+        Some(snap)
     }
 
     /// Whether the pass-4 LLM should run when no named recording is
@@ -1166,7 +1298,7 @@ impl RecordState {
     pub fn start_recording(&self, name: String) -> Result<String, &'static str> {
         let name = name.trim().to_string();
         let name = if name.is_empty() {
-            format!("Recording {}", chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"))
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
         } else {
             name
         };

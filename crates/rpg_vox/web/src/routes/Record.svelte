@@ -168,6 +168,7 @@
       err = e.message;
       return;
     }
+    applyServerPlayback(state.playback ?? null);
     // Auto-select the active recording the first time it appears, so
     // the "New Recording" flow lands the user on the recording view
     // without a manual click.
@@ -193,7 +194,7 @@
   }
 
   // Start recording immediately with the server-assigned default name
-  // ("Recording <timestamp>"). The user can click-to-rename in the
+  // (a local-time timestamp). The user can click-to-rename in the
   // active pane header once the bucket is live — no prompt in the way
   // between "I want to record" and "recording is happening".
   async function beginNewRecording() {
@@ -591,18 +592,30 @@
       // in-flight (not hardened) should not be visually sliced off
       // from adjacent content by a silence break — during recording,
       // everything currently being spoken belongs in the same cluster
-      // so brief overlapping utterances land beside the recording
-      // clip rather than in a separated column-form cluster. If only
-      // the *cluster* side is in-flight, keep a bounded merge window
-      // so a stale unhardened paragraph doesn't pull in unrelated
-      // later content indefinitely.
+      // so brief overlapping utterances on *different* channels land
+      // beside the recording clip rather than in a separated column-
+      // form cluster. If only the *cluster* side is in-flight, keep a
+      // bounded merge window so a stale unhardened paragraph doesn't
+      // pull in unrelated later content indefinitely.
+      //
+      // The merge is restricted to cross-channel cases: two consecutive
+      // paragraphs on the *same* channel are chronological, not
+      // simultaneous, so they belong in their own clusters and get the
+      // uniform inter-cluster gap. Otherwise the tail of a live log
+      // shows same-channel pairs glued together inside one card while
+      // every other pair has the normal 8px break.
       const CLUSTER_INFLIGHT_MERGE_MAX_MS = 30000;
       const clusterHasInFlight = cluster.some(isInFlight);
       const pIsInFlight = isInFlight(p);
       const gapMs = pStart - clusterEnd;
+      const pCh = p.channel || 'Unknown';
+      const sameChannelInCluster = cluster.some(
+        (cp) => (cp.channel || 'Unknown') === pCh,
+      );
       if (
-        pIsInFlight ||
-        (clusterHasInFlight && gapMs < CLUSTER_INFLIGHT_MERGE_MAX_MS)
+        !sameChannelInCluster &&
+        (pIsInFlight ||
+          (clusterHasInFlight && gapMs < CLUSTER_INFLIGHT_MERGE_MAX_MS))
       ) {
         cluster.push(p);
         if (pEnd > clusterEnd) clusterEnd = pEnd;
@@ -643,76 +656,75 @@
     return rows;
   }
 
-  // Chronological playback state. One shared <audio> element per pane
-  // (active + saved) is used so seeking + play is atomic. We track
-  // currentTime with a rAF loop so the "playing now" highlight moves
-  // smoothly; server-side gets pinged with /record/playback so any
-  // VAD-captured vox during playback is flagged (see push_transcript).
-  let playingRecordingId = $state(null); // which recording is currently sounding
-  let playingTimeMs = $state(0);          // ms — master timeline in 'master' mode, clip offset in 'clip' mode
-  let masterAudioEl = $state(null);       // hidden <audio> for the silence-gated mixed track
-  let clipAudioEl = $state(null);         // hidden <audio> for one-shot per-clip segment playback
-  // Duration mirrors of the two audio elements. Reading `.duration` off
-  // the DOM directly isn't reactive, so a template value that depends
-  // on it stays stale until *some other* reactive dep changes. Copying
-  // duration into `$state` via the audio element's own events makes
-  // downstream computations (Stop button swipe) update the instant the
-  // metadata for a freshly-loaded track becomes known.
-  let masterDurationMs = $state(0);
-  let clipDurationMs = $state(0);
-  const refreshMasterDuration = () => {
-    const d = masterAudioEl?.duration;
-    masterDurationMs = Number.isFinite(d) ? d * 1000 : 0;
-  };
-  const refreshClipDuration = () => {
-    const d = clipAudioEl?.duration;
-    clipDurationMs = Number.isFinite(d) ? d * 1000 : 0;
-  };
-  // 'master' when the mixed track is playing (auto-advances through rows);
-  // 'clip' when a single per-channel clip is playing (no advance).
-  // null when nothing is playing. Drives which element the rAF loop
-  // samples and which row/clip button lights up.
-  let playbackMode = $state(null);
-  // Which clip id is playing under 'clip' mode. Only set when
-  // playbackMode === 'clip'.
+  // ---- Server-driven playback state ----
+  //
+  // Playback runs server-side through the mixer/PipeWire virtual mic —
+  // that way Discord actually hears what the user auditions, unlike the
+  // old browser `<audio>` path which only reached the local speakers.
+  //
+  // The client just issues POSTs (start, stop) and reads a `playback`
+  // field off each /record poll (every 500 ms) for authoritative
+  // position + duration. `tickPlayhead` extrapolates forward from the
+  // most recent server sample using `performance.now()` so the swipe
+  // animation stays smooth at 60 fps without hammering the endpoint.
+  //
+  // Regression from the old <audio> version: silence-skip during "Play
+  // All" is now click-only. Server playback can't be seeked mid-burst
+  // (the ring is a one-shot push), so a long dead-air section plays
+  // through until the user Stops and clicks the next row's ▶.
+  let playingRecordingId = $state(null);
   let playingClipId = $state(null);
+  let playbackMode = $state(null);          // 'master' | 'clip' | null
+  let playingTimeMs = $state(0);            // ms — highlight + swipe cursor
+  let playbackDurationMs = $state(0);       // ms — from server; used to bound fills
+  // Most recent server position sample plus the client wall-clock at
+  // which we received it, for smooth extrapolation between polls.
+  let playbackSample = $state(null);
   let rafId = 0;
 
-  // ---- Master vs clip playback ----
-  //
-  // Master: click a row's ▶. Seeks the (hidden) per-slot audio element
-  // to that row's `audioStart` and lets it play straight through —
-  // subsequent rows highlight naturally as the playhead crosses their
-  // `audioStart` boundaries. Silence rows have no play affordance of
-  // their own; continuous master playback either falls through them or
-  // triggers the silence-skip cutoff.
-  //
-  // Clip: click a per-paragraph clip chip. Fetches just that clip's
-  // audio segment via /record/recordings/:id/segment and plays it in a
-  // second hidden element. No auto-advance — one segment, done.
-
-  // Cap on how long a stretch of silence is allowed to play during
-  // master playback before the playhead auto-advances to the next
-  // speech row. Prevents the "Play All" flow from sitting through a
-  // long dead-air section captured between two clusters of speech.
-  const MAX_MASTER_SILENCE_MS = 5000;
-
   function tickPlayhead() {
-    const el = playbackMode === 'clip' ? clipAudioEl : masterAudioEl;
-    if (el && !el.paused) {
-      playingTimeMs = el.currentTime * 1000;
-      if (playbackMode === 'master') maybeSilenceSkip();
+    rafId = 0;
+    if (playbackMode != null && playbackSample) {
+      const elapsed = performance.now() - playbackSample.recvPerfMs;
+      const target = playbackSample.serverPositionMs + elapsed;
+      playingTimeMs = playbackDurationMs
+        ? Math.min(target, playbackDurationMs)
+        : target;
     }
-    rafId = requestAnimationFrame(tickPlayhead);
+    if (playbackMode != null) {
+      rafId = requestAnimationFrame(tickPlayhead);
+    }
   }
 
-  /// Locate whichever recording the master player is currently reading
-  /// from. Only used for the silence-skip lookup; returns null if the
-  /// id doesn't match anything on the state snapshot.
-  function currentPlayingRecording() {
-    if (!state || playingRecordingId == null) return null;
-    if (state.activeRecording?.id === playingRecordingId) return state.activeRecording;
-    return state.recordings?.find((r) => r.id === playingRecordingId) ?? null;
+  function ensureRaf() {
+    if (!rafId && playbackMode != null) {
+      rafId = requestAnimationFrame(tickPlayhead);
+    }
+  }
+
+  /// Fold a `/record` snapshot's `playback` field into the client's
+  /// local state. `pb === null` means "nothing playing" and clears the
+  /// highlight. Called from every refresh() so the state stays honest.
+  function applyServerPlayback(pb) {
+    if (!pb) {
+      playingRecordingId = null;
+      playingClipId = null;
+      playbackMode = null;
+      playingTimeMs = 0;
+      playbackDurationMs = 0;
+      playbackSample = null;
+      return;
+    }
+    playingRecordingId = pb.recordingId ?? null;
+    playingClipId = pb.clipId ?? null;
+    playbackMode = pb.mode ?? null;
+    playbackDurationMs = pb.durationMs ?? 0;
+    playbackSample = {
+      serverPositionMs: pb.positionMs ?? 0,
+      recvPerfMs: performance.now(),
+    };
+    playingTimeMs = pb.positionMs ?? 0;
+    ensureRaf();
   }
 
   /// Resolve a recording by id from the current state snapshot,
@@ -721,6 +733,13 @@
     if (!state || id == null) return null;
     if (state.activeRecording?.id === id) return state.activeRecording;
     return state.recordings?.find((r) => r.id === id) ?? null;
+  }
+
+  /// Whichever recording the mixer is currently reading from, if any.
+  /// Used by the paragraph-highlight logic to look up per-clip audio
+  /// ranges in the right transcript.
+  function currentPlayingRecording() {
+    return findRecording(playingRecordingId);
   }
 
   /// Audio-timeline offset of the first transcribed utterance in a
@@ -737,117 +756,40 @@
     return 0;
   }
 
-  /// Playback progress (0..1) for the Stop button's swipe fill. In
-  /// master mode this is elapsed / total on the per-slot audio element;
-  /// in clip mode it's elapsed / clip duration. Both `playingTimeMs`
-  /// and the duration mirrors are `$state`, so the swipe updates
-  /// reactively the instant metadata arrives on a first-play load.
+  /// Progress (0..1) for the Stop button's swipe fill.
   function stopBtnProgress() {
-    const durMs = playbackMode === 'clip' ? clipDurationMs : masterDurationMs;
-    if (!durMs) return 0;
-    return Math.max(0, Math.min(1, playingTimeMs / durMs));
-  }
-
-  /// If the master playhead has been sitting in a silence gap between
-  /// two speech rows for longer than [`MAX_MASTER_SILENCE_MS`], seek
-  /// straight to the next speech row's `audioStart`.
-  function maybeSilenceSkip() {
-    if (!masterAudioEl) return;
-    const rec = currentPlayingRecording();
-    if (!rec) return;
-    const rows = computeClusters(rec.paragraphs, state?.channelNames ?? []).filter(
-      (r) => r.kind === 'speech' && r.audioStart != null,
-    );
-    if (rows.length < 2) return;
-    // Find the last speech row whose start is at or before the playhead.
-    let curIdx = -1;
-    for (let i = 0; i < rows.length; i++) {
-      if (rows[i].audioStart <= playingTimeMs) curIdx = i;
-      else break;
-    }
-    if (curIdx < 0 || curIdx >= rows.length - 1) return;
-    const cur = rows[curIdx];
-    const next = rows[curIdx + 1];
-    // audio.wav is wall-clock aligned, so the current row's audio
-    // range covers exactly its wall-clock duration.
-    const curEndMs = cur.audioStart + (cur.wallEnd - cur.wallStart);
-    if (
-      playingTimeMs > curEndMs + MAX_MASTER_SILENCE_MS &&
-      playingTimeMs < next.audioStart
-    ) {
-      try { masterAudioEl.currentTime = next.audioStart / 1000; } catch {}
-      playingTimeMs = next.audioStart;
-    }
-  }
-
-  function ensureRaf() {
-    if (!rafId) rafId = requestAnimationFrame(tickPlayhead);
+    if (!playbackDurationMs) return 0;
+    return Math.max(0, Math.min(1, playingTimeMs / playbackDurationMs));
   }
 
   async function playMasterAtMs(recordingId, startMs) {
-    await tick();
-    if (!masterAudioEl) return;
-    // Use the per-slot recording (audio.wav). It's the source of truth
-    // for "everything captured this session" — every clip's
-    // audio_start_ms is a position within it, so the row's audioStart
-    // seeks correctly regardless of whether the vox slots were routed
-    // to the mic feed.
-    const wantSrc = api.recordingAudioUrl(recordingId);
-    if (!masterAudioEl.src.endsWith(wantSrc)) {
-      masterAudioEl.src = wantSrc;
-      masterAudioEl.load();
-    }
-    if (clipAudioEl && !clipAudioEl.paused) clipAudioEl.pause();
-    playbackMode = 'master';
-    playingClipId = null;
+    // Optimistic UI: switch highlight immediately so the button
+    // transitions to Stop without waiting the ~1 RTT for the POST +
+    // ~500 ms for the next /record poll to arrive.
     playingRecordingId = recordingId;
+    playingClipId = null;
+    playbackMode = 'master';
     playingTimeMs = startMs;
-    // On a fresh load, `loadedmetadata` fires at readyState=1 (HAVE_METADATA)
-    // — the browser knows the duration but hasn't buffered any audio
-    // data yet. Setting `currentTime` at that moment schedules a seek
-    // but `play()` fired in the same tick can start before the seek
-    // has actually landed, so the first Play All would start from 0
-    // instead of the requested `startMs`. Wait for the `seeked` event
-    // to fire before starting playback so `startMs` always sticks.
-    const startPlay = () => {
-      masterAudioEl.play().catch((e) => console.warn('master play failed', e));
-    };
-    const seekAndPlay = () => {
-      const targetSec = Math.max(0, startMs) / 1000;
-      if (Math.abs(masterAudioEl.currentTime - targetSec) < 0.05) {
-        startPlay();
-        return;
-      }
-      const onSeeked = () => {
-        masterAudioEl.removeEventListener('seeked', onSeeked);
-        startPlay();
-      };
-      masterAudioEl.addEventListener('seeked', onSeeked);
-      try {
-        masterAudioEl.currentTime = targetSec;
-      } catch {
-        masterAudioEl.removeEventListener('seeked', onSeeked);
-        startPlay();
-      }
-    };
-    if (masterAudioEl.readyState >= 1) {
-      seekAndPlay();
-    } else {
-      masterAudioEl.addEventListener('loadedmetadata', seekAndPlay, { once: true });
-    }
+    playbackDurationMs = 0;
+    playbackSample = null;
     ensureRaf();
+    try {
+      await api.playRecording(recordingId, { startMs });
+      await refresh();
+    } catch (e) {
+      err = e.message;
+      applyServerPlayback(null);
+    }
   }
 
-  /// Master-column click for a row. Speech rows seek to their own
-  /// `audioStart`; silence rows jump to the next speech row's
-  /// `audioStart` so the user can use the master column as a
-  /// scrub-forward affordance without waiting through dead air.
+  /// Master-column click for a row. Speech rows play from their own
+  /// `audioStart`; silence rows jump to the next speech row so the
+  /// master column doubles as a scrub-forward affordance.
   function playMasterFromRow(row, rows, recordingId) {
     if (row.kind === 'speech') {
       if (row.audioStart != null) playMasterAtMs(recordingId, row.audioStart);
       return;
     }
-    // Silence row: find the next speech row and jump to its audioStart.
     const idx = rows.indexOf(row);
     for (let i = idx + 1; i < rows.length; i++) {
       if (rows[i].kind === 'speech' && rows[i].audioStart != null) {
@@ -855,57 +797,87 @@
         return;
       }
     }
-    // No later speech row: nothing to play — just stop.
     stopPlayback();
   }
 
-  /// One-shot playback of a single clip's audio. Accepts a partial
-  /// clip descriptor so callers can pass an isolated `{ id, audio_url }`
-  /// (for TTS widgets) or a `{ id, audio_start_ms, audio_duration_ms }`
-  /// pair (for saved-recording vox segments).
+  /// One-shot playback of a single clip through the mixer.
   ///
-  /// **Risk 1 (live-pane vox):** the segment endpoint only exists on
-  /// `/record/recordings/:id/segment` — there is no per-slot ring
-  /// endpoint. Live-pane vox clips (recId == null && !audio_url) simply
-  /// have no server-serveable audio and the chip is disabled at the
-  /// callsite.
+  /// Routing:
+  ///   * Vox clip (saved/active recording): POST /record/recordings/:id/
+  ///     playback with startMs + durationMs + clipId → server slices
+  ///     the parent recording's audio.wav.
+  ///   * TTS clip in a recording: same endpoint with widgetId + clipId
+  ///     — server reads the widget's cached WAV instead.
+  ///   * TTS clip in the live pane (no recording context): fall back to
+  ///     /widgets/:id/say directly. Audio still reaches the mic but
+  ///     there's no position tracker, so the chip's swipe fill won't
+  ///     animate here.
+  ///   * Vox clip in the live pane: unplayable (no server-side audio
+  ///     endpoint for the rolling buffer); the chip is disabled at the
+  ///     callsite.
   async function playClip(clipLike, recordingId) {
-    await tick();
-    if (!clipAudioEl) return;
-    let src;
+    let opts;
     if (clipLike.audio_url) {
-      src = clipLike.audio_url;
+      const m = String(clipLike.audio_url).match(/\/widgets\/([^\/?]+)/);
+      const widgetId = m ? m[1] : null;
+      if (!widgetId) return;
+      if (recordingId == null) {
+        // Live-pane TTS chip: no recording context to attach the
+        // tracker to. Route through widget_say for the mixer path;
+        // the swipe fill won't animate here but the audio still
+        // reaches Discord.
+        playingClipId = clipLike.id;
+        playbackMode = 'clip';
+        playingRecordingId = null;
+        playingTimeMs = 0;
+        playbackDurationMs = 0;
+        playbackSample = null;
+        ensureRaf();
+        try {
+          await fetch(`/widgets/${encodeURIComponent(widgetId)}/say`, { method: 'POST' });
+        } catch (e) {
+          err = e.message;
+        }
+        applyServerPlayback(null);
+        return;
+      }
+      opts = { widgetId, clipId: clipLike.id };
     } else if (
       recordingId != null &&
       clipLike.audio_start_ms != null &&
       clipLike.audio_duration_ms != null
     ) {
-      src = api.recordingSegmentUrl(
-        recordingId,
-        clipLike.audio_start_ms,
-        clipLike.audio_duration_ms,
-      );
+      opts = {
+        startMs: clipLike.audio_start_ms,
+        durationMs: clipLike.audio_duration_ms,
+        clipId: clipLike.id,
+      };
     } else {
       return;
     }
-    clipAudioEl.src = src;
-    clipAudioEl.load();
-    if (masterAudioEl && !masterAudioEl.paused) masterAudioEl.pause();
-    playbackMode = 'clip';
-    playingClipId = clipLike.id;
     playingRecordingId = recordingId;
+    playingClipId = clipLike.id;
+    playbackMode = 'clip';
     playingTimeMs = 0;
-    clipAudioEl.play().catch((e) => console.warn('clip play failed', e));
+    playbackDurationMs = 0;
+    playbackSample = null;
     ensureRaf();
+    try {
+      await api.playRecording(recordingId, opts);
+      await refresh();
+    } catch (e) {
+      err = e.message;
+      applyServerPlayback(null);
+    }
   }
 
-  function stopPlayback() {
-    if (masterAudioEl && !masterAudioEl.paused) masterAudioEl.pause();
-    if (clipAudioEl && !clipAudioEl.paused) clipAudioEl.pause();
-    playingRecordingId = null;
-    playingClipId = null;
-    playingTimeMs = 0;
-    playbackMode = null;
+  async function stopPlayback() {
+    applyServerPlayback(null);
+    try {
+      await api.stopPlayback();
+    } catch (e) {
+      err = e.message;
+    }
   }
 
   // Which paragraph the log should currently highlight — for clip
@@ -979,8 +951,7 @@
   }
   /// Silence rows are "master-playing" while the playhead sits in the
   /// gap between the previous speech row's audio end and the next
-  /// speech row's audio start — the same window `maybeSilenceSkip`
-  /// watches.
+  /// speech row's audio start.
   function isSilenceRowPlaying(row, rows) {
     if (playbackMode !== 'master' || row.kind !== 'silence') return false;
     const idx = rows.indexOf(row);
@@ -991,16 +962,18 @@
     return playingTimeMs >= prevEnd && playingTimeMs < next.audioStart;
   }
   /// Progress across a silence-row's swipe animation, normalised to
-  /// [`MAX_MASTER_SILENCE_MS`] so the fill has a consistent visual
-  /// meaning: "how close are we to the auto-skip cutoff".
+  /// the wall-clock gap between the flanking speech rows so a short
+  /// silence still fills fully and a long silence still crawls.
   function silenceRowProgress(row, rows) {
     if (!isSilenceRowPlaying(row, rows)) return 0;
     const idx = rows.indexOf(row);
     const prev = prevSpeechRow(rows, idx);
-    if (!prev) return 0;
+    const next = nextSpeechRow(rows, idx);
+    if (!prev || !next) return 0;
     const prevEnd = prev.audioStart + (prev.wallEnd - prev.wallStart);
     const elapsed = playingTimeMs - prevEnd;
-    return Math.max(0, Math.min(1, elapsed / MAX_MASTER_SILENCE_MS));
+    const dur = Math.max(1, next.audioStart - prevEnd);
+    return Math.max(0, Math.min(1, elapsed / dur));
   }
   function prevSpeechRow(rows, fromIdx) {
     for (let i = fromIdx - 1; i >= 0; i--) {
@@ -1036,20 +1009,6 @@
     const elapsed = playingTimeMs - row.audioStart;
     const dur = Math.max(1, end - row.audioStart);
     return Math.max(0, Math.min(1, elapsed / dur));
-  }
-
-  function onPlaybackEnded() {
-    playingRecordingId = null;
-    playingTimeMs = 0;
-  }
-
-  function onPlaybackPause() {
-    // No-op — kept as an event target so any future pause-specific
-    // side-effect can hook in without threading a new handler.
-  }
-
-  function onPlaybackPlay() {
-    ensureRaf();
   }
 
   // Reset playback whenever the selected recording changes so a stale
@@ -1276,33 +1235,6 @@
   }
 </script>
 
-{#snippet hiddenAudios()}
-  <!-- Both audio elements are hidden — playback is driven entirely by
-       the clip chips + row master ▶ buttons. Master (per-slot audio)
-       auto-advances through subsequent rows; Clip (single-segment) is
-       one-shot. `ondurationchange` + `onloadedmetadata` mirror the
-       browser's duration into `$state` so the Stop button's swipe fill
-       reacts the moment metadata for a fresh track arrives. -->
-  <audio
-    bind:this={masterAudioEl}
-    onplay={onPlaybackPlay}
-    onpause={onPlaybackPause}
-    onended={onPlaybackEnded}
-    ondurationchange={refreshMasterDuration}
-    onloadedmetadata={refreshMasterDuration}
-    preload="none"
-  ></audio>
-  <audio
-    bind:this={clipAudioEl}
-    onplay={onPlaybackPlay}
-    onpause={onPlaybackPause}
-    onended={onPlaybackEnded}
-    ondurationchange={refreshClipDuration}
-    onloadedmetadata={refreshClipDuration}
-    preload="none"
-  ></audio>
-{/snippet}
-
 {#snippet playAllBtn(recordingId)}
   {#if playbackMode != null && playingRecordingId === recordingId}
     <button
@@ -1359,7 +1291,7 @@
           }}
         >
           {#if playingClipId === clip.id}
-            <div class="clip-fill" style="width: {clipDurationMs ? Math.min(1, playingTimeMs / clipDurationMs) * 100 : 0}%" aria-hidden="true"></div>
+            <div class="clip-fill" style="width: {playbackDurationMs ? Math.min(1, playingTimeMs / playbackDurationMs) * 100 : 0}%" aria-hidden="true"></div>
           {/if}
           <span class="clip-chip-label">
             {#if soloTts}▸{:else}{fmtRelMs((clip.start_wall_ms ?? 0) - (p.start_wall_ms ?? 0))}{/if}
@@ -1506,7 +1438,7 @@
             }}
           >
             {#if playingClipId === clip.id}
-              <div class="clip-fill" style="width: {clipDurationMs ? Math.min(1, playingTimeMs / clipDurationMs) * 100 : 0}%" aria-hidden="true"></div>
+              <div class="clip-fill" style="width: {playbackDurationMs ? Math.min(1, playingTimeMs / playbackDurationMs) * 100 : 0}%" aria-hidden="true"></div>
             {/if}
             <span class="clip-cell-play-glyph">▸</span>
           </button>
@@ -1680,7 +1612,6 @@
           <span class="live-rec-label">Record</span>
         </button>
       </div>
-      {@render hiddenAudios()}
       {#if !liveRecording || liveRecording.paragraphs.length === 0}
         <div class="empty pane-empty">
           nothing spoken yet — the {channelFallback} channel is quiet
@@ -1724,7 +1655,6 @@
           </button>
         </div>
       </div>
-      {@render hiddenAudios()}
       {#if (state.activeRecording.paragraphs ?? []).length === 0}
         <div class="empty pane-empty">listening…</div>
       {:else}
@@ -1764,7 +1694,6 @@
           >⤓</a>
         </div>
       </div>
-      {@render hiddenAudios()}
       {#if (selectedSaved.paragraphs ?? []).length === 0}
         <div class="empty pane-empty">no transcript for this recording</div>
       {:else}

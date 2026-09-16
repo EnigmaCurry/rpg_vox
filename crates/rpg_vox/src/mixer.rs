@@ -249,6 +249,14 @@ pub struct AtomicMixer {
     /// runner can wait until a pending stop has been honored before it
     /// starts pushing a fresh clip.
     tts_stop_observed_gen: AtomicU64,
+    /// Monotonic count of stereo frames the pw process callback has
+    /// actually popped out of the TTS ring (successful pops only —
+    /// silences produced by an empty ring don't count). Used by
+    /// server-driven "play a recording through the bridge" flows to
+    /// report a live playback position back to the browser: the HTTP
+    /// handler snapshots this at burst start, and any subsequent read
+    /// minus that snapshot is the frames-of-this-burst-consumed.
+    tts_frames_played: AtomicU64,
     /// Wait-fill click track selection. `0` = off; any other value
     /// decodes to a [`ClickPreset`] via [`ClickPreset::from_u8`].
     clicks_preset: AtomicU8,
@@ -272,6 +280,7 @@ impl AtomicMixer {
             tts_stop_gen: AtomicU64::new(0),
             play_seq: AtomicU64::new(0),
             tts_stop_observed_gen: AtomicU64::new(0),
+            tts_frames_played: AtomicU64::new(0),
             clicks_preset: AtomicU8::new(0),
         })
     }
@@ -329,6 +338,24 @@ impl AtomicMixer {
     #[inline]
     pub fn tts_stop_observed_gen(&self) -> u64 {
         self.tts_stop_observed_gen.load(RELAXED)
+    }
+
+    /// Bump the successful-pop counter by `n` stereo frames. Called once
+    /// per pw process cycle from the source callback with the exact
+    /// count of TTS ring pops that yielded audio (silent fallback pops
+    /// don't count).
+    #[inline]
+    pub fn add_tts_frames_played(&self, n: u64) {
+        if n > 0 {
+            self.tts_frames_played.fetch_add(n, RELAXED);
+        }
+    }
+
+    /// Read the current cumulative frame count. Monotonic; wraps at
+    /// u64 which is effectively never for our sample rates.
+    #[inline]
+    pub fn tts_frames_played(&self) -> u64 {
+        self.tts_frames_played.load(RELAXED)
     }
 
     #[inline]

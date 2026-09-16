@@ -79,10 +79,11 @@
     $pingStats.sampled && !$pingStats.err ? Math.round($pingStats.avgMs) : null
   );
 
-  // When a recording is active, the health chip is replaced by a red
-  // pulsing dot + "RECORDING" + running duration (hh:mm). Tracks the
-  // wall clock locally so the timer advances smoothly between the 1s
-  // recordingStatus polls instead of ticking in visible 1s hops.
+  // When a recording is active, a red pulsing "RECORDING" pill renders
+  // *alongside* the health chip (not in place of it) so link health is
+  // still visible mid-session — a network drop while recording is worth
+  // seeing at a glance. Local wall-clock tick keeps the duration
+  // display smooth between the 1s recordingStatus polls.
   const recording = $derived($recordingStatus?.active === true);
 
   let now = $state(Date.now());
@@ -120,11 +121,10 @@
     <span class="rec-label">RECORDING</span>
     <span class="rec-time">{fmtHhMm(elapsedMs)}</span>
   </a>
-{:else}
-  <span class="health {$health}">
-    {label}{#if lagging}<span class="lagging" title="Web Monitor auto-paused — waiting for ping to recover"> · LAGGING{#if laggingMs != null} {laggingMs}ms{:else if $pingStats.err} · no response{/if}</span>{:else if streaming}<button type="button" class="streaming" title={streamingTitle} onclick={onStreamingClick}> · {copiedFlash ? 'copied stats' : 'streaming'}</button>{/if}
-  </span>
 {/if}
+<span class="health {$health}">
+  {label}{#if lagging}<span class="lagging" title="Web Monitor auto-paused — waiting for ping to recover"> · LAGGING{#if laggingMs != null} {laggingMs}ms{:else if $pingStats.err} · no response{/if}</span>{:else if streaming}<button type="button" class="streaming" title={streamingTitle} onclick={onStreamingClick}> · {copiedFlash ? 'copied stats' : 'streaming'}</button>{/if}
+</span>
 
 <style>
   .health {

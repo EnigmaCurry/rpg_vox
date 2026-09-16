@@ -1431,11 +1431,18 @@ fn run(
                 let mut master_r_peak = 0.0f32;
 
                 let mut any_audio = false;
+                let mut tts_pops = 0u64;
                 for i in 0..frames {
                     // Always drain each ring even if muted — otherwise the
                     // upstream sink callback will spin against a full ring
                     // and drop input frames instead of just being silenced.
-                    let [tts_lin, tts_rin] = state.tts_consumer.pop().unwrap_or([0.0, 0.0]);
+                    let (tts_lin, tts_rin) = match state.tts_consumer.pop() {
+                        Ok([l, r]) => {
+                            tts_pops += 1;
+                            (l, r)
+                        }
+                        Err(_) => (0.0, 0.0),
+                    };
                     let [mus_lin, mus_rin] = state.music_consumer.pop().unwrap_or([0.0, 0.0]);
 
                     let tts_l_c = tts_lin * tts_l;
@@ -1492,6 +1499,7 @@ fn run(
                 }
 
                 state.mixer.tts.observe_peak(tts_peak);
+                state.mixer.add_tts_frames_played(tts_pops);
                 state.mixer.music.observe_peak(music_peak);
                 for slot_i in 0..effective_slots {
                     state.mixer.vox[slot_i]
