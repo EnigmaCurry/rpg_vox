@@ -862,7 +862,6 @@ export async function unlinkSource(id) {
 //   recordings: [{ id, name, created_at, duration_ms, sample_rate,
 //                  paragraphs, audio_url }]
 // }
-// PUT  /record/llm-when-idle { enabled } → { llmWhenIdle }
 //
 // Paragraph = { id, channel, speaker?, hardened, text, raw_text,
 //               clips: ClipRef[], start_wall_ms, end_wall_ms, created_at }
@@ -957,24 +956,6 @@ export async function clearLiveBuffer() {
     const detail = await r.text().catch(() => `HTTP ${r.status}`);
     throw new Error(detail || `HTTP ${r.status}`);
   }
-}
-
-/// Set the "reinterpret with LLM (live)" runtime toggle. Off by
-/// default; the live pane's checkbox persists the choice to
-/// localStorage and posts here on every change plus on page mount so
-/// the server mirrors the operator's preference. During a named
-/// recording the LLM always runs — this flag only affects live mode.
-export async function setLlmWhenIdle(enabled) {
-  const r = await fetch('/record/llm-when-idle', {
-    method: 'PUT',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ enabled: !!enabled }),
-  });
-  if (!r.ok) {
-    const detail = await r.text().catch(() => `HTTP ${r.status}`);
-    throw new Error(detail || `HTTP ${r.status}`);
-  }
-  return await r.json();
 }
 
 /// Correct the text of a transcript clip that lives in the RAM state —

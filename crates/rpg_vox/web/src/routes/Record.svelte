@@ -22,23 +22,6 @@
   let err = $state(null);
   let busy = $state(false);
 
-  // "Reinterpret with LLM" toggle for the live pane. Off by default.
-  // The value is authoritative on the client (localStorage) — the
-  // server just mirrors last-writer. onMount reads localStorage and
-  // POSTs once so a fresh server picks up the operator's preference;
-  // every checkbox change POSTs the new value. During a named
-  // recording the server ignores this flag and always runs the LLM.
-  const LLM_WHEN_IDLE_KEY = 'rpgvox.llmWhenIdle';
-  let llmWhenIdle = $state(false);
-  async function onLlmWhenIdleChange() {
-    try {
-      localStorage.setItem(LLM_WHEN_IDLE_KEY, llmWhenIdle ? '1' : '0');
-      await api.setLlmWhenIdle(llmWhenIdle);
-    } catch (e) {
-      console.warn('llm-when-idle put failed', e);
-    }
-  }
-
   // Selected sidebar item: 'live' (rolling buffer), 'active' (in-flight
   // recording), or a recording id (saved). Recording auto-selects to
   // 'active' on start; stop drops back to 'live' unless the user is
@@ -48,6 +31,13 @@
 
   const POLL_MS = 500;
   let timer = null;
+
+  // Wall-clock tick for relative timestamps ("Ns ago" / "Nm ago"). We
+  // tick every second so the label updates promptly when it crosses a
+  // bucket boundary; the formatter itself rounds to 10s so the visible
+  // number only steps in 10s increments.
+  let nowMs = $state(Date.now());
+  let nowTimer = null;
 
   // Autoscroll — targets the *page* (browser window scrollbar), because
   // the Record layout is designed so the page itself is the only
@@ -159,27 +149,14 @@
   });
 
   onMount(async () => {
-    // Restore the "Reinterpret with LLM" toggle from localStorage
-    // before the first poll so the checkbox reflects the persisted
-    // choice, and POST it once so the server (which just restarted
-    // and defaults to off) picks it up. Failures are non-fatal —
-    // worst case the server stays at its default until the user
-    // clicks the box.
-    try {
-      const stored = localStorage.getItem(LLM_WHEN_IDLE_KEY);
-      llmWhenIdle = stored === '1' || stored === 'true';
-      await api.setLlmWhenIdle(llmWhenIdle);
-    } catch (e) {
-      // Non-fatal — the checkbox still works; server just misses
-      // the initial sync.
-      console.warn('llm-when-idle init failed', e);
-    }
     await refresh();
     timer = setInterval(refresh, POLL_MS);
+    nowTimer = setInterval(() => { nowMs = Date.now(); }, 1000);
   });
 
   onDestroy(() => {
     if (timer) { clearInterval(timer); timer = null; }
+    if (nowTimer) { clearInterval(nowTimer); nowTimer = null; }
     if (rafId) { cancelAnimationFrame(rafId); rafId = 0; }
   });
 
@@ -305,6 +282,21 @@
       minute: '2-digit',
       second: '2-digit',
     });
+  }
+  // Relative wall time. Under a minute → "Ns ago" bucketed to the
+  // nearest 10s (0s, 10s, 20s, …, 50s). Under an hour → "Nm ago". At
+  // or beyond an hour → the absolute HH:MM:SS, since "62m ago" is
+  // harder to parse than the actual clock time.
+  function fmtWallTimeRel(ms, now) {
+    if (!ms) return '';
+    const diff = Math.max(0, now - ms);
+    if (diff < 60_000) {
+      return `${Math.floor(diff / 10_000) * 10}s ago`;
+    }
+    if (diff < 3_600_000) {
+      return `${Math.floor(diff / 60_000)}m ago`;
+    }
+    return fmtWallTime(ms);
   }
   // Single-letter placeholder derived from the pill text so an avatar
   // that isn't yet wired to a real portrait still reads as
@@ -1092,6 +1084,27 @@
     }
   }
 
+  // Timestamp click → copy the full local timestamp string and briefly
+  // swap the label to "copied" so the user sees the click landed. Keyed
+  // by whatever id the clicker passed in (paragraph id or clip id) so
+  // only that one button flashes.
+  let copiedTsId = $state(null);
+  let tsCopyClearTimer = 0;
+  const TS_COPY_FLASH_MS = 700;
+  async function copyTimestamp(id, fullStr) {
+    try {
+      await navigator.clipboard.writeText(fullStr);
+      copiedTsId = id;
+      if (tsCopyClearTimer) clearTimeout(tsCopyClearTimer);
+      tsCopyClearTimer = setTimeout(() => {
+        copiedTsId = null;
+        tsCopyClearTimer = 0;
+      }, TS_COPY_FLASH_MS);
+    } catch (e) {
+      err = `copy failed: ${e.message}`;
+    }
+  }
+
   // Inline rename for the in-flight recording's pane header. Click the
   // name to enter edit mode; Enter/blur commits, Escape cancels.
   let renamingActive = $state(false);
@@ -1397,9 +1410,18 @@
           {harden_secs}s
         </span>
       {/if}
-      <span class="paragraph-ts" title={fmtTime(p.created_at)}>
-        {fmtWallTime(p.start_wall_ms)}
-      </span>
+      <button
+        type="button"
+        class="paragraph-ts"
+        class:copied={copiedTsId === p.id}
+        title={fmtTime(p.created_at)}
+        onclick={() => copyTimestamp(p.id, fmtTime(p.created_at))}
+      >
+        {copiedTsId === p.id ? 'copied' : fmtWallTimeRel(p.start_wall_ms, nowMs)}
+        {#if copiedTsId === p.id}
+          <span class="ts-full">{fmtTime(p.created_at)}</span>
+        {/if}
+      </button>
     </div>
     <button
       type="button"
@@ -1499,9 +1521,18 @@
           title={copiedParagraphId === p.id ? 'Copied!' : 'Click to copy paragraph text'}
           onclick={() => copyParagraphText(p)}
         >{clip.text || ''}</button>
-        <span class="clip-cell-ts" title={fmtTime(p.created_at)}>
-          {fmtWallTime(clip.start_wall_ms ?? p.start_wall_ms)}
-        </span>
+        <button
+          type="button"
+          class="clip-cell-ts"
+          class:copied={copiedTsId === clip.id}
+          title={fmtTime(p.created_at)}
+          onclick={() => copyTimestamp(clip.id, fmtTime(p.created_at))}
+        >
+          {copiedTsId === clip.id ? 'copied' : fmtWallTimeRel(clip.start_wall_ms ?? p.start_wall_ms, nowMs)}
+          {#if copiedTsId === clip.id}
+            <span class="ts-full">{fmtTime(p.created_at)}</span>
+          {/if}
+        </button>
       </div>
     {/if}
   </div>
@@ -1531,7 +1562,7 @@
                 {#if isSilenceRowPlaying(row, rows)}
                   <div class="clip-fill" style="width: {silenceRowProgress(row, rows) * 100}%" aria-hidden="true"></div>
                 {/if}
-                <span class="silence-text">silence · {Math.max(0, Math.round((row.wallEnd - row.wallStart) / 1000))}s</span>
+                silence · {Math.max(0, Math.round((row.wallEnd - row.wallStart) / 1000))}s
               </button>
             </div>
           {:else if row.channels.length === 1}
@@ -1635,17 +1666,6 @@
             <span class="stt-off"> · STT disabled</span>
           {/if}
         </h1>
-        <label
-          class="llm-toggle"
-          title="Off (default): the live pane is a plain per-clip transcript. On: the LLM reinterprets paragraphs as they land, using GPU time. Ignored during a named recording — the LLM always runs there."
-        >
-          <input
-            type="checkbox"
-            bind:checked={llmWhenIdle}
-            onchange={onLlmWhenIdleChange}
-          />
-          <span>Reinterpret with LLM</span>
-        </label>
         <button
           type="button"
           class="live-rec-btn"
@@ -1826,38 +1846,6 @@
   /* Start-recording affordance pinned to the far-right corner of the
      sticky header. Deliberately understated in its resting state — a
      small red dot as an icon, muted border, no glow, no animation. */
-  /* "Reinterpret with LLM" checkbox — sits between the title and the
-     Record button. `margin-left: auto` on this element pushes the
-     Record button flush right; the toggle stays packed to the left of
-     it so the compact header still fits on narrow widths. */
-  .pane-head.live .llm-toggle {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    padding: 3px 8px;
-    border-radius: 999px;
-    color: var(--muted);
-    font-size: 12px;
-    cursor: pointer;
-    flex: 0 0 auto;
-    margin-left: auto;
-    user-select: none;
-  }
-  .pane-head.live .llm-toggle:hover {
-    color: var(--text);
-  }
-  .pane-head.live .llm-toggle input[type="checkbox"] {
-    margin: 0;
-    accent-color: rgba(122,162,255,0.8);
-  }
-  .pane-head.live.compact .llm-toggle {
-    /* In the compact (scrolled) header the space is tight; drop the
-       label but keep the checkbox so the toggle is still available. */
-    padding: 3px 4px;
-  }
-  .pane-head.live.compact .llm-toggle span {
-    display: none;
-  }
   .pane-head.live .live-rec-btn {
     display: inline-flex;
     align-items: center;
@@ -2323,7 +2311,15 @@
     font-size: 10px;
     font-variant-numeric: tabular-nums;
     white-space: nowrap;
+    background: transparent;
+    border: 0;
+    padding: 0;
+    font-family: inherit;
+    cursor: pointer;
+    position: relative;
   }
+  .clip-cell-ts:hover { color: var(--text); }
+  .clip-cell-ts.copied { color: rgb(90, 220, 120); }
 
   /* Paragraph block: avatar header + prose button + clip strip. */
   .paragraph-block {
@@ -2355,6 +2351,28 @@
     font-variant-numeric: tabular-nums;
     white-space: nowrap;
     margin-left: auto;
+    background: transparent;
+    border: 0;
+    padding: 0;
+    font-family: inherit;
+    cursor: pointer;
+    position: relative;
+  }
+  .paragraph-ts:hover { color: var(--text); }
+  .paragraph-ts.copied { color: rgb(90, 220, 120); }
+  /* Full timestamp shown just below the "copied" flash. Absolutely
+     positioned so the row height doesn't jitter during the 700ms
+     flash window. */
+  .paragraph-ts .ts-full,
+  .clip-cell-ts .ts-full {
+    position: absolute;
+    top: 100%;
+    right: 0;
+    margin-top: 2px;
+    font-size: 10px;
+    color: var(--muted);
+    white-space: nowrap;
+    pointer-events: none;
   }
   /* State indicator: a small colored circle in the paragraph header
      showing the paragraph's current processing state.
@@ -2586,10 +2604,6 @@
   }
   .silence-tag .clip-fill {
     z-index: 0;
-  }
-  .silence-text {
-    position: relative;
-    z-index: 1;
   }
 
   /* Master row button — the ▶ that plays the per-slot audio from the
