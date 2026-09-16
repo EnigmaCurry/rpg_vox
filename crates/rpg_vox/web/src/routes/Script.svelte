@@ -1538,7 +1538,7 @@
 </script>
 
 <!-- Two-pane layout: sidebar (script list) + main (transcript + input).
-     Under 1080px the sidebar collapses into a shared hamburger drawer
+     At 720p and below the sidebar collapses into a shared hamburger drawer
      (see sidebarDrawer.svelte.js); on wider screens the sidebar is
      always visible in the flex row. -->
 <div class="script-shell">
@@ -1954,10 +1954,10 @@
     width: 100%;
   }
 
-  /* Under 1080px the sidebar becomes a fixed-position drawer (shared
+  /* At 720p and below the sidebar becomes a fixed-position drawer (shared
      drawer CSS in app.css), so the grid becomes a single column and
      the main pane fills the viewport. */
-  @media (max-width: 1079px) {
+  @media (max-width: 1280px) {
     .script-shell {
       grid-template-columns: 1fr;
     }

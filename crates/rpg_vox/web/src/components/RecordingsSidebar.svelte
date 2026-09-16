@@ -7,7 +7,7 @@
   // list, current selection, active-recording bucket) and passes callbacks
   // in so this component doesn't fetch anything itself.
   //
-  // Under 1080px the sidebar collapses into a fixed hamburger button at
+  // At 720p and below the sidebar collapses into a fixed hamburger button at
   // the top-left; tapping it slides the sidebar in as a drawer. Any
   // navigation choice (select row, new recording) auto-dismisses; the
   // backdrop and Escape also close it. See `sidebarDrawer.svelte.js`.

@@ -84,7 +84,7 @@
     else if (e.key === 'Escape') { e.preventDefault(); cancelRename(); }
   }
 
-  // Below the 1080px breakpoint the sidebar collapses to a hamburger
+  // At 720p and below the sidebar collapses to a hamburger
   // drawer; selecting a scene or hitting `+` dismisses it.
   const drawer = createSidebarDrawer();
   const selectAndClose = drawer.wrap(onSelect);

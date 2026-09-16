@@ -54,12 +54,12 @@
   // full-bleed too rather than centering under the 720px cap.
   const isFullBleed = $derived(
     $route === '/scenes' || $route === '/speak'
-      || $route === '/record'
+      || $route === '/record' || $route === '/mixer'
       || $route.startsWith('/script') || $route.startsWith('/chat'),
   );
   // Record grows tall and uses the page scrollbar instead of an inner
   // one, unlike other full-bleed routes which cap at viewport height.
-  const isPageScroll = $derived($route === '/record');
+  const isPageScroll = $derived($route === '/record' || $route === '/mixer');
 
   onMount(() => {
     startHealthPoll();

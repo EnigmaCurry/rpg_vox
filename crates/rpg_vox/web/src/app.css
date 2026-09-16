@@ -89,7 +89,7 @@ hr {
 /* Shared mobile-drawer visuals for the left-rail sidebars (Recordings,
    Scenes, Scripts). Each sidebar renders a `.drawer-hamburger`, a
    `.drawer-backdrop`, and applies `.drawer` (+ optional `.open`) to its
-   `<aside>` root when the (max-width: 1079px) breakpoint hits. The
+   `<aside>` root when the (max-width: 1280px) breakpoint hits. The
    sidebars keep their existing 240px flex-child layout above that
    width — these rules only apply inside the media query below.
 
@@ -103,7 +103,7 @@ hr {
   display: none;
 }
 
-@media (max-width: 1079px) {
+@media (max-width: 1280px) {
   .drawer-hamburger {
     display: inline-flex;
     align-items: center;
@@ -149,7 +149,7 @@ hr {
     /* Overlay drawers get a shadow so they read as elevated over the
        page content behind the backdrop. */
     box-shadow: 4px 0 16px rgba(0, 0, 0, 0.4);
-    /* Above-1080 sidebars are ~240px flex children of a row layout;
+    /* Above 1280px sidebars are ~240px flex children of a row layout;
        collapsing that flex slot when the drawer is fixed keeps the
        main content full-width. */
     flex: 0 0 auto;

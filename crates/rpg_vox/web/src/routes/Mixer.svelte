@@ -706,7 +706,7 @@
 </div>
 
 <style>
-  .mixer { display: flex; flex-direction: column; gap: 16px; padding: 20px; max-width: 1200px; margin: 0 auto; }
+  .mixer { display: flex; flex-direction: column; gap: 12px; padding: 10px; }
   .header { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
   h1 { font-size: 20px; margin: 0; }
   h2 { font-size: 14px; margin: 0; font-weight: 600; letter-spacing: 0.02em; }
@@ -771,24 +771,26 @@
 
   .board {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
-    gap: 14px;
+    grid-auto-flow: column;
+    grid-auto-columns: minmax(0, 1fr);
+    gap: 8px;
     background: var(--panel);
     border: 1px solid var(--border);
     border-radius: 10px;
-    padding: 18px;
+    padding: 10px;
   }
 
   .strip {
     display: flex;
     flex-direction: column;
     align-items: center;
-    gap: 10px;
-    padding: 14px 10px;
+    gap: 8px;
+    padding: 12px 6px;
     border-radius: 8px;
     background: rgba(0,0,0,0.15);
     border: 1px solid var(--border);
     transition: opacity 0.15s;
+    min-width: 0;
   }
   .strip.master { background: rgba(122,162,255,0.05); border-color: rgba(122,162,255,0.25); }
   .strip.muted { opacity: 0.55; }
@@ -814,7 +816,8 @@
   }
   .name-btn:hover { background: rgba(255,255,255,0.05); }
   .rename-input {
-    width: 110px;
+    width: 100%;
+    max-width: 110px;
     text-align: center;
     background: rgba(0,0,0,0.3);
     color: var(--text);

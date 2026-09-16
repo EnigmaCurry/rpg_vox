@@ -1817,7 +1817,7 @@
     padding-bottom: 2px;
   }
   .pane-head.compact h1 { font-size: 12px; }
-  @media (max-width: 1079px) {
+  @media (max-width: 1280px) {
     .pane-head { padding-left: 44px; }
   }
   .pane-head h1 { font-size: 16px; margin: 0; line-height: 1.2; }
@@ -1828,7 +1828,7 @@
     flex-wrap: nowrap;
     padding: 6px 4px;
   }
-  @media (max-width: 1079px) {
+  @media (max-width: 1280px) {
     .pane-head.saved { padding-left: 44px; }
   }
   .pane-head.saved .saved-title {
@@ -1899,7 +1899,7 @@
     border: 1px solid rgba(255, 80, 80, 0.4);
     border-radius: 10px;
   }
-  @media (max-width: 1079px) {
+  @media (max-width: 1280px) {
     .pane-head.active { padding-left: 44px; }
   }
   .active-title { display: flex; align-items: center; gap: 12px; min-width: 0; }

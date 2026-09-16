@@ -1,13 +1,13 @@
 // Shared mobile-drawer state for the left-rail sidebars (Recordings,
-// Scenes, Scripts). Under 1080px each sidebar becomes a slide-in drawer
-// controlled by a hamburger button that stays fixed below the menubar.
-// Above 1080px the sidebar sits in the layout normally and the drawer
-// state is ignored.
+// Scenes, Scripts). At 720p and below each sidebar becomes a slide-in
+// drawer controlled by a hamburger button that stays fixed below the
+// menubar. Above 1280px the sidebar sits in the layout normally and
+// the drawer state is ignored.
 //
 // Each sidebar owns its own drawer instance so opening the Scripts
 // drawer while on the Scripts page doesn't affect the Recordings
 // drawer's state on the Record page. The instance exposes:
-//   * `isMobile` — reactive, tracks the (max-width: 1079px) media query
+//   * `isMobile` — reactive, tracks the (max-width: 1280px) media query
 //   * `open` / `setOpen` / `toggle` / `close` — drawer visibility
 //   * `wrap(fn)` — helper that returns a wrapped callback which closes
 //     the drawer after invoking `fn` (mobile only). Use this on
@@ -19,7 +19,7 @@
 
 import { onMount, onDestroy } from 'svelte';
 
-export const DRAWER_BREAKPOINT_PX = 1080;
+export const DRAWER_BREAKPOINT_PX = 1281;
 
 export function createSidebarDrawer() {
   let isMobile = $state(false);

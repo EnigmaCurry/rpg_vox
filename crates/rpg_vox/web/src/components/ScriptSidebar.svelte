@@ -109,7 +109,7 @@
     }, DELETE_CONFIRM_MS);
   }
 
-  // Below 1080px collapse into a hamburger drawer. Selecting a script
+  // At 720p and below collapse into a hamburger drawer. Selecting a script
   // (which triggers a hash-navigate) or hitting `+` dismisses it.
   const drawer = createSidebarDrawer();
   const selectAndClose = drawer.wrap(selectScript);
