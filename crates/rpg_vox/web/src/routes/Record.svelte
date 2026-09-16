@@ -413,20 +413,37 @@
     const rows = [];
     let cluster = [];
     let clusterEnd = 0;
-    // An in-flight (not-yet-hardened) paragraph's `end_wall_ms` only
-    // reflects clips that have already finished transcribing. During
-    // live recording, a brief utterance on another channel can arrive
-    // *after* the in-flight paragraph's last-transcribed clip ended
-    // but *before* its next clip lands — with plain `end_wall_ms` the
-    // two would land in separate clusters (utterance shows below,
-    // then snaps into the same cluster once the next clip transcribes).
-    // Extending non-hardened paragraphs' effective end to "now"
-    // avoids that flicker and shows the utterance in the correct
-    // cluster from the moment it appears.
     const nowMs = Date.now();
+    // "Latest paragraph on channel" is stable — once a newer paragraph
+    // opens on the same channel, the server imperatively hardens the
+    // previous one and it can never come back to being the latest. In
+    // contrast, `p.hardened` in the snapshot is *re-derived* on every
+    // render from a 2 s timeout, so during natural pauses in speech
+    // the current paragraph's `hardened` flips true, then back to
+    // false when the next chunk lands. Basing "in-flight" on that
+    // flag directly makes the split-cluster rendering oscillate.
+    const latestByChannel = {};
+    for (const p of paragraphs ?? []) {
+      const ch = p.channel || 'Unknown';
+      const cur = latestByChannel[ch];
+      if (!cur || (p.start_wall_ms ?? 0) > (cur.start_wall_ms ?? 0)) {
+        latestByChannel[ch] = p;
+      }
+    }
+    // A recording's latest paragraph on a channel counts as in-flight
+    // only while its last-clip end is fresh — after this window we
+    // treat it as hardened even if a new chunk could theoretically
+    // still arrive. Long enough to cover natural pauses inside a
+    // speaking turn; short enough that a genuinely finished paragraph
+    // eventually settles into per-clip rendering.
+    const RECENT_ACTIVITY_MS = 30000;
+    const isInFlight = (p) => {
+      if (latestByChannel[p.channel || 'Unknown'] !== p) return false;
+      return (p.end_wall_ms ?? 0) > nowMs - RECENT_ACTIVITY_MS;
+    };
     const effectiveEnd = (p) => {
       const base = p.end_wall_ms ?? 0;
-      return p.hardened ? base : Math.max(base, nowMs);
+      return isInFlight(p) ? Math.max(base, nowMs) : base;
     };
     const flush = () => {
       if (!cluster.length) return;
@@ -449,19 +466,37 @@
         }
       }
       const channels = orderChannels(chSet, canonical);
-      // For split clusters (multiple participating channels), break each
-      // paragraph into per-clip entries and place them in wall-clock
-      // start-time order. This lets a brief utterance on one channel
-      // land visually *between* two clips of a longer paragraph on
-      // another channel — aligned with the timestamp of the specific
-      // clip it overlaps, rather than pushed below the whole paragraph.
-      // Single-channel clusters (.cluster.full) still render one unified
-      // paragraph block since there's no cross-channel alignment to
-      // achieve.
+      // For split clusters (multiple participating channels), each
+      // entry becomes one grid cell. In-flight (not-yet-hardened)
+      // paragraphs are emitted as a single paragraph-level entry: while
+      // chunks are still landing, cross-channel alignment must stay
+      // stable, so we treat the whole paragraph as one unit rather than
+      // exposing its per-chunk boundaries (which would cause a brief
+      // utterance on another channel to jump between slots as each
+      // Vox2 chunk finalizes and its cEnd shrinks). Hardened paragraphs
+      // fan out into per-clip entries so a brief utterance can align
+      // with the specific clip it overlaps.
       const orderedClips = [];
       for (const p of cluster) {
         const clipList = p.clips ?? [];
         const colIndex = channels.indexOf(p.channel || 'Unknown');
+        if (isInFlight(p)) {
+          const lastClip = clipList[clipList.length - 1];
+          const lastEnd =
+            (lastClip?.start_wall_ms ?? p.start_wall_ms ?? wallStart) +
+            (lastClip?.audio_duration_ms ?? 0);
+          orderedClips.push({
+            p,
+            clip: null,
+            colIndex,
+            cStart: p.start_wall_ms ?? wallStart,
+            paragraphCEnd: lastEnd,
+            isInFlight: true,
+            isFirstOfP: true,
+            isLastOfP: true,
+          });
+          continue;
+        }
         if (clipList.length === 0) {
           orderedClips.push({
             p,
@@ -498,10 +533,18 @@
       let numSlots = 0;
       for (const entry of orderedClips) {
         const cStart = entry.cStart;
-        const cDur = entry.clip?.audio_duration_ms ?? 0;
-        const rawEnd = cStart + cDur;
-        const isProvisional = !!entry.clip?.provisional;
-        const cEnd = isProvisional ? Math.max(rawEnd, nowMs) : rawEnd;
+        let cEnd;
+        if (entry.isInFlight) {
+          // In-flight paragraph entry: extend to `now` so overlapping
+          // utterances on other channels can share this slot regardless
+          // of how far behind transcription is lagging.
+          cEnd = Math.max(entry.paragraphCEnd ?? cStart, nowMs);
+        } else {
+          const cDur = entry.clip?.audio_duration_ms ?? 0;
+          const rawEnd = cStart + cDur;
+          const isProvisional = !!entry.clip?.provisional;
+          cEnd = isProvisional ? Math.max(rawEnd, nowMs) : rawEnd;
+        }
         const ch = entry.p.channel || 'Unknown';
         const canJoin =
           currentSlot &&
@@ -552,7 +595,29 @@
         if (pEnd > clusterEnd) clusterEnd = pEnd;
         continue;
       }
-      // Gap: flush current cluster; conditionally emit silence.
+      // Nominal gap in wall-clock time. Any paragraph that is still
+      // in-flight (not hardened) should not be visually sliced off
+      // from adjacent content by a silence break — during recording,
+      // everything currently being spoken belongs in the same cluster
+      // so brief overlapping utterances land beside the recording
+      // clip rather than in a separated column-form cluster. If only
+      // the *cluster* side is in-flight, keep a bounded merge window
+      // so a stale unhardened paragraph doesn't pull in unrelated
+      // later content indefinitely.
+      const CLUSTER_INFLIGHT_MERGE_MAX_MS = 30000;
+      const clusterHasInFlight = cluster.some(isInFlight);
+      const pIsInFlight = isInFlight(p);
+      const gapMs = pStart - clusterEnd;
+      if (
+        pIsInFlight ||
+        (clusterHasInFlight && gapMs < CLUSTER_INFLIGHT_MERGE_MAX_MS)
+      ) {
+        cluster.push(p);
+        if (pEnd > clusterEnd) clusterEnd = pEnd;
+        continue;
+      }
+      // Real gap between fully-hardened clusters — flush and emit
+      // silence if the gap is long enough.
       const gap = pStart - clusterEnd;
       const prevEnd = clusterEnd;
       // audio-timeline end of the just-closed cluster's last paragraph,
@@ -1517,12 +1582,16 @@
                   <span class="master-glyph">▶</span>
                 </button>
               {/if}
-              {#each row.orderedClips as entry (entry.clip ? entry.clip.id : `${entry.p.id}-empty`)}
+              {#each row.orderedClips as entry (entry.clip ? entry.clip.id : entry.p.id)}
                 <div
                   class="cluster-cell"
                   style="grid-column: {entry.colIndex + 1}; grid-row: {clipRowStart + entry.slotIdx - 1};"
                 >
-                  {@render clipCell(entry, recId)}
+                  {#if entry.isInFlight}
+                    {@render paragraphBlock(entry.p, recId)}
+                  {:else}
+                    {@render clipCell(entry, recId)}
+                  {/if}
                 </div>
               {/each}
             </div>
