@@ -564,7 +564,9 @@
   </div>
 
   <section class="io-panel">
-    <div class="subhead"><span>Local monitor</span></div>
+    <div class="subhead"><span>Web monitor</span>
+      <span class="note">piped directly into your browser — listen from anywhere</span>
+    </div>
     <div class="sink-list">
       <label class="sink browser-monitor" title="Stream the tap into this browser tab (does not affect other clients)">
         <input
@@ -590,7 +592,14 @@
       {#if browserMonitorError}
         <div class="monitor-err">{browserMonitorError}</div>
       {/if}
+    </div>
+  </section>
 
+  <section class="io-panel">
+    <div class="subhead"><span>Server monitor</span>
+      <span class="note">piped into a pipewire sink on the server</span>
+    </div>
+    <div class="sink-list">
       {#if monitorable.length === 0}
         <div class="empty">no pipewire sinks available</div>
       {:else}
