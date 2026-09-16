@@ -1,7 +1,10 @@
 <script>
-  import { health, recordingStatus, pingStats, pingBad } from '../lib/stores.js';
+  import { health, recordingStatus, pingStats, pingBad, graph, getClientId } from '../lib/stores.js';
   import { monitorState, monitorPref, monitorStats } from '../lib/browserMonitor.js';
+  import { micState } from '../lib/browserMic.js';
   import { navigate } from '../lib/router.js';
+
+  const clientId = getClientId();
 
   const label = $derived({ checking: 'checking…', ok: 'online', err: 'offline' }[$health] || '');
   // Only decorate with "streaming" when the app is healthy AND the browser
@@ -9,6 +12,24 @@
   // monitor state ('connecting', 'error', 'stopped') is quiet — no need to
   // clutter the menubar with transient states.
   const streaming = $derived($health === 'ok' && $monitorState === 'listening');
+  // Red "your mic is live" decorator whenever this browser's web
+  // microphone is actively capturing (mic hardware acquired, encoder
+  // running). Label reflects the current routing so a glance tells you
+  // where your voice is going — "Music", "Vox 1", "Vox 2", …
+  const micCapturing = $derived($micState?.capture === 'active');
+  const ownWebMicRoute = $derived(
+    ($graph?.web_mic_sources ?? []).find((w) => w.client_uuid === clientId)?.routed_to ?? null
+  );
+  const micRouteLabel = $derived.by(() => {
+    const s = ownWebMicRoute;
+    if (!s) return null;
+    if (s === 'music') return 'Music';
+    if (s === 'vox') return 'Vox 1';
+    const m = s.match(/^vox(\d+)$/);
+    if (m) return `Vox ${m[1]}`;
+    return s;
+  });
+  const showLiveMic = $derived(micCapturing && micRouteLabel !== null);
   // Auto-paused because the ping meter tripped. Shown to the user as a
   // yellow "LAGGING Xms" so they know why the browser monitor went silent
   // — the pref is still on and we'll auto-resume when the link recovers.
@@ -123,7 +144,7 @@
   </a>
 {/if}
 <span class="health {$health}">
-  {label}{#if lagging}<span class="lagging" title="Web Monitor auto-paused — waiting for ping to recover"> · LAGGING{#if laggingMs != null} {laggingMs}ms{:else if $pingStats.err} · no response{/if}</span>{:else if streaming}<button type="button" class="streaming" title={streamingTitle} onclick={onStreamingClick}> · {copiedFlash ? 'copied stats' : 'streaming'}</button>{/if}
+  {label}{#if lagging}<span class="lagging" title="Web Monitor auto-paused — waiting for ping to recover"> · LAGGING{#if laggingMs != null} {laggingMs}ms{:else if $pingStats.err} · no response{/if}</span>{:else if streaming}<button type="button" class="streaming" title={streamingTitle} onclick={onStreamingClick}> · {copiedFlash ? 'copied stats' : 'streaming'}</button>{/if}{#if showLiveMic}<span class="live-mic" title={`Web microphone capturing → ${micRouteLabel}`}> · {micRouteLabel}</span>{/if}
 </span>
 
 <style>
@@ -158,6 +179,14 @@
     font-weight: 600;
     letter-spacing: 0.03em;
     font-variant-numeric: tabular-nums;
+  }
+  /* Red "live mic" indicator when this browser's web microphone is
+     capturing. Same weight as `.streaming` for visual parity, but red
+     so it reads as a "you are transmitting" warning. */
+  .live-mic {
+    color: var(--err);
+    font-weight: 600;
+    letter-spacing: 0.02em;
   }
 
   .recording {

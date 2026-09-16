@@ -6,6 +6,35 @@ import * as api from './api.js';
 // exactly one source of truth for the pref.
 export const PW_MONITOR_PREF_KEY = 'rpg_vox.monitor_sink_name';
 
+// Stable per-browser client id used by `/mic.ws?client=<uuid>` and the
+// web-mic routing endpoints. Persisted in localStorage so a page reload
+// keeps the same slot and the server can restore the client's saved
+// routing pref. Each browser tab in the same profile shares one id —
+// only one mic can be captured per tab anyway, and separate profiles /
+// private windows naturally get distinct ids since their localStorage
+// is isolated.
+export const CLIENT_ID_KEY = 'rpg_vox.client_id';
+export function getClientId() {
+  try {
+    let id = localStorage.getItem(CLIENT_ID_KEY);
+    if (id && /^[0-9a-f-]{36}$/i.test(id)) return id;
+    id = (crypto.randomUUID && crypto.randomUUID()) || generateFallbackUuid();
+    localStorage.setItem(CLIENT_ID_KEY, id);
+    return id;
+  } catch {
+    // localStorage disabled — hand out an ephemeral id so the app still
+    // works, at the cost of losing routing pref persistence.
+    return generateFallbackUuid();
+  }
+}
+function generateFallbackUuid() {
+  // RFC 4122 v4 shape from Math.random — only used when crypto.randomUUID
+  // is missing (very old browsers) and localStorage is blocked.
+  const hex = () => Math.floor(Math.random() * 16).toString(16);
+  const s = Array.from({ length: 32 }, hex).join('');
+  return `${s.slice(0,8)}-${s.slice(8,12)}-4${s.slice(13,16)}-${(8 + Math.floor(Math.random()*4)).toString(16)}${s.slice(17,20)}-${s.slice(20,32)}`;
+}
+
 export function getPwMonitorPref() {
   try { return localStorage.getItem(PW_MONITOR_PREF_KEY); } catch { return null; }
 }

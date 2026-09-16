@@ -16,6 +16,7 @@ mod stderr_filter;
 mod store;
 mod stt;
 mod tts;
+mod web_mic;
 mod workflow;
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -424,6 +425,15 @@ fn main() -> Result<()> {
     // opt in on demand via `subscribe()`.
     let (monitor_tap, _) = monitor::channel();
 
+    // Browser-microphone slot pool. Each `/mic.ws` connection claims a
+    // slot; decoded PCM is pushed into an SPSC ring per slot and drained
+    // by the pw source callback. Ring size mirrors the sink-input rings
+    // (~half a second at the target rate) so decode jitter has room to
+    // absorb without pushing perceivable latency into the mic feed. See
+    // `crate::web_mic` for the pool's shape and lifecycle.
+    let web_mic_ring_frames = (args.sample_rate as usize / 2).max(1024);
+    let (web_mic_pool, web_mic_rt_slots) = web_mic::WebMicPool::new(web_mic_ring_frames);
+
     // Runtime mixer state. Booted with defaults so the pw thread has
     // something to read; persisted state is folded in as a patch below
     // once the store is open.
@@ -438,6 +448,7 @@ fn main() -> Result<()> {
         input_taps: vox_taps.clone(),
         monitor_tap: monitor_tap.clone(),
         mixer: mixer.clone(),
+        web_mic_slots: web_mic_rt_slots,
     };
     let pw_handle = pw_source::spawn(pw_cfg, consumer)?;
     let pw_client = pw_handle.client.clone();
@@ -666,6 +677,22 @@ fn main() -> Result<()> {
         "device routings restored from store"
     );
 
+    // Persisted per-client web-mic routings. Same pattern as device_routings:
+    // load at boot, hand to AppState so both the /mic.ws connect path (to
+    // seed the slot's target atomic) and the /web-mic route handler (to
+    // upsert on user change) share the same map.
+    let web_mic_routings = std::sync::Arc::new(http::WebMicRoutings::new(
+        rt.block_on(store.get_web_mic_routings())
+            .unwrap_or_else(|err| {
+                tracing::warn!(err = %format!("{err:#}"), "reading persisted web-mic routings failed");
+                Default::default()
+            }),
+    ));
+    info!(
+        prefs = web_mic_routings.lock().unwrap().len(),
+        "web-mic routings restored from store"
+    );
+
     let result = rt.block_on(async move {
         let (tts_tx, tts_rx) = mpsc::channel::<tts::Command>(32);
 
@@ -726,6 +753,8 @@ fn main() -> Result<()> {
             stt,
             record_state,
             device_routings.clone(),
+            web_mic_pool.clone(),
+            web_mic_routings.clone(),
         ));
 
         // Reconcile persisted device pins against the live pw graph. Handles

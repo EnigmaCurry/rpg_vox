@@ -7,9 +7,12 @@
     reloadGraph,
     getPwMonitorPref,
     setPwMonitorPref,
+    getClientId,
   } from '../lib/stores.js';
   import * as browserMonitor from '../lib/browserMonitor.js';
   import { monitorState, monitorStats, monitorPref } from '../lib/browserMonitor.js';
+  import * as browserMic from '../lib/browserMic.js';
+  import { micState, micPref, micDevice } from '../lib/browserMic.js';
   import {
     pingStats,
     pingBad,
@@ -17,6 +20,19 @@
     PING_BAD_STREAK,
     PING_INTERVAL_MS,
   } from '../lib/stores.js';
+
+  // Stable per-browser client id used by the web-mic pool. Read once
+  // on mount and reused for the WS + every routing call; never changes
+  // for the lifetime of this tab (localStorage).
+  const clientId = getClientId();
+  const browserMicSupported = browserMic.isSupported();
+  // Enumerated audio-input devices, populated after mount. Labels may
+  // be empty until the user grants mic permission once — we still
+  // include devices with empty labels so the dropdown isn't stuck
+  // saying "no devices" before the first grant.
+  let inputDevices = $state([]);
+  let webMicError = $state('');
+  let webMicBusy = $state(false);
 
   // Mixer state mirror. Populated from GET /mixer on mount; every knob
   // change PUTs a partial patch and adopts the server's echoed snapshot.
@@ -99,6 +115,21 @@
     startLevelPoll();
     refreshGraph();
     graphTimer = setInterval(refreshGraph, GRAPH_POLL_MS);
+    // Restore the Web microphone input pref: if the user had it on
+    // last session, open the presence WS now so the source row shows
+    // up in Sources immediately. Capture still requires a user
+    // gesture (a destination pick in Sources) so we don't call
+    // getUserMedia here.
+    if (browserMicSupported && $micPref) {
+      try {
+        await browserMic.startPresence();
+        inputDevices = await browserMic.listInputDevices();
+      } catch (e) {
+        webMicError = e?.message || 'web mic auto-restore failed';
+      }
+    } else if (browserMicSupported) {
+      inputDevices = await browserMic.listInputDevices();
+    }
   });
 
   onDestroy(() => {
@@ -124,6 +155,11 @@
       startMonitor(match.id, { restore: true });
     }
   });
+
+  // Web-mic gesture-triggered auto-resume is armed at the App level
+  // (see App.svelte) so it works from any route — reloading on
+  // /script with a persisted mic routing must still resume on the
+  // first user click without requiring a visit to /mixer.
 
   async function startMonitor(sinkId, opts = {}) {
     monitorRestored = true;
@@ -206,6 +242,101 @@
       status = { text: `unroute failed: ${e.message}`, kind: 'err' };
     }
     await refreshGraph();
+  }
+
+  // Web-mic rows appear alongside pipewire sources but are keyed by
+  // client_uuid rather than pipewire node id, so route calls use the
+  // web-mic endpoint. Clicking a destination on our OWN row also
+  // starts local capture (getUserMedia — the click serves as the user
+  // gesture that unlocks it); Off stops capture.
+  async function routeWebMic(uuid, target) {
+    const isOwn = uuid === clientId;
+    try {
+      if (isOwn) {
+        // Acquire the mic BEFORE telling the server — otherwise the
+        // slot's routing atomic flips on but the WS carries zero PCM
+        // for a beat, which is confusing to hear on the receiving end.
+        await browserMic.startCapture();
+      }
+      await api.routeWebMic(uuid, target);
+      status = { text: '', kind: '' };
+    } catch (e) {
+      status = { text: `route failed: ${e.message}`, kind: 'err' };
+    }
+    await refreshGraph();
+  }
+
+  async function unrouteWebMic(uuid) {
+    const isOwn = uuid === clientId;
+    try {
+      await api.unrouteWebMic(uuid);
+      if (isOwn) {
+        // Halt the mic hardware for the current tab. Presence WS
+        // stays open so the row remains visible with Off selected.
+        await browserMic.stopCapture();
+      }
+      status = { text: '', kind: '' };
+    } catch (e) {
+      status = { text: `unroute failed: ${e.message}`, kind: 'err' };
+    }
+    await refreshGraph();
+  }
+
+  // Merge pipewire sources + web-mic sources into one list rendered by
+  // the Sources block. Each web-mic entry is normalized to look like
+  // a SourceInfo (id/kind/labels) plus a `client_uuid` marker so we
+  // can style our own row and route through the correct endpoint.
+  const mergedSources = $derived([
+    ...sources.map((s) => ({ ...s, srcKind: 'pw' })),
+    ...(($graph?.web_mic_sources ?? []).map((w) => ({
+      srcKind: 'web_mic',
+      id: `wm:${w.client_uuid}`,
+      client_uuid: w.client_uuid,
+      kind: 'web_mic',
+      name: 'web microphone',
+      description: 'Web microphone',
+      application_name: 'Web browser',
+      media_name: null,
+      pid: null,
+      icon_name: null,
+      routed_to: w.routed_to,
+      isOwn: w.client_uuid === clientId,
+    }))),
+  ]);
+
+  async function toggleWebMic(ev) {
+    const wantOn = ev.currentTarget.checked;
+    webMicBusy = true;
+    webMicError = '';
+    try {
+      if (wantOn) {
+        browserMic.persistPref(true);
+        await browserMic.startPresence();
+        // Refresh the device list once presence is open — some
+        // browsers only fill in device labels after the page has
+        // held a mic permission at least once.
+        inputDevices = await browserMic.listInputDevices();
+      } else {
+        browserMic.persistPref(false);
+        await browserMic.stopPresence();
+      }
+    } catch (e) {
+      webMicError = e?.message || 'web mic failed';
+    } finally {
+      webMicBusy = false;
+    }
+    await refreshGraph();
+  }
+
+  function onDeviceChange(ev) {
+    const id = ev.currentTarget.value || null;
+    browserMic.persistDevice(id);
+    // If we're actively capturing, restart with the new device so the
+    // switch takes effect immediately. Otherwise the next startCapture
+    // will pick it up naturally.
+    if ($micState.capture === 'active') {
+      browserMic.stopCapture().then(() => browserMic.startCapture()).catch(() => {});
+    }
   }
 
   function sourceLabel(s) {
@@ -537,39 +668,60 @@
       <div class="hint">
         route an audio-producing app (browser tab, media player…) into
         Music or a Vox slot. Default = leave the app's existing pipewire
-        connection (usually your default output) untouched.
+        connection (usually your default output) untouched. Rows for
+        web-microphone clients also appear here — your own is highlighted.
       </div>
     </div>
-    {#if sources.length === 0}
+    {#if mergedSources.length === 0}
       <div class="empty">no external audio producers currently in the graph</div>
     {:else}
       <ul class="source-list">
-        {#each sources as s (s.id)}
-          <li class="source-row" class:routed={s.routed_to}>
+        {#each mergedSources as s (s.id)}
+          <li
+            class="source-row"
+            class:routed={s.routed_to}
+            class:own-web-mic={s.srcKind === 'web_mic' && s.isOwn}
+          >
             <div class="source-meta">
-              <div class="source-app">{sourceApp(s)}</div>
-              <div class="source-title" title={sourceLabel(s)}>{sourceLabel(s)}</div>
+              <div class="source-app">
+                {#if s.srcKind === 'web_mic'}
+                  web microphone{#if s.isOwn} · this browser{/if}
+                {:else}
+                  {sourceApp(s)}
+                {/if}
+              </div>
+              <div class="source-title" title={s.srcKind === 'web_mic' ? `client ${s.client_uuid}` : sourceLabel(s)}>
+                {#if s.srcKind === 'web_mic'}
+                  {s.isOwn ? 'Your microphone' : `client ${s.client_uuid.slice(0, 8)}…`}
+                {:else}
+                  {sourceLabel(s)}
+                {/if}
+              </div>
             </div>
-            <div class="source-actions" role="radiogroup" aria-label="{sourceLabel(s)} routing">
+            <div class="source-actions" role="radiogroup" aria-label="{s.srcKind === 'web_mic' ? 'web mic' : sourceLabel(s)} routing">
               <button type="button" class="route-btn"
                 class:active={s.routed_to === 'music'}
-                onclick={() => routeSource(s.id, 'music')}
+                onclick={() => s.srcKind === 'web_mic' ? routeWebMic(s.client_uuid, 'music') : routeSource(s.id, 'music')}
                 role="radio" aria-checked={s.routed_to === 'music'}>Music</button>
               {#each mixer?.vox ?? [] as slot, i (i)}
                 {@const target = slotSuffix(i)}
                 <button type="button" class="route-btn"
                   class:active={s.routed_to === target}
-                  onclick={() => routeSource(s.id, target)}
+                  onclick={() => s.srcKind === 'web_mic' ? routeWebMic(s.client_uuid, target) : routeSource(s.id, target)}
                   role="radio" aria-checked={s.routed_to === target}>{slot.name}</button>
               {/each}
               <button type="button" class="route-btn"
                 class:active={!s.routed_to}
-                onclick={() => unrouteSource(s.id)}
+                onclick={() => s.srcKind === 'web_mic' ? unrouteWebMic(s.client_uuid) : unrouteSource(s.id)}
                 role="radio" aria-checked={!s.routed_to}
-                title={s.kind === 'device'
-                  ? 'do not feed this input into rpg_vox'
-                  : "drop rpg_vox's routing link; app keeps its default connection"}
-              >{s.kind === 'device' ? 'Off' : 'Default'}</button>
+                title={
+                  s.srcKind === 'web_mic'
+                    ? (s.isOwn ? 'stop your microphone capture' : "don't feed this client's mic into rpg_vox")
+                    : (s.kind === 'device'
+                      ? 'do not feed this input into rpg_vox'
+                      : "drop rpg_vox's routing link; app keeps its default connection")
+                }
+              >{(s.srcKind === 'web_mic' || s.kind === 'device') ? 'Off' : 'Default'}</button>
             </div>
           </li>
         {/each}
@@ -577,9 +729,9 @@
     {/if}
   </div>
 
-  <section id="web-monitor" class="io-panel" style="scroll-margin-top: 60px">
-    <div class="subhead"><span>Web monitor</span>
-      <span class="note">piped directly into your browser — listen from anywhere</span>
+  <section id="web-audio" class="io-panel" style="scroll-margin-top: 60px">
+    <div class="subhead"><span>Web audio</span>
+      <span class="note">this browser tab's audio-in and audio-out for rpg_vox</span>
     </div>
     <div class="sink-list">
       <label class="sink browser-monitor" title="Stream the tap into this browser tab (does not affect other clients)">
@@ -588,7 +740,7 @@
           checked={$monitorPref}
           disabled={!browserMonitorSupported || browserMonitorBusy}
           onchange={toggleBrowserMonitor}>
-        <span>Web browser (this tab)</span>
+        <span>Web audio monitor (master)</span>
         <span class="id">
           {#if !browserMonitorSupported}
             unsupported
@@ -639,6 +791,47 @@
           ping {$pingStats.lastMs.toFixed(0)} ms (avg {$pingStats.avgMs.toFixed(0)} ms)
         {/if}
       </div>
+
+      <label class="sink browser-monitor" title="Add a Sources row for this browser's microphone. Pick a destination from the Sources block above to actually route it into rpg_vox.">
+        <input
+          type="checkbox"
+          checked={$micPref}
+          disabled={!browserMicSupported || webMicBusy}
+          onchange={toggleWebMic}>
+        <span>Web microphone input</span>
+        <span class="id">
+          {#if !browserMicSupported}
+            unsupported
+          {:else if webMicBusy}
+            …
+          {:else if $micState.capture === 'active'}
+            capturing
+          {:else if $micState.presence === 'listening'}
+            ready — pick a destination in Sources
+          {:else if $micState.presence === 'connecting'}
+            connecting…
+          {:else if $micPref}
+            starting…
+          {:else}
+            off
+          {/if}
+        </span>
+      </label>
+      {#if $micPref && browserMicSupported}
+        <label class="sink" title="Choose which of this machine's audio inputs to capture.">
+          <span style="flex: 0 0 auto">Input device</span>
+          <select value={$micDevice ?? ''} onchange={onDeviceChange}
+                  style="flex: 1; margin-left: 8px; min-width: 0;">
+            <option value="">Default</option>
+            {#each inputDevices as d (d.deviceId)}
+              <option value={d.deviceId}>{d.label || `mic ${d.deviceId.slice(0, 8)}…`}</option>
+            {/each}
+          </select>
+        </label>
+      {/if}
+      {#if webMicError}
+        <div class="monitor-err">{webMicError}</div>
+      {/if}
     </div>
   </section>
 
@@ -742,6 +935,15 @@
     transition: border-color 0.15s;
   }
   .source-row.routed { border-color: rgba(122,162,255,0.5); }
+  /* Highlight this browser's own web-mic row so it's obvious which
+     entry is under this tab's control. Preserved on top of the
+     `.routed` styling so the highlight persists when the user has
+     picked a destination for their own mic. */
+  .source-row.own-web-mic {
+    background: rgba(255,213,79,0.12);
+    border-color: rgba(255,213,79,0.55);
+  }
+  .source-row.own-web-mic .source-app { color: rgb(255,213,79); }
   .source-meta { min-width: 0; }
   .source-app { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
   .source-title { font-size: 13px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

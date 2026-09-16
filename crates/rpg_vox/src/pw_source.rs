@@ -48,6 +48,7 @@ use tokio::sync::{broadcast, oneshot};
 use tracing::{debug, error, info, warn};
 
 use crate::mixer::AtomicMixer;
+use crate::web_mic::{TARGET_MUSIC, TARGET_VOX_BASE, WebMicRtSlot};
 
 use pipewire as pw;
 use pw::{
@@ -179,6 +180,12 @@ pub struct Config {
     /// channel every process cycle (lock-free atomics) to compute the
     /// stereo mic feed.
     pub mixer: Arc<AtomicMixer>,
+    /// One pool of browser-mic slots, each with an SPSC consumer the
+    /// source callback drains and a shared state atom the HTTP layer
+    /// updates (routing target + active flag). Slots contribute PCM to
+    /// either the music strip or a specific Vox slot based on their
+    /// routing atomic — see the source `process` closure below.
+    pub web_mic_slots: Vec<WebMicRtSlot>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1203,7 +1210,7 @@ fn route_source_via_metadata(
 // -----------------------------------------------------------------------------
 
 fn run(
-    cfg: Config,
+    mut cfg: Config,
     consumer: Consumer<[f32; 2]>,
     stop: Arc<AtomicBool>,
     cmd_rx: pw_channel::Receiver<Command>,
@@ -1307,6 +1314,21 @@ fn run(
         /// this cycle — so an in-flight clip actually falls silent within
         /// one pipewire process() interval instead of finishing to drain.
         last_stop_gen: u64,
+        /// Browser-mic slot consumers. Fixed length = WEB_MIC_SLOTS.
+        /// Popped once per output frame regardless of whether the slot
+        /// is active (so a released slot's leftover audio drains rather
+        /// than lingering into the next client that claims it). Routing
+        /// target is read from each slot's shared state atomic.
+        web_mic_slots: Vec<WebMicRtSlot>,
+        /// Per-vox-slot broadcast taps — one per entry in
+        /// `vox_consumers`. Fired once per process cycle with the
+        /// summed input for that slot (pipewire audio + any routed
+        /// web-mic contribution). Consumers of this tap include the
+        /// streaming STT worker (see `record::spawn_worker`) and the
+        /// widget-record path; both want to see what actually reaches
+        /// the slot, so summing web-mic here makes browser mics
+        /// transcribable via the same pipeline.
+        input_taps: Vec<broadcast::Sender<Arc<[f32]>>>,
     }
     let state = StreamState {
         tts_consumer: consumer,
@@ -1316,6 +1338,11 @@ fn run(
         monitor_tap: cfg.monitor_tap.clone(),
         silent_frames: 0,
         last_stop_gen: 0,
+        // `std::mem::take` (rather than moving cfg.web_mic_slots) so
+        // cfg stays fully valid for the later `&Config` borrows that
+        // register the per-role sink streams.
+        web_mic_slots: std::mem::take(&mut cfg.web_mic_slots),
+        input_taps: cfg.input_taps.clone(),
     };
 
     let graph_stream = graph.clone();
@@ -1424,6 +1451,28 @@ fn run(
                     Vec::new()
                 };
 
+                // Per-vox-slot input buffers. Populated in the mix loop
+                // with the summed raw input (pipewire + web-mic) for
+                // each slot, then broadcast once per cycle to the
+                // slot's `input_tap`. Only allocated for slots with an
+                // actual receiver (streaming STT worker, record path)
+                // so idle installs don't pay for empty per-cycle
+                // allocations.
+                let mut input_tap_bufs: [Option<Vec<f32>>; 16] =
+                    [const { None }; 16];
+                for slot_i in 0..effective_slots {
+                    if state
+                        .input_taps
+                        .get(slot_i)
+                        .map(|t| t.receiver_count() > 0)
+                        .unwrap_or(false)
+                    {
+                        input_tap_bufs[slot_i] = Some(Vec::with_capacity(
+                            frames * SOURCE_CHANNELS as usize,
+                        ));
+                    }
+                }
+
                 let mut tts_peak = 0.0f32;
                 let mut music_peak = 0.0f32;
                 let mut vox_peaks: [f32; 16] = [0.0; 16];
@@ -1443,7 +1492,46 @@ fn run(
                         }
                         Err(_) => (0.0, 0.0),
                     };
-                    let [mus_lin, mus_rin] = state.music_consumer.pop().unwrap_or([0.0, 0.0]);
+                    let [mus_lin_raw, mus_rin_raw] =
+                        state.music_consumer.pop().unwrap_or([0.0, 0.0]);
+
+                    // Drain every browser-mic slot's ring first so
+                    // leftover audio from a just-disconnected client
+                    // clears within one process cycle. Slots that are
+                    // inactive (no client) or routed Off contribute
+                    // nothing; Music-routed slots sum into the music
+                    // strip's input; Vox-routed slots sum into the
+                    // matching Vox slot's input. Both routings go
+                    // through the destination strip's gain/pan/mute
+                    // exactly like any pipewire source that had been
+                    // linked into the same sink.
+                    let mut wm_music_l = 0.0f32;
+                    let mut wm_music_r = 0.0f32;
+                    let mut wm_vox_l: [f32; 16] = [0.0; 16];
+                    let mut wm_vox_r: [f32; 16] = [0.0; 16];
+                    for wm in state.web_mic_slots.iter_mut() {
+                        let [l, r] = wm.consumer.pop().unwrap_or([0.0, 0.0]);
+                        if !wm.state.active() {
+                            continue;
+                        }
+                        let t = wm.state.target_raw();
+                        if t == TARGET_MUSIC {
+                            wm_music_l += l;
+                            wm_music_r += r;
+                        } else if t >= TARGET_VOX_BASE {
+                            let idx = (t - TARGET_VOX_BASE) as usize;
+                            if idx < 16 {
+                                wm_vox_l[idx] += l;
+                                wm_vox_r[idx] += r;
+                            }
+                        }
+                        // t == TARGET_OFF (or anything below TARGET_MUSIC)
+                        // discards the sample; the pop above already
+                        // drained the ring so there's nothing more to do.
+                    }
+
+                    let mus_lin = mus_lin_raw + wm_music_l;
+                    let mus_rin = mus_rin_raw + wm_music_r;
 
                     let tts_l_c = tts_lin * tts_l;
                     let tts_r_c = tts_rin * tts_r;
@@ -1459,9 +1547,26 @@ fn run(
                     let mut vox_sum_l = 0.0f32;
                     let mut vox_sum_r = 0.0f32;
                     for slot_i in 0..effective_slots {
-                        let [vox_lin, vox_rin] = state.vox_consumers[slot_i]
+                        let [vox_lin_raw, vox_rin_raw] = state.vox_consumers[slot_i]
                             .pop()
                             .unwrap_or([0.0, 0.0]);
+                        // Fold in any web-mic contribution routed to this
+                        // vox slot BEFORE the strip's gain/pan, so the
+                        // "Vox N" routing button on a web-mic row behaves
+                        // exactly like linking a pipewire source into the
+                        // matching `-voxN` sink.
+                        let vox_lin = vox_lin_raw + wm_vox_l[slot_i];
+                        let vox_rin = vox_rin_raw + wm_vox_r[slot_i];
+                        // Record the pre-strip summed input for STT /
+                        // record subscribers. Regardless of the slot's
+                        // enabled / mute state — we want the transcript
+                        // pipeline to see raw arriving audio, matching
+                        // the previous "publish from the sink callback"
+                        // behavior it replaced.
+                        if let Some(buf) = input_tap_bufs[slot_i].as_mut() {
+                            buf.push(vox_lin);
+                            buf.push(vox_rin);
+                        }
                         let (vl, vr, enabled, to_out) = vox_state[slot_i];
                         if !enabled {
                             continue;
@@ -1510,6 +1615,21 @@ fn run(
 
                 if want_tap && !tap_buf.is_empty() {
                     let _ = state.monitor_tap.send(Arc::from(tap_buf));
+                }
+                // Fire per-vox-slot input taps. Send once per cycle
+                // with the summed raw input (pipewire + web-mic) so
+                // streaming STT and the record path see the same audio
+                // that reaches the strip. No-op for slots without
+                // subscribers because we didn't allocate a buffer for
+                // them above.
+                for slot_i in 0..effective_slots {
+                    if let Some(buf) = input_tap_bufs[slot_i].take() {
+                        if !buf.is_empty() {
+                            if let Some(tap) = state.input_taps.get(slot_i) {
+                                let _ = tap.send(Arc::from(buf));
+                            }
+                        }
+                    }
                 }
                 if !any_audio {
                     state.silent_frames = state.silent_frames.saturating_add(frames as u64);
@@ -1650,17 +1770,15 @@ fn register_sink_stream(
     };
     let stream = Stream::new(core, &sink_node_name, props).context("input Stream::new")?;
 
-    // Every Vox slot's sink needs a broadcast tap so downstream
-    // recording / FX consumers can subscribe. Enforce here so a future
-    // refactor can't silently drop the tap for one slot.
-    if matches!(role, SinkRole::Vox(_)) {
-        anyhow::ensure!(input_tap.is_some(), "Vox sink requires an input_tap");
-    }
+    // Sink tap moved to the source callback so it can include summed
+    // web-mic contributions; the `_input_tap` parameter is preserved
+    // in the signature for now so call-sites don't need to change
+    // shape, but it's no longer used here.
+    let _ = input_tap;
 
     let state = SinkState {
         role,
         producer: input_producer,
-        tap: input_tap,
         frames_seen: 0,
         overflow_frames: 0,
     };
@@ -1735,11 +1853,11 @@ fn register_sink_stream(
                     );
                 }
             }
-            if let Some(tap) = state.tap.as_ref() {
-                if tap.receiver_count() > 0 {
-                    let _ = tap.send(Arc::from(stereo));
-                }
-            }
+            // Broadcast tap is now fired from the source callback so
+            // it can include summed web-mic contributions (see
+            // `input_taps` handling there). The sink callback is
+            // purely a pipewire → SPSC-ring bridge now; STT / record
+            // subscribers get their audio from the source-side tap.
 
             state.frames_seen = state.frames_seen.saturating_add(frames as u64);
             if state.frames_seen > 0 && state.frames_seen.is_power_of_two() {
@@ -1783,9 +1901,6 @@ struct SinkState {
     /// Mono ring producer drained by the source callback (populated for
     /// every role — both music and vox now mix through the source).
     producer: Producer<[f32; 2]>,
-    /// Broadcast sender for downstream FX / recording consumers. Only the
-    /// Vox sink attaches one.
-    tap: Option<broadcast::Sender<Arc<[f32]>>>,
     frames_seen: u64,
     overflow_frames: u64,
 }

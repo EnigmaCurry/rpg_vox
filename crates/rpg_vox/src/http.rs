@@ -131,10 +131,18 @@ use std::sync::Arc;
 /// because operations never cross await points and the map is tiny.
 pub(crate) type DeviceRoutings = std::sync::Mutex<BTreeMap<String, String>>;
 
+/// Persisted routing map for browser microphones: client UUID string →
+/// target selector ("music" / "vox" / "vox2" / ...). Same wire shape as
+/// [`DeviceRoutings`]; separate row in the store so device pins and
+/// web-mic prefs don't collide on save. Read on `/mic.ws` connect to
+/// restore a returning client's destination.
+pub(crate) type WebMicRoutings = std::sync::Mutex<BTreeMap<String, String>>;
+
 use crate::chat;
 use crate::mixer::{AtomicMixer, MixerPatch};
 use crate::monitor;
 use crate::pw_source::{GraphSnapshot, PwClient, SinkRole};
+use crate::web_mic::{WebMicPool, WebMicTarget};
 use crate::script;
 use crate::settings::{self, SettingsUpdate};
 use crate::store::{AgentField, AgentRow, DEFAULT_AGENT_ID, ScriptBlockRow, ScriptTakeRow, ScriptTurnRow, Store, UpdateResult};
@@ -213,6 +221,15 @@ pub(crate) struct AppState {
     /// or unpins a device on the Mixer's Sources panel. Persisted to sqlite
     /// under the `device_routings` key by the handler after every write.
     pub(crate) device_routings: Arc<DeviceRoutings>,
+    /// Browser-microphone slot pool. Each `/mic.ws` connection claims a
+    /// slot; decoded PCM is pushed into the slot's SPSC ring and drained
+    /// by the pipewire source callback. See [`crate::web_mic`].
+    pub(crate) web_mic_pool: Arc<WebMicPool>,
+    /// Persisted per-client routing prefs for the web-mic pool. Same
+    /// shape as [`Self::device_routings`], keyed by client UUID string.
+    /// Read on WS connect (to seed the slot's target atomic); written
+    /// by `web_mic_route_handler` after every change.
+    pub(crate) web_mic_routings: Arc<WebMicRoutings>,
 }
 
 /// One in-flight `/widgets/record` capture. The recording task lives on the
@@ -891,6 +908,8 @@ pub async fn serve(
     stt: Option<SttHandle>,
     record: RecordState,
     device_routings: Arc<DeviceRoutings>,
+    web_mic_pool: Arc<WebMicPool>,
+    web_mic_routings: Arc<WebMicRoutings>,
 ) -> Result<()> {
     let state = AppState {
         tts,
@@ -908,6 +927,8 @@ pub async fn serve(
         stt,
         record,
         device_routings,
+        web_mic_pool,
+        web_mic_routings,
     };
     let app = Router::new()
         .route("/", get(index))
@@ -1045,6 +1066,12 @@ pub async fn serve(
         )
         .route("/healthz", get(|| async { "ok" }))
         .route("/monitor.ws", get(monitor::ws_handler))
+        .route("/mic.ws", get(crate::web_mic::ws_handler))
+        .route(
+            "/web-mic/:client_uuid/route",
+            axum::routing::post(web_mic_route_handler)
+                .delete(web_mic_unroute_handler),
+        )
         .route("/pw/graph", get(graph_handler))
         .route(
             "/pw/monitor",
@@ -1173,7 +1200,35 @@ async fn asset_handler(Path(path): Path<String>) -> Response {
 
 async fn graph_handler(State(state): State<AppState>) -> impl IntoResponse {
     match state.pw.snapshot().await {
-        Ok(snap) => (StatusCode::OK, Json(serde_json::to_value(&snap).unwrap())).into_response(),
+        Ok(snap) => {
+            // Merge active browser-mic clients into the JSON response as
+            // a peer of the pipewire `sources` array. The frontend renders
+            // both in the same Sources block, styling the row whose
+            // `client_uuid` matches its own localStorage id as "mine".
+            let mut v = serde_json::to_value(&snap).unwrap();
+            let web_mic_sources: Vec<serde_json::Value> = state
+                .web_mic_pool
+                .iter()
+                .filter_map(|slot| {
+                    if !slot.active() {
+                        return None;
+                    }
+                    let uuid = slot.client_uuid()?;
+                    let routed_to = slot.target().map(|t| t.suffix());
+                    Some(serde_json::json!({
+                        "client_uuid": uuid.to_string(),
+                        "routed_to": routed_to,
+                    }))
+                })
+                .collect();
+            if let serde_json::Value::Object(ref mut obj) = v {
+                obj.insert(
+                    "web_mic_sources".to_string(),
+                    serde_json::Value::Array(web_mic_sources),
+                );
+            }
+            (StatusCode::OK, Json(v)).into_response()
+        }
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ActionResponse {
@@ -1380,6 +1435,118 @@ async fn device_node_name(state: &AppState, source_id: u32) -> Option<String> {
     let snap = state.pw.snapshot().await.ok()?;
     let src = snap.sources.iter().find(|s| s.id == source_id)?;
     (src.kind == "device").then(|| src.name.clone())
+}
+
+/// Wire body for `POST /web-mic/:client_uuid/route`. `target` is a
+/// SinkRole suffix ("music" / "vox" / "vox2" / ...) or the literal
+/// string "off" as a synonym for DELETE.
+#[derive(Debug, Deserialize)]
+struct WebMicRouteBody {
+    target: String,
+}
+
+async fn web_mic_route_handler(
+    State(state): State<AppState>,
+    Path(client_uuid): Path<String>,
+    Json(body): Json<WebMicRouteBody>,
+) -> Response {
+    let Ok(uuid) = Uuid::parse_str(&client_uuid) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ActionResponse {
+                ok: false,
+                error: Some("invalid client uuid".into()),
+            }),
+        )
+            .into_response();
+    };
+    let target = if body.target == "off" {
+        None
+    } else {
+        match WebMicTarget::from_suffix(&body.target) {
+            Some(t) => Some(t),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ActionResponse {
+                        ok: false,
+                        error: Some(format!(
+                            "unknown target `{}` (expected \"music\", \"vox\", \"vox2\"…, or \"off\")",
+                            body.target
+                        )),
+                    }),
+                )
+                    .into_response();
+            }
+        }
+    };
+    // Live update: if the client is currently connected, retarget its
+    // slot immediately so the routing takes effect on the very next RT
+    // cycle. If the client is offline, we still persist below so the
+    // pref applies on their next reconnect.
+    if let Some(slot) = state.web_mic_pool.find_by_uuid(&uuid) {
+        slot.set_target(target);
+    }
+    persist_web_mic_routing(&state, client_uuid, target.map(|t| t.suffix())).await;
+    (
+        StatusCode::OK,
+        Json(ActionResponse {
+            ok: true,
+            error: None,
+        }),
+    )
+        .into_response()
+}
+
+async fn web_mic_unroute_handler(
+    State(state): State<AppState>,
+    Path(client_uuid): Path<String>,
+) -> Response {
+    let Ok(uuid) = Uuid::parse_str(&client_uuid) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ActionResponse {
+                ok: false,
+                error: Some("invalid client uuid".into()),
+            }),
+        )
+            .into_response();
+    };
+    if let Some(slot) = state.web_mic_pool.find_by_uuid(&uuid) {
+        slot.set_target(None);
+    }
+    persist_web_mic_routing(&state, client_uuid, None).await;
+    (
+        StatusCode::OK,
+        Json(ActionResponse {
+            ok: true,
+            error: None,
+        }),
+    )
+        .into_response()
+}
+
+/// Mirror of [`persist_device_routing`] for the web-mic pref map. Missing
+/// target removes the entry so the next connection defaults to Off.
+async fn persist_web_mic_routing(state: &AppState, uuid_str: String, target: Option<String>) {
+    let snapshot = {
+        let mut map = state
+            .web_mic_routings
+            .lock()
+            .expect("web_mic_routings mutex poisoned");
+        match target {
+            Some(sel) => {
+                map.insert(uuid_str, sel);
+            }
+            None => {
+                map.remove(&uuid_str);
+            }
+        }
+        map.clone()
+    };
+    if let Err(err) = state.store.put_web_mic_routings(&snapshot).await {
+        tracing::warn!(err = %format!("{err:#}"), "persisting web-mic routings failed");
+    }
 }
 
 /// Update the in-memory device-routing map and write the whole map back to

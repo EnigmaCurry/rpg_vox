@@ -841,6 +841,34 @@ export async function unlinkSource(id) {
   }
 }
 
+// Web-microphone routing: mirrors linkSource/unlinkSource semantics but
+// keyed by the browser's persistent client uuid rather than a pipewire
+// node id. The server holds the routing pref (uuid → target) so a
+// reconnect restores whatever the user last picked. `target` accepts
+// the same suffixes as pipewire sources ("music", "vox", "vox2", ...)
+// plus the literal "off".
+export async function routeWebMic(clientUuid, target) {
+  const r = await fetch(`/web-mic/${encodeURIComponent(clientUuid)}/route`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ target }),
+  });
+  const parsed = await r.json().catch(() => null);
+  if (!r.ok || parsed?.ok === false) {
+    throw new Error(parsed?.error || `HTTP ${r.status}`);
+  }
+}
+
+export async function unrouteWebMic(clientUuid) {
+  const r = await fetch(`/web-mic/${encodeURIComponent(clientUuid)}/route`, {
+    method: 'DELETE',
+  });
+  const parsed = await r.json().catch(() => null);
+  if (!r.ok || parsed?.ok === false) {
+    throw new Error(parsed?.error || `HTTP ${r.status}`);
+  }
+}
+
 // --- Mixer ----------------------------------------------------------------
 //
 // GET /mixer      → full MixerState snapshot ({ tts, music, vox, master }).

@@ -6,8 +6,21 @@
     startRecordingPoll,
     reloadSettings,
     restorePwMonitorFromPref,
+    reloadGraph,
+    graph,
+    getClientId,
   } from './lib/stores.js';
   import { restoreFromPref as restoreBrowserMonitor } from './lib/browserMonitor.js';
+  import {
+    isSupported as browserMicIsSupported,
+    restoreFromPref as restoreBrowserMic,
+    armGestureCapture as armMicGestureCapture,
+    disarmGestureCapture as disarmMicGestureCapture,
+    micState,
+  } from './lib/browserMic.js';
+
+  const clientId = getClientId();
+  const browserMicSupported = browserMicIsSupported();
   import Menubar from './components/Menubar.svelte';
   import Projects from './routes/Projects.svelte';
   import Characters from './routes/Characters.svelte';
@@ -81,6 +94,36 @@
     restorePwMonitorFromPref().catch((err) => {
       console.warn('[pw-monitor] restore failed', err);
     });
+    // Web microphone presence restore. Opens the /mic.ws socket so the
+    // server can re-seed the slot's routing from its persisted pref;
+    // the gesture-triggered auto-start below picks up capture as soon
+    // as the first user click lands, regardless of which page they're
+    // currently on. A one-shot graph refresh after presence is up
+    // populates `$graph.web_mic_sources` so the effect below can
+    // observe our own routing even when the user hasn't visited
+    // /mixer this session (whose 2 s poll would otherwise be the only
+    // graph refresher on the page).
+    restoreBrowserMic()
+      .then(() => reloadGraph().catch(() => {}))
+      .catch((err) => {
+        console.warn('[mic] restore failed', err);
+      });
+  });
+
+  // App-level auto-resume for the web microphone. Lives here rather than
+  // in Mixer.svelte so it works from any route — the user can reload on
+  // /script or /record with a persisted mic routing and the first click
+  // anywhere still resumes capture. Watches this browser's own web-mic
+  // row in $graph and toggles the gesture listener based on whether we
+  // have a routing pinned but haven't captured yet.
+  $effect(() => {
+    if (!browserMicSupported) return;
+    const own = ($graph?.web_mic_sources ?? []).find((w) => w.client_uuid === clientId);
+    const needsGesture = !!own?.routed_to
+      && $micState.capture !== 'active'
+      && $micState.capture !== 'starting';
+    if (needsGesture) armMicGestureCapture();
+    else              disarmMicGestureCapture();
   });
 </script>
 

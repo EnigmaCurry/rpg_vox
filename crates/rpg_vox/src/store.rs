@@ -168,6 +168,14 @@ const MIXER_STATE_KEY: &str = "mixer";
 /// pinned to Vox 2 today lands back on Vox 2 after a reboot or replug.
 const DEVICE_ROUTINGS_KEY: &str = "device_routings";
 
+/// Row key for persisted browser-microphone routings. Value is a JSON
+/// object mapping a client UUID string (v4, hyphenated) to a companion-
+/// sink selector ("music", "vox", "vox2", ...) — same wire format as
+/// DEVICE_ROUTINGS_KEY. Restored on boot; when a client reconnects to
+/// /mic.ws we look up its uuid here and seed the slot's routing atomic
+/// so the destination survives across restarts and page reloads.
+const WEB_MIC_ROUTINGS_KEY: &str = "web_mic_routings";
+
 /// Row key for the currently-open project id. Empty / missing = no project
 /// selected. Backend-owned singleton so pass 4 (which runs on a scheduler
 /// task with no request context) can load the right dictionary for
@@ -867,6 +875,60 @@ impl Store {
                 }
             })
             .unwrap_or_default())
+    }
+
+    /// Read the persisted browser-mic routing map (client UUID → target
+    /// selector). Same shape/semantics as [`Self::get_device_routings`];
+    /// empty on parse failure so the pool boots clean.
+    pub async fn get_web_mic_routings(&self) -> Result<std::collections::BTreeMap<String, String>> {
+        let db = self.db.clone();
+        let raw = tokio::task::spawn_blocking(move || -> Result<Option<String>> {
+            let conn = db.lock().unwrap();
+            let value = conn
+                .query_row(
+                    "SELECT value FROM app_state WHERE key = ?1",
+                    params![WEB_MIC_ROUTINGS_KEY],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?;
+            Ok(value)
+        })
+        .await
+        .context("db task panicked")??;
+        Ok(raw
+            .and_then(|text| match serde_json::from_str::<std::collections::BTreeMap<String, String>>(&text) {
+                Ok(m) => Some(m),
+                Err(err) => {
+                    tracing::warn!(err = %err, "persisted web-mic routings didn't parse; using empty map");
+                    None
+                }
+            })
+            .unwrap_or_default())
+    }
+
+    /// Upsert the browser-mic routing map. Whole-blob replace, keyed by
+    /// [`WEB_MIC_ROUTINGS_KEY`].
+    pub async fn put_web_mic_routings(
+        &self,
+        map: &std::collections::BTreeMap<String, String>,
+    ) -> Result<()> {
+        let value = serde_json::to_string(map).context("serialize web-mic routings")?;
+        let now = unix_now();
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO app_state (key, value, updated_at)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value,
+                                                updated_at = excluded.updated_at",
+                params![WEB_MIC_ROUTINGS_KEY, value, now],
+            )?;
+            Ok(())
+        })
+        .await
+        .context("db task panicked")??;
+        Ok(())
     }
 
     /// Upsert the device-routing map. Whole-blob replace matches the

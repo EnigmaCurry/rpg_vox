@@ -28,6 +28,7 @@ const BACKEND_ROUTES = [
   '/settings',
   '/state',
   '/voices',
+  '/web-mic',
   '/widgets',
   '/workflow',
   '/workflows',
@@ -39,6 +40,7 @@ const proxy = Object.fromEntries(
 // WebSocket path is proxied separately with `ws: true` so vite forwards the
 // upgrade handshake and binary frames to the Rust backend.
 proxy['/monitor.ws'] = { target: BACKEND, changeOrigin: false, ws: true };
+proxy['/mic.ws']     = { target: BACKEND, changeOrigin: false, ws: true };
 
 export default defineConfig({
   plugins: [svelte()],
@@ -51,5 +53,10 @@ export default defineConfig({
     outDir: '../dist-ui',
     emptyOutDir: true,
     sourcemap: false,
+    // AudioWorklet.addModule() won't accept data URLs, so anything
+    // named `*.worklet.js` must be emitted as an external asset even
+    // when it's under the default 4 KiB inline threshold. Other assets
+    // keep the default behavior.
+    assetsInlineLimit: (filePath) => filePath.endsWith('.worklet.js') ? false : undefined,
   },
 });
