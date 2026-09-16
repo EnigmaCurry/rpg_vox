@@ -24,7 +24,7 @@ use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::chat::{self, ChatMessage};
@@ -264,6 +264,22 @@ async fn run_once(
         return LlmOutcome::Skipped("empty hot zone");
     }
 
+    // Provisional-clip gate. Any clip whose pass-2 finalize hasn't
+    // landed yet still has streaming pass-1 partial text (typically
+    // ALL CAPS Zipformer output). Sending that to the LLM as if it
+    // were stable content produces garbage in the output (the LLM
+    // dutifully preserves "CREATED" alongside "created", etc.) and
+    // wastes a cycle since apply_diff would immediately be
+    // invalidated by pass 2. Wait for the tail to finalize; the next
+    // wake_llm from finalize_clip fires within a few hundred ms.
+    let any_provisional = snapshot
+        .hot
+        .iter()
+        .any(|p| p.clips.iter().any(|c| c.provisional));
+    if any_provisional {
+        return LlmOutcome::Skipped("hot zone has provisional clips");
+    }
+
     // Threshold gate. Forced-breaks bypass the word/audio thresholds
     // entirely (they're a "we just closed a paragraph, please
     // reconsider" signal). Otherwise the scheduler task itself decides
@@ -283,9 +299,26 @@ async fn run_once(
     };
     let history = vec![ChatMessage {
         role: "user".into(),
-        content: user_json,
+        content: user_json.clone(),
     }];
     let schema = response_schema();
+
+    // Log the outbound request. `info!` so it shows up without RUST_LOG
+    // tuning during active debugging; downgrade to `debug!` once the
+    // pipeline is stable. Word/hot counts help spot "why did I fire?"
+    // at a glance; the raw payload is on its own line so it can be
+    // grepped and pretty-printed.
+    let (in_words, in_audio_ms) = compute_unassigned_metrics(&snapshot);
+    info!(
+        slot,
+        context_paragraphs = snapshot.context.len(),
+        hot_paragraphs = snapshot.hot.len(),
+        hot_clips = snapshot.hot.iter().map(|p| p.clips.len()).sum::<usize>(),
+        in_words,
+        in_audio_ms,
+        "paragraph LLM request"
+    );
+    info!(slot, payload = %user_json, "paragraph LLM request payload");
 
     // Flip the per-channel inflight flag on so the snapshot's
     // `channel.llm_inflight` reads true for the UI's "reorganizing…"
@@ -302,12 +335,14 @@ async fn run_once(
             Some(LLM_MAX_TOKENS),
         )
         .await;
+    log_llm_response(slot, "first", &attempt);
     let output_paragraphs = match parse_and_validate(attempt, &snapshot) {
         Ok(paragraphs) => paragraphs,
         Err(reason) => {
             // Retry once with the error appended to a system-prompt
             // override addendum. If that also fails, abort without
             // touching state.
+            info!(slot, reason = %reason, "paragraph LLM first attempt rejected — retrying");
             let addendum = format!(
                 "{SYSTEM_PROMPT}\n\nYour previous response was rejected: {reason}. \
                  Return a valid JSON array matching the schema."
@@ -320,6 +355,7 @@ async fn run_once(
                     Some(LLM_MAX_TOKENS),
                 )
                 .await;
+            log_llm_response(slot, "retry", &retry);
             match parse_and_validate(retry, &snapshot) {
                 Ok(paragraphs) => paragraphs,
                 Err(final_reason) => {
@@ -330,11 +366,92 @@ async fn run_once(
         }
     };
 
+    // Word-count sanity check. The prompt tells the LLM to reproduce
+    // the input verbatim aside from a few narrow allowed edits, so
+    // total word count should be roughly conserved (small
+    // fluctuations from homophone fixes are fine). If the output is
+    // dramatically shorter than the input, the model summarized in
+    // spite of the prompt — reject the cycle rather than clobber the
+    // transcript with a lossy paraphrase. The raw response was
+    // already logged above so operators can see exactly what came
+    // back; nothing gets applied to state.
+    let out_words: u32 = output_paragraphs
+        .iter()
+        .map(|p| count_words(&p.text))
+        .sum();
+    // Ratio floor: allow up to 30% word loss (some fillers might get
+    // legitimately collapsed by whitespace normalization), reject
+    // anything more aggressive.
+    let min_out_words = (in_words as f64 * 0.7).round() as u32;
+    if in_words >= 20 && out_words < min_out_words {
+        warn!(
+            slot,
+            in_words,
+            out_words,
+            min_out_words,
+            "paragraph LLM output too short — likely summarized; discarding"
+        );
+        for (i, p) in output_paragraphs.iter().enumerate() {
+            info!(
+                slot,
+                idx = i,
+                end_clip = %p.end_clip,
+                words = count_words(&p.text),
+                text = %p.text,
+                "paragraph LLM discarded output paragraph"
+            );
+        }
+        return LlmOutcome::Aborted("LLM output too short (summarization)");
+    }
+    info!(
+        slot,
+        out_paragraphs = output_paragraphs.len(),
+        out_words,
+        in_words,
+        "paragraph LLM accepted output"
+    );
+    for (i, p) in output_paragraphs.iter().enumerate() {
+        info!(
+            slot,
+            idx = i,
+            end_clip = %p.end_clip,
+            words = count_words(&p.text),
+            text = %p.text,
+            "paragraph LLM accepted output paragraph"
+        );
+    }
+
     // Apply the diff. Reacquire the lock via `apply_llm_diff` which
     // handles the "hot zone changed while we were decoding" case by
     // clamping the truncation index.
     apply_diff(record, slot, &snapshot, output_paragraphs);
     LlmOutcome::Fired
+}
+
+/// Log the raw LLM response (or the transport error) so operators can
+/// diff request vs response when the model is misbehaving. Shared by
+/// the first-attempt and retry paths in `run_once`.
+fn log_llm_response(slot: usize, attempt: &str, res: &anyhow::Result<serde_json::Value>) {
+    match res {
+        Ok(v) => {
+            let raw = serde_json::to_string(v).unwrap_or_else(|_| "<unserializable>".into());
+            info!(
+                slot,
+                attempt,
+                bytes = raw.len(),
+                raw = %raw,
+                "paragraph LLM response"
+            );
+        }
+        Err(err) => {
+            info!(
+                slot,
+                attempt,
+                err = %format!("{err:#}"),
+                "paragraph LLM response error"
+            );
+        }
+    }
 }
 
 /// Scope guard that flips a channel's `llm_inflight` flag on
@@ -360,18 +477,33 @@ impl Drop for LlmInflightGuard {
 }
 
 /// Hardcoded system prompt. No CLI knob in Stage 3.
-const SYSTEM_PROMPT: &str = "You are a paragraph editor for a live transcription pipeline. You receive:\n\
-- Up to 3 previous PARAGRAPHS that are already hardened (context only — do not edit them).\n\
-- 0 to 3 HOT paragraphs that are provisional and MUST be re-emitted (you may edit their text and split/merge them).\n\
-- A stream of raw CLIP fragments that come after the last hot paragraph.\n\
+const SYSTEM_PROMPT: &str = "You are a verbatim transcript proofreader for a live speech-to-text pipeline. You receive:\n\
+- Up to 3 previous PARAGRAPHS already hardened (context only — do not edit or re-emit them).\n\
+- Up to 3 HOT paragraphs (provisional — you MUST re-emit these, and you may split or merge them at paragraph boundaries only).\n\
+- Zero or more NEW clip fragments after the last hot paragraph.\n\
 \n\
-Your job: emit paragraphs of continuous prose that read well. Fix obvious transcription errors from context. Respect silence-gap boundaries — any clip pair with `gap_ms_since_prev` greater than 6000 MUST have a paragraph break between them.\n\
+Your ONLY job is to reproduce the speaker's words verbatim, with corrections limited to the specific edits listed below. This is a transcript, not a summary. The speaker's voice, filler words, digressions, run-on sentences, and rhetorical repetition are all intentional and must be preserved.\n\
 \n\
-Output: a JSON array of objects. Each object has:\n\
-- `end_clip`: the clip id of the LAST clip contained in the paragraph.\n\
-- `text`: the paragraph's final prose text.\n\
+ALLOWED EDITS (make these when clearly warranted):\n\
+1. Fix obviously mistranscribed words when context makes the correct word unambiguous. Common cases: homophones misheard by the ASR (e.g. \"peace\" ↔ \"piece\", \"there\" ↔ \"their\"), proper nouns the ASR mangled (people's names, place names), and words split or joined across clip boundaries (\"of mind\" heard as \"Mine\"). Only fix what a fluent listener would confidently correct — do not guess.\n\
+2. Add or correct punctuation and capitalization to reflect the sentence structure the speaker actually used. You may join two adjacent clip fragments into one sentence when the speech is continuous, or split one clip's run-on into multiple sentences when the speaker's phrasing clearly changed.\n\
+3. Choose paragraph boundaries within the HOT zone. A paragraph is a coherent stretch of the speaker's thought; use silence gaps and topic shifts as cues. Any clip pair whose `gap_ms_since_prev` exceeds 6000 MUST fall on a paragraph boundary (do not merge across such a gap).\n\
 \n\
-Every clip id in the input (from HOT + new material) must appear in exactly one output paragraph's `end_clip` (or be included as an internal clip of a paragraph whose `end_clip` is later than it). The clip ids in your `end_clip` values must be in the same order as they appear in the input.";
+FORBIDDEN EDITS (never do these):\n\
+- Do NOT summarize, condense, paraphrase, or rephrase the speaker's words. If the speaker rambled for 300 words, your output for that span contains those 300 words (proofread), not a 20-word gloss.\n\
+- Do NOT drop filler words (\"um\", \"you know\", \"I mean\", \"like\", \"sort of\") that appear in the input. They are part of the speaker's voice.\n\
+- Do NOT drop or shorten digressions, repetitions, self-corrections, or false starts. If the input has them, your output has them.\n\
+- Do NOT add sentences, ideas, transitions, or content that isn't in the input.\n\
+- Do NOT re-order sentences or clips. The output must follow the same chronological order as the input.\n\
+- Do NOT remove or add empty paragraphs. Every hot-zone paragraph (and every new-material clip) must be represented in your output.\n\
+\n\
+OUTPUT: a JSON array of objects, in the order the paragraphs appear in time. Each object:\n\
+- `end_clip`: the clip id of the LAST clip contained in this paragraph.\n\
+- `text`: the paragraph's proofread text — same words as the input, in the same order, with the ALLOWED EDITS above applied.\n\
+\n\
+Every clip id in the input (HOT clips + new-material clips) MUST appear in exactly one output paragraph. Either it is that paragraph's `end_clip`, or it is an interior clip of a paragraph whose `end_clip` is later in the input. The `end_clip` values in your output MUST be in the same order as they appear in the input.\n\
+\n\
+If in doubt about any edit, do nothing — preserve the input verbatim. A slightly clunky transcript is always better than a lossy one.";
 
 /// JSON schema handed to `response_format`. Kept as a Value so
 /// llama.cpp's grammar-constrained decoding sees the exact structure

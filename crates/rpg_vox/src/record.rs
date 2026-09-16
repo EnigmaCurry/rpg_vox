@@ -2129,6 +2129,33 @@ impl RecordState {
                     return;
                 }
             };
+            // SenseVoice-hallucination guards. On short single-word audio,
+            // long silences, or otherwise "confusing" inputs, SenseVoice
+            // sometimes returns a single false-positive interjection
+            // ("Yeah", "Y.", "I.", etc.) or a much shorter transcript than
+            // the audio actually contains. Distributing that tiny output
+            // across the window's clips WIPES real content ("one, two,
+            // three, four, …" → "Yeah" split across N clips = every
+            // number gone). Both cases: keep the previous per-clip text
+            // and let the next pass 3 fire try again with fresh audio.
+            let existing_joined_words: usize = window
+                .iter()
+                .map(|(_, _, _, _, txt, _)| count_words(txt))
+                .sum();
+            let out_words = count_words(&text);
+            let too_short = existing_joined_words >= 6
+                && out_words < (existing_joined_words as f64 * 0.5).round() as usize;
+            if is_false_positive(&text) || too_short {
+                debug!(
+                    paragraph = %paragraph_id_for_task,
+                    out_words,
+                    existing_joined_words,
+                    output = %text,
+                    "pass3: SenseVoice output implausibly short — discarding"
+                );
+                state.clear_pass3_inflight(&paragraph_id_for_task);
+                return;
+            }
             // Proportional split: assign per-clip text ranges from the
             // returned string based on each clip's duration ratio,
             // snapping cut points to the nearest whitespace.
@@ -2139,6 +2166,39 @@ impl RecordState {
             let durations: Vec<u64> = window.iter().map(|(_, _, _, d, _, _)| *d).collect();
             let split_texts = split_boundary_text(&text, &durations);
             let clip_count = clip_refs.len();
+            // Per-clip shrinkage guard. Even when the total word count
+            // roughly matches, the proportional split can shift words
+            // between clips in a way that erases previously-good
+            // per-clip content — e.g. a long finalized clip A ("okay
+            // we're ready to get started here") sharing a window with
+            // short number clips (B=1 word, C=1 word) where SenseVoice
+            // dropped the middle of A's phrase; the split then gives A
+            // only ~4 words, EATING A's tail. Reject the entire pass-3
+            // update if any populated clip (≥3 words) would shrink to
+            // less than 70% of its current word count.
+            let per_clip_shrinkage = window
+                .iter()
+                .zip(split_texts.iter())
+                .any(|((_, _, _, _, old_text, _), new_text)| {
+                    let old_w = count_words(old_text);
+                    let new_w = count_words(new_text);
+                    old_w >= 3 && new_w < (old_w as f64 * 0.7).round() as usize
+                });
+            if per_clip_shrinkage {
+                debug!(
+                    paragraph = %paragraph_id_for_task,
+                    per_clip = ?window
+                        .iter()
+                        .zip(split_texts.iter())
+                        .map(|((_, _, _, _, o, _), n)| {
+                            format!("{}→{}", count_words(o), count_words(n))
+                        })
+                        .collect::<Vec<_>>(),
+                    "pass3: per-clip shrinkage detected — discarding whole update"
+                );
+                state.clear_pass3_inflight(&paragraph_id_for_task);
+                return;
+            }
             // Reacquire lock + re-validate.
             let mut g = state.inner.lock().expect("record state mutex poisoned");
             // Locate the trigger paragraph — may have moved.

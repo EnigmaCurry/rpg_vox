@@ -14,3 +14,4 @@ models/
 # Keeps ROCm builds cached in /nix/store across restarts; bump via
 # `just llama_rocm_update`.
 .llama-cpp.rev
+hold_music/
