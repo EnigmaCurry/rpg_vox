@@ -48,7 +48,7 @@ use crate::stt::{StreamingSession, StreamingSttHandle, SttHandle};
 /// new clip whose start is more than this far past the previous clip's end
 /// (on the same channel) starts a fresh paragraph instead of appending to
 /// the growing one.
-pub const PARAGRAPH_GAP_MS: u64 = 6_000;
+pub const PARAGRAPH_GAP_MS: u64 = 2_000;
 
 /// Soft cap on paragraph length (in words). Once a paragraph exceeds
 /// this AND its most recent clip ends on a sentence-terminating
@@ -2240,6 +2240,44 @@ impl RecordState {
                 state.clear_pass3_inflight(&paragraph_id_for_task);
                 return;
             }
+            // Edge-word preservation guard. SenseVoice occasionally
+            // drops the very first or last word when re-decoding the
+            // concatenated audio (observed: "My grandmother …" losing
+            // "My"). A one-word loss out of ~16 is only ~6% of the
+            // total, so a bulk word-count check would miss it — but
+            // the duration-proportional split shifts every downstream
+            // cut, so clip 1's leading word gets replaced and words
+            // from clip 2 flow backward into clip 1's row.
+            // Cheap precise check: the joined decode's first word must
+            // match the first clip's original first word, and its last
+            // word must match the last clip's original last word
+            // (case- and punctuation-insensitive). Any mismatch means
+            // the split would assign shifted content — reject the cycle.
+            let normalize_edge = |w: &str| -> String {
+                w.trim_matches(|c: char| !c.is_alphanumeric())
+                    .to_lowercase()
+            };
+            let joined_first = text.split_whitespace().next().map(normalize_edge);
+            let joined_last = text.split_whitespace().last().map(normalize_edge);
+            let first_clip_first = window
+                .first()
+                .and_then(|(_, _, _, _, t, _)| t.split_whitespace().next().map(normalize_edge));
+            let last_clip_last = window
+                .last()
+                .and_then(|(_, _, _, _, t, _)| t.split_whitespace().last().map(normalize_edge));
+            if joined_first != first_clip_first || joined_last != last_clip_last {
+                info!(
+                    paragraph = %paragraph_id_for_task,
+                    joined_first = ?joined_first,
+                    first_clip_first = ?first_clip_first,
+                    joined_last = ?joined_last,
+                    last_clip_last = ?last_clip_last,
+                    output = %text,
+                    "pass3-diag: edge word mismatch — discarding (per-clip text preserved)"
+                );
+                state.clear_pass3_inflight(&paragraph_id_for_task);
+                return;
+            }
             // Proportional split: assign per-clip text ranges from the
             // returned string based on each clip's duration ratio,
             // snapping cut points to the nearest whitespace.
@@ -2321,6 +2359,30 @@ impl RecordState {
                 g.channels[ci].paragraphs[pi].pass3_inflight = false;
                 return;
             }
+            // TEMP DIAGNOSTIC: dump joined re-decode + per-clip old→new
+            // so we can see when pass 3's proportional split shuffles
+            // content across clip boundaries (the "eats good words" bug).
+            info!(
+                paragraph = %paragraph_id_for_task,
+                joined = %text,
+                "pass3-diag: joined re-decode"
+            );
+            for ((cid, pid, start_wall, dur, old_text, _prov), new_text) in
+                window.iter().zip(split_texts.iter())
+            {
+                let borrowed = pid != &paragraph_id_for_task;
+                info!(
+                    paragraph = %paragraph_id_for_task,
+                    clip = %cid,
+                    borrowed,
+                    start_wall_ms = start_wall,
+                    duration_ms = dur,
+                    old = %old_text,
+                    new = %new_text,
+                    "pass3-diag: per-clip old→new"
+                );
+            }
+
             // Apply the split — ONLY to clips in the trigger paragraph.
             // Any borrowed clip from the previous paragraph is context
             // audio only and never gets its text overwritten. This

@@ -1089,7 +1089,7 @@
   // arriving past this window opens a new paragraph anyway, so the
   // paragraph is effectively done). Ticks via the /record poll
   // (500 ms) so the value re-derives on every state refresh.
-  const HARDEN_TIMEOUT_MS = 6000;
+  const HARDEN_TIMEOUT_MS = 2000;
   function hardenCountdownSec(p) {
     if (!p || p.hardened) return null;
     const clips = p.clips ?? [];

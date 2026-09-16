@@ -487,7 +487,7 @@ Your ONLY job is to reproduce the speaker's words verbatim, with corrections lim
 ALLOWED EDITS (make these when clearly warranted):\n\
 1. Fix obviously mistranscribed words when context makes the correct word unambiguous. Common cases: homophones misheard by the ASR (e.g. \"peace\" ↔ \"piece\", \"there\" ↔ \"their\"), proper nouns the ASR mangled (people's names, place names), and words split or joined across clip boundaries (\"of mind\" heard as \"Mine\"). Only fix what a fluent listener would confidently correct — do not guess.\n\
 2. Add or correct punctuation and capitalization to reflect the sentence structure the speaker actually used. You may join two adjacent clip fragments into one sentence when the speech is continuous, or split one clip's run-on into multiple sentences when the speaker's phrasing clearly changed.\n\
-3. Choose paragraph boundaries within the HOT zone. A paragraph is a coherent stretch of the speaker's thought; use silence gaps and topic shifts as cues. Any clip pair whose `gap_ms_since_prev` exceeds 6000 MUST fall on a paragraph boundary (do not merge across such a gap).\n\
+3. Choose paragraph boundaries within the HOT zone. A paragraph is a coherent stretch of the speaker's thought; use silence gaps and topic shifts as cues. Any clip pair whose `gap_ms_since_prev` exceeds 2000 MUST fall on a paragraph boundary (do not merge across such a gap).\n\
 \n\
 FORBIDDEN EDITS (never do these):\n\
 - Do NOT summarize, condense, paraphrase, or rephrase the speaker's words. If the speaker rambled for 300 words, your output for that span contains those 300 words (proofread), not a 20-word gloss.\n\
