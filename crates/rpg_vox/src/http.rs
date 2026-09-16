@@ -1040,6 +1040,7 @@ pub async fn serve(
         )
         .route("/mixer", get(get_mixer).put(put_mixer))
         .route("/mixer/levels", get(get_mixer_levels))
+        .route("/projects/active", get(get_active_project).put(put_active_project))
         .route("/settings", get(get_settings).post(update_settings))
         .route("/workflows", get(list_workflows))
         .route("/workflow/verify", post(verify_workflow))
@@ -1416,6 +1417,63 @@ async fn put_mixer(
         tracing::warn!(err = %format!("{err:#}"), "persisting mixer state failed");
     }
     (StatusCode::OK, Json(snap)).into_response()
+}
+
+#[derive(Debug, Serialize)]
+struct ActiveProjectResponse {
+    project_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ActiveProjectPatch {
+    #[serde(default)]
+    project_id: Option<String>,
+}
+
+async fn get_active_project(State(state): State<AppState>) -> impl IntoResponse {
+    match state.store.get_active_project().await {
+        Ok(project_id) => (
+            StatusCode::OK,
+            Json(ActiveProjectResponse { project_id }),
+        )
+            .into_response(),
+        Err(err) => {
+            tracing::warn!(err = %format!("{err:#}"), "reading active project failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ActionResponse {
+                    ok: false,
+                    error: Some("read failed".into()),
+                }),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn put_active_project(
+    State(state): State<AppState>,
+    Json(patch): Json<ActiveProjectPatch>,
+) -> impl IntoResponse {
+    let id = patch.project_id.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    if let Err(err) = state.store.put_active_project(id).await {
+        tracing::warn!(err = %format!("{err:#}"), "persisting active project failed");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ActionResponse {
+                ok: false,
+                error: Some("write failed".into()),
+            }),
+        )
+            .into_response();
+    }
+    (
+        StatusCode::OK,
+        Json(ActiveProjectResponse {
+            project_id: id.map(str::to_string),
+        }),
+    )
+        .into_response()
 }
 
 async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {

@@ -306,6 +306,31 @@ export async function putAppState(state) {
     throw new Error(detail || `HTTP ${r.status}`);
   }
 }
+
+// The backend owns "which project is currently open" so pass 4 (the
+// LLM proofreader) can load the right dictionary as vocabulary from a
+// scheduler task that has no request context. Frontend PUTs on
+// selection change; backend re-reads on startup and holds it for the
+// life of the process. Empty/null body = clear the selection.
+
+export async function getActiveProject() {
+  const r = await fetch('/projects/active');
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  const body = await r.json();
+  return body?.project_id ?? null;
+}
+
+export async function putActiveProject(projectId) {
+  const r = await fetch('/projects/active', {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ project_id: projectId ?? null }),
+  });
+  if (!r.ok) {
+    const detail = await r.text().catch(() => `HTTP ${r.status}`);
+    throw new Error(detail || `HTTP ${r.status}`);
+  }
+}
 // --- Script (chat with inline <speak> blocks) -----------------------------
 //
 // GET    /script                            → full script (turns + blocks + takes)

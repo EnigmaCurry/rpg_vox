@@ -168,6 +168,12 @@ const MIXER_STATE_KEY: &str = "mixer";
 /// pinned to Vox 2 today lands back on Vox 2 after a reboot or replug.
 const DEVICE_ROUTINGS_KEY: &str = "device_routings";
 
+/// Row key for the currently-open project id. Empty / missing = no project
+/// selected. Backend-owned singleton so pass 4 (which runs on a scheduler
+/// task with no request context) can load the right dictionary for
+/// vocabulary hints without frontend having to send it every trigger.
+const ACTIVE_PROJECT_KEY: &str = "active_project";
+
 
 #[derive(Clone)]
 pub struct Store {
@@ -880,6 +886,49 @@ impl Store {
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value,
                                                 updated_at = excluded.updated_at",
                 params![DEVICE_ROUTINGS_KEY, value, now],
+            )?;
+            Ok(())
+        })
+        .await
+        .context("db task panicked")??;
+        Ok(())
+    }
+
+    /// Read the currently-open project id. `Ok(None)` when no project has
+    /// been selected yet (fresh install) or when the row's value is empty.
+    /// Backend-owned; frontend writes it via `PUT /projects/active` when
+    /// the user changes selection.
+    pub async fn get_active_project(&self) -> Result<Option<String>> {
+        let db = self.db.clone();
+        let raw = tokio::task::spawn_blocking(move || -> Result<Option<String>> {
+            let conn = db.lock().unwrap();
+            let value = conn
+                .query_row(
+                    "SELECT value FROM app_state WHERE key = ?1",
+                    params![ACTIVE_PROJECT_KEY],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?;
+            Ok(value)
+        })
+        .await
+        .context("db task panicked")??;
+        Ok(raw.filter(|s| !s.is_empty()))
+    }
+
+    /// Upsert the currently-open project id. Pass `None` to clear.
+    pub async fn put_active_project(&self, id: Option<&str>) -> Result<()> {
+        let value = id.unwrap_or("").to_string();
+        let now = unix_now();
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = db.lock().unwrap();
+            conn.execute(
+                "INSERT INTO app_state (key, value, updated_at)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value,
+                                                updated_at = excluded.updated_at",
+                params![ACTIVE_PROJECT_KEY, value, now],
             )?;
             Ok(())
         })

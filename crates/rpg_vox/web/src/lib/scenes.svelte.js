@@ -87,7 +87,14 @@
 //   - projects / scenes / characters   → server (/state, sqlite blob)
 //   - selectedProjectId / selectedSceneId → localStorage (per-browser prefs)
 
-import { deleteWidget, deleteImage, getAppState, putAppState } from './api.js';
+import {
+  deleteWidget,
+  deleteImage,
+  getAppState,
+  putAppState,
+  getActiveProject,
+  putActiveProject,
+} from './api.js';
 
 // Per-browser UI selection only. All shared data lives server-side.
 const SELECTION_KEY = 'rpg-vox:selection:v1';
@@ -595,6 +602,19 @@ async function hydrateFromServer() {
   scenesState.scenes = normalized.scenes;
   scenesState.characters = normalized.characters;
 
+  // If localStorage didn't hand us a selection, ask the server for the
+  // last-known active project. The backend persists it so pass 4 can
+  // load the right dictionary from a scheduler task with no request
+  // context; a fresh browser reuses whatever the backend last saw.
+  if (!scenesState.selectedProjectId) {
+    try {
+      const serverProject = await getActiveProject();
+      if (serverProject) scenesState.selectedProjectId = serverProject;
+    } catch (e) {
+      console.warn('failed to load /projects/active', e);
+    }
+  }
+
   // Validate the current selection against what we ended up with — if the
   // referenced project or scene isn't there anymore, drop back to safe
   // defaults instead of leaving the user staring at a broken picker.
@@ -658,7 +678,37 @@ $effect.root(() => {
     };
     try { localStorage.setItem(SELECTION_KEY, JSON.stringify(sel)); } catch {}
   });
+
+  // Backend mirror of the active project only (scene selection stays
+  // per-browser). Pass 4 reads this on every LLM cycle to load the
+  // right dictionary as vocabulary. Debounced so a burst of clicks
+  // through the project picker coalesces into one PUT; a stale write
+  // will just get overwritten by the next steady-state value.
+  $effect(() => {
+    const pid = scenesState.selectedProjectId;
+    scheduleActiveProjectPut(pid);
+  });
 });
+
+let activeProjectTimer = 0;
+let pendingActiveProject = undefined;
+let lastPutActiveProject = undefined;
+function scheduleActiveProjectPut(pid) {
+  pendingActiveProject = pid;
+  if (activeProjectTimer) clearTimeout(activeProjectTimer);
+  activeProjectTimer = setTimeout(async () => {
+    activeProjectTimer = 0;
+    const value = pendingActiveProject;
+    pendingActiveProject = undefined;
+    if (value === lastPutActiveProject) return;
+    try {
+      await putActiveProject(value);
+      lastPutActiveProject = value;
+    } catch (e) {
+      console.warn('failed to persist active project', e);
+    }
+  }, STATE_SAVE_DEBOUNCE_MS);
+}
 
 // Kick the hydration once the module loads. Fire-and-forget — components
 // that render before it resolves see the empty seed above.

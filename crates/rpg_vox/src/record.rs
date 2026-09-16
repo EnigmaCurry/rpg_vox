@@ -50,6 +50,14 @@ use crate::stt::{StreamingSession, StreamingSttHandle, SttHandle};
 /// the growing one.
 pub const PARAGRAPH_GAP_MS: u64 = 2_000;
 
+/// Absolute ceiling (ms since last clip end) after which a paragraph
+/// is force-hardened regardless of outstanding pass-4 work. Prevents a
+/// stuck / down LLM from leaving paragraphs perpetually un-hardened in
+/// the UI. Chosen well past a typical LLM latency (a few seconds) but
+/// short enough that a wedged pipeline surfaces to the operator within
+/// a reasonable window.
+pub const HARDEN_MAX_WAIT_MS: u64 = 30_000;
+
 /// Soft cap on paragraph length (in words). Once a paragraph exceeds
 /// this AND its most recent clip ends on a sentence-terminating
 /// punctuation mark, the next clip on the channel opens a fresh
@@ -216,6 +224,14 @@ pub struct ClipRef {
     /// LLM only rewrites paragraph text, not per-clip text.
     #[serde(default)]
     pub pass3_ran: bool,
+    /// True once pass 4 (the LLM conservative-corrector) has run on
+    /// this clip. Pass 4 is per-clip in the current design — it
+    /// applies dictionary/vocabulary corrections and can rewrite/merge
+    /// sentences within a clip for readability. Skipped for clips
+    /// that already have `pass4_ran=true` so we don't burn LLM budget
+    /// re-processing text that was already polished.
+    #[serde(default)]
+    pub pass4_ran: bool,
 }
 
 /// A run of same-channel clips grouped by silence-gap. Stage 1 keeps
@@ -875,64 +891,6 @@ impl RecordState {
             .map(|c| c.paragraphs.clone())
     }
 
-    /// Apply an LLM diff to a Vox slot's paragraph list. Replaces the
-    /// tail of the paragraph vector (from `first_replaced_index`
-    /// onwards) with `new_tail`. Broadcasts `ParagraphUpsert` for every
-    /// paragraph in `new_tail` and `ParagraphRemove` for every id in
-    /// `removed_ids` (paragraphs that were merged away). Only fires SSE
-    /// events if a named recording is active — matches `finalize_clip`'s
-    /// guard.
-    ///
-    /// Returns `true` when the diff landed, `false` when the slot was
-    /// out of range (which should never happen in practice).
-    pub(crate) fn apply_llm_diff(
-        &self,
-        slot: usize,
-        first_replaced_index: usize,
-        new_tail: Vec<Paragraph>,
-        removed_ids: Vec<String>,
-    ) -> bool {
-        let mut g = self.inner.lock().expect("record state mutex poisoned");
-        let Some(ch) = g.channels.iter_mut().find(|c| c.kind == ChannelKind::Vox(slot)) else {
-            return false;
-        };
-        if first_replaced_index > ch.paragraphs.len() {
-            return false;
-        }
-        ch.paragraphs.truncate(first_replaced_index);
-        for p in &new_tail {
-            ch.paragraphs.push(p.clone());
-        }
-        trim_channel_cap(ch);
-        // Mirror into the active recording by id.
-        if let Some(active) = g.active.as_mut() {
-            for pid in &removed_ids {
-                if let Some(pos) = active.paragraphs.iter().position(|p| p.id == *pid) {
-                    active.paragraphs.remove(pos);
-                }
-            }
-            for p in &new_tail {
-                if let Some(existing) = active.paragraphs.iter_mut().find(|q| q.id == p.id) {
-                    *existing = p.clone();
-                } else {
-                    active.paragraphs.push(p.clone());
-                }
-            }
-        }
-        let recording = g.active.is_some();
-        drop(g);
-        if !recording {
-            return true;
-        }
-        for pid in removed_ids {
-            let _ = self.subtitles.send(SubtitleEvent::ParagraphRemove(pid));
-        }
-        for p in new_tail {
-            let _ = self.subtitles.send(SubtitleEvent::ParagraphUpsert(p));
-        }
-        true
-    }
-
     /// Subscribe to the OBS subtitles fan-out. Yields paragraph/clip
     /// changes (only while a named recording is in flight) plus
     /// recording-active state transitions. Broadcast lag drops the
@@ -1009,6 +967,17 @@ impl RecordState {
         let g = self.inner.lock().expect("record state mutex poisoned");
         let mode = if g.active.is_some() { "recording" } else { "idle" };
         let now_ms = unix_now_ms();
+        // Pass 4 runs during any named recording, and in live-buffer
+        // mode only when the operator opted in via "Reinterpret with
+        // LLM". When pass 4 is going to fire, hardening must wait
+        // until every non-provisional clip has been polished — the UI
+        // shouldn't flip to the grey "hardened" indicator while the
+        // LLM edits are still landing. Read once here so the closure
+        // below doesn't re-check per paragraph. Also short-circuits
+        // to false when the compile-time master switch is off so
+        // hardening reverts to the plain 2 s timeout.
+        let pass4_will_run = crate::paragraph::PASS4_ENABLED
+            && (g.active.is_some() || self.llm_when_idle());
         // Timeout-based hardening: once a paragraph's last clip ended
         // more than `PARAGRAPH_GAP_MS` ago (same threshold that would
         // open a new paragraph on the next clip anyway), it can no
@@ -1016,7 +985,17 @@ impl RecordState {
         // so the UI's state dot goes grey without waiting for a new
         // clip to arrive and trigger the imperative harden path.
         // Snapshot-only — doesn't mutate stored state.
+        //
+        // Also derive `p.pass4_ran` from clip-level state so the UI
+        // can distinguish "condensed" from "reorganized" — pass 4 is
+        // per-clip now, so the paragraph is "reorganized" iff every
+        // non-provisional clip has been through pass 4.
         let harden_by_timeout = |p: &mut Paragraph| {
+            let non_provisional: Vec<&ClipRef> =
+                p.clips.iter().filter(|c| !c.provisional).collect();
+            let all_pass4 = !non_provisional.is_empty()
+                && non_provisional.iter().all(|c| c.pass4_ran);
+            p.pass4_ran = all_pass4;
             if p.hardened {
                 return;
             }
@@ -1025,9 +1004,22 @@ impl RecordState {
                 .audio_duration_ms
                 .map(|d| last.start_wall_ms.saturating_add(d))
                 .unwrap_or(last.start_wall_ms);
-            if now_ms.saturating_sub(last_end) >= PARAGRAPH_GAP_MS {
-                p.hardened = true;
+            let elapsed = now_ms.saturating_sub(last_end);
+            if elapsed < PARAGRAPH_GAP_MS {
+                return;
             }
+            // Defer hardening while pass 4 is expected but hasn't
+            // finished polishing every non-provisional clip yet.
+            // Hard-cap the wait at `HARDEN_MAX_WAIT_MS` so a broken
+            // LLM doesn't leave paragraphs perpetually un-hardened —
+            // after that ceiling we mark hardened anyway and the UI
+            // reflects the raw text.
+            let awaiting_pass4 = pass4_will_run
+                && non_provisional.iter().any(|c| !c.pass4_ran);
+            if awaiting_pass4 && elapsed < HARDEN_MAX_WAIT_MS {
+                return;
+            }
+            p.hardened = true;
         };
         let active_recording = g.active.as_ref().map(|a| {
             // Project each paragraph with freshly-computed
@@ -1349,6 +1341,62 @@ impl RecordState {
             if let Some(pair) = update_clip_in_paragraphs(&mut active.paragraphs, clip_id, &text) {
                 if updated_pair.is_none() {
                     updated_pair = Some(pair);
+                }
+            }
+        }
+        let recording = g.active.is_some();
+        drop(g);
+        if let Some((paragraph_id, clip)) = updated_pair {
+            if recording {
+                let _ = self
+                    .subtitles
+                    .send(SubtitleEvent::ClipUpsert { paragraph_id, clip });
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Pass-4 completion path: replace `clip_id`'s text with the LLM's
+    /// polished version and flip `pass4_ran=true` so future triggers
+    /// skip it. Rebuilds the owning paragraph so its aggregated
+    /// `raw_text` / `text` reflect the new clip content, then emits a
+    /// `ClipUpsert` (only if a named recording is active — matches the
+    /// finalize/pass-3 pattern).
+    ///
+    /// Returns `true` when a matching clip was found and updated. A
+    /// paragraph reorg between snapshot and apply (or the clip being
+    /// removed as noise) is a benign no-op.
+    pub(crate) fn apply_pass4_clip_text(&self, clip_id: &str, text: String) -> bool {
+        let text = text.trim().to_string();
+        if text.is_empty() {
+            return false;
+        }
+        let mut g = self.inner.lock().expect("record state mutex poisoned");
+        let mut updated_pair: Option<(String, ClipRef)> = None;
+        for ch in g.channels.iter_mut() {
+            for paragraph in ch.paragraphs.iter_mut() {
+                if let Some(clip) = paragraph.clips.iter_mut().find(|c| c.id == clip_id) {
+                    clip.text = text.clone();
+                    clip.pass4_ran = true;
+                    let snap = clip.clone();
+                    paragraph.rebuild();
+                    updated_pair = Some((paragraph.id.clone(), snap));
+                    break;
+                }
+            }
+            if updated_pair.is_some() {
+                break;
+            }
+        }
+        if let Some(active) = g.active.as_mut() {
+            for paragraph in active.paragraphs.iter_mut() {
+                if let Some(clip) = paragraph.clips.iter_mut().find(|c| c.id == clip_id) {
+                    clip.text = text.clone();
+                    clip.pass4_ran = true;
+                    paragraph.rebuild();
+                    break;
                 }
             }
         }
@@ -1696,8 +1744,11 @@ impl RecordState {
             // TTS text is authoritative — no re-transcription happens,
             // but the punctuation is already real. Mark pass3_ran=true
             // so the paragraph soft-cap treats TTS trailing punctuation
-            // as reliable.
+            // as reliable. TTS text is also LLM-authored (from the
+            // /say or /chat call), so pass 4 has nothing to correct —
+            // mark pass4_ran=true to skip it.
             pass3_ran: true,
+            pass4_ran: true,
         };
         let speaker = voice_label.and_then(|s| {
             let t = s.trim().to_string();
@@ -2669,6 +2720,7 @@ fn upsert_clip_into_channel(
         audio_url: None,
         mixed_start_ms: None,
         pass3_ran: false,
+        pass4_ran: false,
     };
     if need_new {
         // First-clip speaker attribution stays on the paragraph for its

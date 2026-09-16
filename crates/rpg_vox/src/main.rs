@@ -701,6 +701,7 @@ fn main() -> Result<()> {
             let sched = paragraph::spawn(
                 record_state.clone(),
                 chat_client.clone(),
+                store.clone(),
                 vox_slots,
             );
             record_state.set_llm_scheduler(sched);
