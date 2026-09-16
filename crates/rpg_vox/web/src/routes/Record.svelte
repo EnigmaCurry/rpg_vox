@@ -1084,6 +1084,24 @@
     reorganized: 'Reorganized — LLM rewrote this paragraph',
     hardened: 'Hardened — scrolled out of the LLM hot zone',
   };
+  // Countdown until the paragraph auto-hardens by timeout — matches
+  // the server-side `PARAGRAPH_GAP_MS` in record.rs (any new clip
+  // arriving past this window opens a new paragraph anyway, so the
+  // paragraph is effectively done). Ticks via the /record poll
+  // (500 ms) so the value re-derives on every state refresh.
+  const HARDEN_TIMEOUT_MS = 6000;
+  function hardenCountdownSec(p) {
+    if (!p || p.hardened) return null;
+    const clips = p.clips ?? [];
+    if (clips.length === 0) return null;
+    if (clips.some((c) => c.provisional)) return null;
+    const last = clips[clips.length - 1];
+    const lastEnd =
+      (last.start_wall_ms ?? 0) + (last.audio_duration_ms ?? 0);
+    const remainingMs = lastEnd + HARDEN_TIMEOUT_MS - Date.now();
+    if (remainingMs <= 0) return null;
+    return Math.ceil(remainingMs / 1000);
+  }
 </script>
 
 {#snippet hiddenAudios()}
@@ -1195,6 +1213,7 @@
   {@const channelType = isTts ? 'TTS' : 'VOX'}
   {@const pstate = paragraphState(p)}
   {@const pulsing = paragraphInflight(p)}
+  {@const harden_secs = hardenCountdownSec(p)}
   <div
     class="paragraph-block"
     class:playing={currentPlayingParagraphId === p.id}
@@ -1214,6 +1233,11 @@
         title={STATE_LABELS[pstate]}
         aria-label={pstate}
       ></span>
+      {#if harden_secs != null}
+        <span class="harden-countdown" title="Auto-hardens in {harden_secs}s">
+          {harden_secs}s
+        </span>
+      {/if}
       <span class="paragraph-ts" title={fmtTime(p.created_at)}>
         {fmtWallTime(p.start_wall_ms)}
       </span>
@@ -1953,6 +1977,16 @@
   @keyframes state-dot-pulse {
     0%, 100% { opacity: 1; box-shadow: 0 0 0 1px rgba(0,0,0,0.35); }
     50%      { opacity: 0.35; box-shadow: 0 0 0 4px rgba(255,255,255,0.08); }
+  }
+  /* Countdown label sits just after the state dot until the paragraph
+     auto-hardens by timeout. Tabular numerals so the width doesn't
+     shift as the seconds tick down. */
+  .harden-countdown {
+    color: var(--muted);
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+    line-height: 1.2;
+    user-select: none;
   }
   .paragraph-text {
     display: block;

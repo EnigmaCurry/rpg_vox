@@ -93,6 +93,14 @@ const BOUNDARY_MAX_WINDOW_MS: u64 = 25_000;
 /// Cheap safety net so a rapid succession of `finalize_clip` calls
 /// doesn't stack blocking STT decodes on the spawn_blocking pool.
 const BOUNDARY_DEBOUNCE_MS: u64 = 500;
+/// Max silence gap between the borrowed previous-paragraph clip and
+/// the current paragraph's first clip. Above this we skip the
+/// cross-paragraph borrow entirely — a long pause means the speaker
+/// took a real break, so there's no continuous-speech seam to smooth
+/// and feeding SenseVoice audio spanning a long silence tends to
+/// make it drop content on one side (which then corrupts
+/// previously-good text via the proportional split).
+const BOUNDARY_BORROW_MAX_GAP_MS: u64 = 3_000;
 
 /// Cap on paragraphs kept per channel outside of a named recording. Older
 /// paragraphs drop FIFO when this is exceeded so the rolling per-channel
@@ -1000,6 +1008,27 @@ impl RecordState {
     pub fn snapshot(&self) -> RecordStateSnapshot {
         let g = self.inner.lock().expect("record state mutex poisoned");
         let mode = if g.active.is_some() { "recording" } else { "idle" };
+        let now_ms = unix_now_ms();
+        // Timeout-based hardening: once a paragraph's last clip ended
+        // more than `PARAGRAPH_GAP_MS` ago (same threshold that would
+        // open a new paragraph on the next clip anyway), it can no
+        // longer grow. Flip `hardened=true` in the serialized snapshot
+        // so the UI's state dot goes grey without waiting for a new
+        // clip to arrive and trigger the imperative harden path.
+        // Snapshot-only — doesn't mutate stored state.
+        let harden_by_timeout = |p: &mut Paragraph| {
+            if p.hardened {
+                return;
+            }
+            let Some(last) = p.clips.last() else { return };
+            let last_end = last
+                .audio_duration_ms
+                .map(|d| last.start_wall_ms.saturating_add(d))
+                .unwrap_or(last.start_wall_ms);
+            if now_ms.saturating_sub(last_end) >= PARAGRAPH_GAP_MS {
+                p.hardened = true;
+            }
+        };
         let active_recording = g.active.as_ref().map(|a| {
             // Project each paragraph with freshly-computed
             // `mixed_start_ms` values so the client's mixed-audio
@@ -1014,6 +1043,7 @@ impl RecordState {
                     for clip in out.clips.iter_mut() {
                         clip.mixed_start_ms = a.wall_to_mixed_ms(clip.start_wall_ms);
                     }
+                    harden_by_timeout(&mut out);
                     out
                 })
                 .collect();
@@ -1043,9 +1073,18 @@ impl RecordState {
                     ChannelKind::Vox(slot) => self.channel_name(slot),
                     ChannelKind::Tts => TTS_CHANNEL_NAME.to_string(),
                 };
+                let paragraphs: Vec<Paragraph> = c
+                    .paragraphs
+                    .iter()
+                    .map(|p| {
+                        let mut out = p.clone();
+                        harden_by_timeout(&mut out);
+                        out
+                    })
+                    .collect();
                 ChannelParagraphs {
                     channel: channel_name,
-                    paragraphs: c.paragraphs.clone(),
+                    paragraphs,
                     llm_inflight: c.llm_inflight,
                 }
             })
@@ -1979,41 +2018,95 @@ impl RecordState {
                 .collect();
             window.reverse();
             // Cross-paragraph borrow: when the current paragraph is
-            // short (typically because a soft-cap close just opened it
-            // with its first clip), reach back into the PREVIOUS
-            // paragraph on the same channel and pull its last
-            // finalized clip into the window. This lets pass 3
-            // re-transcribe across the paragraph seam and fix the
-            // classic mid-sentence split ("just a little peace." /
-            // "Mine would be…" → "…just a little peace of mind would
-            // be…"). Only borrow when:
-            //   (a) the current paragraph has fewer than 2 clips (so
-            //       pass 3 wouldn't otherwise run), and
-            //   (b) the resulting WALL-CLOCK audio span fits inside
-            //       `BOUNDARY_MAX_WINDOW_MS`. The span includes any
-            //       silence between the borrowed clip and the current
-            //       one; feeding SenseVoice 25+ seconds of audio
-            //       degrades quickly and can DROP content entirely
-            //       (visible to the operator as "words being eaten"
-            //       across the seam). If the seam is too wide, skip
-            //       the borrow — the paragraphs will keep their
-            //       per-clip pass-2 text at the boundary, which is
-            //       just the pre-fix "seam mistranscription" behavior.
+            // short (its first clip just landed), reach back into the
+            // PREVIOUS paragraph on the same channel and pull its last
+            // finalized clip into the window as CONTEXT audio only.
+            // Pass 3 re-transcribes the joined audio; the split is
+            // applied ONLY to clips in the current paragraph — the
+            // borrowed clip is never written back (see the apply
+            // loop). Guards:
+            //   (a) current paragraph has fewer than 2 clips (so
+            //       pass 3 wouldn't otherwise fire), and
+            //   (b) previous paragraph is NOT hardened (either the
+            //       flag or the wall-clock timeout past
+            //       `PARAGRAPH_GAP_MS` — a hardened paragraph is a
+            //       committed boundary and reaching back across it
+            //       would defeat the point of hardening), and
+            //   (c) the silence gap between the borrow candidate and
+            //       the current clip is under
+            //       `BOUNDARY_BORROW_MAX_GAP_MS` (a long pause means
+            //       the speaker really stopped; no continuous-speech
+            //       seam to smooth, and long SenseVoice-across-
+            //       silence inputs degrade), and
+            //   (d) the resulting WALL-CLOCK audio span fits inside
+            //       `BOUNDARY_MAX_WINDOW_MS` (SenseVoice comfort zone).
+            // Any failed guard → skip borrow entirely.
             if window.len() < 2 {
                 if let Some(prev_idx) = pi.checked_sub(1) {
                     if let Some(prev_p) = g.channels[ci].paragraphs.get(prev_idx) {
-                        if let Some(prev_last) = prev_p
+                        // Compute effective hardened state (flag OR
+                        // timeout past PARAGRAPH_GAP_MS from last
+                        // clip's end). The snapshot serializer does
+                        // the same computation for UI display; we do
+                        // it inline here so behavior matches the
+                        // user's mental model regardless of whether
+                        // the imperative harden path has fired yet.
+                        let prev_last_end = prev_p
+                            .clips
+                            .last()
+                            .map(|c| {
+                                c.audio_duration_ms
+                                    .map(|d| c.start_wall_ms.saturating_add(d))
+                                    .unwrap_or(c.start_wall_ms)
+                            })
+                            .unwrap_or(0);
+                        let now = unix_now_ms();
+                        let prev_timed_out =
+                            now.saturating_sub(prev_last_end) >= PARAGRAPH_GAP_MS;
+                        let prev_effectively_hardened =
+                            prev_p.hardened || prev_timed_out;
+                        if prev_effectively_hardened {
+                            debug!(
+                                paragraph = %paragraph_id,
+                                prev = %prev_p.id,
+                                flag = prev_p.hardened,
+                                timed_out = prev_timed_out,
+                                "pass3: cross-paragraph borrow declined (prev paragraph hardened)"
+                            );
+                        } else if let Some(prev_last) = prev_p
                             .clips
                             .iter()
                             .rev()
                             .find(|c| c.audio_duration_ms.is_some() && !c.provisional)
                         {
+                            let cur_start = window
+                                .last()
+                                .map(|(_, _, s, _, _, _)| *s)
+                                .unwrap_or(0);
                             let cur_end = window
                                 .last()
                                 .map(|(_, _, s, d, _, _)| s.saturating_add(*d))
                                 .unwrap_or(0);
+                            let borrow_end = prev_last
+                                .start_wall_ms
+                                .saturating_add(prev_last.audio_duration_ms.unwrap_or(0));
+                            let gap = cur_start.saturating_sub(borrow_end);
                             let span = cur_end.saturating_sub(prev_last.start_wall_ms);
-                            if span <= BOUNDARY_MAX_WINDOW_MS {
+                            if gap > BOUNDARY_BORROW_MAX_GAP_MS {
+                                debug!(
+                                    paragraph = %paragraph_id,
+                                    gap_ms = gap,
+                                    limit_ms = BOUNDARY_BORROW_MAX_GAP_MS,
+                                    "pass3: cross-paragraph borrow declined (silence gap too long)"
+                                );
+                            } else if span > BOUNDARY_MAX_WINDOW_MS {
+                                debug!(
+                                    paragraph = %paragraph_id,
+                                    span_ms = span,
+                                    limit_ms = BOUNDARY_MAX_WINDOW_MS,
+                                    "pass3: cross-paragraph borrow declined (audio span too long)"
+                                );
+                            } else {
                                 window.insert(
                                     0,
                                     (
@@ -2024,13 +2117,6 @@ impl RecordState {
                                         prev_last.text.clone(),
                                         false,
                                     ),
-                                );
-                            } else {
-                                debug!(
-                                    paragraph = %paragraph_id,
-                                    span_ms = span,
-                                    limit_ms = BOUNDARY_MAX_WINDOW_MS,
-                                    "pass3: cross-paragraph borrow declined (audio span too long)"
                                 );
                             }
                         }
@@ -2164,19 +2250,16 @@ impl RecordState {
             let durations: Vec<u64> = window.iter().map(|(_, _, _, d, _, _)| *d).collect();
             let split_texts = split_boundary_text(&text, &durations);
             let clip_count = clip_refs.len();
-            // Per-clip shrinkage guard. Even when the total word count
-            // roughly matches, the proportional split can shift words
-            // between clips in a way that erases previously-good
-            // per-clip content — e.g. a long finalized clip A ("okay
-            // we're ready to get started here") sharing a window with
-            // short number clips (B=1 word, C=1 word) where SenseVoice
-            // dropped the middle of A's phrase; the split then gives A
-            // only ~4 words, EATING A's tail. Reject the entire pass-3
-            // update if any populated clip (≥3 words) would shrink to
-            // less than 70% of its current word count.
+            // Per-clip shrinkage guard. Only checks clips we would
+            // actually write — the borrowed clip from the previous
+            // paragraph is never touched (see the apply loop below),
+            // so its shrinkage doesn't count against this check.
+            // Rejects the whole update if any writable clip (≥3
+            // words) would shrink to < 70% of its current word count.
             let per_clip_shrinkage = window
                 .iter()
                 .zip(split_texts.iter())
+                .filter(|((_, pid, _, _, _, _), _)| pid == &paragraph_id_for_task)
                 .any(|((_, _, _, _, old_text, _), new_text)| {
                     let old_w = count_words(old_text);
                     let new_w = count_words(new_text);
@@ -2188,11 +2271,12 @@ impl RecordState {
                     per_clip = ?window
                         .iter()
                         .zip(split_texts.iter())
+                        .filter(|((_, pid, _, _, _, _), _)| pid == &paragraph_id_for_task)
                         .map(|((_, _, _, _, o, _), n)| {
                             format!("{}→{}", count_words(o), count_words(n))
                         })
                         .collect::<Vec<_>>(),
-                    "pass3: per-clip shrinkage detected — discarding whole update"
+                    "pass3: per-clip shrinkage detected on writable clips — discarding"
                 );
                 state.clear_pass3_inflight(&paragraph_id_for_task);
                 return;
@@ -2237,40 +2321,28 @@ impl RecordState {
                 g.channels[ci].paragraphs[pi].pass3_inflight = false;
                 return;
             }
-            // Apply the split. Walk each clip ref, find its paragraph,
-            // update the clip's text + pass3_ran, and rebuild any
-            // paragraph touched (there can be up to two: the current
-            // one plus the previous one via cross-paragraph borrow).
+            // Apply the split — ONLY to clips in the trigger paragraph.
+            // Any borrowed clip from the previous paragraph is context
+            // audio only and never gets its text overwritten. This
+            // preserves the "once hardened (or done), never amend"
+            // invariant even when the pass-3 window happened to span
+            // a paragraph seam for smoothing purposes.
             let mut updated_clips: Vec<(String, ClipRef)> = Vec::with_capacity(clip_count);
-            let mut touched_paragraph_ids: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
             let paragraph_snapshot: Option<Paragraph>;
             {
-                for ((cid, pid), new_text) in clip_refs.iter().zip(split_texts.iter()) {
-                    if let Some(p) = g.channels[ci]
-                        .paragraphs
-                        .iter_mut()
-                        .find(|p| p.id == *pid)
-                    {
-                        if let Some(clip) = p.clips.iter_mut().find(|c| c.id == *cid) {
-                            clip.text = new_text.clone();
-                            clip.pass3_ran = true;
-                            updated_clips.push((pid.clone(), clip.clone()));
-                        }
-                        touched_paragraph_ids.insert(pid.clone());
-                    }
-                }
-                // Rebuild every touched paragraph and evaluate the
-                // soft-cap only on the trigger paragraph (the one we
-                // were originally scheduled for). Previous paragraph
-                // was already closed; its text/end refresh is enough.
-                for p in g.channels[ci].paragraphs.iter_mut() {
-                    if touched_paragraph_ids.contains(&p.id) {
-                        p.rebuild();
-                        p.pass3_ran = true;
-                    }
-                }
                 let paragraph = &mut g.channels[ci].paragraphs[pi];
+                for ((cid, pid), new_text) in clip_refs.iter().zip(split_texts.iter()) {
+                    if pid != &paragraph_id_for_task {
+                        continue;
+                    }
+                    if let Some(clip) = paragraph.clips.iter_mut().find(|c| c.id == *cid) {
+                        clip.text = new_text.clone();
+                        clip.pass3_ran = true;
+                        updated_clips.push((paragraph_id_for_task.clone(), clip.clone()));
+                    }
+                }
+                paragraph.rebuild();
+                paragraph.pass3_ran = true;
                 paragraph.pass3_inflight = false;
                 // Soft-cap evaluation. Runs on the pass-3-authored text
                 // (so trailing punctuation is real, not SenseVoice's
@@ -2303,17 +2375,19 @@ impl RecordState {
                 }
                 paragraph_snapshot = Some(paragraph.clone());
             }
-            // Mirror into the active recording. Walk all touched
-            // paragraphs (may be more than one when we borrowed from
-            // the previous paragraph across a soft-cap boundary).
-            let mut active_snapshots: Vec<Paragraph> = Vec::new();
+            // Mirror into the active recording — only the trigger
+            // paragraph. Borrowed clips from the previous paragraph
+            // were never written above, so nothing to mirror there.
             if let Some(active) = g.active.as_mut() {
-                for ((cid, pid), new_text) in clip_refs.iter().zip(split_texts.iter()) {
-                    if let Some(mirror) = active
-                        .paragraphs
-                        .iter_mut()
-                        .find(|p| p.id == *pid)
-                    {
+                if let Some(mirror) = active
+                    .paragraphs
+                    .iter_mut()
+                    .find(|p| p.id == paragraph_id_for_task)
+                {
+                    for ((cid, pid), new_text) in clip_refs.iter().zip(split_texts.iter()) {
+                        if pid != &paragraph_id_for_task {
+                            continue;
+                        }
                         if let Some(clip) =
                             mirror.clips.iter_mut().find(|c| c.id == *cid)
                         {
@@ -2321,22 +2395,11 @@ impl RecordState {
                             clip.pass3_ran = true;
                         }
                     }
-                }
-                for touched_pid in &touched_paragraph_ids {
-                    if let Some(mirror) = active
-                        .paragraphs
-                        .iter_mut()
-                        .find(|p| p.id == *touched_pid)
-                    {
-                        mirror.rebuild();
-                        mirror.pass3_ran = true;
-                        if touched_pid == &paragraph_id_for_task {
-                            mirror.pass3_inflight = false;
-                            if let Some(snap) = &paragraph_snapshot {
-                                mirror.closed = snap.closed;
-                            }
-                        }
-                        active_snapshots.push(mirror.clone());
+                    mirror.rebuild();
+                    mirror.pass3_ran = true;
+                    mirror.pass3_inflight = false;
+                    if let Some(snap) = &paragraph_snapshot {
+                        mirror.closed = snap.closed;
                     }
                 }
             }
@@ -2356,16 +2419,6 @@ impl RecordState {
                 }
                 if let Some(p) = paragraph_snapshot {
                     let _ = state.subtitles.send(SubtitleEvent::ParagraphUpsert(p));
-                }
-                // Also broadcast any OTHER touched paragraphs (the
-                // previous-paragraph cross-boundary case) so subscribers
-                // see the updated text on the previous block.
-                for snap in active_snapshots {
-                    if snap.id != paragraph_id_for_task {
-                        let _ = state
-                            .subtitles
-                            .send(SubtitleEvent::ParagraphUpsert(snap));
-                    }
                 }
             }
         });
