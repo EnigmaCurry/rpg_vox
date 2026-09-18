@@ -103,6 +103,12 @@ impl WebMicTarget {
 pub struct WebMicSlotState {
     active: AtomicBool,
     target: AtomicU8,
+    /// Client-reported mute state. The client zeros out the encoded
+    /// PCM before sending, so audio flow is unchanged — this atomic
+    /// exists purely so `/pw/graph` can distinguish "muted" from "just
+    /// silent" on the Sources row. Set via a `{"muted": bool}` text
+    /// WebSocket message from the browser.
+    muted: AtomicBool,
     client_uuid: Mutex<Option<Uuid>>,
     /// Slot's SPSC producer, taken by whichever WS task claims the slot
     /// and returned to this Mutex by [`ClaimedSlot`]'s Drop. `None`
@@ -133,6 +139,13 @@ impl WebMicSlotState {
     }
     pub fn client_uuid(&self) -> Option<Uuid> {
         *self.client_uuid.lock().expect("web_mic uuid mutex poisoned")
+    }
+    #[inline]
+    pub fn muted(&self) -> bool {
+        self.muted.load(Ordering::Relaxed)
+    }
+    pub fn set_muted(&self, muted: bool) {
+        self.muted.store(muted, Ordering::Relaxed);
     }
 }
 
@@ -178,6 +191,7 @@ impl WebMicPool {
             let state = Arc::new(WebMicSlotState {
                 active: AtomicBool::new(false),
                 target: AtomicU8::new(TARGET_OFF),
+                muted: AtomicBool::new(false),
                 client_uuid: Mutex::new(None),
                 producer: Mutex::new(Some(producer)),
             });
@@ -289,6 +303,7 @@ impl Drop for ClaimedSlot {
         }
         self.state.active.store(false, Ordering::Relaxed);
         self.state.target.store(TARGET_OFF, Ordering::Relaxed);
+        self.state.muted.store(false, Ordering::Relaxed);
         *self.state.client_uuid.lock().expect("web_mic uuid mutex poisoned") = None;
     }
 }
@@ -415,7 +430,19 @@ async fn run_subscriber(mut socket: WebSocket, mut claimed: ClaimedSlot) -> anyh
             Some(Ok(Message::Ping(payload))) => {
                 let _ = socket.send(Message::Pong(payload)).await;
             }
-            Some(Ok(_)) => {} // ignore Text / Pong / Binary of unknown shape
+            Some(Ok(Message::Text(txt))) => {
+                // Client-side mute signal: `{"muted": true|false}`.
+                // Cheap to parse — only fires on state changes plus
+                // once on WS open. Malformed messages are ignored so
+                // a future protocol extension can add fields without
+                // needing a schema handshake.
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
+                    if let Some(m) = v.get("muted").and_then(|x| x.as_bool()) {
+                        claimed.state().set_muted(m);
+                    }
+                }
+            }
+            Some(Ok(_)) => {} // ignore Pong / other unknown binary shapes
             Some(Err(err)) => {
                 warn!(?err, client = %uuid_str, "web-mic socket recv error");
                 return Ok(());

@@ -16,8 +16,9 @@
 // posts fixed-size 20 ms chunks on the main thread; we wrap each in
 // an AudioData and feed AudioEncoder.
 
-import { writable } from 'svelte/store';
+import { writable, derived } from 'svelte/store';
 import { getClientId } from './stores.js';
+import { setMicHasAudio } from './audioClaim.js';
 import micCaptureWorkletUrl from './mic-capture.worklet.js?url';
 
 const OPUS_SAMPLE_RATE = 48000;
@@ -25,7 +26,13 @@ const FRAME_SAMPLES_PER_CHANNEL = 960; // 20 ms — matches the worklet
 const OPUS_BITRATE = 96_000;
 const PREF_ENABLED_KEY = 'rpg_vox.web_mic_enabled';
 const PREF_DEVICE_KEY = 'rpg_vox.web_mic_device_id';
+const PREF_MODE_KEY = 'rpg_vox.web_mic_mute_mode';       // 'toggle' | 'ptt'
+const PREF_TOGGLE_MUTED_KEY = 'rpg_vox.web_mic_muted';   // 'on' / absent
 
+// Module state — must be declared BEFORE the micEffectiveMuted subscriber
+// below, since `subscribe()` fires its callback synchronously with the
+// initial value and the callback reads `ws`. Any `let` declared after
+// that subscribe would be in the TDZ at first-call time.
 let ws = null;
 let audioCtx = null;
 let mediaStream = null;
@@ -38,6 +45,70 @@ let nextTsUs = 0;
 // leaving orphan hardware behind. See the myGen check inside
 // startCapture.
 let captureGen = 0;
+
+/// Mute mode. In `toggle` mode the mute button is sticky — click flips
+/// `micToggleMuted` and stays there. In `ptt` mode the mic is always
+/// muted unless the user is actively holding the button (pointerdown
+/// through pointerup).
+export const micMode = writable(readModePref());
+function readModePref() {
+  try { return localStorage.getItem(PREF_MODE_KEY) === 'ptt' ? 'ptt' : 'toggle'; } catch { return 'toggle'; }
+}
+export function persistMode(mode) {
+  try {
+    if (mode === 'ptt') localStorage.setItem(PREF_MODE_KEY, 'ptt');
+    else localStorage.removeItem(PREF_MODE_KEY);
+  } catch {}
+  micMode.set(mode === 'ptt' ? 'ptt' : 'toggle');
+  // Reset PTT-pressed on any mode change so switching modes never
+  // leaves the mic accidentally hot.
+  micPttPressed.set(false);
+}
+
+/// Sticky mute state used in toggle mode. Persisted so a reload doesn't
+/// silently unmute (or mute) an active mic against the user's last
+/// setting. Ignored in PTT mode (see `micEffectiveMuted`).
+export const micToggleMuted = writable(readToggleMutedPref());
+function readToggleMutedPref() {
+  try { return localStorage.getItem(PREF_TOGGLE_MUTED_KEY) === 'on'; } catch { return false; }
+}
+export function persistToggleMuted(muted) {
+  try {
+    if (muted) localStorage.setItem(PREF_TOGGLE_MUTED_KEY, 'on');
+    else localStorage.removeItem(PREF_TOGGLE_MUTED_KEY);
+  } catch {}
+  micToggleMuted.set(!!muted);
+}
+
+/// Transient "user is currently holding the PTT button" flag. Not
+/// persisted — it's an ephemeral pointerdown/pointerup pair. Ignored
+/// in toggle mode.
+export const micPttPressed = writable(false);
+
+/// The single boolean the rest of the system consults: are we sending
+/// silence right now? Derived from mode + the appropriate flag so
+/// mode switches never require a fan-out of the "am I muted" bit.
+export const micEffectiveMuted = derived(
+  [micMode, micToggleMuted, micPttPressed],
+  ([$mode, $toggle, $ptt]) => ($mode === 'ptt' ? !$ptt : $toggle),
+);
+
+// Mirror the derived store into a plain module variable so the RT
+// message handler (which fires every 20 ms) reads a scalar rather than
+// re-subscribing per frame. Also send a `{"muted": bool}` text message
+// to the server on every change so `/pw/graph` can surface muted state
+// on the Sources row — the audio is still zeros regardless, this is
+// just so the operator can tell "silent because muted" from "silent
+// because nobody's talking".
+let effectiveMutedNow = false;
+let lastSentMuted = null;
+micEffectiveMuted.subscribe((v) => {
+  effectiveMutedNow = !!v;
+  if (ws && ws.readyState === WebSocket.OPEN && effectiveMutedNow !== lastSentMuted) {
+    lastSentMuted = effectiveMutedNow;
+    try { ws.send(JSON.stringify({ muted: effectiveMutedNow })); } catch {}
+  }
+});
 
 /// State the UI observes to decide what to render (starting / listening /
 /// off / error). Presence and capture are independent — 'presence' can
@@ -56,6 +127,11 @@ export const micPref = writable(readPref());
 function readPref() {
   try { return localStorage.getItem(PREF_ENABLED_KEY) === 'on'; } catch { return false; }
 }
+/// Public helper mirroring `browserMonitor.isPrefEnabled`. Used by
+/// App.svelte to seed an immediate cross-tab audio claim at boot so
+/// races between two tabs loading within the ancillary-check window
+/// resolve deterministically.
+export function isPrefEnabled() { return readPref(); }
 export function persistPref(on) {
   try {
     if (on) localStorage.setItem(PREF_ENABLED_KEY, 'on');
@@ -122,7 +198,17 @@ export async function startPresence() {
   const socket = new WebSocket(`${scheme}://${location.host}/mic.ws?client=${encodeURIComponent(clientId)}`);
   socket.binaryType = 'arraybuffer';
   ws = socket;
-  socket.addEventListener('open', () => setPresence('listening'));
+  socket.addEventListener('open', () => {
+    setPresence('listening');
+    // Seed the server with our current mute state so its /pw/graph
+    // response is accurate from the first request — the subscriber
+    // only fires on *changes* so a fresh WS otherwise wouldn't hear
+    // "already muted" until the user toggles.
+    try {
+      socket.send(JSON.stringify({ muted: effectiveMutedNow }));
+      lastSentMuted = effectiveMutedNow;
+    } catch {}
+  });
   socket.addEventListener('close', () => {
     // Server may have closed us for pool-full / uuid conflict, or the
     // page went offline. Either way, tear capture down too — nothing
@@ -264,6 +350,17 @@ export async function startCapture() {
     workletNode.port.onmessage = (ev) => {
       const { left, right } = ev.data || {};
       if (!left || !right || left.length !== FRAME_SAMPLES_PER_CHANNEL) return;
+      // Client-side mute: still encode + transmit a frame so the WS
+      // stays in a steady 50 Hz cadence and the server never sees a
+      // hitch in the audio flow — we just fill with zeros so the
+      // decoded PCM contributes nothing to the mix. The parallel
+      // {"muted": true} text message (see the micEffectiveMuted
+      // subscriber above) lets the server label the source
+      // accordingly.
+      if (effectiveMutedNow) {
+        left.fill(0);
+        right.fill(0);
+      }
       // Build a planar-stereo AudioData: L samples then R samples,
       // one Float32 backing buffer. AudioData copies internally so
       // reusing the incoming views is fine, but we still need a
@@ -348,6 +445,9 @@ function setPresence(next, error = '') {
 }
 function setCapture(next, error = '') {
   micState.update((s) => ({ ...s, capture: next, error: error || s.error }));
+  // Announce claim state across tabs — this browser's mic is a "held"
+  // audio path only when capture is actually running.
+  setMicHasAudio(next === 'active');
 }
 
 // Document-level one-shot gesture listener. Installed by

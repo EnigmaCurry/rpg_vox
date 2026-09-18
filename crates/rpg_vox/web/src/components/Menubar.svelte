@@ -2,7 +2,30 @@
   import { route } from '../lib/router.js';
   import { scenesState } from '../lib/scenes.svelte.js';
   import { monitorState } from '../lib/browserMonitor.js';
+  import {
+    micPref,
+    micMode,
+    micToggleMuted,
+    micPttPressed,
+    micEffectiveMuted,
+    persistToggleMuted,
+  } from '../lib/browserMic.js';
+  import { graph, getClientId } from '../lib/stores.js';
+  import { micState } from '../lib/browserMic.js';
+  import { audioAncillary } from '../lib/audioClaim.js';
   import HealthDot from './HealthDot.svelte';
+
+  const clientId = getClientId();
+  // The mute button is only meaningful when capture is actually running
+  // — before the browser's audio-autoplay gesture unlocks getUserMedia
+  // (or if the Sources row is Off) there's nothing to mute. Grey the
+  // button in either case; it snaps back to its persisted state only
+  // once `micState.capture === 'active'`.
+  const micRouted = $derived(
+    !!($graph?.web_mic_sources ?? []).find((w) => w.client_uuid === clientId)?.routed_to
+  );
+  const micActive = $derived($micState?.capture === 'active');
+  const micIdle = $derived(!micRouted || !micActive);
 
   // Menu structure: top-level items are either simple links or dropdown
   // openers. An item with `children` has no route of its own — its label is
@@ -99,11 +122,91 @@
   // (a listener in browserMonitor.js is watching), so this is purely a
   // hint — no click handler needed on the banner itself.
   const awaitingGesture = $derived($monitorState === 'awaiting-gesture');
+
+  // Mic mute button. Visible only when the Web microphone input toggle
+  // is on (otherwise there's nothing to mute). Two behaviors:
+  //   * `toggle` mode — click flips the sticky `micToggleMuted` store.
+  //   * `ptt` mode    — mic is muted unless the user is actively holding
+  //                     the button (pointerdown → pointerup / cancel /
+  //                     leave, plus keyboard Space for accessibility).
+  function onMuteClick() {
+    if (micIdle) return; // disabled — either not routed or capture not yet active
+    if ($micMode === 'toggle') persistToggleMuted(!$micToggleMuted);
+    // In PTT mode a plain click is a no-op — the pointerdown/pointerup
+    // handlers below drive the transient state.
+  }
+  function onMutePointerDown(ev) {
+    if (micIdle) return;
+    if ($micMode !== 'ptt') return;
+    // Only left button. Capture the pointer so pointerup fires here
+    // even if the cursor slides off the button while held.
+    if (ev.button !== 0 && ev.pointerType === 'mouse') return;
+    ev.currentTarget.setPointerCapture?.(ev.pointerId);
+    micPttPressed.set(true);
+  }
+  function onMutePointerUp(ev) {
+    if ($micMode !== 'ptt') return;
+    try { ev.currentTarget.releasePointerCapture?.(ev.pointerId); } catch {}
+    micPttPressed.set(false);
+  }
+  function onMuteKeyDown(ev) {
+    if (micIdle) return;
+    if ($micMode !== 'ptt') return;
+    if (ev.key !== ' ' && ev.key !== 'Spacebar') return;
+    if (ev.repeat) return;
+    ev.preventDefault();
+    micPttPressed.set(true);
+  }
+  function onMuteKeyUp(ev) {
+    if ($micMode !== 'ptt') return;
+    if (ev.key !== ' ' && ev.key !== 'Spacebar') return;
+    ev.preventDefault();
+    micPttPressed.set(false);
+  }
 </script>
 
 <svelte:window onclick={closeAll} />
 
 <nav class="menubar">
+  {#if $micPref && !$audioAncillary}
+    <button
+      type="button"
+      class="mic-btn"
+      class:muted={$micEffectiveMuted}
+      class:ptt={$micMode === 'ptt'}
+      class:pressed={$micMode === 'ptt' && $micPttPressed}
+      class:idle={micIdle}
+      disabled={micIdle}
+      onclick={onMuteClick}
+      onpointerdown={onMutePointerDown}
+      onpointerup={onMutePointerUp}
+      onpointercancel={onMutePointerUp}
+      onpointerleave={onMutePointerUp}
+      onkeydown={onMuteKeyDown}
+      onkeyup={onMuteKeyUp}
+      aria-pressed={$micEffectiveMuted ? 'false' : 'true'}
+      title={!micRouted
+        ? 'Web mic not routed — pick a destination in Mixer › Sources'
+        : (!micActive
+          ? 'Web mic waiting for a page interaction to unlock audio capture'
+          : ($micMode === 'ptt'
+            ? ($micPttPressed ? 'Push-to-talk — transmitting' : 'Push-to-talk — hold to transmit')
+            : ($micToggleMuted ? 'Web mic muted (click to unmute)' : 'Web mic live (click to mute)')))}
+    >
+      <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+        <!-- Microphone body + stand -->
+        <path d="M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3z"
+              fill="currentColor"/>
+        <path d="M5 11a7 7 0 0 0 14 0M12 18v3M8 21h8"
+              fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+        {#if $micEffectiveMuted}
+          <!-- Slash for muted state -->
+          <line x1="4" y1="4" x2="20" y2="20"
+                stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/>
+        {/if}
+      </svg>
+    </button>
+  {/if}
   <a class="brand" href="#/">RPG Vox</a>
   <ul>
     {#each items as it, i (it.href)}
@@ -191,6 +294,73 @@
     text-decoration: none;
     font-size: 15px;
   }
+  /* Square mic-mute button. Rendered as a top-left corner tab that
+     stacks directly above `.drawer-hamburger` (which lives fixed at
+     `top: var(--menubar-height); left: 0`) — same 34 px width and same
+     rounded-bottom-right shape so the pair reads as one column of
+     corner buttons. Colors track the *effective* mute state: green
+     when transmitting (unmuted / PTT held), red when silent.
+
+     `margin-left: -20px` eats the menubar's 20 px left padding so the
+     button is flush against the viewport edge; the flex `gap: 20px`
+     on the menubar keeps the brand a comfortable distance away. */
+  .mic-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    margin: 0 0 0 -20px;
+    width: 34px;
+    height: var(--menubar-height);
+    padding: 0;
+    background: rgba(255,255,255,0.04);
+    color: #6fd08c;
+    /* Match `.drawer-hamburger`: no top/left border, rounded only at
+       the bottom-right corner so the two tabs stack seamlessly. */
+    border: 1px solid rgba(111,208,140,0.5);
+    border-top: none;
+    border-left: none;
+    border-radius: 0 0 6px 0;
+    cursor: pointer;
+    /* Touch-action prevents mobile browsers from interpreting a hold
+       as a scroll gesture — required for PTT to feel responsive. */
+    touch-action: none;
+    /* Prevent the browser's tap-hold selection popover from firing
+       during PTT holds. */
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  .mic-btn:hover { background: rgba(255,255,255,0.08); }
+  .mic-btn.muted {
+    color: #e35555;
+    border-color: rgba(227,85,85,0.55);
+    background: rgba(227,85,85,0.08);
+  }
+  .mic-btn.muted:hover { background: rgba(227,85,85,0.16); }
+  /* Push-to-talk mode: while pressed, treat as "live-transmit" green
+     and add a subtle inset shadow so the button visibly depresses. */
+  .mic-btn.ptt.pressed {
+    color: #6fd08c;
+    border-color: rgba(111,208,140,0.7);
+    background: rgba(111,208,140,0.16);
+    box-shadow: inset 0 2px 4px rgba(0,0,0,0.35);
+  }
+  .mic-btn:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+  /* Web mic enabled but not routed anywhere — muting is meaningless,
+     so the button greys out and stops reacting to clicks. Takes
+     precedence over `.muted` / `.pressed` via source order below. */
+  .mic-btn.idle,
+  .mic-btn.idle.muted,
+  .mic-btn.idle.ptt.pressed {
+    color: var(--muted);
+    border-color: var(--border);
+    background: rgba(255,255,255,0.02);
+    cursor: not-allowed;
+    box-shadow: none;
+  }
+  .mic-btn.idle:hover { background: rgba(255,255,255,0.02); }
   ul {
     list-style: none;
     margin: 0;

@@ -1218,6 +1218,7 @@ async fn graph_handler(State(state): State<AppState>) -> impl IntoResponse {
                     Some(serde_json::json!({
                         "client_uuid": uuid.to_string(),
                         "routed_to": routed_to,
+                        "muted": slot.muted(),
                     }))
                 })
                 .collect();

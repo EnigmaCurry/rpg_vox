@@ -12,7 +12,8 @@
   import * as browserMonitor from '../lib/browserMonitor.js';
   import { monitorState, monitorStats, monitorPref } from '../lib/browserMonitor.js';
   import * as browserMic from '../lib/browserMic.js';
-  import { micState, micPref, micDevice } from '../lib/browserMic.js';
+  import { micState, micPref, micDevice, micMode } from '../lib/browserMic.js';
+  import { audioAncillary } from '../lib/audioClaim.js';
   import {
     pingStats,
     pingBad,
@@ -247,12 +248,16 @@
   // Web-mic rows appear alongside pipewire sources but are keyed by
   // client_uuid rather than pipewire node id, so route calls use the
   // web-mic endpoint. Clicking a destination on our OWN row also
-  // starts local capture (getUserMedia — the click serves as the user
-  // gesture that unlocks it); Off stops capture.
+  // starts local capture in the primary tab (getUserMedia — the
+  // click serves as the user gesture that unlocks it); Off stops
+  // capture. In an ancillary tab (another tab in this browser is
+  // already holding audio), we're just controlling the primary
+  // tab's routing server-side and never touch local mic hardware.
   async function routeWebMic(uuid, target) {
     const isOwn = uuid === clientId;
+    const runsLocalCapture = isOwn && !$audioAncillary;
     try {
-      if (isOwn) {
+      if (runsLocalCapture) {
         // Acquire the mic BEFORE telling the server — otherwise the
         // slot's routing atomic flips on but the WS carries zero PCM
         // for a beat, which is confusing to hear on the receiving end.
@@ -268,9 +273,10 @@
 
   async function unrouteWebMic(uuid) {
     const isOwn = uuid === clientId;
+    const runsLocalCapture = isOwn && !$audioAncillary;
     try {
       await api.unrouteWebMic(uuid);
-      if (isOwn) {
+      if (runsLocalCapture) {
         // Halt the mic hardware for the current tab. Presence WS
         // stays open so the row remains visible with Off selected.
         await browserMic.stopCapture();
@@ -337,6 +343,10 @@
     if ($micState.capture === 'active') {
       browserMic.stopCapture().then(() => browserMic.startCapture()).catch(() => {});
     }
+  }
+
+  function onMuteModeChange(mode) {
+    browserMic.persistMode(mode);
   }
 
   function sourceLabel(s) {
@@ -733,12 +743,24 @@
     <div class="subhead"><span>Web audio</span>
       <span class="note">this browser tab's audio-in and audio-out for rpg_vox</span>
     </div>
+    {#if $audioAncillary}
+      <!-- Another tab in this browser already holds web audio. Every
+           control on the page still works, but the two audio streams
+           (monitor + mic) stay off in this tab to avoid double-billing
+           bandwidth and echoing the monitor twice. The primary tab
+           dropping web audio flips this back to enabled automatically. -->
+      <div class="monitor-err" role="status">
+        Another browser tab is holding web audio for this session.
+        Toggle off Web audio in that tab (or close it) to enable web
+        monitor / microphone here.
+      </div>
+    {/if}
     <div class="sink-list">
       <label class="sink browser-monitor" title="Stream the tap into this browser tab (does not affect other clients)">
         <input
           type="checkbox"
           checked={$monitorPref}
-          disabled={!browserMonitorSupported || browserMonitorBusy}
+          disabled={!browserMonitorSupported || browserMonitorBusy || $audioAncillary}
           onchange={toggleBrowserMonitor}>
         <span>Web audio monitor (master)</span>
         <span class="id">
@@ -796,7 +818,7 @@
         <input
           type="checkbox"
           checked={$micPref}
-          disabled={!browserMicSupported || webMicBusy}
+          disabled={!browserMicSupported || webMicBusy || $audioAncillary}
           onchange={toggleWebMic}>
         <span>Web microphone input</span>
         <span class="id">
@@ -828,6 +850,27 @@
             {/each}
           </select>
         </label>
+        <div class="sink" title="How the mic-mute button in the menubar behaves. Toggle mute = sticky (click to flip). Push-to-talk = mic is muted unless you hold the button (or press Space when focused).">
+          <span style="flex: 0 0 auto">Mute mode</span>
+          <div class="mode-group" role="radiogroup" aria-label="Mute mode" style="margin-left: 8px;">
+            <button
+              type="button"
+              class="mode-btn"
+              class:active={$micMode !== 'ptt'}
+              role="radio"
+              aria-checked={$micMode !== 'ptt'}
+              onclick={() => onMuteModeChange('toggle')}
+            >Toggle mute</button>
+            <button
+              type="button"
+              class="mode-btn"
+              class:active={$micMode === 'ptt'}
+              role="radio"
+              aria-checked={$micMode === 'ptt'}
+              onclick={() => onMuteModeChange('ptt')}
+            >Push to talk</button>
+          </div>
+        </div>
       {/if}
       {#if webMicError}
         <div class="monitor-err">{webMicError}</div>
@@ -965,6 +1008,35 @@
   .route-btn:last-child  { border-top-right-radius: 4px; border-bottom-right-radius: 4px; }
   .route-btn:hover:not(:disabled) { background: rgba(255,255,255,0.05); }
   .route-btn.active {
+    background: rgba(122,162,255,0.2);
+    border-color: rgba(122,162,255,0.6);
+    color: var(--text);
+    z-index: 1;
+  }
+  /* Mute-mode radio pair in the Web Audio section. Reuses the
+     `.route-btn` visual style so mode picking feels consistent with
+     source routing. */
+  .mode-group {
+    display: inline-flex;
+    border-radius: 4px;
+    overflow: hidden;
+  }
+  .mode-btn {
+    background: transparent;
+    color: var(--text);
+    border: 1px solid var(--border);
+    padding: 4px 12px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    cursor: pointer;
+    border-radius: 0;
+    margin-left: -1px;
+  }
+  .mode-btn:first-child { margin-left: 0; border-top-left-radius: 4px; border-bottom-left-radius: 4px; }
+  .mode-btn:last-child  { border-top-right-radius: 4px; border-bottom-right-radius: 4px; }
+  .mode-btn:hover:not(:disabled) { background: rgba(255,255,255,0.05); }
+  .mode-btn.active {
     background: rgba(122,162,255,0.2);
     border-color: rgba(122,162,255,0.6);
     color: var(--text);

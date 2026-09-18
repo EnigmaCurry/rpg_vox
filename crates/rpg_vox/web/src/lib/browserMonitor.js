@@ -18,6 +18,7 @@
 import { writable, get } from 'svelte/store';
 import workletUrl from './monitor-player.worklet.js?url';
 import { pingBad } from './stores.js';
+import { setMonitorHasAudio } from './audioClaim.js';
 
 const OPUS_SAMPLE_RATE = 48000;
 const FRAME_DURATION_US = 20_000; // 20 ms per Opus frame the server sends
@@ -72,6 +73,11 @@ export const monitorPref = writable(readPrefRaw());
 function readPrefRaw() {
   try { return localStorage.getItem(PREF_KEY) === 'on'; } catch { return false; }
 }
+/// Public helper for App.svelte's boot claim: exposes the persisted
+/// pref bit so the cross-tab audio-claim broadcaster can publish
+/// "intent to hold monitor audio" as soon as the ancillary check
+/// clears — before the actual WS has even opened.
+export function isPrefEnabled() { return readPrefRaw(); }
 
 /// Live buffer diagnostics from the AudioWorklet — depth in ms tells you
 /// whether we're accumulating a backlog somewhere upstream, catch-up
@@ -102,6 +108,11 @@ function setState(next) {
   if (next === 'listening') gestureUnlocked = true;
   if (next === 'awaiting-gesture' && gestureUnlocked) return;
   monitorState.set(next);
+  // Broadcast to other tabs whether this tab is currently holding the
+  // monitor audio path. 'listening' = we're actively receiving Opus
+  // frames and driving the AudioWorklet; everything else is either
+  // pre-open, paused, or torn down.
+  setMonitorHasAudio(next === 'listening');
 }
 
 /// AudioContext.statechange handler. Fires every time ctx transitions
