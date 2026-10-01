@@ -44,7 +44,10 @@ Other options:
 * `--once`: one-shot recorder. Records a single manual paragraph until you
   press `enter`, then finishes every pass (including `--llm`), prints the
   text, copies it to the clipboard and exits. `q`, `esc` or `ctrl-c`
-  cancels without copying. Only one runs at a time: launching a second
+  cancels without copying. `shift+enter` starts a new paragraph without
+  finishing (in normal mode it's the same as `enter`); it needs a terminal
+  with the kitty keyboard protocol (Ghostty, kitty, WezTerm, iTerm2), since
+  macOS Terminal sends the same code for both. Only one runs at a time: launching a second
   `--once` (or running `vox_scribe stop-once`) finishes and copies the
   running one instead, so one key can both start and stop dictation.
 * `--no-tui`: print paragraphs to stdout as they settle.

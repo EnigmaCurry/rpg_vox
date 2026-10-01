@@ -49,8 +49,23 @@ struct App {
 }
 
 pub fn run(session: Session) -> Result<Outcome> {
+    use ratatui::crossterm::event::{
+        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    };
+    use ratatui::crossterm::{execute, terminal::supports_keyboard_enhancement};
     let mut terminal = ratatui::init();
+    // Ask for the kitty keyboard protocol so Shift+Enter is distinguishable
+    // from Enter (Ghostty, kitty, WezTerm, iTerm2; not macOS Terminal).
+    let enhanced = supports_keyboard_enhancement().unwrap_or(false)
+        && execute!(
+            std::io::stdout(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )
+        .is_ok();
     let res = run_loop(&mut terminal, &session);
+    if enhanced {
+        let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
+    }
     // Show progress while queued passes drain.
     let _ = terminal.draw(|f| {
         let msg = Paragraph::new("Finishing queued passes and saving…").block(Block::bordered());
@@ -109,6 +124,7 @@ fn run_loop(terminal: &mut DefaultTerminal, s: &Session) -> Result<bool> {
             continue;
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         if let Some(name) = app.prompt.as_mut() {
             match key.code {
                 KeyCode::Char('c') if ctrl => return Ok(false),
@@ -125,7 +141,8 @@ fn run_loop(terminal: &mut DefaultTerminal, s: &Session) -> Result<bool> {
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => return Ok(false),
             KeyCode::Char('c') if ctrl => return Ok(false),
-            KeyCode::Enter if s.once => return Ok(true),
+            // In --once, Shift+Enter starts a new paragraph and Enter finishes.
+            KeyCode::Enter if s.once && !shift => return Ok(true),
             KeyCode::Char(' ') => {
                 let was = s.paused.fetch_xor(true, Ordering::SeqCst);
                 if !was {
@@ -439,7 +456,7 @@ fn draw(f: &mut Frame, app: &App, s: &Session) {
         ]),
         None => Line::from(
             if s.once {
-                " enter finish & copy · space pause · s save · q cancel"
+                " enter finish & copy · shift+enter new paragraph · space pause · s save · q cancel"
             } else if s.llm {
                 " ↑↓ select · y copy · o original · space pause · enter new paragraph · m mode · s save · q quit"
             } else {

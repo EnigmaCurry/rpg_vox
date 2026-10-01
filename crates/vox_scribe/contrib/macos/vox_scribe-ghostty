@@ -14,4 +14,4 @@ x=$(( (sw - w) / 2 )) y=$(( (sh - h) / 2 ))
 exec open -na Ghostty --args --quit-after-last-window-closed=true \
   --font-size=$font --window-width=$cols --window-height=$rows \
   --window-position-x=$(( x > 0 ? x : 0 )) --window-position-y=$(( y > 0 ? y : 0 )) \
-  --title=vox_scribe -e "$bin/vox_scribe" --once
+  --title=vox_scribe --command="$bin/vox_scribe --once"
