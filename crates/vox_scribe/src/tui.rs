@@ -83,6 +83,9 @@ fn run_loop(terminal: &mut DefaultTerminal, s: &Session) -> Result<bool> {
     };
     let events = s.engine.events().clone();
     loop {
+        if s.finish_requested.load(Ordering::SeqCst) {
+            return Ok(true);
+        }
         for ev in events.try_iter() {
             app.apply(ev, s);
         }

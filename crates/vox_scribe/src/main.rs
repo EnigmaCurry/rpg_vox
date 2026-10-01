@@ -7,6 +7,8 @@
 mod clipboard;
 mod markdown;
 mod models;
+#[cfg(unix)]
+mod once;
 mod tui;
 
 use std::collections::HashSet;
@@ -72,7 +74,8 @@ struct Cli {
     manual: bool,
     /// One-shot: record a single manual paragraph until Enter, then
     /// finish every pass, copy the text to the clipboard and exit.
-    /// q / Esc / Ctrl-C cancels without copying.
+    /// q / Esc / Ctrl-C cancels without copying. Only one runs at a time:
+    /// launching another finishes the running one instead.
     #[arg(long)]
     once: bool,
     /// Enable pass 4: LLM proofreading of each paragraph before it is
@@ -98,6 +101,9 @@ enum Cmd {
     Devices,
     /// Download the SenseVoice and Zipformer models.
     DownloadModels,
+    /// Finish the running --once recorder (as if Enter were pressed).
+    /// Exits 1 if none is running.
+    StopOnce,
 }
 
 /// Audio source feeding the engine.
@@ -122,6 +128,8 @@ pub struct Session {
     pub llm: bool,
     /// --once: Enter finishes the session instead of breaking a paragraph.
     pub once: bool,
+    /// --once: set by SIGUSR1 (another launch) to finish like Enter.
+    pub finish_requested: Arc<AtomicBool>,
     pub stop: Arc<AtomicBool>,
     /// Set when a file input has been fully pushed.
     pub source_done: Arc<AtomicBool>,
@@ -197,8 +205,28 @@ fn main() -> Result<()> {
                 .unwrap_or_else(models::user_models_dir);
             return models::download(&dir);
         }
+        Some(Cmd::StopOnce) => {
+            #[cfg(unix)]
+            if once::signal_finish() {
+                return Ok(());
+            }
+            eprintln!("no vox_scribe --once recorder is running");
+            std::process::exit(1);
+        }
         None => {}
     }
+
+    let finish_requested = Arc::new(AtomicBool::new(false));
+    #[cfg(unix)]
+    let _once_guard = if cli.once {
+        if once::signal_finish() {
+            eprintln!("a --once recorder is already running; told it to finish");
+            return Ok(());
+        }
+        Some(once::claim(finish_requested.clone())?)
+    } else {
+        None
+    };
 
     let now = chrono::Local::now();
     let output = cli.output.clone();
@@ -223,24 +251,9 @@ fn main() -> Result<()> {
         eprintln!("models not found, downloading them once (about 280 MB)…");
         models::download(&models_dir)?;
     }
-    let mut sv = SenseVoiceConfig::from_dir(&models_dir.join(models::SENSE_VOICE));
-    sv.language = cli.language.clone();
-    sv.num_threads = cli.threads;
-    let offline = SenseVoice::open(&sv).with_context(|| {
-        format!(
-            "loading SenseVoice from {} (run `vox_scribe download-models`)",
-            models_dir.display()
-        )
-    })?;
-    let streaming: Option<Box<dyn StreamingRecognizer>> =
-        if cli.no_streaming || !models::has_zipformer(&models_dir) {
-            None
-        } else {
-            let mut zc = ZipformerConfig::from_dir(&models_dir.join(models::ZIPFORMER));
-            zc.num_threads = cli.threads;
-            Some(Box::new(Zipformer::open(&zc)?.session()))
-        };
 
+    // Open the mic before loading models so speech during the load is
+    // buffered (the capture queue holds ~10 s) rather than lost.
     let (source, rate, device) = match &cli.input {
         Some(path) => {
             let d = vox_audio::file::decode(path)?;
@@ -261,6 +274,24 @@ fn main() -> Result<()> {
         }
     };
     info!(rate, device = %device, "audio source ready");
+    let mut sv = SenseVoiceConfig::from_dir(&models_dir.join(models::SENSE_VOICE));
+    sv.language = cli.language.clone();
+    sv.num_threads = cli.threads;
+    let offline = SenseVoice::open(&sv).with_context(|| {
+        format!(
+            "loading SenseVoice from {} (run `vox_scribe download-models`)",
+            models_dir.display()
+        )
+    })?;
+    let streaming: Option<Box<dyn StreamingRecognizer>> =
+        if cli.no_streaming || !models::has_zipformer(&models_dir) {
+            None
+        } else {
+            let mut zc = ZipformerConfig::from_dir(&models_dir.join(models::ZIPFORMER));
+            zc.num_threads = cli.threads;
+            Some(Box::new(Zipformer::open(&zc)?.session()))
+        };
+
 
     let title = cli.title.clone().unwrap_or_else(|| match &cli.input {
         Some(p) => p
@@ -341,6 +372,7 @@ fn main() -> Result<()> {
         manual: AtomicBool::new(manual),
         llm,
         once: cli.once,
+        finish_requested,
         stop,
         source_done,
         capture,
@@ -422,6 +454,7 @@ fn headless(session: Session) -> Result<Outcome> {
     };
     while !interrupted.load(Ordering::SeqCst)
         && !entered.load(Ordering::SeqCst)
+        && !session.finish_requested.load(Ordering::SeqCst)
         && !session.source_done.load(Ordering::SeqCst)
     {
         if let Ok(Event::Paragraph {

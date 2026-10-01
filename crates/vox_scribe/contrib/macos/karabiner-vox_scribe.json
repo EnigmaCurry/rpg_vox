@@ -2,7 +2,7 @@
   "title": "vox_scribe",
   "rules": [
     {
-      "description": "Mic/F5 key: vox_scribe --once in a new Terminal",
+      "description": "Mic/F5 key: start vox_scribe --once, or finish the running one",
       "manipulators": [
         {
           "type": "basic",
@@ -11,7 +11,7 @@
           },
           "to": [
             {
-              "shell_command": "open -a Terminal ~/.local/bin/vox_scribe-once.command"
+              "shell_command": "~/.local/bin/vox_scribe stop-once 2>/dev/null || open -a Terminal ~/.local/bin/vox_scribe-once.terminal"
             }
           ]
         },
@@ -22,7 +22,7 @@
           },
           "to": [
             {
-              "shell_command": "open -a Terminal ~/.local/bin/vox_scribe-once.command"
+              "shell_command": "~/.local/bin/vox_scribe stop-once 2>/dev/null || open -a Terminal ~/.local/bin/vox_scribe-once.terminal"
             }
           ]
         }

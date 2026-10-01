@@ -44,7 +44,9 @@ Other options:
 * `--once`: one-shot recorder. Records a single manual paragraph until you
   press `enter`, then finishes every pass (including `--llm`), prints the
   text, copies it to the clipboard and exits. `q`, `esc` or `ctrl-c`
-  cancels without copying.
+  cancels without copying. Only one runs at a time: launching a second
+  `--once` (or running `vox_scribe stop-once`) finishes and copies the
+  running one instead, so one key can both start and stop dictation.
 * `--no-tui`: print paragraphs to stdout as they settle.
 * `--language en`: pin SenseVoice's language (default `auto`).
 
@@ -104,7 +106,7 @@ just install-scribe              # or: just install-scribe /usr/local/bin
 This builds the release binary, copies it to `~/.local/bin/vox_scribe`, and
 downloads the models into the per-user data dir (skipped if already there).
 Make sure the install directory is on your `PATH`. On macOS it also installs
-`vox_scribe-once.command` next to the binary and drops the Karabiner rule
+`vox_scribe-once.terminal` next to the binary and drops the Karabiner rule
 below into `~/.config/karabiner/assets/complex_modifications/`.
 
 ## One-shot dictation key
@@ -124,10 +126,9 @@ macOS can't rebind the dictation key itself, so this uses
 3. Install Karabiner-Elements and allow its driver and Input Monitoring in
    System Settings › Privacy & Security.
 4. In Karabiner-Elements › Complex Modifications › Add predefined rule,
-   enable "Mic/F5 key: vox_scribe --once in a new Terminal".
-5. Press 🎤. The first time, allow Terminal to use the microphone. To
-   have the window close when it's done, set Terminal › Settings ›
-   Profiles › Shell › "When the shell exits" to close the window.
+   enable "Mic/F5 key: start vox_scribe --once, or finish the running one".
+5. Press 🎤 to start and again (or `enter`) to finish. The first time,
+   allow Terminal to use the microphone. The window closes on its own.
 
 Notes:
 
@@ -136,7 +137,14 @@ Notes:
   function-key mapping) and `dictation` (external Apple keyboards).
   `fn`+F5 still sends a plain F5. If your key reports something else in
   Karabiner-EventViewer, edit the `from` entries.
-* It runs `open -a Terminal ~/.local/bin/vox_scribe-once.command` rather
+* It runs `vox_scribe stop-once || open -a Terminal …/vox_scribe-once.terminal`:
+  a second press finishes the running recorder without opening a window.
+* [vox_scribe-once.terminal](contrib/macos/vox_scribe-once.terminal) is a
+  Terminal window-settings file that runs vox_scribe directly, so no login
+  shell (and its `.zprofile`) runs first, and closes the window on exit.
+  The mic opens before the models load, so you can start talking as soon
+  as the window appears.
+* It opens Terminal with `open -a Terminal` rather
   than `osascript … do script`. With osascript, macOS attributes the mic to
   Karabiner, which has no microphone permission, and vox_scribe hears
   silence (the meter sits at -90 dB).
@@ -148,8 +156,11 @@ Notes:
 
 No special permissions are needed: PipeWire gives the mic to anything in
 your session. Copying needs `wl-copy` (wl-clipboard) on Wayland or `xclip`
-on X11. Bind any key to a command that opens your terminal running
-`vox_scribe --once`; use `wev` (Wayland) or `xev` (X11) to find the key's
+on X11. Bind any key to a command that finishes a running recorder or else opens
+your terminal running `vox_scribe --once`, e.g.
+`sh -c 'vox_scribe stop-once || foot vox_scribe --once'` (without the
+`stop-once` part a second press briefly opens a terminal that does the
+same thing); use `wev` (Wayland) or `xev` (X11) to find the key's
 name. Many laptops' mic keys are `XF86AudioMicMute`, which you may want to
 keep; `F5` or `Super+D` are good alternatives.
 

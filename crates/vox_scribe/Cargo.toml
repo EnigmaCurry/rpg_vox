@@ -17,3 +17,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 ratatui = "0.30"
 unicode-width = "0.2"
 ctrlc = "3"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+signal-hook = "0.3"
