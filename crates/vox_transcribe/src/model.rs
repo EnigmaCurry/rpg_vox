@@ -53,6 +53,27 @@ pub struct Paragraph {
     pub hardened: bool,
     /// A pass-3 decode is running for this paragraph.
     pub pass3_inflight: bool,
+    /// Pass 4 (LLM correction) state; `None` when pass 4 is disabled or
+    /// hasn't started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pass4: Option<Pass4>,
+}
+
+/// Pass-4 progress for one paragraph.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "lowercase")]
+pub enum Pass4 {
+    Running,
+    /// `original` is the pass-3 text the corrections were applied to;
+    /// `text` on the paragraph holds the corrected version.
+    Done {
+        original: String,
+        edits: usize,
+    },
+    /// The LLM call or its edits were rejected; `text` is unchanged.
+    Failed {
+        reason: String,
+    },
 }
 
 impl Paragraph {
@@ -66,6 +87,7 @@ impl Paragraph {
             closed: false,
             hardened: false,
             pass3_inflight: false,
+            pass4: None,
         };
         p.rebuild();
         p

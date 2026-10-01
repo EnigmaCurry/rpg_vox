@@ -149,3 +149,81 @@ fn manual_mode_ignores_silence_until_break() {
     assert_eq!(t.paragraphs[0].clips.len(), 2);
     assert_eq!(t.paragraphs[1].clips.len(), 1);
 }
+
+struct FakeCorrector {
+    fail: bool,
+}
+
+impl vox_transcribe::correct::Corrector for FakeCorrector {
+    fn correct(
+        &self,
+        _text: &str,
+        _ctx: &[String],
+    ) -> anyhow::Result<Vec<vox_transcribe::correct::Edit>> {
+        if self.fail {
+            anyhow::bail!("endpoint down");
+        }
+        Ok(vec![vox_transcribe::correct::Edit {
+            from: "alpha beta.".into(),
+            to: "alpha gamma.".into(),
+        }])
+    }
+}
+
+fn run_with_corrector(fail: bool) -> (Vec<Event>, vox_transcribe::Transcript) {
+    let mut cfg = EngineConfig::new(SR);
+    cfg.partial_interval = std::time::Duration::ZERO;
+    let engine = Engine::spawn_with(
+        cfg,
+        Some(Box::new(FakeStreaming { fed: 0 })),
+        Arc::new(FakeOffline),
+        Some(Arc::new(FakeCorrector { fail })),
+    );
+    let events = engine.events().clone();
+    for (ms, amp) in [
+        (500, 0.0),
+        (1200, 0.2),
+        (800, 0.0),
+        (1200, 0.2),
+        (3000, 0.0),
+    ] {
+        for chunk in tone(ms, amp).chunks(SR as usize / 50) {
+            engine.push(chunk);
+        }
+    }
+    let t = engine.finish();
+    (events.try_iter().collect(), t)
+}
+
+#[test]
+fn pass4_corrects_before_hardening() {
+    let (events, t) = run_with_corrector(false);
+    let ch = changes(&events);
+    let corrected = ch
+        .iter()
+        .position(|c| *c == Change::Corrected)
+        .expect("corrected");
+    let hardened = ch
+        .iter()
+        .position(|c| *c == Change::Hardened)
+        .expect("hardened");
+    assert!(corrected < hardened);
+    let p = &t.paragraphs[0];
+    assert_eq!(p.text, "Alpha beta, alpha gamma.");
+    assert!(matches!(
+        p.pass4,
+        Some(vox_transcribe::Pass4::Done { edits: 1, .. })
+    ));
+}
+
+#[test]
+fn pass4_failure_keeps_pass3_text() {
+    let (_, t) = run_with_corrector(true);
+    let p = &t.paragraphs[0];
+    assert!(p.hardened);
+    assert_eq!(p.text, "Alpha beta, alpha beta.");
+    assert!(matches!(
+        p.pass4,
+        Some(vox_transcribe::Pass4::Failed { .. })
+    ));
+}

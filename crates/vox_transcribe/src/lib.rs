@@ -7,12 +7,18 @@
 //! * **Pass 3**: the last few clips of a paragraph are re-decoded as one
 //!   buffer to fix words mangled at utterance boundaries.
 //!
+//! * **Pass 4** (optional): once a paragraph settles, an LLM proposes
+//!   small edits (number formats, misheard names, bogus sentence breaks).
+//!
 //! Feed mono `f32` samples into an [`Engine`] and consume [`Event`]s.
 
 pub mod boundary;
+pub mod correct;
 pub mod engine;
 pub mod filters;
 pub mod model;
+#[cfg(feature = "llm")]
+pub mod openai;
 pub mod recognizer;
 pub mod ring;
 #[cfg(feature = "sherpa")]
@@ -22,5 +28,5 @@ pub mod stderr;
 pub mod vad;
 
 pub use engine::{Change, Engine, EngineConfig, Event, ParagraphConfig, ParagraphMode, Pusher};
-pub use model::{Clip, Paragraph, Stage, Transcript};
+pub use model::{Clip, Paragraph, Pass4, Stage, Transcript};
 pub use recognizer::{OfflineRecognizer, StreamingRecognizer};

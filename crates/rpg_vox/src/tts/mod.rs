@@ -15,11 +15,9 @@
 //! (`Command::Say`) and the widget WAV writer (`Command::Synthesize`), so
 //! saved clips preserve pan and layering by construction.
 
-pub mod chunker;
 pub mod clicks;
 pub mod comfyui;
 pub mod perf;
-pub mod piper;
 pub mod qwen3;
 
 use anyhow::Result;
@@ -94,7 +92,7 @@ pub enum Command {
 ///   (`-1.0` = full L, `+1.0` = full R, `0.0` = center).
 /// * `delay_ms` staggers the voice's start relative to the profile's mix.
 /// Which synthesis workflow to route this config through. Only [`qwen3`]
-/// looks at this — piper/comfyui ignore mode and always synthesize plain
+/// looks at this — comfyui ignores mode and always synthesizes plain
 /// text through their single-model pipeline.
 ///
 /// `Preset` uses the top-level `speaker` + `instruct` fields on the parent
@@ -357,7 +355,6 @@ pub struct AudioChunk {
 }
 
 pub enum Backend {
-    Piper(piper::Backend),
     Comfy(comfyui::Backend),
     Qwen3(qwen3::Backend),
 }
@@ -366,14 +363,13 @@ impl Backend {
     /// Human-readable tag for logs.
     pub fn kind(&self) -> &'static str {
         match self {
-            Self::Piper(_) => "piper",
             Self::Comfy(_) => "comfyui",
             Self::Qwen3(_) => "qwen3",
         }
     }
 
-    /// Drive one utterance. The backend decides internal chunking (phrase
-    /// splits for Piper, per-websocket-message for ComfyUI, single-request
+    /// Drive one utterance. The backend decides internal chunking
+    /// (per-websocket-message for ComfyUI, single-request
     /// for remote Qwen3) and pushes each PCM chunk through the shared [`Sink`].
     ///
     /// `voice` is a per-request voice override (speaker/language/instruct).
@@ -385,7 +381,6 @@ impl Backend {
         sink: &mut Sink<'_>,
     ) -> Result<()> {
         match self {
-            Self::Piper(b) => b.synthesize(text, sink).await,
             Self::Comfy(b) => b.synthesize(text, sink).await,
             Self::Qwen3(b) => b.synthesize(text, voice, sink).await,
         }
@@ -549,8 +544,8 @@ async fn run_backend(
     play_tx: mpsc::Sender<PlayCmd>,
 ) -> Result<()> {
     // Bounded fan-out for Qwen3 Synthesize. Say (mic path — must serialize
-    // against the pipewire ring buffer) and non-Qwen3 backends (Piper /
-    // ComfyUI carry heavier per-instance state) stay inline; only widget-
+    // against the pipewire ring buffer) and non-Qwen3 backends (ComfyUI
+    // carries heavier per-instance state) stay inline; only widget-
     // WAV synth against the stateless Qwen3 HTTP backend spawns.
     // Permit acquisition happens BEFORE spawn, so a full permit set naturally
     // back-pressures the mpsc through the recv loop instead of piling up
@@ -627,7 +622,7 @@ async fn handle_save_prompt(backend: &mut Backend, req: SavePromptRequest) {
             .save_prompt(voice_id, reference_wav, ref_txt)
             .await
             .map_err(|e| format!("{e:#}")),
-        Backend::Piper(_) | Backend::Comfy(_) => Err(format!(
+        Backend::Comfy(_) => Err(format!(
             "voice cloning requires the qwen3 backend (currently: {})",
             backend.kind()
         )),

@@ -19,6 +19,8 @@ use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand};
 use tracing::info;
 use vox_audio::{Capture, OpenOptions};
+use vox_transcribe::correct::Corrector;
+use vox_transcribe::openai::{OpenAiConfig, OpenAiCorrector};
 use vox_transcribe::sherpa::{SenseVoice, SenseVoiceConfig, Zipformer, ZipformerConfig};
 use vox_transcribe::{
     Change, Engine, EngineConfig, Event, ParagraphMode, StreamingRecognizer, Transcript,
@@ -68,6 +70,18 @@ struct Cli {
     /// Start new paragraphs only on Enter, not on silence (toggle with `m`).
     #[arg(long)]
     manual: bool,
+    /// Enable pass 4: LLM proofreading of each paragraph before it is
+    /// written. Configured by VOX_SCRIBE_LLM_URL (default
+    /// https://api.openai.com/v1), VOX_SCRIBE_LLM_MODEL (required) and
+    /// VOX_SCRIBE_LLM_KEY or OPENAI_API_KEY.
+    #[arg(long)]
+    llm: bool,
+    /// Seconds to wait for each pass-4 reply before keeping pass-3 text.
+    #[arg(long, default_value_t = 30)]
+    llm_timeout: u64,
+    /// File of names and terms (one per line) to help pass 4 spell them.
+    #[arg(long)]
+    vocab: Option<PathBuf>,
     /// Log file. Default: <tmp>/vox_scribe.log in TUI mode, stderr otherwise.
     #[arg(long)]
     log: Option<PathBuf>,
@@ -95,6 +109,8 @@ pub struct Session {
     pub paused: Arc<AtomicBool>,
     /// Paragraphs break only on Enter.
     pub manual: AtomicBool,
+    /// Pass 4 is enabled.
+    pub llm: bool,
     pub stop: Arc<AtomicBool>,
     /// Set when a file input has been fully pushed.
     pub source_done: Arc<AtomicBool>,
@@ -150,6 +166,8 @@ fn main() -> Result<()> {
             output.display()
         );
     }
+    let corrector = llm_corrector(&cli)?;
+    let llm = corrector.is_some();
 
     let models_dir = models::resolve(cli.models_dir.as_deref());
     let mut sv = SenseVoiceConfig::from_dir(&models_dir.join(models::SENSE_VOICE));
@@ -212,7 +230,7 @@ fn main() -> Result<()> {
     if cli.manual {
         engine_cfg.paragraph.mode = ParagraphMode::Manual;
     }
-    let engine = Engine::spawn(engine_cfg, streaming, Arc::new(offline));
+    let engine = Engine::spawn_with(engine_cfg, streaming, Arc::new(offline), corrector);
     let paused = Arc::new(AtomicBool::new(false));
     let stop = Arc::new(AtomicBool::new(false));
     let source_done = Arc::new(AtomicBool::new(false));
@@ -263,6 +281,7 @@ fn main() -> Result<()> {
         device,
         paused,
         manual: AtomicBool::new(cli.manual),
+        llm,
         stop,
         source_done,
         capture,
@@ -324,6 +343,40 @@ fn headless(session: Session) -> Result<()> {
         print(p, &mut printed);
     }
     Ok(())
+}
+
+/// Build the pass-4 corrector when `--llm` is given.
+fn llm_corrector(cli: &Cli) -> Result<Option<Arc<dyn Corrector>>> {
+    if !cli.llm {
+        return Ok(None);
+    }
+    let env = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
+    let url = env("VOX_SCRIBE_LLM_URL").unwrap_or_else(|| "https://api.openai.com/v1".into());
+    let model = env("VOX_SCRIBE_LLM_MODEL").context("--llm needs VOX_SCRIBE_LLM_MODEL set")?;
+    let api_key = env("VOX_SCRIBE_LLM_KEY").or_else(|| env("OPENAI_API_KEY"));
+    let vocabulary = match &cli.vocab {
+        Some(path) => std::fs::read_to_string(path)
+            .with_context(|| format!("read {}", path.display()))?
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(String::from)
+            .collect(),
+        None => Vec::new(),
+    };
+    info!(url = %url, model = %model, vocab = vocabulary.len(), "pass 4 enabled");
+    let corrector = OpenAiCorrector::new(OpenAiConfig {
+        base_url: url.clone(),
+        model: model.clone(),
+        api_key,
+        vocabulary,
+        timeout: Duration::from_secs(cli.llm_timeout),
+    });
+    eprintln!("checking LLM endpoint {url} ({model})…");
+    corrector
+        .check()
+        .with_context(|| format!("pass 4 endpoint check failed ({url}, model {model})"))?;
+    Ok(Some(Arc::new(corrector)))
 }
 
 fn list_devices() -> Result<()> {

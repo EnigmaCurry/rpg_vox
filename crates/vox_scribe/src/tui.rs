@@ -16,12 +16,16 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 use unicode_width::UnicodeWidthStr;
-use vox_transcribe::{Change, Event, ParagraphMode, Stage, Transcript};
+use vox_transcribe::correct::changed_words;
+use vox_transcribe::{Change, Event, ParagraphMode, Pass4, Stage, Transcript};
 
 use crate::markdown::{timestamp, HistoryBlock};
 use crate::Session;
 
 const FLASH: Duration = Duration::from_millis(1500);
+/// Bright sky blue (xterm 256-colour 117) for pass-4 text. The basic ANSI
+/// blues are too dark on black in macOS Terminal.
+const LLM_BLUE: Color = Color::Indexed(117);
 const STATUS_TTL: Duration = Duration::from_secs(3);
 const GUTTER: usize = 11; // "[hh:mm:ss] "
 
@@ -38,6 +42,8 @@ struct App {
     selected: Option<String>,
     /// Footer message and when it was set; cleared after `STATUS_TTL`.
     status: Option<(String, Instant)>,
+    /// Show pre-pass-4 text instead of the LLM-corrected text.
+    show_original: bool,
 }
 
 pub fn run(session: Session) -> Result<()> {
@@ -63,6 +69,7 @@ fn run_loop(terminal: &mut DefaultTerminal, s: &Session) -> Result<()> {
         flashes: HashMap::new(),
         scroll_back: 0,
         selected: None,
+        show_original: false,
         status: None,
     };
     let events = s.engine.events().clone();
@@ -100,6 +107,14 @@ fn run_loop(terminal: &mut DefaultTerminal, s: &Session) -> Result<()> {
                 }
             }
             KeyCode::Enter => s.engine.break_paragraph(),
+            KeyCode::Char('o') if s.llm => {
+                app.show_original = !app.show_original;
+                app.set_status(if app.show_original {
+                    "showing text before LLM correction".into()
+                } else {
+                    "showing LLM-corrected text".into()
+                });
+            }
             KeyCode::Char('m') => {
                 let manual = !s.manual.fetch_xor(true, Ordering::SeqCst);
                 let mode = if manual {
@@ -239,7 +254,7 @@ fn draw(f: &mut Frame, app: &App, s: &Session) {
     let state = if paused {
         Span::styled(" PAUSED ", Style::new().black().on_yellow())
     } else if s.source_done.load(Ordering::Relaxed) {
-        Span::styled(" INPUT DONE ", Style::new().black().on_blue())
+        Span::styled(" INPUT DONE ", Style::new().black().bg(LLM_BLUE))
     } else {
         Span::styled(" ● REC ", Style::new().white().on_red())
     };
@@ -345,8 +360,13 @@ fn draw(f: &mut Frame, app: &App, s: &Session) {
             " LIVE CAPS".dark_gray().italic(),
             " · re-decoded".into(),
             " · boundary-fixed".green(),
-            "   ↑↓ select · y copy · space pause · enter new paragraph · m mode · q quit"
-                .dark_gray(),
+            if s.llm { " · LLM-fixed".fg(LLM_BLUE) } else { "".into() },
+            if s.llm {
+                "   ↑↓ select · y copy · o original · space pause · enter new paragraph · m mode · q quit"
+            } else {
+                "   ↑↓ select · y copy · space pause · enter new paragraph · m mode · q quit"
+            }
+            .dark_gray(),
         ]),
         help_line,
     );
@@ -437,7 +457,22 @@ fn transcript_lines(
     history_lines(history, width, &mut out);
     for p in &app.transcript.paragraphs {
         let mut words: Vec<(String, Style)> = Vec::new();
-        for c in &p.clips {
+        if let (Some(Pass4::Done { original, .. }), false) = (&p.pass4, app.show_original) {
+            // Pass 4 rewrote the paragraph text; mark the words it changed.
+            let before: Vec<&str> = original.split_whitespace().collect();
+            let after: Vec<&str> = p.text.split_whitespace().collect();
+            let changed = changed_words(&before, &after);
+            for (w, ch) in after.iter().zip(changed) {
+                let style = if ch {
+                    Style::new().fg(LLM_BLUE)
+                } else {
+                    Style::new()
+                };
+                words.push((w.to_string(), style));
+            }
+        }
+        let per_clip = words.is_empty();
+        for c in p.clips.iter().filter(|_| per_clip) {
             let style = match c.stage {
                 Stage::Partial => Style::new().dark_gray().add_modifier(Modifier::ITALIC),
                 _ if app.flashes.contains_key(&c.id) => Style::new().green(),
@@ -449,10 +484,12 @@ fn transcript_lines(
             continue;
         }
         let selected = app.selected.as_deref() == Some(p.id.as_str());
-        let gutter_style = match (selected, p.hardened) {
-            (true, _) => Style::new().black().on_cyan(),
-            (false, true) => Style::new().cyan(),
-            (false, false) => Style::new().cyan().bold(),
+        let gutter_style = match (selected, p.hardened, &p.pass4) {
+            (true, _, _) => Style::new().black().on_cyan(),
+            (false, false, Some(Pass4::Running)) => Style::new().fg(LLM_BLUE).bold(),
+            (false, _, Some(Pass4::Failed { .. })) => Style::new().red(),
+            (false, true, _) => Style::new().cyan(),
+            (false, false, _) => Style::new().cyan().bold(),
         };
         let cont_style = if selected { gutter_style } else { Style::new() };
         let start_line = out.len();

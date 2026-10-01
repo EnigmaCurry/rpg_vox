@@ -41,9 +41,48 @@ Other options:
 * `--no-tui`: print paragraphs to stdout as they settle.
 * `--language en`: pin SenseVoice's language (default `auto`).
 
-Models are looked up in `--models-dir`, `$VOX_SCRIBE_MODELS`, the per-user
+## Pass 4: LLM proofreading (optional)
+
+Pass `--llm` and each paragraph is proofread by an OpenAI-compatible chat
+endpoint once it settles, before it is written to the file. The model returns
+small edits (number and time formats, misheard names, sentence breaks inserted
+mid-sentence) rather than rewriting, and edits that would change more than 40%
+of a paragraph's words are rejected.
+
+The endpoint is configured with environment variables, which `just scribe`
+also loads from the repo's `.env` file:
+
+```bash
+VOX_SCRIBE_LLM_URL=https://api.openai.com/v1   # default
+VOX_SCRIBE_LLM_MODEL=<model>                   # required
+OPENAI_API_KEY=...                             # or VOX_SCRIBE_LLM_KEY
+```
+
+```bash
+just scribe --llm --vocab names.txt -o notes.md
+```
+
+* `--vocab FILE`: names and terms, one per line, to help with spelling.
+* `--llm-timeout SECS` (default 30): after a failure or timeout the paragraph
+  is written with its pass-3 text and its timestamp turns red.
+* Local servers (llama.cpp, ollama, vLLM) work the same way: set
+  `VOX_SCRIBE_LLM_URL` to their `/v1` URL; the key is optional.
+
+In the TUI, words pass 4 changed are blue, a paragraph's timestamp is bold
+blue while it waits for the LLM, and `o` toggles the text from before pass 4.
+Without `--llm`, pass 3 is the final pass and paragraphs are written as
+soon as they settle.
+
+ `--models-dir`, `$VOX_SCRIBE_MODELS`, the per-user
 data dir, then `./models` (so an rpg_vox checkout's models work as-is). In
 TUI mode, logs go to `$TMPDIR/vox_scribe.log`.
 
 On macOS, build with plain cargo (no nix-shell), and use `-p vox_scribe`:
 the rpg_vox and discord_vox crates need PipeWire and only build on Linux.
+sherpa-onnx is linked statically, so the binary is self-contained on both
+macOS and Linux:
+
+```bash
+cargo build -p vox_scribe --release   # target/release/vox_scribe
+cargo install --path crates/vox_scribe   # or install into ~/.cargo/bin
+```

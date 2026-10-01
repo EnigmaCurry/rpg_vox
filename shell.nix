@@ -9,7 +9,6 @@ pkgs.mkShell {
     clippy
     pkg-config
     clang
-    # espeak-rs-sys (pulled in by piper-rs) builds espeak-ng from vendored source.
     cmake
     # Web UI: Vite + Svelte SPA built by build.rs and embedded via rust-embed.
     nodejs_22
@@ -25,9 +24,6 @@ pkgs.mkShell {
     # Runtime dep of discord_vox --record: WAV → FLAC (mixed) and
     # WAV → Opus (per-user) transcode happens via `ffmpeg` at session end.
     ffmpeg
-    # `ort` (ONNX Runtime bindings, load-dynamic) dlopens this at runtime;
-    # ORT_DYLIB_PATH below points it at the nixpkgs build.
-    onnxruntime
   ];
 
   # bindgen (used by pipewire-sys) needs libclang at runtime.
@@ -37,24 +33,7 @@ pkgs.mkShell {
   BINDGEN_EXTRA_CLANG_ARGS =
     "-I${pkgs.glibc.dev}/include -I${pkgs.pipewire.dev}/include/pipewire-0.3 -I${pkgs.pipewire.dev}/include/spa-0.2";
 
-  # Point `ort` at nixpkgs' libonnxruntime instead of its bundled download.
-  ORT_DYLIB_PATH = "${pkgs.onnxruntime}/lib/libonnxruntime.so";
-
   shellHook = ''
     echo "rpg_vox dev shell: rustc $(rustc --version), pipewire $(${pkgs.pipewire}/bin/pipewire --version | head -1)"
-    echo "ORT_DYLIB_PATH=$ORT_DYLIB_PATH"
-    # sherpa-onnx-sys downloads prebuilt shared libs into
-    # target/sherpa-onnx-prebuilt/*/lib and encodes an rpath pointing at
-    # that dir. NixOS's ld-wrapper strips non-/nix/store rpath entries, so
-    # we prepend the same path to LD_LIBRARY_PATH here — the glob picks up
-    # whatever version cargo just downloaded, so bumps of the crate don't
-    # need a matching edit here. Silent if the dir doesn't exist yet
-    # (first build hasn't happened).
-    for _dir in "$PWD"/target/sherpa-onnx-prebuilt/*/lib; do
-      if [ -d "$_dir" ]; then
-        export LD_LIBRARY_PATH="$_dir''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-      fi
-    done
-    unset _dir
   '';
 }

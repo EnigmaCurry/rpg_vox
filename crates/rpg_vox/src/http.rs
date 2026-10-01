@@ -369,8 +369,8 @@ fn configs_or_default(configs: Vec<ConfigBody>) -> Vec<VoiceConfig> {
 /// Default voice profile for a Script speech block based on its role.
 /// "character" → the backend's default voice unchanged (the PC's own line).
 /// "narrator"  → the same voice with a DSP shift so the storyteller reads
-/// noticeably different from the PC even when only one Piper model is
-/// loaded: deeper (pitch −3 semitones), slower (0.9×), slightly quieter
+/// noticeably different from the PC even when only one voice is
+/// available: deeper (pitch −3 semitones), slower (0.9×), slightly quieter
 /// (−2 dB) and panned right so both voices don't compete on the same
 /// side of the stereo image. Not a "real" second voice — a full multi-voice
 /// setup would want a separate model per role — but enough to make the
@@ -392,7 +392,7 @@ fn default_configs_for_role(role: &str) -> Vec<VoiceConfig> {
 /// turn's text when the user typed instead of recording. Panned LEFT (so
 /// it doesn't collide with the narrator's right-panned position), pitched
 /// UP a bit and read at slightly faster-than-normal cadence so the GM
-/// reads as its own distinct third voice on a single-model piper install.
+/// reads as its own distinct third voice when only one voice is available.
 fn gm_proxy_configs() -> Vec<VoiceConfig> {
     vec![VoiceConfig {
         pitch_semitones: 2.0,
@@ -476,7 +476,7 @@ async fn character_voice_label(
 
 /// Best-effort voice label for raw-config renders (no `character_id`).
 /// Reads the first non-empty identifying field on the first config's
-/// synth mode — a Piper voice name for Preset, the registered voice
+/// synth mode — the speaker name for Preset, the registered voice
 /// name for Clone, the (truncated) description for Design, the sample
 /// filename for Sample. Returns `None` when nothing identifiable is
 /// present so callers don't stamp an entry with a bare "Preset" tag.

@@ -17,13 +17,14 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{bounded, select, unbounded, Receiver, Sender};
+use crossbeam_channel::{bounded, never, select, unbounded, Receiver, Sender};
 use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::boundary::{self, BoundaryConfig, WindowClip};
+use crate::correct::{apply_edits, Corrector, Edit};
 use crate::filters::{count_words, ends_on_sentence, is_junk};
-use crate::model::{Clip, Paragraph, Stage, Transcript};
+use crate::model::{Clip, Paragraph, Pass4, Stage, Transcript};
 use crate::recognizer::{OfflineRecognizer, StreamingRecognizer};
 use crate::ring::AudioRing;
 use crate::vad::{EndReason, Vad, VadConfig, VadEvent};
@@ -104,6 +105,8 @@ pub enum Change {
     ClipRemoved,
     /// Word cap reached; the next clip opens a new paragraph.
     Closed,
+    /// Pass 4 finished (see [`Paragraph::pass4`] for the outcome).
+    Corrected,
     /// No further passes will touch it.
     Hardened,
 }
@@ -149,6 +152,17 @@ enum Job {
     },
 }
 
+struct LlmJob {
+    paragraph_id: String,
+    text: String,
+    context: Vec<String>,
+}
+
+struct LlmResult {
+    job: LlmJob,
+    edits: anyhow::Result<Vec<Edit>>,
+}
+
 struct JobResult {
     job: Job,
     text: anyhow::Result<String>,
@@ -170,6 +184,17 @@ impl Engine {
         streaming: Option<Box<dyn StreamingRecognizer>>,
         offline: Arc<dyn OfflineRecognizer>,
     ) -> Self {
+        Self::spawn_with(cfg, streaming, offline, None)
+    }
+
+    /// Like [`Engine::spawn`], with an optional pass-4 corrector. When
+    /// given, every paragraph goes through it before it hardens.
+    pub fn spawn_with(
+        cfg: EngineConfig,
+        streaming: Option<Box<dyn StreamingRecognizer>>,
+        offline: Arc<dyn OfflineRecognizer>,
+        corrector: Option<Arc<dyn Corrector>>,
+    ) -> Self {
         let (cmd_tx, cmd_rx) = bounded::<Cmd>(64);
         let (ev_tx, ev_rx) = unbounded::<Event>();
         let (final_tx, final_rx) = unbounded::<Job>();
@@ -182,11 +207,34 @@ impl Engine {
             .spawn(move || offline_worker(offline, rate, final_rx, bound_rx, res_tx))
             .expect("spawn offline worker");
 
+        // Pass 4 gets its own thread: LLM calls are slow and network-bound
+        // and must not hold up passes 2 and 3.
+        let (llm_tx, llm_rx) = match corrector {
+            Some(c) => {
+                let (job_tx, job_rx) = unbounded::<LlmJob>();
+                let (out_tx, out_rx) = unbounded::<LlmResult>();
+                std::thread::Builder::new()
+                    .name("vox-llm".into())
+                    .spawn(move || {
+                        for job in job_rx {
+                            let edits = c.correct(&job.text, &job.context);
+                            if out_tx.send(LlmResult { job, edits }).is_err() {
+                                return;
+                            }
+                        }
+                    })
+                    .expect("spawn llm worker");
+                (Some(job_tx), out_rx)
+            }
+            None => (None, never()),
+        };
+
         let control = std::thread::Builder::new()
             .name("vox-control".into())
             .spawn(move || {
                 let mut core = Core::new(cfg, streaming, ev_tx, final_tx, bound_tx);
-                core.run(cmd_rx, res_rx);
+                core.llm_tx = llm_tx;
+                core.run(cmd_rx, res_rx, llm_rx);
             })
             .expect("spawn control thread");
 
@@ -302,6 +350,8 @@ struct Core {
     bound_tx: Sender<Job>,
     outstanding_final: usize,
     outstanding_boundary: usize,
+    llm_tx: Option<Sender<LlmJob>>,
+    outstanding_llm: usize,
     pass3_pending: HashSet<String>,
     level_max: f32,
     level_next: u64,
@@ -327,6 +377,8 @@ impl Core {
             bound_tx,
             outstanding_final: 0,
             outstanding_boundary: 0,
+            llm_tx: None,
+            outstanding_llm: 0,
             pass3_pending: HashSet::new(),
             level_max: 0.0,
             level_next: 0,
@@ -334,20 +386,29 @@ impl Core {
         }
     }
 
-    fn run(&mut self, cmd_rx: Receiver<Cmd>, res_rx: Receiver<JobResult>) {
+    fn run(
+        &mut self,
+        cmd_rx: Receiver<Cmd>,
+        res_rx: Receiver<JobResult>,
+        llm_rx: Receiver<LlmResult>,
+    ) {
         let mut finishing: Option<Option<Sender<Transcript>>> = None;
         loop {
             if let Some(reply) = &finishing {
-                if self.outstanding_final + self.outstanding_boundary == 0 {
+                let idle =
+                    self.outstanding_final + self.outstanding_boundary + self.outstanding_llm == 0;
+                // Once passes 2 and 3 are drained, send every remaining
+                // paragraph through pass 4 before hardening it.
+                if idle && self.request_pass4_all() == 0 {
                     self.harden_all();
                     if let Some(tx) = reply {
                         let _ = tx.send(self.transcript.clone());
                     }
                     return;
                 }
-                match res_rx.recv() {
-                    Ok(r) => self.on_result(r),
-                    Err(_) => return,
+                select! {
+                    recv(res_rx) -> r => match r { Ok(r) => self.on_result(r), Err(_) => return },
+                    recv(llm_rx) -> r => match r { Ok(r) => self.on_llm(r), Err(_) => return },
                 }
                 continue;
             }
@@ -366,6 +427,7 @@ impl Core {
                     }
                 },
                 recv(res_rx) -> r => if let Ok(r) = r { self.on_result(r) },
+                recv(llm_rx) -> r => if let Ok(r) = r { self.on_llm(r) },
             }
         }
     }
@@ -660,9 +722,84 @@ impl Core {
             if idx == last && self.cfg.paragraph.mode == ParagraphMode::Manual && !p.closed {
                 continue;
             }
+            // Pass 4 has the last word before hardening.
+            if self.llm_tx.is_some() && !p.text.trim().is_empty() {
+                match p.pass4 {
+                    None => {
+                        self.request_pass4(idx);
+                        continue;
+                    }
+                    Some(Pass4::Running) => continue,
+                    Some(_) => {}
+                }
+            }
             self.transcript.paragraphs[idx].hardened = true;
             self.emit(idx, Change::Hardened);
         }
+    }
+
+    /// Queue pass 4 for `paragraphs[idx]`. Closes the paragraph so new
+    /// speech can't land in it while the LLM is working.
+    fn request_pass4(&mut self, idx: usize) {
+        let Some(tx) = &self.llm_tx else { return };
+        let context = self.transcript.paragraphs[idx.saturating_sub(2)..idx]
+            .iter()
+            .map(|p| p.text.clone())
+            .collect();
+        let p = &mut self.transcript.paragraphs[idx];
+        p.closed = true;
+        p.pass4 = Some(Pass4::Running);
+        let job = LlmJob {
+            paragraph_id: p.id.clone(),
+            text: p.text.clone(),
+            context,
+        };
+        if tx.send(job).is_ok() {
+            self.outstanding_llm += 1;
+        }
+        self.emit(idx, Change::Closed);
+    }
+
+    /// Queue pass 4 for every paragraph that hasn't had it. Returns how
+    /// many were queued.
+    fn request_pass4_all(&mut self) -> usize {
+        if self.llm_tx.is_none() {
+            return 0;
+        }
+        let todo: Vec<usize> = (0..self.transcript.paragraphs.len())
+            .filter(|&i| {
+                let p = &self.transcript.paragraphs[i];
+                !p.hardened && p.pass4.is_none() && !p.text.trim().is_empty()
+            })
+            .collect();
+        for &i in &todo {
+            self.request_pass4(i);
+        }
+        todo.len()
+    }
+
+    fn on_llm(&mut self, r: LlmResult) {
+        self.outstanding_llm -= 1;
+        let Some(idx) = self.find_paragraph(&r.job.paragraph_id) else {
+            return;
+        };
+        let p = &mut self.transcript.paragraphs[idx];
+        let outcome = r
+            .edits
+            .map_err(|e| format!("{e:#}"))
+            .and_then(|edits| apply_edits(&r.job.text, &edits));
+        p.pass4 = Some(match outcome {
+            Ok((text, edits)) => {
+                let original = std::mem::replace(&mut p.text, text);
+                Pass4::Done { original, edits }
+            }
+            Err(reason) => {
+                warn!(paragraph = %p.id, %reason, "pass 4 failed; keeping pass-3 text");
+                Pass4::Failed { reason }
+            }
+        });
+        self.emit(idx, Change::Corrected);
+        self.harden_idle();
     }
 
     fn harden_all(&mut self) {

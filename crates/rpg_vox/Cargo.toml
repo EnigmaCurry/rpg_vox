@@ -42,13 +42,6 @@ zip = { version = "2", default-features = false }
 # server doesn't take a locale.
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
-# Piper TTS backend. Runs the ONNX voice model in-process via `ort`; espeak-rs
-# vendors espeak-ng (build needs cmake). `ort`'s `load-dynamic` feature makes
-# it dlopen libonnxruntime at runtime — friendlier on NixOS than the default
-# prebuilt-binary download. The shell.nix provides ORT_DYLIB_PATH.
-piper-rs = "0.2"
-ort = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dynamic", "ndarray"] }
-
 # Pure-Rust pitch-shift + time-stretch for per-style voice effects. Applied
 # to the mono f32 buffer after the TTS backend synthesizes and before the
 # audio hits the ringbuf / WAV encoder. Only DSP dep is rustfft.
@@ -71,22 +64,13 @@ uuid = { version = "1", features = ["v4"] }
 # native lib in one build graph).
 rusqlite = { version = "0.31", features = ["bundled"] }
 
-# Speech-to-text via k2-fsa/sherpa-onnx. We deliberately opt out of the
-# default `static` feature because that would statically link espeak-ng
-# — a symbol conflict with `piper-rs`'s `espeak-rs-sys`, which also
-# statically links its own copy of the same C library. `shared` makes
-# the build.rs download prebuilt .so files and encode an rpath into the
-# binary, so sherpa-onnx keeps its private espeak inside its .so and our
-# binary only sees the C-API surface. Onnxruntime symbol overlap with
-# the `ort` crate above is separately avoided by `ort`'s `load-dynamic`
-# feature (dlopens libonnxruntime at runtime from ORT_DYLIB_PATH).
-sherpa-onnx = { version = "1.13.7", default-features = false, features = ["shared"] }
+# Speech-to-text via k2-fsa/sherpa-onnx, linked statically (its prebuilt
+# archive bundles onnxruntime), so the binary needs no .so files beside
+# it. Every crate in the workspace must agree: sherpa-onnx-sys refuses
+# to build with both `static` and `shared` enabled.
+sherpa-onnx = { version = "1.13.7", default-features = false, features = ["static"] }
 
 # Shared transcription helpers (pass-3 split, false-positive filter,
 # sherpa stderr filter). Recognizers stay in stt.rs for now, so the
 # crate's own sherpa feature is off.
 vox_transcribe = { path = "../vox_transcribe", default-features = false }
-
-# Just used for the pipe/dup2 dance that filters sherpa-onnx's C++ stderr
-# noise ("Creating a resampler:" every utterance) out of our logs.
-libc = "0.2"

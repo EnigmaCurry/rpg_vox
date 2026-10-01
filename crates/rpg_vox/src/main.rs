@@ -20,7 +20,6 @@ mod workflow;
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
 enum TtsBackend {
-    Piper,
     Comfyui,
     /// Remote Qwen3-TTS Gradio deployment. Inference runs on the remote GPU;
     /// rpg_vox just fetches the resulting WAV. Configure with --qwen3-*.
@@ -35,61 +34,11 @@ struct Args {
     #[arg(long, default_value = "127.0.0.1:7331")]
     bind: String,
 
-    /// TTS backend to run. `piper` is local, in-process, low-latency (default);
-    /// `comfyui` submits to a remote ComfyUI instance over HTTP+WS.
-    #[arg(long, value_enum, env = "RPG_VOX_TTS_BACKEND", default_value_t = TtsBackend::Piper)]
+    /// TTS backend to run. Both are remote: `qwen3` fetches WAVs from a
+    /// Qwen3-TTS deployment (default); `comfyui` submits to a ComfyUI
+    /// instance over HTTP+WS.
+    #[arg(long, value_enum, env = "RPG_VOX_TTS_BACKEND", default_value_t = TtsBackend::Qwen3)]
     tts_backend: TtsBackend,
-
-    /// Path to the Piper ONNX voice model (required when --tts-backend=piper).
-    #[arg(
-        long,
-        env = "RPG_VOX_PIPER_MODEL",
-        default_value = "models/piper/en_US-kristin-medium.onnx"
-    )]
-    piper_model: String,
-
-    /// Path to the Piper voice config JSON. Defaults to `{model}.json`.
-    #[arg(long, env = "RPG_VOX_PIPER_CONFIG")]
-    piper_config: Option<String>,
-
-    /// Speaker id for multi-speaker Piper voices. Ignored by single-speaker models.
-    #[arg(long, env = "RPG_VOX_PIPER_SPEAKER")]
-    piper_speaker: Option<i64>,
-
-    /// Minimum words per phrase before the chunker will accept a punctuation
-    /// break. Raise this to get longer, more naturally intonated Piper output
-    /// at the cost of higher time-to-first-audio.
-    #[arg(long, env = "RPG_VOX_PIPER_MIN_WORDS", default_value_t = 5)]
-    piper_min_words: usize,
-
-    /// Upper word count at which the chunker force-breaks a run-on phrase
-    /// even without punctuation. Raise together with --piper-min-words for
-    /// longer chunks; lower for faster first audio.
-    #[arg(long, env = "RPG_VOX_PIPER_MAX_WORDS", default_value_t = 20)]
-    piper_max_words: usize,
-
-    /// Piper duration multiplier (`length_scale`). Values > 1.0 slow speech
-    /// down; < 1.0 speed it up. Unset uses the voice model's own default
-    /// (typically 1.0). Try 1.2–1.4 for a noticeably calmer cadence.
-    #[arg(long, env = "RPG_VOX_PIPER_LENGTH_SCALE")]
-    piper_length_scale: Option<f32>,
-
-    /// Word count at which the chunker will break on a comma / colon /
-    /// semicolon. Unset picks a midpoint between min and max, which biases
-    /// toward sentence-end breaks. Set to the same value as --piper-min-words
-    /// to make commas audibly pause (each comma-terminated segment becomes
-    /// its own chunk with an inter-chunk silence).
-    #[arg(long, env = "RPG_VOX_PIPER_WEAK_AFTER_WORDS")]
-    piper_weak_after_words: Option<usize>,
-
-    /// Silence (ms) inserted after a chunk that ended on `,:;`. Default 140.
-    /// Raise this if comma breaks still feel too rushed.
-    #[arg(long, env = "RPG_VOX_PIPER_WEAK_MS", default_value_t = 140)]
-    piper_weak_ms: u32,
-
-    /// Silence (ms) inserted after a chunk that ended on `.?!`. Default 320.
-    #[arg(long, env = "RPG_VOX_PIPER_STRONG_MS", default_value_t = 320)]
-    piper_strong_ms: u32,
 
     /// ComfyUI base URL (HTTP; the WebSocket endpoint is derived from this).
     #[arg(long, env = "RPG_VOX_COMFYUI", default_value = "http://127.0.0.1:8188")]
@@ -352,9 +301,7 @@ fn main() -> Result<()> {
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        // ort spams per-node optimizer info at INFO — pin it to WARN so
-        // the rpg_vox startup log stays readable.
-        tracing_subscriber::EnvFilter::new("info,ort=warn,ort::logging=warn")
+        tracing_subscriber::EnvFilter::new("info")
     });
     tracing_subscriber::registry()
         .with(
@@ -512,8 +459,7 @@ fn main() -> Result<()> {
 
     let shared_settings = settings::new(settings::Settings {
         backend: match args.tts_backend {
-            TtsBackend::Piper => "piper",
-            TtsBackend::Comfyui => "comfyui",
+                TtsBackend::Comfyui => "comfyui",
             TtsBackend::Qwen3 => "qwen3",
         },
         comfyui_base: args.comfyui.trim_end_matches('/').to_string(),
@@ -766,8 +712,8 @@ fn main() -> Result<()> {
             device_routings.clone(),
         ));
 
-        // Verify + warmup are ComfyUI-specific — skip both entirely when a
-        // local backend (piper) is active, otherwise the log fills with
+        // Verify + warmup are ComfyUI-specific — skip both entirely when
+        // another backend is active, otherwise the log fills with
         // "connection refused" from probing an endpoint we're not using.
         let use_comfyui = matches!(args.tts_backend, TtsBackend::Comfyui);
         if use_comfyui {
@@ -833,39 +779,6 @@ fn main() -> Result<()> {
 
 fn build_backend(args: &Args, settings: settings::Shared) -> Result<tts::Backend> {
     match args.tts_backend {
-        TtsBackend::Piper => {
-            let config_path = args
-                .piper_config
-                .clone()
-                .unwrap_or_else(|| format!("{}.json", args.piper_model));
-            if args.piper_min_words == 0 || args.piper_max_words < args.piper_min_words {
-                return Err(anyhow::anyhow!(
-                    "invalid piper chunker sizes: min={} max={} (require 1 <= min <= max)",
-                    args.piper_min_words,
-                    args.piper_max_words,
-                ));
-            }
-            let default_pauses = tts::piper::PauseConfig::default();
-            let cfg = tts::piper::Config {
-                model_path: args.piper_model.clone(),
-                config_path,
-                speaker_id: args.piper_speaker,
-                length_scale: args.piper_length_scale,
-                chunker: tts::chunker::Config {
-                    min_words: args.piper_min_words,
-                    max_words: args.piper_max_words,
-                    weak_after_words: args.piper_weak_after_words,
-                },
-                pauses: tts::piper::PauseConfig {
-                    strong_ms: args.piper_strong_ms,
-                    weak_ms: args.piper_weak_ms,
-                    force_ms: default_pauses.force_ms,
-                },
-            };
-            let backend = tts::piper::Backend::load(cfg)
-                .context("loading piper backend at startup")?;
-            Ok(tts::Backend::Piper(backend))
-        }
         TtsBackend::Comfyui => Ok(tts::Backend::Comfy(tts::comfyui::Backend::new(settings))),
         TtsBackend::Qwen3 => {
             // Presets URL falls back to the legacy RPG_VOX_QWEN3_URL so

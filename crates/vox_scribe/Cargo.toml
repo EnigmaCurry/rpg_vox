@@ -6,7 +6,7 @@ license.workspace = true
 description = "Live layered transcription in the terminal, saved as markdown"
 
 [dependencies]
-vox_transcribe = { path = "../vox_transcribe" }
+vox_transcribe = { path = "../vox_transcribe", features = ["llm", "sherpa-static"] }
 vox_audio = { path = "../vox_audio" }
 anyhow.workspace = true
 clap = { workspace = true, features = ["env"] }
