@@ -133,7 +133,8 @@ pub struct Session {
     pub stop: Arc<AtomicBool>,
     /// Set when a file input has been fully pushed.
     pub source_done: Arc<AtomicBool>,
-    pub capture: Option<Capture>,
+    /// The live input; None for a file, or while paused (mic released).
+    pub capture: Arc<Mutex<Option<Capture>>>,
     /// Tail of the existing file when appending, shown greyed out.
     pub history: Vec<markdown::HistoryBlock>,
     pump: Option<std::thread::JoinHandle<()>>,
@@ -143,7 +144,7 @@ impl Session {
     /// Stop the audio, drain every pass, append what's left to the markdown.
     pub fn finish(mut self) -> Result<Transcript> {
         self.stop.store(true, Ordering::SeqCst);
-        self.capture.take();
+        self.capture.lock().expect("capture lock").take();
         if let Some(p) = self.pump.take() {
             let _ = p.join();
         }
@@ -337,22 +338,19 @@ fn main() -> Result<()> {
         let (paused, stop, done) = (paused.clone(), stop.clone(), source_done.clone());
         match source {
             Source::Live(cap) => {
-                let chunks = cap.chunks().clone();
-                let pump = std::thread::spawn(move || {
-                    while !stop.load(Ordering::Relaxed) {
-                        let Ok(chunk) = chunks.recv_timeout(Duration::from_millis(100)) else {
-                            continue;
-                        };
-                        // While paused, keep the audio clock running with
-                        // silence so timestamps stay aligned to wall time.
-                        if paused.load(Ordering::Relaxed) {
-                            pusher.push(&vec![0.0; chunk.len()]);
-                        } else {
-                            pusher.push(&chunk);
-                        }
-                    }
-                });
-                (Some(cap), pump)
+                let capture = Arc::new(Mutex::new(Some(cap)));
+                let live = LivePump {
+                    capture: capture.clone(),
+                    opts: OpenOptions {
+                        device: cli.device.clone(),
+                        virtual_sink: cli.virtual_sink,
+                    },
+                    rate,
+                    pusher,
+                    paused,
+                    stop,
+                };
+                (capture, std::thread::spawn(move || live.run()))
             }
             Source::File(samples) => {
                 let pump = std::thread::spawn(move || {
@@ -367,7 +365,7 @@ fn main() -> Result<()> {
                     }
                     done.store(true, Ordering::SeqCst);
                 });
-                (None, pump)
+                (Arc::new(Mutex::new(None)), pump)
             }
         }
     };
@@ -425,6 +423,94 @@ fn copy_transcript(outcome: &Outcome) {
     match clipboard::copy(&text) {
         Ok(how) => eprintln!("copied {words} words ({how})"),
         Err(e) => eprintln!("copy failed: {e}"),
+    }
+}
+
+/// Feeds mic audio to the engine. While paused it releases the mic (so
+/// the OS stops showing it in use) and pushes silence on wall-clock time,
+/// keeping timestamps aligned; on resume it reopens the device.
+struct LivePump {
+    capture: Arc<Mutex<Option<Capture>>>,
+    opts: OpenOptions,
+    rate: u32,
+    pusher: vox_transcribe::Pusher,
+    paused: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+}
+
+impl LivePump {
+    fn run(self) {
+        let mut chunks = self.chunks();
+        // Silence pushed since the mic was released: (since, samples).
+        let mut silent: Option<(std::time::Instant, u64)> = None;
+        while !self.stop.load(Ordering::Relaxed) {
+            if self.paused.load(Ordering::Relaxed) {
+                // A virtual sink stays up so apps playing into it aren't
+                // rerouted; its audio is replaced with silence.
+                if chunks.is_some() && !self.opts.virtual_sink {
+                    chunks = None;
+                    self.capture.lock().expect("capture lock").take();
+                    info!("paused: microphone released");
+                }
+                if let Some(rx) = &chunks {
+                    if let Ok(chunk) = rx.recv_timeout(Duration::from_millis(100)) {
+                        self.pusher.push(&vec![0.0; chunk.len()]);
+                    }
+                    continue;
+                }
+                let (since, pushed) = silent.get_or_insert((std::time::Instant::now(), 0));
+                self.catch_up(*since, pushed);
+                std::thread::sleep(Duration::from_millis(20));
+                continue;
+            }
+            if chunks.is_none() {
+                match self.reopen() {
+                    Ok(rx) => chunks = Some(rx),
+                    Err(e) => {
+                        tracing::warn!("reopening the microphone failed: {e:#}");
+                        self.paused.store(true, Ordering::SeqCst);
+                        continue;
+                    }
+                }
+                // Cover the time spent reopening.
+                if let Some((since, mut pushed)) = silent.take() {
+                    self.catch_up(since, &mut pushed);
+                }
+            }
+            let Some(rx) = &chunks else { continue };
+            if let Ok(chunk) = rx.recv_timeout(Duration::from_millis(100)) {
+                self.pusher.push(&chunk);
+            }
+        }
+    }
+
+    fn chunks(&self) -> Option<crossbeam_channel::Receiver<Vec<f32>>> {
+        let cap = self.capture.lock().expect("capture lock");
+        cap.as_ref().map(|c| c.chunks().clone())
+    }
+
+    fn reopen(&self) -> Result<crossbeam_channel::Receiver<Vec<f32>>> {
+        let cap = vox_audio::default_backend()?.open(&self.opts)?;
+        if cap.sample_rate != self.rate {
+            anyhow::bail!(
+                "device now runs at {} Hz, session started at {} Hz",
+                cap.sample_rate,
+                self.rate
+            );
+        }
+        let rx = cap.chunks().clone();
+        *self.capture.lock().expect("capture lock") = Some(cap);
+        info!("resumed: microphone reopened");
+        Ok(rx)
+    }
+
+    /// Push silence up to the wall-clock time elapsed since `since`.
+    fn catch_up(&self, since: std::time::Instant, pushed: &mut u64) {
+        let due = (since.elapsed().as_secs_f64() * self.rate as f64) as u64;
+        if due > *pushed {
+            self.pusher.push(&vec![0.0; (due - *pushed) as usize]);
+            *pushed = due;
+        }
     }
 }
 

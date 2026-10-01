@@ -19,7 +19,8 @@ cargo run -p vox_scribe --release -- -o notes.md
 ```
 
 Keys: `↑↓` select a paragraph, `y` copy it (the newest one if none is
-selected), `PgUp PgDn` scroll, `End` follow, `space` pause, `enter` new
+selected), `PgUp PgDn` scroll, `End` follow, `space` pause (releases the mic, so the
+OS stops showing it in use; timestamps keep running), `enter` new
 paragraph, `m` switch auto/manual paragraphs, `q` quit. Nothing is saved
 to disk unless you pass `-o FILE`. With it, each paragraph is appended to
 the markdown file once it settles (2 s of quiet; in manual mode,

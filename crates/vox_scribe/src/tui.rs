@@ -449,6 +449,8 @@ fn draw(f: &mut Frame, app: &App, s: &Session) {
     let filled = (frac * width as f32).round() as usize;
     let overruns = s
         .capture
+        .lock()
+        .expect("capture lock")
         .as_ref()
         .map(|c| c.overruns.load(Ordering::Relaxed))
         .unwrap_or(0);
