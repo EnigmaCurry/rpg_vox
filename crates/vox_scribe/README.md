@@ -9,6 +9,8 @@ layered passes as rpg_vox's Record page, via the `vox_transcribe` crate:
    together to repair words cut at utterance edges. Changed words flash green.
 
 Audio comes from CoreAudio on macOS and PipeWire on Linux (`vox_audio`).
+The first run downloads the models (about 270 MB) if none are found;
+`download-models` does the same thing up front.
 
 ```bash
 cargo run -p vox_scribe --release -- download-models

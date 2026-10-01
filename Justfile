@@ -185,7 +185,7 @@ download-stt-model:
       exit 0
     fi
     mkdir -p models
-    stem="sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17"
+    stem="sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17"
     archive="$stem.tar.bz2"
     url="https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/$archive"
     tmp="$(mktemp -d)"
@@ -255,6 +255,21 @@ release-scribe:
     else
       cargo build -p vox_scribe --release
     fi
+
+# Build vox_scribe, install it to BIN and download its models.
+install-scribe BIN="~/.local/bin": release-scribe
+    #!/usr/bin/env bash
+    set -euo pipefail
+    bin="{{BIN}}"
+    bin="${bin/#\~/$HOME}"
+    mkdir -p "$bin"
+    install -m 755 target/release/vox_scribe "$bin/vox_scribe"
+    echo "installed $bin/vox_scribe"
+    "$bin/vox_scribe" download-models
+    case ":$PATH:" in
+      *":$bin:"*) ;;
+      *) echo "note: $bin is not on your PATH" ;;
+    esac
 
 # --- discord_vox (PipeWire sink → Discord voice) ---
 

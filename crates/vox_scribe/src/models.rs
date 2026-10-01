@@ -51,6 +51,12 @@ pub fn resolve(explicit: Option<&Path>) -> PathBuf {
     user
 }
 
+pub fn has_sense_voice(dir: &Path) -> bool {
+    ["model.int8.onnx", "tokens.txt"]
+        .iter()
+        .all(|f| dir.join(SENSE_VOICE).join(f).is_file())
+}
+
 pub fn has_zipformer(dir: &Path) -> bool {
     ["encoder.onnx", "decoder.onnx", "joiner.onnx", "tokens.txt"]
         .iter()
@@ -61,12 +67,14 @@ pub fn has_zipformer(dir: &Path) -> bool {
 /// that are already present.
 pub fn download(dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    let shown = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    println!("models directory: {}", shown.display());
     let sv = dir.join(SENSE_VOICE);
-    if sv.join("model.int8.onnx").is_file() && sv.join("tokens.txt").is_file() {
+    if has_sense_voice(dir) {
         println!("SenseVoice already present in {}", sv.display());
     } else {
         fetch(
-            "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17",
+            "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17",
             &sv,
             &[
                 ("model.int8.onnx", "model.int8.onnx"),

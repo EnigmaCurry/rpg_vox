@@ -109,8 +109,11 @@ enum Source {
 /// Everything the UI loops need.
 pub struct Session {
     pub engine: Engine,
-    /// None without -o.
-    pub writer: Option<Mutex<MarkdownWriter>>,
+    /// None until -o or the TUI's `s` names a file.
+    pub writer: Mutex<Option<MarkdownWriter>>,
+    /// Heading and date line for a file started with `s`.
+    pub title: String,
+    pub subtitle: String,
     pub device: String,
     pub paused: Arc<AtomicBool>,
     /// Paragraphs break only on Enter.
@@ -137,30 +140,45 @@ impl Session {
             let _ = p.join();
         }
         let t = self.engine.finish();
-        if let Some(w) = &self.writer {
-            w.lock().expect("writer lock").append_remaining(&t)?;
+        if let Some(w) = self.writer.lock().expect("writer lock").as_mut() {
+            w.append_remaining(&t)?;
         }
         Ok(t)
     }
 
     /// Append a hardened paragraph to the markdown file, if there is one.
     pub fn write(&self, p: &vox_transcribe::Paragraph) -> Result<()> {
-        match &self.writer {
-            Some(w) => w.lock().expect("writer lock").append(p),
+        match self.writer.lock().expect("writer lock").as_mut() {
+            Some(w) => w.append(p),
             None => Ok(()),
         }
     }
 
     pub fn path(&self) -> Option<PathBuf> {
         self.writer
+            .lock()
+            .expect("writer lock")
             .as_ref()
-            .map(|w| w.lock().expect("writer lock").path().to_path_buf())
+            .map(|w| w.path().to_path_buf())
+    }
+
+    /// Start saving to a new file at `path`: write `settled` (the
+    /// paragraphs no pass will change) now; later ones append as they settle.
+    pub fn save_as(&self, path: PathBuf, settled: &[&vox_transcribe::Paragraph]) -> Result<()> {
+        let mut w = MarkdownWriter::create(path, &self.title, &self.subtitle, false)?;
+        for p in settled {
+            w.append(p)?;
+        }
+        *self.writer.lock().expect("writer lock") = Some(w);
+        Ok(())
     }
 }
 
 /// How a session ended.
 pub struct Outcome {
     pub transcript: Transcript,
+    /// The markdown file, if one was being written.
+    pub path: Option<PathBuf>,
     /// --once: Enter was pressed (copy the text) rather than cancelled.
     pub confirmed: bool,
 }
@@ -198,6 +216,13 @@ fn main() -> Result<()> {
     let llm = corrector.is_some();
 
     let models_dir = models::resolve(cli.models_dir.as_deref());
+    // First run: fetch the models rather than failing.
+    if !models::has_sense_voice(&models_dir)
+        || (!cli.no_streaming && !models::has_zipformer(&models_dir))
+    {
+        eprintln!("models not found, downloading them once (about 280 MB)…");
+        models::download(&models_dir)?;
+    }
     let mut sv = SenseVoiceConfig::from_dir(&models_dir.join(models::SENSE_VOICE));
     sv.language = cli.language.clone();
     sv.num_threads = cli.threads;
@@ -250,9 +275,9 @@ fn main() -> Result<()> {
         _ => Vec::new(),
     };
     let writer = match output {
-        Some(o) => Some(Mutex::new(MarkdownWriter::create(
+        Some(o) => Some(MarkdownWriter::create(
             o, &title, &subtitle, cli.append,
-        )?)),
+        )?),
         None => None,
     };
 
@@ -308,7 +333,9 @@ fn main() -> Result<()> {
 
     let session = Session {
         engine,
-        writer,
+        writer: Mutex::new(writer),
+        title,
+        subtitle,
         device,
         paused,
         manual: AtomicBool::new(manual),
@@ -320,7 +347,6 @@ fn main() -> Result<()> {
         history,
         pump: Some(pump),
     };
-    let path = session.path();
     let outcome = if tui_mode {
         // sherpa-onnx's C++ code writes to fd 2 directly; send it to the
         // log while the TUI owns the screen.
@@ -336,7 +362,7 @@ fn main() -> Result<()> {
     if cli.once {
         copy_transcript(&outcome);
     }
-    if let Some(path) = path {
+    if let Some(path) = &outcome.path {
         println!("saved {}", path.display());
     }
     Ok(())
@@ -411,6 +437,7 @@ fn headless(session: Session) -> Result<Outcome> {
     }
     let once = session.once;
     let confirmed = !interrupted.load(Ordering::SeqCst);
+    let path = session.path();
     let t = session.finish()?;
     if !once {
         for p in &t.paragraphs {
@@ -419,6 +446,7 @@ fn headless(session: Session) -> Result<Outcome> {
     }
     Ok(Outcome {
         transcript: t,
+        path,
         confirmed,
     })
 }

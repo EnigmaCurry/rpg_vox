@@ -44,6 +44,8 @@ struct App {
     status: Option<(String, Instant)>,
     /// Show pre-pass-4 text instead of the LLM-corrected text.
     show_original: bool,
+    /// Filename being typed after `s`.
+    prompt: Option<String>,
 }
 
 pub fn run(session: Session) -> Result<Outcome> {
@@ -54,11 +56,13 @@ pub fn run(session: Session) -> Result<Outcome> {
         let msg = Paragraph::new("Finishing queued passes and saving…").block(Block::bordered());
         f.render_widget(msg, f.area());
     });
+    let path = session.path();
     let finished = session.finish();
     ratatui::restore();
     let confirmed = res?;
     Ok(Outcome {
         transcript: finished?,
+        path,
         confirmed,
     })
 }
@@ -75,6 +79,7 @@ fn run_loop(terminal: &mut DefaultTerminal, s: &Session) -> Result<bool> {
         selected: None,
         show_original: false,
         status: None,
+        prompt: None,
     };
     let events = s.engine.events().clone();
     loop {
@@ -101,6 +106,19 @@ fn run_loop(terminal: &mut DefaultTerminal, s: &Session) -> Result<bool> {
             continue;
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if let Some(name) = app.prompt.as_mut() {
+            match key.code {
+                KeyCode::Char('c') if ctrl => return Ok(false),
+                KeyCode::Esc => app.prompt = None,
+                KeyCode::Enter => app.save_as(s),
+                KeyCode::Backspace => {
+                    name.pop();
+                }
+                KeyCode::Char(c) => name.push(c),
+                _ => {}
+            }
+            continue;
+        }
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => return Ok(false),
             KeyCode::Char('c') if ctrl => return Ok(false),
@@ -134,6 +152,15 @@ fn run_loop(terminal: &mut DefaultTerminal, s: &Session) -> Result<bool> {
                     "auto paragraphs: silence breaks".into()
                 });
             }
+            KeyCode::Char('s') => match s.path() {
+                Some(p) => app.set_status(format!("already saving to {}", p.display())),
+                None => {
+                    let name = chrono::Local::now()
+                        .format("transcript-%Y%m%d-%H%M%S.md")
+                        .to_string();
+                    app.prompt = Some(name);
+                }
+            },
             KeyCode::Up | KeyCode::Char('k') => app.move_selection(-1),
             KeyCode::Down | KeyCode::Char('j') => app.move_selection(1),
             KeyCode::Char('y') | KeyCode::Char('c') => app.copy_selected(),
@@ -196,6 +223,34 @@ impl App {
         }
     }
 
+    /// Create the typed file in the current directory, dump the settled
+    /// paragraphs into it, and keep appending from then on.
+    fn save_as(&mut self, s: &Session) {
+        let name = self.prompt.as_deref().unwrap_or_default().trim().to_string();
+        if name.is_empty() {
+            self.prompt = None;
+            return;
+        }
+        let path = std::path::PathBuf::from(&name);
+        if path.exists() {
+            self.set_status(format!("{name} exists, pick another name"));
+            return;
+        }
+        let settled: Vec<_> = self
+            .transcript
+            .paragraphs
+            .iter()
+            .filter(|p| p.hardened)
+            .collect();
+        match s.save_as(path, &settled) {
+            Ok(()) => {
+                self.prompt = None;
+                self.set_status(format!("saving to {name}"));
+            }
+            Err(e) => self.set_status(format!("save failed: {e:#}")),
+        }
+    }
+
     fn set_status(&mut self, msg: String) {
         self.status = Some((msg, Instant::now()));
     }
@@ -251,7 +306,7 @@ fn draw(f: &mut Frame, app: &App, s: &Session) {
     let [header, body, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(3),
-        Constraint::Length(2),
+        Constraint::Length(3),
     ])
     .areas(f.area());
 
@@ -319,8 +374,12 @@ fn draw(f: &mut Frame, app: &App, s: &Session) {
         body,
     );
 
-    let [meter_line, help_line] =
-        Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(footer);
+    let [meter_line, legend_line, help_line] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(footer);
     let db = if app.rms > 0.0 {
         20.0 * app.rms.log10()
     } else {
@@ -365,17 +424,28 @@ fn draw(f: &mut Frame, app: &App, s: &Session) {
             " · re-decoded".into(),
             " · boundary-fixed".green(),
             if s.llm { " · LLM-fixed".fg(LLM_BLUE) } else { "".into() },
+        ]),
+        legend_line,
+    );
+    let help = match &app.prompt {
+        Some(name) => Line::from(vec![
+            " save as: ".yellow(),
+            Span::raw(name.clone()),
+            Span::styled("▌", Style::new().magenta()),
+            "   enter save · esc cancel".dark_gray(),
+        ]),
+        None => Line::from(
             if s.once {
-                "   enter finish & copy · space pause · q cancel"
+                " enter finish & copy · space pause · s save · q cancel"
             } else if s.llm {
-                "   ↑↓ select · y copy · o original · space pause · enter new paragraph · m mode · q quit"
+                " ↑↓ select · y copy · o original · space pause · enter new paragraph · m mode · s save · q quit"
             } else {
-                "   ↑↓ select · y copy · space pause · enter new paragraph · m mode · q quit"
+                " ↑↓ select · y copy · space pause · enter new paragraph · m mode · s save · q quit"
             }
             .dark_gray(),
-        ]),
-        help_line,
-    );
+        ),
+    };
+    f.render_widget(help, help_line);
 }
 
 /// Word-wrap `words` behind a gutter: `label` on the first line, blank
