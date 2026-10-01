@@ -9,7 +9,7 @@ layered passes as rpg_vox's Record page, via the `vox_transcribe` crate:
    together to repair words cut at utterance edges. Changed words flash green.
 
 Audio comes from CoreAudio on macOS and PipeWire on Linux (`vox_audio`).
-The first run downloads the models (about 270 MB) if none are found;
+The first run downloads the models (about 280 MB) if none are found;
 `download-models` does the same thing up front.
 
 ```bash
@@ -80,8 +80,9 @@ blue while it waits for the LLM, and `o` toggles the text from before pass 4.
 Without `--llm`, pass 3 is the final pass and paragraphs are written as
 soon as they settle.
 
- `--models-dir`, `$VOX_SCRIBE_MODELS`, the per-user
-data dir, then `./models` (so an rpg_vox checkout's models work as-is). In
+Models are looked up in `--models-dir`, `$VOX_SCRIBE_MODELS`, the per-user
+data dir (`~/Library/Application Support/vox_scribe/models` on macOS,
+`${XDG_DATA_HOME:-~/.local/share}/vox_scribe/models` on Linux), then `./models` (so an rpg_vox checkout's models work as-is). In
 TUI mode, logs go to `$TMPDIR/vox_scribe.log`.
 
 On macOS, build with plain cargo (no nix-shell), and use `-p vox_scribe`:
@@ -93,3 +94,74 @@ macOS and Linux:
 cargo build -p vox_scribe --release   # target/release/vox_scribe
 cargo install --path crates/vox_scribe   # or install into ~/.cargo/bin
 ```
+
+## Install
+
+```bash
+just install-scribe              # or: just install-scribe /usr/local/bin
+```
+
+This builds the release binary, copies it to `~/.local/bin/vox_scribe`, and
+downloads the models into the per-user data dir (skipped if already there).
+Make sure the install directory is on your `PATH`. On macOS it also installs
+`vox_scribe-once.command` next to the binary and drops the Karabiner rule
+below into `~/.config/karabiner/assets/complex_modifications/`.
+
+## One-shot dictation key
+
+`vox_scribe --once` works as a push-to-talk dictation tool: bind a key that
+opens a terminal running it, speak, press `enter`, and the text is on the
+clipboard when the window closes.
+
+### macOS (🎤 / F5 key)
+
+macOS can't rebind the dictation key itself, so this uses
+[Karabiner-Elements](https://karabiner-elements.pqrs.org/).
+
+1. Run `just install-scribe`.
+2. In System Settings › Keyboard › Dictation, turn Dictation off (or give
+   it another shortcut). Otherwise macOS takes the key first.
+3. Install Karabiner-Elements and allow its driver and Input Monitoring in
+   System Settings › Privacy & Security.
+4. In Karabiner-Elements › Complex Modifications › Add predefined rule,
+   enable "Mic/F5 key: vox_scribe --once in a new Terminal".
+5. Press 🎤. The first time, allow Terminal to use the microphone. To
+   have the window close when it's done, set Terminal › Settings ›
+   Profiles › Shell › "When the shell exits" to close the window.
+
+Notes:
+
+* The rule ([contrib/macos/karabiner-vox_scribe.json](contrib/macos/karabiner-vox_scribe.json))
+  matches `f5` (what the built-in keyboard reports before Karabiner's
+  function-key mapping) and `dictation` (external Apple keyboards).
+  `fn`+F5 still sends a plain F5. If your key reports something else in
+  Karabiner-EventViewer, edit the `from` entries.
+* It runs `open -a Terminal ~/.local/bin/vox_scribe-once.command` rather
+  than `osascript … do script`. With osascript, macOS attributes the mic to
+  Karabiner, which has no microphone permission, and vox_scribe hears
+  silence (the meter sits at -90 dB).
+* Once Karabiner grabs the keyboard, System Settings › Keyboard › Modifier
+  Keys no longer applies to it. Recreate remaps such as Caps Lock → Control
+  in Karabiner-Elements › Simple Modifications.
+
+### Linux
+
+No special permissions are needed: PipeWire gives the mic to anything in
+your session. Copying needs `wl-copy` (wl-clipboard) on Wayland or `xclip`
+on X11. Bind any key to a command that opens your terminal running
+`vox_scribe --once`; use `wev` (Wayland) or `xev` (X11) to find the key's
+name. Many laptops' mic keys are `XF86AudioMicMute`, which you may want to
+keep; `F5` or `Super+D` are good alternatives.
+
+* GNOME: Settings › Keyboard › View and Customize Shortcuts › Custom
+  Shortcuts, command `gnome-terminal -- vox_scribe --once` (or
+  `ptyxis -- vox_scribe --once`, `kgx -e vox_scribe --once`).
+* KDE Plasma: System Settings › Keyboard › Shortcuts › Add New › Command,
+  `konsole -e vox_scribe --once`.
+* Sway / i3: `bindsym $mod+d exec foot vox_scribe --once` (i3:
+  `exec alacritty -e vox_scribe --once`).
+* Hyprland: `bind = SUPER, D, exec, kitty vox_scribe --once`.
+
+Desktop launchers often don't read your shell's `PATH`, so if nothing
+happens use the full path, e.g. `~/.local/bin/vox_scribe` (or
+`/home/you/.local/bin/vox_scribe` where `~` isn't expanded).

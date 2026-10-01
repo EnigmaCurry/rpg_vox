@@ -265,6 +265,14 @@ install-scribe BIN="~/.local/bin": release-scribe
     mkdir -p "$bin"
     install -m 755 target/release/vox_scribe "$bin/vox_scribe"
     echo "installed $bin/vox_scribe"
+    if [ "$(uname)" = Darwin ]; then
+      contrib=crates/vox_scribe/contrib/macos
+      install -m 755 "$contrib/vox_scribe-once.command" "$bin/"
+      rules="$HOME/.config/karabiner/assets/complex_modifications"
+      mkdir -p "$rules"
+      sed "s|~/.local/bin|$bin|g" "$contrib/karabiner-vox_scribe.json" > "$rules/vox_scribe.json"
+      echo "installed $bin/vox_scribe-once.command and the Karabiner rule (enable it in Karabiner-Elements)"
+    fi
     "$bin/vox_scribe" download-models
     case ":$PATH:" in
       *":$bin:"*) ;;

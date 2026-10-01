@@ -1,0 +1,32 @@
+{
+  "title": "vox_scribe",
+  "rules": [
+    {
+      "description": "Mic/F5 key: vox_scribe --once in a new Terminal",
+      "manipulators": [
+        {
+          "type": "basic",
+          "from": {
+            "key_code": "f5"
+          },
+          "to": [
+            {
+              "shell_command": "open -a Terminal ~/.local/bin/vox_scribe-once.command"
+            }
+          ]
+        },
+        {
+          "type": "basic",
+          "from": {
+            "consumer_key_code": "dictation"
+          },
+          "to": [
+            {
+              "shell_command": "open -a Terminal ~/.local/bin/vox_scribe-once.command"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
