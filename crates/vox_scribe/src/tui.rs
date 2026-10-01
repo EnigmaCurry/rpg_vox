@@ -20,7 +20,7 @@ use vox_transcribe::correct::changed_words;
 use vox_transcribe::{Change, Event, ParagraphMode, Pass4, Stage, Transcript};
 
 use crate::markdown::{timestamp, HistoryBlock};
-use crate::Session;
+use crate::{Outcome, Session};
 
 const FLASH: Duration = Duration::from_millis(1500);
 /// Bright sky blue (xterm 256-colour 117) for pass-4 text. The basic ANSI
@@ -46,7 +46,7 @@ struct App {
     show_original: bool,
 }
 
-pub fn run(session: Session) -> Result<()> {
+pub fn run(session: Session) -> Result<Outcome> {
     let mut terminal = ratatui::init();
     let res = run_loop(&mut terminal, &session);
     // Show progress while queued passes drain.
@@ -56,11 +56,15 @@ pub fn run(session: Session) -> Result<()> {
     });
     let finished = session.finish();
     ratatui::restore();
-    res?;
-    finished.map(|_| ())
+    let confirmed = res?;
+    Ok(Outcome {
+        transcript: finished?,
+        confirmed,
+    })
 }
 
-fn run_loop(terminal: &mut DefaultTerminal, s: &Session) -> Result<()> {
+/// Returns true when --once ended with Enter (copy the text), false on quit.
+fn run_loop(terminal: &mut DefaultTerminal, s: &Session) -> Result<bool> {
     let mut app = App {
         transcript: Transcript::default(),
         rms: 0.0,
@@ -98,8 +102,9 @@ fn run_loop(terminal: &mut DefaultTerminal, s: &Session) -> Result<()> {
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-            KeyCode::Char('c') if ctrl => return Ok(()),
+            KeyCode::Char('q') | KeyCode::Esc => return Ok(false),
+            KeyCode::Char('c') if ctrl => return Ok(false),
+            KeyCode::Enter if s.once => return Ok(true),
             KeyCode::Char(' ') => {
                 let was = s.paused.fetch_xor(true, Ordering::SeqCst);
                 if !was {
@@ -115,7 +120,7 @@ fn run_loop(terminal: &mut DefaultTerminal, s: &Session) -> Result<()> {
                     "showing LLM-corrected text".into()
                 });
             }
-            KeyCode::Char('m') => {
+            KeyCode::Char('m') if !s.once => {
                 let manual = !s.manual.fetch_xor(true, Ordering::SeqCst);
                 let mode = if manual {
                     ParagraphMode::Manual
@@ -167,7 +172,7 @@ impl App {
                     }
                 }
                 if change == Change::Hardened {
-                    if let Err(e) = s.writer.lock().expect("writer lock").append(&paragraph) {
+                    if let Err(e) = s.write(&paragraph) {
                         self.set_status(format!("write failed: {e:#}"));
                     }
                 }
@@ -259,23 +264,22 @@ fn draw(f: &mut Frame, app: &App, s: &Session) {
         Span::styled(" ● REC ", Style::new().white().on_red())
     };
     let path = s
-        .writer
-        .lock()
-        .expect("writer lock")
         .path()
-        .display()
-        .to_string();
+        .map(|p| format!("  → {}", p.display()))
+        .unwrap_or_default();
     f.render_widget(
         Line::from(vec![
             state,
-            if s.manual.load(Ordering::Relaxed) {
+            if s.once {
+                Span::styled(" ONE-SHOT ", Style::new().black().on_magenta())
+            } else if s.manual.load(Ordering::Relaxed) {
                 Span::styled(" ¶ MANUAL ", Style::new().black().on_magenta())
             } else {
                 Span::styled(" ¶ AUTO ", Style::new().black().on_gray())
             },
             format!(" {}  ", timestamp(app.position_ms)).bold(),
             Span::raw(s.device.clone()),
-            format!("  → {path}").dark_gray(),
+            path.dark_gray(),
         ]),
         header,
     );
@@ -361,7 +365,9 @@ fn draw(f: &mut Frame, app: &App, s: &Session) {
             " · re-decoded".into(),
             " · boundary-fixed".green(),
             if s.llm { " · LLM-fixed".fg(LLM_BLUE) } else { "".into() },
-            if s.llm {
+            if s.once {
+                "   enter finish & copy · space pause · q cancel"
+            } else if s.llm {
                 "   ↑↓ select · y copy · o original · space pause · enter new paragraph · m mode · q quit"
             } else {
                 "   ↑↓ select · y copy · space pause · enter new paragraph · m mode · q quit"

@@ -43,7 +43,7 @@ struct Cli {
     /// Transcribe an audio file (wav, flac, mp3, ogg) instead of a device.
     #[arg(short, long)]
     input: Option<PathBuf>,
-    /// Markdown output path. Default: ./transcript-<date>-<time>.md
+    /// Markdown output path. Without it nothing is saved to disk.
     #[arg(short, long)]
     output: Option<PathBuf>,
     /// Add to the output file if it already exists (normally an error).
@@ -70,6 +70,11 @@ struct Cli {
     /// Start new paragraphs only on Enter, not on silence (toggle with `m`).
     #[arg(long)]
     manual: bool,
+    /// One-shot: record a single manual paragraph until Enter, then
+    /// finish every pass, copy the text to the clipboard and exit.
+    /// q / Esc / Ctrl-C cancels without copying.
+    #[arg(long)]
+    once: bool,
     /// Enable pass 4: LLM proofreading of each paragraph before it is
     /// written. Configured by VOX_SCRIBE_LLM_URL (default
     /// https://api.openai.com/v1), VOX_SCRIBE_LLM_MODEL (required) and
@@ -104,13 +109,16 @@ enum Source {
 /// Everything the UI loops need.
 pub struct Session {
     pub engine: Engine,
-    pub writer: Mutex<MarkdownWriter>,
+    /// None without -o.
+    pub writer: Option<Mutex<MarkdownWriter>>,
     pub device: String,
     pub paused: Arc<AtomicBool>,
     /// Paragraphs break only on Enter.
     pub manual: AtomicBool,
     /// Pass 4 is enabled.
     pub llm: bool,
+    /// --once: Enter finishes the session instead of breaking a paragraph.
+    pub once: bool,
     pub stop: Arc<AtomicBool>,
     /// Set when a file input has been fully pushed.
     pub source_done: Arc<AtomicBool>,
@@ -129,12 +137,32 @@ impl Session {
             let _ = p.join();
         }
         let t = self.engine.finish();
-        self.writer
-            .lock()
-            .expect("writer lock")
-            .append_remaining(&t)?;
+        if let Some(w) = &self.writer {
+            w.lock().expect("writer lock").append_remaining(&t)?;
+        }
         Ok(t)
     }
+
+    /// Append a hardened paragraph to the markdown file, if there is one.
+    pub fn write(&self, p: &vox_transcribe::Paragraph) -> Result<()> {
+        match &self.writer {
+            Some(w) => w.lock().expect("writer lock").append(p),
+            None => Ok(()),
+        }
+    }
+
+    pub fn path(&self) -> Option<PathBuf> {
+        self.writer
+            .as_ref()
+            .map(|w| w.lock().expect("writer lock").path().to_path_buf())
+    }
+}
+
+/// How a session ended.
+pub struct Outcome {
+    pub transcript: Transcript,
+    /// --once: Enter was pressed (copy the text) rather than cancelled.
+    pub confirmed: bool,
 }
 
 fn main() -> Result<()> {
@@ -155,12 +183,12 @@ fn main() -> Result<()> {
     }
 
     let now = chrono::Local::now();
-    let output = cli
-        .output
-        .clone()
-        .unwrap_or_else(|| PathBuf::from(now.format("transcript-%Y%m%d-%H%M%S.md").to_string()));
+    let output = cli.output.clone();
+    if cli.append && output.is_none() {
+        anyhow::bail!("--append needs -o FILE");
+    }
     // Fail before loading models or opening the mic.
-    if output.exists() && !cli.append {
+    if let Some(output) = output.as_ref().filter(|o| o.exists() && !cli.append) {
         anyhow::bail!(
             "{} already exists (pass --append to add to it)",
             output.display()
@@ -217,17 +245,20 @@ fn main() -> Result<()> {
         None => format!("Transcript {}", now.format("%Y-%m-%d %H:%M")),
     });
     let subtitle = format!("{} · {}", now.format("%Y-%m-%d %H:%M"), device);
-    let history = if cli.append {
-        markdown::read_tail(&output, 200)
-    } else {
-        Vec::new()
+    let history = match &output {
+        Some(o) if cli.append => markdown::read_tail(o, 200),
+        _ => Vec::new(),
     };
-    let writer = Mutex::new(MarkdownWriter::create(
-        output, &title, &subtitle, cli.append,
-    )?);
+    let writer = match output {
+        Some(o) => Some(Mutex::new(MarkdownWriter::create(
+            o, &title, &subtitle, cli.append,
+        )?)),
+        None => None,
+    };
 
+    let manual = cli.manual || cli.once;
     let mut engine_cfg = EngineConfig::new(rate);
-    if cli.manual {
+    if manual {
         engine_cfg.paragraph.mode = ParagraphMode::Manual;
     }
     let engine = Engine::spawn_with(engine_cfg, streaming, Arc::new(offline), corrector);
@@ -280,21 +311,17 @@ fn main() -> Result<()> {
         writer,
         device,
         paused,
-        manual: AtomicBool::new(cli.manual),
+        manual: AtomicBool::new(manual),
         llm,
+        once: cli.once,
         stop,
         source_done,
         capture,
         history,
         pump: Some(pump),
     };
-    let path = session
-        .writer
-        .lock()
-        .expect("writer lock")
-        .path()
-        .to_path_buf();
-    if tui_mode {
+    let path = session.path();
+    let outcome = if tui_mode {
         // sherpa-onnx's C++ code writes to fd 2 directly; send it to the
         // log while the TUI owns the screen.
         #[cfg(unix)]
@@ -302,20 +329,63 @@ fn main() -> Result<()> {
             Some(f) => Some(vox_transcribe::stderr::redirect_to(f)?),
             None => None,
         };
-        tui::run(session)?;
+        tui::run(session)?
     } else {
-        headless(session)?;
+        headless(session)?
+    };
+    if cli.once {
+        copy_transcript(&outcome);
     }
-    println!("saved {}", path.display());
+    if let Some(path) = path {
+        println!("saved {}", path.display());
+    }
     Ok(())
 }
 
-fn headless(session: Session) -> Result<()> {
+/// --once: print the finished text and put it on the clipboard.
+fn copy_transcript(outcome: &Outcome) {
+    if !outcome.confirmed {
+        eprintln!("cancelled, nothing copied");
+        return;
+    }
+    let text = outcome
+        .transcript
+        .paragraphs
+        .iter()
+        .map(|p| p.text.trim())
+        .filter(|t| !t.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if text.is_empty() {
+        eprintln!("nothing transcribed, clipboard unchanged");
+        return;
+    }
+    println!("{text}");
+    let words = text.split_whitespace().count();
+    match clipboard::copy(&text) {
+        Ok(how) => eprintln!("copied {words} words ({how})"),
+        Err(e) => eprintln!("copy failed: {e}"),
+    }
+}
+
+fn headless(session: Session) -> Result<Outcome> {
     let interrupted = Arc::new(AtomicBool::new(false));
     {
         let i = interrupted.clone();
         ctrlc::set_handler(move || i.store(true, Ordering::SeqCst))
             .context("install Ctrl-C handler")?;
+    }
+    // --once: a line on stdin (Enter) finishes the recording.
+    let entered = Arc::new(AtomicBool::new(false));
+    if session.once {
+        let e = entered.clone();
+        eprintln!("recording; press Enter to finish and copy, Ctrl-C to cancel");
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            if std::io::stdin().read_line(&mut line).is_ok_and(|n| n > 0) {
+                e.store(true, Ordering::SeqCst);
+            }
+        });
     }
     let events = session.engine.events().clone();
     let mut printed = HashSet::new();
@@ -324,25 +394,33 @@ fn headless(session: Session) -> Result<()> {
             println!("[{}] {}\n", timestamp(p.start_ms), p.text.trim());
         }
     };
-    while !interrupted.load(Ordering::SeqCst) && !session.source_done.load(Ordering::SeqCst) {
+    while !interrupted.load(Ordering::SeqCst)
+        && !entered.load(Ordering::SeqCst)
+        && !session.source_done.load(Ordering::SeqCst)
+    {
         if let Ok(Event::Paragraph {
             paragraph,
             change: Change::Hardened,
         }) = events.recv_timeout(Duration::from_millis(100))
         {
-            print(&paragraph, &mut printed);
-            session
-                .writer
-                .lock()
-                .expect("writer lock")
-                .append(&paragraph)?;
+            if !session.once {
+                print(&paragraph, &mut printed);
+            }
+            session.write(&paragraph)?;
         }
     }
+    let once = session.once;
+    let confirmed = !interrupted.load(Ordering::SeqCst);
     let t = session.finish()?;
-    for p in &t.paragraphs {
-        print(p, &mut printed);
+    if !once {
+        for p in &t.paragraphs {
+            print(p, &mut printed);
+        }
     }
-    Ok(())
+    Ok(Outcome {
+        transcript: t,
+        confirmed,
+    })
 }
 
 /// Build the pass-4 corrector when `--llm` is given.
