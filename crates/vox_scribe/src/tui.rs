@@ -48,24 +48,63 @@ struct App {
     prompt: Option<String>,
 }
 
-pub fn run(session: Session) -> Result<Outcome> {
-    use ratatui::crossterm::event::{
-        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
-    };
-    use ratatui::crossterm::{execute, terminal::supports_keyboard_enhancement};
-    let mut terminal = ratatui::init();
-    // Ask for the kitty keyboard protocol so Shift+Enter is distinguishable
-    // from Enter (Ghostty, kitty, WezTerm, iTerm2; not macOS Terminal).
-    let enhanced = supports_keyboard_enhancement().unwrap_or(false)
-        && execute!(
-            std::io::stdout(),
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-        )
-        .is_ok();
-    let res = run_loop(&mut terminal, &session);
-    if enhanced {
-        let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
+/// The terminal in TUI mode. Restored on drop, so an error while loading
+/// models still leaves the shell usable.
+pub struct Screen {
+    terminal: DefaultTerminal,
+    /// Kitty keyboard protocol is on (pop it when restoring).
+    enhanced: bool,
+    restored: bool,
+}
+
+impl Screen {
+    /// Enter the TUI and show a loading frame.
+    pub fn splash() -> Self {
+        use ratatui::crossterm::event::{KeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
+        use ratatui::crossterm::{execute, terminal::supports_keyboard_enhancement};
+        let mut terminal = ratatui::init();
+        // Ask for the kitty keyboard protocol so Shift+Enter is distinguishable
+        // from Enter (Ghostty, kitty, WezTerm, iTerm2; not macOS Terminal).
+        let enhanced = supports_keyboard_enhancement().unwrap_or(false)
+            && execute!(
+                std::io::stdout(),
+                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+            )
+            .is_ok();
+        let _ = terminal.draw(|f| {
+            let msg = Paragraph::new(" loading models…")
+                .dark_gray()
+                .block(Block::bordered().title(" vox_scribe "));
+            f.render_widget(msg, f.area());
+        });
+        Self {
+            terminal,
+            enhanced,
+            restored: false,
+        }
     }
+
+    fn restore(&mut self) {
+        if !self.restored {
+            if self.enhanced {
+                use ratatui::crossterm::{event::PopKeyboardEnhancementFlags, execute};
+                let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
+            }
+            ratatui::restore();
+            self.restored = true;
+        }
+    }
+}
+
+impl Drop for Screen {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
+
+pub fn run(mut screen: Screen, session: Session) -> Result<Outcome> {
+    let terminal = &mut screen.terminal;
+    let res = run_loop(terminal, &session);
     // Show progress while queued passes drain.
     let _ = terminal.draw(|f| {
         let msg = Paragraph::new("Finishing queued passes and saving…").block(Block::bordered());
@@ -73,7 +112,7 @@ pub fn run(session: Session) -> Result<Outcome> {
     });
     let path = session.path();
     let finished = session.finish();
-    ratatui::restore();
+    screen.restore();
     let confirmed = res?;
     Ok(Outcome {
         transcript: finished?,

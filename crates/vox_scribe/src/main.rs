@@ -252,6 +252,16 @@ fn main() -> Result<()> {
         models::download(&models_dir)?;
     }
 
+    // Put the TUI on screen now so the mic and models load behind it
+    // rather than behind a blank terminal. sherpa-onnx's C++ code writes to
+    // fd 2 directly; send it to the log while the TUI owns the screen.
+    #[cfg(unix)]
+    let _stderr_restore = match (&log_file, tui_mode) {
+        (Some(f), true) => Some(vox_transcribe::stderr::redirect_to(f)?),
+        _ => None,
+    };
+    let screen = tui_mode.then(tui::Screen::splash);
+
     // Open the mic before loading models so speech during the load is
     // buffered (the capture queue holds ~10 s) rather than lost.
     let (source, rate, device) = match &cli.input {
@@ -379,17 +389,9 @@ fn main() -> Result<()> {
         history,
         pump: Some(pump),
     };
-    let outcome = if tui_mode {
-        // sherpa-onnx's C++ code writes to fd 2 directly; send it to the
-        // log while the TUI owns the screen.
-        #[cfg(unix)]
-        let _restore = match &log_file {
-            Some(f) => Some(vox_transcribe::stderr::redirect_to(f)?),
-            None => None,
-        };
-        tui::run(session)?
-    } else {
-        headless(session)?
+    let outcome = match screen {
+        Some(screen) => tui::run(screen, session)?,
+        None => headless(session)?,
     };
     if cli.once {
         copy_transcript(&outcome);
