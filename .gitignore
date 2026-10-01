@@ -15,3 +15,5 @@ models/
 # `just llama_rocm_update`.
 .llama-cpp.rev
 hold_music/
+# Local vox_scribe test transcript.
+/notes.md
