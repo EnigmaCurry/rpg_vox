@@ -245,6 +245,17 @@ scribe *ARGS: download-stt-model download-streaming-stt-model
       cargo run -p vox_scribe --release -- {{ARGS}}
     fi
 
+# Uses nix-shell when available (Linux), plain cargo otherwise (macOS).
+# Optimized vox_scribe build only → target/release/vox_scribe.
+release-scribe:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if command -v nix-shell >/dev/null; then
+      nix-shell --run "cargo build -p vox_scribe --release"
+    else
+      cargo build -p vox_scribe --release
+    fi
+
 # --- discord_vox (PipeWire sink → Discord voice) ---
 
 # Run the discord_vox release binary. Expects DISCORD_TOKEN / DISCORD_GUILD_ID /
