@@ -1,0 +1,21 @@
+[package]
+name = "vox_audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Mono f32 audio capture: PipeWire on Linux, CoreAudio on macOS, plus file decode"
+
+[dependencies]
+anyhow.workspace = true
+tracing.workspace = true
+serde_json.workspace = true
+crossbeam-channel = "0.5"
+rtrb.workspace = true
+symphonia = { version = "0.5", features = ["wav", "mp3", "flac", "ogg", "vorbis", "pcm"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+pipewire.workspace = true
+libspa.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+cpal = "0.18"

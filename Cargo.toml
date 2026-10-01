@@ -3,6 +3,9 @@ resolver = "2"
 members = [
     "crates/rpg_vox",
     "crates/discord_vox",
+    "crates/vox_transcribe",
+    "crates/vox_audio",
+    "crates/vox_scribe",
 ]
 
 [workspace.package]

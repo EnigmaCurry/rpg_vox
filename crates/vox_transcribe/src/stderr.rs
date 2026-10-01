@@ -19,15 +19,13 @@
 //! `tracing_subscriber` grabs a handle to stderr, otherwise tracing keeps
 //! writing to the pre-swap fd.
 //!
-//! Unix only. On other platforms this is a no-op.
+//! Unix only.
 
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::io::FromRawFd;
+use std::os::unix::io::{AsRawFd, FromRawFd};
 
 /// Install the filter. Returns whether the *original* stderr was a TTY,
-/// so callers configuring loggers (e.g. `tracing_subscriber`) can still
-/// enable ANSI colors — the post-swap fd 2 is a pipe and would otherwise
-/// auto-detect as "not a terminal".
+/// so callers configuring loggers can still enable ANSI colors.
 pub fn install() -> bool {
     // SAFETY: syscalls guarded by return-value checks; we only touch fds
     // we just created or just duplicated.
@@ -50,7 +48,6 @@ pub fn install() -> bool {
             libc::close(orig_stderr);
             return was_tty;
         }
-        // The pipe's write end lives on as fd 2; drop this extra copy.
         libc::close(write_fd);
 
         let read_file = std::fs::File::from_raw_fd(read_fd);
@@ -64,6 +61,15 @@ pub fn install() -> bool {
     }
 }
 
+/// Point fd 2 at `file` for the rest of the process. A full-screen TUI
+/// uses this so C++ log lines can't scribble over the display.
+pub fn redirect_to(file: &std::fs::File) -> std::io::Result<()> {
+    // SAFETY: dup2 onto the well-known stderr fd.
+    if unsafe { libc::dup2(file.as_raw_fd(), libc::STDERR_FILENO) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
 fn run(read_file: std::fs::File, mut orig_stderr: std::fs::File) {
     let mut reader = BufReader::new(read_file);
     // After we drop a sherpa banner we keep dropping subsequent indented
@@ -87,9 +93,7 @@ fn run(read_file: std::fs::File, mut orig_stderr: std::fs::File) {
                     trailing_to_drop = 4;
                     continue;
                 }
-                if trailing_to_drop > 0
-                    && (starts_with_indent(&line) || is_blank(&line))
-                {
+                if trailing_to_drop > 0 && (starts_with_indent(&line) || is_blank(&line)) {
                     trailing_to_drop -= 1;
                     continue;
                 }

@@ -82,6 +82,11 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 # feature (dlopens libonnxruntime at runtime from ORT_DYLIB_PATH).
 sherpa-onnx = { version = "1.13.7", default-features = false, features = ["shared"] }
 
+# Shared transcription helpers (pass-3 split, false-positive filter,
+# sherpa stderr filter). Recognizers stay in stt.rs for now, so the
+# crate's own sherpa feature is off.
+vox_transcribe = { path = "../vox_transcribe", default-features = false }
+
 # Just used for the pipe/dup2 dance that filters sherpa-onnx's C++ stderr
 # noise ("Creating a resampler:" every utterance) out of our logs.
 libc = "0.2"

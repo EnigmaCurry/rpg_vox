@@ -231,6 +231,20 @@ download-streaming-stt-model:
     cp "$tmp/$stem/tokens.txt"                       "$dest/tokens.txt"
     echo "installed streaming-zipformer model → $dest/"
 
+# --- vox_scribe (standalone live transcription TUI) ---
+
+# Uses nix-shell when available (Linux), plain cargo otherwise (macOS,
+# where only this crate builds).
+# Run the vox_scribe live transcription TUI (fetches models first).
+scribe *ARGS: download-stt-model download-streaming-stt-model
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if command -v nix-shell >/dev/null; then
+      nix-shell --run "cargo run -p vox_scribe --release -- {{ARGS}}"
+    else
+      cargo run -p vox_scribe --release -- {{ARGS}}
+    fi
+
 # --- discord_vox (PipeWire sink → Discord voice) ---
 
 # Run the discord_vox release binary. Expects DISCORD_TOKEN / DISCORD_GUILD_ID /

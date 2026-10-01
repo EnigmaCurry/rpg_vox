@@ -43,6 +43,8 @@ use uuid::Uuid;
 use crate::mixer::AtomicMixer;
 use crate::paragraph::LlmScheduler;
 use crate::stt::{StreamingSession, StreamingSttHandle, SttHandle};
+use vox_transcribe::boundary::split_boundary_text;
+use vox_transcribe::filters::{count_words, ends_on_sentence, is_false_positive};
 
 /// Silence gap (ms) that forces a paragraph break on a given channel. A
 /// new clip whose start is more than this far past the previous clip's end
@@ -3065,130 +3067,6 @@ fn harden_prev_paragraph(inner: &mut Inner, kind: ChannelKind) {
 /// of marginal segments; those are dropped by a length heuristic when
 /// the text is a single "word" (no whitespace) with no Latin letters
 /// and at most two script characters.
-/// Count whitespace-separated words in `text`. Used by the paragraph
-/// soft-cap check to decide when a paragraph is big enough that a
-/// sentence-boundary break would improve readability. Cheap linear
-/// scan; the soft-cap runs at most once per clip finalize.
-fn count_words(text: &str) -> usize {
-    text.split_whitespace().count()
-}
-
-/// True when `text`'s last non-whitespace character is a
-/// sentence-terminating punctuation mark. Handles the standard ASCII
-/// set (`.`, `!`, `?`) plus the fullwidth CJK equivalents SenseVoice
-/// emits on Chinese / Japanese output. Used by the paragraph soft-cap
-/// to only cut at real sentence ends after pass 3 has consolidated
-/// the trailing clip.
-fn ends_on_sentence(text: &str) -> bool {
-    matches!(
-        text.trim_end().chars().last(),
-        Some('.' | '!' | '?' | '。' | '！' | '？'),
-    )
-}
-
-fn is_false_positive(text: &str) -> bool {
-    let trimmed = text.trim();
-    if matches!(trimmed, "I." | "The.") {
-        return true;
-    }
-    if trimmed.chars().any(char::is_whitespace) {
-        return false;
-    }
-    if trimmed.chars().any(|c| c.is_ascii_alphabetic()) {
-        return false;
-    }
-    let content_chars = trimmed
-        .chars()
-        .filter(|c| c.is_alphanumeric())
-        .count();
-    content_chars > 0 && content_chars <= 2
-}
-
-/// Proportional split of a pass-3 result string across the window's
-/// clips by duration ratio. Cut points snap to the nearest whitespace
-/// so multi-char words never split across two clips. `durations` and
-/// the returned Vec have the same length; a run of empty durations or
-/// an empty `text` collapses every slot to `""` (the caller then
-/// leaves clip text untouched at rebuild time — the resulting empty
-/// paragraph would get pruned by later stages).
-fn split_boundary_text(text: &str, durations: &[u64]) -> Vec<String> {
-    let n = durations.len();
-    if n == 0 {
-        return Vec::new();
-    }
-    let text = text.trim();
-    if text.is_empty() {
-        return vec![String::new(); n];
-    }
-    let total: u64 = durations.iter().sum();
-    if total == 0 {
-        // No duration info — dump everything into the last clip.
-        let mut out = vec![String::new(); n];
-        out[n - 1] = text.to_string();
-        return out;
-    }
-    // Work in char indices (not byte indices) so multi-byte UTF-8 is
-    // handled correctly. `char_positions` is the byte offset of each
-    // char, plus a trailing sentinel at `text.len()`.
-    let char_positions: Vec<usize> = text
-        .char_indices()
-        .map(|(i, _)| i)
-        .chain(std::iter::once(text.len()))
-        .collect();
-    let total_chars = char_positions.len() - 1;
-    // Nearest-whitespace snap: find the closest whitespace char to
-    // `target_char_idx`, searching outward up to `half_word_width`
-    // chars in either direction. Returns a char index (into
-    // `char_positions`) suitable for slicing.
-    let half_word_width = ((total_chars as u64) / (n as u64 * 2)).max(1) as usize;
-    let chars: Vec<char> = text.chars().collect();
-    let snap_to_whitespace = |target: usize| -> usize {
-        if target == 0 || target >= total_chars {
-            return target.min(total_chars);
-        }
-        // Prefer the closest whitespace within the half-word window.
-        for d in 0..=half_word_width {
-            let left = target.saturating_sub(d);
-            let right = (target + d).min(total_chars);
-            // A char index `i` sits on a whitespace boundary when
-            // chars[i-1] is whitespace (i.e. the split-before happens
-            // at start of a non-space run).
-            if left > 0 && chars[left - 1].is_whitespace() {
-                return left;
-            }
-            if right < total_chars && chars[right - 1].is_whitespace() {
-                return right;
-            }
-            if right == total_chars {
-                return right;
-            }
-        }
-        target.min(total_chars)
-    };
-    let mut out: Vec<String> = Vec::with_capacity(n);
-    let mut prev_char_end = 0usize;
-    let mut acc: u64 = 0;
-    for (i, dur) in durations.iter().enumerate() {
-        let text_slice = if i + 1 == n {
-            // Last clip: whatever remains.
-            let start_byte = char_positions[prev_char_end];
-            text[start_byte..].trim().to_string()
-        } else {
-            acc = acc.saturating_add(*dur);
-            let frac_end =
-                ((acc as f64 / total as f64) * total_chars as f64).round() as usize;
-            let frac_end = frac_end.min(total_chars);
-            let char_end = snap_to_whitespace(frac_end).max(prev_char_end);
-            let start_byte = char_positions[prev_char_end];
-            let end_byte = char_positions[char_end];
-            prev_char_end = char_end;
-            text[start_byte..end_byte].trim().to_string()
-        };
-        out.push(text_slice);
-    }
-    out
-}
-
 fn audio_duration_ms(interleaved_len: usize, sample_rate: u32) -> u64 {
     if sample_rate == 0 {
         return 0;

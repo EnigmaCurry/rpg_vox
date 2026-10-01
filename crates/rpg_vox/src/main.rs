@@ -12,7 +12,6 @@ mod pw_source;
 mod record;
 mod script;
 mod settings;
-mod stderr_filter;
 mod store;
 mod stt;
 mod tts;
@@ -342,7 +341,7 @@ fn main() -> Result<()> {
     // of stderr before tracing grabs it, so the terminal stays readable
     // during recording. Returns the pre-swap TTY state so ANSI colors
     // still get enabled even though the post-swap fd 2 is a pipe.
-    let stderr_was_tty = stderr_filter::install();
+    let stderr_was_tty = vox_transcribe::stderr::install();
 
     // Layered subscriber: the same fmt() logger as before, PLUS an in-memory
     // ring-buffer profiler that captures every `render` span tree from the
