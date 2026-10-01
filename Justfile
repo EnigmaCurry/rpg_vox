@@ -268,11 +268,24 @@ install-scribe BIN="~/.local/bin": release-scribe
     if [ "$(uname)" = Darwin ]; then
       contrib=crates/vox_scribe/contrib/macos
       sed "s|@BIN@|$bin|" "$contrib/vox_scribe-once.terminal" > "$bin/vox_scribe-once.terminal"
+      install -m 755 "$contrib/vox_scribe-ghostty" "$bin/"
       rm -f "$bin/vox_scribe-once.command"
       rules="$HOME/.config/karabiner/assets/complex_modifications"
       mkdir -p "$rules"
-      sed "s|~/.local/bin|$bin|g" "$contrib/karabiner-vox_scribe.json" > "$rules/vox_scribe.json"
-      echo "installed $bin/vox_scribe-once.terminal and the Karabiner rule (enable it in Karabiner-Elements)"
+      # Ghostty runs as its own app, so only the recorder's window comes
+      # forward; Terminal raises all of its windows. Override with
+      # VOX_SCRIBE_TERMINAL=terminal|ghostty.
+      term="${VOX_SCRIBE_TERMINAL:-}"
+      if [ -z "$term" ]; then
+        if [ -d /Applications/Ghostty.app ]; then term=ghostty; else term=terminal; fi
+      fi
+      case "$term" in
+        ghostty) launch="$bin/vox_scribe-ghostty" ;;
+        terminal) launch="open -a Terminal $bin/vox_scribe-once.terminal" ;;
+        *) echo "VOX_SCRIBE_TERMINAL must be terminal or ghostty" >&2; exit 1 ;;
+      esac
+      sed -e "s|@BIN@|$bin|g" -e "s|@LAUNCH@|$launch|" "$contrib/karabiner-vox_scribe.json" > "$rules/vox_scribe.json"
+      echo "installed the Karabiner rule ($term; enable it in Karabiner-Elements)"
     fi
     "$bin/vox_scribe" download-models
     case ":$PATH:" in

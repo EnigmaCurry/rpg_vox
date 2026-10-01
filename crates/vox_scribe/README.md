@@ -128,7 +128,7 @@ macOS can't rebind the dictation key itself, so this uses
 4. In Karabiner-Elements › Complex Modifications › Add predefined rule,
    enable "Mic/F5 key: start vox_scribe --once, or finish the running one".
 5. Press 🎤 to start and again (or `enter`) to finish. The first time,
-   allow Terminal to use the microphone. The window closes on its own.
+   allow Ghostty (or Terminal) to use the microphone. The window closes on its own.
 
 Notes:
 
@@ -137,9 +137,17 @@ Notes:
   function-key mapping) and `dictation` (external Apple keyboards).
   `fn`+F5 still sends a plain F5. If your key reports something else in
   Karabiner-EventViewer, edit the `from` entries.
-* It runs `vox_scribe stop-once || open -a Terminal …/vox_scribe-once.terminal`:
-  a second press finishes the running recorder without opening a window.
-* [vox_scribe-once.terminal](contrib/macos/vox_scribe-once.terminal) is a
+* It runs `vox_scribe stop-once || <open a terminal>`: a second press
+  finishes the running recorder without opening a window.
+* If Ghostty is installed, the recorder opens in a new Ghostty instance
+  via [vox_scribe-ghostty](contrib/macos/vox_scribe-ghostty): a 100×20
+  window at 13 pt, centred on the current screen. Change the size by
+  setting `VOX_SCRIBE_FONT_SIZE=11` in front of it in the Karabiner rule.
+  As a separate app, only its window comes forward; activating Terminal brings all of
+  Terminal's windows to the front. Without Ghostty, or with
+  `VOX_SCRIBE_TERMINAL=terminal just install-scribe`, it uses Terminal.
+  Either way, the first launch asks to let that app use the microphone.
+* For Terminal, [vox_scribe-once.terminal](contrib/macos/vox_scribe-once.terminal) is a
   Terminal window-settings file that runs vox_scribe directly, so no login
   shell (and its `.zprofile`) runs first, and closes the window on exit.
   The mic opens before the models load, so you can start talking as soon

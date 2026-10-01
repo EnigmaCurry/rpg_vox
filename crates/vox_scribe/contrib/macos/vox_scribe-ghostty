@@ -1,0 +1,17 @@
+#!/bin/zsh
+# Open `vox_scribe --once` in its own small Ghostty window, centred on the
+# current screen. A separate Ghostty instance means only this window comes
+# to the front. Font size: $VOX_SCRIBE_FONT_SIZE (default 13).
+bin=${0:A:h}
+font=${VOX_SCRIBE_FONT_SIZE:-13}
+cols=100 rows=20
+read sw sh <<< "$(osascript -l JavaScript -e 'ObjC.import("AppKit");
+  const v = $.NSScreen.mainScreen.visibleFrame; [v.size.width, v.size.height].map(Math.round).join(" ")')"
+# Ghostty's window for 100x20 cells measures about (75*font - 167) by
+# (25*font + 55) points.
+w=$(( 75 * font - 167 )) h=$(( 25 * font + 55 ))
+x=$(( (sw - w) / 2 )) y=$(( (sh - h) / 2 ))
+exec open -na Ghostty --args --quit-after-last-window-closed=true \
+  --font-size=$font --window-width=$cols --window-height=$rows \
+  --window-position-x=$(( x > 0 ? x : 0 )) --window-position-y=$(( y > 0 ? y : 0 )) \
+  --title=vox_scribe -e "$bin/vox_scribe" --once
