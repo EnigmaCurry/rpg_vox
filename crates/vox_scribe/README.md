@@ -48,7 +48,8 @@ Other options:
   cancels without copying. `shift+enter` starts a new paragraph without
   finishing (in normal mode it's the same as `enter`); it needs a terminal
   with the kitty keyboard protocol (Ghostty, kitty, WezTerm, iTerm2), since
-  macOS Terminal sends the same code for both. Only one runs at a time: launching a second
+  macOS Terminal sends the same code for both. Nothing is saved to disk:
+  `-o`, `--append` and the `s` key are off in this mode. Only one runs at a time: launching a second
   `--once` (or running `vox_scribe stop-once`) finishes and copies the
   running one instead, so one key can both start and stop dictation.
 * `--no-tui`: print paragraphs to stdout as they settle.

@@ -211,7 +211,7 @@ fn run_loop(terminal: &mut DefaultTerminal, s: &Session) -> Result<bool> {
                     "auto paragraphs: silence breaks".into()
                 });
             }
-            KeyCode::Char('s') => match s.path() {
+            KeyCode::Char('s') if !s.once => match s.path() {
                 Some(p) => app.set_status(format!("already saving to {}", p.display())),
                 None => {
                     let name = chrono::Local::now()
@@ -497,7 +497,7 @@ fn draw(f: &mut Frame, app: &App, s: &Session) {
         ]),
         None => Line::from(
             if s.once {
-                " enter finish & copy · shift+enter new paragraph · space pause · s save · q cancel"
+                " enter finish & copy · shift+enter new paragraph · space pause · q cancel"
             } else if s.llm {
                 " ↑↓ select · y copy · o original · space pause · enter new paragraph · m mode · s save · q quit"
             } else {

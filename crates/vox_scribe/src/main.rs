@@ -75,8 +75,9 @@ struct Cli {
     /// One-shot: record a single manual paragraph until Enter, then
     /// finish every pass, copy the text to the clipboard and exit.
     /// q / Esc / Ctrl-C cancels without copying. Only one runs at a time:
-    /// launching another finishes the running one instead.
-    #[arg(long)]
+    /// launching another finishes the running one instead. Nothing is
+    /// saved to disk.
+    #[arg(long, conflicts_with_all = ["output", "append"])]
     once: bool,
     /// Enable pass 4: LLM proofreading of each paragraph before it is
     /// written. Configured by VOX_SCRIBE_LLM_URL (default
