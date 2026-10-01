@@ -16,9 +16,12 @@ cargo run -p vox_scribe --release -- devices
 cargo run -p vox_scribe --release -- -o notes.md
 ```
 
-Keys: `space` pause, `enter` new paragraph, `s` save now, `↑↓ PgUp PgDn`
-scroll, `End` follow, `q` save and quit. The markdown file is rewritten each
-time a paragraph settles (2 s of quiet), and in full on exit.
+Keys: `↑↓` select a paragraph, `y` copy it (the newest one if none is
+selected), `PgUp PgDn` scroll, `End` follow, `space` pause, `enter` new
+paragraph, `q` quit. Each paragraph is appended to the markdown file once it
+settles (2 s of quiet), so `tail -f notes.md` follows along; quitting
+appends whatever is still open. Copying uses `pbcopy`, `wl-copy` or `xclip`,
+falling back to the OSC 52 terminal escape (e.g. over ssh).
 
 Other options:
 
@@ -28,6 +31,9 @@ Other options:
   transcribe whatever apps play into it. On macOS use a loopback device
   such as BlackHole with `--device`.
 * `--input FILE`: transcribe a wav/flac/mp3/ogg file.
+* `--append`: add to an existing output file, after a `---` rule and a new
+  date line. The TUI shows the file's previous content in grey above the
+  new session. Without `--append`, an existing file is an error.
 * `--no-tui`: print paragraphs to stdout as they settle.
 * `--language en`: pin SenseVoice's language (default `auto`).
 

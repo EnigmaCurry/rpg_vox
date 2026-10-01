@@ -4,6 +4,7 @@
 //! (ALL CAPS, instant), SenseVoice re-decodes of each utterance, and
 //! boundary re-transcription across neighbouring utterances.
 
+mod clipboard;
 mod markdown;
 mod models;
 mod tui;
@@ -11,7 +12,7 @@ mod tui;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
@@ -41,6 +42,9 @@ struct Cli {
     /// Markdown output path. Default: ./transcript-<date>-<time>.md
     #[arg(short, long)]
     output: Option<PathBuf>,
+    /// Add to the output file if it already exists (normally an error).
+    #[arg(long)]
+    append: bool,
     /// Heading for the markdown file.
     #[arg(long)]
     title: Option<String>,
@@ -81,18 +85,20 @@ enum Source {
 /// Everything the UI loops need.
 pub struct Session {
     pub engine: Engine,
-    pub writer: MarkdownWriter,
+    pub writer: Mutex<MarkdownWriter>,
     pub device: String,
     pub paused: Arc<AtomicBool>,
     pub stop: Arc<AtomicBool>,
     /// Set when a file input has been fully pushed.
     pub source_done: Arc<AtomicBool>,
     pub capture: Option<Capture>,
+    /// Tail of the existing file when appending, shown greyed out.
+    pub history: Vec<markdown::HistoryBlock>,
     pump: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Session {
-    /// Stop the audio, drain every pass, write the final markdown.
+    /// Stop the audio, drain every pass, append what's left to the markdown.
     pub fn finish(mut self) -> Result<Transcript> {
         self.stop.store(true, Ordering::SeqCst);
         self.capture.take();
@@ -100,7 +106,10 @@ impl Session {
             let _ = p.join();
         }
         let t = self.engine.finish();
-        self.writer.save(&t, true)?;
+        self.writer
+            .lock()
+            .expect("writer lock")
+            .append_remaining(&t)?;
         Ok(t)
     }
 }
@@ -108,7 +117,7 @@ impl Session {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let tui_mode = cli.cmd.is_none() && !cli.no_tui;
-    init_logging(&cli, tui_mode)?;
+    let log_file = init_logging(&cli, tui_mode)?;
 
     match cli.cmd {
         Some(Cmd::Devices) => return list_devices(),
@@ -120,6 +129,19 @@ fn main() -> Result<()> {
             return models::download(&dir);
         }
         None => {}
+    }
+
+    let now = chrono::Local::now();
+    let output = cli
+        .output
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(now.format("transcript-%Y%m%d-%H%M%S.md").to_string()));
+    // Fail before loading models or opening the mic.
+    if output.exists() && !cli.append {
+        anyhow::bail!(
+            "{} already exists (pass --append to add to it)",
+            output.display()
+        );
     }
 
     let models_dir = models::resolve(cli.models_dir.as_deref());
@@ -162,11 +184,6 @@ fn main() -> Result<()> {
     };
     info!(rate, device = %device, "audio source ready");
 
-    let now = chrono::Local::now();
-    let output = cli
-        .output
-        .clone()
-        .unwrap_or_else(|| PathBuf::from(now.format("transcript-%Y%m%d-%H%M%S.md").to_string()));
     let title = cli.title.clone().unwrap_or_else(|| match &cli.input {
         Some(p) => p
             .file_stem()
@@ -175,7 +192,14 @@ fn main() -> Result<()> {
         None => format!("Transcript {}", now.format("%Y-%m-%d %H:%M")),
     });
     let subtitle = format!("{} · {}", now.format("%Y-%m-%d %H:%M"), device);
-    let writer = MarkdownWriter::new(output, title, subtitle);
+    let history = if cli.append {
+        markdown::read_tail(&output, 200)
+    } else {
+        Vec::new()
+    };
+    let writer = Mutex::new(MarkdownWriter::create(
+        output, &title, &subtitle, cli.append,
+    )?);
 
     let engine = Engine::spawn(EngineConfig::new(rate), streaming, Arc::new(offline));
     let paused = Arc::new(AtomicBool::new(false));
@@ -230,10 +254,23 @@ fn main() -> Result<()> {
         stop,
         source_done,
         capture,
+        history,
         pump: Some(pump),
     };
-    let path = session.writer.path().to_path_buf();
+    let path = session
+        .writer
+        .lock()
+        .expect("writer lock")
+        .path()
+        .to_path_buf();
     if tui_mode {
+        // sherpa-onnx's C++ code writes to fd 2 directly; send it to the
+        // log while the TUI owns the screen.
+        #[cfg(unix)]
+        let _restore = match &log_file {
+            Some(f) => Some(vox_transcribe::stderr::redirect_to(f)?),
+            None => None,
+        };
         tui::run(session)?;
     } else {
         headless(session)?;
@@ -251,23 +288,23 @@ fn headless(session: Session) -> Result<()> {
     }
     let events = session.engine.events().clone();
     let mut printed = HashSet::new();
-    let mut mirror = Transcript::default();
     let print = |p: &vox_transcribe::Paragraph, printed: &mut HashSet<String>| {
         if !p.text.trim().is_empty() && printed.insert(p.id.clone()) {
             println!("[{}] {}\n", timestamp(p.start_ms), p.text.trim());
         }
     };
     while !interrupted.load(Ordering::SeqCst) && !session.source_done.load(Ordering::SeqCst) {
-        match events.recv_timeout(Duration::from_millis(100)) {
-            Ok(Event::Paragraph { paragraph, change }) => {
-                mirror.upsert(&paragraph);
-                if change == Change::Hardened {
-                    print(&paragraph, &mut printed);
-                    session.writer.save(&mirror, false)?;
-                }
-            }
-            Ok(Event::ParagraphRemoved { id }) => mirror.remove(&id),
-            Ok(Event::Level { .. }) | Err(_) => {}
+        if let Ok(Event::Paragraph {
+            paragraph,
+            change: Change::Hardened,
+        }) = events.recv_timeout(Duration::from_millis(100))
+        {
+            print(&paragraph, &mut printed);
+            session
+                .writer
+                .lock()
+                .expect("writer lock")
+                .append(&paragraph)?;
         }
     }
     let t = session.finish()?;
@@ -287,7 +324,8 @@ fn list_devices() -> Result<()> {
     Ok(())
 }
 
-fn init_logging(cli: &Cli, tui_mode: bool) -> Result<()> {
+/// Returns the log file in TUI mode, for redirecting fd 2 into it.
+fn init_logging(cli: &Cli, tui_mode: bool) -> Result<Option<std::fs::File>> {
     use tracing_subscriber::EnvFilter;
     let filter = EnvFilter::try_from_env("VOX_SCRIBE_LOG").unwrap_or_else(|_| {
         EnvFilter::new("warn,vox_scribe=info,vox_transcribe=info,vox_audio=info")
@@ -303,17 +341,17 @@ fn init_logging(cli: &Cli, tui_mode: bool) -> Result<()> {
                 .append(true)
                 .open(&path)
                 .with_context(|| format!("open log {}", path.display()))?;
-            // sherpa-onnx's C++ code writes to fd 2 directly; send it to
-            // the log too so it can't draw over the TUI.
-            #[cfg(unix)]
-            if tui_mode {
-                vox_transcribe::stderr::redirect_to(&file)?;
-            }
+            let for_tui = if tui_mode {
+                Some(file.try_clone()?)
+            } else {
+                None
+            };
             tracing_subscriber::fmt()
                 .with_env_filter(filter)
                 .with_ansi(false)
                 .with_writer(std::sync::Mutex::new(file))
                 .init();
+            Ok(for_tui)
         }
         None => {
             #[cfg(unix)]
@@ -325,7 +363,7 @@ fn init_logging(cli: &Cli, tui_mode: bool) -> Result<()> {
                 .with_ansi(ansi)
                 .with_writer(std::io::stderr)
                 .init();
+            Ok(None)
         }
     }
-    Ok(())
 }

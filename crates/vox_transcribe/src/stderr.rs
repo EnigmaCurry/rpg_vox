@@ -61,15 +61,37 @@ pub fn install() -> bool {
     }
 }
 
-/// Point fd 2 at `file` for the rest of the process. A full-screen TUI
-/// uses this so C++ log lines can't scribble over the display.
-pub fn redirect_to(file: &std::fs::File) -> std::io::Result<()> {
-    // SAFETY: dup2 onto the well-known stderr fd.
-    if unsafe { libc::dup2(file.as_raw_fd(), libc::STDERR_FILENO) } < 0 {
-        return Err(std::io::Error::last_os_error());
+/// Point fd 2 at `file` until the returned guard drops. A full-screen
+/// TUI uses this so C++ log lines can't scribble over the display, then
+/// restores the terminal so later errors are visible.
+pub fn redirect_to(file: &std::fs::File) -> std::io::Result<RestoreStderr> {
+    // SAFETY: dup/dup2 on fds we own or the well-known stderr fd.
+    unsafe {
+        let saved = libc::dup(libc::STDERR_FILENO);
+        if saved < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if libc::dup2(file.as_raw_fd(), libc::STDERR_FILENO) < 0 {
+            libc::close(saved);
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(RestoreStderr(saved))
     }
-    Ok(())
 }
+
+/// Restores the original fd 2 on drop.
+pub struct RestoreStderr(libc::c_int);
+
+impl Drop for RestoreStderr {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` is the dup of the original stderr we own.
+        unsafe {
+            libc::dup2(self.0, libc::STDERR_FILENO);
+            libc::close(self.0);
+        }
+    }
+}
+
 fn run(read_file: std::fs::File, mut orig_stderr: std::fs::File) {
     let mut reader = BufReader::new(read_file);
     // After we drop a sherpa banner we keep dropping subsequent indented

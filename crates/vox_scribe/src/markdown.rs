@@ -1,50 +1,118 @@
-//! Markdown output, rewritten atomically so a crash loses at most the
-//! paragraph still being spoken.
+//! Append-only markdown output. The header is written at start and each
+//! paragraph is appended once it hardens (no further pass will change
+//! it), so `tail -f` and file watchers see ordinary appends.
 
+use std::collections::HashSet;
+use std::fs::{File, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context as _, Result};
-use vox_transcribe::Transcript;
+use anyhow::{anyhow, Context as _, Result};
+use vox_transcribe::{Paragraph, Transcript};
 
 pub struct MarkdownWriter {
     path: PathBuf,
-    title: String,
-    subtitle: String,
+    file: File,
+    written: HashSet<String>,
 }
 
 impl MarkdownWriter {
-    pub fn new(path: PathBuf, title: String, subtitle: String) -> Self {
-        Self {
-            path,
-            title,
-            subtitle,
+    /// Open `path` for this session. A new file gets the heading. An
+    /// existing file is an error unless `append`, in which case the
+    /// session starts after a `---` rule with its own date line.
+    pub fn create(path: PathBuf, title: &str, subtitle: &str, append: bool) -> Result<Self> {
+        let existing = path.metadata().map(|m| m.len() > 0).unwrap_or(false);
+        let mut opts = OpenOptions::new();
+        if append {
+            opts.append(true).create(true);
+        } else {
+            opts.write(true).create_new(true);
         }
+        let mut file = opts.open(&path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                anyhow!(
+                    "{} already exists (pass --append to add to it)",
+                    path.display()
+                )
+            } else {
+                anyhow!("create {}: {e}", path.display())
+            }
+        })?;
+        if append && existing {
+            write!(file, "\n---\n\n*{subtitle}*\n")?;
+        } else {
+            write!(file, "# {title}\n\n*{subtitle}*\n")?;
+        }
+        file.sync_data()?;
+        Ok(Self {
+            path,
+            file,
+            written: HashSet::new(),
+        })
     }
 
     pub fn path(&self) -> &Path {
         &self.path
     }
 
-    /// Write every hardened paragraph (or all of them when `all`).
-    pub fn save(&self, t: &Transcript, all: bool) -> Result<()> {
-        let mut out = format!("# {}\n\n*{}*\n", self.title, self.subtitle);
-        for p in t.paragraphs.iter().filter(|p| all || p.hardened) {
-            let text = p.text.trim();
-            if text.is_empty() {
-                continue;
-            }
-            out.push_str(&format!("\n**[{}]** {}\n", timestamp(p.start_ms), text));
+    /// Append `p` unless it was already written or is empty. Synced to
+    /// disk so a crash can't lose a settled paragraph.
+    pub fn append(&mut self, p: &Paragraph) -> Result<()> {
+        let text = p.text.trim();
+        if text.is_empty() || !self.written.insert(p.id.clone()) {
+            return Ok(());
         }
-        let tmp = self.path.with_extension("md.tmp");
-        let mut f =
-            std::fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
-        f.write_all(out.as_bytes())?;
-        f.sync_all()?;
-        std::fs::rename(&tmp, &self.path)
-            .with_context(|| format!("write {}", self.path.display()))?;
+        write!(self.file, "\n**[{}]** {}\n", timestamp(p.start_ms), text)
+            .and_then(|_| self.file.sync_data())
+            .with_context(|| format!("write {}", self.path.display()))
+    }
+
+    /// Append every paragraph not yet written (end of session).
+    pub fn append_remaining(&mut self, t: &Transcript) -> Result<()> {
+        for p in &t.paragraphs {
+            self.append(p)?;
+        }
         Ok(())
     }
+}
+
+/// One block of a previous session's markdown, for showing as context
+/// when appending.
+pub enum HistoryBlock {
+    Paragraph {
+        timestamp: String,
+        text: String,
+    },
+    /// A `---` session separator.
+    Rule,
+    /// An italic date line or other text.
+    Note(String),
+}
+
+/// The last `max` blocks of an existing transcript (empty if unreadable).
+pub fn read_tail(path: &Path, max: usize) -> Vec<HistoryBlock> {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let blocks: Vec<HistoryBlock> = content
+        .split("\n\n")
+        .map(|b| b.trim())
+        .filter(|b| !b.is_empty() && !b.starts_with("# "))
+        .map(|b| {
+            if b == "---" {
+                return HistoryBlock::Rule;
+            }
+            if let Some((ts, text)) = b.strip_prefix("**[").and_then(|r| r.split_once("]** ")) {
+                return HistoryBlock::Paragraph {
+                    timestamp: ts.to_string(),
+                    text: text.split_whitespace().collect::<Vec<_>>().join(" "),
+                };
+            }
+            HistoryBlock::Note(b.trim_matches('*').to_string())
+        })
+        .collect();
+    let skip = blocks.len().saturating_sub(max);
+    blocks.into_iter().skip(skip).collect()
 }
 
 /// `hh:mm:ss` from milliseconds.
