@@ -21,6 +21,6 @@ pub mod sherpa;
 pub mod stderr;
 pub mod vad;
 
-pub use engine::{Change, Engine, EngineConfig, Event, ParagraphConfig, Pusher};
+pub use engine::{Change, Engine, EngineConfig, Event, ParagraphConfig, ParagraphMode, Pusher};
 pub use model::{Clip, Paragraph, Stage, Transcript};
 pub use recognizer::{OfflineRecognizer, StreamingRecognizer};

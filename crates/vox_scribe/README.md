@@ -18,8 +18,9 @@ cargo run -p vox_scribe --release -- -o notes.md
 
 Keys: `↑↓` select a paragraph, `y` copy it (the newest one if none is
 selected), `PgUp PgDn` scroll, `End` follow, `space` pause, `enter` new
-paragraph, `q` quit. Each paragraph is appended to the markdown file once it
-settles (2 s of quiet), so `tail -f notes.md` follows along; quitting
+paragraph, `m` switch auto/manual paragraphs, `q` quit. Each paragraph is
+appended to the markdown file once it settles (2 s of quiet; in manual mode,
+2 s of quiet after `enter`), so `tail -f notes.md` follows along; quitting
 appends whatever is still open. Copying uses `pbcopy`, `wl-copy` or `xclip`,
 falling back to the OSC 52 terminal escape (e.g. over ssh).
 
@@ -34,6 +35,9 @@ Other options:
 * `--append`: add to an existing output file, after a `---` rule and a new
   date line. The TUI shows the file's previous content in grey above the
   new session. Without `--append`, an existing file is an error.
+* `--manual`: start new paragraphs only when you press `enter`, not on
+  silence or word count. Press `m` in the TUI to switch modes; the header
+  shows `¶ AUTO` or `¶ MANUAL`.
 * `--no-tui`: print paragraphs to stdout as they settle.
 * `--language en`: pin SenseVoice's language (default `auto`).
 

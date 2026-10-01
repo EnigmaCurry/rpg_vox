@@ -122,3 +122,30 @@ fn noise_blip_leaves_no_trace() {
         "{last:?}"
     );
 }
+
+#[test]
+fn manual_mode_ignores_silence_until_break() {
+    let mut cfg = EngineConfig::new(SR);
+    cfg.paragraph.mode = vox_transcribe::ParagraphMode::Manual;
+    let engine = Engine::spawn(
+        cfg,
+        Some(Box::new(FakeStreaming { fed: 0 })),
+        Arc::new(FakeOffline),
+    );
+    let push = |ms, amp| {
+        for chunk in tone(ms, amp).chunks(SR as usize / 50) {
+            engine.push(chunk);
+        }
+    };
+    push(1200, 0.2);
+    push(4000, 0.0);
+    push(1200, 0.2);
+    push(4000, 0.0);
+    engine.break_paragraph();
+    push(1200, 0.2);
+    push(1000, 0.0);
+    let t = engine.finish();
+    assert_eq!(t.paragraphs.len(), 2);
+    assert_eq!(t.paragraphs[0].clips.len(), 2);
+    assert_eq!(t.paragraphs[1].clips.len(), 1);
+}

@@ -16,7 +16,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 use unicode_width::UnicodeWidthStr;
-use vox_transcribe::{Change, Event, Stage, Transcript};
+use vox_transcribe::{Change, Event, ParagraphMode, Stage, Transcript};
 
 use crate::markdown::{timestamp, HistoryBlock};
 use crate::Session;
@@ -100,6 +100,20 @@ fn run_loop(terminal: &mut DefaultTerminal, s: &Session) -> Result<()> {
                 }
             }
             KeyCode::Enter => s.engine.break_paragraph(),
+            KeyCode::Char('m') => {
+                let manual = !s.manual.fetch_xor(true, Ordering::SeqCst);
+                let mode = if manual {
+                    ParagraphMode::Manual
+                } else {
+                    ParagraphMode::Auto
+                };
+                s.engine.set_paragraph_mode(mode);
+                app.set_status(if manual {
+                    "manual paragraphs: press enter to break".into()
+                } else {
+                    "auto paragraphs: silence breaks".into()
+                });
+            }
             KeyCode::Up | KeyCode::Char('k') => app.move_selection(-1),
             KeyCode::Down | KeyCode::Char('j') => app.move_selection(1),
             KeyCode::Char('y') | KeyCode::Char('c') => app.copy_selected(),
@@ -239,6 +253,11 @@ fn draw(f: &mut Frame, app: &App, s: &Session) {
     f.render_widget(
         Line::from(vec![
             state,
+            if s.manual.load(Ordering::Relaxed) {
+                Span::styled(" ¶ MANUAL ", Style::new().black().on_magenta())
+            } else {
+                Span::styled(" ¶ AUTO ", Style::new().black().on_gray())
+            },
             format!(" {}  ", timestamp(app.position_ms)).bold(),
             Span::raw(s.device.clone()),
             format!("  → {path}").dark_gray(),
@@ -247,7 +266,12 @@ fn draw(f: &mut Frame, app: &App, s: &Session) {
     );
 
     let inner_w = body.width.saturating_sub(2) as usize;
-    let (lines, ranges) = transcript_lines(app, &s.history, inner_w.max(GUTTER + 10));
+    let (lines, ranges) = transcript_lines(
+        app,
+        &s.history,
+        inner_w.max(GUTTER + 10),
+        s.manual.load(Ordering::Relaxed),
+    );
     let visible = body.height.saturating_sub(2) as usize;
     let max_scroll = lines.len().saturating_sub(visible);
     let mut top = max_scroll.saturating_sub(app.scroll_back as usize);
@@ -321,7 +345,8 @@ fn draw(f: &mut Frame, app: &App, s: &Session) {
             " LIVE CAPS".dark_gray().italic(),
             " · re-decoded".into(),
             " · boundary-fixed".green(),
-            "   ↑↓ select · y copy · space pause · enter new paragraph · q quit".dark_gray(),
+            "   ↑↓ select · y copy · space pause · enter new paragraph · m mode · q quit"
+                .dark_gray(),
         ]),
         help_line,
     );
@@ -404,6 +429,7 @@ fn transcript_lines(
     app: &App,
     history: &[HistoryBlock],
     width: usize,
+    manual: bool,
 ) -> (Vec<Line<'static>>, Vec<(String, usize, usize)>) {
     let text_w = width.saturating_sub(GUTTER).max(10);
     let mut out = Vec::new();
@@ -435,5 +461,36 @@ fn transcript_lines(
         ranges.push((p.id.clone(), start_line, out.len()));
         out.push(Line::default());
     }
+    if manual {
+        place_cursor(app, width, &mut out);
+    }
     (out, ranges)
+}
+
+/// Manual mode: mark where the next utterance will land, at the end of
+/// the open paragraph or on a fresh line after a break.
+fn place_cursor(app: &App, width: usize, out: &mut Vec<Line<'static>>) {
+    let cursor = Span::styled("▌", Style::new().magenta());
+    let open = app
+        .transcript
+        .paragraphs
+        .iter()
+        .rev()
+        .find(|p| !p.text.trim().is_empty())
+        .is_some_and(|p| !p.closed && !p.hardened);
+    // The open paragraph's last line sits just before its trailing blank.
+    if open && out.len() >= 2 {
+        let idx = out.len() - 2;
+        if out[idx].width() + 2 <= width {
+            out[idx].spans.push(Span::raw(" "));
+            out[idx].spans.push(cursor);
+        } else {
+            out.insert(
+                idx + 1,
+                Line::from(vec![Span::raw(" ".repeat(GUTTER)), cursor]),
+            );
+        }
+    } else {
+        out.push(Line::from(vec![Span::raw(" ".repeat(GUTTER)), cursor]));
+    }
 }

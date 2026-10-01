@@ -28,8 +28,19 @@ use crate::recognizer::{OfflineRecognizer, StreamingRecognizer};
 use crate::ring::AudioRing;
 use crate::vad::{EndReason, Vad, VadConfig, VadEvent};
 
+/// How paragraphs are split.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ParagraphMode {
+    /// A silence gap or a word cap opens a new paragraph.
+    #[default]
+    Auto,
+    /// Only [`Engine::break_paragraph`] opens a new paragraph.
+    Manual,
+}
+
 #[derive(Debug, Clone)]
 pub struct ParagraphConfig {
+    pub mode: ParagraphMode,
     /// Silence that opens a new paragraph, and after which an idle
     /// paragraph is hardened.
     pub gap_ms: u64,
@@ -43,6 +54,7 @@ pub struct ParagraphConfig {
 impl Default for ParagraphConfig {
     fn default() -> Self {
         Self {
+            mode: ParagraphMode::Auto,
             gap_ms: 2_000,
             soft_max_words: 100,
             hard_max_words: 200,
@@ -118,6 +130,7 @@ pub enum Event {
 enum Cmd {
     Audio(Vec<f32>),
     Break,
+    Mode(ParagraphMode),
     Finish(Sender<Transcript>),
 }
 
@@ -193,6 +206,12 @@ impl Engine {
     /// next clip (e.g. the user paused capture or pressed a key).
     pub fn break_paragraph(&self) {
         let _ = self.cmd_tx.send(Cmd::Break);
+    }
+
+    /// Switch between automatic and Enter-only paragraph breaks. Takes
+    /// effect from the next clip.
+    pub fn set_paragraph_mode(&self, mode: ParagraphMode) {
+        let _ = self.cmd_tx.send(Cmd::Mode(mode));
     }
 
     /// A cloneable handle for feeding audio from another thread while
@@ -336,6 +355,7 @@ impl Core {
                 recv(cmd_rx) -> m => match m {
                     Ok(Cmd::Audio(a)) => self.on_audio(&a),
                     Ok(Cmd::Break) => self.on_break(),
+                    Ok(Cmd::Mode(m)) => self.cfg.paragraph.mode = m,
                     Ok(Cmd::Finish(tx)) => {
                         self.flush_vad();
                         finishing = Some(Some(tx));
@@ -566,6 +586,7 @@ impl Core {
         let need_new = match self.transcript.paragraphs.last() {
             None => true,
             Some(p) if p.closed || p.hardened => true,
+            Some(_) if self.cfg.paragraph.mode == ParagraphMode::Manual => false,
             Some(p) => match p.clips.last() {
                 None => true,
                 Some(last) => {
@@ -632,6 +653,11 @@ impl Core {
                 continue;
             }
             if idx == last && (speaking || self.outstanding_final > 0) {
+                continue;
+            }
+            // In manual mode the open paragraph stays open through any
+            // silence until the user breaks it.
+            if idx == last && self.cfg.paragraph.mode == ParagraphMode::Manual && !p.closed {
                 continue;
             }
             self.transcript.paragraphs[idx].hardened = true;
@@ -707,7 +733,8 @@ impl Core {
         let p = &mut self.transcript.paragraphs[idx];
         let words = count_words(&p.text);
         let silence_closed = reason != EndReason::MaxLength;
-        if !p.closed
+        if pc.mode == ParagraphMode::Auto
+            && !p.closed
             && (words >= pc.hard_max_words || (silence_closed && words >= pc.soft_max_words))
         {
             p.closed = true;
@@ -795,7 +822,10 @@ impl Core {
             p.rebuild();
             // Soft cap on pass-3 text, whose trailing punctuation is real
             // rather than SenseVoice's per-clip reflexive period.
-            if !p.closed && count_words(&p.text) >= soft {
+            if self.cfg.paragraph.mode == ParagraphMode::Auto
+                && !p.closed
+                && count_words(&p.text) >= soft
+            {
                 let ends = p
                     .clips
                     .iter()

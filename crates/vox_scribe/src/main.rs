@@ -20,7 +20,9 @@ use clap::{Parser, Subcommand};
 use tracing::info;
 use vox_audio::{Capture, OpenOptions};
 use vox_transcribe::sherpa::{SenseVoice, SenseVoiceConfig, Zipformer, ZipformerConfig};
-use vox_transcribe::{Change, Engine, EngineConfig, Event, StreamingRecognizer, Transcript};
+use vox_transcribe::{
+    Change, Engine, EngineConfig, Event, ParagraphMode, StreamingRecognizer, Transcript,
+};
 
 use crate::markdown::{timestamp, MarkdownWriter};
 
@@ -63,6 +65,9 @@ struct Cli {
     /// Skip pass 1 (no live partials; text appears per utterance).
     #[arg(long)]
     no_streaming: bool,
+    /// Start new paragraphs only on Enter, not on silence (toggle with `m`).
+    #[arg(long)]
+    manual: bool,
     /// Log file. Default: <tmp>/vox_scribe.log in TUI mode, stderr otherwise.
     #[arg(long)]
     log: Option<PathBuf>,
@@ -88,6 +93,8 @@ pub struct Session {
     pub writer: Mutex<MarkdownWriter>,
     pub device: String,
     pub paused: Arc<AtomicBool>,
+    /// Paragraphs break only on Enter.
+    pub manual: AtomicBool,
     pub stop: Arc<AtomicBool>,
     /// Set when a file input has been fully pushed.
     pub source_done: Arc<AtomicBool>,
@@ -201,7 +208,11 @@ fn main() -> Result<()> {
         output, &title, &subtitle, cli.append,
     )?);
 
-    let engine = Engine::spawn(EngineConfig::new(rate), streaming, Arc::new(offline));
+    let mut engine_cfg = EngineConfig::new(rate);
+    if cli.manual {
+        engine_cfg.paragraph.mode = ParagraphMode::Manual;
+    }
+    let engine = Engine::spawn(engine_cfg, streaming, Arc::new(offline));
     let paused = Arc::new(AtomicBool::new(false));
     let stop = Arc::new(AtomicBool::new(false));
     let source_done = Arc::new(AtomicBool::new(false));
@@ -251,6 +262,7 @@ fn main() -> Result<()> {
         writer,
         device,
         paused,
+        manual: AtomicBool::new(cli.manual),
         stop,
         source_done,
         capture,
