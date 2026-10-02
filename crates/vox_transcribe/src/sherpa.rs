@@ -1,12 +1,13 @@
 //! sherpa-onnx recognizers: streaming Zipformer transducer for pass 1,
-//! offline SenseVoice for passes 2 and 3.
+//! offline SenseVoice or NeMo Parakeet TDT for passes 2 and 3.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context as _, Result};
 use sherpa_onnx::{
-    OfflineRecognizerConfig, OfflineSenseVoiceModelConfig, OnlineRecognizerConfig, OnlineStream,
+    OfflineRecognizerConfig, OfflineSenseVoiceModelConfig, OfflineTransducerModelConfig,
+    OnlineRecognizerConfig, OnlineStream,
 };
 use tracing::info;
 
@@ -64,18 +65,78 @@ impl SenseVoice {
 
 impl OfflineRecognizer for SenseVoice {
     fn transcribe(&self, samples: &[f32], sample_rate: u32) -> Result<String> {
-        // Clips under ~50 ms decode to garbage on any ASR.
-        if samples.len() < (sample_rate as usize / 20).max(64) {
-            return Ok(String::new());
-        }
-        let stream = self.inner.create_stream();
-        stream.accept_waveform(sample_rate as i32, samples);
-        self.inner.decode(&stream);
-        let result = stream
-            .get_result()
-            .context("sherpa-onnx returned no result")?;
-        Ok(result.text.trim().to_string())
+        decode_offline(&self.inner, samples, sample_rate)
     }
+}
+
+/// NeMo Parakeet TDT bundle (`sherpa-onnx-nemo-parakeet-tdt-*-int8`):
+/// `encoder.int8.onnx`, `decoder.int8.onnx`, `joiner.int8.onnx`,
+/// `tokens.txt`. Punctuates and capitalises on its own.
+#[derive(Clone, Debug)]
+pub struct ParakeetConfig {
+    pub encoder: PathBuf,
+    pub decoder: PathBuf,
+    pub joiner: PathBuf,
+    pub tokens: PathBuf,
+    pub num_threads: i32,
+}
+
+impl ParakeetConfig {
+    pub fn from_dir(dir: &Path) -> Self {
+        Self {
+            encoder: dir.join("encoder.int8.onnx"),
+            decoder: dir.join("decoder.int8.onnx"),
+            joiner: dir.join("joiner.int8.onnx"),
+            tokens: dir.join("tokens.txt"),
+            num_threads: 2,
+        }
+    }
+}
+
+pub struct Parakeet {
+    inner: sherpa_onnx::OfflineRecognizer,
+}
+
+impl Parakeet {
+    pub fn open(cfg: &ParakeetConfig) -> Result<Self> {
+        let mut config = OfflineRecognizerConfig::default();
+        config.model_config.transducer = OfflineTransducerModelConfig {
+            encoder: Some(require(&cfg.encoder, "Parakeet encoder")?),
+            decoder: Some(require(&cfg.decoder, "Parakeet decoder")?),
+            joiner: Some(require(&cfg.joiner, "Parakeet joiner")?),
+        };
+        config.model_config.tokens = Some(require(&cfg.tokens, "Parakeet tokens")?);
+        config.model_config.model_type = Some("nemo_transducer".into());
+        config.model_config.num_threads = cfg.num_threads;
+        let inner = sherpa_onnx::OfflineRecognizer::create(&config)
+            .ok_or_else(|| anyhow!("sherpa-onnx failed to create Parakeet recognizer"))?;
+        info!(encoder = %cfg.encoder.display(), "Parakeet loaded");
+        Ok(Self { inner })
+    }
+}
+
+impl OfflineRecognizer for Parakeet {
+    fn transcribe(&self, samples: &[f32], sample_rate: u32) -> Result<String> {
+        decode_offline(&self.inner, samples, sample_rate)
+    }
+}
+
+fn decode_offline(
+    recognizer: &sherpa_onnx::OfflineRecognizer,
+    samples: &[f32],
+    sample_rate: u32,
+) -> Result<String> {
+    // Clips under ~50 ms decode to garbage on any ASR.
+    if samples.len() < (sample_rate as usize / 20).max(64) {
+        return Ok(String::new());
+    }
+    let stream = recognizer.create_stream();
+    stream.accept_waveform(sample_rate as i32, samples);
+    recognizer.decode(&stream);
+    let result = stream
+        .get_result()
+        .context("sherpa-onnx returned no result")?;
+    Ok(result.text.trim().to_string())
 }
 
 /// Streaming Zipformer transducer bundle.

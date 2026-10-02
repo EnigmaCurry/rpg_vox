@@ -9,7 +9,9 @@ use std::sync::Arc;
 use anyhow::{Context as _, Result};
 
 fn pid_path() -> PathBuf {
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default();
     let dir = if cfg!(target_os = "macos") {
         home.join("Library/Caches/vox_scribe")
     } else {
@@ -23,7 +25,11 @@ fn pid_path() -> PathBuf {
 
 /// The pid of a live `--once` recorder, if there is one.
 fn running() -> Option<i32> {
-    let pid: i32 = std::fs::read_to_string(pid_path()).ok()?.trim().parse().ok()?;
+    let pid: i32 = std::fs::read_to_string(pid_path())
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
     if pid == std::process::id() as i32 {
         return None;
     }

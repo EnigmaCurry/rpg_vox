@@ -4,12 +4,12 @@ Live transcription in the terminal, saved as markdown. It uses the same
 layered passes as rpg_vox's Record page, via the `vox_transcribe` crate:
 
 1. **Streaming** (Zipformer): words appear instantly, in dim ALL CAPS.
-2. **Re-decode** (SenseVoice): each utterance is re-transcribed when you pause.
-3. **Boundary fix** (SenseVoice): the last 2–3 utterances are re-decoded
+2. **Re-decode** (Parakeet): each utterance is re-transcribed when you pause.
+3. **Boundary fix** (Parakeet): the last 2–3 utterances are re-decoded
    together to repair words cut at utterance edges. Changed words flash green.
 
 Audio comes from CoreAudio on macOS and PipeWire on Linux (`vox_audio`).
-The first run downloads the models (about 280 MB) if none are found;
+The first run downloads the models (about 580 MB) if none are found;
 `download-models` does the same thing up front.
 
 ```bash
@@ -53,7 +53,14 @@ Other options:
   `--once` (or running `vox_scribe stop-once`) finishes and copies the
   running one instead, so one key can both start and stop dictation.
 * `--no-tui`: print paragraphs to stdout as they settle.
-* `--language en`: pin SenseVoice's language (default `auto`).
+* `--model sensevoice` (or `VOX_SCRIBE_MODEL=sensevoice`): use SenseVoice
+  Small for passes 2 and 3 instead of the default NVIDIA Parakeet TDT 0.6B
+  v2. Parakeet is English only and noticeably more accurate on English;
+  SenseVoice is multilingual, about twice as fast, uses half the memory
+  (~620 MB vs ~1.2 GB on an M1) and is a smaller download (155 MB vs
+  460 MB, fetched on first use).
+* `--language en`: pin SenseVoice's language (default `auto`; SenseVoice
+  only).
 
 ## Pass 4: LLM proofreading (optional)
 

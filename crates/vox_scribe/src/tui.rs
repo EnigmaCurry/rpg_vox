@@ -285,7 +285,12 @@ impl App {
     /// Create the typed file in the current directory, dump the settled
     /// paragraphs into it, and keep appending from then on.
     fn save_as(&mut self, s: &Session) {
-        let name = self.prompt.as_deref().unwrap_or_default().trim().to_string();
+        let name = self
+            .prompt
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
         if name.is_empty() {
             self.prompt = None;
             return;
@@ -484,7 +489,11 @@ fn draw(f: &mut Frame, app: &App, s: &Session) {
             " LIVE CAPS".dark_gray().italic(),
             " · re-decoded".into(),
             " · boundary-fixed".green(),
-            if s.llm { " · LLM-fixed".fg(LLM_BLUE) } else { "".into() },
+            if s.llm {
+                " · LLM-fixed".fg(LLM_BLUE)
+            } else {
+                "".into()
+            },
         ]),
         legend_line,
     );

@@ -3,6 +3,7 @@
 //!
 //! ```text
 //! <dir>/sense-voice/{model.int8.onnx,tokens.txt}
+//! <dir>/parakeet-tdt-0.6b-v2/{encoder,decoder,joiner}.int8.onnx + tokens.txt
 //! <dir>/streaming-zipformer/{encoder,decoder,joiner}.onnx + tokens.txt
 //! ```
 
@@ -13,6 +14,34 @@ use anyhow::{bail, Context as _, Result};
 
 pub const SENSE_VOICE: &str = "sense-voice";
 pub const ZIPFORMER: &str = "streaming-zipformer";
+pub const PARAKEET: &str = "parakeet-tdt-0.6b-v2";
+
+/// The pass-2/3 recognizer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum Offline {
+    /// SenseVoice Small: multilingual, fast, ~230 MB.
+    #[value(name = "sensevoice")]
+    SenseVoice,
+    /// NVIDIA Parakeet TDT 0.6B v2: English only, more accurate, ~660 MB.
+    Parakeet,
+}
+
+impl Offline {
+    pub fn present(self, dir: &Path) -> bool {
+        match self {
+            Offline::SenseVoice => has_sense_voice(dir),
+            Offline::Parakeet => has_parakeet(dir),
+        }
+    }
+
+    /// Approximate download for this model plus Zipformer.
+    pub fn download_size(self) -> &'static str {
+        match self {
+            Offline::SenseVoice => "about 280 MB",
+            Offline::Parakeet => "about 580 MB",
+        }
+    }
+}
 
 const RELEASES: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models";
 
@@ -32,7 +61,7 @@ pub fn user_models_dir() -> PathBuf {
 }
 
 /// `--models-dir`, else `$VOX_SCRIBE_MODELS`, else the user data dir if
-/// it has SenseVoice, else `./models` (an rpg_vox checkout).
+/// it has a pass-2 model, else `./models` (an rpg_vox checkout).
 pub fn resolve(explicit: Option<&Path>) -> PathBuf {
     if let Some(p) = explicit {
         return p.to_path_buf();
@@ -41,11 +70,11 @@ pub fn resolve(explicit: Option<&Path>) -> PathBuf {
         return PathBuf::from(p);
     }
     let user = user_models_dir();
-    if user.join(SENSE_VOICE).join("model.int8.onnx").is_file() {
+    if has_sense_voice(&user) || has_parakeet(&user) {
         return user;
     }
     let local = PathBuf::from("models");
-    if local.join(SENSE_VOICE).join("model.int8.onnx").is_file() {
+    if has_sense_voice(&local) || has_parakeet(&local) {
         return local;
     }
     user
@@ -57,20 +86,45 @@ pub fn has_sense_voice(dir: &Path) -> bool {
         .all(|f| dir.join(SENSE_VOICE).join(f).is_file())
 }
 
+pub fn has_parakeet(dir: &Path) -> bool {
+    [
+        "encoder.int8.onnx",
+        "decoder.int8.onnx",
+        "joiner.int8.onnx",
+        "tokens.txt",
+    ]
+    .iter()
+    .all(|f| dir.join(PARAKEET).join(f).is_file())
+}
+
 pub fn has_zipformer(dir: &Path) -> bool {
     ["encoder.onnx", "decoder.onnx", "joiner.onnx", "tokens.txt"]
         .iter()
         .all(|f| dir.join(ZIPFORMER).join(f).is_file())
 }
 
-/// Download both bundles into `dir` with `curl` + `tar`, skipping any
-/// that are already present.
-pub fn download(dir: &Path) -> Result<()> {
+/// Download `offline` and Zipformer into `dir` with `curl` + `tar`,
+/// skipping any that are already present.
+pub fn download(dir: &Path, offline: Offline) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     let shown = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
     println!("models directory: {}", shown.display());
     let sv = dir.join(SENSE_VOICE);
-    if has_sense_voice(dir) {
+    let pk = dir.join(PARAKEET);
+    if offline == Offline::Parakeet {
+        if has_parakeet(dir) {
+            println!("Parakeet already present in {}", pk.display());
+        } else {
+            let files = [
+                "encoder.int8.onnx",
+                "decoder.int8.onnx",
+                "joiner.int8.onnx",
+                "tokens.txt",
+            ]
+            .map(|f| (f, f));
+            fetch("sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8", &pk, &files)?;
+        }
+    } else if has_sense_voice(dir) {
         println!("SenseVoice already present in {}", sv.display());
     } else {
         fetch(

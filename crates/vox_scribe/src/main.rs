@@ -1,8 +1,9 @@
 //! vox_scribe: live transcription in the terminal, saved as markdown.
 //!
 //! Uses vox_transcribe's three passes: streaming Zipformer partials
-//! (ALL CAPS, instant), SenseVoice re-decodes of each utterance, and
-//! boundary re-transcription across neighbouring utterances.
+//! (ALL CAPS, instant), Parakeet (or SenseVoice) re-decodes of each
+//! utterance, and boundary re-transcription across neighbouring
+//! utterances.
 
 mod clipboard;
 mod markdown;
@@ -23,7 +24,9 @@ use tracing::info;
 use vox_audio::{Capture, OpenOptions};
 use vox_transcribe::correct::Corrector;
 use vox_transcribe::openai::{OpenAiConfig, OpenAiCorrector};
-use vox_transcribe::sherpa::{SenseVoice, SenseVoiceConfig, Zipformer, ZipformerConfig};
+use vox_transcribe::sherpa::{
+    Parakeet, ParakeetConfig, SenseVoice, SenseVoiceConfig, Zipformer, ZipformerConfig,
+};
 use vox_transcribe::{
     Change, Engine, EngineConfig, Event, ParagraphMode, StreamingRecognizer, Transcript,
 };
@@ -57,9 +60,17 @@ struct Cli {
     /// Print finished paragraphs to stdout instead of the full-screen UI.
     #[arg(long)]
     no_tui: bool,
-    /// Directory holding sense-voice/ and streaming-zipformer/.
+    /// Directory holding the model bundles (sense-voice/, parakeet-tdt-0.6b-v2/, streaming-zipformer/).
     #[arg(long, env = "VOX_SCRIBE_MODELS")]
     models_dir: Option<PathBuf>,
+    /// Recognizer for passes 2 and 3 (re-decode and boundary fix).
+    #[arg(
+        long,
+        value_enum,
+        default_value = "parakeet",
+        env = "VOX_SCRIBE_MODEL"
+    )]
+    model: models::Offline,
     /// SenseVoice language: auto, en, zh, ja, ko, yue.
     #[arg(long, default_value = "auto")]
     language: String,
@@ -100,7 +111,7 @@ struct Cli {
 enum Cmd {
     /// List input devices for the native audio backend.
     Devices,
-    /// Download the SenseVoice and Zipformer models.
+    /// Download the Zipformer model and the --model recognizer.
     DownloadModels,
     /// Finish the running --once recorder (as if Enter were pressed).
     /// Exits 1 if none is running.
@@ -205,7 +216,7 @@ fn main() -> Result<()> {
                 .models_dir
                 .clone()
                 .unwrap_or_else(models::user_models_dir);
-            return models::download(&dir);
+            return models::download(&dir, cli.model);
         }
         Some(Cmd::StopOnce) => {
             #[cfg(unix)]
@@ -247,11 +258,13 @@ fn main() -> Result<()> {
 
     let models_dir = models::resolve(cli.models_dir.as_deref());
     // First run: fetch the models rather than failing.
-    if !models::has_sense_voice(&models_dir)
-        || (!cli.no_streaming && !models::has_zipformer(&models_dir))
+    if !cli.model.present(&models_dir) || (!cli.no_streaming && !models::has_zipformer(&models_dir))
     {
-        eprintln!("models not found, downloading them once (about 280 MB)…");
-        models::download(&models_dir)?;
+        eprintln!(
+            "models not found, downloading them once ({})…",
+            cli.model.download_size()
+        );
+        models::download(&models_dir, cli.model)?;
     }
 
     // Put the TUI on screen now so the mic and models load behind it
@@ -286,15 +299,25 @@ fn main() -> Result<()> {
         }
     };
     info!(rate, device = %device, "audio source ready");
-    let mut sv = SenseVoiceConfig::from_dir(&models_dir.join(models::SENSE_VOICE));
-    sv.language = cli.language.clone();
-    sv.num_threads = cli.threads;
-    let offline = SenseVoice::open(&sv).with_context(|| {
-        format!(
-            "loading SenseVoice from {} (run `vox_scribe download-models`)",
-            models_dir.display()
-        )
-    })?;
+    let offline: Arc<dyn vox_transcribe::OfflineRecognizer> = match cli.model {
+        models::Offline::SenseVoice => {
+            let mut sv = SenseVoiceConfig::from_dir(&models_dir.join(models::SENSE_VOICE));
+            sv.language = cli.language.clone();
+            sv.num_threads = cli.threads;
+            Arc::new(
+                SenseVoice::open(&sv)
+                    .with_context(|| format!("loading SenseVoice from {}", models_dir.display()))?,
+            )
+        }
+        models::Offline::Parakeet => {
+            let mut pc = ParakeetConfig::from_dir(&models_dir.join(models::PARAKEET));
+            pc.num_threads = cli.threads;
+            Arc::new(
+                Parakeet::open(&pc)
+                    .with_context(|| format!("loading Parakeet from {}", models_dir.display()))?,
+            )
+        }
+    };
     let streaming: Option<Box<dyn StreamingRecognizer>> =
         if cli.no_streaming || !models::has_zipformer(&models_dir) {
             None
@@ -303,7 +326,6 @@ fn main() -> Result<()> {
             zc.num_threads = cli.threads;
             Some(Box::new(Zipformer::open(&zc)?.session()))
         };
-
 
     let title = cli.title.clone().unwrap_or_else(|| match &cli.input {
         Some(p) => p
@@ -318,9 +340,7 @@ fn main() -> Result<()> {
         _ => Vec::new(),
     };
     let writer = match output {
-        Some(o) => Some(MarkdownWriter::create(
-            o, &title, &subtitle, cli.append,
-        )?),
+        Some(o) => Some(MarkdownWriter::create(o, &title, &subtitle, cli.append)?),
         None => None,
     };
 
@@ -329,7 +349,7 @@ fn main() -> Result<()> {
     if manual {
         engine_cfg.paragraph.mode = ParagraphMode::Manual;
     }
-    let engine = Engine::spawn_with(engine_cfg, streaming, Arc::new(offline), corrector);
+    let engine = Engine::spawn_with(engine_cfg, streaming, offline, corrector);
     let paused = Arc::new(AtomicBool::new(false));
     let stop = Arc::new(AtomicBool::new(false));
     let source_done = Arc::new(AtomicBool::new(false));
