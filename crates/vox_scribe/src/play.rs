@@ -231,6 +231,8 @@ pub fn run(paths: &RecordPaths) -> Result<()> {
         .with_context(|| format!("read {}", paths.ass.display()))?;
     let cues = parse_ass(&ass);
     let starts = word_starts(&cues);
+    let words: Vec<&KWord> = cues.iter().flat_map(|c| c.words.iter()).collect();
+    let mut search = Search::default();
     let file = OpusFile::open(&paths.opus)?;
     let name = paths
         .md
@@ -255,7 +257,7 @@ pub fn run(paths: &RecordPaths) -> Result<()> {
             };
             screen
                 .terminal()
-                .draw(|f| draw(f, &name, &cues, &player, pos))?;
+                .draw(|f| draw(f, &name, &cues, &player, &search, pos))?;
             last_draw = Instant::now();
         }
         if !event::poll(Duration::from_millis(10))? {
@@ -268,7 +270,45 @@ pub fn run(paths: &RecordPaths) -> Result<()> {
             continue;
         }
         let pos = player.position_ms();
+        if let Some(typed) = search.prompt.as_mut() {
+            match key.code {
+                KeyCode::Enter => {
+                    let pattern = search.prompt.take().unwrap_or_default();
+                    if let Some(t) = search.start(&pattern, &words, pos) {
+                        player.seek(t)?;
+                    }
+                }
+                KeyCode::Esc => search.prompt = None,
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    search.prompt = None
+                }
+                KeyCode::Backspace => {
+                    if typed.pop().is_none() {
+                        search.prompt = None;
+                    }
+                }
+                KeyCode::Char(c) => typed.push(c),
+                _ => {}
+            }
+            last_draw = Instant::now() - FRAME;
+            continue;
+        }
         match key.code {
+            KeyCode::Char('/') => {
+                search.prompt = Some(String::new());
+                search.message = None;
+            }
+            KeyCode::Char('n') => {
+                if let Some(t) = search.step(1, &words) {
+                    player.seek(t)?;
+                }
+            }
+            KeyCode::Char('p') | KeyCode::Char('N') => {
+                if let Some(t) = search.step(-1, &words) {
+                    player.seek(t)?;
+                }
+            }
+            KeyCode::Esc if search.active() => search = Search::default(),
             KeyCode::Char('q') | KeyCode::Esc => break,
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
             KeyCode::Char(' ') => {
@@ -292,6 +332,107 @@ pub fn run(paths: &RecordPaths) -> Result<()> {
     }
     screen.restore();
     Ok(())
+}
+
+/// `/` search over the transcript, like `less`: case-insensitive, and
+/// a match may span several words.
+#[derive(Default)]
+struct Search {
+    /// Pattern being typed after `/`.
+    prompt: Option<String>,
+    pattern: String,
+    /// Matches as (first, last) index into the flat word list.
+    hits: Vec<(usize, usize)>,
+    current: usize,
+    /// "not found", "search wrapped", …
+    message: Option<String>,
+}
+
+impl Search {
+    fn active(&self) -> bool {
+        !self.pattern.is_empty()
+    }
+
+    /// Search for `pattern`; returns where the first match at or after
+    /// `pos` starts (wrapping to the top).
+    fn start(&mut self, pattern: &str, words: &[&KWord], pos: u64) -> Option<u64> {
+        let pattern = pattern.trim();
+        if pattern.is_empty() {
+            // A bare `/` repeats the last search, as in less.
+            return self.step(1, words);
+        }
+        self.pattern = pattern.to_string();
+        self.hits = find(words, pattern);
+        if self.hits.is_empty() {
+            self.message = Some("pattern not found".into());
+            return None;
+        }
+        match self.hits.iter().position(|h| words[h.0].start_ms >= pos) {
+            Some(i) => {
+                self.current = i;
+                self.message = None;
+            }
+            None => {
+                self.current = 0;
+                self.message = Some("search wrapped".into());
+            }
+        }
+        Some(words[self.hits[self.current].0].start_ms)
+    }
+
+    /// Move `dir` (+1 / -1) matches, wrapping around the ends.
+    fn step(&mut self, dir: isize, words: &[&KWord]) -> Option<u64> {
+        if self.hits.is_empty() {
+            if self.active() {
+                self.message = Some("pattern not found".into());
+            }
+            return None;
+        }
+        let n = self.hits.len() as isize;
+        let next = self.current as isize + dir;
+        self.message = (next < 0 || next >= n).then(|| "search wrapped".into());
+        self.current = next.rem_euclid(n) as usize;
+        Some(words[self.hits[self.current].0].start_ms)
+    }
+
+    /// 0 = not a match, 1 = another match, 2 = the current match.
+    fn mark(&self, word: usize) -> u8 {
+        let i = self.hits.partition_point(|h| h.1 < word);
+        match self.hits.get(i) {
+            Some(h) if h.0 <= word => {
+                if i == self.current {
+                    2
+                } else {
+                    1
+                }
+            }
+            _ => 0,
+        }
+    }
+}
+
+/// Case-insensitive matches of `pattern` in the words joined by
+/// spaces, as (first, last) word indices.
+fn find(words: &[&KWord], pattern: &str) -> Vec<(usize, usize)> {
+    let pattern = pattern
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    let mut text = String::new();
+    // Byte offset where each word starts in `text`.
+    let mut at = Vec::with_capacity(words.len());
+    for w in words {
+        if !text.is_empty() {
+            text.push(' ');
+        }
+        at.push(text.len());
+        text.push_str(&w.text.to_lowercase());
+    }
+    let word_of = |byte: usize| at.partition_point(|&a| a <= byte).saturating_sub(1);
+    text.match_indices(&pattern)
+        .map(|(i, m)| (word_of(i), word_of(i + m.len().saturating_sub(1))))
+        .collect()
 }
 
 /// Every word's start time, ascending.
@@ -333,7 +474,7 @@ fn clock(ms: u64) -> String {
     }
 }
 
-fn draw(f: &mut Frame, name: &str, cues: &[Cue], player: &Player, pos: u64) {
+fn draw(f: &mut Frame, name: &str, cues: &[Cue], player: &Player, search: &Search, pos: u64) {
     let [main, bar, keys] = Layout::vertical([
         Constraint::Min(1),
         Constraint::Length(1),
@@ -345,6 +486,7 @@ fn draw(f: &mut Frame, name: &str, cues: &[Cue], player: &Player, pos: u64) {
     let inner = block.inner(main);
     let width = (inner.width as usize).max(GUTTER + 10);
     let mut lines: Vec<Line> = Vec::new();
+    let mut index = 0;
     for cue in cues.iter().take_while(|c| c.start_ms <= pos) {
         let current = pos < cue.end_ms;
         let spans: Vec<Span> = cue
@@ -358,6 +500,12 @@ fn draw(f: &mut Frame, name: &str, cues: &[Cue], player: &Player, pos: u64) {
                 } else {
                     Style::new().fg(Color::DarkGray)
                 };
+                let style = match search.mark(index) {
+                    2 => style.fg(Color::Black).bg(Color::Cyan),
+                    1 => style.add_modifier(Modifier::UNDERLINED),
+                    _ => style,
+                };
+                index += 1;
                 Span::styled(w.text.clone(), style)
             })
             .collect();
@@ -392,10 +540,29 @@ fn draw(f: &mut Frame, name: &str, cues: &[Cue], player: &Player, pos: u64) {
         ]),
         bar,
     );
-    f.render_widget(
-        Line::from(" space pause · ←/→ previous/next word · home restart · q quit").dark_gray(),
-        keys,
-    );
+    let footer = if let Some(typed) = &search.prompt {
+        Line::from(format!("/{typed}▏"))
+    } else if search.active() {
+        let count = if search.hits.is_empty() {
+            String::new()
+        } else {
+            format!("  {}/{}", search.current + 1, search.hits.len())
+        };
+        let note = search
+            .message
+            .as_deref()
+            .map(|m| format!("  ({m})"))
+            .unwrap_or_default();
+        Line::from(vec![
+            Span::raw(format!(" /{}", search.pattern)),
+            Span::styled(format!("{count}{note}"), Style::new().fg(Color::Cyan)),
+            Span::raw("  n next · p previous · esc clear").dark_gray(),
+        ])
+    } else {
+        Line::from(" space pause · ←/→ previous/next word · / search · home restart · q quit")
+            .dark_gray()
+    };
+    f.render_widget(footer, keys);
 }
 
 /// Word-wrap one cue to `width`, indenting continuation lines under the
@@ -463,6 +630,33 @@ mod tests {
         assert_eq!(prev_word(&starts, 1100), 0);
         // Close-together words: only the current one is skipped.
         assert_eq!(prev_word(&[0, 160, 560, 800], 800), 560);
+    }
+
+    #[test]
+    fn searches_across_words() {
+        let ws: Vec<KWord> = ["The", "Goblin", "King,", "the", "goblin", "fled."]
+            .iter()
+            .enumerate()
+            .map(|(i, t)| KWord {
+                text: t.to_string(),
+                start_ms: i as u64 * 100,
+                end_ms: i as u64 * 100 + 90,
+            })
+            .collect();
+        let words: Vec<&KWord> = ws.iter().collect();
+        assert_eq!(find(&words, "goblin  king"), vec![(1, 2)]);
+        assert_eq!(find(&words, "GOB"), vec![(1, 1), (4, 4)]);
+        assert!(find(&words, "dragon").is_empty());
+
+        let mut s = Search::default();
+        // From the middle: the next match, then wrap back to the first.
+        assert_eq!(s.start("goblin", &words, 250), Some(400));
+        assert_eq!(s.step(1, &words), Some(100));
+        assert_eq!(s.message.as_deref(), Some("search wrapped"));
+        assert_eq!(s.step(-1, &words), Some(400));
+        assert_eq!((s.mark(4), s.mark(1), s.mark(0)), (2, 1, 0));
+        assert_eq!(s.start("dragon", &words, 0), None);
+        assert_eq!(s.message.as_deref(), Some("pattern not found"));
     }
 
     #[test]
