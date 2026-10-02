@@ -19,7 +19,9 @@ use crate::markdown::timestamp;
 use crate::tui::Screen;
 use crate::RecordPaths;
 
-const SKIP_MS: u64 = 5000;
+/// `←` within this long of a word's start goes to the word before it,
+/// so repeated presses keep stepping back while audio plays.
+const BACK_GRACE_MS: u64 = 300;
 const FRAME: Duration = Duration::from_millis(33);
 const GUTTER: usize = 11; // "[hh:mm:ss] "
 const SPOKEN: Color = Color::Yellow;
@@ -228,6 +230,7 @@ pub fn run(paths: &RecordPaths) -> Result<()> {
     let ass = std::fs::read_to_string(&paths.ass)
         .with_context(|| format!("read {}", paths.ass.display()))?;
     let cues = parse_ass(&ass);
+    let starts = word_starts(&cues);
     let file = OpusFile::open(&paths.opus)?;
     let name = paths
         .md
@@ -276,8 +279,12 @@ pub fn run(paths: &RecordPaths) -> Result<()> {
                     player.set_paused(!player.paused);
                 }
             }
-            KeyCode::Left => player.seek(pos.saturating_sub(SKIP_MS))?,
-            KeyCode::Right => player.seek(pos + SKIP_MS)?,
+            KeyCode::Left => player.seek(prev_word(&starts, pos))?,
+            KeyCode::Right => {
+                if let Some(t) = next_word(&starts, pos) {
+                    player.seek(t)?;
+                }
+            }
             KeyCode::Home => player.seek(0)?,
             _ => {}
         }
@@ -285,6 +292,36 @@ pub fn run(paths: &RecordPaths) -> Result<()> {
     }
     screen.restore();
     Ok(())
+}
+
+/// Every word's start time, ascending.
+fn word_starts(cues: &[Cue]) -> Vec<u64> {
+    let mut s: Vec<u64> = cues
+        .iter()
+        .flat_map(|c| c.words.iter().map(|w| w.start_ms))
+        .collect();
+    s.sort_unstable();
+    s.dedup();
+    s
+}
+
+/// Start of the first word after `pos`.
+fn next_word(starts: &[u64], pos: u64) -> Option<u64> {
+    starts.get(starts.partition_point(|&s| s <= pos)).copied()
+}
+
+/// Start of the word being spoken at `pos`, or of the one before it
+/// when `pos` is just past a word's start (0 before the first word).
+fn prev_word(starts: &[u64], pos: u64) -> u64 {
+    let Some(cur) = starts.partition_point(|&s| s <= pos).checked_sub(1) else {
+        return 0;
+    };
+    let i = if pos - starts[cur] < BACK_GRACE_MS {
+        cur.checked_sub(1)
+    } else {
+        Some(cur)
+    };
+    i.map(|i| starts[i]).unwrap_or(0)
 }
 
 fn clock(ms: u64) -> String {
@@ -356,7 +393,7 @@ fn draw(f: &mut Frame, name: &str, cues: &[Cue], player: &Player, pos: u64) {
         bar,
     );
     f.render_widget(
-        Line::from(" space pause · ←/→ 5 s · home restart · q quit").dark_gray(),
+        Line::from(" space pause · ←/→ previous/next word · home restart · q quit").dark_gray(),
         keys,
     );
 }
@@ -410,6 +447,22 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn steps_between_words() {
+        let starts = [1000, 1500, 4000];
+        assert_eq!(next_word(&starts, 0), Some(1000));
+        assert_eq!(next_word(&starts, 1000), Some(1500));
+        assert_eq!(next_word(&starts, 2000), Some(4000));
+        assert_eq!(next_word(&starts, 4000), None);
+        // Mid-word: back to that word's start.
+        assert_eq!(prev_word(&starts, 3000), 1500);
+        // Just after a start: the word before.
+        assert_eq!(prev_word(&starts, 1600), 1000);
+        assert_eq!(prev_word(&starts, 1100), 0);
+        // Close-together words: only the current one is skipped.
+        assert_eq!(prev_word(&[0, 160, 560, 800], 800), 560);
     }
 
     #[test]

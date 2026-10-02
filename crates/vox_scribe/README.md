@@ -42,7 +42,8 @@ other players, e.g. `mpv --sub-file=NAME.ass video.mp4`.
 
 `-p NAME` (`--play`) plays a recording back in the terminal: the audio
 with the subtitles printed as they are spoken, the current word lit up.
-`space` pauses, `←` `→` skip 5 s, `home` restarts, `q` quits.
+`space` pauses, `←` `→` jump to the previous / next word, `home`
+restarts, `q` quits.
 
 Other options:
 
