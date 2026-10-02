@@ -2,7 +2,8 @@
 //! chunks (~20 ms) on a channel, at whatever rate the device runs.
 //!
 //! * Linux: native PipeWire stream ([`pipewire`]).
-//! * macOS: CoreAudio through cpal ([`coreaudio`]).
+//! * macOS: CoreAudio through cpal ([`coreaudio`]); one app's output
+//!   through a Core Audio process tap ([`process_tap`], macOS 14.4+).
 //! * Any OS: decode a file ([`file`]).
 //!
 //! The realtime callback only writes into an SPSC ring; a reader thread
@@ -21,6 +22,10 @@ pub mod coreaudio;
 pub mod file;
 #[cfg(target_os = "linux")]
 pub mod pipewire;
+#[cfg(target_os = "macos")]
+pub mod process_tap;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod pw_dump;
 
 #[derive(Debug, Clone)]
 pub struct DeviceInfo {
@@ -38,11 +43,47 @@ pub struct OpenOptions {
     /// PipeWire only: register a virtual `Audio/Sink` node that other
     /// apps can play into, instead of capturing from a source.
     pub virtual_sink: bool,
+    /// Capture what one app is playing instead of an input: a PID, or a
+    /// case-insensitive substring of the app's name (see [`Backend::list_apps`]).
+    pub app: Option<String>,
+}
+
+/// An app that is (or was) playing audio, a candidate for
+/// [`OpenOptions::app`].
+#[derive(Debug, Clone)]
+pub struct AppInfo {
+    pub pid: u32,
+    /// Process name.
+    pub name: String,
+    /// Bundle id on macOS, `application.name` on PipeWire.
+    pub id: String,
+    /// Producing sound right now.
+    pub playing: bool,
+    /// Core Audio process object on macOS, stream node id on PipeWire.
+    pub(crate) object: u32,
+}
+
+impl AppInfo {
+    /// `want` is a PID or a case-insensitive substring of name or id.
+    pub fn matches(&self, want: &str) -> bool {
+        if let Ok(pid) = want.parse::<u32>() {
+            return self.pid == pid;
+        }
+        let want = want.to_lowercase();
+        self.name.to_lowercase().contains(&want) || self.id.to_lowercase().contains(&want)
+    }
 }
 
 pub trait Backend {
     fn name(&self) -> &'static str;
     fn list_devices(&self) -> Result<Vec<DeviceInfo>>;
+    /// Apps whose output can be captured with [`OpenOptions::app`].
+    fn list_apps(&self) -> Result<Vec<AppInfo>> {
+        anyhow::bail!(
+            "per-app capture is not supported by the {} backend",
+            self.name()
+        )
+    }
     fn open(&self, opts: &OpenOptions) -> Result<Capture>;
 }
 

@@ -5,7 +5,11 @@
 //! is a capture client that autoconnects to the default source (or the
 //! node named by `--device`) and can be relinked in qpwgraph/Helvum.
 //! With `virtual_sink` it instead registers an `Audio/Sink` node that
-//! other apps can play into, like rpg_vox's `-vox` sinks.
+//! other apps can play into, like rpg_vox's `-vox` sinks. With `app`
+//! the stream is left unconnected and a helper thread links every output
+//! stream of the matching app(s) to it with `pw-link`, rescanning so new
+//! streams (a browser's next tab, a restarted player) are picked up. The
+//! app keeps playing to its usual sink.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -24,11 +28,28 @@ use pw::{
 };
 use tracing::{error, info};
 
-use crate::{push_rt, Backend, Capture, DeviceInfo, OpenOptions, Plumbing};
+use crate::{push_rt, pw_dump, AppInfo, Backend, Capture, DeviceInfo, OpenOptions, Plumbing};
 
 /// Rate we ask PipeWire for; it resamples whatever the graph runs at.
 const RATE: u32 = 48_000;
 const NODE_NAME: &str = "vox_scribe";
+/// How often app mode looks for new streams to link.
+const RELINK: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Our node's name: unique in app mode so links find this instance.
+fn node_name(opts: &OpenOptions) -> String {
+    match opts.app {
+        Some(_) => format!("{NODE_NAME}-{}", std::process::id()),
+        None => NODE_NAME.to_string(),
+    }
+}
+
+fn pw_dump() -> Result<serde_json::Value> {
+    let out = std::process::Command::new("pw-dump")
+        .output()
+        .context("run pw-dump (is pipewire-utils installed?)")?;
+    serde_json::from_slice(&out.stdout).context("parse pw-dump")
+}
 
 pub struct PipeWire;
 
@@ -40,11 +61,7 @@ impl Backend for PipeWire {
     /// Lists sources and sinks via `pw-dump`. Pass a sink's name to
     /// capture its monitor (what's playing on it).
     fn list_devices(&self) -> Result<Vec<DeviceInfo>> {
-        let out = std::process::Command::new("pw-dump")
-            .output()
-            .context("run pw-dump (is pipewire-utils installed?)")?;
-        let objects: serde_json::Value =
-            serde_json::from_slice(&out.stdout).context("parse pw-dump")?;
+        let objects = pw_dump()?;
         let mut devices = Vec::new();
         for obj in objects.as_array().into_iter().flatten() {
             let props = &obj["info"]["props"];
@@ -67,7 +84,17 @@ impl Backend for PipeWire {
         Ok(devices)
     }
 
+    /// App output streams, via `pw-dump`.
+    fn list_apps(&self) -> Result<Vec<AppInfo>> {
+        Ok(pw_dump::apps(&pw_dump()?))
+    }
+
     fn open(&self, opts: &OpenOptions) -> Result<Capture> {
+        if let Some(app) = &opts.app {
+            if !self.list_apps()?.iter().any(|a| a.matches(app)) {
+                anyhow::bail!("no PipeWire output stream matching {app:?} (try `apps`)");
+            }
+        }
         let plumbing = Plumbing::new(RATE, 1);
         let (producer, parts) = plumbing.into_parts();
         let stop = parts.stop.clone();
@@ -84,10 +111,11 @@ impl Backend for PipeWire {
             })
             .context("spawn PipeWire thread")?;
         ready_rx.recv().context("PipeWire thread died")??;
-        let label = match (&opts.device, opts.virtual_sink) {
-            (_, true) => format!("PipeWire sink '{NODE_NAME}'"),
-            (Some(d), false) => format!("PipeWire {d}"),
-            (None, false) => "PipeWire default source".to_string(),
+        let label = match (&opts.app, &opts.device, opts.virtual_sink) {
+            (Some(app), _, _) => format!("PipeWire app {app:?}"),
+            (_, _, true) => format!("PipeWire sink '{NODE_NAME}'"),
+            (_, Some(d), false) => format!("PipeWire {d}"),
+            (_, None, false) => "PipeWire default source".to_string(),
         };
         Ok(parts.finish(RATE, label, thread))
     }
@@ -105,14 +133,17 @@ fn run(
     let context = Context::new(&mainloop).context("Context::new")?;
     let core = context.connect(None).context("Context::connect")?;
 
+    let node_name = node_name(&opts);
     let mut props = properties! {
         *keys::MEDIA_TYPE => "Audio",
         *keys::MEDIA_CATEGORY => "Capture",
         *keys::MEDIA_ROLE => "Production",
-        *keys::NODE_NAME => NODE_NAME,
+        *keys::NODE_NAME => node_name.as_str(),
         *keys::NODE_DESCRIPTION => "vox_scribe transcription",
     };
-    if opts.virtual_sink {
+    if opts.app.is_some() {
+        // Linked by `link_app`, not the session manager.
+    } else if opts.virtual_sink {
         props.insert(*keys::MEDIA_CLASS, "Audio/Sink");
         props.insert("node.virtual", "true");
     } else if let Some(target) = &opts.device {
@@ -124,7 +155,7 @@ fn run(
         );
     }
 
-    let stream = Stream::new(&core, NODE_NAME, props).context("Stream::new")?;
+    let stream = Stream::new(&core, &node_name, props).context("Stream::new")?;
 
     struct State {
         producer: rtrb::Producer<f32>,
@@ -171,15 +202,27 @@ fn run(
             .0
             .into_inner();
     let mut params = [Pod::from_bytes(&values).context("format pod parse")?];
+    let mut flags = StreamFlags::MAP_BUFFERS | StreamFlags::RT_PROCESS;
+    if opts.app.is_none() {
+        flags |= StreamFlags::AUTOCONNECT;
+    }
     stream
-        .connect(
-            libspa::utils::Direction::Input,
-            None,
-            StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS | StreamFlags::RT_PROCESS,
-            &mut params,
-        )
+        .connect(libspa::utils::Direction::Input, None, flags, &mut params)
         .context("Stream::connect")?;
     let _ = ready.send(Ok(()));
+
+    let linker = match &opts.app {
+        Some(app) => {
+            let (app, stop) = (app.clone(), stop.clone());
+            Some(
+                std::thread::Builder::new()
+                    .name("vox-pipewire-link".into())
+                    .spawn(move || link_app(&app, &node_name, &stop))
+                    .context("spawn PipeWire linker")?,
+            )
+        }
+        None => None,
+    };
 
     let mainloop_weak = mainloop.downgrade();
     let timer = mainloop.loop_().add_timer(move |_| {
@@ -195,7 +238,40 @@ fn run(
     );
     mainloop.run();
     drop(timer);
+    if let Some(linker) = linker {
+        let _ = linker.join();
+    }
     Ok(())
+}
+
+/// Keep every output port of the apps matching `app` linked to our node.
+fn link_app(app: &str, node_name: &str, stop: &AtomicBool) {
+    let mut next = std::time::Instant::now();
+    while !stop.load(Ordering::SeqCst) {
+        if std::time::Instant::now() >= next {
+            next = std::time::Instant::now() + RELINK;
+            let dump = match pw_dump() {
+                Ok(d) => d,
+                Err(err) => {
+                    error!(?err, "pw-dump failed");
+                    continue;
+                }
+            };
+            for (out, inp) in pw_dump::missing_links(&dump, app, node_name) {
+                let status = std::process::Command::new("pw-link")
+                    .arg(out.to_string())
+                    .arg(inp.to_string())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+                match status {
+                    Ok(s) if s.success() => info!(out, inp, "linked app port"),
+                    other => error!(out, inp, ?other, "pw-link failed"),
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 }
 
 /// Whether `node` names an `Audio/Sink` (best effort via `pw-dump`).

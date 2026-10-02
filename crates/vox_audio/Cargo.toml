@@ -3,7 +3,7 @@ name = "vox_audio"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Mono f32 audio capture: PipeWire on Linux, CoreAudio on macOS, plus file decode"
+description = "Mono f32 audio capture: PipeWire on Linux, CoreAudio on macOS (devices or one app), plus file decode"
 
 [dependencies]
 anyhow.workspace = true
@@ -19,3 +19,9 @@ libspa.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 cpal = "0.18"
+libc = "0.2"
+objc2 = "0.6"
+objc2-core-audio = "0.3"
+objc2-core-audio-types = "0.3"
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFDictionary"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSDictionary", "NSObject", "NSString", "NSUUID", "NSValue"] }

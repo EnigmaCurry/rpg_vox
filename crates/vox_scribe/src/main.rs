@@ -45,6 +45,11 @@ struct Cli {
     /// transcribe whatever is played into it.
     #[arg(long)]
     virtual_sink: bool,
+    /// Transcribe what one app is playing instead of an input: a PID or a
+    /// name / bundle id substring (see `apps`). The app still plays to
+    /// your speakers. macOS 14.4+ (process tap) or PipeWire.
+    #[arg(short, long, conflicts_with_all = ["device", "virtual_sink", "input"])]
+    app: Option<String>,
     /// Transcribe an audio file (wav, flac, mp3, ogg) instead of a device.
     #[arg(short, long)]
     input: Option<PathBuf>,
@@ -64,12 +69,7 @@ struct Cli {
     #[arg(long, env = "VOX_SCRIBE_MODELS")]
     models_dir: Option<PathBuf>,
     /// Recognizer for passes 2 and 3 (re-decode and boundary fix).
-    #[arg(
-        long,
-        value_enum,
-        default_value = "parakeet",
-        env = "VOX_SCRIBE_MODEL"
-    )]
+    #[arg(long, value_enum, default_value = "parakeet", env = "VOX_SCRIBE_MODEL")]
     model: models::Offline,
     /// SenseVoice language: auto, en, zh, ja, ko, yue.
     #[arg(long, default_value = "auto")]
@@ -107,10 +107,22 @@ struct Cli {
     log: Option<PathBuf>,
 }
 
+impl Cli {
+    fn open_options(&self) -> OpenOptions {
+        OpenOptions {
+            device: self.device.clone(),
+            virtual_sink: self.virtual_sink,
+            app: self.app.clone(),
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum Cmd {
     /// List input devices for the native audio backend.
     Devices,
+    /// List apps whose audio --app can capture.
+    Apps,
     /// Download the Zipformer model and the --model recognizer.
     DownloadModels,
     /// Finish the running --once recorder (as if Enter were pressed).
@@ -211,6 +223,7 @@ fn main() -> Result<()> {
 
     match cli.cmd {
         Some(Cmd::Devices) => return list_devices(),
+        Some(Cmd::Apps) => return list_apps(),
         Some(Cmd::DownloadModels) => {
             let dir = cli
                 .models_dir
@@ -290,10 +303,7 @@ fn main() -> Result<()> {
         }
         None => {
             let backend = vox_audio::default_backend()?;
-            let cap = backend.open(&OpenOptions {
-                device: cli.device.clone(),
-                virtual_sink: cli.virtual_sink,
-            })?;
+            let cap = backend.open(&cli.open_options())?;
             let (rate, name) = (cap.sample_rate, cap.device.clone());
             (Source::Live(cap), rate, name)
         }
@@ -362,10 +372,7 @@ fn main() -> Result<()> {
                 let capture = Arc::new(Mutex::new(Some(cap)));
                 let live = LivePump {
                     capture: capture.clone(),
-                    opts: OpenOptions {
-                        device: cli.device.clone(),
-                        virtual_sink: cli.virtual_sink,
-                    },
+                    opts: cli.open_options(),
                     rate,
                     pusher,
                     paused,
@@ -625,6 +632,18 @@ fn llm_corrector(cli: &Cli) -> Result<Option<Arc<dyn Corrector>>> {
         .check()
         .with_context(|| format!("pass 4 endpoint check failed ({url}, model {model})"))?;
     Ok(Some(Arc::new(corrector)))
+}
+
+fn list_apps() -> Result<()> {
+    let backend = vox_audio::default_backend()?;
+    let mut apps = backend.list_apps()?;
+    apps.sort_by_key(|a| (!a.playing, a.name.to_lowercase()));
+    println!("{} apps with audio (* = playing now):", backend.name());
+    for a in apps {
+        let mark = if a.playing { "*" } else { " " };
+        println!("{mark} {:>7}  {}  {}", a.pid, a.name, a.id);
+    }
+    Ok(())
 }
 
 fn list_devices() -> Result<()> {

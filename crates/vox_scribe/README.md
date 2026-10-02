@@ -15,6 +15,7 @@ The first run downloads the models (about 580 MB) if none are found;
 ```bash
 cargo run -p vox_scribe --release -- download-models
 cargo run -p vox_scribe --release -- devices
+cargo run -p vox_scribe --release -- apps
 cargo run -p vox_scribe --release -- -o notes.md
 ```
 
@@ -32,9 +33,21 @@ Other options:
 
 * `--device NAME`: an input by id or name substring (see `devices`). On
   Linux, a sink's node name captures what is playing on it.
+* `--app NAME`: transcribe what one app is playing, by PID or by a
+  substring of its process name or bundle id (see `apps`, which marks the
+  ones playing now with `*`). Every matching process is captured, so
+  `--app chrome` also gets Chrome's helper processes, and new ones are
+  picked up while running. The app keeps playing to your speakers.
+  * macOS 14.4+: a Core Audio process tap. The first run asks for
+    *System Audio Recording* permission for your terminal app (System
+    Settings → Privacy & Security → Screen & System Audio Recording);
+    without it the tap records silence rather than failing. An app only
+    shows up once it has opened an audio output.
+  * Linux: vox_scribe's PipeWire stream is linked to the app's output
+    streams with `pw-link`.
 * `--virtual-sink` (Linux): register a `vox_scribe` PipeWire sink and
-  transcribe whatever apps play into it. On macOS use a loopback device
-  such as BlackHole with `--device`.
+  transcribe whatever apps play into it. On macOS use `--app`, or a
+  loopback device such as BlackHole with `--device`.
 * `--input FILE`: transcribe a wav/flac/mp3/ogg file.
 * `--append`: add to an existing output file, after a `---` rule and a new
   date line. The TUI shows the file's previous content in grey above the
