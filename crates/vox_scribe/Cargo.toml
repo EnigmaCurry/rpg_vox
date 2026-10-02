@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 description = "Live layered transcription in the terminal, saved as markdown"
 
+# Short to type; the crate keeps its workspace name.
+[[bin]]
+name = "scribe"
+path = "src/main.rs"
+
 [dependencies]
 vox_transcribe = { path = "../vox_transcribe", features = ["llm", "sherpa-static"] }
 vox_audio = { path = "../vox_audio" }

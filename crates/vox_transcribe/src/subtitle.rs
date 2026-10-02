@@ -120,7 +120,9 @@ fn fits(words: &[Word], cfg: &CueConfig) -> bool {
     let text: Vec<&str> = words.iter().map(|w| w.text.as_str()).collect();
     let wrapped = wrap(&text, cfg.max_line_chars);
     wrapped.lines().count() <= cfg.max_lines
-        && wrapped.lines().all(|l| l.chars().count() <= cfg.max_line_chars)
+        && wrapped
+            .lines()
+            .all(|l| l.chars().count() <= cfg.max_line_chars)
 }
 
 /// Break into two lines at the word boundary nearest the middle when
@@ -141,7 +143,11 @@ fn wrap(words: &[&str], max_line: usize) -> String {
             best = (score, k);
         }
     }
-    format!("{}\n{}", words[..best.1].join(" "), words[best.1..].join(" "))
+    format!(
+        "{}\n{}",
+        words[..best.1].join(" "),
+        words[best.1..].join(" ")
+    )
 }
 
 fn clock(ms: u64, sep: char) -> String {

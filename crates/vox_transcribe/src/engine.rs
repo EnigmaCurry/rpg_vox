@@ -602,7 +602,9 @@ impl Core {
         cur.last_partial = text.clone();
         cur.last_emit = Instant::now();
         let (id, start) = (cur.clip_id.clone(), cur.start_ms);
-        if let Some((idx, change)) = self.upsert_clip(&id, text, Vec::new(), start, None, Stage::Partial) {
+        if let Some((idx, change)) =
+            self.upsert_clip(&id, text, Vec::new(), start, None, Stage::Partial)
+        {
             self.emit(idx, change);
         }
     }
@@ -870,8 +872,7 @@ impl Core {
             start_ms,
             Some(duration_ms),
             Stage::Final,
-        )
-        else {
+        ) else {
             return;
         };
         // Word caps. The soft cap only fires on a silence-closed

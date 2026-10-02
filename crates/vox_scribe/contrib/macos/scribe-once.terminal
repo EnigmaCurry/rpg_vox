@@ -1,20 +1,20 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!-- Terminal window settings for one-shot dictation. Opening this file
-     (`open -a Terminal vox_scribe-once.terminal`) runs vox_scribe directly,
+     (`open -a Terminal scribe-once.terminal`) runs scribe directly,
      without a login shell, and closes the window when it exits. Launching
      through `open` also makes macOS grant the microphone to Terminal rather
      than to the launcher. `just install-scribe` fills in @BIN@. -->
 <plist version="1.0">
 <dict>
 	<key>name</key>
-	<string>vox_scribe</string>
+	<string>scribe</string>
 	<key>type</key>
 	<string>Window Settings</string>
 	<key>ProfileCurrentVersion</key>
 	<real>2.07</real>
 	<key>CommandString</key>
-	<string>@BIN@/vox_scribe --once</string>
+	<string>@BIN@/scribe --once</string>
 	<key>RunCommandAsShell</key>
 	<true/>
 	<key>shellExitAction</key>

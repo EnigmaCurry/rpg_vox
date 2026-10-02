@@ -121,7 +121,9 @@ pub fn align_words(old: &[Word], text: &str, span: (u64, u64)) -> Vec<Word> {
         // A run of unmatched words takes the span of the old words it
         // replaces, or the gap between its matched neighbours when it is
         // a pure insertion.
-        let run_end = (j..new.len()).find(|&k| matched[k].is_some()).unwrap_or(new.len());
+        let run_end = (j..new.len())
+            .find(|&k| matched[k].is_some())
+            .unwrap_or(new.len());
         let prev_old = j.checked_sub(1).and_then(|p| matched[p]);
         let next_old = matched.get(run_end).copied().flatten();
         let first_replaced = prev_old.map(|p| p + 1).unwrap_or(0);
@@ -198,7 +200,11 @@ mod tests {
         let words = words_from_tokens(&tokens, &[0.06, 0.6, 2.5], &[], 3000);
         assert_eq!(
             words,
-            vec![w("The", 60, 600), w("King", 600, 1400), w("rolled", 2500, 3000)]
+            vec![
+                w("The", 60, 600),
+                w("King", 600, 1400),
+                w("rolled", 2500, 3000)
+            ]
         );
     }
 

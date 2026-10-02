@@ -60,6 +60,11 @@ pub struct Screen {
 impl Screen {
     /// Enter the TUI and show a loading frame.
     pub fn splash() -> Self {
+        Self::enter(" loading models…")
+    }
+
+    /// Enter the TUI showing `msg` until the first real frame.
+    pub fn enter(msg: &str) -> Self {
         use ratatui::crossterm::event::{KeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
         use ratatui::crossterm::{execute, terminal::supports_keyboard_enhancement};
         let mut terminal = ratatui::init();
@@ -72,7 +77,7 @@ impl Screen {
             )
             .is_ok();
         let _ = terminal.draw(|f| {
-            let msg = Paragraph::new(" loading models…")
+            let msg = Paragraph::new(msg)
                 .dark_gray()
                 .block(Block::bordered().title(" vox_scribe "));
             f.render_widget(msg, f.area());
@@ -84,7 +89,11 @@ impl Screen {
         }
     }
 
-    fn restore(&mut self) {
+    pub fn terminal(&mut self) -> &mut DefaultTerminal {
+        &mut self.terminal
+    }
+
+    pub fn restore(&mut self) {
         if !self.restored {
             if self.enhanced {
                 use ratatui::crossterm::{event::PopKeyboardEnhancementFlags, execute};
@@ -215,7 +224,7 @@ fn run_loop(terminal: &mut DefaultTerminal, s: &Session) -> Result<bool> {
                 Some(p) => app.set_status(format!("already saving to {}", p.display())),
                 None => {
                     let name = chrono::Local::now()
-                        .format("transcript-%Y%m%d-%H%M%S")
+                        .format("transcript-%Y%m%d-%H%M%S.md")
                         .to_string();
                     app.prompt = Some(name);
                 }
@@ -295,10 +304,9 @@ impl App {
             self.prompt = None;
             return;
         }
-        let base = std::path::PathBuf::from(&name);
-        let out = crate::output_paths(&base);
-        if let Some(p) = out.all().into_iter().find(|p| p.exists()) {
-            self.set_status(format!("{} exists, pick another name", p.display()));
+        let path = std::path::PathBuf::from(&name);
+        if path.exists() {
+            self.set_status(format!("{name} exists, pick another name"));
             return;
         }
         let settled: Vec<_> = self
@@ -307,10 +315,10 @@ impl App {
             .iter()
             .filter(|p| p.hardened)
             .collect();
-        match s.save_as(&base, &settled) {
+        match s.save_as(path, &settled) {
             Ok(()) => {
                 self.prompt = None;
-                self.set_status(format!("saving to {} (+ .srt, .ass)", out.md.display()));
+                self.set_status(format!("saving to {name}"));
             }
             Err(e) => self.set_status(format!("save failed: {e:#}")),
         }

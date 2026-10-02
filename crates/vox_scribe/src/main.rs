@@ -10,6 +10,7 @@ mod markdown;
 mod models;
 #[cfg(unix)]
 mod once;
+mod play;
 mod subtitles;
 mod tui;
 
@@ -34,9 +35,10 @@ use vox_transcribe::{
 
 use crate::markdown::{timestamp, MarkdownWriter};
 use crate::subtitles::{Format, SubtitleWriter};
+use vox_audio::opus_file::OpusWriter;
 
 #[derive(Parser)]
-#[command(version, about)]
+#[command(name = "scribe", version, about)]
 struct Cli {
     #[command(subcommand)]
     cmd: Option<Cmd>,
@@ -55,13 +57,20 @@ struct Cli {
     /// Transcribe an audio file (wav, flac, mp3, ogg) instead of a device.
     #[arg(short, long)]
     input: Option<PathBuf>,
-    /// Output name without extension: writes NAME.md (the transcript),
-    /// NAME.srt (subtitles) and NAME.ass (karaoke subtitles that
-    /// highlight each word as it is spoken). Without it nothing is saved
-    /// to disk.
+    /// Markdown output: writes NAME.md (`.md` is added if missing).
+    /// Without it (or --record) nothing is saved to disk.
     #[arg(short, long)]
     output: Option<PathBuf>,
-    /// Add to the output files if they already exist (normally an error).
+    /// Record a session: NAME.md (the transcript), NAME.srt (subtitles),
+    /// NAME.ass (karaoke subtitles that highlight each word as it is
+    /// spoken) and NAME.opus (the audio). Play it back with --play.
+    #[arg(short, long, conflicts_with_all = ["output", "append"])]
+    record: Option<PathBuf>,
+    /// Play a recording made with --record: NAME.opus with NAME.ass
+    /// shown word by word in time with the audio.
+    #[arg(short, long, conflicts_with_all = ["output", "record", "input", "app", "device", "virtual_sink", "once", "no_tui"])]
+    play: Option<PathBuf>,
+    /// Add to the -o file if it already exists (normally an error).
     #[arg(long)]
     append: bool,
     /// Heading for the markdown file.
@@ -93,7 +102,7 @@ struct Cli {
     /// q / Esc / Ctrl-C cancels without copying. Only one runs at a time:
     /// launching another finishes the running one instead. Nothing is
     /// saved to disk.
-    #[arg(long, conflicts_with_all = ["output", "append"])]
+    #[arg(long, conflicts_with_all = ["output", "append", "record"])]
     once: bool,
     /// Enable pass 4: LLM proofreading of each paragraph before it is
     /// written. Configured by VOX_SCRIBE_LLM_URL (default
@@ -146,7 +155,7 @@ pub struct Session {
     pub engine: Engine,
     /// None until -o or the TUI's `s` names a file.
     pub writer: Mutex<Option<MarkdownWriter>>,
-    /// The .srt and .ass beside the markdown; set with `writer`.
+    /// --record: the .srt and .ass beside the markdown.
     pub subtitles: Mutex<Vec<SubtitleWriter>>,
     /// Heading and date line for a file started with `s`.
     pub title: String,
@@ -208,64 +217,68 @@ impl Session {
             .map(|w| w.path().to_path_buf())
     }
 
-    /// Start saving to new files named `base`: write `settled` (the
+    /// Start saving markdown to the new file `path`: write `settled` (the
     /// paragraphs no pass will change) now; later ones append as they settle.
-    pub fn save_as(&self, base: &Path, settled: &[&vox_transcribe::Paragraph]) -> Result<()> {
-        let out = output_paths(base);
-        let mut w = MarkdownWriter::create(out.md.clone(), &self.title, &self.subtitle, false)?;
-        let mut subs = subtitle_writers(&out, false)?;
+    pub fn save_as(&self, path: PathBuf, settled: &[&vox_transcribe::Paragraph]) -> Result<()> {
+        let mut w = MarkdownWriter::create(path, &self.title, &self.subtitle, false)?;
         for p in settled {
             w.append(p)?;
-            for sw in &mut subs {
-                sw.append(p)?;
-            }
         }
         *self.writer.lock().expect("writer lock") = Some(w);
-        *self.subtitles.lock().expect("subtitles lock") = subs;
         Ok(())
     }
 }
 
-/// The files `-o NAME` writes.
-pub struct OutputPaths {
+/// `-o NAME` writes `NAME.md`; a name already ending in `.md` is kept.
+fn markdown_path(name: &Path) -> PathBuf {
+    match name.extension().and_then(|e| e.to_str()) {
+        Some(e) if e.eq_ignore_ascii_case("md") => name.to_path_buf(),
+        _ => {
+            let mut s = name.as_os_str().to_owned();
+            s.push(".md");
+            PathBuf::from(s)
+        }
+    }
+}
+
+/// The files of a `--record NAME` session.
+pub struct RecordPaths {
     pub md: PathBuf,
     pub srt: PathBuf,
     pub ass: PathBuf,
+    pub opus: PathBuf,
 }
 
-impl OutputPaths {
-    pub fn all(&self) -> [&PathBuf; 3] {
-        [&self.md, &self.srt, &self.ass]
-    }
-}
-
-/// `NAME.md`, `NAME.srt` and `NAME.ass` for an output name. A trailing
-/// `.md`, `.srt` or `.ass` on `base` is dropped, so `-o notes.md` still
-/// means `notes`.
-pub fn output_paths(base: &Path) -> OutputPaths {
-    let base = match base.extension().and_then(|e| e.to_str()) {
-        Some(e) if ["md", "srt", "ass"].iter().any(|x| e.eq_ignore_ascii_case(x)) => {
-            base.with_extension("")
+impl RecordPaths {
+    /// `NAME.md`, `.srt`, `.ass` and `.opus`. One of those extensions on
+    /// `base` is dropped, so `notes.opus` and `notes` name the same set.
+    pub fn new(base: &Path) -> Self {
+        let base = match base.extension().and_then(|e| e.to_str()) {
+            Some(e)
+                if ["md", "srt", "ass", "opus"]
+                    .iter()
+                    .any(|x| e.eq_ignore_ascii_case(x)) =>
+            {
+                base.with_extension("")
+            }
+            _ => base.to_path_buf(),
+        };
+        let with = |ext: &str| {
+            let mut s = base.clone().into_os_string();
+            s.push(ext);
+            PathBuf::from(s)
+        };
+        Self {
+            md: with(".md"),
+            srt: with(".srt"),
+            ass: with(".ass"),
+            opus: with(".opus"),
         }
-        _ => base.to_path_buf(),
-    };
-    let with = |ext: &str| {
-        let mut s = base.clone().into_os_string();
-        s.push(ext);
-        PathBuf::from(s)
-    };
-    OutputPaths {
-        md: with(".md"),
-        srt: with(".srt"),
-        ass: with(".ass"),
     }
-}
 
-fn subtitle_writers(out: &OutputPaths, append: bool) -> Result<Vec<SubtitleWriter>> {
-    Ok(vec![
-        SubtitleWriter::create(out.srt.clone(), Format::Srt, append)?,
-        SubtitleWriter::create(out.ass.clone(), Format::Ass, append)?,
-    ])
+    pub fn all(&self) -> [&PathBuf; 4] {
+        [&self.md, &self.srt, &self.ass, &self.opus]
+    }
 }
 
 /// How a session ended.
@@ -297,7 +310,7 @@ fn main() -> Result<()> {
             if once::signal_finish() {
                 return Ok(());
             }
-            eprintln!("no vox_scribe --once recorder is running");
+            eprintln!("no scribe --once recorder is running");
             std::process::exit(1);
         }
         None => {}
@@ -315,18 +328,30 @@ fn main() -> Result<()> {
         None
     };
 
+    if let Some(name) = &cli.play {
+        return play::run(&RecordPaths::new(name));
+    }
+
     let now = chrono::Local::now();
-    let output = cli.output.as_deref().map(output_paths);
-    if cli.append && output.is_none() {
+    let record = cli.record.as_deref().map(RecordPaths::new);
+    let output = match (&cli.output, &record) {
+        (Some(o), _) => Some(markdown_path(o)),
+        (None, Some(r)) => Some(r.md.clone()),
+        (None, None) => None,
+    };
+    if cli.append && cli.output.is_none() {
         anyhow::bail!("--append needs -o NAME");
     }
     // Fail before loading models or opening the mic.
-    if let Some(out) = &output {
-        if let Some(p) = out.all().into_iter().find(|p| p.exists() && !cli.append) {
-            anyhow::bail!(
-                "{} already exists (pass --append to add to it)",
-                p.display()
-            );
+    if let Some(output) = output.as_ref().filter(|o| o.exists() && !cli.append) {
+        anyhow::bail!(
+            "{} already exists (pass --append to add to it)",
+            output.display()
+        );
+    }
+    if let Some(r) = &record {
+        if let Some(p) = r.all().into_iter().find(|p| p.exists()) {
+            anyhow::bail!("{} already exists", p.display());
         }
     }
     let corrector = llm_corrector(&cli)?;
@@ -409,15 +434,22 @@ fn main() -> Result<()> {
     });
     let subtitle = format!("{} · {}", now.format("%Y-%m-%d %H:%M"), device);
     let history = match &output {
-        Some(out) if cli.append => markdown::read_tail(&out.md, 200),
+        Some(o) if cli.append => markdown::read_tail(o, 200),
         _ => Vec::new(),
     };
-    let (writer, subtitles) = match output {
-        Some(out) => (
-            Some(MarkdownWriter::create(out.md.clone(), &title, &subtitle, cli.append)?),
-            subtitle_writers(&out, cli.append)?,
+    let writer = match output {
+        Some(o) => Some(MarkdownWriter::create(o, &title, &subtitle, cli.append)?),
+        None => None,
+    };
+    let (subtitles, recording) = match &record {
+        Some(r) => (
+            vec![
+                SubtitleWriter::create(r.srt.clone(), Format::Srt, false)?,
+                SubtitleWriter::create(r.ass.clone(), Format::Ass, false)?,
+            ],
+            Some(OpusWriter::create(&r.opus, rate)?),
         ),
-        None => (None, Vec::new()),
+        None => (Vec::new(), None),
     };
 
     let manual = cli.manual || cli.once;
@@ -431,7 +463,10 @@ fn main() -> Result<()> {
     let source_done = Arc::new(AtomicBool::new(false));
 
     let (capture, pump) = {
-        let pusher = engine.pusher();
+        let mut feed = Feed {
+            pusher: engine.pusher(),
+            recording,
+        };
         let (paused, stop, done) = (paused.clone(), stop.clone(), source_done.clone());
         match source {
             Source::Live(cap) => {
@@ -440,7 +475,7 @@ fn main() -> Result<()> {
                     capture: capture.clone(),
                     opts: cli.open_options(),
                     rate,
-                    pusher,
+                    feed,
                     paused,
                     stop,
                 };
@@ -455,8 +490,9 @@ fn main() -> Result<()> {
                         if stop.load(Ordering::Relaxed) {
                             break;
                         }
-                        pusher.push(chunk);
+                        feed.push(chunk);
                     }
+                    feed.finish();
                     done.store(true, Ordering::SeqCst);
                 });
                 (Arc::new(Mutex::new(None)), pump)
@@ -491,8 +527,15 @@ fn main() -> Result<()> {
     }
     if let Some(path) = &outcome.path {
         println!("saved {}", path.display());
-        println!("saved {}", path.with_extension("srt").display());
-        println!("saved {}", path.with_extension("ass").display());
+    }
+    if let Some(r) = &record {
+        for p in [&r.srt, &r.ass, &r.opus] {
+            println!("saved {}", p.display());
+        }
+        println!(
+            "play it back with: scribe --play {}",
+            r.md.with_extension("").display()
+        );
     }
     Ok(())
 }
@@ -526,17 +569,43 @@ fn copy_transcript(outcome: &Outcome) {
 /// Feeds mic audio to the engine. While paused it releases the mic (so
 /// the OS stops showing it in use) and pushes silence on wall-clock time,
 /// keeping timestamps aligned; on resume it reopens the device.
+/// Where captured audio goes: the engine, and the --record file.
+struct Feed {
+    pusher: vox_transcribe::Pusher,
+    recording: Option<OpusWriter>,
+}
+
+impl Feed {
+    fn push(&mut self, mono: &[f32]) {
+        self.pusher.push(mono);
+        if let Some(r) = &mut self.recording {
+            if let Err(e) = r.write(mono) {
+                tracing::error!("recording stopped: {e:#}");
+                self.recording = None;
+            }
+        }
+    }
+
+    fn finish(self) {
+        if let Some(r) = self.recording {
+            if let Err(e) = r.finish() {
+                tracing::error!("finishing the recording failed: {e:#}");
+            }
+        }
+    }
+}
+
 struct LivePump {
     capture: Arc<Mutex<Option<Capture>>>,
     opts: OpenOptions,
     rate: u32,
-    pusher: vox_transcribe::Pusher,
+    feed: Feed,
     paused: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
 }
 
 impl LivePump {
-    fn run(self) {
+    fn run(mut self) {
         let mut chunks = self.chunks();
         // Silence pushed since the mic was released: (since, samples).
         let mut silent: Option<(std::time::Instant, u64)> = None;
@@ -551,7 +620,7 @@ impl LivePump {
                 }
                 if let Some(rx) = &chunks {
                     if let Ok(chunk) = rx.recv_timeout(Duration::from_millis(100)) {
-                        self.pusher.push(&vec![0.0; chunk.len()]);
+                        self.feed.push(&vec![0.0; chunk.len()]);
                     }
                     continue;
                 }
@@ -576,9 +645,10 @@ impl LivePump {
             }
             let Some(rx) = &chunks else { continue };
             if let Ok(chunk) = rx.recv_timeout(Duration::from_millis(100)) {
-                self.pusher.push(&chunk);
+                self.feed.push(&chunk);
             }
         }
+        self.feed.finish();
     }
 
     fn chunks(&self) -> Option<crossbeam_channel::Receiver<Vec<f32>>> {
@@ -602,10 +672,10 @@ impl LivePump {
     }
 
     /// Push silence up to the wall-clock time elapsed since `since`.
-    fn catch_up(&self, since: std::time::Instant, pushed: &mut u64) {
+    fn catch_up(&mut self, since: std::time::Instant, pushed: &mut u64) {
         let due = (since.elapsed().as_secs_f64() * self.rate as f64) as u64;
         if due > *pushed {
-            self.pusher.push(&vec![0.0; (due - *pushed) as usize]);
+            self.feed.push(&vec![0.0; (due - *pushed) as usize]);
             *pushed = due;
         }
     }
@@ -729,7 +799,7 @@ fn list_devices() -> Result<()> {
 fn init_logging(cli: &Cli, tui_mode: bool) -> Result<Option<std::fs::File>> {
     use tracing_subscriber::EnvFilter;
     let filter = EnvFilter::try_from_env("VOX_SCRIBE_LOG").unwrap_or_else(|_| {
-        EnvFilter::new("warn,vox_scribe=info,vox_transcribe=info,vox_audio=info")
+        EnvFilter::new("warn,scribe=info,vox_transcribe=info,vox_audio=info")
     });
     let log_path = cli
         .log

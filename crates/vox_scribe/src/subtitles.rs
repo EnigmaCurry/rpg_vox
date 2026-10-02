@@ -139,8 +139,12 @@ mod tests {
 
     #[test]
     fn resumes_after_last_cue() {
-        let srt = "1\n00:00:00,000 --> 00:00:02,480\nHi.\n\n2\n01:00:03,020 --> 01:00:07,340\nThere.\n\n";
-        assert_eq!(resume_point(srt, Format::Srt), (2, 3_607_340 + SESSION_GAP_MS));
+        let srt =
+            "1\n00:00:00,000 --> 00:00:02,480\nHi.\n\n2\n01:00:03,020 --> 01:00:07,340\nThere.\n\n";
+        assert_eq!(
+            resume_point(srt, Format::Srt),
+            (2, 3_607_340 + SESSION_GAP_MS)
+        );
         assert_eq!(resume_point("", Format::Srt), (0, 0));
         let ass = "[Events]\nDialogue: 0,0:00:00.28,0:00:01.50,Default,,0,0,0,,{\\k22}Hi\n";
         assert_eq!(resume_point(ass, Format::Ass), (1, 1500 + SESSION_GAP_MS));

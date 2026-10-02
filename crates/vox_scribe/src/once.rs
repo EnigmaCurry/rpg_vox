@@ -1,5 +1,5 @@
 //! One `--once` recorder at a time. The running recorder's pid lives in a
-//! per-user file; launching another (or `vox_scribe stop-once`) sends it
+//! per-user file; launching another (or `scribe stop-once`) sends it
 //! SIGUSR1, which finishes and copies just like Enter.
 
 use std::path::PathBuf;
@@ -39,7 +39,7 @@ fn running() -> Option<i32> {
         .output()
         .ok()?;
     String::from_utf8_lossy(&out.stdout)
-        .contains("vox_scribe")
+        .contains("scribe")
         .then_some(pid)
 }
 

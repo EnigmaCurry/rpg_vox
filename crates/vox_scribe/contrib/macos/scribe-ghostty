@@ -1,5 +1,5 @@
 #!/bin/zsh
-# Open `vox_scribe --once` in its own small Ghostty window, centred on the
+# Open `scribe --once` in its own small Ghostty window, centred on the
 # current screen. A separate Ghostty instance means only this window comes
 # to the front. Font size: $VOX_SCRIBE_FONT_SIZE (default 13).
 bin=${0:A:h}
@@ -14,4 +14,4 @@ x=$(( (sw - w) / 2 )) y=$(( (sh - h) / 2 ))
 exec open -na Ghostty --args --quit-after-last-window-closed=true \
   --font-size=$font --window-width=$cols --window-height=$rows \
   --window-position-x=$(( x > 0 ? x : 0 )) --window-position-y=$(( y > 0 ? y : 0 )) \
-  --title=vox_scribe --command="$bin/vox_scribe --once"
+  --title=scribe --command="$bin/scribe --once"

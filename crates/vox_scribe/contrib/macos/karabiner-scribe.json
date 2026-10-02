@@ -1,8 +1,8 @@
 {
-  "title": "vox_scribe",
+  "title": "scribe",
   "rules": [
     {
-      "description": "Mic/F5 key: start vox_scribe --once, or finish the running one",
+      "description": "Mic/F5 key: start scribe --once, or finish the running one",
       "manipulators": [
         {
           "type": "basic",
@@ -11,7 +11,7 @@
           },
           "to": [
             {
-              "shell_command": "@BIN@/vox_scribe stop-once 2>/dev/null || @LAUNCH@"
+              "shell_command": "@BIN@/scribe stop-once 2>/dev/null || @LAUNCH@"
             }
           ]
         },
@@ -22,7 +22,7 @@
           },
           "to": [
             {
-              "shell_command": "@BIN@/vox_scribe stop-once 2>/dev/null || @LAUNCH@"
+              "shell_command": "@BIN@/scribe stop-once 2>/dev/null || @LAUNCH@"
             }
           ]
         }

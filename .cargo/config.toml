@@ -1,0 +1,5 @@
+[env]
+# audiopus_sys builds its bundled libopus with CMake when pkg-config
+# can't find a system one (e.g. macOS without pkg-config). Its
+# CMakeLists predates CMake 3.5, which CMake 4 refuses without this.
+CMAKE_POLICY_VERSION_MINIMUM = "3.5"

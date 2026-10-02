@@ -246,7 +246,7 @@ scribe *ARGS: download-stt-model download-streaming-stt-model
     fi
 
 # Uses nix-shell when available (Linux), plain cargo otherwise (macOS).
-# Optimized vox_scribe build only → target/release/vox_scribe.
+# Optimized vox_scribe build only → target/release/scribe.
 release-scribe:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -263,15 +263,19 @@ install-scribe BIN="~/.local/bin": release-scribe
     bin="{{BIN}}"
     bin="${bin/#\~/$HOME}"
     mkdir -p "$bin"
-    install -m 755 target/release/vox_scribe "$bin/vox_scribe"
-    echo "installed $bin/vox_scribe"
+    install -m 755 target/release/scribe "$bin/scribe"
+    # The binary used to be called vox_scribe.
+    rm -f "$bin/vox_scribe"
+    echo "installed $bin/scribe"
     if [ "$(uname)" = Darwin ]; then
       contrib=crates/vox_scribe/contrib/macos
-      sed "s|@BIN@|$bin|" "$contrib/vox_scribe-once.terminal" > "$bin/vox_scribe-once.terminal"
-      install -m 755 "$contrib/vox_scribe-ghostty" "$bin/"
-      rm -f "$bin/vox_scribe-once.command"
+      sed "s|@BIN@|$bin|" "$contrib/scribe-once.terminal" > "$bin/scribe-once.terminal"
+      install -m 755 "$contrib/scribe-ghostty" "$bin/"
+      # Older installs used these names.
+      rm -f "$bin/vox_scribe-once.command" "$bin/vox_scribe-once.terminal" "$bin/vox_scribe-ghostty"
       rules="$HOME/.config/karabiner/assets/complex_modifications"
       mkdir -p "$rules"
+      rm -f "$rules/vox_scribe.json"
       # Ghostty runs as its own app, so only the recorder's window comes
       # forward; Terminal raises all of its windows. Override with
       # VOX_SCRIBE_TERMINAL=terminal|ghostty.
@@ -280,14 +284,14 @@ install-scribe BIN="~/.local/bin": release-scribe
         if [ -d /Applications/Ghostty.app ]; then term=ghostty; else term=terminal; fi
       fi
       case "$term" in
-        ghostty) launch="$bin/vox_scribe-ghostty" ;;
-        terminal) launch="open -a Terminal $bin/vox_scribe-once.terminal" ;;
+        ghostty) launch="$bin/scribe-ghostty" ;;
+        terminal) launch="open -a Terminal $bin/scribe-once.terminal" ;;
         *) echo "VOX_SCRIBE_TERMINAL must be terminal or ghostty" >&2; exit 1 ;;
       esac
-      sed -e "s|@BIN@|$bin|g" -e "s|@LAUNCH@|$launch|" "$contrib/karabiner-vox_scribe.json" > "$rules/vox_scribe.json"
+      sed -e "s|@BIN@|$bin|g" -e "s|@LAUNCH@|$launch|" "$contrib/karabiner-scribe.json" > "$rules/scribe.json"
       echo "installed the Karabiner rule ($term; enable it in Karabiner-Elements)"
     fi
-    "$bin/vox_scribe" download-models
+    "$bin/scribe" download-models
     case ":$PATH:" in
       *":$bin:"*) ;;
       *) echo "note: $bin is not on your PATH" ;;

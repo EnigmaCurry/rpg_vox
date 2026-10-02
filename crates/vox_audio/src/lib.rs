@@ -6,6 +6,9 @@
 //!   through a Core Audio process tap ([`process_tap`], macOS 14.4+).
 //! * Any OS: decode a file ([`file`]).
 //!
+//! Also: playback to the default output ([`playback`]) and Ogg Opus
+//! recordings ([`opus_file`]).
+//!
 //! The realtime callback only writes into an SPSC ring; a reader thread
 //! downmixes and forwards, so nothing allocates on the audio thread.
 
@@ -20,12 +23,15 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 #[cfg(target_os = "macos")]
 pub mod coreaudio;
 pub mod file;
+pub mod opus_file;
 #[cfg(target_os = "linux")]
 pub mod pipewire;
+pub mod playback;
 #[cfg(target_os = "macos")]
 pub mod process_tap;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod pw_dump;
+pub mod resample;
 
 #[derive(Debug, Clone)]
 pub struct DeviceInfo {
