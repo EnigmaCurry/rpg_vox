@@ -342,17 +342,17 @@ fn main() -> Result<()> {
     if cli.append && cli.output.is_none() {
         anyhow::bail!("--append needs -o NAME");
     }
-    // Fail before loading models or opening the mic.
-    if let Some(output) = output.as_ref().filter(|o| o.exists() && !cli.append) {
+    // Fail before loading models or opening the mic. A recording is
+    // never appended to, so only -o mentions --append.
+    if let Some(r) = &record {
+        if let Some(p) = r.all().into_iter().find(|p| p.exists()) {
+            anyhow::bail!("{} already exists; pick another name", p.display());
+        }
+    } else if let Some(output) = output.as_ref().filter(|o| o.exists() && !cli.append) {
         anyhow::bail!(
             "{} already exists (pass --append to add to it)",
             output.display()
         );
-    }
-    if let Some(r) = &record {
-        if let Some(p) = r.all().into_iter().find(|p| p.exists()) {
-            anyhow::bail!("{} already exists", p.display());
-        }
     }
     let corrector = llm_corrector(&cli)?;
     let llm = corrector.is_some();
