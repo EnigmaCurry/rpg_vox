@@ -28,7 +28,9 @@ to disk unless you pass `-o NAME`. With it, each paragraph is appended to
 2 s of quiet after `enter`), so `tail -f notes.md` follows along; quitting
 appends whatever is still open. `NAME.srt` gets the same paragraphs as
 word-timed subtitles (from the offline recognizer's word timestamps,
-carried through the boundary and LLM passes). Copying uses `pbcopy`, `wl-copy` or `xclip`,
+carried through the boundary and LLM passes), and `NAME.ass` the same
+cues as karaoke, highlighting each word as it is spoken (`mpv
+--sub-file=NAME.ass recording.mp4`, or any libass player). Copying uses `pbcopy`, `wl-copy` or `xclip`,
 falling back to the OSC 52 terminal escape (e.g. over ssh).
 
 Other options:

@@ -33,7 +33,7 @@ use vox_transcribe::{
 };
 
 use crate::markdown::{timestamp, MarkdownWriter};
-use crate::subtitles::SubtitleWriter;
+use crate::subtitles::{Format, SubtitleWriter};
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -55,8 +55,9 @@ struct Cli {
     /// Transcribe an audio file (wav, flac, mp3, ogg) instead of a device.
     #[arg(short, long)]
     input: Option<PathBuf>,
-    /// Output name without extension: writes NAME.md (the transcript)
-    /// and NAME.srt (word-timed subtitles). Without it nothing is saved
+    /// Output name without extension: writes NAME.md (the transcript),
+    /// NAME.srt (subtitles) and NAME.ass (karaoke subtitles that
+    /// highlight each word as it is spoken). Without it nothing is saved
     /// to disk.
     #[arg(short, long)]
     output: Option<PathBuf>,
@@ -145,8 +146,8 @@ pub struct Session {
     pub engine: Engine,
     /// None until -o or the TUI's `s` names a file.
     pub writer: Mutex<Option<MarkdownWriter>>,
-    /// The .srt beside the markdown; set and cleared with `writer`.
-    pub subtitles: Mutex<Option<SubtitleWriter>>,
+    /// The .srt and .ass beside the markdown; set with `writer`.
+    pub subtitles: Mutex<Vec<SubtitleWriter>>,
     /// Heading and date line for a file started with `s`.
     pub title: String,
     pub subtitle: String,
@@ -182,7 +183,7 @@ impl Session {
         if let Some(w) = self.writer.lock().expect("writer lock").as_mut() {
             w.append_remaining(&t)?;
         }
-        if let Some(w) = self.subtitles.lock().expect("subtitles lock").as_mut() {
+        for w in self.subtitles.lock().expect("subtitles lock").iter_mut() {
             w.append_remaining(&t)?;
         }
         Ok(t)
@@ -190,7 +191,7 @@ impl Session {
 
     /// Append a hardened paragraph to the markdown file, if there is one.
     pub fn write(&self, p: &vox_transcribe::Paragraph) -> Result<()> {
-        if let Some(w) = self.subtitles.lock().expect("subtitles lock").as_mut() {
+        for w in self.subtitles.lock().expect("subtitles lock").iter_mut() {
             w.append(p)?;
         }
         match self.writer.lock().expect("writer lock").as_mut() {
@@ -210,24 +211,40 @@ impl Session {
     /// Start saving to new files named `base`: write `settled` (the
     /// paragraphs no pass will change) now; later ones append as they settle.
     pub fn save_as(&self, base: &Path, settled: &[&vox_transcribe::Paragraph]) -> Result<()> {
-        let (md, srt) = output_paths(base);
-        let mut w = MarkdownWriter::create(md, &self.title, &self.subtitle, false)?;
-        let mut sw = SubtitleWriter::create(srt, false)?;
+        let out = output_paths(base);
+        let mut w = MarkdownWriter::create(out.md.clone(), &self.title, &self.subtitle, false)?;
+        let mut subs = subtitle_writers(&out, false)?;
         for p in settled {
             w.append(p)?;
-            sw.append(p)?;
+            for sw in &mut subs {
+                sw.append(p)?;
+            }
         }
         *self.writer.lock().expect("writer lock") = Some(w);
-        *self.subtitles.lock().expect("subtitles lock") = Some(sw);
+        *self.subtitles.lock().expect("subtitles lock") = subs;
         Ok(())
     }
 }
 
-/// `NAME.md` and `NAME.srt` for an output name. A trailing `.md` or
-/// `.srt` on `base` is dropped, so `-o notes.md` still means `notes`.
-pub fn output_paths(base: &Path) -> (PathBuf, PathBuf) {
+/// The files `-o NAME` writes.
+pub struct OutputPaths {
+    pub md: PathBuf,
+    pub srt: PathBuf,
+    pub ass: PathBuf,
+}
+
+impl OutputPaths {
+    pub fn all(&self) -> [&PathBuf; 3] {
+        [&self.md, &self.srt, &self.ass]
+    }
+}
+
+/// `NAME.md`, `NAME.srt` and `NAME.ass` for an output name. A trailing
+/// `.md`, `.srt` or `.ass` on `base` is dropped, so `-o notes.md` still
+/// means `notes`.
+pub fn output_paths(base: &Path) -> OutputPaths {
     let base = match base.extension().and_then(|e| e.to_str()) {
-        Some(e) if e.eq_ignore_ascii_case("md") || e.eq_ignore_ascii_case("srt") => {
+        Some(e) if ["md", "srt", "ass"].iter().any(|x| e.eq_ignore_ascii_case(x)) => {
             base.with_extension("")
         }
         _ => base.to_path_buf(),
@@ -237,7 +254,18 @@ pub fn output_paths(base: &Path) -> (PathBuf, PathBuf) {
         s.push(ext);
         PathBuf::from(s)
     };
-    (with(".md"), with(".srt"))
+    OutputPaths {
+        md: with(".md"),
+        srt: with(".srt"),
+        ass: with(".ass"),
+    }
+}
+
+fn subtitle_writers(out: &OutputPaths, append: bool) -> Result<Vec<SubtitleWriter>> {
+    Ok(vec![
+        SubtitleWriter::create(out.srt.clone(), Format::Srt, append)?,
+        SubtitleWriter::create(out.ass.clone(), Format::Ass, append)?,
+    ])
 }
 
 /// How a session ended.
@@ -293,8 +321,8 @@ fn main() -> Result<()> {
         anyhow::bail!("--append needs -o NAME");
     }
     // Fail before loading models or opening the mic.
-    if let Some((md, srt)) = &output {
-        if let Some(p) = [md, srt].into_iter().find(|p| p.exists() && !cli.append) {
+    if let Some(out) = &output {
+        if let Some(p) = out.all().into_iter().find(|p| p.exists() && !cli.append) {
             anyhow::bail!(
                 "{} already exists (pass --append to add to it)",
                 p.display()
@@ -381,15 +409,15 @@ fn main() -> Result<()> {
     });
     let subtitle = format!("{} · {}", now.format("%Y-%m-%d %H:%M"), device);
     let history = match &output {
-        Some((md, _)) if cli.append => markdown::read_tail(md, 200),
+        Some(out) if cli.append => markdown::read_tail(&out.md, 200),
         _ => Vec::new(),
     };
     let (writer, subtitles) = match output {
-        Some((md, srt)) => (
-            Some(MarkdownWriter::create(md, &title, &subtitle, cli.append)?),
-            Some(SubtitleWriter::create(srt, cli.append)?),
+        Some(out) => (
+            Some(MarkdownWriter::create(out.md.clone(), &title, &subtitle, cli.append)?),
+            subtitle_writers(&out, cli.append)?,
         ),
-        None => (None, None),
+        None => (None, Vec::new()),
     };
 
     let manual = cli.manual || cli.once;
@@ -464,6 +492,7 @@ fn main() -> Result<()> {
     if let Some(path) = &outcome.path {
         println!("saved {}", path.display());
         println!("saved {}", path.with_extension("srt").display());
+        println!("saved {}", path.with_extension("ass").display());
     }
     Ok(())
 }

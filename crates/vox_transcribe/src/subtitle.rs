@@ -33,6 +33,8 @@ pub struct Cue {
     pub end_ms: u64,
     /// Already wrapped; lines separated by `\n`.
     pub text: String,
+    /// The cue's words with their own times, for karaoke output.
+    pub words: Vec<Word>,
 }
 
 fn ends_sentence(w: &str) -> bool {
@@ -107,6 +109,7 @@ pub fn cues(words: &[Word], limit_ms: u64, cfg: &CueConfig) -> Vec<Cue> {
             start_ms,
             end_ms: end_ms.max(start_ms + 1),
             text: wrap(&text, cfg.max_line_chars),
+            words: g.to_vec(),
         });
     }
     out
@@ -174,6 +177,73 @@ pub fn vtt(c: &Cue) -> String {
     )
 }
 
+/// Header that starts an ASS file. Karaoke turns each word from the
+/// secondary colour (white, not yet spoken) to the primary colour
+/// (yellow) as it is spoken.
+pub const ASS_HEADER: &str = "[Script Info]
+ScriptType: v4.00+
+PlayResX: 1280
+PlayResY: 720
+WrapStyle: 2
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Arial,52,&H0000FFFF,&H00FFFFFF,&H00000000,&H80000000,0,0,0,0,100,100,0,0,1,3,1,2,60,60,50,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+";
+
+fn ass_clock(ms: u64) -> String {
+    let cs = (ms + 5) / 10;
+    format!(
+        "{}:{:02}:{:02}.{:02}",
+        cs / 360_000,
+        cs / 6000 % 60,
+        cs / 100 % 60,
+        cs % 100
+    )
+}
+
+/// One ASS dialogue line whose `\k` tags highlight each word over its
+/// own time. Durations are taken from rounded absolute times, so
+/// rounding never accumulates across a cue.
+pub fn ass(c: &Cue) -> String {
+    let cs = |ms: u64| (ms + 5) / 10;
+    let first_line_words = c
+        .text
+        .lines()
+        .next()
+        .map(|l| l.split_whitespace().count())
+        .unwrap_or(0);
+    let mut out = String::new();
+    let mut at = cs(c.start_ms);
+    for (i, w) in c.words.iter().enumerate() {
+        if i > 0 {
+            out.push_str(if i == first_line_words { "\\N" } else { " " });
+        }
+        let start = cs(w.start_ms).max(at);
+        if start > at {
+            // Silence before the word: nothing lights up.
+            out.push_str(&format!("{{\\k{}}}", start - at));
+        }
+        let end = cs(w.end_ms).max(start);
+        out.push_str(&format!("{{\\k{}}}{}", end - start, ass_escape(&w.text)));
+        at = end;
+    }
+    format!(
+        "Dialogue: 0,{},{},Default,,0,0,0,,{}\n",
+        ass_clock(c.start_ms),
+        ass_clock(c.end_ms),
+        out
+    )
+}
+
+fn ass_escape(s: &str) -> String {
+    s.replace('{', "(").replace('}', ")").replace('\\', "/")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,11 +305,24 @@ mod tests {
     }
 
     #[test]
+    fn karaoke_times_each_word() {
+        let w = words(&[("Hi", 280, 500), ("there,", 500, 900), ("you", 1300, 1500)]);
+        let mut c = cues(&w, 2000, &CueConfig::default()).remove(0);
+        assert_eq!(
+            ass(&c),
+            "Dialogue: 0,0:00:00.28,0:00:01.50,Default,,0,0,0,,{\\k22}Hi {\\k40}there, {\\k40}{\\k20}you\n"
+        );
+        c.text = "Hi there,\nyou".into();
+        assert!(ass(&c).contains("there,\\N{\\k40}"));
+    }
+
+    #[test]
     fn formats_clocks() {
         let c = Cue {
             start_ms: 3_723_004,
             end_ms: 3_724_500,
             text: "x".into(),
+            words: Vec::new(),
         };
         assert_eq!(srt(1, &c), "1\n01:02:03,004 --> 01:02:04,500\nx\n\n");
         assert_eq!(vtt(&c), "01:02:03.004 --> 01:02:04.500\nx\n\n");

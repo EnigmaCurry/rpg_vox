@@ -18,3 +18,6 @@ hold_music/
 # Local vox_scribe test transcript.
 /notes.md
 transcript-*.md
+*.srt
+*.ass
+*.wav

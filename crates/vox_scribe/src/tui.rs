@@ -296,8 +296,8 @@ impl App {
             return;
         }
         let base = std::path::PathBuf::from(&name);
-        let (md, srt) = crate::output_paths(&base);
-        if let Some(p) = [&md, &srt].into_iter().find(|p| p.exists()) {
+        let out = crate::output_paths(&base);
+        if let Some(p) = out.all().into_iter().find(|p| p.exists()) {
             self.set_status(format!("{} exists, pick another name", p.display()));
             return;
         }
@@ -310,7 +310,7 @@ impl App {
         match s.save_as(&base, &settled) {
             Ok(()) => {
                 self.prompt = None;
-                self.set_status(format!("saving to {} and .srt", md.display()));
+                self.set_status(format!("saving to {} (+ .srt, .ass)", out.md.display()));
             }
             Err(e) => self.set_status(format!("save failed: {e:#}")),
         }
