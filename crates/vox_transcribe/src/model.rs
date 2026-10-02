@@ -4,6 +4,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::timing::{align_words, Word};
+
 /// Which pass last authored a clip's text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -25,6 +27,10 @@ pub struct Clip {
     pub duration_ms: Option<u64>,
     pub text: String,
     pub stage: Stage,
+    /// One per word of `text`, from the offline pass that wrote it.
+    /// Empty while the clip is a streaming partial.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub words: Vec<Word>,
 }
 
 impl Clip {
@@ -34,6 +40,15 @@ impl Clip {
 
     pub fn end_ms(&self) -> u64 {
         self.start_ms + self.duration_ms.unwrap_or(0)
+    }
+
+    /// `words` when they match `text`, else `text` spread over the clip.
+    pub fn timed_words(&self) -> Vec<Word> {
+        if self.words.len() == self.text.split_whitespace().count() {
+            self.words.clone()
+        } else {
+            align_words(&self.words, &self.text, (self.start_ms, self.end_ms()))
+        }
     }
 }
 
@@ -46,6 +61,10 @@ pub struct Paragraph {
     /// Space-join of the clips' texts.
     pub text: String,
     pub clips: Vec<Clip>,
+    /// One per word of `text` (finalized clips only), carried through
+    /// pass 4's edits.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub words: Vec<Word>,
     /// Soft/hard word cap reached: the next clip opens a new paragraph
     /// even without a silence gap.
     pub closed: bool,
@@ -84,6 +103,7 @@ impl Paragraph {
             end_ms: first.start_ms,
             text: String::new(),
             clips: vec![first],
+            words: Vec::new(),
             closed: false,
             hardened: false,
             pass3_inflight: false,
@@ -102,6 +122,12 @@ impl Paragraph {
             .filter(|t| !t.is_empty())
             .collect::<Vec<_>>()
             .join(" ");
+        self.words = self
+            .clips
+            .iter()
+            .filter(|c| !c.is_partial())
+            .flat_map(Clip::timed_words)
+            .collect();
         if let Some(first) = self.clips.first() {
             self.start_ms = first.start_ms;
         }

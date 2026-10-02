@@ -25,8 +25,9 @@ use crate::boundary::{self, BoundaryConfig, WindowClip};
 use crate::correct::{apply_edits, Corrector, Edit};
 use crate::filters::{count_words, ends_on_sentence, is_junk};
 use crate::model::{Clip, Paragraph, Pass4, Stage, Transcript};
-use crate::recognizer::{OfflineRecognizer, StreamingRecognizer};
+use crate::recognizer::{OfflineRecognizer, StreamingRecognizer, Transcription};
 use crate::ring::AudioRing;
+use crate::timing::{align_words, offset, Word};
 use crate::vad::{EndReason, Vad, VadConfig, VadEvent};
 
 /// How paragraphs are split.
@@ -165,7 +166,7 @@ struct LlmResult {
 
 struct JobResult {
     job: Job,
-    text: anyhow::Result<String>,
+    text: anyhow::Result<Transcription>,
 }
 
 /// Handle to a running pipeline. Dropping it stops the threads without
@@ -324,7 +325,7 @@ fn offline_worker(
         let samples = match &job {
             Job::Final { samples, .. } | Job::Boundary { samples, .. } => samples,
         };
-        let text = rec.transcribe(samples, rate);
+        let text = rec.transcribe_timed(samples, rate);
         if res_tx.send(JobResult { job, text }).is_err() {
             return;
         }
@@ -601,7 +602,7 @@ impl Core {
         cur.last_partial = text.clone();
         cur.last_emit = Instant::now();
         let (id, start) = (cur.clip_id.clone(), cur.start_ms);
-        if let Some((idx, change)) = self.upsert_clip(&id, text, start, None, Stage::Partial) {
+        if let Some((idx, change)) = self.upsert_clip(&id, text, Vec::new(), start, None, Stage::Partial) {
             self.emit(idx, change);
         }
     }
@@ -614,6 +615,7 @@ impl Core {
         &mut self,
         clip_id: &str,
         text: String,
+        words: Vec<Word>,
         start_ms: u64,
         duration_ms: Option<u64>,
         stage: Stage,
@@ -630,6 +632,7 @@ impl Core {
                 return None;
             }
             clip.text = text;
+            clip.words = words;
             clip.start_ms = start_ms;
             clip.duration_ms = duration_ms;
             clip.stage = stage;
@@ -642,6 +645,7 @@ impl Core {
             duration_ms,
             text,
             stage,
+            words,
         };
         let max_utt = self.cfg.vad.max_utterance_ms as u64;
         let gap = self.cfg.paragraph.gap_ms;
@@ -790,6 +794,7 @@ impl Core {
             .and_then(|edits| apply_edits(&r.job.text, &edits));
         p.pass4 = Some(match outcome {
             Ok((text, edits)) => {
+                p.words = align_words(&p.words, &text, (p.start_ms, p.end_ms));
                 let original = std::mem::replace(&mut p.text, text);
                 Pass4::Done { original, edits }
             }
@@ -845,21 +850,27 @@ impl Core {
         start_ms: u64,
         duration_ms: u64,
         reason: EndReason,
-        text: anyhow::Result<String>,
+        text: anyhow::Result<Transcription>,
     ) {
-        let text = match text {
-            Ok(t) => t.trim().to_string(),
-            Err(err) => {
-                warn!(err = %format!("{err:#}"), "pass 2 decode failed");
-                String::new()
-            }
-        };
+        let t = text.unwrap_or_else(|err| {
+            warn!(err = %format!("{err:#}"), "pass 2 decode failed");
+            Transcription::default()
+        });
+        let text = t.text.trim().to_string();
         if is_junk(&text) {
             self.remove_clip(&clip_id);
             return;
         }
-        let Some((idx, change)) =
-            self.upsert_clip(&clip_id, text, start_ms, Some(duration_ms), Stage::Final)
+        let mut words = align_words(&t.words, &text, (0, duration_ms));
+        offset(&mut words, start_ms);
+        let Some((idx, change)) = self.upsert_clip(
+            &clip_id,
+            text,
+            words,
+            start_ms,
+            Some(duration_ms),
+            Stage::Final,
+        )
         else {
             return;
         };
@@ -920,7 +931,7 @@ impl Core {
         &mut self,
         paragraph_id: String,
         window: Vec<WindowClip>,
-        text: anyhow::Result<String>,
+        text: anyhow::Result<Transcription>,
     ) {
         let Some(idx) = self.find_paragraph(&paragraph_id) else {
             self.pass3_pending.remove(&paragraph_id);
@@ -928,8 +939,8 @@ impl Core {
         };
         self.transcript.paragraphs[idx].pass3_inflight = false;
         let plan = match text {
-            Ok(t) => boundary::plan_revision(&window, &t).map_err(|r| {
-                debug!(paragraph = %paragraph_id, reason = ?r, output = %t, "pass 3 rejected");
+            Ok(t) => boundary::plan_revision(&window, &t.text, &t.words).map_err(|r| {
+                debug!(paragraph = %paragraph_id, reason = ?r, output = %t.text, "pass 3 rejected");
             }),
             Err(err) => {
                 warn!(err = %format!("{err:#}"), "pass 3 decode failed");
@@ -946,13 +957,14 @@ impl Core {
             let soft = self.cfg.paragraph.soft_max_words;
             let p = &mut self.transcript.paragraphs[idx];
             let mut changed = false;
-            for (w, new_text) in window.iter().zip(split) {
+            for (w, rev) in window.iter().zip(split) {
                 if !w.writable {
                     continue;
                 }
                 if let Some(c) = p.clips.iter_mut().find(|c| c.id == w.clip_id) {
-                    changed |= c.text != new_text;
-                    c.text = new_text;
+                    changed |= c.text != rev.text;
+                    c.text = rev.text;
+                    c.words = rev.words;
                     c.stage = Stage::Revised;
                 }
             }

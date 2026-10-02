@@ -4,7 +4,8 @@
 //! a cut get mangled and every clip ends with SenseVoice's reflexive
 //! period. Pass 3 re-decodes the audio of the last 2–3 clips of a
 //! paragraph as one buffer, then splits the joined text back across the
-//! clips by duration ratio. Several guards reject decodes that would
+//! clips by word timestamps (or by duration ratio when the recognizer
+//! reports none). Several guards reject decodes that would
 //! lose content rather than improve it.
 //!
 //! Everything here is pure; the engine owns the audio ring, the
@@ -12,6 +13,7 @@
 
 use crate::filters::{count_words, is_false_positive};
 use crate::model::Paragraph;
+use crate::timing::{align_words, offset, Word};
 
 #[derive(Debug, Clone)]
 pub struct BoundaryConfig {
@@ -160,9 +162,23 @@ pub enum Reject {
     Shrinkage,
 }
 
+/// New text and word timings for one window clip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClipRevision {
+    pub text: String,
+    /// Absolute times; empty when the decode had no timings.
+    pub words: Vec<Word>,
+}
+
 /// Validate a joined re-decode against the window and split it back
-/// into one string per window clip.
-pub fn plan_revision(window: &[WindowClip], joined: &str) -> Result<Vec<String>, Reject> {
+/// into one revision per window clip. `words` are the decode's word
+/// timings relative to the window's first clip; when present the split
+/// follows them, otherwise it is proportional to clip duration.
+pub fn plan_revision(
+    window: &[WindowClip],
+    joined: &str,
+    words: &[Word],
+) -> Result<Vec<ClipRevision>, Reject> {
     let joined = joined.trim();
     let existing_words: usize = window.iter().map(|w| count_words(&w.text)).sum();
     let out_words = count_words(joined);
@@ -189,20 +205,71 @@ pub fn plan_revision(window: &[WindowClip], joined: &str) -> Result<Vec<String>,
         return Err(Reject::EdgeMismatch);
     }
 
-    let durations: Vec<u64> = window.iter().map(|w| w.duration_ms).collect();
-    let split = split_boundary_text(joined, &durations);
+    let split = if words.is_empty() {
+        let durations: Vec<u64> = window.iter().map(|w| w.duration_ms).collect();
+        split_boundary_text(joined, &durations)
+            .into_iter()
+            .map(|text| ClipRevision {
+                text,
+                words: Vec::new(),
+            })
+            .collect()
+    } else {
+        split_by_time(window, joined, words)
+    };
     let shrinks = window
         .iter()
         .zip(split.iter())
         .filter(|(w, _)| w.writable)
         .any(|(w, new)| {
             let old_w = count_words(&w.text);
-            old_w >= 3 && count_words(new) < (old_w as f64 * 0.7).round() as usize
+            old_w >= 3 && count_words(&new.text) < (old_w as f64 * 0.7).round() as usize
         });
     if shrinks {
         return Err(Reject::Shrinkage);
     }
     Ok(split)
+}
+
+/// Assign each word of `joined` to the window clip its midpoint falls in
+/// (or the nearest one, if it lands in the silence between clips),
+/// never going back to an earlier clip.
+fn split_by_time(window: &[WindowClip], joined: &str, words: &[Word]) -> Vec<ClipRevision> {
+    let base = window.first().map(|w| w.start_ms).unwrap_or(0);
+    let mut timed = align_words(words, joined, (0, window_span(window)));
+    offset(&mut timed, base);
+    let mut out: Vec<ClipRevision> = window
+        .iter()
+        .map(|_| ClipRevision {
+            text: String::new(),
+            words: Vec::new(),
+        })
+        .collect();
+    let mut at = 0;
+    for w in timed {
+        let mid = (w.start_ms + w.end_ms) / 2;
+        let dist = |c: &WindowClip| {
+            let end = c.start_ms + c.duration_ms;
+            if mid < c.start_ms {
+                c.start_ms - mid
+            } else {
+                mid.saturating_sub(end)
+            }
+        };
+        while at + 1 < window.len() && dist(&window[at + 1]) < dist(&window[at]) {
+            at += 1;
+        }
+        out[at].words.push(w);
+    }
+    for r in &mut out {
+        r.text = r
+            .words
+            .iter()
+            .map(|w| w.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+    }
+    out
 }
 
 /// Proportional split of `text` across clips by duration ratio. Cut
@@ -309,9 +376,37 @@ mod tests {
             wc("We went to the.", 0, 1500, true),
             wc("Store today.", 1600, 1000, true),
         ];
-        let out = plan_revision(&w, "We went to the store today.").unwrap();
+        let out = plan_revision(&w, "We went to the store today.", &[]).unwrap();
         assert_eq!(out.len(), 2);
-        assert_eq!(out.join(" "), "We went to the store today.");
+        let texts: Vec<&str> = out.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(texts.join(" "), "We went to the store today.");
+    }
+
+    #[test]
+    fn revision_splits_on_word_times() {
+        let w = vec![
+            wc("We went to the.", 1000, 1500, true),
+            wc("Store today.", 2600, 1000, true),
+        ];
+        // "the" starts late in clip 1 but its midpoint is still there;
+        // "store" falls in the silence nearer clip 2.
+        let words = [
+            ("We", 0, 200),
+            ("went", 200, 500),
+            ("to", 500, 700),
+            ("the", 1300, 1490),
+            ("store", 1560, 1900),
+            ("today.", 1900, 2400),
+        ]
+        .map(|(t, s, e)| Word {
+            text: t.into(),
+            start_ms: s,
+            end_ms: e,
+        });
+        let out = plan_revision(&w, "We went to the store today.", &words).unwrap();
+        assert_eq!(out[0].text, "We went to the");
+        assert_eq!(out[1].text, "store today.");
+        assert_eq!(out[1].words[0].start_ms, 2560);
     }
 
     #[test]
@@ -320,10 +415,10 @@ mod tests {
             wc("one two three four.", 0, 2000, true),
             wc("five six seven eight.", 2100, 2000, true),
         ];
-        assert_eq!(plan_revision(&w, "I."), Err(Reject::FalsePositive));
-        assert_eq!(plan_revision(&w, "one eight."), Err(Reject::TooShort));
+        assert_eq!(plan_revision(&w, "I.", &[]), Err(Reject::FalsePositive));
+        assert_eq!(plan_revision(&w, "one eight.", &[]), Err(Reject::TooShort));
         assert_eq!(
-            plan_revision(&w, "two three four five six seven eight."),
+            plan_revision(&w, "two three four five six seven eight.", &[]),
             Err(Reject::EdgeMismatch)
         );
     }

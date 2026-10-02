@@ -11,7 +11,8 @@ use sherpa_onnx::{
 };
 use tracing::info;
 
-use crate::recognizer::{OfflineRecognizer, StreamingRecognizer};
+use crate::recognizer::{OfflineRecognizer, StreamingRecognizer, Transcription};
+use crate::timing::words_from_tokens;
 
 fn require(p: &Path, label: &str) -> Result<String> {
     if !p.is_file() {
@@ -65,6 +66,10 @@ impl SenseVoice {
 
 impl OfflineRecognizer for SenseVoice {
     fn transcribe(&self, samples: &[f32], sample_rate: u32) -> Result<String> {
+        Ok(decode_offline(&self.inner, samples, sample_rate)?.text)
+    }
+
+    fn transcribe_timed(&self, samples: &[f32], sample_rate: u32) -> Result<Transcription> {
         decode_offline(&self.inner, samples, sample_rate)
     }
 }
@@ -117,6 +122,10 @@ impl Parakeet {
 
 impl OfflineRecognizer for Parakeet {
     fn transcribe(&self, samples: &[f32], sample_rate: u32) -> Result<String> {
+        Ok(decode_offline(&self.inner, samples, sample_rate)?.text)
+    }
+
+    fn transcribe_timed(&self, samples: &[f32], sample_rate: u32) -> Result<Transcription> {
         decode_offline(&self.inner, samples, sample_rate)
     }
 }
@@ -125,10 +134,10 @@ fn decode_offline(
     recognizer: &sherpa_onnx::OfflineRecognizer,
     samples: &[f32],
     sample_rate: u32,
-) -> Result<String> {
+) -> Result<Transcription> {
     // Clips under ~50 ms decode to garbage on any ASR.
     if samples.len() < (sample_rate as usize / 20).max(64) {
-        return Ok(String::new());
+        return Ok(Transcription::default());
     }
     let stream = recognizer.create_stream();
     stream.accept_waveform(sample_rate as i32, samples);
@@ -136,7 +145,17 @@ fn decode_offline(
     let result = stream
         .get_result()
         .context("sherpa-onnx returned no result")?;
-    Ok(result.text.trim().to_string())
+    let total_ms = samples.len() as u64 * 1000 / sample_rate.max(1) as u64;
+    let words = words_from_tokens(
+        &result.tokens,
+        result.timestamps.as_deref().unwrap_or_default(),
+        result.durations.as_deref().unwrap_or_default(),
+        total_ms,
+    );
+    Ok(Transcription {
+        text: result.text.trim().to_string(),
+        words,
+    })
 }
 
 /// Streaming Zipformer transducer bundle.

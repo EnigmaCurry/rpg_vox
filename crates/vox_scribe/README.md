@@ -16,17 +16,19 @@ The first run downloads the models (about 580 MB) if none are found;
 cargo run -p vox_scribe --release -- download-models
 cargo run -p vox_scribe --release -- devices
 cargo run -p vox_scribe --release -- apps
-cargo run -p vox_scribe --release -- -o notes.md
+cargo run -p vox_scribe --release -- -o notes
 ```
 
 Keys: `↑↓` select a paragraph, `y` copy it (the newest one if none is
 selected), `PgUp PgDn` scroll, `End` follow, `space` pause (releases the mic, so the
 OS stops showing it in use; timestamps keep running), `enter` new
 paragraph, `m` switch auto/manual paragraphs, `q` quit. Nothing is saved
-to disk unless you pass `-o FILE`. With it, each paragraph is appended to
-the markdown file once it settles (2 s of quiet; in manual mode,
+to disk unless you pass `-o NAME`. With it, each paragraph is appended to
+`NAME.md` once it settles (2 s of quiet; in manual mode,
 2 s of quiet after `enter`), so `tail -f notes.md` follows along; quitting
-appends whatever is still open. Copying uses `pbcopy`, `wl-copy` or `xclip`,
+appends whatever is still open. `NAME.srt` gets the same paragraphs as
+word-timed subtitles (from the offline recognizer's word timestamps,
+carried through the boundary and LLM passes). Copying uses `pbcopy`, `wl-copy` or `xclip`,
 falling back to the OSC 52 terminal escape (e.g. over ssh).
 
 Other options:
@@ -93,7 +95,7 @@ OPENAI_API_KEY=...                             # or VOX_SCRIBE_LLM_KEY
 ```
 
 ```bash
-just scribe --llm --vocab names.txt -o notes.md
+just scribe --llm --vocab names.txt -o notes
 ```
 
 * `--vocab FILE`: names and terms, one per line, to help with spelling.

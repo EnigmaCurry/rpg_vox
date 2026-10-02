@@ -25,8 +25,11 @@ pub mod ring;
 pub mod sherpa;
 #[cfg(unix)]
 pub mod stderr;
+pub mod subtitle;
+pub mod timing;
 pub mod vad;
 
 pub use engine::{Change, Engine, EngineConfig, Event, ParagraphConfig, ParagraphMode, Pusher};
 pub use model::{Clip, Paragraph, Pass4, Stage, Transcript};
-pub use recognizer::{OfflineRecognizer, StreamingRecognizer};
+pub use recognizer::{OfflineRecognizer, StreamingRecognizer, Transcription};
+pub use timing::Word;

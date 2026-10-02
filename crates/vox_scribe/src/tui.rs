@@ -215,7 +215,7 @@ fn run_loop(terminal: &mut DefaultTerminal, s: &Session) -> Result<bool> {
                 Some(p) => app.set_status(format!("already saving to {}", p.display())),
                 None => {
                     let name = chrono::Local::now()
-                        .format("transcript-%Y%m%d-%H%M%S.md")
+                        .format("transcript-%Y%m%d-%H%M%S")
                         .to_string();
                     app.prompt = Some(name);
                 }
@@ -295,9 +295,10 @@ impl App {
             self.prompt = None;
             return;
         }
-        let path = std::path::PathBuf::from(&name);
-        if path.exists() {
-            self.set_status(format!("{name} exists, pick another name"));
+        let base = std::path::PathBuf::from(&name);
+        let (md, srt) = crate::output_paths(&base);
+        if let Some(p) = [&md, &srt].into_iter().find(|p| p.exists()) {
+            self.set_status(format!("{} exists, pick another name", p.display()));
             return;
         }
         let settled: Vec<_> = self
@@ -306,10 +307,10 @@ impl App {
             .iter()
             .filter(|p| p.hardened)
             .collect();
-        match s.save_as(path, &settled) {
+        match s.save_as(&base, &settled) {
             Ok(()) => {
                 self.prompt = None;
-                self.set_status(format!("saving to {name}"));
+                self.set_status(format!("saving to {} and .srt", md.display()));
             }
             Err(e) => self.set_status(format!("save failed: {e:#}")),
         }
