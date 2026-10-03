@@ -71,9 +71,14 @@ pub fn run(
         };
         s
     } else {
-        eprintln!("diarizing the recording (this can take a while)…");
-        job.join()
-            .map_err(|_| anyhow::anyhow!("diarization thread panicked"))?
+        eprintln!("diarizing the recording (this can take a while; Ctrl-C skips it)…");
+        crate::CTRL_C_QUITS.store(true, std::sync::atomic::Ordering::SeqCst);
+        let segments = job
+            .join()
+            .map_err(|_| anyhow::anyhow!("diarization thread panicked"))?;
+        // Don't quit halfway through rewriting the files.
+        crate::CTRL_C_QUITS.store(false, std::sync::atomic::Ordering::SeqCst);
+        segments
     }?;
     let t = relabel(transcript, &segments);
     if let Some(p) = &files.md {

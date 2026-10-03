@@ -893,12 +893,24 @@ impl LivePump {
     }
 }
 
+/// Headless mode: Ctrl-C quits at once rather than asking the session to
+/// stop (see [`headless`]).
+pub static CTRL_C_QUITS: AtomicBool = AtomicBool::new(false);
+
 fn headless(session: Session) -> Result<Outcome> {
     let interrupted = Arc::new(AtomicBool::new(false));
     {
         let i = interrupted.clone();
-        ctrlc::set_handler(move || i.store(true, Ordering::SeqCst))
-            .context("install Ctrl-C handler")?;
+        ctrlc::set_handler(move || {
+            // The first press ends a mic session gracefully; a second one,
+            // or any press when there is nothing graceful to do (a file
+            // input, diarizing), quits.
+            if CTRL_C_QUITS.load(Ordering::SeqCst) || i.swap(true, Ordering::SeqCst) {
+                eprintln!("\ninterrupted; files keep what was saved so far");
+                std::process::exit(130);
+            }
+        })
+        .context("install Ctrl-C handler")?;
     }
     // --once: a line on stdin (Enter) finishes the recording.
     let entered = Arc::new(AtomicBool::new(false));
@@ -914,6 +926,11 @@ fn headless(session: Session) -> Result<Outcome> {
     }
     let events = session.engine.events().clone();
     let started = std::time::Instant::now();
+    // A file has nothing to stop gracefully (it is all queued at once),
+    // so Ctrl-C just quits.
+    if session.input_ms.is_some() {
+        CTRL_C_QUITS.store(true, Ordering::SeqCst);
+    }
     if let Some(ms) = session.input_ms {
         eprintln!(
             "transcribing {} ({} of audio)…",
