@@ -390,7 +390,11 @@ fn draw(f: &mut Frame, app: &App, s: &Session) {
     } else if s.source_done.load(Ordering::Relaxed) {
         Span::styled(" INPUT DONE ", Style::new().black().bg(LLM_BLUE))
     } else {
-        Span::styled(" ● REC ", Style::new().white().on_red())
+        if s.live {
+            Span::styled(" ▶ LIVE ", Style::new().black().on_green())
+        } else {
+            Span::styled(" ● REC ", Style::new().white().on_red())
+        }
     };
     let path = s
         .path()

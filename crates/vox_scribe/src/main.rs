@@ -63,6 +63,11 @@ struct Cli {
     /// Transcribe an audio file (wav, flac, mp3, ogg) instead of a device.
     #[arg(short, long)]
     input: Option<PathBuf>,
+    /// With --input: open the TUI and play the file to the speakers,
+    /// transcribing it in real time as if it were coming from the mic.
+    /// `space` pauses both.
+    #[arg(long, requires = "input", conflicts_with = "no_tui")]
+    live: bool,
     /// Markdown output: writes NAME.md (`.md` is added if missing).
     /// Without it (or --record) nothing is saved to disk.
     #[arg(short, long)]
@@ -83,7 +88,8 @@ struct Cli {
     #[arg(long)]
     title: Option<String>,
     /// Print finished paragraphs to stdout instead of the full-screen UI.
-    /// Always the case with --input, which shows brief progress on stderr.
+    /// Always the case with --input (unless --live), which shows brief
+    /// progress on stderr.
     #[arg(long)]
     no_tui: bool,
     /// Directory holding the model bundles (sense-voice/, parakeet-tdt-0.6b-v2/, streaming-zipformer/).
@@ -203,6 +209,8 @@ pub struct Session {
     pub history: Vec<markdown::HistoryBlock>,
     /// Length of a file input, for progress.
     pub input_ms: Option<u64>,
+    /// --live: a file playing to the speakers rather than a mic.
+    pub live: bool,
     pump: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -318,8 +326,9 @@ pub struct Outcome {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    // A file is transcribed without the TUI, with brief progress on stderr.
-    let tui_mode = cli.cmd.is_none() && !cli.no_tui && cli.input.is_none();
+    // A file is transcribed without the TUI, with brief progress on
+    // stderr, unless --live plays it through the TUI in real time.
+    let tui_mode = cli.cmd.is_none() && !cli.no_tui && (cli.input.is_none() || cli.live);
     let log_file = init_logging(&cli, tui_mode)?;
 
     match cli.cmd {
@@ -412,7 +421,7 @@ fn main() -> Result<()> {
         _ => None,
     };
     let screen = tui_mode.then(tui::Screen::splash);
-    if cli.input.is_some() {
+    if cli.input.is_some() && !tui_mode {
         eprintln!("loading models…");
     }
 
@@ -555,6 +564,23 @@ fn main() -> Result<()> {
                 };
                 (capture, std::thread::spawn(move || live.run()))
             }
+            Source::File(samples) if cli.live => {
+                let out = vox_audio::playback::Output::open().context("open audio output")?;
+                info!(device = %out.device, rate = out.sample_rate, "playing the input live");
+                let player = LivePlayer {
+                    samples,
+                    rate,
+                    out,
+                    feed,
+                    paused,
+                    stop,
+                };
+                let pump = std::thread::spawn(move || {
+                    player.run();
+                    done.store(true, Ordering::SeqCst);
+                });
+                (Arc::new(Mutex::new(None)), pump)
+            }
             Source::File(samples) => {
                 let pump = std::thread::spawn(move || {
                     for chunk in samples.chunks((rate as usize / 50).max(1)) {
@@ -598,6 +624,7 @@ fn main() -> Result<()> {
         capture,
         history,
         input_ms,
+        live: cli.live,
         pump: Some(pump),
     };
     let mut outcome = match screen {
@@ -707,6 +734,76 @@ impl Feed {
                 tracing::error!("finishing the recording failed: {e:#}");
             }
         }
+    }
+}
+
+/// --live: plays a file to the speakers and feeds the engine each sample
+/// as it is heard, so transcription runs in real time like a mic. While
+/// paused, playback and feeding both stop, so times stay in file time.
+struct LivePlayer {
+    samples: Vec<f32>,
+    rate: u32,
+    out: vox_audio::playback::Output,
+    feed: Feed,
+    paused: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+}
+
+impl LivePlayer {
+    fn run(mut self) {
+        let len = self.samples.len();
+        let out_rate = self.out.sample_rate.max(1) as u64;
+        let mut resampler = vox_audio::resample::Linear::new(self.rate, self.out.sample_rate);
+        let chunk = (self.rate as usize / 50).max(1);
+        // Input samples handed to the output, and to the engine.
+        let (mut queued, mut fed) = (0usize, 0usize);
+        let mut pending: Vec<f32> = Vec::new();
+        let mut was_paused = false;
+        while !self.stop.load(Ordering::Relaxed) {
+            let paused = self.paused.load(Ordering::Relaxed);
+            if paused != was_paused {
+                self.out.set_paused(paused);
+                was_paused = paused;
+            }
+            // Keep the output ring topped up.
+            while self.out.free() > 0 {
+                if pending.is_empty() {
+                    if queued >= len {
+                        break;
+                    }
+                    let end = (queued + chunk).min(len);
+                    resampler.process(&self.samples[queued..end], &mut pending);
+                    queued = end;
+                }
+                let n = self.out.push(&pending);
+                pending.drain(..n);
+                if n == 0 {
+                    break;
+                }
+            }
+            // Feed the engine what has been played. Once everything has
+            // drained, the resampler's tail rounding no longer matters.
+            let drained = queued >= len && pending.is_empty() && self.out.queued() == 0;
+            let heard = if drained {
+                len
+            } else {
+                ((self.out.played() * self.rate as u64 / out_rate) as usize).min(len)
+            };
+            if heard > fed {
+                self.feed.push(&self.samples[fed..heard]);
+                fed = heard;
+            }
+            if fed >= len {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // No silence follows the end of a file to close its last
+        // utterance, so close it now rather than at quit.
+        if fed >= len {
+            self.feed.pusher.break_paragraph();
+        }
+        self.feed.finish();
     }
 }
 
@@ -992,7 +1089,7 @@ fn list_devices() -> Result<()> {
 fn init_logging(cli: &Cli, tui_mode: bool) -> Result<Option<std::fs::File>> {
     use tracing_subscriber::EnvFilter;
     // A file input prints its own brief progress; keep logs to warnings.
-    let quiet = cli.input.is_some() && cli.log.is_none();
+    let quiet = cli.input.is_some() && !cli.live && cli.log.is_none();
     let filter = EnvFilter::try_from_env("VOX_SCRIBE_LOG").unwrap_or_else(|_| {
         EnvFilter::new(if quiet {
             "warn"

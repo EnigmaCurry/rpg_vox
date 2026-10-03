@@ -70,6 +70,10 @@ Other options:
 * `--input FILE`: transcribe a wav/flac/mp3/ogg file. No TUI: brief
   progress goes to stderr, and the paragraphs to stdout unless `-o` / `-r`
   are writing them to files.
+* `--live` (with `--input`): open the TUI instead and play the file to
+  the speakers, transcribing it in real time as if it came from the mic.
+  `space` pauses both; times stay in file time. No seeking (that is what
+  `--play` is for).
 * `--append`: add to an existing output file, after a `---` rule and a new
   date line. The TUI shows the file's previous content in grey above the
   new session. Without `--append`, an existing file is an error.
