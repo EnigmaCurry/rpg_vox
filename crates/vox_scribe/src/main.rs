@@ -83,6 +83,7 @@ struct Cli {
     #[arg(long)]
     title: Option<String>,
     /// Print finished paragraphs to stdout instead of the full-screen UI.
+    /// Always the case with --input, which shows brief progress on stderr.
     #[arg(long)]
     no_tui: bool,
     /// Directory holding the model bundles (sense-voice/, parakeet-tdt-0.6b-v2/, streaming-zipformer/).
@@ -200,6 +201,8 @@ pub struct Session {
     pub capture: Arc<Mutex<Option<Capture>>>,
     /// Tail of the existing file when appending, shown greyed out.
     pub history: Vec<markdown::HistoryBlock>,
+    /// Length of a file input, for progress.
+    pub input_ms: Option<u64>,
     pump: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -315,7 +318,8 @@ pub struct Outcome {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let tui_mode = cli.cmd.is_none() && !cli.no_tui;
+    // A file is transcribed without the TUI, with brief progress on stderr.
+    let tui_mode = cli.cmd.is_none() && !cli.no_tui && cli.input.is_none();
     let log_file = init_logging(&cli, tui_mode)?;
 
     match cli.cmd {
@@ -408,6 +412,9 @@ fn main() -> Result<()> {
         _ => None,
     };
     let screen = tui_mode.then(tui::Screen::splash);
+    if cli.input.is_some() {
+        eprintln!("loading models…");
+    }
 
     // Open the mic before loading models so speech during the load is
     // buffered (the capture queue holds ~10 s) rather than lost.
@@ -446,6 +453,10 @@ fn main() -> Result<()> {
     };
     // What the final diarization pass reads and rewrites, if it runs:
     // only when there are files to rewrite and the audio is at hand.
+    let input_ms = match &source {
+        Source::File(s) => Some(s.len() as u64 * 1000 / rate.max(1) as u64),
+        Source::Live(_) => None,
+    };
     let final_pass = match (&speaker_models, &source, &record) {
         (None, _, _) => None,
         (Some(_), Source::File(s), _) if record.is_some() || output.is_some() => {
@@ -586,6 +597,7 @@ fn main() -> Result<()> {
         source_done,
         capture,
         history,
+        input_ms,
         pump: Some(pump),
     };
     let mut outcome = match screen {
@@ -615,10 +627,10 @@ fn main() -> Result<()> {
                         .collect();
                     who.sort_unstable();
                     who.dedup();
-                    println!("diarized: {} speaker(s)", who.len());
+                    eprintln!("diarized: {} speaker(s)", who.len());
                     outcome.transcript = t;
                 }
-                Ok(None) => println!("diarization skipped; files keep the live speaker labels"),
+                Ok(None) => eprintln!("diarization skipped; files keep the live speaker labels"),
                 Err(e) => {
                     eprintln!("diarization failed, files keep the live speaker labels: {e:#}")
                 }
@@ -629,13 +641,13 @@ fn main() -> Result<()> {
         copy_transcript(&outcome);
     }
     if let Some(path) = &outcome.path {
-        println!("saved {}", path.display());
+        eprintln!("saved {}", path.display());
     }
     if let Some(r) = &record {
         for p in [&r.srt, &r.ass, &r.opus] {
-            println!("saved {}", p.display());
+            eprintln!("saved {}", p.display());
         }
-        println!(
+        eprintln!(
             "play it back with: scribe --play {}",
             r.md.with_extension("").display()
         );
@@ -804,6 +816,21 @@ fn headless(session: Session) -> Result<Outcome> {
         });
     }
     let events = session.engine.events().clone();
+    let started = std::time::Instant::now();
+    if let Some(ms) = session.input_ms {
+        eprintln!(
+            "transcribing {} ({} of audio)…",
+            session.device,
+            timestamp(ms)
+        );
+    }
+    // A file transcribed into files keeps stdout quiet; otherwise the
+    // paragraphs are the output.
+    let has_files =
+        session.path().is_some() || !session.subtitles.lock().expect("subtitles lock").is_empty();
+    let into_files = session.input_ms.is_some() && has_files;
+    let to_stdout = !session.once && !into_files;
+    let mut progress = Progress::new(session.input_ms);
     let mut printed = HashSet::new();
     let print = |p: &vox_transcribe::Paragraph, printed: &mut HashSet<String>| {
         if !p.text.trim().is_empty() && printed.insert(p.id.clone()) {
@@ -820,31 +847,89 @@ fn headless(session: Session) -> Result<Outcome> {
         && !session.finish_requested.load(Ordering::SeqCst)
         && !session.source_done.load(Ordering::SeqCst)
     {
-        if let Ok(Event::Paragraph {
-            paragraph,
-            change: Change::Hardened,
-        }) = events.recv_timeout(Duration::from_millis(100))
+        if let Ok(Event::Paragraph { paragraph, change }) =
+            events.recv_timeout(Duration::from_millis(100))
         {
-            if !session.once {
-                print(&paragraph, &mut printed);
+            progress.update(&paragraph);
+            if change == Change::Hardened {
+                if to_stdout {
+                    print(&paragraph, &mut printed);
+                }
+                session.write(&paragraph)?;
             }
-            session.write(&paragraph)?;
         }
     }
-    let once = session.once;
     let confirmed = !interrupted.load(Ordering::SeqCst);
     let path = session.path();
-    let t = session.finish()?;
-    if !once {
+    let input = session.input_ms.is_some();
+    // A file is fed faster than pass 2 keeps up, so most of the work is
+    // still queued here; keep reporting progress while it drains.
+    let t = std::thread::scope(|sc| {
+        let finishing = sc.spawn(move || session.finish());
+        while !finishing.is_finished() {
+            if let Ok(Event::Paragraph { paragraph, .. }) =
+                events.recv_timeout(Duration::from_millis(100))
+            {
+                progress.update(&paragraph);
+            }
+        }
+        finishing
+            .join()
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("finishing the session panicked")))
+    })?;
+    if to_stdout {
         for p in &t.paragraphs {
             print(p, &mut printed);
         }
+    }
+    if input {
+        let n = t
+            .paragraphs
+            .iter()
+            .filter(|p| !p.text.trim().is_empty())
+            .count();
+        eprintln!(
+            "transcribed {n} paragraph(s) in {:.1} s",
+            started.elapsed().as_secs_f32()
+        );
     }
     Ok(Outcome {
         transcript: t,
         path,
         confirmed,
     })
+}
+
+/// File input: prints how much of the audio has been transcribed (pass 2
+/// done), in 10% steps, to stderr.
+struct Progress {
+    len_ms: Option<u64>,
+    next_tenth: u64,
+}
+
+impl Progress {
+    fn new(len_ms: Option<u64>) -> Self {
+        Self {
+            len_ms: len_ms.filter(|&l| l > 0),
+            next_tenth: 1,
+        }
+    }
+
+    fn update(&mut self, p: &vox_transcribe::Paragraph) {
+        let Some(len) = self.len_ms else { return };
+        let done = p
+            .clips
+            .iter()
+            .filter(|c| !c.is_partial())
+            .map(|c| c.end_ms())
+            .max()
+            .unwrap_or(0);
+        let tenths = (done * 10 / len).min(9);
+        if tenths >= self.next_tenth {
+            eprintln!("  {}0%", tenths);
+            self.next_tenth = tenths + 1;
+        }
+    }
 }
 
 /// Build the pass-4 corrector when `--llm` is given.
@@ -906,8 +991,14 @@ fn list_devices() -> Result<()> {
 /// Returns the log file in TUI mode, for redirecting fd 2 into it.
 fn init_logging(cli: &Cli, tui_mode: bool) -> Result<Option<std::fs::File>> {
     use tracing_subscriber::EnvFilter;
+    // A file input prints its own brief progress; keep logs to warnings.
+    let quiet = cli.input.is_some() && cli.log.is_none();
     let filter = EnvFilter::try_from_env("VOX_SCRIBE_LOG").unwrap_or_else(|_| {
-        EnvFilter::new("warn,scribe=info,vox_transcribe=info,vox_audio=info")
+        EnvFilter::new(if quiet {
+            "warn"
+        } else {
+            "warn,scribe=info,vox_transcribe=info,vox_audio=info"
+        })
     });
     let log_path = cli
         .log

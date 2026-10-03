@@ -67,7 +67,9 @@ Other options:
 * `--virtual-sink` (Linux): register a `vox_scribe` PipeWire sink and
   transcribe whatever apps play into it. On macOS use `--app`, or a
   loopback device such as BlackHole with `--device`.
-* `--input FILE`: transcribe a wav/flac/mp3/ogg file.
+* `--input FILE`: transcribe a wav/flac/mp3/ogg file. No TUI: brief
+  progress goes to stderr, and the paragraphs to stdout unless `-o` / `-r`
+  are writing them to files.
 * `--append`: add to an existing output file, after a `---` rule and a new
   date line. The TUI shows the file's previous content in grey above the
   new session. Without `--append`, an existing file is an error.
