@@ -42,8 +42,8 @@ other players, e.g. `mpv --sub-file=NAME.ass video.mp4`.
 
 `-p NAME` (`--play`) plays a recording back in the terminal: the audio
 with the subtitles printed as they are spoken, the current word lit up.
-`space` pauses, `←` `→` jump to the previous / next word, `home`
-restarts, `q` quits. `/` searches like `less`: type a pattern
+`space` pauses, `←` `→` jump to the previous / next word, `↑` `↓` to
+the previous / next line (subtitle cue), `home` restarts, `q` quits. `/` searches like `less`: type a pattern
 (case-insensitive, may span words) and `enter` to jump to the next
 match, then `n` / `p` (or `N`) for the next / previous match, wrapping
 at the ends; matches are underlined and `esc` clears them.

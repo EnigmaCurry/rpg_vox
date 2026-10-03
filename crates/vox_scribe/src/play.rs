@@ -19,8 +19,8 @@ use crate::markdown::timestamp;
 use crate::tui::Screen;
 use crate::RecordPaths;
 
-/// `←` within this long of a word's start goes to the word before it,
-/// so repeated presses keep stepping back while audio plays.
+/// `←` (`↑`) within this long of a word's (line's) start goes to the one
+/// before it, so repeated presses keep stepping back while audio plays.
 const BACK_GRACE_MS: u64 = 300;
 const FRAME: Duration = Duration::from_millis(33);
 const GUTTER: usize = 11; // "[hh:mm:ss] "
@@ -231,6 +231,7 @@ pub fn run(paths: &RecordPaths) -> Result<()> {
         .with_context(|| format!("read {}", paths.ass.display()))?;
     let cues = parse_ass(&ass);
     let starts = word_starts(&cues);
+    let line_starts: Vec<u64> = cues.iter().map(|c| c.start_ms).collect();
     let words: Vec<&KWord> = cues.iter().flat_map(|c| c.words.iter()).collect();
     let mut search = Search::default();
     let file = OpusFile::open(&paths.opus)?;
@@ -319,9 +320,15 @@ pub fn run(paths: &RecordPaths) -> Result<()> {
                     player.set_paused(!player.paused);
                 }
             }
-            KeyCode::Left => player.seek(prev_word(&starts, pos))?,
+            KeyCode::Left => player.seek(prev_start(&starts, pos))?,
             KeyCode::Right => {
-                if let Some(t) = next_word(&starts, pos) {
+                if let Some(t) = next_start(&starts, pos) {
+                    player.seek(t)?;
+                }
+            }
+            KeyCode::Up => player.seek(prev_start(&line_starts, pos))?,
+            KeyCode::Down => {
+                if let Some(t) = next_start(&line_starts, pos) {
                     player.seek(t)?;
                 }
             }
@@ -446,14 +453,14 @@ fn word_starts(cues: &[Cue]) -> Vec<u64> {
     s
 }
 
-/// Start of the first word after `pos`.
-fn next_word(starts: &[u64], pos: u64) -> Option<u64> {
+/// First of `starts` (word or line starts, ascending) after `pos`.
+fn next_start(starts: &[u64], pos: u64) -> Option<u64> {
     starts.get(starts.partition_point(|&s| s <= pos)).copied()
 }
 
-/// Start of the word being spoken at `pos`, or of the one before it
-/// when `pos` is just past a word's start (0 before the first word).
-fn prev_word(starts: &[u64], pos: u64) -> u64 {
+/// Start of the word (line) playing at `pos`, or of the one before it
+/// when `pos` is just past its start (0 before the first).
+fn prev_start(starts: &[u64], pos: u64) -> u64 {
     let Some(cur) = starts.partition_point(|&s| s <= pos).checked_sub(1) else {
         return 0;
     };
@@ -559,7 +566,7 @@ fn draw(f: &mut Frame, name: &str, cues: &[Cue], player: &Player, search: &Searc
             Span::raw("  n next · p previous · esc clear").dark_gray(),
         ])
     } else {
-        Line::from(" space pause · ←/→ previous/next word · / search · home restart · q quit")
+        Line::from(" space pause · ←/→ word · ↑/↓ line · / search · home restart · q quit")
             .dark_gray()
     };
     f.render_widget(footer, keys);
@@ -619,17 +626,17 @@ mod tests {
     #[test]
     fn steps_between_words() {
         let starts = [1000, 1500, 4000];
-        assert_eq!(next_word(&starts, 0), Some(1000));
-        assert_eq!(next_word(&starts, 1000), Some(1500));
-        assert_eq!(next_word(&starts, 2000), Some(4000));
-        assert_eq!(next_word(&starts, 4000), None);
+        assert_eq!(next_start(&starts, 0), Some(1000));
+        assert_eq!(next_start(&starts, 1000), Some(1500));
+        assert_eq!(next_start(&starts, 2000), Some(4000));
+        assert_eq!(next_start(&starts, 4000), None);
         // Mid-word: back to that word's start.
-        assert_eq!(prev_word(&starts, 3000), 1500);
+        assert_eq!(prev_start(&starts, 3000), 1500);
         // Just after a start: the word before.
-        assert_eq!(prev_word(&starts, 1600), 1000);
-        assert_eq!(prev_word(&starts, 1100), 0);
+        assert_eq!(prev_start(&starts, 1600), 1000);
+        assert_eq!(prev_start(&starts, 1100), 0);
         // Close-together words: only the current one is skipped.
-        assert_eq!(prev_word(&[0, 160, 560, 800], 800), 560);
+        assert_eq!(prev_start(&[0, 160, 560, 800], 800), 560);
     }
 
     #[test]
