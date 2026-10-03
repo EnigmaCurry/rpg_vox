@@ -23,10 +23,34 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::sync::OnceLock;
+
+/// The terminal's stderr from before [`install`] or [`redirect_to`]
+/// swapped fd 2, for output that must reach the user directly: progress
+/// bars redrawn with `\r` (the filter forwards whole lines only), or
+/// status lines printed while fd 2 points at a log file.
+static CONSOLE: OnceLock<std::fs::File> = OnceLock::new();
+
+/// A handle on the original stderr, if fd 2 has been swapped.
+pub fn console() -> Option<std::fs::File> {
+    CONSOLE.get().and_then(|f| f.try_clone().ok())
+}
+
+/// Remember a dup of the current fd 2 as [`console`] (first call wins).
+fn save_console() {
+    // SAFETY: dup of the well-known stderr fd; the new fd is ours.
+    unsafe {
+        let fd = libc::dup(libc::STDERR_FILENO);
+        if fd >= 0 && CONSOLE.set(std::fs::File::from_raw_fd(fd)).is_err() {
+            libc::close(fd);
+        }
+    }
+}
 
 /// Install the filter. Returns whether the *original* stderr was a TTY,
 /// so callers configuring loggers can still enable ANSI colors.
 pub fn install() -> bool {
+    save_console();
     // SAFETY: syscalls guarded by return-value checks; we only touch fds
     // we just created or just duplicated.
     unsafe {
@@ -65,6 +89,7 @@ pub fn install() -> bool {
 /// TUI uses this so C++ log lines can't scribble over the display, then
 /// restores the terminal so later errors are visible.
 pub fn redirect_to(file: &std::fs::File) -> std::io::Result<RestoreStderr> {
+    save_console();
     // SAFETY: dup/dup2 on fds we own or the well-known stderr fd.
     unsafe {
         let saved = libc::dup(libc::STDERR_FILENO);

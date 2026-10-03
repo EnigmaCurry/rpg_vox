@@ -13,6 +13,7 @@ mod models;
 #[cfg(unix)]
 mod once;
 mod play;
+mod progress;
 mod speakers;
 mod subtitles;
 mod tui;
@@ -422,7 +423,7 @@ fn main() -> Result<()> {
     };
     let screen = tui_mode.then(tui::Screen::splash);
     if cli.input.is_some() && !tui_mode {
-        eprintln!("loading models…");
+        say!("loading models…");
     }
 
     // Open the mic before loading models so speech during the load is
@@ -654,12 +655,12 @@ fn main() -> Result<()> {
                         .collect();
                     who.sort_unstable();
                     who.dedup();
-                    eprintln!("diarized: {} speaker(s)", who.len());
+                    say!("diarized: {} speaker(s)", who.len());
                     outcome.transcript = t;
                 }
-                Ok(None) => eprintln!("diarization skipped; files keep the live speaker labels"),
+                Ok(None) => say!("diarization skipped; files keep the live speaker labels"),
                 Err(e) => {
-                    eprintln!("diarization failed, files keep the live speaker labels: {e:#}")
+                    say!("diarization failed, files keep the live speaker labels: {e:#}")
                 }
             }
         }
@@ -668,13 +669,13 @@ fn main() -> Result<()> {
         copy_transcript(&outcome);
     }
     if let Some(path) = &outcome.path {
-        eprintln!("saved {}", path.display());
+        say!("saved {}", path.display());
     }
     if let Some(r) = &record {
         for p in [&r.srt, &r.ass, &r.opus] {
-            eprintln!("saved {}", p.display());
+            say!("saved {}", p.display());
         }
-        eprintln!(
+        say!(
             "play it back with: scribe --play {}",
             r.md.with_extension("").display()
         );
@@ -685,7 +686,7 @@ fn main() -> Result<()> {
 /// --once: print the finished text and put it on the clipboard.
 fn copy_transcript(outcome: &Outcome) {
     if !outcome.confirmed {
-        eprintln!("cancelled, nothing copied");
+        say!("cancelled, nothing copied");
         return;
     }
     let text = outcome
@@ -697,14 +698,14 @@ fn copy_transcript(outcome: &Outcome) {
         .collect::<Vec<_>>()
         .join("\n\n");
     if text.is_empty() {
-        eprintln!("nothing transcribed, clipboard unchanged");
+        say!("nothing transcribed, clipboard unchanged");
         return;
     }
     println!("{text}");
     let words = text.split_whitespace().count();
     match clipboard::copy(&text) {
-        Ok(how) => eprintln!("copied {words} words ({how})"),
-        Err(e) => eprintln!("copy failed: {e}"),
+        Ok(how) => say!("copied {words} words ({how})"),
+        Err(e) => say!("copy failed: {e}"),
     }
 }
 
@@ -906,7 +907,7 @@ fn headless(session: Session) -> Result<Outcome> {
             // or any press when there is nothing graceful to do (a file
             // input, diarizing), quits.
             if CTRL_C_QUITS.load(Ordering::SeqCst) || i.swap(true, Ordering::SeqCst) {
-                eprintln!("\ninterrupted; files keep what was saved so far");
+                say!("interrupted; files keep what was saved so far");
                 std::process::exit(130);
             }
         })
@@ -932,7 +933,7 @@ fn headless(session: Session) -> Result<Outcome> {
         CTRL_C_QUITS.store(true, Ordering::SeqCst);
     }
     if let Some(ms) = session.input_ms {
-        eprintln!(
+        say!(
             "transcribing {} ({} of audio)…",
             session.device,
             timestamp(ms)
@@ -944,7 +945,7 @@ fn headless(session: Session) -> Result<Outcome> {
         session.path().is_some() || !session.subtitles.lock().expect("subtitles lock").is_empty();
     let into_files = session.input_ms.is_some() && has_files;
     let to_stdout = !session.once && !into_files;
-    let mut progress = Progress::new(session.input_ms);
+    let mut progress = progress::Progress::new(session.input_ms);
     let mut printed = HashSet::new();
     let print = |p: &vox_transcribe::Paragraph, printed: &mut HashSet<String>| {
         if !p.text.trim().is_empty() && printed.insert(p.id.clone()) {
@@ -967,11 +968,13 @@ fn headless(session: Session) -> Result<Outcome> {
             progress.update(&paragraph);
             if change == Change::Hardened {
                 if to_stdout {
+                    progress.clear();
                     print(&paragraph, &mut printed);
                 }
                 session.write(&paragraph)?;
             }
         }
+        progress.tick();
     }
     let confirmed = !interrupted.load(Ordering::SeqCst);
     let path = session.path();
@@ -986,7 +989,9 @@ fn headless(session: Session) -> Result<Outcome> {
             {
                 progress.update(&paragraph);
             }
+            progress.tick();
         }
+        progress.clear();
         finishing
             .join()
             .unwrap_or_else(|_| Err(anyhow::anyhow!("finishing the session panicked")))
@@ -1002,7 +1007,7 @@ fn headless(session: Session) -> Result<Outcome> {
             .iter()
             .filter(|p| !p.text.trim().is_empty())
             .count();
-        eprintln!(
+        say!(
             "transcribed {n} paragraph(s) in {:.1} s",
             started.elapsed().as_secs_f32()
         );
@@ -1012,38 +1017,6 @@ fn headless(session: Session) -> Result<Outcome> {
         path,
         confirmed,
     })
-}
-
-/// File input: prints how much of the audio has been transcribed (pass 2
-/// done), in 10% steps, to stderr.
-struct Progress {
-    len_ms: Option<u64>,
-    next_tenth: u64,
-}
-
-impl Progress {
-    fn new(len_ms: Option<u64>) -> Self {
-        Self {
-            len_ms: len_ms.filter(|&l| l > 0),
-            next_tenth: 1,
-        }
-    }
-
-    fn update(&mut self, p: &vox_transcribe::Paragraph) {
-        let Some(len) = self.len_ms else { return };
-        let done = p
-            .clips
-            .iter()
-            .filter(|c| !c.is_partial())
-            .map(|c| c.end_ms())
-            .max()
-            .unwrap_or(0);
-        let tenths = (done * 10 / len).min(9);
-        if tenths >= self.next_tenth {
-            eprintln!("  {}0%", tenths);
-            self.next_tenth = tenths + 1;
-        }
-    }
 }
 
 /// Build the pass-4 corrector when `--llm` is given.
