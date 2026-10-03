@@ -1,4 +1,6 @@
-//! Ogg Opus recordings: mono speech at 48 kHz, 20 ms packets.
+//! Ogg Opus recordings: mono speech at 48 kHz, 20 ms packets. Reading
+//! also takes stereo files (any Ogg Opus with the standard channel
+//! mapping), decoded straight to mono.
 //!
 //! [`OpusWriter`] encodes the same samples the transcriber saw, so time
 //! zero of the file is time zero of the transcript. [`OpusFile`] keeps
@@ -156,8 +158,14 @@ impl OpusFile {
                 if !pkt.data.starts_with(b"OpusHead") || pkt.data.len() < 19 {
                     bail!("{} is not an Ogg Opus file", path.display());
                 }
-                if pkt.data[9] != 1 {
-                    bail!("{}: only mono recordings are supported", path.display());
+                // A mono decoder downmixes a stereo stream itself; more
+                // channels need the multistream API.
+                let (channels, mapping) = (pkt.data[9], pkt.data[18]);
+                if !(1..=2).contains(&channels) || mapping != 0 {
+                    bail!(
+                        "{}: only mono and stereo Opus is supported ({channels} channels)",
+                        path.display()
+                    );
                 }
                 pre_skip = Some(u16::from_le_bytes([pkt.data[10], pkt.data[11]]) as i64);
                 continue;

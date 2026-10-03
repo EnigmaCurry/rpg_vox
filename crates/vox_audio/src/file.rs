@@ -1,4 +1,6 @@
-//! Decode an audio file (wav, flac, mp3, ogg/vorbis) to mono f32.
+//! Decode an audio file (wav, flac, mp3, ogg/vorbis, ogg/opus) to mono
+//! f32. Symphonia has no Opus decoder, so Ogg Opus goes through libopus
+//! ([`crate::opus_file`]).
 
 use std::path::Path;
 
@@ -16,7 +18,30 @@ pub struct Decoded {
     pub sample_rate: u32,
 }
 
+/// True when `path` starts with an Ogg page carrying an Opus header.
+fn is_ogg_opus(path: &Path) -> bool {
+    let mut head = [0u8; 64];
+    let n = std::fs::File::open(path)
+        .and_then(|mut f| std::io::Read::read(&mut f, &mut head))
+        .unwrap_or(0);
+    head[..n].starts_with(b"OggS") && head[..n].windows(8).any(|w| w == b"OpusHead")
+}
+
+fn decode_opus(path: &Path) -> Result<Decoded> {
+    let file = crate::opus_file::OpusFile::open(path)?;
+    let mut cursor = file.cursor(0)?;
+    let mut samples = Vec::with_capacity(file.len as usize);
+    while cursor.read(&mut samples)? {}
+    Ok(Decoded {
+        samples,
+        sample_rate: crate::opus_file::RATE,
+    })
+}
+
 pub fn decode(path: &Path) -> Result<Decoded> {
+    if is_ogg_opus(path) {
+        return decode_opus(path);
+    }
     let file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
     let mut hint = Hint::new();
