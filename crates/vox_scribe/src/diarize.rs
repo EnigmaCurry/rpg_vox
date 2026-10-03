@@ -115,16 +115,22 @@ pub fn run(
         crate::CTRL_C_QUITS.store(false, std::sync::atomic::Ordering::SeqCst);
         t
     }?;
+    rewrite(files, &t)?;
+    Ok(Some(t))
+}
+
+/// Replace `files` with renderings of `t` (with the current speaker names).
+pub fn rewrite(files: &Files, t: &Transcript) -> Result<()> {
     if let Some(p) = &files.md {
-        replace(p, &markdown::render(&files.title, &files.subtitle, &t))?;
+        replace(p, &markdown::render(&files.title, &files.subtitle, t))?;
     }
     if let Some(p) = &files.srt {
-        replace(p, &subtitles::render(Format::Srt, &t))?;
+        replace(p, &subtitles::render(Format::Srt, t))?;
     }
     if let Some(p) = &files.ass {
-        replace(p, &subtitles::render(Format::Ass, &t))?;
+        replace(p, &subtitles::render(Format::Ass, t))?;
     }
-    Ok(Some(t))
+    Ok(())
 }
 
 /// Show elapsed time until `job` finishes. `None` if the user skipped

@@ -155,6 +155,17 @@ with a style (colour) per speaker, which `--play` shows. `--append` keeps
 the live labels only.
 
 * `--speakers N`: the number of speakers, when known. Helps both passes.
+* `--speaker-names "Alice,Bob"`: names for the speakers in the order they
+  are first heard (A, B, …), used everywhere "Speaker A" would be.
+
+In the TUI, `n` lists the speakers (those heard so far, or A… up to
+`--speakers N`): `↑`/`↓` select, `enter` types a new name, `del`
+restores "Speaker A", `esc` closes. Renaming applies straight away on
+screen; files already written get the new names when the session ends.
+Names go into the ASS Name field, so `--play` shows them too. Names
+follow letters, and the final pass letters speakers by first appearance
+like the live pass, so a name can land on a different voice when the
+live labels were wrong.
 * `--speaker-threshold X` (default 0.7): how alike a voice must be to a
   known speaker to join them live. Raise it if two people share a label,
   lower it if one person is split in two.

@@ -233,9 +233,10 @@ pub fn ass(c: &Cue) -> String {
     ass_for(c, None)
 }
 
-/// Like [`ass`], for a cue spoken by `speaker` ("A", "B", …): the line's
-/// Name is "Speaker A" and its style that speaker's colour.
-pub fn ass_for(c: &Cue, speaker: Option<&str>) -> String {
+/// Like [`ass`], for a cue spoken by `speaker`: its label ("A", "B", …),
+/// which picks the line's style (colour), and the name shown for it
+/// ("Speaker A", or one the user gave), which goes in the Name field.
+pub fn ass_for(c: &Cue, speaker: Option<(&str, &str)>) -> String {
     let cs = |ms: u64| (ms + 5) / 10;
     let first_line_words = c
         .text
@@ -258,10 +259,10 @@ pub fn ass_for(c: &Cue, speaker: Option<&str>) -> String {
         out.push_str(&format!("{{\\k{}}}{}", end - start, ass_escape(&w.text)));
         at = end;
     }
-    let (style, name) = match speaker.and_then(|s| crate::speaker::index(s).map(|i| (i, s))) {
-        Some((i, s)) => (
+    let (style, name) = match speaker.and_then(|(l, n)| crate::speaker::index(l).map(|i| (i, n))) {
+        Some((i, n)) => (
             format!("S{}", i % SPEAKER_STYLES + 1),
-            format!("Speaker {s}"),
+            n.replace(',', " "),
         ),
         None => ("Default".to_string(), String::new()),
     };

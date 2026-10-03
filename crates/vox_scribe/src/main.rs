@@ -143,6 +143,11 @@ struct Cli {
     /// the live labels use it.
     #[arg(long, requires = "diarize", default_value_t = ClusterConfig::default().threshold)]
     speaker_threshold: f32,
+    /// With --diarize: names for the speakers in the order they are first
+    /// heard (A, B, …), comma-separated, e.g. "Alice,Bob". Rename them
+    /// any time with `n` in the TUI.
+    #[arg(long, requires = "diarize", value_delimiter = ',')]
+    speaker_names: Vec<String>,
     /// File of names and terms (one per line) to help pass 4 spell them.
     #[arg(long)]
     vocab: Option<PathBuf>,
@@ -212,6 +217,10 @@ pub struct Session {
     pub input_ms: Option<u64>,
     /// --live: a file playing to the speakers rather than a mic.
     pub live: bool,
+    /// --diarize: speakers are labelled (and can be renamed with `n`).
+    pub diarize: bool,
+    /// --speakers N.
+    pub num_speakers: Option<usize>,
     pump: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -446,6 +455,7 @@ fn main() -> Result<()> {
     };
     info!(rate, device = %device, "audio source ready");
     let num_speakers = cli.speakers.map(|n| n as usize);
+    speakers::preset(&cli.speaker_names);
     let speaker_models = cli.diarize.then(|| SpeakerModels {
         num_threads: cli.threads,
         ..SpeakerModels::from_dir(&models_dir.join(models::SPEAKERS))
@@ -626,12 +636,15 @@ fn main() -> Result<()> {
         history,
         input_ms,
         live: cli.live,
+        diarize: cli.diarize,
+        num_speakers,
         pump: Some(pump),
     };
     let mut outcome = match screen {
         Some(screen) => tui::run(screen, session)?,
         None => headless(session)?,
     };
+    let mut rewritten = false;
     if let (Some(audio), Some(models)) = (final_pass, speaker_models) {
         let has_text = outcome
             .transcript
@@ -657,12 +670,24 @@ fn main() -> Result<()> {
                     who.dedup();
                     say!("diarized: {} speaker(s)", who.len());
                     outcome.transcript = t;
+                    rewritten = true;
                 }
                 Ok(None) => say!("diarization skipped; files keep the live speaker labels"),
                 Err(e) => {
                     say!("diarization failed, files keep the live speaker labels: {e:#}")
                 }
             }
+        }
+    }
+    // Speakers renamed during the session: the files were written with
+    // the old names as they went, so write them again.
+    if speakers::renamed() && !rewritten && !cli.append {
+        let files = diarize::Files {
+            md: outcome.path.clone(),
+            ..files
+        };
+        if let Err(e) = diarize::rewrite(&files, &outcome.transcript) {
+            say!("rewriting the files with the new speaker names failed: {e:#}");
         }
     }
     if cli.once {

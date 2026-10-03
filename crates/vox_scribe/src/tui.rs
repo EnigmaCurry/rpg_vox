@@ -47,6 +47,34 @@ struct App {
     show_original: bool,
     /// Filename being typed after `s`.
     prompt: Option<String>,
+    /// The speaker list opened with `n`.
+    names: Option<NamesMenu>,
+}
+
+/// `n`: the speakers heard so far, to rename.
+struct NamesMenu {
+    selected: usize,
+    /// The new name being typed for the selected speaker.
+    editing: Option<String>,
+}
+
+/// Speaker labels in the transcript, plus A… for `--speakers N` (so they
+/// can be named before they're told apart), in order.
+fn speaker_labels(t: &Transcript, s: &Session) -> Vec<String> {
+    let mut labels: Vec<String> = t
+        .paragraphs
+        .iter()
+        .flat_map(|p| {
+            p.clips
+                .iter()
+                .filter_map(|c| c.speaker.clone())
+                .chain(p.speaker.clone())
+        })
+        .chain((0..s.num_speakers.unwrap_or(0)).map(vox_transcribe::speaker::label))
+        .collect();
+    labels.sort_by_key(|l| (vox_transcribe::speaker::index(l), l.clone()));
+    labels.dedup();
+    labels
 }
 
 /// The terminal in TUI mode. Restored on drop, so an error while loading
@@ -144,6 +172,7 @@ fn run_loop(terminal: &mut DefaultTerminal, s: &Session) -> Result<bool> {
         show_original: false,
         status: None,
         prompt: None,
+        names: None,
     };
     let events = s.engine.events().clone();
     loop {
@@ -174,6 +203,13 @@ fn run_loop(terminal: &mut DefaultTerminal, s: &Session) -> Result<bool> {
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        if app.names.is_some() {
+            if ctrl && key.code == KeyCode::Char('c') {
+                return Ok(false);
+            }
+            app.names_key(key.code, s);
+            continue;
+        }
         if let Some(name) = app.prompt.as_mut() {
             match key.code {
                 KeyCode::Char('c') if ctrl => return Ok(false),
@@ -206,6 +242,20 @@ fn run_loop(terminal: &mut DefaultTerminal, s: &Session) -> Result<bool> {
                 } else {
                     "showing LLM-corrected text".into()
                 });
+            }
+            KeyCode::Char('n') if !s.once => {
+                if speaker_labels(&app.transcript, s).is_empty() {
+                    app.set_status(if s.diarize {
+                        "no speakers yet".into()
+                    } else {
+                        "speaker names need --diarize".into()
+                    });
+                } else {
+                    app.names = Some(NamesMenu {
+                        selected: 0,
+                        editing: None,
+                    });
+                }
             }
             KeyCode::Char('m') if !s.once => {
                 let manual = !s.manual.fetch_xor(true, Ordering::SeqCst);
@@ -289,6 +339,55 @@ impl App {
                 self.speaking = speaking;
                 self.position_ms = position_ms;
             }
+        }
+    }
+
+    /// A key while the speaker list is open.
+    fn names_key(&mut self, code: KeyCode, s: &Session) {
+        let labels = speaker_labels(&self.transcript, s);
+        let Some(menu) = self.names.as_mut() else {
+            return;
+        };
+        menu.selected = menu.selected.min(labels.len().saturating_sub(1));
+        let Some(label) = labels.get(menu.selected) else {
+            self.names = None;
+            return;
+        };
+        if let Some(buf) = menu.editing.as_mut() {
+            match code {
+                KeyCode::Enter => {
+                    // Nothing typed: keep the name.
+                    if !buf.trim().is_empty() {
+                        speakers::rename(label, buf);
+                        let msg = format!("{label} is now {}", speakers::name(label));
+                        self.set_status(msg);
+                    }
+                    if let Some(m) = self.names.as_mut() {
+                        m.editing = None;
+                    }
+                }
+                KeyCode::Esc => menu.editing = None,
+                KeyCode::Backspace => {
+                    buf.pop();
+                }
+                KeyCode::Char(c) => buf.push(c),
+                _ => {}
+            }
+            return;
+        }
+        match code {
+            KeyCode::Up | KeyCode::Char('k') => menu.selected = menu.selected.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => {
+                menu.selected = (menu.selected + 1).min(labels.len() - 1)
+            }
+            KeyCode::Enter => menu.editing = Some(String::new()),
+            KeyCode::Delete | KeyCode::Backspace => {
+                speakers::rename(label, "");
+                let msg = format!("{label} is {} again", speakers::name(label));
+                self.set_status(msg);
+            }
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('q') => self.names = None,
+            _ => {}
         }
     }
 
@@ -518,18 +617,80 @@ fn draw(f: &mut Frame, app: &App, s: &Session) {
             Span::styled("▌", Style::new().magenta()),
             "   enter save · esc cancel".dark_gray(),
         ]),
-        None => Line::from(
-            if s.once {
+        None => {
+            let keys = if s.once {
                 " enter finish & copy · shift+enter new paragraph · space pause · q cancel"
             } else if s.llm {
                 " ↑↓ select · y copy · o original · space pause · enter new paragraph · m mode · s save · q quit"
             } else {
                 " ↑↓ select · y copy · space pause · enter new paragraph · m mode · s save · q quit"
-            }
-            .dark_gray(),
-        ),
+            };
+            let names = if s.diarize && !s.once {
+                " · n speakers"
+            } else {
+                ""
+            };
+            Line::from(format!("{keys}{names}").dark_gray())
+        }
     };
     f.render_widget(help, help_line);
+    if let Some(menu) = &app.names {
+        draw_names(f, body, menu, &speaker_labels(&app.transcript, s));
+    }
+}
+
+/// The `n` speaker list, over the transcript.
+fn draw_names(f: &mut Frame, area: ratatui::layout::Rect, menu: &NamesMenu, labels: &[String]) {
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, l) in labels.iter().enumerate() {
+        let sel = i == menu.selected;
+        let mark = if sel { "▶ " } else { "  " };
+        let color = Style::new().fg(speakers::color(l)).bold();
+        let name: Vec<Span> = match (&menu.editing, sel) {
+            (Some(buf), true) if buf.is_empty() => vec![
+                Span::styled("▌", Style::new().magenta()),
+                Span::styled(speakers::name(l), Style::new().dark_gray()),
+            ],
+            (Some(buf), true) => vec![
+                Span::raw(buf.clone()),
+                Span::styled("▌", Style::new().magenta()),
+            ],
+            _ => vec![Span::styled(speakers::name(l), color)],
+        };
+        let mut spans = vec![Span::raw(mark), Span::styled(format!("{l}  "), color)];
+        spans.extend(name);
+        let line = Line::from(spans);
+        lines.push(if sel && menu.editing.is_none() {
+            line.style(Style::new().add_modifier(Modifier::REVERSED))
+        } else {
+            line
+        });
+    }
+    let help = if menu.editing.is_some() {
+        " type a name · enter save · esc cancel "
+    } else {
+        " ↑↓ select · enter rename · del default · esc close "
+    };
+    let w = (lines.iter().map(|l| l.width()).max().unwrap_or(0) + 6)
+        .max(help.chars().count() + 2)
+        .max(30)
+        .min(area.width as usize) as u16;
+    let h = (lines.len() as u16 + 2).min(area.height);
+    let rect = ratatui::layout::Rect {
+        x: area.x + area.width.saturating_sub(w) / 2,
+        y: area.y + area.height.saturating_sub(h) / 2,
+        width: w,
+        height: h,
+    };
+    f.render_widget(ratatui::widgets::Clear, rect);
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .title(" Speakers ")
+                .title_bottom(Line::from(help).dark_gray()),
+        ),
+        rect,
+    );
 }
 
 /// Word-wrap `words` behind a gutter: `label` on the first line, blank
@@ -645,8 +806,11 @@ fn transcript_lines(
         }
         if let Some(s) = &p.speaker {
             let style = Style::new().fg(speakers::color(s)).bold();
-            words.insert(0, (format!("{s}:"), style));
-            words.insert(0, ("Speaker".to_string(), style));
+            let label = crate::play::label_spans(&speakers::name(s), style);
+            words.splice(
+                0..0,
+                label.into_iter().map(|sp| (sp.content.into_owned(), style)),
+            );
         }
         let selected = app.selected.as_deref() == Some(p.id.as_str());
         let gutter_style = match (selected, p.hardened, &p.pass4) {

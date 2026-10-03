@@ -40,8 +40,10 @@ pub struct Cue {
     pub start_ms: u64,
     pub end_ms: u64,
     pub words: Vec<KWord>,
-    /// Speaker label ("A") from a diarized line's Name ("Speaker A").
+    /// Speaker from a diarized line's Name ("Speaker A", or a given name).
     pub speaker: Option<String>,
+    /// That speaker's colour slot, from the line's style (`S1` → 0).
+    pub slot: Option<usize>,
 }
 
 /// `h:mm:ss.cc` to ms.
@@ -130,13 +132,18 @@ pub fn parse_ass(ass: &str) -> Vec<Cue> {
         };
         if !words.is_empty() {
             let name = fields[4].trim();
-            let speaker = (!name.is_empty())
-                .then(|| name.strip_prefix("Speaker ").unwrap_or(name).to_string());
+            let speaker = (!name.is_empty()).then(|| name.to_string());
+            let slot = fields[3]
+                .trim()
+                .strip_prefix('S')
+                .and_then(|n| n.parse::<usize>().ok())
+                .and_then(|n| n.checked_sub(1));
             cues.push(Cue {
                 start_ms: start,
                 end_ms: end,
                 words,
                 speaker,
+                slot,
             });
         }
     }
@@ -550,9 +557,8 @@ fn draw(
             .as_deref()
             .filter(|&s| last_speaker != Some(s))
         {
-            let style = Style::new().fg(speakers::color(s)).bold();
-            spans.push(Span::styled("Speaker", style));
-            spans.push(Span::styled(format!("{s}:"), style));
+            let color = first.slot.map(speakers::color_at).unwrap_or(Color::Gray);
+            spans.extend(label_spans(s, Style::new().fg(color).bold()));
         }
         last_speaker = first.speaker.as_deref();
         spans.extend(cues[block.clone()].iter().flat_map(|c| &c.words).map(|w| {
@@ -625,6 +631,15 @@ fn draw(
             .dark_gray()
     };
     f.render_widget(footer, keys);
+}
+
+/// "Alice Smith:" as one span per word, so it wraps like the text.
+pub fn label_spans(name: &str, style: Style) -> Vec<Span<'static>> {
+    let mut parts: Vec<String> = name.split_whitespace().map(String::from).collect();
+    if let Some(last) = parts.last_mut() {
+        last.push(':');
+    }
+    parts.into_iter().map(|p| Span::styled(p, style)).collect()
 }
 
 /// Word-wrap one cue to `width`, indenting continuation lines under the
@@ -733,6 +748,7 @@ mod tests {
                 end_ms: e,
             }],
             speaker: who.map(String::from),
+            slot: None,
         };
         let cues = [
             cue(0, 1000, "It is a collection", None),
@@ -747,7 +763,9 @@ mod tests {
     #[test]
     fn reads_speaker_from_name() {
         let ass = "Dialogue: 0,0:00:00.00,0:00:02.00,S2,Speaker B,0,0,0,,{\\k20}Hi\n";
-        assert_eq!(parse_ass(ass)[0].speaker.as_deref(), Some("B"));
+        let cue = &parse_ass(ass)[0];
+        assert_eq!(cue.speaker.as_deref(), Some("Speaker B"));
+        assert_eq!(cue.slot, Some(1));
     }
 
     #[test]

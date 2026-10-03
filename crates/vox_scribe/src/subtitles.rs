@@ -121,7 +121,10 @@ fn paragraph_cues(
                 }
                 subtitle::srt(*count, &cue)
             }
-            Format::Ass => subtitle::ass_for(&cue, p.speaker.as_deref()),
+            Format::Ass => {
+                let name = p.speaker.as_deref().map(crate::speakers::name);
+                subtitle::ass_for(&cue, p.speaker.as_deref().zip(name.as_deref()))
+            }
         });
     }
     out
