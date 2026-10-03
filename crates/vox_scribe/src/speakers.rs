@@ -1,5 +1,5 @@
 //! How speaker labels look: "Speaker A", or a name the user gave it
-//! (`--speaker-names`, or `n` in the TUI), in a colour of its own. The
+//! (`--speakers Alice,Bob`, or `n` in the TUI), in a colour of its own. The
 //! colours follow the ASS styles in `vox_transcribe::subtitle`.
 
 use std::collections::HashMap;
@@ -29,7 +29,7 @@ fn names() -> &'static Mutex<HashMap<String, String>> {
 /// Set when a name changes after files may already hold the old one.
 static RENAMED: AtomicBool = AtomicBool::new(false);
 
-/// Name speakers A, B, … in order (`--speaker-names`).
+/// Name speakers A, B, … in order (`--speakers Alice,Bob`).
 pub fn preset(list: &[String]) {
     let mut n = names().lock().expect("names lock");
     for (i, name) in list.iter().enumerate() {

@@ -134,26 +134,52 @@ struct Cli {
     /// speaker models on first use.
     #[arg(long)]
     diarize: bool,
-    /// With --diarize: how many people are speaking, when known.
-    #[arg(long, requires = "diarize", value_parser = clap::value_parser!(u32).range(1..))]
-    speakers: Option<u32>,
+    /// With --diarize: who is speaking, when known. Either how many people
+    /// ("3") or their names in the order they are first heard
+    /// ("Alice,Bob,Carol", which also means 3). The count is exact: every
+    /// voice goes to one of them. Rename speakers any time with `n` in
+    /// the TUI.
+    #[arg(long, requires = "diarize", value_parser = parse_speakers)]
+    speakers: Option<Speakers>,
     /// With --diarize: how alike (cosine similarity, 0–1) an utterance's
     /// voice must be to a known speaker to get their live label; higher
     /// tells similar voices apart but may split one person in two. Only
     /// the live labels use it.
     #[arg(long, requires = "diarize", default_value_t = ClusterConfig::default().threshold)]
     speaker_threshold: f32,
-    /// With --diarize: names for the speakers in the order they are first
-    /// heard (A, B, …), comma-separated, e.g. "Alice,Bob". Rename them
-    /// any time with `n` in the TUI.
-    #[arg(long, requires = "diarize", value_delimiter = ',')]
-    speaker_names: Vec<String>,
     /// File of names and terms (one per line) to help pass 4 spell them.
     #[arg(long)]
     vocab: Option<PathBuf>,
     /// Log file. Default: <tmp>/vox_scribe.log in TUI mode, stderr otherwise.
     #[arg(long)]
     log: Option<PathBuf>,
+}
+
+/// `--speakers`: a count, or names (whose number is the count).
+#[derive(Clone, Debug, PartialEq)]
+struct Speakers {
+    count: usize,
+    names: Vec<String>,
+}
+
+fn parse_speakers(arg: &str) -> Result<Speakers, String> {
+    if let Ok(n) = arg.trim().parse::<usize>() {
+        if n == 0 {
+            return Err("needs at least 1 speaker".into());
+        }
+        return Ok(Speakers {
+            count: n,
+            names: Vec::new(),
+        });
+    }
+    let names: Vec<String> = arg.split(',').map(|n| n.trim().to_string()).collect();
+    if names.iter().any(|n| n.is_empty()) {
+        return Err("expected a number, or names separated by commas (no empty names)".into());
+    }
+    Ok(Speakers {
+        count: names.len(),
+        names,
+    })
 }
 
 impl Cli {
@@ -454,8 +480,10 @@ fn main() -> Result<()> {
         }
     };
     info!(rate, device = %device, "audio source ready");
-    let num_speakers = cli.speakers.map(|n| n as usize);
-    speakers::preset(&cli.speaker_names);
+    let num_speakers = cli.speakers.as_ref().map(|s| s.count);
+    if let Some(s) = &cli.speakers {
+        speakers::preset(&s.names);
+    }
     let speaker_models = cli.diarize.then(|| SpeakerModels {
         num_threads: cli.threads,
         ..SpeakerModels::from_dir(&models_dir.join(models::SPEAKERS))
@@ -1147,5 +1175,32 @@ fn init_logging(cli: &Cli, tui_mode: bool) -> Result<Option<std::fs::File>> {
                 .init();
             Ok(None)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn speakers_take_a_count_or_names() {
+        assert_eq!(
+            parse_speakers("3"),
+            Ok(Speakers {
+                count: 3,
+                names: vec![]
+            })
+        );
+        assert_eq!(
+            parse_speakers(" Alice, Bob ,Carol "),
+            Ok(Speakers {
+                count: 3,
+                names: vec!["Alice".into(), "Bob".into(), "Carol".into()]
+            })
+        );
+        assert_eq!(parse_speakers("Alice").map(|s| s.count), Ok(1));
+        assert!(parse_speakers("0").is_err());
+        assert!(parse_speakers("Alice,,Bob").is_err());
+        assert!(parse_speakers("").is_err());
     }
 }

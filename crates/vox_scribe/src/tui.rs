@@ -58,7 +58,7 @@ struct NamesMenu {
     editing: Option<String>,
 }
 
-/// Speaker labels in the transcript, plus A… for `--speakers N` (so they
+/// Speaker labels in the transcript, plus A… for `--speakers` (so they
 /// can be named before they're told apart), in order.
 fn speaker_labels(t: &Transcript, s: &Session) -> Vec<String> {
     let mut labels: Vec<String> = t

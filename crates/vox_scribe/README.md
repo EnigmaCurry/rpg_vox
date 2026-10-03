@@ -154,12 +154,15 @@ speaker changes, and ASS lines carry the speaker in their Name field
 with a style (colour) per speaker, which `--play` shows. `--append` keeps
 the live labels only.
 
-* `--speakers N`: the number of speakers, when known. Helps both passes.
-* `--speaker-names "Alice,Bob"`: names for the speakers in the order they
-  are first heard (A, B, …), used everywhere "Speaker A" would be.
+* `--speakers N` or `--speakers "Alice,Bob,Carol"`: who is speaking,
+  when known. A number fixes the count; names fix the count to how many
+  there are and name the speakers in the order they are first heard
+  (A, B, …), used everywhere "Speaker A" would be. The count is exact,
+  not a hint: every voice is put with one of them, so leave it out for
+  open-ended sessions where people may come and go.
 
 In the TUI, `n` lists the speakers (those heard so far, or A… up to
-`--speakers N`): `↑`/`↓` select, `enter` types a new name, `del`
+the `--speakers` count): `↑`/`↓` select, `enter` types a new name, `del`
 restores "Speaker A", `esc` closes. Renaming applies straight away on
 screen; files already written get the new names when the session ends.
 Names go into the ASS Name field, so `--play` shows them too. Names
