@@ -147,7 +147,11 @@ struct Cli {
     /// the live labels use it.
     #[arg(long, requires = "diarize", default_value_t = ClusterConfig::default().threshold)]
     speaker_threshold: f32,
-    /// File of names and terms (one per line) to help pass 4 spell them.
+    /// File of names and terms the recognizer can't know (one per line,
+    /// `#` comments). With Parakeet, decoding is biased toward them, and
+    /// a term is only kept where an unbiased decode heard something that
+    /// sounds like it; with --llm, pass 4 also gets the list. Costs some
+    /// speed (beam search), more where the names come up.
     #[arg(long)]
     vocab: Option<PathBuf>,
     /// Log file. Default: <tmp>/vox_scribe.log in TUI mode, stderr otherwise.
@@ -431,6 +435,20 @@ fn main() -> Result<()> {
         );
     }
     let corrector = llm_corrector(&cli)?;
+    let vocab = match &cli.vocab {
+        Some(path) => {
+            let v = vox_transcribe::vocab::Vocab::parse(
+                &std::fs::read_to_string(path)
+                    .with_context(|| format!("read {}", path.display()))?,
+            );
+            (!v.is_empty()).then_some(v)
+        }
+        None => None,
+    };
+    if vocab.is_some() && cli.model == models::Offline::SenseVoice {
+        eprintln!("--vocab: SenseVoice can't be biased toward words; only --llm uses the list");
+    }
+
     let llm = corrector.is_some();
 
     let models_dir = models::resolve(cli.models_dir.as_deref());
@@ -532,10 +550,27 @@ fn main() -> Result<()> {
         models::Offline::Parakeet => {
             let mut pc = ParakeetConfig::from_dir(&models_dir.join(models::PARAKEET));
             pc.num_threads = cli.threads;
-            Arc::new(
+            let plain: Arc<dyn vox_transcribe::OfflineRecognizer> = Arc::new(
                 Parakeet::open(&pc)
                     .with_context(|| format!("loading Parakeet from {}", models_dir.display()))?,
-            )
+            );
+            match &vocab {
+                Some(v) => {
+                    let biased = Parakeet::open_biased(
+                        &pc,
+                        &v.terms,
+                        vox_transcribe::vocab::HOTWORD_SCORE,
+                        vox_transcribe::vocab::BEAM,
+                    )?;
+                    Arc::new(vox_transcribe::vocab::VocabRecognizer {
+                        biased: Arc::new(biased),
+                        plain,
+                        vocab: v.clone(),
+                        min_similarity: vox_transcribe::vocab::MIN_SIMILARITY,
+                    })
+                }
+                None => plain,
+            }
         }
     };
     let streaming: Option<Box<dyn StreamingRecognizer>> =

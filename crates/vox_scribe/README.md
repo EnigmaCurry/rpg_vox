@@ -132,6 +132,26 @@ blue while it waits for the LLM, and `o` toggles the text from before pass 4.
 Without `--llm`, pass 3 is the final pass and paragraphs are written as
 soon as they settle.
 
+## Vocabulary (optional)
+
+`--vocab FILE` lists names and terms the recognizer can't know (one per
+line, `#` for comments), e.g. the places and characters of a campaign.
+With Parakeet, decoding is biased toward them (sherpa-onnx hotwords with
+beam search). Biasing on its own invents names in ordinary speech, so a
+term is only kept where an unbiased decode of the same audio heard
+something that sounds like it ("Icemark" → "Ismark", "Valaki" →
+"Vallaki"); everywhere else the unbiased words stand. The unbiased
+decode only runs when the biased one produced a term. It costs roughly
+20% more decoding time, more where the names come up. With `--llm`,
+pass 4 gets the list too.
+
+On synthetic test dialogue it got 13 of 20 made-up names right (3
+without it) and invented none in sound-alike sentences, with one
+exception: a homophone spelling of a listed name ("Tatiana" for listed
+"Tatyana") becomes the listed one, since only context could tell them
+apart. Names it still misses come out as before (e.g. "Irena" for
+"Ireena").
+
 ## Speakers (optional)
 
 Pass `--diarize` to label who is speaking. Two passes:

@@ -125,6 +125,61 @@ impl Parakeet {
         info!(encoder = %cfg.encoder.display(), "Parakeet loaded");
         Ok(Self { inner })
     }
+
+    /// Parakeet with beam search biased toward `terms` (sherpa-onnx
+    /// hotwords): `score` is the boost per matched token, `beam` the
+    /// number of active paths. See [`crate::vocab`] for keeping its
+    /// false positives out.
+    pub fn open_biased(
+        cfg: &ParakeetConfig,
+        terms: &[String],
+        score: f32,
+        beam: i32,
+    ) -> Result<Self> {
+        let mut config = OfflineRecognizerConfig::default();
+        config.model_config.transducer = OfflineTransducerModelConfig {
+            encoder: Some(require(&cfg.encoder, "Parakeet encoder")?),
+            decoder: Some(require(&cfg.decoder, "Parakeet decoder")?),
+            joiner: Some(require(&cfg.joiner, "Parakeet joiner")?),
+        };
+        let tokens = require(&cfg.tokens, "Parakeet tokens")?;
+        // Hotwords are encoded with a sentencepiece vocabulary, which the
+        // bundle lacks; derive one from tokens.txt. A BPE vocabulary scores
+        // each piece by its merge order (-id), so the encoding matches the
+        // pieces the model itself emits.
+        let dir = std::env::temp_dir().join(format!("vox_scribe-hotwords-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let vocab: String = std::fs::read_to_string(&tokens)
+            .with_context(|| format!("read {tokens}"))?
+            .lines()
+            .filter_map(|l| l.rsplit_once(' '))
+            .map(|(t, id)| format!("{t}\t-{id}\n"))
+            .collect();
+        let bpe = dir.join("bpe.vocab");
+        std::fs::write(&bpe, vocab)?;
+        let hot = dir.join("hotwords.txt");
+        std::fs::write(&hot, terms.join("\n") + "\n")?;
+        config.model_config.tokens = Some(tokens);
+        config.model_config.model_type = Some("nemo_transducer".into());
+        config.model_config.num_threads = cfg.num_threads;
+        config.model_config.modeling_unit = Some("bpe".into());
+        config.model_config.bpe_vocab = Some(bpe.to_string_lossy().into_owned());
+        config.decoding_method = Some("modified_beam_search".into());
+        config.max_active_paths = beam;
+        config.hotwords_file = Some(hot.to_string_lossy().into_owned());
+        config.hotwords_score = score;
+        let inner = sherpa_onnx::OfflineRecognizer::create(&config);
+        // Both files are read at creation.
+        let _ = std::fs::remove_dir_all(&dir);
+        let inner = inner.ok_or_else(|| {
+            anyhow!("sherpa-onnx failed to create the biased Parakeet recognizer")
+        })?;
+        info!(
+            terms = terms.len(),
+            score, beam, "Parakeet with vocabulary loaded"
+        );
+        Ok(Self { inner })
+    }
 }
 
 impl OfflineRecognizer for Parakeet {

@@ -260,10 +260,7 @@ pub fn ass_for(c: &Cue, speaker: Option<(&str, &str)>) -> String {
         at = end;
     }
     let (style, name) = match speaker.and_then(|(l, n)| crate::speaker::index(l).map(|i| (i, n))) {
-        Some((i, n)) => (
-            format!("S{}", i % SPEAKER_STYLES + 1),
-            n.replace(',', " "),
-        ),
+        Some((i, n)) => (format!("S{}", i % SPEAKER_STYLES + 1), n.replace(',', " ")),
         None => ("Default".to_string(), String::new()),
     };
     format!(

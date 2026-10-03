@@ -35,6 +35,7 @@ pub mod stderr;
 pub mod subtitle;
 pub mod timing;
 pub mod vad;
+pub mod vocab;
 
 pub use engine::{Change, Engine, EngineConfig, Event, ParagraphConfig, ParagraphMode, Pusher};
 pub use model::{Clip, Paragraph, Pass4, Stage, Transcript};
