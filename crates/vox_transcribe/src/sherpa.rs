@@ -6,12 +6,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context as _, Result};
+use std::ffi::{c_void, CString};
+
 use sherpa_onnx::{
-    FastClusteringConfig, LinearResampler, OfflineRecognizerConfig, OfflineSenseVoiceModelConfig,
-    OfflineSpeakerDiarizationConfig, OfflineSpeakerSegmentationModelConfig,
-    OfflineSpeakerSegmentationPyannoteModelConfig, OfflineTransducerModelConfig,
-    OnlineRecognizerConfig, OnlineStream, SpeakerEmbeddingExtractorConfig,
+    LinearResampler, OfflineRecognizerConfig, OfflineSenseVoiceModelConfig,
+    OfflineTransducerModelConfig, OnlineRecognizerConfig, OnlineStream,
+    SpeakerEmbeddingExtractorConfig,
 };
+use sherpa_onnx_sys as sys;
 use tracing::info;
 
 use crate::diarize::Segment;
@@ -327,53 +329,147 @@ impl SpeakerTagger for EmbeddingTagger {
 }
 
 /// Full offline diarization: pyannote segmentation, embeddings and
-/// clustering over a whole recording.
+/// clustering over a whole recording. Built on the raw C API so it can
+/// report progress, which the safe wrapper doesn't expose.
 pub struct Diarizer {
-    inner: sherpa_onnx::OfflineSpeakerDiarization,
+    ptr: *const sys::OfflineSpeakerDiarization,
+}
+
+// SAFETY: sherpa-onnx diarizers are safe to use from one thread at a
+// time; `process` takes `&self` but the C call doesn't mutate shared
+// state beyond the object itself, as with the safe wrapper.
+unsafe impl Send for Diarizer {}
+unsafe impl Sync for Diarizer {}
+
+type ProgressCallback = unsafe extern "C" fn(i32, i32, *mut c_void) -> i32;
+
+extern "C" {
+    // In the sherpa-onnx C API since 1.10; missing from sherpa-onnx-sys.
+    fn SherpaOnnxOfflineSpeakerDiarizationProcessWithCallback(
+        sd: *const sys::OfflineSpeakerDiarization,
+        samples: *const f32,
+        n: i32,
+        callback: ProgressCallback,
+        arg: *mut c_void,
+    ) -> *const sys::OfflineSpeakerDiarizationResult;
+}
+
+/// Forwards sherpa's progress to the `&mut dyn FnMut` behind `arg`.
+unsafe extern "C" fn progress_trampoline(done: i32, total: i32, arg: *mut c_void) -> i32 {
+    // SAFETY: `arg` is the `&mut &mut dyn FnMut` passed by `process`,
+    // alive for the duration of the call that invokes us.
+    let f = unsafe { &mut *(arg as *mut &mut dyn FnMut(usize, usize)) };
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        f(done.max(0) as usize, total.max(0) as usize)
+    }));
+    0
 }
 
 impl Diarizer {
     /// `num_speakers` fixes the speaker count when known; otherwise the
     /// clustering threshold decides.
     pub fn open(models: &SpeakerModels, num_speakers: Option<usize>) -> Result<Self> {
-        let config = OfflineSpeakerDiarizationConfig {
-            segmentation: OfflineSpeakerSegmentationModelConfig {
-                pyannote: OfflineSpeakerSegmentationPyannoteModelConfig {
-                    model: Some(require(&models.segmentation, "speaker segmentation model")?),
-                    ..Default::default()
+        let cstr = |s: String| CString::new(s).map_err(|e| anyhow!("model path: {e}"));
+        let seg = cstr(require(&models.segmentation, "speaker segmentation model")?)?;
+        let emb = cstr(require(&models.embedding, "speaker embedding model")?)?;
+        let cpu = cstr("cpu".into())?;
+        // Defaults as in sherpa-onnx's own config.
+        let config = sys::OfflineSpeakerDiarizationConfig {
+            segmentation: sys::OfflineSpeakerSegmentationModelConfig {
+                pyannote: sys::OfflineSpeakerSegmentationPyannoteModelConfig {
+                    model: seg.as_ptr(),
+                    window_shift_ratio: 0.1,
                 },
                 num_threads: models.num_threads,
-                ..Default::default()
+                debug: 0,
+                provider: cpu.as_ptr(),
             },
-            embedding: models.embedding_config()?,
-            clustering: FastClusteringConfig {
+            embedding: sys::SpeakerEmbeddingExtractorConfig {
+                model: emb.as_ptr(),
+                num_threads: models.num_threads,
+                debug: 0,
+                provider: cpu.as_ptr(),
+            },
+            clustering: sys::FastClusteringConfig {
                 num_clusters: num_speakers.map(|n| n as i32).unwrap_or(-1),
-                ..Default::default()
+                threshold: 0.5,
+                compute_confidence: 0,
             },
-            ..Default::default()
+            min_duration_on: 0.3,
+            min_duration_off: 0.5,
         };
-        let inner = sherpa_onnx::OfflineSpeakerDiarization::create(&config)
-            .ok_or_else(|| anyhow!("sherpa-onnx failed to create the speaker diarizer"))?;
-        Ok(Self { inner })
+        // SAFETY: `config` and the strings it points at outlive the call.
+        let ptr = unsafe { sys::SherpaOnnxCreateOfflineSpeakerDiarization(&config) };
+        if ptr.is_null() {
+            return Err(anyhow!("sherpa-onnx failed to create the speaker diarizer"));
+        }
+        Ok(Self { ptr })
     }
 
     /// Speaker turns in `samples` (mono at `sample_rate`), in ms.
     pub fn process(&self, samples: &[f32], sample_rate: u32) -> Result<Vec<Segment>> {
-        let audio = resample(samples, sample_rate, self.inner.sample_rate().max(1) as u32)?;
-        let result = self
-            .inner
-            .process(&audio)
-            .context("speaker diarization failed")?;
+        self.process_with_progress(samples, sample_rate, &mut |_, _| {})
+    }
+
+    /// Like [`Diarizer::process`], calling `progress(done, total)` as the
+    /// speaker embeddings are computed (the slow part; it starts after
+    /// segmentation, which reports nothing).
+    pub fn process_with_progress(
+        &self,
+        samples: &[f32],
+        sample_rate: u32,
+        progress: &mut dyn FnMut(usize, usize),
+    ) -> Result<Vec<Segment>> {
+        // SAFETY: valid diarizer pointer.
+        let rate = unsafe { sys::SherpaOnnxOfflineSpeakerDiarizationGetSampleRate(self.ptr) };
+        let audio = resample(samples, sample_rate, rate.max(1) as u32)?;
+        let mut f: &mut dyn FnMut(usize, usize) = progress;
+        // SAFETY: `audio` and `f` outlive the call; the trampoline casts
+        // `arg` back to `&mut &mut dyn FnMut`.
+        let result = unsafe {
+            SherpaOnnxOfflineSpeakerDiarizationProcessWithCallback(
+                self.ptr,
+                audio.as_ptr(),
+                audio.len() as i32,
+                progress_trampoline,
+                &mut f as *mut &mut dyn FnMut(usize, usize) as *mut c_void,
+            )
+        };
+        if result.is_null() {
+            return Err(anyhow!("speaker diarization failed"));
+        }
         let ms = |s: f32| (s.max(0.0) * 1000.0).round() as u64;
-        Ok(result
-            .sort_by_start_time()
-            .into_iter()
-            .filter(|s| s.speaker >= 0)
-            .map(|s| Segment {
-                start_ms: ms(s.start),
-                end_ms: ms(s.end),
-                speaker: s.speaker as usize,
-            })
-            .collect())
+        // SAFETY: `result` is non-null and destroyed once below; the
+        // segment array has `n` entries and is freed after copying.
+        let segments = unsafe {
+            let n = sys::SherpaOnnxOfflineSpeakerDiarizationResultGetNumSegments(result).max(0);
+            let mut out = Vec::with_capacity(n as usize);
+            if n > 0 {
+                let p = sys::SherpaOnnxOfflineSpeakerDiarizationResultSortByStartTime(result);
+                if !p.is_null() {
+                    out.extend(
+                        std::slice::from_raw_parts(p, n as usize)
+                            .iter()
+                            .filter(|s| s.speaker >= 0)
+                            .map(|s| Segment {
+                                start_ms: ms(s.start),
+                                end_ms: ms(s.end),
+                                speaker: s.speaker as usize,
+                            }),
+                    );
+                    sys::SherpaOnnxOfflineSpeakerDiarizationDestroySegment(p);
+                }
+            }
+            sys::SherpaOnnxOfflineSpeakerDiarizationDestroyResult(result);
+            out
+        };
+        Ok(segments)
+    }
+}
+
+impl Drop for Diarizer {
+    fn drop(&mut self) {
+        // SAFETY: created by `open`, destroyed once.
+        unsafe { sys::SherpaOnnxDestroyOfflineSpeakerDiarization(self.ptr) }
     }
 }

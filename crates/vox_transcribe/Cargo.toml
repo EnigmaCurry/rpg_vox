@@ -10,7 +10,7 @@ default = []
 # sherpa-onnx recognizers (Zipformer streaming + SenseVoice offline).
 # Pick exactly one link mode; sherpa-onnx-sys errors if both end up on
 # in one build. The workspace uses `static` everywhere (rpg_vox too).
-sherpa = ["dep:sherpa-onnx"]
+sherpa = ["dep:sherpa-onnx", "dep:sherpa-onnx-sys"]
 sherpa-shared = ["sherpa", "sherpa-onnx/shared"]
 sherpa-static = ["sherpa", "sherpa-onnx/static"]
 # OpenAI-compatible chat client for the pass-4 corrector.
@@ -26,3 +26,6 @@ libc = "0.2"
 ureq = { version = "2", features = ["json"], optional = true }
 serde_json = { workspace = true, optional = true }
 sherpa-onnx = { version = "1.13.7", default-features = false, optional = true }
+# Raw bindings, for the diarization progress callback the safe API lacks.
+# Its link mode comes from sherpa-onnx's static/shared feature.
+sherpa-onnx-sys = { version = "1.13.7", default-features = false, optional = true }

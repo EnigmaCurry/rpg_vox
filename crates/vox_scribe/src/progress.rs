@@ -4,6 +4,7 @@
 //! 10%, which reads fine in a log or next to piped output.
 
 use std::io::{IsTerminal as _, Write};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -65,7 +66,7 @@ macro_rules! say {
     ($($t:tt)*) => { $crate::progress::say(&format!($($t)*)) };
 }
 
-fn clock(ms: u64) -> String {
+pub fn clock(ms: u64) -> String {
     let s = ms / 1000;
     if s >= 3600 {
         format!("{}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60)
@@ -84,6 +85,55 @@ fn term_width() -> usize {
 pub fn clear_line() {
     if is_tty() {
         put("\r\x1b[2K");
+    }
+}
+
+/// Time left, once there is enough progress to extrapolate from.
+pub fn eta_ms(frac: f64, since: Instant) -> Option<u64> {
+    let elapsed = since.elapsed().as_secs_f64();
+    (frac > 0.02 && elapsed > 2.0).then(|| ((elapsed / frac - elapsed).max(0.0) * 1000.0) as u64)
+}
+
+/// `⠸ label ━━━━──── 44%  detail  ~0:36 left`, fitted to the terminal.
+/// `since` is when the measured work started (for the time left).
+fn draw_bar(label: &str, frac: f64, detail: &str, since: Instant) {
+    let frac = frac.clamp(0.0, 1.0);
+    let spin = SPINNER[(since.elapsed().as_millis() / 100) as usize % SPINNER.len()];
+    let tail = format!(
+        " {:>3}%  {detail}{}",
+        (frac * 100.0).floor() as u32,
+        eta_ms(frac, since)
+            .map(|e| format!("  ~{} left", clock(e)))
+            .unwrap_or_default()
+    );
+    let head = format!("{spin} {label} ");
+    let room = term_width().saturating_sub(head.chars().count() + tail.chars().count() + 1);
+    let bar_w = room.min(40);
+    let filled = (((bar_w as f64) * frac).round() as usize).min(bar_w);
+    put(&format!(
+        "\r\x1b[2K{head}{}{}{tail}",
+        "━".repeat(filled),
+        "─".repeat(bar_w - filled)
+    ));
+}
+
+/// Done / total of work running on another thread.
+#[derive(Default)]
+pub struct Shared {
+    done: AtomicUsize,
+    total: AtomicUsize,
+}
+
+impl Shared {
+    pub fn set(&self, done: usize, total: usize) {
+        self.done.store(done, Ordering::Relaxed);
+        self.total.store(total, Ordering::Relaxed);
+    }
+
+    /// Done and total, once the work has reported a total.
+    pub fn get(&self) -> Option<(usize, usize)> {
+        let total = self.total.load(Ordering::Relaxed);
+        (total > 0).then(|| (self.done.load(Ordering::Relaxed).min(total), total))
     }
 }
 
@@ -142,30 +192,8 @@ impl Progress {
         }
         self.last_draw = Some(Instant::now());
         let frac = self.done_ms as f64 / len as f64;
-        let elapsed = self.started.elapsed();
-        // ETA once there is enough to extrapolate from.
-        let eta = (frac > 0.02 && elapsed > Duration::from_secs(2)).then(|| {
-            let total = elapsed.as_secs_f64() / frac;
-            ((total - elapsed.as_secs_f64()).max(0.0) * 1000.0) as u64
-        });
-        let spin = SPINNER[(elapsed.as_millis() / 100) as usize % SPINNER.len()];
-        let tail = format!(
-            " {:>3}%  {} / {}{}",
-            (frac * 100.0).floor() as u32,
-            clock(self.done_ms),
-            clock(len),
-            eta.map(|e| format!("  ~{} left", clock(e)))
-                .unwrap_or_default()
-        );
-        let head = format!("{spin} transcribing ");
-        let room = term_width().saturating_sub(head.chars().count() + tail.chars().count() + 1);
-        let bar_w = room.min(40);
-        let filled = ((bar_w as f64) * frac).round() as usize;
-        put(&format!(
-            "\r\x1b[2K{head}{}{}{tail}",
-            "━".repeat(filled),
-            "─".repeat(bar_w - filled.min(bar_w))
-        ));
+        let detail = format!("{} / {}", clock(self.done_ms), clock(len));
+        draw_bar("transcribing", frac, &detail, self.started);
         self.shown = true;
     }
 
@@ -178,31 +206,54 @@ impl Progress {
     }
 }
 
-/// Run `f` while a spinner with the elapsed time and `label` turns on
-/// stderr (a terminal only; otherwise `label` is printed once).
-pub fn spin_while<T>(label: &str, f: impl FnOnce() -> T) -> T {
-    if !is_tty() {
-        say(label);
-        return f();
+/// Run `f` while showing `progress`: until it reports anything, a
+/// spinner with `waiting` and the elapsed time; then a bar with `label`,
+/// the percentage and the time left. Not on a terminal: `waiting` once,
+/// then one line per 10%.
+pub fn bar_while<T>(waiting: &str, label: &str, progress: &Shared, f: impl FnOnce() -> T) -> T {
+    let tty = is_tty();
+    if !tty {
+        say(waiting);
     }
     let started = Instant::now();
-    let stop = std::sync::atomic::AtomicBool::new(false);
+    let stop = AtomicBool::new(false);
     let stop = &stop;
     std::thread::scope(|sc| {
         sc.spawn(move || {
-            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                let e = started.elapsed();
-                let spin = SPINNER[(e.as_millis() / 100) as usize % SPINNER.len()];
-                put(&format!(
-                    "\r\x1b[2K{spin} {label} {}",
-                    clock(e.as_millis() as u64)
-                ));
+            // When the measured work started, for the time left.
+            let mut measuring: Option<Instant> = None;
+            let mut next_tenth = 1;
+            while !stop.load(Ordering::Relaxed) {
+                match progress.get() {
+                    Some((done, total)) => {
+                        let since = *measuring.get_or_insert_with(Instant::now);
+                        let frac = done as f64 / total as f64;
+                        if tty {
+                            draw_bar(label, frac, &format!("{done}/{total}"), since);
+                        } else {
+                            let tenths = (done * 10 / total).min(9);
+                            if tenths >= next_tenth {
+                                say(&format!("  {tenths}0%"));
+                                next_tenth = tenths + 1;
+                            }
+                        }
+                    }
+                    None if tty => {
+                        let e = started.elapsed();
+                        let spin = SPINNER[(e.as_millis() / 100) as usize % SPINNER.len()];
+                        put(&format!(
+                            "\r\x1b[2K{spin} {waiting} {}",
+                            clock(e.as_millis() as u64)
+                        ));
+                    }
+                    None => {}
+                }
                 std::thread::sleep(REDRAW);
             }
             clear_line();
         });
         let out = f();
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        stop.store(true, Ordering::Relaxed);
         out
     })
 }

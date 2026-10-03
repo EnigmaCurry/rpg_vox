@@ -3,17 +3,21 @@
 //! the files written during the session are rewritten with the result.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
 use ratatui::crossterm::event::{self, Event as TermEvent, KeyCode, KeyEventKind, KeyModifiers};
-use ratatui::widgets::{Block, Paragraph};
+use ratatui::layout::{Constraint, Layout};
+use ratatui::style::{Color, Style};
+use ratatui::widgets::{Block, Gauge, Paragraph};
 use vox_audio::opus_file::{OpusFile, RATE};
 use vox_transcribe::diarize::{relabel, Segment};
 use vox_transcribe::sherpa::{Diarizer, SpeakerModels};
 use vox_transcribe::Transcript;
 
 use crate::markdown;
+use crate::progress::{clock, eta_ms, Shared};
 use crate::subtitles::{self, Format};
 use crate::tui::Screen;
 
@@ -61,19 +65,29 @@ pub fn run(
     tui: bool,
 ) -> Result<Option<Transcript>> {
     let started = Instant::now();
-    let job = std::thread::spawn(move || -> Result<Vec<Segment>> {
-        let (samples, rate) = audio.load()?;
-        Diarizer::open(&models, num_speakers)?.process(&samples, rate)
-    });
+    let progress = Arc::new(Shared::default());
+    let job = {
+        let progress = progress.clone();
+        std::thread::spawn(move || -> Result<Vec<Segment>> {
+            let (samples, rate) = audio.load()?;
+            Diarizer::open(&models, num_speakers)?.process_with_progress(
+                &samples,
+                rate,
+                &mut |done, total| progress.set(done, total),
+            )
+        })
+    };
     let segments = if tui {
-        let Some(s) = wait_on_screen(job, started) else {
+        let Some(s) = wait_on_screen(job, &progress, started) else {
             return Ok(None);
         };
         s
     } else {
         crate::CTRL_C_QUITS.store(true, std::sync::atomic::Ordering::SeqCst);
-        let segments = crate::progress::spin_while(
-            "diarizing the recording (this can take a while; Ctrl-C skips it)",
+        let segments = crate::progress::bar_while(
+            "finding speaker turns (Ctrl-C skips diarization)",
+            "diarizing",
+            &progress,
             || job.join(),
         )
         .map_err(|_| anyhow::anyhow!("diarization thread panicked"))?;
@@ -98,21 +112,48 @@ pub fn run(
 /// (the job is left to die with the process).
 fn wait_on_screen<T>(
     job: std::thread::JoinHandle<Result<T>>,
+    progress: &Shared,
     started: Instant,
 ) -> Option<Result<T>> {
     let mut screen = Screen::enter(" diarizing…");
+    let mut measuring: Option<Instant> = None;
     while !job.is_finished() {
-        let secs = started.elapsed().as_secs();
+        let elapsed = clock(started.elapsed().as_millis() as u64);
         let msg = format!(
-            "Working out who spoke when across the whole recording… {}:{:02}\n\n\
+            "Working out who spoke when across the whole recording… {elapsed}\n\n\
              The files already have the live speaker labels; this replaces them\n\
-             with the full-quality ones. q / Esc skips it.",
-            secs / 60,
-            secs % 60
+             with the full-quality ones. q / Esc skips it."
         );
+        let gauge = progress.get().map(|(done, total)| {
+            let since = *measuring.get_or_insert_with(Instant::now);
+            let frac = done as f64 / total as f64;
+            let left = eta_ms(frac, since)
+                .map(|e| format!("  ~{} left", clock(e)))
+                .unwrap_or_default();
+            Gauge::default()
+                .gauge_style(Style::new().fg(Color::Cyan))
+                .ratio(frac.clamp(0.0, 1.0))
+                .label(format!("{:.0}%  {done}/{total}{left}", frac * 100.0))
+        });
         let _ = screen.terminal().draw(|f| {
-            let p = Paragraph::new(msg).block(Block::bordered().title(" vox_scribe "));
-            f.render_widget(p, f.area());
+            let block = Block::bordered().title(" vox_scribe ");
+            let inner = block.inner(f.area());
+            f.render_widget(block, f.area());
+            let [text, _, bar] = Layout::vertical([
+                Constraint::Length(4),
+                Constraint::Length(1),
+                Constraint::Length(1),
+            ])
+            .areas(inner);
+            f.render_widget(Paragraph::new(msg), text);
+            match gauge {
+                Some(g) => f.render_widget(g, bar),
+                None => f.render_widget(
+                    Paragraph::new("finding speaker turns…")
+                        .style(Style::new().fg(Color::DarkGray)),
+                    bar,
+                ),
+            }
         });
         if event::poll(Duration::from_millis(200)).unwrap_or(false) {
             if let Ok(TermEvent::Key(k)) = event::read() {
