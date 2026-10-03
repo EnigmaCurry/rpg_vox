@@ -237,6 +237,7 @@ pub fn run(paths: &RecordPaths) -> Result<()> {
     let ass = std::fs::read_to_string(&paths.ass)
         .with_context(|| format!("read {}", paths.ass.display()))?;
     let cues = parse_ass(&ass);
+    let blocks = sentences(&cues);
     let starts = word_starts(&cues);
     let line_starts: Vec<u64> = cues.iter().map(|c| c.start_ms).collect();
     let words: Vec<&KWord> = cues.iter().flat_map(|c| c.words.iter()).collect();
@@ -265,7 +266,7 @@ pub fn run(paths: &RecordPaths) -> Result<()> {
             };
             screen
                 .terminal()
-                .draw(|f| draw(f, &name, &cues, &player, &search, pos))?;
+                .draw(|f| draw(f, &name, &cues, &blocks, &player, &search, pos))?;
             last_draw = Instant::now();
         }
         if !event::poll(Duration::from_millis(10))? {
@@ -488,7 +489,43 @@ fn clock(ms: u64) -> String {
     }
 }
 
-fn draw(f: &mut Frame, name: &str, cues: &[Cue], player: &Player, search: &Search, pos: u64) {
+/// A pause this long between cues ends a sentence block even without
+/// a full stop.
+const BLOCK_GAP_MS: u64 = 2000;
+
+/// Cue ranges shown together: a subtitle cue holds at most two short
+/// lines, so a sentence often spans several. A block runs until a cue
+/// ends a sentence, the speaker changes, or there is a long pause.
+fn sentences(cues: &[Cue]) -> Vec<std::ops::Range<usize>> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    for i in 0..cues.len() {
+        let ends = cues[i].words.last().is_some_and(|w| {
+            w.text
+                .trim_end_matches(['"', '\'', ')'])
+                .ends_with(['.', '?', '!'])
+        });
+        let next_breaks = cues.get(i + 1).is_none_or(|n| {
+            n.speaker != cues[i].speaker
+                || n.start_ms.saturating_sub(cues[i].end_ms) >= BLOCK_GAP_MS
+        });
+        if ends || next_breaks {
+            out.push(start..i + 1);
+            start = i + 1;
+        }
+    }
+    out
+}
+
+fn draw(
+    f: &mut Frame,
+    name: &str,
+    cues: &[Cue],
+    blocks: &[std::ops::Range<usize>],
+    player: &Player,
+    search: &Search,
+    pos: u64,
+) {
     let [main, bar, keys] = Layout::vertical([
         Constraint::Min(1),
         Constraint::Length(1),
@@ -502,18 +539,24 @@ fn draw(f: &mut Frame, name: &str, cues: &[Cue], player: &Player, search: &Searc
     let mut lines: Vec<Line> = Vec::new();
     let mut index = 0;
     let mut last_speaker = None;
-    for cue in cues.iter().take_while(|c| c.start_ms <= pos) {
-        let current = pos < cue.end_ms;
+    // A whole sentence appears once it starts, the words still to come
+    // dimmed, so it can be read ahead.
+    for block in blocks.iter().take_while(|b| cues[b.start].start_ms <= pos) {
+        let first = &cues[block.start];
         let mut spans: Vec<Span> = Vec::new();
         // Name the speaker whenever it changes.
-        if let Some(s) = cue.speaker.as_deref().filter(|&s| last_speaker != Some(s)) {
+        if let Some(s) = first
+            .speaker
+            .as_deref()
+            .filter(|&s| last_speaker != Some(s))
+        {
             let style = Style::new().fg(speakers::color(s)).bold();
             spans.push(Span::styled("Speaker", style));
             spans.push(Span::styled(format!("{s}:"), style));
         }
-        last_speaker = cue.speaker.as_deref();
-        spans.extend(cue.words.iter().map(|w| {
-            let style = if !current || w.end_ms <= pos {
+        last_speaker = first.speaker.as_deref();
+        spans.extend(cues[block.clone()].iter().flat_map(|c| &c.words).map(|w| {
+            let style = if w.end_ms <= pos {
                 Style::new()
             } else if w.start_ms <= pos {
                 Style::new().fg(SPOKEN).add_modifier(Modifier::BOLD)
@@ -529,7 +572,7 @@ fn draw(f: &mut Frame, name: &str, cues: &[Cue], player: &Player, search: &Searc
             Span::styled(w.text.clone(), style)
         }));
         let gutter = Span::styled(
-            format!("[{}] ", timestamp(cue.start_ms)),
+            format!("[{}] ", timestamp(first.start_ms)),
             Style::new().fg(Color::DarkGray),
         );
         lines.extend(wrap(gutter, spans, width));
@@ -677,6 +720,28 @@ mod tests {
         assert_eq!((s.mark(4), s.mark(1), s.mark(0)), (2, 1, 0));
         assert_eq!(s.start("dragon", &words, 0), None);
         assert_eq!(s.message.as_deref(), Some("pattern not found"));
+    }
+
+    #[test]
+    fn groups_cues_into_sentences() {
+        let cue = |s: u64, e: u64, text: &str, who: Option<&str>| Cue {
+            start_ms: s,
+            end_ms: e,
+            words: vec![KWord {
+                text: text.into(),
+                start_ms: s,
+                end_ms: e,
+            }],
+            speaker: who.map(String::from),
+        };
+        let cues = [
+            cue(0, 1000, "It is a collection", None),
+            cue(1000, 2000, "of tools.", None),
+            cue(2000, 3000, "Next", None),
+            cue(6000, 7000, "after a pause", None),
+            cue(7000, 8000, "and on", Some("B")),
+        ];
+        assert_eq!(sentences(&cues), vec![0..2, 2..3, 3..4, 4..5]);
     }
 
     #[test]
