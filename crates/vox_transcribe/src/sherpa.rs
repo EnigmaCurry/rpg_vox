@@ -295,26 +295,22 @@ impl SpeakerModels {
     }
 }
 
-/// Live speaker labels from per-utterance embeddings.
-pub struct EmbeddingTagger {
+/// Voice embeddings of arbitrary stretches of audio.
+pub struct SpeakerEmbedder {
     extractor: sherpa_onnx::SpeakerEmbeddingExtractor,
-    clusters: OnlineClusters,
 }
 
-impl EmbeddingTagger {
-    pub fn open(models: &SpeakerModels, cfg: ClusterConfig) -> Result<Self> {
+impl SpeakerEmbedder {
+    pub fn open(models: &SpeakerModels) -> Result<Self> {
         let extractor = sherpa_onnx::SpeakerEmbeddingExtractor::create(&models.embedding_config()?)
             .ok_or_else(|| anyhow!("sherpa-onnx failed to create speaker embedding extractor"))?;
         info!(model = %models.embedding.display(), dim = extractor.dim(), "speaker embeddings loaded");
-        Ok(Self {
-            extractor,
-            clusters: OnlineClusters::new(cfg),
-        })
+        Ok(Self { extractor })
     }
-}
 
-impl SpeakerTagger for EmbeddingTagger {
-    fn identify(&mut self, samples: &[f32], sample_rate: u32) -> Option<String> {
+    /// The embedding of `samples` (mono at `sample_rate`), or `None` when
+    /// too short to compute.
+    pub fn embed(&self, samples: &[f32], sample_rate: u32) -> Option<Vec<f32>> {
         let audio = resample(samples, sample_rate, SPEAKER_RATE).ok()?;
         let stream = self.extractor.create_stream()?;
         stream.accept_waveform(SPEAKER_RATE as i32, &audio);
@@ -322,7 +318,28 @@ impl SpeakerTagger for EmbeddingTagger {
         if !self.extractor.is_ready(&stream) {
             return None;
         }
-        let emb = self.extractor.compute(&stream)?;
+        self.extractor.compute(&stream)
+    }
+}
+
+/// Live speaker labels from per-utterance embeddings.
+pub struct EmbeddingTagger {
+    embedder: SpeakerEmbedder,
+    clusters: OnlineClusters,
+}
+
+impl EmbeddingTagger {
+    pub fn open(models: &SpeakerModels, cfg: ClusterConfig) -> Result<Self> {
+        Ok(Self {
+            embedder: SpeakerEmbedder::open(models)?,
+            clusters: OnlineClusters::new(cfg),
+        })
+    }
+}
+
+impl SpeakerTagger for EmbeddingTagger {
+    fn identify(&mut self, samples: &[f32], sample_rate: u32) -> Option<String> {
+        let emb = self.embedder.embed(samples, sample_rate)?;
         let ms = samples.len() as u64 * 1000 / sample_rate.max(1) as u64;
         self.clusters.assign(&emb, ms).map(label)
     }

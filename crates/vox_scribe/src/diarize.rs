@@ -12,8 +12,8 @@ use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Style};
 use ratatui::widgets::{Block, Gauge, Paragraph};
 use vox_audio::opus_file::{OpusFile, RATE};
-use vox_transcribe::diarize::{relabel, Segment};
-use vox_transcribe::sherpa::{Diarizer, SpeakerModels};
+use vox_transcribe::diarize::{relabel_refined, RefineConfig};
+use vox_transcribe::sherpa::{Diarizer, SpeakerEmbedder, SpeakerModels};
 use vox_transcribe::Transcript;
 
 use crate::markdown;
@@ -68,23 +68,43 @@ pub fn run(
     let progress = Arc::new(Shared::default());
     let job = {
         let progress = progress.clone();
-        std::thread::spawn(move || -> Result<Vec<Segment>> {
+        let transcript = transcript.clone();
+        std::thread::spawn(move || -> Result<Transcript> {
             let (samples, rate) = audio.load()?;
-            Diarizer::open(&models, num_speakers)?.process_with_progress(
+            let segments = Diarizer::open(&models, num_speakers)?.process_with_progress(
                 &samples,
                 rate,
                 &mut |done, total| progress.set(done, total),
-            )
+            )?;
+            for s in &segments {
+                tracing::debug!(
+                    start_ms = s.start_ms,
+                    end_ms = s.end_ms,
+                    speaker = s.speaker,
+                    "speaker turn"
+                );
+            }
+            // Tighten the turn boundaries sentence by sentence.
+            let embedder = SpeakerEmbedder::open(&models)?;
+            let at = |ms: u64| ((ms * rate as u64 / 1000) as usize).min(samples.len());
+            let mut embed =
+                |start: u64, end: u64| embedder.embed(&samples[at(start)..at(end)], rate);
+            Ok(relabel_refined(
+                &transcript,
+                &segments,
+                &mut embed,
+                &RefineConfig::default(),
+            ))
         })
     };
-    let segments = if tui {
+    let t = if tui {
         let Some(s) = wait_on_screen(job, &progress, started) else {
             return Ok(None);
         };
         s
     } else {
         crate::CTRL_C_QUITS.store(true, std::sync::atomic::Ordering::SeqCst);
-        let segments = crate::progress::bar_while(
+        let t = crate::progress::bar_while(
             "finding speaker turns (Ctrl-C skips diarization)",
             "diarizing",
             &progress,
@@ -93,9 +113,8 @@ pub fn run(
         .map_err(|_| anyhow::anyhow!("diarization thread panicked"))?;
         // Don't quit halfway through rewriting the files.
         crate::CTRL_C_QUITS.store(false, std::sync::atomic::Ordering::SeqCst);
-        segments
+        t
     }?;
-    let t = relabel(transcript, &segments);
     if let Some(p) = &files.md {
         replace(p, &markdown::render(&files.title, &files.subtitle, &t))?;
     }

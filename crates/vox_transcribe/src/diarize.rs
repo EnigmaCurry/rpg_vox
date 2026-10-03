@@ -131,6 +131,26 @@ fn split_part(p: &Paragraph, n: usize, words: Vec<Word>, speaker: Option<String>
     }
 }
 
+/// Per paragraph, the diarizer speaker of each word (one entry for a
+/// paragraph without word timings).
+type Labels = Vec<Vec<Option<usize>>>;
+
+fn word_labels(t: &Transcript, segments: &[Segment]) -> Labels {
+    t.paragraphs
+        .iter()
+        .map(|p| {
+            if p.words.is_empty() {
+                vec![speaker_at(
+                    segments,
+                    (p.start_ms, p.end_ms.max(p.start_ms + 1)),
+                )]
+            } else {
+                word_speakers(&p.words, segments)
+            }
+        })
+        .collect()
+}
+
 /// `t` relabelled from `segments`. Paragraphs split where the speaker
 /// changes mid-paragraph; text and word timings are otherwise unchanged.
 /// With no segments the transcript is returned as is.
@@ -138,18 +158,261 @@ pub fn relabel(t: &Transcript, segments: &[Segment]) -> Transcript {
     if segments.is_empty() {
         return t.clone();
     }
-    // Per paragraph: diarizer speaker runs over its words, or one speaker
-    // for the whole paragraph when it has no word timings.
+    build(t, &word_labels(t, segments))
+}
+
+/// Embeds the audio between two times (ms of audio), for
+/// [`relabel_refined`]. `None` when it can't (too short, out of range).
+pub type Embed<'a> = dyn FnMut(u64, u64) -> Option<Vec<f32>> + 'a;
+
+#[derive(Debug, Clone)]
+pub struct RefineConfig {
+    /// Units shorter than this aren't embedded; they take the majority
+    /// diarizer speaker of their words instead.
+    pub min_unit_ms: u64,
+    /// A diarizer speaker change mid-sentence moves to the best pause or
+    /// clause break within this many words.
+    pub snap_words: usize,
+    /// Added to the cosine similarity of the diarizer's own choice for a
+    /// unit, so a near tie goes its way.
+    pub diarizer_bonus: f32,
+    /// Segments embedded per speaker to build its first voice profile.
+    pub profile_segments: usize,
+    /// Assign-and-reprofile rounds.
+    pub rounds: usize,
+}
+
+impl Default for RefineConfig {
+    fn default() -> Self {
+        Self {
+            min_unit_ms: 700,
+            snap_words: 4,
+            diarizer_bonus: 0.03,
+            profile_segments: 12,
+            rounds: 4,
+        }
+    }
+}
+
+/// Like [`relabel`], then tightened at the sentence level. The diarizer's
+/// turn boundaries are only accurate to a few hundred ms, so when people
+/// speak in quick succession the first or last words of a turn can land
+/// on the wrong side, and a whole short turn can merge into its
+/// neighbour. So: each paragraph is cut into units at sentence ends and
+/// at diarizer changes (moved to the nearest pause or clause break); each
+/// unit long enough to judge is matched by its own voice embedding
+/// against a profile of every diarizer speaker, and shorter units take
+/// the majority speaker of their words.
+pub fn relabel_refined(
+    t: &Transcript,
+    segments: &[Segment],
+    embed: &mut Embed,
+    cfg: &RefineConfig,
+) -> Transcript {
+    if segments.is_empty() {
+        return t.clone();
+    }
+    let mut labels = word_labels(t, segments);
+    let mut profiles = profiles(segments, embed, cfg);
+    // (paragraph, words a..b, unit embedding if long enough)
+    let mut all: Vec<(usize, usize, usize, Option<Vec<f32>>)> = Vec::new();
+    for (pi, (p, ks)) in t.paragraphs.iter().zip(&labels).enumerate() {
+        if p.words.is_empty() {
+            continue;
+        }
+        for (a, b) in units(&p.words, ks, cfg.snap_words) {
+            let (start, end) = (p.words[a].start_ms, p.words[b - 1].end_ms);
+            let emb = (end.saturating_sub(start) >= cfg.min_unit_ms)
+                .then(|| embed(start, end))
+                .flatten()
+                .and_then(|e| unit_vec(&e));
+            all.push((pi, a, b, emb));
+        }
+    }
+    // Give each unit the speaker whose profile its voice is closest to
+    // (plus a little for the diarizer's own choice; a unit too short to
+    // embed keeps that choice). Then rebuild the profiles from the units
+    // each speaker got (one voice each, unlike a diarizer segment that
+    // ran two turns together) and assign again, until nothing changes.
+    let diarized: Vec<Option<usize>> = all
+        .iter()
+        .map(|(pi, a, b, _)| majority(&labels[*pi][*a..*b]))
+        .collect();
+    let mut assigned: Vec<Option<usize>> = diarized.clone();
+    if profiles.len() > 1 {
+        for _ in 0..cfg.rounds {
+            let next: Vec<Option<usize>> = all
+                .iter()
+                .zip(&diarized)
+                .map(|((_, _, _, emb), &d)| {
+                    let Some(e) = emb else { return d };
+                    profiles
+                        .iter()
+                        .map(|(k, p)| {
+                            let bonus = if d == Some(*k) {
+                                cfg.diarizer_bonus
+                            } else {
+                                0.0
+                            };
+                            (dot(p, e) + bonus, *k)
+                        })
+                        .max_by(|a, b| a.0.total_cmp(&b.0))
+                        .map(|(_, k)| k)
+                })
+                .collect();
+            if next == assigned {
+                break;
+            }
+            assigned = next;
+            let mut sums: HashMap<usize, Vec<f32>> = HashMap::new();
+            for ((_, _, _, emb), k) in all.iter().zip(&assigned) {
+                if let (Some(e), Some(k)) = (emb, k) {
+                    let acc = sums.entry(*k).or_insert_with(|| vec![0.0; e.len()]);
+                    acc.iter_mut().zip(e).for_each(|(s, x)| *s += x);
+                }
+            }
+            for (k, p) in profiles.iter_mut() {
+                if let Some(v) = sums.get(k).and_then(|v| unit_vec(v)) {
+                    *p = v;
+                }
+            }
+        }
+    }
+    for ((pi, a, b, _), k) in all.iter().zip(&assigned) {
+        if k.is_some() {
+            labels[*pi][*a..*b].iter_mut().for_each(|x| *x = *k);
+        }
+    }
+    for ((pi, a, b, emb), (d, k)) in all.iter().zip(diarized.iter().zip(&assigned)) {
+        let words = &t.paragraphs[*pi].words[*a..*b];
+        let sims: Vec<(usize, f32)> = emb
+            .iter()
+            .flat_map(|e| profiles.iter().map(move |(k, p)| (*k, dot(p, e))))
+            .collect();
+        tracing::debug!(
+            start_ms = words[0].start_ms,
+            end_ms = words[words.len() - 1].end_ms,
+            diarizer = ?d,
+            speaker = ?k,
+            ?sims,
+            text = %words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" "),
+            "speaker unit"
+        );
+    }
+    build(t, &labels)
+}
+
+/// A voice profile per diarizer speaker: the normalized mean embedding
+/// of its longest segments.
+fn profiles(segments: &[Segment], embed: &mut Embed, cfg: &RefineConfig) -> Vec<(usize, Vec<f32>)> {
+    let mut by: HashMap<usize, Vec<&Segment>> = HashMap::new();
+    for s in segments {
+        by.entry(s.speaker).or_default().push(s);
+    }
+    let mut out = Vec::new();
+    for (k, mut segs) in by {
+        segs.sort_by_key(|s| std::cmp::Reverse(s.end_ms.saturating_sub(s.start_ms)));
+        let mut sum: Option<Vec<f32>> = None;
+        for s in segs.into_iter().take(cfg.profile_segments) {
+            let Some(e) = embed(s.start_ms, s.end_ms).and_then(|e| unit_vec(&e)) else {
+                continue;
+            };
+            match &mut sum {
+                Some(acc) => acc.iter_mut().zip(&e).for_each(|(a, x)| *a += x),
+                None => sum = Some(e),
+            }
+        }
+        if let Some(p) = sum.and_then(|v| unit_vec(&v)) {
+            out.push((k, p));
+        }
+    }
+    out.sort_by_key(|(k, _)| *k);
+    out
+}
+
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
+
+fn unit_vec(v: &[f32]) -> Option<Vec<f32>> {
+    let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    (n > 1e-6 && n.is_finite()).then(|| v.iter().map(|x| x / n).collect())
+}
+
+fn majority(ks: &[Option<usize>]) -> Option<usize> {
+    let mut count: HashMap<usize, usize> = HashMap::new();
+    for k in ks.iter().flatten() {
+        *count.entry(*k).or_default() += 1;
+    }
+    count
+        .into_iter()
+        .max_by_key(|&(k, n)| (n, std::cmp::Reverse(k)))
+        .map(|(k, _)| k)
+}
+
+fn ends_sentence(w: &str) -> bool {
+    w.trim_end_matches(['"', '\'', ')', '”', '’'])
+        .ends_with(['.', '?', '!'])
+}
+
+fn ends_clause(w: &str) -> bool {
+    w.ends_with([',', ';', ':', '—'])
+}
+
+/// Word ranges `[a, b)` of a paragraph to label as one: cut at sentence
+/// ends, and at each diarizer change that has no sentence end within
+/// `snap` words, moved to the best nearby pause or clause break.
+fn units(words: &[Word], ks: &[Option<usize>], snap: usize) -> Vec<(usize, usize)> {
+    let n = words.len();
+    // A cut at `i` falls between words i-1 and i.
+    let mut cuts: Vec<usize> = (1..n)
+        .filter(|&i| ends_sentence(&words[i - 1].text))
+        .collect();
+    for c in (1..n).filter(|&i| ks[i] != ks[i - 1]) {
+        let lo = c.saturating_sub(snap).max(1);
+        let hi = (c + snap).min(n - 1);
+        if cuts.iter().any(|&x| x >= lo && x <= hi) {
+            continue;
+        }
+        let score = |i: usize| {
+            let gap = words[i].start_ms.saturating_sub(words[i - 1].end_ms) as i64;
+            let clause = if ends_clause(&words[i - 1].text) {
+                150
+            } else {
+                0
+            };
+            gap + clause - 30 * (i as i64 - c as i64).abs()
+        };
+        if let Some(best) = (lo..=hi).max_by_key(|&i| (score(i), std::cmp::Reverse(i))) {
+            cuts.push(best);
+        }
+    }
+    cuts.sort_unstable();
+    cuts.dedup();
+    let mut out = Vec::with_capacity(cuts.len() + 1);
+    let mut a = 0;
+    for c in cuts.into_iter().chain([n]) {
+        if c > a {
+            out.push((a, c));
+            a = c;
+        }
+    }
+    out
+}
+
+/// The output transcript from per-word diarizer labels: runs of one
+/// speaker become paragraphs, lettered in order of first appearance.
+fn build(t: &Transcript, labels: &Labels) -> Transcript {
     let runs: Vec<Vec<(Option<usize>, Vec<Word>)>> = t
         .paragraphs
         .iter()
-        .map(|p| {
+        .zip(labels)
+        .map(|(p, ks)| {
             if p.words.is_empty() {
-                let k = speaker_at(segments, (p.start_ms, p.end_ms.max(p.start_ms + 1)));
-                return vec![(k, Vec::new())];
+                return vec![(ks.first().copied().flatten(), Vec::new())];
             }
             let mut runs: Vec<(Option<usize>, Vec<Word>)> = Vec::new();
-            for (w, k) in p.words.iter().zip(word_speakers(&p.words, segments)) {
+            for (w, &k) in p.words.iter().zip(ks) {
                 match runs.last_mut() {
                     Some((rk, ws)) if *rk == k => ws.push(w.clone()),
                     _ => runs.push((k, vec![w.clone()])),
@@ -294,5 +557,86 @@ mod tests {
         };
         let r = relabel(&t, &[]);
         assert_eq!(r.paragraphs[0].speaker.as_deref(), Some("C"));
+    }
+
+    #[test]
+    fn units_cut_at_sentences_and_snap_changes_to_pauses() {
+        let ws = vec![
+            word("one", 0, 200),
+            word("two.", 200, 400),
+            word("three", 400, 600),
+            word("four,", 600, 800),
+            word("five", 1300, 1500),
+            word("six", 1500, 1700),
+        ];
+        // The diarizer flips one word late (at "six"); the pause before
+        // "five" wins.
+        let ks = [Some(0), Some(0), Some(0), Some(0), Some(0), Some(1)];
+        assert_eq!(units(&ws, &ks, 4), vec![(0, 2), (2, 6)]);
+        let ks = [Some(0), Some(0), Some(0), Some(0), Some(0), Some(0)];
+        assert_eq!(units(&ws, &ks, 4), vec![(0, 2), (2, 6)]);
+        // No sentence end near the flip: it moves to the pause.
+        let ks = [Some(0), Some(0), Some(0), Some(0), Some(1), Some(1)];
+        let ws2: Vec<Word> = ws
+            .iter()
+            .map(|w| word(w.text.trim_end_matches('.'), w.start_ms, w.end_ms))
+            .collect();
+        assert_eq!(units(&ws2, &ks, 4), vec![(0, 4), (4, 6)]);
+    }
+
+    #[test]
+    fn refined_fixes_boundary_words_and_merged_turns() {
+        // Two sentences; the diarizer puts the second speaker's first two
+        // words with the first speaker, and then the whole of a third
+        // sentence that the embeddings say is speaker 1.
+        let t = Transcript {
+            paragraphs: vec![para(
+                "p",
+                vec![
+                    word("Hello", 0, 500),
+                    word("there.", 500, 1500),
+                    word("I'll", 1600, 1900),
+                    word("keep", 1900, 2200),
+                    word("watch.", 2200, 3000),
+                    word("Over", 3100, 3600),
+                    word("here.", 3600, 4500),
+                ],
+                None,
+            )],
+        };
+        let segs = [
+            seg(0, 2200, 0),
+            seg(2200, 4500, 1),
+            seg(5000, 9000, 0),
+            seg(9000, 12000, 1),
+        ];
+        // Voices by time: speaker 0 before 1550 ms, speaker 1 after.
+        let mut embed = |s: u64, e: u64| {
+            let mid = (s + e) / 2;
+            Some(if (mid < 1550) || (5000..9000).contains(&mid) {
+                vec![1.0, 0.0]
+            } else {
+                vec![0.0, 1.0]
+            })
+        };
+        let r = relabel_refined(&t, &segs, &mut embed, &RefineConfig::default());
+        let texts: Vec<(&str, Option<&str>)> = r
+            .paragraphs
+            .iter()
+            .map(|p| (p.text.as_str(), p.speaker.as_deref()))
+            .collect();
+        assert_eq!(
+            texts,
+            vec![
+                ("Hello there.", Some("A")),
+                ("I'll keep watch. Over here.", Some("B")),
+            ]
+        );
+        // Plain relabel splits mid-sentence.
+        assert_eq!(relabel(&t, &segs).paragraphs.len(), 2);
+        assert_eq!(
+            relabel(&t, &segs).paragraphs[0].text,
+            "Hello there. I'll keep"
+        );
     }
 }
