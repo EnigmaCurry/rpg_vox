@@ -20,6 +20,14 @@ pub struct VadConfig {
     pub silence_end_ms: u32,
     /// Audio kept from before the Speaking trigger.
     pub pre_roll_ms: u32,
+    /// Past this length, close the utterance at the next short pause
+    /// (`pause_split_ms`) instead of waiting for `silence_end_ms`, so
+    /// continuous back-and-forth speech is cut between words rather than
+    /// by `max_utterance_ms`. Offline recognizers also drop whole
+    /// sentences from long buffers (Parakeet did at 15 s).
+    pub soft_max_utterance_ms: u32,
+    /// Quiet needed to split an utterance past `soft_max_utterance_ms`.
+    pub pause_split_ms: u32,
     /// Force-close an utterance that runs this long (hot mic, steady noise).
     pub max_utterance_ms: u32,
     /// Utterances shorter than this are discarded as noise.
@@ -34,7 +42,9 @@ impl Default for VadConfig {
             speech_start_ms: 150,
             silence_end_ms: 700,
             pre_roll_ms: 300,
-            max_utterance_ms: 15_000,
+            soft_max_utterance_ms: 8_000,
+            pause_split_ms: 60,
+            max_utterance_ms: 12_000,
             min_utterance_ms: 200,
         }
     }
@@ -43,6 +53,8 @@ impl Default for VadConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EndReason {
     Silence,
+    /// A short pause past the soft maximum length.
+    Pause,
     MaxLength,
     Flush,
 }
@@ -71,6 +83,8 @@ pub struct Vad {
     pre_roll_cap: usize,
     speech_start_windows: u32,
     silence_end_windows: u32,
+    pause_windows: u32,
+    soft_max_samples: usize,
     max_samples: usize,
     min_samples: usize,
     scratch: Vec<f32>,
@@ -93,6 +107,8 @@ impl Vad {
             pre_roll_cap: ms(cfg.pre_roll_ms),
             speech_start_windows: (cfg.speech_start_ms / cfg.window_ms).max(1),
             silence_end_windows: (cfg.silence_end_ms / cfg.window_ms).max(1),
+            pause_windows: (cfg.pause_split_ms / cfg.window_ms).max(1),
+            soft_max_samples: ms(cfg.soft_max_utterance_ms),
             max_samples: ms(cfg.max_utterance_ms),
             min_samples: ms(cfg.min_utterance_ms),
             scratch: Vec::new(),
@@ -155,6 +171,12 @@ impl Vad {
                 self.silence_windows += 1;
                 if self.silence_windows >= self.silence_end_windows {
                     self.finalize(EndReason::Silence, out);
+                    return;
+                }
+                if self.utterance.len() >= self.soft_max_samples
+                    && self.silence_windows >= self.pause_windows
+                {
+                    self.finalize(EndReason::Pause, out);
                     return;
                 }
             }
@@ -284,5 +306,30 @@ mod tests {
             .collect();
         assert_eq!(reasons[0], EndReason::MaxLength);
         assert_eq!(*reasons.last().unwrap(), EndReason::Flush);
+    }
+
+    #[test]
+    fn long_utterance_splits_at_a_short_pause() {
+        let mut vad = Vad::new(VadConfig::default(), SR);
+        let mut ev = Vec::new();
+        // Speech with 100 ms dips: no 700 ms silence, but past 8 s the
+        // first dip closes the utterance.
+        for _ in 0..12 {
+            vad.push(&tone(900, 0.2), &mut ev);
+            vad.push(&tone(100, 0.0), &mut ev);
+        }
+        vad.flush(&mut ev);
+        let ends: Vec<_> = ev
+            .iter()
+            .filter_map(|e| match e {
+                VadEvent::End {
+                    samples, reason, ..
+                } => Some((samples.len() as u64 * 1000 / SR as u64, *reason)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ends[0].1, EndReason::Pause);
+        assert!(ends[0].0 >= 8_000 && ends[0].0 < 9_000, "{ends:?}");
+        assert!(ends.iter().all(|(_, r)| *r != EndReason::MaxLength));
     }
 }

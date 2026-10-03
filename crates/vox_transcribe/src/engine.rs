@@ -217,10 +217,11 @@ impl Engine {
         let (bound_tx, bound_rx) = unbounded::<Job>();
         let (res_tx, res_rx) = unbounded::<JobResult>();
         let rate = cfg.sample_rate;
+        let rms = cfg.vad.rms_threshold;
 
         std::thread::Builder::new()
             .name("vox-offline".into())
-            .spawn(move || offline_worker(offline, speakers, rate, final_rx, bound_rx, res_tx))
+            .spawn(move || offline_worker(offline, speakers, rate, rms, final_rx, bound_rx, res_tx))
             .expect("spawn offline worker");
 
         // Pass 4 gets its own thread: LLM calls are slow and network-bound
@@ -324,6 +325,7 @@ fn offline_worker(
     rec: Arc<dyn OfflineRecognizer>,
     mut speakers: Option<Box<dyn SpeakerTagger>>,
     rate: u32,
+    rms_threshold: f32,
     final_rx: Receiver<Job>,
     bound_rx: Receiver<Job>,
     res_tx: Sender<JobResult>,
@@ -341,7 +343,7 @@ fn offline_worker(
         let samples = match &job {
             Job::Final { samples, .. } | Job::Boundary { samples, .. } => samples,
         };
-        let text = rec.transcribe_timed(samples, rate);
+        let text = crate::gaps::transcribe_covering(rec.as_ref(), samples, rate, rms_threshold);
         let speaker = match (&job, speakers.as_mut()) {
             (Job::Final { .. }, Some(t))
                 if text.as_ref().is_ok_and(|t| !t.text.trim().is_empty()) =>
@@ -912,6 +914,7 @@ impl Core {
             Transcription::default()
         });
         let text = t.text.trim().to_string();
+        debug!(clip = %clip_id, start_ms, duration_ms, ?reason, %text, "pass 2");
         if is_junk(&text) {
             self.remove_clip(&clip_id);
             return;
@@ -934,11 +937,11 @@ impl Core {
         };
         // Word caps. The soft cap only fires on a silence-closed
         // utterance (a real pause); the hard cap fires regardless, for
-        // non-stop speech where every utterance is a max-length rollover.
+        // non-stop speech where every utterance is a length split.
         let pc = &self.cfg.paragraph;
         let p = &mut self.transcript.paragraphs[idx];
         let words = count_words(&p.text);
-        let silence_closed = reason != EndReason::MaxLength;
+        let silence_closed = !matches!(reason, EndReason::MaxLength | EndReason::Pause);
         if pc.mode == ParagraphMode::Auto
             && !p.closed
             && (words >= pc.hard_max_words || (silence_closed && words >= pc.soft_max_words))
@@ -1019,6 +1022,7 @@ impl Core {
                 if !w.writable {
                     continue;
                 }
+                debug!(clip = %w.clip_id, before = %w.text, after = %rev.text, "pass 3");
                 if let Some(c) = p.clips.iter_mut().find(|c| c.id == w.clip_id) {
                     changed |= c.text != rev.text;
                     c.text = rev.text;

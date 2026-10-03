@@ -21,6 +21,7 @@ pub mod correct;
 pub mod diarize;
 pub mod engine;
 pub mod filters;
+pub mod gaps;
 pub mod model;
 #[cfg(feature = "llm")]
 pub mod openai;

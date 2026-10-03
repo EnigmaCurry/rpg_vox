@@ -20,7 +20,8 @@ pub struct BoundaryConfig {
     /// Most clips re-decoded together.
     pub max_clips: usize,
     /// Cap on the audio span of one window. SenseVoice degrades on
-    /// inputs much longer than ~25 s.
+    /// inputs much longer than ~25 s, and Parakeet can drop a whole
+    /// sentence from a 15 s one.
     pub max_window_ms: u64,
     /// Longest silence across which a clip from the previous paragraph
     /// may be borrowed as context.
@@ -31,7 +32,7 @@ impl Default for BoundaryConfig {
     fn default() -> Self {
         Self {
             max_clips: 3,
-            max_window_ms: 25_000,
+            max_window_ms: 14_000,
             borrow_max_gap_ms: 3_000,
         }
     }
