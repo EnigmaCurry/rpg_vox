@@ -1,6 +1,7 @@
-//! Headless progress on stderr. On a terminal: a bar redrawn in place
-//! (and a spinner for work with no measurable progress); otherwise one
-//! line per 10%, which reads fine in a log.
+//! Headless progress on stderr. When both stdout and stderr are a
+//! terminal: a bar redrawn in place (and a spinner for work with no
+//! measurable progress). When either is piped or redirected: one line per
+//! 10%, which reads fine in a log or next to piped output.
 
 use std::io::{IsTerminal as _, Write};
 use std::sync::{Mutex, OnceLock};
@@ -14,6 +15,8 @@ const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '�
 /// redirect of fd 2 to the log file.
 struct Console {
     out: Box<dyn Write + Send>,
+    /// Draw bars and spinners: stderr is a terminal and stdout isn't
+    /// being piped or redirected.
     tty: bool,
 }
 
@@ -22,14 +25,14 @@ fn console() -> &'static Mutex<Console> {
     CONSOLE.get_or_init(|| {
         #[cfg(unix)]
         if let Some(f) = vox_transcribe::stderr::console() {
-            let tty = f.is_terminal();
+            let tty = f.is_terminal() && std::io::stdout().is_terminal();
             return Mutex::new(Console {
                 out: Box::new(f),
                 tty,
             });
         }
         Mutex::new(Console {
-            tty: std::io::stderr().is_terminal(),
+            tty: std::io::stderr().is_terminal() && std::io::stdout().is_terminal(),
             out: Box::new(std::io::stderr()),
         })
     })
