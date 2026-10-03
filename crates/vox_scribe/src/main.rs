@@ -150,8 +150,9 @@ struct Cli {
     /// File of names and terms the recognizer can't know (one per line,
     /// `#` comments). With Parakeet, decoding is biased toward them, and
     /// a term is only kept where an unbiased decode heard something that
-    /// sounds like it; with --llm, pass 4 also gets the list. Costs some
-    /// speed (beam search), more where the names come up.
+    /// sounds like it; with --llm, pass 4 also gets the list. Cost: the
+    /// re-decode passes run about 20% slower, up to ~1.8x where the names
+    /// come up often (live text and diarization are unaffected).
     #[arg(long)]
     vocab: Option<PathBuf>,
     /// Log file. Default: <tmp>/vox_scribe.log in TUI mode, stderr otherwise.

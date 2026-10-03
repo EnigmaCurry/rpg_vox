@@ -141,8 +141,10 @@ beam search). Biasing on its own invents names in ordinary speech, so a
 term is only kept where an unbiased decode of the same audio heard
 something that sounds like it ("Icemark" → "Ismark", "Valaki" →
 "Vallaki"); everywhere else the unbiased words stand. The unbiased
-decode only runs when the biased one produced a term. It costs roughly
-20% more decoding time, more where the names come up. With `--llm`,
+decode only runs when the biased one produced a term. Cost: passes 2
+and 3 run about 20% slower, up to ~1.8x on name-dense speech; the live
+text and diarization are unaffected, and without `--vocab` nothing
+changes. With `--llm`,
 pass 4 gets the list too.
 
 On synthetic test dialogue it got 13 of 20 made-up names right (3
