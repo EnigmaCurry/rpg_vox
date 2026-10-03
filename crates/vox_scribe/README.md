@@ -126,6 +126,36 @@ blue while it waits for the LLM, and `o` toggles the text from before pass 4.
 Without `--llm`, pass 3 is the final pass and paragraphs are written as
 soon as they settle.
 
+## Speakers (optional)
+
+Pass `--diarize` to label who is speaking. Two passes:
+
+* **Live**: as each utterance is transcribed, a voice embedding
+  (WeSpeaker ResNet34) matches it to the speakers heard so far or starts
+  a new one. Paragraphs start on a change of speaker and show as
+  `Speaker A: …`, one colour per speaker. It is quick and approximate.
+* **Final**: with `-r`, or `-i FILE -o NAME`, a full offline diarization
+  (pyannote segmentation + embeddings + clustering) of the whole audio
+  runs after the session ends, however long it takes (`q` skips it in
+  the TUI). It assigns every word to a speaker, splits paragraphs where
+  the speaker changes, and atomically rewrites `NAME.md`, `.srt` and
+  `.ass`. The files are written as usual during the session, with the
+  live labels, so a crash or a skip still leaves them complete.
+
+Speakers are lettered in order of first appearance. The markdown reads
+`**[00:01:02] Speaker A:** …`, SRT cues start `Speaker A: ` where the
+speaker changes, and ASS lines carry the speaker in their Name field
+with a style (colour) per speaker, which `--play` shows. `--append` keeps
+the live labels only.
+
+* `--speakers N`: the number of speakers, when known. Helps both passes.
+* `--speaker-threshold X` (default 0.7): how alike a voice must be to a
+  known speaker to join them live. Raise it if two people share a label,
+  lower it if one person is split in two.
+
+The speaker models (~32 MB) are fetched on first use, or with
+`scribe --diarize download-models` / `just download-speaker-models`.
+
 Models are looked up in `--models-dir`, `$VOX_SCRIBE_MODELS`, the per-user
 data dir (`~/Library/Application Support/vox_scribe/models` on macOS,
 `${XDG_DATA_HOME:-~/.local/share}/vox_scribe/models` on Linux), then `./models` (so an rpg_vox checkout's models work as-is). In

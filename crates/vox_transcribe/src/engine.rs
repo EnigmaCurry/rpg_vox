@@ -25,7 +25,7 @@ use crate::boundary::{self, BoundaryConfig, WindowClip};
 use crate::correct::{apply_edits, Corrector, Edit};
 use crate::filters::{count_words, ends_on_sentence, is_junk};
 use crate::model::{Clip, Paragraph, Pass4, Stage, Transcript};
-use crate::recognizer::{OfflineRecognizer, StreamingRecognizer, Transcription};
+use crate::recognizer::{OfflineRecognizer, SpeakerTagger, StreamingRecognizer, Transcription};
 use crate::ring::AudioRing;
 use crate::timing::{align_words, offset, Word};
 use crate::vad::{EndReason, Vad, VadConfig, VadEvent};
@@ -167,6 +167,8 @@ struct LlmResult {
 struct JobResult {
     job: Job,
     text: anyhow::Result<Transcription>,
+    /// Pass-2 jobs only, when a speaker tagger is set.
+    speaker: Option<String>,
 }
 
 /// Handle to a running pipeline. Dropping it stops the threads without
@@ -196,6 +198,19 @@ impl Engine {
         offline: Arc<dyn OfflineRecognizer>,
         corrector: Option<Arc<dyn Corrector>>,
     ) -> Self {
+        Self::spawn_full(cfg, streaming, offline, corrector, None)
+    }
+
+    /// Like [`Engine::spawn_with`], with an optional live speaker tagger.
+    /// When given, every utterance is labelled as pass 2 finishes it, and
+    /// a change of speaker starts a new paragraph.
+    pub fn spawn_full(
+        cfg: EngineConfig,
+        streaming: Option<Box<dyn StreamingRecognizer>>,
+        offline: Arc<dyn OfflineRecognizer>,
+        corrector: Option<Arc<dyn Corrector>>,
+        speakers: Option<Box<dyn SpeakerTagger>>,
+    ) -> Self {
         let (cmd_tx, cmd_rx) = bounded::<Cmd>(64);
         let (ev_tx, ev_rx) = unbounded::<Event>();
         let (final_tx, final_rx) = unbounded::<Job>();
@@ -205,7 +220,7 @@ impl Engine {
 
         std::thread::Builder::new()
             .name("vox-offline".into())
-            .spawn(move || offline_worker(offline, rate, final_rx, bound_rx, res_tx))
+            .spawn(move || offline_worker(offline, speakers, rate, final_rx, bound_rx, res_tx))
             .expect("spawn offline worker");
 
         // Pass 4 gets its own thread: LLM calls are slow and network-bound
@@ -307,6 +322,7 @@ impl Pusher {
 
 fn offline_worker(
     rec: Arc<dyn OfflineRecognizer>,
+    mut speakers: Option<Box<dyn SpeakerTagger>>,
     rate: u32,
     final_rx: Receiver<Job>,
     bound_rx: Receiver<Job>,
@@ -326,7 +342,15 @@ fn offline_worker(
             Job::Final { samples, .. } | Job::Boundary { samples, .. } => samples,
         };
         let text = rec.transcribe_timed(samples, rate);
-        if res_tx.send(JobResult { job, text }).is_err() {
+        let speaker = match (&job, speakers.as_mut()) {
+            (Job::Final { .. }, Some(t))
+                if text.as_ref().is_ok_and(|t| !t.text.trim().is_empty()) =>
+            {
+                t.identify(samples, rate)
+            }
+            _ => None,
+        };
+        if res_tx.send(JobResult { job, text, speaker }).is_err() {
             return;
         }
     }
@@ -648,6 +672,7 @@ impl Core {
             text,
             stage,
             words,
+            speaker: None,
         };
         let max_utt = self.cfg.vad.max_utterance_ms as u64;
         let gap = self.cfg.paragraph.gap_ms;
@@ -682,6 +707,33 @@ impl Core {
             p.rebuild();
             Some((idx, change))
         }
+    }
+
+    /// Label a clip's speaker. When an earlier clip of its paragraph has
+    /// another speaker, the clip and everything after it move to a new
+    /// paragraph (the old one closes); returns that paragraph's index.
+    fn set_speaker(&mut self, clip_id: &str, speaker: String) -> Option<(usize, Change)> {
+        let (pi, ci) = self.find_clip(clip_id)?;
+        let p = &mut self.transcript.paragraphs[pi];
+        p.clips[ci].speaker = Some(speaker.clone());
+        let before = p.clips[..ci]
+            .iter()
+            .rev()
+            .find_map(|c| c.speaker.as_deref());
+        if before.is_none_or(|b| b == speaker) {
+            p.rebuild();
+            return None;
+        }
+        let moved = p.clips.split_off(ci);
+        p.closed = true;
+        p.rebuild();
+        self.emit(pi, Change::Closed);
+        let mut moved = moved.into_iter();
+        let mut q = Paragraph::new(Uuid::new_v4().to_string(), moved.next()?);
+        q.clips.extend(moved);
+        q.rebuild();
+        self.transcript.paragraphs.insert(pi + 1, q);
+        Some((pi + 1, Change::Opened))
     }
 
     fn remove_clip(&mut self, clip_id: &str) {
@@ -832,7 +884,7 @@ impl Core {
                 ..
             } => {
                 self.outstanding_final -= 1;
-                self.on_final(clip_id, start_ms, duration_ms, reason, r.text);
+                self.on_final(clip_id, start_ms, duration_ms, reason, r.text, r.speaker);
             }
             Job::Boundary {
                 paragraph_id,
@@ -853,6 +905,7 @@ impl Core {
         duration_ms: u64,
         reason: EndReason,
         text: anyhow::Result<Transcription>,
+        speaker: Option<String>,
     ) {
         let t = text.unwrap_or_else(|err| {
             warn!(err = %format!("{err:#}"), "pass 2 decode failed");
@@ -874,6 +927,10 @@ impl Core {
             Stage::Final,
         ) else {
             return;
+        };
+        let (idx, change) = match speaker {
+            Some(s) => self.set_speaker(&clip_id, s).unwrap_or((idx, change)),
+            None => (idx, change),
         };
         // Word caps. The soft cap only fires on a silence-closed
         // utterance (a real pause); the hard cap fires regardless, for

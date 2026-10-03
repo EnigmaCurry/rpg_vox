@@ -3,14 +3,17 @@
 //! Uses vox_transcribe's three passes: streaming Zipformer partials
 //! (ALL CAPS, instant), Parakeet (or SenseVoice) re-decodes of each
 //! utterance, and boundary re-transcription across neighbouring
-//! utterances.
+//! utterances. With --diarize each utterance is also labelled with its
+//! speaker, and a full diarization relabels the saved files at the end.
 
 mod clipboard;
+mod diarize;
 mod markdown;
 mod models;
 #[cfg(unix)]
 mod once;
 mod play;
+mod speakers;
 mod subtitles;
 mod tui;
 
@@ -27,10 +30,13 @@ use vox_audio::{Capture, OpenOptions};
 use vox_transcribe::correct::Corrector;
 use vox_transcribe::openai::{OpenAiConfig, OpenAiCorrector};
 use vox_transcribe::sherpa::{
-    Parakeet, ParakeetConfig, SenseVoice, SenseVoiceConfig, Zipformer, ZipformerConfig,
+    EmbeddingTagger, Parakeet, ParakeetConfig, SenseVoice, SenseVoiceConfig, SpeakerModels,
+    Zipformer, ZipformerConfig,
 };
+use vox_transcribe::speaker::ClusterConfig;
 use vox_transcribe::{
-    Change, Engine, EngineConfig, Event, ParagraphMode, StreamingRecognizer, Transcript,
+    Change, Engine, EngineConfig, Event, ParagraphMode, SpeakerTagger, StreamingRecognizer,
+    Transcript,
 };
 
 use crate::markdown::{timestamp, MarkdownWriter};
@@ -113,6 +119,22 @@ struct Cli {
     /// Seconds to wait for each pass-4 reply before keeping pass-3 text.
     #[arg(long, default_value_t = 30)]
     llm_timeout: u64,
+    /// Label who is speaking (Speaker A, B, …). Each utterance is labelled
+    /// live as it is transcribed; with --record, or -i with -o, a full
+    /// diarization of the whole audio then runs after the session and
+    /// rewrites the files with the final labels. Fetches ~32 MB of
+    /// speaker models on first use.
+    #[arg(long)]
+    diarize: bool,
+    /// With --diarize: how many people are speaking, when known.
+    #[arg(long, requires = "diarize", value_parser = clap::value_parser!(u32).range(1..))]
+    speakers: Option<u32>,
+    /// With --diarize: how alike (cosine similarity, 0–1) an utterance's
+    /// voice must be to a known speaker to get their live label; higher
+    /// tells similar voices apart but may split one person in two. Only
+    /// the live labels use it.
+    #[arg(long, requires = "diarize", default_value_t = ClusterConfig::default().threshold)]
+    speaker_threshold: f32,
     /// File of names and terms (one per line) to help pass 4 spell them.
     #[arg(long)]
     vocab: Option<PathBuf>,
@@ -137,7 +159,8 @@ enum Cmd {
     Devices,
     /// List apps whose audio --app can capture.
     Apps,
-    /// Download the Zipformer model and the --model recognizer.
+    /// Download the Zipformer model and the --model recognizer (and the
+    /// speaker models with --diarize).
     DownloadModels,
     /// Finish the running --once recorder (as if Enter were pressed).
     /// Exits 1 if none is running.
@@ -303,7 +326,11 @@ fn main() -> Result<()> {
                 .models_dir
                 .clone()
                 .unwrap_or_else(models::user_models_dir);
-            return models::download(&dir, cli.model);
+            models::download(&dir, cli.model)?;
+            if cli.diarize {
+                models::download_speakers(&dir)?;
+            }
+            return Ok(());
         }
         Some(Cmd::StopOnce) => {
             #[cfg(unix)]
@@ -367,6 +394,10 @@ fn main() -> Result<()> {
         );
         models::download(&models_dir, cli.model)?;
     }
+    if cli.diarize && !models::has_speakers(&models_dir) {
+        eprintln!("speaker models not found, downloading them once (about 32 MB)…");
+        models::download_speakers(&models_dir)?;
+    }
 
     // Put the TUI on screen now so the mic and models load behind it
     // rather than behind a blank terminal. sherpa-onnx's C++ code writes to
@@ -397,6 +428,38 @@ fn main() -> Result<()> {
         }
     };
     info!(rate, device = %device, "audio source ready");
+    let num_speakers = cli.speakers.map(|n| n as usize);
+    let speaker_models = cli.diarize.then(|| SpeakerModels {
+        num_threads: cli.threads,
+        ..SpeakerModels::from_dir(&models_dir.join(models::SPEAKERS))
+    });
+    let tagger: Option<Box<dyn SpeakerTagger>> = match &speaker_models {
+        Some(m) => Some(Box::new(EmbeddingTagger::open(
+            m,
+            ClusterConfig {
+                max_speakers: num_speakers,
+                threshold: cli.speaker_threshold,
+                ..Default::default()
+            },
+        )?)),
+        None => None,
+    };
+    // What the final diarization pass reads and rewrites, if it runs:
+    // only when there are files to rewrite and the audio is at hand.
+    let final_pass = match (&speaker_models, &source, &record) {
+        (None, _, _) => None,
+        (Some(_), Source::File(s), _) if record.is_some() || output.is_some() => {
+            Some(diarize::Audio::Samples(s.clone(), rate))
+        }
+        (Some(_), _, Some(r)) => Some(diarize::Audio::Opus(r.opus.clone())),
+        _ => None,
+    };
+    let final_pass = if final_pass.is_some() && cli.append {
+        eprintln!("--append: the final diarization pass is skipped (live labels only)");
+        None
+    } else {
+        final_pass
+    };
     let offline: Arc<dyn vox_transcribe::OfflineRecognizer> = match cli.model {
         models::Offline::SenseVoice => {
             let mut sv = SenseVoiceConfig::from_dir(&models_dir.join(models::SENSE_VOICE));
@@ -437,7 +500,7 @@ fn main() -> Result<()> {
         Some(o) if cli.append => markdown::read_tail(o, 200),
         _ => Vec::new(),
     };
-    let writer = match output {
+    let writer = match output.clone() {
         Some(o) => Some(MarkdownWriter::create(o, &title, &subtitle, cli.append)?),
         None => None,
     };
@@ -457,7 +520,7 @@ fn main() -> Result<()> {
     if manual {
         engine_cfg.paragraph.mode = ParagraphMode::Manual;
     }
-    let engine = Engine::spawn_with(engine_cfg, streaming, offline, corrector);
+    let engine = Engine::spawn_full(engine_cfg, streaming, offline, corrector, tagger);
     let paused = Arc::new(AtomicBool::new(false));
     let stop = Arc::new(AtomicBool::new(false));
     let source_done = Arc::new(AtomicBool::new(false));
@@ -500,6 +563,13 @@ fn main() -> Result<()> {
         }
     };
 
+    let files = diarize::Files {
+        md: output.clone(),
+        srt: record.as_ref().map(|r| r.srt.clone()),
+        ass: record.as_ref().map(|r| r.ass.clone()),
+        title: title.clone(),
+        subtitle: subtitle.clone(),
+    };
     let session = Session {
         engine,
         writer: Mutex::new(writer),
@@ -518,10 +588,43 @@ fn main() -> Result<()> {
         history,
         pump: Some(pump),
     };
-    let outcome = match screen {
+    let mut outcome = match screen {
         Some(screen) => tui::run(screen, session)?,
         None => headless(session)?,
     };
+    if let (Some(audio), Some(models)) = (final_pass, speaker_models) {
+        let has_text = outcome
+            .transcript
+            .paragraphs
+            .iter()
+            .any(|p| !p.text.trim().is_empty());
+        if has_text {
+            match diarize::run(
+                models,
+                num_speakers,
+                audio,
+                &outcome.transcript,
+                &files,
+                tui_mode,
+            ) {
+                Ok(Some(t)) => {
+                    let mut who: Vec<&str> = t
+                        .paragraphs
+                        .iter()
+                        .filter_map(|p| p.speaker.as_deref())
+                        .collect();
+                    who.sort_unstable();
+                    who.dedup();
+                    println!("diarized: {} speaker(s)", who.len());
+                    outcome.transcript = t;
+                }
+                Ok(None) => println!("diarization skipped; files keep the live speaker labels"),
+                Err(e) => {
+                    eprintln!("diarization failed, files keep the live speaker labels: {e:#}")
+                }
+            }
+        }
+    }
     if cli.once {
         copy_transcript(&outcome);
     }
@@ -704,7 +807,12 @@ fn headless(session: Session) -> Result<Outcome> {
     let mut printed = HashSet::new();
     let print = |p: &vox_transcribe::Paragraph, printed: &mut HashSet<String>| {
         if !p.text.trim().is_empty() && printed.insert(p.id.clone()) {
-            println!("[{}] {}\n", timestamp(p.start_ms), p.text.trim());
+            let who = p
+                .speaker
+                .as_deref()
+                .map(|s| format!(" {}:", speakers::name(s)))
+                .unwrap_or_default();
+            println!("[{}]{who} {}\n", timestamp(p.start_ms), p.text.trim());
         }
     };
     while !interrupted.load(Ordering::SeqCst)

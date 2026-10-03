@@ -185,7 +185,9 @@ pub fn vtt(c: &Cue) -> String {
 
 /// Header that starts an ASS file. Karaoke turns each word from the
 /// secondary colour (white, not yet spoken) to the primary colour
-/// (yellow) as it is spoken.
+/// (yellow) as it is spoken. Diarized lines use the style named after
+/// their speaker's slot in [`SPEAKER_STYLES`] instead, which only changes
+/// the spoken colour.
 pub const ASS_HEADER: &str = "[Script Info]
 ScriptType: v4.00+
 PlayResX: 1280
@@ -196,6 +198,14 @@ ScaledBorderAndShadow: yes
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
 Style: Default,Arial,52,&H0000FFFF,&H00FFFFFF,&H00000000,&H80000000,0,0,0,0,100,100,0,0,1,3,1,2,60,60,50,1
+Style: S1,Arial,52,&H00FF87FF,&H00FFFFFF,&H00000000,&H80000000,0,0,0,0,100,100,0,0,1,3,1,2,60,60,50,1
+Style: S2,Arial,52,&H0087D787,&H00FFFFFF,&H00000000,&H80000000,0,0,0,0,100,100,0,0,1,3,1,2,60,60,50,1
+Style: S3,Arial,52,&H005FAFFF,&H00FFFFFF,&H00000000,&H80000000,0,0,0,0,100,100,0,0,1,3,1,2,60,60,50,1
+Style: S4,Arial,52,&H00FF87AF,&H00FFFFFF,&H00000000,&H80000000,0,0,0,0,100,100,0,0,1,3,1,2,60,60,50,1
+Style: S5,Arial,52,&H00D7D75F,&H00FFFFFF,&H00000000,&H80000000,0,0,0,0,100,100,0,0,1,3,1,2,60,60,50,1
+Style: S6,Arial,52,&H0087D7FF,&H00FFFFFF,&H00000000,&H80000000,0,0,0,0,100,100,0,0,1,3,1,2,60,60,50,1
+Style: S7,Arial,52,&H005F5FFF,&H00FFFFFF,&H00000000,&H80000000,0,0,0,0,100,100,0,0,1,3,1,2,60,60,50,1
+Style: S8,Arial,52,&H00FFD7AF,&H00FFFFFF,&H00000000,&H80000000,0,0,0,0,100,100,0,0,1,3,1,2,60,60,50,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -212,10 +222,20 @@ fn ass_clock(ms: u64) -> String {
     )
 }
 
+/// Number of per-speaker styles (`S1` … `S8`) in [`ASS_HEADER`]; later
+/// speakers reuse them in turn.
+pub const SPEAKER_STYLES: usize = 8;
+
 /// One ASS dialogue line whose `\k` tags highlight each word over its
 /// own time. Durations are taken from rounded absolute times, so
 /// rounding never accumulates across a cue.
 pub fn ass(c: &Cue) -> String {
+    ass_for(c, None)
+}
+
+/// Like [`ass`], for a cue spoken by `speaker` ("A", "B", …): the line's
+/// Name is "Speaker A" and its style that speaker's colour.
+pub fn ass_for(c: &Cue, speaker: Option<&str>) -> String {
     let cs = |ms: u64| (ms + 5) / 10;
     let first_line_words = c
         .text
@@ -238,8 +258,15 @@ pub fn ass(c: &Cue) -> String {
         out.push_str(&format!("{{\\k{}}}{}", end - start, ass_escape(&w.text)));
         at = end;
     }
+    let (style, name) = match speaker.and_then(|s| crate::speaker::index(s).map(|i| (i, s))) {
+        Some((i, s)) => (
+            format!("S{}", i % SPEAKER_STYLES + 1),
+            format!("Speaker {s}"),
+        ),
+        None => ("Default".to_string(), String::new()),
+    };
     format!(
-        "Dialogue: 0,{},{},Default,,0,0,0,,{}\n",
+        "Dialogue: 0,{},{},{style},{name},0,0,0,,{}\n",
         ass_clock(c.start_ms),
         ass_clock(c.end_ms),
         out

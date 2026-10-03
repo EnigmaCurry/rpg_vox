@@ -16,6 +16,7 @@ use vox_audio::playback::Output;
 use vox_audio::resample::Linear;
 
 use crate::markdown::timestamp;
+use crate::speakers;
 use crate::tui::Screen;
 use crate::RecordPaths;
 
@@ -39,6 +40,8 @@ pub struct Cue {
     pub start_ms: u64,
     pub end_ms: u64,
     pub words: Vec<KWord>,
+    /// Speaker label ("A") from a diarized line's Name ("Speaker A").
+    pub speaker: Option<String>,
 }
 
 /// `h:mm:ss.cc` to ms.
@@ -126,10 +129,14 @@ pub fn parse_ass(ass: &str) -> Vec<Cue> {
                 .collect()
         };
         if !words.is_empty() {
+            let name = fields[4].trim();
+            let speaker = (!name.is_empty())
+                .then(|| name.strip_prefix("Speaker ").unwrap_or(name).to_string());
             cues.push(Cue {
                 start_ms: start,
                 end_ms: end,
                 words,
+                speaker,
             });
         }
     }
@@ -494,28 +501,33 @@ fn draw(f: &mut Frame, name: &str, cues: &[Cue], player: &Player, search: &Searc
     let width = (inner.width as usize).max(GUTTER + 10);
     let mut lines: Vec<Line> = Vec::new();
     let mut index = 0;
+    let mut last_speaker = None;
     for cue in cues.iter().take_while(|c| c.start_ms <= pos) {
         let current = pos < cue.end_ms;
-        let spans: Vec<Span> = cue
-            .words
-            .iter()
-            .map(|w| {
-                let style = if !current || w.end_ms <= pos {
-                    Style::new()
-                } else if w.start_ms <= pos {
-                    Style::new().fg(SPOKEN).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::new().fg(Color::DarkGray)
-                };
-                let style = match search.mark(index) {
-                    2 => style.fg(Color::Black).bg(Color::Cyan),
-                    1 => style.add_modifier(Modifier::UNDERLINED),
-                    _ => style,
-                };
-                index += 1;
-                Span::styled(w.text.clone(), style)
-            })
-            .collect();
+        let mut spans: Vec<Span> = Vec::new();
+        // Name the speaker whenever it changes.
+        if let Some(s) = cue.speaker.as_deref().filter(|&s| last_speaker != Some(s)) {
+            let style = Style::new().fg(speakers::color(s)).bold();
+            spans.push(Span::styled("Speaker", style));
+            spans.push(Span::styled(format!("{s}:"), style));
+        }
+        last_speaker = cue.speaker.as_deref();
+        spans.extend(cue.words.iter().map(|w| {
+            let style = if !current || w.end_ms <= pos {
+                Style::new()
+            } else if w.start_ms <= pos {
+                Style::new().fg(SPOKEN).add_modifier(Modifier::BOLD)
+            } else {
+                Style::new().fg(Color::DarkGray)
+            };
+            let style = match search.mark(index) {
+                2 => style.fg(Color::Black).bg(Color::Cyan),
+                1 => style.add_modifier(Modifier::UNDERLINED),
+                _ => style,
+            };
+            index += 1;
+            Span::styled(w.text.clone(), style)
+        }));
         let gutter = Span::styled(
             format!("[{}] ", timestamp(cue.start_ms)),
             Style::new().fg(Color::DarkGray),
@@ -606,6 +618,7 @@ mod tests {
             Dialogue: 0,0:00:01.00,0:00:02.50,Default,,0,0,0,,{\\k20}Hi,\\N{\\k30}{\\k40}there, you\n";
         let cues = parse_ass(ass);
         assert_eq!(cues.len(), 1);
+        assert_eq!(cues[0].speaker, None);
         assert_eq!(
             cues[0].words,
             vec![
@@ -664,6 +677,12 @@ mod tests {
         assert_eq!((s.mark(4), s.mark(1), s.mark(0)), (2, 1, 0));
         assert_eq!(s.start("dragon", &words, 0), None);
         assert_eq!(s.message.as_deref(), Some("pattern not found"));
+    }
+
+    #[test]
+    fn reads_speaker_from_name() {
+        let ass = "Dialogue: 0,0:00:00.00,0:00:02.00,S2,Speaker B,0,0,0,,{\\k20}Hi\n";
+        assert_eq!(parse_ass(ass)[0].speaker.as_deref(), Some("B"));
     }
 
     #[test]

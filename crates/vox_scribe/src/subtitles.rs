@@ -80,16 +80,7 @@ impl SubtitleWriter {
         if p.words.is_empty() || !self.written.insert(p.id.clone()) {
             return Ok(());
         }
-        let mut out = String::new();
-        for mut cue in subtitle::cues(&p.words, p.end_ms, &self.cfg) {
-            cue.start_ms += self.offset_ms;
-            cue.end_ms += self.offset_ms;
-            self.cues += 1;
-            out.push_str(&match self.format {
-                Format::Srt => subtitle::srt(self.cues, &cue),
-                Format::Ass => subtitle::ass(&cue),
-            });
-        }
+        let out = paragraph_cues(p, self.format, self.offset_ms, &mut self.cues, &self.cfg);
         self.file
             .write_all(out.as_bytes())
             .and_then(|_| self.file.sync_data())
@@ -103,6 +94,52 @@ impl SubtitleWriter {
         }
         Ok(())
     }
+}
+
+/// `p`'s cues in `format`, numbered on from `count`. A speaker's first
+/// SRT cue in the paragraph starts with "Speaker A: "; ASS carries the
+/// speaker in the line's Name and style.
+fn paragraph_cues(
+    p: &Paragraph,
+    format: Format,
+    offset_ms: u64,
+    count: &mut usize,
+    cfg: &CueConfig,
+) -> String {
+    let mut out = String::new();
+    for (i, mut cue) in subtitle::cues(&p.words, p.end_ms, cfg)
+        .into_iter()
+        .enumerate()
+    {
+        cue.start_ms += offset_ms;
+        cue.end_ms += offset_ms;
+        *count += 1;
+        out.push_str(&match format {
+            Format::Srt => {
+                if let (0, Some(s)) = (i, &p.speaker) {
+                    cue.text = format!("{}: {}", crate::speakers::name(s), cue.text);
+                }
+                subtitle::srt(*count, &cue)
+            }
+            Format::Ass => subtitle::ass_for(&cue, p.speaker.as_deref()),
+        });
+    }
+    out
+}
+
+/// A whole file for `t`, as [`SubtitleWriter`] would have written it for
+/// a new (not appended) session.
+pub fn render(format: Format, t: &Transcript) -> String {
+    let cfg = CueConfig::default();
+    let mut out = match format {
+        Format::Srt => String::new(),
+        Format::Ass => subtitle::ASS_HEADER.to_string(),
+    };
+    let mut count = 0;
+    for p in t.paragraphs.iter().filter(|p| !p.words.is_empty()) {
+        out.push_str(&paragraph_cues(p, format, 0, &mut count, &cfg));
+    }
+    out
 }
 
 /// Cue count and start offset for a session appended to `existing`.

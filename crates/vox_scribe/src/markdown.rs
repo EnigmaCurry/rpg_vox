@@ -41,7 +41,7 @@ impl MarkdownWriter {
         if append && existing {
             write!(file, "\n---\n\n*{subtitle}*\n")?;
         } else {
-            write!(file, "# {title}\n\n*{subtitle}*\n")?;
+            file.write_all(header(title, subtitle).as_bytes())?;
         }
         file.sync_data()?;
         Ok(Self {
@@ -62,7 +62,8 @@ impl MarkdownWriter {
         if text.is_empty() || !self.written.insert(p.id.clone()) {
             return Ok(());
         }
-        write!(self.file, "\n**[{}]** {}\n", timestamp(p.start_ms), text)
+        self.file
+            .write_all(block(p).as_bytes())
             .and_then(|_| self.file.sync_data())
             .with_context(|| format!("write {}", self.path.display()))
     }
@@ -74,6 +75,33 @@ impl MarkdownWriter {
         }
         Ok(())
     }
+}
+
+fn header(title: &str, subtitle: &str) -> String {
+    format!("# {title}\n\n*{subtitle}*\n")
+}
+
+/// A paragraph as written: `**[hh:mm:ss]** text`, or
+/// `**[hh:mm:ss] Speaker A:** text` once diarized.
+fn block(p: &Paragraph) -> String {
+    let ts = timestamp(p.start_ms);
+    match &p.speaker {
+        Some(s) => format!(
+            "\n**[{ts}] {}:** {}\n",
+            crate::speakers::name(s),
+            p.text.trim()
+        ),
+        None => format!("\n**[{ts}]** {}\n", p.text.trim()),
+    }
+}
+
+/// A whole file for `t`, as [`MarkdownWriter`] would have written it.
+pub fn render(title: &str, subtitle: &str, t: &Transcript) -> String {
+    let mut out = header(title, subtitle);
+    for p in t.paragraphs.iter().filter(|p| !p.text.trim().is_empty()) {
+        out.push_str(&block(p));
+    }
+    out
 }
 
 /// One block of a previous session's markdown, for showing as context
@@ -102,10 +130,16 @@ pub fn read_tail(path: &Path, max: usize) -> Vec<HistoryBlock> {
             if b == "---" {
                 return HistoryBlock::Rule;
             }
-            if let Some((ts, text)) = b.strip_prefix("**[").and_then(|r| r.split_once("]** ")) {
+            if let Some((head, text)) = b.strip_prefix("**[").and_then(|r| r.split_once("** ")) {
+                // `ts]` or `ts] Speaker A:`
+                let (ts, who) = head.split_once(']').unwrap_or((head, ""));
+                let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
                 return HistoryBlock::Paragraph {
                     timestamp: ts.to_string(),
-                    text: text.split_whitespace().collect::<Vec<_>>().join(" "),
+                    text: match who.trim() {
+                        "" => text,
+                        who => format!("{who} {text}"),
+                    },
                 };
             }
             HistoryBlock::Note(b.trim_matches('*').to_string())

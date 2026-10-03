@@ -5,6 +5,7 @@
 //! <dir>/sense-voice/{model.int8.onnx,tokens.txt}
 //! <dir>/parakeet-tdt-0.6b-v2/{encoder,decoder,joiner}.int8.onnx + tokens.txt
 //! <dir>/streaming-zipformer/{encoder,decoder,joiner}.onnx + tokens.txt
+//! <dir>/speaker-diarization/{segmentation,embedding}.onnx   (--diarize)
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -15,6 +16,7 @@ use anyhow::{bail, Context as _, Result};
 pub const SENSE_VOICE: &str = "sense-voice";
 pub const ZIPFORMER: &str = "streaming-zipformer";
 pub const PARAKEET: &str = "parakeet-tdt-0.6b-v2";
+pub const SPEAKERS: &str = "speaker-diarization";
 
 /// The pass-2/3 recognizer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -43,7 +45,13 @@ impl Offline {
     }
 }
 
-const RELEASES: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models";
+const RELEASES: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download";
+const ASR: &str = "asr-models";
+/// pyannote segmentation 3.0, ~6 MB.
+const SEGMENTATION: &str = "sherpa-onnx-pyannote-segmentation-3-0";
+/// WeSpeaker ResNet34-LM trained on VoxCeleb (English), ~26 MB. The
+/// release tag's misspelling is upstream's.
+const EMBEDDING_URL: &str = "speaker-recongition-models/wespeaker_en_voxceleb_resnet34_LM.onnx";
 
 /// Per-user data directory for downloaded models.
 pub fn user_models_dir() -> PathBuf {
@@ -95,6 +103,34 @@ pub fn has_parakeet(dir: &Path) -> bool {
     ]
     .iter()
     .all(|f| dir.join(PARAKEET).join(f).is_file())
+}
+
+pub fn has_speakers(dir: &Path) -> bool {
+    ["segmentation.onnx", "embedding.onnx"]
+        .iter()
+        .all(|f| dir.join(SPEAKERS).join(f).is_file())
+}
+
+/// Download the --diarize models into `dir`, unless already present.
+pub fn download_speakers(dir: &Path) -> Result<()> {
+    let dest = dir.join(SPEAKERS);
+    if has_speakers(dir) {
+        println!("speaker models already present in {}", dest.display());
+        return Ok(());
+    }
+    std::fs::create_dir_all(&dest).with_context(|| format!("create {}", dest.display()))?;
+    fetch_in(
+        "speaker-segmentation-models",
+        SEGMENTATION,
+        &dest,
+        &[("model.onnx", "segmentation.onnx")],
+    )?;
+    let to = dest.join("embedding.onnx");
+    let part = dest.join("embedding.onnx.part");
+    curl(&format!("{RELEASES}/{EMBEDDING_URL}"), &part)?;
+    std::fs::rename(&part, &to)?;
+    println!("installed {}", to.display());
+    Ok(())
 }
 
 pub fn has_zipformer(dir: &Path) -> bool {
@@ -157,21 +193,30 @@ pub fn download(dir: &Path, offline: Offline) -> Result<()> {
 }
 
 fn fetch(stem: &str, dest: &Path, files: &[(&str, &str)]) -> Result<()> {
-    let tmp = std::env::temp_dir().join(format!("vox_scribe-{stem}"));
-    std::fs::create_dir_all(&tmp)?;
-    let archive = tmp.join(format!("{stem}.tar.bz2"));
-    let url = format!("{RELEASES}/{stem}.tar.bz2");
+    fetch_in(ASR, stem, dest, files)
+}
+
+fn curl(url: &str, to: &Path) -> Result<()> {
     println!("downloading {url}");
     let ok = Command::new("curl")
         .args(["-fL", "--progress-bar", "-o"])
-        .arg(&archive)
-        .arg(&url)
+        .arg(to)
+        .arg(url)
         .status()
         .context("run curl")?
         .success();
     if !ok {
         bail!("download failed: {url}");
     }
+    Ok(())
+}
+
+/// Fetch `<release>/<stem>.tar.bz2` and copy `files` out of it.
+fn fetch_in(release: &str, stem: &str, dest: &Path, files: &[(&str, &str)]) -> Result<()> {
+    let tmp = std::env::temp_dir().join(format!("vox_scribe-{stem}"));
+    std::fs::create_dir_all(&tmp)?;
+    let archive = tmp.join(format!("{stem}.tar.bz2"));
+    curl(&format!("{RELEASES}/{release}/{stem}.tar.bz2"), &archive)?;
     let ok = Command::new("tar")
         .arg("-xjf")
         .arg(&archive)

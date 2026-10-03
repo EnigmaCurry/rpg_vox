@@ -227,3 +227,58 @@ fn pass4_failure_keeps_pass3_text() {
         Some(vox_transcribe::Pass4::Failed { .. })
     ));
 }
+
+/// Labels utterances from a fixed list, in order.
+struct FakeTagger(Vec<&'static str>);
+
+impl vox_transcribe::SpeakerTagger for FakeTagger {
+    fn identify(&mut self, _samples: &[f32], _rate: u32) -> Option<String> {
+        (!self.0.is_empty()).then(|| self.0.remove(0).to_string())
+    }
+}
+
+fn run_tagged(tags: Vec<&'static str>, chunks: &[(u32, f32)]) -> vox_transcribe::Transcript {
+    let mut cfg = EngineConfig::new(SR);
+    cfg.partial_interval = std::time::Duration::ZERO;
+    let engine = Engine::spawn_full(
+        cfg,
+        Some(Box::new(FakeStreaming { fed: 0 })),
+        Arc::new(FakeOffline),
+        None,
+        Some(Box::new(FakeTagger(tags))),
+    );
+    for &(ms, amp) in chunks {
+        for chunk in tone(ms, amp).chunks(SR as usize / 50) {
+            engine.push(chunk);
+        }
+    }
+    engine.finish()
+}
+
+const TWO_CLOSE_UTTERANCES: &[(u32, f32)] = &[
+    (500, 0.0),
+    (1200, 0.2),
+    (800, 0.0),
+    (1200, 0.2),
+    (3000, 0.0),
+];
+
+#[test]
+fn speaker_change_opens_new_paragraph() {
+    let t = run_tagged(vec!["A", "B"], TWO_CLOSE_UTTERANCES);
+    assert_eq!(t.paragraphs.len(), 2, "{t:#?}");
+    assert_eq!(t.paragraphs[0].speaker.as_deref(), Some("A"));
+    assert_eq!(t.paragraphs[1].speaker.as_deref(), Some("B"));
+    assert!(t
+        .paragraphs
+        .iter()
+        .all(|p| p.hardened && p.clips.len() == 1));
+}
+
+#[test]
+fn same_speaker_stays_in_one_paragraph() {
+    let t = run_tagged(vec!["A", "A"], TWO_CLOSE_UTTERANCES);
+    assert_eq!(t.paragraphs.len(), 1);
+    assert_eq!(t.paragraphs[0].speaker.as_deref(), Some("A"));
+    assert_eq!(t.paragraphs[0].clips.len(), 2);
+}

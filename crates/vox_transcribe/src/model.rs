@@ -31,6 +31,10 @@ pub struct Clip {
     /// Empty while the clip is a streaming partial.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub words: Vec<Word>,
+    /// Speaker label ("A", "B", …) when diarization is on and the clip
+    /// has been identified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speaker: Option<String>,
 }
 
 impl Clip {
@@ -65,6 +69,10 @@ pub struct Paragraph {
     /// pass 4's edits.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub words: Vec<Word>,
+    /// The first identified speaker among the clips. The engine starts a
+    /// new paragraph when the speaker changes, so this covers them all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speaker: Option<String>,
     /// Soft/hard word cap reached: the next clip opens a new paragraph
     /// even without a silence gap.
     pub closed: bool,
@@ -104,6 +112,7 @@ impl Paragraph {
             text: String::new(),
             clips: vec![first],
             words: Vec::new(),
+            speaker: None,
             closed: false,
             hardened: false,
             pass3_inflight: false,
@@ -128,6 +137,7 @@ impl Paragraph {
             .filter(|c| !c.is_partial())
             .flat_map(Clip::timed_words)
             .collect();
+        self.speaker = self.clips.iter().find_map(|c| c.speaker.clone());
         if let Some(first) = self.clips.first() {
             self.start_ms = first.start_ms;
         }

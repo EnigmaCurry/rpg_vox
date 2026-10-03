@@ -233,6 +233,33 @@ download-streaming-stt-model:
 
 # --- vox_scribe (standalone live transcription TUI) ---
 
+# Download the speaker models for `scribe --diarize` into
+# models/speaker-diarization/: pyannote segmentation 3.0 (~6 MB) and the
+# WeSpeaker ResNet34-LM VoxCeleb embedding model (~26 MB). `scribe
+# --diarize` also fetches them on first use into its own models dir.
+download-speaker-models:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dest="models/speaker-diarization"
+    if [ -f "$dest/segmentation.onnx" ] && [ -f "$dest/embedding.onnx" ]; then
+      echo "speaker models already present at $dest/"
+      exit 0
+    fi
+    base="https://github.com/k2-fsa/sherpa-onnx/releases/download"
+    stem="sherpa-onnx-pyannote-segmentation-3-0"
+    tmp="$(mktemp -d)"
+    trap "rm -rf '$tmp'" EXIT
+    echo "downloading $stem …"
+    curl -fL --progress-bar -o "$tmp/$stem.tar.bz2" "$base/speaker-segmentation-models/$stem.tar.bz2"
+    tar -xjf "$tmp/$stem.tar.bz2" -C "$tmp"
+    mkdir -p "$dest"
+    cp "$tmp/$stem/model.onnx" "$dest/segmentation.onnx"
+    echo "downloading the speaker embedding model …"
+    curl -fL --progress-bar -o "$dest/embedding.onnx.part" \
+      "$base/speaker-recongition-models/wespeaker_en_voxceleb_resnet34_LM.onnx"
+    mv "$dest/embedding.onnx.part" "$dest/embedding.onnx"
+    echo "installed speaker models → $dest/"
+
 # Uses nix-shell when available (Linux), plain cargo otherwise (macOS,
 # where only this crate builds).
 # Run the vox_scribe live transcription TUI (fetches models first).

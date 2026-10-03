@@ -20,6 +20,7 @@ use vox_transcribe::correct::changed_words;
 use vox_transcribe::{Change, Event, ParagraphMode, Pass4, Stage, Transcript};
 
 use crate::markdown::{timestamp, HistoryBlock};
+use crate::speakers;
 use crate::{Outcome, Session};
 
 const FLASH: Duration = Duration::from_millis(1500);
@@ -637,6 +638,11 @@ fn transcript_lines(
         }
         if words.is_empty() {
             continue;
+        }
+        if let Some(s) = &p.speaker {
+            let style = Style::new().fg(speakers::color(s)).bold();
+            words.insert(0, (format!("{s}:"), style));
+            words.insert(0, ("Speaker".to_string(), style));
         }
         let selected = app.selected.as_deref() == Some(p.id.as_str());
         let gutter_style = match (selected, p.hardened, &p.pass4) {

@@ -1,17 +1,22 @@
 //! sherpa-onnx recognizers: streaming Zipformer transducer for pass 1,
-//! offline SenseVoice or NeMo Parakeet TDT for passes 2 and 3.
+//! offline SenseVoice or NeMo Parakeet TDT for passes 2 and 3, plus
+//! speaker embeddings (live labels) and pyannote diarization (offline).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context as _, Result};
 use sherpa_onnx::{
-    OfflineRecognizerConfig, OfflineSenseVoiceModelConfig, OfflineTransducerModelConfig,
-    OnlineRecognizerConfig, OnlineStream,
+    FastClusteringConfig, LinearResampler, OfflineRecognizerConfig, OfflineSenseVoiceModelConfig,
+    OfflineSpeakerDiarizationConfig, OfflineSpeakerSegmentationModelConfig,
+    OfflineSpeakerSegmentationPyannoteModelConfig, OfflineTransducerModelConfig,
+    OnlineRecognizerConfig, OnlineStream, SpeakerEmbeddingExtractorConfig,
 };
 use tracing::info;
 
-use crate::recognizer::{OfflineRecognizer, StreamingRecognizer, Transcription};
+use crate::diarize::Segment;
+use crate::recognizer::{OfflineRecognizer, SpeakerTagger, StreamingRecognizer, Transcription};
+use crate::speaker::{label, ClusterConfig, OnlineClusters};
 use crate::timing::words_from_tokens;
 
 fn require(p: &Path, label: &str) -> Result<String> {
@@ -243,5 +248,132 @@ impl StreamingRecognizer for ZipformerSession {
             .get_result(&self.stream)
             .map(|r| r.text.trim().to_string())
             .unwrap_or_default()
+    }
+}
+
+/// Rate the speaker models run at.
+const SPEAKER_RATE: u32 = 16_000;
+
+/// `samples` converted from rate `from` to rate `to`.
+fn resample(samples: &[f32], from: u32, to: u32) -> Result<Vec<f32>> {
+    if from == to {
+        return Ok(samples.to_vec());
+    }
+    let r = LinearResampler::create(from as i32, to as i32)
+        .ok_or_else(|| anyhow!("sherpa-onnx failed to create a resampler"))?;
+    Ok(r.resample(samples, true))
+}
+
+/// Speaker models: pyannote segmentation (offline diarization only) and
+/// a speaker-embedding model (both modes).
+#[derive(Clone, Debug)]
+pub struct SpeakerModels {
+    pub segmentation: PathBuf,
+    pub embedding: PathBuf,
+    pub num_threads: i32,
+}
+
+impl SpeakerModels {
+    /// Layout written by `scribe download-models --diarize`:
+    /// `<dir>/segmentation.onnx` and `<dir>/embedding.onnx`.
+    pub fn from_dir(dir: &Path) -> Self {
+        Self {
+            segmentation: dir.join("segmentation.onnx"),
+            embedding: dir.join("embedding.onnx"),
+            num_threads: 2,
+        }
+    }
+
+    fn embedding_config(&self) -> Result<SpeakerEmbeddingExtractorConfig> {
+        Ok(SpeakerEmbeddingExtractorConfig {
+            model: Some(require(&self.embedding, "speaker embedding model")?),
+            num_threads: self.num_threads,
+            ..Default::default()
+        })
+    }
+}
+
+/// Live speaker labels from per-utterance embeddings.
+pub struct EmbeddingTagger {
+    extractor: sherpa_onnx::SpeakerEmbeddingExtractor,
+    clusters: OnlineClusters,
+}
+
+impl EmbeddingTagger {
+    pub fn open(models: &SpeakerModels, cfg: ClusterConfig) -> Result<Self> {
+        let extractor = sherpa_onnx::SpeakerEmbeddingExtractor::create(&models.embedding_config()?)
+            .ok_or_else(|| anyhow!("sherpa-onnx failed to create speaker embedding extractor"))?;
+        info!(model = %models.embedding.display(), dim = extractor.dim(), "speaker embeddings loaded");
+        Ok(Self {
+            extractor,
+            clusters: OnlineClusters::new(cfg),
+        })
+    }
+}
+
+impl SpeakerTagger for EmbeddingTagger {
+    fn identify(&mut self, samples: &[f32], sample_rate: u32) -> Option<String> {
+        let audio = resample(samples, sample_rate, SPEAKER_RATE).ok()?;
+        let stream = self.extractor.create_stream()?;
+        stream.accept_waveform(SPEAKER_RATE as i32, &audio);
+        stream.input_finished();
+        if !self.extractor.is_ready(&stream) {
+            return None;
+        }
+        let emb = self.extractor.compute(&stream)?;
+        let ms = samples.len() as u64 * 1000 / sample_rate.max(1) as u64;
+        self.clusters.assign(&emb, ms).map(label)
+    }
+}
+
+/// Full offline diarization: pyannote segmentation, embeddings and
+/// clustering over a whole recording.
+pub struct Diarizer {
+    inner: sherpa_onnx::OfflineSpeakerDiarization,
+}
+
+impl Diarizer {
+    /// `num_speakers` fixes the speaker count when known; otherwise the
+    /// clustering threshold decides.
+    pub fn open(models: &SpeakerModels, num_speakers: Option<usize>) -> Result<Self> {
+        let config = OfflineSpeakerDiarizationConfig {
+            segmentation: OfflineSpeakerSegmentationModelConfig {
+                pyannote: OfflineSpeakerSegmentationPyannoteModelConfig {
+                    model: Some(require(&models.segmentation, "speaker segmentation model")?),
+                    ..Default::default()
+                },
+                num_threads: models.num_threads,
+                ..Default::default()
+            },
+            embedding: models.embedding_config()?,
+            clustering: FastClusteringConfig {
+                num_clusters: num_speakers.map(|n| n as i32).unwrap_or(-1),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let inner = sherpa_onnx::OfflineSpeakerDiarization::create(&config)
+            .ok_or_else(|| anyhow!("sherpa-onnx failed to create the speaker diarizer"))?;
+        Ok(Self { inner })
+    }
+
+    /// Speaker turns in `samples` (mono at `sample_rate`), in ms.
+    pub fn process(&self, samples: &[f32], sample_rate: u32) -> Result<Vec<Segment>> {
+        let audio = resample(samples, sample_rate, self.inner.sample_rate().max(1) as u32)?;
+        let result = self
+            .inner
+            .process(&audio)
+            .context("speaker diarization failed")?;
+        let ms = |s: f32| (s.max(0.0) * 1000.0).round() as u64;
+        Ok(result
+            .sort_by_start_time()
+            .into_iter()
+            .filter(|s| s.speaker >= 0)
+            .map(|s| Segment {
+                start_ms: ms(s.start),
+                end_ms: ms(s.end),
+                speaker: s.speaker as usize,
+            })
+            .collect())
     }
 }

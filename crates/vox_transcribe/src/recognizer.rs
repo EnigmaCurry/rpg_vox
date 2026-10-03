@@ -36,3 +36,11 @@ pub trait OfflineRecognizer: Send + Sync {
         })
     }
 }
+
+/// Live speaker identification: labels each finished utterance with a
+/// speaker ("A", "B", …). Called on the offline worker thread, one
+/// utterance at a time and in order, so implementations may keep state.
+pub trait SpeakerTagger: Send {
+    /// `None` when the utterance is too short or unclear to tell.
+    fn identify(&mut self, samples: &[f32], sample_rate: u32) -> Option<String>;
+}

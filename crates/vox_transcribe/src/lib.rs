@@ -10,10 +10,15 @@
 //! * **Pass 4** (optional): once a paragraph settles, an LLM proposes
 //!   small edits (number formats, misheard names, bogus sentence breaks).
 //!
+//! * **Speakers** (optional): each utterance is labelled live with a
+//!   speaker; [`diarize`] relabels a finished transcript from a full
+//!   offline diarization of the audio.
+//!
 //! Feed mono `f32` samples into an [`Engine`] and consume [`Event`]s.
 
 pub mod boundary;
 pub mod correct;
+pub mod diarize;
 pub mod engine;
 pub mod filters;
 pub mod model;
@@ -23,6 +28,7 @@ pub mod recognizer;
 pub mod ring;
 #[cfg(feature = "sherpa")]
 pub mod sherpa;
+pub mod speaker;
 #[cfg(unix)]
 pub mod stderr;
 pub mod subtitle;
@@ -31,5 +37,5 @@ pub mod vad;
 
 pub use engine::{Change, Engine, EngineConfig, Event, ParagraphConfig, ParagraphMode, Pusher};
 pub use model::{Clip, Paragraph, Pass4, Stage, Transcript};
-pub use recognizer::{OfflineRecognizer, StreamingRecognizer, Transcription};
+pub use recognizer::{OfflineRecognizer, SpeakerTagger, StreamingRecognizer, Transcription};
 pub use timing::Word;
