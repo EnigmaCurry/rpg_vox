@@ -9,10 +9,17 @@
 //! Apps such as browsers play from helper processes that come and go, so
 //! the capture thread rescans every couple of seconds and retargets the
 //! tap when the set of matching processes changes.
+//!
+//! The aggregate device runs on the default output device's clock, so
+//! the samples arrive at that device's rate. The capture thread also
+//! follows the output: when it switches device, the aggregate is rebuilt
+//! on the new one's clock, and when the rate changes (Bluetooth
+//! headphones drop to 16 or 24 kHz when their mic turns on) the reader
+//! resamples to the rate the session started with.
 
 use std::ffi::{c_void, CStr};
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -47,6 +54,8 @@ use tracing::{info, warn};
 use crate::{push_rt, AppInfo, Capture, CaptureParts, Plumbing};
 
 const RESCAN: Duration = Duration::from_secs(2);
+/// How often the output device and its rate are checked.
+const FOLLOW: Duration = Duration::from_millis(250);
 
 /// Audio clients Core Audio knows about (anything that has opened an
 /// output or input), with whether each is playing right now.
@@ -102,9 +111,15 @@ pub fn open(want: &str) -> Result<Capture> {
             let stop = tap.parts.as_ref().expect("parts").stop.clone();
             let parts = tap.parts.take().expect("parts");
             let _ = ready_tx.send(Ok((tap.rate, tap.label(), parts)));
-            let mut last_scan = Instant::now();
+            let (mut last_scan, mut last_follow) = (Instant::now(), Instant::now());
             while !stop.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(50));
+                if last_follow.elapsed() >= FOLLOW {
+                    last_follow = Instant::now();
+                    if let Err(e) = tap.follow_output() {
+                        warn!("process tap: following the output device: {e:#}");
+                    }
+                }
                 if last_scan.elapsed() >= RESCAN {
                     last_scan = Instant::now();
                     if let Err(e) = tap.retarget() {
@@ -131,7 +146,12 @@ struct Tap {
     device: AudioObjectID,
     io_proc: AudioDeviceIOProcID,
     state: *mut RtState,
+    /// The rate the session runs at (the device's when it started).
     rate: u32,
+    /// The rate samples arrive at now; the reader resamples to `rate`.
+    device_rate: Arc<AtomicU32>,
+    /// UID of the output device clocking the aggregate.
+    clock: Option<String>,
     parts: Option<CaptureParts>,
 }
 
@@ -166,6 +186,8 @@ impl Tap {
             io_proc: None,
             state: std::ptr::null_mut(),
             rate: 0,
+            device_rate: Arc::new(AtomicU32::new(0)),
+            clock: None,
             parts: None,
         };
         // On error, Drop releases whatever was created so far.
@@ -190,29 +212,26 @@ impl Tap {
             "process tap format"
         );
 
+        tap.clock = default_output_uid();
         tap.device = create_aggregate(&tap.desc)?;
         // The IOProc runs on the aggregate device's clock, which follows
         // the default output device, not the tap's nominal format: with
         // 44.1 kHz Bluetooth headphones the samples arrive at 44.1 kHz
         // while the tap still says 48 kHz, and a recording played back
         // 9% fast and high. Trust the device.
-        match get::<f64>(tap.device, kAudioDevicePropertyNominalSampleRate) {
-            Ok(r) if r >= 8000.0 => {
-                let r = r.round() as u32;
-                if r != tap.rate {
-                    info!(
-                        tap = tap.rate,
-                        device = r,
-                        "process tap runs at the output device's rate"
-                    );
-                    tap.rate = r;
-                }
+        if let Some(r) = device_rate(tap.device) {
+            if r != tap.rate {
+                info!(
+                    tap = tap.rate,
+                    device = r,
+                    "process tap runs at the output device's rate"
+                );
+                tap.rate = r;
             }
-            Ok(r) => warn!(rate = r, "aggregate device reports no usable sample rate"),
-            Err(e) => warn!("reading the aggregate device's sample rate: {e:#}"),
         }
+        tap.device_rate.store(tap.rate, Ordering::Relaxed);
 
-        let plumbing = Plumbing::new(tap.rate, channels);
+        let plumbing = Plumbing::with_input_rate(tap.rate, channels, tap.device_rate.clone());
         let (producer, parts) = plumbing.into_parts();
         tap.state = Box::into_raw(Box::new(RtState {
             producer,
@@ -238,6 +257,63 @@ impl Tap {
             "AudioDeviceStart",
         )?;
         Ok(tap)
+    }
+
+    /// Keep up with the output device: rebuild the aggregate on a new
+    /// default output's clock, and pass on any change of rate.
+    fn follow_output(&mut self) -> Result<()> {
+        let uid = default_output_uid();
+        if uid.is_some() && uid != self.clock {
+            info!(from = ?self.clock, to = ?uid, "output device changed; re-clocking the process tap");
+            self.rebuild_aggregate()?;
+            self.clock = uid;
+        }
+        if let Some(r) = device_rate(self.device) {
+            let old = self.device_rate.swap(r, Ordering::Relaxed);
+            if old != r {
+                info!(
+                    from = old,
+                    to = r,
+                    session = self.rate,
+                    "process tap rate changed; resampling"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Replace the aggregate device (and its IOProc) with one clocked by
+    /// the current default output. The tap and the RT state stay.
+    fn rebuild_aggregate(&mut self) -> Result<()> {
+        unsafe {
+            if self.io_proc.is_some() {
+                AudioDeviceStop(self.device, self.io_proc);
+                AudioDeviceDestroyIOProcID(self.device, self.io_proc);
+                self.io_proc = None;
+            }
+            if self.device != 0 {
+                AudioHardwareDestroyAggregateDevice(self.device);
+                self.device = 0;
+            }
+        }
+        self.device = create_aggregate(&self.desc)?;
+        let mut io_proc: AudioDeviceIOProcID = None;
+        check(
+            unsafe {
+                AudioDeviceCreateIOProcID(
+                    self.device,
+                    Some(io_proc_cb),
+                    self.state.cast(),
+                    NonNull::from(&mut io_proc),
+                )
+            },
+            "AudioDeviceCreateIOProcID",
+        )?;
+        self.io_proc = io_proc;
+        check(
+            unsafe { AudioDeviceStart(self.device, self.io_proc) },
+            "AudioDeviceStart",
+        )
     }
 
     fn label(&self) -> String {
@@ -325,6 +401,32 @@ unsafe extern "C-unwind" fn io_proc_cb(
 
 /// A private aggregate device whose only input is the tap, clocked by
 /// the default output device (as in Apple's sample code).
+/// The aggregate device's nominal rate, if it reports a usable one.
+fn device_rate(device: AudioObjectID) -> Option<u32> {
+    match get::<f64>(device, kAudioDevicePropertyNominalSampleRate) {
+        Ok(r) if r >= 8000.0 => Some(r.round() as u32),
+        Ok(r) => {
+            warn!(rate = r, "aggregate device reports no usable sample rate");
+            None
+        }
+        Err(e) => {
+            warn!("reading the aggregate device's sample rate: {e:#}");
+            None
+        }
+    }
+}
+
+/// UID of the current default output device.
+fn default_output_uid() -> Option<String> {
+    get::<AudioObjectID>(
+        kAudioObjectSystemObject as AudioObjectID,
+        kAudioHardwarePropertyDefaultOutputDevice,
+    )
+    .and_then(|dev| get_string(dev, kAudioDevicePropertyDeviceUID))
+    .ok()
+    .map(|s| s.to_string())
+}
+
 fn create_aggregate(desc: &CATapDescription) -> Result<AudioObjectID> {
     let tap_uid = unsafe { desc.UUID() }.UUIDString();
     let agg_uid = NSUUID::new().UUIDString();

@@ -12,7 +12,7 @@
 //! The realtime callback only writes into an SPSC ring; a reader thread
 //! downmixes and forwards, so nothing allocates on the audio thread.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -148,6 +148,13 @@ pub(crate) struct Plumbing {
 
 impl Plumbing {
     pub fn new(sample_rate: u32, channels: usize) -> Self {
+        Self::with_input_rate(sample_rate, channels, Arc::new(AtomicU32::new(sample_rate)))
+    }
+
+    /// Like [`Plumbing::new`] for a device whose rate can change under
+    /// it: samples arrive at `input_rate` (updated by the backend) and
+    /// are resampled to the fixed `sample_rate` the session started with.
+    pub fn with_input_rate(sample_rate: u32, channels: usize, input_rate: Arc<AtomicU32>) -> Self {
         let channels = channels.max(1);
         // Two seconds of headroom.
         let (producer, consumer) =
@@ -158,7 +165,17 @@ impl Plumbing {
         let chunk = (sample_rate as usize / 50).max(1);
         let reader = std::thread::Builder::new()
             .name("vox-audio-reader".into())
-            .spawn(move || reader_loop(consumer, channels, chunk, tx, stop_r))
+            .spawn(move || {
+                reader_loop(
+                    consumer,
+                    channels,
+                    chunk,
+                    tx,
+                    stop_r,
+                    input_rate,
+                    sample_rate,
+                )
+            })
             .expect("spawn audio reader");
         Self {
             producer,
@@ -232,9 +249,14 @@ fn reader_loop(
     chunk: usize,
     tx: Sender<Vec<f32>>,
     stop: Arc<AtomicBool>,
+    input_rate: Arc<AtomicU32>,
+    out_rate: u32,
 ) {
     let mut out: Vec<f32> = Vec::with_capacity(chunk);
     let mut frame: Vec<f32> = Vec::with_capacity(channels);
+    let mut mono: Vec<f32> = Vec::new();
+    let mut rate = out_rate;
+    let mut resampler = resample::Linear::new(rate, out_rate);
     while !stop.load(Ordering::Relaxed) {
         let available = consumer.slots();
         if available == 0 {
@@ -247,16 +269,55 @@ fn reader_loop(
         for s in read {
             frame.push(s);
             if frame.len() == channels {
-                out.push(frame.iter().sum::<f32>() / channels as f32);
+                mono.push(frame.iter().sum::<f32>() / channels as f32);
                 frame.clear();
-                if out.len() >= chunk
-                    && tx
-                        .send(std::mem::replace(&mut out, Vec::with_capacity(chunk)))
-                        .is_err()
-                {
-                    return;
-                }
             }
         }
+        let now = input_rate.load(Ordering::Relaxed);
+        if now != rate && now > 0 {
+            rate = now;
+            resampler = resample::Linear::new(rate, out_rate);
+        }
+        resampler.process(&mono, &mut out);
+        mono.clear();
+        while out.len() >= chunk {
+            let rest = out.split_off(chunk);
+            if tx.send(std::mem::replace(&mut out, rest)).is_err() {
+                return;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Feed `secs` of samples at `rate` into a plumbing whose session runs
+    /// at 48 kHz; return how many session samples come out.
+    fn through(rate: u32, secs: f32, input_rate: &Arc<AtomicU32>, p: &mut rtrb::Producer<f32>) {
+        input_rate.store(rate, Ordering::Relaxed);
+        let n = (rate as f32 * secs) as usize;
+        for i in 0..n {
+            while p.push((i as f32 * 0.01).sin()).is_err() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        // Let the reader see this batch at this rate.
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    #[test]
+    fn reader_resamples_when_the_device_rate_changes() {
+        let rate = Arc::new(AtomicU32::new(48_000));
+        let (mut producer, parts) = Plumbing::with_input_rate(48_000, 1, rate.clone()).into_parts();
+        through(48_000, 0.5, &rate, &mut producer);
+        through(16_000, 0.5, &rate, &mut producer);
+        through(44_100, 0.5, &rate, &mut producer);
+        std::thread::sleep(Duration::from_millis(200));
+        parts.stop.store(true, Ordering::SeqCst);
+        let got: usize = parts.chunks.try_iter().map(|c| c.len()).sum();
+        // 1.5 s at the session rate, give or take the last partial chunk.
+        assert!((got as i64 - 72_000).abs() <= 1_000, "{got}");
     }
 }
