@@ -250,6 +250,8 @@ pub struct Session {
     pub live: bool,
     /// --diarize: speakers are labelled (and can be renamed with `n`).
     pub diarize: bool,
+    /// --record: the audio is being saved too.
+    pub recording: bool,
     /// --speakers N.
     pub num_speakers: Option<usize>,
     pump: Option<std::thread::JoinHandle<()>>,
@@ -705,6 +707,7 @@ fn main() -> Result<()> {
         input_ms,
         live: cli.live,
         diarize: cli.diarize,
+        recording: record.is_some(),
         num_speakers,
         pump: Some(pump),
     };

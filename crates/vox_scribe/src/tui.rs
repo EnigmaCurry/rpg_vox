@@ -500,16 +500,33 @@ fn draw(f: &mut Frame, app: &App, s: &Session) {
 
     let paused = s.paused.load(Ordering::Relaxed);
     let state = if paused {
-        Span::styled(" PAUSED ", Style::new().black().on_yellow())
+        Span::styled(" ❚❚ PAUSED ", Style::new().black().on_yellow())
     } else if s.source_done.load(Ordering::Relaxed) {
         Span::styled(" INPUT DONE ", Style::new().black().bg(LLM_BLUE))
+    } else if s.live {
+        Span::styled(" ▶ LIVE ", Style::new().black().on_green())
     } else {
-        if s.live {
-            Span::styled(" ▶ LIVE ", Style::new().black().on_green())
-        } else {
-            Span::styled(" ● REC ", Style::new().white().on_red())
-        }
+        Span::styled(" ◉ LISTENING ", Style::new().black().on_green())
     };
+    // Where the words are going, top right.
+    let (badge, badge_style) = if s.recording {
+        (" ● REC ", Style::new().white().on_red())
+    } else if s.once {
+        (" ⧉ CLIPBOARD ", Style::new().black().on_magenta())
+    } else if s.path().is_some() {
+        (" ✎ SAVING ", Style::new().black().bg(Color::Indexed(214)))
+    } else {
+        (" ○ NOT SAVED ", Style::new().black().on_gray())
+    };
+    let badge_style = if paused {
+        badge_style.add_modifier(Modifier::DIM)
+    } else {
+        badge_style
+    };
+    let [header, corner] =
+        Layout::horizontal([Constraint::Min(0), Constraint::Length(badge.width() as u16)])
+            .areas(header);
+    f.render_widget(Line::from(Span::styled(badge, badge_style)), corner);
     let path = s
         .path()
         .map(|p| format!("  → {}", p.display()))
@@ -518,7 +535,7 @@ fn draw(f: &mut Frame, app: &App, s: &Session) {
         Line::from(vec![
             state,
             if s.once {
-                Span::styled(" ONE-SHOT ", Style::new().black().on_magenta())
+                Span::raw("")
             } else if s.manual.load(Ordering::Relaxed) {
                 Span::styled(" ¶ MANUAL ", Style::new().black().on_magenta())
             } else {
