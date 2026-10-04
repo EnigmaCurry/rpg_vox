@@ -522,6 +522,7 @@ fn draw(f: &mut Frame, app: &App, s: &Session) {
         &s.history,
         inner_w.max(GUTTER + 10),
         s.manual.load(Ordering::Relaxed),
+        s.diarize,
     );
     let visible = body.height.saturating_sub(2) as usize;
     let max_scroll = lines.len().saturating_sub(visible);
@@ -771,10 +772,16 @@ fn transcript_lines(
     history: &[HistoryBlock],
     width: usize,
     manual: bool,
+    diarize: bool,
 ) -> (Vec<Line<'static>>, Vec<(String, usize, usize)>) {
     let text_w = width.saturating_sub(GUTTER).max(10);
     let mut out = Vec::new();
     let mut ranges = Vec::new();
+    // With speakers, streaming text isn't anyone's yet: it waits in its
+    // own block at the bottom until pass 2 finalizes it and the speaker
+    // is known, then joins that speaker's paragraph.
+    let partial_style = Style::new().dark_gray().add_modifier(Modifier::ITALIC);
+    let mut pending: Vec<(u64, String)> = Vec::new();
     history_lines(history, width, &mut out);
     for p in &app.transcript.paragraphs {
         let mut words: Vec<(String, Style)> = Vec::new();
@@ -794,8 +801,12 @@ fn transcript_lines(
         }
         let per_clip = words.is_empty();
         for c in p.clips.iter().filter(|_| per_clip) {
+            if diarize && c.is_partial() {
+                pending.push((c.start_ms, c.text.clone()));
+                continue;
+            }
             let style = match c.stage {
-                Stage::Partial => Style::new().dark_gray().add_modifier(Modifier::ITALIC),
+                Stage::Partial => partial_style,
                 _ if app.flashes.contains_key(&c.id) => Style::new().green(),
                 _ => Style::new(),
             };
@@ -825,6 +836,23 @@ fn transcript_lines(
         let label = format!("[{}]", timestamp(p.start_ms));
         wrap(label, gutter_style, cont_style, words, text_w, &mut out);
         ranges.push((p.id.clone(), start_line, out.len()));
+        out.push(Line::default());
+    }
+    if let Some(&(start, _)) = pending.first() {
+        let words = pending
+            .iter()
+            .flat_map(|(_, t)| t.split_whitespace())
+            .map(|w| (w.to_string(), partial_style))
+            .collect();
+        let label = format!("[{}]", timestamp(start));
+        wrap(
+            label,
+            Style::new().dark_gray(),
+            Style::new(),
+            words,
+            text_w,
+            &mut out,
+        );
         out.push(Line::default());
     }
     if manual {
