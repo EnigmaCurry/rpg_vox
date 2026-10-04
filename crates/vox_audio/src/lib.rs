@@ -32,6 +32,7 @@ pub mod process_tap;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod pw_dump;
 pub mod resample;
+pub mod stretch;
 
 #[derive(Debug, Clone)]
 pub struct DeviceInfo {

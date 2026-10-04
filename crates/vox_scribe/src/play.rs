@@ -14,6 +14,7 @@ use unicode_width::UnicodeWidthStr;
 use vox_audio::opus_file::{Cursor, OpusFile, RATE};
 use vox_audio::playback::Output;
 use vox_audio::resample::Linear;
+use vox_audio::stretch::Stretch;
 
 use crate::markdown::timestamp;
 use crate::speakers;
@@ -157,9 +158,12 @@ struct Player<'a> {
     cursor: Cursor<'a>,
     out: Output,
     resampler: Linear,
+    /// Speed changes without changing pitch.
+    stretch: Stretch,
     /// Resampled audio not yet accepted by the output.
     buf: Vec<f32>,
     decoded: Vec<f32>,
+    stretched: Vec<f32>,
     /// Position the output's played counter counts from.
     base_ms: u64,
     eof: bool,
@@ -173,9 +177,11 @@ impl<'a> Player<'a> {
             file,
             cursor: file.cursor(0)?,
             resampler: Linear::new(RATE, out.sample_rate),
+            stretch: Stretch::new(RATE),
             out,
             buf: Vec::new(),
             decoded: Vec::new(),
+            stretched: Vec::new(),
             base_ms: 0,
             eof: false,
             paused: false,
@@ -186,8 +192,21 @@ impl<'a> Player<'a> {
         self.file.len * 1000 / RATE as u64
     }
 
+    /// Each second played covers `speed` seconds of the recording.
     fn position_ms(&self) -> u64 {
-        (self.base_ms + self.out.played() * 1000 / self.out.sample_rate as u64).min(self.len_ms())
+        let played = self.out.played() as f64 * 1000.0 / self.out.sample_rate as f64;
+        (self.base_ms + (played * self.stretch.speed()) as u64).min(self.len_ms())
+    }
+
+    fn speed(&self) -> f64 {
+        self.stretch.speed()
+    }
+
+    /// Play at `speed`× from where playback is now.
+    fn set_speed(&mut self, speed: f64) -> Result<()> {
+        let pos = self.position_ms();
+        self.stretch.set_speed(speed);
+        self.seek(pos)
     }
 
     fn ended(&self) -> bool {
@@ -202,11 +221,15 @@ impl<'a> Player<'a> {
                     return Ok(());
                 }
                 self.decoded.clear();
+                self.stretched.clear();
                 if !self.cursor.read(&mut self.decoded)? {
                     self.eof = true;
-                    return Ok(());
+                    self.stretch.flush(&mut self.stretched);
+                    self.resampler.process(&self.stretched, &mut self.buf);
+                    continue;
                 }
-                self.resampler.process(&self.decoded, &mut self.buf);
+                self.stretch.process(&self.decoded, &mut self.stretched);
+                self.resampler.process(&self.stretched, &mut self.buf);
             }
             let n = self.out.push(&self.buf);
             self.buf.drain(..n);
@@ -222,6 +245,7 @@ impl<'a> Player<'a> {
         self.out.flush();
         self.cursor = self.file.cursor(ms * RATE as u64 / 1000)?;
         self.resampler.reset();
+        self.stretch.reset();
         self.buf.clear();
         self.base_ms = ms;
         self.eof = false;
@@ -351,12 +375,30 @@ pub fn run(paths: &RecordPaths) -> Result<()> {
                 }
             }
             KeyCode::Home => player.seek(0)?,
+            KeyCode::Char('<') | KeyCode::Char(',') => {
+                player.set_speed(step_speed(player.speed(), -1))?
+            }
+            KeyCode::Char('>') | KeyCode::Char('.') => {
+                player.set_speed(step_speed(player.speed(), 1))?
+            }
             _ => {}
         }
         last_draw = Instant::now() - FRAME;
     }
     screen.restore();
     Ok(())
+}
+
+/// Playback speeds `<` and `>` step through.
+const SPEEDS: [f64; 9] = [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0];
+
+/// The next speed up (`dir` 1) or down (-1) from `now`.
+fn step_speed(now: f64, dir: i32) -> f64 {
+    let i = SPEEDS
+        .iter()
+        .position(|&s| (s - now).abs() < 1e-9)
+        .unwrap_or(2) as i32;
+    SPEEDS[(i + dir).clamp(0, SPEEDS.len() as i32 - 1) as usize]
 }
 
 /// `/` search over the transcript, like `less`: case-insensitive, and
@@ -598,13 +640,25 @@ fn draw(
     } else {
         Span::styled(" ▶ PLAYING ", Style::new().black().on_green())
     };
+    let speed = {
+        let x = format!("{:.2}", player.speed());
+        let x = x.trim_end_matches('0').trim_end_matches('.');
+        let style = if (player.speed() - 1.0).abs() < 1e-9 {
+            Style::new().dark_gray()
+        } else {
+            Style::new().black().on_cyan()
+        };
+        Span::styled(format!(" {x}x "), style)
+    };
     let len = player.len_ms().max(1);
     let label = format!(" {} / {} ", clock(pos), clock(len));
-    let room = (bar.width as usize).saturating_sub(state.width() + label.width() + 1);
+    let room =
+        (bar.width as usize).saturating_sub(state.width() + speed.width() + label.width() + 1);
     let filled = (room as u64 * pos.min(len) / len) as usize;
     f.render_widget(
         Line::from(vec![
             state,
+            speed,
             Span::raw(label),
             Span::styled("━".repeat(filled), Style::new().fg(SPOKEN)),
             Span::styled("─".repeat(room - filled), Style::new().fg(Color::DarkGray)),
@@ -630,8 +684,10 @@ fn draw(
             Span::raw("  n next · p previous · esc clear").dark_gray(),
         ])
     } else {
-        Line::from(" space pause · ←/→ word · ↑/↓ line · / search · home restart · q quit")
-            .dark_gray()
+        Line::from(
+            " space pause · ←/→ word · ↑/↓ line · < > speed · / search · home restart · q quit",
+        )
+        .dark_gray()
     };
     f.render_widget(footer, keys);
 }
@@ -761,6 +817,14 @@ mod tests {
             cue(7000, 8000, "and on", Some("B")),
         ];
         assert_eq!(sentences(&cues), vec![0..2, 2..3, 3..4, 4..5]);
+    }
+
+    #[test]
+    fn speed_steps_and_stops_at_the_ends() {
+        assert_eq!(step_speed(1.0, 1), 1.25);
+        assert_eq!(step_speed(1.0, -1), 0.75);
+        assert_eq!(step_speed(3.0, 1), 3.0);
+        assert_eq!(step_speed(0.5, -1), 0.5);
     }
 
     #[test]
