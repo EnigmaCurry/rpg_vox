@@ -9,7 +9,9 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use ratatui::crossterm::event::{self, Event as TermEvent, KeyCode, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    self, Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+};
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
@@ -75,6 +77,17 @@ fn speaker_labels(t: &Transcript, s: &Session) -> Vec<String> {
     labels.sort_by_key(|l| (vox_transcribe::speaker::index(l), l.clone()));
     labels.dedup();
     labels
+}
+
+/// Esc as some terminals send it: Ctrl+[ is the same byte, and Emacs
+/// vterm sends Esc as Alt+Ctrl+[ (an Esc prefix on an Esc).
+pub fn normalize_key(key: KeyEvent) -> KeyEvent {
+    match key.code {
+        KeyCode::Char('[') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyEvent::new_with_kind(KeyCode::Esc, KeyModifiers::NONE, key.kind)
+        }
+        _ => key,
+    }
 }
 
 /// The terminal in TUI mode. Restored on drop, so an error while loading
@@ -198,6 +211,7 @@ fn run_loop(terminal: &mut DefaultTerminal, s: &Session) -> Result<bool> {
         let TermEvent::Key(key) = event::read()? else {
             continue;
         };
+        let key = normalize_key(key);
         tracing::debug!(?key, menu = app.names.is_some(), "key");
         if key.kind != KeyEventKind::Press {
             continue;
@@ -887,5 +901,21 @@ fn place_cursor(app: &App, width: usize, out: &mut Vec<Line<'static>>) {
         }
     } else {
         out.push(Line::from(vec![Span::raw(" ".repeat(GUTTER)), cursor]));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ctrl_bracket_is_esc() {
+        let vterm = KeyEvent::new(
+            KeyCode::Char('['),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        );
+        assert_eq!(normalize_key(vterm).code, KeyCode::Esc);
+        let plain = KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE);
+        assert_eq!(normalize_key(plain).code, KeyCode::Char('['));
     }
 }

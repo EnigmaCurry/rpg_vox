@@ -188,6 +188,7 @@ fn wait_on_screen<T>(
         });
         if event::poll(Duration::from_millis(200)).unwrap_or(false) {
             if let Ok(TermEvent::Key(k)) = event::read() {
+                let k = crate::tui::normalize_key(k);
                 let ctrl_c =
                     k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL);
                 if k.kind == KeyEventKind::Press

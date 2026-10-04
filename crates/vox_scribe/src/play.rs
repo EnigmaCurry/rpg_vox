@@ -279,7 +279,10 @@ pub fn run(paths: &RecordPaths) -> Result<()> {
         if !event::poll(Duration::from_millis(10))? {
             continue;
         }
-        let TermEvent::Key(key) = event::read()? else {
+        let Some(key) = (match event::read()? {
+            TermEvent::Key(k) => Some(crate::tui::normalize_key(k)),
+            _ => None,
+        }) else {
             continue;
         };
         if key.kind == KeyEventKind::Release {
