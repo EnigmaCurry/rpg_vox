@@ -180,6 +180,14 @@ pub struct RefineConfig {
     pub profile_segments: usize,
     /// Assign-and-reprofile rounds.
     pub rounds: usize,
+    /// Keep this many speakers (`--speakers N`): the diarizer's N biggest
+    /// clusters. Without it, clusters under `min_speaker_ms` are dropped.
+    pub max_speakers: Option<usize>,
+    /// Total speech below which a cluster is a stray (laughter, a jingle,
+    /// a cough) rather than a speaker: `min_speaker_ms`, or less in a
+    /// short recording (`min_speaker_share` of all its speech).
+    pub min_speaker_ms: u64,
+    pub min_speaker_share: f32,
 }
 
 impl Default for RefineConfig {
@@ -190,6 +198,9 @@ impl Default for RefineConfig {
             diarizer_bonus: 0.03,
             profile_segments: 12,
             rounds: 4,
+            max_speakers: None,
+            min_speaker_ms: 10_000,
+            min_speaker_share: 0.05,
         }
     }
 }
@@ -212,8 +223,9 @@ pub fn relabel_refined(
     if segments.is_empty() {
         return t.clone();
     }
-    let mut labels = word_labels(t, segments);
     let mut profiles = profiles(segments, embed, cfg);
+    let segments = &consolidate(segments, &mut profiles, cfg);
+    let mut labels = word_labels(t, segments);
     // (paragraph, words a..b, unit embedding if long enough)
     let mut all: Vec<(usize, usize, usize, Option<Vec<f32>>)> = Vec::new();
     for (pi, (p, ks)) in t.paragraphs.iter().zip(&labels).enumerate() {
@@ -300,6 +312,67 @@ pub fn relabel_refined(
         );
     }
     build(t, &labels)
+}
+
+/// Fold stray clusters into real speakers. The diarizer is run without
+/// a fixed count (forcing one makes it merge two real voices and keep
+/// a stray as the other "speaker"), so it can return extra clusters of a
+/// few seconds each. Keep the `max_speakers` biggest, or every cluster
+/// with enough speech (see [`RefineConfig::min_speaker_ms`]), and
+/// give each other cluster's segments to the kept speaker whose voice
+/// profile is closest. `profiles` is cut down to the kept speakers.
+fn consolidate(
+    segments: &[Segment],
+    profiles: &mut Vec<(usize, Vec<f32>)>,
+    cfg: &RefineConfig,
+) -> Vec<Segment> {
+    let mut total: HashMap<usize, u64> = HashMap::new();
+    for s in segments {
+        *total.entry(s.speaker).or_default() += s.end_ms.saturating_sub(s.start_ms);
+    }
+    let all: u64 = total.values().sum();
+    let min_ms = cfg
+        .min_speaker_ms
+        .min((all as f64 * cfg.min_speaker_share as f64) as u64);
+    let mut by_size: Vec<(usize, u64)> = total.into_iter().collect();
+    by_size.sort_by_key(|&(k, ms)| (std::cmp::Reverse(ms), k));
+    let keep: Vec<usize> = match cfg.max_speakers {
+        Some(n) => by_size.iter().take(n.max(1)).map(|&(k, _)| k).collect(),
+        None => by_size
+            .iter()
+            .enumerate()
+            .filter(|&(i, &(_, ms))| i == 0 || ms >= min_ms)
+            .map(|(_, &(k, _))| k)
+            .collect(),
+    };
+    let profile = |k: usize| profiles.iter().find(|(pk, _)| *pk == k).map(|(_, p)| p);
+    let mut map: HashMap<usize, usize> = HashMap::new();
+    for &(k, _) in &by_size {
+        let to = if keep.contains(&k) {
+            k
+        } else {
+            profile(k)
+                .and_then(|p| {
+                    keep.iter()
+                        .filter_map(|&j| profile(j).map(|q| (dot(p, q), j)))
+                        .max_by(|a, b| a.0.total_cmp(&b.0))
+                        .map(|(_, j)| j)
+                })
+                .unwrap_or(keep[0])
+        };
+        if to != k {
+            tracing::debug!(from = k, to, "stray speaker cluster folded in");
+        }
+        map.insert(k, to);
+    }
+    profiles.retain(|(k, _)| keep.contains(k));
+    segments
+        .iter()
+        .map(|s| Segment {
+            speaker: map[&s.speaker],
+            ..*s
+        })
+        .collect()
 }
 
 /// A voice profile per diarizer speaker: the normalized mean embedding
@@ -400,6 +473,10 @@ fn units(words: &[Word], ks: &[Option<usize>], snap: usize) -> Vec<(usize, usize
     out
 }
 
+/// Words in a row that make a speaker's first appearance count for
+/// lettering (see [`build`]).
+const SUBSTANTIAL_WORDS: usize = 6;
+
 /// The output transcript from per-word diarizer labels: runs of one
 /// speaker become paragraphs, lettered in order of first appearance.
 fn build(t: &Transcript, labels: &Labels) -> Transcript {
@@ -421,8 +498,16 @@ fn build(t: &Transcript, labels: &Labels) -> Transcript {
             runs
         })
         .collect();
+    // Letter speakers by when they first say something substantial, so a
+    // jingle or a stray word folded into one speaker at the very start
+    // doesn't make them "A" (and take the first --speakers name).
     let mut names: HashMap<usize, String> = HashMap::new();
-    for k in runs.iter().flatten().filter_map(|(k, _)| *k) {
+    let substantial = runs
+        .iter()
+        .flatten()
+        .filter(|(_, ws)| ws.len() >= SUBSTANTIAL_WORDS)
+        .filter_map(|(k, _)| *k);
+    for k in substantial.chain(runs.iter().flatten().filter_map(|(k, _)| *k)) {
         let next = label(names.len());
         names.entry(k).or_insert(next);
     }
@@ -619,7 +704,11 @@ mod tests {
                 vec![0.0, 1.0]
             })
         };
-        let r = relabel_refined(&t, &segs, &mut embed, &RefineConfig::default());
+        let cfg = RefineConfig {
+            min_speaker_ms: 0,
+            ..Default::default()
+        };
+        let r = relabel_refined(&t, &segs, &mut embed, &cfg);
         let texts: Vec<(&str, Option<&str>)> = r
             .paragraphs
             .iter()
@@ -638,5 +727,34 @@ mod tests {
             relabel(&t, &segs).paragraphs[0].text,
             "Hello there. I'll keep"
         );
+    }
+
+    #[test]
+    fn strays_fold_into_the_closest_kept_speaker() {
+        let segs = [
+            seg(0, 30_000, 0),
+            seg(30_000, 31_000, 5),
+            seg(31_000, 60_000, 1),
+            seg(60_000, 62_000, 7),
+        ];
+        let mut profiles = vec![
+            (0, vec![1.0, 0.0]),
+            (1, vec![0.0, 1.0]),
+            (5, vec![0.1, 0.9]),
+            (7, vec![0.9, 0.1]),
+        ];
+        let out = consolidate(&segs, &mut profiles, &RefineConfig::default());
+        let ks: Vec<usize> = out.iter().map(|s| s.speaker).collect();
+        assert_eq!(ks, vec![0, 1, 1, 0]);
+        assert_eq!(profiles.len(), 2);
+        // --speakers 1: everything goes to the biggest.
+        let mut profiles = vec![(0, vec![1.0, 0.0]), (1, vec![0.0, 1.0])];
+        let cfg = RefineConfig {
+            max_speakers: Some(1),
+            ..Default::default()
+        };
+        let out = consolidate(&segs[..3], &mut profiles, &cfg);
+        assert!(out.iter().all(|s| s.speaker == 0 || s.speaker == 1));
+        assert_eq!(profiles.len(), 1);
     }
 }

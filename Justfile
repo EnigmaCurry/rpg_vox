@@ -235,13 +235,14 @@ download-streaming-stt-model:
 
 # Download the speaker models for `scribe --diarize` into
 # models/speaker-diarization/: pyannote segmentation 3.0 (~6 MB) and the
-# WeSpeaker ResNet34-LM VoxCeleb embedding model (~26 MB). `scribe
+# 3D-Speaker ERes2NetV2 embedding model (~71 MB). `scribe
 # --diarize` also fetches them on first use into its own models dir.
 download-speaker-models:
     #!/usr/bin/env bash
     set -euo pipefail
     dest="models/speaker-diarization"
-    if [ -f "$dest/segmentation.onnx" ] && [ -f "$dest/embedding.onnx" ]; then
+    emb="embedding-eres2netv2.onnx"
+    if [ -f "$dest/segmentation.onnx" ] && [ -f "$dest/$emb" ]; then
       echo "speaker models already present at $dest/"
       exit 0
     fi
@@ -255,9 +256,9 @@ download-speaker-models:
     mkdir -p "$dest"
     cp "$tmp/$stem/model.onnx" "$dest/segmentation.onnx"
     echo "downloading the speaker embedding model …"
-    curl -fL --progress-bar -o "$dest/embedding.onnx.part" \
-      "$base/speaker-recongition-models/wespeaker_en_voxceleb_resnet34_LM.onnx"
-    mv "$dest/embedding.onnx.part" "$dest/embedding.onnx"
+    curl -fL --progress-bar -o "$dest/$emb.part" \
+      "$base/speaker-recongition-models/3dspeaker_speech_eres2netv2_sv_zh-cn_16k-common.onnx"
+    mv "$dest/$emb.part" "$dest/$emb"
     echo "installed speaker models → $dest/"
 
 # Uses nix-shell when available (Linux), plain cargo otherwise (macOS,

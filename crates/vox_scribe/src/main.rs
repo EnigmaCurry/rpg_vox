@@ -130,7 +130,7 @@ struct Cli {
     /// Label who is speaking (Speaker A, B, …). Each utterance is labelled
     /// live as it is transcribed; with --record, or -i with -o, a full
     /// diarization of the whole audio then runs after the session and
-    /// rewrites the files with the final labels. Fetches ~32 MB of
+    /// rewrites the files with the final labels. Fetches ~77 MB of
     /// speaker models on first use.
     #[arg(long)]
     diarize: bool,
@@ -463,7 +463,7 @@ fn main() -> Result<()> {
         models::download(&models_dir, cli.model)?;
     }
     if cli.diarize && !models::has_speakers(&models_dir) {
-        eprintln!("speaker models not found, downloading them once (about 32 MB)…");
+        eprintln!("speaker models not found, downloading them once (about 77 MB)…");
         models::download_speakers(&models_dir)?;
     }
 

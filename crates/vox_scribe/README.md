@@ -159,7 +159,7 @@ apart. Names it still misses come out as before (e.g. "Irena" for
 Pass `--diarize` to label who is speaking. Two passes:
 
 * **Live**: as each utterance is transcribed, a voice embedding
-  (WeSpeaker ResNet34) matches it to the speakers heard so far or starts
+  (3D-Speaker ERes2NetV2) matches it to the speakers heard so far or starts
   a new one. Paragraphs start on a change of speaker and show as
   `Speaker A: …`, one colour per speaker. It is quick and approximate.
 * **Final**: with `-r`, or `-i FILE -o NAME`, a full offline diarization
@@ -170,7 +170,15 @@ Pass `--diarize` to label who is speaking. Two passes:
   `.ass`. The files are written as usual during the session, with the
   live labels, so a crash or a skip still leaves them complete.
 
-Speakers are lettered in order of first appearance. The markdown reads
+  The clustering always picks the number of voices itself; clusters
+  with little speech (laughter, a jingle: under 10 s, or 5% of a short
+  recording) are folded into the closest real speaker, and `--speakers`
+  keeps the biggest N. Fixing the count inside the clustering instead
+  made it merge two real voices and keep a stray as the other speaker.
+  Each sentence is then matched to a speaker by its own voice.
+
+Speakers are lettered in order of first appearance (of a run of a few
+words, so a jingle at the start doesn't take the first letter). The markdown reads
 `**[00:01:02] Speaker A:** …`, SRT cues start `Speaker A: ` where the
 speaker changes, and ASS lines carry the speaker in their Name field
 with a style (colour) per speaker, which `--play` shows. `--append` keeps
@@ -195,7 +203,7 @@ live labels were wrong.
   known speaker to join them live. Raise it if two people share a label,
   lower it if one person is split in two.
 
-The speaker models (~32 MB) are fetched on first use, or with
+The speaker models (~77 MB) are fetched on first use, or with
 `scribe --diarize download-models` / `just download-speaker-models`.
 
 Models are looked up in `--models-dir`, `$VOX_SCRIBE_MODELS`, the per-user

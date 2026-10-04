@@ -71,7 +71,10 @@ pub fn run(
         let transcript = transcript.clone();
         std::thread::spawn(move || -> Result<Transcript> {
             let (samples, rate) = audio.load()?;
-            let segments = Diarizer::open(&models, num_speakers)?.process_with_progress(
+            // The count is applied afterwards (see relabel_refined): fixed
+            // in the clustering, it merges two real voices and keeps a
+            // stray as the other "speaker".
+            let segments = Diarizer::open(&models, None)?.process_with_progress(
                 &samples,
                 rate,
                 &mut |done, total| progress.set(done, total),
@@ -93,7 +96,10 @@ pub fn run(
                 &transcript,
                 &segments,
                 &mut embed,
-                &RefineConfig::default(),
+                &RefineConfig {
+                    max_speakers: num_speakers,
+                    ..Default::default()
+                },
             ))
         })
     };

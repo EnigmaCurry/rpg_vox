@@ -5,7 +5,7 @@
 //! <dir>/sense-voice/{model.int8.onnx,tokens.txt}
 //! <dir>/parakeet-tdt-0.6b-v2/{encoder,decoder,joiner}.int8.onnx + tokens.txt
 //! <dir>/streaming-zipformer/{encoder,decoder,joiner}.onnx + tokens.txt
-//! <dir>/speaker-diarization/{segmentation,embedding}.onnx   (--diarize)
+//! <dir>/speaker-diarization/{segmentation,embedding-eres2netv2}.onnx   (--diarize)
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -49,9 +49,16 @@ const RELEASES: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download"
 const ASR: &str = "asr-models";
 /// pyannote segmentation 3.0, ~6 MB.
 const SEGMENTATION: &str = "sherpa-onnx-pyannote-segmentation-3-0";
-/// WeSpeaker ResNet34-LM trained on VoxCeleb (English), ~26 MB. The
-/// release tag's misspelling is upstream's.
-const EMBEDDING_URL: &str = "speaker-recongition-models/wespeaker_en_voxceleb_resnet34_LM.onnx";
+/// 3D-Speaker ERes2NetV2 (200k speakers, many languages), ~71 MB. On a
+/// real two-man podcast it separated the voices where WeSpeaker
+/// ResNet34 split one of them into extra speakers, and it did better on
+/// the synthetic tests too. The release tag's misspelling is upstream's.
+const EMBEDDING_URL: &str =
+    "speaker-recongition-models/3dspeaker_speech_eres2netv2_sv_zh-cn_16k-common.onnx";
+/// File names in the speakers dir; the embedding file is named after its
+/// model so an install with the old one fetches the new one.
+pub const SEGMENTATION_FILE: &str = "segmentation.onnx";
+pub const EMBEDDING_FILE: &str = "embedding-eres2netv2.onnx";
 
 /// Per-user data directory for downloaded models.
 pub fn user_models_dir() -> PathBuf {
@@ -106,7 +113,7 @@ pub fn has_parakeet(dir: &Path) -> bool {
 }
 
 pub fn has_speakers(dir: &Path) -> bool {
-    ["segmentation.onnx", "embedding.onnx"]
+    [SEGMENTATION_FILE, EMBEDDING_FILE]
         .iter()
         .all(|f| dir.join(SPEAKERS).join(f).is_file())
 }
@@ -119,17 +126,23 @@ pub fn download_speakers(dir: &Path) -> Result<()> {
         return Ok(());
     }
     std::fs::create_dir_all(&dest).with_context(|| format!("create {}", dest.display()))?;
-    fetch_in(
-        "speaker-segmentation-models",
-        SEGMENTATION,
-        &dest,
-        &[("model.onnx", "segmentation.onnx")],
-    )?;
-    let to = dest.join("embedding.onnx");
-    let part = dest.join("embedding.onnx.part");
-    curl(&format!("{RELEASES}/{EMBEDDING_URL}"), &part)?;
-    std::fs::rename(&part, &to)?;
-    println!("installed {}", to.display());
+    if !dest.join(SEGMENTATION_FILE).is_file() {
+        fetch_in(
+            "speaker-segmentation-models",
+            SEGMENTATION,
+            &dest,
+            &[("model.onnx", SEGMENTATION_FILE)],
+        )?;
+    }
+    let to = dest.join(EMBEDDING_FILE);
+    if !to.is_file() {
+        let part = dest.join(format!("{EMBEDDING_FILE}.part"));
+        curl(&format!("{RELEASES}/{EMBEDDING_URL}"), &part)?;
+        std::fs::rename(&part, &to)?;
+        println!("installed {}", to.display());
+    }
+    // The previous embedding model, superseded.
+    let _ = std::fs::remove_file(dest.join("embedding.onnx"));
     Ok(())
 }
 

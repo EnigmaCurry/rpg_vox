@@ -332,11 +332,11 @@ pub struct SpeakerModels {
 
 impl SpeakerModels {
     /// Layout written by `scribe download-models --diarize`:
-    /// `<dir>/segmentation.onnx` and `<dir>/embedding.onnx`.
+    /// `<dir>/segmentation.onnx` and `<dir>/embedding-eres2netv2.onnx`.
     pub fn from_dir(dir: &Path) -> Self {
         Self {
             segmentation: dir.join("segmentation.onnx"),
-            embedding: dir.join("embedding.onnx"),
+            embedding: dir.join("embedding-eres2netv2.onnx"),
             num_threads: 2,
         }
     }
@@ -437,20 +437,53 @@ unsafe extern "C" fn progress_trampoline(done: i32, total: i32, arg: *mut c_void
     0
 }
 
+/// Diarizer settings; defaults as in sherpa-onnx's own config.
+#[derive(Clone, Debug)]
+pub struct DiarizerTuning {
+    /// Fixed speaker count; `None` lets `threshold` decide.
+    pub num_speakers: Option<usize>,
+    /// Clustering distance threshold when the count isn't fixed.
+    pub threshold: f32,
+    pub min_duration_on: f32,
+    pub min_duration_off: f32,
+    pub window_shift_ratio: f32,
+}
+
+impl Default for DiarizerTuning {
+    fn default() -> Self {
+        Self {
+            num_speakers: None,
+            threshold: 0.5,
+            min_duration_on: 0.3,
+            min_duration_off: 0.5,
+            window_shift_ratio: 0.1,
+        }
+    }
+}
+
 impl Diarizer {
     /// `num_speakers` fixes the speaker count when known; otherwise the
     /// clustering threshold decides.
     pub fn open(models: &SpeakerModels, num_speakers: Option<usize>) -> Result<Self> {
+        Self::open_tuned(
+            models,
+            &DiarizerTuning {
+                num_speakers,
+                ..Default::default()
+            },
+        )
+    }
+
+    pub fn open_tuned(models: &SpeakerModels, tuning: &DiarizerTuning) -> Result<Self> {
         let cstr = |s: String| CString::new(s).map_err(|e| anyhow!("model path: {e}"));
         let seg = cstr(require(&models.segmentation, "speaker segmentation model")?)?;
         let emb = cstr(require(&models.embedding, "speaker embedding model")?)?;
         let cpu = cstr("cpu".into())?;
-        // Defaults as in sherpa-onnx's own config.
         let config = sys::OfflineSpeakerDiarizationConfig {
             segmentation: sys::OfflineSpeakerSegmentationModelConfig {
                 pyannote: sys::OfflineSpeakerSegmentationPyannoteModelConfig {
                     model: seg.as_ptr(),
-                    window_shift_ratio: 0.1,
+                    window_shift_ratio: tuning.window_shift_ratio,
                 },
                 num_threads: models.num_threads,
                 debug: 0,
@@ -463,12 +496,12 @@ impl Diarizer {
                 provider: cpu.as_ptr(),
             },
             clustering: sys::FastClusteringConfig {
-                num_clusters: num_speakers.map(|n| n as i32).unwrap_or(-1),
-                threshold: 0.5,
+                num_clusters: tuning.num_speakers.map(|n| n as i32).unwrap_or(-1),
+                threshold: tuning.threshold,
                 compute_confidence: 0,
             },
-            min_duration_on: 0.3,
-            min_duration_off: 0.5,
+            min_duration_on: tuning.min_duration_on,
+            min_duration_off: tuning.min_duration_off,
         };
         // SAFETY: `config` and the strings it points at outlive the call.
         let ptr = unsafe { sys::SherpaOnnxCreateOfflineSpeakerDiarization(&config) };
