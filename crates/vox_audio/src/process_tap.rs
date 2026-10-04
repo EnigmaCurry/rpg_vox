@@ -26,17 +26,17 @@ use objc2_core_audio::{
     kAudioAggregateDeviceNameKey, kAudioAggregateDeviceSubDeviceListKey,
     kAudioAggregateDeviceTapAutoStartKey, kAudioAggregateDeviceTapListKey,
     kAudioAggregateDeviceUIDKey, kAudioDevicePropertyDeviceUID,
-    kAudioHardwarePropertyDefaultOutputDevice, kAudioHardwarePropertyProcessObjectList,
-    kAudioObjectPropertyElementMain, kAudioObjectPropertyScopeGlobal, kAudioObjectSystemObject,
-    kAudioProcessPropertyBundleID, kAudioProcessPropertyIsRunningOutput, kAudioProcessPropertyPID,
-    kAudioSubDeviceUIDKey, kAudioSubTapDriftCompensationKey, kAudioSubTapUIDKey,
-    kAudioTapPropertyDescription, kAudioTapPropertyFormat, AudioDeviceCreateIOProcID,
-    AudioDeviceDestroyIOProcID, AudioDeviceIOProcID, AudioDeviceStart, AudioDeviceStop,
-    AudioHardwareCreateAggregateDevice, AudioHardwareCreateProcessTap,
-    AudioHardwareDestroyAggregateDevice, AudioHardwareDestroyProcessTap,
-    AudioObjectGetPropertyData, AudioObjectGetPropertyDataSize, AudioObjectID,
-    AudioObjectPropertyAddress, AudioObjectPropertySelector, AudioObjectSetPropertyData,
-    CATapDescription,
+    kAudioDevicePropertyNominalSampleRate, kAudioHardwarePropertyDefaultOutputDevice,
+    kAudioHardwarePropertyProcessObjectList, kAudioObjectPropertyElementMain,
+    kAudioObjectPropertyScopeGlobal, kAudioObjectSystemObject, kAudioProcessPropertyBundleID,
+    kAudioProcessPropertyIsRunningOutput, kAudioProcessPropertyPID, kAudioSubDeviceUIDKey,
+    kAudioSubTapDriftCompensationKey, kAudioSubTapUIDKey, kAudioTapPropertyDescription,
+    kAudioTapPropertyFormat, AudioDeviceCreateIOProcID, AudioDeviceDestroyIOProcID,
+    AudioDeviceIOProcID, AudioDeviceStart, AudioDeviceStop, AudioHardwareCreateAggregateDevice,
+    AudioHardwareCreateProcessTap, AudioHardwareDestroyAggregateDevice,
+    AudioHardwareDestroyProcessTap, AudioObjectGetPropertyData, AudioObjectGetPropertyDataSize,
+    AudioObjectID, AudioObjectPropertyAddress, AudioObjectPropertySelector,
+    AudioObjectSetPropertyData, CATapDescription,
 };
 use objc2_core_audio_types::{
     kAudioFormatFlagIsNonInterleaved, AudioBufferList, AudioStreamBasicDescription, AudioTimeStamp,
@@ -191,6 +191,26 @@ impl Tap {
         );
 
         tap.device = create_aggregate(&tap.desc)?;
+        // The IOProc runs on the aggregate device's clock, which follows
+        // the default output device, not the tap's nominal format: with
+        // 44.1 kHz Bluetooth headphones the samples arrive at 44.1 kHz
+        // while the tap still says 48 kHz, and a recording played back
+        // 9% fast and high. Trust the device.
+        match get::<f64>(tap.device, kAudioDevicePropertyNominalSampleRate) {
+            Ok(r) if r >= 8000.0 => {
+                let r = r.round() as u32;
+                if r != tap.rate {
+                    info!(
+                        tap = tap.rate,
+                        device = r,
+                        "process tap runs at the output device's rate"
+                    );
+                    tap.rate = r;
+                }
+            }
+            Ok(r) => warn!(rate = r, "aggregate device reports no usable sample rate"),
+            Err(e) => warn!("reading the aggregate device's sample rate: {e:#}"),
+        }
 
         let plumbing = Plumbing::new(tap.rate, channels);
         let (producer, parts) = plumbing.into_parts();
