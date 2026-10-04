@@ -160,15 +160,58 @@ pub struct Transcript {
 
 impl Transcript {
     /// Insert or replace a paragraph by id. Lets a consumer mirror the
-    /// engine's state from [`crate::Event::Paragraph`] alone.
+    /// engine's state from [`crate::Event::Paragraph`] alone. A new
+    /// paragraph goes in time order, not at the end: a change of speaker
+    /// can split one off an earlier paragraph after later ones exist.
     pub fn upsert(&mut self, p: &Paragraph) {
         match self.paragraphs.iter_mut().find(|q| q.id == p.id) {
             Some(slot) => *slot = p.clone(),
-            None => self.paragraphs.push(p.clone()),
+            None => {
+                let at = self
+                    .paragraphs
+                    .iter()
+                    .position(|q| q.start_ms > p.start_ms)
+                    .unwrap_or(self.paragraphs.len());
+                self.paragraphs.insert(at, p.clone());
+            }
         }
     }
 
     pub fn remove(&mut self, id: &str) {
         self.paragraphs.retain(|p| p.id != id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn para(id: &str, start_ms: u64) -> Paragraph {
+        Paragraph::new(
+            id.into(),
+            Clip {
+                id: format!("{id}c"),
+                start_ms,
+                duration_ms: Some(1000),
+                text: id.into(),
+                stage: Stage::Final,
+                words: Vec::new(),
+                speaker: None,
+            },
+        )
+    }
+
+    #[test]
+    fn upsert_keeps_time_order() {
+        let mut t = Transcript::default();
+        t.upsert(&para("a", 30_000));
+        t.upsert(&para("c", 41_000));
+        // Split off "a" after "c" already exists.
+        t.upsert(&para("b", 35_000));
+        let ids: Vec<&str> = t.paragraphs.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "b", "c"]);
+        // Replacing keeps the slot.
+        t.upsert(&para("c", 41_000));
+        assert_eq!(t.paragraphs.len(), 3);
     }
 }
