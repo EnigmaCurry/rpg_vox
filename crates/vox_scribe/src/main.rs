@@ -366,6 +366,7 @@ pub struct Outcome {
 }
 
 fn main() -> Result<()> {
+    let started = std::time::Instant::now();
     let cli = Cli::parse();
     // A file is transcribed without the TUI, with brief progress on
     // stderr, unless --live plays it through the TUI in real time.
@@ -616,6 +617,8 @@ fn main() -> Result<()> {
         engine_cfg.paragraph.mode = ParagraphMode::Manual;
     }
     let engine = Engine::spawn_full(engine_cfg, streaming, offline, corrector, tagger);
+    let loaded = started.elapsed();
+    let fed = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let paused = Arc::new(AtomicBool::new(false));
     let stop = Arc::new(AtomicBool::new(false));
     let source_done = Arc::new(AtomicBool::new(false));
@@ -624,6 +627,7 @@ fn main() -> Result<()> {
         let mut feed = Feed {
             pusher: engine.pusher(),
             recording,
+            fed: fed.clone(),
         };
         let (paused, stop, done) = (paused.clone(), stop.clone(), source_done.clone());
         match source {
@@ -708,6 +712,8 @@ fn main() -> Result<()> {
         Some(screen) => tui::run(screen, session)?,
         None => headless(session)?,
     };
+    let transcribed = started.elapsed();
+    let mut diarized = None;
     let mut rewritten = false;
     if let (Some(audio), Some(models)) = (final_pass, speaker_models) {
         let has_text = outcome
@@ -716,14 +722,19 @@ fn main() -> Result<()> {
             .iter()
             .any(|p| !p.text.trim().is_empty());
         if has_text {
-            match diarize::run(
+            let t0 = std::time::Instant::now();
+            let result = diarize::run(
                 models,
                 num_speakers,
                 audio,
                 &outcome.transcript,
                 &files,
                 tui_mode,
-            ) {
+            );
+            if !matches!(result, Ok(None)) {
+                diarized = Some(t0.elapsed());
+            }
+            match result {
                 Ok(Some(t)) => {
                     let mut who: Vec<&str> = t
                         .paragraphs
@@ -769,7 +780,88 @@ fn main() -> Result<()> {
             r.md.with_extension("").display()
         );
     }
+    if !cli.once {
+        let audio_ms = fed.load(Ordering::Relaxed) * 1000 / rate.max(1) as u64;
+        let offline = cli.input.is_some() && !cli.live;
+        let stats = Stats {
+            audio_ms,
+            total: started.elapsed(),
+            loading: loaded,
+            session: transcribed.saturating_sub(loaded),
+            diarization: diarized,
+            offline,
+        };
+        for line in stats.lines() {
+            say!("{line}");
+        }
+    }
     Ok(())
+}
+
+/// Timings shown when a session ends.
+struct Stats {
+    audio_ms: u64,
+    total: Duration,
+    loading: Duration,
+    /// Transcription (a file) or the session itself (live).
+    session: Duration,
+    diarization: Option<Duration>,
+    /// A file transcribed as fast as possible, not paced like a mic.
+    offline: bool,
+}
+
+impl Stats {
+    fn lines(&self) -> Vec<String> {
+        let clock = |d: Duration| progress::clock(d.as_millis() as u64);
+        let audio = progress::clock(self.audio_ms);
+        let mut out = Vec::new();
+        if self.audio_ms == 0 {
+            return out;
+        }
+        if self.offline {
+            out.push(format!(
+                "done: {audio} of audio in {} ({})",
+                clock(self.total),
+                speed(self.audio_ms, self.total)
+            ));
+        } else {
+            out.push(format!(
+                "done: {audio} of audio, {} in all",
+                clock(self.total)
+            ));
+        }
+        let mut parts = vec![format!("loading {}", clock(self.loading))];
+        parts.push(if self.offline {
+            format!(
+                "transcription {} ({})",
+                clock(self.session),
+                speed(self.audio_ms, self.session)
+            )
+        } else {
+            format!("recording {}", clock(self.session))
+        });
+        if let Some(d) = self.diarization {
+            parts.push(format!(
+                "diarization {} ({})",
+                clock(d),
+                speed(self.audio_ms, d)
+            ));
+        }
+        out.push(format!("  {}", parts.join(" · ")));
+        out
+    }
+}
+
+/// "2.3x faster than real time" / "1.4x slower than real time" for
+/// `audio_ms` of audio processed in `took`.
+fn speed(audio_ms: u64, took: Duration) -> String {
+    let took_ms = took.as_millis().max(1) as f64;
+    let ratio = audio_ms as f64 / took_ms;
+    if ratio >= 1.0 {
+        format!("{ratio:.1}x faster than real time")
+    } else {
+        format!("{:.1}x slower than real time", 1.0 / ratio.max(1e-9))
+    }
 }
 
 /// --once: print the finished text and put it on the clipboard.
@@ -805,10 +897,13 @@ fn copy_transcript(outcome: &Outcome) {
 struct Feed {
     pusher: vox_transcribe::Pusher,
     recording: Option<OpusWriter>,
+    /// Samples pushed, for the end-of-run stats.
+    fed: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Feed {
     fn push(&mut self, mono: &[f32]) {
+        self.fed.fetch_add(mono.len() as u64, Ordering::Relaxed);
         self.pusher.push(mono);
         if let Some(r) = &mut self.recording {
             if let Err(e) = r.write(mono) {
@@ -1015,7 +1110,6 @@ fn headless(session: Session) -> Result<Outcome> {
         });
     }
     let events = session.engine.events().clone();
-    let started = std::time::Instant::now();
     // A file has nothing to stop gracefully (it is all queued at once),
     // so Ctrl-C just quits.
     if session.input_ms.is_some() {
@@ -1096,10 +1190,7 @@ fn headless(session: Session) -> Result<Outcome> {
             .iter()
             .filter(|p| !p.text.trim().is_empty())
             .count();
-        say!(
-            "transcribed {n} paragraph(s) in {:.1} s",
-            started.elapsed().as_secs_f32()
-        );
+        say!("transcribed {n} paragraph(s)");
     }
     Ok(Outcome {
         transcript: t,
@@ -1238,5 +1329,17 @@ mod tests {
         assert!(parse_speakers("0").is_err());
         assert!(parse_speakers("Alice,,Bob").is_err());
         assert!(parse_speakers("").is_err());
+    }
+
+    #[test]
+    fn speed_reads_both_ways() {
+        assert_eq!(
+            speed(244_000, Duration::from_secs(122)),
+            "2.0x faster than real time"
+        );
+        assert_eq!(
+            speed(60_000, Duration::from_secs(90)),
+            "1.5x slower than real time"
+        );
     }
 }
