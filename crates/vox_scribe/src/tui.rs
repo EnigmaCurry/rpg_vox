@@ -198,6 +198,7 @@ fn run_loop(terminal: &mut DefaultTerminal, s: &Session) -> Result<bool> {
         let TermEvent::Key(key) = event::read()? else {
             continue;
         };
+        tracing::debug!(?key, menu = app.names.is_some(), "key");
         if key.kind != KeyEventKind::Press {
             continue;
         }
