@@ -53,11 +53,18 @@ struct App {
     names: Option<NamesMenu>,
 }
 
-/// `n`: the speakers heard so far, to rename.
-struct NamesMenu {
-    selected: usize,
+/// `n`: the speakers, to rename (here and in --play).
+pub struct NamesMenu {
+    pub selected: usize,
     /// The new name being typed for the selected speaker.
-    editing: Option<String>,
+    pub editing: Option<String>,
+}
+
+/// One speaker in the `n` list: its letter, current name and colour.
+pub struct SpeakerRow {
+    pub tag: String,
+    pub name: String,
+    pub color: Color,
 }
 
 /// Speaker labels in the transcript, plus A… for `--speakers` (so they
@@ -668,29 +675,45 @@ fn draw(f: &mut Frame, app: &App, s: &Session) {
     };
     f.render_widget(help, help_line);
     if let Some(menu) = &app.names {
-        draw_names(f, body, menu, &speaker_labels(&app.transcript, s));
+        let rows: Vec<SpeakerRow> = speaker_labels(&app.transcript, s)
+            .into_iter()
+            .map(|l| SpeakerRow {
+                name: speakers::name(&l),
+                color: speakers::color(&l),
+                tag: l,
+            })
+            .collect();
+        draw_names(f, body, menu, &rows);
     }
 }
 
 /// The `n` speaker list, over the transcript.
-fn draw_names(f: &mut Frame, area: ratatui::layout::Rect, menu: &NamesMenu, labels: &[String]) {
+pub fn draw_names(
+    f: &mut Frame,
+    area: ratatui::layout::Rect,
+    menu: &NamesMenu,
+    rows: &[SpeakerRow],
+) {
     let mut lines: Vec<Line> = Vec::new();
-    for (i, l) in labels.iter().enumerate() {
+    for (i, row) in rows.iter().enumerate() {
         let sel = i == menu.selected;
         let mark = if sel { "▶ " } else { "  " };
-        let color = Style::new().fg(speakers::color(l)).bold();
+        let color = Style::new().fg(row.color).bold();
         let name: Vec<Span> = match (&menu.editing, sel) {
             (Some(buf), true) if buf.is_empty() => vec![
                 Span::styled("▌", Style::new().magenta()),
-                Span::styled(speakers::name(l), Style::new().dark_gray()),
+                Span::styled(row.name.clone(), Style::new().dark_gray()),
             ],
             (Some(buf), true) => vec![
                 Span::raw(buf.clone()),
                 Span::styled("▌", Style::new().magenta()),
             ],
-            _ => vec![Span::styled(speakers::name(l), color)],
+            _ => vec![Span::styled(row.name.clone(), color)],
         };
-        let mut spans = vec![Span::raw(mark), Span::styled(format!("{l}  "), color)];
+        let mut spans = vec![
+            Span::raw(mark),
+            Span::styled(format!("{}  ", row.tag), color),
+        ];
         spans.extend(name);
         let line = Line::from(spans);
         lines.push(if sel && menu.editing.is_none() {

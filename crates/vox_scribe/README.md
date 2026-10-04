@@ -46,7 +46,10 @@ with the subtitles printed as they are spoken, the current word lit up.
 the previous / next line (subtitle cue), `home` restarts, `q` quits.
 `<` and `>` (or `,` and `.`) slow down and speed up playback in steps
 from 0.5x to 3x without changing the pitch; the status bar shows the
-speed. `/` searches like `less`: type a pattern
+speed. `n` opens the speaker list (as in the recording TUI) to rename a
+speaker in `NAME.md`, `.srt` and `.ass`, e.g. after the final
+diarization has sorted them out; while a search is active, `n` is
+"next match" instead. `/` searches like `less`: type a pattern
 (case-insensitive, may span words) and `enter` to jump to the next
 match, then `n` / `p` (or `N`) for the next / previous match, wrapping
 at the ends; matches are underlined and `esc` clears them.

@@ -1,6 +1,7 @@
 //! `--play NAME`: play NAME.opus and print NAME.ass in time with it,
 //! lighting up each word as it is spoken.
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context as _, Result};
@@ -18,7 +19,7 @@ use vox_audio::stretch::Stretch;
 
 use crate::markdown::timestamp;
 use crate::speakers;
-use crate::tui::Screen;
+use crate::tui::{draw_names, NamesMenu, Screen, SpeakerRow};
 use crate::RecordPaths;
 
 /// `←` (`↑`) within this long of a word's (line's) start goes to the one
@@ -273,6 +274,10 @@ pub fn run(paths: &RecordPaths) -> Result<()> {
     let line_starts: Vec<u64> = cues.iter().map(|c| c.start_ms).collect();
     let words: Vec<&KWord> = cues.iter().flat_map(|c| c.words.iter()).collect();
     let mut search = Search::default();
+    // Speaker renames: name in the file as opened → name now.
+    let mut renamed: HashMap<String, String> = HashMap::new();
+    let mut names_menu: Option<NamesMenu> = None;
+    let mut status: Option<(String, Instant)> = None;
     let file = OpusFile::open(&paths.opus)?;
     let name = paths
         .md
@@ -295,9 +300,23 @@ pub fn run(paths: &RecordPaths) -> Result<()> {
             } else {
                 player.position_ms()
             };
-            screen
-                .terminal()
-                .draw(|f| draw(f, &name, &cues, &blocks, &player, &search, pos))?;
+            screen.terminal().draw(|f| {
+                let view = View {
+                    cues: &cues,
+                    blocks: &blocks,
+                    player: &player,
+                    search: &search,
+                    renamed: &renamed,
+                    status: status
+                        .as_ref()
+                        .filter(|(_, at)| at.elapsed() < STATUS_TTL)
+                        .map(|(m, _)| m.as_str()),
+                };
+                draw(f, &name, &view, pos);
+                if let Some(menu) = &names_menu {
+                    draw_names(f, f.area(), menu, &speaker_rows(&cues, &renamed));
+                }
+            })?;
             last_draw = Instant::now();
         }
         if !event::poll(Duration::from_millis(10))? {
@@ -313,6 +332,50 @@ pub fn run(paths: &RecordPaths) -> Result<()> {
             continue;
         }
         let pos = player.position_ms();
+        if let Some(menu) = names_menu.as_mut() {
+            let rows = speaker_rows(&cues, &renamed);
+            menu.selected = menu.selected.min(rows.len().saturating_sub(1));
+            let row = &rows[menu.selected];
+            if let Some(buf) = menu.editing.as_mut() {
+                match key.code {
+                    KeyCode::Enter => {
+                        let new = buf.clone();
+                        menu.editing = None;
+                        let msg = rename(paths, &cues, &mut renamed, &row.name, &new, &rows)
+                            .unwrap_or_else(|e| format!("rename failed: {e:#}"));
+                        status = Some((msg, Instant::now()));
+                    }
+                    KeyCode::Esc => menu.editing = None,
+                    KeyCode::Backspace => {
+                        buf.pop();
+                    }
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
+                    KeyCode::Char(c) => buf.push(c),
+                    _ => {}
+                }
+            } else {
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        menu.selected = menu.selected.saturating_sub(1)
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        menu.selected = (menu.selected + 1).min(rows.len() - 1)
+                    }
+                    KeyCode::Enter => menu.editing = Some(String::new()),
+                    KeyCode::Delete | KeyCode::Backspace => {
+                        let default = format!("Speaker {}", row.tag);
+                        let msg = rename(paths, &cues, &mut renamed, &row.name, &default, &rows)
+                            .unwrap_or_else(|e| format!("rename failed: {e:#}"));
+                        status = Some((msg, Instant::now()));
+                    }
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
+                    KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('q') => names_menu = None,
+                    _ => {}
+                }
+            }
+            last_draw = Instant::now() - FRAME;
+            continue;
+        }
         if let Some(typed) = search.prompt.as_mut() {
             match key.code {
                 KeyCode::Enter => {
@@ -341,9 +404,21 @@ pub fn run(paths: &RecordPaths) -> Result<()> {
                 search.prompt = Some(String::new());
                 search.message = None;
             }
-            KeyCode::Char('n') => {
+            // `n` steps through search matches while there is a search;
+            // otherwise it opens the speaker list, as in the recording TUI.
+            KeyCode::Char('n') if search.active() => {
                 if let Some(t) = search.step(1, &words) {
                     player.seek(t)?;
+                }
+            }
+            KeyCode::Char('n') => {
+                if speaker_rows(&cues, &renamed).is_empty() {
+                    status = Some(("no speakers in this recording".into(), Instant::now()));
+                } else {
+                    names_menu = Some(NamesMenu {
+                        selected: 0,
+                        editing: None,
+                    });
                 }
             }
             KeyCode::Char('p') | KeyCode::Char('N') => {
@@ -569,15 +644,154 @@ fn sentences(cues: &[Cue]) -> Vec<std::ops::Range<usize>> {
     out
 }
 
-fn draw(
-    f: &mut Frame,
-    name: &str,
+/// What [`draw`] shows besides the clock.
+struct View<'a, 'b> {
+    cues: &'a [Cue],
+    blocks: &'a [std::ops::Range<usize>],
+    player: &'a Player<'b>,
+    search: &'a Search,
+    renamed: &'a HashMap<String, String>,
+    status: Option<&'a str>,
+}
+
+/// How long a footer message stays.
+const STATUS_TTL: Duration = Duration::from_secs(3);
+
+/// The speakers in `cues` (as renamed), in colour-slot order.
+fn speaker_rows(cues: &[Cue], renamed: &HashMap<String, String>) -> Vec<SpeakerRow> {
+    let mut seen: Vec<(usize, String)> = Vec::new();
+    for c in cues {
+        if let Some(s) = &c.speaker {
+            let name = renamed.get(s).cloned().unwrap_or_else(|| s.clone());
+            if !seen.iter().any(|(_, n)| *n == name) {
+                seen.push((c.slot.unwrap_or(usize::MAX), name));
+            }
+        }
+    }
+    seen.sort_by_key(|(slot, _)| *slot);
+    seen.into_iter()
+        .map(|(slot, name)| SpeakerRow {
+            tag: if slot == usize::MAX {
+                "?".into()
+            } else {
+                vox_transcribe::speaker::label(slot)
+            },
+            color: if slot == usize::MAX {
+                Color::Gray
+            } else {
+                speakers::color_at(slot)
+            },
+            name,
+        })
+        .collect()
+}
+
+/// Rename speaker `old` (its current name) to `new` on screen and in the
+/// recording's markdown, SRT and ASS. Returns a message for the footer.
+fn rename(
+    paths: &RecordPaths,
     cues: &[Cue],
-    blocks: &[std::ops::Range<usize>],
-    player: &Player,
-    search: &Search,
-    pos: u64,
-) {
+    renamed: &mut HashMap<String, String>,
+    old: &str,
+    new: &str,
+    rows: &[SpeakerRow],
+) -> Result<String> {
+    let new = new
+        .replace(',', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if new.is_empty() || new == old {
+        return Ok(format!("{old}: unchanged"));
+    }
+    if rows.iter().any(|r| r.name == new) {
+        return Ok(format!("{new:?} is already another speaker"));
+    }
+    for (path, kind) in [
+        (&paths.ass, Kind::Ass),
+        (&paths.srt, Kind::Srt),
+        (&paths.md, Kind::Md),
+    ] {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            replace_file(path, &rename_in(&text, kind, old, &new))?;
+        }
+    }
+    for c in cues {
+        if let Some(s) = &c.speaker {
+            let now = renamed.get(s).cloned().unwrap_or_else(|| s.clone());
+            if now == old {
+                renamed.insert(s.clone(), new.clone());
+            }
+        }
+    }
+    Ok(format!("{old} is now {new}"))
+}
+
+#[derive(Clone, Copy)]
+enum Kind {
+    Ass,
+    Srt,
+    Md,
+}
+
+/// `text` (a recording's ASS, SRT or markdown) with speaker `old` named
+/// `new`: the ASS Name field, an SRT cue's `old: ` prefix, a markdown
+/// paragraph's `**[ts] old:**`.
+fn rename_in(text: &str, kind: Kind, old: &str, new: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut srt_first_text = false;
+    for line in text.split_inclusive('\n') {
+        let replaced = match kind {
+            Kind::Ass => line.strip_prefix("Dialogue:").and_then(|rest| {
+                let f: Vec<&str> = rest.splitn(10, ',').collect();
+                (f.len() == 10 && f[4] == old).then(|| {
+                    let mut g = f.clone();
+                    g[4] = new;
+                    format!("Dialogue:{}", g.join(","))
+                })
+            }),
+            Kind::Srt => {
+                let r = if srt_first_text {
+                    line.strip_prefix(&format!("{old}: "))
+                        .map(|t| format!("{new}: {t}"))
+                } else {
+                    None
+                };
+                srt_first_text = line.contains(" --> ");
+                r
+            }
+            Kind::Md => line
+                .strip_prefix("**[")
+                .and_then(|r| r.split_once("] "))
+                .and_then(|(ts, r)| {
+                    r.strip_prefix(&format!("{old}:** "))
+                        .map(|t| format!("**[{ts}] {new}:** {t}"))
+                }),
+        };
+        out.push_str(replaced.as_deref().unwrap_or(line));
+    }
+    out
+}
+
+/// Write `content` to `path` via a temporary file and a rename.
+fn replace_file(path: &std::path::Path, content: &str) -> Result<()> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = std::path::PathBuf::from(tmp);
+    std::fs::write(&tmp, content).with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("replace {}", path.display()))
+}
+
+fn draw(f: &mut Frame, name: &str, view: &View, pos: u64) {
+    let View {
+        cues,
+        blocks,
+        player,
+        search,
+        renamed,
+        status,
+    } = *view;
+    let shown = |s: &str| renamed.get(s).cloned().unwrap_or_else(|| s.to_string());
     let [main, bar, keys] = Layout::vertical([
         Constraint::Min(1),
         Constraint::Length(1),
@@ -603,7 +817,7 @@ fn draw(
             .filter(|&s| last_speaker != Some(s))
         {
             let color = first.slot.map(speakers::color_at).unwrap_or(Color::Gray);
-            spans.extend(label_spans(s, Style::new().fg(color).bold()));
+            spans.extend(label_spans(&shown(s), Style::new().fg(color).bold()));
         }
         last_speaker = first.speaker.as_deref();
         spans.extend(cues[block.clone()].iter().flat_map(|c| &c.words).map(|w| {
@@ -665,7 +879,9 @@ fn draw(
         ]),
         bar,
     );
-    let footer = if let Some(typed) = &search.prompt {
+    let footer = if let Some(msg) = status {
+        Line::from(format!(" {msg}")).yellow()
+    } else if let Some(typed) = &search.prompt {
         Line::from(format!("/{typed}▏"))
     } else if search.active() {
         let count = if search.hits.is_empty() {
@@ -685,7 +901,7 @@ fn draw(
         ])
     } else {
         Line::from(
-            " space pause · ←/→ word · ↑/↓ line · < > speed · / search · home restart · q quit",
+            " space pause · ←/→ word · ↑/↓ line · < > speed · / search · n speakers · home restart · q quit",
         )
         .dark_gray()
     };
@@ -825,6 +1041,23 @@ mod tests {
         assert_eq!(step_speed(1.0, -1), 0.75);
         assert_eq!(step_speed(3.0, 1), 3.0);
         assert_eq!(step_speed(0.5, -1), 0.5);
+    }
+
+    #[test]
+    fn renames_in_each_format() {
+        let ass = "[Events]\nDialogue: 0,0:00:00.00,0:00:02.00,S1,Speaker A,0,0,0,,{\\k20}Hi, A\nDialogue: 0,0:00:02.00,0:00:03.00,S2,Speaker B,0,0,0,,Yo\n";
+        let out = rename_in(ass, Kind::Ass, "Speaker A", "Sam");
+        assert!(out.contains(",S1,Sam,0,0,0,,{\\k20}Hi, A\n"));
+        assert!(out.contains(",S2,Speaker B,"));
+        let srt = "1\n00:00:00,000 --> 00:00:02,000\nSpeaker A: Hi.\n\n2\n00:00:02,000 --> 00:00:03,000\nSpeaker A: is me\nSpeaker A: not a prefix line\n\n";
+        let out = rename_in(srt, Kind::Srt, "Speaker A", "Sam");
+        assert_eq!(out.matches("Sam: ").count(), 2);
+        assert!(out.contains("\nSpeaker A: not a prefix line"));
+        let md =
+            "# T\n\n**[00:00:00] Speaker A:** Hi.\n\n**[00:00:05] Speaker B:** Speaker A: no.\n";
+        let out = rename_in(md, Kind::Md, "Speaker A", "Sam");
+        assert!(out.contains("**[00:00:00] Sam:** Hi."));
+        assert!(out.contains("**[00:00:05] Speaker B:** Speaker A: no."));
     }
 
     #[test]
