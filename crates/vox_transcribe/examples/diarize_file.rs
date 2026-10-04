@@ -2,6 +2,8 @@
 //!
 //! cargo run --release -p vox_transcribe --features sherpa-static \
 //!   --example diarize_file -- FILE.wav SEG.onnx EMB.onnx [N|auto] [THRESHOLD]
+//!
+//! THREADS=n sets the threads per model (default 2, like scribe).
 
 use std::path::PathBuf;
 
@@ -40,7 +42,10 @@ fn main() {
     let models = SpeakerModels {
         segmentation: PathBuf::from(&a[2]),
         embedding: PathBuf::from(&a[3]),
-        num_threads: 4,
+        num_threads: std::env::var("THREADS")
+            .ok()
+            .and_then(|t| t.parse().ok())
+            .unwrap_or(2),
     };
     let tuning = DiarizerTuning {
         num_speakers: a.get(4).and_then(|n| n.parse().ok()),
