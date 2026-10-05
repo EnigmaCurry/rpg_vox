@@ -329,18 +329,13 @@ install-scribe BIN="~/.local/bin": release-scribe
     bin="${bin/#\~/$HOME}"
     mkdir -p "$bin"
     install -m 755 target/release/scribe "$bin/scribe"
-    # The binary used to be called vox_scribe.
-    rm -f "$bin/vox_scribe"
     echo "installed $bin/scribe"
     if [ "$(uname)" = Darwin ]; then
       contrib=crates/vox_scribe/contrib/macos
       sed "s|@BIN@|$bin|" "$contrib/scribe-once.terminal" > "$bin/scribe-once.terminal"
       install -m 755 "$contrib/scribe-ghostty" "$bin/"
-      # Older installs used these names.
-      rm -f "$bin/vox_scribe-once.command" "$bin/vox_scribe-once.terminal" "$bin/vox_scribe-ghostty"
       rules="$HOME/.config/karabiner/assets/complex_modifications"
       mkdir -p "$rules"
-      rm -f "$rules/vox_scribe.json"
       # Ghostty runs as its own app, so only the recorder's window comes
       # forward; Terminal raises all of its windows. Override with
       # VOX_SCRIBE_TERMINAL=terminal|ghostty.

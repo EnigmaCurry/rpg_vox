@@ -119,12 +119,11 @@ from a source install.
 just install-scribe              # or: just install-scribe /usr/local/bin
 ```
 
-This builds the release binary, copies it to `~/.local/bin/scribe`
-(removing an old `vox_scribe` binary there), and downloads the models
-into the per-user data dir (skipped if already there). Make sure the
-install directory is on your `PATH`. On macOS it also installs
-`scribe-once.terminal` next to the binary and drops the Karabiner rule
-for the [dictation key](#one-shot-dictation-key) into
+This builds the release binary, copies it to `~/.local/bin/scribe`, and
+downloads the models into the per-user data dir (skipped if already
+there). Make sure the install directory is on your `PATH`. On macOS it
+also installs `scribe-once.terminal` next to the binary and drops the
+Karabiner rule for the [dictation key](#one-shot-dictation-key) into
 `~/.config/karabiner/assets/complex_modifications/`.
 
 On macOS, build with plain cargo (no nix-shell), and use `-p vox_scribe`:
