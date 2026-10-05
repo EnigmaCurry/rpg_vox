@@ -261,8 +261,10 @@ final diarization (which runs on the console after the TUI closes too),
   * macOS 14.4+: a Core Audio process tap. The first run asks for
     *System Audio Recording* permission for your terminal app (System
     Settings → Privacy & Security → Screen & System Audio Recording);
-    without it the tap records silence rather than failing. An app only
-    shows up once it has opened an audio output.
+    without it the tap records silence rather than failing. Each
+    terminal needs it separately: the F5 [dictation key](#macos--f5-key)
+    runs scribe in Ghostty (or Terminal), so allow that one too to pick
+    apps there. An app only shows up once it has opened an audio output.
   * Linux: scribe's PipeWire stream is linked to the app's output streams
     with `pw-link`.
 * `--virtual-sink` (Linux): a `vox_scribe` PipeWire sink; route apps into
@@ -444,6 +446,10 @@ without finishing.
 5. Press 🎤 to start and again (or `enter`) to finish. The first time,
    allow Ghostty (or Terminal) to use the microphone. The window closes
    on its own.
+6. To transcribe an app's audio there (with `a`), also allow Ghostty (or
+   Terminal) under *System Audio Recording Only* in System Settings ›
+   Privacy & Security › Screen & System Audio Recording. Without it, the
+   app records as silence.
 
 Notes:
 
