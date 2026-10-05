@@ -2,8 +2,9 @@
 
 ![rpg_vox](rpg_vox.png)
 
-Voice tools for tabletop RPGs played over a video call, built on
-PipeWire and local speech models. This repository holds two apps:
+A collection of voice tools for tabletop RPGs played over a video
+call, as well as for general transcription tasks, built on PipeWire
+and local speech models. This repository holds two separate apps:
 
 ## [rpg_vox](RPG_VOX.md)
 
