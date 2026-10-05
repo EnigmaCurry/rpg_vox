@@ -212,6 +212,25 @@ live labels were wrong.
 The speaker models (~77 MB) are fetched on first use, or with
 `scribe --diarize download-models` / `just download-speaker-models`.
 
+### One source per speaker
+
+When each person has their own channel, transcribe the channels
+separately instead of diarizing a mix: repeat `-d` and/or `-a` (or `-i`
+for per-speaker tracks of one session, all starting together), and each
+source becomes one speaker, A, B, … in command-line order:
+
+```bash
+scribe -d "USB Mic" -a Discord --speakers "Me,Party" -r session
+scribe -i alice.flac -i bob.flac --speakers Alice,Bob -o game
+```
+
+Every source runs its own pipeline, so people talking over each other
+are each transcribed in full. `--speakers` takes their names in the same
+order, and `n` renames them as with `--diarize` (which this replaces:
+the two don't combine). The level meter shows the loudest source,
+`--record` mixes them all into one `.opus`, and at the end the files
+are rewritten in time order, since sources settle out of step.
+
 Models are looked up in `--models-dir`, `$VOX_SCRIBE_MODELS`, the per-user
 data dir (`~/Library/Application Support/vox_scribe/models` on macOS,
 `${XDG_DATA_HOME:-~/.local/share}/vox_scribe/models` on Linux), then `./models` (so an rpg_vox checkout's models work as-is). In

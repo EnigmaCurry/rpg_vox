@@ -107,40 +107,65 @@ fn paragraph_cues(
     cfg: &CueConfig,
 ) -> String {
     let mut out = String::new();
-    for (i, mut cue) in subtitle::cues(&p.words, p.end_ms, cfg)
+    for (i, cue) in subtitle::cues(&p.words, p.end_ms, cfg)
         .into_iter()
         .enumerate()
     {
-        cue.start_ms += offset_ms;
-        cue.end_ms += offset_ms;
-        *count += 1;
-        out.push_str(&match format {
-            Format::Srt => {
-                if let (0, Some(s)) = (i, &p.speaker) {
-                    cue.text = format!("{}: {}", crate::speakers::name(s), cue.text);
-                }
-                subtitle::srt(*count, &cue)
-            }
-            Format::Ass => {
-                let name = p.speaker.as_deref().map(crate::speakers::name);
-                subtitle::ass_for(&cue, p.speaker.as_deref().zip(name.as_deref()))
-            }
-        });
+        out.push_str(&format_cue(p, i, cue, format, offset_ms, count));
     }
     out
 }
 
+/// The `i`th cue of `p` in `format`, numbered after `count`.
+fn format_cue(
+    p: &Paragraph,
+    i: usize,
+    mut cue: subtitle::Cue,
+    format: Format,
+    offset_ms: u64,
+    count: &mut usize,
+) -> String {
+    cue.start_ms += offset_ms;
+    cue.end_ms += offset_ms;
+    *count += 1;
+    match format {
+        Format::Srt => {
+            if let (0, Some(s)) = (i, &p.speaker) {
+                cue.text = format!("{}: {}", crate::speakers::name(s), cue.text);
+            }
+            subtitle::srt(*count, &cue)
+        }
+        Format::Ass => {
+            let name = p.speaker.as_deref().map(crate::speakers::name);
+            subtitle::ass_for(&cue, p.speaker.as_deref().zip(name.as_deref()))
+        }
+    }
+}
+
 /// A whole file for `t`, as [`SubtitleWriter`] would have written it for
-/// a new (not appended) session.
+/// a new (not appended) session. Cues go in time order, so speakers who
+/// talk over each other (one per source) interleave.
 pub fn render(format: Format, t: &Transcript) -> String {
     let cfg = CueConfig::default();
     let mut out = match format {
         Format::Srt => String::new(),
         Format::Ass => subtitle::ASS_HEADER.to_string(),
     };
+    let mut cues: Vec<(&Paragraph, usize, subtitle::Cue)> = t
+        .paragraphs
+        .iter()
+        .filter(|p| !p.words.is_empty())
+        .flat_map(|p| {
+            subtitle::cues(&p.words, p.end_ms, &cfg)
+                .into_iter()
+                .enumerate()
+                .map(move |(i, c)| (p, i, c))
+        })
+        .collect();
+    cues.sort_by_key(|(_, _, c)| c.start_ms);
     let mut count = 0;
-    for p in t.paragraphs.iter().filter(|p| !p.words.is_empty()) {
-        out.push_str(&paragraph_cues(p, format, 0, &mut count, &cfg));
+    for (p, i, cue) in cues {
+        out.push_str(&format_cue(p, i, cue, format, 0, &mut count));
     }
     out
 }

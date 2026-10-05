@@ -5,6 +5,8 @@
 //! utterance, and boundary re-transcription across neighbouring
 //! utterances. With --diarize each utterance is also labelled with its
 //! speaker, and a full diarization relabels the saved files at the end.
+//! Alternatively, several sources (-d / -a / -i, repeated) are each
+//! transcribed on their own as one speaker apiece.
 
 mod clipboard;
 mod diarize;
@@ -14,6 +16,7 @@ mod models;
 mod once;
 mod play;
 mod progress;
+mod sources;
 mod speakers;
 mod subtitles;
 mod tui;
@@ -25,7 +28,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory as _, FromArgMatches as _, Parser, Subcommand};
 use tracing::info;
 use vox_audio::{Capture, OpenOptions};
 use vox_transcribe::correct::Corrector;
@@ -50,20 +53,26 @@ struct Cli {
     #[command(subcommand)]
     cmd: Option<Cmd>,
     /// Input device id or name substring (see `devices`). Default: system input.
+    /// Repeat it (and/or -a) to transcribe several sources at once, each
+    /// on its own as one speaker: Speaker A, B, … in the order given, or
+    /// the names from --speakers.
     #[arg(short, long)]
-    device: Option<String>,
+    device: Vec<String>,
     /// PipeWire only: register a virtual sink named `vox_scribe` and
     /// transcribe whatever is played into it.
     #[arg(long)]
     virtual_sink: bool,
     /// Transcribe what one app is playing instead of an input: a PID or a
     /// name / bundle id substring (see `apps`). The app still plays to
-    /// your speakers. macOS 14.4+ (process tap) or PipeWire.
-    #[arg(short, long, conflicts_with_all = ["device", "virtual_sink", "input"])]
-    app: Option<String>,
+    /// your speakers. macOS 14.4+ (process tap) or PipeWire. Repeatable,
+    /// and combines with -d: one speaker per source.
+    #[arg(short, long, conflicts_with_all = ["virtual_sink", "input"])]
+    app: Vec<String>,
     /// Transcribe an audio file (wav, flac, mp3, ogg) instead of a device.
-    #[arg(short, long)]
-    input: Option<PathBuf>,
+    /// Repeat it for per-speaker tracks of one session (one speaker per
+    /// file, all starting at the same moment).
+    #[arg(short, long, conflicts_with_all = ["device", "virtual_sink"])]
+    input: Vec<PathBuf>,
     /// With --input: open the TUI and play the file to the speakers,
     /// transcribing it in real time as if it were coming from the mic.
     /// `space` pauses both.
@@ -137,9 +146,10 @@ struct Cli {
     /// With --diarize: who is speaking, when known. Either how many people
     /// ("3") or their names in the order they are first heard
     /// ("Alice,Bob,Carol", which also means 3). The count is exact: every
-    /// voice goes to one of them. Rename speakers any time with `n` in
-    /// the TUI.
-    #[arg(long, requires = "diarize", value_parser = parse_speakers)]
+    /// voice goes to one of them. With several sources: their names, in
+    /// the order the sources were given. Rename speakers any time with
+    /// `n` in the TUI.
+    #[arg(long, value_parser = parse_speakers)]
     speakers: Option<Speakers>,
     /// With --diarize: how alike (cosine similarity, 0–1) an utterance's
     /// voice must be to a known speaker to get their live label; higher
@@ -187,14 +197,45 @@ fn parse_speakers(arg: &str) -> Result<Speakers, String> {
     })
 }
 
-impl Cli {
-    fn open_options(&self) -> OpenOptions {
-        OpenOptions {
-            device: self.device.clone(),
-            virtual_sink: self.virtual_sink,
-            app: self.app.clone(),
-        }
+/// What to capture for each live source, in command-line order (-d and
+/// -a interleaved as typed). One default source when none is given.
+fn live_sources(cli: &Cli, matches: &clap::ArgMatches) -> Vec<OpenOptions> {
+    let at = |id: &str| -> Vec<usize> {
+        matches
+            .indices_of(id)
+            .map(|i| i.collect())
+            .unwrap_or_default()
+    };
+    let mut list: Vec<(usize, OpenOptions)> = Vec::new();
+    for (i, d) in at("device").into_iter().zip(&cli.device) {
+        list.push((
+            i,
+            OpenOptions {
+                device: Some(d.clone()),
+                ..Default::default()
+            },
+        ));
     }
+    for (i, a) in at("app").into_iter().zip(&cli.app) {
+        list.push((
+            i,
+            OpenOptions {
+                app: Some(a.clone()),
+                ..Default::default()
+            },
+        ));
+    }
+    list.sort_by_key(|(i, _)| *i);
+    if let [(_, only)] = list.as_mut_slice() {
+        only.virtual_sink = cli.virtual_sink;
+    }
+    if list.is_empty() {
+        return vec![OpenOptions {
+            virtual_sink: cli.virtual_sink,
+            ..Default::default()
+        }];
+    }
+    list.into_iter().map(|(_, o)| o).collect()
 }
 
 #[derive(Subcommand)]
@@ -211,15 +252,16 @@ enum Cmd {
     StopOnce,
 }
 
-/// Audio source feeding the engine.
+/// Audio source feeding an engine.
 enum Source {
-    Live(Capture),
+    Live(Capture, OpenOptions),
     File(Vec<f32>),
 }
 
 /// Everything the UI loops need.
 pub struct Session {
-    pub engine: Engine,
+    /// One engine per source.
+    pub engine: sources::Engines,
     /// None until -o or the TUI's `s` names a file.
     pub writer: Mutex<Option<MarkdownWriter>>,
     /// --record: the .srt and .ass beside the markdown.
@@ -240,8 +282,8 @@ pub struct Session {
     pub stop: Arc<AtomicBool>,
     /// Set when a file input has been fully pushed.
     pub source_done: Arc<AtomicBool>,
-    /// The live input; None for a file, or while paused (mic released).
-    pub capture: Arc<Mutex<Option<Capture>>>,
+    /// The live inputs; None for a file, or while paused (mic released).
+    pub captures: Vec<Arc<Mutex<Option<Capture>>>>,
     /// Tail of the existing file when appending, shown greyed out.
     pub history: Vec<markdown::HistoryBlock>,
     /// Length of a file input, for progress.
@@ -250,19 +292,23 @@ pub struct Session {
     pub live: bool,
     /// --diarize: speakers are labelled (and can be renamed with `n`).
     pub diarize: bool,
+    /// Several sources, each its own speaker (also renamed with `n`).
+    pub per_source: bool,
     /// --record: the audio is being saved too.
     pub recording: bool,
-    /// --speakers N.
+    /// --speakers N, or the number of sources.
     pub num_speakers: Option<usize>,
-    pump: Option<std::thread::JoinHandle<()>>,
+    pumps: Vec<std::thread::JoinHandle<()>>,
 }
 
 impl Session {
     /// Stop the audio, drain every pass, append what's left to the markdown.
     pub fn finish(mut self) -> Result<Transcript> {
         self.stop.store(true, Ordering::SeqCst);
-        self.capture.lock().expect("capture lock").take();
-        if let Some(p) = self.pump.take() {
+        for c in &self.captures {
+            c.lock().expect("capture lock").take();
+        }
+        for p in self.pumps.drain(..) {
             let _ = p.join();
         }
         let t = self.engine.finish();
@@ -369,10 +415,11 @@ pub struct Outcome {
 
 fn main() -> Result<()> {
     let started = std::time::Instant::now();
-    let cli = Cli::parse();
+    let matches = Cli::command().get_matches();
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
     // A file is transcribed without the TUI, with brief progress on
     // stderr, unless --live plays it through the TUI in real time.
-    let tui_mode = cli.cmd.is_none() && !cli.no_tui && (cli.input.is_none() || cli.live);
+    let tui_mode = cli.cmd.is_none() && !cli.no_tui && (cli.input.is_empty() || cli.live);
     let log_file = init_logging(&cli, tui_mode)?;
 
     match cli.cmd {
@@ -414,6 +461,41 @@ fn main() -> Result<()> {
 
     if let Some(name) = &cli.play {
         return play::run(&RecordPaths::new(name));
+    }
+
+    let live_opts = live_sources(&cli, &matches);
+    let n_sources = if cli.input.is_empty() {
+        live_opts.len()
+    } else {
+        cli.input.len()
+    };
+    let per_source = n_sources > 1;
+    if per_source {
+        if cli.diarize {
+            anyhow::bail!(
+                "--diarize tells speakers apart within one source; with several sources each one is its own speaker already"
+            );
+        }
+        if cli.virtual_sink {
+            anyhow::bail!(
+                "--virtual-sink is one source; it can't be combined with several -d / -a"
+            );
+        }
+        if cli.live {
+            anyhow::bail!("--live plays one file; drop it to transcribe several -i files");
+        }
+    }
+    if let Some(s) = &cli.speakers {
+        if per_source {
+            if s.count > n_sources {
+                anyhow::bail!(
+                    "--speakers names {} speakers for {n_sources} sources",
+                    s.count
+                );
+            }
+        } else if !cli.diarize {
+            anyhow::bail!("--speakers needs --diarize, or several sources (-d / -a / -i repeated)");
+        }
     }
 
     let now = chrono::Local::now();
@@ -479,30 +561,50 @@ fn main() -> Result<()> {
         _ => None,
     };
     let screen = tui_mode.then(tui::Screen::splash);
-    if cli.input.is_some() && !tui_mode {
+    if !cli.input.is_empty() && !tui_mode {
         say!("loading models…");
     }
 
     // Open the mic before loading models so speech during the load is
     // buffered (the capture queue holds ~10 s) rather than lost.
-    let (source, rate, device) = match &cli.input {
-        Some(path) => {
+    // (source, its sample rate, its name), in speaker order.
+    let mut srcs: Vec<(Source, u32, String)> = Vec::new();
+    if cli.input.is_empty() {
+        let backend = vox_audio::default_backend()?;
+        for opts in live_opts {
+            let cap = backend
+                .open(&opts)
+                .with_context(|| match (&opts.device, &opts.app) {
+                    (Some(d), _) => format!("open device {d}"),
+                    (_, Some(a)) => format!("capture app {a}"),
+                    _ => "open the default input".into(),
+                })?;
+            let (rate, name) = (cap.sample_rate, cap.device.clone());
+            srcs.push((Source::Live(cap, opts), rate, name));
+        }
+    } else {
+        for path in &cli.input {
             let d = vox_audio::file::decode(path)?;
-            (
+            srcs.push((
                 Source::File(d.samples),
                 d.sample_rate,
                 path.display().to_string(),
-            )
+            ));
         }
-        None => {
-            let backend = vox_audio::default_backend()?;
-            let cap = backend.open(&cli.open_options())?;
-            let (rate, name) = (cap.sample_rate, cap.device.clone());
-            (Source::Live(cap), rate, name)
-        }
+    }
+    for (i, (_, rate, name)) in srcs.iter().enumerate() {
+        info!(source = i, rate, device = %name, "audio source ready");
+    }
+    let device = srcs
+        .iter()
+        .map(|(_, _, name)| name.as_str())
+        .collect::<Vec<_>>()
+        .join(" + ");
+    let num_speakers = if per_source {
+        Some(n_sources)
+    } else {
+        cli.speakers.as_ref().map(|s| s.count)
     };
-    info!(rate, device = %device, "audio source ready");
-    let num_speakers = cli.speakers.as_ref().map(|s| s.count);
     if let Some(s) = &cli.speakers {
         speakers::preset(&s.names);
     }
@@ -523,14 +625,19 @@ fn main() -> Result<()> {
     };
     // What the final diarization pass reads and rewrites, if it runs:
     // only when there are files to rewrite and the audio is at hand.
-    let input_ms = match &source {
-        Source::File(s) => Some(s.len() as u64 * 1000 / rate.max(1) as u64),
-        Source::Live(_) => None,
-    };
-    let final_pass = match (&speaker_models, &source, &record) {
+    let input_ms = srcs
+        .iter()
+        .filter_map(|(src, rate, _)| match src {
+            Source::File(s) => Some(s.len() as u64 * 1000 / (*rate).max(1) as u64),
+            Source::Live(..) => None,
+        })
+        .max();
+    // --diarize is single-source.
+    let (first, first_rate) = (&srcs[0].0, srcs[0].1);
+    let final_pass = match (&speaker_models, first, &record) {
         (None, _, _) => None,
         (Some(_), Source::File(s), _) if record.is_some() || output.is_some() => {
-            Some(diarize::Audio::Samples(s.clone(), rate))
+            Some(diarize::Audio::Samples(s.clone(), first_rate))
         }
         (Some(_), _, Some(r)) => Some(diarize::Audio::Opus(r.opus.clone())),
         _ => None,
@@ -577,22 +684,25 @@ fn main() -> Result<()> {
             }
         }
     };
-    let streaming: Option<Box<dyn StreamingRecognizer>> =
-        if cli.no_streaming || !models::has_zipformer(&models_dir) {
-            None
-        } else {
-            let mut zc = ZipformerConfig::from_dir(&models_dir.join(models::ZIPFORMER));
-            zc.num_threads = cli.threads;
-            Some(Box::new(Zipformer::open(&zc)?.session()))
-        };
+    // One streaming model, a session (stream) per source.
+    let zipformer = if cli.no_streaming || !models::has_zipformer(&models_dir) {
+        None
+    } else {
+        let mut zc = ZipformerConfig::from_dir(&models_dir.join(models::ZIPFORMER));
+        zc.num_threads = cli.threads;
+        Some(Zipformer::open(&zc)?)
+    };
 
-    let title = cli.title.clone().unwrap_or_else(|| match &cli.input {
-        Some(p) => p
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_default(),
-        None => format!("Transcript {}", now.format("%Y-%m-%d %H:%M")),
-    });
+    let title = cli
+        .title
+        .clone()
+        .unwrap_or_else(|| match cli.input.first() {
+            Some(p) => p
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            None => format!("Transcript {}", now.format("%Y-%m-%d %H:%M")),
+        });
     let subtitle = format!("{} · {}", now.format("%Y-%m-%d %H:%M"), device);
     let history = match &output {
         Some(o) if cli.append => markdown::read_tail(o, 200),
@@ -602,42 +712,84 @@ fn main() -> Result<()> {
         Some(o) => Some(MarkdownWriter::create(o, &title, &subtitle, cli.append)?),
         None => None,
     };
-    let (subtitles, recording) = match &record {
-        Some(r) => (
-            vec![
-                SubtitleWriter::create(r.srt.clone(), Format::Srt, false)?,
-                SubtitleWriter::create(r.ass.clone(), Format::Ass, false)?,
-            ],
-            Some(OpusWriter::create(&r.opus, rate)?),
-        ),
-        None => (Vec::new(), None),
+    let subtitles = match &record {
+        Some(r) => vec![
+            SubtitleWriter::create(r.srt.clone(), Format::Srt, false)?,
+            SubtitleWriter::create(r.ass.clone(), Format::Ass, false)?,
+        ],
+        None => Vec::new(),
+    };
+    // Several sources are mixed into the one recording.
+    let mixer = match &record {
+        Some(r) if per_source => {
+            let rates: Vec<u32> = srcs.iter().map(|(_, rate, _)| *rate).collect();
+            Some(Arc::new(Mutex::new(sources::Mixer::create(
+                &r.opus, &rates,
+            )?)))
+        }
+        _ => None,
     };
 
     let manual = cli.manual || cli.once;
-    let mut engine_cfg = EngineConfig::new(rate);
-    if manual {
-        engine_cfg.paragraph.mode = ParagraphMode::Manual;
-    }
-    let engine = Engine::spawn_full(engine_cfg, streaming, offline, corrector, tagger);
+    let mut tagger = tagger;
+    let engines: Vec<Engine> = srcs
+        .iter()
+        .map(|(_, rate, _)| {
+            let mut engine_cfg = EngineConfig::new(*rate);
+            if manual {
+                engine_cfg.paragraph.mode = ParagraphMode::Manual;
+            }
+            let streaming = zipformer
+                .as_ref()
+                .map(|z| Box::new(z.session()) as Box<dyn StreamingRecognizer>);
+            Engine::spawn_full(
+                engine_cfg,
+                streaming,
+                offline.clone(),
+                corrector.clone(),
+                tagger.take(),
+            )
+        })
+        .collect();
+    let engine = sources::Engines::new(engines);
     let loaded = started.elapsed();
-    let fed = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let paused = Arc::new(AtomicBool::new(false));
     let stop = Arc::new(AtomicBool::new(false));
     let source_done = Arc::new(AtomicBool::new(false));
+    // File sources still being pushed; the last one sets `source_done`.
+    let files_left = Arc::new(std::sync::atomic::AtomicUsize::new(srcs.len()));
 
-    let (capture, pump) = {
+    // Samples fed per source, with its rate, for the end-of-run stats.
+    let mut fed: Vec<(Arc<std::sync::atomic::AtomicU64>, u32)> = Vec::new();
+    let mut captures = Vec::new();
+    let mut pumps = Vec::new();
+    for (i, (source, rate, _)) in srcs.into_iter().enumerate() {
+        let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        fed.push((counter.clone(), rate));
+        let recording = match (&mixer, &record) {
+            (Some(m), _) => Some(Recorder::Mixed(m.clone(), i)),
+            (None, Some(r)) => Some(Recorder::Own(OpusWriter::create(&r.opus, rate)?)),
+            (None, None) => None,
+        };
         let mut feed = Feed {
-            pusher: engine.pusher(),
+            pusher: engine.pusher(i),
             recording,
-            fed: fed.clone(),
+            fed: counter,
         };
         let (paused, stop, done) = (paused.clone(), stop.clone(), source_done.clone());
-        match source {
-            Source::Live(cap) => {
+        let files_left = files_left.clone();
+        // The last file to finish marks the input done.
+        let file_done = move || {
+            if files_left.fetch_sub(1, Ordering::SeqCst) == 1 {
+                done.store(true, Ordering::SeqCst);
+            }
+        };
+        let (capture, pump) = match source {
+            Source::Live(cap, opts) => {
                 let capture = Arc::new(Mutex::new(Some(cap)));
                 let live = LivePump {
                     capture: capture.clone(),
-                    opts: cli.open_options(),
+                    opts,
                     rate,
                     feed,
                     paused,
@@ -658,7 +810,7 @@ fn main() -> Result<()> {
                 };
                 let pump = std::thread::spawn(move || {
                     player.run();
-                    done.store(true, Ordering::SeqCst);
+                    file_done();
                 });
                 (Arc::new(Mutex::new(None)), pump)
             }
@@ -674,12 +826,14 @@ fn main() -> Result<()> {
                         feed.push(chunk);
                     }
                     feed.finish();
-                    done.store(true, Ordering::SeqCst);
+                    file_done();
                 });
                 (Arc::new(Mutex::new(None)), pump)
             }
-        }
-    };
+        };
+        captures.push(capture);
+        pumps.push(pump);
+    }
 
     let files = diarize::Files {
         md: output.clone(),
@@ -702,14 +856,15 @@ fn main() -> Result<()> {
         finish_requested,
         stop,
         source_done,
-        capture,
+        captures,
         history,
         input_ms,
         live: cli.live,
         diarize: cli.diarize,
+        per_source,
         recording: record.is_some(),
         num_speakers,
-        pump: Some(pump),
+        pumps,
     };
     let mut outcome = match screen {
         Some(screen) => tui::run(screen, session)?,
@@ -755,8 +910,9 @@ fn main() -> Result<()> {
         }
     }
     // Speakers renamed during the session: the files were written with
-    // the old names as they went, so write them again.
-    if speakers::renamed() && !rewritten && !cli.append {
+    // the old names as they went, so write them again. Several sources
+    // harden out of order, so their files are rewritten in time order.
+    if (speakers::renamed() || per_source) && !rewritten && !cli.append {
         let files = diarize::Files {
             md: outcome.path.clone(),
             ..files
@@ -781,8 +937,12 @@ fn main() -> Result<()> {
         );
     }
     if !cli.once {
-        let audio_ms = fed.load(Ordering::Relaxed) * 1000 / rate.max(1) as u64;
-        let offline = cli.input.is_some() && !cli.live;
+        let audio_ms = fed
+            .iter()
+            .map(|(n, rate)| n.load(Ordering::Relaxed) * 1000 / (*rate).max(1) as u64)
+            .max()
+            .unwrap_or(0);
+        let offline = !cli.input.is_empty() && !cli.live;
         let stats = Stats {
             audio_ms,
             total: started.elapsed(),
@@ -896,7 +1056,7 @@ fn copy_transcript(outcome: &Outcome) {
 /// Where captured audio goes: the engine, and the --record file.
 struct Feed {
     pusher: vox_transcribe::Pusher,
-    recording: Option<OpusWriter>,
+    recording: Option<Recorder>,
     /// Samples pushed, for the end-of-run stats.
     fed: Arc<std::sync::atomic::AtomicU64>,
 }
@@ -905,21 +1065,35 @@ impl Feed {
     fn push(&mut self, mono: &[f32]) {
         self.fed.fetch_add(mono.len() as u64, Ordering::Relaxed);
         self.pusher.push(mono);
-        if let Some(r) = &mut self.recording {
-            if let Err(e) = r.write(mono) {
-                tracing::error!("recording stopped: {e:#}");
-                self.recording = None;
+        match &mut self.recording {
+            Some(Recorder::Own(r)) => {
+                if let Err(e) = r.write(mono) {
+                    tracing::error!("recording stopped: {e:#}");
+                    self.recording = None;
+                }
             }
+            Some(Recorder::Mixed(m, i)) => m.lock().expect("mixer lock").push(*i, mono),
+            None => {}
         }
     }
 
     fn finish(self) {
-        if let Some(r) = self.recording {
-            if let Err(e) = r.finish() {
-                tracing::error!("finishing the recording failed: {e:#}");
+        match self.recording {
+            Some(Recorder::Own(r)) => {
+                if let Err(e) = r.finish() {
+                    tracing::error!("finishing the recording failed: {e:#}");
+                }
             }
+            Some(Recorder::Mixed(m, i)) => m.lock().expect("mixer lock").done(i),
+            None => {}
         }
     }
+}
+
+/// The --record file: one source's own, or a share of the mix.
+enum Recorder {
+    Own(OpusWriter),
+    Mixed(Arc<Mutex<sources::Mixer>>, usize),
 }
 
 /// --live: plays a file to the speakers and feeds the engine each sample
@@ -1259,7 +1433,7 @@ fn list_devices() -> Result<()> {
 fn init_logging(cli: &Cli, tui_mode: bool) -> Result<Option<std::fs::File>> {
     use tracing_subscriber::EnvFilter;
     // A file input prints its own brief progress; keep logs to warnings.
-    let quiet = cli.input.is_some() && !cli.live && cli.log.is_none();
+    let quiet = !cli.input.is_empty() && !cli.live && cli.log.is_none();
     let filter = EnvFilter::try_from_env("VOX_SCRIBE_LOG").unwrap_or_else(|_| {
         EnvFilter::new(if quiet {
             "warn"

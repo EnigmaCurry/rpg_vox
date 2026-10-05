@@ -267,10 +267,10 @@ fn run_loop(terminal: &mut DefaultTerminal, s: &Session) -> Result<bool> {
             }
             KeyCode::Char('n') if !s.once => {
                 if speaker_labels(&app.transcript, s).is_empty() {
-                    app.set_status(if s.diarize {
+                    app.set_status(if s.diarize || s.per_source {
                         "no speakers yet".into()
                     } else {
-                        "speaker names need --diarize".into()
+                        "speaker names need --diarize or several sources".into()
                     });
                 } else {
                     app.names = Some(NamesMenu {
@@ -605,13 +605,16 @@ fn draw(f: &mut Frame, app: &App, s: &Session) {
     let frac = ((db + 60.0) / 60.0).clamp(0.0, 1.0);
     let width = 24usize;
     let filled = (frac * width as f32).round() as usize;
-    let overruns = s
-        .capture
-        .lock()
-        .expect("capture lock")
-        .as_ref()
-        .map(|c| c.overruns.load(Ordering::Relaxed))
-        .unwrap_or(0);
+    let overruns: u64 = s
+        .captures
+        .iter()
+        .filter_map(|c| {
+            c.lock()
+                .expect("capture lock")
+                .as_ref()
+                .map(|c| c.overruns.load(Ordering::Relaxed))
+        })
+        .sum();
     let mut meter = vec![
         Span::raw(" level "),
         Span::styled(
@@ -665,7 +668,7 @@ fn draw(f: &mut Frame, app: &App, s: &Session) {
             } else {
                 " ↑↓ select · y copy · space pause · enter new paragraph · m mode · s save · q quit"
             };
-            let names = if s.diarize && !s.once {
+            let names = if (s.diarize || s.per_source) && !s.once {
                 " · n speakers"
             } else {
                 ""
