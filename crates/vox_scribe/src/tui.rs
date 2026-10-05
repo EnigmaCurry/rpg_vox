@@ -97,6 +97,66 @@ pub fn normalize_key(key: KeyEvent) -> KeyEvent {
     }
 }
 
+/// What the transcript view shows while the models load.
+pub struct Loading<'a> {
+    pub device: &'a str,
+    pub recording: bool,
+    pub once: bool,
+    pub saving: bool,
+}
+
+/// The transcript view before the session exists: same layout, no
+/// text yet, model loading noted in the status line.
+fn draw_loading(f: &mut Frame, v: &Loading, elapsed: Duration) {
+    let [header, body, footer] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(3),
+        Constraint::Length(3),
+    ])
+    .areas(f.area());
+    let (badge, badge_style) = if v.recording {
+        (" ● REC ", Style::new().white().on_red())
+    } else if v.once {
+        (" ⧉ CLIPBOARD ", Style::new().black().on_magenta())
+    } else if v.saving {
+        (" ✎ SAVING ", Style::new().black().bg(Color::Indexed(214)))
+    } else {
+        (" ○ NOT SAVED ", Style::new().black().on_gray())
+    };
+    let [header, corner] =
+        Layout::horizontal([Constraint::Min(0), Constraint::Length(badge.width() as u16)])
+            .areas(header);
+    f.render_widget(Line::from(Span::styled(badge, badge_style)), corner);
+    f.render_widget(
+        Line::from(vec![
+            Span::styled(" ◉ LISTENING ", Style::new().black().on_green()),
+            format!(" {}  ", timestamp(0)).bold(),
+            Span::raw(v.device.to_string()),
+        ]),
+        header,
+    );
+    f.render_widget(Block::bordered().title(" Transcript "), body);
+    let [status_line, _, help_line] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(footer);
+    const SPIN: [&str; 4] = ["◐", "◓", "◑", "◒"];
+    let spin = SPIN[(elapsed.as_millis() / 150) as usize % SPIN.len()];
+    f.render_widget(
+        Line::from(
+            format!(
+                " {spin} loading models… {}s (audio is buffered)",
+                elapsed.as_secs()
+            )
+            .yellow(),
+        ),
+        status_line,
+    );
+    f.render_widget(Line::from(" q quit".dark_gray()), help_line);
+}
+
 /// The terminal in TUI mode. Restored on drop, so an error while loading
 /// models still leaves the shell usable.
 pub struct Screen {
@@ -107,9 +167,13 @@ pub struct Screen {
 }
 
 impl Screen {
-    /// Enter the TUI and show a loading frame.
-    pub fn splash() -> Self {
-        Self::enter(" loading models…")
+    /// Enter the TUI already showing the (empty) transcript view.
+    pub fn splash(view: &Loading) -> Self {
+        let mut screen = Self::enter("");
+        let _ = screen
+            .terminal
+            .draw(|f| draw_loading(f, view, Duration::ZERO));
+        screen
     }
 
     /// Enter the TUI showing `msg` until the first real frame.
@@ -136,6 +200,31 @@ impl Screen {
             enhanced,
             restored: false,
         }
+    }
+
+    /// Show the transcript view, empty, until `done` (the models are
+    /// loaded). The mic is already open, so speech meanwhile is buffered.
+    /// Returns false if the user quit first.
+    pub fn wait_loading(&mut self, view: &Loading, done: impl Fn() -> bool) -> Result<bool> {
+        let start = Instant::now();
+        while !done() {
+            self.terminal
+                .draw(|f| draw_loading(f, view, start.elapsed()))?;
+            if !event::poll(Duration::from_millis(80))? {
+                continue;
+            }
+            if let TermEvent::Key(key) = event::read()? {
+                let key = normalize_key(key);
+                let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                match key.code {
+                    _ if key.kind != KeyEventKind::Press => {}
+                    KeyCode::Char('q') | KeyCode::Esc => return Ok(false),
+                    KeyCode::Char('c') if ctrl => return Ok(false),
+                    _ => {}
+                }
+            }
+        }
+        Ok(true)
     }
 
     pub fn terminal(&mut self) -> &mut DefaultTerminal {

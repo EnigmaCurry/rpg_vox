@@ -404,6 +404,84 @@ impl RecordPaths {
     }
 }
 
+/// What the model-loading thread needs, owned so it can run while the
+/// TUI is already up.
+struct Load {
+    model: models::Offline,
+    language: String,
+    threads: i32,
+    streaming: bool,
+    models_dir: PathBuf,
+    vocab: Option<vox_transcribe::vocab::Vocab>,
+    speakers: Option<SpeakerModels>,
+    cluster: ClusterConfig,
+}
+
+struct Loaded {
+    offline: Arc<dyn vox_transcribe::OfflineRecognizer>,
+    zipformer: Option<Zipformer>,
+    tagger: Option<Box<dyn SpeakerTagger>>,
+}
+
+impl Load {
+    fn run(self) -> Result<Loaded> {
+        let models_dir = &self.models_dir;
+        let tagger: Option<Box<dyn SpeakerTagger>> = match &self.speakers {
+            Some(m) => Some(Box::new(EmbeddingTagger::open(m, self.cluster)?)),
+            None => None,
+        };
+        let offline: Arc<dyn vox_transcribe::OfflineRecognizer> =
+            match self.model {
+                models::Offline::SenseVoice => {
+                    let mut sv = SenseVoiceConfig::from_dir(&models_dir.join(models::SENSE_VOICE));
+                    sv.language = self.language;
+                    sv.num_threads = self.threads;
+                    Arc::new(SenseVoice::open(&sv).with_context(|| {
+                        format!("loading SenseVoice from {}", models_dir.display())
+                    })?)
+                }
+                models::Offline::Parakeet => {
+                    let mut pc = ParakeetConfig::from_dir(&models_dir.join(models::PARAKEET));
+                    pc.num_threads = self.threads;
+                    let plain: Arc<dyn vox_transcribe::OfflineRecognizer> =
+                        Arc::new(Parakeet::open(&pc).with_context(|| {
+                            format!("loading Parakeet from {}", models_dir.display())
+                        })?);
+                    match &self.vocab {
+                        Some(v) => {
+                            let biased = Parakeet::open_biased(
+                                &pc,
+                                &v.terms,
+                                vox_transcribe::vocab::HOTWORD_SCORE,
+                                vox_transcribe::vocab::BEAM,
+                            )?;
+                            Arc::new(vox_transcribe::vocab::VocabRecognizer {
+                                biased: Arc::new(biased),
+                                plain,
+                                vocab: v.clone(),
+                                min_similarity: vox_transcribe::vocab::MIN_SIMILARITY,
+                            })
+                        }
+                        None => plain,
+                    }
+                }
+            };
+        // One streaming model, a session (stream) per source.
+        let zipformer = if self.streaming {
+            let mut zc = ZipformerConfig::from_dir(&models_dir.join(models::ZIPFORMER));
+            zc.num_threads = self.threads;
+            Some(Zipformer::open(&zc)?)
+        } else {
+            None
+        };
+        Ok(Loaded {
+            offline,
+            zipformer,
+            tagger,
+        })
+    }
+}
+
 /// How a session ended.
 pub struct Outcome {
     pub transcript: Transcript,
@@ -560,7 +638,13 @@ fn main() -> Result<()> {
         (Some(f), true) => Some(vox_transcribe::stderr::redirect_to(f)?),
         _ => None,
     };
-    let screen = tui_mode.then(tui::Screen::splash);
+    let view = |device| tui::Loading {
+        device,
+        recording: record.is_some(),
+        once: cli.once,
+        saving: output.is_some(),
+    };
+    let mut screen = tui_mode.then(|| tui::Screen::splash(&view("")));
     if !cli.input.is_empty() && !tui_mode {
         say!("loading models…");
     }
@@ -612,16 +696,24 @@ fn main() -> Result<()> {
         num_threads: cli.threads,
         ..SpeakerModels::from_dir(&models_dir.join(models::SPEAKERS))
     });
-    let tagger: Option<Box<dyn SpeakerTagger>> = match &speaker_models {
-        Some(m) => Some(Box::new(EmbeddingTagger::open(
-            m,
-            ClusterConfig {
+    // Load the models on a thread so the TUI shows the transcript view
+    // (and the mic keeps buffering) while they come up.
+    let load = {
+        let load = Load {
+            model: cli.model,
+            language: cli.language.clone(),
+            threads: cli.threads,
+            streaming: !cli.no_streaming && models::has_zipformer(&models_dir),
+            models_dir: models_dir.clone(),
+            vocab: vocab.clone(),
+            speakers: speaker_models.clone(),
+            cluster: ClusterConfig {
                 max_speakers: num_speakers,
                 threshold: cli.speaker_threshold,
                 ..Default::default()
             },
-        )?)),
-        None => None,
+        };
+        std::thread::spawn(move || load.run())
     };
     // What the final diarization pass reads and rewrites, if it runs:
     // only when there are files to rewrite and the audio is at hand.
@@ -648,50 +740,19 @@ fn main() -> Result<()> {
     } else {
         final_pass
     };
-    let offline: Arc<dyn vox_transcribe::OfflineRecognizer> = match cli.model {
-        models::Offline::SenseVoice => {
-            let mut sv = SenseVoiceConfig::from_dir(&models_dir.join(models::SENSE_VOICE));
-            sv.language = cli.language.clone();
-            sv.num_threads = cli.threads;
-            Arc::new(
-                SenseVoice::open(&sv)
-                    .with_context(|| format!("loading SenseVoice from {}", models_dir.display()))?,
-            )
+    if let Some(screen) = screen.as_mut() {
+        if !screen.wait_loading(&view(&device), || load.is_finished())? {
+            // Quit before anything was written; the mic is just dropped.
+            return Ok(());
         }
-        models::Offline::Parakeet => {
-            let mut pc = ParakeetConfig::from_dir(&models_dir.join(models::PARAKEET));
-            pc.num_threads = cli.threads;
-            let plain: Arc<dyn vox_transcribe::OfflineRecognizer> = Arc::new(
-                Parakeet::open(&pc)
-                    .with_context(|| format!("loading Parakeet from {}", models_dir.display()))?,
-            );
-            match &vocab {
-                Some(v) => {
-                    let biased = Parakeet::open_biased(
-                        &pc,
-                        &v.terms,
-                        vox_transcribe::vocab::HOTWORD_SCORE,
-                        vox_transcribe::vocab::BEAM,
-                    )?;
-                    Arc::new(vox_transcribe::vocab::VocabRecognizer {
-                        biased: Arc::new(biased),
-                        plain,
-                        vocab: v.clone(),
-                        min_similarity: vox_transcribe::vocab::MIN_SIMILARITY,
-                    })
-                }
-                None => plain,
-            }
-        }
-    };
-    // One streaming model, a session (stream) per source.
-    let zipformer = if cli.no_streaming || !models::has_zipformer(&models_dir) {
-        None
-    } else {
-        let mut zc = ZipformerConfig::from_dir(&models_dir.join(models::ZIPFORMER));
-        zc.num_threads = cli.threads;
-        Some(Zipformer::open(&zc)?)
-    };
+    }
+    let Loaded {
+        offline,
+        zipformer,
+        tagger,
+    } = load
+        .join()
+        .map_err(|_| anyhow::anyhow!("model loading panicked"))??;
 
     let title = cli
         .title
