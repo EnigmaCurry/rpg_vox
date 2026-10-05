@@ -1,5 +1,8 @@
 # scribe
 
+![rpg_vox](whos_on_first.png)
+*Transcribing Abbott and Costello's Who's on First?*
+
 Live transcription in the terminal, saved as markdown and subtitles
 (`.srt` / `.ass`). `scribe` is the standalone companion to
 [rpg_vox](RPG_VOX.md): it uses the same layered speech-to-text passes
