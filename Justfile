@@ -20,6 +20,43 @@ build:
 release:
     nix-shell --run "cargo build --release"
 
+# Release archives in dist/: one tarball per binary, named
+# <bin>-<VERSION>-<target>.tar.gz, plus a .sha256 beside each. scribe
+# builds everywhere; rpg_vox needs PipeWire, so it ships on Linux only.
+# Uses nix-shell when available, plain cargo otherwise (macOS, CI).
+# The release workflow runs this on each target.
+dist VERSION=`git describe --tags --always --dirty`:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    bins=(scribe)
+    pkgs=(-p vox_scribe)
+    if [ "$(uname)" = Linux ]; then
+      bins+=(rpg_vox)
+      pkgs+=(-p rpg_vox)
+    fi
+    build="cargo build --release ${pkgs[*]}"
+    if command -v nix-shell >/dev/null; then
+      nix-shell --run "$build"
+    else
+      $build
+    fi
+    target="$(rustc -vV | sed -n 's/^host: //p')"
+    mkdir -p dist
+    for bin in "${bins[@]}"; do
+      name="$bin-{{VERSION}}-$target"
+      stage="$(mktemp -d)/$name"
+      mkdir -p "$stage"
+      cp "target/release/$bin" LICENSE.txt README.md "$stage/"
+      case "$bin" in
+        scribe) cp SCRIBE.md "$stage/" ;;
+        rpg_vox) cp RPG_VOX.md "$stage/" ;;
+      esac
+      tar -czf "dist/$name.tar.gz" -C "$(dirname "$stage")" "$name"
+      rm -rf "$(dirname "$stage")"
+      (cd dist && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256")
+      echo "packaged dist/$name.tar.gz"
+    done
+
 # Fast type-check without codegen (whole workspace).
 check:
     nix-shell --run "cargo check --workspace --all-targets"

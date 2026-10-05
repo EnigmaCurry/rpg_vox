@@ -21,3 +21,4 @@ transcript-*.md
 *.srt
 *.ass
 *.wav
+/dist/
