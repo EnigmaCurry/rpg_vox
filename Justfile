@@ -34,7 +34,7 @@ dist VERSION=`git describe --tags --always --dirty`:
       bins+=(rpg_vox)
       pkgs+=(-p rpg_vox)
     fi
-    build="cargo build --release ${pkgs[*]}"
+    build="cargo build --release --locked ${pkgs[*]}"
     if command -v nix-shell >/dev/null; then
       nix-shell --run "$build"
     else
