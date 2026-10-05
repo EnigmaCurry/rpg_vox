@@ -9,6 +9,8 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use anyhow::Result;
@@ -21,34 +23,36 @@ use vox_transcribe::{
     Change, Clip, Engine, Event, Paragraph, ParagraphMode, Pass4, Pusher, Transcript, Word,
 };
 
-/// One engine per source, driven as one.
+/// One engine per source, driven as one. Sources can be added while it
+/// runs (the TUI's `a` menu); from the second one on, paragraphs are
+/// labelled by source.
 pub struct Engines {
-    engines: Vec<Engine>,
+    engines: Mutex<Vec<Engine>>,
     events: Receiver<Event>,
+    /// New engines' events, for the merger.
+    add: Mutex<Option<Sender<Receiver<Event>>>>,
+    labelled: Arc<AtomicBool>,
     merger: Option<JoinHandle<()>>,
 }
 
 impl Engines {
-    /// A single engine is passed through untouched (its speakers, if
+    /// A single engine's events pass through untouched (its speakers, if
     /// any, come from --diarize); several are labelled by source.
     pub fn new(engines: Vec<Engine>) -> Self {
-        if engines.len() == 1 {
-            let events = engines[0].events().clone();
-            return Self {
-                engines,
-                events,
-                merger: None,
-            };
-        }
         let (tx, events) = unbounded();
+        let (add_tx, add_rx) = unbounded();
         let rxs: Vec<Receiver<Event>> = engines.iter().map(|e| e.events().clone()).collect();
+        let labelled = Arc::new(AtomicBool::new(engines.len() > 1));
+        let l = labelled.clone();
         let merger = std::thread::Builder::new()
             .name("vox-merge".into())
-            .spawn(move || merge(rxs, tx))
+            .spawn(move || merge(rxs, add_rx, l, tx))
             .expect("spawn event merger");
         Self {
-            engines,
+            engines: Mutex::new(engines),
             events,
+            add: Mutex::new(Some(add_tx)),
+            labelled,
             merger: Some(merger),
         }
     }
@@ -57,19 +61,39 @@ impl Engines {
         &self.events
     }
 
+    /// Paragraphs are labelled by source (there are, or were, several).
+    pub fn labelled(&self) -> Arc<AtomicBool> {
+        self.labelled.clone()
+    }
+
+    pub fn len(&self) -> usize {
+        self.engines.lock().expect("engines lock").len()
+    }
+
+    /// Add a source's engine; returns its index.
+    pub fn add(&self, engine: Engine) -> usize {
+        let mut engines = self.engines.lock().expect("engines lock");
+        self.labelled.store(true, Ordering::SeqCst);
+        if let Some(add) = self.add.lock().expect("add lock").as_ref() {
+            let _ = add.send(engine.events().clone());
+        }
+        engines.push(engine);
+        engines.len() - 1
+    }
+
     /// Feeds source `i`.
     pub fn pusher(&self, i: usize) -> Pusher {
-        self.engines[i].pusher()
+        self.engines.lock().expect("engines lock")[i].pusher()
     }
 
     pub fn break_paragraph(&self) {
-        for e in &self.engines {
+        for e in self.engines.lock().expect("engines lock").iter() {
             e.break_paragraph();
         }
     }
 
     pub fn set_paragraph_mode(&self, mode: ParagraphMode) {
-        for e in &self.engines {
+        for e in self.engines.lock().expect("engines lock").iter() {
             e.set_paragraph_mode(mode);
         }
     }
@@ -77,11 +101,12 @@ impl Engines {
     /// Drain every engine (in parallel) and merge their transcripts in
     /// time order.
     pub fn finish(mut self) -> Transcript {
-        let labelled = self.merger.is_some();
+        let labelled = self.labelled.load(Ordering::SeqCst);
+        self.add.lock().expect("add lock").take();
+        let engines = std::mem::take(&mut *self.engines.lock().expect("engines lock"));
         let parts: Vec<Transcript> = std::thread::scope(|sc| {
-            let jobs: Vec<_> = self
-                .engines
-                .drain(..)
+            let jobs: Vec<_> = engines
+                .into_iter()
                 .map(|e| sc.spawn(move || e.finish()))
                 .collect();
             jobs.into_iter()
@@ -348,37 +373,60 @@ impl Splitter {
     }
 }
 
-/// Forward every engine's events until all have finished. The level
-/// meter shows the loudest source.
-fn merge(rxs: Vec<Receiver<Event>>, tx: Sender<Event>) {
+/// Forward every engine's events until all have finished (and no more
+/// can be added). While there is one source its events pass through as
+/// they are; once `labelled`, each is stamped with its source and split
+/// where others interrupt. The level meter shows the loudest source.
+fn merge(
+    first: Vec<Receiver<Event>>,
+    add: Receiver<Receiver<Event>>,
+    labelled: Arc<AtomicBool>,
+    tx: Sender<Event>,
+) {
+    let mut rxs: Vec<Option<Receiver<Event>>> = first.into_iter().map(Some).collect();
+    let mut add = Some(add);
     let mut levels = vec![(0.0f32, false, 0u64); rxs.len()];
     let mut splitter = Splitter::default();
-    let mut sel = Select::new();
-    for rx in &rxs {
-        sel.recv(rx);
-    }
-    let mut open = rxs.len();
-    while open > 0 {
+    loop {
+        let mut sel = Select::new();
+        let open: Vec<usize> = (0..rxs.len()).filter(|&i| rxs[i].is_some()).collect();
+        for &i in &open {
+            sel.recv(rxs[i].as_ref().expect("open receiver"));
+        }
+        let add_at = add.as_ref().map(|a| sel.recv(a));
+        if open.is_empty() && add_at.is_none() {
+            return;
+        }
         let op = sel.select();
-        let i = op.index();
-        let ev = match op.recv(&rxs[i]) {
+        if Some(op.index()) == add_at {
+            match op.recv(add.as_ref().expect("add receiver")) {
+                Ok(rx) => {
+                    rxs.push(Some(rx));
+                    levels.push((0.0, false, 0));
+                }
+                Err(_) => add = None,
+            }
+            continue;
+        }
+        let i = open[op.index()];
+        let ev = match op.recv(rxs[i].as_ref().expect("open receiver")) {
             Ok(ev) => ev,
             Err(_) => {
-                sel.remove(i);
-                open -= 1;
+                rxs[i] = None;
                 continue;
             }
         };
+        let label = labelled.load(Ordering::Relaxed);
         let ev = match ev {
             Event::Paragraph {
                 mut paragraph,
                 change,
-            } => {
+            } if label => {
                 stamp(&mut paragraph, i);
                 splitter.update(paragraph, change, &tx);
                 continue;
             }
-            Event::ParagraphRemoved { id } => {
+            Event::ParagraphRemoved { id } if label => {
                 splitter.remove(&id, &tx);
                 continue;
             }
@@ -394,6 +442,7 @@ fn merge(rxs: Vec<Receiver<Event>>, tx: Sender<Event>) {
                     position_ms: levels.iter().map(|l| l.2).max().unwrap_or(0),
                 }
             }
+            other => other,
         };
         let _ = tx.send(ev);
     }
@@ -431,6 +480,18 @@ impl Mixer {
                 })
                 .collect(),
         })
+    }
+
+    /// A source joining mid-recording: it starts at the newest audio
+    /// any source has queued. Returns its index.
+    pub fn add_track(&mut self, rate: u32) -> usize {
+        let ahead = self.tracks.iter().map(|t| t.queue.len()).max().unwrap_or(0);
+        self.tracks.push(Track {
+            resampler: Linear::new(rate, RATE),
+            queue: std::iter::repeat_n(0.0, ahead).collect(),
+            done: false,
+        });
+        self.tracks.len() - 1
     }
 
     pub fn push(&mut self, i: usize, mono: &[f32]) {

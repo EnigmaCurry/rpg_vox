@@ -22,6 +22,7 @@ use vox_transcribe::correct::changed_words;
 use vox_transcribe::{Change, Event, ParagraphMode, Pass4, Stage, Transcript};
 
 use crate::markdown::{timestamp, HistoryBlock};
+use crate::picker::{Action, SourcesMenu};
 use crate::speakers;
 use crate::{Outcome, Session};
 
@@ -51,6 +52,8 @@ struct App {
     prompt: Option<String>,
     /// The speaker list opened with `n`.
     names: Option<NamesMenu>,
+    /// The audio source list opened with `a`.
+    sources: Option<SourcesMenu>,
 }
 
 /// `n`: the speakers, to rename (here and in --play).
@@ -79,7 +82,7 @@ fn speaker_labels(t: &Transcript, s: &Session) -> Vec<String> {
                 .filter_map(|c| c.speaker.clone())
                 .chain(p.speaker.clone())
         })
-        .chain((0..s.num_speakers.unwrap_or(0)).map(vox_transcribe::speaker::label))
+        .chain((0..s.speaker_count()).map(vox_transcribe::speaker::label))
         .collect();
     labels.sort_by_key(|l| (vox_transcribe::speaker::index(l), l.clone()));
     labels.dedup();
@@ -282,6 +285,7 @@ fn run_loop(terminal: &mut DefaultTerminal, s: &Session) -> Result<bool> {
         status: None,
         prompt: None,
         names: None,
+        sources: None,
     };
     let events = s.engine.events().clone();
     loop {
@@ -292,6 +296,11 @@ fn run_loop(terminal: &mut DefaultTerminal, s: &Session) -> Result<bool> {
             app.apply(ev, s);
         }
         app.flashes.retain(|_, t| t.elapsed() < FLASH);
+        for slot in s.slots.lock().expect("slots lock").iter() {
+            if let Some(e) = slot.error.lock().expect("error lock").take() {
+                app.set_status(format!("couldn't switch input: {e}"));
+            }
+        }
         if app
             .status
             .as_ref()
@@ -314,6 +323,23 @@ fn run_loop(terminal: &mut DefaultTerminal, s: &Session) -> Result<bool> {
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        if let Some(menu) = app.sources.as_mut() {
+            if ctrl && key.code == KeyCode::Char('c') {
+                return Ok(false);
+            }
+            match menu.key(key.code) {
+                Action::None => {}
+                Action::Close => app.sources = None,
+                Action::Apply(keep, new) => match s.set_sources(&keep, new) {
+                    Ok(()) => {
+                        app.sources = None;
+                        app.set_status("switching input…".into());
+                    }
+                    Err(e) => app.set_status(format!("{e:#}")),
+                },
+            }
+            continue;
+        }
         if app.names.is_some() {
             if ctrl && key.code == KeyCode::Char('c') {
                 return Ok(false);
@@ -354,9 +380,16 @@ fn run_loop(terminal: &mut DefaultTerminal, s: &Session) -> Result<bool> {
                     "showing LLM-corrected text".into()
                 });
             }
+            KeyCode::Char('a') => {
+                if s.can_switch() {
+                    app.sources = Some(SourcesMenu::open(s));
+                } else {
+                    app.set_status("sources can only change for live input".into());
+                }
+            }
             KeyCode::Char('n') if !s.once => {
                 if speaker_labels(&app.transcript, s).is_empty() {
-                    app.set_status(if s.diarize || s.per_source {
+                    app.set_status(if s.diarize || s.per_source() {
                         "no speakers yet".into()
                     } else {
                         "speaker names need --diarize or several sources".into()
@@ -638,7 +671,7 @@ fn draw(f: &mut Frame, app: &App, s: &Session) {
                 Span::styled(" ¶ AUTO ", Style::new().black().on_gray())
             },
             format!(" {}  ", timestamp(app.position_ms)).bold(),
-            Span::raw(s.device.clone()),
+            Span::raw(s.device()),
             path.dark_gray(),
         ]),
         header,
@@ -695,10 +728,13 @@ fn draw(f: &mut Frame, app: &App, s: &Session) {
     let width = 24usize;
     let filled = (frac * width as f32).round() as usize;
     let overruns: u64 = s
-        .captures
+        .slots
+        .lock()
+        .expect("slots lock")
         .iter()
-        .filter_map(|c| {
-            c.lock()
+        .filter_map(|slot| {
+            slot.capture
+                .lock()
                 .expect("capture lock")
                 .as_ref()
                 .map(|c| c.overruns.load(Ordering::Relaxed))
@@ -757,12 +793,17 @@ fn draw(f: &mut Frame, app: &App, s: &Session) {
             } else {
                 " ↑↓ select · y copy · space pause · enter new paragraph · m mode · s save · q quit"
             };
-            let names = if (s.diarize || s.per_source) && !s.once {
+            let names = if (s.diarize || s.per_source()) && !s.once {
                 " · n speakers"
             } else {
                 ""
             };
-            Line::from(format!("{keys}{names}").dark_gray())
+            let sources = if s.can_switch() && !s.once {
+                " · a sources"
+            } else {
+                ""
+            };
+            Line::from(format!("{keys}{names}{sources}").dark_gray())
         }
     };
     f.render_widget(help, help_line);
@@ -776,6 +817,9 @@ fn draw(f: &mut Frame, app: &App, s: &Session) {
             })
             .collect();
         draw_names(f, body, menu, &rows);
+    }
+    if let Some(menu) = &app.sources {
+        menu.draw(f, body);
     }
 }
 

@@ -14,6 +14,7 @@ mod markdown;
 mod models;
 #[cfg(unix)]
 mod once;
+mod picker;
 mod play;
 mod progress;
 mod sources;
@@ -269,7 +270,6 @@ pub struct Session {
     /// Heading and date line for a file started with `s`.
     pub title: String,
     pub subtitle: String,
-    pub device: String,
     pub paused: Arc<AtomicBool>,
     /// Paragraphs break only on Enter.
     pub manual: AtomicBool,
@@ -282,8 +282,10 @@ pub struct Session {
     pub stop: Arc<AtomicBool>,
     /// Set when a file input has been fully pushed.
     pub source_done: Arc<AtomicBool>,
-    /// The live inputs; None for a file, or while paused (mic released).
-    pub captures: Vec<Arc<Mutex<Option<Capture>>>>,
+    /// One per engine, in order: what each source captures.
+    pub slots: Mutex<Vec<Arc<Slot>>>,
+    /// Live input: starts engines for sources added with `a`.
+    spawner: Option<Spawner>,
     /// Tail of the existing file when appending, shown greyed out.
     pub history: Vec<markdown::HistoryBlock>,
     /// Length of a file input, for progress.
@@ -292,23 +294,208 @@ pub struct Session {
     pub live: bool,
     /// --diarize: speakers are labelled (and can be renamed with `n`).
     pub diarize: bool,
-    /// Several sources, each its own speaker (also renamed with `n`).
-    pub per_source: bool,
     /// --record: the audio is being saved too.
     pub recording: bool,
     /// --speakers N, or the number of sources.
     pub num_speakers: Option<usize>,
-    pumps: Vec<std::thread::JoinHandle<()>>,
+    pumps: Mutex<Vec<std::thread::JoinHandle<()>>>,
+}
+
+/// One source feeding one engine. A live slot's input can be swapped or
+/// switched off from the TUI (`a`); the engine, and so the speaker
+/// label, stays.
+pub struct Slot {
+    pub opts: Mutex<OpenOptions>,
+    /// Deselected: the input is released and the engine fed silence.
+    pub off: AtomicBool,
+    /// `opts` changed: reopen with them.
+    reopen: AtomicBool,
+    /// The live input; None for a file, or while paused or off.
+    pub capture: Mutex<Option<Capture>>,
+    pub name: Mutex<String>,
+    /// Why the last switch to new `opts` failed, for the TUI to show once.
+    pub error: Mutex<Option<String>>,
+    pub live: bool,
+    rate: u32,
+    /// Samples fed so far.
+    fed: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl Slot {
+    fn new(opts: OpenOptions, capture: Option<Capture>, rate: u32, name: String) -> Self {
+        Self {
+            live: capture.is_some(),
+            opts: Mutex::new(opts),
+            off: AtomicBool::new(false),
+            reopen: AtomicBool::new(false),
+            capture: Mutex::new(capture),
+            name: Mutex::new(name),
+            error: Mutex::new(None),
+            rate,
+            fed: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    fn fed_ms(&self) -> u64 {
+        self.fed.load(Ordering::Relaxed) * 1000 / self.rate.max(1) as u64
+    }
+}
+
+/// What a source added mid-session needs for its engine.
+struct Spawner {
+    offline: Arc<dyn vox_transcribe::OfflineRecognizer>,
+    zipformer: Option<Zipformer>,
+    corrector: Option<Arc<dyn Corrector>>,
+    /// --record: the mix every live source goes into.
+    mixer: Option<Arc<Mutex<sources::Mixer>>>,
+}
+
+fn new_engine(
+    rate: u32,
+    manual: bool,
+    zipformer: Option<&Zipformer>,
+    offline: &Arc<dyn vox_transcribe::OfflineRecognizer>,
+    corrector: &Option<Arc<dyn Corrector>>,
+    tagger: Option<Box<dyn SpeakerTagger>>,
+) -> Engine {
+    let mut cfg = EngineConfig::new(rate);
+    if manual {
+        cfg.paragraph.mode = ParagraphMode::Manual;
+    }
+    let streaming = zipformer.map(|z| Box::new(z.session()) as Box<dyn StreamingRecognizer>);
+    Engine::spawn_full(cfg, streaming, offline.clone(), corrector.clone(), tagger)
 }
 
 impl Session {
-    /// Stop the audio, drain every pass, append what's left to the markdown.
-    pub fn finish(mut self) -> Result<Transcript> {
-        self.stop.store(true, Ordering::SeqCst);
-        for c in &self.captures {
-            c.lock().expect("capture lock").take();
+    /// Several sources, each its own speaker (also renamed with `n`).
+    pub fn per_source(&self) -> bool {
+        self.engine.labelled().load(Ordering::Relaxed)
+    }
+
+    /// Speakers to offer in `n` before any is heard.
+    pub fn speaker_count(&self) -> usize {
+        let sources = if self.per_source() {
+            self.engine.len()
+        } else {
+            0
+        };
+        sources.max(self.num_speakers.unwrap_or(0))
+    }
+
+    /// What is being transcribed, for the header.
+    pub fn device(&self) -> String {
+        self.slots
+            .lock()
+            .expect("slots lock")
+            .iter()
+            .filter(|s| !s.off.load(Ordering::Relaxed))
+            .map(|s| s.name.lock().expect("name lock").clone())
+            .collect::<Vec<_>>()
+            .join(" + ")
+    }
+
+    /// Sources can be changed (`a`): live input, not --live or a file.
+    pub fn can_switch(&self) -> bool {
+        self.spawner.is_some()
+    }
+
+    /// Listen to slots `keep` plus `new` inputs from now on; the other
+    /// slots go silent. A new input takes over a silent slot (and its
+    /// speaker label) when there is one, else gets its own engine.
+    pub fn set_sources(&self, keep: &[usize], new: Vec<OpenOptions>) -> Result<()> {
+        let Some(sp) = &self.spawner else {
+            anyhow::bail!("sources can only change for live input");
+        };
+        let n = keep.len() + new.len();
+        if n == 0 {
+            anyhow::bail!("pick at least one source");
         }
-        for p in self.pumps.drain(..) {
+        if self.diarize && n > 1 {
+            anyhow::bail!("--diarize listens to one source");
+        }
+        let mut slots = self.slots.lock().expect("slots lock");
+        let mut free: std::collections::VecDeque<usize> =
+            (0..slots.len()).filter(|i| !keep.contains(i)).collect();
+        for opts in new {
+            match free.pop_front() {
+                Some(i) => {
+                    let s = &slots[i];
+                    *s.opts.lock().expect("opts lock") = opts;
+                    s.reopen.store(true, Ordering::SeqCst);
+                    s.off.store(false, Ordering::SeqCst);
+                }
+                None => {
+                    let slot = self.add_source(sp, &slots, opts)?;
+                    slots.push(slot);
+                }
+            }
+        }
+        for i in free {
+            slots[i].off.store(true, Ordering::SeqCst);
+        }
+        for &i in keep {
+            slots[i].off.store(false, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+
+    /// Open `opts` with an engine of its own, starting at the session's
+    /// current time.
+    fn add_source(
+        &self,
+        sp: &Spawner,
+        slots: &[Arc<Slot>],
+        opts: OpenOptions,
+    ) -> Result<Arc<Slot>> {
+        let cap = vox_audio::default_backend()?.open(&opts)?;
+        let rate = cap.sample_rate;
+        let now_ms = slots.iter().map(|s| s.fed_ms()).max().unwrap_or(0);
+        let engine = new_engine(
+            rate,
+            self.manual.load(Ordering::Relaxed),
+            sp.zipformer.as_ref(),
+            &sp.offline,
+            &sp.corrector,
+            None,
+        );
+        let pusher = engine.pusher();
+        self.engine.add(engine);
+        let recording = sp.mixer.as_ref().map(|m| {
+            let track = m.lock().expect("mixer lock").add_track(rate);
+            Recorder::Mixed(m.clone(), track)
+        });
+        let name = cap.device.clone();
+        info!(rate, device = %name, "audio source added");
+        let slot = Arc::new(Slot::new(opts, Some(cap), rate, name));
+        let lead = now_ms * rate as u64 / 1000;
+        slot.fed.store(lead, Ordering::SeqCst);
+        let pump = LivePump {
+            slot: slot.clone(),
+            rate,
+            feed: Feed {
+                pusher,
+                recording,
+                fed: slot.fed.clone(),
+            },
+            paused: self.paused.clone(),
+            stop: self.stop.clone(),
+            lead,
+        };
+        self.pumps
+            .lock()
+            .expect("pumps lock")
+            .push(std::thread::spawn(move || pump.run()));
+        Ok(slot)
+    }
+
+    /// Stop the audio, drain every pass, append what's left to the markdown.
+    pub fn finish(self) -> Result<Transcript> {
+        self.stop.store(true, Ordering::SeqCst);
+        for s in self.slots.lock().expect("slots lock").iter() {
+            s.capture.lock().expect("capture lock").take();
+        }
+        let pumps = std::mem::take(&mut *self.pumps.lock().expect("pumps lock"));
+        for p in pumps {
             let _ = p.join();
         }
         let t = self.engine.finish();
@@ -780,9 +967,10 @@ fn main() -> Result<()> {
         ],
         None => Vec::new(),
     };
-    // Several sources are mixed into the one recording.
+    // Several sources are mixed into the one recording; so is live input,
+    // which can gain sources mid-session.
     let mixer = match &record {
-        Some(r) if per_source => {
+        Some(r) if per_source || cli.input.is_empty() => {
             let rates: Vec<u32> = srcs.iter().map(|(_, rate, _)| *rate).collect();
             Some(Arc::new(Mutex::new(sources::Mixer::create(
                 &r.opus, &rates,
@@ -796,18 +984,12 @@ fn main() -> Result<()> {
     let engines: Vec<Engine> = srcs
         .iter()
         .map(|(_, rate, _)| {
-            let mut engine_cfg = EngineConfig::new(*rate);
-            if manual {
-                engine_cfg.paragraph.mode = ParagraphMode::Manual;
-            }
-            let streaming = zipformer
-                .as_ref()
-                .map(|z| Box::new(z.session()) as Box<dyn StreamingRecognizer>);
-            Engine::spawn_full(
-                engine_cfg,
-                streaming,
-                offline.clone(),
-                corrector.clone(),
+            new_engine(
+                *rate,
+                manual,
+                zipformer.as_ref(),
+                &offline,
+                &corrector,
                 tagger.take(),
             )
         })
@@ -822,20 +1004,28 @@ fn main() -> Result<()> {
 
     // Samples fed per source, with its rate, for the end-of-run stats.
     let mut fed: Vec<(Arc<std::sync::atomic::AtomicU64>, u32)> = Vec::new();
-    let mut captures = Vec::new();
+    let mut slots = Vec::new();
     let mut pumps = Vec::new();
-    for (i, (source, rate, _)) in srcs.into_iter().enumerate() {
-        let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        fed.push((counter.clone(), rate));
+    for (i, (source, rate, name)) in srcs.into_iter().enumerate() {
         let recording = match (&mixer, &record) {
             (Some(m), _) => Some(Recorder::Mixed(m.clone(), i)),
             (None, Some(r)) => Some(Recorder::Own(OpusWriter::create(&r.opus, rate)?)),
             (None, None) => None,
         };
+        let opts = match &source {
+            Source::Live(_, opts) => opts.clone(),
+            Source::File(_) => OpenOptions::default(),
+        };
+        let (source, capture) = match source {
+            Source::Live(cap, _) => (None, Some(cap)),
+            Source::File(samples) => (Some(samples), None),
+        };
+        let slot = Arc::new(Slot::new(opts, capture, rate, name));
+        fed.push((slot.fed.clone(), rate));
         let mut feed = Feed {
             pusher: engine.pusher(i),
             recording,
-            fed: counter,
+            fed: slot.fed.clone(),
         };
         let (paused, stop, done) = (paused.clone(), stop.clone(), source_done.clone());
         let files_left = files_left.clone();
@@ -845,20 +1035,19 @@ fn main() -> Result<()> {
                 done.store(true, Ordering::SeqCst);
             }
         };
-        let (capture, pump) = match source {
-            Source::Live(cap, opts) => {
-                let capture = Arc::new(Mutex::new(Some(cap)));
+        let pump = match source {
+            None => {
                 let live = LivePump {
-                    capture: capture.clone(),
-                    opts,
+                    slot: slot.clone(),
                     rate,
                     feed,
                     paused,
                     stop,
+                    lead: 0,
                 };
-                (capture, std::thread::spawn(move || live.run()))
+                std::thread::spawn(move || live.run())
             }
-            Source::File(samples) if cli.live => {
+            Some(samples) if cli.live => {
                 let out = vox_audio::playback::Output::open().context("open audio output")?;
                 info!(device = %out.device, rate = out.sample_rate, "playing the input live");
                 let player = LivePlayer {
@@ -869,32 +1058,35 @@ fn main() -> Result<()> {
                     paused,
                     stop,
                 };
-                let pump = std::thread::spawn(move || {
+                std::thread::spawn(move || {
                     player.run();
                     file_done();
-                });
-                (Arc::new(Mutex::new(None)), pump)
+                })
             }
-            Source::File(samples) => {
-                let pump = std::thread::spawn(move || {
-                    for chunk in samples.chunks((rate as usize / 50).max(1)) {
-                        while paused.load(Ordering::Relaxed) && !stop.load(Ordering::Relaxed) {
-                            std::thread::sleep(Duration::from_millis(50));
-                        }
-                        if stop.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        feed.push(chunk);
+            Some(samples) => std::thread::spawn(move || {
+                for chunk in samples.chunks((rate as usize / 50).max(1)) {
+                    while paused.load(Ordering::Relaxed) && !stop.load(Ordering::Relaxed) {
+                        std::thread::sleep(Duration::from_millis(50));
                     }
-                    feed.finish();
-                    file_done();
-                });
-                (Arc::new(Mutex::new(None)), pump)
-            }
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    feed.push(chunk);
+                }
+                feed.finish();
+                file_done();
+            }),
         };
-        captures.push(capture);
+        slots.push(slot);
         pumps.push(pump);
     }
+    let spawner = cli.input.is_empty().then(|| Spawner {
+        offline: offline.clone(),
+        zipformer,
+        corrector: corrector.clone(),
+        mixer: mixer.clone(),
+    });
+    let labelled = engine.labelled();
 
     let files = diarize::Files {
         md: output.clone(),
@@ -909,7 +1101,6 @@ fn main() -> Result<()> {
         subtitles: Mutex::new(subtitles),
         title,
         subtitle,
-        device,
         paused,
         manual: AtomicBool::new(manual),
         llm,
@@ -917,15 +1108,15 @@ fn main() -> Result<()> {
         finish_requested,
         stop,
         source_done,
-        captures,
+        slots: Mutex::new(slots),
+        spawner,
         history,
         input_ms,
         live: cli.live,
         diarize: cli.diarize,
-        per_source,
         recording: record.is_some(),
         num_speakers,
-        pumps,
+        pumps: Mutex::new(pumps),
     };
     let mut outcome = match screen {
         Some(screen) => tui::run(screen, session)?,
@@ -973,6 +1164,7 @@ fn main() -> Result<()> {
     // Speakers renamed during the session: the files were written with
     // the old names as they went, so write them again. Several sources
     // harden out of order, so their files are rewritten in time order.
+    let per_source = labelled.load(Ordering::SeqCst);
     if (speakers::renamed() || per_source) && !rewritten && !cli.append {
         let files = diarize::Files {
             md: outcome.path.clone(),
@@ -1228,31 +1420,55 @@ impl LivePlayer {
 }
 
 struct LivePump {
-    capture: Arc<Mutex<Option<Capture>>>,
-    opts: OpenOptions,
+    slot: Arc<Slot>,
+    /// The engine's rate; an input reopened at another rate is resampled.
     rate: u32,
     feed: Feed,
     paused: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
+    /// Silence to feed the engine first: a source added mid-session
+    /// starts at the session's current time.
+    lead: u64,
 }
+
+type Chunks = crossbeam_channel::Receiver<Vec<f32>>;
 
 impl LivePump {
     fn run(mut self) {
+        let second = vec![0.0; self.rate as usize];
+        let mut lead = self.lead;
+        while lead > 0 && !self.stop.load(Ordering::Relaxed) {
+            let n = lead.min(second.len() as u64) as usize;
+            self.feed.pusher.push(&second[..n]);
+            lead -= n as u64;
+        }
         let mut chunks = self.chunks();
-        // Silence pushed since the mic was released: (since, samples).
+        let mut resampler: Option<vox_audio::resample::Linear> = None;
+        // Silence pushed since the input was released: (since, samples).
         let mut silent: Option<(std::time::Instant, u64)> = None;
+        // The input was switched in the `a` menu (vs. resuming a pause).
+        let mut switched = false;
         while !self.stop.load(Ordering::Relaxed) {
-            if self.paused.load(Ordering::Relaxed) {
-                // A virtual sink stays up so apps playing into it aren't
-                // rerouted; its audio is replaced with silence.
-                if chunks.is_some() && !self.opts.virtual_sink {
+            if self.slot.reopen.swap(false, Ordering::SeqCst) {
+                chunks = None;
+                self.slot.capture.lock().expect("capture lock").take();
+                silent.get_or_insert((std::time::Instant::now(), 0));
+                switched = true;
+            }
+            let off = self.slot.off.load(Ordering::Relaxed);
+            if self.paused.load(Ordering::Relaxed) || off {
+                // A virtual sink stays up while paused so apps playing
+                // into it aren't rerouted; its audio is replaced with
+                // silence.
+                let keep = !off && self.slot.opts.lock().expect("opts lock").virtual_sink;
+                if chunks.is_some() && !keep {
                     chunks = None;
-                    self.capture.lock().expect("capture lock").take();
-                    info!("paused: microphone released");
+                    self.slot.capture.lock().expect("capture lock").take();
+                    info!(off, "input released");
                 }
                 if let Some(rx) = &chunks {
                     if let Ok(chunk) = rx.recv_timeout(Duration::from_millis(100)) {
-                        self.feed.push(&vec![0.0; chunk.len()]);
+                        self.push(&vec![0.0; chunk.len()], &mut resampler);
                     }
                     continue;
                 }
@@ -1263,13 +1479,23 @@ impl LivePump {
             }
             if chunks.is_none() {
                 match self.reopen() {
-                    Ok(rx) => chunks = Some(rx),
+                    Ok((rx, rs)) => {
+                        chunks = Some(rx);
+                        resampler = rs;
+                    }
+                    Err(e) if switched => {
+                        tracing::warn!("switching input failed: {e:#}");
+                        *self.slot.error.lock().expect("error lock") = Some(format!("{e:#}"));
+                        self.slot.off.store(true, Ordering::SeqCst);
+                        continue;
+                    }
                     Err(e) => {
                         tracing::warn!("reopening the microphone failed: {e:#}");
                         self.paused.store(true, Ordering::SeqCst);
                         continue;
                     }
                 }
+                switched = false;
                 // Cover the time spent reopening.
                 if let Some((since, mut pushed)) = silent.take() {
                     self.catch_up(since, &mut pushed);
@@ -1277,30 +1503,40 @@ impl LivePump {
             }
             let Some(rx) = &chunks else { continue };
             if let Ok(chunk) = rx.recv_timeout(Duration::from_millis(100)) {
-                self.feed.push(&chunk);
+                self.push(&chunk, &mut resampler);
             }
         }
         self.feed.finish();
     }
 
-    fn chunks(&self) -> Option<crossbeam_channel::Receiver<Vec<f32>>> {
-        let cap = self.capture.lock().expect("capture lock");
+    fn push(&mut self, chunk: &[f32], resampler: &mut Option<vox_audio::resample::Linear>) {
+        match resampler {
+            Some(r) => {
+                let mut out = Vec::with_capacity(chunk.len() * 2);
+                r.process(chunk, &mut out);
+                self.feed.push(&out);
+            }
+            None => self.feed.push(chunk),
+        }
+    }
+
+    fn chunks(&self) -> Option<Chunks> {
+        let cap = self.slot.capture.lock().expect("capture lock");
         cap.as_ref().map(|c| c.chunks().clone())
     }
 
-    fn reopen(&self) -> Result<crossbeam_channel::Receiver<Vec<f32>>> {
-        let cap = vox_audio::default_backend()?.open(&self.opts)?;
-        if cap.sample_rate != self.rate {
-            anyhow::bail!(
-                "device now runs at {} Hz, session started at {} Hz",
-                cap.sample_rate,
-                self.rate
-            );
-        }
+    /// Open the slot's input, with a resampler if it runs at another
+    /// rate than the engine.
+    fn reopen(&self) -> Result<(Chunks, Option<vox_audio::resample::Linear>)> {
+        let opts = self.slot.opts.lock().expect("opts lock").clone();
+        let cap = vox_audio::default_backend()?.open(&opts)?;
+        let resampler = (cap.sample_rate != self.rate)
+            .then(|| vox_audio::resample::Linear::new(cap.sample_rate, self.rate));
         let rx = cap.chunks().clone();
-        *self.capture.lock().expect("capture lock") = Some(cap);
-        info!("resumed: microphone reopened");
-        Ok(rx)
+        *self.slot.name.lock().expect("name lock") = cap.device.clone();
+        info!(device = %cap.device, rate = cap.sample_rate, "input opened");
+        *self.slot.capture.lock().expect("capture lock") = Some(cap);
+        Ok((rx, resampler))
     }
 
     /// Push silence up to the wall-clock time elapsed since `since`.
@@ -1353,7 +1589,7 @@ fn headless(session: Session) -> Result<Outcome> {
     if let Some(ms) = session.input_ms {
         say!(
             "transcribing {} ({} of audio)…",
-            session.device,
+            session.device(),
             timestamp(ms)
         );
     }
