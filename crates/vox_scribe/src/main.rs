@@ -734,11 +734,9 @@ fn main() -> Result<()> {
                 &files,
                 tui_mode,
             );
-            if !matches!(result, Ok(None)) {
-                diarized = Some(t0.elapsed());
-            }
+            diarized = Some(t0.elapsed());
             match result {
-                Ok(Some(t)) => {
+                Ok(t) => {
                     let mut who: Vec<&str> = t
                         .paragraphs
                         .iter()
@@ -750,7 +748,6 @@ fn main() -> Result<()> {
                     outcome.transcript = t;
                     rewritten = true;
                 }
-                Ok(None) => say!("diarization skipped; files keep the live speaker labels"),
                 Err(e) => {
                     say!("diarization failed, files keep the live speaker labels: {e:#}")
                 }

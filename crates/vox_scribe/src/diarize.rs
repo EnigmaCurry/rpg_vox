@@ -4,22 +4,16 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
-use ratatui::crossterm::event::{self, Event as TermEvent, KeyCode, KeyEventKind, KeyModifiers};
-use ratatui::layout::{Constraint, Layout};
-use ratatui::style::{Color, Style};
-use ratatui::widgets::{Block, Gauge, Paragraph};
 use vox_audio::opus_file::{OpusFile, RATE};
 use vox_transcribe::diarize::{relabel_refined, RefineConfig};
 use vox_transcribe::sherpa::{Diarizer, DiarizerTuning, SpeakerEmbedder, SpeakerModels};
 use vox_transcribe::Transcript;
 
 use crate::markdown;
-use crate::progress::{clock, eta_ms, Shared};
+use crate::progress::Shared;
 use crate::subtitles::{self, Format};
-use crate::tui::Screen;
 
 /// Where the session's audio is, for the final pass.
 pub enum Audio {
@@ -53,9 +47,10 @@ pub struct Files {
     pub subtitle: String,
 }
 
-/// Run the diarization and rewrite `files`. Returns the relabelled
-/// transcript, or `None` when the user skipped it (TUI: q / Esc), in
-/// which case the files keep their live labels.
+/// Run the diarization and rewrite `files`, with a progress bar on the
+/// console (after a TUI session too: its screen has closed by now).
+/// Returns the relabelled transcript. Ctrl-C skips it by quitting, and
+/// the files keep their live labels.
 pub fn run(
     models: SpeakerModels,
     num_speakers: Option<usize>,
@@ -63,8 +58,7 @@ pub fn run(
     transcript: &Transcript,
     files: &Files,
     tui: bool,
-) -> Result<Option<Transcript>> {
-    let started = Instant::now();
+) -> Result<Transcript> {
     let progress = Arc::new(Shared::default());
     let job = {
         let progress = progress.clone();
@@ -109,26 +103,29 @@ pub fn run(
             ))
         })
     };
-    let t = if tui {
-        let Some(s) = wait_on_screen(job, &progress, started) else {
-            return Ok(None);
-        };
-        s
-    } else {
-        crate::CTRL_C_QUITS.store(true, std::sync::atomic::Ordering::SeqCst);
-        let t = crate::progress::bar_while(
-            "finding speaker turns (Ctrl-C skips diarization)",
-            "diarizing",
-            &progress,
-            || job.join(),
-        )
-        .map_err(|_| anyhow::anyhow!("diarization thread panicked"))?;
-        // Don't quit halfway through rewriting the files.
-        crate::CTRL_C_QUITS.store(false, std::sync::atomic::Ordering::SeqCst);
-        t
-    }?;
+    if tui {
+        // The TUI has closed; the terminal is back to normal, so Ctrl-C
+        // is a plain signal now and nothing has caught it yet.
+        let _ = ctrlc::set_handler(|| {
+            if crate::CTRL_C_QUITS.load(std::sync::atomic::Ordering::SeqCst) {
+                crate::progress::say("diarization skipped; files keep the live speaker labels");
+                std::process::exit(130);
+            }
+        });
+    }
+    crate::CTRL_C_QUITS.store(true, std::sync::atomic::Ordering::SeqCst);
+    let t = crate::progress::bar_while(
+        "finding speaker turns (Ctrl-C skips diarization)",
+        "diarizing",
+        &progress,
+        || job.join(),
+    )
+    .map_err(|_| anyhow::anyhow!("diarization thread panicked"))?;
+    // Don't quit halfway through rewriting the files.
+    crate::CTRL_C_QUITS.store(false, std::sync::atomic::Ordering::SeqCst);
+    let t = t?;
     rewrite(files, &t)?;
-    Ok(Some(t))
+    Ok(t)
 }
 
 /// Replace `files` with renderings of `t` (with the current speaker names).
@@ -143,73 +140,6 @@ pub fn rewrite(files: &Files, t: &Transcript) -> Result<()> {
         replace(p, &subtitles::render(Format::Ass, t))?;
     }
     Ok(())
-}
-
-/// Show elapsed time until `job` finishes. `None` if the user skipped
-/// (the job is left to die with the process).
-fn wait_on_screen<T>(
-    job: std::thread::JoinHandle<Result<T>>,
-    progress: &Shared,
-    started: Instant,
-) -> Option<Result<T>> {
-    let mut screen = Screen::enter(" diarizing…");
-    let mut measuring: Option<Instant> = None;
-    while !job.is_finished() {
-        let elapsed = clock(started.elapsed().as_millis() as u64);
-        let msg = format!(
-            "Working out who spoke when across the whole recording… {elapsed}\n\n\
-             The files already have the live speaker labels; this replaces them\n\
-             with the full-quality ones. q / Esc skips it."
-        );
-        let gauge = progress.get().map(|(done, total)| {
-            let since = *measuring.get_or_insert_with(Instant::now);
-            let frac = done as f64 / total as f64;
-            let left = eta_ms(frac, since)
-                .map(|e| format!("  ~{} left", clock(e)))
-                .unwrap_or_default();
-            Gauge::default()
-                .gauge_style(Style::new().fg(Color::Cyan))
-                .ratio(frac.clamp(0.0, 1.0))
-                .label(format!("{:.0}%  {done}/{total}{left}", frac * 100.0))
-        });
-        let _ = screen.terminal().draw(|f| {
-            let block = Block::bordered().title(" vox_scribe ");
-            let inner = block.inner(f.area());
-            f.render_widget(block, f.area());
-            let [text, _, bar] = Layout::vertical([
-                Constraint::Length(4),
-                Constraint::Length(1),
-                Constraint::Length(1),
-            ])
-            .areas(inner);
-            f.render_widget(Paragraph::new(msg), text);
-            match gauge {
-                Some(g) => f.render_widget(g, bar),
-                None => f.render_widget(
-                    Paragraph::new("finding speaker turns…")
-                        .style(Style::new().fg(Color::DarkGray)),
-                    bar,
-                ),
-            }
-        });
-        if event::poll(Duration::from_millis(200)).unwrap_or(false) {
-            if let Ok(TermEvent::Key(k)) = event::read() {
-                let k = crate::tui::normalize_key(k);
-                let ctrl_c =
-                    k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL);
-                if k.kind == KeyEventKind::Press
-                    && (ctrl_c || matches!(k.code, KeyCode::Char('q') | KeyCode::Esc))
-                {
-                    return None;
-                }
-            }
-        }
-    }
-    screen.restore();
-    Some(
-        job.join()
-            .unwrap_or_else(|_| Err(anyhow::anyhow!("diarization thread panicked"))),
-    )
 }
 
 /// Write `content` to `path` via a temporary file and a rename, so the
