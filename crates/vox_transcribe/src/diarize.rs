@@ -188,12 +188,18 @@ pub struct RefineConfig {
     /// short recording (`min_speaker_share` of all its speech).
     pub min_speaker_ms: u64,
     pub min_speaker_share: f32,
+    /// Added for each change of speaker between consecutive sentences
+    /// when the final labels are chosen over the whole sequence: in a
+    /// rapid back-and-forth a one-word reply is too short for its voice
+    /// to say much, but the conversation's rhythm does. A sentence whose
+    /// voice clearly matches one speaker is never moved by it.
+    pub turn_bonus: f32,
 }
 
 impl Default for RefineConfig {
     fn default() -> Self {
         Self {
-            min_unit_ms: 700,
+            min_unit_ms: 300,
             snap_words: 4,
             diarizer_bonus: 0.03,
             profile_segments: 12,
@@ -201,6 +207,7 @@ impl Default for RefineConfig {
             max_speakers: None,
             min_speaker_ms: 10_000,
             min_speaker_share: 0.05,
+            turn_bonus: 0.04,
         }
     }
 }
@@ -241,53 +248,64 @@ pub fn relabel_refined(
             all.push((pi, a, b, emb));
         }
     }
-    // Give each unit the speaker whose profile its voice is closest to
-    // (plus a little for the diarizer's own choice; a unit too short to
-    // embed keeps that choice). Then rebuild the profiles from the units
-    // each speaker got (one voice each, unlike a diarizer segment that
-    // ran two turns together) and assign again, until nothing changes.
+    // Give each unit the speaker whose profile its voice is closest to,
+    // rebuild the profiles from the units each speaker got, and repeat
+    // (k-means over the units' voices). Twice: once starting from the
+    // diarizer's speakers (with a little bonus for its choice), and once
+    // from the units' own voices alone, which wins when the diarizer's
+    // turns ran voices together (rapid back-and-forth, old recordings).
+    // Keep whichever fits the voices better.
     let diarized: Vec<Option<usize>> = all
         .iter()
         .map(|(pi, a, b, _)| majority(&labels[*pi][*a..*b]))
         .collect();
     let mut assigned: Vec<Option<usize>> = diarized.clone();
     if profiles.len() > 1 {
-        for _ in 0..cfg.rounds {
-            let next: Vec<Option<usize>> = all
-                .iter()
-                .zip(&diarized)
-                .map(|((_, _, _, emb), &d)| {
-                    let Some(e) = emb else { return d };
-                    profiles
-                        .iter()
-                        .map(|(k, p)| {
-                            let bonus = if d == Some(*k) {
-                                cfg.diarizer_bonus
-                            } else {
-                                0.0
-                            };
-                            (dot(p, e) + bonus, *k)
-                        })
-                        .max_by(|a, b| a.0.total_cmp(&b.0))
-                        .map(|(_, k)| k)
+        let weights: Vec<f32> = all
+            .iter()
+            .map(|(pi, a, b, _)| {
+                let w = &t.paragraphs[*pi].words;
+                w[*b - 1].end_ms.saturating_sub(w[*a].start_ms) as f32
+            })
+            .collect();
+        let embs: Vec<Option<&Vec<f32>>> = all.iter().map(|u| u.3.as_ref()).collect();
+        let from_diarizer = kmeans(
+            &embs,
+            &diarized,
+            profiles.clone(),
+            cfg.diarizer_bonus,
+            cfg.rounds,
+        );
+        let ids: Vec<usize> = profiles.iter().map(|(k, _)| *k).collect();
+        let from_voices = farthest_profiles(&embs, &weights, &ids)
+            .map(|init| kmeans(&embs, &diarized, init, 0.0, cfg.rounds * 3))
+            .map(|(a, p)| relabel_like(a, p, &diarized, &weights));
+        let fit = |(a, p): &Clustering| {
+            embs.iter()
+                .zip(a)
+                .zip(&weights)
+                .filter_map(|((e, k), w)| {
+                    let (e, k) = (e.as_ref()?, k.as_ref()?);
+                    let p = &p.iter().find(|(pk, _)| pk == k)?.1;
+                    Some(w * dot(e, p))
                 })
-                .collect();
-            if next == assigned {
-                break;
+                .sum::<f32>()
+        };
+        let best = match from_voices {
+            Some(v) if fit(&v) > fit(&from_diarizer) => {
+                tracing::debug!(
+                    voices = fit(&v),
+                    diarizer = fit(&from_diarizer),
+                    "speakers clustered from the sentences' voices"
+                );
+                v
             }
-            assigned = next;
-            let mut sums: HashMap<usize, Vec<f32>> = HashMap::new();
-            for ((_, _, _, emb), k) in all.iter().zip(&assigned) {
-                if let (Some(e), Some(k)) = (emb, k) {
-                    let acc = sums.entry(*k).or_insert_with(|| vec![0.0; e.len()]);
-                    acc.iter_mut().zip(e).for_each(|(s, x)| *s += x);
-                }
-            }
-            for (k, p) in profiles.iter_mut() {
-                if let Some(v) = sums.get(k).and_then(|v| unit_vec(v)) {
-                    *p = v;
-                }
-            }
+            _ => from_diarizer,
+        };
+        assigned = best.0;
+        profiles = best.1;
+        if cfg.turn_bonus > 0.0 {
+            assigned = alternate(&embs, assigned, &profiles, cfg.turn_bonus);
         }
     }
     for ((pi, a, b, _), k) in all.iter().zip(&assigned) {
@@ -312,6 +330,186 @@ pub fn relabel_refined(
         );
     }
     build(t, &labels)
+}
+
+/// Each unit's speaker, and each speaker's voice profile.
+type Clustering = (Vec<Option<usize>>, Vec<(usize, Vec<f32>)>);
+
+/// k-means over the units' voices from `profiles`: each embedded unit
+/// goes to the closest profile (`bonus` added for the diarizer's choice;
+/// a unit without an embedding keeps that choice), then the profiles are
+/// rebuilt from their units, for up to `rounds` rounds.
+fn kmeans(
+    embs: &[Option<&Vec<f32>>],
+    diarized: &[Option<usize>],
+    mut profiles: Vec<(usize, Vec<f32>)>,
+    bonus: f32,
+    rounds: usize,
+) -> Clustering {
+    let mut assigned: Vec<Option<usize>> = diarized.to_vec();
+    for _ in 0..rounds {
+        let next: Vec<Option<usize>> = embs
+            .iter()
+            .zip(diarized)
+            .map(|(emb, &d)| {
+                let Some(e) = emb else { return d };
+                profiles
+                    .iter()
+                    .map(|(k, p)| (dot(p, e) + if d == Some(*k) { bonus } else { 0.0 }, *k))
+                    .max_by(|a, b| a.0.total_cmp(&b.0))
+                    .map(|(_, k)| k)
+            })
+            .collect();
+        let done = next == assigned;
+        assigned = next;
+        let mut sums: HashMap<usize, Vec<f32>> = HashMap::new();
+        for (emb, k) in embs.iter().zip(&assigned) {
+            if let (Some(e), Some(k)) = (emb, k) {
+                let acc = sums.entry(*k).or_insert_with(|| vec![0.0; e.len()]);
+                acc.iter_mut().zip(e.iter()).for_each(|(s, x)| *s += x);
+            }
+        }
+        for (k, p) in profiles.iter_mut() {
+            if let Some(v) = sums.get(k).and_then(|v| unit_vec(v)) {
+                *p = v;
+            }
+        }
+        if done {
+            break;
+        }
+    }
+    (assigned, profiles)
+}
+
+/// The most likely speaker sequence over the embedded units (Viterbi):
+/// each unit scores its similarity to the speaker's profile, and each
+/// change of speaker from the previous embedded unit adds `bonus`. Units
+/// without an embedding keep their speaker and don't break the chain.
+fn alternate(
+    embs: &[Option<&Vec<f32>>],
+    mut assigned: Vec<Option<usize>>,
+    profiles: &[(usize, Vec<f32>)],
+    bonus: f32,
+) -> Vec<Option<usize>> {
+    let idx: Vec<usize> = (0..embs.len()).filter(|&i| embs[i].is_some()).collect();
+    let n = profiles.len();
+    if idx.is_empty() || n < 2 {
+        return assigned;
+    }
+    let score = |i: usize, s: usize| dot(&profiles[s].1, embs[i].unwrap());
+    let mut best: Vec<f32> = (0..n).map(|s| score(idx[0], s)).collect();
+    let mut back: Vec<Vec<usize>> = Vec::with_capacity(idx.len());
+    for &i in &idx[1..] {
+        let mut next = vec![0.0; n];
+        let mut from = vec![0; n];
+        for s in 0..n {
+            let (j, v) = (0..n)
+                .map(|j| (j, best[j] + if j == s { 0.0 } else { bonus }))
+                .max_by(|a, b| a.1.total_cmp(&b.1))
+                .unwrap();
+            next[s] = v + score(i, s);
+            from[s] = j;
+        }
+        best = next;
+        back.push(from);
+    }
+    let mut s = (0..n).max_by(|&a, &b| best[a].total_cmp(&best[b])).unwrap();
+    for (k, &i) in idx.iter().enumerate().rev() {
+        assigned[i] = Some(profiles[s].0);
+        if k > 0 {
+            s = back[k - 1][s];
+        }
+    }
+    assigned
+}
+
+/// One starting profile per id, from the units' voices alone: the unit
+/// most like all the others, then each time the unit least like any
+/// profile so far. Only units of at least a second, if there are enough.
+fn farthest_profiles(
+    embs: &[Option<&Vec<f32>>],
+    weights: &[f32],
+    ids: &[usize],
+) -> Option<Vec<(usize, Vec<f32>)>> {
+    let long: Vec<&Vec<f32>> = embs
+        .iter()
+        .zip(weights)
+        .filter(|(_, &w)| w >= 1000.0)
+        .filter_map(|(e, _)| *e)
+        .collect();
+    let pool: Vec<&Vec<f32>> = if long.len() >= ids.len() * 3 {
+        long
+    } else {
+        embs.iter().filter_map(|e| *e).collect()
+    };
+    if pool.len() < ids.len() {
+        return None;
+    }
+    let first = (0..pool.len()).max_by(|&i, &j| {
+        let s = |i: usize| pool.iter().map(|q| dot(pool[i], q)).sum::<f32>();
+        s(i).total_cmp(&s(j))
+    })?;
+    let mut chosen = vec![first];
+    while chosen.len() < ids.len() {
+        let next = (0..pool.len())
+            .filter(|i| !chosen.contains(i))
+            .min_by(|&i, &j| {
+                let near = |i: usize| {
+                    chosen
+                        .iter()
+                        .map(|&c| dot(pool[i], pool[c]))
+                        .fold(f32::MIN, f32::max)
+                };
+                near(i).total_cmp(&near(j))
+            })?;
+        chosen.push(next);
+    }
+    Some(
+        ids.iter()
+            .zip(chosen)
+            .map(|(&k, c)| (k, pool[c].clone()))
+            .collect(),
+    )
+}
+
+/// `assigned`/`profiles` with their ids swapped so each matches the
+/// diarizer speaker it shares the most speech with (keeps lettering and
+/// logs comparable).
+fn relabel_like(
+    assigned: Vec<Option<usize>>,
+    profiles: Vec<(usize, Vec<f32>)>,
+    diarized: &[Option<usize>],
+    weights: &[f32],
+) -> Clustering {
+    let mut shared: HashMap<(usize, usize), f32> = HashMap::new();
+    for ((a, d), w) in assigned.iter().zip(diarized).zip(weights) {
+        if let (Some(a), Some(d)) = (a, d) {
+            *shared.entry((*a, *d)).or_default() += w;
+        }
+    }
+    let mut pairs: Vec<((usize, usize), f32)> = shared.into_iter().collect();
+    pairs.sort_by(|x, y| y.1.total_cmp(&x.1));
+    let ids: Vec<usize> = profiles.iter().map(|(k, _)| *k).collect();
+    let mut map: HashMap<usize, usize> = HashMap::new();
+    for ((a, d), _) in pairs {
+        if !map.contains_key(&a) && !map.values().any(|&v| v == d) && ids.contains(&d) {
+            map.insert(a, d);
+        }
+    }
+    for &k in &ids {
+        if !map.contains_key(&k) {
+            let free = ids
+                .iter()
+                .copied()
+                .find(|j| !map.values().any(|v| v == j))
+                .unwrap_or(k);
+            map.insert(k, free);
+        }
+    }
+    (
+        assigned.into_iter().map(|a| a.map(|a| map[&a])).collect(),
+        profiles.into_iter().map(|(k, p)| (map[&k], p)).collect(),
+    )
 }
 
 /// Fold stray clusters into real speakers. The diarizer is run without
@@ -756,5 +954,20 @@ mod tests {
         let out = consolidate(&segs[..3], &mut profiles, &cfg);
         assert!(out.iter().all(|s| s.speaker == 0 || s.speaker == 1));
         assert_eq!(profiles.len(), 1);
+    }
+
+    #[test]
+    fn alternate_flips_only_unclear_replies() {
+        let (a, b) = (vec![1.0, 0.0], vec![0.0, 1.0]);
+        let profiles = vec![(0, a.clone()), (1, b.clone())];
+        // A, then a reply that leans A only slightly, then A again; and
+        // a clear A sentence between two more A's.
+        let unclear = unit_vec(&[0.52, 0.48]).unwrap();
+        let embs = [&a, &unclear, &a, &a, &a];
+        let embs: Vec<Option<&Vec<f32>>> = embs.iter().map(|e| Some(*e)).collect();
+        let out = alternate(&embs, vec![Some(0); 5], &profiles, 0.04);
+        assert_eq!(out, vec![Some(0), Some(1), Some(0), Some(0), Some(0)]);
+        let out = alternate(&embs, vec![Some(0); 5], &profiles, 0.0);
+        assert_eq!(out, vec![Some(0); 5]);
     }
 }
