@@ -77,27 +77,26 @@ impl SourcesMenu {
                 app: None,
             });
         }
-        // Apps playing sound first; a name shared by several processes
-        // gets its PID.
+        // One row per app (by bundle id, else name), as `-a` matches
+        // them: all its processes, and ones it starts later. Apps playing
+        // sound first.
+        let key = |a: &AppInfo| {
+            if a.id.is_empty() {
+                a.name.clone()
+            } else {
+                a.id.clone()
+            }
+        };
         let mut apps = apps;
         apps.sort_by_key(|a| (!a.playing, a.name.to_lowercase()));
-        let shared = |a: &AppInfo| apps.iter().filter(|b| b.name == a.name).count() > 1;
-        let labels: Vec<String> = apps
-            .iter()
-            .map(|a| {
-                if shared(a) {
-                    format!("{} ({})", a.name, a.pid)
-                } else {
-                    a.name.clone()
-                }
-            })
-            .collect();
-        for (a, label) in apps.into_iter().zip(labels) {
+        let mut seen = std::collections::HashSet::new();
+        apps.retain(|a| seen.insert(key(a)));
+        for a in apps {
             rows.push(Row {
-                label,
+                label: a.name.clone(),
                 kind: if a.playing { "app ♪" } else { "app" },
                 opts: OpenOptions {
-                    app: Some(a.pid.to_string()),
+                    app: Some(key(&a)),
                     ..Default::default()
                 },
                 slot: None,
