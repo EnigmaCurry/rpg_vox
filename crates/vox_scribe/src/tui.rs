@@ -31,6 +31,8 @@ const FLASH: Duration = Duration::from_millis(1500);
 /// blues are too dark on black in macOS Terminal.
 const LLM_BLUE: Color = Color::Indexed(117);
 const STATUS_TTL: Duration = Duration::from_secs(3);
+/// How long a source problem (see `Slot::notice`) stays in the footer.
+const NOTICE_TTL: Duration = Duration::from_secs(15);
 const GUTTER: usize = 11; // "[hh:mm:ss] "
 
 struct App {
@@ -297,8 +299,8 @@ fn run_loop(terminal: &mut DefaultTerminal, s: &Session) -> Result<bool> {
         }
         app.flashes.retain(|_, t| t.elapsed() < FLASH);
         for slot in s.slots.lock().expect("slots lock").iter() {
-            if let Some(e) = slot.error.lock().expect("error lock").take() {
-                app.set_status(format!("couldn't switch input: {e}"));
+            if let Some(msg) = slot.notice.lock().expect("notice lock").take() {
+                app.set_status_for(msg, NOTICE_TTL);
             }
         }
         if app
@@ -572,6 +574,12 @@ impl App {
         self.status = Some((msg, Instant::now()));
     }
 
+    /// A status that stays up for `ttl` rather than `STATUS_TTL`.
+    fn set_status_for(&mut self, msg: String, ttl: Duration) {
+        let at = Instant::now() + ttl.saturating_sub(STATUS_TTL);
+        self.status = Some((msg, at));
+    }
+
     /// Non-empty paragraphs, in display order.
     fn visible_ids(&self) -> Vec<&str> {
         self.transcript
@@ -761,12 +769,20 @@ fn draw(f: &mut Frame, app: &App, s: &Session) {
     if overruns > 0 {
         meter.push(format!("  dropped {overruns} samples").red());
     }
+    // A status too long to fit beside the meter takes the legend's line.
+    let used: usize = meter.iter().map(|sp| sp.width()).sum();
+    let mut long_status = None;
     if let Some((msg, _)) = &app.status {
-        meter.push(format!("  {msg}").yellow());
+        if used + 2 + msg.width() <= meter_line.width as usize {
+            meter.push(format!("  {msg}").yellow());
+        } else {
+            long_status = Some(msg);
+        }
     }
     f.render_widget(Line::from(meter), meter_line);
-    f.render_widget(
-        Line::from(vec![
+    let legend = match long_status {
+        Some(msg) => Line::from(format!(" {msg}").yellow()),
+        None => Line::from(vec![
             " LIVE CAPS".dark_gray().italic(),
             " · re-decoded".into(),
             " · boundary-fixed".green(),
@@ -776,8 +792,8 @@ fn draw(f: &mut Frame, app: &App, s: &Session) {
                 "".into()
             },
         ]),
-        legend_line,
-    );
+    };
+    f.render_widget(legend, legend_line);
     let help = match &app.prompt {
         Some(name) => Line::from(vec![
             " save as: ".yellow(),

@@ -313,8 +313,9 @@ pub struct Slot {
     /// The live input; None for a file, or while paused or off.
     pub capture: Mutex<Option<Capture>>,
     pub name: Mutex<String>,
-    /// Why the last switch to new `opts` failed, for the TUI to show once.
-    pub error: Mutex<Option<String>>,
+    /// A problem to show in the TUI once: a failed switch, or an app
+    /// that plays but records as silence.
+    pub notice: Mutex<Option<String>>,
     pub live: bool,
     rate: u32,
     /// Samples fed so far.
@@ -330,7 +331,7 @@ impl Slot {
             reopen: AtomicBool::new(false),
             capture: Mutex::new(capture),
             name: Mutex::new(name),
-            error: Mutex::new(None),
+            notice: Mutex::new(None),
             rate,
             fed: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
@@ -1436,6 +1437,19 @@ struct LivePump {
     lead: u64,
 }
 
+/// How long an app capture may give pure digital silence before we check
+/// whether the app is playing (and so the tap is likely denied).
+const HUSH: Duration = Duration::from_secs(4);
+
+/// Watches an app capture for the silence macOS returns when the
+/// terminal lacks System Audio Recording permission.
+#[derive(Default)]
+struct Hush {
+    since: Option<std::time::Instant>,
+    /// Real sound arrived, or the warning was given: stop watching.
+    done: bool,
+}
+
 type Chunks = crossbeam_channel::Receiver<Vec<f32>>;
 
 impl LivePump {
@@ -1453,12 +1467,14 @@ impl LivePump {
         let mut silent: Option<(std::time::Instant, u64)> = None;
         // The input was switched in the `a` menu (vs. resuming a pause).
         let mut switched = false;
+        let mut hush = Hush::default();
         while !self.stop.load(Ordering::Relaxed) {
             if self.slot.reopen.swap(false, Ordering::SeqCst) {
                 chunks = None;
                 self.slot.capture.lock().expect("capture lock").take();
                 silent.get_or_insert((std::time::Instant::now(), 0));
                 switched = true;
+                hush = Hush::default();
             }
             let off = self.slot.off.load(Ordering::Relaxed);
             if self.paused.load(Ordering::Relaxed) || off {
@@ -1490,7 +1506,8 @@ impl LivePump {
                     }
                     Err(e) if switched => {
                         tracing::warn!("switching input failed: {e:#}");
-                        *self.slot.error.lock().expect("error lock") = Some(format!("{e:#}"));
+                        *self.slot.notice.lock().expect("notice lock") =
+                            Some(format!("couldn't switch input: {e:#}"));
                         self.slot.off.store(true, Ordering::SeqCst);
                         continue;
                     }
@@ -1508,10 +1525,44 @@ impl LivePump {
             }
             let Some(rx) = &chunks else { continue };
             if let Ok(chunk) = rx.recv_timeout(Duration::from_millis(100)) {
+                self.watch(&mut hush, &chunk);
                 self.push(&chunk, &mut resampler);
             }
         }
         self.feed.finish();
+    }
+
+    /// An app capture that stays exactly zero while the app is playing:
+    /// say the terminal likely needs System Audio Recording permission.
+    fn watch(&self, hush: &mut Hush, chunk: &[f32]) {
+        if hush.done {
+            return;
+        }
+        let Some(want) = self.slot.opts.lock().expect("opts lock").app.clone() else {
+            hush.done = true;
+            return;
+        };
+        if chunk.iter().any(|&x| x != 0.0) {
+            hush.done = true;
+            return;
+        }
+        let since = *hush.since.get_or_insert_with(std::time::Instant::now);
+        if since.elapsed() < HUSH {
+            return;
+        }
+        hush.since = None;
+        let playing = vox_audio::default_backend()
+            .and_then(|b| b.list_apps())
+            .map(|apps| apps.iter().any(|a| a.playing && a.matches(&want)))
+            .unwrap_or(false);
+        if playing {
+            hush.done = true;
+            let msg = format!(
+                "{want:?} is silent: allow this terminal System Audio Recording (Privacy & Security)"
+            );
+            tracing::warn!("{msg}");
+            *self.slot.notice.lock().expect("notice lock") = Some(msg);
+        }
     }
 
     fn push(&mut self, chunk: &[f32], resampler: &mut Option<vox_audio::resample::Linear>) {
