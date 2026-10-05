@@ -13,7 +13,7 @@ use ratatui::style::{Color, Style};
 use ratatui::widgets::{Block, Gauge, Paragraph};
 use vox_audio::opus_file::{OpusFile, RATE};
 use vox_transcribe::diarize::{relabel_refined, RefineConfig};
-use vox_transcribe::sherpa::{Diarizer, SpeakerEmbedder, SpeakerModels};
+use vox_transcribe::sherpa::{Diarizer, DiarizerTuning, SpeakerEmbedder, SpeakerModels};
 use vox_transcribe::Transcript;
 
 use crate::markdown;
@@ -73,8 +73,14 @@ pub fn run(
             let (samples, rate) = audio.load()?;
             // The count is applied afterwards (see relabel_refined): fixed
             // in the clustering, it merges two real voices and keeps a
-            // stray as the other "speaker".
-            let segments = Diarizer::open(&models, None)?.process_with_progress(
+            // stray as the other "speaker". The 10 s windows step by 5 s,
+            // not sherpa's 1 s: embedding them is nearly all the time, and
+            // the sentence pass below redoes the fine detail anyway.
+            let tuning = DiarizerTuning {
+                window_shift_ratio: 0.5,
+                ..Default::default()
+            };
+            let segments = Diarizer::open_tuned(&models, &tuning)?.process_with_progress(
                 &samples,
                 rate,
                 &mut |done, total| progress.set(done, total),
