@@ -1,7 +1,7 @@
 # rpg_vox workspace task runner. All recipes run inside the project's nix-shell.
 
 # Load .env from the workspace root into every recipe's environment (e.g.
-# DISCORD_TOKEN / DISCORD_GUILD_ID / DISCORD_CHANNEL_ID for discord_vox).
+# DISCORD_VOX_TOKEN / DISCORD_VOX_GUILD_ID / DISCORD_VOX_CHANNEL_ID for discord_vox).
 set dotenv-load
 
 # Default: show recipes.
@@ -327,8 +327,8 @@ install-scribe BIN="~/.local/bin": release-scribe
 
 # --- discord_vox (PipeWire sink → Discord voice) ---
 
-# Run the discord_vox release binary. Expects DISCORD_TOKEN / DISCORD_GUILD_ID /
-# DISCORD_CHANNEL_ID in the env (or pass --token / --guild-id / --channel-id).
+# Run the discord_vox release binary. Expects DISCORD_VOX_TOKEN /
+# DISCORD_VOX_GUILD_ID / DISCORD_VOX_CHANNEL_ID in the env (or pass --token / --guild-id / --channel-id).
 discord *ARGS:
     nix-shell --run "cargo run -p discord_vox --release -- {{ARGS}}"
 
