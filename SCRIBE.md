@@ -417,7 +417,14 @@ clipboard when the window closes. A second press of the same key can run
 macOS can't rebind the dictation key itself, so this uses
 [Karabiner-Elements](https://karabiner-elements.pqrs.org/).
 
-1. Run `just install-scribe`.
+We recommend installing [Ghostty](https://ghostty.org) first. The
+recorder then pops up as a small window over whatever app you're
+dictating into, and only that window comes forward. With macOS Terminal,
+every Terminal window comes to the front with it. Ghostty also tells
+`shift+enter` apart from `enter`, so you can start a new paragraph
+without finishing.
+
+1. Run `just install-scribe`. It uses Ghostty if it's installed.
 2. In System Settings › Keyboard › Dictation, turn Dictation off (or give
    it another shortcut). Otherwise macOS takes the key first.
 3. Install Karabiner-Elements and allow its driver and Input Monitoring
