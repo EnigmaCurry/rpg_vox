@@ -134,7 +134,9 @@ fn interruptions<'a>(p: &Paragraph, all: impl Iterator<Item = &'a Paragraph>) ->
 /// Split `p` at the sentence end nearest each time in `cuts`. The first
 /// piece keeps `p`'s id; the others get `<id>~1`, `<id>~2`, …. Only
 /// finished (timed) words are split; a trailing partial stays with the
-/// last piece.
+/// last piece. A piece after a cut starts no earlier than just after the
+/// interruption, so in time order the interrupter's paragraph falls
+/// between the two (the words keep their real times).
 pub fn split_at(p: &Paragraph, cuts: &[u64]) -> Vec<Paragraph> {
     let tokens: Vec<&str> = p.text.split_whitespace().collect();
     let words = &p.words;
@@ -150,12 +152,14 @@ pub fn split_at(p: &Paragraph, cuts: &[u64]) -> Vec<Paragraph> {
             (k, (a + b.max(a)) / 2)
         })
         .collect();
-    let mut at: Vec<(usize, u64)> = cuts
-        .iter()
-        .filter_map(|&t| ends.iter().min_by_key(|(_, e)| e.abs_diff(t)).copied())
-        .collect();
-    at.sort_unstable();
-    at.dedup();
+    // Split point → (its time, the latest interruption it serves).
+    let mut at: std::collections::BTreeMap<usize, (u64, u64)> = Default::default();
+    for &t in cuts {
+        if let Some(&(k, e)) = ends.iter().min_by_key(|(_, e)| e.abs_diff(t)) {
+            let slot = at.entry(k).or_insert((e, t));
+            slot.1 = slot.1.max(t);
+        }
+    }
     if at.is_empty() {
         return vec![p.clone()];
     }
@@ -168,8 +172,10 @@ pub fn split_at(p: &Paragraph, cuts: &[u64]) -> Vec<Paragraph> {
         .sum::<usize>()
         == tokens.len();
     let mut bounds: Vec<(usize, u64)> = vec![(0, 0)];
-    bounds.extend(at);
+    bounds.extend(at.iter().map(|(&k, &(e, _))| (k, e)));
     bounds.push((tokens.len(), u64::MAX));
+    let mut after: Vec<u64> = vec![0];
+    after.extend(at.values().map(|&(_, t)| t + 1));
     let last = bounds.len() - 2;
     bounds
         .windows(2)
@@ -196,7 +202,7 @@ pub fn split_at(p: &Paragraph, cuts: &[u64]) -> Vec<Paragraph> {
                 start_ms: if i == 0 {
                     p.start_ms
                 } else {
-                    ws.first().map_or(from_ms, |w| w.start_ms)
+                    ws.first().map_or(from_ms, |w| w.start_ms).max(after[i])
                 },
                 end_ms: if i == last {
                     p.end_ms
@@ -602,7 +608,8 @@ mod tests {
         assert_eq!(pieces[0].id, "p");
         assert_eq!(pieces[1].id, "p~1");
         assert!(pieces[0].closed);
-        assert_eq!(pieces[1].start_ms, 1000);
+        // Resumes at 1 s, but after the interruption at 1.8 s.
+        assert_eq!(pieces[1].start_ms, 1801);
         assert_eq!(pieces[1].clips.len(), 2);
         assert_eq!(texts(&split_at(&p, &[2700])).len(), 2);
         assert_eq!(texts(&split_at(&p, &[2700]))[1], "I am fine.");
