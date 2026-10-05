@@ -1,10 +1,11 @@
 # scribe
 
-Live transcription in the terminal, saved as markdown. `scribe` is the
-standalone companion to [rpg_vox](RPG_VOX.md): it uses the same layered
-speech-to-text passes as rpg_vox's Record page (via the `vox_transcribe`
-crate) but has nothing RPG-specific in it. It runs on macOS (CoreAudio)
-and Linux (PipeWire). The crate is `vox_scribe`; the binary it builds is
+Live transcription in the terminal, saved as markdown and subtitles
+(`.srt` / `.ass`). `scribe` is the standalone companion to
+[rpg_vox](RPG_VOX.md): it uses the same layered speech-to-text passes
+as rpg_vox's Record page (via the `vox_transcribe` crate) but has
+nothing RPG-specific in it. It runs on macOS (CoreAudio) and Linux
+(PipeWire). The crate is `vox_scribe`; the binary it builds is
 `scribe`.
 
 * [How it works](#how-it-works)
