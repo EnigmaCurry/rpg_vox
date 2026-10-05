@@ -39,7 +39,7 @@ impl MarkdownWriter {
             }
         })?;
         if append && existing {
-            write!(file, "\n---\n\n*{subtitle}*\n")?;
+            write!(file, "\n---\n\n{}\n", wrap(&format!("*{subtitle}*")))?;
         } else {
             file.write_all(header(title, subtitle).as_bytes())?;
         }
@@ -78,21 +78,42 @@ impl MarkdownWriter {
 }
 
 fn header(title: &str, subtitle: &str) -> String {
-    format!("# {title}\n\n*{subtitle}*\n")
+    format!("# {title}\n\n{}\n", wrap(&format!("*{subtitle}*")))
+}
+
+/// Lines are wrapped to fit within this many columns.
+const WIDTH: usize = 79;
+
+/// Word-wrap `text` to [`WIDTH`] columns. A word longer than that gets
+/// a line of its own.
+fn wrap(text: &str) -> String {
+    use unicode_width::UnicodeWidthStr;
+    let mut out = String::new();
+    let mut col = 0;
+    for word in text.split_whitespace() {
+        let w = word.width();
+        if col > 0 && col + 1 + w > WIDTH {
+            out.push('\n');
+            col = 0;
+        } else if col > 0 {
+            out.push(' ');
+            col += 1;
+        }
+        out.push_str(word);
+        col += w;
+    }
+    out
 }
 
 /// A paragraph as written: `**[hh:mm:ss]** text`, or
-/// `**[hh:mm:ss] Speaker A:** text` once diarized.
+/// `**[hh:mm:ss] Speaker A:** text` once diarized, wrapped to [`WIDTH`].
 fn block(p: &Paragraph) -> String {
     let ts = timestamp(p.start_ms);
-    match &p.speaker {
-        Some(s) => format!(
-            "\n**[{ts}] {}:** {}\n",
-            crate::speakers::name(s),
-            p.text.trim()
-        ),
-        None => format!("\n**[{ts}]** {}\n", p.text.trim()),
-    }
+    let line = match &p.speaker {
+        Some(s) => format!("**[{ts}] {}:** {}", crate::speakers::name(s), p.text.trim()),
+        None => format!("**[{ts}]** {}", p.text.trim()),
+    };
+    format!("\n{}\n", wrap(&line))
 }
 
 /// A whole file for `t`, as [`MarkdownWriter`] would have written it.
@@ -153,4 +174,26 @@ pub fn read_tail(path: &Path, max: usize) -> Vec<HistoryBlock> {
 pub fn timestamp(ms: u64) -> String {
     let s = ms / 1000;
     format!("{:02}:{:02}:{:02}", s / 3600, (s / 60) % 60, s % 60)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wraps_before_80_columns() {
+        let text = "word ".repeat(40);
+        let out = wrap(&format!("**[00:00:01] Speaker A:** {text}"));
+        assert!(out.lines().count() > 1);
+        assert!(out.lines().all(|l| l.chars().count() <= WIDTH));
+        assert_eq!(
+            out.split_whitespace().collect::<Vec<_>>(),
+            format!("**[00:00:01] Speaker A:** {text}")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(wrap("short line"), "short line");
+        let long = "x".repeat(100);
+        assert_eq!(wrap(&format!("a {long} b")), format!("a\n{long}\nb"));
+    }
 }
