@@ -3,9 +3,11 @@
 //! is transcribed channel by channel rather than diarized from a mix.
 //! Their events merge into one stream with each paragraph labelled by
 //! its source (A, B, … in command-line order), and --record mixes the
-//! sources into one .opus.
+//! sources into one .opus. When one speaker starts talking in the middle
+//! of another's paragraph, that paragraph is split at the nearest
+//! sentence end, so the transcript reads as a conversation.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::thread::JoinHandle;
 
@@ -13,8 +15,11 @@ use anyhow::Result;
 use crossbeam_channel::{unbounded, Receiver, Select, Sender};
 use vox_audio::opus_file::{OpusWriter, RATE};
 use vox_audio::resample::Linear;
+use vox_transcribe::filters::ends_on_sentence;
 use vox_transcribe::speaker::label;
-use vox_transcribe::{Engine, Event, Paragraph, ParagraphMode, Pusher, Transcript};
+use vox_transcribe::{
+    Change, Clip, Engine, Event, Paragraph, ParagraphMode, Pass4, Pusher, Transcript, Word,
+};
 
 /// One engine per source, driven as one.
 pub struct Engines {
@@ -89,7 +94,7 @@ impl Engines {
         if !labelled {
             return parts.into_iter().next().unwrap_or_default();
         }
-        let mut paragraphs: Vec<Paragraph> = parts
+        let whole: Vec<Paragraph> = parts
             .into_iter()
             .enumerate()
             .flat_map(|(i, t)| {
@@ -98,6 +103,10 @@ impl Engines {
                     p
                 })
             })
+            .collect();
+        let mut paragraphs: Vec<Paragraph> = whole
+            .iter()
+            .flat_map(|p| split_at(p, &interruptions(p, whole.iter())))
             .collect();
         paragraphs.sort_by_key(|p| p.start_ms);
         Transcript { paragraphs }
@@ -113,10 +122,231 @@ fn stamp(p: &mut Paragraph, i: usize) {
     p.speaker = Some(l);
 }
 
+/// When other speakers started talking during `p`: the starts of their
+/// paragraphs that fall inside it.
+fn interruptions<'a>(p: &Paragraph, all: impl Iterator<Item = &'a Paragraph>) -> Vec<u64> {
+    all.filter(|q| q.speaker != p.speaker && !q.text.trim().is_empty())
+        .map(|q| q.start_ms)
+        .filter(|&t| t > p.start_ms && t < p.end_ms)
+        .collect()
+}
+
+/// Split `p` at the sentence end nearest each time in `cuts`. The first
+/// piece keeps `p`'s id; the others get `<id>~1`, `<id>~2`, …. Only
+/// finished (timed) words are split; a trailing partial stays with the
+/// last piece.
+pub fn split_at(p: &Paragraph, cuts: &[u64]) -> Vec<Paragraph> {
+    let tokens: Vec<&str> = p.text.split_whitespace().collect();
+    let words = &p.words;
+    if cuts.is_empty() || words.len() < 2 || words.len() > tokens.len() {
+        return vec![p.clone()];
+    }
+    // Split points: before word k when word k-1 ends a sentence, at the
+    // middle of the pause between them.
+    let ends: Vec<(usize, u64)> = (1..words.len())
+        .filter(|&k| ends_on_sentence(tokens[k - 1]))
+        .map(|k| {
+            let (a, b) = (words[k - 1].end_ms, words[k].start_ms);
+            (k, (a + b.max(a)) / 2)
+        })
+        .collect();
+    let mut at: Vec<(usize, u64)> = cuts
+        .iter()
+        .filter_map(|&t| ends.iter().min_by_key(|(_, e)| e.abs_diff(t)).copied())
+        .collect();
+    at.sort_unstable();
+    at.dedup();
+    if at.is_empty() {
+        return vec![p.clone()];
+    }
+    // The clips split by word when their words make up the text (no
+    // pass-4 rewrite), else by time.
+    let by_word = p
+        .clips
+        .iter()
+        .map(|c| c.text.split_whitespace().count())
+        .sum::<usize>()
+        == tokens.len();
+    let mut bounds: Vec<(usize, u64)> = vec![(0, 0)];
+    bounds.extend(at);
+    bounds.push((tokens.len(), u64::MAX));
+    let last = bounds.len() - 2;
+    bounds
+        .windows(2)
+        .enumerate()
+        .map(|(i, w)| {
+            let ((a, from_ms), (b, to_ms)) = (w[0], w[1]);
+            let text = tokens[a..b].join(" ");
+            let ws: Vec<Word> = words[a.min(words.len())..b.min(words.len())].to_vec();
+            let clips = if by_word {
+                clips_between(&p.clips, a, b)
+            } else {
+                p.clips
+                    .iter()
+                    .filter(|c| c.start_ms >= from_ms && c.start_ms < to_ms)
+                    .cloned()
+                    .collect()
+            };
+            Paragraph {
+                id: if i == 0 {
+                    p.id.clone()
+                } else {
+                    format!("{}~{i}", p.id)
+                },
+                start_ms: if i == 0 {
+                    p.start_ms
+                } else {
+                    ws.first().map_or(from_ms, |w| w.start_ms)
+                },
+                end_ms: if i == last {
+                    p.end_ms
+                } else {
+                    ws.last().map_or(to_ms, |w| w.end_ms)
+                },
+                pass4: match &p.pass4 {
+                    // The before/after diff can't be split; show the
+                    // pieces as they are.
+                    Some(Pass4::Done { .. }) => Some(Pass4::Done {
+                        original: text.clone(),
+                        edits: 0,
+                    }),
+                    other => other.clone(),
+                },
+                text,
+                words: ws,
+                clips,
+                speaker: p.speaker.clone(),
+                closed: p.closed || i < last,
+                hardened: p.hardened,
+                pass3_inflight: p.pass3_inflight,
+            }
+        })
+        .collect()
+}
+
+/// The parts of `clips` covering words `a..b` of their joined text; a
+/// clip that straddles a bound is cut there.
+fn clips_between(clips: &[Clip], a: usize, b: usize) -> Vec<Clip> {
+    let mut out = Vec::new();
+    let mut at = 0;
+    for c in clips {
+        let toks: Vec<&str> = c.text.split_whitespace().collect();
+        let (lo, hi) = (a.max(at), b.min(at + toks.len()));
+        if lo < hi {
+            let (i, j) = (lo - at, hi - at);
+            if i == 0 && j == toks.len() {
+                out.push(c.clone());
+            } else {
+                let timed = if c.is_partial() {
+                    Vec::new()
+                } else {
+                    c.timed_words()
+                };
+                let ws: Vec<Word> = timed.get(i..j).map(<[Word]>::to_vec).unwrap_or_default();
+                let start_ms = ws.first().map_or(c.start_ms, |w| w.start_ms);
+                out.push(Clip {
+                    id: if i == 0 {
+                        c.id.clone()
+                    } else {
+                        format!("{}~{i}", c.id)
+                    },
+                    start_ms,
+                    duration_ms: match ws.last() {
+                        Some(w) => Some(w.end_ms.saturating_sub(start_ms)),
+                        None => c.duration_ms,
+                    },
+                    text: toks[i..j].join(" "),
+                    stage: c.stage,
+                    words: ws,
+                    speaker: c.speaker.clone(),
+                });
+            }
+        }
+        at += toks.len();
+    }
+    out
+}
+
+/// The merger's view of every source's paragraphs, re-split as other
+/// speakers interrupt them.
+#[derive(Default)]
+struct Splitter {
+    /// Latest unsplit paragraph by id.
+    whole: HashMap<String, Paragraph>,
+    /// Piece ids last sent for each paragraph.
+    sent: HashMap<String, Vec<String>>,
+}
+
+impl Splitter {
+    /// `p` changed: send its pieces, then re-split the open paragraphs
+    /// of other speakers it now interrupts.
+    fn update(&mut self, p: Paragraph, change: Change, tx: &Sender<Event>) {
+        let (start, speaker) = (p.start_ms, p.speaker.clone());
+        self.whole.insert(p.id.clone(), p.clone());
+        self.send(&p, change, tx);
+        let others: Vec<Paragraph> = self
+            .whole
+            .values()
+            .filter(|q| {
+                q.speaker != speaker && !q.hardened && q.start_ms < start && start < q.end_ms
+            })
+            .cloned()
+            .collect();
+        for q in others {
+            self.resend_if_split_changed(&q, tx);
+        }
+    }
+
+    fn remove(&mut self, id: &str, tx: &Sender<Event>) {
+        let Some(p) = self.whole.remove(id) else {
+            let _ = tx.send(Event::ParagraphRemoved { id: id.into() });
+            return;
+        };
+        for piece in self.sent.remove(id).unwrap_or_default() {
+            let _ = tx.send(Event::ParagraphRemoved { id: piece });
+        }
+        let others: Vec<Paragraph> = self
+            .whole
+            .values()
+            .filter(|q| q.speaker != p.speaker && !q.hardened && q.start_ms < p.start_ms)
+            .cloned()
+            .collect();
+        for q in others {
+            self.resend_if_split_changed(&q, tx);
+        }
+    }
+
+    fn pieces(&self, p: &Paragraph) -> Vec<Paragraph> {
+        split_at(p, &interruptions(p, self.whole.values()))
+    }
+
+    fn resend_if_split_changed(&mut self, q: &Paragraph, tx: &Sender<Event>) {
+        let ids: Vec<String> = self.pieces(q).into_iter().map(|p| p.id).collect();
+        if self.sent.get(&q.id) != Some(&ids) {
+            self.send(q, Change::Revised, tx);
+        }
+    }
+
+    fn send(&mut self, p: &Paragraph, change: Change, tx: &Sender<Event>) {
+        let pieces = self.pieces(p);
+        let ids: Vec<String> = pieces.iter().map(|q| q.id.clone()).collect();
+        for old in self.sent.get(&p.id).into_iter().flatten() {
+            if !ids.contains(old) {
+                let _ = tx.send(Event::ParagraphRemoved { id: old.clone() });
+            }
+        }
+        for paragraph in pieces {
+            let _ = tx.send(Event::Paragraph { paragraph, change });
+        }
+        self.sent.insert(p.id.clone(), ids);
+    }
+}
+
 /// Forward every engine's events until all have finished. The level
 /// meter shows the loudest source.
 fn merge(rxs: Vec<Receiver<Event>>, tx: Sender<Event>) {
     let mut levels = vec![(0.0f32, false, 0u64); rxs.len()];
+    let mut splitter = Splitter::default();
     let mut sel = Select::new();
     for rx in &rxs {
         sel.recv(rx);
@@ -139,7 +369,12 @@ fn merge(rxs: Vec<Receiver<Event>>, tx: Sender<Event>) {
                 change,
             } => {
                 stamp(&mut paragraph, i);
-                Event::Paragraph { paragraph, change }
+                splitter.update(paragraph, change, &tx);
+                continue;
+            }
+            Event::ParagraphRemoved { id } => {
+                splitter.remove(&id, &tx);
+                continue;
             }
             Event::Level {
                 rms,
@@ -153,7 +388,6 @@ fn merge(rxs: Vec<Receiver<Event>>, tx: Sender<Event>) {
                     position_ms: levels.iter().map(|l| l.2).max().unwrap_or(0),
                 }
             }
-            other => other,
         };
         let _ = tx.send(ev);
     }
@@ -305,6 +539,104 @@ mod tests {
         assert!(m.tracks[0].queue.is_empty());
         m.done(0);
         assert!(m.writer.is_none());
+    }
+
+    /// One clip per sentence, a word every 500 ms.
+    fn talk(sentences: &[&str]) -> Paragraph {
+        let mut clips = Vec::new();
+        let mut words = Vec::new();
+        let mut t = 0;
+        for (n, s) in sentences.iter().enumerate() {
+            let start = t;
+            let ws: Vec<Word> = s
+                .split_whitespace()
+                .map(|w| {
+                    t += 500;
+                    Word {
+                        text: w.into(),
+                        start_ms: t - 500,
+                        end_ms: t - 100,
+                    }
+                })
+                .collect();
+            words.extend(ws.clone());
+            clips.push(vox_transcribe::Clip {
+                id: format!("c{n}"),
+                start_ms: start,
+                duration_ms: Some(t - start),
+                text: s.to_string(),
+                stage: vox_transcribe::Stage::Final,
+                words: ws,
+                speaker: Some("A".into()),
+            });
+        }
+        Paragraph {
+            id: "p".into(),
+            start_ms: 0,
+            end_ms: t,
+            text: sentences.join(" "),
+            clips,
+            words,
+            speaker: Some("A".into()),
+            closed: false,
+            hardened: false,
+            pass3_inflight: false,
+            pass4: None,
+        }
+    }
+
+    fn texts(ps: &[Paragraph]) -> Vec<&str> {
+        ps.iter().map(|p| p.text.as_str()).collect()
+    }
+
+    #[test]
+    fn splits_at_the_nearest_sentence_end() {
+        let p = talk(&["Hello there.", "How are you today?", "I am fine."]);
+        // "there." ends at 900 ms, "today?" at 2900: 2.2 s is nearer the
+        // first.
+        let pieces = split_at(&p, &[1800]);
+        assert_eq!(
+            texts(&pieces),
+            ["Hello there.", "How are you today? I am fine."]
+        );
+        assert_eq!(pieces[0].id, "p");
+        assert_eq!(pieces[1].id, "p~1");
+        assert!(pieces[0].closed);
+        assert_eq!(pieces[1].start_ms, 1000);
+        assert_eq!(pieces[1].clips.len(), 2);
+        assert_eq!(texts(&split_at(&p, &[2700])).len(), 2);
+        assert_eq!(texts(&split_at(&p, &[2700]))[1], "I am fine.");
+    }
+
+    #[test]
+    fn a_sentence_split_across_clips_cuts_the_clip() {
+        let p = talk(&["Yes. And then", "we left."]);
+        let pieces = split_at(&p, &[600]);
+        assert_eq!(texts(&pieces), ["Yes.", "And then we left."]);
+        let first: Vec<&str> = pieces[1].clips.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(first, ["And then", "we left."]);
+        assert_eq!(pieces[1].clips[0].id, "c0~1");
+        assert_eq!(pieces[1].clips[0].start_ms, 500);
+    }
+
+    #[test]
+    fn no_sentence_end_no_split() {
+        let p = talk(&["and so on and so forth"]);
+        assert_eq!(split_at(&p, &[1000]).len(), 1);
+        assert_eq!(split_at(&talk(&["One.", "Two."]), &[]).len(), 1);
+    }
+
+    #[test]
+    fn interruptions_are_other_speakers_starting_inside() {
+        let p = talk(&["Hello there.", "How are you today?"]);
+        let mut q = talk(&["Hi."]);
+        q.speaker = Some("B".into());
+        q.start_ms = 1200;
+        let mut own = q.clone();
+        own.speaker = Some("A".into());
+        let mut late = q.clone();
+        late.start_ms = 9_000;
+        assert_eq!(interruptions(&p, [&q, &own, &late].into_iter()), [1200]);
     }
 
     #[test]

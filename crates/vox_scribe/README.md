@@ -225,7 +225,10 @@ scribe -i alice.flac -i bob.flac --speakers Alice,Bob -o game
 ```
 
 Every source runs its own pipeline, so people talking over each other
-are each transcribed in full. `--speakers` takes their names in the same
+are each transcribed in full. When someone starts talking in the middle
+of another speaker's paragraph, that paragraph is split at the sentence
+end nearest the interruption, so the two read as a back-and-forth (live
+and in the files). `--speakers` takes their names in the same
 order, and `n` renames them as with `--diarize` (which this replaces:
 the two don't combine). The level meter shows the loudest source,
 `--record` mixes them all into one `.opus`, and at the end the files
