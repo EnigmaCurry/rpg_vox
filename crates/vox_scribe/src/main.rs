@@ -394,7 +394,8 @@ impl Session {
             .join(" + ")
     }
 
-    /// Sources can be changed (`a`): live input, not --live or a file.
+    /// Sources can be changed (`a`): the default input, with no -d / -a /
+    /// -i / --virtual-sink on the command line.
     pub fn can_switch(&self) -> bool {
         self.spawner.is_some()
     }
@@ -404,7 +405,7 @@ impl Session {
     /// speaker label) when there is one, else gets its own engine.
     pub fn set_sources(&self, keep: &[usize], new: Vec<OpenOptions>) -> Result<()> {
         let Some(sp) = &self.spawner else {
-            anyhow::bail!("sources can only change for live input");
+            anyhow::bail!("sources were set on the command line");
         };
         let n = keep.len() + new.len();
         if n == 0 {
@@ -967,10 +968,14 @@ fn main() -> Result<()> {
         ],
         None => Vec::new(),
     };
-    // Several sources are mixed into the one recording; so is live input,
-    // which can gain sources mid-session.
+    // The `a` menu only changes the default input: sources named on the
+    // command line stay as given.
+    let switchable =
+        cli.input.is_empty() && cli.device.is_empty() && cli.app.is_empty() && !cli.virtual_sink;
+    // Several sources are mixed into the one recording; so is switchable
+    // input, which can gain sources mid-session.
     let mixer = match &record {
-        Some(r) if per_source || cli.input.is_empty() => {
+        Some(r) if per_source || switchable => {
             let rates: Vec<u32> = srcs.iter().map(|(_, rate, _)| *rate).collect();
             Some(Arc::new(Mutex::new(sources::Mixer::create(
                 &r.opus, &rates,
@@ -1080,7 +1085,7 @@ fn main() -> Result<()> {
         slots.push(slot);
         pumps.push(pump);
     }
-    let spawner = cli.input.is_empty().then(|| Spawner {
+    let spawner = switchable.then(|| Spawner {
         offline: offline.clone(),
         zipformer,
         corrector: corrector.clone(),

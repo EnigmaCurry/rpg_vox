@@ -189,7 +189,7 @@ Esc can also be typed as `ctrl+[` (and Emacs vterm's Alt+Ctrl+[ works).
 | `s`                    | Start saving: prompts for a file name (default `transcript-YYYYMMDD-HHMMSS.md` in the current directory), writes the settled paragraphs so far and appends from then on. Says so if already saving. |
 | `o`                    | With `--llm`: toggle showing the text from before pass 4.                                                                                                                                           |
 | `n`                    | With `--diarize` or several sources: open the speaker list.                                                                                                                                         |
-| `a`                    | Live input: open the audio source list to switch inputs or apps, or add more.                                                                                                                       |
+| `a`                    | Without -d / -a / -i: open the audio source list to switch inputs or apps, or add more.                                                                                                             |
 | `q` / `esc` / `ctrl+c` | Quit. Whatever paragraph is still open is finished and written first.                                                                                                                               |
 
 In the **audio source list**: `↑`/`k` and `↓`/`j` move, `space` ticks

@@ -384,7 +384,7 @@ fn run_loop(terminal: &mut DefaultTerminal, s: &Session) -> Result<bool> {
                 if s.can_switch() {
                     app.sources = Some(SourcesMenu::open(s));
                 } else {
-                    app.set_status("sources can only change for live input".into());
+                    app.set_status("sources were set on the command line".into());
                 }
             }
             KeyCode::Char('n') if !s.once => {
