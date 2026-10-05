@@ -87,87 +87,87 @@ scribe [OPTIONS] [COMMAND]
 
 ### Commands
 
-| Command | What it does |
-|---|---|
-| *(none)* | Transcribe (the TUI, or headless with `--no-tui` / `--input`). |
-| `devices` | List input devices for the native audio backend. |
-| `apps` | List apps whose audio `--app` can capture; ones playing now are marked `*`. |
+| Command           | What it does                                                                                         |
+|-------------------|------------------------------------------------------------------------------------------------------|
+| *(none)*          | Transcribe (the TUI, or headless with `--no-tui` / `--input`).                                       |
+| `devices`         | List input devices for the native audio backend.                                                     |
+| `apps`            | List apps whose audio `--app` can capture; ones playing now are marked `*`.                          |
 | `download-models` | Download the Zipformer model and the `--model` recognizer, plus the speaker models with `--diarize`. |
-| `stop-once` | Finish the running `--once` recorder, as if Enter were pressed. Exits 1 if none is running. |
-| `help` | Print help, or the help of a subcommand. |
+| `stop-once`       | Finish the running `--once` recorder, as if Enter were pressed. Exits 1 if none is running.          |
+| `help`            | Print help, or the help of a subcommand.                                                             |
 
 ### Input
 
-| Option | Description |
-|---|---|
-| `-d, --device NAME` | Input device by id or name substring (see `devices`). Default: the system input. On Linux, a sink's node name captures what is playing on it. Repeatable: see [one source per speaker](#one-source-per-speaker). |
-| `-a, --app NAME` | Transcribe what one app is playing: a PID, or a substring of its process name or bundle id (see `apps`). The app keeps playing to your speakers. macOS 14.4+ or PipeWire. Repeatable, and combines with `-d`. Conflicts with `--virtual-sink`, `--input`. |
-| `--virtual-sink` | PipeWire only: register a `vox_scribe` sink and transcribe whatever apps play into it. |
-| `-i, --input FILE` | Transcribe a wav, flac, mp3 or ogg file instead of a device. Repeat it for per-speaker tracks of one session (all starting at the same moment). No TUI unless `--live`. Conflicts with `-d`, `--virtual-sink`. |
-| `--live` | With `--input`: open the TUI and play the file to the speakers, transcribing it in real time as if it came from the mic. Times stay in file time; no seeking. Conflicts with `--no-tui`. |
+| Option              | Description                                                                                                                                                                                                                                               |
+|---------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `-d, --device NAME` | Input device by id or name substring (see `devices`). Default: the system input. On Linux, a sink's node name captures what is playing on it. Repeatable: see [one source per speaker](#one-source-per-speaker).                                          |
+| `-a, --app NAME`    | Transcribe what one app is playing: a PID, or a substring of its process name or bundle id (see `apps`). The app keeps playing to your speakers. macOS 14.4+ or PipeWire. Repeatable, and combines with `-d`. Conflicts with `--virtual-sink`, `--input`. |
+| `--virtual-sink`    | PipeWire only: register a `vox_scribe` sink and transcribe whatever apps play into it.                                                                                                                                                                    |
+| `-i, --input FILE`  | Transcribe a wav, flac, mp3 or ogg file instead of a device. Repeat it for per-speaker tracks of one session (all starting at the same moment). No TUI unless `--live`. Conflicts with `-d`, `--virtual-sink`.                                            |
+| `--live`            | With `--input`: open the TUI and play the file to the speakers, transcribing it in real time as if it came from the mic. Times stay in file time; no seeking. Conflicts with `--no-tui`.                                                                  |
 
 ### Output
 
-| Option | Description |
-|---|---|
-| `-o, --output NAME` | Write the transcript to `NAME.md` (`.md` is added if missing). Without `-o` or `-r` nothing is saved to disk (but `s` in the TUI can start a file). |
-| `-r, --record NAME` | Record a session: `NAME.md`, `NAME.srt`, `NAME.ass` and `NAME.opus`. See [output files](#output-files). Conflicts with `-o`, `--append`. |
-| `-p, --play NAME` | Play a recording made with `-r`: the audio with the subtitles shown word by word. Conflicts with every input and output option, `--once` and `--no-tui`. |
-| `--append` | Add to an existing `-o` file, after a `---` rule and a new date line. The TUI shows the file's earlier content in grey. Without it, an existing file is an error. |
-| `--title TEXT` | Heading for the markdown file. |
-| `--no-tui` | Print finished paragraphs to stdout instead of the full-screen UI. Always the case with `--input` (unless `--live`), which shows brief progress on stderr. |
+| Option              | Description                                                                                                                                                       |
+|---------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `-o, --output NAME` | Write the transcript to `NAME.md` (`.md` is added if missing). Without `-o` or `-r` nothing is saved to disk (but `s` in the TUI can start a file).               |
+| `-r, --record NAME` | Record a session: `NAME.md`, `NAME.srt`, `NAME.ass` and `NAME.opus`. See [output files](#output-files). Conflicts with `-o`, `--append`.                          |
+| `-p, --play NAME`   | Play a recording made with `-r`: the audio with the subtitles shown word by word. Conflicts with every input and output option, `--once` and `--no-tui`.          |
+| `--append`          | Add to an existing `-o` file, after a `---` rule and a new date line. The TUI shows the file's earlier content in grey. Without it, an existing file is an error. |
+| `--title TEXT`      | Heading for the markdown file.                                                                                                                                    |
+| `--no-tui`          | Print finished paragraphs to stdout instead of the full-screen UI. Always the case with `--input` (unless `--live`), which shows brief progress on stderr.        |
 
 ### Paragraphs and dictation
 
-| Option | Description |
-|---|---|
-| `--manual` | Start new paragraphs only on Enter, not on silence or word count. Toggle in the TUI with `m`; the header shows `¶ AUTO` or `¶ MANUAL`. |
-| `--once` | One-shot dictation: record a single manual paragraph until Enter, finish every pass (including `--llm`), print the text, copy it to the clipboard and exit. Nothing is saved to disk. Only one runs at a time: launching a second one (or `scribe stop-once`) finishes the running one instead. Conflicts with `-o`, `--append`, `-r`. |
+| Option     | Description                                                                                                                                                                                                                                                                                                                            |
+|------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `--manual` | Start new paragraphs only on Enter, not on silence or word count. Toggle in the TUI with `m`; the header shows `¶ AUTO` or `¶ MANUAL`.                                                                                                                                                                                                 |
+| `--once`   | One-shot dictation: record a single manual paragraph until Enter, finish every pass (including `--llm`), print the text, copy it to the clipboard and exit. Nothing is saved to disk. Only one runs at a time: launching a second one (or `scribe stop-once`) finishes the running one instead. Conflicts with `-o`, `--append`, `-r`. |
 
 ### Recognition
 
-| Option | Default | Description |
-|---|---|---|
+| Option                         | Default                             | Description                                                                                                                                                                                                                                                                                                  |
+|--------------------------------|-------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `--model parakeet\|sensevoice` | `parakeet` (env `VOX_SCRIBE_MODEL`) | Recognizer for passes 2 and 3. Parakeet (NVIDIA Parakeet TDT 0.6B v2) is English only and noticeably more accurate on English. SenseVoice Small is multilingual, about twice as fast, uses half the memory (~620 MB vs ~1.2 GB on an M1) and is a smaller download (155 MB vs 460 MB, fetched on first use). |
-| `--language LANG` | `auto` | SenseVoice only: `auto`, `en`, `zh`, `ja`, `ko` or `yue`. |
-| `--threads N` | `2` | Threads per recognizer. |
-| `--no-streaming` | off | Skip pass 1: no live partials, text appears per utterance. |
-| `--vocab FILE` | | Names and terms the recognizer can't know, one per line, `#` for comments. See [vocabulary](#vocabulary-optional). |
-| `--models-dir DIR` | (env `VOX_SCRIBE_MODELS`) | Directory holding the model bundles (`sense-voice/`, `parakeet-tdt-0.6b-v2/`, `streaming-zipformer/`). See [models](#models-and-logs). |
+| `--language LANG`              | `auto`                              | SenseVoice only: `auto`, `en`, `zh`, `ja`, `ko` or `yue`.                                                                                                                                                                                                                                                    |
+| `--threads N`                  | `2`                                 | Threads per recognizer.                                                                                                                                                                                                                                                                                      |
+| `--no-streaming`               | off                                 | Skip pass 1: no live partials, text appears per utterance.                                                                                                                                                                                                                                                   |
+| `--vocab FILE`                 |                                     | Names and terms the recognizer can't know, one per line, `#` for comments. See [vocabulary](#vocabulary-optional).                                                                                                                                                                                           |
+| `--models-dir DIR`             | (env `VOX_SCRIBE_MODELS`)           | Directory holding the model bundles (`sense-voice/`, `parakeet-tdt-0.6b-v2/`, `streaming-zipformer/`). See [models](#models-and-logs).                                                                                                                                                                       |
 
 ### LLM proofreading
 
-| Option | Default | Description |
-|---|---|---|
-| `--llm` | off | Enable pass 4. Configured by environment variables; see [pass 4](#pass-4-llm-proofreading-optional). |
-| `--llm-timeout SECS` | `30` | How long to wait for each pass-4 reply before keeping the pass-3 text. |
+| Option               | Default | Description                                                                                          |
+|----------------------|---------|------------------------------------------------------------------------------------------------------|
+| `--llm`              | off     | Enable pass 4. Configured by environment variables; see [pass 4](#pass-4-llm-proofreading-optional). |
+| `--llm-timeout SECS` | `30`    | How long to wait for each pass-4 reply before keeping the pass-3 text.                               |
 
 ### Speakers
 
-| Option | Default | Description |
-|---|---|---|
-| `--diarize` | off | Label who is speaking (Speaker A, B, …), live and, with `-r` or `-i … -o`, with a full diarization after the session. Fetches ~77 MB of speaker models on first use. |
-| `--speakers N\|NAMES` | | Who is speaking, when known: a count (`3`) or names in the order they are first heard (`Alice,Bob,Carol`, which also means 3). The count is exact. With several sources, their names in the order the sources were given. |
-| `--speaker-threshold X` | `0.7` | Needs `--diarize`. How alike (cosine similarity, 0–1) a voice must be to a known speaker to get their live label. Raise it if two people share a label, lower it if one person is split in two. Only the live labels use it. |
+| Option                  | Default | Description                                                                                                                                                                                                                  |
+|-------------------------|---------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `--diarize`             | off     | Label who is speaking (Speaker A, B, …), live and, with `-r` or `-i … -o`, with a full diarization after the session. Fetches ~77 MB of speaker models on first use.                                                         |
+| `--speakers N\|NAMES`   |         | Who is speaking, when known: a count (`3`) or names in the order they are first heard (`Alice,Bob,Carol`, which also means 3). The count is exact. With several sources, their names in the order the sources were given.    |
+| `--speaker-threshold X` | `0.7`   | Needs `--diarize`. How alike (cosine similarity, 0–1) a voice must be to a known speaker to get their live label. Raise it if two people share a label, lower it if one person is split in two. Only the live labels use it. |
 
 ### Logging
 
-| Option | Description |
-|---|---|
-| `--log FILE` | Log file. Default: `$TMPDIR/vox_scribe.log` in TUI mode, stderr otherwise. The level is set with `VOX_SCRIBE_LOG` (a `tracing` filter such as `debug` or `vox_transcribe=trace`). |
-| `-h, --help` | Print help (`-h` for the short form). |
-| `-V, --version` | Print the version. |
+| Option          | Description                                                                                                                                                                       |
+|-----------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `--log FILE`    | Log file. Default: `$TMPDIR/vox_scribe.log` in TUI mode, stderr otherwise. The level is set with `VOX_SCRIBE_LOG` (a `tracing` filter such as `debug` or `vox_transcribe=trace`). |
+| `-h, --help`    | Print help (`-h` for the short form).                                                                                                                                             |
+| `-V, --version` | Print the version.                                                                                                                                                                |
 
 ### Environment variables
 
-| Variable | Used for |
-|---|---|
-| `VOX_SCRIBE_MODELS` | Same as `--models-dir`. |
-| `VOX_SCRIBE_MODEL` | Same as `--model`. |
-| `VOX_SCRIBE_LLM_URL` | Pass-4 endpoint, default `https://api.openai.com/v1`. |
-| `VOX_SCRIBE_LLM_MODEL` | Pass-4 model name (required with `--llm`). |
-| `VOX_SCRIBE_LLM_KEY`, `OPENAI_API_KEY` | Pass-4 API key, optional for local servers. |
-| `VOX_SCRIBE_LOG` | Log filter. |
+| Variable                                      | Used for                                                |
+|-----------------------------------------------|---------------------------------------------------------|
+| `VOX_SCRIBE_MODELS`                           | Same as `--models-dir`.                                 |
+| `VOX_SCRIBE_MODEL`                            | Same as `--model`.                                      |
+| `VOX_SCRIBE_LLM_URL`                          | Pass-4 endpoint, default `https://api.openai.com/v1`.   |
+| `VOX_SCRIBE_LLM_MODEL`                        | Pass-4 model name (required with `--llm`).              |
+| `VOX_SCRIBE_LLM_KEY`, `OPENAI_API_KEY`        | Pass-4 API key, optional for local servers.             |
+| `VOX_SCRIBE_LOG`                              | Log filter.                                             |
 | `VOX_SCRIBE_TERMINAL`, `VOX_SCRIBE_FONT_SIZE` | macOS dictation key setup; see [below](#macos--f5-key). |
 
 ## Keys
@@ -176,20 +176,20 @@ Esc can also be typed as `ctrl+[` (and Emacs vterm's Alt+Ctrl+[ works).
 
 ### Recording TUI
 
-| Key | Action |
-|---|---|
-| `↑` / `k` | Select the previous paragraph. |
-| `↓` / `j` | Select the next paragraph. |
-| `y` / `c` | Copy the selected paragraph to the clipboard (the newest one if none is selected). |
-| `PgUp` / `PgDn` | Scroll back / forward 10 lines (clears the selection). |
-| `End` / `G` | Jump to the bottom and follow new text. |
-| `space` | Pause / resume. Pausing ends the current paragraph and releases the mic, so the OS stops showing it in use; timestamps keep running. With `--live`, the file's playback pauses too. |
-| `enter` | Start a new paragraph. |
-| `m` | Switch between auto paragraphs (silence or word count breaks them) and manual ones (only `enter` does). |
-| `s` | Start saving: prompts for a file name (default `transcript-YYYYMMDD-HHMMSS.md` in the current directory), writes the settled paragraphs so far and appends from then on. Says so if already saving. |
-| `o` | With `--llm`: toggle showing the text from before pass 4. |
-| `n` | With `--diarize` or several sources: open the speaker list. |
-| `q` / `esc` / `ctrl+c` | Quit. Whatever paragraph is still open is finished and written first. |
+| Key                    | Action                                                                                                                                                                                              |
+|------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `↑` / `k`              | Select the previous paragraph.                                                                                                                                                                      |
+| `↓` / `j`              | Select the next paragraph.                                                                                                                                                                          |
+| `y` / `c`              | Copy the selected paragraph to the clipboard (the newest one if none is selected).                                                                                                                  |
+| `PgUp` / `PgDn`        | Scroll back / forward 10 lines (clears the selection).                                                                                                                                              |
+| `End` / `G`            | Jump to the bottom and follow new text.                                                                                                                                                             |
+| `space`                | Pause / resume. Pausing ends the current paragraph and releases the mic, so the OS stops showing it in use; timestamps keep running. With `--live`, the file's playback pauses too.                 |
+| `enter`                | Start a new paragraph.                                                                                                                                                                              |
+| `m`                    | Switch between auto paragraphs (silence or word count breaks them) and manual ones (only `enter` does).                                                                                             |
+| `s`                    | Start saving: prompts for a file name (default `transcript-YYYYMMDD-HHMMSS.md` in the current directory), writes the settled paragraphs so far and appends from then on. Says so if already saving. |
+| `o`                    | With `--llm`: toggle showing the text from before pass 4.                                                                                                                                           |
+| `n`                    | With `--diarize` or several sources: open the speaker list.                                                                                                                                         |
+| `q` / `esc` / `ctrl+c` | Quit. Whatever paragraph is still open is finished and written first.                                                                                                                               |
 
 In the **save prompt**: type the name, `backspace` deletes, `enter` saves
 (an existing file is refused), `esc` cancels.
@@ -202,32 +202,32 @@ get the new names when the session ends.
 
 ### `--once` (dictation)
 
-| Key | Action |
-|---|---|
-| `enter` | Finish: run the remaining passes, copy the text and exit. |
-| `shift+enter` | Start a new paragraph without finishing. Needs a terminal with the kitty keyboard protocol (Ghostty, kitty, WezTerm, iTerm2); macOS Terminal sends the same code as `enter`. |
-| `space` | Pause / resume. |
-| `↑` `↓` `y` `PgUp` `PgDn` `End` | As in the recording TUI. |
-| `q` / `esc` / `ctrl+c` | Cancel without copying. |
+| Key                             | Action                                                                                                                                                                       |
+|---------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `enter`                         | Finish: run the remaining passes, copy the text and exit.                                                                                                                    |
+| `shift+enter`                   | Start a new paragraph without finishing. Needs a terminal with the kitty keyboard protocol (Ghostty, kitty, WezTerm, iTerm2); macOS Terminal sends the same code as `enter`. |
+| `space`                         | Pause / resume.                                                                                                                                                              |
+| `↑` `↓` `y` `PgUp` `PgDn` `End` | As in the recording TUI.                                                                                                                                                     |
+| `q` / `esc` / `ctrl+c`          | Cancel without copying.                                                                                                                                                      |
 
 `m`, `n` and `s` are off in this mode. With `--once --no-tui`, a line on
 stdin (`enter`) finishes and `ctrl+c` cancels.
 
 ### `--play` (playback)
 
-| Key | Action |
-|---|---|
-| `space` | Pause / resume (at the end, restart from the top). |
-| `←` / `→` | Jump to the previous / next word. |
-| `↑` / `↓` | Jump to the previous / next line (subtitle cue). |
-| `home` | Restart from the beginning. |
-| `<` / `,` | Slow down, in steps 0.5×, 0.75×, 1×, 1.25×, 1.5×, 1.75×, 2×, 2.5×, 3×, without changing the pitch. |
-| `>` / `.` | Speed up. The status bar shows the speed. |
-| `/` | Search, like `less`: type a pattern (case-insensitive, may span words), `enter` jumps to the next match, `esc` / `ctrl+c` cancels, `backspace` on an empty pattern closes the prompt. |
-| `n` | During a search: next match. Otherwise: open the speaker list to rename a speaker in `NAME.md`, `.srt` and `.ass`. |
-| `p` / `N` | Previous match. Matches wrap at the ends and are underlined. |
-| `esc` | Clear the search; with no search, quit. |
-| `q` / `ctrl+c` | Quit. |
+| Key            | Action                                                                                                                                                                                |
+|----------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `space`        | Pause / resume (at the end, restart from the top).                                                                                                                                    |
+| `←` / `→`      | Jump to the previous / next word.                                                                                                                                                     |
+| `↑` / `↓`      | Jump to the previous / next line (subtitle cue).                                                                                                                                      |
+| `home`         | Restart from the beginning.                                                                                                                                                           |
+| `<` / `,`      | Slow down, in steps 0.5×, 0.75×, 1×, 1.25×, 1.5×, 1.75×, 2×, 2.5×, 3×, without changing the pitch.                                                                                    |
+| `>` / `.`      | Speed up. The status bar shows the speed.                                                                                                                                             |
+| `/`            | Search, like `less`: type a pattern (case-insensitive, may span words), `enter` jumps to the next match, `esc` / `ctrl+c` cancels, `backspace` on an empty pattern closes the prompt. |
+| `n`            | During a search: next match. Otherwise: open the speaker list to rename a speaker in `NAME.md`, `.srt` and `.ass`.                                                                    |
+| `p` / `N`      | Previous match. Matches wrap at the ends and are underlined.                                                                                                                          |
+| `esc`          | Clear the search; with no search, quit.                                                                                                                                               |
+| `q` / `ctrl+c` | Quit.                                                                                                                                                                                 |
 
 The speaker list works as in the recording TUI, except that renames are
 written to the files immediately.
