@@ -40,6 +40,33 @@ none are found; `scribe download-models` does the same thing up front.
 
 ## Install
 
+Prebuilt binaries are attached to each
+[GitHub release](https://github.com/EnigmaCurry/rpg_vox/releases) for
+macOS (Apple Silicon) and Linux (x86_64 and aarch64). Pick the archive for
+your platform, unpack it, put `scribe` on your `PATH` and fetch the models:
+
+```bash
+VERSION=v0.1.0
+TARGET=aarch64-apple-darwin   # or x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu
+curl -fLO "https://github.com/EnigmaCurry/rpg_vox/releases/download/$VERSION/scribe-$VERSION-$TARGET.tar.gz"
+tar -xzf "scribe-$VERSION-$TARGET.tar.gz"
+install -m 755 "scribe-$VERSION-$TARGET/scribe" ~/.local/bin/scribe
+scribe download-models
+```
+
+Each archive has a `.sha256` beside it to check the download against
+(`shasum -a 256 -c scribe-$VERSION-$TARGET.tar.gz.sha256`). The macOS
+binary is not signed: if you downloaded it with a browser instead of
+`curl`, clear the quarantine flag with `xattr -d com.apple.quarantine
+~/.local/bin/scribe`. The Linux binaries need PipeWire (`libpipewire-0.3`)
+and glibc 2.39 or newer (Ubuntu 24.04, Fedora 40, or later).
+
+The release archive has only the binary. The macOS
+[dictation key](#one-shot-dictation-key) launchers and Karabiner rule come
+from a source install.
+
+### From source
+
 ```bash
 just install-scribe              # or: just install-scribe /usr/local/bin
 ```
