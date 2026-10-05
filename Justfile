@@ -48,7 +48,7 @@ dist VERSION=`git describe --tags --always --dirty`:
       mkdir -p "$stage"
       cp "target/release/$bin" LICENSE.txt README.md "$stage/"
       case "$bin" in
-        scribe) cp SCRIBE.md "$stage/" ;;
+        scribe) cp SCRIBE.md SCRIBE_REFERENCE.md "$stage/" ;;
         rpg_vox) cp RPG_VOX.md "$stage/" ;;
       esac
       tar -czf "dist/$name.tar.gz" -C "$(dirname "$stage")" "$name"
