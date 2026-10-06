@@ -1,5 +1,6 @@
 # scribe
 
+https://github.com/user-attachments/assets/4fc6dbd3-05c7-4c80-b4ab-5aaae2d44119
 *Transcription of Abbott and Costello's Who's on First?*
 
 Live transcription in your terminal, using speech models that run on your
