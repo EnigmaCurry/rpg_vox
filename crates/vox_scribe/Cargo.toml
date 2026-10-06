@@ -18,6 +18,9 @@ clap = { workspace = true, features = ["env"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 crossbeam-channel = "0.5"
+# --chat: the database scribe and a responder share. Same version and
+# bundled sqlite as rpg_vox and discord_vox (one libsqlite3-sys per build).
+rusqlite = { version = "0.31", features = ["bundled"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 ratatui = "0.30"
 unicode-width = "0.2"

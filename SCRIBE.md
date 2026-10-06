@@ -56,6 +56,7 @@ scribe                        # transcribe the default mic; nothing is saved
 scribe -o notes               # ... and append each paragraph to notes.md
 scribe -r session             # record session.md/.srt/.ass/.opus
 scribe -p session             # play the recording back with karaoke subtitles
+scribe -p notes               # no notes.opus: read notes.md aloud instead
 scribe -i talk.mp3 -o talk    # transcribe a file without the TUI
 scribe --once                 # dictate one paragraph to the clipboard
 ```
@@ -204,8 +205,54 @@ Word times come from the offline recognizer's token timestamps and are
 carried through the boundary and LLM passes. `scribe -p NAME` plays the
 recording back in the terminal with the current word lit up.
 
+### Reading a transcript aloud
+
+`scribe -p NAME` with only `NAME.md` (from `-o`, or written by hand)
+reads it aloud with [Kokoro](https://huggingface.co/hexgrad/Kokoro-82M),
+an 82M-parameter voice model that runs on the CPU, about 3.5x faster than
+real time on an M1. Each speaker gets a voice of their own (`--voices`
+picks them), and the player works as it does for a recording. Speech is
+made a sentence at a time, up to two minutes ahead of where you are
+listening; until a sentence is ready the status bar shows `VOICING`.
+Word highlighting is approximate, spread over each sentence by word
+length. The model (about 350 MB, English only) is downloaded on first
+use into the models directory.
+
 Copying (`y`, `--once`) uses `pbcopy`, `wl-copy` or `xclip`, falling back
 to the OSC 52 terminal escape (e.g. over ssh).
+
+## Chat with a responder
+
+`scribe --chat NAME` turns scribe into the voice end of a conversation.
+What you say collects on screen until `enter` sends it (`backspace`
+throws it away). The message is written to `NAME.db`, a SQLite file that
+a separate responder process (an LLM bridge, say) watches; its reply is
+written back to the same file, a sentence or so at a time, and scribe
+reads it aloud with Kokoro as it arrives.
+
+It's half duplex: from `enter` until the reply has been spoken, the mic
+is muted so scribe doesn't hear itself. `space` holds the reply and
+opens the mic. Start talking and the reply is cut off (and the
+responder is told), or press `space` again to hear the rest.
+
+Try it with the stand-in responder in another terminal:
+
+```sh
+scribe chat-echo talk     # reads back what you say, then asks for more
+scribe --chat talk
+```
+
+### The database
+
+One table, `messages(id, role, kind, reply_to, text, more, at)`, in WAL
+mode. Neither side is notified of the other's writes: poll for rows with
+`id` above the last one seen (scribe checks every 30 ms).
+
+| Row                                   | Written by | Meaning                                                                                                                                         |
+|---------------------------------------|------------|-------------------------------------------------------------------------------------------------------------------------------------------------|
+| `role='user', kind='say'`             | scribe     | Something the user said and sent.                                                                                                               |
+| `role='assistant', kind='say'`        | responder  | Part of the reply to user row `reply_to`, spoken in `id` order. `more=1` means more is coming and scribe keeps waiting; the last row has `more=0`. Text may be empty (`more=1` alone means "still working"). |
+| `role='user', kind='interrupt'`       | scribe     | The user cut off the reply to `reply_to`. Stop writing it; scribe ignores any more rows for it. A new `say` also supersedes any reply in progress. |
 
 ## Pass 4: LLM proofreading (optional)
 

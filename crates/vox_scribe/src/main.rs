@@ -8,6 +8,8 @@
 //! Alternatively, several sources (-d / -a / -i, repeated) are each
 //! transcribed on their own as one speaker apiece.
 
+mod chat;
+mod chatdb;
 mod clipboard;
 mod diarize;
 mod markdown;
@@ -18,9 +20,11 @@ mod picker;
 mod play;
 mod progress;
 mod sources;
+mod speak;
 mod speakers;
 mod subtitles;
 mod tui;
+mod voice;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -89,9 +93,21 @@ struct Cli {
     #[arg(short, long, conflicts_with_all = ["output", "append"])]
     record: Option<PathBuf>,
     /// Play a recording made with --record: NAME.opus with NAME.ass
-    /// shown word by word in time with the audio.
+    /// shown word by word in time with the audio. With no NAME.opus,
+    /// NAME.md is read aloud by a local voice model (Kokoro) instead.
     #[arg(short, long, conflicts_with_all = ["output", "record", "input", "app", "device", "virtual_sink", "once", "no_tui"])]
     play: Option<PathBuf>,
+    /// With --play reading a transcript aloud: Kokoro voices for the
+    /// speakers in order of appearance, e.g. `am_adam,bf_emma`. The rest
+    /// get the built-in cast (af_heart, am_michael, bf_emma, bm_george, …).
+    /// With --chat, the first one is the voice of the replies.
+    #[arg(long, value_delimiter = ',')]
+    voices: Vec<String>,
+    /// Talk with a responder through NAME.db (`.db` is added if missing):
+    /// Enter sends what you said, the reply is read aloud. See
+    /// `scribe chat-echo` for a stand-in responder.
+    #[arg(long, conflicts_with_all = ["output", "record", "play", "input", "once", "no_tui", "append", "live"])]
+    chat: Option<PathBuf>,
     /// Add to the -o file if it already exists (normally an error).
     #[arg(long)]
     append: bool,
@@ -248,6 +264,9 @@ enum Cmd {
     /// Download the Zipformer model and the --model recognizer (and the
     /// speaker models with --diarize).
     DownloadModels,
+    /// A stand-in --chat responder: reads back whatever is said in
+    /// NAME.db, a sentence at a time, then asks for more.
+    ChatEcho { name: PathBuf },
     /// Finish the running --once recorder (as if Enter were pressed).
     /// Exits 1 if none is running.
     StopOnce,
@@ -271,6 +290,9 @@ pub struct Session {
     pub title: String,
     pub subtitle: String,
     pub paused: Arc<AtomicBool>,
+    /// The mic stays open but is heard as silence (--chat, while a
+    /// reply is being spoken).
+    pub muted: Arc<AtomicBool>,
     /// Paragraphs break only on Enter.
     pub manual: AtomicBool,
     /// Pass 4 is enabled.
@@ -354,6 +376,7 @@ struct Spawner {
 fn new_engine(
     rate: u32,
     manual: bool,
+    chat: bool,
     zipformer: Option<&Zipformer>,
     offline: &Arc<dyn vox_transcribe::OfflineRecognizer>,
     corrector: &Option<Arc<dyn Corrector>>,
@@ -362,6 +385,13 @@ fn new_engine(
     let mut cfg = EngineConfig::new(rate);
     if manual {
         cfg.paragraph.mode = ParagraphMode::Manual;
+    }
+    if chat {
+        // What was said is sent once it hardens: soon after Enter, and
+        // as one message however long it runs.
+        cfg.paragraph.gap_ms = 300;
+        cfg.paragraph.soft_max_words = usize::MAX;
+        cfg.paragraph.hard_max_words = usize::MAX;
     }
     let streaming = zipformer.map(|z| Box::new(z.session()) as Box<dyn StreamingRecognizer>);
     Engine::spawn_full(cfg, streaming, offline.clone(), corrector.clone(), tagger)
@@ -455,6 +485,7 @@ impl Session {
         let engine = new_engine(
             rate,
             self.manual.load(Ordering::Relaxed),
+            false,
             sp.zipformer.as_ref(),
             &sp.offline,
             &sp.corrector,
@@ -480,6 +511,7 @@ impl Session {
                 fed: slot.fed.clone(),
             },
             paused: self.paused.clone(),
+            muted: self.muted.clone(),
             stop: self.stop.clone(),
             lead,
         };
@@ -703,6 +735,7 @@ fn main() -> Result<()> {
             }
             return Ok(());
         }
+        Some(Cmd::ChatEcho { name }) => return chatdb::echo(&chatdb::path_for(&name)),
         Some(Cmd::StopOnce) => {
             #[cfg(unix)]
             if once::signal_finish() {
@@ -727,7 +760,27 @@ fn main() -> Result<()> {
     };
 
     if let Some(name) = &cli.play {
-        return play::run(&RecordPaths::new(name));
+        let paths = RecordPaths::new(name);
+        if paths.opus.exists() || !paths.md.exists() {
+            return play::run(&paths);
+        }
+        let models_dir = models::resolve(cli.models_dir.as_deref());
+        if !models::has_kokoro(&models_dir) {
+            eprintln!(
+                "no {} to play; reading {} aloud instead",
+                paths.opus.display(),
+                paths.md.display()
+            );
+            eprintln!("voice model not found, downloading it once (about 350 MB)…");
+            models::download_kokoro(&models_dir)?;
+        }
+        // sherpa-onnx logs to fd 2 while loading; keep it off the TUI.
+        #[cfg(unix)]
+        let _stderr_restore = match &log_file {
+            Some(f) => Some(vox_transcribe::stderr::redirect_to(f)?),
+            None => None,
+        };
+        return play::run_speech(&paths, &models::kokoro_dir(&models_dir), &cli.voices);
     }
 
     let live_opts = live_sources(&cli, &matches);
@@ -817,6 +870,10 @@ fn main() -> Result<()> {
     if cli.diarize && !models::has_speakers(&models_dir) {
         eprintln!("speaker models not found, downloading them once (about 77 MB)…");
         models::download_speakers(&models_dir)?;
+    }
+    if cli.chat.is_some() && !models::has_kokoro(&models_dir) {
+        eprintln!("voice model not found, downloading it once (about 350 MB)…");
+        models::download_kokoro(&models_dir)?;
     }
 
     // Put the TUI on screen now so the mic and models load behind it
@@ -985,7 +1042,7 @@ fn main() -> Result<()> {
         _ => None,
     };
 
-    let manual = cli.manual || cli.once;
+    let manual = cli.manual || cli.once || cli.chat.is_some();
     let mut tagger = tagger;
     let engines: Vec<Engine> = srcs
         .iter()
@@ -993,6 +1050,7 @@ fn main() -> Result<()> {
             new_engine(
                 *rate,
                 manual,
+                cli.chat.is_some(),
                 zipformer.as_ref(),
                 &offline,
                 &corrector,
@@ -1003,6 +1061,7 @@ fn main() -> Result<()> {
     let engine = sources::Engines::new(engines);
     let loaded = started.elapsed();
     let paused = Arc::new(AtomicBool::new(false));
+    let muted = Arc::new(AtomicBool::new(false));
     let stop = Arc::new(AtomicBool::new(false));
     let source_done = Arc::new(AtomicBool::new(false));
     // File sources still being pushed; the last one sets `source_done`.
@@ -1048,6 +1107,7 @@ fn main() -> Result<()> {
                     rate,
                     feed,
                     paused,
+                    muted: muted.clone(),
                     stop,
                     lead: 0,
                 };
@@ -1108,6 +1168,7 @@ fn main() -> Result<()> {
         title,
         subtitle,
         paused,
+        muted,
         manual: AtomicBool::new(manual),
         llm,
         once: cli.once,
@@ -1124,6 +1185,10 @@ fn main() -> Result<()> {
         num_speakers,
         pumps: Mutex::new(pumps),
     };
+    if let (Some(name), Some(screen)) = (&cli.chat, screen.take()) {
+        let voice = chat_voice(&models_dir, &cli.voices)?;
+        return chat::run(screen, session, &chatdb::path_for(name), voice);
+    }
     let mut outcome = match screen {
         Some(screen) => tui::run(screen, session)?,
         None => headless(session)?,
@@ -1431,6 +1496,7 @@ struct LivePump {
     rate: u32,
     feed: Feed,
     paused: Arc<AtomicBool>,
+    muted: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     /// Silence to feed the engine first: a source added mid-session
     /// starts at the session's current time.
@@ -1525,6 +1591,10 @@ impl LivePump {
             }
             let Some(rx) = &chunks else { continue };
             if let Ok(chunk) = rx.recv_timeout(Duration::from_millis(100)) {
+                if self.muted.load(Ordering::Relaxed) {
+                    self.push(&vec![0.0; chunk.len()], &mut resampler);
+                    continue;
+                }
                 self.watch(&mut hush, &chunk);
                 self.push(&chunk, &mut resampler);
             }
@@ -1724,6 +1794,18 @@ fn headless(session: Session) -> Result<Outcome> {
         path,
         confirmed,
     })
+}
+
+/// The voice --chat replies in: the first of `--voices`, else af_heart.
+fn chat_voice(models_dir: &Path, voices: &[String]) -> Result<voice::Voice> {
+    let name = voices.first().map(String::as_str).unwrap_or("af_heart");
+    let sid =
+        vox_transcribe::tts::voice_id(name).with_context(|| format!("no Kokoro voice {name:?}"))?;
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get().min(4))
+        .unwrap_or(2) as i32;
+    let tts = vox_transcribe::tts::Kokoro::load(&models::kokoro_dir(models_dir), threads)?;
+    voice::Voice::new(tts, sid)
 }
 
 /// Build the pass-4 corrector when `--llm` is given.

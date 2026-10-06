@@ -34,6 +34,8 @@ pub mod speaker;
 pub mod stderr;
 pub mod subtitle;
 pub mod timing;
+#[cfg(feature = "sherpa")]
+pub mod tts;
 pub mod vad;
 pub mod vocab;
 

@@ -6,6 +6,7 @@
 //! <dir>/parakeet-tdt-0.6b-v2/{encoder,decoder,joiner}.int8.onnx + tokens.txt
 //! <dir>/streaming-zipformer/{encoder,decoder,joiner}.onnx + tokens.txt
 //! <dir>/speaker-diarization/{segmentation,embedding-eres2netv2}.onnx   (--diarize)
+//! <dir>/kokoro/{model.onnx,voices.bin,…}                              (--play NAME.md)
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -17,6 +18,7 @@ pub const SENSE_VOICE: &str = "sense-voice";
 pub const ZIPFORMER: &str = "streaming-zipformer";
 pub const PARAKEET: &str = "parakeet-tdt-0.6b-v2";
 pub const SPEAKERS: &str = "speaker-diarization";
+pub const KOKORO: &str = "kokoro";
 
 /// The pass-2/3 recognizer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -146,6 +148,29 @@ pub fn download_speakers(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+pub fn kokoro_dir(dir: &Path) -> PathBuf {
+    dir.join(KOKORO)
+}
+
+pub fn has_kokoro(dir: &Path) -> bool {
+    vox_transcribe::tts::has_kokoro(&kokoro_dir(dir))
+}
+
+/// Download the Kokoro voice model (English parts only) into `dir`.
+pub fn download_kokoro(dir: &Path) -> Result<()> {
+    if has_kokoro(dir) {
+        println!("Kokoro already present in {}", kokoro_dir(dir).display());
+        return Ok(());
+    }
+    let files = vox_transcribe::tts::KOKORO_FILES.map(|f| (f, f));
+    fetch_in(
+        "tts-models",
+        "kokoro-multi-lang-v1_0",
+        &kokoro_dir(dir),
+        &files,
+    )
+}
+
 pub fn has_zipformer(dir: &Path) -> bool {
     ["encoder.onnx", "decoder.onnx", "joiner.onnx", "tokens.txt"]
         .iter()
@@ -242,10 +267,24 @@ fn fetch_in(release: &str, stem: &str, dest: &Path, files: &[(&str, &str)]) -> R
     }
     std::fs::create_dir_all(dest)?;
     for (from, to) in files {
-        std::fs::copy(tmp.join(stem).join(from), dest.join(to))
+        copy_all(&tmp.join(stem).join(from), &dest.join(to))
             .with_context(|| format!("copy {from}"))?;
     }
     let _ = std::fs::remove_dir_all(&tmp);
     println!("installed {}", dest.display());
+    Ok(())
+}
+
+/// Copy a file, or a directory and everything in it.
+fn copy_all(from: &Path, to: &Path) -> Result<()> {
+    if from.is_dir() {
+        std::fs::create_dir_all(to)?;
+        for entry in std::fs::read_dir(from)? {
+            let entry = entry?;
+            copy_all(&entry.path(), &to.join(entry.file_name()))?;
+        }
+    } else {
+        std::fs::copy(from, to)?;
+    }
     Ok(())
 }

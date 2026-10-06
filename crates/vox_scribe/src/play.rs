@@ -1,7 +1,10 @@
 //! `--play NAME`: play NAME.opus and print NAME.ass in time with it,
-//! lighting up each word as it is spoken.
+//! lighting up each word as it is spoken. Without NAME.opus, NAME.md is
+//! read aloud instead (see [`crate::speak`]).
 
 use std::collections::HashMap;
+use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context as _, Result};
@@ -18,6 +21,7 @@ use vox_audio::resample::Linear;
 use vox_audio::stretch::Stretch;
 
 use crate::markdown::timestamp;
+use crate::speak::Speech;
 use crate::speakers;
 use crate::tui::{draw_names, NamesMenu, Screen, SpeakerRow};
 use crate::RecordPaths;
@@ -153,10 +157,59 @@ pub fn parse_ass(ass: &str) -> Vec<Cue> {
     cues
 }
 
+/// Where the audio comes from.
+enum Track<'a> {
+    Recording(&'a OpusFile),
+    /// Speech still being made, read as it grows.
+    Speech(Arc<Speech>),
+}
+
+impl<'a> Track<'a> {
+    fn rate(&self) -> u32 {
+        match self {
+            Track::Recording(_) => RATE,
+            Track::Speech(s) => s.rate,
+        }
+    }
+
+    fn reader(&self, pos: u64) -> Result<Reader<'a>> {
+        Ok(match self {
+            Track::Recording(f) => Reader::Recording(f.cursor(pos)?),
+            Track::Speech(s) => Reader::Speech {
+                speech: s.clone(),
+                pos: (pos as usize).min(s.len()),
+            },
+        })
+    }
+}
+
+enum Reader<'a> {
+    Recording(Cursor<'a>),
+    Speech { speech: Arc<Speech>, pos: usize },
+}
+
+impl Reader<'_> {
+    /// Append the next chunk to `out`; `false` at the end. While speech
+    /// is still being made, appends nothing and returns `true`.
+    fn read(&mut self, out: &mut Vec<f32>) -> Result<bool> {
+        match self {
+            Reader::Recording(c) => c.read(out),
+            Reader::Speech { speech, pos } => Ok(match speech.read(*pos, 2400, out) {
+                Some(n) => {
+                    *pos += n;
+                    true
+                }
+                None => false,
+            }),
+        }
+    }
+}
+
 /// Feeds decoded audio to the output and keeps the clock.
 struct Player<'a> {
-    file: &'a OpusFile,
-    cursor: Cursor<'a>,
+    track: Track<'a>,
+    rate: u32,
+    cursor: Reader<'a>,
     out: Output,
     resampler: Linear,
     /// Speed changes without changing pitch.
@@ -172,13 +225,15 @@ struct Player<'a> {
 }
 
 impl<'a> Player<'a> {
-    fn new(file: &'a OpusFile) -> Result<Self> {
+    fn new(track: Track<'a>) -> Result<Self> {
         let out = Output::open().context("open audio output")?;
+        let rate = track.rate();
         Ok(Self {
-            file,
-            cursor: file.cursor(0)?,
-            resampler: Linear::new(RATE, out.sample_rate),
-            stretch: Stretch::new(RATE),
+            cursor: track.reader(0)?,
+            track,
+            rate,
+            resampler: Linear::new(rate, out.sample_rate),
+            stretch: Stretch::new(rate),
             out,
             buf: Vec::new(),
             decoded: Vec::new(),
@@ -190,7 +245,17 @@ impl<'a> Player<'a> {
     }
 
     fn len_ms(&self) -> u64 {
-        self.file.len * 1000 / RATE as u64
+        let len = match &self.track {
+            Track::Recording(f) => f.len,
+            Track::Speech(s) => s.len() as u64,
+        };
+        len * 1000 / self.rate as u64
+    }
+
+    /// Caught up with speech that is still being made.
+    fn waiting(&self) -> bool {
+        matches!(&self.cursor, Reader::Speech { speech, pos } if !speech.done() && *pos >= speech.len())
+            && self.out.queued() == 0
     }
 
     /// Each second played covers `speed` seconds of the recording.
@@ -244,7 +309,7 @@ impl<'a> Player<'a> {
     fn seek(&mut self, ms: u64) -> Result<()> {
         let ms = ms.min(self.len_ms());
         self.out.flush();
-        self.cursor = self.file.cursor(ms * RATE as u64 / 1000)?;
+        self.cursor = self.track.reader(ms * self.rate as u64 / 1000)?;
         self.resampler.reset();
         self.stretch.reset();
         self.buf.clear();
@@ -259,6 +324,7 @@ impl<'a> Player<'a> {
     }
 }
 
+/// Play the recording NAME.opus with NAME.ass.
 pub fn run(paths: &RecordPaths) -> Result<()> {
     if !paths.opus.exists() {
         bail!(
@@ -268,28 +334,64 @@ pub fn run(paths: &RecordPaths) -> Result<()> {
     }
     let ass = std::fs::read_to_string(&paths.ass)
         .with_context(|| format!("read {}", paths.ass.display()))?;
-    let cues = parse_ass(&ass);
-    let blocks = sentences(&cues);
-    let starts = word_starts(&cues);
-    let line_starts: Vec<u64> = cues.iter().map(|c| c.start_ms).collect();
-    let words: Vec<&KWord> = cues.iter().flat_map(|c| c.words.iter()).collect();
+    let file = OpusFile::open(&paths.opus)?;
+    let screen = Screen::enter(" opening audio…");
+    play(paths, screen, Track::Recording(&file), parse_ass(&ass))
+}
+
+/// Read NAME.md aloud with the Kokoro model in `model_dir`; `voices`
+/// name the voice of each speaker in turn.
+pub fn run_speech(paths: &RecordPaths, model_dir: &Path, voices: &[String]) -> Result<()> {
+    let md = std::fs::read_to_string(&paths.md)
+        .with_context(|| format!("read {}", paths.md.display()))?;
+    let screen = Screen::enter(" loading the voice model…");
+    let speech = crate::speak::start(&md, model_dir, voices)?;
+    let result = play(paths, screen, Track::Speech(speech.clone()), Vec::new());
+    speech.stop();
+    result
+}
+
+fn play(paths: &RecordPaths, mut screen: Screen, track: Track, mut cues: Vec<Cue>) -> Result<()> {
+    let speech = match &track {
+        Track::Speech(s) => Some(s.clone()),
+        Track::Recording(_) => None,
+    };
+    let mut blocks = sentences(&cues);
+    let mut starts = word_starts(&cues);
+    let mut line_starts: Vec<u64> = cues.iter().map(|c| c.start_ms).collect();
     let mut search = Search::default();
     // Speaker renames: name in the file as opened → name now.
     let mut renamed: HashMap<String, String> = HashMap::new();
     let mut names_menu: Option<NamesMenu> = None;
     let mut status: Option<(String, Instant)> = None;
-    let file = OpusFile::open(&paths.opus)?;
-    let name = paths
+    let mut name = paths
         .md
         .with_extension("")
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
+    if speech.is_some() {
+        name.push_str(" · read aloud");
+    }
+    let mut speech_error = false;
 
-    let mut screen = Screen::enter(" opening audio…");
-    let mut player = Player::new(&file)?;
+    let mut player = Player::new(track)?;
     let mut last_draw = Instant::now() - FRAME;
     loop {
+        if let Some(s) = &speech {
+            let new = s.cues_from(cues.len());
+            if !new.is_empty() {
+                cues.extend(new);
+                blocks = sentences(&cues);
+                starts = word_starts(&cues);
+                line_starts = cues.iter().map(|c| c.start_ms).collect();
+            }
+            s.set_playhead(player.position_ms());
+            if let Some(e) = s.error().filter(|_| !speech_error) {
+                speech_error = true;
+                status = Some((format!("speech stopped: {e}"), Instant::now()));
+            }
+        }
         player.fill()?;
         if player.ended() && !player.paused {
             player.set_paused(true);
@@ -307,6 +409,10 @@ pub fn run(paths: &RecordPaths) -> Result<()> {
                     player: &player,
                     search: &search,
                     renamed: &renamed,
+                    speaking: speech
+                        .as_ref()
+                        .filter(|s| !s.done())
+                        .map(|s| (cues.len(), s.total)),
                     status: status
                         .as_ref()
                         .filter(|(_, at)| at.elapsed() < STATUS_TTL)
@@ -332,6 +438,7 @@ pub fn run(paths: &RecordPaths) -> Result<()> {
             continue;
         }
         let pos = player.position_ms();
+        let words: Vec<&KWord> = cues.iter().flat_map(|c| c.words.iter()).collect();
         if let Some(menu) = names_menu.as_mut() {
             let rows = speaker_rows(&cues, &renamed);
             menu.selected = menu.selected.min(rows.len().saturating_sub(1));
@@ -651,6 +758,8 @@ struct View<'a, 'b> {
     player: &'a Player<'b>,
     search: &'a Search,
     renamed: &'a HashMap<String, String>,
+    /// Reading aloud: sentences spoken so far, of how many.
+    speaking: Option<(usize, usize)>,
     status: Option<&'a str>,
 }
 
@@ -789,6 +898,7 @@ fn draw(f: &mut Frame, name: &str, view: &View, pos: u64) {
         player,
         search,
         renamed,
+        speaking,
         status,
     } = *view;
     let shown = |s: &str| renamed.get(s).cloned().unwrap_or_else(|| s.to_string());
@@ -849,6 +959,8 @@ fn draw(f: &mut Frame, name: &str, view: &View, pos: u64) {
 
     let state = if player.ended() {
         Span::styled(" END ", Style::new().black().on_dark_gray())
+    } else if player.waiting() && !player.paused {
+        Span::styled(" … VOICING ", Style::new().black().on_cyan())
     } else if player.paused {
         Span::styled(" ❚❚ PAUSED ", Style::new().black().on_yellow())
     } else {
@@ -865,7 +977,12 @@ fn draw(f: &mut Frame, name: &str, view: &View, pos: u64) {
         Span::styled(format!(" {x}x "), style)
     };
     let len = player.len_ms().max(1);
-    let label = format!(" {} / {} ", clock(pos), clock(len));
+    let label = match speaking {
+        Some((done, total)) => {
+            format!(" {} / {}+ ({done}/{total} voiced) ", clock(pos), clock(len))
+        }
+        None => format!(" {} / {} ", clock(pos), clock(len)),
+    };
     let room =
         (bar.width as usize).saturating_sub(state.width() + speed.width() + label.width() + 1);
     let filled = (room as u64 * pos.min(len) / len) as usize;

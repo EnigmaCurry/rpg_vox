@@ -22,6 +22,7 @@ scribe [OPTIONS] [COMMAND]
 | `devices`         | List input devices for the native audio backend.                                                     |
 | `apps`            | List apps whose audio `--app` can capture; ones playing now are marked `*`.                          |
 | `download-models` | Download the Zipformer model and the `--model` recognizer, plus the speaker models with `--diarize`. |
+| `chat-echo NAME`  | A stand-in `--chat` responder: reads back whatever is said in `NAME.db` (`.db` optional), a sentence at a time, then after a pause asks for more. |
 | `stop-once`       | Finish the running `--once` recorder, as if Enter were pressed. Exits 1 if none is running.          |
 | `help`            | Print help, or the help of a subcommand.                                                             |
 
@@ -41,7 +42,9 @@ scribe [OPTIONS] [COMMAND]
 |---------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `-o, --output NAME` | Write the transcript to `NAME.md` (`.md` is added if missing). Without `-o` or `-r` nothing is saved to disk (but `s` in the TUI can start a file).               |
 | `-r, --record NAME` | Record a session: `NAME.md`, `NAME.srt`, `NAME.ass` and `NAME.opus`. See [output files](SCRIBE.md#output-files). Conflicts with `-o`, `--append`.                          |
-| `-p, --play NAME`   | Play a recording made with `-r`: the audio with the subtitles shown word by word. Conflicts with every input and output option, `--once` and `--no-tui`.          |
+| `-p, --play NAME`   | Play a recording made with `-r`: the audio with the subtitles shown word by word. With no `NAME.opus`, reads `NAME.md` aloud instead (see [reading a transcript aloud](SCRIBE.md#reading-a-transcript-aloud)). Conflicts with every input and output option, `--once` and `--no-tui`. |
+| `--voices LIST`     | With `--play` reading `NAME.md` aloud: Kokoro voices for the speakers in order of appearance, e.g. `am_adam,bf_emma`. Unlisted speakers get af_heart, am_michael, bf_emma, bm_george, af_bella, am_fenrir, bf_isabella, bm_lewis in turn. |
+| `--chat NAME`       | Talk with a responder through `NAME.db` (`.db` is added if missing). See [chat](SCRIBE.md#chat-with-a-responder). Conflicts with `-o`, `-r`, `-p`, `-i`, `--once`, `--no-tui`. |
 | `--append`          | Add to an existing `-o` file, after a `---` rule and a new date line. The TUI shows the file's earlier content in grey. Without it, an existing file is an error. |
 | `--title TEXT`      | Heading for the markdown file.                                                                                                                                    |
 | `--no-tui`          | Print finished paragraphs to stdout instead of the full-screen UI. Always the case with `--input` (unless `--live`), which shows brief progress on stderr.        |
@@ -170,6 +173,16 @@ stdin (`enter`) finishes and `ctrl+c` cancels.
 
 The speaker list works as in the recording TUI, except that renames are
 written to the files immediately.
+
+### `--chat`
+
+| Key            | Action                                                                                                       |
+|----------------|--------------------------------------------------------------------------------------------------------------|
+| `enter`        | Send what you've said (once its last pass is done).                                                          |
+| `backspace`    | Discard what you've said since the last send.                                                                |
+| `space`        | During the reply: hold it and open the mic; talk to cut it off, or `space` again to hear the rest. Between turns: pause the mic. |
+| `pgup` / `pgdn` / `end` | Scroll.                                                                                             |
+| `q` / `esc` / `ctrl+c`  | Quit.                                                                                               |
 
 ### Headless (`--no-tui`, `--input`)
 

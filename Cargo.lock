@@ -6386,6 +6386,7 @@ dependencies = [
  "ctrlc",
  "libc",
  "ratatui",
+ "rusqlite",
  "signal-hook",
  "tracing",
  "tracing-subscriber",
