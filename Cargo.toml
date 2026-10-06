@@ -6,6 +6,8 @@ members = [
     "crates/vox_transcribe",
     "crates/vox_audio",
     "crates/vox_scribe",
+    "crates/vox_chat",
+    "crates/vox_agent",
 ]
 
 [workspace.package]

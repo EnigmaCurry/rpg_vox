@@ -28,8 +28,8 @@ release:
 dist VERSION=`git describe --tags --always --dirty`:
     #!/usr/bin/env bash
     set -euo pipefail
-    bins=(scribe)
-    pkgs=(-p vox_scribe)
+    bins=(scribe agent)
+    pkgs=(-p vox_scribe -p vox_agent)
     if [ "$(uname)" = Linux ]; then
       bins+=(rpg_vox)
       pkgs+=(-p rpg_vox)
@@ -49,6 +49,7 @@ dist VERSION=`git describe --tags --always --dirty`:
       cp "target/release/$bin" LICENSE.txt README.md "$stage/"
       case "$bin" in
         scribe) cp SCRIBE.md SCRIBE_REFERENCE.md "$stage/" ;;
+        agent) cp AGENT.md "$stage/" ;;
         rpg_vox) cp RPG_VOX.md "$stage/" ;;
       esac
       tar -czf "dist/$name.tar.gz" -C "$(dirname "$stage")" "$name"
@@ -375,3 +376,20 @@ list-sinks:
 # Clean build artifacts.
 clean:
     cargo clean
+
+# --- vox_agent (LLM responder for scribe --chat) ---
+
+# Run agent on a scribe --chat conversation, e.g. `just agent talk`.
+agent *ARGS:
+    cargo run -p vox_agent --release -- {{ARGS}}
+
+# Build agent and install it to BIN.
+install-agent BIN="~/.local/bin":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build -p vox_agent --release
+    bin="{{BIN}}"
+    bin="${bin/#\~/$HOME}"
+    mkdir -p "$bin"
+    install -m 755 target/release/agent "$bin/agent"
+    echo "installed $bin/agent"

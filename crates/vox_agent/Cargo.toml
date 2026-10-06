@@ -1,0 +1,21 @@
+[package]
+name = "vox_agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Answers a scribe --chat conversation with an OpenAI-compatible LLM"
+
+[[bin]]
+name = "agent"
+path = "src/main.rs"
+
+[dependencies]
+vox_chat = { path = "../vox_chat" }
+anyhow.workspace = true
+clap = { workspace = true, features = ["env"] }
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+# Same blocking HTTP client as scribe's pass 4; the reply is streamed
+# (server-sent events) and read line by line.
+ureq = { version = "2", features = ["json"] }

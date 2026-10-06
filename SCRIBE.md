@@ -248,7 +248,8 @@ before sending it: `enter` puts the edit back as the unsent text (press
 same format as a transcript, so `scribe -p NAME` reads it back with a
 voice for each side.
 
-Try it with the stand-in responder in another terminal:
+For a real conversation, run [`agent`](AGENT.md) as the responder. To
+try the plumbing first, use the stand-in responder in another terminal:
 
 ```sh
 scribe chat-echo talk     # reads back what you say, then asks for more

@@ -1,0 +1,12 @@
+[package]
+name = "vox_chat"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The SQLite conversation log shared by scribe --chat and agent"
+
+[dependencies]
+anyhow.workspace = true
+# Same version and bundled sqlite as rpg_vox and discord_vox (one
+# libsqlite3-sys per build).
+rusqlite = { version = "0.31", features = ["bundled"] }

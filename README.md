@@ -5,7 +5,7 @@
 A collection of voice tools for tabletop RPGs played over a video
 call, as well as for general transcription tasks, built on PipeWire
 and local speech models. This repository holds two separate apps built
-with the same core:
+with the same core, plus an LLM responder for scribe's chat mode:
 
 > [!NOTE]
 > These tools are produced with the assistance of Claude Code and other AI tools. 
@@ -24,6 +24,19 @@ scribe -o notes
 ```
 
 [Read more →](SCRIBE.md)
+
+## [agent](AGENT.md)
+
+The other side of `scribe --chat`: answers what you say with any
+OpenAI-compatible LLM, streaming each reply back a sentence at a time
+for scribe to read aloud. You can talk over it to cut it off.
+
+```bash
+just install-agent
+agent talk & scribe --chat talk
+```
+
+[Read more →](AGENT.md)
 
 ## [rpg_vox](RPG_VOX.md)
 

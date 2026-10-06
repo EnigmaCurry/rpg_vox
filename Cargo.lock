@@ -6353,6 +6353,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
+name = "vox_agent"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber",
+ "ureq",
+ "vox_chat",
+]
+
+[[package]]
 name = "vox_audio"
 version = "0.1.0"
 dependencies = [
@@ -6376,6 +6389,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "vox_chat"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rusqlite",
+]
+
+[[package]]
 name = "vox_scribe"
 version = "0.1.0"
 dependencies = [
@@ -6386,12 +6407,12 @@ dependencies = [
  "ctrlc",
  "libc",
  "ratatui",
- "rusqlite",
  "signal-hook",
  "tracing",
  "tracing-subscriber",
  "unicode-width 0.2.2",
  "vox_audio",
+ "vox_chat",
  "vox_transcribe",
 ]
 
