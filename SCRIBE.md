@@ -1,7 +1,6 @@
 # scribe
 
-![rpg_vox](whos_on_first.png)
-*Transcribing Abbott and Costello's Who's on First?*
+*Transcription of Abbott and Costello's Who's on First?*
 
 Live transcription in your terminal, using speech models that run on your
 own machine. Words appear as they are spoken, then get quietly corrected
