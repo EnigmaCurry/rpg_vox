@@ -4,10 +4,10 @@
 //! doesn't hear the reply) until the reply has been read aloud and the
 //! responder says it has no more. Space holds the reply and opens the
 //! mic: start talking and the reply is cut off, or press space again to
-//! hear the rest.
+//! hear it again from the start.
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
@@ -21,7 +21,7 @@ use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 use vox_transcribe::{Change, Event, Stage, Transcript};
 
-use crate::chatdb::{Db, Kind, Role};
+use crate::chatdb::{Db, Kind, Role, Row};
 use crate::tui::{normalize_key, Screen};
 use crate::voice::Voice;
 use crate::Session;
@@ -59,14 +59,114 @@ struct Chat<'a> {
     done: HashSet<String>,
     /// Paragraphs sent with Enter, waiting for their last pass.
     sending: Vec<String>,
+    /// The reply word last heard: (user message it answers, word index).
+    heard: Option<(i64, usize)>,
     /// Space during the responder's turn: reply paused, mic open.
     held: bool,
+    /// ↑/↓: the reply highlighted in the scrollback (index into `turns`).
+    selected: Option<usize>,
+    /// An earlier reply being played again with enter (its `reply_to`).
+    playing: Option<i64>,
     /// When the mic was last wanted open, for [`TAIL`].
     open_since: Option<Instant>,
     rms: f32,
     speaking: bool,
     scroll_back: u16,
     status: Option<(String, Instant)>,
+    db_path: PathBuf,
+    /// `e`: the file name being typed, and whether enter has already
+    /// been pressed once on an existing file (a second press replaces it).
+    export: Option<(String, bool)>,
+    /// Typed or edited text (`i`) waiting to be sent, ahead of anything
+    /// transcribed since.
+    draft: Option<String>,
+    /// The `i` editor, while open.
+    editor: Option<Editor>,
+}
+
+/// `i`: a text box over the chat for typing or fixing the unsent text.
+struct Editor {
+    text: Vec<char>,
+    /// Char index the next character goes in at.
+    cursor: usize,
+    /// The transcribed paragraphs it was opened with; applying the edit
+    /// replaces them.
+    ids: Vec<String>,
+}
+
+impl Editor {
+    /// A key; `Some(true)` applies the edit, `Some(false)` drops it.
+    fn key(&mut self, code: KeyCode, ctrl: bool) -> Option<bool> {
+        match code {
+            KeyCode::Esc => return Some(false),
+            KeyCode::Char('q') if ctrl => return Some(false),
+            KeyCode::Char('c') if ctrl => return Some(false),
+            KeyCode::Enter => return Some(true),
+            KeyCode::Char('a') if ctrl => self.cursor = 0,
+            KeyCode::Char('e') if ctrl => self.cursor = self.text.len(),
+            KeyCode::Char('u') if ctrl => {
+                self.text.drain(..self.cursor);
+                self.cursor = 0;
+            }
+            KeyCode::Char(_) if ctrl => {}
+            KeyCode::Char(c) => {
+                self.text.insert(self.cursor, c);
+                self.cursor += 1;
+            }
+            KeyCode::Backspace if self.cursor > 0 => {
+                self.cursor -= 1;
+                self.text.remove(self.cursor);
+            }
+            KeyCode::Delete if self.cursor < self.text.len() => {
+                self.text.remove(self.cursor);
+            }
+            KeyCode::Left => self.cursor = self.cursor.saturating_sub(1),
+            KeyCode::Right => self.cursor = (self.cursor + 1).min(self.text.len()),
+            KeyCode::Home => self.cursor = 0,
+            KeyCode::End => self.cursor = self.text.len(),
+            _ => {}
+        }
+        None
+    }
+
+    fn draw(&self, f: &mut Frame, area: ratatui::layout::Rect) {
+        use ratatui::widgets::{Clear, Wrap};
+        let w = (area.width * 4 / 5).max(30).min(area.width);
+        let h = 10.min(area.height);
+        let rect = ratatui::layout::Rect {
+            x: area.x + (area.width - w) / 2,
+            y: area.y + (area.height - h) / 2,
+            width: w,
+            height: h,
+        };
+        let before: String = self.text[..self.cursor].iter().collect();
+        let at: String = self
+            .text
+            .get(self.cursor)
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| " ".into());
+        let after: String = self
+            .text
+            .get(self.cursor + 1..)
+            .unwrap_or(&[])
+            .iter()
+            .collect();
+        let line = Line::from(vec![
+            Span::raw(before),
+            Span::styled(at, Style::new().add_modifier(Modifier::REVERSED)),
+            Span::raw(after),
+        ]);
+        f.render_widget(Clear, rect);
+        f.render_widget(
+            Paragraph::new(line).wrap(Wrap { trim: false }).block(
+                Block::bordered().title(" Message ").title_bottom(
+                    Line::from(" enter apply (enter again sends) · esc / ctrl+q discard edit ")
+                        .dark_gray(),
+                ),
+            ),
+            rect,
+        );
+    }
 }
 
 pub fn run(mut screen: Screen, session: Session, db_path: &Path, voice: Voice) -> Result<()> {
@@ -83,12 +183,19 @@ pub fn run(mut screen: Screen, session: Session, db_path: &Path, voice: Voice) -
         more: false,
         done: HashSet::new(),
         sending: Vec::new(),
+        heard: None,
         held: false,
+        selected: None,
+        playing: None,
         open_since: Some(Instant::now()),
         rms: 0.0,
         speaking: false,
         scroll_back: 0,
         status: None,
+        db_path: db_path.to_path_buf(),
+        export: None,
+        draft: None,
+        editor: None,
     };
     let res = chat.run_loop(&mut screen, db_path);
     chat.voice.stop();
@@ -182,15 +289,66 @@ impl Chat<'_> {
                 continue;
             }
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            if let Some(ed) = self.editor.as_mut() {
+                match ed.key(key.code, ctrl) {
+                    Some(true) => self.apply_edit(),
+                    Some(false) => self.editor = None,
+                    None => {}
+                }
+                continue;
+            }
+            if let Some((name, confirm)) = self.export.as_mut() {
+                match key.code {
+                    KeyCode::Char('c') if ctrl => return Ok(()),
+                    KeyCode::Esc => self.export = None,
+                    KeyCode::Enter => self.export_to(),
+                    KeyCode::Backspace => {
+                        name.pop();
+                        *confirm = false;
+                    }
+                    KeyCode::Char(c) => {
+                        name.push(c);
+                        *confirm = false;
+                    }
+                    _ => {}
+                }
+                continue;
+            }
             match key.code {
+                KeyCode::Char('i') => self.open_editor(),
+                KeyCode::Char('e') => {
+                    let name = self.db_path.with_extension("md");
+                    self.export = Some((name.display().to_string(), false));
+                }
+                // Out of the scrollback first; quit only from the bottom.
+                KeyCode::Char('q') | KeyCode::Esc
+                    if self.selected.is_some() || self.scroll_back > 0 =>
+                {
+                    self.selected = None;
+                    self.scroll_back = 0;
+                }
                 KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                 KeyCode::Char('c') if ctrl => return Ok(()),
-                KeyCode::Enter => self.send(),
+                KeyCode::Enter => match self.selected {
+                    Some(i) => self.play_turn(i),
+                    None => self.send(),
+                },
                 KeyCode::Backspace => self.discard(),
                 KeyCode::Char(' ') => self.space(),
-                KeyCode::PageUp => self.scroll_back = self.scroll_back.saturating_add(10),
-                KeyCode::PageDown => self.scroll_back = self.scroll_back.saturating_sub(10),
-                KeyCode::End => self.scroll_back = 0,
+                KeyCode::Up => self.select(-1),
+                KeyCode::Down => self.select(1),
+                KeyCode::PageUp => {
+                    self.selected = None;
+                    self.scroll_back = self.scroll_back.saturating_add(10);
+                }
+                KeyCode::PageDown => {
+                    self.selected = None;
+                    self.scroll_back = self.scroll_back.saturating_sub(10);
+                }
+                KeyCode::End => {
+                    self.selected = None;
+                    self.scroll_back = 0;
+                }
                 _ => {}
             }
         }
@@ -226,16 +384,49 @@ impl Chat<'_> {
             .collect()
     }
 
+    /// The unsent text: the draft, then what was transcribed after it.
     fn input_text(&self) -> String {
         let ids = self.input_ids();
-        self.transcript
-            .paragraphs
+        self.draft
             .iter()
-            .filter(|p| ids.contains(&p.id))
-            .flat_map(|p| p.clips.iter().map(|c| c.text.trim()))
+            .map(|d| d.trim())
+            .chain(
+                self.transcript
+                    .paragraphs
+                    .iter()
+                    .filter(|p| ids.contains(&p.id))
+                    .flat_map(|p| p.clips.iter().map(|c| c.text.trim())),
+            )
             .filter(|t| !t.is_empty())
             .collect::<Vec<_>>()
             .join(" ")
+    }
+
+    /// `i`: edit the unsent text in a box. The mic is muted until it
+    /// closes; speech still being decoded lands after the edit.
+    fn open_editor(&mut self) {
+        let ids = self.input_ids();
+        let text: Vec<char> = self.input_text().chars().collect();
+        if !ids.is_empty() {
+            self.s.engine.break_paragraph();
+        }
+        self.editor = Some(Editor {
+            cursor: text.len(),
+            text,
+            ids,
+        });
+    }
+
+    /// Enter in the editor: its text replaces the unsent text it was
+    /// opened with. Enter again sends it.
+    fn apply_edit(&mut self) {
+        let Some(ed) = self.editor.take() else {
+            return;
+        };
+        self.done.extend(ed.ids);
+        let text: String = ed.text.iter().collect();
+        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        self.draft = (!text.is_empty()).then_some(text);
     }
 
     /// Enter: send what has been said once its last pass is done.
@@ -245,7 +436,10 @@ impl Chat<'_> {
         }
         let ids = self.input_ids();
         if ids.is_empty() {
-            self.set_status("nothing to send yet");
+            match self.draft.take() {
+                Some(text) => self.deliver(text),
+                None => self.set_status("nothing to send yet"),
+            }
             return;
         }
         self.s.engine.break_paragraph();
@@ -267,9 +461,11 @@ impl Chat<'_> {
         if !ps.iter().all(|p| p.hardened) {
             return;
         }
-        let text = ps
-            .iter()
-            .map(|p| p.text.trim())
+        let text = self
+            .draft
+            .take()
+            .into_iter()
+            .chain(ps.iter().map(|p| p.text.trim().to_string()))
             .filter(|t| !t.is_empty())
             .collect::<Vec<_>>()
             .join(" ");
@@ -278,6 +474,11 @@ impl Chat<'_> {
             self.set_status("nothing was heard; not sent");
             return;
         }
+        self.deliver(text);
+    }
+
+    /// Write `text` as the user's message and wait for the reply.
+    fn deliver(&mut self, text: String) {
         self.cut_reply();
         match self.db.say(&text) {
             Ok(id) => {
@@ -299,25 +500,87 @@ impl Chat<'_> {
     /// Backspace: drop what has been said since the last send.
     fn discard(&mut self) {
         let ids = self.input_ids();
-        if ids.is_empty() {
+        if ids.is_empty() && self.draft.take().is_none() {
             return;
         }
-        self.s.engine.break_paragraph();
+        self.draft = None;
+        if !ids.is_empty() {
+            self.s.engine.break_paragraph();
+        }
         self.done.extend(ids);
         self.set_status("discarded");
     }
 
-    /// Space: hold or resume the reply; between turns, pause the mic.
+    /// Space: hold the reply, or play it again from the start; between
+    /// turns, pause the mic.
     fn space(&mut self) {
-        if self.awaiting.is_some() {
+        if let Some(id) = self.awaiting {
             self.held = !self.held;
-            self.voice.set_paused(self.held);
             if self.held {
-                self.set_status("reply held: talk to interrupt, space to resume");
+                self.voice.set_paused(true);
+                self.set_status("reply held: talk to interrupt, space to hear it again");
+            } else {
+                self.replay(id);
             }
+        } else if self.playing.take().is_some() {
+            self.voice.stop();
         } else {
             let was = self.s.paused.fetch_xor(true, Ordering::SeqCst);
             self.set_status(if was { "mic on" } else { "mic paused" });
+        }
+    }
+
+    /// ↑ (`dir` -1) / ↓ (1): highlight the previous / next reply. ↓ past
+    /// the last one goes back to the bottom.
+    fn select(&mut self, dir: isize) {
+        let replies: Vec<usize> = self
+            .turns
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.role == Role::Assistant && !t.text.trim().is_empty())
+            .map(|(i, _)| i)
+            .collect();
+        self.scroll_back = 0;
+        self.selected = match (self.selected, dir < 0) {
+            (None, true) => replies.last().copied(),
+            (None, false) => None,
+            (Some(cur), true) => replies
+                .iter()
+                .rev()
+                .find(|&&i| i < cur)
+                .or(replies.first())
+                .copied(),
+            (Some(cur), false) => replies.iter().find(|&&i| i > cur).copied(),
+        };
+    }
+
+    /// Enter on a highlighted reply: play it again.
+    fn play_turn(&mut self, i: usize) {
+        if self.awaiting.is_some() {
+            self.set_status("wait for this reply to finish (or space, then talk)");
+            return;
+        }
+        let Some(t) = self.turns.get(i) else { return };
+        let Some(key) = t.reply_to else { return };
+        let text = t.text.clone();
+        self.voice.stop();
+        self.heard = None;
+        self.playing = Some(key);
+        self.voice.say(key, &text);
+    }
+
+    /// Speak the reply to `id`, as much as has arrived, from the top.
+    /// Rows still to come are spoken after it as usual.
+    fn replay(&mut self, id: i64) {
+        self.voice.stop();
+        self.heard = None;
+        if let Some(t) = self
+            .turns
+            .iter()
+            .rev()
+            .find(|t| t.role == Role::Assistant && t.reply_to == Some(id))
+        {
+            self.voice.say(id, &t.text);
         }
     }
 
@@ -356,16 +619,26 @@ impl Chat<'_> {
                 continue;
             }
             push_reply(&mut self.turns, r.reply_to, &r.text);
-            self.voice.say(&r.text);
+            if let Some(key) = r.reply_to {
+                self.voice.say(key, &r.text);
+            }
             self.more = r.more;
             self.scroll_back = 0;
+        }
+        if let Some(h) = self.voice.heard() {
+            self.heard = Some(h);
         }
         if self.awaiting.is_some() && !self.more && !self.voice.busy() {
             self.awaiting = None;
             self.held = false;
         }
-        // Half duplex: muted for the responder's whole turn unless held.
-        let open = self.awaiting.is_none() || self.held;
+        if self.playing.is_some() && !self.voice.busy() {
+            self.playing = None;
+        }
+        // Half duplex: muted for the responder's whole turn unless held,
+        // while an earlier reply is played again, and while typing.
+        let open = self.editor.is_none()
+            && (self.held || (self.awaiting.is_none() && self.playing.is_none()));
         if !open {
             self.open_since = None;
         } else if self.open_since.is_none() {
@@ -374,6 +647,40 @@ impl Chat<'_> {
         let muted = self.open_since.is_none_or(|t| t.elapsed() < TAIL);
         self.s.muted.store(muted, Ordering::SeqCst);
         Ok(())
+    }
+
+    /// Write the whole chat, from the database, to the typed file.
+    fn export_to(&mut self) {
+        let Some((name, confirmed)) = self.export.clone() else {
+            return;
+        };
+        let name = name.trim();
+        if name.is_empty() {
+            self.export = None;
+            return;
+        }
+        let path = PathBuf::from(name);
+        if path.exists() && !confirmed {
+            self.export = Some((name.to_string(), true));
+            self.set_status(format!("{name} exists: enter again to replace it"));
+            return;
+        }
+        let title = self
+            .db_path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let result = self
+            .db
+            .since(0)
+            .and_then(|rows| Ok(std::fs::write(&path, render(&title, &rows))?));
+        match result {
+            Ok(()) => {
+                self.export = None;
+                self.set_status(format!("exported to {name}"));
+            }
+            Err(e) => self.set_status(format!("export failed: {e:#}")),
+        }
     }
 
     fn set_status(&mut self, msg: impl Into<String>) {
@@ -412,28 +719,23 @@ impl Chat<'_> {
 
         let width = (body.width.saturating_sub(2) as usize).max(GUTTER + 10);
         let mut lines: Vec<Line<'static>> = Vec::new();
-        for t in &self.turns {
+        // The highlighted reply's [start, end) lines.
+        let mut range = None;
+        for (i, t) in self.turns.iter().enumerate() {
             let (label, color) = match t.role {
                 Role::User => ("You", YOU),
                 Role::Assistant => ("Reply", THEM),
             };
-            let mut text = t.text.clone();
-            if t.cut {
-                text.push_str(" —");
-            }
-            let style = if t.cut {
-                Style::new().add_modifier(Modifier::DIM)
+            let label_style = if self.selected == Some(i) {
+                Style::new().black().bg(color).bold()
             } else {
-                Style::new()
+                Style::new().fg(color).bold()
             };
-            wrap(
-                label,
-                Style::new().fg(color).bold(),
-                &text,
-                style,
-                width,
-                &mut lines,
-            );
+            let start = lines.len();
+            wrap_words(label, label_style, self.turn_words(t), width, &mut lines);
+            if self.selected == Some(i) {
+                range = Some((start, lines.len()));
+            }
             lines.push(Line::default());
         }
         if !self.sending.is_empty() {
@@ -458,16 +760,32 @@ impl Chat<'_> {
         let input = self.input_line(width);
         lines.extend(input);
         let visible = body.height.saturating_sub(2) as usize;
-        let top = lines
+        let mut top = lines
             .len()
             .saturating_sub(visible)
             .saturating_sub(self.scroll_back as usize);
+        // Keep the highlighted reply on screen.
+        if let Some((start, end)) = range {
+            if start < top {
+                top = start;
+            } else if end > top + visible {
+                top = end.saturating_sub(visible).min(start);
+            }
+        }
+        let title = if self.selected.is_some() || self.scroll_back > 0 {
+            " Chat (esc back to the bottom) "
+        } else {
+            " Chat "
+        };
         f.render_widget(
             Paragraph::new(Text::from(lines))
-                .block(Block::bordered().title(" Chat "))
+                .block(Block::bordered().title(title))
                 .scroll((top as u16, 0)),
             body,
         );
+        if let Some(ed) = &self.editor {
+            ed.draw(f, body);
+        }
 
         let [meter_line, help_line] =
             Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(footer);
@@ -480,7 +798,9 @@ impl Chat<'_> {
         let muted = self.s.muted.load(Ordering::Relaxed);
         let mut meter = vec![
             Span::raw(" mic "),
-            if muted {
+            if muted && self.editor.is_some() {
+                "muted while typing ".dark_gray()
+            } else if muted {
                 "muted: their turn ".dark_gray()
             } else {
                 Span::styled(
@@ -497,20 +817,83 @@ impl Chat<'_> {
             meter.push(format!("  {msg}").yellow());
         }
         f.render_widget(Line::from(meter), meter_line);
-        let keys = if self.held {
-            " talk to interrupt · space resume the reply · q quit"
+        if let Some((name, _)) = &self.export {
+            f.render_widget(
+                Line::from(vec![
+                    " export to: ".yellow(),
+                    Span::raw(name.clone()),
+                    Span::styled("▌", Style::new().magenta()),
+                    "   enter save · esc cancel".dark_gray(),
+                ]),
+                help_line,
+            );
+            return;
+        }
+        let keys = if self.selected.is_some() {
+            " ↑↓ replies · enter play it again · space stop · esc back to the bottom"
+        } else if self.scroll_back > 0 {
+            " pgup/pgdn scroll · ↑↓ replies · esc back to the bottom"
+        } else if self.playing.is_some() {
+            " space stop · ↑↓ replies · q quit"
+        } else if self.held {
+            " talk to interrupt · space hear it again · q quit"
         } else if self.awaiting.is_some() {
             " space hold the reply (then talk to interrupt) · q quit"
         } else {
-            " enter send · backspace discard · space pause mic · pgup/pgdn scroll · q quit"
+            " enter send · backspace discard · space pause mic · ↑↓ replies · i type/edit · e export · q quit"
         };
         f.render_widget(Line::from(keys.dark_gray()), help_line);
+    }
+
+    /// A turn's words, styled. The reply being spoken lights up like
+    /// `--play`: heard words plain, the current one yellow, the rest dim.
+    fn turn_words(&self, t: &Turn) -> Vec<(String, Style)> {
+        let base = if t.cut {
+            Style::new().add_modifier(Modifier::DIM)
+        } else {
+            Style::new()
+        };
+        let live = t.role == Role::Assistant
+            && !t.cut
+            && t.reply_to.is_some()
+            && (t.reply_to == self.awaiting || t.reply_to == self.playing);
+        let at = match self.heard {
+            Some((key, i)) if Some(key) == t.reply_to => Some(i),
+            _ => None,
+        };
+        let sounding = self.voice.heard().is_some();
+        let mut words: Vec<(String, Style)> = t
+            .text
+            .split_whitespace()
+            .enumerate()
+            .map(|(i, w)| {
+                let style = match (live, at) {
+                    (false, _) => base,
+                    (true, Some(a)) if i < a => base,
+                    (true, Some(a)) if i == a && sounding => {
+                        Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                    }
+                    (true, Some(a)) if i == a => base,
+                    (true, _) => Style::new().fg(Color::DarkGray),
+                };
+                (w.to_string(), style)
+            })
+            .collect();
+        if t.cut {
+            words.push(("—".into(), base));
+        }
+        words
     }
 
     /// What is being said now, with a cursor.
     fn input_line(&self, width: usize) -> Vec<Line<'static>> {
         let ids = self.input_ids();
-        let mut words: Vec<(String, Style)> = Vec::new();
+        let mut words: Vec<(String, Style)> = self
+            .draft
+            .iter()
+            .flat_map(|d| d.split_whitespace())
+            .map(|w| (w.to_string(), Style::new()))
+            .collect();
         for p in self
             .transcript
             .paragraphs
@@ -537,6 +920,64 @@ impl Chat<'_> {
         );
         out
     }
+}
+
+/// The chat as scribe markdown, `**[hh:mm:ss] You:** …` per turn (times
+/// from the first message), so `scribe -p` can read it back in two
+/// voices. A reply that was cut off ends in a dash.
+fn render(title: &str, rows: &[Row]) -> String {
+    let parse = |at: &str| chrono::NaiveDateTime::parse_from_str(at, "%Y-%m-%dT%H:%M:%S%.fZ").ok();
+    let start = rows.first().and_then(|r| parse(&r.at));
+    let subtitle = match start {
+        Some(t) => format!("Chat · {} UTC", t.format("%Y-%m-%d %H:%M")),
+        None => "Chat".into(),
+    };
+    let mut out = crate::markdown::header(title, &subtitle);
+    // (role, reply_to, start ms, text, cut)
+    let mut turns: Vec<(Role, Option<i64>, u64, String, bool)> = Vec::new();
+    for r in rows {
+        let ms = match (start, parse(&r.at)) {
+            (Some(s), Some(t)) => (t - s).num_milliseconds().max(0) as u64,
+            _ => 0,
+        };
+        let text = r.text.trim();
+        match (r.role, r.kind) {
+            (Role::User, Kind::Say) => turns.push((Role::User, None, ms, text.into(), false)),
+            (Role::User, Kind::Interrupt) => {
+                if let Some(t) = turns
+                    .iter_mut()
+                    .rev()
+                    .find(|t| t.0 == Role::Assistant && t.1 == r.reply_to)
+                {
+                    t.4 = true;
+                }
+            }
+            (Role::Assistant, _) => match turns.last_mut() {
+                Some(t) if t.0 == Role::Assistant && t.1 == r.reply_to => {
+                    if !text.is_empty() {
+                        t.3 = format!("{} {text}", t.3).trim().to_string();
+                    }
+                }
+                _ => turns.push((Role::Assistant, r.reply_to, ms, text.into(), false)),
+            },
+        }
+    }
+    for (role, _, ms, text, cut) in turns {
+        if text.is_empty() {
+            continue;
+        }
+        let who = match role {
+            Role::User => "You",
+            Role::Assistant => "Reply",
+        };
+        let dash = if cut { " —" } else { "" };
+        let line = format!(
+            "**[{}] {who}:** {text}{dash}",
+            crate::markdown::timestamp(ms)
+        );
+        out.push_str(&format!("\n{}\n", crate::markdown::wrap(&line)));
+    }
+    out
 }
 
 fn wrap(
@@ -588,6 +1029,90 @@ fn wrap_words(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn renders_markdown_scribe_can_play() {
+        let row = |id, role, kind, reply_to, text: &str, at: &str| Row {
+            id,
+            role,
+            kind,
+            reply_to,
+            text: text.into(),
+            more: false,
+            at: at.into(),
+        };
+        let rows = [
+            row(
+                1,
+                Role::User,
+                Kind::Say,
+                None,
+                "Hi there.",
+                "2026-10-06T17:00:00.000Z",
+            ),
+            row(
+                2,
+                Role::Assistant,
+                Kind::Say,
+                Some(1),
+                "Hello.",
+                "2026-10-06T17:00:02.500Z",
+            ),
+            row(
+                3,
+                Role::Assistant,
+                Kind::Say,
+                Some(1),
+                "And more.",
+                "2026-10-06T17:00:03.000Z",
+            ),
+            row(
+                4,
+                Role::User,
+                Kind::Interrupt,
+                Some(1),
+                "",
+                "2026-10-06T17:00:04.000Z",
+            ),
+            row(
+                5,
+                Role::User,
+                Kind::Say,
+                None,
+                "Stop.",
+                "2026-10-06T17:01:05.000Z",
+            ),
+        ];
+        let md = render("talk", &rows);
+        assert!(md.starts_with("# talk\n\n*Chat · 2026-10-06 17:00 UTC*\n"));
+        assert!(md.contains("\n**[00:00:00] You:** Hi there.\n"));
+        assert!(md.contains("\n**[00:00:02] Reply:** Hello. And more. —\n"));
+        assert!(md.contains("\n**[00:01:05] You:** Stop.\n"));
+        let paras = crate::speak::paragraphs(&md);
+        assert_eq!(paras.len(), 3);
+        assert_eq!(paras[1].speaker.as_deref(), Some("Reply"));
+    }
+
+    #[test]
+    fn editor_types_and_moves() {
+        let mut ed = Editor {
+            text: "helo".chars().collect(),
+            cursor: 4,
+            ids: Vec::new(),
+        };
+        ed.key(KeyCode::Left, false);
+        ed.key(KeyCode::Char('l'), false);
+        assert_eq!(ed.text.iter().collect::<String>(), "hello");
+        ed.key(KeyCode::End, false);
+        for c in " q".chars() {
+            assert_eq!(ed.key(KeyCode::Char(c), false), None);
+        }
+        ed.key(KeyCode::Backspace, false);
+        assert_eq!(ed.text.iter().collect::<String>(), "hello ");
+        assert_eq!(ed.key(KeyCode::Char('q'), true), Some(false));
+        assert_eq!(ed.key(KeyCode::Esc, false), Some(false));
+        assert_eq!(ed.key(KeyCode::Enter, false), Some(true));
+    }
 
     #[test]
     fn reply_chunks_join_one_turn() {

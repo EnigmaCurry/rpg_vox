@@ -180,9 +180,13 @@ written to the files immediately.
 |----------------|--------------------------------------------------------------------------------------------------------------|
 | `enter`        | Send what you've said (once its last pass is done).                                                          |
 | `backspace`    | Discard what you've said since the last send.                                                                |
-| `space`        | During the reply: hold it and open the mic; talk to cut it off, or `space` again to hear the rest. Between turns: pause the mic. |
+| `space`        | During the reply: hold it and open the mic; talk to cut it off, or `space` again to hear the reply again from the start. Between turns: pause the mic. |
+| `i`            | Mute the mic and open a box to type a message, or fix the unsent transcribed text. `enter` puts it back as the unsent text (a second `enter` sends it); `esc` / `ctrl+q` closes the box, dropping the edit. |
+| `e`            | Export the whole chat to a markdown file (default `NAME.md`; `enter` saves, `esc` cancels, `enter` twice replaces an existing file). `scribe -p NAME` reads it back in two voices. |
+| `↑` / `↓`      | Highlight the previous / next reply in the scrollback; `↓` past the last one returns to the bottom. |
+| `enter` (reply highlighted) | Play that reply again, its words lit up as they're spoken; `space` stops it.                   |
 | `pgup` / `pgdn` / `end` | Scroll.                                                                                             |
-| `q` / `esc` / `ctrl+c`  | Quit.                                                                                               |
+| `esc` / `q`    | In the scrollback: back to the bottom. At the bottom: quit (also `ctrl+c`).                                  |
 
 ### Headless (`--no-tui`, `--input`)
 

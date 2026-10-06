@@ -233,7 +233,20 @@ reads it aloud with Kokoro as it arrives.
 It's half duplex: from `enter` until the reply has been spoken, the mic
 is muted so scribe doesn't hear itself. `space` holds the reply and
 opens the mic. Start talking and the reply is cut off (and the
-responder is told), or press `space` again to hear the rest.
+responder is told), or press `space` again to hear the reply again
+from the start.
+
+`↑` / `↓` step through the replies in the scrollback, highlighting one;
+`enter` plays it again. `pgup` / `pgdn` scroll. `esc` or `q` returns to
+the bottom, and quits from there.
+
+`i` mutes the mic and opens a box to type a message, or to fix what was transcribed
+before sending it: `enter` puts the edit back as the unsent text (press
+`enter` again to send), `esc` or `ctrl+q` drops the edit.
+
+`e` exports the whole chat to `NAME.md` (or a name you type), in the
+same format as a transcript, so `scribe -p NAME` reads it back with a
+voice for each side.
 
 Try it with the stand-in responder in another terminal:
 

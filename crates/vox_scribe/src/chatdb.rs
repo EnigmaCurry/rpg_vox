@@ -59,6 +59,8 @@ pub struct Row {
     pub reply_to: Option<i64>,
     pub text: String,
     pub more: bool,
+    /// When it was written, UTC: `2026-10-06T17:09:24.123Z`.
+    pub at: String,
 }
 
 /// `NAME.db`, unless NAME already ends in `.db`.
@@ -130,7 +132,7 @@ impl Db {
     /// Rows after `id`, oldest first.
     pub fn since(&self, id: i64) -> Result<Vec<Row>> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT id, role, kind, reply_to, text, more FROM messages WHERE id > ?1 ORDER BY id",
+            "SELECT id, role, kind, reply_to, text, more, at FROM messages WHERE id > ?1 ORDER BY id",
         )?;
         let rows = stmt
             .query_map([id], |r| {
@@ -149,6 +151,7 @@ impl Db {
                     reply_to: r.get(3)?,
                     text: r.get(4)?,
                     more: r.get::<_, i64>(5)? != 0,
+                    at: r.get(6)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;

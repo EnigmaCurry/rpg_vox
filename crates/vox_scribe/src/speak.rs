@@ -79,7 +79,7 @@ pub fn sentences(text: &str) -> Vec<String> {
 
 /// Word timings across `[start, end)` ms, each word's share by length
 /// (plus one for the gap after it).
-fn spread(words: &[&str], start: u64, end: u64) -> Vec<KWord> {
+pub fn spread(words: &[&str], start: u64, end: u64) -> Vec<KWord> {
     let weights: Vec<u64> = words.iter().map(|w| w.chars().count() as u64 + 1).collect();
     let total = weights.iter().sum::<u64>().max(1);
     let span = end.saturating_sub(start);

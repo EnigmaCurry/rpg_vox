@@ -77,7 +77,7 @@ impl MarkdownWriter {
     }
 }
 
-fn header(title: &str, subtitle: &str) -> String {
+pub fn header(title: &str, subtitle: &str) -> String {
     format!("# {title}\n\n{}\n", wrap(&format!("*{subtitle}*")))
 }
 
@@ -86,7 +86,7 @@ const WIDTH: usize = 79;
 
 /// Word-wrap `text` to [`WIDTH`] columns. A word longer than that gets
 /// a line of its own.
-fn wrap(text: &str) -> String {
+pub fn wrap(text: &str) -> String {
     use unicode_width::UnicodeWidthStr;
     let mut out = String::new();
     let mut col = 0;
