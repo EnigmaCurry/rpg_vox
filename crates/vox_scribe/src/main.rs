@@ -1185,9 +1185,13 @@ fn main() -> Result<()> {
         num_speakers,
         pumps: Mutex::new(pumps),
     };
-    if let (Some(name), Some(screen)) = (&cli.chat, screen.take()) {
-        let voice = chat_voice(&models_dir, &cli.voices)?;
-        return chat::run(screen, session, &chatdb::path_for(name), voice);
+    // Only --chat takes the screen; taking it otherwise would leave the
+    // session headless with the terminal already cleared.
+    if let Some(name) = &cli.chat {
+        if let Some(screen) = screen.take() {
+            let voice = chat_voice(&models_dir, &cli.voices)?;
+            return chat::run(screen, session, &chatdb::path_for(name), voice);
+        }
     }
     let mut outcome = match screen {
         Some(screen) => tui::run(screen, session)?,
