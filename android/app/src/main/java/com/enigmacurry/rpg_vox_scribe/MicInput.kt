@@ -24,7 +24,7 @@ enum class Boost(val label: String, val db: Float?) {
 enum class MicRoute(val label: String) {
     /** A Bluetooth headset's mic when one is connected, else the phone's. */
     AUTO("Bluetooth headset when connected"),
-    PHONE("Phone mic"),
+    PHONE("Phone mic always"),
 }
 
 /**
