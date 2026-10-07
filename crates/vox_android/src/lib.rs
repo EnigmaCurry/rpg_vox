@@ -4,7 +4,7 @@
 //! samples from Kotlin, and hands its events back as JSON.
 //!
 //! Every handle is a `Box` pointer passed to Kotlin as a `long`. The
-//! Kotlin side (`com.enigmacurry.voxscribe.Native`) owns the order of
+//! Kotlin side (`com.enigmacurry.rpg_vox_scribe.Native`) owns the order of
 //! calls: no `push`/`poll` once `finish` has been called, no `start`
 //! after `freeModels`.
 
@@ -193,7 +193,7 @@ unsafe fn __android_log_write(
 
 /// `unpack(archive, destDir, spec)`: blocks until done; throws on failure.
 #[no_mangle]
-pub extern "system" fn Java_com_enigmacurry_voxscribe_Native_unpack(
+pub extern "system" fn Java_com_enigmacurry_rpg_1vox_1scribe_Native_unpack(
     mut env: JNIEnv,
     _class: JClass,
     archive: JString,
@@ -216,7 +216,7 @@ pub extern "system" fn Java_com_enigmacurry_voxscribe_Native_unpack(
 
 /// Compressed bytes the running `unpack` has read so far.
 #[no_mangle]
-pub extern "system" fn Java_com_enigmacurry_voxscribe_Native_unpackProgress(
+pub extern "system" fn Java_com_enigmacurry_rpg_1vox_1scribe_Native_unpackProgress(
     _env: JNIEnv,
     _class: JClass,
 ) -> jlong {
@@ -225,7 +225,7 @@ pub extern "system" fn Java_com_enigmacurry_voxscribe_Native_unpackProgress(
 
 /// `load(modelsDir, threads)`: a models handle, or throws.
 #[no_mangle]
-pub extern "system" fn Java_com_enigmacurry_voxscribe_Native_load(
+pub extern "system" fn Java_com_enigmacurry_rpg_1vox_1scribe_Native_load(
     mut env: JNIEnv,
     _class: JClass,
     dir: JString,
@@ -249,7 +249,7 @@ pub extern "system" fn Java_com_enigmacurry_voxscribe_Native_load(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_enigmacurry_voxscribe_Native_freeModels(
+pub extern "system" fn Java_com_enigmacurry_rpg_1vox_1scribe_Native_freeModels(
     _env: JNIEnv,
     _class: JClass,
     models: jlong,
@@ -261,7 +261,7 @@ pub extern "system" fn Java_com_enigmacurry_voxscribe_Native_freeModels(
 
 /// `start(models, sampleRate)`: a session handle for one recording.
 #[no_mangle]
-pub extern "system" fn Java_com_enigmacurry_voxscribe_Native_start(
+pub extern "system" fn Java_com_enigmacurry_rpg_1vox_1scribe_Native_start(
     _env: JNIEnv,
     _class: JClass,
     models: jlong,
@@ -279,7 +279,7 @@ pub extern "system" fn Java_com_enigmacurry_voxscribe_Native_start(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_enigmacurry_voxscribe_Native_push(
+pub extern "system" fn Java_com_enigmacurry_rpg_1vox_1scribe_Native_push(
     env: JNIEnv,
     _class: JClass,
     session: jlong,
@@ -294,7 +294,7 @@ pub extern "system" fn Java_com_enigmacurry_voxscribe_Native_push(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_enigmacurry_voxscribe_Native_breakParagraph(
+pub extern "system" fn Java_com_enigmacurry_rpg_1vox_1scribe_Native_breakParagraph(
     _env: JNIEnv,
     _class: JClass,
     session: jlong,
@@ -305,7 +305,7 @@ pub extern "system" fn Java_com_enigmacurry_voxscribe_Native_breakParagraph(
 
 /// `poll(session, timeoutMs)`: a JSON array of events, possibly empty.
 #[no_mangle]
-pub extern "system" fn Java_com_enigmacurry_voxscribe_Native_poll(
+pub extern "system" fn Java_com_enigmacurry_rpg_1vox_1scribe_Native_poll(
     mut env: JNIEnv,
     _class: JClass,
     session: jlong,
@@ -322,7 +322,7 @@ pub extern "system" fn Java_com_enigmacurry_voxscribe_Native_poll(
 /// `finish(session)`: drains every pass and returns the final transcript
 /// as JSON (`{"paragraphs": [...]}`). Frees the session.
 #[no_mangle]
-pub extern "system" fn Java_com_enigmacurry_voxscribe_Native_finish(
+pub extern "system" fn Java_com_enigmacurry_rpg_1vox_1scribe_Native_finish(
     mut env: JNIEnv,
     _class: JClass,
     session: jlong,

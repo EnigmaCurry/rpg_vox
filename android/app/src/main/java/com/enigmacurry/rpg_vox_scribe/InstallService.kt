@@ -1,4 +1,4 @@
-package com.enigmacurry.voxscribe
+package com.enigmacurry.rpg_vox_scribe
 
 import android.app.Notification
 import android.app.NotificationChannel
@@ -30,7 +30,7 @@ sealed interface Install {
  */
 class InstallService : Service() {
     companion object {
-        private const val TAG = "VoxScribe"
+        private const val TAG = "Scribe"
         private const val CHANNEL = "install"
         private const val ID = 1
 

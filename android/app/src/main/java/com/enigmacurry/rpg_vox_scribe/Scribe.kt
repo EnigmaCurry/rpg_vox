@@ -1,4 +1,4 @@
-package com.enigmacurry.voxscribe
+package com.enigmacurry.rpg_vox_scribe
 
 import android.annotation.SuppressLint
 import android.content.Context
@@ -25,7 +25,7 @@ import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 
-private const val TAG = "VoxScribe"
+private const val TAG = "Scribe"
 private const val RATE = 16_000
 /** Threads per recognizer (Parakeet and Zipformer each). */
 private const val THREADS = 4

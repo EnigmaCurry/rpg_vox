@@ -4,11 +4,11 @@ plugins {
 }
 
 android {
-    namespace = "com.enigmacurry.voxscribe"
+    namespace = "com.enigmacurry.rpg_vox_scribe"
     compileSdk = 37
 
     defaultConfig {
-        applicationId = "com.enigmacurry.voxscribe"
+        applicationId = "com.enigmacurry.rpg_vox_scribe"
         // AAudio-era devices; matches the CLI build's API level.
         minSdk = 26
         targetSdk = 36

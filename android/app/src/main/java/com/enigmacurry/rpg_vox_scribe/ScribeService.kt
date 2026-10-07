@@ -1,4 +1,4 @@
-package com.enigmacurry.voxscribe
+package com.enigmacurry.rpg_vox_scribe
 
 import android.app.ForegroundServiceStartNotAllowedException
 import android.app.Notification
@@ -25,7 +25,7 @@ import android.util.Log
  */
 class ScribeService : Service() {
     companion object {
-        private const val TAG = "VoxScribe"
+        private const val TAG = "Scribe"
         private const val CHANNEL = "dictation"
         private const val ID = 2
         private const val IDLE_MS = 10 * 60_000L

@@ -1,4 +1,4 @@
-package com.enigmacurry.voxscribe
+package com.enigmacurry.rpg_vox_scribe
 
 /** JNI bridge to crates/vox_android. Handles are opaque pointers. */
 object Native {

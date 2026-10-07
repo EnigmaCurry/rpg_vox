@@ -1,4 +1,4 @@
-package com.enigmacurry.voxscribe
+package com.enigmacurry.rpg_vox_scribe
 
 import android.Manifest
 import android.content.ClipData
@@ -106,7 +106,7 @@ private fun AppTheme(content: @Composable () -> Unit) {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun App() {
-    Scaffold(topBar = { TopAppBar(title = { Text("Vox Scribe") }) }) { pad ->
+    Scaffold(topBar = { TopAppBar(title = { Text("Scribe") }) }) { pad ->
         Box(Modifier.padding(pad).fillMaxSize()) {
             when (val phase = Scribe.phase) {
                 is Phase.NeedModels -> Setup(phase)
@@ -163,7 +163,7 @@ private fun Setup(phase: Phase.NeedModels) {
         Text("Speech models", style = MaterialTheme.typography.headlineSmall)
         Spacer(Modifier.height(12.dp))
         Text(
-            "Vox Scribe transcribes on the phone. It needs two models from the " +
+            "Scribe transcribes on the phone. It needs two models from the " +
                 "sherpa-onnx releases on GitHub: Parakeet TDT 0.6B v2 (English) and a " +
                 "streaming Zipformer for live text. That's a one-time download of about " +
                 "$mb MB, kept in the app's private storage. Wi-Fi recommended.",
@@ -223,15 +223,23 @@ private fun KeepScreenOn() {
 @Composable
 private fun Dictate() {
     val context = LocalContext.current
-    val askMic = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { ok ->
-        if (ok) Scribe.start() else Toast.makeText(context, "Microphone permission is needed", Toast.LENGTH_LONG).show()
+    val ask = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { got ->
+        if (got[Manifest.permission.RECORD_AUDIO] != false) {
+            Scribe.start()
+        } else {
+            Toast.makeText(context, "Microphone permission is needed", Toast.LENGTH_LONG).show()
+        }
     }
     val toggle = {
+        // The notification (with Pause/Stop) needs its own permission on Android 13+.
+        val wanted = listOfNotNull(
+            Manifest.permission.RECORD_AUDIO,
+            if (Build.VERSION.SDK_INT >= 33) Manifest.permission.POST_NOTIFICATIONS else null,
+        ).filter { ContextCompat.checkSelfPermission(context, it) != PackageManager.PERMISSION_GRANTED }
         when {
             Scribe.recording -> Scribe.stop()
-            ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
-                PackageManager.PERMISSION_GRANTED -> Scribe.start()
-            else -> askMic.launch(Manifest.permission.RECORD_AUDIO)
+            wanted.isEmpty() -> Scribe.start()
+            else -> ask.launch(wanted.toTypedArray())
         }
     }
     if (Scribe.recording) KeepScreenOn()
