@@ -96,9 +96,9 @@ scribe [OPTIONS] [COMMAND]
 |-----------------------------------------------|---------------------------------------------------------|
 | `VOX_SCRIBE_MODELS`                           | Same as `--models-dir`.                                 |
 | `VOX_SCRIBE_MODEL`                            | Same as `--model`.                                      |
-| `VOX_SCRIBE_LLM_URL`                          | Pass-4 endpoint, default `https://api.openai.com/v1`.   |
-| `VOX_SCRIBE_LLM_MODEL`                        | Pass-4 model name (required with `--llm`).              |
-| `VOX_SCRIBE_LLM_KEY`, `OPENAI_API_KEY`        | Pass-4 API key, optional for local servers.             |
+| `VOX_SCRIBE_LLM_URL`                          | LLM endpoint for pass 4 and `agent`, default `http://127.0.0.1:9931/v1`. |
+| `VOX_SCRIBE_LLM_MODEL`                        | LLM model name (required with `--llm`, and by `agent`).  |
+| `VOX_SCRIBE_LLM_KEY`, `OPENAI_API_KEY`        | LLM API key, optional for local servers. `OPENAI_API_KEY` is only sent to OpenAI's URL. |
 | `VOX_SCRIBE_LOG`                              | Log filter.                                             |
 | `VOX_SCRIBE_TERMINAL`, `VOX_SCRIBE_FONT_SIZE` | macOS dictation key setup; see [below](#macos--f5-key). |
 
@@ -179,10 +179,14 @@ written to the files immediately.
 | Key            | Action                                                                                                       |
 |----------------|--------------------------------------------------------------------------------------------------------------|
 | `enter`        | Send what you've said (once its last pass is done).                                                          |
-| `backspace`    | Discard what you've said since the last send.                                                                |
+| `m`            | Toggle manual (the default: `enter` sends) and auto (what you said is sent after 1.5 s without speech; typed text still waits for `enter`). |
+| `backspace`    | Delete the last sentence of the unsent text; hold it down to delete the lot.                                 |
 | `space`        | During the reply: hold it and open the mic; talk to cut it off, or `space` again to hear the reply again from the start. Between turns: pause the mic. |
 | `i`            | Mute the mic and open a box to type a message, or fix the unsent transcribed text. `enter` puts it back as the unsent text (a second `enter` sends it); `esc` / `ctrl+q` closes the box, dropping the edit. |
-| `e`            | Export the whole chat to a markdown file (default `NAME.md`; `enter` saves, `esc` cancels, `enter` twice replaces an existing file). `scribe -p NAME` reads it back in two voices. |
+| `v`            | Choose the voice replies are read in (Kokoro's American and British voices). Enter picks one and says a line in it; the choice is saved in `NAME.db` and used whenever that chat is opened (`--voices` overrides it). |
+| `c`            | List the conversations in `NAME.db`, the most recently active first, with "+ New conversation" at the top; `enter` opens one. The one open when you quit opens next time. |
+| `t`            | Rename this conversation (a new one is titled with its date and time); `enter` saves, `esc` cancels. |
+| `e`            | Export this conversation to a markdown file (default `NAME-<title>.md`; `enter` saves, `esc` cancels, `enter` twice replaces an existing file). `scribe -p NAME` reads it back in two voices. |
 | `↑` / `↓`      | Highlight the previous / next reply in the scrollback; `↓` past the last one returns to the bottom. |
 | `enter` (reply highlighted) | Play that reply again, its words lit up as they're spoken; `space` stops it.                   |
 | `pgup` / `pgdn` / `end` | Scroll.                                                                                             |

@@ -16,14 +16,18 @@ scribe --chat talk  # in another: talk to it
 
 ## Configuration
 
+The LLM settings are the same environment variables scribe's `--llm`
+pass uses, so both talk to the same service.
+
 | Option                | Environment                                     | Default                                         |
 |-----------------------|-------------------------------------------------|-------------------------------------------------|
 | `NAME`                |                                                 | The conversation, `NAME.db` (`.db` optional).   |
 | `--prompt TEXT`       | `VOX_AGENT_PROMPT`                              | A short prompt for spoken conversation: plain sentences, no markdown, usually brief. |
 | `--prompt-file PATH`  | `VOX_AGENT_PROMPT_FILE`                         |                                                 |
-| `--url URL`           | `VOX_AGENT_URL`                                 | `http://127.0.0.1:9931/v1` (a local server)     |
-| `--model NAME`        | `VOX_AGENT_MODEL`, then `VOX_SCRIBE_LLM_MODEL`  | required                                        |
-| API key               | `VOX_AGENT_KEY`; `OPENAI_API_KEY` too when the URL is OpenAI's | none (fine for local servers)    |
+| `--url URL`           | `VOX_SCRIBE_LLM_URL`                            | `http://127.0.0.1:9931/v1` (a local server)     |
+| `--model NAME`        | `VOX_SCRIBE_LLM_MODEL`                          | required                                        |
+| API key               | `VOX_SCRIBE_LLM_KEY`; `OPENAI_API_KEY` too when the URL is OpenAI's | none (fine for local servers) |
+| `--think`             | `VOX_AGENT_THINK`                               | off: reasoning models answer without thinking first |
 | `--history N`         |                                                 | 40 earlier messages sent with each new one      |
 
 `RUST_LOG=debug` shows more of what it's doing; by default it logs each

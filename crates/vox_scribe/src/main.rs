@@ -146,8 +146,9 @@ struct Cli {
     once: bool,
     /// Enable pass 4: LLM proofreading of each paragraph before it is
     /// written. Configured by VOX_SCRIBE_LLM_URL (default
-    /// https://api.openai.com/v1), VOX_SCRIBE_LLM_MODEL (required) and
-    /// VOX_SCRIBE_LLM_KEY or OPENAI_API_KEY.
+    /// http://127.0.0.1:9931/v1), VOX_SCRIBE_LLM_MODEL (required) and
+    /// VOX_SCRIBE_LLM_KEY (or OPENAI_API_KEY for OpenAI's URL), the same
+    /// service `agent` uses.
     #[arg(long)]
     llm: bool,
     /// Seconds to wait for each pass-4 reply before keeping pass-3 text.
@@ -1189,8 +1190,9 @@ fn main() -> Result<()> {
     // session headless with the terminal already cleared.
     if let Some(name) = &cli.chat {
         if let Some(screen) = screen.take() {
-            let voice = chat_voice(&models_dir, &cli.voices)?;
-            return chat::run(screen, session, &chatdb::path_for(name), voice);
+            let path = chatdb::path_for(name);
+            let (voice, voice_name) = chat_voice(&models_dir, &cli.voices, &path)?;
+            return chat::run(screen, session, &path, voice, voice_name);
         }
     }
     let mut outcome = match screen {
@@ -1800,16 +1802,29 @@ fn headless(session: Session) -> Result<Outcome> {
     })
 }
 
-/// The voice --chat replies in: the first of `--voices`, else af_heart.
-fn chat_voice(models_dir: &Path, voices: &[String]) -> Result<voice::Voice> {
-    let name = voices.first().map(String::as_str).unwrap_or("af_heart");
+/// The voice --chat replies in: the first of `--voices`, else the one
+/// chosen for this conversation with `v`, else af_heart.
+fn chat_voice(models_dir: &Path, voices: &[String], db: &Path) -> Result<(voice::Voice, String)> {
+    let saved = match voices.first() {
+        Some(_) => None,
+        None => {
+            let db = chatdb::Db::open(db)?;
+            chat::saved_voice(&db, db.current()?)?
+        }
+    };
+    let name = voices
+        .first()
+        .cloned()
+        .or(saved)
+        .unwrap_or_else(|| "af_heart".into());
+    let name = name.as_str();
     let sid =
         vox_transcribe::tts::voice_id(name).with_context(|| format!("no Kokoro voice {name:?}"))?;
     let threads = std::thread::available_parallelism()
         .map(|n| n.get().min(4))
         .unwrap_or(2) as i32;
     let tts = vox_transcribe::tts::Kokoro::load(&models::kokoro_dir(models_dir), threads)?;
-    voice::Voice::new(tts, sid)
+    Ok((voice::Voice::new(tts, sid)?, name.to_string()))
 }
 
 /// Build the pass-4 corrector when `--llm` is given.
@@ -1817,10 +1832,12 @@ fn llm_corrector(cli: &Cli) -> Result<Option<Arc<dyn Corrector>>> {
     if !cli.llm {
         return Ok(None);
     }
-    let env = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
-    let url = env("VOX_SCRIBE_LLM_URL").unwrap_or_else(|| "https://api.openai.com/v1".into());
-    let model = env("VOX_SCRIBE_LLM_MODEL").context("--llm needs VOX_SCRIBE_LLM_MODEL set")?;
-    let api_key = env("VOX_SCRIBE_LLM_KEY").or_else(|| env("OPENAI_API_KEY"));
+    let vox_transcribe::openai::Endpoint {
+        url,
+        model,
+        api_key,
+    } = vox_transcribe::openai::Endpoint::from_env();
+    let model = model.context("--llm needs VOX_SCRIBE_LLM_MODEL set")?;
     let vocabulary = match &cli.vocab {
         Some(path) => std::fs::read_to_string(path)
             .with_context(|| format!("read {}", path.display()))?

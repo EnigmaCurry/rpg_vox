@@ -6363,6 +6363,7 @@ dependencies = [
  "tracing-subscriber",
  "ureq",
  "vox_chat",
+ "vox_transcribe",
 ]
 
 [[package]]

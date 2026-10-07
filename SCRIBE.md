@@ -225,7 +225,8 @@ to the OSC 52 terminal escape (e.g. over ssh).
 
 `scribe --chat NAME` turns scribe into the voice end of a conversation.
 What you say collects on screen until `enter` sends it (`backspace`
-throws it away). The message is written to `NAME.db`, a SQLite file that
+deletes the last sentence; hold it to delete them all), or, after `m` switches to auto mode, until you pause
+for 1.5 seconds. The message is written to `NAME.db`, a SQLite file that
 a separate responder process (an LLM bridge, say) watches; its reply is
 written back to the same file, a sentence or so at a time, and scribe
 reads it aloud with Kokoro as it arrives.
@@ -244,8 +245,17 @@ the bottom, and quits from there.
 before sending it: `enter` puts the edit back as the unsent text (press
 `enter` again to send), `esc` or `ctrl+q` drops the edit.
 
-`e` exports the whole chat to `NAME.md` (or a name you type), in the
-same format as a transcript, so `scribe -p NAME` reads it back with a
+One database holds many conversations. `c` lists them, the most
+recently active first, with "+ New conversation" at the top; the title
+of the one open is shown above it, `t` renames it (a new conversation is
+titled with its date and time), and whichever is open when you quit
+opens next time.
+
+`v` picks the voice replies are read in. The choice is saved with the
+conversation and used every time it is opened.
+
+`e` exports the conversation to `NAME-<title>.md` (or a name you type),
+in the same format as a transcript, so `scribe -p` reads it back with a
 voice for each side.
 
 For a real conversation, run [`agent`](AGENT.md) as the responder. To
@@ -258,14 +268,19 @@ scribe --chat talk
 
 ### The database
 
-One table, `messages(id, role, kind, reply_to, text, more, at)`, in WAL
-mode. Neither side is notified of the other's writes: poll for rows with
-`id` above the last one seen (scribe checks every 30 ms).
+Messages are one table, `messages(id, conversation, role, kind,
+reply_to, text, more, at)`, in WAL mode. Neither side is notified of the
+other's writes: poll for rows with `id` above the last one seen (scribe
+checks every 30 ms). `conversations(id, title, created_at)` names the
+conversations; a reply or interrupt belongs to the conversation of the
+user message it refers to, so a responder only needs to read that
+conversation's rows for context. `settings(key, value)` keeps the
+conversation last open and each one's voice.
 
 | Row                                   | Written by | Meaning                                                                                                                                         |
 |---------------------------------------|------------|-------------------------------------------------------------------------------------------------------------------------------------------------|
 | `role='user', kind='say'`             | scribe     | Something the user said and sent.                                                                                                               |
-| `role='assistant', kind='say'`        | responder  | Part of the reply to user row `reply_to`, spoken in `id` order. `more=1` means more is coming and scribe keeps waiting; the last row has `more=0`. Text may be empty (`more=1` alone means "still working"). |
+| `role='assistant', kind='say'`        | responder  | Part of the reply to user row `reply_to`, spoken in `id` order. `more=1` means more is coming and scribe keeps waiting; the last row has `more=0`. An empty row with `more=1` means "thinking": scribe shows a spinner until text arrives (send one as soon as you start on a reply). |
 | `role='user', kind='interrupt'`       | scribe     | The user cut off the reply to `reply_to`. Stop writing it; scribe ignores any more rows for it. A new `say` also supersedes any reply in progress. |
 
 ## Pass 4: LLM proofreading (optional)
@@ -277,20 +292,25 @@ breaks inserted mid-sentence) rather than rewriting, and edits that would
 change more than 40% of a paragraph's words are rejected.
 
 The endpoint is configured with environment variables, which `just
-scribe` also loads from the repo's `.env` file:
+scribe` also loads from the repo's `.env` file. [`agent`](AGENT.md) uses
+the same ones, so both talk to the same service:
 
 ```bash
-VOX_SCRIBE_LLM_URL=https://api.openai.com/v1   # default
+VOX_SCRIBE_LLM_URL=http://127.0.0.1:9931/v1    # default: a local server
 VOX_SCRIBE_LLM_MODEL=<model>                   # required
-OPENAI_API_KEY=...                             # or VOX_SCRIBE_LLM_KEY
+VOX_SCRIBE_LLM_KEY=...                         # if the server needs one
 ```
+
+For OpenAI, set `VOX_SCRIBE_LLM_URL=https://api.openai.com/v1`;
+`OPENAI_API_KEY` then works as the key too (it is never sent to any
+other URL). Reasoning models are asked not to think first
+(llama.cpp's `enable_thinking`), which only slows proofreading down.
 
 ```bash
 just scribe --llm --vocab names.txt -o notes
 ```
 
-Local servers (llama.cpp, ollama, vLLM) work the same way: set
-`VOX_SCRIBE_LLM_URL` to their `/v1` URL; the key is optional. After a
+After a
 failure or a timeout (`--llm-timeout`) the paragraph is written with its
 pass-3 text and its timestamp turns red.
 

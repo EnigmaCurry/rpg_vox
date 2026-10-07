@@ -5,7 +5,7 @@
 //! drops everything not yet heard.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -28,6 +28,8 @@ struct Shared {
     /// Audio is queued or still coming out of the speaker.
     sounding: AtomicBool,
     paused: AtomicBool,
+    /// Kokoro speaker id; [`Voice::set_voice`] changes it.
+    sid: AtomicI32,
     /// (key, index of the word being heard among all the words said
     /// under that key).
     heard: Mutex<Option<(i64, usize)>>,
@@ -67,6 +69,7 @@ impl Voice {
     /// Speak with voice `sid` of `tts`.
     pub fn new(tts: Kokoro, sid: i32) -> Result<Self> {
         let shared = Arc::new(Shared::default());
+        shared.sid.store(sid, Ordering::SeqCst);
         let (jobs, job_rx) = crossbeam_channel::unbounded::<(u64, i64, String)>();
         let (audio_tx, audio_rx) = crossbeam_channel::unbounded::<Audio>();
         let rate = tts.sample_rate();
@@ -74,7 +77,7 @@ impl Voice {
             let shared = shared.clone();
             std::thread::Builder::new()
                 .name("voice-synth".into())
-                .spawn(move || synth(tts, sid, &shared, job_rx, audio_tx))?;
+                .spawn(move || synth(tts, &shared, job_rx, audio_tx))?;
         }
         // The output is opened on its own thread, which keeps it.
         let (ready_tx, ready_rx) = crossbeam_channel::bounded(1);
@@ -122,6 +125,11 @@ impl Voice {
         self.shared.paused.store(paused, Ordering::SeqCst);
     }
 
+    /// Speak with Kokoro voice `sid` from the next sentence on.
+    pub fn set_voice(&self, sid: i32) {
+        self.shared.sid.store(sid, Ordering::SeqCst);
+    }
+
     /// Drop everything not yet heard.
     pub fn stop(&self) {
         self.shared.generation.fetch_add(1, Ordering::SeqCst);
@@ -130,13 +138,7 @@ impl Voice {
     }
 }
 
-fn synth(
-    tts: Kokoro,
-    sid: i32,
-    shared: &Shared,
-    jobs: Receiver<(u64, i64, String)>,
-    out: Sender<Audio>,
-) {
+fn synth(tts: Kokoro, shared: &Shared, jobs: Receiver<(u64, i64, String)>, out: Sender<Audio>) {
     let current = |g: u64| shared.generation.load(Ordering::SeqCst) == g;
     let rate = tts.sample_rate() as u64;
     let gap = vec![0.0f32; (GAP_MS * rate / 1000) as usize];
@@ -156,6 +158,7 @@ fn synth(
             let words: Vec<&str> = sentence.split_whitespace().collect();
             let first_word = *counts.get(&key).unwrap_or(&0);
             counts.insert(key, first_word + words.len());
+            let sid = shared.sid.load(Ordering::SeqCst);
             match tts.speak(&sentence, sid, 1.0) {
                 Ok(audio) if current(generation) => {
                     let mut samples = crate::speak::trim_silence(&audio).to_vec();

@@ -11,6 +11,49 @@ use tracing::warn;
 
 use crate::correct::{Corrector, Edit};
 
+/// Where the LLM is unless VOX_SCRIBE_LLM_URL says otherwise: a local
+/// OpenAI-compatible server (llama.cpp, ollama, vLLM, …).
+pub const DEFAULT_URL: &str = "http://127.0.0.1:9931/v1";
+
+/// The LLM service, shared by scribe's pass 4 and `agent`, from the
+/// environment:
+///
+/// * `VOX_SCRIBE_LLM_URL`: base URL ending in `/v1`, default [`DEFAULT_URL`]
+/// * `VOX_SCRIBE_LLM_MODEL`: model name
+/// * `VOX_SCRIBE_LLM_KEY`: API key; `OPENAI_API_KEY` is used too, but
+///   only when the URL is OpenAI's, so it never goes to another server
+#[derive(Clone, Debug)]
+pub struct Endpoint {
+    pub url: String,
+    pub model: Option<String>,
+    pub api_key: Option<String>,
+}
+
+fn env(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.trim().is_empty())
+}
+
+impl Endpoint {
+    pub fn from_env() -> Self {
+        Self::at(env("VOX_SCRIBE_LLM_URL").unwrap_or_else(|| DEFAULT_URL.into()))
+    }
+
+    /// The service at `url` (e.g. from a command-line flag), with the
+    /// model and key from the environment.
+    pub fn at(url: String) -> Self {
+        let api_key = env("VOX_SCRIBE_LLM_KEY").or_else(|| {
+            url.contains("api.openai.com")
+                .then(|| env("OPENAI_API_KEY"))
+                .flatten()
+        });
+        Self {
+            model: env("VOX_SCRIBE_LLM_MODEL"),
+            url,
+            api_key,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct OpenAiConfig {
     /// Base URL ending in `/v1`, e.g. `https://api.openai.com/v1`.
@@ -34,7 +77,7 @@ pub struct OpenAiCorrector {
 
 /// Optional parameters, tried in this order and dropped one by one when
 /// a 400 names them.
-const OPTIONAL_PARAMS: [&str; 2] = ["temperature", "response_format"];
+const OPTIONAL_PARAMS: [&str; 3] = ["temperature", "response_format", "chat_template_kwargs"];
 
 const PROMPT: &str = "\
 You proofread live speech-to-text transcripts. The text was produced by an \
@@ -114,6 +157,11 @@ impl Corrector for OpenAiCorrector {
             }
             if !dropped.contains(&"response_format") {
                 body["response_format"] = json!({ "type": "json_object" });
+            }
+            // A reasoning model's thinking would only slow proofreading
+            // down (llama.cpp's switch for it).
+            if !dropped.contains(&"chat_template_kwargs") {
+                body["chat_template_kwargs"] = json!({ "enable_thinking": false });
             }
             let mut req = self.agent.post(&url);
             if let Some(key) = &self.cfg.api_key {

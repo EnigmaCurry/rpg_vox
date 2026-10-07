@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::Result;
-pub use vox_chat::{path_for, Db, Kind, Role, Row};
+pub use vox_chat::{path_for, Conversation, Db, Kind, Role, Row};
 
 /// `scribe chat-echo NAME`: a stand-in responder. Each thing the user
 /// says is read back a sentence per row, then, after a pause during
@@ -32,6 +32,7 @@ pub fn echo(path: &Path) -> Result<()> {
         // Only the newest thing said gets a reply.
         last = say.id;
         println!("user #{}: {}", say.id, say.text);
+        db.reply(say.id, "", true)?; // thinking
         let words = say.text.split_whitespace().count();
         let mut parts: Vec<(String, u64)> =
             crate::speak::sentences(&format!("You said: {}", say.text))

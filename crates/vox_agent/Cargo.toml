@@ -11,6 +11,8 @@ path = "src/main.rs"
 
 [dependencies]
 vox_chat = { path = "../vox_chat" }
+# Only for the LLM endpoint settings shared with scribe's pass 4.
+vox_transcribe = { path = "../vox_transcribe", default-features = false, features = ["llm"] }
 anyhow.workspace = true
 clap = { workspace = true, features = ["env"] }
 serde_json.workspace = true
