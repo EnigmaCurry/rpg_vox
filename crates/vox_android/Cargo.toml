@@ -1,0 +1,21 @@
+[package]
+name = "vox_android"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "JNI bridge from the Android dictation app (android/app) to vox_transcribe"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+vox_transcribe = { path = "../vox_transcribe", features = ["sherpa-static"] }
+anyhow.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+jni = "0.21"
+crossbeam-channel = "0.5"
+# Unpacking the model archives: Java's bzip2 is ~50x slower on a phone.
+bzip2 = "0.6"
+tar = "0.4"

@@ -1,0 +1,5 @@
+.gradle/
+build/
+local.properties
+# Filled by `just android-app`: libvox_android.so and the sherpa-onnx libs.
+app/src/main/jniLibs/

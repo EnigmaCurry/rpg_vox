@@ -392,6 +392,32 @@ android:
     done
     du -sh "$out"
 
+# Android dictation app (android/): builds crates/vox_android into its
+# jniLibs next to the sherpa-onnx libs, assembles the debug APK and, with
+# a device on adb, installs it. Needs what `just android` needs plus a
+# JDK 17+ (JAVA_HOME, default: Homebrew's openjdk@21) and the Android SDK
+# (ANDROID_HOME, default: Homebrew's android-commandlinetools).
+android-app INSTALL="yes":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-/opt/homebrew/share/android-ndk}"
+    export ANDROID_HOME="${ANDROID_HOME:-/opt/homebrew/share/android-commandlinetools}"
+    export JAVA_HOME="${JAVA_HOME:-/opt/homebrew/opt/openjdk@21}"
+    export CMAKE_TOOLCHAIN_FILE="$PWD/android/toolchain.cmake"
+    cargo ndk -t arm64-v8a --platform 26 build --release -p vox_android
+    jni=android/app/src/main/jniLibs/arm64-v8a
+    libs=target/sherpa-onnx-prebuilt/jniLibs/arm64-v8a
+    mkdir -p "$jni"
+    cp target/aarch64-linux-android/release/libvox_android.so \
+      "$libs/libsherpa-onnx-c-api.so" "$libs/libonnxruntime.so" "$jni/"
+    [ -f android/local.properties ] || echo "sdk.dir=$ANDROID_HOME" > android/local.properties
+    (cd android && ./gradlew assembleDebug)
+    apk=android/app/build/outputs/apk/debug/app-debug.apk
+    du -h "$apk"
+    if [ "{{INSTALL}}" = yes ] && adb get-state >/dev/null 2>&1; then
+      adb install -r "$apk"
+    fi
+
 # --- discord_vox (PipeWire sink → Discord voice) ---
 
 # Run the discord_vox release binary. Expects DISCORD_VOX_TOKEN /
