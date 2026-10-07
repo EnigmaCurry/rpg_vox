@@ -13,7 +13,6 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.activity.viewModels
 import androidx.compose.foundation.background
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
@@ -51,6 +50,11 @@ import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import kotlinx.coroutines.delay
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -66,18 +70,23 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 
 class MainActivity : ComponentActivity() {
-    private val vm: DictationViewModel by viewModels()
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        Scribe.init(this)
         enableEdgeToEdge()
-        setContent { AppTheme { App(vm) } }
+        setContent { AppTheme { App() } }
     }
 
-    // Dictation runs only while the app is visible (no foreground service).
+    // Dictation keeps going in the background (ScribeService); this only
+    // tracks visibility, which loads the models and times their release.
+    override fun onStart() {
+        super.onStart()
+        Scribe.onVisible(true)
+    }
+
     override fun onStop() {
         super.onStop()
-        vm.stop()
+        Scribe.onVisible(false)
     }
 }
 
@@ -96,15 +105,16 @@ private fun AppTheme(content: @Composable () -> Unit) {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun App(vm: DictationViewModel) {
+private fun App() {
     Scaffold(topBar = { TopAppBar(title = { Text("Vox Scribe") }) }) { pad ->
         Box(Modifier.padding(pad).fillMaxSize()) {
-            when (val phase = vm.phase) {
-                is Phase.NeedModels -> Setup(vm, phase)
+            when (val phase = Scribe.phase) {
+                is Phase.NeedModels -> Setup(phase)
                 is Phase.Installing -> Installing(phase)
                 Phase.Loading -> Centered("Loading speech models…", progress = null)
+                Phase.Unloaded -> Unloaded()
                 is Phase.Failed -> Centered("Could not load the models:\n${phase.error}", progress = null)
-                Phase.Ready -> Dictate(vm)
+                Phase.Ready -> Dictate()
             }
         }
     }
@@ -128,11 +138,11 @@ private fun Centered(text: String, progress: Float?) {
 }
 
 @Composable
-private fun Setup(vm: DictationViewModel, phase: Phase.NeedModels) {
+private fun Setup(phase: Phase.NeedModels) {
     val error = phase.error
     // The download runs in a foreground service; its notification needs this on 13+.
     val askNotify = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {
-        vm.install()
+        Scribe.install()
     }
     val context = LocalContext.current
     val go = {
@@ -142,7 +152,7 @@ private fun Setup(vm: DictationViewModel, phase: Phase.NeedModels) {
         ) {
             askNotify.launch(Manifest.permission.POST_NOTIFICATIONS)
         } else {
-            vm.install()
+            Scribe.install()
         }
     }
     val mb = BUNDLES.sumOf { it.approxBytes } / 1_000_000
@@ -189,6 +199,19 @@ private fun Installing(phase: Phase.Installing) {
 }
 
 @Composable
+private fun Unloaded() {
+    Column(
+        Modifier.fillMaxSize().padding(24.dp),
+        verticalArrangement = Arrangement.Center,
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Text("Speech models are unloaded to free memory.", style = MaterialTheme.typography.bodyLarge)
+        Spacer(Modifier.height(16.dp))
+        Button(onClick = Scribe::load) { Text("Load models") }
+    }
+}
+
+@Composable
 private fun KeepScreenOn() {
     val view = LocalView.current
     DisposableEffect(Unit) {
@@ -198,38 +221,50 @@ private fun KeepScreenOn() {
 }
 
 @Composable
-private fun Dictate(vm: DictationViewModel) {
+private fun Dictate() {
     val context = LocalContext.current
     val askMic = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { ok ->
-        if (ok) vm.start() else Toast.makeText(context, "Microphone permission is needed", Toast.LENGTH_LONG).show()
+        if (ok) Scribe.start() else Toast.makeText(context, "Microphone permission is needed", Toast.LENGTH_LONG).show()
     }
     val toggle = {
         when {
-            vm.recording -> vm.stop()
+            Scribe.recording -> Scribe.stop()
             ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
-                PackageManager.PERMISSION_GRANTED -> vm.start()
+                PackageManager.PERMISSION_GRANTED -> Scribe.start()
             else -> askMic.launch(Manifest.permission.RECORD_AUDIO)
         }
     }
-    if (vm.recording) KeepScreenOn()
+    if (Scribe.recording) KeepScreenOn()
 
     Column(Modifier.fillMaxSize()) {
-        Transcript(vm, Modifier.weight(1f).fillMaxWidth())
+        Transcript(Modifier.weight(1f).fillMaxWidth())
         Surface(tonalElevation = 3.dp) {
             Column(
                 Modifier.fillMaxWidth().navigationBarsPadding().padding(16.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
+                // Ticks the elapsed time once a second while a session is open.
+                var now by remember { mutableLongStateOf(0L) }
+                LaunchedEffect(Scribe.recording) {
+                    while (Scribe.recording) {
+                        now = Scribe.elapsedMs()
+                        delay(1_000 - now % 1_000)
+                    }
+                }
+                val time = clock(if (Scribe.recording) now else 0)
                 val status = when {
-                    vm.finishing -> "Finishing…"
-                    vm.recording -> "Listening"
-                    else -> "Tap to dictate"
+                    Scribe.finishing -> "Finishing…"
+                    Scribe.paused -> "Paused · $time"
+                    Scribe.recording -> "Listening · $time"
+                    else -> "Tap to dictate · keeps going in the background"
                 }
                 Text(status, style = MaterialTheme.typography.labelLarge)
                 Spacer(Modifier.height(8.dp))
                 LinearProgressIndicator(
-                    progress = { if (vm.recording) (vm.level * 8f).coerceIn(0f, 1f) else 0f },
+                    progress = { if (Scribe.recording) (Scribe.level * 8f).coerceIn(0f, 1f) else 0f },
                     modifier = Modifier.fillMaxWidth(0.6f),
+                    gapSize = 0.dp,
+                    drawStopIndicator = {},
                 )
                 Spacer(Modifier.height(12.dp))
                 Row(
@@ -237,16 +272,26 @@ private fun Dictate(vm: DictationViewModel) {
                     horizontalArrangement = Arrangement.SpaceEvenly,
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    val idle = !vm.recording && !vm.finishing
-                    val hasText = vm.paragraphs.isNotEmpty()
+                    val idle = !Scribe.recording && !Scribe.finishing
+                    val hasText = Scribe.paragraphs.isNotEmpty()
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        TextButton(onClick = { copy(context, vm.text()) }, enabled = hasText) { Text("Copy") }
-                        TextButton(onClick = { share(context, vm.text()) }, enabled = hasText) { Text("Share") }
+                        TextButton(onClick = { copy(context, Scribe.text()) }, enabled = hasText) { Text("Copy") }
+                        TextButton(onClick = { share(context, Scribe.text()) }, enabled = hasText) { Text("Share") }
                     }
-                    RecordButton(recording = vm.recording, enabled = !vm.finishing, onClick = toggle)
+                    RecordButton(recording = Scribe.recording, enabled = !Scribe.finishing, onClick = toggle)
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        OutlinedButton(onClick = vm::breakParagraph, enabled = vm.recording) { Text("¶") }
-                        TextButton(onClick = vm::clear, enabled = idle && hasText) { Text("Clear") }
+                        Row {
+                            OutlinedButton(
+                                onClick = { if (Scribe.paused) Scribe.resume() else Scribe.pause() },
+                                enabled = Scribe.recording && !Scribe.finishing,
+                            ) { Text(if (Scribe.paused) "▶" else "❚❚") }
+                            Spacer(Modifier.size(4.dp))
+                            OutlinedButton(
+                                onClick = Scribe::breakParagraph,
+                                enabled = Scribe.recording && !Scribe.paused,
+                            ) { Text("¶") }
+                        }
+                        TextButton(onClick = Scribe::clear, enabled = idle && hasText) { Text("Clear") }
                     }
                 }
             }
@@ -277,13 +322,13 @@ private fun RecordButton(recording: Boolean, enabled: Boolean, onClick: () -> Un
 }
 
 @Composable
-private fun Transcript(vm: DictationViewModel, modifier: Modifier) {
+private fun Transcript(modifier: Modifier) {
     val list = rememberLazyListState()
-    val last = vm.paragraphs.lastOrNull()
-    LaunchedEffect(vm.paragraphs.size, last?.text) {
-        if (vm.paragraphs.isNotEmpty()) list.animateScrollToItem(vm.paragraphs.size - 1)
+    val last = Scribe.paragraphs.lastOrNull()
+    LaunchedEffect(Scribe.paragraphs.size, last?.text) {
+        if (Scribe.paragraphs.isNotEmpty()) list.animateScrollToItem(Scribe.paragraphs.size - 1)
     }
-    if (vm.paragraphs.isEmpty()) {
+    if (Scribe.paragraphs.isEmpty()) {
         Box(modifier.padding(24.dp), contentAlignment = Alignment.Center) {
             Text(
                 "Your words appear here. Live text is shown faint, then replaced by the " +
@@ -302,7 +347,7 @@ private fun Transcript(vm: DictationViewModel, modifier: Modifier) {
             contentPadding = androidx.compose.foundation.layout.PaddingValues(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            items(vm.paragraphs, key = { it.id }) { p ->
+            items(Scribe.paragraphs, key = { it.id }) { p ->
                 Text(
                     buildAnnotatedString {
                         p.clips.filter { it.text.isNotBlank() }.forEachIndexed { i, c ->
@@ -322,6 +367,11 @@ private fun Transcript(vm: DictationViewModel, modifier: Modifier) {
             }
         }
     }
+}
+
+private fun clock(ms: Long): String {
+    val s = ms / 1000
+    return if (s >= 3600) "%d:%02d:%02d".format(s / 3600, s / 60 % 60, s % 60) else "%d:%02d".format(s / 60, s % 60)
 }
 
 private fun copy(context: android.content.Context, text: String) {
