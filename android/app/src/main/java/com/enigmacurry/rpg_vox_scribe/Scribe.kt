@@ -42,15 +42,11 @@ private const val FILE_AHEAD_MS = 120_000L
 
 data class ClipUi(val text: String, val partial: Boolean)
 
-/**
- * One paragraph. [source] labels where it came from ("Me", "Phone", or a
- * file name, when [fromFile]); null for a plain mic dictation.
- */
+/** One paragraph. [source] is its speaker ("Me", "Phone") when a recording has two sources. */
 data class Para(
     val id: String,
     val clips: List<ClipUi>,
     val source: String? = null,
-    val fromFile: Boolean = false,
 ) {
     val text: String get() = clips.filter { it.text.isNotBlank() }.joinToString(" ") { it.text }
 }
@@ -87,7 +83,7 @@ object Scribe {
     lateinit var store: ModelStore
         private set
     private lateinit var app: Context
-    private lateinit var saved: File
+    private lateinit var threads: ThreadStore
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val main = Handler(Looper.getMainLooper())
 
@@ -109,7 +105,15 @@ object Scribe {
         private set
     var level by mutableFloatStateOf(0f)
         private set
+    /** The open thread's transcript. */
     val paragraphs = mutableStateListOf<Para>()
+    /** The open thread. */
+    var thread by mutableStateOf(ThreadInfo(0, "", "", "", 0))
+        private set
+    /** Every thread, the most recently active first. */
+    val threadList = mutableStateListOf<ThreadInfo>()
+    /** Paragraph id to its stored row, as last written. */
+    private val written = HashMap<String, Saved>()
 
     /** An activity is on screen. */
     @Volatile var visible = false
@@ -139,12 +143,13 @@ object Scribe {
         if (::app.isInitialized) return
         app = context.applicationContext
         store = ModelStore(app.noBackupFilesDir)
-        saved = File(app.filesDir, "transcript.json")
+        threads = ThreadStore(File(app.filesDir, "scribe.db"))
         val prefs = app.getSharedPreferences("scribe", Context.MODE_PRIVATE)
         mode = runCatching { Mode.valueOf(prefs.getString("mode", "MIC")!!) }.getOrDefault(Mode.MIC)
         if (Build.VERSION.SDK_INT < 29) mode = Mode.MIC
         phase = if (store.ready()) Phase.Unloaded else Phase.NeedModels(resume = store.started())
-        restore()
+        migrate()
+        show(threads.current())
         scope.launch {
             InstallService.state.collect { s ->
                 when (s) {
@@ -455,7 +460,9 @@ object Scribe {
 
     private fun startFile(uri: Uri) {
         val name = displayName(uri)
-        val src = open(Kind.FILE, name, streaming = false)
+        // Each file gets a thread of its own, named after it.
+        switchTo(threads.create(name), force = true)
+        val src = open(Kind.FILE, null, streaming = false)
         cancelFile = false
         fileTotalMs = 0
         file = FileJob(name, 0f)
@@ -513,30 +520,104 @@ object Scribe {
 
     fun clear() {
         if (busy()) return
+        threads.clear(thread.id)
         paragraphs.clear()
-        save(now = true)
+        written.clear()
+        refreshThreads()
     }
 
-    /** The transcript as text: files as headings, speakers as "Me: …". */
-    fun text(): String {
-        val out = StringBuilder()
-        var last: String? = null
-        for (p in paragraphs) {
-            val t = p.text
-            if (t.isBlank()) continue
-            if (out.isNotEmpty()) out.append("\n\n")
-            when {
-                p.fromFile -> {
-                    if (p.source != last) out.append("# ").append(p.source).append("\n\n")
-                    out.append(t)
-                }
-                p.source != null -> out.append(p.source).append(": ").append(t)
-                else -> out.append(t)
-            }
-            last = p.source
-        }
-        return out.toString()
+    // ---- threads -------------------------------------------------------
+
+    /** Open thread [id] (only while idle, unless [force]). */
+    fun switchTo(id: Long, force: Boolean = false) {
+        if (busy() && !force) return
+        if (id == thread.id) return
+        sync()
+        dropIfEmpty(thread)
+        show(id)
     }
+
+    fun newThread() {
+        if (busy()) return
+        sync()
+        // An untouched new thread is reused rather than piling up empty ones.
+        if (paragraphs.isEmpty() && isDateTitle(thread.title)) return
+        dropIfEmpty(thread)
+        show(threads.create())
+    }
+
+    fun rename(id: Long, title: String) {
+        val t = title.trim()
+        if (t.isEmpty()) return
+        threads.rename(id, t)
+        refreshThreads()
+    }
+
+    fun delete(id: Long) {
+        if (id == thread.id && busy()) return
+        threads.delete(id)
+        if (id == thread.id) {
+            paragraphs.clear()
+            written.clear()
+            show(threads.list().firstOrNull()?.id ?: threads.create())
+        } else {
+            refreshThreads()
+        }
+    }
+
+    private val dateTitle = Regex("""\d{4}-\d\d-\d\d \d\d:\d\d""")
+
+    private fun isDateTitle(t: String) = dateTitle.matches(t)
+
+    /** Forget a thread left with nothing in it and its date title. */
+    private fun dropIfEmpty(t: ThreadInfo) {
+        if (t.id != 0L && paragraphs.isEmpty() && isDateTitle(t.title) && threads.messages(t.id).isEmpty()) {
+            threads.delete(t.id)
+        }
+    }
+
+    /** Load thread [id] into [paragraphs] and remember it as the one open. */
+    private fun show(id: Long) {
+        saver?.cancel()
+        paragraphs.clear()
+        written.clear()
+        for (m in threads.messages(id)) {
+            val p = Para("m${m.rowId}", listOf(ClipUi(m.text, partial = false)), source = m.speaker)
+            paragraphs += p
+            written[p.id] = m
+        }
+        threads.setCurrent(id)
+        thread = ThreadInfo(id, "", "", "", 0)
+        refreshThreads()
+    }
+
+    private fun refreshThreads() {
+        val list = threads.list()
+        threadList.clear()
+        threadList += list
+        list.firstOrNull { it.id == thread.id }?.let { thread = it }
+    }
+
+    /** Move the pre-threads transcript.json into a thread of its own. */
+    private fun migrate() {
+        val old = File(app.filesDir, "transcript.json")
+        if (!old.exists()) return
+        val list = runCatching { JSONArray(old.readText()) }.getOrNull()
+        if (list != null && list.length() > 0) {
+            val id = threads.create("Earlier transcript")
+            for (i in 0 until list.length()) {
+                val o = list.getJSONObject(i)
+                threads.say(id, o.getString("text"), if (o.has("source")) o.getString("source") else null)
+            }
+            threads.setCurrent(id)
+        }
+        old.renameTo(File(app.filesDir, "transcript.json.migrated"))
+    }
+
+    /** The open thread as text, speakers as "Me: …". */
+    fun text(): String =
+        paragraphs.filter { it.text.isNotBlank() }
+            .joinToString("\n\n") { p -> if (p.source != null) "${p.source}: ${p.text}" else p.text }
 
     /** The last finished (non-partial) text, for the notification. */
     fun lastLine(): String =
@@ -544,7 +625,7 @@ object Scribe {
             p.clips.filter { !it.partial && it.text.isNotBlank() }
                 .takeIf { it.isNotEmpty() }
                 ?.joinToString(" ") { it.text }
-                ?.let { if (p.source != null && !p.fromFile) "${p.source}: $it" else it }
+                ?.let { if (p.source != null) "${p.source}: $it" else it }
         } ?: ""
 
     private fun apply(src: Source, json: String) {
@@ -613,44 +694,47 @@ object Scribe {
                 ClipUi(c.getString("text"), c.getString("stage") == "partial")
             },
             source = src.label,
-            fromFile = src.kind == Kind.FILE,
         )
     }
 
     /**
-     * Write the finished text to `files/transcript.json`, so a killed
-     * process doesn't lose it. Partials are left out. Debounced unless [now].
+     * Store the open thread's finished text (partials are left out), so
+     * a killed process doesn't lose it. Debounced unless [now].
      */
     private fun save(now: Boolean) {
-        val snapshot = JSONArray()
-        for (p in paragraphs) {
-            val text = p.clips.filter { !it.partial && it.text.isNotBlank() }.joinToString(" ") { it.text }
-            if (text.isEmpty()) continue
-            val o = JSONObject().put("id", p.id).put("text", text)
-            if (p.source != null) o.put("source", p.source).put("file", p.fromFile)
-            snapshot.put(o)
-        }
         saver?.cancel()
+        if (now) {
+            sync()
+            return
+        }
         saver = scope.launch {
-            if (!now) delay(2_000)
-            withContext(Dispatchers.IO + NonCancellable) {
-                val tmp = File(saved.path + ".tmp")
-                tmp.writeText(snapshot.toString())
-                tmp.renameTo(saved)
-            }
+            delay(2_000)
+            sync()
         }
     }
 
-    private fun restore() {
-        val list = runCatching { JSONArray(saved.readText()) }.getOrNull() ?: return
-        for (i in 0 until list.length()) {
-            val o = list.getJSONObject(i)
-            paragraphs += Para(
-                o.getString("id"),
-                listOf(ClipUi(o.getString("text"), partial = false)),
-                source = if (o.has("source")) o.getString("source") else null,
-                fromFile = o.optBoolean("file", false),
-            )
+    /** Write what changed in [paragraphs] since the last sync. */
+    private fun sync() {
+        saver?.cancel()
+        val id = thread.id
+        if (id == 0L) return
+        val present = HashSet<String>()
+        for (p in paragraphs) {
+            val text = p.clips.filter { !it.partial && it.text.isNotBlank() }.joinToString(" ") { it.text }
+            if (text.isEmpty()) continue
+            present += p.id
+            val w = written[p.id]
+            when {
+                w == null -> written[p.id] = Saved(threads.say(id, text, p.source), text, p.source)
+                w.text != text -> {
+                    threads.edit(w.rowId, text)
+                    written[p.id] = w.copy(text = text)
+                }
+            }
         }
+        val gone = written.keys.filter { it !in present }
+        for (k in gone) written.remove(k)?.let { threads.remove(it.rowId) }
+        refreshThreads()
     }
+
 }

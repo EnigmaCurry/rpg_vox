@@ -13,11 +13,13 @@ import android.os.Build
 import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.DragInteraction
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
@@ -38,6 +40,10 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material3.Button
+import androidx.compose.material3.DrawerValue
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.ModalNavigationDrawer
+import androidx.compose.material3.rememberDrawerState
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.ColorScheme
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -64,6 +70,9 @@ import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.ui.text.style.TextOverflow
+import kotlinx.coroutines.launch
 import androidx.compose.runtime.setValue
 import kotlinx.coroutines.delay
 import androidx.compose.ui.Alignment
@@ -138,18 +147,54 @@ private fun AppTheme(content: @Composable () -> Unit) {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun App() {
-    Scaffold(topBar = { TopAppBar(title = { Text("Scribe") }) }) { pad ->
-        Box(Modifier.padding(pad).fillMaxSize()) {
-            when (val phase = Scribe.phase) {
-                is Phase.NeedModels -> Setup(phase)
-                is Phase.Installing -> Installing(phase)
-                Phase.Loading -> Centered("Loading speech models…", progress = null)
-                Phase.Unloaded -> Unloaded()
-                is Phase.Failed -> Centered("Could not load the models:\n${phase.error}", progress = null)
-                Phase.Ready -> Dictate()
+    val drawer = rememberDrawerState(DrawerValue.Closed)
+    val ui = rememberCoroutineScope()
+    val dialogs = remember { ThreadDialogs() }
+    val ready = Scribe.phase == Phase.Ready
+    // Back closes the drawer before it leaves the app.
+    BackHandler(enabled = drawer.isOpen) { ui.launch { drawer.close() } }
+    ModalNavigationDrawer(
+        drawerState = drawer,
+        gesturesEnabled = ready,
+        drawerContent = { ThreadDrawer(dialogs, close = { ui.launch { drawer.close() } }) },
+    ) {
+        Scaffold(
+            topBar = {
+                TopAppBar(
+                    navigationIcon = {
+                        if (ready) {
+                            IconButton(onClick = { ui.launch { drawer.open() } }) { Text("☰") }
+                        }
+                    },
+                    // The open thread; tap to rename it.
+                    title = {
+                        if (ready) {
+                            Text(
+                                Scribe.thread.title,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.clickable { dialogs.renaming = Scribe.thread },
+                            )
+                        } else {
+                            Text("Scribe")
+                        }
+                    },
+                )
+            },
+        ) { pad ->
+            Box(Modifier.padding(pad).fillMaxSize()) {
+                when (val phase = Scribe.phase) {
+                    is Phase.NeedModels -> Setup(phase)
+                    is Phase.Installing -> Installing(phase)
+                    Phase.Loading -> Centered("Loading speech models…", progress = null)
+                    Phase.Unloaded -> Unloaded()
+                    is Phase.Failed -> Centered("Could not load the models:\n${phase.error}", progress = null)
+                    Phase.Ready -> Dictate()
+                }
             }
         }
     }
+    ThreadDialogHost(dialogs)
 }
 
 @Composable
@@ -466,12 +511,12 @@ private fun Transcript(modifier: Modifier) {
                 verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
                 itemsIndexed(Scribe.paragraphs, key = { _, p -> p.id }) { i, p ->
-                    // Label a run of paragraphs from one source: a file's name, or the speaker.
+                    // Label each run of paragraphs from one speaker.
                     val prev = Scribe.paragraphs.getOrNull(i - 1)
-                    if (p.source != null && (prev?.source != p.source || prev.fromFile != p.fromFile)) {
+                    if (p.source != null && prev?.source != p.source) {
                         Text(
                             p.source,
-                            style = if (p.fromFile) MaterialTheme.typography.titleMedium else MaterialTheme.typography.labelLarge,
+                            style = MaterialTheme.typography.labelLarge,
                             color = MaterialTheme.colorScheme.primary,
                             modifier = Modifier.padding(bottom = 4.dp),
                         )
