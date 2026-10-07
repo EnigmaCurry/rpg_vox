@@ -209,6 +209,22 @@ fun MicSettings(close: () -> Unit) {
                     val label = if (b == Boost.AUTO) "Auto (raise quiet speech)" else b.label
                     Choice(label, Scribe.boost == b) { Scribe.chooseBoost(b) }
                 }
+                val context = androidx.compose.ui.platform.LocalContext.current
+                Text(
+                    "Voice typing",
+                    style = MaterialTheme.typography.titleSmall,
+                    modifier = Modifier.padding(top = 12.dp),
+                )
+                Text(
+                    "Turn on \"Scribe voice typing\" to dictate into other apps, then pick it with the keyboard switcher.",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                TextButton(onClick = {
+                    context.startActivity(
+                        android.content.Intent(android.provider.Settings.ACTION_INPUT_METHOD_SETTINGS)
+                            .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK),
+                    )
+                }) { Text("Keyboard settings") }
                 if (Scribe.recording) {
                     Text(
                         "Changes apply when the mic next starts (pause and resume).",

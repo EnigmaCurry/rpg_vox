@@ -1,3 +1,5 @@
 <resources>
     <string name="app_name">Scribe</string>
+    <string name="keyboard_name">Scribe voice typing</string>
+    <string name="voice_subtype">Voice</string>
 </resources>

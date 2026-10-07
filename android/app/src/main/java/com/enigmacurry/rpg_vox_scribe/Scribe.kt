@@ -149,6 +149,23 @@ object Scribe {
 
     fun busy() = recording || finishing || file != null
 
+    /** The voice keyboard ([ScribeKeyboard]) holds the mic and the models. */
+    @Volatile var dictating = false
+        private set
+
+    /** The loaded models for the keyboard, marking them in use; 0 if not loaded or Scribe is busy. */
+    fun claimForKeyboard(): Long {
+        if (models == 0L || busy()) return 0
+        dictating = true
+        lastActive = SystemClock.elapsedRealtime()
+        return models
+    }
+
+    fun releaseFromKeyboard() {
+        dictating = false
+        lastActive = SystemClock.elapsedRealtime()
+    }
+
     fun init(context: Context) {
         if (::app.isInitialized) return
         app = context.applicationContext
@@ -225,7 +242,7 @@ object Scribe {
 
     /** Free the models if nothing is using them; they reload when the app is next opened. */
     fun release() {
-        if (models == 0L || busy()) return
+        if (models == 0L || busy() || dictating) return
         Native.freeModels(models)
         models = 0
         phase = Phase.Unloaded
@@ -283,7 +300,7 @@ object Scribe {
      * Caller has checked RECORD_AUDIO and is in the foreground.
      */
     fun start(consent: Pair<Int, Intent>? = null) {
-        if (models == 0L || busy()) return
+        if (models == 0L || busy() || dictating) return
         val m = mode
         if (m.phone && consent == null) return
         recordingMode = m

@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- A voice-mode subtype, so keyboards with a voice-input shortcut can switch to Scribe. -->
+<input-method xmlns:android="http://schemas.android.com/apk/res/android"
+    android:settingsActivity="com.enigmacurry.rpg_vox_scribe.MainActivity"
+    android:supportsSwitchingToNextInputMethod="true">
+    <subtype
+        android:label="@string/voice_subtype"
+        android:imeSubtypeMode="voice"
+        android:imeSubtypeLocale="en_US"
+        android:overridesImplicitlyEnabledSubtype="true" />
+</input-method>
