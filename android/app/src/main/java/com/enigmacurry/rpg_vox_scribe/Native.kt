@@ -21,14 +21,18 @@ object Native {
     external fun load(modelsDir: String, threads: Int): Long
     external fun freeModels(models: Long)
 
-    /** Starts one recording session fed at [sampleRate] Hz mono. */
-    external fun start(models: Long, sampleRate: Int): Long
+    /** Starts one session (one source) fed at [sampleRate] Hz mono; [streaming] adds live partials. */
+    external fun start(models: Long, sampleRate: Int, streaming: Boolean): Long
     external fun push(session: Long, samples: FloatArray, len: Int)
     external fun breakParagraph(session: Long)
 
     /** JSON array of events, waiting up to [timeoutMs] for the first. */
     external fun poll(session: Long, timeoutMs: Int): String
 
-    /** Drains every pass and frees the session; JSON `{"paragraphs": [...]}`. Blocks. */
+    /**
+     * Drains every pass; JSON `{"paragraphs": [...]}`. Blocks. [poll] and
+     * [push] stay safe meanwhile (pushes are dropped); call [free] after.
+     */
     external fun finish(session: Long): String
+    external fun free(session: Long)
 }

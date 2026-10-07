@@ -5,25 +5,25 @@
 //!
 //! Every handle is a `Box` pointer passed to Kotlin as a `long`. The
 //! Kotlin side (`com.enigmacurry.rpg_vox_scribe.Native`) owns the order of
-//! calls: no `push`/`poll` once `finish` has been called, no `start`
-//! after `freeModels`.
+//! calls: nothing on a session after `free`, no `start` after
+//! `freeModels`. `push` and `poll` may run alongside `finish`.
 
 use std::collections::HashMap;
 use std::io::{BufReader, Read};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Once};
+use std::sync::{Arc, Mutex, Once};
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use crossbeam_channel::Receiver;
 use jni::objects::{JClass, JFloatArray, JString};
-use jni::sys::{jfloat, jint, jlong, jstring};
+use jni::sys::{jboolean, jfloat, jint, jlong, jstring};
 use jni::JNIEnv;
 use serde_json::{json, Value};
 use vox_transcribe::sherpa::{Parakeet, ParakeetConfig, Zipformer, ZipformerConfig};
 use vox_transcribe::{
-    Change, Engine, EngineConfig, Event, OfflineRecognizer, StreamingRecognizer,
+    Change, Engine, EngineConfig, Event, OfflineRecognizer, Pusher, StreamingRecognizer,
 };
 
 /// Same layout as vox_scribe's models dir.
@@ -36,7 +36,9 @@ struct Models {
 }
 
 struct Session {
-    engine: Engine,
+    /// Taken by `finish`; pushes after that are dropped.
+    engine: Mutex<Option<Engine>>,
+    pusher: Pusher,
     events: Receiver<Event>,
 }
 
@@ -259,23 +261,28 @@ pub extern "system" fn Java_com_enigmacurry_rpg_1vox_1scribe_Native_freeModels(
     }
 }
 
-/// `start(models, sampleRate)`: a session handle for one recording.
+/// `start(models, sampleRate, streaming)`: a session handle for one
+/// source. Without streaming (files) there are no pass-1 partials.
 #[no_mangle]
 pub extern "system" fn Java_com_enigmacurry_rpg_1vox_1scribe_Native_start(
     _env: JNIEnv,
     _class: JClass,
     models: jlong,
     rate: jint,
+    streaming: jboolean,
 ) -> jlong {
     let models = unsafe { &*(models as *const Models) };
-    let streaming = Box::new(models.zipformer.session()) as Box<dyn StreamingRecognizer>;
-    let engine = Engine::spawn(
-        EngineConfig::new(rate as u32),
-        Some(streaming),
-        models.offline.clone(),
-    );
+    let streaming = (streaming != 0)
+        .then(|| Box::new(models.zipformer.session()) as Box<dyn StreamingRecognizer>);
+    let engine = Engine::spawn(EngineConfig::new(rate as u32), streaming, models.offline.clone());
     let events = engine.events().clone();
-    Box::into_raw(Box::new(Session { engine, events })) as jlong
+    let pusher = engine.pusher();
+    let session = Session {
+        engine: Mutex::new(Some(engine)),
+        pusher,
+        events,
+    };
+    Box::into_raw(Box::new(session)) as jlong
 }
 
 #[no_mangle]
@@ -289,7 +296,7 @@ pub extern "system" fn Java_com_enigmacurry_rpg_1vox_1scribe_Native_push(
     let session = unsafe { &*(session as *const Session) };
     let mut buf = vec![0 as jfloat; len.max(0) as usize];
     if env.get_float_array_region(&samples, 0, &mut buf).is_ok() {
-        session.engine.push(&buf);
+        session.pusher.push(&buf);
     }
 }
 
@@ -300,7 +307,7 @@ pub extern "system" fn Java_com_enigmacurry_rpg_1vox_1scribe_Native_breakParagra
     session: jlong,
 ) {
     let session = unsafe { &*(session as *const Session) };
-    session.engine.break_paragraph();
+    session.pusher.break_paragraph();
 }
 
 /// `poll(session, timeoutMs)`: a JSON array of events, possibly empty.
@@ -320,15 +327,28 @@ pub extern "system" fn Java_com_enigmacurry_rpg_1vox_1scribe_Native_poll(
 }
 
 /// `finish(session)`: drains every pass and returns the final transcript
-/// as JSON (`{"paragraphs": [...]}`). Frees the session.
+/// as JSON (`{"paragraphs": [...]}`). Events keep arriving on `poll`
+/// meanwhile. The session stays allocated until `free`.
 #[no_mangle]
 pub extern "system" fn Java_com_enigmacurry_rpg_1vox_1scribe_Native_finish(
     mut env: JNIEnv,
     _class: JClass,
     session: jlong,
 ) -> jstring {
-    let session = unsafe { Box::from_raw(session as *mut Session) };
-    let transcript = session.engine.finish();
+    let session = unsafe { &*(session as *const Session) };
+    let engine = session.engine.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let transcript = engine.map(Engine::finish).unwrap_or_default();
     let json = serde_json::to_string(&transcript).unwrap_or_else(|_| "{}".into());
     new_string(&mut env, &json)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_enigmacurry_rpg_1vox_1scribe_Native_free(
+    _env: JNIEnv,
+    _class: JClass,
+    session: jlong,
+) {
+    if session != 0 {
+        drop(unsafe { Box::from_raw(session as *mut Session) });
+    }
 }

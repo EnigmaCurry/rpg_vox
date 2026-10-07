@@ -3,7 +3,11 @@ package com.enigmacurry.rpg_vox_scribe
 import android.Manifest
 import android.content.ClipData
 import android.content.ClipboardManager
+import android.app.Activity
 import android.content.Intent
+import android.media.projection.MediaProjectionConfig
+import android.media.projection.MediaProjectionManager
+import android.net.Uri
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
@@ -14,6 +18,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
+import androidx.compose.foundation.interaction.DragInteraction
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -27,18 +32,22 @@ import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material3.Button
+import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.ColorScheme
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SegmentedButton
+import androidx.compose.material3.SegmentedButtonDefaults
+import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -52,6 +61,8 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import kotlinx.coroutines.delay
@@ -75,6 +86,27 @@ class MainActivity : ComponentActivity() {
         Scribe.init(this)
         enableEdgeToEdge()
         setContent { AppTheme { App() } }
+        if (savedInstanceState == null) handle(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        handle(intent)
+    }
+
+    /** Share to Scribe / Open with Scribe: transcribe the file. */
+    private fun handle(intent: Intent?) {
+        val uri: Uri = when (intent?.action) {
+            Intent.ACTION_SEND ->
+                if (Build.VERSION.SDK_INT >= 33) {
+                    intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
+                } else {
+                    @Suppress("DEPRECATION") intent.getParcelableExtra(Intent.EXTRA_STREAM)
+                }
+            Intent.ACTION_VIEW -> intent.data
+            else -> null
+        } ?: return
+        Scribe.transcribe(uri)?.let { Toast.makeText(this, it, Toast.LENGTH_LONG).show() }
     }
 
     // Dictation keeps going in the background (ScribeService); this only
@@ -223,26 +255,48 @@ private fun KeepScreenOn() {
 @Composable
 private fun Dictate() {
     val context = LocalContext.current
+    // Phone audio: Android's screen-sharing consent, once per recording.
+    val consent = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
+        val data = r.data
+        if (r.resultCode == Activity.RESULT_OK && data != null) Scribe.start(r.resultCode to data)
+    }
+    val begin = {
+        if (Scribe.mode.phone) {
+            val mpm = context.getSystemService(MediaProjectionManager::class.java)
+            // Whole device: a single app's projection would only capture that app's audio.
+            consent.launch(
+                if (Build.VERSION.SDK_INT >= 34) {
+                    mpm.createScreenCaptureIntent(MediaProjectionConfig.createConfigForDefaultDisplay())
+                } else {
+                    mpm.createScreenCaptureIntent()
+                },
+            )
+        } else {
+            Scribe.start()
+        }
+    }
     val ask = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { got ->
         if (got[Manifest.permission.RECORD_AUDIO] != false) {
-            Scribe.start()
+            begin()
         } else {
             Toast.makeText(context, "Microphone permission is needed", Toast.LENGTH_LONG).show()
         }
     }
     val toggle = {
-        // The notification (with Pause/Stop) needs its own permission on Android 13+.
+        // Phone audio is recorded under RECORD_AUDIO too; the notification
+        // (with Pause/Stop) needs its own permission on Android 13+.
         val wanted = listOfNotNull(
             Manifest.permission.RECORD_AUDIO,
             if (Build.VERSION.SDK_INT >= 33) Manifest.permission.POST_NOTIFICATIONS else null,
         ).filter { ContextCompat.checkSelfPermission(context, it) != PackageManager.PERMISSION_GRANTED }
         when {
-            Scribe.recording -> Scribe.stop()
-            wanted.isEmpty() -> Scribe.start()
+            Scribe.recording || Scribe.file != null -> Scribe.stop()
+            wanted.isEmpty() -> begin()
             else -> ask.launch(wanted.toTypedArray())
         }
     }
     if (Scribe.recording) KeepScreenOn()
+    val job = Scribe.file
 
     Column(Modifier.fillMaxSize()) {
         Transcript(Modifier.weight(1f).fillMaxWidth())
@@ -261,15 +315,27 @@ private fun Dictate() {
                 }
                 val time = clock(if (Scribe.recording) now else 0)
                 val status = when {
+                    job != null -> "Transcribing ${job.name}" +
+                        if (job.progress >= 0) " · ${(job.progress * 100).toInt()}%" else "…"
                     Scribe.finishing -> "Finishing…"
                     Scribe.paused -> "Paused · $time"
                     Scribe.recording -> "Listening · $time"
-                    else -> "Tap to dictate · keeps going in the background"
+                    else -> "Tap to start · keeps going in the background"
                 }
-                Text(status, style = MaterialTheme.typography.labelLarge)
+                if (Build.VERSION.SDK_INT >= 29) {
+                    SourcePicker(enabled = !Scribe.busy())
+                    Spacer(Modifier.height(8.dp))
+                }
+                Text(status, style = MaterialTheme.typography.labelLarge, maxLines = 1)
                 Spacer(Modifier.height(8.dp))
                 LinearProgressIndicator(
-                    progress = { if (Scribe.recording) (Scribe.level * 8f).coerceIn(0f, 1f) else 0f },
+                    progress = {
+                        when {
+                            job != null -> job.progress.coerceAtLeast(0f)
+                            Scribe.recording -> (Scribe.level * 8f).coerceIn(0f, 1f)
+                            else -> 0f
+                        }
+                    },
                     modifier = Modifier.fillMaxWidth(0.6f),
                     gapSize = 0.dp,
                     drawStopIndicator = {},
@@ -280,13 +346,17 @@ private fun Dictate() {
                     horizontalArrangement = Arrangement.SpaceEvenly,
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    val idle = !Scribe.recording && !Scribe.finishing
+                    val idle = !Scribe.busy()
                     val hasText = Scribe.paragraphs.isNotEmpty()
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
                         TextButton(onClick = { copy(context, Scribe.text()) }, enabled = hasText) { Text("Copy") }
                         TextButton(onClick = { share(context, Scribe.text()) }, enabled = hasText) { Text("Share") }
                     }
-                    RecordButton(recording = Scribe.recording, enabled = !Scribe.finishing, onClick = toggle)
+                    RecordButton(
+                        recording = Scribe.recording || job != null,
+                        enabled = !Scribe.finishing,
+                        onClick = toggle,
+                    )
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
                         Row {
                             OutlinedButton(
@@ -303,6 +373,22 @@ private fun Dictate() {
                     }
                 }
             }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun SourcePicker(enabled: Boolean) {
+    val modes = listOf(Mode.MIC to "Mic", Mode.PHONE to "Phone", Mode.BOTH to "Both")
+    SingleChoiceSegmentedButtonRow {
+        modes.forEachIndexed { i, (m, label) ->
+            SegmentedButton(
+                selected = Scribe.mode == m,
+                onClick = { Scribe.choose(m) },
+                enabled = enabled,
+                shape = SegmentedButtonDefaults.itemShape(i, modes.size),
+            ) { Text(label, maxLines = 1) }
         }
     }
 }
@@ -332,9 +418,32 @@ private fun RecordButton(recording: Boolean, enabled: Boolean, onClick: () -> Un
 @Composable
 private fun Transcript(modifier: Modifier) {
     val list = rememberLazyListState()
+    // Follow the bottom (the newest, still-changing text) until the reader
+    // scrolls up; "Jump to latest" or scrolling back down resumes it.
+    var follow by remember { mutableStateOf(true) }
+    var dragged by remember { mutableStateOf(false) }
+    LaunchedEffect(list) {
+        list.interactionSource.interactions.collect {
+            if (it is DragInteraction.Start) {
+                dragged = true
+                follow = false
+            }
+        }
+    }
+    LaunchedEffect(list) {
+        snapshotFlow { list.isScrollInProgress }.collect { scrolling ->
+            if (!scrolling && dragged) {
+                dragged = false
+                follow = !list.canScrollForward
+            }
+        }
+    }
     val last = Scribe.paragraphs.lastOrNull()
-    LaunchedEffect(Scribe.paragraphs.size, last?.text) {
-        if (Scribe.paragraphs.isNotEmpty()) list.animateScrollToItem(Scribe.paragraphs.size - 1)
+    LaunchedEffect(Scribe.paragraphs.size, last, follow) {
+        if (follow && Scribe.paragraphs.isNotEmpty()) {
+            // Past the last item's top, clamped to the very end.
+            list.scrollToItem(Scribe.paragraphs.size - 1, Int.MAX_VALUE)
+        }
     }
     if (Scribe.paragraphs.isEmpty()) {
         Box(modifier.padding(24.dp), contentAlignment = Alignment.Center) {
@@ -348,31 +457,49 @@ private fun Transcript(modifier: Modifier) {
         return
     }
     val faint = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.45f)
-    SelectionContainer(modifier) {
-        LazyColumn(
-            state = list,
-            modifier = Modifier.fillMaxSize(),
-            contentPadding = androidx.compose.foundation.layout.PaddingValues(16.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
-        ) {
-            items(Scribe.paragraphs, key = { it.id }) { p ->
-                Text(
-                    buildAnnotatedString {
-                        p.clips.filter { it.text.isNotBlank() }.forEachIndexed { i, c ->
-                            if (i > 0) append(' ')
-                            if (c.partial) {
-                                // Zipformer partials are ALL CAPS.
-                                withStyle(SpanStyle(color = faint, fontStyle = FontStyle.Italic)) {
-                                    append(c.text.lowercase())
+    Box(modifier) {
+        SelectionContainer(Modifier.fillMaxSize()) {
+            LazyColumn(
+                state = list,
+                modifier = Modifier.fillMaxSize(),
+                contentPadding = androidx.compose.foundation.layout.PaddingValues(16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                itemsIndexed(Scribe.paragraphs, key = { _, p -> p.id }) { i, p ->
+                    // Label a run of paragraphs from one source: a file's name, or the speaker.
+                    val prev = Scribe.paragraphs.getOrNull(i - 1)
+                    if (p.source != null && (prev?.source != p.source || prev.fromFile != p.fromFile)) {
+                        Text(
+                            p.source,
+                            style = if (p.fromFile) MaterialTheme.typography.titleMedium else MaterialTheme.typography.labelLarge,
+                            color = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.padding(bottom = 4.dp),
+                        )
+                    }
+                    Text(
+                        buildAnnotatedString {
+                            p.clips.filter { it.text.isNotBlank() }.forEachIndexed { i, c ->
+                                if (i > 0) append(' ')
+                                if (c.partial) {
+                                    // Zipformer partials are ALL CAPS.
+                                    withStyle(SpanStyle(color = faint, fontStyle = FontStyle.Italic)) {
+                                        append(c.text.lowercase())
+                                    }
+                                } else {
+                                    append(c.text)
                                 }
-                            } else {
-                                append(c.text)
                             }
-                        }
-                    },
-                    style = MaterialTheme.typography.bodyLarge,
-                )
+                        },
+                        style = MaterialTheme.typography.bodyLarge,
+                    )
+                }
             }
+        }
+        if (!follow) {
+            FilledTonalButton(
+                onClick = { follow = true },
+                modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 12.dp),
+            ) { Text("↓ Jump to latest") }
         }
     }
 }
