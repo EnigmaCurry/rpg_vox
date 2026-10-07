@@ -23,6 +23,7 @@ use uuid::Uuid;
 
 use crate::boundary::{self, BoundaryConfig, WindowClip};
 use crate::correct::{apply_edits, Corrector, Edit};
+use crate::digits::spoken_digits;
 use crate::filters::{count_words, ends_on_sentence, is_junk};
 use crate::model::{Clip, Paragraph, Pass4, Stage, Transcript};
 use crate::recognizer::{OfflineRecognizer, SpeakerTagger, StreamingRecognizer, Transcription};
@@ -77,6 +78,9 @@ pub struct EngineConfig {
     pub partial_interval: Duration,
     /// Audio time between [`Event::Level`] updates.
     pub level_interval_ms: u64,
+    /// Rewrite spelled-out digit strings in pass-2 and pass-3 text as
+    /// numerals (see [`crate::digits`]).
+    pub spoken_digits: bool,
 }
 
 impl EngineConfig {
@@ -89,6 +93,7 @@ impl EngineConfig {
             ring_ms: 90_000,
             partial_interval: Duration::from_millis(150),
             level_interval_ms: 50,
+            spoken_digits: true,
         }
     }
 }
@@ -913,8 +918,11 @@ impl Core {
             warn!(err = %format!("{err:#}"), "pass 2 decode failed");
             Transcription::default()
         });
-        let text = t.text.trim().to_string();
+        let mut text = t.text.trim().to_string();
         debug!(clip = %clip_id, start_ms, duration_ms, ?reason, %text, "pass 2");
+        if self.cfg.spoken_digits {
+            text = spoken_digits(&text);
+        }
         if is_junk(&text) {
             self.remove_clip(&clip_id);
             return;
@@ -1000,9 +1008,16 @@ impl Core {
         };
         self.transcript.paragraphs[idx].pass3_inflight = false;
         let plan = match text {
-            Ok(t) => boundary::plan_revision(&window, &t.text, &t.words).map_err(|r| {
-                debug!(paragraph = %paragraph_id, reason = ?r, output = %t.text, "pass 3 rejected");
-            }),
+            Ok(mut t) => {
+                // Pass 2 already converted digits in the window's text, so
+                // the decode must match it for the edge checks.
+                if self.cfg.spoken_digits {
+                    t.text = spoken_digits(&t.text);
+                }
+                boundary::plan_revision(&window, &t.text, &t.words).map_err(|r| {
+                    debug!(paragraph = %paragraph_id, reason = ?r, output = %t.text, "pass 3 rejected");
+                })
+            }
             Err(err) => {
                 warn!(err = %format!("{err:#}"), "pass 3 decode failed");
                 Err(())

@@ -79,6 +79,12 @@ Each utterance goes through up to four passes:
    small edits from an OpenAI-compatible chat model. Changed words are
    blue.
 
+Digits read out one at a time become numerals in passes 2 and 3, with
+"dash", "dot" / "point" and "slash" between them becoming `-`, `.` and
+`/`: "zero seven eight four zero dash one five zero three" is written
+`07840-1503`, and "one nine two dot one six eight dot one dot one" is
+`192.168.1.1`. A lone digit word ("one of them") is left alone.
+
 Audio comes from CoreAudio on macOS and PipeWire on Linux (the
 `vox_audio` crate). The first run downloads the models (about 580 MB) if
 none are found; `scribe download-models` does the same thing up front.

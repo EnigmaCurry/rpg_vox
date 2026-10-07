@@ -19,6 +19,7 @@
 pub mod boundary;
 pub mod correct;
 pub mod diarize;
+pub mod digits;
 pub mod engine;
 pub mod filters;
 pub mod gaps;
