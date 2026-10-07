@@ -150,6 +150,7 @@ private fun App() {
     val drawer = rememberDrawerState(DrawerValue.Closed)
     val ui = rememberCoroutineScope()
     val dialogs = remember { ThreadDialogs() }
+    var settings by remember { mutableStateOf(false) }
     val ready = Scribe.phase == Phase.Ready
     // Back closes the drawer before it leaves the app.
     BackHandler(enabled = drawer.isOpen) { ui.launch { drawer.close() } }
@@ -165,6 +166,9 @@ private fun App() {
                         if (ready) {
                             IconButton(onClick = { ui.launch { drawer.open() } }) { Text("☰") }
                         }
+                    },
+                    actions = {
+                        if (ready) IconButton(onClick = { settings = true }) { Text("⚙") }
                     },
                     // The open thread; tap to rename it.
                     title = {
@@ -195,6 +199,7 @@ private fun App() {
         }
     }
     ThreadDialogHost(dialogs)
+    if (settings) MicSettings(close = { settings = false })
 }
 
 @Composable
@@ -364,7 +369,7 @@ private fun Dictate() {
                         if (job.progress >= 0) " · ${(job.progress * 100).toInt()}%" else "…"
                     Scribe.finishing -> "Finishing…"
                     Scribe.paused -> "Paused · $time"
-                    Scribe.recording -> "Listening · $time"
+                    Scribe.recording -> "Listening · $time" + (Scribe.micName?.let { " · $it" } ?: "")
                     else -> "Tap to start · keeps going in the background"
                 }
                 if (Build.VERSION.SDK_INT >= 29) {

@@ -8,6 +8,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.DropdownMenu
@@ -16,6 +17,7 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalDrawerSheet
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -26,6 +28,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.TextFieldValue
@@ -182,5 +185,53 @@ fun ThreadDialogHost(dialogs: ThreadDialogs) {
             },
             dismissButton = { TextButton(onClick = { dialogs.deleting = null }) { Text("Cancel") } },
         )
+    }
+}
+
+/** Mic settings: which mic, and its gain. Take effect when the mic next starts. */
+@Composable
+fun MicSettings(close: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = close,
+        title = { Text("Microphone") },
+        text = {
+            Column {
+                Text("Mic", style = MaterialTheme.typography.titleSmall)
+                MicRoute.entries.forEach { r ->
+                    Choice(r.label, Scribe.route == r) { Scribe.chooseRoute(r) }
+                }
+                Text(
+                    "Mic boost",
+                    style = MaterialTheme.typography.titleSmall,
+                    modifier = Modifier.padding(top = 12.dp),
+                )
+                Boost.entries.forEach { b ->
+                    val label = if (b == Boost.AUTO) "Auto (raise quiet speech)" else b.label
+                    Choice(label, Scribe.boost == b) { Scribe.chooseBoost(b) }
+                }
+                if (Scribe.recording) {
+                    Text(
+                        "Changes apply when the mic next starts (pause and resume).",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(top = 8.dp),
+                    )
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = close) { Text("Done") } },
+    )
+}
+
+@Composable
+private fun Choice(label: String, selected: Boolean, onClick: () -> Unit) {
+    androidx.compose.foundation.layout.Row(
+        verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
+        modifier = Modifier
+            .fillMaxWidth()
+            .selectable(selected = selected, onClick = onClick, role = Role.RadioButton),
+    ) {
+        RadioButton(selected = selected, onClick = null)
+        Text(label, modifier = Modifier.padding(start = 8.dp))
     }
 }

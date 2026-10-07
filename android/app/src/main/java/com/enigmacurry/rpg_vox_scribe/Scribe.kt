@@ -6,7 +6,9 @@ import android.content.Intent
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioPlaybackCaptureConfiguration
+import android.media.AudioManager
 import android.media.AudioRecord
+import android.media.audiofx.AutomaticGainControl
 import android.media.MediaRecorder
 import android.media.projection.MediaProjection
 import android.net.Uri
@@ -90,6 +92,14 @@ object Scribe {
     var phase by mutableStateOf<Phase>(Phase.Unloaded)
         private set
     var mode by mutableStateOf(Mode.MIC)
+    /** Mic gain and which mic; applied when the mic (re)starts. */
+    var boost by mutableStateOf(Boost.AUTO)
+        private set
+    var route by mutableStateOf(MicRoute.AUTO)
+        private set
+    /** The input the mic source is recording from, while it runs. */
+    var micName by mutableStateOf<String?>(null)
+        private set
     /** A live recording is open (capturing or paused). */
     var recording by mutableStateOf(false)
         private set
@@ -147,6 +157,8 @@ object Scribe {
         val prefs = app.getSharedPreferences("scribe", Context.MODE_PRIVATE)
         mode = runCatching { Mode.valueOf(prefs.getString("mode", "MIC")!!) }.getOrDefault(Mode.MIC)
         if (Build.VERSION.SDK_INT < 29) mode = Mode.MIC
+        boost = runCatching { Boost.valueOf(prefs.getString("boost", "AUTO")!!) }.getOrDefault(Boost.AUTO)
+        route = runCatching { MicRoute.valueOf(prefs.getString("route", "AUTO")!!) }.getOrDefault(MicRoute.AUTO)
         phase = if (store.ready()) Phase.Unloaded else Phase.NeedModels(resume = store.started())
         migrate()
         show(threads.current())
@@ -161,6 +173,16 @@ object Scribe {
                 }
             }
         }
+    }
+
+    fun chooseBoost(b: Boost) {
+        boost = b
+        app.getSharedPreferences("scribe", Context.MODE_PRIVATE).edit().putString("boost", b.name).apply()
+    }
+
+    fun chooseRoute(r: MicRoute) {
+        route = r
+        app.getSharedPreferences("scribe", Context.MODE_PRIVATE).edit().putString("route", r.name).apply()
     }
 
     fun choose(m: Mode) {
@@ -294,10 +316,10 @@ object Scribe {
         for (src in sources) {
             if (src.capture != null) continue
             when (src.kind) {
-                Kind.MIC -> src.capture = capture(src) { micRecord() }
+                Kind.MIC -> src.capture = micCapture(src)
                 Kind.PHONE -> {
                     val mp = projection ?: continue
-                    if (Build.VERSION.SDK_INT >= 29) src.capture = capture(src) { phoneRecord(mp) }
+                    if (Build.VERSION.SDK_INT >= 29) src.capture = capture(src, make = { phoneRecord(mp) })
                 }
                 Kind.FILE -> {}
             }
@@ -371,29 +393,67 @@ object Scribe {
             .build()
     }
 
+    /**
+     * The mic: routed to a Bluetooth headset when [route] allows and one
+     * is connected, through [MicGain], with its name in [micName].
+     */
+    private fun micCapture(src: Source): Capture {
+        val routing = MicRouting(app.getSystemService(AudioManager::class.java))
+        val gain = MicGain(boost)
+        val useHeadset = route == MicRoute.AUTO
+        return capture(
+            src,
+            make = {
+                val headset = if (useHeadset) routing.headset() else null
+                micRecord().also { rec -> headset?.let { rec.preferredDevice = it } }
+            },
+            process = gain::process,
+            started = { rec ->
+                // The headset's call link takes a moment; the name follows the switch.
+                rec.addOnRoutingChangedListener({ r -> main.post { micName = (r as AudioRecord).inputName() } }, main)
+                main.post { micName = rec.inputName() }
+                Log.i(TAG, "mic: ${rec.inputName()}, boost ${boost.label}, platform AGC available: ${AutomaticGainControl.isAvailable()}")
+            },
+            ended = {
+                routing.release()
+                main.post { micName = null }
+            },
+        )
+    }
+
     /** Read 100 ms blocks from [make]'s recorder into [src] until stopped. */
-    private fun capture(src: Source, make: () -> AudioRecord): Capture {
+    private fun capture(
+        src: Source,
+        make: () -> AudioRecord,
+        process: ((FloatArray, Int) -> Unit)? = null,
+        started: (AudioRecord) -> Unit = {},
+        ended: () -> Unit = {},
+    ): Capture {
         lateinit var c: Capture
         c = Capture(Thread({
             val rec = runCatching(make).getOrNull()
             if (rec == null || rec.state != AudioRecord.STATE_INITIALIZED) {
                 Log.e(TAG, "${src.kind} AudioRecord failed to initialize")
                 rec?.release()
+                ended()
                 return@Thread
             }
             val shorts = ShortArray(RATE / 10)
             val buf = FloatArray(shorts.size)
             rec.startRecording()
+            started(rec)
             try {
                 while (c.run) {
                     val n = rec.read(shorts, 0, shorts.size, AudioRecord.READ_BLOCKING)
                     if (n <= 0) continue
                     for (i in 0 until n) buf[i] = shorts[i] / 32768f
+                    process?.invoke(buf, n)
                     Native.push(src.session, buf, n)
                 }
             } finally {
                 rec.stop()
                 rec.release()
+                ended()
             }
         }, "vox-${src.kind.name.lowercase()}"))
         c.thread.start()
