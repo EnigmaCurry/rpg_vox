@@ -20,7 +20,7 @@ use std::time::Duration;
 use anyhow::Result;
 use crossbeam_channel::{bounded, Receiver, Sender};
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "android"))]
 pub mod coreaudio;
 pub mod file;
 pub mod opus_file;
@@ -104,7 +104,11 @@ pub fn default_backend() -> Result<Box<dyn Backend>> {
     {
         Ok(Box::new(pipewire::PipeWire))
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(target_os = "android")]
+    {
+        Ok(Box::new(coreaudio::CoreAudio))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
     {
         anyhow::bail!("no live audio backend for this OS; use a file input")
     }

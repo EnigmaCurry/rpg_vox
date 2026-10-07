@@ -358,6 +358,40 @@ install-scribe BIN="~/.local/bin": release-scribe
       *) echo "note: $bin is not on your PATH" ;;
     esac
 
+# Android arm64 (API 26+) scribe bundle in dist/android-arm64/: scribe, the
+# sherpa-onnx / onnxruntime .so files it loads, and run.sh, which sets
+# LD_LIBRARY_PATH and points VOX_SCRIBE_MODELS at ./models unless already
+# set. Needs the NDK (ANDROID_NDK_HOME, default: Homebrew's android-ndk),
+# `rustup target add aarch64-linux-android` and `cargo install cargo-ndk`.
+android:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-/opt/homebrew/share/android-ndk}"
+    # libopus is built by CMake, which needs the ABI and API level pinned.
+    export CMAKE_TOOLCHAIN_FILE="$PWD/android/toolchain.cmake"
+    cargo ndk -t arm64-v8a --platform 26 build --release -p vox_scribe
+    out=dist/android-arm64
+    rm -rf "$out"
+    mkdir -p "$out"
+    libs=target/sherpa-onnx-prebuilt/jniLibs/arm64-v8a
+    cp target/aarch64-linux-android/release/scribe "$out/"
+    cp "$libs/libsherpa-onnx-c-api.so" "$libs/libonnxruntime.so" "$out/"
+    cp SCRIBE.md "$out/"
+    printf '%s\n' '#!/system/bin/sh' \
+      'dir="$(cd "$(dirname "$0")" && pwd)"' \
+      'export LD_LIBRARY_PATH="$dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"' \
+      'export VOX_SCRIBE_MODELS="${VOX_SCRIBE_MODELS:-$dir/models}"' \
+      'exec "$dir/scribe" "$@"' > "$out/run.sh"
+    chmod 755 "$out/run.sh" "$out/scribe"
+    readelf="$(ls "$ANDROID_NDK_HOME"/toolchains/llvm/prebuilt/*/bin/llvm-readelf | head -1)"
+    for need in $("$readelf" -d "$out"/scribe "$out"/*.so | sed -n 's/.*NEEDED.*\[\(.*\)\]/\1/p' | sort -u); do
+      case "$need" in
+        libc.so|libm.so|libdl.so|liblog.so|libandroid.so|libaaudio.so) ;;
+        *) [ -f "$out/$need" ] || { echo "missing $need" >&2; exit 1; } ;;
+      esac
+    done
+    du -sh "$out"
+
 # --- discord_vox (PipeWire sink → Discord voice) ---
 
 # Run the discord_vox release binary. Expects DISCORD_VOX_TOKEN /

@@ -8,7 +8,9 @@ use cpal::{Sample, SampleFormat};
 use crossbeam_channel::bounded;
 use tracing::warn;
 
-use crate::{push_rt, AppInfo, Backend, Capture, DeviceInfo, OpenOptions, Plumbing};
+#[cfg(target_os = "macos")]
+use crate::AppInfo;
+use crate::{push_rt, Backend, Capture, DeviceInfo, OpenOptions, Plumbing};
 
 pub struct CoreAudio;
 
@@ -62,6 +64,7 @@ impl Backend for CoreAudio {
         Ok(out)
     }
 
+    #[cfg(target_os = "macos")]
     fn list_apps(&self) -> Result<Vec<AppInfo>> {
         crate::process_tap::list_apps()
     }
@@ -70,8 +73,13 @@ impl Backend for CoreAudio {
         if opts.virtual_sink {
             bail!("--virtual-sink is PipeWire-only; on macOS use --app, or route apps through a loopback device such as BlackHole and pick it with --device");
         }
+        #[cfg(target_os = "macos")]
         if let Some(app) = &opts.app {
             return crate::process_tap::open(app);
+        }
+        #[cfg(not(target_os = "macos"))]
+        if opts.app.is_some() {
+            bail!("--app is not supported on this OS");
         }
         // cpal::Stream is !Send on macOS, so it lives on its own thread
         // for the whole capture.
