@@ -6,6 +6,8 @@ section after the version it releases.
 
 ## Unreleased
 
+## v0.1.2 (2026-10-08)
+
 ### Scribe for Android
 
 - **Keep audio.** A Recording setting saves each recording (.opus) with
