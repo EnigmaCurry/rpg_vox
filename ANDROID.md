@@ -171,7 +171,8 @@ resume to apply them mid-recording.
   deleted with its thread, or by **Clear**.
 * **Keep non-speech audio**: with Keep audio on, also keeps recordings
   in which no words were detected. Off by default, so those are deleted
-  when they finish.
+  when they finish, and a recording whose text has all been cut isn't
+  played or shown.
 
 **Keyboard**: a shortcut to turn on the [voice typing
 keyboard](#voice-typing-keyboard).

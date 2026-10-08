@@ -724,7 +724,8 @@ private fun Transcript(modifier: Modifier) {
     val heard = Scribe.paragraphs.mapNotNullTo(HashSet()) { p -> p.audio?.let { Scribe.threadAudio[it] } }
     val before = HashMap<String, MutableList<String>>()
     val tail = mutableListOf<String>()
-    for (rec in Scribe.recordings.filter { it !in heard }) {
+    // Shown only when non-speech audio is kept; otherwise there's nothing to play.
+    for (rec in Scribe.recordings.filter { Scribe.keepNonSpeech && it !in heard }) {
         val start = recordingStart(rec)
         val p = Scribe.paragraphs.firstOrNull { it.atMs > start }
         if (p == null) tail += rec else before.getOrPut(p.id) { mutableListOf() } += rec
@@ -738,7 +739,7 @@ private fun Transcript(modifier: Modifier) {
     }
     if (Scribe.paragraphs.isEmpty()) {
         // Kept audio with nothing transcribed still plays, from the start.
-        val rec = Scribe.threadAudio.values.maxOrNull()
+        val rec = Scribe.threadAudio.values.maxOrNull()?.takeIf { Scribe.keepNonSpeech }
         Box(modifier.padding(24.dp), contentAlignment = Alignment.Center) {
             if (rec != null && !Scribe.busy()) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {

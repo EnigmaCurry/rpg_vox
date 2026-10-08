@@ -290,6 +290,8 @@ object Scribe {
         val heard = paragraphs.mapNotNullTo(HashSet()) { it.audio }
         var at = 0L
         for ((rec, rows) in threads.audioRows(thread.id).groupBy { it.recording }) {
+            // Without "Keep non-speech audio", a recording with no text left isn't played.
+            if (!keepNonSpeech && rows.none { it.file in heard }) continue
             val base = rows.minOf { it.offsetMs }
             var end = 0L
             var sound = Long.MAX_VALUE
