@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use crossbeam_channel::Receiver;
-use jni::objects::{JClass, JFloatArray, JString};
+use jni::objects::{JClass, JFloatArray, JLongArray, JString};
 use jni::sys::{jboolean, jfloat, jint, jlong, jstring};
 use jni::JNIEnv;
 use serde_json::{json, Value};
@@ -411,6 +411,34 @@ impl Player {
         Ok(())
     }
 
+    /// The stretch from the first to the last 50 ms window louder than
+    /// `threshold_db` (RMS, dBFS), in ms, padded by `pad_ms` each side;
+    /// `None` if nothing is that loud. Leaves the player at the start.
+    fn span(&mut self, threshold_db: f32, pad_ms: u64) -> Result<Option<(u64, u64)>> {
+        let window = (OPUS_RATE / 20) as usize;
+        let floor = 10f32.powf(threshold_db / 20.0);
+        self.seek(0)?;
+        let mut buf = vec![0f32; window];
+        let (mut first, mut last) = (None, 0u64);
+        let mut at = 0u64;
+        loop {
+            let n = self.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            let rms = (buf[..n].iter().map(|s| s * s).sum::<f32>() / n as f32).sqrt();
+            if rms > floor {
+                first.get_or_insert(at);
+                last = at + n as u64;
+            }
+            at += n as u64;
+        }
+        self.seek(0)?;
+        let ms = |samples: u64| samples * 1000 / OPUS_RATE as u64;
+        let len = ms(at);
+        Ok(first.map(|f| (ms(f).saturating_sub(pad_ms), (ms(last) + pad_ms).min(len))))
+    }
+
     /// Fill `out` from the cursor; how many samples were written (fewer
     /// only at the end).
     fn read(&mut self, out: &mut [f32]) -> Result<usize> {
@@ -454,6 +482,34 @@ pub extern "system" fn Java_com_enigmacurry_rpg_1vox_1scribe_Native_playerOpen(
         Err(e) => {
             throw(&mut env, &e);
             0
+        }
+    }
+}
+
+/// `playerSpan(player, thresholdDb, padMs)`: `[startMs, endMs]` of the
+/// sound in the recording (see [`Player::span`]), or null if it's all
+/// quieter than that. The player is left at the start.
+#[no_mangle]
+pub extern "system" fn Java_com_enigmacurry_rpg_1vox_1scribe_Native_playerSpan<'a>(
+    mut env: JNIEnv<'a>,
+    _class: JClass,
+    player: jlong,
+    threshold_db: jfloat,
+    pad_ms: jlong,
+) -> JLongArray<'a> {
+    let player = unsafe { &mut *(player as *mut Player) };
+    match player.span(threshold_db, pad_ms.max(0) as u64) {
+        Ok(Some((a, b))) => {
+            let Ok(arr) = env.new_long_array(2) else {
+                return JLongArray::default();
+            };
+            let _ = env.set_long_array_region(&arr, 0, &[a as jlong, b as jlong]);
+            arr
+        }
+        Ok(None) => JLongArray::default(),
+        Err(e) => {
+            throw(&mut env, &e);
+            JLongArray::default()
         }
     }
 }
@@ -558,6 +614,11 @@ mod tests {
         let peak = (0..out.len()).max_by(|&a, &b| out[a].abs().total_cmp(&out[b].abs())).unwrap();
         assert!((peak as i64 - 24_000).abs() < 200, "click at {peak}");
         assert_eq!(p.read(&mut buf).unwrap(), 0);
+        // The click is the only sound: 1.5 s, padded 100 ms each side, to
+        // within a 50 ms window (Opus smears it a little).
+        let (a, b) = p.span(-40.0, 100).unwrap().unwrap();
+        assert!((1340..=1410).contains(&a), "{a}");
+        assert!((1640..=1710).contains(&b), "{b}");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

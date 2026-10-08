@@ -42,6 +42,11 @@ object Native {
 
     /** Opens an Ogg Opus recording for playback, at its start; throws on failure. */
     external fun playerOpen(path: String): Long
+    /**
+     * `[startMs, endMs]` from the first to the last 50 ms louder than
+     * [thresholdDb] dBFS, padded by [padMs]; null if none is. Rewinds the player.
+     */
+    external fun playerSpan(player: Long, thresholdDb: Float, padMs: Long): LongArray?
     /** Length of the recording in ms. */
     external fun playerLength(player: Long): Long
     external fun playerSeek(player: Long, ms: Long)

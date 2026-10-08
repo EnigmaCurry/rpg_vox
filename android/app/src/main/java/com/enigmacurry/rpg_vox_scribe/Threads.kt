@@ -34,11 +34,25 @@ private fun isoAt(ms: Long): String = synchronized(iso) { iso.format(Date(ms)) }
 private fun parseAt(at: String?): Long =
     at?.let { runCatching { synchronized(iso) { iso.parse(it)?.time } }.getOrNull() } ?: 0L
 
-/** A kept recording: one source's audio file and where it starts in its recording. */
-data class AudioFile(val file: String, val offsetMs: Long)
+/**
+ * A kept file placed on a timeline: it starts at [offsetMs] (its time
+ * zero; negative when its head is cut off) and plays until [untilMs].
+ */
+data class AudioFile(val file: String, val offsetMs: Long, val untilMs: Long = Long.MAX_VALUE)
 
-/** One source's file of [recording], [offsetMs] into it and [lengthMs] long (0: not known yet). */
-data class AudioRow(val file: String, val recording: String, val offsetMs: Long, val lengthMs: Long)
+/**
+ * One source's file of [recording], [offsetMs] into it and [lengthMs]
+ * long (0: not known yet), with sound from [soundStartMs] to
+ * [soundEndMs] (-1: not looked for yet).
+ */
+data class AudioRow(
+    val file: String,
+    val recording: String,
+    val offsetMs: Long,
+    val lengthMs: Long,
+    val soundStartMs: Long,
+    val soundEndMs: Long,
+)
 
 /**
  * Threads (named transcripts) in `files/scribe.db`, using the desktop
@@ -89,8 +103,10 @@ class ThreadStore(file: File) {
                 offset_ms    INTEGER NOT NULL DEFAULT 0
             )""",
         )
-        rawQuery("SELECT 1 FROM pragma_table_info('audio') WHERE name = 'length_ms'", null).use {
-            if (!it.moveToFirst()) execSQL("ALTER TABLE audio ADD COLUMN length_ms INTEGER NOT NULL DEFAULT 0")
+        for ((column, default) in listOf("length_ms" to 0, "sound_start_ms" to -1, "sound_end_ms" to -1)) {
+            rawQuery("SELECT 1 FROM pragma_table_info('audio') WHERE name = ?", arrayOf(column)).use {
+                if (!it.moveToFirst()) execSQL("ALTER TABLE audio ADD COLUMN $column INTEGER NOT NULL DEFAULT $default")
+            }
         }
     }
 
@@ -216,13 +232,30 @@ class ThreadStore(file: File) {
         db.update("audio", ContentValues().apply { put("length_ms", lengthMs) }, "file = ?", arrayOf(file))
     }
 
+    fun setAudioSound(file: String, startMs: Long, endMs: Long) {
+        db.update(
+            "audio",
+            ContentValues().apply {
+                put("sound_start_ms", startMs)
+                put("sound_end_ms", endMs)
+            },
+            "file = ?",
+            arrayOf(file),
+        )
+    }
+
     /** [thread]'s kept audio, oldest recording first. */
     fun audioRows(thread: Long): List<AudioRow> =
         db.rawQuery(
-            "SELECT file, recording, offset_ms, length_ms FROM audio WHERE conversation = ? ORDER BY recording, file",
+            """SELECT file, recording, offset_ms, length_ms, sound_start_ms, sound_end_ms
+               FROM audio WHERE conversation = ? ORDER BY recording, file""",
             arrayOf("$thread"),
         ).use { c ->
-            buildList { while (c.moveToNext()) add(AudioRow(c.getString(0), c.getString(1), c.getLong(2), c.getLong(3))) }
+            buildList {
+                while (c.moveToNext()) {
+                    add(AudioRow(c.getString(0), c.getString(1), c.getLong(2), c.getLong(3), c.getLong(4), c.getLong(5)))
+                }
+            }
         }
 
     private fun audioFiles(thread: Long): List<String> =

@@ -64,6 +64,7 @@ object Playback {
     @Volatile private var fromMs = 0L
     private var worker: Thread? = null
     private var dir = File("")
+    private var files = emptyList<AudioFile>()
     /** Restarts after the audio output died under us, this playback. */
     private var retries = 0
 
@@ -74,16 +75,16 @@ object Playback {
         return fromMs + frames * 1000 / PLAY_RATE
     }
 
-    /** Play the recording made of [files] (in [dir]) from [atMs] on its timeline. */
+    /** Play [files] (in [dir]), placed on one timeline, from [atMs] on it. */
     fun play(dir: File, files: List<AudioFile>, atMs: Long) {
         stop()
         if (files.isEmpty()) return
-        val base = files.minOf { it.offsetMs }
         this.dir = dir
+        this.files = files
         retries = 0
         paused = false
         lengthMs = 0
-        playing = Playing(files.associate { it.file to it.offsetMs - base })
+        playing = Playing(files.associate { it.file to it.offsetMs })
         startWorker(atMs.coerceAtLeast(0))
     }
 
@@ -126,10 +127,11 @@ object Playback {
     }
 
     private fun startWorker(from: Long) {
-        val offsets = playing?.offsets ?: return
+        if (playing == null) return
+        val files = files
         fromMs = from
         run = true
-        val me = Thread({ loop(dir, offsets, from) }, "vox-play")
+        val me = Thread({ loop(dir, files, from) }, "vox-play")
         worker = me
         me.start()
     }
@@ -145,21 +147,28 @@ object Playback {
         worker = null
     }
 
-    private class Source(val handle: Long, var silence: Long, var done: Boolean = false)
+    /** [silence] to play before its audio, then at most [left] samples of it. */
+    private class Source(val handle: Long, var silence: Long, var left: Long, var done: Boolean = false)
 
-    private fun loop(dir: File, offsets: Map<String, Long>, from: Long) {
+    private fun loop(dir: File, files: List<AudioFile>, from: Long) {
         val sources = mutableListOf<Source>()
         var t: AudioTrack? = null
         var died = false
         try {
-            for ((file, off) in offsets) {
-                val h = runCatching { Native.playerOpen(File(dir, file).path) }
-                    .onFailure { Log.w(TAG, "can't open $file", it) }
+            for (f in files) {
+                val off = f.offsetMs
+                val h = runCatching { Native.playerOpen(File(dir, f.file).path) }
+                    .onFailure { Log.w(TAG, "can't open ${f.file}", it) }
                     .getOrNull() ?: continue
-                sources += Source(h, (off - from).coerceAtLeast(0) * PLAY_RATE / 1000)
-                Native.playerSeek(h, (from - off).coerceAtLeast(0))
-                val end = off + Native.playerLength(h)
+                val end = minOf(f.untilMs, off + Native.playerLength(h))
                 main.post { if (end > lengthMs) lengthMs = end }
+                val begin = maxOf(from, off)
+                if (end <= begin) {
+                    Native.playerFree(h)
+                    continue
+                }
+                Native.playerSeek(h, begin - off)
+                sources += Source(h, (begin - from) * PLAY_RATE / 1000, (end - begin) * PLAY_RATE / 1000)
             }
             if (sources.isEmpty()) return
             val min = AudioTrack.getMinBufferSize(PLAY_RATE, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_FLOAT)
@@ -245,10 +254,15 @@ object Playback {
             i = k
         }
         if (s.done || i == mix.size) return i
-        val want = mix.size - i
+        val want = minOf((mix.size - i).toLong(), s.left).toInt()
+        if (want == 0) {
+            s.done = true
+            return i
+        }
         val buf = if (want == got.size) got else FloatArray(want)
         val n = Native.playerRead(s.handle, buf)
-        if (n < want) s.done = true
+        s.left -= n
+        if (n < want || s.left == 0L) s.done = true
         for (j in 0 until n) mix[i + j] += buf[j]
         return i + n
     }
