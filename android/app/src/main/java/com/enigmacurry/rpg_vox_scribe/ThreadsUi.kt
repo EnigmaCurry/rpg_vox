@@ -23,7 +23,15 @@ import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.text.input.ImeAction
+import kotlinx.coroutines.delay
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -161,7 +169,30 @@ fun ThreadDialogHost(dialogs: ThreadDialogs) {
         AlertDialog(
             onDismissRequest = { dialogs.renaming = null },
             title = { Text("Rename thread") },
-            text = { OutlinedTextField(value = text, onValueChange = { text = it }, singleLine = true) },
+            text = {
+                // Focused with the keyboard up, ready to type; Done renames.
+                val focus = remember { FocusRequester() }
+                val keyboard = LocalSoftwareKeyboardController.current
+                LaunchedEffect(Unit) {
+                    // The dialog's window must be up before it can take focus.
+                    delay(100)
+                    focus.requestFocus()
+                    keyboard?.show()
+                }
+                OutlinedTextField(
+                    value = text,
+                    onValueChange = { text = it },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+                    keyboardActions = KeyboardActions(onDone = {
+                        if (text.text.isNotBlank()) {
+                            Scribe.rename(t.id, text.text)
+                            dialogs.renaming = null
+                        }
+                    }),
+                    modifier = Modifier.focusRequester(focus),
+                )
+            },
             confirmButton = {
                 TextButton(
                     onClick = {
