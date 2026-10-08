@@ -447,7 +447,8 @@ private fun Dictate() {
                                 enabled = Scribe.recording && !Scribe.paused,
                             ) { Text("¶") }
                         }
-                        TextButton(onClick = Scribe::clear, enabled = idle && hasText) { Text("Clear") }
+                        // Also clears audio that has no text with it.
+                        TextButton(onClick = Scribe::clear, enabled = idle && (hasText || Scribe.threadAudio.isNotEmpty())) { Text("Clear") }
                     }
                 }
             }
