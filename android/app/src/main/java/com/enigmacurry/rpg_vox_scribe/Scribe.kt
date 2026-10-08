@@ -417,6 +417,16 @@ object Scribe {
             paragraphs[i] = p.copy(clips = listOf(ClipUi(text, partial = false)), words = words)
         }
         sync()
+        // Its recording left without text: gone too, unless non-speech audio is kept.
+        val rec = p.audio?.let { threadAudio[it] }
+        if (rec != null && !keepNonSpeech) {
+            val files = threadAudio.filterValues { it == rec }.keys
+            if (paragraphs.none { it.audio in files }) {
+                files.forEach(threads::removeAudio)
+                deleteAudio(files.toList())
+                refreshThreads()
+            }
+        }
     }
 
     fun chooseRoute(r: MicRoute) {
