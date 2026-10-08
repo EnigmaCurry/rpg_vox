@@ -551,14 +551,15 @@ private fun RecordButton(recording: Boolean, enabled: Boolean, onClick: () -> Un
             contentDescription = if (recording) "Stop dictation" else "Start dictation"
         },
         colors = androidx.compose.material3.ButtonDefaults.buttonColors(
-            containerColor = Color(0xFFD32F2F),
+            // Red only while recording (the stop button); idle it's a red dot.
+            containerColor = if (recording) Color(0xFFD32F2F) else MaterialTheme.colorScheme.surfaceVariant,
             contentColor = Color.White,
         ),
     ) {
         if (recording) {
             Box(Modifier.size(28.dp).background(Color.White, RoundedCornerShape(4.dp)))
         } else {
-            Box(Modifier.size(30.dp).background(Color.White, CircleShape))
+            Box(Modifier.size(30.dp).background(Color(0xFFD32F2F), CircleShape))
         }
     }
 }
