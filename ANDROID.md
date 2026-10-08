@@ -127,10 +127,10 @@ phone audio together.
 Playback runs through all of a thread's recordings in order, one after
 another, and the time shown is for the whole thread. The green ▶ above
 a recording's first paragraph plays from its start. A recording in which
-no words were heard plays only from its first sound to its last (quiet
-in the middle is kept) and appears as "▶ No words detected" where it happened,
+no words were heard appears as "▶ No words detected" where it happened,
 or, in a thread with no text at all, as a big ▶ with "No words detected
-in log". Long-pressing still selects text to copy. Paragraphs recorded without
+in log"; it plays from its first sound, though the recording is kept
+whole. Long-pressing still selects text to copy. Paragraphs recorded without
 the setting have no audio.
 
 ## Transcribing a file

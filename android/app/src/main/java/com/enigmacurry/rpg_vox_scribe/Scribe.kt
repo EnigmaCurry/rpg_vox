@@ -39,9 +39,9 @@ private const val TAG = "Scribe"
 private const val RATE = 16_000
 /** Threads per recognizer (Parakeet and Zipformer each). */
 private const val THREADS = 4
-/** Louder than this (RMS dBFS) is sound, when trimming a recording with no words. */
+/** Louder than this (RMS dBFS) is sound, where a recording with no words starts playing. */
 private const val SOUND_DB = -45f
-/** Kept around the sound when trimming. */
+/** Started this far before that sound. */
 private const val SOUND_PAD_MS = 300L
 /** How far file decoding may run ahead of pass 2, bounding queued audio. */
 private const val FILE_AHEAD_MS = 120_000L
@@ -230,10 +230,10 @@ object Scribe {
 
     /**
      * The open thread's recordings end to end, oldest first, as one
-     * timeline: each file with where it plays on it, and where each
-     * recording starts. A recording with no words is cut to the stretch
-     * from its first sound to its last (quiet inside it stays). Fills in
-     * lengths and sound spans not known yet.
+     * timeline, each at its full length: each file with where it plays
+     * on it, and where to start each recording from. That's its start,
+     * except for a recording with no words, which starts at its first
+     * sound. Fills in lengths and sound spans not known yet.
      */
     private fun timeline(): Pair<List<AudioFile>, Map<String, Long>> {
         val files = mutableListOf<AudioFile>()
@@ -242,30 +242,26 @@ object Scribe {
         var at = 0L
         for ((rec, rows) in threads.audioRows(thread.id).groupBy { it.recording }) {
             val base = rows.minOf { it.offsetMs }
-            // The recording's own time of each file: (start, length).
-            val placed = rows.map { r ->
+            var end = 0L
+            var sound = Long.MAX_VALUE
+            for (r in rows) {
+                val off = r.offsetMs - base
                 val len = r.lengthMs.takeIf { it > 0 } ?: audioLength(r.file).also { threads.setAudioLength(r.file, it) }
-                Triple(r, r.offsetMs - base, len)
-            }
-            var from = 0L
-            var to = placed.maxOf { (_, off, len) -> off + len }
-            if (rows.none { it.file in heard }) {
-                val sound = placed.mapNotNull { (r, off, len) ->
-                    val (a, b) = if (r.soundStartMs >= 0) {
-                        r.soundStartMs to r.soundEndMs
+                files += AudioFile(r.file, at + off)
+                end = maxOf(end, off + len)
+                if (rows.none { it.file in heard }) {
+                    val start = if (r.soundStartMs >= 0) {
+                        r.soundStartMs.takeIf { r.soundEndMs > it }
                     } else {
-                        (audioSound(r.file) ?: (0L to len)).also { threads.setAudioSound(r.file, it.first, it.second) }
+                        val span = audioSound(r.file)
+                        threads.setAudioSound(r.file, span?.first ?: 0, span?.second ?: 0)
+                        span?.first
                     }
-                    (off + a to off + b).takeIf { b > a }
-                }
-                if (sound.isNotEmpty()) {
-                    from = sound.minOf { it.first }
-                    to = sound.maxOf { it.second }
+                    if (start != null) sound = minOf(sound, off + start)
                 }
             }
-            for ((r, off, _) in placed) files += AudioFile(r.file, at + off - from, at + to - from)
-            starts[rec] = at
-            at += to - from
+            starts[rec] = at + if (sound == Long.MAX_VALUE) 0 else sound
+            at += end
         }
         return files to starts
     }
