@@ -40,6 +40,8 @@ private const val TAG = "Scribe"
 private const val RATE = 16_000
 /** Threads per recognizer (Parakeet and Zipformer each). */
 private const val THREADS = 4
+/** Without "Keep non-speech audio", longer quiet between words plays as this long. */
+private const val MAX_GAP_MS = 2_000L
 /** Louder than this (RMS dBFS) is sound, where a recording with no words starts playing. */
 private const val SOUND_DB = -45f
 /** Started this far before that sound. */
@@ -339,10 +341,31 @@ object Scribe {
             }
         }.getOrDefault(0L)
 
-    /** The open thread's cut stretches, placed on the timeline of [files]. */
+    /**
+     * What playback jumps over on the timeline of [files]: the open
+     * thread's cut stretches, and without "Keep non-speech audio", any
+     * quiet between words longer than [MAX_GAP_MS] (trimmed to that).
+     */
     private fun skips(files: List<AudioFile>): List<LongRange> {
         val cuts = threads.cuts(thread.id)
-        return files.flatMap { f -> cuts[f.file].orEmpty().map { (f.offsetMs + it.first)..(f.offsetMs + it.last) } }
+        val out = files.flatMap { f -> cuts[f.file].orEmpty().map { (f.offsetMs + it.first)..(f.offsetMs + it.last) } }
+            .toMutableList()
+        if (!keepNonSpeech) {
+            val offsets = files.associate { it.file to it.offsetMs }
+            val speech = paragraphs.flatMap { p ->
+                val off = offsets[p.audio ?: return@flatMap emptyList()] ?: return@flatMap emptyList()
+                p.words.map { (off + it.startMs) to (off + it.endMs) }
+            }.sortedBy { it.first }
+            val half = MAX_GAP_MS / 2
+            var heard = 0L - half // the start counts as speech, less half a gap
+            for ((a, b) in speech) {
+                if (a - heard > MAX_GAP_MS) out += (heard + half)..(a - half)
+                heard = maxOf(heard, b)
+            }
+            // After the last word, nothing left to hear.
+            if (speech.isNotEmpty()) out += (heard + half)..(Long.MAX_VALUE / 4)
+        }
+        return out
     }
 
     /** Play the open thread's audio, every recording in turn, from the start of [recording]. */
