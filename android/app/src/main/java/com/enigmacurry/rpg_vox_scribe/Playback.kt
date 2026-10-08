@@ -54,6 +54,9 @@ object Playback {
     /** Playing, but held where it is. */
     var paused by mutableStateOf(false)
         private set
+    /** Length of the playing recording (ms), once known. */
+    var lengthMs by mutableStateOf(0L)
+        private set
 
     private val main = Handler(Looper.getMainLooper())
     @Volatile private var run = false
@@ -78,6 +81,7 @@ object Playback {
         fromMs = from
         run = true
         paused = false
+        lengthMs = 0
         playing = Playing(offsets)
         val me = Thread({ loop(dir, offsets, from) }, "vox-play")
         worker = me
@@ -121,6 +125,8 @@ object Playback {
                     .getOrNull() ?: continue
                 sources += Source(h, (off - from).coerceAtLeast(0) * PLAY_RATE / 1000)
                 Native.playerSeek(h, (from - off).coerceAtLeast(0))
+                val end = off + Native.playerLength(h)
+                main.post { if (end > lengthMs) lengthMs = end }
             }
             if (sources.isEmpty()) return
             val min = AudioTrack.getMinBufferSize(PLAY_RATE, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_FLOAT)

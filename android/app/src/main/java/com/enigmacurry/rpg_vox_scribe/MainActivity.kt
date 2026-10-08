@@ -19,10 +19,8 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
-import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
-import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.gestures.detectTapGestures
@@ -356,8 +354,6 @@ private fun Dictate() {
             if (Build.VERSION.SDK_INT >= 33) Manifest.permission.POST_NOTIFICATIONS else null,
         ).filter { ContextCompat.checkSelfPermission(context, it) != PackageManager.PERMISSION_GRANTED }
         when {
-            Playback.paused -> Playback.resume()
-            Playback.playing != null -> Playback.stop()
             Scribe.recording || Scribe.file != null -> Scribe.stop()
             wanted.isEmpty() -> begin()
             else -> ask.launch(wanted.toTypedArray())
@@ -388,10 +384,10 @@ private fun Dictate() {
                         delay(250)
                     }
                 }
-                val time = clock(if (Scribe.recording || playing) now else 0)
+                val time = clock(if (Scribe.recording) now else 0)
                 val status = when {
-                    playing && Playback.paused -> "Paused · $time · tap ▶ to resume"
-                    playing -> "Playing · $time · tap the text to pause"
+                    playing && Playback.paused -> "Playback paused"
+                    playing -> "Tap the text to pause"
                     job != null -> "Transcribing ${job.name}" +
                         if (job.progress >= 0) " · ${(job.progress * 100).toInt()}%" else "…"
                     Scribe.finishing -> "Finishing…"
@@ -400,7 +396,10 @@ private fun Dictate() {
                     Scribe.paragraphs.any { it.playable() } -> "Tap to start · long-press a word to play it"
                     else -> "Tap to start · keeps going in the background"
                 }
-                if (Build.VERSION.SDK_INT >= 29) {
+                if (playing) {
+                    PlaybackBar(now)
+                    Spacer(Modifier.height(8.dp))
+                } else if (Build.VERSION.SDK_INT >= 29) {
                     SourcePicker(enabled = !Scribe.busy())
                     Spacer(Modifier.height(8.dp))
                 }
@@ -431,16 +430,9 @@ private fun Dictate() {
                         TextButton(onClick = { share(context, Scribe.text()) }, enabled = hasText) { Text("Share") }
                     }
                     RecordButton(
-                        recording = Scribe.recording || job != null || playing,
+                        recording = Scribe.recording || job != null,
                         enabled = !Scribe.finishing,
                         onClick = toggle,
-                        resume = playing && Playback.paused,
-                        label = when {
-                            playing && Playback.paused -> "Resume playback"
-                            playing -> "Stop playback"
-                            Scribe.recording || job != null -> "Stop dictation"
-                            else -> "Start dictation"
-                        },
                     )
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
                         Row {
@@ -478,37 +470,39 @@ private fun SourcePicker(enabled: Boolean) {
     }
 }
 
+/** In place of the source picker while a recording plays: pause/resume, stop, and where it is. */
 @Composable
-private fun RecordButton(
-    recording: Boolean,
-    enabled: Boolean,
-    onClick: () -> Unit,
-    label: String,
-    resume: Boolean = false,
-) {
+private fun PlaybackBar(now: Long) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        FilledTonalButton(onClick = { if (Playback.paused) Playback.resume() else Playback.pause() }) {
+            Text(if (Playback.paused) "▶ Resume" else "❚❚ Pause")
+        }
+        Spacer(Modifier.size(8.dp))
+        OutlinedButton(onClick = Playback::stop) { Text("■ Stop") }
+        Spacer(Modifier.size(12.dp))
+        val length = Playback.lengthMs
+        Text(
+            clock(now) + if (length > 0) " / ${clock(length)}" else "",
+            style = MaterialTheme.typography.labelLarge,
+        )
+    }
+}
+
+@Composable
+private fun RecordButton(recording: Boolean, enabled: Boolean, onClick: () -> Unit) {
     Button(
         onClick = onClick,
         enabled = enabled,
         shape = CircleShape,
         modifier = Modifier.size(88.dp).semantics {
-            contentDescription = label
+            contentDescription = if (recording) "Stop dictation" else "Start dictation"
         },
         colors = androidx.compose.material3.ButtonDefaults.buttonColors(
-            containerColor = if (resume) Color(0xFF2E7D32) else Color(0xFFD32F2F),
+            containerColor = Color(0xFFD32F2F),
             contentColor = Color.White,
         ),
     ) {
-        if (resume) {
-            Canvas(Modifier.size(30.dp)) {
-                val path = Path().apply {
-                    moveTo(size.width * 0.2f, 0f)
-                    lineTo(size.width, size.height / 2)
-                    lineTo(size.width * 0.2f, size.height)
-                    close()
-                }
-                drawPath(path, Color.White)
-            }
-        } else if (recording) {
+        if (recording) {
             Box(Modifier.size(28.dp).background(Color.White, RoundedCornerShape(4.dp)))
         } else {
             Box(Modifier.size(30.dp).background(Color.White, CircleShape))
