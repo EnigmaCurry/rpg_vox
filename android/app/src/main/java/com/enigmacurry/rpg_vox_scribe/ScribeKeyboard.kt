@@ -224,8 +224,11 @@ class ScribeKeyboard : InputMethodService() {
                 if (c.partial) sb.setSpan(ForegroundColorSpan(dim), at, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
             }
         }
+        // Follow new text only while already at the bottom, so scrolling
+        // up to reread earlier text isn't undone by the next update.
+        val atBottom = !scroll.canScrollVertically(1)
         transcript.text = sb
-        scroll.post { scroll.fullScroll(View.FOCUS_DOWN) }
+        if (atBottom) scroll.post { scroll.fullScroll(View.FOCUS_DOWN) }
     }
 
     private fun insert() {
@@ -328,14 +331,16 @@ private class Dictation(
     private fun apply(json: String) {
         if (ended) return
         val events = JSONArray(json)
+        var changed = false
         for (i in 0 until events.length()) {
             val ev = events.getJSONObject(i)
             when (ev.getString("t")) {
-                "paragraph" -> parse(ev.getJSONObject("p")).let { paras[it.id] = it }
-                "removed" -> paras.remove(ev.getString("id"))
+                "paragraph" -> parse(ev.getJSONObject("p")).let { paras[it.id] = it; changed = true }
+                "removed" -> changed = paras.remove(ev.getString("id")) != null || changed
             }
         }
-        onChange(paras.values.toList())
+        // Level events arrive every 50 ms; only text changes redraw.
+        if (changed) onChange(paras.values.toList())
     }
 
     /** Stop listening, let the passes finish, then hand back the final paragraphs on [main]. */
