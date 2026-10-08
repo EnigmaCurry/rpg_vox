@@ -89,11 +89,18 @@ jobs:
           java-version: 21
 
       # The runner's Android SDK has an NDK, but pin the one the app is
-      # developed against.
+      # developed against. It's ~1 GB, so cache it rather than refetch.
+      - name: Locate Android NDK
+        run: echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION" >> "$GITHUB_ENV"
+      - uses: actions/cache@v4
+        id: ndk-cache
+        with:
+          path: ${{ env.ANDROID_NDK_HOME }}
+          key: android-ndk-${{ runner.os }}-${{ env.ANDROID_NDK_VERSION }}
       - name: Install Android NDK
+        if: steps.ndk-cache.outputs.cache-hit != 'true'
         run: |
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$ANDROID_NDK_VERSION" >/dev/null
-          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION" >> "$GITHUB_ENV"
 
       - uses: dtolnay/rust-toolchain@stable
         with:
