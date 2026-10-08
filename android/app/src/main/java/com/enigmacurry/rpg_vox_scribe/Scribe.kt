@@ -227,6 +227,8 @@ object Scribe {
             result.onSuccess {
                 models = it
                 phase = Phase.Ready
+                // Starts the idle clock: loaded by the keyboard, the app may never have been on screen.
+                lastActive = SystemClock.elapsedRealtime()
                 // Keeps the models warm (and the process alive) after the app is left.
                 ScribeService.update(app)
                 pendingFile?.let { uri ->
