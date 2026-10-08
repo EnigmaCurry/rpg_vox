@@ -202,6 +202,10 @@ class ThreadStore(file: File) {
         )
     }
 
+    fun removeAudio(file: String) {
+        db.delete("audio", "file = ?", arrayOf(file))
+    }
+
     /** Every file of the recording [file] belongs to (itself included). */
     fun recording(file: String): List<AudioFile> =
         db.rawQuery(
