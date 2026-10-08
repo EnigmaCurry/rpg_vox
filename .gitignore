@@ -21,3 +21,5 @@ transcript-*.md
 *.ass
 *.wav
 /dist/
+# Android signing keystores.
+*.jks
