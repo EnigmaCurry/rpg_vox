@@ -386,7 +386,7 @@ private fun Dictate() {
                 }
                 val time = clock(if (Scribe.recording) now else 0)
                 val status = when {
-                    playing && Playback.paused -> "Paused · ${playTime(now)}"
+                    playing && Playback.paused -> "Paused · ${playTime(now)} · stop to record"
                     playing -> "${playTime(now)} · tap the text to pause"
                     job != null -> "Transcribing ${job.name}" +
                         if (job.progress >= 0) " · ${(job.progress * 100).toInt()}%" else "…"
@@ -431,7 +431,8 @@ private fun Dictate() {
                     }
                     RecordButton(
                         recording = Scribe.recording || job != null,
-                        enabled = !Scribe.finishing,
+                        // Stop playback first; recording mid-playback was confusing.
+                        enabled = !Scribe.finishing && !playing,
                         onClick = toggle,
                     )
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
