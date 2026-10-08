@@ -103,6 +103,8 @@ class ThreadStore(file: File) {
                 offset_ms    INTEGER NOT NULL DEFAULT 0
             )""",
         )
+        // Stretches of a kept file whose text was cut: skipped on playback.
+        execSQL("CREATE TABLE IF NOT EXISTS cuts (file TEXT NOT NULL, start_ms INTEGER NOT NULL, end_ms INTEGER NOT NULL)")
         for ((column, default) in listOf("length_ms" to 0, "sound_start_ms" to -1, "sound_end_ms" to -1)) {
             rawQuery("SELECT 1 FROM pragma_table_info('audio') WHERE name = ?", arrayOf(column)).use {
                 if (!it.moveToFirst()) execSQL("ALTER TABLE audio ADD COLUMN $column INTEGER NOT NULL DEFAULT $default")
@@ -125,6 +127,7 @@ class ThreadStore(file: File) {
         val files = audioFiles(id)
         db.beginTransaction()
         try {
+            files.forEach { db.delete("cuts", "file = ?", arrayOf(it)) }
             db.delete("messages", "conversation = ?", arrayOf("$id"))
             db.delete("audio", "conversation = ?", arrayOf("$id"))
             db.delete("conversations", "id = ?", arrayOf("$id"))
@@ -234,7 +237,28 @@ class ThreadStore(file: File) {
 
     fun removeAudio(file: String) {
         db.delete("audio", "file = ?", arrayOf(file))
+        db.delete("cuts", "file = ?", arrayOf(file))
     }
+
+    /** Skip [startMs]..[endMs] of [file] on playback. */
+    fun addCut(file: String, startMs: Long, endMs: Long) {
+        db.insert("cuts", null, ContentValues().apply {
+            put("file", file)
+            put("start_ms", startMs)
+            put("end_ms", endMs)
+        })
+    }
+
+    /** [thread]'s cuts, by file. */
+    fun cuts(thread: Long): Map<String, List<LongRange>> =
+        db.rawQuery(
+            "SELECT c.file, c.start_ms, c.end_ms FROM cuts c JOIN audio a ON a.file = c.file WHERE a.conversation = ?",
+            arrayOf("$thread"),
+        ).use { c ->
+            val out = HashMap<String, MutableList<LongRange>>()
+            while (c.moveToNext()) out.getOrPut(c.getString(0)) { mutableListOf() } += c.getLong(1)..c.getLong(2)
+            out
+        }
 
     fun setAudioSound(file: String, startMs: Long, endMs: Long) {
         db.update(
@@ -274,6 +298,7 @@ class ThreadStore(file: File) {
     /** Empty [thread]; its audio files, for the caller to remove. */
     fun clear(thread: Long): List<String> {
         val files = audioFiles(thread)
+        files.forEach { db.delete("cuts", "file = ?", arrayOf(it)) }
         db.delete("messages", "conversation = ?", arrayOf("$thread"))
         db.delete("audio", "conversation = ?", arrayOf("$thread"))
         return files

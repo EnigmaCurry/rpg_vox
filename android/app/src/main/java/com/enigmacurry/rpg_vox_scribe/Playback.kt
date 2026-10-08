@@ -66,9 +66,16 @@ object Playback {
     @Volatile private var run = false
     @Volatile private var track: AudioTrack? = null
     @Volatile private var fromMs = 0L
+    /**
+     * Where playback jumped over a cut, as (frames written before it,
+     * timeline ms after it), so [positionMs] follows the jumps.
+     */
+    @Volatile private var jumps = emptyList<Pair<Long, Long>>()
     private var worker: Thread? = null
     private var dir = File("")
     private var files = emptyList<AudioFile>()
+    /** Stretches of the timeline skipped over (cut text), sorted. */
+    private var skips = emptyList<LongRange>()
     /** Restarts after the audio output died under us, this playback. */
     private var retries = 0
 
@@ -76,15 +83,20 @@ object Playback {
     fun positionMs(): Long {
         val t = track ?: return fromMs
         val frames = runCatching { t.playbackHeadPosition.toLong() and 0xffffffffL }.getOrDefault(0L)
-        return fromMs + frames * 1000 / PLAY_RATE
+        val (at, ms) = jumps.lastOrNull { it.first <= frames } ?: (0L to fromMs)
+        return ms + (frames - at) * 1000 / PLAY_RATE
     }
 
-    /** Play [files] (in [dir]), placed on one timeline, from [atMs] on it. */
-    fun play(dir: File, files: List<AudioFile>, atMs: Long) {
+    /**
+     * Play [files] (in [dir]), placed on one timeline, from [atMs] on it,
+     * jumping over [skips].
+     */
+    fun play(dir: File, files: List<AudioFile>, atMs: Long, skips: List<LongRange> = emptyList()) {
         stop()
         if (files.isEmpty()) return
         this.dir = dir
         this.files = files
+        this.skips = skips.sortedBy { it.first }
         retries = 0
         paused = false
         lengthMs = 0
@@ -137,9 +149,11 @@ object Playback {
     private fun startWorker(from: Long) {
         if (playing == null) return
         val files = files
+        val skips = skips
         fromMs = from
+        jumps = emptyList()
         run = true
-        val me = Thread({ loop(dir, files, from) }, "vox-play")
+        val me = Thread({ loop(dir, files, skips, from) }, "vox-play")
         worker = me
         me.start()
     }
@@ -155,10 +169,26 @@ object Playback {
         worker = null
     }
 
-    /** [silence] to play before its audio, then at most [left] samples of it. */
-    private class Source(val handle: Long, var silence: Long, var left: Long, var done: Boolean = false)
+    /**
+     * One file on the timeline, from [startMs] to [endMs]; once [place]d,
+     * [silence] to play before its audio, then at most [left] samples of it.
+     */
+    private class Source(val handle: Long, val startMs: Long, val endMs: Long) {
+        var silence = 0L
+        var left = 0L
+        var done = false
 
-    private fun loop(dir: File, files: List<AudioFile>, from: Long) {
+        /** Ready to play from [at] on the timeline. */
+        fun place(at: Long) {
+            val begin = maxOf(at, startMs)
+            done = endMs <= begin
+            silence = if (done) 0 else (begin - at) * PLAY_RATE / 1000
+            left = if (done) 0 else (endMs - begin) * PLAY_RATE / 1000
+            if (!done) Native.playerSeek(handle, begin - startMs)
+        }
+    }
+
+    private fun loop(dir: File, files: List<AudioFile>, skips: List<LongRange>, from: Long) {
         val sources = mutableListOf<Source>()
         var t: AudioTrack? = null
         var died = false
@@ -170,15 +200,13 @@ object Playback {
                     .getOrNull() ?: continue
                 val end = minOf(f.untilMs, off + Native.playerLength(h))
                 main.post { if (end > lengthMs) lengthMs = end }
-                val begin = maxOf(from, off)
-                if (end <= begin) {
-                    Native.playerFree(h)
-                    continue
-                }
-                Native.playerSeek(h, begin - off)
-                sources += Source(h, (begin - from) * PLAY_RATE / 1000, (end - begin) * PLAY_RATE / 1000)
+                sources += Source(h, off, end)
             }
             if (sources.isEmpty()) return
+            // Starting inside a cut starts after it.
+            var pos = skips.firstOrNull { from in it }?.let { it.last } ?: from
+            if (pos != from) fromMs = pos
+            sources.forEach { it.place(pos) }
             val min = AudioTrack.getMinBufferSize(PLAY_RATE, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_FLOAT)
             t = AudioTrack.Builder()
                 .setAudioAttributes(
@@ -202,11 +230,27 @@ object Playback {
             val mix = FloatArray(PLAY_RATE / 20) // 50 ms
             val got = FloatArray(mix.size)
             var written = 0L
+            // Timeline ms of the next sample, in samples (exact).
+            var posSamples = pos * PLAY_RATE / 1000
             while (run) {
+                pos = posSamples * 1000 / PLAY_RATE
+                // At a cut: jump past it.
+                val cut = skips.firstOrNull { pos in it && it.last > pos }
+                if (cut != null) {
+                    sources.forEach { it.place(cut.last) }
+                    posSamples = cut.last * PLAY_RATE / 1000
+                    jumps = jumps + (written to cut.last)
+                    continue
+                }
+                // Stop short of the next cut.
+                val next = skips.firstOrNull { it.first > pos }?.first
+                val room = if (next == null) mix.size else
+                    minOf(mix.size.toLong(), maxOf(1L, next * PLAY_RATE / 1000 - posSamples)).toInt()
                 mix.fill(0f)
                 var produced = 0
-                for (s in sources) produced = maxOf(produced, add(s, mix, got))
+                for (s in sources) produced = maxOf(produced, add(s, mix, got, room))
                 if (produced == 0) break
+                posSamples += produced
                 for (i in 0 until produced) mix[i] = mix[i].coerceIn(-1f, 1f)
                 val n = t.write(mix, 0, produced, AudioTrack.WRITE_BLOCKING)
                 if (n < 0) {
@@ -253,16 +297,16 @@ object Playback {
         }
     }
 
-    /** Mix [s]'s next samples into [mix]; how many it covered (0 once it's over). */
-    private fun add(s: Source, mix: FloatArray, got: FloatArray): Int {
+    /** Mix up to [room] of [s]'s next samples into [mix]; how many it covered (0 once it's over). */
+    private fun add(s: Source, mix: FloatArray, got: FloatArray, room: Int): Int {
         var i = 0
         if (s.silence > 0) {
-            val k = minOf(s.silence, mix.size.toLong()).toInt()
+            val k = minOf(s.silence, room.toLong()).toInt()
             s.silence -= k
             i = k
         }
-        if (s.done || i == mix.size) return i
-        val want = minOf((mix.size - i).toLong(), s.left).toInt()
+        if (s.done || i == room) return i
+        val want = minOf((room - i).toLong(), s.left).toInt()
         if (want == 0) {
             s.done = true
             return i

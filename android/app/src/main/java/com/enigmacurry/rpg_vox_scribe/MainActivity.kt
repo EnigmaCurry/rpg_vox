@@ -19,6 +19,12 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.contextmenu.builder.item
+import androidx.compose.foundation.text.contextmenu.modifier.appendTextContextMenuComponents
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.text.TextRange
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
@@ -112,6 +118,9 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         Scribe.init(this)
+        // Edit and Cut join the text selection menu (Paragraph).
+        @OptIn(ExperimentalFoundationApi::class)
+        androidx.compose.foundation.ComposeFoundationFlags.isNewContextMenuEnabled = true
         enableEdgeToEdge()
         setContent { AppTheme { App() } }
         if (savedInstanceState == null) handle(intent)
@@ -791,8 +800,8 @@ private fun Transcript(modifier: Modifier) {
                     }
                     val first = firsts[p.id]
                     if (first != null && !Scribe.busy()) PlayFromStart(first, big = false)
-                    if (p.playable()) {
-                        PlayableParagraph(p, playing, at, canPlay = !Scribe.busy(), follow = !held)
+                    if (p.clips.none { it.partial }) {
+                        Paragraph(p, playing, at, canPlay = !Scribe.busy() && p.playable(), follow = !held)
                     } else {
                         Text(
                             buildAnnotatedString {
@@ -838,6 +847,33 @@ private suspend fun AwaitPointerEventScope.awaitTap(pass: PointerEventPass): Off
     }
 }
 
+private object EditItem
+private object CutItem
+
+/** Retype a paragraph; word times carry over where words still match. */
+@Composable
+private fun EditParagraph(p: Para, close: () -> Unit) {
+    var text by remember { mutableStateOf(p.text) }
+    androidx.compose.material3.AlertDialog(
+        onDismissRequest = close,
+        title = { Text("Edit") },
+        text = {
+            androidx.compose.material3.OutlinedTextField(
+                value = text,
+                onValueChange = { text = it },
+                modifier = Modifier.fillMaxWidth(),
+            )
+        },
+        confirmButton = {
+            TextButton(onClick = {
+                Scribe.edit(p, text)
+                close()
+            }) { Text("Save") }
+        },
+        dismissButton = { TextButton(onClick = close) { Text("Cancel") } },
+    )
+}
+
 /** The word being heard: in paragraph [para], word [word], which starts at [ms] on the recording's timeline. */
 private data class Karaoke(val para: String, val word: Int, val ms: Long)
 
@@ -859,7 +895,7 @@ private fun locate(paras: List<Para>, playing: Playing, pos: Long): Karaoke? {
 }
 
 /** Timing for shown word [i] of [shown]: one to one when the counts agree, else spread. */
-private fun Para.wordAt(i: Int, shown: Int): Word =
+fun Para.wordAt(i: Int, shown: Int): Word =
     if (words.size == shown) words[i] else words[(i.toLong() * words.size / shown).toInt().coerceIn(0, words.size - 1)]
 
 /**
@@ -870,7 +906,7 @@ private fun Para.wordAt(i: Int, shown: Int): Word =
  */
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun PlayableParagraph(p: Para, playing: Playing?, at: Karaoke?, canPlay: Boolean, follow: Boolean) {
+private fun Paragraph(p: Para, playing: Playing?, at: Karaoke?, canPlay: Boolean, follow: Boolean) {
     val shown = p.shown
     // Start offset of each shown word in the text.
     val starts = remember(shown) { shown.runningFold(0) { acc, w -> acc + w.length + 1 }.dropLast(1) }
@@ -902,11 +938,35 @@ private fun PlayableParagraph(p: Para, playing: Playing?, at: Karaoke?, canPlay:
         val below = minOf(line + 2, l.lineCount - 1)
         requester.bringIntoView(Rect(0f, l.getLineTop(line), l.size.width.toFloat(), l.getLineBottom(below)))
     }
-    Text(
-        text,
-        style = MaterialTheme.typography.bodyLarge.scaled(FONT_SCALES[Scribe.fontStep]),
+    // A read-only field rather than plain text: it reports what's selected,
+    // which Edit and Cut in the selection menu act on.
+    var selection by remember(p.id) { mutableStateOf(TextRange.Zero) }
+    val sel = TextRange(selection.start.coerceIn(0, text.length), selection.end.coerceIn(0, text.length))
+    var editing by remember(p.id) { mutableStateOf(false) }
+    if (editing) EditParagraph(p, close = { editing = false })
+    BasicTextField(
+        value = TextFieldValue(text, sel),
+        onValueChange = { selection = it.selection },
+        readOnly = true,
+        textStyle = MaterialTheme.typography.bodyLarge.scaled(FONT_SCALES[Scribe.fontStep])
+            .copy(color = MaterialTheme.colorScheme.onSurface),
+        cursorBrush = SolidColor(Color.Transparent),
         onTextLayout = { layout = it },
         modifier = Modifier
+            .fillMaxWidth()
+            .appendTextContextMenuComponents {
+                if (Scribe.busy() || sel.collapsed) return@appendTextContextMenuComponents
+                separator()
+                item(key = EditItem, label = "Edit") {
+                    editing = true
+                    close()
+                }
+                item(key = CutItem, label = "Cut") {
+                    Scribe.cut(p, sel.min, sel.max)
+                    selection = TextRange.Zero
+                    close()
+                }
+            }
             .bringIntoViewRequester(requester)
             .pointerInput(p, canPlay) {
                 if (!canPlay) return@pointerInput

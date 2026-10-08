@@ -337,11 +337,17 @@ object Scribe {
             }
         }.getOrDefault(0L)
 
+    /** The open thread's cut stretches, placed on the timeline of [files]. */
+    private fun skips(files: List<AudioFile>): List<LongRange> {
+        val cuts = threads.cuts(thread.id)
+        return files.flatMap { f -> cuts[f.file].orEmpty().map { (f.offsetMs + it.first)..(f.offsetMs + it.last) } }
+    }
+
     /** Play the open thread's audio, every recording in turn, from the start of [recording]. */
     fun playFromStart(recording: String) {
         if (busy()) return
         val (files, starts) = timeline()
-        Playback.play(audioDir, files, starts[recording] ?: return)
+        Playback.play(audioDir, files, starts[recording] ?: return, skips(files))
         PlaybackService.start(app)
     }
 
@@ -350,8 +356,65 @@ object Scribe {
         if (busy()) return
         val (files, _) = timeline()
         val offset = files.firstOrNull { it.file == p.audio }?.offsetMs ?: return
-        Playback.play(audioDir, files, offset + word.startMs)
+        Playback.play(audioDir, files, offset + word.startMs, skips(files))
         PlaybackService.start(app)
+    }
+
+    /**
+     * Cut characters [from] until [to] of [p]'s text: the words they touch
+     * go from the transcript, and with kept audio, their stretch of it is
+     * skipped on playback (the file stays whole).
+     */
+    fun cut(p: Para, from: Int, to: Int) {
+        if (busy()) return
+        Playback.stop()
+        val shown = p.shown
+        var at = 0
+        val gone = mutableListOf<Int>()
+        shown.forEachIndexed { i, w ->
+            if (at < to && at + w.length > from) gone += i
+            at += w.length + 1
+        }
+        if (gone.isEmpty()) return
+        val keep = shown.filterIndexed { i, _ -> i !in gone }
+        val text = keep.joinToString(" ")
+        var words = emptyList<Word>()
+        if (p.words.isNotEmpty()) {
+            val a = p.wordAt(gone.first(), shown.size).startMs
+            val b = p.wordAt(gone.last(), shown.size).endMs
+            p.audio?.let { if (b > a) threads.addCut(it, a, b) }
+            words = if (p.words.size == shown.size) {
+                p.words.filterIndexed { i, _ -> i !in gone }
+            } else {
+                realign(p.words, text)
+            }
+        }
+        replace(p, text, words)
+    }
+
+    /** Replace [p]'s text with [text]; word times carry over where the words match. */
+    fun edit(p: Para, text: String) {
+        if (busy()) return
+        val t = text.split(Regex("\\s+")).filter { it.isNotEmpty() }.joinToString(" ")
+        if (t == p.text) return
+        Playback.stop()
+        replace(p, t, if (p.words.isEmpty() || t.isEmpty()) emptyList() else realign(p.words, t))
+    }
+
+    private fun realign(words: List<Word>, text: String): List<Word> =
+        runCatching { parseWords(Native.alignWords(words.toJson(), text, words.first().startMs, words.last().endMs)) }
+            .getOrElse { emptyList() }
+
+    /** [p] with new text and word times, or gone if [text] is empty; then stored. */
+    private fun replace(p: Para, text: String, words: List<Word>) {
+        val i = paragraphs.indexOfFirst { it.id == p.id }
+        if (i < 0) return
+        if (text.isEmpty()) {
+            paragraphs.removeAt(i)
+        } else {
+            paragraphs[i] = p.copy(clips = listOf(ClipUi(text, partial = false)), words = words)
+        }
+        sync()
     }
 
     fun chooseRoute(r: MicRoute) {

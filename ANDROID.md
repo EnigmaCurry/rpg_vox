@@ -135,7 +135,10 @@ delete that one recording (its audio and its text). With **Keep non-speech audio
 no words were heard appears as "▶ No words detected" where it happened,
 or, in a thread with no text at all, as a big ▶ with "No words detected
 in log"; it plays from its first sound, though the recording is kept
-whole. Long-pressing still selects text to copy. Paragraphs recorded without
+whole. Long-pressing still selects text to copy, and the selection menu also
+has **Edit**, to retype that paragraph, and **Cut**, which removes the
+selected words and skips their audio on playback (the recording itself
+is kept whole). Paragraphs recorded without
 the setting have no audio.
 
 ## Transcribing a file

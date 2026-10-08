@@ -486,6 +486,35 @@ pub extern "system" fn Java_com_enigmacurry_rpg_1vox_1scribe_Native_playerOpen(
     }
 }
 
+/// `alignWords(wordsJson, text, startMs, endMs)`: timings for the words
+/// of `text` (an edit of the text `wordsJson` timed), as the same JSON:
+/// words that survive keep their times, new ones are spread between
+/// (see [`vox_transcribe::timing::align_words`]).
+#[no_mangle]
+pub extern "system" fn Java_com_enigmacurry_rpg_1vox_1scribe_Native_alignWords(
+    mut env: JNIEnv,
+    _class: JClass,
+    words: JString,
+    text: JString,
+    start_ms: jlong,
+    end_ms: jlong,
+) -> jstring {
+    let aligned: Result<String> = (|| {
+        let words: String = env.get_string(&words)?.into();
+        let text: String = env.get_string(&text)?.into();
+        let old: Vec<vox_transcribe::Word> = serde_json::from_str(&words)?;
+        let span = (start_ms.max(0) as u64, end_ms.max(0) as u64);
+        Ok(serde_json::to_string(&vox_transcribe::timing::align_words(&old, &text, span))?)
+    })();
+    match aligned {
+        Ok(json) => new_string(&mut env, &json),
+        Err(e) => {
+            throw(&mut env, &e);
+            std::ptr::null_mut()
+        }
+    }
+}
+
 /// `playerSpan(player, thresholdDb, padMs)`: `[startMs, endMs]` of the
 /// sound in the recording (see [`Player::span`]), or null if it's all
 /// quieter than that. The player is left at the start.

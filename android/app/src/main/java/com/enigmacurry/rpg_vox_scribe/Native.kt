@@ -40,6 +40,13 @@ object Native {
     external fun finish(session: Long): String
     external fun free(session: Long)
 
+    /**
+     * Timings for the words of [text], an edit of the text [wordsJson]
+     * timed (the [toJson] format, and the same back): surviving words keep
+     * their times, new ones are spread between, within [startMs]..[endMs].
+     */
+    external fun alignWords(wordsJson: String, text: String, startMs: Long, endMs: Long): String
+
     /** Opens an Ogg Opus recording for playback, at its start; throws on failure. */
     external fun playerOpen(path: String): Long
     /**
