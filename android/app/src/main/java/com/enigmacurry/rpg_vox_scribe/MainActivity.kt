@@ -57,6 +57,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -476,25 +477,22 @@ private fun Dictate() {
                             enabled = !Scribe.finishing,
                             onClick = toggle,
                         )
-                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                            Row {
+                        // Pause while recording, Clear otherwise: one spot.
+                        Box(Modifier.width(96.dp), contentAlignment = Alignment.Center) {
+                            if (Scribe.recording) {
                                 OutlinedButton(
                                     onClick = { if (Scribe.paused) Scribe.resume() else Scribe.pause() },
-                                    enabled = Scribe.recording && !Scribe.finishing,
+                                    enabled = !Scribe.finishing,
                                 ) { Text(if (Scribe.paused) "▶" else "❚❚") }
-                                Spacer(Modifier.size(4.dp))
-                                OutlinedButton(
-                                    onClick = Scribe::breakParagraph,
-                                    enabled = Scribe.recording && !Scribe.paused,
-                                ) { Text("¶") }
+                            } else {
+                                // Also clears audio that has no text with it.
+                                var confirm by remember { mutableStateOf(false) }
+                                TextButton(
+                                    onClick = { confirm = true },
+                                    enabled = idle && (hasText || Scribe.threadAudio.isNotEmpty()),
+                                ) { Text("Clear") }
+                                if (confirm) ConfirmClear(close = { confirm = false })
                             }
-                            // Also clears audio that has no text with it.
-                            var confirm by remember { mutableStateOf(false) }
-                            TextButton(
-                                onClick = { confirm = true },
-                                enabled = idle && (hasText || Scribe.threadAudio.isNotEmpty()),
-                            ) { Text("Clear") }
-                            if (confirm) ConfirmClear(close = { confirm = false })
                         }
                     }
                 }

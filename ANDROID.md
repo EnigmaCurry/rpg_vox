@@ -92,8 +92,8 @@ Faint text is the live guess, which is replaced by the corrected
 paragraph when you pause.
 While recording:
 
-* **❚❚ / ▶** pauses and resumes.
-* **¶** starts a new paragraph now instead of waiting for a pause.
+* **❚❚ / ▶** pauses and resumes (in **Clear**'s place, which returns
+  once the recording stops).
 * The transcript follows the newest text. Scroll up to read back, and
   **↓ Jump to latest** returns.
 

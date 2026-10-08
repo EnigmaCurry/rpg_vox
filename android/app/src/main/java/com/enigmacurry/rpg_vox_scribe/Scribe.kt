@@ -803,10 +803,6 @@ object Scribe {
         }
     }
 
-    fun breakParagraph() {
-        if (recording && !paused) sources.forEach { Native.breakParagraph(it.session) }
-    }
-
     // ---- files ---------------------------------------------------------
 
     /**
