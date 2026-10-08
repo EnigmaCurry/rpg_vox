@@ -32,10 +32,29 @@ Arm64 phones running Android 8.0 (API 26) or newer. English only.
 
 ## Install
 
+### With Obtainium (recommended)
+
+[Obtainium](https://github.com/ImranR98/Obtainium) installs apps
+straight from their GitHub releases and updates them when a new one is
+published.
+
+1. Install Obtainium.
+2. On the phone, open
+   [Add Scribe to Obtainium](https://apps.obtainium.imranr.dev/redirect?r=obtainium://add/https://github.com/EnigmaCurry/rpg_vox),
+   or tap **Add App** in Obtainium and enter
+   `https://github.com/EnigmaCurry/rpg_vox`.
+3. Tap **Add**, then **Install**. Android asks you to allow installs
+   from Obtainium the first time.
+
+Each release also carries the desktop scribe archives, but Obtainium
+only looks at the `.apk`.
+
+### By hand
+
 Download `scribe-<version>-android-arm64.apk` from the
 [releases page](https://github.com/EnigmaCurry/rpg_vox/releases) on the
 phone and open it. Android asks you to allow installs from your browser
-or file manager the first time.
+or file manager the first time. Repeat for each new version.
 
 If a new version won't install over the old one, the two were signed
 with different keys: uninstall Scribe first. This deletes its threads
