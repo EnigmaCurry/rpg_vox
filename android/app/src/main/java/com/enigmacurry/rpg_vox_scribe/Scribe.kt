@@ -44,13 +44,21 @@ private const val FILE_AHEAD_MS = 120_000L
 
 data class ClipUi(val text: String, val partial: Boolean)
 
-/** One paragraph. [source] is its speaker ("Me", "Phone") when a recording has two sources. */
+/**
+ * One paragraph. [source] is its speaker ("Me", "Phone") when a recording
+ * has two sources. With kept audio, [audio] is the file it was heard in
+ * and [words] its words' times there.
+ */
 data class Para(
     val id: String,
     val clips: List<ClipUi>,
     val source: String? = null,
+    val audio: String? = null,
+    val words: List<Word> = emptyList(),
 ) {
     val text: String get() = clips.filter { it.text.isNotBlank() }.joinToString(" ") { it.text }
+    /** [text]'s words as shown. */
+    val shown: List<String> by lazy { text.split(' ').filter { it.isNotEmpty() } }
 }
 
 sealed interface Phase {
@@ -96,6 +104,9 @@ object Scribe {
     var boost by mutableStateOf(Boost.AUTO)
         private set
     var route by mutableStateOf(MicRoute.AUTO)
+        private set
+    /** Save each recording's audio (.opus) with its transcript, for playback. */
+    var keepAudio by mutableStateOf(false)
         private set
     /** The input the mic source is recording from, while it runs. */
     var micName by mutableStateOf<String?>(null)
@@ -144,8 +155,8 @@ object Scribe {
     private var projection: MediaProjection? = null
 
     /** Recorded time of the open recording, excluding pauses. */
-    private var activeMs = 0L
-    private var runStart = 0L
+    @Volatile private var activeMs = 0L
+    @Volatile private var runStart = 0L
 
     fun busy() = recording || finishing || file != null
 
@@ -176,6 +187,7 @@ object Scribe {
         if (Build.VERSION.SDK_INT < 29) mode = Mode.MIC
         boost = runCatching { Boost.valueOf(prefs.getString("boost", "AUTO")!!) }.getOrDefault(Boost.AUTO)
         route = runCatching { MicRoute.valueOf(prefs.getString("route", "AUTO")!!) }.getOrDefault(MicRoute.AUTO)
+        keepAudio = prefs.getBoolean("keep_audio", false)
         phase = if (store.ready()) Phase.Unloaded else Phase.NeedModels(resume = store.started())
         migrate()
         show(threads.current())
@@ -195,6 +207,24 @@ object Scribe {
     fun chooseBoost(b: Boost) {
         boost = b
         app.getSharedPreferences("scribe", Context.MODE_PRIVATE).edit().putString("boost", b.name).apply()
+    }
+
+    fun chooseKeepAudio(keep: Boolean) {
+        keepAudio = keep
+        app.getSharedPreferences("scribe", Context.MODE_PRIVATE).edit().putBoolean("keep_audio", keep).apply()
+    }
+
+    /** Where kept recordings live. */
+    val audioDir: File get() = File(app.filesDir, "audio")
+
+    /** Play the open thread's recording that [p] is in, from [word] of it. */
+    fun play(p: Para, word: Word) {
+        if (busy()) return
+        val audio = p.audio ?: return
+        val files = threads.recording(audio)
+        val base = files.minOfOrNull { it.offsetMs } ?: return
+        val offset = files.firstOrNull { it.file == audio }?.offsetMs ?: return
+        Playback.play(audioDir, files, offset - base + word.startMs)
     }
 
     fun chooseRoute(r: MicRoute) {
@@ -258,7 +288,16 @@ object Scribe {
     private enum class Kind { MIC, PHONE, FILE }
 
     /** One engine session and what feeds it. */
-    private class Source(val kind: Kind, val label: String?, val session: Long) {
+    /** [audio]: the file this source's audio is kept in, part of [recording]. */
+    private class Source(
+        val kind: Kind,
+        val label: String?,
+        val session: Long,
+        val audio: String?,
+        val recording: String?,
+    ) {
+        /** Set once the first audio arrives (kept audio, two sources). */
+        @Volatile var started = false
         /** Paragraphs this session produced (to apply its final transcript). */
         val ids = mutableSetOf<String>()
         var capture: Capture? = null
@@ -274,8 +313,22 @@ object Scribe {
         @Volatile var run = true
     }
 
-    private fun open(kind: Kind, label: String?, streaming: Boolean): Source {
-        val src = Source(kind, label, Native.start(models, RATE, streaming))
+    /** Start a session for [kind]; with [recording], its audio is kept as part of that recording. */
+    private fun open(kind: Kind, label: String?, streaming: Boolean, recording: String? = null): Source {
+        var audio = recording?.let { "$it-${kind.name.lowercase()}.opus" }
+        val session = if (audio == null) {
+            Native.start(models, RATE, streaming, null)
+        } else {
+            audioDir.mkdirs()
+            runCatching { Native.start(models, RATE, streaming, File(audioDir, audio).path) }
+                .onFailure { Log.e(TAG, "can't keep audio", it) }
+                .getOrElse {
+                    audio = null
+                    Native.start(models, RATE, streaming, null)
+                }
+        }
+        val src = Source(kind, label, session, audio, recording)
+        audio?.let { threads.addAudio(thread.id, recording!!, it, 0) }
         sources += src
         src.poller = Thread({
             while (src.polling) {
@@ -305,10 +358,12 @@ object Scribe {
         if (models == 0L || busy() || dictating) return
         val m = mode
         if (m.phone && consent == null) return
+        Playback.stop()
         recordingMode = m
         sources.clear()
-        if (m.mic) open(Kind.MIC, if (m.phone) "Me" else null, streaming = true)
-        if (m.phone) open(Kind.PHONE, "Phone", streaming = true)
+        val rec = if (keepAudio) newRecording() else null
+        if (m.mic) open(Kind.MIC, if (m.phone) "Me" else null, streaming = true, rec)
+        if (m.phone) open(Kind.PHONE, "Phone", streaming = true, rec)
         pendingProjection = consent
         recording = true
         paused = false
@@ -467,6 +522,7 @@ object Scribe {
                     if (n <= 0) continue
                     for (i in 0 until n) buf[i] = shorts[i] / 32768f
                     process?.invoke(buf, n)
+                    if (!src.started) placeAudio(src)
                     Native.push(src.session, buf, n)
                 }
             } finally {
@@ -477,6 +533,23 @@ object Scribe {
         }, "vox-${src.kind.name.lowercase()}"))
         c.thread.start()
         return c
+    }
+
+    private fun newRecording(): String =
+        java.text.SimpleDateFormat("yyyyMMdd-HHmmss", java.util.Locale.ROOT).format(java.util.Date()) +
+            "-" + java.lang.Long.toString(System.nanoTime() % 46_656, 36)
+
+    /**
+     * A source's first audio: note where it starts in the recording, so
+     * Me and Phone (whose capture starts later) line up on playback.
+     */
+    private fun placeAudio(src: Source) {
+        src.started = true
+        val audio = src.audio ?: return
+        val rec = src.recording ?: return
+        val at = elapsedMs()
+        val id = thread.id
+        main.post { threads.addAudio(id, rec, audio, at) }
     }
 
     /** Stop the recording (or cancel a file), then let the passes finish in the background. */
@@ -539,9 +612,10 @@ object Scribe {
 
     private fun startFile(uri: Uri) {
         val name = displayName(uri)
+        Playback.stop()
         // Each file gets a thread of its own, named after it.
         switchTo(threads.create(name), force = true)
-        val src = open(Kind.FILE, null, streaming = false)
+        val src = open(Kind.FILE, null, streaming = false, if (keepAudio) newRecording() else null)
         cancelFile = false
         fileTotalMs = 0
         file = FileJob(name, 0f)
@@ -597,9 +671,14 @@ object Scribe {
 
     // ---- transcript ----------------------------------------------------
 
+    private fun deleteAudio(files: List<String>) {
+        files.forEach { File(audioDir, it).delete() }
+    }
+
     fun clear() {
         if (busy()) return
-        threads.clear(thread.id)
+        Playback.stop()
+        deleteAudio(threads.clear(thread.id))
         paragraphs.clear()
         written.clear()
         refreshThreads()
@@ -634,7 +713,8 @@ object Scribe {
 
     fun delete(id: Long) {
         if (id == thread.id && busy()) return
-        threads.delete(id)
+        if (id == thread.id) Playback.stop()
+        deleteAudio(threads.delete(id))
         if (id == thread.id) {
             paragraphs.clear()
             written.clear()
@@ -651,17 +731,24 @@ object Scribe {
     /** Forget a thread left with nothing in it and its date title. */
     private fun dropIfEmpty(t: ThreadInfo) {
         if (t.id != 0L && paragraphs.isEmpty() && isDateTitle(t.title) && threads.messages(t.id).isEmpty()) {
-            threads.delete(t.id)
+            deleteAudio(threads.delete(t.id))
         }
     }
 
     /** Load thread [id] into [paragraphs] and remember it as the one open. */
     private fun show(id: Long) {
+        Playback.stop()
         saver?.cancel()
         paragraphs.clear()
         written.clear()
         for (m in threads.messages(id)) {
-            val p = Para("m${m.rowId}", listOf(ClipUi(m.text, partial = false)), source = m.speaker)
+            val p = Para(
+                "m${m.rowId}",
+                listOf(ClipUi(m.text, partial = false)),
+                source = m.speaker,
+                audio = m.audio,
+                words = parseWords(m.words),
+            )
             paragraphs += p
             written[p.id] = m
         }
@@ -773,6 +860,8 @@ object Scribe {
                 ClipUi(c.getString("text"), c.getString("stage") == "partial")
             },
             source = src.label,
+            audio = src.audio,
+            words = if (src.audio != null) parseWords(o.optJSONArray("words")) else emptyList(),
         )
     }
 
@@ -802,12 +891,14 @@ object Scribe {
             val text = p.clips.filter { !it.partial && it.text.isNotBlank() }.joinToString(" ") { it.text }
             if (text.isEmpty()) continue
             present += p.id
+            val words = p.words.takeIf { it.isNotEmpty() }?.toJson()
             val w = written[p.id]
             when {
-                w == null -> written[p.id] = Saved(threads.say(id, text, p.source), text, p.source)
-                w.text != text -> {
-                    threads.edit(w.rowId, text)
-                    written[p.id] = w.copy(text = text)
+                w == null -> written[p.id] =
+                    Saved(threads.say(id, text, p.source, p.audio, words), text, p.source, p.audio, words)
+                w.text != text || w.words != words -> {
+                    threads.edit(w.rowId, text, words)
+                    written[p.id] = w.copy(text = text, words = words)
                 }
             }
         }

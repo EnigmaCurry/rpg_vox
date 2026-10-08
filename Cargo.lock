@@ -6415,6 +6415,7 @@ dependencies = [
  "tar",
  "tracing",
  "tracing-subscriber",
+ "vox_audio",
  "vox_transcribe",
 ]
 

@@ -2,6 +2,7 @@ package com.enigmacurry.rpg_vox_scribe
 
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -9,6 +10,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.DropdownMenu
@@ -195,7 +197,7 @@ fun MicSettings(close: () -> Unit) {
         onDismissRequest = close,
         title = { Text("Microphone") },
         text = {
-            Column {
+            Column(Modifier.verticalScroll(androidx.compose.foundation.rememberScrollState())) {
                 Text("Mic", style = MaterialTheme.typography.titleSmall)
                 MicRoute.entries.forEach { r ->
                     Choice(r.label, Scribe.route == r) { Scribe.chooseRoute(r) }
@@ -208,6 +210,26 @@ fun MicSettings(close: () -> Unit) {
                 Boost.entries.forEach { b ->
                     val label = if (b == Boost.AUTO) "Auto (raise quiet speech)" else b.label
                     Choice(label, Scribe.boost == b) { Scribe.chooseBoost(b) }
+                }
+                androidx.compose.foundation.layout.Row(
+                    verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 12.dp)
+                        .toggleable(
+                            value = Scribe.keepAudio,
+                            role = Role.Switch,
+                            onValueChange = Scribe::chooseKeepAudio,
+                        ),
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Keep audio (.opus)", style = MaterialTheme.typography.titleSmall)
+                        Text(
+                            "Save the audio with the transcript. Afterwards, long-press a word to hear it from there.",
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                    androidx.compose.material3.Switch(checked = Scribe.keepAudio, onCheckedChange = null)
                 }
                 val context = androidx.compose.ui.platform.LocalContext.current
                 Text(

@@ -21,8 +21,12 @@ object Native {
     external fun load(modelsDir: String, threads: Int): Long
     external fun freeModels(models: Long)
 
-    /** Starts one session (one source) fed at [sampleRate] Hz mono; [streaming] adds live partials. */
-    external fun start(models: Long, sampleRate: Int, streaming: Boolean): Long
+    /**
+     * Starts one session (one source) fed at [sampleRate] Hz mono; [streaming]
+     * adds live partials. With [opusPath] the pushed audio is also kept there
+     * as Ogg Opus, closed by [finish]; throws if it can't be created.
+     */
+    external fun start(models: Long, sampleRate: Int, streaming: Boolean, opusPath: String?): Long
     external fun push(session: Long, samples: FloatArray, len: Int)
     external fun breakParagraph(session: Long)
 
@@ -35,4 +39,13 @@ object Native {
      */
     external fun finish(session: Long): String
     external fun free(session: Long)
+
+    /** Opens an Ogg Opus recording for playback, at its start; throws on failure. */
+    external fun playerOpen(path: String): Long
+    /** Length of the recording in ms. */
+    external fun playerLength(player: Long): Long
+    external fun playerSeek(player: Long, ms: Long)
+    /** Fills [out] with mono float samples at 48 kHz; how many, fewer only at the end. */
+    external fun playerRead(player: Long, out: FloatArray): Int
+    external fun playerFree(player: Long)
 }

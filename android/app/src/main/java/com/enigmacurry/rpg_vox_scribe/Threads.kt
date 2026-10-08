@@ -10,16 +10,31 @@ import java.util.Locale
 /** A thread in the list: [last] is local "YYYY-MM-DD HH:MM" of its latest text (or creation). */
 data class ThreadInfo(val id: Long, val title: String, val last: String, val preview: String, val count: Int)
 
-/** One stored paragraph. */
-data class Saved(val rowId: Long, val text: String, val speaker: String?)
+/**
+ * One stored paragraph. [audio] is the recording it was heard in and
+ * [words] its word timings in that recording (JSON, see [Word.toJson]).
+ */
+data class Saved(
+    val rowId: Long,
+    val text: String,
+    val speaker: String?,
+    val audio: String? = null,
+    val words: String? = null,
+)
+
+/** A kept recording: one source's audio file and where it starts in its recording. */
+data class AudioFile(val file: String, val offsetMs: Long)
 
 /**
  * Threads (named transcripts) in `files/scribe.db`, using the desktop
  * chat database's schema (crates/vox_chat): `conversations` are threads,
  * each finished paragraph is a `messages` row (`role='user'`,
  * `kind='say'`), and `settings.conversation` is the thread last open.
- * One addition, ignored by the desktop: `messages.speaker` ("Me",
- * "Phone") for recordings with two sources.
+ * Additions, ignored by the desktop: `messages.speaker` ("Me",
+ * "Phone") for recordings with two sources, and for kept audio
+ * `messages.audio` and `messages.words` (see [Saved]) plus the `audio`
+ * table, which groups the files a recording made (one per source) with
+ * each one's start in it, so they play back together.
  */
 class ThreadStore(file: File) {
     private val db: SQLiteDatabase = SQLiteDatabase.openOrCreateDatabase(file, null).apply {
@@ -44,9 +59,19 @@ class ThreadStore(file: File) {
             )""",
         )
         execSQL("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
-        rawQuery("SELECT 1 FROM pragma_table_info('messages') WHERE name = 'speaker'", null).use {
-            if (!it.moveToFirst()) execSQL("ALTER TABLE messages ADD COLUMN speaker TEXT")
+        for (column in listOf("speaker", "audio", "words")) {
+            rawQuery("SELECT 1 FROM pragma_table_info('messages') WHERE name = ?", arrayOf(column)).use {
+                if (!it.moveToFirst()) execSQL("ALTER TABLE messages ADD COLUMN $column TEXT")
+            }
         }
+        execSQL(
+            """CREATE TABLE IF NOT EXISTS audio (
+                file         TEXT PRIMARY KEY,
+                conversation INTEGER REFERENCES conversations(id),
+                recording    TEXT NOT NULL,
+                offset_ms    INTEGER NOT NULL DEFAULT 0
+            )""",
+        )
     }
 
     /** A new thread titled [title], or with the local date and time like the desktop's. */
@@ -59,15 +84,19 @@ class ThreadStore(file: File) {
         db.update("conversations", ContentValues().apply { put("title", title) }, "id = ?", arrayOf("$id"))
     }
 
-    fun delete(id: Long) {
+    /** Delete thread [id]; its audio files, for the caller to remove. */
+    fun delete(id: Long): List<String> {
+        val files = audioFiles(id)
         db.beginTransaction()
         try {
             db.delete("messages", "conversation = ?", arrayOf("$id"))
+            db.delete("audio", "conversation = ?", arrayOf("$id"))
             db.delete("conversations", "id = ?", arrayOf("$id"))
             db.setTransactionSuccessful()
         } finally {
             db.endTransaction()
         }
+        return files
     }
 
     fun exists(id: Long) =
@@ -103,31 +132,73 @@ class ThreadStore(file: File) {
 
     fun messages(thread: Long): List<Saved> =
         db.rawQuery(
-            "SELECT id, text, speaker FROM messages WHERE conversation = ? AND role = 'user' AND kind = 'say' ORDER BY id",
+            "SELECT id, text, speaker, audio, words FROM messages WHERE conversation = ? AND role = 'user' AND kind = 'say' ORDER BY id",
             arrayOf("$thread"),
         ).use { c ->
-            buildList { while (c.moveToNext()) add(Saved(c.getLong(0), c.getString(1), c.getString(2))) }
+            buildList {
+                while (c.moveToNext()) add(Saved(c.getLong(0), c.getString(1), c.getString(2), c.getString(3), c.getString(4)))
+            }
         }
 
-    fun say(thread: Long, text: String, speaker: String?): Long =
+    fun say(thread: Long, text: String, speaker: String?, audio: String? = null, words: String? = null): Long =
         db.insert("messages", null, ContentValues().apply {
             put("conversation", thread)
             put("role", "user")
             put("kind", "say")
             put("text", text)
             put("speaker", speaker)
+            put("audio", audio)
+            put("words", words)
         })
 
-    fun edit(rowId: Long, text: String) {
-        db.update("messages", ContentValues().apply { put("text", text) }, "id = ?", arrayOf("$rowId"))
+    fun edit(rowId: Long, text: String, words: String? = null) {
+        db.update(
+            "messages",
+            ContentValues().apply {
+                put("text", text)
+                put("words", words)
+            },
+            "id = ?",
+            arrayOf("$rowId"),
+        )
     }
+
+    /** Register [file], one source of [recording] in [thread], starting [offsetMs] into it. */
+    fun addAudio(thread: Long, recording: String, file: String, offsetMs: Long) {
+        db.insertWithOnConflict(
+            "audio", null,
+            ContentValues().apply {
+                put("file", file)
+                put("conversation", thread)
+                put("recording", recording)
+                put("offset_ms", offsetMs)
+            },
+            SQLiteDatabase.CONFLICT_REPLACE,
+        )
+    }
+
+    /** Every file of the recording [file] belongs to (itself included). */
+    fun recording(file: String): List<AudioFile> =
+        db.rawQuery(
+            "SELECT file, offset_ms FROM audio WHERE recording = (SELECT recording FROM audio WHERE file = ?) ORDER BY file",
+            arrayOf(file),
+        ).use { c -> buildList { while (c.moveToNext()) add(AudioFile(c.getString(0), c.getLong(1))) } }
+
+    private fun audioFiles(thread: Long): List<String> =
+        db.rawQuery("SELECT file FROM audio WHERE conversation = ?", arrayOf("$thread")).use { c ->
+            buildList { while (c.moveToNext()) add(c.getString(0)) }
+        }
 
     fun remove(rowId: Long) {
         db.delete("messages", "id = ?", arrayOf("$rowId"))
     }
 
-    fun clear(thread: Long) {
+    /** Empty [thread]; its audio files, for the caller to remove. */
+    fun clear(thread: Long): List<String> {
+        val files = audioFiles(thread)
         db.delete("messages", "conversation = ?", arrayOf("$thread"))
+        db.delete("audio", "conversation = ?", arrayOf("$thread"))
+        return files
     }
 
     fun setting(key: String): String? =

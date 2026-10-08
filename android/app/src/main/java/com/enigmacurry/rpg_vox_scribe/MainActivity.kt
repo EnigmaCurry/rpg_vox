@@ -19,6 +19,17 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.relocation.BringIntoViewRequester
+import androidx.compose.foundation.relocation.bringIntoViewRequester
+import androidx.compose.foundation.text.selection.DisableSelection
+import androidx.compose.runtime.withFrameMillis
+import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.DragInteraction
 import androidx.compose.foundation.isSystemInDarkTheme
@@ -340,6 +351,7 @@ private fun Dictate() {
             if (Build.VERSION.SDK_INT >= 33) Manifest.permission.POST_NOTIFICATIONS else null,
         ).filter { ContextCompat.checkSelfPermission(context, it) != PackageManager.PERMISSION_GRANTED }
         when {
+            Playback.playing != null -> Playback.stop()
             Scribe.recording || Scribe.file != null -> Scribe.stop()
             wanted.isEmpty() -> begin()
             else -> ask.launch(wanted.toTypedArray())
@@ -347,6 +359,7 @@ private fun Dictate() {
     }
     if (Scribe.recording) KeepScreenOn()
     val job = Scribe.file
+    val playing = Playback.playing != null
 
     Column(Modifier.fillMaxSize()) {
         Transcript(Modifier.weight(1f).fillMaxWidth())
@@ -363,13 +376,21 @@ private fun Dictate() {
                         delay(1_000 - now % 1_000)
                     }
                 }
-                val time = clock(if (Scribe.recording) now else 0)
+                LaunchedEffect(playing) {
+                    while (Playback.playing != null) {
+                        now = Playback.positionMs()
+                        delay(250)
+                    }
+                }
+                val time = clock(if (Scribe.recording || playing) now else 0)
                 val status = when {
+                    playing -> "Playing · $time"
                     job != null -> "Transcribing ${job.name}" +
                         if (job.progress >= 0) " · ${(job.progress * 100).toInt()}%" else "…"
                     Scribe.finishing -> "Finishing…"
                     Scribe.paused -> "Paused · $time"
                     Scribe.recording -> "Listening · $time" + (Scribe.micName?.let { " · $it" } ?: "")
+                    Scribe.paragraphs.any { it.playable() } -> "Tap to start · long-press a word to play it"
                     else -> "Tap to start · keeps going in the background"
                 }
                 if (Build.VERSION.SDK_INT >= 29) {
@@ -403,9 +424,14 @@ private fun Dictate() {
                         TextButton(onClick = { share(context, Scribe.text()) }, enabled = hasText) { Text("Share") }
                     }
                     RecordButton(
-                        recording = Scribe.recording || job != null,
+                        recording = Scribe.recording || job != null || playing,
                         enabled = !Scribe.finishing,
                         onClick = toggle,
+                        label = when {
+                            playing -> "Stop playback"
+                            Scribe.recording || job != null -> "Stop dictation"
+                            else -> "Start dictation"
+                        },
                     )
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
                         Row {
@@ -444,13 +470,13 @@ private fun SourcePicker(enabled: Boolean) {
 }
 
 @Composable
-private fun RecordButton(recording: Boolean, enabled: Boolean, onClick: () -> Unit) {
+private fun RecordButton(recording: Boolean, enabled: Boolean, onClick: () -> Unit, label: String) {
     Button(
         onClick = onClick,
         enabled = enabled,
         shape = CircleShape,
         modifier = Modifier.size(88.dp).semantics {
-            contentDescription = if (recording) "Stop dictation" else "Start dictation"
+            contentDescription = label
         },
         colors = androidx.compose.material3.ButtonDefaults.buttonColors(
             containerColor = Color(0xFFD32F2F),
@@ -487,6 +513,22 @@ private fun Transcript(modifier: Modifier) {
                 follow = !list.canScrollForward
             }
         }
+    }
+    // Playback: the word being heard, followed down the transcript.
+    val playing = Playback.playing
+    var at by remember { mutableStateOf<Karaoke?>(null) }
+    LaunchedEffect(playing) {
+        at = null
+        if (playing == null) return@LaunchedEffect
+        while (true) {
+            withFrameMillis { }
+            val k = locate(Scribe.paragraphs, playing, Playback.positionMs())
+            if (k != at) at = k
+        }
+    }
+    LaunchedEffect(at?.para) {
+        val i = Scribe.paragraphs.indexOfFirst { it.id == at?.para }
+        if (i >= 0 && list.layoutInfo.visibleItemsInfo.none { it.index == i }) list.animateScrollToItem(i)
     }
     val last = Scribe.paragraphs.lastOrNull()
     LaunchedEffect(Scribe.paragraphs.size, last, follow) {
@@ -526,22 +568,28 @@ private fun Transcript(modifier: Modifier) {
                             modifier = Modifier.padding(bottom = 4.dp),
                         )
                     }
-                    Text(
-                        buildAnnotatedString {
-                            p.clips.filter { it.text.isNotBlank() }.forEachIndexed { i, c ->
-                                if (i > 0) append(' ')
-                                if (c.partial) {
-                                    // Zipformer partials are ALL CAPS.
-                                    withStyle(SpanStyle(color = faint, fontStyle = FontStyle.Italic)) {
-                                        append(c.text.lowercase())
+                    if (p.playable()) {
+                        DisableSelection {
+                            PlayableParagraph(p, playing, at, canPlay = !Scribe.busy())
+                        }
+                    } else {
+                        Text(
+                            buildAnnotatedString {
+                                p.clips.filter { it.text.isNotBlank() }.forEachIndexed { i, c ->
+                                    if (i > 0) append(' ')
+                                    if (c.partial) {
+                                        // Zipformer partials are ALL CAPS.
+                                        withStyle(SpanStyle(color = faint, fontStyle = FontStyle.Italic)) {
+                                            append(c.text.lowercase())
+                                        }
+                                    } else {
+                                        append(c.text)
                                     }
-                                } else {
-                                    append(c.text)
                                 }
-                            }
-                        },
-                        style = MaterialTheme.typography.bodyLarge,
-                    )
+                            },
+                            style = MaterialTheme.typography.bodyLarge,
+                        )
+                    }
                 }
             }
         }
@@ -552,6 +600,89 @@ private fun Transcript(modifier: Modifier) {
             ) { Text("↓ Jump to latest") }
         }
     }
+}
+
+/** The word being heard: in paragraph [para], word [word], which starts at [ms] on the recording's timeline. */
+private data class Karaoke(val para: String, val word: Int, val ms: Long)
+
+/** Has kept audio and word times, and is finished text. */
+private fun Para.playable() = audio != null && words.isNotEmpty() && clips.none { it.partial }
+
+/** The last word of [playing] to have started by [pos]. */
+private fun locate(paras: List<Para>, playing: Playing, pos: Long): Karaoke? {
+    var best: Karaoke? = null
+    for (p in paras) {
+        val off = playing.offsets[p.audio ?: continue] ?: continue
+        val shown = p.shown.size
+        for (i in 0 until shown) {
+            val t = off + p.wordAt(i, shown).startMs
+            if (t <= pos && (best == null || t >= best.ms)) best = Karaoke(p.id, i, t)
+        }
+    }
+    return best
+}
+
+/** Timing for shown word [i] of [shown]: one to one when the counts agree, else spread. */
+private fun Para.wordAt(i: Int, shown: Int): Word =
+    if (words.size == shown) words[i] else words[(i.toLong() * words.size / shown).toInt().coerceIn(0, words.size - 1)]
+
+/**
+ * A paragraph with kept audio: long-press a word to play from it, and
+ * while its recording plays, the words already heard are lit and the
+ * current one highlighted, kept in view.
+ */
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun PlayableParagraph(p: Para, playing: Playing?, at: Karaoke?, canPlay: Boolean) {
+    val shown = p.shown
+    // Start offset of each shown word in the text.
+    val starts = remember(shown) { shown.runningFold(0) { acc, w -> acc + w.length + 1 }.dropLast(1) }
+    val off = playing?.offsets?.get(p.audio)
+    val heard = MaterialTheme.colorScheme.primary
+    val current = SpanStyle(
+        color = MaterialTheme.colorScheme.onPrimaryContainer,
+        background = MaterialTheme.colorScheme.primaryContainer,
+    )
+    val text = buildAnnotatedString {
+        shown.forEachIndexed { i, w ->
+            if (i > 0) append(' ')
+            val t = off?.let { it + p.wordAt(i, shown.size).startMs }
+            when {
+                at == null || t == null -> append(w)
+                at.para == p.id && at.word == i -> withStyle(current) { append(w) }
+                t < at.ms -> withStyle(SpanStyle(color = heard)) { append(w) }
+                else -> append(w)
+            }
+        }
+    }
+    var layout by remember { mutableStateOf<TextLayoutResult?>(null) }
+    val haptics = LocalHapticFeedback.current
+    val requester = remember { BringIntoViewRequester() }
+    // Keep the line being heard in view, with a couple of lines below it.
+    val line = if (at?.para == p.id) layout?.getLineForOffset(starts.getOrElse(at.word) { 0 }) else null
+    LaunchedEffect(line) {
+        val l = layout ?: return@LaunchedEffect
+        if (line == null) return@LaunchedEffect
+        val below = minOf(line + 2, l.lineCount - 1)
+        requester.bringIntoView(Rect(0f, l.getLineTop(line), l.size.width.toFloat(), l.getLineBottom(below)))
+    }
+    Text(
+        text,
+        style = MaterialTheme.typography.bodyLarge,
+        onTextLayout = { layout = it },
+        modifier = Modifier
+            .bringIntoViewRequester(requester)
+            .pointerInput(p, canPlay) {
+                if (!canPlay) return@pointerInput
+                detectTapGestures(onLongPress = { pos ->
+                    val l = layout ?: return@detectTapGestures
+                    val c = l.getOffsetForPosition(pos)
+                    val i = starts.indexOfLast { it <= c }.coerceAtLeast(0)
+                    haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                    Scribe.play(p, p.wordAt(i, shown.size))
+                })
+            },
+    )
 }
 
 private fun clock(ms: Long): String {

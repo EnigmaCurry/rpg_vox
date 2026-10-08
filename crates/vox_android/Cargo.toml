@@ -10,6 +10,8 @@ crate-type = ["cdylib"]
 
 [dependencies]
 vox_transcribe = { path = "../vox_transcribe", features = ["sherpa-static"] }
+# Ogg Opus: recordings kept next to the transcript, and their playback.
+vox_audio = { path = "../vox_audio" }
 anyhow.workspace = true
 serde_json.workspace = true
 tracing.workspace = true

@@ -25,6 +25,7 @@ Arm64 phones running Android 8.0 (API 26) or newer. English only.
 * [First run: speech models](#first-run-speech-models)
 * [Recording](#recording)
 * [Threads](#threads)
+* [Playing back](#playing-back)
 * [Transcribing a file](#transcribing-a-file)
 * [Microphone settings](#microphone-settings)
 * [Voice typing keyboard](#voice-typing-keyboard)
@@ -110,6 +111,17 @@ thread. New threads are named with the date and time.
 Recording adds to the open thread. While a recording or a file is being
 transcribed, the other threads can't be opened.
 
+## Playing back
+
+With **Keep audio (.opus)** on in **⚙**, long-press any word of a
+transcript, once the recording has stopped, to hear it from that word.
+The words light up as they are spoken and the transcript scrolls along.
+The record button becomes a stop button while it plays. A Both
+recording plays the mic and the phone audio together.
+
+Paragraphs recorded without the setting have no audio, and long-pressing
+them selects text as usual.
+
 ## Transcribing a file
 
 Share an audio or video file to Scribe from another app (**Transcribe
@@ -129,6 +141,10 @@ starts, so pause and resume to apply them mid-recording.
   a steady level without raising background noise into words. **Off**,
   **+6 dB**, **+12 dB** and **+18 dB** apply a fixed boost instead.
   Phone audio and files are never boosted.
+* **Keep audio (.opus)**: saves each recording's audio (and a shared
+  file's) with its transcript, along with when each word was said, so
+  you can [play it back](#playing-back). Off by default. The audio is
+  deleted with its thread, or by **Clear**.
 
 ## Voice typing keyboard
 

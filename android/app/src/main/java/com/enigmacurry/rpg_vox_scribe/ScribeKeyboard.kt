@@ -279,7 +279,7 @@ private class Dictation(
     private val paras = LinkedHashMap<String, Para>()
 
     fun start() {
-        session = Native.start(models, RATE, true)
+        session = Native.start(models, RATE, true, null)
         poller = Thread({
             while (polling) {
                 val events = Native.poll(session, 100)
