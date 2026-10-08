@@ -86,7 +86,37 @@ enum class Mode(val mic: Boolean, val phone: Boolean) {
 }
 
 /** A file being transcribed. [progress] is the share of its audio through pass 2. */
-data class FileJob(val name: String, val progress: Float)
+data class FileJob(
+    val name: String,
+    val progress: Float,
+    /** Audio through pass 2 and the file's length (0 until known), in ms. */
+    val doneMs: Long = 0,
+    val totalMs: Long = 0,
+    /** Started ([SystemClock.elapsedRealtime]), for the time left. */
+    val startedAt: Long = SystemClock.elapsedRealtime(),
+) {
+    /**
+     * "1:23 / 10:05 · about 2:10 left": how far it's got, and the time
+     * left at the pace so far (once there's enough to go on).
+     */
+    fun detail(): String? {
+        if (totalMs <= 0) return null
+        val spent = SystemClock.elapsedRealtime() - startedAt
+        val left = if (doneMs >= 5_000 && spent > 0) {
+            val ms = (totalMs - doneMs).coerceAtLeast(0) * spent / doneMs
+            " · about ${clock(ms)} left"
+        } else {
+            ""
+        }
+        return "${clock(doneMs)} / ${clock(totalMs)}$left"
+    }
+}
+
+/** m:ss, or h:mm:ss from an hour. */
+fun clock(ms: Long): String {
+    val s = ms / 1000
+    return if (s >= 3600) "%d:%02d:%02d".format(s / 3600, s / 60 % 60, s % 60) else "%d:%02d".format(s / 60, s % 60)
+}
 
 /**
  * Process-wide dictation state: the loaded models, the running sources,
@@ -910,7 +940,11 @@ object Scribe {
         }
         if (src.kind == Kind.FILE) {
             val total = fileTotalMs
-            file = file?.copy(progress = if (total > 0) (src.doneMs.toFloat() / total).coerceIn(0f, 1f) else -1f)
+            file = file?.copy(
+                progress = if (total > 0) (src.doneMs.toFloat() / total).coerceIn(0f, 1f) else -1f,
+                doneMs = minOf(src.doneMs, total),
+                totalMs = total,
+            )
         }
         if (changed) save(now = false)
     }

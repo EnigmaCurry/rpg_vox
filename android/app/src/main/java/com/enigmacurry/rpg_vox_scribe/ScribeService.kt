@@ -165,7 +165,7 @@ class ScribeService : Service() {
         val job = Scribe.file
         val (title, text) = when {
             job != null -> "Transcribing ${job.name}" to
-                (if (job.progress >= 0) "${(job.progress * 100).toInt()}% · " else "") + line
+                (job.detail()?.let { "$it · " } ?: if (job.progress >= 0) "${(job.progress * 100).toInt()}% · " else "") + line
             Scribe.finishing -> "Finishing transcription…" to line
             Scribe.recording && Scribe.paused -> "Paused · $time" to line
             Scribe.recording -> "$what · $time" to line.ifEmpty { "Listening…" }

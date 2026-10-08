@@ -404,6 +404,9 @@ private fun Dictate() {
                     Spacer(Modifier.height(8.dp))
                 }
                 Text(status, style = MaterialTheme.typography.labelLarge, maxLines = 1)
+                job?.detail()?.let {
+                    Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
                 if (playing && Playback.paused) {
                     Text(
                         "tap text to seek and resume",
@@ -861,10 +864,6 @@ private fun PlayableParagraph(p: Para, playing: Playing?, at: Karaoke?, canPlay:
     )
 }
 
-private fun clock(ms: Long): String {
-    val s = ms / 1000
-    return if (s >= 3600) "%d:%02d:%02d".format(s / 3600, s / 60 % 60, s % 60) else "%d:%02d".format(s / 60, s % 60)
-}
 
 private fun copy(context: android.content.Context, text: String) {
     val cm = context.getSystemService(ClipboardManager::class.java)
