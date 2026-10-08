@@ -386,7 +386,7 @@ private fun Dictate() {
                 }
                 val time = clock(if (Scribe.recording) now else 0)
                 val status = when {
-                    playing && Playback.paused -> "Paused · ${playTime(now)} · stop to record"
+                    playing && Playback.paused -> "Paused · ${playTime(now)}"
                     playing -> "${playTime(now)} · tap the text to pause"
                     job != null -> "Transcribing ${job.name}" +
                         if (job.progress >= 0) " · ${(job.progress * 100).toInt()}%" else "…"
@@ -404,57 +404,58 @@ private fun Dictate() {
                     Spacer(Modifier.height(8.dp))
                 }
                 Text(status, style = MaterialTheme.typography.labelLarge, maxLines = 1)
-                Spacer(Modifier.height(8.dp))
-                LinearProgressIndicator(
-                    progress = {
-                        when {
-                            job != null -> job.progress.coerceAtLeast(0f)
-                            Scribe.recording -> (Scribe.level * 8f).coerceIn(0f, 1f)
-                            else -> 0f
-                        }
-                    },
-                    modifier = Modifier.fillMaxWidth(0.6f),
-                    gapSize = 0.dp,
-                    drawStopIndicator = {},
-                )
-                Spacer(Modifier.height(12.dp))
-                Row(
-                    Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceEvenly,
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    val idle = !Scribe.busy()
-                    val hasText = Scribe.paragraphs.isNotEmpty()
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        TextButton(onClick = { copy(context, Scribe.text()) }, enabled = hasText) { Text("Copy") }
-                        TextButton(onClick = { share(context, Scribe.text()) }, enabled = hasText) { Text("Share") }
-                    }
-                    RecordButton(
-                        recording = Scribe.recording || job != null,
-                        // Stop playback first; recording mid-playback was confusing.
-                        enabled = !Scribe.finishing && !playing,
-                        blank = playing,
-                        onClick = toggle,
+                // Playback shows only its own controls; Stop leaves it.
+                if (!playing) {
+                    Spacer(Modifier.height(8.dp))
+                    LinearProgressIndicator(
+                        progress = {
+                            when {
+                                job != null -> job.progress.coerceAtLeast(0f)
+                                Scribe.recording -> (Scribe.level * 8f).coerceIn(0f, 1f)
+                                else -> 0f
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth(0.6f),
+                        gapSize = 0.dp,
+                        drawStopIndicator = {},
                     )
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        Row {
-                            OutlinedButton(
-                                onClick = { if (Scribe.paused) Scribe.resume() else Scribe.pause() },
-                                enabled = Scribe.recording && !Scribe.finishing,
-                            ) { Text(if (Scribe.paused) "▶" else "❚❚") }
-                            Spacer(Modifier.size(4.dp))
-                            OutlinedButton(
-                                onClick = Scribe::breakParagraph,
-                                enabled = Scribe.recording && !Scribe.paused,
-                            ) { Text("¶") }
+                    Spacer(Modifier.height(12.dp))
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceEvenly,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        val idle = !Scribe.busy()
+                        val hasText = Scribe.paragraphs.isNotEmpty()
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            TextButton(onClick = { copy(context, Scribe.text()) }, enabled = hasText) { Text("Copy") }
+                            TextButton(onClick = { share(context, Scribe.text()) }, enabled = hasText) { Text("Share") }
                         }
-                        // Also clears audio that has no text with it.
-                        var confirm by remember { mutableStateOf(false) }
-                        TextButton(
-                            onClick = { confirm = true },
-                            enabled = idle && !playing && (hasText || Scribe.threadAudio.isNotEmpty()),
-                        ) { Text("Clear") }
-                        if (confirm) ConfirmClear(close = { confirm = false })
+                        RecordButton(
+                            recording = Scribe.recording || job != null,
+                            enabled = !Scribe.finishing,
+                            onClick = toggle,
+                        )
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            Row {
+                                OutlinedButton(
+                                    onClick = { if (Scribe.paused) Scribe.resume() else Scribe.pause() },
+                                    enabled = Scribe.recording && !Scribe.finishing,
+                                ) { Text(if (Scribe.paused) "▶" else "❚❚") }
+                                Spacer(Modifier.size(4.dp))
+                                OutlinedButton(
+                                    onClick = Scribe::breakParagraph,
+                                    enabled = Scribe.recording && !Scribe.paused,
+                                ) { Text("¶") }
+                            }
+                            // Also clears audio that has no text with it.
+                            var confirm by remember { mutableStateOf(false) }
+                            TextButton(
+                                onClick = { confirm = true },
+                                enabled = idle && (hasText || Scribe.threadAudio.isNotEmpty()),
+                            ) { Text("Clear") }
+                            if (confirm) ConfirmClear(close = { confirm = false })
+                        }
                     }
                 }
             }
@@ -573,7 +574,7 @@ private fun PlaybackBar() {
 }
 
 @Composable
-private fun RecordButton(recording: Boolean, enabled: Boolean, onClick: () -> Unit, blank: Boolean = false) {
+private fun RecordButton(recording: Boolean, enabled: Boolean, onClick: () -> Unit) {
     Button(
         onClick = onClick,
         enabled = enabled,
@@ -587,9 +588,7 @@ private fun RecordButton(recording: Boolean, enabled: Boolean, onClick: () -> Un
             contentColor = Color.White,
         ),
     ) {
-        if (blank) {
-            // Unavailable (during playback): no record dot.
-        } else if (recording) {
+        if (recording) {
             Box(Modifier.size(28.dp).background(Color.White, RoundedCornerShape(4.dp)))
         } else {
             Box(Modifier.size(30.dp).background(Color(0xFFD32F2F), CircleShape))

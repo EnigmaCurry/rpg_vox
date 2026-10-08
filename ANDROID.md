@@ -120,8 +120,8 @@ While it plays, **« 10s** and **10s »** (back and ahead ten seconds),
 **Pause**/**Resume** and **Stop** take the place of the source picker,
 with the time below. Tapping the transcript also pauses: the
 current word stays highlighted and you can scroll freely until you
-resume, or tap another word to play from there. The record button is
-off until playback is stopped. A Both recording plays the mic and the
+resume, or tap another word to play from there. Nothing else is
+shown while it plays; **Stop** brings back recording. A Both recording plays the mic and the
 phone audio together.
 
 Playback runs through all of a thread's recordings in order, one after
