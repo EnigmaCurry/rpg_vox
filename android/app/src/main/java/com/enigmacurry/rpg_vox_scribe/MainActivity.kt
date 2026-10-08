@@ -19,6 +19,8 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
+import androidx.compose.foundation.Canvas
+import androidx.compose.ui.graphics.Path
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.ui.input.pointer.AwaitPointerEventScope
@@ -468,6 +470,37 @@ private fun SourcePicker(enabled: Boolean) {
     }
 }
 
+/** Play [recording] from 0:00: small above its first paragraph, or [big] when it has no words. */
+@Composable
+private fun PlayFromStart(recording: String, big: Boolean) {
+    val size = if (big) 96.dp else 36.dp
+    Button(
+        onClick = { Scribe.playFromStart(recording) },
+        shape = CircleShape,
+        contentPadding = androidx.compose.foundation.layout.PaddingValues(0.dp),
+        colors = androidx.compose.material3.ButtonDefaults.buttonColors(
+            containerColor = Color(0xFF2E7D32),
+            contentColor = Color.White,
+        ),
+        modifier = Modifier
+            .padding(bottom = if (big) 0.dp else 4.dp)
+            .size(size)
+            .semantics { contentDescription = "Play the recording from the start" },
+    ) {
+        Canvas(Modifier.size(size * 0.36f)) {
+            drawPath(
+                Path().apply {
+                    moveTo(this@Canvas.size.width * 0.15f, 0f)
+                    lineTo(this@Canvas.size.width, this@Canvas.size.height / 2)
+                    lineTo(this@Canvas.size.width * 0.15f, this@Canvas.size.height)
+                    close()
+                },
+                Color.White,
+            )
+        }
+    }
+}
+
 /** "1:23 / 4:56": where playback is, of how long. */
 private fun playTime(now: Long): String =
     clock(now) + Playback.lengthMs.let { if (it > 0) " / ${clock(it)}" else "" }
@@ -559,15 +592,35 @@ private fun Transcript(modifier: Modifier) {
         }
     }
     if (Scribe.paragraphs.isEmpty()) {
+        // Kept audio with nothing transcribed still plays, from the start.
+        val rec = Scribe.threadAudio.values.maxOrNull()
         Box(modifier.padding(24.dp), contentAlignment = Alignment.Center) {
-            Text(
-                "Your words appear here. Live text is shown faint, then replaced by the " +
-                    "final transcription a moment later.",
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+            if (rec != null && !Scribe.busy()) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    PlayFromStart(rec, big = true)
+                    Spacer(Modifier.height(16.dp))
+                    Text(
+                        "No words detected in log",
+                        style = MaterialTheme.typography.bodyLarge,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            } else {
+                Text(
+                    "Your words appear here. Live text is shown faint, then replaced by the " +
+                        "final transcription a moment later.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
         }
         return
+    }
+    // The first paragraph of each recording, which gets a play-from-start button.
+    val firsts = HashMap<String, String>()
+    for (p in Scribe.paragraphs) {
+        val rec = Scribe.threadAudio[p.audio ?: continue] ?: continue
+        if (rec !in firsts.values) firsts[p.id] = rec
     }
     val faint = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.45f)
     Box(
@@ -599,6 +652,8 @@ private fun Transcript(modifier: Modifier) {
                             modifier = Modifier.padding(bottom = 4.dp),
                         )
                     }
+                    val first = firsts[p.id]
+                    if (first != null && !Scribe.busy()) PlayFromStart(first, big = false)
                     if (p.playable()) {
                         PlayableParagraph(p, playing, at, canPlay = !Scribe.busy(), follow = !held)
                     } else {

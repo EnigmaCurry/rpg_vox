@@ -202,6 +202,18 @@ class ThreadStore(file: File) {
         )
     }
 
+    /** [thread]'s kept audio: file to the recording it's part of. */
+    fun audioIn(thread: Long): Map<String, String> =
+        db.rawQuery("SELECT file, recording FROM audio WHERE conversation = ?", arrayOf("$thread")).use { c ->
+            buildMap { while (c.moveToNext()) put(c.getString(0), c.getString(1)) }
+        }
+
+    /** The files of [recording]. */
+    fun recordingFiles(recording: String): List<AudioFile> =
+        db.rawQuery("SELECT file, offset_ms FROM audio WHERE recording = ? ORDER BY file", arrayOf(recording)).use { c ->
+            buildList { while (c.moveToNext()) add(AudioFile(c.getString(0), c.getLong(1))) }
+        }
+
     /** Every file of the recording [file] belongs to (itself included). */
     fun recording(file: String): List<AudioFile> =
         db.rawQuery(

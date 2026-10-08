@@ -124,7 +124,9 @@ resume, or tap another word to play from there. The record button only records; 
 playback. A Both
 recording plays the mic and the phone audio together.
 
-Long-pressing still selects text to copy. Paragraphs recorded without
+The green ▶ above a recording's first paragraph plays it from 0:00,
+and a recording in which no words were heard shows a big ▶ with "No
+words detected in log". Long-pressing still selects text to copy. Paragraphs recorded without
 the setting have no audio.
 
 ## Transcribing a file

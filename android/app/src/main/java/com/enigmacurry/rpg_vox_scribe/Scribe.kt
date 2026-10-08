@@ -133,6 +133,9 @@ object Scribe {
     /** The open thread. */
     var thread by mutableStateOf(ThreadInfo(0, "", "", "", 0))
         private set
+    /** The open thread's kept audio: file to the recording it's part of. */
+    var threadAudio by mutableStateOf<Map<String, String>>(emptyMap())
+        private set
     /** Every thread, the most recently active first. */
     val threadList = mutableStateListOf<ThreadInfo>()
     /** Paragraph id to its stored row, as last written. */
@@ -220,6 +223,12 @@ object Scribe {
     val audioDir: File get() = File(app.filesDir, "audio")
 
     /** Play the open thread's recording that [p] is in, from [word] of it. */
+    /** Play [recording] (of the open thread) from its start. */
+    fun playFromStart(recording: String) {
+        if (busy()) return
+        Playback.play(audioDir, threads.recordingFiles(recording), 0)
+    }
+
     fun play(p: Para, word: Word) {
         if (busy()) return
         val audio = p.audio ?: return
@@ -741,7 +750,9 @@ object Scribe {
 
     /** Forget a thread left with nothing in it and its date title. */
     private fun dropIfEmpty(t: ThreadInfo) {
-        if (t.id != 0L && paragraphs.isEmpty() && isDateTitle(t.title) && threads.messages(t.id).isEmpty()) {
+        if (t.id != 0L && paragraphs.isEmpty() && isDateTitle(t.title) && threads.messages(t.id).isEmpty() &&
+            threads.audioIn(t.id).isEmpty()
+        ) {
             deleteAudio(threads.delete(t.id))
         }
     }
@@ -774,6 +785,7 @@ object Scribe {
         threadList.clear()
         threadList += list
         list.firstOrNull { it.id == thread.id }?.let { thread = it }
+        threadAudio = if (thread.id != 0L) threads.audioIn(thread.id) else emptyMap()
     }
 
     /** Move the pre-threads transcript.json into a thread of its own. */
