@@ -41,7 +41,7 @@ private const val RATE = 16_000
 /** Threads per recognizer (Parakeet and Zipformer each). */
 private const val THREADS = 4
 /** Without "Keep non-speech audio", longer quiet between words plays as this long. */
-private const val MAX_GAP_MS = 2_000L
+private const val MAX_GAP_MS = 1_000L
 /** Louder than this (RMS dBFS) is sound, where a recording with no words starts playing. */
 private const val SOUND_DB = -45f
 /** Started this far before that sound. */
