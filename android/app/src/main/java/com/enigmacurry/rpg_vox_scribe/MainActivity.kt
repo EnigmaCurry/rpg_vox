@@ -448,7 +448,12 @@ private fun Dictate() {
                             ) { Text("¶") }
                         }
                         // Also clears audio that has no text with it.
-                        TextButton(onClick = Scribe::clear, enabled = idle && (hasText || Scribe.threadAudio.isNotEmpty())) { Text("Clear") }
+                        var confirm by remember { mutableStateOf(false) }
+                        TextButton(
+                            onClick = { confirm = true },
+                            enabled = idle && (hasText || Scribe.threadAudio.isNotEmpty()),
+                        ) { Text("Clear") }
+                        if (confirm) ConfirmClear(close = { confirm = false })
                     }
                 }
             }
@@ -501,6 +506,29 @@ private fun PlayFromStart(recording: String, big: Boolean) {
             )
         }
     }
+}
+
+/** Asks before [Scribe.clear] empties the open thread. */
+@Composable
+private fun ConfirmClear(close: () -> Unit) {
+    val recordings = Scribe.recordings.size
+    androidx.compose.material3.AlertDialog(
+        onDismissRequest = close,
+        title = { Text("Clear this thread?") },
+        text = {
+            Text(
+                "Its text" + (if (recordings > 0) " and $recordings recording(s)" else "") +
+                    " will be deleted. The thread itself stays. This can't be undone.",
+            )
+        },
+        confirmButton = {
+            TextButton(onClick = {
+                Scribe.clear()
+                close()
+            }) { Text("Clear", color = MaterialTheme.colorScheme.error) }
+        },
+        dismissButton = { TextButton(onClick = close) { Text("Cancel") } },
+    )
 }
 
 /** A recording in the log with no words: play the thread from its start. */
