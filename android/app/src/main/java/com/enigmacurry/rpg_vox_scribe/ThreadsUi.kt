@@ -225,7 +225,7 @@ fun MicSettings(close: () -> Unit) {
                     Column(Modifier.weight(1f)) {
                         Text("Keep audio (.opus)", style = MaterialTheme.typography.titleSmall)
                         Text(
-                            "Save the audio with the transcript. Afterwards, long-press a word to hear it from there.",
+                            "Save the audio with the transcript. Afterwards, tap a word to hear it from there.",
                             style = MaterialTheme.typography.bodySmall,
                         )
                     }

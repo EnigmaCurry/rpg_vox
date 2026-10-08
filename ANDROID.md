@@ -113,18 +113,18 @@ transcribed, the other threads can't be opened.
 
 ## Playing back
 
-With **Keep audio (.opus)** on in **⚙**, long-press any word of a
+With **Keep audio (.opus)** on in **⚙**, tap any word of a
 transcript, once the recording has stopped, to hear it from that word.
 The words light up as they are spoken and the transcript scrolls along.
 While it plays, **Pause**/**Resume** and **Stop** take the place of the
 source picker, with the time. Tapping the transcript also pauses: the
 current word stays highlighted and you can scroll freely until you
-resume. The record button only records; starting a recording stops
+resume, or tap another word to play from there. The record button only records; starting a recording stops
 playback. A Both
 recording plays the mic and the phone audio together.
 
-Paragraphs recorded without the setting have no audio, and long-pressing
-them selects text as usual.
+Long-pressing still selects text to copy. Paragraphs recorded without
+the setting have no audio.
 
 ## Transcribing a file
 

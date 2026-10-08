@@ -21,17 +21,15 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.ui.input.pointer.AwaitPointerEventScope
 import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.foundation.ExperimentalFoundationApi
-import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.relocation.BringIntoViewRequester
 import androidx.compose.foundation.relocation.bringIntoViewRequester
-import androidx.compose.foundation.text.selection.DisableSelection
 import androidx.compose.runtime.withFrameMillis
 import androidx.compose.ui.geometry.Rect
-import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.DragInteraction
@@ -393,7 +391,7 @@ private fun Dictate() {
                     Scribe.finishing -> "Finishing…"
                     Scribe.paused -> "Paused · $time"
                     Scribe.recording -> "Listening · $time" + (Scribe.micName?.let { " · $it" } ?: "")
-                    Scribe.paragraphs.any { it.playable() } -> "Tap to start · long-press a word to play it"
+                    Scribe.paragraphs.any { it.playable() } -> "Tap to start · tap a word to play from it"
                     else -> "Tap to start · keeps going in the background"
                 }
                 if (playing) {
@@ -575,21 +573,10 @@ private fun Transcript(modifier: Modifier) {
         modifier.pointerInput(playing != null && !held) {
             if (playing == null || held) return@pointerInput
             // Tap anywhere to pause. Watched before the text and the list
-            // see it, without taking it from them; a scroll or long-press
+            // see it, without taking it from them; a scroll or long-press (selection)
             // isn't a tap.
             awaitEachGesture {
-                val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
-                var moved = false
-                while (true) {
-                    val c = awaitPointerEvent(PointerEventPass.Initial).changes.firstOrNull { it.id == down.id } ?: break
-                    if ((c.position - down.position).getDistance() > viewConfiguration.touchSlop) moved = true
-                    if (!c.pressed) {
-                        if (!moved && c.uptimeMillis - down.uptimeMillis < viewConfiguration.longPressTimeoutMillis) {
-                            Playback.pause()
-                        }
-                        break
-                    }
-                }
+                if (awaitTap(PointerEventPass.Initial) != null) Playback.pause()
             }
         },
     ) {
@@ -612,9 +599,7 @@ private fun Transcript(modifier: Modifier) {
                         )
                     }
                     if (p.playable()) {
-                        DisableSelection {
-                            PlayableParagraph(p, playing, at, canPlay = !Scribe.busy(), follow = !held)
-                        }
+                        PlayableParagraph(p, playing, at, canPlay = !Scribe.busy(), follow = !held)
                     } else {
                         Text(
                             buildAnnotatedString {
@@ -645,6 +630,20 @@ private fun Transcript(modifier: Modifier) {
     }
 }
 
+/**
+ * A quick tap, without consuming anything: where it was lifted, or null
+ * for a drag past the touch slop or a press held to a long-press.
+ */
+private suspend fun AwaitPointerEventScope.awaitTap(pass: PointerEventPass): Offset? {
+    val down = awaitFirstDown(requireUnconsumed = false, pass = pass)
+    while (true) {
+        val c = awaitPointerEvent(pass).changes.firstOrNull { it.id == down.id } ?: return null
+        if ((c.position - down.position).getDistance() > viewConfiguration.touchSlop) return null
+        if (c.uptimeMillis - down.uptimeMillis >= viewConfiguration.longPressTimeoutMillis) return null
+        if (!c.pressed) return c.position
+    }
+}
+
 /** The word being heard: in paragraph [para], word [word], which starts at [ms] on the recording's timeline. */
 private data class Karaoke(val para: String, val word: Int, val ms: Long)
 
@@ -670,7 +669,8 @@ private fun Para.wordAt(i: Int, shown: Int): Word =
     if (words.size == shown) words[i] else words[(i.toLong() * words.size / shown).toInt().coerceIn(0, words.size - 1)]
 
 /**
- * A paragraph with kept audio: long-press a word to play from it, and
+ * A paragraph with kept audio: tap a word to play from it (long-press
+ * still selects text), and
  * while its recording plays, the words already heard are lit and the
  * current one highlighted, kept in view.
  */
@@ -699,7 +699,6 @@ private fun PlayableParagraph(p: Para, playing: Playing?, at: Karaoke?, canPlay:
         }
     }
     var layout by remember { mutableStateOf<TextLayoutResult?>(null) }
-    val haptics = LocalHapticFeedback.current
     val requester = remember { BringIntoViewRequester() }
     // Keep the line being heard in view, with a couple of lines below it.
     val line = if (at?.para == p.id) layout?.getLineForOffset(starts.getOrElse(at.word) { 0 }) else null
@@ -717,13 +716,18 @@ private fun PlayableParagraph(p: Para, playing: Playing?, at: Karaoke?, canPlay:
             .bringIntoViewRequester(requester)
             .pointerInput(p, canPlay) {
                 if (!canPlay) return@pointerInput
-                detectTapGestures(onLongPress = { pos ->
-                    val l = layout ?: return@detectTapGestures
-                    val c = l.getOffsetForPosition(pos)
+                // A quick tap, so a long-press stays text selection. Nothing
+                // is consumed, leaving the selection and the list their gestures.
+                awaitEachGesture {
+                    // While playing, a tap pauses instead (see Transcript).
+                    val playingAtDown = Playback.playing != null && !Playback.paused
+                    val up = awaitTap(PointerEventPass.Main) ?: return@awaitEachGesture
+                    if (playingAtDown || Playback.playing != null && !Playback.paused) return@awaitEachGesture
+                    val l = layout ?: return@awaitEachGesture
+                    val c = l.getOffsetForPosition(up)
                     val i = starts.indexOfLast { it <= c }.coerceAtLeast(0)
-                    haptics.performHapticFeedback(HapticFeedbackType.LongPress)
                     Scribe.play(p, p.wordAt(i, shown.size))
-                })
+                }
             },
     )
 }
