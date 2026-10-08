@@ -58,6 +58,45 @@ dist VERSION=`git describe --tags --always --dirty`:
       echo "packaged dist/$name.tar.gz"
     done
 
+# Cut a release from master: bump the workspace version (prompts, default
+# next patch), commit, tag v<version> and push both after confirmation.
+# The tag push runs the release workflow. Needs a clean, up-to-date master
+# (untracked files are ignored).
+publish:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    branch="$(git rev-parse --abbrev-ref HEAD)"
+    [ "$branch" = master ] || { echo "publish from master, not $branch" >&2; exit 1; }
+    [ -z "$(git status --porcelain --untracked-files=no)" ] \
+      || { echo "uncommitted changes:" >&2; git status --short --untracked-files=no >&2; exit 1; }
+    git fetch --quiet origin master --tags
+    [ "$(git rev-parse HEAD)" = "$(git rev-parse origin/master)" ] \
+      || { echo "master differs from origin/master; pull or push first" >&2; exit 1; }
+    current="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)"
+    IFS=. read -r major minor patch <<< "${current%%-*}"
+    default="$major.$minor.$((patch + 1))"
+    read -rp "Current version $current. New version [$default]: " version
+    version="${version:-$default}"
+    [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] \
+      || { echo "not a semver version: $version" >&2; exit 1; }
+    tag="v$version"
+    ! git rev-parse -q --verify "refs/tags/$tag" >/dev/null \
+      || { echo "tag $tag already exists" >&2; exit 1; }
+    sed -i.bak '/^\[workspace.package\]/,/^\[/s/^version = ".*"/version = "'"$version"'"/' Cargo.toml
+    rm Cargo.toml.bak
+    cargo update --workspace --quiet
+    git --no-pager diff --stat
+    read -rp "Commit, tag $tag and push to origin? [y/N] " ok
+    if [ "$ok" != y ] && [ "$ok" != Y ]; then
+      git checkout -- Cargo.toml Cargo.lock
+      echo "aborted; version change reverted"
+      exit 1
+    fi
+    git commit -q -m "Release $tag" Cargo.toml Cargo.lock
+    git tag -a "$tag" -m "Release $tag"
+    git push --atomic origin master "$tag"
+    echo "pushed $tag; the release workflow is building it"
+
 # Fast type-check without codegen (whole workspace).
 check:
     nix-shell --run "cargo check --workspace --all-targets"
