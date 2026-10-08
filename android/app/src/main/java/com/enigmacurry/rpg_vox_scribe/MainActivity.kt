@@ -433,6 +433,7 @@ private fun Dictate() {
                         recording = Scribe.recording || job != null,
                         // Stop playback first; recording mid-playback was confusing.
                         enabled = !Scribe.finishing && !playing,
+                        blank = playing,
                         onClick = toggle,
                     )
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
@@ -451,7 +452,7 @@ private fun Dictate() {
                         var confirm by remember { mutableStateOf(false) }
                         TextButton(
                             onClick = { confirm = true },
-                            enabled = idle && (hasText || Scribe.threadAudio.isNotEmpty()),
+                            enabled = idle && !playing && (hasText || Scribe.threadAudio.isNotEmpty()),
                         ) { Text("Clear") }
                         if (confirm) ConfirmClear(close = { confirm = false })
                     }
@@ -572,7 +573,7 @@ private fun PlaybackBar() {
 }
 
 @Composable
-private fun RecordButton(recording: Boolean, enabled: Boolean, onClick: () -> Unit) {
+private fun RecordButton(recording: Boolean, enabled: Boolean, onClick: () -> Unit, blank: Boolean = false) {
     Button(
         onClick = onClick,
         enabled = enabled,
@@ -586,7 +587,9 @@ private fun RecordButton(recording: Boolean, enabled: Boolean, onClick: () -> Un
             contentColor = Color.White,
         ),
     ) {
-        if (recording) {
+        if (blank) {
+            // Unavailable (during playback): no record dot.
+        } else if (recording) {
             Box(Modifier.size(28.dp).background(Color.White, RoundedCornerShape(4.dp)))
         } else {
             Box(Modifier.size(30.dp).background(Color(0xFFD32F2F), CircleShape))
