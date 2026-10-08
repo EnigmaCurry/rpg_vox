@@ -116,7 +116,9 @@ transcribed, the other threads can't be opened.
 With **Keep audio (.opus)** on in **⚙**, long-press any word of a
 transcript, once the recording has stopped, to hear it from that word.
 The words light up as they are spoken and the transcript scrolls along.
-The record button becomes a stop button while it plays. A Both
+The record button becomes a stop button while it plays. Tap the
+transcript to pause: the current word stays highlighted and you can
+scroll freely, and the green ▶ button resumes from there. A Both
 recording plays the mic and the phone audio together.
 
 Paragraphs recorded without the setting have no audio, and long-pressing

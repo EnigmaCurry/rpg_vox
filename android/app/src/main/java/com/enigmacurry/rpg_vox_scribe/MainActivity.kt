@@ -19,6 +19,11 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.relocation.BringIntoViewRequester
@@ -351,6 +356,7 @@ private fun Dictate() {
             if (Build.VERSION.SDK_INT >= 33) Manifest.permission.POST_NOTIFICATIONS else null,
         ).filter { ContextCompat.checkSelfPermission(context, it) != PackageManager.PERMISSION_GRANTED }
         when {
+            Playback.paused -> Playback.resume()
             Playback.playing != null -> Playback.stop()
             Scribe.recording || Scribe.file != null -> Scribe.stop()
             wanted.isEmpty() -> begin()
@@ -384,7 +390,8 @@ private fun Dictate() {
                 }
                 val time = clock(if (Scribe.recording || playing) now else 0)
                 val status = when {
-                    playing -> "Playing · $time"
+                    playing && Playback.paused -> "Paused · $time · tap ▶ to resume"
+                    playing -> "Playing · $time · tap the text to pause"
                     job != null -> "Transcribing ${job.name}" +
                         if (job.progress >= 0) " · ${(job.progress * 100).toInt()}%" else "…"
                     Scribe.finishing -> "Finishing…"
@@ -427,7 +434,9 @@ private fun Dictate() {
                         recording = Scribe.recording || job != null || playing,
                         enabled = !Scribe.finishing,
                         onClick = toggle,
+                        resume = playing && Playback.paused,
                         label = when {
+                            playing && Playback.paused -> "Resume playback"
                             playing -> "Stop playback"
                             Scribe.recording || job != null -> "Stop dictation"
                             else -> "Start dictation"
@@ -470,7 +479,13 @@ private fun SourcePicker(enabled: Boolean) {
 }
 
 @Composable
-private fun RecordButton(recording: Boolean, enabled: Boolean, onClick: () -> Unit, label: String) {
+private fun RecordButton(
+    recording: Boolean,
+    enabled: Boolean,
+    onClick: () -> Unit,
+    label: String,
+    resume: Boolean = false,
+) {
     Button(
         onClick = onClick,
         enabled = enabled,
@@ -479,11 +494,21 @@ private fun RecordButton(recording: Boolean, enabled: Boolean, onClick: () -> Un
             contentDescription = label
         },
         colors = androidx.compose.material3.ButtonDefaults.buttonColors(
-            containerColor = Color(0xFFD32F2F),
+            containerColor = if (resume) Color(0xFF2E7D32) else Color(0xFFD32F2F),
             contentColor = Color.White,
         ),
     ) {
-        if (recording) {
+        if (resume) {
+            Canvas(Modifier.size(30.dp)) {
+                val path = Path().apply {
+                    moveTo(size.width * 0.2f, 0f)
+                    lineTo(size.width, size.height / 2)
+                    lineTo(size.width * 0.2f, size.height)
+                    close()
+                }
+                drawPath(path, Color.White)
+            }
+        } else if (recording) {
             Box(Modifier.size(28.dp).background(Color.White, RoundedCornerShape(4.dp)))
         } else {
             Box(Modifier.size(30.dp).background(Color.White, CircleShape))
@@ -526,7 +551,10 @@ private fun Transcript(modifier: Modifier) {
             if (k != at) at = k
         }
     }
-    LaunchedEffect(at?.para) {
+    val held = Playback.paused
+    // Paused, the reader scrolls freely; resuming brings the word back.
+    LaunchedEffect(at?.para, held) {
+        if (held) return@LaunchedEffect
         val i = Scribe.paragraphs.indexOfFirst { it.id == at?.para }
         if (i >= 0 && list.layoutInfo.visibleItemsInfo.none { it.index == i }) list.animateScrollToItem(i)
     }
@@ -549,7 +577,28 @@ private fun Transcript(modifier: Modifier) {
         return
     }
     val faint = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.45f)
-    Box(modifier) {
+    Box(
+        modifier.pointerInput(playing != null && !held) {
+            if (playing == null || held) return@pointerInput
+            // Tap anywhere to pause. Watched before the text and the list
+            // see it, without taking it from them; a scroll or long-press
+            // isn't a tap.
+            awaitEachGesture {
+                val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+                var moved = false
+                while (true) {
+                    val c = awaitPointerEvent(PointerEventPass.Initial).changes.firstOrNull { it.id == down.id } ?: break
+                    if ((c.position - down.position).getDistance() > viewConfiguration.touchSlop) moved = true
+                    if (!c.pressed) {
+                        if (!moved && c.uptimeMillis - down.uptimeMillis < viewConfiguration.longPressTimeoutMillis) {
+                            Playback.pause()
+                        }
+                        break
+                    }
+                }
+            }
+        },
+    ) {
         SelectionContainer(Modifier.fillMaxSize()) {
             LazyColumn(
                 state = list,
@@ -570,7 +619,7 @@ private fun Transcript(modifier: Modifier) {
                     }
                     if (p.playable()) {
                         DisableSelection {
-                            PlayableParagraph(p, playing, at, canPlay = !Scribe.busy())
+                            PlayableParagraph(p, playing, at, canPlay = !Scribe.busy(), follow = !held)
                         }
                     } else {
                         Text(
@@ -593,7 +642,7 @@ private fun Transcript(modifier: Modifier) {
                 }
             }
         }
-        if (!follow) {
+        if (!follow && playing == null) {
             FilledTonalButton(
                 onClick = { follow = true },
                 modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 12.dp),
@@ -633,7 +682,7 @@ private fun Para.wordAt(i: Int, shown: Int): Word =
  */
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun PlayableParagraph(p: Para, playing: Playing?, at: Karaoke?, canPlay: Boolean) {
+private fun PlayableParagraph(p: Para, playing: Playing?, at: Karaoke?, canPlay: Boolean, follow: Boolean) {
     val shown = p.shown
     // Start offset of each shown word in the text.
     val starts = remember(shown) { shown.runningFold(0) { acc, w -> acc + w.length + 1 }.dropLast(1) }
@@ -660,9 +709,9 @@ private fun PlayableParagraph(p: Para, playing: Playing?, at: Karaoke?, canPlay:
     val requester = remember { BringIntoViewRequester() }
     // Keep the line being heard in view, with a couple of lines below it.
     val line = if (at?.para == p.id) layout?.getLineForOffset(starts.getOrElse(at.word) { 0 }) else null
-    LaunchedEffect(line) {
+    LaunchedEffect(line, follow) {
         val l = layout ?: return@LaunchedEffect
-        if (line == null) return@LaunchedEffect
+        if (line == null || !follow) return@LaunchedEffect
         val below = minOf(line + 2, l.lineCount - 1)
         requester.bringIntoView(Rect(0f, l.getLineTop(line), l.size.width.toFloat(), l.getLineBottom(below)))
     }

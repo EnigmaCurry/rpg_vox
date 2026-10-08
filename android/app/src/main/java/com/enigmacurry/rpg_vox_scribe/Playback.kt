@@ -51,6 +51,9 @@ data class Playing(val offsets: Map<String, Long>)
 object Playback {
     var playing by mutableStateOf<Playing?>(null)
         private set
+    /** Playing, but held where it is. */
+    var paused by mutableStateOf(false)
+        private set
 
     private val main = Handler(Looper.getMainLooper())
     @Volatile private var run = false
@@ -74,17 +77,36 @@ object Playback {
         val from = atMs.coerceAtLeast(0)
         fromMs = from
         run = true
+        paused = false
         playing = Playing(offsets)
         val me = Thread({ loop(dir, offsets, from) }, "vox-play")
         worker = me
         me.start()
     }
 
+    fun pause() {
+        if (playing == null || paused) return
+        paused = true
+        track?.runCatching { pause() }
+    }
+
+    fun resume() {
+        if (playing == null || !paused) return
+        paused = false
+        track?.runCatching { play() }
+    }
+
     fun stop() {
         run = false
+        // A paused track blocks the writer; dropping what's queued frees it.
+        track?.runCatching {
+            pause()
+            flush()
+        }
         worker?.join()
         worker = null
         playing = null
+        paused = false
     }
 
     private class Source(val handle: Long, var silence: Long, var done: Boolean = false)
@@ -120,7 +142,7 @@ object Playback {
                 .setBufferSizeInBytes(maxOf(min, PLAY_RATE / 5 * 4)) // ~200 ms
                 .build()
             track = t
-            t.play()
+            if (!paused) t.play()
             val mix = FloatArray(PLAY_RATE / 20) // 50 ms
             val got = FloatArray(mix.size)
             var written = 0L
@@ -147,7 +169,13 @@ object Playback {
             sources.forEach { Native.playerFree(it.handle) }
             val me = Thread.currentThread()
             // Ended by itself: clear the state, unless a newer playback took over.
-            main.post { if (worker === me) { worker = null; playing = null } }
+            main.post {
+                if (worker === me) {
+                    worker = null
+                    playing = null
+                    paused = false
+                }
+            }
         }
     }
 
