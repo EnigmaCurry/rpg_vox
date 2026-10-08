@@ -501,6 +501,27 @@ private fun PlayFromStart(recording: String, big: Boolean) {
     }
 }
 
+/** A recording in the log with no words: play the thread from its start. */
+@Composable
+private fun NoWords(recording: String) {
+    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(bottom = 8.dp)) {
+        if (!Scribe.busy()) PlayFromStart(recording, big = false)
+        Spacer(Modifier.size(8.dp))
+        Text(
+            "No words detected",
+            style = MaterialTheme.typography.bodyMedium,
+            fontStyle = FontStyle.Italic,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+/** When [recording] began (epoch ms), from its name (yyyyMMdd-HHmmss-…). */
+private fun recordingStart(recording: String): Long =
+    runCatching {
+        java.text.SimpleDateFormat("yyyyMMdd-HHmmss", java.util.Locale.ROOT).parse(recording.take(15))!!.time
+    }.getOrDefault(0L)
+
 /** "1:23 / 4:56": where playback is, of how long. */
 private fun playTime(now: Long): String =
     clock(now) + Playback.lengthMs.let { if (it > 0) " / ${clock(it)}" else "" }
@@ -584,11 +605,21 @@ private fun Transcript(modifier: Modifier) {
         val i = Scribe.paragraphs.indexOfFirst { it.id == at?.para }
         if (i >= 0 && list.layoutInfo.visibleItemsInfo.none { it.index == i }) list.animateScrollToItem(i)
     }
+    // Recordings in which nothing was transcribed, each shown just before
+    // the first paragraph said after it started (or at the end).
+    val heard = Scribe.paragraphs.mapNotNullTo(HashSet()) { p -> p.audio?.let { Scribe.threadAudio[it] } }
+    val before = HashMap<String, MutableList<String>>()
+    val tail = mutableListOf<String>()
+    for (rec in Scribe.recordings.filter { it !in heard }) {
+        val start = recordingStart(rec)
+        val p = Scribe.paragraphs.firstOrNull { it.atMs > start }
+        if (p == null) tail += rec else before.getOrPut(p.id) { mutableListOf() } += rec
+    }
     val last = Scribe.paragraphs.lastOrNull()
-    LaunchedEffect(Scribe.paragraphs.size, last, follow) {
+    LaunchedEffect(Scribe.paragraphs.size, last, tail.size, follow) {
         if (follow && Scribe.paragraphs.isNotEmpty()) {
             // Past the last item's top, clamped to the very end.
-            list.scrollToItem(Scribe.paragraphs.size - 1, Int.MAX_VALUE)
+            list.scrollToItem(list.layoutInfo.totalItemsCount.coerceAtLeast(1) - 1, Int.MAX_VALUE)
         }
     }
     if (Scribe.paragraphs.isEmpty()) {
@@ -642,6 +673,7 @@ private fun Transcript(modifier: Modifier) {
                 verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
                 itemsIndexed(Scribe.paragraphs, key = { _, p -> p.id }) { i, p ->
+                    before[p.id]?.forEach { NoWords(it) }
                     // Label each run of paragraphs from one speaker.
                     val prev = Scribe.paragraphs.getOrNull(i - 1)
                     if (p.source != null && prev?.source != p.source) {
@@ -675,6 +707,7 @@ private fun Transcript(modifier: Modifier) {
                         )
                     }
                 }
+                if (tail.isNotEmpty()) item(key = "wordless") { tail.forEach { NoWords(it) } }
             }
         }
         if (!follow && playing == null) {

@@ -37,6 +37,9 @@ private fun parseAt(at: String?): Long =
 /** A kept recording: one source's audio file and where it starts in its recording. */
 data class AudioFile(val file: String, val offsetMs: Long)
 
+/** One source's file of [recording], [offsetMs] into it and [lengthMs] long (0: not known yet). */
+data class AudioRow(val file: String, val recording: String, val offsetMs: Long, val lengthMs: Long)
+
 /**
  * Threads (named transcripts) in `files/scribe.db`, using the desktop
  * chat database's schema (crates/vox_chat): `conversations` are threads,
@@ -86,6 +89,9 @@ class ThreadStore(file: File) {
                 offset_ms    INTEGER NOT NULL DEFAULT 0
             )""",
         )
+        rawQuery("SELECT 1 FROM pragma_table_info('audio') WHERE name = 'length_ms'", null).use {
+            if (!it.moveToFirst()) execSQL("ALTER TABLE audio ADD COLUMN length_ms INTEGER NOT NULL DEFAULT 0")
+        }
     }
 
     /** A new thread titled [title], or with the local date and time like the desktop's. */
@@ -188,38 +194,36 @@ class ThreadStore(file: File) {
         )
     }
 
-    /** Register [file], one source of [recording] in [thread], starting [offsetMs] into it. */
-    fun addAudio(thread: Long, recording: String, file: String, offsetMs: Long) {
+    /** Register [file], one source of [recording] in [thread]. */
+    fun addAudio(thread: Long, recording: String, file: String) {
         db.insertWithOnConflict(
             "audio", null,
             ContentValues().apply {
                 put("file", file)
                 put("conversation", thread)
                 put("recording", recording)
-                put("offset_ms", offsetMs)
             },
-            SQLiteDatabase.CONFLICT_REPLACE,
+            SQLiteDatabase.CONFLICT_IGNORE,
         )
     }
 
-    /** [thread]'s kept audio: file to the recording it's part of. */
-    fun audioIn(thread: Long): Map<String, String> =
-        db.rawQuery("SELECT file, recording FROM audio WHERE conversation = ?", arrayOf("$thread")).use { c ->
-            buildMap { while (c.moveToNext()) put(c.getString(0), c.getString(1)) }
-        }
+    /** Where [file] starts in its recording. */
+    fun setAudioOffset(file: String, offsetMs: Long) {
+        db.update("audio", ContentValues().apply { put("offset_ms", offsetMs) }, "file = ?", arrayOf(file))
+    }
 
-    /** The files of [recording]. */
-    fun recordingFiles(recording: String): List<AudioFile> =
-        db.rawQuery("SELECT file, offset_ms FROM audio WHERE recording = ? ORDER BY file", arrayOf(recording)).use { c ->
-            buildList { while (c.moveToNext()) add(AudioFile(c.getString(0), c.getLong(1))) }
-        }
+    fun setAudioLength(file: String, lengthMs: Long) {
+        db.update("audio", ContentValues().apply { put("length_ms", lengthMs) }, "file = ?", arrayOf(file))
+    }
 
-    /** Every file of the recording [file] belongs to (itself included). */
-    fun recording(file: String): List<AudioFile> =
+    /** [thread]'s kept audio, oldest recording first. */
+    fun audioRows(thread: Long): List<AudioRow> =
         db.rawQuery(
-            "SELECT file, offset_ms FROM audio WHERE recording = (SELECT recording FROM audio WHERE file = ?) ORDER BY file",
-            arrayOf(file),
-        ).use { c -> buildList { while (c.moveToNext()) add(AudioFile(c.getString(0), c.getLong(1))) } }
+            "SELECT file, recording, offset_ms, length_ms FROM audio WHERE conversation = ? ORDER BY recording, file",
+            arrayOf("$thread"),
+        ).use { c ->
+            buildList { while (c.moveToNext()) add(AudioRow(c.getString(0), c.getString(1), c.getLong(2), c.getLong(3))) }
+        }
 
     private fun audioFiles(thread: Long): List<String> =
         db.rawQuery("SELECT file FROM audio WHERE conversation = ?", arrayOf("$thread")).use { c ->

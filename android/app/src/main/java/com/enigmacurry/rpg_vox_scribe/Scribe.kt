@@ -136,6 +136,8 @@ object Scribe {
     /** The open thread's kept audio: file to the recording it's part of. */
     var threadAudio by mutableStateOf<Map<String, String>>(emptyMap())
         private set
+    /** The open thread's recordings, oldest first. */
+    val recordings: List<String> get() = threadAudio.values.distinct().sorted()
     /** Every thread, the most recently active first. */
     val threadList = mutableStateListOf<ThreadInfo>()
     /** Paragraph id to its stored row, as last written. */
@@ -222,20 +224,53 @@ object Scribe {
     /** Where kept recordings live. */
     val audioDir: File get() = File(app.filesDir, "audio")
 
-    /** Play the open thread's recording that [p] is in, from [word] of it. */
-    /** Play [recording] (of the open thread) from its start. */
-    fun playFromStart(recording: String) {
-        if (busy()) return
-        Playback.play(audioDir, threads.recordingFiles(recording), 0)
+    /**
+     * The open thread's recordings end to end, oldest first, as one
+     * timeline: each file with where it starts on it, and where each
+     * recording starts. Fills in lengths not known yet.
+     */
+    private fun timeline(): Pair<List<AudioFile>, Map<String, Long>> {
+        val files = mutableListOf<AudioFile>()
+        val starts = HashMap<String, Long>()
+        var at = 0L
+        for ((rec, rows) in threads.audioRows(thread.id).groupBy { it.recording }) {
+            val base = rows.minOf { it.offsetMs }
+            var end = 0L
+            for (r in rows) {
+                val len = r.lengthMs.takeIf { it > 0 } ?: audioLength(r.file).also { threads.setAudioLength(r.file, it) }
+                files += AudioFile(r.file, at + r.offsetMs - base)
+                end = maxOf(end, r.offsetMs - base + len)
+            }
+            starts[rec] = at
+            at += end
+        }
+        return files to starts
     }
 
+    /** Length of a kept file (ms), 0 if it can't be read. */
+    private fun audioLength(file: String): Long =
+        runCatching {
+            val h = Native.playerOpen(File(audioDir, file).path)
+            try {
+                Native.playerLength(h)
+            } finally {
+                Native.playerFree(h)
+            }
+        }.getOrDefault(0L)
+
+    /** Play the open thread's audio, every recording in turn, from the start of [recording]. */
+    fun playFromStart(recording: String) {
+        if (busy()) return
+        val (files, starts) = timeline()
+        Playback.play(audioDir, files, starts[recording] ?: return)
+    }
+
+    /** Play the open thread's audio, every recording in turn, from [word] of [p]. */
     fun play(p: Para, word: Word) {
         if (busy()) return
-        val audio = p.audio ?: return
-        val files = threads.recording(audio)
-        val base = files.minOfOrNull { it.offsetMs } ?: return
-        val offset = files.firstOrNull { it.file == audio }?.offsetMs ?: return
-        Playback.play(audioDir, files, offset - base + word.startMs)
+        val (files, _) = timeline()
+        val offset = files.firstOrNull { it.file == p.audio }?.offsetMs ?: return
+        Playback.play(audioDir, files, offset + word.startMs)
     }
 
     fun chooseRoute(r: MicRoute) {
@@ -341,7 +376,7 @@ object Scribe {
                 }
         }
         val src = Source(kind, label, session, audio, recording)
-        audio?.let { threads.addAudio(thread.id, recording!!, it, 0) }
+        audio?.let { threads.addAudio(thread.id, recording!!, it) }
         sources += src
         src.poller = Thread({
             while (src.polling) {
@@ -565,10 +600,8 @@ object Scribe {
         src.baseMs = wallStart + elapsedMs()
         src.started = true
         val audio = src.audio ?: return
-        val rec = src.recording ?: return
         val at = elapsedMs()
-        val id = thread.id
-        main.post { threads.addAudio(id, rec, audio, at) }
+        main.post { threads.setAudioOffset(audio, at) }
     }
 
     /** Stop the recording (or cancel a file), then let the passes finish in the background. */
@@ -594,6 +627,7 @@ object Scribe {
             withContext(Dispatchers.Main) { recording = false }
             val finals = srcs.map { it to Native.finish(it.session) }
             srcs.forEach(::close)
+            srcs.forEach { s -> s.audio?.let { threads.setAudioLength(it, audioLength(it)) } }
             withContext(Dispatchers.Main) {
                 finals.forEach { (src, json) -> applyFinal(src, json) }
                 sources.clear()
@@ -663,6 +697,7 @@ object Scribe {
             if (error != null) Log.e(TAG, "decode failed", error)
             val json = Native.finish(src.session)
             close(src)
+            src.audio?.let { threads.setAudioLength(it, audioLength(it)) }
             main.post {
                 applyFinal(src, json)
                 sources.remove(src)
@@ -751,7 +786,7 @@ object Scribe {
     /** Forget a thread left with nothing in it and its date title. */
     private fun dropIfEmpty(t: ThreadInfo) {
         if (t.id != 0L && paragraphs.isEmpty() && isDateTitle(t.title) && threads.messages(t.id).isEmpty() &&
-            threads.audioIn(t.id).isEmpty()
+            threads.audioRows(t.id).isEmpty()
         ) {
             deleteAudio(threads.delete(t.id))
         }
@@ -785,7 +820,7 @@ object Scribe {
         threadList.clear()
         threadList += list
         list.firstOrNull { it.id == thread.id }?.let { thread = it }
-        threadAudio = if (thread.id != 0L) threads.audioIn(thread.id) else emptyMap()
+        threadAudio = if (thread.id != 0L) threads.audioRows(thread.id).associate { it.file to it.recording } else emptyMap()
     }
 
     /** Move the pre-threads transcript.json into a thread of its own. */

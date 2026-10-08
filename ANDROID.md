@@ -124,9 +124,12 @@ resume, or tap another word to play from there. The record button only records; 
 playback. A Both
 recording plays the mic and the phone audio together.
 
-The green ▶ above a recording's first paragraph plays it from 0:00,
-and a recording in which no words were heard shows a big ▶ with "No
-words detected in log". Long-pressing still selects text to copy. Paragraphs recorded without
+Playback runs through all of a thread's recordings in order, one after
+another, and the time shown is for the whole thread. The green ▶ above
+a recording's first paragraph plays from its start. A recording in which
+no words were heard appears as "▶ No words detected" where it happened,
+or, in a thread with no text at all, as a big ▶ with "No words detected
+in log". Long-pressing still selects text to copy. Paragraphs recorded without
 the setting have no audio.
 
 ## Transcribing a file
