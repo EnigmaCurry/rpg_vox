@@ -593,7 +593,6 @@ object Scribe {
                 finishing = false
                 lastActive = SystemClock.elapsedRealtime()
                 save(now = true)
-                dropIfWordless(srcs)
                 ScribeService.update(app)
             }
         }
@@ -661,7 +660,6 @@ object Scribe {
                 file = null
                 lastActive = SystemClock.elapsedRealtime()
                 save(now = true)
-                dropIfWordless(listOf(src))
                 ScribeService.update(app)
                 if (error != null) {
                     android.widget.Toast.makeText(app, "Could not read $name: ${error.message}", android.widget.Toast.LENGTH_LONG).show()
@@ -683,19 +681,6 @@ object Scribe {
     private fun thread(name: String, body: () -> Unit) = Thread(body, name).apply { start() }
 
     // ---- transcript ----------------------------------------------------
-
-    /**
-     * A finished recording's audio, when no paragraph has words in it:
-     * there's nothing to play it from. With two sources, the Phone audio
-     * stays when only Me said anything, since they play together.
-     */
-    private fun dropIfWordless(srcs: List<Source>) {
-        val files = srcs.mapNotNull { it.audio }.toSet()
-        if (files.isEmpty()) return
-        if (paragraphs.any { it.audio in files && it.words.isNotEmpty() }) return
-        files.forEach(threads::removeAudio)
-        deleteAudio(files.toList())
-    }
 
     private fun deleteAudio(files: List<String>) {
         files.forEach { File(audioDir, it).delete() }

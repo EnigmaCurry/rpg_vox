@@ -149,8 +149,7 @@ starts, so pause and resume to apply them mid-recording.
 * **Keep audio (.opus)**: saves each recording's audio (and a shared
   file's) with its transcript, along with when each word was said, so
   you can [play it back](#playing-back). Off by default. The audio is
-  deleted with its thread, or by **Clear**, and a recording in which no
-  words were heard isn't kept.
+  deleted with its thread, or by **Clear**.
 
 ## Voice typing keyboard
 
