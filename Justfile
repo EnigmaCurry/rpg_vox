@@ -458,8 +458,12 @@ android-app INSTALL="yes": _android-jni
     (cd android && ./gradlew assembleDebug)
     apk=android/app/build/outputs/apk/debug/app-debug.apk
     du -h "$apk"
-    if [ "{{INSTALL}}" = yes ] && adb get-state >/dev/null 2>&1; then
-      adb install -r "$apk"
+    if [ "{{INSTALL}}" = yes ]; then
+      if adb get-state >/dev/null 2>&1; then
+        adb install -r "$apk"
+      else
+        echo "no device on adb, so not installed (USB or wireless debugging; check \`adb devices\`)" >&2
+      fi
     fi
 
 # Release APK of the dictation app in dist/, as the release workflow ships
