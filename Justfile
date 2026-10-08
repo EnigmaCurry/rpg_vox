@@ -435,12 +435,22 @@ android:
 # jniLibs next to the sherpa-onnx libs, assembles the debug APK and, with
 # a device on adb, installs it. Needs what `just android` needs plus a
 # JDK 17+ (JAVA_HOME, default: Homebrew's openjdk@21) and the Android SDK
-# (ANDROID_HOME, default: Homebrew's android-commandlinetools).
+# (ANDROID_HOME, default: Homebrew's android-commandlinetools). Signs with
+# the release key, SCRIBE_KEYSTORE (default ~/scribe.jks), when it exists,
+# asking for its password unless SCRIBE_KEYSTORE_PASSWORD is set (e.g. in
+# .env), so it installs over a release; the debug key otherwise.
 android-app INSTALL="yes": _android-jni
     #!/usr/bin/env bash
     set -euo pipefail
     export ANDROID_HOME="${ANDROID_HOME:-/opt/homebrew/share/android-commandlinetools}"
     export JAVA_HOME="${JAVA_HOME:-/opt/homebrew/opt/openjdk@21}"
+    if [ -z "${SCRIBE_KEYSTORE:-}" ] && [ -f "$HOME/scribe.jks" ]; then
+      export SCRIBE_KEYSTORE="$HOME/scribe.jks"
+    fi
+    if [ -n "${SCRIBE_KEYSTORE:-}" ] && [ -z "${SCRIBE_KEYSTORE_PASSWORD:-}" ]; then
+      read -rsp "Password for $SCRIBE_KEYSTORE: " SCRIBE_KEYSTORE_PASSWORD; echo
+      export SCRIBE_KEYSTORE_PASSWORD
+    fi
     [ -f android/local.properties ] || echo "sdk.dir=$ANDROID_HOME" > android/local.properties
     (cd android && ./gradlew assembleDebug)
     apk=android/app/build/outputs/apk/debug/app-debug.apk

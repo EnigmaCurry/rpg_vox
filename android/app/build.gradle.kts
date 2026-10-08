@@ -27,13 +27,18 @@ android {
             create("release") {
                 storeFile = file(keystore)
                 storePassword = System.getenv("SCRIBE_KEYSTORE_PASSWORD")
-                keyAlias = System.getenv("SCRIBE_KEY_ALIAS")
-                keyPassword = System.getenv("SCRIBE_KEY_PASSWORD")
+                keyAlias = System.getenv("SCRIBE_KEY_ALIAS") ?: "scribe"
+                keyPassword = System.getenv("SCRIBE_KEY_PASSWORD") ?: storePassword
             }
         }
     }
 
     buildTypes {
+        // Same key as releases, so local builds and releases install over
+        // each other without losing the app's models and threads.
+        debug {
+            if (keystore != null) signingConfig = signingConfigs.getByName("release")
+        }
         release {
             isMinifyEnabled = false
             signingConfig = signingConfigs.getByName(if (keystore != null) "release" else "debug")
