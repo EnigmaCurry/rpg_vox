@@ -44,6 +44,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import kotlin.math.roundToInt
 
 /** Rename or delete requests raised from the drawer or the title, shown as dialogs. */
 class ThreadDialogs {
@@ -221,75 +222,131 @@ fun ThreadDialogHost(dialogs: ThreadDialogs) {
     }
 }
 
-/** Mic settings: which mic, and its gain. Take effect when the mic next starts. */
+/** The pages of settings, listed under ⚙. */
+enum class SettingsPage(val title: String) {
+    MICROPHONE("Microphone"),
+    RECORDING("Recording"),
+    KEYBOARD("Keyboard"),
+    DISPLAY("Display"),
+}
+
+/** One settings page as a dialog. */
 @Composable
-fun MicSettings(close: () -> Unit) {
+fun Settings(page: SettingsPage, close: () -> Unit) {
     AlertDialog(
         onDismissRequest = close,
-        title = { Text("Microphone") },
+        title = { Text(page.title) },
         text = {
             Column(Modifier.verticalScroll(androidx.compose.foundation.rememberScrollState())) {
-                Text("Mic", style = MaterialTheme.typography.titleSmall)
-                MicRoute.entries.forEach { r ->
-                    Choice(r.label, Scribe.route == r) { Scribe.chooseRoute(r) }
-                }
-                Text(
-                    "Mic boost",
-                    style = MaterialTheme.typography.titleSmall,
-                    modifier = Modifier.padding(top = 12.dp),
-                )
-                Boost.entries.forEach { b ->
-                    val label = if (b == Boost.AUTO) "Auto (raise quiet speech)" else b.label
-                    Choice(label, Scribe.boost == b) { Scribe.chooseBoost(b) }
-                }
-                androidx.compose.foundation.layout.Row(
-                    verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(top = 12.dp)
-                        .toggleable(
-                            value = Scribe.keepAudio,
-                            role = Role.Switch,
-                            onValueChange = Scribe::chooseKeepAudio,
-                        ),
-                ) {
-                    Column(Modifier.weight(1f)) {
-                        Text("Keep audio (.opus)", style = MaterialTheme.typography.titleSmall)
-                        Text(
-                            "Save the audio with the transcript. Afterwards, tap a word to hear it from there.",
-                            style = MaterialTheme.typography.bodySmall,
-                        )
-                    }
-                    androidx.compose.material3.Switch(checked = Scribe.keepAudio, onCheckedChange = null)
-                }
-                val context = androidx.compose.ui.platform.LocalContext.current
-                Text(
-                    "Voice typing",
-                    style = MaterialTheme.typography.titleSmall,
-                    modifier = Modifier.padding(top = 12.dp),
-                )
-                Text(
-                    "Turn on \"Scribe voice typing\" to dictate into other apps, then pick it with the keyboard switcher.",
-                    style = MaterialTheme.typography.bodySmall,
-                )
-                TextButton(onClick = {
-                    context.startActivity(
-                        android.content.Intent(android.provider.Settings.ACTION_INPUT_METHOD_SETTINGS)
-                            .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK),
-                    )
-                }) { Text("Keyboard settings") }
-                if (Scribe.recording) {
-                    Text(
-                        "Changes apply when the mic next starts (pause and resume).",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.padding(top = 8.dp),
-                    )
+                when (page) {
+                    SettingsPage.MICROPHONE -> MicrophonePage()
+                    SettingsPage.RECORDING -> RecordingPage()
+                    SettingsPage.KEYBOARD -> KeyboardPage()
+                    SettingsPage.DISPLAY -> DisplayPage()
                 }
             }
         },
         confirmButton = { TextButton(onClick = close) { Text("Done") } },
     )
+}
+
+/** Which mic, and its gain. Take effect when the mic next starts. */
+@Composable
+private fun MicrophonePage() {
+    Text("Mic", style = MaterialTheme.typography.titleSmall)
+    MicRoute.entries.forEach { r ->
+        Choice(r.label, Scribe.route == r) { Scribe.chooseRoute(r) }
+    }
+    Text(
+        "Mic boost",
+        style = MaterialTheme.typography.titleSmall,
+        modifier = Modifier.padding(top = 12.dp),
+    )
+    Boost.entries.forEach { b ->
+        val label = if (b == Boost.AUTO) "Auto (raise quiet speech)" else b.label
+        Choice(label, Scribe.boost == b) { Scribe.chooseBoost(b) }
+    }
+    if (Scribe.recording) {
+        Text(
+            "Changes apply when the mic next starts (pause and resume).",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(top = 8.dp),
+        )
+    }
+}
+
+/** What's kept of a recording. Takes effect from the next recording. */
+@Composable
+private fun RecordingPage() {
+    Toggle(
+        "Keep audio (.opus)",
+        "Save the audio with the transcript. Afterwards, tap a word to hear it from there.",
+        Scribe.keepAudio,
+        Scribe::chooseKeepAudio,
+    )
+    Toggle(
+        "Keep non-speech audio",
+        "Also keep recordings in which no words were detected.",
+        Scribe.keepNonSpeech,
+        Scribe::chooseKeepNonSpeech,
+        enabled = Scribe.keepAudio,
+    )
+}
+
+@Composable
+private fun KeyboardPage() {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    Text(
+        "Turn on \"Scribe voice typing\" to dictate into other apps, then pick it with the keyboard switcher.",
+        style = MaterialTheme.typography.bodyMedium,
+    )
+    TextButton(onClick = {
+        context.startActivity(
+            android.content.Intent(android.provider.Settings.ACTION_INPUT_METHOD_SETTINGS)
+                .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK),
+        )
+    }) { Text("Keyboard settings") }
+}
+
+/** Transcript text size: five steps, the default in the middle. */
+@Composable
+private fun DisplayPage() {
+    Text("Font size", style = MaterialTheme.typography.titleSmall)
+    androidx.compose.material3.Slider(
+        value = Scribe.fontStep.toFloat(),
+        onValueChange = { Scribe.chooseFontStep(it.roundToInt()) },
+        valueRange = 0f..(FONT_SCALES.size - 1).toFloat(),
+        steps = FONT_SCALES.size - 2,
+    )
+    Text(
+        "The quick brown fox jumps over the lazy dog.",
+        style = MaterialTheme.typography.bodyLarge.scaled(FONT_SCALES[Scribe.fontStep]),
+    )
+}
+
+@Composable
+private fun Toggle(
+    title: String,
+    detail: String,
+    value: Boolean,
+    onChange: (Boolean) -> Unit,
+    enabled: Boolean = true,
+) {
+    androidx.compose.foundation.layout.Row(
+        verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(bottom = 12.dp)
+            .alpha(if (enabled) 1f else 0.4f)
+            .toggleable(value = value, enabled = enabled, role = Role.Switch, onValueChange = onChange),
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(title, style = MaterialTheme.typography.titleSmall)
+            Text(detail, style = MaterialTheme.typography.bodySmall)
+        }
+        androidx.compose.material3.Switch(checked = value, onCheckedChange = null, enabled = enabled)
+    }
 }
 
 @Composable

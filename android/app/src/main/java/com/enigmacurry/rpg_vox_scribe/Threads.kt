@@ -232,6 +232,10 @@ class ThreadStore(file: File) {
         db.update("audio", ContentValues().apply { put("length_ms", lengthMs) }, "file = ?", arrayOf(file))
     }
 
+    fun removeAudio(file: String) {
+        db.delete("audio", "file = ?", arrayOf(file))
+    }
+
     fun setAudioSound(file: String, startMs: Long, endMs: Long) {
         db.update(
             "audio",

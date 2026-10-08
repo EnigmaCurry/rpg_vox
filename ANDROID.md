@@ -27,7 +27,7 @@ Arm64 phones running Android 8.0 (API 26) or newer. English only.
 * [Threads](#threads)
 * [Playing back](#playing-back)
 * [Transcribing a file](#transcribing-a-file)
-* [Microphone settings](#microphone-settings)
+* [Settings](#settings)
 * [Voice typing keyboard](#voice-typing-keyboard)
 * [Building from source](#building-from-source)
 
@@ -113,7 +113,7 @@ transcribed, the other threads can't be opened.
 
 ## Playing back
 
-With **Keep audio (.opus)** on in **⚙**, tap any word of a
+With **Keep audio (.opus)** on in **⚙** → **Recording**, tap any word of a
 transcript, once the recording has stopped, to hear it from that word.
 The words light up as they are spoken and the transcript scrolls along.
 While it plays, **« 10s** and **10s »** (back and ahead ten seconds),
@@ -130,7 +130,7 @@ phone audio together.
 
 Playback runs through all of a thread's recordings in order, one after
 another, and the time shown is for the whole thread. The green ▶ above
-a recording's first paragraph plays from its start. A recording in which
+a recording's first paragraph plays from its start. With **Keep non-speech audio** on, a recording in which
 no words were heard appears as "▶ No words detected" where it happened,
 or, in a thread with no text at all, as a big ▶ with "No words detected
 in log"; it plays from its first sound, though the recording is kept
@@ -144,10 +144,12 @@ with Scribe**), or open one with it from a file manager. Scribe starts a
 new thread named after the file and transcribes it faster than real
 time, with progress in the app and the notification.
 
-## Microphone settings
+## Settings
 
-**⚙** opens the microphone settings. Changes apply the next time the mic
-starts, so pause and resume to apply them mid-recording.
+**⚙** lists four pages of settings.
+
+**Microphone**: changes apply the next time the mic starts, so pause and
+resume to apply them mid-recording.
 
 * **Mic**: **Bluetooth headset when connected** (the default) records
   from a connected headset's mic, and the status line names the input in
@@ -156,16 +158,28 @@ starts, so pause and resume to apply them mid-recording.
   a steady level without raising background noise into words. **Off**,
   **+6 dB**, **+12 dB** and **+18 dB** apply a fixed boost instead.
   Phone audio and files are never boosted.
+
+**Recording**:
+
 * **Keep audio (.opus)**: saves each recording's audio (and a shared
   file's) with its transcript, along with when each word was said, so
   you can [play it back](#playing-back). Off by default. The audio is
   deleted with its thread, or by **Clear**.
+* **Keep non-speech audio**: with Keep audio on, also keeps recordings
+  in which no words were detected. Off by default, so those are deleted
+  when they finish.
+
+**Keyboard**: a shortcut to turn on the [voice typing
+keyboard](#voice-typing-keyboard).
+
+**Display**: the transcript's font size, five steps with the default in
+the middle.
 
 ## Voice typing keyboard
 
 Scribe voice typing dictates into any app's text field.
 
-1. In **⚙**, tap **Keyboard settings** and turn on **Scribe voice
+1. In **⚙** → **Keyboard**, tap **Keyboard settings** and turn on **Scribe voice
    typing**.
 2. In any app, open the keyboard and pick Scribe with the keyboard
    switcher.

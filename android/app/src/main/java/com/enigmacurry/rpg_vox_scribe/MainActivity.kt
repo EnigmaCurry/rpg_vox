@@ -97,6 +97,7 @@ import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.withStyle
@@ -164,7 +165,8 @@ private fun App() {
     val drawer = rememberDrawerState(DrawerValue.Closed)
     val ui = rememberCoroutineScope()
     val dialogs = remember { ThreadDialogs() }
-    var settings by remember { mutableStateOf(false) }
+    var settings by remember { mutableStateOf<SettingsPage?>(null) }
+    var menu by remember { mutableStateOf(false) }
     val ready = Scribe.phase == Phase.Ready
     // Back closes the drawer before it leaves the app.
     BackHandler(enabled = drawer.isOpen) { ui.launch { drawer.close() } }
@@ -182,7 +184,22 @@ private fun App() {
                         }
                     },
                     actions = {
-                        if (ready) IconButton(onClick = { settings = true }) { Text("⚙") }
+                        if (ready) {
+                            Box {
+                                IconButton(onClick = { menu = true }) { Text("⚙") }
+                                androidx.compose.material3.DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                                    SettingsPage.entries.forEach { page ->
+                                        androidx.compose.material3.DropdownMenuItem(
+                                            text = { Text(page.title) },
+                                            onClick = {
+                                                menu = false
+                                                settings = page
+                                            },
+                                        )
+                                    }
+                                }
+                            }
+                        }
                     },
                     // The open thread; tap to rename it.
                     title = {
@@ -213,7 +230,7 @@ private fun App() {
         }
     }
     ThreadDialogHost(dialogs)
-    if (settings) MicSettings(close = { settings = false })
+    settings?.let { Settings(it, close = { settings = null }) }
 }
 
 @Composable
@@ -564,6 +581,13 @@ private fun recordingStart(recording: String): Long =
         java.text.SimpleDateFormat("yyyyMMdd-HHmmss", java.util.Locale.ROOT).parse(recording.take(15))!!.time
     }.getOrDefault(0L)
 
+/** Transcript text sizes the Display setting steps through; the middle one is the default. */
+val FONT_SCALES = listOf(0.8f, 0.9f, 1f, 1.15f, 1.3f)
+
+/** This style with its font size and line height times [scale]. */
+fun TextStyle.scaled(scale: Float): TextStyle =
+    copy(fontSize = fontSize * scale, lineHeight = lineHeight * scale)
+
 /** "1:23 / 4:56": where playback is, of how long. */
 private fun playTime(now: Long): String =
     clock(now) + Playback.lengthMs.let { if (it > 0) " / ${clock(it)}" else "" }
@@ -722,7 +746,7 @@ private fun Transcript(modifier: Modifier) {
                     if (p.source != null && prev?.source != p.source) {
                         Text(
                             p.source,
-                            style = MaterialTheme.typography.labelLarge,
+                            style = MaterialTheme.typography.labelLarge.scaled(FONT_SCALES[Scribe.fontStep]),
                             color = MaterialTheme.colorScheme.primary,
                             modifier = Modifier.padding(bottom = 4.dp),
                         )
@@ -746,7 +770,7 @@ private fun Transcript(modifier: Modifier) {
                                     }
                                 }
                             },
-                            style = MaterialTheme.typography.bodyLarge,
+                            style = MaterialTheme.typography.bodyLarge.scaled(FONT_SCALES[Scribe.fontStep]),
                         )
                     }
                 }
@@ -842,7 +866,7 @@ private fun PlayableParagraph(p: Para, playing: Playing?, at: Karaoke?, canPlay:
     }
     Text(
         text,
-        style = MaterialTheme.typography.bodyLarge,
+        style = MaterialTheme.typography.bodyLarge.scaled(FONT_SCALES[Scribe.fontStep]),
         onTextLayout = { layout = it },
         modifier = Modifier
             .bringIntoViewRequester(requester)

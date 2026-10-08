@@ -20,6 +20,7 @@ import android.provider.OpenableColumns
 import android.util.Log
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -144,6 +145,12 @@ object Scribe {
     /** Save each recording's audio (.opus) with its transcript, for playback. */
     var keepAudio by mutableStateOf(false)
         private set
+    /** With [keepAudio], also keep recordings in which no words were detected. */
+    var keepNonSpeech by mutableStateOf(false)
+        private set
+    /** Transcript text size, an index into [FONT_SCALES]. */
+    var fontStep by mutableIntStateOf(FONT_SCALES.size / 2)
+        private set
     /** The input the mic source is recording from, while it runs. */
     var micName by mutableStateOf<String?>(null)
         private set
@@ -229,6 +236,8 @@ object Scribe {
         boost = runCatching { Boost.valueOf(prefs.getString("boost", "AUTO")!!) }.getOrDefault(Boost.AUTO)
         route = runCatching { MicRoute.valueOf(prefs.getString("route", "AUTO")!!) }.getOrDefault(MicRoute.AUTO)
         keepAudio = prefs.getBoolean("keep_audio", false)
+        keepNonSpeech = prefs.getBoolean("keep_non_speech", false)
+        fontStep = prefs.getInt("font_step", FONT_SCALES.size / 2).coerceIn(0, FONT_SCALES.size - 1)
         phase = if (store.ready()) Phase.Unloaded else Phase.NeedModels(resume = store.started())
         migrate()
         show(threads.current())
@@ -253,6 +262,16 @@ object Scribe {
     fun chooseKeepAudio(keep: Boolean) {
         keepAudio = keep
         app.getSharedPreferences("scribe", Context.MODE_PRIVATE).edit().putBoolean("keep_audio", keep).apply()
+    }
+
+    fun chooseKeepNonSpeech(keep: Boolean) {
+        keepNonSpeech = keep
+        app.getSharedPreferences("scribe", Context.MODE_PRIVATE).edit().putBoolean("keep_non_speech", keep).apply()
+    }
+
+    fun chooseFontStep(step: Int) {
+        fontStep = step.coerceIn(0, FONT_SCALES.size - 1)
+        app.getSharedPreferences("scribe", Context.MODE_PRIVATE).edit().putInt("font_step", fontStep).apply()
     }
 
     /** Where kept recordings live. */
@@ -698,6 +717,7 @@ object Scribe {
                 finishing = false
                 lastActive = SystemClock.elapsedRealtime()
                 save(now = true)
+                if (!keepNonSpeech) dropIfWordless(srcs)
                 ScribeService.update(app)
             }
         }
@@ -766,6 +786,7 @@ object Scribe {
                 file = null
                 lastActive = SystemClock.elapsedRealtime()
                 save(now = true)
+                if (!keepNonSpeech) dropIfWordless(listOf(src))
                 ScribeService.update(app)
                 if (error != null) {
                     android.widget.Toast.makeText(app, "Could not read $name: ${error.message}", android.widget.Toast.LENGTH_LONG).show()
@@ -787,6 +808,20 @@ object Scribe {
     private fun thread(name: String, body: () -> Unit) = Thread(body, name).apply { start() }
 
     // ---- transcript ----------------------------------------------------
+
+    /**
+     * A finished recording's audio, when no paragraph has words in it
+     * ("Keep non-speech audio" off). With two sources, the Phone audio
+     * stays when only Me said anything, since they play together.
+     */
+    private fun dropIfWordless(srcs: List<Source>) {
+        val files = srcs.mapNotNull { it.audio }.toSet()
+        if (files.isEmpty()) return
+        if (paragraphs.any { it.audio in files && it.words.isNotEmpty() }) return
+        files.forEach(threads::removeAudio)
+        deleteAudio(files.toList())
+        refreshThreads()
+    }
 
     private fun deleteAudio(files: List<String>) {
         files.forEach { File(audioDir, it).delete() }
