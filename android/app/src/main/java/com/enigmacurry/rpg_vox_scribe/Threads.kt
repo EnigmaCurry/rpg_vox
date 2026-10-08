@@ -13,6 +13,7 @@ data class ThreadInfo(val id: Long, val title: String, val last: String, val pre
 /**
  * One stored paragraph. [audio] is the recording it was heard in and
  * [words] its word timings in that recording (JSON, see [Word.toJson]).
+ * [atMs] is when it was said (epoch ms), which orders a thread.
  */
 data class Saved(
     val rowId: Long,
@@ -20,7 +21,18 @@ data class Saved(
     val speaker: String?,
     val audio: String? = null,
     val words: String? = null,
+    val atMs: Long = 0,
 )
+
+private val iso = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.ROOT).apply {
+    timeZone = java.util.TimeZone.getTimeZone("UTC")
+}
+
+/** The desktop's `at` format, from epoch ms. */
+private fun isoAt(ms: Long): String = synchronized(iso) { iso.format(Date(ms)) }
+
+private fun parseAt(at: String?): Long =
+    at?.let { runCatching { synchronized(iso) { iso.parse(it)?.time } }.getOrNull() } ?: 0L
 
 /** A kept recording: one source's audio file and where it starts in its recording. */
 data class AudioFile(val file: String, val offsetMs: Long)
@@ -30,7 +42,9 @@ data class AudioFile(val file: String, val offsetMs: Long)
  * chat database's schema (crates/vox_chat): `conversations` are threads,
  * each finished paragraph is a `messages` row (`role='user'`,
  * `kind='say'`), and `settings.conversation` is the thread last open.
- * Additions, ignored by the desktop: `messages.speaker` ("Me",
+ * `messages.at` is when a paragraph was said rather than stored, so a
+ * thread lists in speaking order even when a paragraph was finished after
+ * a later one. Additions, ignored by the desktop: `messages.speaker` ("Me",
  * "Phone") for recordings with two sources, and for kept audio
  * `messages.audio` and `messages.words` (see [Saved]) plus the `audio`
  * table, which groups the files a recording made (one per source) with
@@ -132,16 +146,26 @@ class ThreadStore(file: File) {
 
     fun messages(thread: Long): List<Saved> =
         db.rawQuery(
-            "SELECT id, text, speaker, audio, words FROM messages WHERE conversation = ? AND role = 'user' AND kind = 'say' ORDER BY id",
+            "SELECT id, text, speaker, audio, words, at FROM messages WHERE conversation = ? AND role = 'user' AND kind = 'say' ORDER BY at, id",
             arrayOf("$thread"),
         ).use { c ->
             buildList {
-                while (c.moveToNext()) add(Saved(c.getLong(0), c.getString(1), c.getString(2), c.getString(3), c.getString(4)))
+                while (c.moveToNext()) {
+                    add(Saved(c.getLong(0), c.getString(1), c.getString(2), c.getString(3), c.getString(4), parseAt(c.getString(5))))
+                }
             }
         }
 
-    fun say(thread: Long, text: String, speaker: String?, audio: String? = null, words: String? = null): Long =
+    fun say(
+        thread: Long,
+        text: String,
+        speaker: String?,
+        audio: String? = null,
+        words: String? = null,
+        atMs: Long = 0,
+    ): Long =
         db.insert("messages", null, ContentValues().apply {
+            if (atMs > 0) put("at", isoAt(atMs))
             put("conversation", thread)
             put("role", "user")
             put("kind", "say")
@@ -151,12 +175,13 @@ class ThreadStore(file: File) {
             put("words", words)
         })
 
-    fun edit(rowId: Long, text: String, words: String? = null) {
+    fun edit(rowId: Long, text: String, words: String? = null, atMs: Long = 0) {
         db.update(
             "messages",
             ContentValues().apply {
                 put("text", text)
                 put("words", words)
+                if (atMs > 0) put("at", isoAt(atMs))
             },
             "id = ?",
             arrayOf("$rowId"),

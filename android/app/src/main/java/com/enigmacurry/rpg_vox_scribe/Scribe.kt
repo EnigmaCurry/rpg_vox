@@ -55,6 +55,8 @@ data class Para(
     val source: String? = null,
     val audio: String? = null,
     val words: List<Word> = emptyList(),
+    /** When it was said (epoch ms); the transcript is in this order. */
+    val atMs: Long = 0,
 ) {
     val text: String get() = clips.filter { it.text.isNotBlank() }.joinToString(" ") { it.text }
     /** [text]'s words as shown. */
@@ -296,8 +298,10 @@ object Scribe {
         val audio: String?,
         val recording: String?,
     ) {
-        /** Set once the first audio arrives (kept audio, two sources). */
+        /** Set once the first audio arrives. */
         @Volatile var started = false
+        /** Epoch ms at the session's time zero, for ordering its paragraphs. */
+        @Volatile var baseMs = 0L
         /** Paragraphs this session produced (to apply its final transcript). */
         val ids = mutableSetOf<String>()
         var capture: Capture? = null
@@ -369,6 +373,7 @@ object Scribe {
         paused = false
         activeMs = 0
         runStart = SystemClock.elapsedRealtime()
+        wallStart = System.currentTimeMillis()
         ScribeService.update(app)
         startCaptures()
     }
@@ -522,7 +527,7 @@ object Scribe {
                     if (n <= 0) continue
                     for (i in 0 until n) buf[i] = shorts[i] / 32768f
                     process?.invoke(buf, n)
-                    if (!src.started) placeAudio(src)
+                    if (!src.started) place(src)
                     Native.push(src.session, buf, n)
                 }
             } finally {
@@ -539,11 +544,16 @@ object Scribe {
         java.text.SimpleDateFormat("yyyyMMdd-HHmmss", java.util.Locale.ROOT).format(java.util.Date()) +
             "-" + java.lang.Long.toString(System.nanoTime() % 46_656, 36)
 
+    /** Wall clock when the open recording started. */
+    @Volatile private var wallStart = 0L
+
     /**
      * A source's first audio: note where it starts in the recording, so
-     * Me and Phone (whose capture starts later) line up on playback.
+     * Me and Phone (whose capture starts later) are ordered and, on
+     * playback, line up.
      */
-    private fun placeAudio(src: Source) {
+    private fun place(src: Source) {
+        src.baseMs = wallStart + elapsedMs()
         src.started = true
         val audio = src.audio ?: return
         val rec = src.recording ?: return
@@ -616,6 +626,7 @@ object Scribe {
         // Each file gets a thread of its own, named after it.
         switchTo(threads.create(name), force = true)
         val src = open(Kind.FILE, null, streaming = false, if (keepAudio) newRecording() else null)
+        src.baseMs = System.currentTimeMillis()
         cancelFile = false
         fileTotalMs = 0
         file = FileJob(name, 0f)
@@ -748,6 +759,7 @@ object Scribe {
                 source = m.speaker,
                 audio = m.audio,
                 words = parseWords(m.words),
+                atMs = m.atMs,
             )
             paragraphs += p
             written[p.id] = m
@@ -845,10 +857,21 @@ object Scribe {
         final.forEach { upsert(src, it) }
     }
 
+    /**
+     * Add or replace [p], in the order it was said: a paragraph can be
+     * finished after a later one (a short noise with no live text, or the
+     * other source's), as the desktop's transcript also allows for.
+     */
     private fun upsert(src: Source, p: Para) {
         src.ids += p.id
         val i = paragraphs.indexOfFirst { it.id == p.id }
-        if (i >= 0) paragraphs[i] = p else paragraphs += p
+        if (i >= 0 && paragraphs[i].atMs == p.atMs) {
+            paragraphs[i] = p
+            return
+        }
+        if (i >= 0) paragraphs.removeAt(i)
+        val at = paragraphs.indexOfFirst { it.atMs > p.atMs }
+        if (at < 0) paragraphs += p else paragraphs.add(at, p)
     }
 
     private fun parse(src: Source, o: JSONObject): Para {
@@ -862,6 +885,7 @@ object Scribe {
             source = src.label,
             audio = src.audio,
             words = if (src.audio != null) parseWords(o.optJSONArray("words")) else emptyList(),
+            atMs = src.baseMs + o.optLong("start_ms"),
         )
     }
 
@@ -895,10 +919,10 @@ object Scribe {
             val w = written[p.id]
             when {
                 w == null -> written[p.id] =
-                    Saved(threads.say(id, text, p.source, p.audio, words), text, p.source, p.audio, words)
-                w.text != text || w.words != words -> {
-                    threads.edit(w.rowId, text, words)
-                    written[p.id] = w.copy(text = text, words = words)
+                    Saved(threads.say(id, text, p.source, p.audio, words, p.atMs), text, p.source, p.audio, words, p.atMs)
+                w.text != text || w.words != words || w.atMs != p.atMs -> {
+                    threads.edit(w.rowId, text, words, p.atMs)
+                    written[p.id] = w.copy(text = text, words = words, atMs = p.atMs)
                 }
             }
         }
