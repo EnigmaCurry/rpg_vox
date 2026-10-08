@@ -116,8 +116,9 @@ transcribed, the other threads can't be opened.
 With **Keep audio (.opus)** on in **⚙**, tap any word of a
 transcript, once the recording has stopped, to hear it from that word.
 The words light up as they are spoken and the transcript scrolls along.
-While it plays, **Pause**/**Resume** and **Stop** take the place of the
-source picker, with the time. Tapping the transcript also pauses: the
+While it plays, **« 10s** and **10s »** (back and ahead ten seconds),
+**Pause**/**Resume** and **Stop** take the place of the source picker,
+with the time below. Tapping the transcript also pauses: the
 current word stays highlighted and you can scroll freely until you
 resume, or tap another word to play from there. The record button only records; starting a recording stops
 playback. A Both

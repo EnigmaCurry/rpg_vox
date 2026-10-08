@@ -384,8 +384,8 @@ private fun Dictate() {
                 }
                 val time = clock(if (Scribe.recording) now else 0)
                 val status = when {
-                    playing && Playback.paused -> "Playback paused"
-                    playing -> "Tap the text to pause"
+                    playing && Playback.paused -> "Paused · ${playTime(now)}"
+                    playing -> "${playTime(now)} · tap the text to pause"
                     job != null -> "Transcribing ${job.name}" +
                         if (job.progress >= 0) " · ${(job.progress * 100).toInt()}%" else "…"
                     Scribe.finishing -> "Finishing…"
@@ -395,7 +395,7 @@ private fun Dictate() {
                     else -> "Tap to start · keeps going in the background"
                 }
                 if (playing) {
-                    PlaybackBar(now)
+                    PlaybackBar()
                     Spacer(Modifier.height(8.dp))
                 } else if (Build.VERSION.SDK_INT >= 29) {
                     SourcePicker(enabled = !Scribe.busy())
@@ -468,21 +468,22 @@ private fun SourcePicker(enabled: Boolean) {
     }
 }
 
-/** In place of the source picker while a recording plays: pause/resume, stop, and where it is. */
+/** "1:23 / 4:56": where playback is, of how long. */
+private fun playTime(now: Long): String =
+    clock(now) + Playback.lengthMs.let { if (it > 0) " / ${clock(it)}" else "" }
+
+/** In place of the source picker while a recording plays: back/ahead 10 s, pause/resume, stop. */
 @Composable
-private fun PlaybackBar(now: Long) {
+private fun PlaybackBar() {
+    val pad = androidx.compose.foundation.layout.PaddingValues(horizontal = 12.dp)
     Row(verticalAlignment = Alignment.CenterVertically) {
-        FilledTonalButton(onClick = { if (Playback.paused) Playback.resume() else Playback.pause() }) {
+        TextButton(onClick = { Playback.skip(-10_000) }, contentPadding = pad) { Text("« 10s") }
+        FilledTonalButton(onClick = { if (Playback.paused) Playback.resume() else Playback.pause() }, contentPadding = pad) {
             Text(if (Playback.paused) "▶ Resume" else "❚❚ Pause")
         }
-        Spacer(Modifier.size(8.dp))
-        OutlinedButton(onClick = Playback::stop) { Text("■ Stop") }
-        Spacer(Modifier.size(12.dp))
-        val length = Playback.lengthMs
-        Text(
-            clock(now) + if (length > 0) " / ${clock(length)}" else "",
-            style = MaterialTheme.typography.labelLarge,
-        )
+        TextButton(onClick = { Playback.skip(10_000) }, contentPadding = pad) { Text("10s »") }
+        Spacer(Modifier.size(4.dp))
+        OutlinedButton(onClick = Playback::stop, contentPadding = pad) { Text("■ Stop") }
     }
 }
 

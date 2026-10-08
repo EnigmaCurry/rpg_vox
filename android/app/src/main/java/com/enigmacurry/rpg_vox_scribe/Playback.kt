@@ -106,6 +106,19 @@ object Playback {
         startWorker(fromMs)
     }
 
+    /** Jump [deltaMs] back or ahead, staying paused if paused. */
+    fun skip(deltaMs: Long) {
+        if (playing == null) return
+        val end = lengthMs.takeIf { it > 0 } ?: Long.MAX_VALUE
+        val at = (positionMs() + deltaMs).coerceIn(0, end)
+        if (paused) {
+            fromMs = at
+        } else {
+            stopWorker()
+            startWorker(at)
+        }
+    }
+
     fun stop() {
         stopWorker()
         playing = null
