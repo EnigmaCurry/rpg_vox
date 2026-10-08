@@ -181,7 +181,8 @@ keyboard](#voice-typing-keyboard).
 **Display**: the transcript's font size, five steps with the default in
 the middle.
 
-**About**: the app's version and a link to its source.
+**About**: the app's version, a link to its source, and the
+[changelog](CHANGELOG.md).
 
 ## Voice typing keyboard
 

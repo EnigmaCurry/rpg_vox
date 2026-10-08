@@ -59,9 +59,11 @@ dist VERSION=`git describe --tags --always --dirty`:
     done
 
 # Cut a release from master: bump the workspace version (prompts, default
-# next patch), commit, tag v<version> and push both after confirmation.
-# The tag push runs the release workflow. Needs a clean, up-to-date master
-# (untracked files are ignored).
+# next patch), name CHANGELOG.md's "## Unreleased" section after it (and
+# open a new one), commit, tag v<version> and push both after
+# confirmation. The tag push runs the release workflow. Needs a clean,
+# up-to-date master (untracked files are ignored) and CHANGELOG.md entries
+# under "## Unreleased", committed since the last release.
 publish:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -72,6 +74,14 @@ publish:
     git fetch --quiet origin master --tags
     [ "$(git rev-parse HEAD)" = "$(git rev-parse origin/master)" ] \
       || { echo "master differs from origin/master; pull or push first" >&2; exit 1; }
+    last="$(git describe --tags --abbrev=0 2>/dev/null || true)"
+    if [ -n "$last" ] && git diff --quiet "$last" HEAD -- CHANGELOG.md; then
+      echo "CHANGELOG.md hasn't changed since $last; add this release's changes under ## Unreleased" >&2
+      exit 1
+    fi
+    unreleased="$(awk '/^## /{on = ($0 == "## Unreleased"); next} on && NF' CHANGELOG.md)"
+    [ -n "$unreleased" ] \
+      || { echo "CHANGELOG.md has nothing under ## Unreleased" >&2; exit 1; }
     current="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)"
     IFS=. read -r major minor patch <<< "${current%%-*}"
     default="$major.$minor.$((patch + 1))"
@@ -84,15 +94,19 @@ publish:
       || { echo "tag $tag already exists" >&2; exit 1; }
     sed -i.bak '/^\[workspace.package\]/,/^\[/s/^version = ".*"/version = "'"$version"'"/' Cargo.toml
     rm Cargo.toml.bak
+    # "## Unreleased" becomes this version, under a fresh empty one.
+    awk -v head="## $tag ($(date +%Y-%m-%d))" \
+      '$0 == "## Unreleased" && !done {print; print ""; print head; done = 1; next} {print}' \
+      CHANGELOG.md > CHANGELOG.md.new && mv CHANGELOG.md.new CHANGELOG.md
     cargo update --workspace --quiet
     git --no-pager diff --stat
     read -rp "Commit, tag $tag and push to origin? [y/N] " ok
     if [ "$ok" != y ] && [ "$ok" != Y ]; then
-      git checkout -- Cargo.toml Cargo.lock
+      git checkout -- Cargo.toml Cargo.lock CHANGELOG.md
       echo "aborted; version change reverted"
       exit 1
     fi
-    git commit -q -m "Release $tag" Cargo.toml Cargo.lock
+    git commit -q -m "Release $tag" Cargo.toml Cargo.lock CHANGELOG.md
     git tag -a "$tag" -m "Release $tag"
     git push --atomic origin master "$tag"
     echo "pushed $tag; the release workflow is building it"

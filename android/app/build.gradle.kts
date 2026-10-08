@@ -55,6 +55,24 @@ android {
     buildFeatures { compose = true }
 }
 
+/** CHANGELOG.md from the repository root, shipped as an asset for the About page. */
+abstract class CopyChangelog : DefaultTask() {
+    @get:InputFile abstract val source: RegularFileProperty
+    @get:OutputDirectory abstract val out: DirectoryProperty
+
+    @TaskAction
+    fun copy() {
+        source.get().asFile.copyTo(out.get().file("CHANGELOG.md").asFile, overwrite = true)
+    }
+}
+
+val changelog = tasks.register<CopyChangelog>("copyChangelog") {
+    source.set(rootProject.file("../CHANGELOG.md"))
+}
+androidComponents {
+    onVariants { it.sources.assets?.addGeneratedSourceDirectory(changelog, CopyChangelog::out) }
+}
+
 dependencies {
     val bom = platform("androidx.compose:compose-bom:2026.09.00")
     implementation(bom)
