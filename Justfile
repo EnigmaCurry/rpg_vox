@@ -469,15 +469,14 @@ android-app INSTALL="yes": _android-jni
 # Release APK of the dictation app in dist/, as the release workflow ships
 # it. Signed with the keystore in SCRIBE_KEYSTORE (plus SCRIBE_KEYSTORE_PASSWORD,
 # SCRIBE_KEY_ALIAS, SCRIBE_KEY_PASSWORD) when set, the debug key otherwise.
-# VERSION_CODE must grow between releases for Android to upgrade in place.
-android-apk VERSION=`git describe --tags --always --dirty` VERSION_CODE="1": _android-jni
+android-apk VERSION=`git describe --tags --always --dirty`: _android-jni
     #!/usr/bin/env bash
     set -euo pipefail
     export ANDROID_HOME="${ANDROID_HOME:-/opt/homebrew/share/android-commandlinetools}"
     export JAVA_HOME="${JAVA_HOME:-/opt/homebrew/opt/openjdk@21}"
     [ -f android/local.properties ] || echo "sdk.dir=$ANDROID_HOME" > android/local.properties
     (cd android && ./gradlew assembleRelease \
-      -PscribeVersionName="{{VERSION}}" -PscribeVersionCode="{{VERSION_CODE}}")
+      -PscribeVersionName="{{VERSION}}")
     name="scribe-{{VERSION}}-android-arm64.apk"
     mkdir -p dist
     cp android/app/build/outputs/apk/release/app-release.apk "dist/$name"

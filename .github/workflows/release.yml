@@ -129,7 +129,7 @@ jobs:
           SCRIBE_KEYSTORE_PASSWORD: ${{ secrets.SCRIBE_KEYSTORE_PASSWORD }}
           SCRIBE_KEY_ALIAS: ${{ secrets.SCRIBE_KEY_ALIAS }}
           SCRIBE_KEY_PASSWORD: ${{ secrets.SCRIBE_KEY_PASSWORD }}
-        run: just android-apk "$GITHUB_REF_NAME" "$GITHUB_RUN_NUMBER"
+        run: just android-apk "$GITHUB_REF_NAME"
 
       - uses: actions/upload-artifact@v4
         with:

@@ -12,8 +12,10 @@ android {
         // AAudio-era devices; matches the CLI build's API level.
         minSdk = 26
         targetSdk = 36
-        // `just android-apk` passes the release tag and a growing code.
-        versionCode = (findProperty("scribeVersionCode") as String?)?.toInt() ?: 1
+        // Minutes since 2020 unless given: every build, local or CI, is newer
+        // than the ones before it, so any can install over any earlier one.
+        versionCode = (findProperty("scribeVersionCode") as String?)?.toInt()
+            ?: ((System.currentTimeMillis() - 1_577_836_800_000L) / 60_000).toInt()
         versionName = findProperty("scribeVersionName") as String? ?: "0.1.0"
         ndk { abiFilters += "arm64-v8a" }
     }
