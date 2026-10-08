@@ -3,11 +3,15 @@
 # packaging, so a local `just dist` produces the same archives.
 #
 #   git tag v0.1.0 && git push origin v0.1.0
+#
+# Running it by hand (Actions > release > Run workflow) on any branch
+# builds everything as workflow artifacts without publishing a release.
 name: release
 
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -68,8 +72,67 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  # The Scribe dictation app (android/). arm64-v8a only: it covers every
+  # current phone, and the 32-bit-only phones a second ABI would add are
+  # too slow for the speech models anyway.
+  android:
+    name: build (android-arm64 apk)
+    runs-on: ubuntu-24.04
+    env:
+      ANDROID_NDK_VERSION: 30.0.16248370
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      # The runner's Android SDK has an NDK, but pin the one the app is
+      # developed against.
+      - name: Install Android NDK
+        run: |
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$ANDROID_NDK_VERSION" >/dev/null
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: aarch64-linux-android
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk,just
+      - uses: gradle/actions/setup-gradle@v4
+
+      # Release signing key, if the repo has one (base64 keystore plus
+      # passwords in secrets); otherwise `just android-apk` signs with a
+      # throwaway debug key and each release must be installed fresh.
+      - name: Release keystore
+        env:
+          KEYSTORE_B64: ${{ secrets.SCRIBE_KEYSTORE_BASE64 }}
+        if: env.KEYSTORE_B64 != ''
+        run: |
+          echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/scribe.jks"
+          echo "SCRIBE_KEYSTORE=$RUNNER_TEMP/scribe.jks" >> "$GITHUB_ENV"
+
+      - name: Build APK
+        env:
+          SCRIBE_KEYSTORE_PASSWORD: ${{ secrets.SCRIBE_KEYSTORE_PASSWORD }}
+          SCRIBE_KEY_ALIAS: ${{ secrets.SCRIBE_KEY_ALIAS }}
+          SCRIBE_KEY_PASSWORD: ${{ secrets.SCRIBE_KEY_PASSWORD }}
+        run: just android-apk "$GITHUB_REF_NAME" "$GITHUB_RUN_NUMBER"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-android-arm64
+          path: dist/*
+          if-no-files-found: error
+
   release:
-    needs: build
+    needs: [build, android]
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-24.04
     permissions:
       contents: write

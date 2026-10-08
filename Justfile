@@ -397,19 +397,11 @@ android:
 # a device on adb, installs it. Needs what `just android` needs plus a
 # JDK 17+ (JAVA_HOME, default: Homebrew's openjdk@21) and the Android SDK
 # (ANDROID_HOME, default: Homebrew's android-commandlinetools).
-android-app INSTALL="yes":
+android-app INSTALL="yes": _android-jni
     #!/usr/bin/env bash
     set -euo pipefail
-    export ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-/opt/homebrew/share/android-ndk}"
     export ANDROID_HOME="${ANDROID_HOME:-/opt/homebrew/share/android-commandlinetools}"
     export JAVA_HOME="${JAVA_HOME:-/opt/homebrew/opt/openjdk@21}"
-    export CMAKE_TOOLCHAIN_FILE="$PWD/android/toolchain.cmake"
-    cargo ndk -t arm64-v8a --platform 26 build --release -p vox_android
-    jni=android/app/src/main/jniLibs/arm64-v8a
-    libs=target/sherpa-onnx-prebuilt/jniLibs/arm64-v8a
-    mkdir -p "$jni"
-    cp target/aarch64-linux-android/release/libvox_android.so \
-      "$libs/libsherpa-onnx-c-api.so" "$libs/libonnxruntime.so" "$jni/"
     [ -f android/local.properties ] || echo "sdk.dir=$ANDROID_HOME" > android/local.properties
     (cd android && ./gradlew assembleDebug)
     apk=android/app/build/outputs/apk/debug/app-debug.apk
@@ -417,6 +409,37 @@ android-app INSTALL="yes":
     if [ "{{INSTALL}}" = yes ] && adb get-state >/dev/null 2>&1; then
       adb install -r "$apk"
     fi
+
+# Release APK of the dictation app in dist/, as the release workflow ships
+# it. Signed with the keystore in SCRIBE_KEYSTORE (plus SCRIBE_KEYSTORE_PASSWORD,
+# SCRIBE_KEY_ALIAS, SCRIBE_KEY_PASSWORD) when set, the debug key otherwise.
+# VERSION_CODE must grow between releases for Android to upgrade in place.
+android-apk VERSION=`git describe --tags --always --dirty` VERSION_CODE="1": _android-jni
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export ANDROID_HOME="${ANDROID_HOME:-/opt/homebrew/share/android-commandlinetools}"
+    export JAVA_HOME="${JAVA_HOME:-/opt/homebrew/opt/openjdk@21}"
+    [ -f android/local.properties ] || echo "sdk.dir=$ANDROID_HOME" > android/local.properties
+    (cd android && ./gradlew assembleRelease \
+      -PscribeVersionName="{{VERSION}}" -PscribeVersionCode="{{VERSION_CODE}}")
+    name="scribe-{{VERSION}}-android-arm64.apk"
+    mkdir -p dist
+    cp android/app/build/outputs/apk/release/app-release.apk "dist/$name"
+    (cd dist && shasum -a 256 "$name" > "$name.sha256")
+    echo "packaged dist/$name"
+
+# libvox_android.so and the sherpa-onnx libs it loads, into the app's jniLibs.
+_android-jni:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-/opt/homebrew/share/android-ndk}"
+    export CMAKE_TOOLCHAIN_FILE="$PWD/android/toolchain.cmake"
+    cargo ndk -t arm64-v8a --platform 26 build --release --locked -p vox_android
+    jni=android/app/src/main/jniLibs/arm64-v8a
+    libs=target/sherpa-onnx-prebuilt/jniLibs/arm64-v8a
+    mkdir -p "$jni"
+    cp target/aarch64-linux-android/release/libvox_android.so \
+      "$libs/libsherpa-onnx-c-api.so" "$libs/libonnxruntime.so" "$jni/"
 
 # --- discord_vox (PipeWire sink → Discord voice) ---
 

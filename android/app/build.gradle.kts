@@ -12,15 +12,31 @@ android {
         // AAudio-era devices; matches the CLI build's API level.
         minSdk = 26
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.1.0"
+        // `just android-apk` passes the release tag and a growing code.
+        versionCode = (findProperty("scribeVersionCode") as String?)?.toInt() ?: 1
+        versionName = findProperty("scribeVersionName") as String? ?: "0.1.0"
         ndk { abiFilters += "arm64-v8a" }
+    }
+
+    // A stable release key (SCRIBE_KEYSTORE etc., see `just android-apk`)
+    // lets new APKs install over old ones; without it the debug key signs,
+    // and a CI-built debug key differs every run.
+    val keystore = System.getenv("SCRIBE_KEYSTORE")?.takeIf { it.isNotEmpty() }
+    signingConfigs {
+        if (keystore != null) {
+            create("release") {
+                storeFile = file(keystore)
+                storePassword = System.getenv("SCRIBE_KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("SCRIBE_KEY_ALIAS")
+                keyPassword = System.getenv("SCRIBE_KEY_PASSWORD")
+            }
+        }
     }
 
     buildTypes {
         release {
             isMinifyEnabled = false
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.getByName(if (keystore != null) "release" else "debug")
         }
     }
 
