@@ -5,7 +5,8 @@
 A collection of voice tools for tabletop RPGs played over a video
 call, as well as for general transcription tasks, built on PipeWire
 and local speech models. This repository holds two separate apps built
-with the same core, plus an LLM responder for scribe's chat mode:
+with the same core, an Android version of scribe, plus an LLM responder
+for scribe's chat mode:
 
 > [!NOTE]
 > These tools are produced with the assistance of Claude Code and other AI tools. 
@@ -24,6 +25,15 @@ scribe -o notes
 ```
 
 [Read more →](SCRIBE.md)
+
+## [Scribe for Android](ANDROID.md)
+
+scribe as a phone app: live transcription of the mic, other apps'
+audio, or shared files, kept as threads, plus a voice keyboard for
+dictating into any app. Everything runs on the phone after a one-time
+model download. Arm64, Android 8.0 or newer.
+
+[Read more →](ANDROID.md)
 
 ## [agent](AGENT.md)
 
