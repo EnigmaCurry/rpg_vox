@@ -467,6 +467,43 @@ android-apk VERSION=`git describe --tags --always --dirty` VERSION_CODE="1": _an
     (cd dist && shasum -a 256 "$name" > "$name.sha256")
     echo "packaged dist/$name"
 
+# Release signing key for the APK: creates KEYSTORE (asks for a password)
+# unless it exists, then, after confirmation, stores it and its password as
+# the repo secrets the release workflow signs with (needs `gh`). Every APK
+# must be signed by this same key to install over the last one, so back
+# KEYSTORE up; losing it means uninstalling Scribe to update.
+android-keystore KEYSTORE="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export JAVA_HOME="${JAVA_HOME:-/opt/homebrew/opt/openjdk@21}"
+    keytool="$JAVA_HOME/bin/keytool"
+    keystore="{{KEYSTORE}}"
+    keystore="${keystore:-$HOME/scribe.jks}"
+    alias=scribe
+    read -rsp "Keystore password: " SCRIBE_KEYSTORE_PASSWORD; echo
+    export SCRIBE_KEYSTORE_PASSWORD
+    if [ -f "$keystore" ]; then
+      "$keytool" -list -keystore "$keystore" -storepass:env SCRIBE_KEYSTORE_PASSWORD -alias "$alias" >/dev/null \
+        || { echo "wrong password, or no $alias key in $keystore" >&2; exit 1; }
+      echo "using existing $keystore"
+    else
+      [ "${#SCRIBE_KEYSTORE_PASSWORD}" -ge 6 ] || { echo "password needs 6+ characters" >&2; exit 1; }
+      read -rsp "Again: " again; echo
+      [ "$again" = "$SCRIBE_KEYSTORE_PASSWORD" ] || { echo "passwords differ" >&2; exit 1; }
+      # PKCS12 keystores use the store password for the key too.
+      "$keytool" -genkeypair -keystore "$keystore" -alias "$alias" \
+        -keyalg RSA -keysize 4096 -validity 10000 -dname CN=Scribe \
+        -storepass:env SCRIBE_KEYSTORE_PASSWORD
+      chmod 600 "$keystore"
+      echo "created $keystore; back it up"
+    fi
+    read -rp "Store it as secrets of $(gh repo view --json nameWithOwner -q .nameWithOwner)? [y/N] " ok
+    [ "$ok" = y ] || [ "$ok" = Y ] || exit 0
+    base64 < "$keystore" | gh secret set SCRIBE_KEYSTORE_BASE64
+    printf %s "$SCRIBE_KEYSTORE_PASSWORD" | gh secret set SCRIBE_KEYSTORE_PASSWORD
+    printf %s "$SCRIBE_KEYSTORE_PASSWORD" | gh secret set SCRIBE_KEY_PASSWORD
+    printf %s "$alias" | gh secret set SCRIBE_KEY_ALIAS
+
 # libvox_android.so and the sherpa-onnx libs it loads, into the app's jniLibs.
 _android-jni:
     #!/usr/bin/env bash

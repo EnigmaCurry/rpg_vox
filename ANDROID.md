@@ -147,7 +147,9 @@ just android-apk          # release APK in dist/
 when it is set, and with the debug key otherwise. The release workflow
 builds it on every version tag, using a keystore from the repository's
 secrets when there is one (`SCRIBE_KEYSTORE_BASE64` and the three
-passwords).
+passwords). `just android-keystore` creates that keystore in
+`~/scribe.jks` and stores the secrets with `gh`. Back the keystore up:
+each release must be signed with the same key to install over the last.
 
 The app is in [android/](android/), Kotlin and Jetpack Compose over a
 JNI bridge, [crates/vox_android](crates/vox_android), to the same
