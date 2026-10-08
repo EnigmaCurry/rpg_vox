@@ -404,6 +404,13 @@ private fun Dictate() {
                     Spacer(Modifier.height(8.dp))
                 }
                 Text(status, style = MaterialTheme.typography.labelLarge, maxLines = 1)
+                if (playing && Playback.paused) {
+                    Text(
+                        "tap text to seek and resume",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
                 // Playback shows only its own controls; Stop leaves it.
                 if (!playing) {
                     Spacer(Modifier.height(8.dp))
