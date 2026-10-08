@@ -7,6 +7,7 @@ import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import java.io.File
@@ -56,6 +57,9 @@ object Playback {
         private set
     /** Length of the playing recording (ms), once known. */
     var lengthMs by mutableStateOf(0L)
+        private set
+    /** Counts jumps in position (seeks, skips), for anything mirroring it. */
+    var seeks by mutableIntStateOf(0)
         private set
 
     private val main = Handler(Looper.getMainLooper())
@@ -108,10 +112,14 @@ object Playback {
     }
 
     /** Jump [deltaMs] back or ahead, staying paused if paused. */
-    fun skip(deltaMs: Long) {
+    fun skip(deltaMs: Long) = seekTo(positionMs() + deltaMs)
+
+    /** Jump to [ms] on the timeline, staying paused if paused. */
+    fun seekTo(ms: Long) {
         if (playing == null) return
         val end = lengthMs.takeIf { it > 0 } ?: Long.MAX_VALUE
-        val at = (positionMs() + deltaMs).coerceIn(0, end)
+        val at = ms.coerceIn(0, end)
+        seeks++
         if (paused) {
             fromMs = at
         } else {

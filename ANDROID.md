@@ -121,7 +121,11 @@ While it plays, **« 10s** and **10s »** (back and ahead ten seconds),
 with the time below. Tapping the transcript also pauses: the
 current word stays highlighted and you can scroll freely until you
 resume, or tap another word to play from there. Nothing else is
-shown while it plays; **Stop** brings back recording. A Both recording plays the mic and the
+shown while it plays; **Stop** brings back recording. Playback carries on
+with the app in the background or the screen off, with the same controls
+in the notification and on the lock screen (and headset buttons). It
+pauses for a call or another app's audio, and when headphones are
+unplugged. A Both recording plays the mic and the
 phone audio together.
 
 Playback runs through all of a thread's recordings in order, one after

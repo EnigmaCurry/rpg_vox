@@ -293,6 +293,7 @@ object Scribe {
         if (busy()) return
         val (files, starts) = timeline()
         Playback.play(audioDir, files, starts[recording] ?: return)
+        PlaybackService.start(app)
     }
 
     /** Play the open thread's audio, every recording in turn, from [word] of [p]. */
@@ -301,6 +302,7 @@ object Scribe {
         val (files, _) = timeline()
         val offset = files.firstOrNull { it.file == p.audio }?.offsetMs ?: return
         Playback.play(audioDir, files, offset + word.startMs)
+        PlaybackService.start(app)
     }
 
     fun chooseRoute(r: MicRoute) {
