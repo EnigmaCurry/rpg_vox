@@ -470,8 +470,9 @@ android-apk VERSION=`git describe --tags --always --dirty` VERSION_CODE="1": _an
 # Release signing key for the APK: creates KEYSTORE (asks for a password)
 # unless it exists, then, after confirmation, stores it and its password as
 # the repo secrets the release workflow signs with (needs `gh`). Every APK
-# must be signed by this same key to install over the last one, so back
-# KEYSTORE up; losing it means uninstalling Scribe to update.
+# must be signed by this same key to install over the last one. GitHub
+# can't give the secret back, so a lost KEYSTORE only matters if the
+# secret goes too: a new key then means uninstalling Scribe once.
 android-keystore KEYSTORE="":
     #!/usr/bin/env bash
     set -euo pipefail
