@@ -455,7 +455,7 @@ android-app INSTALL="yes": _android-jni
       fi
     fi
     [ -f android/local.properties ] || echo "sdk.dir=$ANDROID_HOME" > android/local.properties
-    (cd android && ./gradlew assembleDebug)
+    (cd android && ./gradlew assembleDebug -PscribeVersionName="$(git describe --tags --always --dirty)")
     apk=android/app/build/outputs/apk/debug/app-debug.apk
     du -h "$apk"
     if [ "{{INSTALL}}" = yes ]; then

@@ -146,7 +146,7 @@ time, with progress in the app and the notification.
 
 ## Settings
 
-**⚙** lists four pages of settings.
+**⚙** lists the settings pages and About.
 
 **Microphone**: changes apply the next time the mic starts, so pause and
 resume to apply them mid-recording.
@@ -174,6 +174,8 @@ keyboard](#voice-typing-keyboard).
 
 **Display**: the transcript's font size, five steps with the default in
 the middle.
+
+**About**: the app's version and a link to its source.
 
 ## Voice typing keyboard
 

@@ -228,6 +228,7 @@ enum class SettingsPage(val title: String) {
     RECORDING("Recording"),
     KEYBOARD("Keyboard"),
     DISPLAY("Display"),
+    ABOUT("About"),
 }
 
 /** One settings page as a dialog. */
@@ -243,6 +244,7 @@ fun Settings(page: SettingsPage, close: () -> Unit) {
                     SettingsPage.RECORDING -> RecordingPage()
                     SettingsPage.KEYBOARD -> KeyboardPage()
                     SettingsPage.DISPLAY -> DisplayPage()
+                    SettingsPage.ABOUT -> AboutPage()
                 }
             }
         },
@@ -324,6 +326,44 @@ private fun DisplayPage() {
         style = MaterialTheme.typography.bodyLarge.scaled(FONT_SCALES[Scribe.fontStep]),
     )
 }
+
+/** The app's name, version, source, and (later) what changed. */
+@Composable
+private fun AboutPage() {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val info = remember {
+        runCatching { context.packageManager.getPackageInfo(context.packageName, 0) }.getOrNull()
+    }
+    val code = info?.let { if (android.os.Build.VERSION.SDK_INT >= 28) it.longVersionCode else @Suppress("DEPRECATION") it.versionCode.toLong() }
+    Text("Scribe", style = MaterialTheme.typography.headlineSmall)
+    Text(
+        "Version ${info?.versionName ?: "?"}" + (code?.let { " ($it)" } ?: ""),
+        style = MaterialTheme.typography.bodyMedium,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+    Text(
+        "Live transcription on your phone, with speech models that run on it.",
+        style = MaterialTheme.typography.bodyMedium,
+        modifier = Modifier.padding(top = 12.dp),
+    )
+    TextButton(
+        onClick = {
+            context.startActivity(
+                android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse(SOURCE_URL))
+                    .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK),
+            )
+        },
+        contentPadding = androidx.compose.foundation.layout.PaddingValues(0.dp),
+    ) { Text("github.com/EnigmaCurry/rpg_vox") }
+    Text("Changelog", style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(top = 12.dp))
+    Text(
+        "TBD",
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+}
+
+private const val SOURCE_URL = "https://github.com/EnigmaCurry/rpg_vox"
 
 @Composable
 private fun Toggle(
