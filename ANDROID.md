@@ -130,7 +130,8 @@ phone audio together.
 
 Playback runs through all of a thread's recordings in order, one after
 another, and the time shown is for the whole thread. The green ▶ above
-a recording's first paragraph plays from its start. With **Keep non-speech audio** on, a recording in which
+a recording's first paragraph plays from its start; long-press it to
+delete that one recording (its audio and its text). With **Keep non-speech audio** on, a recording in which
 no words were heard appears as "▶ No words detected" where it happened,
 or, in a thread with no text at all, as a big ▶ with "No words detected
 in log"; it plays from its first sound, though the recording is kept

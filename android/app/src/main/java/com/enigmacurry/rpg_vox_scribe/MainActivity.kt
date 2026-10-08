@@ -19,6 +19,10 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.foundation.Canvas
 import androidx.compose.ui.graphics.Path
 import androidx.compose.foundation.gestures.awaitEachGesture
@@ -507,22 +511,56 @@ private fun SourcePicker(enabled: Boolean) {
 }
 
 /** Play [recording] from 0:00: small above its first paragraph, or [big] when it has no words. */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun PlayFromStart(recording: String, big: Boolean) {
     val size = if (big) 96.dp else 36.dp
-    Button(
-        onClick = { Scribe.playFromStart(recording) },
-        shape = CircleShape,
-        contentPadding = androidx.compose.foundation.layout.PaddingValues(0.dp),
-        colors = androidx.compose.material3.ButtonDefaults.buttonColors(
-            containerColor = Color(0xFF2E7D32),
-            contentColor = Color.White,
-        ),
+    // Tap plays; long-press offers to delete this one recording.
+    var menu by remember { mutableStateOf(false) }
+    var confirm by remember { mutableStateOf(false) }
+    val haptics = LocalHapticFeedback.current
+    Box(
+        contentAlignment = Alignment.Center,
         modifier = Modifier
             .padding(bottom = if (big) 0.dp else 4.dp)
             .size(size)
-            .semantics { contentDescription = "Play the recording from the start" },
+            .background(Color(0xFF2E7D32), CircleShape)
+            .clip(CircleShape)
+            .combinedClickable(
+                onClickLabel = "Play the recording from the start",
+                onLongClickLabel = "Recording options",
+                onLongClick = {
+                    haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                    menu = true
+                },
+                onClick = { Scribe.playFromStart(recording) },
+            ),
     ) {
+        androidx.compose.material3.DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+            androidx.compose.material3.DropdownMenuItem(
+                text = { Text("Delete clip", color = MaterialTheme.colorScheme.error) },
+                onClick = {
+                    menu = false
+                    confirm = true
+                },
+            )
+        }
+        if (confirm) {
+            androidx.compose.material3.AlertDialog(
+                onDismissRequest = { confirm = false },
+                title = { Text("Delete this clip?") },
+                text = {
+                    Text("Its audio and the text transcribed from it will be deleted. The rest of the thread stays. This can't be undone.")
+                },
+                confirmButton = {
+                    TextButton(onClick = {
+                        confirm = false
+                        Scribe.deleteRecording(recording)
+                    }) { Text("Delete", color = MaterialTheme.colorScheme.error) }
+                },
+                dismissButton = { TextButton(onClick = { confirm = false }) { Text("Cancel") } },
+            )
+        }
         Canvas(Modifier.size(size * 0.36f)) {
             drawPath(
                 Path().apply {

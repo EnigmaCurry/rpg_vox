@@ -836,6 +836,19 @@ object Scribe {
         refreshThreads()
     }
 
+    /** Delete one recording of the open thread: its audio and the text heard in it. */
+    fun deleteRecording(recording: String) {
+        if (busy()) return
+        Playback.stop()
+        val files = threadAudio.filterValues { it == recording }.keys
+        val gone = paragraphs.filter { it.audio in files }
+        for (p in gone) written.remove(p.id)?.let { threads.remove(it.rowId) }
+        paragraphs.removeAll(gone)
+        files.forEach(threads::removeAudio)
+        deleteAudio(files.toList())
+        refreshThreads()
+    }
+
     // ---- threads -------------------------------------------------------
 
     /** Open thread [id] (only while idle, unless [force]). */
