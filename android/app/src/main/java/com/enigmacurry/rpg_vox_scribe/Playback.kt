@@ -63,6 +63,9 @@ object Playback {
     @Volatile private var track: AudioTrack? = null
     @Volatile private var fromMs = 0L
     private var worker: Thread? = null
+    private var dir = File("")
+    /** Restarts after the audio output died under us, this playback. */
+    private var retries = 0
 
     /** Position on the playing recording's timeline (ms). */
     fun positionMs(): Long {
@@ -76,41 +79,57 @@ object Playback {
         stop()
         if (files.isEmpty()) return
         val base = files.minOf { it.offsetMs }
-        val offsets = files.associate { it.file to it.offsetMs - base }
-        val from = atMs.coerceAtLeast(0)
-        fromMs = from
-        run = true
+        this.dir = dir
+        retries = 0
         paused = false
         lengthMs = 0
-        playing = Playing(offsets)
-        val me = Thread({ loop(dir, offsets, from) }, "vox-play")
-        worker = me
-        me.start()
+        playing = Playing(files.associate { it.file to it.offsetMs - base })
+        startWorker(atMs.coerceAtLeast(0))
     }
 
+    /**
+     * Pausing lets go of the audio output and resuming opens a new one at
+     * the same spot: an output left paused can be torn down meanwhile (a
+     * Bluetooth headset idling), and wouldn't play again.
+     */
     fun pause() {
         if (playing == null || paused) return
+        val at = positionMs()
+        stopWorker()
+        fromMs = at
         paused = true
-        track?.runCatching { pause() }
     }
 
     fun resume() {
         if (playing == null || !paused) return
         paused = false
-        track?.runCatching { play() }
+        startWorker(fromMs)
     }
 
     fun stop() {
+        stopWorker()
+        playing = null
+        paused = false
+    }
+
+    private fun startWorker(from: Long) {
+        val offsets = playing?.offsets ?: return
+        fromMs = from
+        run = true
+        val me = Thread({ loop(dir, offsets, from) }, "vox-play")
+        worker = me
+        me.start()
+    }
+
+    private fun stopWorker() {
         run = false
-        // A paused track blocks the writer; dropping what's queued frees it.
+        // A blocked write returns once what's queued is dropped.
         track?.runCatching {
             pause()
             flush()
         }
         worker?.join()
         worker = null
-        playing = null
-        paused = false
     }
 
     private class Source(val handle: Long, var silence: Long, var done: Boolean = false)
@@ -118,6 +137,7 @@ object Playback {
     private fun loop(dir: File, offsets: Map<String, Long>, from: Long) {
         val sources = mutableListOf<Source>()
         var t: AudioTrack? = null
+        var died = false
         try {
             for ((file, off) in offsets) {
                 val h = runCatching { Native.playerOpen(File(dir, file).path) }
@@ -148,7 +168,7 @@ object Playback {
                 .setBufferSizeInBytes(maxOf(min, PLAY_RATE / 5 * 4)) // ~200 ms
                 .build()
             track = t
-            if (!paused) t.play()
+            t.play()
             val mix = FloatArray(PLAY_RATE / 20) // 50 ms
             val got = FloatArray(mix.size)
             var written = 0L
@@ -158,14 +178,27 @@ object Playback {
                 for (s in sources) produced = maxOf(produced, add(s, mix, got))
                 if (produced == 0) break
                 for (i in 0 until produced) mix[i] = mix[i].coerceIn(-1f, 1f)
-                t.write(mix, 0, produced, AudioTrack.WRITE_BLOCKING)
+                val n = t.write(mix, 0, produced, AudioTrack.WRITE_BLOCKING)
+                if (n < 0) {
+                    // The output went away (e.g. a route change); pick up
+                    // where it got to on a new one.
+                    if (run) died = true
+                    break
+                }
                 written += produced
             }
             // Let the buffered tail play out.
-            while (run && (t.playbackHeadPosition.toLong() and 0xffffffffL) < written) Thread.sleep(20)
+            while (run && !died && (t.playbackHeadPosition.toLong() and 0xffffffffL) < written) {
+                if (t.playState != AudioTrack.PLAYSTATE_PLAYING) {
+                    died = true
+                    break
+                }
+                Thread.sleep(20)
+            }
         } catch (e: Exception) {
             Log.e(TAG, "playback failed", e)
         } finally {
+            val at = positionMs()
             track = null
             t?.runCatching {
                 pause()
@@ -176,8 +209,13 @@ object Playback {
             val me = Thread.currentThread()
             // Ended by itself: clear the state, unless a newer playback took over.
             main.post {
-                if (worker === me) {
-                    worker = null
+                if (worker !== me) return@post
+                worker = null
+                if (died && retries < 3) {
+                    retries++
+                    Log.w(TAG, "audio output died at $at ms; reopening")
+                    startWorker(at)
+                } else {
                     playing = null
                     paused = false
                 }
