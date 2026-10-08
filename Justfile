@@ -437,8 +437,8 @@ android:
 # JDK 17+ (JAVA_HOME, default: Homebrew's openjdk@21) and the Android SDK
 # (ANDROID_HOME, default: Homebrew's android-commandlinetools). Signs with
 # the release key, SCRIBE_KEYSTORE (default ~/scribe.jks), when it exists,
-# asking for its password unless SCRIBE_KEYSTORE_PASSWORD is set (e.g. in
-# .env), so it installs over a release; the debug key otherwise.
+# with SCRIBE_KEYSTORE_PASSWORD (e.g. in .env), else "android", else asking,
+# so it installs over a release; the debug key otherwise.
 android-app INSTALL="yes": _android-jni
     #!/usr/bin/env bash
     set -euo pipefail
@@ -448,8 +448,11 @@ android-app INSTALL="yes": _android-jni
       export SCRIBE_KEYSTORE="$HOME/scribe.jks"
     fi
     if [ -n "${SCRIBE_KEYSTORE:-}" ] && [ -z "${SCRIBE_KEYSTORE_PASSWORD:-}" ]; then
-      read -rsp "Password for $SCRIBE_KEYSTORE: " SCRIBE_KEYSTORE_PASSWORD; echo
-      export SCRIBE_KEYSTORE_PASSWORD
+      export SCRIBE_KEYSTORE_PASSWORD=android
+      if ! "$JAVA_HOME/bin/keytool" -list -keystore "$SCRIBE_KEYSTORE" \
+          -storepass:env SCRIBE_KEYSTORE_PASSWORD >/dev/null 2>&1; then
+        read -rsp "Password for $SCRIBE_KEYSTORE: " SCRIBE_KEYSTORE_PASSWORD; echo
+      fi
     fi
     [ -f android/local.properties ] || echo "sdk.dir=$ANDROID_HOME" > android/local.properties
     (cd android && ./gradlew assembleDebug)

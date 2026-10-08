@@ -187,9 +187,9 @@ passwords). `just android-keystore` creates that keystore in
 signed with the same key to install over the last, so if the secrets are
 ever lost along with the keystore, the next release needs a fresh install.
 `just android-app` signs with that same keystore when `~/scribe.jks`
-exists (asking for its password unless `SCRIBE_KEYSTORE_PASSWORD` is set,
-for example in `.env`), so local builds and releases install over each
-other.
+exists, so local builds and releases install over each other. Its
+password is `SCRIBE_KEYSTORE_PASSWORD` if set (for example in `.env`),
+else `android`; you're asked only when that doesn't open it.
 
 The app is in [android/](android/), Kotlin and Jetpack Compose over a
 JNI bridge, [crates/vox_android](crates/vox_android), to the same
