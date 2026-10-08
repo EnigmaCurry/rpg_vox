@@ -22,6 +22,7 @@ import android.util.Log
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
+import android.view.WindowInsets
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
 import android.view.inputmethod.EditorInfo
@@ -105,6 +106,18 @@ class ScribeKeyboard : InputMethodService() {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(if (dark) 0xFF1E1F22.toInt() else 0xFFF1F3F4.toInt())
             setPadding(dp(16), dp(10), dp(16), dp(6))
+            // The IME window is edge to edge: keep the buttons clear of the
+            // navigation bar's back and keyboard-switch buttons.
+            setOnApplyWindowInsetsListener { v, insets ->
+                val (l, r, bottom) = if (Build.VERSION.SDK_INT >= 30) {
+                    insets.getInsets(WindowInsets.Type.navigationBars()).let { Triple(it.left, it.right, it.bottom) }
+                } else {
+                    @Suppress("DEPRECATION")
+                    Triple(insets.systemWindowInsetLeft, insets.systemWindowInsetRight, insets.systemWindowInsetBottom)
+                }
+                v.setPadding(dp(16) + l, dp(10), dp(16) + r, dp(6) + bottom)
+                insets
+            }
             addView(status)
             addView(scroll, LinearLayout.LayoutParams(MATCH_PARENT, dp(170)))
             addView(buttons, MATCH_PARENT, WRAP_CONTENT)
