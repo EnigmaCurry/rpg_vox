@@ -956,11 +956,15 @@ private fun Paragraph(p: Para, playing: Playing?, at: Karaoke?, canPlay: Boolean
         modifier = Modifier
             .fillMaxWidth()
             .appendTextContextMenuComponents {
-                if (Scribe.busy() || sel.collapsed) return@appendTextContextMenuComponents
+                if (sel.collapsed) return@appendTextContextMenuComponents
                 separator()
-                item(key = EditItem, label = "Edit") {
-                    editing = true
-                    close()
+                // Edits would be overwritten while the engine still works on the
+                // text; cuts are reapplied to its later versions.
+                if (!Scribe.busy()) {
+                    item(key = EditItem, label = "Edit") {
+                        editing = true
+                        close()
+                    }
                 }
                 item(key = CutItem, label = "Cut") {
                     Scribe.cut(p, sel.min, sel.max)

@@ -138,7 +138,8 @@ in log"; it plays from its first sound, though the recording is kept
 whole. Long-pressing still selects text to copy, and the selection menu also
 has **Edit**, to retype that paragraph, and **Cut**, which removes the
 selected words and skips their audio on playback (the recording itself
-is kept whole). Paragraphs recorded without
+is kept whole). Cut also works while recording; Edit waits until the
+recording stops. Paragraphs recorded without
 the setting have no audio.
 
 ## Transcribing a file

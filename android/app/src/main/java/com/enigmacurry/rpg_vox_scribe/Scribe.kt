@@ -368,7 +368,6 @@ object Scribe {
      * skipped on playback (the file stays whole).
      */
     fun cut(p: Para, from: Int, to: Int) {
-        if (busy()) return
         Playback.stop()
         val shown = p.shown
         var at = 0
@@ -385,6 +384,9 @@ object Scribe {
             val a = p.wordAt(gone.first(), shown.size).startMs
             val b = p.wordAt(gone.last(), shown.size).endMs
             p.audio?.let { if (b > a) threads.addCut(it, a, b) }
+            // Still being transcribed: the engine's later versions of this
+            // paragraph are cut the same way (see [parse]).
+            sources.firstOrNull { p.id in it.ids }?.cuts?.add(a..b)
             words = if (p.words.size == shown.size) {
                 p.words.filterIndexed { i, _ -> i !in gone }
             } else {
@@ -417,9 +419,10 @@ object Scribe {
             paragraphs[i] = p.copy(clips = listOf(ClipUi(text, partial = false)), words = words)
         }
         sync()
-        // Its recording left without text: gone too, unless non-speech audio is kept.
+        // Its recording left without text: gone too, unless non-speech audio is
+        // kept. (While recording, the end of the recording decides that.)
         val rec = p.audio?.let { threadAudio[it] }
-        if (rec != null && !keepNonSpeech) {
+        if (rec != null && !keepNonSpeech && !busy()) {
             val files = threadAudio.filterValues { it == rec }.keys
             if (paragraphs.none { it.audio in files }) {
                 files.forEach(threads::removeAudio)
@@ -500,6 +503,8 @@ object Scribe {
     ) {
         /** Set once the first audio arrives. */
         @Volatile var started = false
+        /** Cut stretches (session ms): their words are left out of this session's paragraphs. */
+        val cuts = mutableListOf<LongRange>()
         /** Epoch ms at the session's time zero, for ordering its paragraphs. */
         @Volatile var baseMs = 0L
         /** Paragraphs this session produced (to apply its final transcript). */
@@ -1101,6 +1106,11 @@ object Scribe {
     private fun upsert(src: Source, p: Para) {
         src.ids += p.id
         val i = paragraphs.indexOfFirst { it.id == p.id }
+        if (p.text.isEmpty() && p.clips.none { it.partial }) {
+            // All of it cut.
+            if (i >= 0) paragraphs.removeAt(i)
+            return
+        }
         if (i >= 0 && paragraphs[i].atMs == p.atMs) {
             paragraphs[i] = p
             return
@@ -1112,7 +1122,7 @@ object Scribe {
 
     private fun parse(src: Source, o: JSONObject): Para {
         val clips = o.getJSONArray("clips")
-        return Para(
+        val p = Para(
             id = o.getString("id"),
             clips = (0 until clips.length()).map {
                 val c = clips.getJSONObject(it)
@@ -1120,9 +1130,21 @@ object Scribe {
             },
             source = src.label,
             audio = src.audio,
-            words = if (src.audio != null) parseWords(o.optJSONArray("words")) else emptyList(),
+            words = parseWords(o.optJSONArray("words")),
             atMs = src.baseMs + o.optLong("start_ms"),
         )
+        return withoutCuts(src, p)
+    }
+
+    /** [p] without the words [src] has had cut (finished text only). */
+    private fun withoutCuts(src: Source, p: Para): Para {
+        if (src.cuts.isEmpty() || p.clips.any { it.partial }) return p
+        val shown = p.shown
+        if (p.words.size != shown.size) return p
+        val keep = p.words.indices.filter { i -> src.cuts.none { p.words[i].startMs in it } }
+        if (keep.size == shown.size) return p
+        val text = keep.joinToString(" ") { shown[it] }
+        return p.copy(clips = listOf(ClipUi(text, partial = false)), words = keep.map { p.words[it] })
     }
 
     /**
