@@ -51,7 +51,7 @@ private const val CARET = '\u200A'
 /**
  * Voice keyboard: pick Scribe as the input method in any app and it
  * starts listening, shows the live transcript (partials dimmed), and
- * Insert types the finished text into the field once passes 2 and 3 are
+ * Done types the finished text into the field once passes 2 and 3 are
  * done, then switches back to the previous keyboard. Pause mutes the mic
  * without closing it, so Resume picks up at once. Selecting text offers
  * Delete for its finished words, and a tap moves the purple cursor, where
@@ -156,7 +156,7 @@ class ScribeKeyboard : InputMethodService() {
             setOnClickListener { paragraphBreak() }
         }
         insertButton = Button(this).apply {
-            text = "Insert"
+            text = "Done"
             setTypeface(typeface, Typeface.BOLD)
             setOnClickListener { insert() }
         }
@@ -231,7 +231,7 @@ class ScribeKeyboard : InputMethodService() {
 
     override fun onFinishInputView(finishingInput: Boolean) {
         // Hidden: keep listening (unless paused), so you can switch apps
-        // to read something out; Insert or ⌨ ends it.
+        // to read something out; Done or ⌨ ends it.
         waiting = false
         showLoading(false)
         super.onFinishInputView(finishingInput)
