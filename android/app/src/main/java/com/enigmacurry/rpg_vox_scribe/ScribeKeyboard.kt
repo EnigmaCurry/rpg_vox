@@ -35,6 +35,7 @@ import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
 import android.view.inputmethod.EditorInfo
 import android.widget.Button
+import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -67,6 +68,9 @@ class ScribeKeyboard : InputMethodService() {
     private lateinit var insertButton: Button
     private lateinit var pauseButton: Button
     private lateinit var breakButton: Button
+    /** The transcript and buttons, hidden behind [loading] while the models load. */
+    private lateinit var content: LinearLayout
+    private lateinit var loading: TextView
 
     private var session: Dictation? = null
     /** The latest paragraphs, to redraw after a cut. */
@@ -184,10 +188,30 @@ class ScribeKeyboard : InputMethodService() {
                 v.setPadding(dp(16) + l, dp(10), dp(16) + r, dp(6) + bottom)
                 insets
             }
-            addView(status)
-            addView(scroll, LinearLayout.LayoutParams(MATCH_PARENT, dp(170)))
-            addView(buttons, MATCH_PARENT, WRAP_CONTENT)
+            content = LinearLayout(context).apply {
+                orientation = LinearLayout.VERTICAL
+                addView(status)
+                addView(scroll, LinearLayout.LayoutParams(MATCH_PARENT, dp(170)))
+                addView(buttons, MATCH_PARENT, WRAP_CONTENT)
+            }
+            loading = TextView(context).apply {
+                text = "Loading models…"
+                setTextColor(fg)
+                textSize = 24f
+                gravity = Gravity.CENTER
+                visibility = View.GONE
+            }
+            // Stacked, so the keyboard keeps its height while loading.
+            addView(FrameLayout(context).apply {
+                addView(content, MATCH_PARENT, WRAP_CONTENT)
+                addView(loading, MATCH_PARENT, MATCH_PARENT)
+            }, MATCH_PARENT, WRAP_CONTENT)
         }
+    }
+
+    private fun showLoading(on: Boolean) {
+        loading.visibility = if (on) View.VISIBLE else View.GONE
+        content.visibility = if (on) View.INVISIBLE else View.VISIBLE
     }
 
     override fun onStartInputView(info: EditorInfo?, restarting: Boolean) {
@@ -211,6 +235,7 @@ class ScribeKeyboard : InputMethodService() {
         // Hidden: keep listening (unless paused), so you can switch apps
         // to read something out; Insert or Cancel ends it.
         waiting = false
+        showLoading(false)
         super.onFinishInputView(finishingInput)
     }
 
@@ -250,7 +275,8 @@ class ScribeKeyboard : InputMethodService() {
             return
         }
         if (!Scribe.loaded()) {
-            status.text = "Loading speech models…"
+            status.text = ""
+            showLoading(true)
             waiting = true
             Scribe.load()
             awaitModels()
@@ -265,10 +291,12 @@ class ScribeKeyboard : InputMethodService() {
             when {
                 Scribe.loaded() -> {
                     waiting = false
+                    showLoading(false)
                     start()
                 }
                 Scribe.phase is Phase.Failed -> {
                     waiting = false
+                    showLoading(false)
                     status.text = "The speech models failed to load; open Scribe."
                 }
                 else -> awaitModels()
