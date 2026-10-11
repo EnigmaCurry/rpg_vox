@@ -188,7 +188,7 @@ class ScribeKeyboard : InputMethodService() {
         return LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(if (dark) 0xFF1E1F22.toInt() else 0xFFF1F3F4.toInt())
-            setPadding(dp(16), dp(10), dp(16), dp(6))
+            setPadding(dp(16), dp(10), dp(16), dp(14))
             // The IME window is edge to edge: keep the buttons clear of the
             // navigation bar's back and keyboard-switch buttons.
             setOnApplyWindowInsetsListener { v, insets ->
@@ -198,7 +198,7 @@ class ScribeKeyboard : InputMethodService() {
                     @Suppress("DEPRECATION")
                     Triple(insets.systemWindowInsetLeft, insets.systemWindowInsetRight, insets.systemWindowInsetBottom)
                 }
-                v.setPadding(dp(16) + l, dp(10), dp(16) + r, dp(6) + bottom)
+                v.setPadding(dp(16) + l, dp(10), dp(16) + r, dp(14) + bottom)
                 insets
             }
             content = LinearLayout(context).apply {
