@@ -40,7 +40,8 @@ private const val RATE = 16_000
  * Voice keyboard: pick Scribe as the input method in any app and it
  * starts listening, shows the live transcript (partials dimmed), and
  * Insert types the finished text into the field once passes 2 and 3 are
- * done, then switches back to the previous keyboard. Uses the models
+ * done, then switches back to the previous keyboard. Pause mutes the mic
+ * without closing it, so Resume picks up at once. Uses the models
  * the app loaded, loading them if needed.
  */
 class ScribeKeyboard : InputMethodService() {
@@ -50,6 +51,7 @@ class ScribeKeyboard : InputMethodService() {
     private lateinit var transcript: TextView
     private lateinit var scroll: ScrollView
     private lateinit var insertButton: Button
+    private lateinit var pauseButton: Button
 
     private var session: Dictation? = null
     /** Waiting for the models to load before starting. */
@@ -89,6 +91,10 @@ class ScribeKeyboard : InputMethodService() {
                 leave()
             }
         }
+        pauseButton = Button(this).apply {
+            text = "Pause"
+            setOnClickListener { togglePause() }
+        }
         insertButton = Button(this).apply {
             text = "Insert"
             setTypeface(typeface, Typeface.BOLD)
@@ -100,6 +106,7 @@ class ScribeKeyboard : InputMethodService() {
             addView(keyboards, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT))
             addView(View(context), LinearLayout.LayoutParams(0, 0, 1f))
             addView(cancel)
+            addView(pauseButton)
             addView(insertButton)
         }
         return LinearLayout(this).apply {
@@ -146,6 +153,8 @@ class ScribeKeyboard : InputMethodService() {
     private fun begin() {
         transcript.text = ""
         insertButton.isEnabled = false
+        pauseButton.isEnabled = false
+        pauseButton.text = "Pause"
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             status.text = "Open Scribe once and allow the microphone."
             return
@@ -200,6 +209,8 @@ class ScribeKeyboard : InputMethodService() {
         }
         status.text = "Listening…"
         insertButton.isEnabled = true
+        pauseButton.isEnabled = true
+        pauseButton.text = "Pause"
         session = Dictation(
             models,
             getSystemService(AudioManager::class.java),
@@ -231,10 +242,18 @@ class ScribeKeyboard : InputMethodService() {
         if (atBottom) scroll.post { scroll.fullScroll(View.FOCUS_DOWN) }
     }
 
+    private fun togglePause() {
+        val s = session ?: return
+        s.paused = !s.paused
+        pauseButton.text = if (s.paused) "Resume" else "Pause"
+        status.text = if (s.paused) "Paused" else "Listening…"
+    }
+
     private fun insert() {
         val s = session ?: return
         session = null
         insertButton.isEnabled = false
+        pauseButton.isEnabled = false
         status.text = "Finishing…"
         s.finish { paras ->
             val ic = currentInputConnection
@@ -274,6 +293,8 @@ private class Dictation(
     @Volatile private var capturing = true
     @Volatile private var polling = true
     @Volatile private var ended = false
+    /** The mic keeps running but its audio is dropped, so resuming is instant. */
+    @Volatile var paused = false
     private var capture: Thread? = null
     private var poller: Thread? = null
     private val paras = LinkedHashMap<String, Para>()
@@ -313,10 +334,19 @@ private class Dictation(
         val buf = FloatArray(shorts.size)
         rec.startRecording()
         Log.i(TAG, "mic: ${rec.inputName()}")
+        var wasPaused = false
         try {
             while (capturing) {
                 val n = rec.read(shorts, 0, shorts.size, AudioRecord.READ_BLOCKING)
                 if (n <= 0) continue
+                val p = paused
+                if (p != wasPaused) {
+                    wasPaused = p
+                    // Close the utterance the pause cut off. Here rather
+                    // than on the main thread so it can't race a push.
+                    if (p) Native.breakParagraph(session)
+                }
+                if (p) continue
                 for (i in 0 until n) buf[i] = shorts[i] / 32768f
                 gain.process(buf, n)
                 Native.push(session, buf, n)
