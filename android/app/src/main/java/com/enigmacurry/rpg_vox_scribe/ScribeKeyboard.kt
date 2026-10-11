@@ -373,8 +373,10 @@ class ScribeKeyboard : InputMethodService() {
             if (!ends(prev) && head.firstOrNull()?.isUpperCase() == true && !name(head)) {
                 out[j] = t.withText(head.replaceFirstChar { it.lowercaseChar() })
             }
-            if (head.firstOrNull()?.isLowerCase() == true && prev.text.endsWith('.') && !prev.text.endsWith("..")) {
-                out[i] = out[i].withText(prev.text.dropLast(1))
+            // out[i], not prev: the first word may have been lowercased already.
+            val last = out[i].text
+            if (head.firstOrNull()?.isLowerCase() == true && last.endsWith('.') && !last.endsWith("..")) {
+                out[i] = out[i].withText(last.dropLast(1))
             }
         }
         return out
