@@ -148,14 +148,24 @@ class ScribeKeyboard : InputMethodService() {
 
     override fun onStartInputView(info: EditorInfo?, restarting: Boolean) {
         super.onStartInputView(info, restarting)
-        if (session == null && !waiting) begin()
+        val s = session
+        when {
+            s != null -> {
+                // Back from another app or field: it kept going meanwhile.
+                insertButton.isEnabled = true
+                pauseButton.isEnabled = true
+                pauseButton.text = if (s.paused) "Resume" else "Pause"
+                status.text = if (s.paused) "Paused" else "Listening…"
+                render(paras)
+            }
+            !waiting -> begin()
+        }
     }
 
     override fun onFinishInputView(finishingInput: Boolean) {
-        // Hidden or moved to another field: drop what was being said.
+        // Hidden: keep listening (unless paused), so you can switch apps
+        // to read something out; Insert or Cancel ends it.
         waiting = false
-        session?.cancel()
-        session = null
         super.onFinishInputView(finishingInput)
     }
 
