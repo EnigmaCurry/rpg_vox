@@ -320,7 +320,7 @@ class ScribeKeyboard : InputMethodService() {
                 c.words.mapIndexed { i, w ->
                     val t = c.times.getOrNull(i)
                     val ms = t?.startMs ?: c.startMs
-                    Tok(w, t, ms, c.partial, segOf(ms))
+                    Tok(w, t, ms, c.partial, segOf(ms), head = i == 0)
                 }
             }
         } + breaks.map { Tok("\n\n", null, it, false, segOf(it), brk = true) }
@@ -343,7 +343,9 @@ class ScribeKeyboard : InputMethodService() {
      * doesn't end a sentence, the first word is lowercased unless it
      * looks like a name: "I", an acronym, inner capitals, or capitalized
      * elsewhere mid-sentence. A full stop before a lowercase word of the
-     * old text is dropped.
+     * old text is dropped. Speech put mid-sentence is a fragment, so the
+     * same goes for the utterances within it ("brown" "lazy" said with a
+     * pause comes as "Brown." "Lazy.").
      */
     private fun polish(doc: List<Tok>): List<Tok> {
         val out = doc.toMutableList()
@@ -363,13 +365,25 @@ class ScribeKeyboard : InputMethodService() {
             return core == "I" || core.startsWith("I'") || core.startsWith("I’") ||
                 core.drop(1).any { it.isUpperCase() } || core in names
         }
+        val fragment = HashSet<Int>()
         for (k in 1 until words.size) {
             val i = words[k - 1]
             val j = words[k]
             val prev = doc[i]
             val t = doc[j]
-            if (t.seg == prev.seg || t.brk || prev.brk || t.partial || prev.partial) continue
+            if (t.brk || prev.brk || t.partial || prev.partial) continue
             val head = t.text
+            if (t.seg == prev.seg) {
+                // An utterance within a fragment: carry the sentence on.
+                if (!t.head || t.seg !in fragment) continue
+                val last = out[i].text
+                if (last.endsWith('.') && !last.endsWith("..")) out[i] = out[i].withText(last.dropLast(1))
+                if (!ends(out[i]) && head.firstOrNull()?.isUpperCase() == true && !name(head)) {
+                    out[j] = t.withText(head.replaceFirstChar { it.lowercaseChar() })
+                }
+                continue
+            }
+            if (!ends(prev)) fragment += t.seg
             if (!ends(prev) && head.firstOrNull()?.isUpperCase() == true && !name(head)) {
                 out[j] = t.withText(head.replaceFirstChar { it.lowercaseChar() })
             }
@@ -594,8 +608,10 @@ private class Tok(
     val mark: Boolean = false,
     /** A paragraph break the ¶ button put in. */
     val brk: Boolean = false,
+    /** First word of its clip (utterance). */
+    val head: Boolean = false,
 ) {
-    fun withText(text: String) = Tok(text, time, ms, partial, seg, mark, brk)
+    fun withText(text: String) = Tok(text, time, ms, partial, seg, mark, brk, head)
 
     companion object {
         fun mark(seg: Int) = Tok("", null, Long.MIN_VALUE, false, seg, mark = true)
