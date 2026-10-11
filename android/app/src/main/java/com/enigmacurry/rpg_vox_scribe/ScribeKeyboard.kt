@@ -66,12 +66,15 @@ class ScribeKeyboard : InputMethodService() {
     private lateinit var scroll: ScrollView
     private lateinit var insertButton: Button
     private lateinit var pauseButton: Button
+    private lateinit var breakButton: Button
 
     private var session: Dictation? = null
     /** The latest paragraphs, to redraw after a cut. */
     private var paras: List<KPara> = emptyList()
     /** Spans of the session's audio (ms) whose words were deleted. */
     private val cuts = mutableListOf<LongRange>()
+    /** Paragraph breaks, each at a time on the session's audio clock (ms). */
+    private val breaks = mutableListOf<Long>()
     /** Cursor moves, in order: speech from each one's [Insertion.fromMs] on goes there. */
     private val inserts = mutableListOf<Insertion>()
     /** The transcript as last drawn, in order, hidden words and marks included. */
@@ -146,6 +149,10 @@ class ScribeKeyboard : InputMethodService() {
             text = "Pause"
             setOnClickListener { togglePause() }
         }
+        breakButton = Button(this).apply {
+            text = "¶"
+            setOnClickListener { paragraphBreak() }
+        }
         insertButton = Button(this).apply {
             text = "Insert"
             setTypeface(typeface, Typeface.BOLD)
@@ -157,6 +164,7 @@ class ScribeKeyboard : InputMethodService() {
             addView(keyboards, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT))
             addView(View(context), LinearLayout.LayoutParams(0, 0, 1f))
             addView(cancel)
+            addView(breakButton, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT))
             addView(pauseButton)
             addView(insertButton)
         }
@@ -190,6 +198,7 @@ class ScribeKeyboard : InputMethodService() {
                 // Back from another app or field: it kept going meanwhile.
                 insertButton.isEnabled = true
                 pauseButton.isEnabled = true
+                breakButton.isEnabled = true
                 pauseButton.text = if (s.paused) "Resume" else "Pause"
                 status.text = if (s.paused) "Paused" else "Listening…"
                 render(paras)
@@ -215,9 +224,11 @@ class ScribeKeyboard : InputMethodService() {
         transcript.text = ""
         paras = emptyList()
         cuts.clear()
+        breaks.clear()
         inserts.clear()
         insertButton.isEnabled = false
         pauseButton.isEnabled = false
+        breakButton.isEnabled = false
         pauseButton.text = "Pause"
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             status.text = "Open Scribe once and allow the microphone."
@@ -274,6 +285,7 @@ class ScribeKeyboard : InputMethodService() {
         status.text = "Listening…"
         insertButton.isEnabled = true
         pauseButton.isEnabled = true
+        breakButton.isEnabled = true
         pauseButton.text = "Pause"
         session = Dictation(
             models,
@@ -311,7 +323,7 @@ class ScribeKeyboard : InputMethodService() {
                     Tok(w, t, ms, c.partial, segOf(ms))
                 }
             }
-        }
+        } + breaks.map { Tok("\n\n", null, it, false, segOf(it), brk = true) }
         // sortedBy is stable: words of one clip keep their order.
         val bySeg = toks.sortedBy { it.ms }.groupBy { it.seg }
         val doc = mutableListOf(Tok.mark(0))
@@ -339,7 +351,7 @@ class ScribeKeyboard : InputMethodService() {
         val doc = document(paras)
         val cursor = cursorAt(doc)
         fun caret() {
-            if (sb.isNotEmpty() && sb.last() != ' ') sb.append(' ')
+            if (sb.isNotEmpty() && sb.last() != ' ' && sb.last() != '\n') sb.append(' ')
             caretAt = sb.length
             sb.append(CARET)
             val purple = if (dark) 0xFFCE93D8.toInt() else 0xFF8E24AA.toInt()
@@ -348,12 +360,13 @@ class ScribeKeyboard : InputMethodService() {
         doc.forEachIndexed { i, t ->
             if (i == cursor) caret()
             if (!shown(t)) return@forEachIndexed
-            if (sb.isNotEmpty() && sb.last() != ' ' && sb.last() != CARET) sb.append(' ')
+            if (!t.brk && sb.isNotEmpty() && sb.last() != ' ' && sb.last() != '\n' && sb.last() != CARET) sb.append(' ')
+            if (t.brk && sb.isNotEmpty() && sb.last() == ' ') sb.delete(sb.length - 1, sb.length)
             val at = sb.length
             sb.append(t.text)
             when {
                 t.partial -> sb.setSpan(ForegroundColorSpan(dim), at, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-                t.time != null -> placed += (at until sb.length) to i
+                t.time != null || t.brk -> placed += (at until sb.length) to i
             }
         }
         if (cursor == doc.size) caret()
@@ -425,8 +438,13 @@ class ScribeKeyboard : InputMethodService() {
             val a = minOf(transcript.selectionStart, transcript.selectionEnd)
             val b = maxOf(transcript.selectionStart, transcript.selectionEnd)
             for ((at, i) in placed) {
-                val w = doc[i].time ?: continue
-                if (at.first < b && at.last >= a) cuts += w.startMs..maxOf(w.startMs, w.endMs - 1)
+                if (at.first >= b || at.last < a) continue
+                val t = doc[i]
+                val w = t.time
+                when {
+                    t.brk -> breaks.remove(t.ms)
+                    w != null -> cuts += w.startMs..maxOf(w.startMs, w.endMs - 1)
+                }
             }
             mode.finish()
             return true
@@ -436,6 +454,13 @@ class ScribeKeyboard : InputMethodService() {
             selecting = false
             render(paras)
         }
+    }
+
+    /** Finish what's being said and start a new paragraph at the cursor. */
+    private fun paragraphBreak() {
+        val s = session ?: return
+        breaks += s.breakNow()
+        render(paras)
     }
 
     private fun togglePause() {
@@ -450,13 +475,26 @@ class ScribeKeyboard : InputMethodService() {
         session = null
         insertButton.isEnabled = false
         pauseButton.isEnabled = false
+        breakButton.isEnabled = false
         status.text = "Finishing…"
         s.finish { paras ->
             val ic = currentInputConnection
-            var text = document(paras).filter(::shown).joinToString(" ") { it.text }
+            val multiLine = (currentInputEditorInfo?.inputType ?: 0) and EditorInfo.TYPE_TEXT_FLAG_MULTI_LINE != 0
+            val sb = StringBuilder()
+            for (t in document(paras).filter(::shown)) {
+                if (t.brk) {
+                    // A one-line field gets a space instead.
+                    while (sb.endsWith(' ')) sb.setLength(sb.length - 1)
+                    sb.append(if (multiLine) "\n\n" else " ")
+                } else {
+                    if (sb.isNotEmpty() && !sb.last().isWhitespace()) sb.append(' ')
+                    sb.append(t.text)
+                }
+            }
+            var text = sb.toString()
             if (ic != null && text.isNotEmpty()) {
                 val before = ic.getTextBeforeCursor(1, 0)
-                if (!before.isNullOrEmpty() && !before.last().isWhitespace()) text = " $text"
+                if (!before.isNullOrEmpty() && !before.last().isWhitespace() && !text.first().isWhitespace()) text = " $text"
                 ic.commitText(text, 1)
             }
             leave()
@@ -479,7 +517,7 @@ private class Insertion(val seg: Int, val afterMs: Long, val fromMs: Long)
 /**
  * A word of the transcript, [ms] when it was said (its clip's start if
  * untimed), from cursor move [seg]; a [mark] holds where a move's speech
- * starts and shows nothing.
+ * starts and shows nothing; a [brk] is a paragraph break.
  */
 private class Tok(
     val text: String,
@@ -488,6 +526,8 @@ private class Tok(
     val partial: Boolean,
     val seg: Int,
     val mark: Boolean = false,
+    /** A paragraph break the ¶ button put in. */
+    val brk: Boolean = false,
 ) {
     companion object {
         fun mark(seg: Int) = Tok("", null, Long.MIN_VALUE, false, seg, mark = true)
