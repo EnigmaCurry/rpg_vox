@@ -357,9 +357,14 @@ class ScribeKeyboard : InputMethodService() {
             val purple = if (dark) 0xFFCE93D8.toInt() else 0xFF8E24AA.toInt()
             sb.setSpan(CaretSpan(purple, resources.displayMetrics.density * 2), sb.length - 1, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
         }
+        var lastBrk = false
         doc.forEachIndexed { i, t ->
             if (i == cursor) caret()
             if (!shown(t)) return@forEachIndexed
+            // Two breaks can't touch, but a break said meanwhile could
+            // land beside one; show it once.
+            if (t.brk && lastBrk) return@forEachIndexed
+            lastBrk = t.brk
             if (!t.brk && sb.isNotEmpty() && sb.last() != ' ' && sb.last() != '\n' && sb.last() != CARET) sb.append(' ')
             if (t.brk && sb.isNotEmpty() && sb.last() == ' ') sb.delete(sb.length - 1, sb.length)
             val at = sb.length
@@ -446,6 +451,13 @@ class ScribeKeyboard : InputMethodService() {
                     w != null -> cuts += w.startMs..maxOf(w.startMs, w.endMs - 1)
                 }
             }
+            // Breaks now side by side become one, so deleting it later
+            // doesn't uncover another.
+            var lastBrk = false
+            for (t in document(paras).filter(::shown)) {
+                if (t.brk && lastBrk) breaks.remove(t.ms)
+                lastBrk = t.brk
+            }
             mode.finish()
             return true
         }
@@ -459,6 +471,11 @@ class ScribeKeyboard : InputMethodService() {
     /** Finish what's being said and start a new paragraph at the cursor. */
     private fun paragraphBreak() {
         val s = session ?: return
+        val cursor = cursorAt(doc)
+        // Never two in a row: not beside a break already there.
+        val before = doc.subList(0, cursor).lastOrNull(::shown)
+        val after = doc.subList(cursor, doc.size).firstOrNull(::shown)
+        if (before?.brk == true || after?.brk == true) return
         breaks += s.breakNow()
         render(paras)
     }
@@ -481,7 +498,10 @@ class ScribeKeyboard : InputMethodService() {
             val ic = currentInputConnection
             val multiLine = (currentInputEditorInfo?.inputType ?: 0) and EditorInfo.TYPE_TEXT_FLAG_MULTI_LINE != 0
             val sb = StringBuilder()
+            var lastBrk = false
             for (t in document(paras).filter(::shown)) {
+                if (t.brk && lastBrk) continue
+                lastBrk = t.brk
                 if (t.brk) {
                     // A one-line field gets a space instead.
                     while (sb.endsWith(' ')) sb.setLength(sb.length - 1)
