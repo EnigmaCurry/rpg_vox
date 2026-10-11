@@ -14,6 +14,9 @@ section after the version it releases.
   silence even with music or a fan on. Before, steady background kept
   every utterance open until the 12 second cap, delaying the re-decode.
   Quiet rooms are unaffected.
+- **Pass 2 doesn't wait on sound without words.** When the live
+  transcription (pass 1) has heard no new word for 1.5 seconds, the
+  utterance closes even if it's still loud, and pass 2 runs on it.
 
 ## v0.1.3 (2026-10-11)
 

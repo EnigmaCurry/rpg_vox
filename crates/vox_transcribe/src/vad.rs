@@ -72,6 +72,8 @@ pub enum EndReason {
     Pause,
     MaxLength,
     Flush,
+    /// Cut by the caller with [`Vad::cut`]: still loud, but no new words.
+    Stall,
 }
 
 #[derive(Debug)]
@@ -181,6 +183,13 @@ impl Vad {
     pub fn flush(&mut self, out: &mut Vec<VadEvent>) {
         if self.speaking {
             self.finalize(EndReason::Flush, out);
+        }
+    }
+
+    /// Close the in-flight utterance even though it is still loud.
+    pub fn cut(&mut self, out: &mut Vec<VadEvent>) {
+        if self.speaking {
+            self.finalize(EndReason::Stall, out);
         }
     }
 

@@ -282,3 +282,52 @@ fn same_speaker_stays_in_one_paragraph() {
     assert_eq!(t.paragraphs[0].speaker.as_deref(), Some("A"));
     assert_eq!(t.paragraphs[0].clips.len(), 2);
 }
+
+/// Emits one "WORD" per 200 ms fed during the first second of the
+/// stream, then nothing: speech that trails off into steady music.
+struct TrailingOff {
+    /// Samples fed in all, and when the current utterance began.
+    total: usize,
+    start: usize,
+}
+
+impl StreamingRecognizer for TrailingOff {
+    fn reset(&mut self) {
+        self.start = self.total;
+    }
+    fn feed(&mut self, samples: &[f32], _rate: u32) {
+        self.total += samples.len();
+    }
+    fn partial(&self) -> String {
+        let speech = |n: usize| n.min(SR as usize);
+        let n = (speech(self.total) - speech(self.start)) / (SR as usize / 5);
+        vec!["WORD"; n].join(" ")
+    }
+}
+
+#[test]
+fn loud_utterance_without_new_words_is_cut() {
+    let mut cfg = EngineConfig::new(SR);
+    cfg.partial_interval = std::time::Duration::ZERO;
+    // Constant loudness for 8 s: without the cut the VAD would hold it
+    // open until 12 s (and only the flush at the end would close it).
+    cfg.vad.noise_margin = 0.0;
+    let engine = Engine::spawn(
+        cfg,
+        Some(Box::new(TrailingOff { total: 0, start: 0 })),
+        Arc::new(FakeOffline),
+    );
+    let events = engine.events().clone();
+    for chunk in tone(8_000, 0.2).chunks(SR as usize / 50) {
+        engine.push(chunk);
+    }
+    let t = engine.finish();
+    let _ = events.try_iter().count();
+    // The words stop after 1 s, so the first utterance is cut 1.5 s
+    // later; the rest (no words at all) is cut into pieces as long.
+    let clips: Vec<_> = t.paragraphs.iter().flat_map(|p| &p.clips).collect();
+    let durations: Vec<_> = clips.iter().filter_map(|c| c.duration_ms).collect();
+    assert!(durations.len() >= 3, "{clips:?}");
+    assert!((2_000..3_500).contains(&durations[0]), "{durations:?}");
+    assert!(durations.iter().all(|&d| d < 3_500), "{durations:?}");
+}

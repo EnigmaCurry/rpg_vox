@@ -81,6 +81,12 @@ pub struct EngineConfig {
     /// Rewrite spelled-out digit strings in pass-2 and pass-3 text as
     /// numerals (see [`crate::digits`]).
     pub spoken_digits: bool,
+    /// Close an utterance that is still loud (music, a fan) once pass 1
+    /// has heard no new word for this long, so pass 2 doesn't wait for
+    /// silence that never comes. Pass 2 still decodes all of it, so
+    /// words pass 1 missed are kept.
+    /// 0 turns it off.
+    pub word_stall_ms: u64,
 }
 
 impl EngineConfig {
@@ -94,6 +100,7 @@ impl EngineConfig {
             partial_interval: Duration::from_millis(150),
             level_interval_ms: 50,
             spoken_digits: true,
+            word_stall_ms: 1_500,
         }
     }
 }
@@ -368,6 +375,10 @@ struct Current {
     start_ms: u64,
     last_partial: String,
     last_emit: Instant,
+    /// Most words pass 1 has had for this utterance, and when (audio
+    /// ms) that last grew.
+    words: usize,
+    last_word_ms: u64,
 }
 
 struct Core {
@@ -512,6 +523,7 @@ impl Core {
         for ev in evs {
             self.on_vad(ev);
         }
+        self.cut_if_stalled();
         self.level_max = self.level_max.max(self.vad.last_rms());
         let pos = self.vad.position();
         if pos >= self.level_next {
@@ -524,6 +536,31 @@ impl Core {
             self.level_next = pos + self.sample(self.cfg.level_interval_ms).max(1);
         }
         self.harden_idle();
+    }
+
+    /// See [`EngineConfig::word_stall_ms`].
+    fn cut_if_stalled(&mut self) {
+        let stall = self.cfg.word_stall_ms;
+        let now = self.now_ms();
+        let (Some(s), Some(cur)) = (self.streaming.as_ref(), self.current.as_mut()) else {
+            return;
+        };
+        if stall == 0 {
+            return;
+        }
+        let words = s.partial().split_whitespace().count();
+        if words > cur.words {
+            cur.words = words;
+            cur.last_word_ms = now;
+        }
+        if now.saturating_sub(cur.last_word_ms) < stall {
+            return;
+        }
+        let mut evs = Vec::new();
+        self.vad.cut(&mut evs);
+        for ev in evs {
+            self.on_vad(ev);
+        }
     }
 
     fn flush_vad(&mut self) {
@@ -557,6 +594,8 @@ impl Core {
                     start_ms: self.ms(start_sample),
                     last_partial: String::new(),
                     last_emit: Instant::now(),
+                    words: 0,
+                    last_word_ms: self.now_ms(),
                 });
                 if let Some(s) = self.streaming.as_mut() {
                     s.reset();
