@@ -164,19 +164,12 @@ class ScribeKeyboard : InputMethodService() {
         }
         val buttons = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.END
-            addView(keyboards, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT))
-            addView(View(context), LinearLayout.LayoutParams(0, 0, 1f))
-            addView(cancel)
-            addView(breakButton, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT))
-            addView(pauseButton)
-            addView(insertButton)
-            // Buttons default to a wide minimum; five of those overflow a
-            // phone, pushing ⌨ off the left edge. Size each to its label.
-            for (i in 0 until childCount) (getChildAt(i) as? Button)?.apply {
-                minWidth = 0
-                minimumWidth = 0
-                setPadding(dp(14), paddingTop, dp(14), paddingBottom)
+            // All the same width, sharing the row, so each is easy to hit.
+            for (b in listOf(keyboards, cancel, breakButton, pauseButton, insertButton)) {
+                b.minWidth = 0
+                b.minimumWidth = 0
+                b.setPadding(0, b.paddingTop, 0, b.paddingBottom)
+                addView(b, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f).apply { marginEnd = dp(4) })
             }
         }
         return LinearLayout(this).apply {
