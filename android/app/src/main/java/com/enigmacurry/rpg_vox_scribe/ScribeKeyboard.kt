@@ -351,12 +351,17 @@ class ScribeKeyboard : InputMethodService() {
         val out = doc.toMutableList()
         val words = doc.indices.filter { shown(doc[it]) }
         fun ends(t: Tok) = t.brk || t.text.trimEnd('"', '\'', ')', '”', '’').let { it.endsWith('.') || it.endsWith('?') || it.endsWith('!') || it.endsWith('…') }
-        // Words the engine capitalized mid-sentence, so likely names.
+        fun upper(t: Tok) = t.text.firstOrNull()?.isUpperCase() == true
+        // Words the engine capitalized mid-utterance after a lowercase word,
+        // so likely names. Not after a capital: an utterance's first word is
+        // capitalized as a sentence start and can drag the next one along
+        // ("Lazy Brown").
         val names = HashSet<String>()
         for (k in 1 until words.size) {
             val prev = doc[words[k - 1]]
             val t = doc[words[k]]
-            if (!t.brk && !t.partial && t.seg == prev.seg && !ends(prev) && t.text.firstOrNull()?.isUpperCase() == true) {
+            if (!t.brk && !t.partial && !t.head && t.seg == prev.seg && !prev.brk &&
+                prev.text.firstOrNull()?.isLowerCase() == true && upper(t)) {
                 names += t.text.trim { !it.isLetterOrDigit() }
             }
         }
@@ -364,6 +369,17 @@ class ScribeKeyboard : InputMethodService() {
             val core = w.trim { !it.isLetterOrDigit() }
             return core == "I" || core.startsWith("I'") || core.startsWith("I’") ||
                 core.drop(1).any { it.isUpperCase() } || core in names
+        }
+        /** Lowercase the utterance head words[k] and the run of capitals it dragged along. */
+        fun lower(k: Int) {
+            var m = k
+            while (m < words.size) {
+                val t = doc[words[m]]
+                if (m > k && (t.head || t.brk || t.partial || t.seg != doc[words[k]].seg)) break
+                if (!upper(t) || name(t.text)) break
+                out[words[m]] = out[words[m]].withText(out[words[m]].text.replaceFirstChar { it.lowercaseChar() })
+                m++
+            }
         }
         val fragment = HashSet<Int>()
         for (k in 1 until words.size) {
@@ -378,15 +394,11 @@ class ScribeKeyboard : InputMethodService() {
                 if (!t.head || t.seg !in fragment) continue
                 val last = out[i].text
                 if (last.endsWith('.') && !last.endsWith("..")) out[i] = out[i].withText(last.dropLast(1))
-                if (!ends(out[i]) && head.firstOrNull()?.isUpperCase() == true && !name(head)) {
-                    out[j] = t.withText(head.replaceFirstChar { it.lowercaseChar() })
-                }
+                if (!ends(out[i])) lower(k)
                 continue
             }
             if (!ends(prev)) fragment += t.seg
-            if (!ends(prev) && head.firstOrNull()?.isUpperCase() == true && !name(head)) {
-                out[j] = t.withText(head.replaceFirstChar { it.lowercaseChar() })
-            }
+            if (!ends(prev)) lower(k)
             // out[i], not prev: the first word may have been lowercased already.
             val last = out[i].text
             if (head.firstOrNull()?.isLowerCase() == true && last.endsWith('.') && !last.endsWith("..")) {
