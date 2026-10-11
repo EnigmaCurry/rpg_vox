@@ -45,8 +45,12 @@ import org.json.JSONObject
 private const val TAG = "ScribeKeyboard"
 private const val RATE = 16_000
 private const val DELETE = 1
-/** Stands in for the cursor in the transcript's text, drawn by [CaretSpan]. */
-private const val CARET = '\u200A'
+/**
+ * Stands in for the cursor in the transcript's text, drawn by [CaretSpan].
+ * Not a space: a space ending a line isn't drawn, so the cursor vanished
+ * there. This one wraps with the word after it.
+ */
+private const val CARET = '|'
 
 /**
  * Voice keyboard: pick Scribe as the input method in any app and it
