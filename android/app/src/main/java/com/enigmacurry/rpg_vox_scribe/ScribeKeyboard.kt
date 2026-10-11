@@ -5,7 +5,9 @@ import android.annotation.SuppressLint
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.res.Configuration
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Paint
 import android.graphics.Typeface
 import android.inputmethodservice.InputMethodService
 import android.media.AudioFormat
@@ -18,12 +20,15 @@ import android.os.Looper
 import android.text.SpannableStringBuilder
 import android.text.Spanned
 import android.text.style.ForegroundColorSpan
+import android.text.style.ReplacementSpan
 import android.util.Log
 import android.util.TypedValue
 import android.view.ActionMode
+import android.view.GestureDetector
 import android.view.Gravity
 import android.view.Menu
 import android.view.MenuItem
+import android.view.MotionEvent
 import android.view.View
 import android.view.WindowInsets
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
@@ -39,6 +44,8 @@ import org.json.JSONObject
 private const val TAG = "ScribeKeyboard"
 private const val RATE = 16_000
 private const val DELETE = 1
+/** Stands in for the cursor in the transcript's text, drawn by [CaretSpan]. */
+private const val CARET = '\u200A'
 
 /**
  * Voice keyboard: pick Scribe as the input method in any app and it
@@ -46,8 +53,9 @@ private const val DELETE = 1
  * Insert types the finished text into the field once passes 2 and 3 are
  * done, then switches back to the previous keyboard. Pause mutes the mic
  * without closing it, so Resume picks up at once. Selecting text offers
- * Delete for its finished words; the cut is by time, so it holds when
- * later passes rewrite the paragraph. Uses the models
+ * Delete for its finished words, and a tap moves the purple cursor, where
+ * new speech goes, to the nearest gap between words. Both work by time in
+ * the session's audio, so they hold when later passes rewrite the text. Uses the models
  * the app loaded, loading them if needed.
  */
 class ScribeKeyboard : InputMethodService() {
@@ -64,12 +72,18 @@ class ScribeKeyboard : InputMethodService() {
     private var paras: List<KPara> = emptyList()
     /** Spans of the session's audio (ms) whose words were deleted. */
     private val cuts = mutableListOf<LongRange>()
-    /** Where each finished word is in [transcript]'s text, and its time. */
-    private var placed: List<Pair<IntRange, Word>> = emptyList()
+    /** Cursor moves, in order: speech from each one's [Insertion.fromMs] on goes there. */
+    private val inserts = mutableListOf<Insertion>()
+    /** The transcript as last drawn, in order, hidden words and marks included. */
+    private var doc: List<Tok> = emptyList()
+    /** Where each finished word is in [transcript]'s text, and its index in [doc]. */
+    private var placed: List<Pair<IntRange, Int>> = emptyList()
     /** A selection is open: updates wait, so it isn't wiped by a redraw. */
     private var selecting = false
-    /** Keep the newest text in view: the transcript was at its bottom when last updated. */
+    /** Keep the cursor in view: it was in view when the transcript last changed. */
     private var follow = true
+    /** Where the cursor is in [transcript]'s text. */
+    private var caretAt = 0
     /** Waiting for the models to load before starting. */
     private var waiting = false
     private var dark = false
@@ -93,6 +107,17 @@ class ScribeKeyboard : InputMethodService() {
             setTextIsSelectable(true)
             customSelectionActionModeCallback = DeleteAction()
         }
+        val taps = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
+            override fun onSingleTapUp(e: MotionEvent): Boolean {
+                moveCursor(transcript.getOffsetForPosition(e.x, e.y))
+                return false
+            }
+        })
+        // Watch for taps but leave the touch to the text, for long-press selection.
+        transcript.setOnTouchListener { _, e ->
+            taps.onTouchEvent(e)
+            false
+        }
         scroll = object : ScrollView(this) {
             // The selectable text's cursor sits at its start; don't let
             // it drag the view back to the top on every update.
@@ -100,9 +125,10 @@ class ScribeKeyboard : InputMethodService() {
         }.apply {
             addView(transcript, MATCH_PARENT, WRAP_CONTENT)
         }
-        // Scroll once the new text is laid out, not before.
+        // Scroll again once grown text is laid out: until then the scroll
+        // view can't go past the old end.
         transcript.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
-            if (follow) scroll.post { scroll.scrollTo(0, maxOf(0, transcript.height - scroll.height)) }
+            if (follow) scroll.post { revealCaret() }
         }
         val keyboards = Button(this).apply {
             text = "⌨"
@@ -189,6 +215,7 @@ class ScribeKeyboard : InputMethodService() {
         transcript.text = ""
         paras = emptyList()
         cuts.clear()
+        inserts.clear()
         insertButton.isEnabled = false
         pauseButton.isEnabled = false
         pauseButton.text = "Pause"
@@ -260,39 +287,127 @@ class ScribeKeyboard : InputMethodService() {
 
     private fun isCut(w: Word) = cuts.any { w.startMs in it }
 
-    /** [c]'s words that weren't deleted, each with its time if it has one. */
-    private fun kept(c: KClip): List<Pair<String, Word?>> =
-        c.words.mapIndexedNotNull { i, s ->
-            val t = c.times.getOrNull(i)
-            if (t != null && isCut(t)) null else s to t
+    private fun shown(t: Tok) = !t.mark && (t.time == null || !isCut(t.time))
+
+    /** The cursor move whose speech [ms] is, 0 for none (the original run). */
+    private fun segOf(ms: Long): Int {
+        var seg = 0
+        inserts.forEachIndexed { i, ins -> if (ins.fromMs <= ms) seg = i + 1 }
+        return seg
+    }
+
+    /**
+     * All the words in reading order, as one running paragraph (the
+     * engine's breaks are pauses, not intent). Each cursor move's speech,
+     * in the order said, goes after the word it was placed after, found
+     * by time so later passes rewriting the text don't move it.
+     */
+    private fun document(paras: List<KPara>): List<Tok> {
+        val toks = paras.flatMap { p ->
+            p.clips.flatMap { c ->
+                c.words.mapIndexed { i, w ->
+                    val t = c.times.getOrNull(i)
+                    val ms = t?.startMs ?: c.startMs
+                    Tok(w, t, ms, c.partial, segOf(ms))
+                }
+            }
         }
+        // sortedBy is stable: words of one clip keep their order.
+        val bySeg = toks.sortedBy { it.ms }.groupBy { it.seg }
+        val doc = mutableListOf(Tok.mark(0))
+        doc += bySeg[0].orEmpty()
+        inserts.forEachIndexed { i, ins ->
+            val last = doc.indexOfLast { !it.mark && it.seg == ins.seg && it.ms <= ins.afterMs }
+            val at = if (last >= 0) last + 1 else doc.indexOfFirst { it.mark && it.seg == ins.seg } + 1
+            doc.addAll(at, listOf(Tok.mark(i + 1)) + bySeg[i + 1].orEmpty())
+        }
+        return doc
+    }
+
+    /** Where in [doc] new speech goes: after the latest cursor move's words. */
+    private fun cursorAt(doc: List<Tok>): Int = doc.indexOfLast { it.seg == inserts.size } + 1
 
     private fun render(paras: List<KPara>) {
         this.paras = paras
         if (selecting) return
+        // Follow the cursor only while it's in view, so scrolling away
+        // to reread earlier text isn't undone by the next update.
+        follow = caretLines()?.let { (top, bottom) -> top >= scroll.scrollY && bottom <= scroll.scrollY + scroll.height } ?: true
         val dim = 0xFF888888.toInt()
         val sb = SpannableStringBuilder()
-        val placed = mutableListOf<Pair<IntRange, Word>>()
-        for (p in paras) {
-            val words = p.clips.flatMap { c -> kept(c).map { Triple(it.first, it.second, c.partial) } }
-            if (words.isEmpty()) continue
-            // One running paragraph: the engine's breaks are pauses, not intent.
-            if (sb.isNotEmpty()) sb.append(' ')
-            words.forEachIndexed { i, (s, t, partial) ->
-                if (i > 0) sb.append(' ')
-                val at = sb.length
-                sb.append(s)
-                when {
-                    partial -> sb.setSpan(ForegroundColorSpan(dim), at, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-                    t != null -> placed += (at until sb.length) to t
-                }
+        val placed = mutableListOf<Pair<IntRange, Int>>()
+        val doc = document(paras)
+        val cursor = cursorAt(doc)
+        fun caret() {
+            if (sb.isNotEmpty() && sb.last() != ' ') sb.append(' ')
+            caretAt = sb.length
+            sb.append(CARET)
+            val purple = if (dark) 0xFFCE93D8.toInt() else 0xFF8E24AA.toInt()
+            sb.setSpan(CaretSpan(purple, resources.displayMetrics.density * 2), sb.length - 1, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        }
+        doc.forEachIndexed { i, t ->
+            if (i == cursor) caret()
+            if (!shown(t)) return@forEachIndexed
+            if (sb.isNotEmpty() && sb.last() != ' ' && sb.last() != CARET) sb.append(' ')
+            val at = sb.length
+            sb.append(t.text)
+            when {
+                t.partial -> sb.setSpan(ForegroundColorSpan(dim), at, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                t.time != null -> placed += (at until sb.length) to i
             }
         }
-        // Follow new text only while already at the bottom, so scrolling
-        // up to reread earlier text isn't undone by the next update.
-        follow = !scroll.canScrollVertically(1)
+        if (cursor == doc.size) caret()
         transcript.text = sb
+        this.doc = doc
         this.placed = placed
+        if (follow) scroll.post { revealCaret() }
+    }
+
+    /** Top and bottom of the cursor's line in [transcript], once laid out. */
+    private fun caretLines(): Pair<Int, Int>? {
+        val l = transcript.layout ?: return null
+        if (caretAt > transcript.text.length) return null
+        val line = l.getLineForOffset(caretAt)
+        return (transcript.paddingTop + l.getLineTop(line)) to (transcript.paddingTop + l.getLineBottom(line))
+    }
+
+    /** Scroll just enough to show the cursor's line. */
+    private fun revealCaret() {
+        val (top, bottom) = caretLines() ?: return
+        when {
+            bottom > scroll.scrollY + scroll.height -> scroll.scrollTo(0, bottom - scroll.height)
+            top < scroll.scrollY -> scroll.scrollTo(0, top)
+        }
+    }
+
+    /**
+     * Tapped at [offset] in the text: finish what's being said, then send
+     * new speech to the gap between words nearest the tap.
+     */
+    private fun moveCursor(offset: Int) {
+        val s = session ?: return
+        if (selecting) return
+        val near = placed.minByOrNull { (at, _) ->
+            when {
+                offset < at.first -> at.first - offset
+                offset > at.last + 1 -> offset - at.last - 1
+                else -> 0
+            }
+        } ?: return
+        val (at, index) = near
+        // The gap is before doc[gap]: after the word when the tap is past its middle.
+        val gap = if (offset * 2 > at.first + at.last + 1) index + 1 else index
+        val from = s.breakNow()
+        val cursor = cursorAt(doc)
+        // Already there (only hidden words or marks between): nothing moves.
+        if ((minOf(gap, cursor) until maxOf(gap, cursor)).none { shown(doc[it]) }) return
+        val prev = doc[gap - 1]
+        inserts += if (prev.mark) {
+            Insertion(prev.seg, Long.MIN_VALUE, from)
+        } else {
+            Insertion(prev.seg, prev.ms, from)
+        }
+        render(paras)
     }
 
     /** Adds Delete to the selection's menu: it cuts every finished word the selection touches. */
@@ -309,7 +424,8 @@ class ScribeKeyboard : InputMethodService() {
             if (item.itemId != DELETE) return false
             val a = minOf(transcript.selectionStart, transcript.selectionEnd)
             val b = maxOf(transcript.selectionStart, transcript.selectionEnd)
-            for ((at, w) in placed) {
+            for ((at, i) in placed) {
+                val w = doc[i].time ?: continue
                 if (at.first < b && at.last >= a) cuts += w.startMs..maxOf(w.startMs, w.endMs - 1)
             }
             mode.finish()
@@ -337,9 +453,7 @@ class ScribeKeyboard : InputMethodService() {
         status.text = "Finishing…"
         s.finish { paras ->
             val ic = currentInputConnection
-            var text = paras.map { p -> p.clips.flatMap { c -> kept(c).map { it.first } }.joinToString(" ") }
-                .filter { it.isNotEmpty() }
-                .joinToString(" ")
+            var text = document(paras).filter(::shown).joinToString(" ") { it.text }
             if (ic != null && text.isNotEmpty()) {
                 val before = ic.getTextBeforeCursor(1, 0)
                 if (!before.isNullOrEmpty() && !before.last().isWhitespace()) text = " $text"
@@ -353,6 +467,44 @@ class ScribeKeyboard : InputMethodService() {
     private fun leave() {
         if (Build.VERSION.SDK_INT >= 28 && switchToPreviousInputMethod()) return
         requestHideSelf(0)
+    }
+}
+
+/**
+ * A cursor move: speech from [fromMs] on (session audio) goes after the
+ * last word of move [seg]'s speech said by [afterMs], or at its start.
+ */
+private class Insertion(val seg: Int, val afterMs: Long, val fromMs: Long)
+
+/**
+ * A word of the transcript, [ms] when it was said (its clip's start if
+ * untimed), from cursor move [seg]; a [mark] holds where a move's speech
+ * starts and shows nothing.
+ */
+private class Tok(
+    val text: String,
+    val time: Word?,
+    val ms: Long,
+    val partial: Boolean,
+    val seg: Int,
+    val mark: Boolean = false,
+) {
+    companion object {
+        fun mark(seg: Int) = Tok("", null, Long.MIN_VALUE, false, seg, mark = true)
+    }
+}
+
+/** The cursor: a full-height bar [width] px wide. */
+private class CaretSpan(color: Int, private val width: Float) : ReplacementSpan() {
+    private val paint = Paint().apply { this.color = color }
+
+    override fun getSize(paint: Paint, text: CharSequence?, start: Int, end: Int, fm: Paint.FontMetricsInt?): Int {
+        fm?.let { paint.getFontMetricsInt(it) }
+        return width.toInt() + 1
+    }
+
+    override fun draw(canvas: Canvas, text: CharSequence?, start: Int, end: Int, x: Float, top: Int, y: Int, bottom: Int, paint: Paint) {
+        canvas.drawRect(x, top.toFloat(), x + width, bottom.toFloat(), this.paint)
     }
 }
 
@@ -375,6 +527,9 @@ private class Dictation(
     @Volatile private var ended = false
     /** The mic keeps running but its audio is dropped, so resuming is instant. */
     @Volatile var paused = false
+    /** Samples pushed so far: the session's audio clock. */
+    @Volatile private var pushed = 0L
+    @Volatile private var breakAsked = false
     private var capture: Thread? = null
     private var poller: Thread? = null
     private val paras = LinkedHashMap<String, KPara>()
@@ -388,6 +543,12 @@ private class Dictation(
             }
         }, "ime-poll").apply { start() }
         capture = Thread(::record, "ime-mic").apply { start() }
+    }
+
+    /** Close the utterance in progress; returns now on the session's clock (ms). */
+    fun breakNow(): Long {
+        breakAsked = true
+        return pushed * 1000 / RATE
     }
 
     @SuppressLint("MissingPermission")
@@ -419,6 +580,10 @@ private class Dictation(
             while (capturing) {
                 val n = rec.read(shorts, 0, shorts.size, AudioRecord.READ_BLOCKING)
                 if (n <= 0) continue
+                if (breakAsked) {
+                    breakAsked = false
+                    Native.breakParagraph(session)
+                }
                 val p = paused
                 if (p != wasPaused) {
                     wasPaused = p
@@ -430,6 +595,7 @@ private class Dictation(
                 for (i in 0 until n) buf[i] = shorts[i] / 32768f
                 gain.process(buf, n)
                 Native.push(session, buf, n)
+                pushed += n
             }
         } finally {
             rec.stop()
@@ -490,21 +656,21 @@ private class Dictation(
         val text = c.getString("text")
         val partial = c.getString("stage") == "partial"
         val words = text.split(Regex("\\s+")).filter { it.isNotEmpty() }
-        if (partial || words.isEmpty()) return KClip(partial, words, emptyList())
+        val start = c.getLong("start_ms")
+        if (partial || words.isEmpty()) return KClip(partial, start, words, emptyList())
         val timed = parseWords(c.optJSONArray("words"))
         val times = if (timed.size == words.size) {
             timed
         } else {
             // A pass changed the words without timing them: spread the
             // new ones over the clip, keeping the times of those that match.
-            val start = c.getLong("start_ms")
             val end = start + c.optLong("duration_ms", 0)
             runCatching { parseWords(Native.alignWords(timed.toJson(), text, start, end)) }
                 .getOrDefault(emptyList())
                 .takeIf { it.size == words.size }
                 .orEmpty()
         }
-        return KClip(partial, words, times)
+        return KClip(partial, start, words, times)
     }
 }
 
@@ -513,6 +679,7 @@ private class KPara(val id: String, val clips: List<KClip>)
 
 /**
  * One clip's [words] as shown, with their [times] in the session's audio
- * when known (finished clips); a word without a time can't be tapped away.
+ * when known (finished clips); a word without a time can't be deleted or
+ * have the cursor put beside it. [startMs] is when the clip began.
  */
-private class KClip(val partial: Boolean, val words: List<String>, val times: List<Word>)
+private class KClip(val partial: Boolean, val startMs: Long, val words: List<String>, val times: List<Word>)
