@@ -1360,12 +1360,16 @@ impl Chat<'_> {
             .filter(|p| ids.contains(&p.id))
         {
             for c in &p.clips {
-                let style = if c.stage == Stage::Partial {
-                    Style::new().dark_gray().italic()
+                if c.stage == Stage::Partial {
+                    let style = Style::new().dark_gray().italic();
+                    words.extend(self.s.pass1.words(&c.text).into_iter().map(|w| (w, style)));
                 } else {
-                    Style::new()
-                };
-                words.extend(c.text.split_whitespace().map(|w| (w.to_string(), style)));
+                    words.extend(
+                        c.text
+                            .split_whitespace()
+                            .map(|w| (w.to_string(), Style::new())),
+                    );
+                }
             }
         }
         words.push(("▌".into(), Style::new().magenta()));

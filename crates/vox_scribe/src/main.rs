@@ -134,6 +134,11 @@ struct Cli {
     /// Skip pass 1 (no live partials; text appears per utterance).
     #[arg(long)]
     no_streaming: bool,
+    /// How pass 1's live text is shown: `text` (dim ALL CAPS), `ellipsis`
+    /// (an `…` per word heard, no text), or `off` (pass 1 doesn't run, like
+    /// --no-streaming).
+    #[arg(long, value_enum, default_value = "text", env = "VOX_SCRIBE_PASS1")]
+    pass1: Pass1,
     /// Start new paragraphs only on Enter, not on silence (toggle with `m`).
     #[arg(long)]
     manual: bool,
@@ -203,6 +208,28 @@ struct Cli {
 }
 
 /// `--speakers`: a count, or names (whose number is the count).
+/// How pass 1's streaming text is shown (--pass1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum Pass1 {
+    Off,
+    Text,
+    Ellipsis,
+}
+
+impl Pass1 {
+    /// What to show for pass-1 text: its words, or with `ellipsis` one
+    /// growing run of dots, one per word.
+    pub fn words(self, text: &str) -> Vec<String> {
+        match self {
+            Pass1::Ellipsis => {
+                let n = text.split_whitespace().count();
+                (n > 0).then(|| "…".repeat(n)).into_iter().collect()
+            }
+            _ => text.split_whitespace().map(str::to_string).collect(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct Speakers {
     count: usize,
@@ -331,6 +358,8 @@ pub struct Session {
     pub live: bool,
     /// --diarize: speakers are labelled (and can be renamed with `n`).
     pub diarize: bool,
+    /// --pass1: how streaming text is shown.
+    pub pass1: Pass1,
     /// --record: the audio is being saved too.
     pub recording: bool,
     /// --speakers N, or the number of sources.
@@ -880,8 +909,8 @@ fn main() -> Result<()> {
 
     let models_dir = models::resolve(cli.models_dir.as_deref());
     // First run: fetch the models rather than failing.
-    if !cli.model.present(&models_dir) || (!cli.no_streaming && !models::has_zipformer(&models_dir))
-    {
+    let streaming = !cli.no_streaming && cli.pass1 != Pass1::Off;
+    if !cli.model.present(&models_dir) || (streaming && !models::has_zipformer(&models_dir)) {
         eprintln!(
             "models not found, downloading them once ({})…",
             cli.model.download_size()
@@ -970,7 +999,7 @@ fn main() -> Result<()> {
             model: cli.model,
             language: cli.language.clone(),
             threads: cli.threads,
-            streaming: !cli.no_streaming && models::has_zipformer(&models_dir),
+            streaming: streaming && models::has_zipformer(&models_dir),
             models_dir: models_dir.clone(),
             vocab: vocab.clone(),
             speakers: speaker_models.clone(),
@@ -1207,6 +1236,7 @@ fn main() -> Result<()> {
         input_ms,
         live: cli.live,
         diarize: cli.diarize,
+        pass1: cli.pass1,
         recording: record.is_some(),
         num_speakers,
         pumps: Mutex::new(pumps),
@@ -1996,5 +2026,17 @@ mod tests {
             speed(60_000, Duration::from_secs(90)),
             "1.5x slower than real time"
         );
+    }
+}
+
+#[cfg(test)]
+mod pass1_tests {
+    use super::Pass1;
+
+    #[test]
+    fn ellipsis_hides_the_words() {
+        assert_eq!(Pass1::Text.words("HELLO THERE"), ["HELLO", "THERE"]);
+        assert_eq!(Pass1::Ellipsis.words("HELLO THERE YOU"), ["………"]);
+        assert!(Pass1::Ellipsis.words("  ").is_empty());
     }
 }

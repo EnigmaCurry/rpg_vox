@@ -692,6 +692,7 @@ fn draw(f: &mut Frame, app: &App, s: &Session) {
         inner_w.max(GUTTER + 10),
         s.manual.load(Ordering::Relaxed),
         s.diarize,
+        s.pass1,
     );
     let visible = body.height.saturating_sub(2) as usize;
     let max_scroll = lines.len().saturating_sub(visible);
@@ -980,6 +981,7 @@ fn transcript_lines(
     width: usize,
     manual: bool,
     diarize: bool,
+    pass1: crate::Pass1,
 ) -> (Vec<Line<'static>>, Vec<(String, usize, usize)>) {
     let text_w = width.saturating_sub(GUTTER).max(10);
     let mut out = Vec::new();
@@ -1017,7 +1019,11 @@ fn transcript_lines(
                 _ if app.flashes.contains_key(&c.id) => Style::new().green(),
                 _ => Style::new(),
             };
-            words.extend(c.text.split_whitespace().map(|w| (w.to_string(), style)));
+            if c.is_partial() {
+                words.extend(pass1.words(&c.text).into_iter().map(|w| (w, style)));
+            } else {
+                words.extend(c.text.split_whitespace().map(|w| (w.to_string(), style)));
+            }
         }
         if words.is_empty() {
             continue;
@@ -1048,8 +1054,8 @@ fn transcript_lines(
     if let Some(&(start, _)) = pending.first() {
         let words = pending
             .iter()
-            .flat_map(|(_, t)| t.split_whitespace())
-            .map(|w| (w.to_string(), partial_style))
+            .flat_map(|(_, t)| pass1.words(t))
+            .map(|w| (w, partial_style))
             .collect();
         let label = format!("[{}]", timestamp(start));
         wrap(
