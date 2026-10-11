@@ -336,6 +336,50 @@ class ScribeKeyboard : InputMethodService() {
         return doc
     }
 
+    /**
+     * [doc] with the seams of cursor moves fixed up: the engine starts
+     * every utterance as a sentence, so speech put mid-sentence begins
+     * with a capital and may end with a full stop. Where the word before
+     * doesn't end a sentence, the first word is lowercased unless it
+     * looks like a name: "I", an acronym, inner capitals, or capitalized
+     * elsewhere mid-sentence. A full stop before a lowercase word of the
+     * old text is dropped.
+     */
+    private fun polish(doc: List<Tok>): List<Tok> {
+        val out = doc.toMutableList()
+        val words = doc.indices.filter { shown(doc[it]) }
+        fun ends(t: Tok) = t.brk || t.text.trimEnd('"', '\'', ')', '”', '’').let { it.endsWith('.') || it.endsWith('?') || it.endsWith('!') || it.endsWith('…') }
+        // Words the engine capitalized mid-sentence, so likely names.
+        val names = HashSet<String>()
+        for (k in 1 until words.size) {
+            val prev = doc[words[k - 1]]
+            val t = doc[words[k]]
+            if (!t.brk && !t.partial && t.seg == prev.seg && !ends(prev) && t.text.firstOrNull()?.isUpperCase() == true) {
+                names += t.text.trim { !it.isLetterOrDigit() }
+            }
+        }
+        fun name(w: String): Boolean {
+            val core = w.trim { !it.isLetterOrDigit() }
+            return core == "I" || core.startsWith("I'") || core.startsWith("I’") ||
+                core.drop(1).any { it.isUpperCase() } || core in names
+        }
+        for (k in 1 until words.size) {
+            val i = words[k - 1]
+            val j = words[k]
+            val prev = doc[i]
+            val t = doc[j]
+            if (t.seg == prev.seg || t.brk || prev.brk || t.partial || prev.partial) continue
+            val head = t.text
+            if (!ends(prev) && head.firstOrNull()?.isUpperCase() == true && !name(head)) {
+                out[j] = t.withText(head.replaceFirstChar { it.lowercaseChar() })
+            }
+            if (head.firstOrNull()?.isLowerCase() == true && prev.text.endsWith('.') && !prev.text.endsWith("..")) {
+                out[i] = out[i].withText(prev.text.dropLast(1))
+            }
+        }
+        return out
+    }
+
     /** Where in [doc] new speech goes: after the latest cursor move's words. */
     private fun cursorAt(doc: List<Tok>): Int = doc.indexOfLast { it.seg == inserts.size } + 1
 
@@ -348,7 +392,7 @@ class ScribeKeyboard : InputMethodService() {
         val dim = 0xFF888888.toInt()
         val sb = SpannableStringBuilder()
         val placed = mutableListOf<Pair<IntRange, Int>>()
-        val doc = document(paras)
+        val doc = polish(document(paras))
         val cursor = cursorAt(doc)
         fun caret() {
             if (sb.isNotEmpty() && sb.last() != ' ' && sb.last() != '\n') sb.append(' ')
@@ -499,7 +543,7 @@ class ScribeKeyboard : InputMethodService() {
             val multiLine = (currentInputEditorInfo?.inputType ?: 0) and EditorInfo.TYPE_TEXT_FLAG_MULTI_LINE != 0
             val sb = StringBuilder()
             var lastBrk = false
-            for (t in document(paras).filter(::shown)) {
+            for (t in polish(document(paras)).filter(::shown)) {
                 if (t.brk && lastBrk) continue
                 lastBrk = t.brk
                 if (t.brk) {
@@ -549,6 +593,8 @@ private class Tok(
     /** A paragraph break the ¶ button put in. */
     val brk: Boolean = false,
 ) {
+    fun withText(text: String) = Tok(text, time, ms, partial, seg, mark, brk)
+
     companion object {
         fun mark(seg: Int) = Tok("", null, Long.MIN_VALUE, false, seg, mark = true)
     }
