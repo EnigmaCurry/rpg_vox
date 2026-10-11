@@ -135,8 +135,9 @@ struct Cli {
     #[arg(long)]
     no_streaming: bool,
     /// How pass 1's live text is shown: `text` (dim ALL CAPS), `ellipsis`
-    /// (an `…` per word heard, no text), or `off` (pass 1 doesn't run, like
-    /// --no-streaming).
+    /// (an `…` per word heard, no text), `hidden` (pass 1 still runs, so it
+    /// can close utterances that stop having words, but shows nothing), or
+    /// `off` (pass 1 doesn't run, like --no-streaming).
     #[arg(long, value_enum, default_value = "text", env = "VOX_SCRIBE_PASS1")]
     pass1: Pass1,
     /// Start new paragraphs only on Enter, not on silence (toggle with `m`).
@@ -214,6 +215,7 @@ pub enum Pass1 {
     Off,
     Text,
     Ellipsis,
+    Hidden,
 }
 
 impl Pass1 {
@@ -221,6 +223,7 @@ impl Pass1 {
     /// growing run of dots, one per word.
     pub fn words(self, text: &str) -> Vec<String> {
         match self {
+            Pass1::Hidden => Vec::new(),
             Pass1::Ellipsis => {
                 let n = text.split_whitespace().count();
                 (n > 0).then(|| "…".repeat(n)).into_iter().collect()
@@ -2041,5 +2044,6 @@ mod pass1_tests {
         assert_eq!(Pass1::Text.words("HELLO THERE"), ["HELLO", "THERE"]);
         assert_eq!(Pass1::Ellipsis.words("HELLO THERE YOU"), ["………"]);
         assert!(Pass1::Ellipsis.words("  ").is_empty());
+        assert!(Pass1::Hidden.words("HELLO").is_empty());
     }
 }

@@ -20,9 +20,10 @@ section after the version it releases.
 - **`--denoise` (experimental)** runs the DeepFilterNet 3 noise filter
   on the audio before transcribing it, to push background music down
   and keep the voice. `--denoise-limit DB` caps how much it removes.
-- **`--pass1 off|text|ellipsis`** chooses how the live pass-1 text is
-  shown: as now, as a run of `…` that grows with each word heard, or
-  not at all (pass 1 is skipped and text appears after pass 2).
+- **`--pass1 off|text|ellipsis|hidden`** chooses how the live pass-1
+  text is shown: as now, as a run of `…` that grows with each word
+  heard, not at all while pass 1 still runs (`hidden`), or not at all
+  with pass 1 skipped (`off`). Either way text appears after pass 2.
 
 ## v0.1.3 (2026-10-11)
 

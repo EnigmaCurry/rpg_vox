@@ -793,7 +793,7 @@ fn draw(f: &mut Frame, app: &App, s: &Session) {
             match s.pass1 {
                 crate::Pass1::Text => " LIVE CAPS ·".dark_gray().italic(),
                 crate::Pass1::Ellipsis => " … live ·".dark_gray().italic(),
-                crate::Pass1::Off => "".into(),
+                crate::Pass1::Hidden | crate::Pass1::Off => "".into(),
             },
             " re-decoded".into(),
             " · boundary-fixed".green(),
