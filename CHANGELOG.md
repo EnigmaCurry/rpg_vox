@@ -6,6 +6,15 @@ section after the version it releases.
 
 ## Unreleased
 
+### scribe
+
+- **Pass 2 keeps up with background music.** The voice detector's
+  threshold now rises with the background level (2.5× the quietest
+  moment of the last 3 seconds), so pauses between your words count as
+  silence even with music or a fan on. Before, steady background kept
+  every utterance open until the 12 second cap, delaying the re-decode.
+  Quiet rooms are unaffected.
+
 ## v0.1.3 (2026-10-11)
 
 ### Scribe for Android

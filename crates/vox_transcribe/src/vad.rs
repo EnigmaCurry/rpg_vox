@@ -4,6 +4,11 @@
 //! audio and contributes its RMS to a speaking/silent state machine.
 //! Per-sample checks don't work for speech, which crosses zero many
 //! times per cycle.
+//!
+//! The speech threshold follows the background: it is the larger of
+//! `rms_threshold` and `noise_margin` times the quietest window of the
+//! last `noise_window_ms`. Steady background (music, a fan) then sits
+//! under it, so the gaps between words still close an utterance.
 
 use std::collections::VecDeque;
 
@@ -11,8 +16,16 @@ use std::collections::VecDeque;
 pub struct VadConfig {
     pub window_ms: u32,
     /// RMS threshold in linear amplitude. Normal talking sits around
-    /// 0.04–0.15; residual digital silence is well under 0.001.
+    /// 0.04–0.15; residual digital silence is well under 0.001. The
+    /// noise floor can raise the threshold above this, never lower it.
     pub rms_threshold: f32,
+    /// How far above the noise floor speech must be (a ratio of RMS;
+    /// 2.5 is about 8 dB). 0 turns noise tracking off.
+    pub noise_margin: f32,
+    /// The noise floor is the quietest window over this span. Longer
+    /// than a sentence's worth of word gaps, short enough to follow a
+    /// change of music.
+    pub noise_window_ms: u32,
     /// Consecutive voiced time needed to enter Speaking. Filters one-off
     /// spikes (a keyboard click); pre-roll recovers the first syllable.
     pub speech_start_ms: u32,
@@ -39,6 +52,8 @@ impl Default for VadConfig {
         Self {
             window_ms: 20,
             rms_threshold: 0.008,
+            noise_margin: 2.5,
+            noise_window_ms: 3_000,
             speech_start_ms: 150,
             silence_end_ms: 700,
             pre_roll_ms: 300,
@@ -87,6 +102,10 @@ pub struct Vad {
     soft_max_samples: usize,
     max_samples: usize,
     min_samples: usize,
+    noise_windows: usize,
+    /// RMS of the last `noise_windows` windows, for the noise floor.
+    recent_rms: VecDeque<f32>,
+    threshold: f32,
     scratch: Vec<f32>,
     utterance: Vec<f32>,
     pre_roll: VecDeque<f32>,
@@ -111,6 +130,9 @@ impl Vad {
             soft_max_samples: ms(cfg.soft_max_utterance_ms),
             max_samples: ms(cfg.max_utterance_ms),
             min_samples: ms(cfg.min_utterance_ms),
+            noise_windows: (cfg.noise_window_ms / cfg.window_ms) as usize,
+            recent_rms: VecDeque::new(),
+            threshold: cfg.rms_threshold,
             scratch: Vec::new(),
             utterance: Vec::new(),
             pre_roll: VecDeque::new(),
@@ -131,6 +153,12 @@ impl Vad {
     /// RMS of the most recent window.
     pub fn last_rms(&self) -> f32 {
         self.last_rms
+    }
+
+    /// The RMS level speech must exceed right now: `rms_threshold`,
+    /// raised by the noise floor.
+    pub fn threshold(&self) -> f32 {
+        self.threshold
     }
 
     /// Samples consumed so far (the engine's audio clock).
@@ -160,7 +188,8 @@ impl Vad {
         self.pos += window.len() as u64;
         let rms = (window.iter().map(|s| s * s).sum::<f32>() / window.len() as f32).sqrt();
         self.last_rms = rms;
-        let hot = rms > self.cfg.rms_threshold;
+        self.track_noise(rms);
+        let hot = rms > self.threshold;
 
         if self.speaking {
             self.utterance.extend_from_slice(&window);
@@ -214,6 +243,27 @@ impl Vad {
             start_sample: self.utterance_start,
             audio: self.utterance.clone(),
         });
+    }
+
+    /// Raise the threshold to `noise_margin` above the quietest recent
+    /// window, once a full `noise_window_ms` has been heard.
+    fn track_noise(&mut self, rms: f32) {
+        if self.cfg.noise_margin <= 0.0 || self.noise_windows == 0 {
+            return;
+        }
+        if self.recent_rms.len() == self.noise_windows {
+            self.recent_rms.pop_front();
+        }
+        self.recent_rms.push_back(rms);
+        if self.recent_rms.len() < self.noise_windows {
+            return;
+        }
+        let floor = self
+            .recent_rms
+            .iter()
+            .copied()
+            .fold(f32::INFINITY, f32::min);
+        self.threshold = self.cfg.rms_threshold.max(floor * self.cfg.noise_margin);
     }
 
     fn finalize(&mut self, reason: EndReason, out: &mut Vec<VadEvent>) {
@@ -291,6 +341,7 @@ mod tests {
     fn max_length_rolls_over() {
         let cfg = VadConfig {
             max_utterance_ms: 2_000,
+            noise_margin: 0.0,
             ..Default::default()
         };
         let mut vad = Vad::new(cfg, SR);
@@ -331,5 +382,49 @@ mod tests {
         assert_eq!(ends[0].1, EndReason::Pause);
         assert!(ends[0].0 >= 8_000 && ends[0].0 < 9_000, "{ends:?}");
         assert!(ends.iter().all(|(_, r)| *r != EndReason::MaxLength));
+    }
+    #[test]
+    fn steady_background_does_not_hold_an_utterance_open() {
+        // Music at 0.03 RMS, well over the fixed 0.008 threshold, with
+        // 1 s phrases at 0.2 and 1 s gaps where only the music plays.
+        let music = |ms: u32| tone(ms, 0.03 * std::f32::consts::SQRT_2);
+        let mut vad = Vad::new(VadConfig::default(), SR);
+        let mut ev = Vec::new();
+        vad.push(&music(4000), &mut ev);
+        for _ in 0..8 {
+            let mut phrase = tone(1000, 0.2);
+            for (p, m) in phrase.iter_mut().zip(music(1000)) {
+                *p += m;
+            }
+            vad.push(&phrase, &mut ev);
+            vad.push(&music(1000), &mut ev);
+        }
+        vad.flush(&mut ev);
+        let reasons: Vec<_> = ev
+            .iter()
+            .filter_map(|e| match e {
+                VadEvent::End { reason, .. } => Some(*reason),
+                _ => None,
+            })
+            .collect();
+        // The music alone until the floor is known (3 s), then one per
+        // phrase, each closed by the gap after it.
+        assert_eq!(reasons, vec![EndReason::Silence; 9]);
+
+        // Without noise tracking the music is one long utterance.
+        let cfg = VadConfig {
+            noise_margin: 0.0,
+            ..Default::default()
+        };
+        let mut vad = Vad::new(cfg, SR);
+        let mut ev = Vec::new();
+        vad.push(&music(20_000), &mut ev);
+        assert!(ev.iter().any(|e| matches!(
+            e,
+            VadEvent::End {
+                reason: EndReason::MaxLength,
+                ..
+            }
+        )));
     }
 }
