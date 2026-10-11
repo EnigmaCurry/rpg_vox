@@ -6,6 +6,8 @@ section after the version it releases.
 
 ## Unreleased
 
+## v0.1.3 (2026-10-11)
+
 ### Scribe for Android
 
 - **Voice keyboard: Pause.** Pause stops transcribing without losing
