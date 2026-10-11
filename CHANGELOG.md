@@ -20,10 +20,19 @@ section after the version it releases.
 - **`--denoise` (experimental)** runs the DeepFilterNet 3 noise filter
   on the audio before transcribing it, to push background music down
   and keep the voice. `--denoise-limit DB` caps how much it removes.
+  While it's on, `◆ denoise` shows beside the level meter (which then
+  reads the filtered level).
 - **`--pass1 off|text|ellipsis|hidden`** chooses how the live pass-1
   text is shown: as now, as a run of `…` that grows with each word
   heard, not at all while pass 1 still runs (`hidden`), or not at all
   with pass 1 skipped (`off`). Either way text appears after pass 2.
+  The colour legend under the meter follows it.
+
+### Scribe for Android
+
+- The voice keyboard shares scribe's engine, so it gets the same two
+  background-music fixes: pauses count as silence over steady
+  background, and audio with no new words closes after 1.5 seconds.
 
 ## v0.1.3 (2026-10-11)
 
