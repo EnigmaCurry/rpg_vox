@@ -171,6 +171,13 @@ class ScribeKeyboard : InputMethodService() {
             addView(breakButton, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT))
             addView(pauseButton)
             addView(insertButton)
+            // Buttons default to a wide minimum; five of those overflow a
+            // phone, pushing ⌨ off the left edge. Size each to its label.
+            for (i in 0 until childCount) (getChildAt(i) as? Button)?.apply {
+                minWidth = 0
+                minimumWidth = 0
+                setPadding(dp(14), paddingTop, dp(14), paddingBottom)
+            }
         }
         return LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
