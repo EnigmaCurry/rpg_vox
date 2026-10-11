@@ -767,6 +767,12 @@ fn draw(f: &mut Frame, app: &App, s: &Session) {
             "○ quiet".dark_gray()
         },
     ];
+    // The level is measured after the filter.
+    match s.denoise {
+        Some(db) if db.is_finite() => meter.push(format!("  ◆ denoise ≤{db:.0} dB").magenta()),
+        Some(_) => meter.push("  ◆ denoise".magenta()),
+        None => {}
+    }
     if overruns > 0 {
         meter.push(format!("  dropped {overruns} samples").red());
     }
@@ -784,8 +790,12 @@ fn draw(f: &mut Frame, app: &App, s: &Session) {
     let legend = match long_status {
         Some(msg) => Line::from(format!(" {msg}").yellow()),
         None => Line::from(vec![
-            " LIVE CAPS".dark_gray().italic(),
-            " · re-decoded".into(),
+            match s.pass1 {
+                crate::Pass1::Text => " LIVE CAPS ·".dark_gray().italic(),
+                crate::Pass1::Ellipsis => " … live ·".dark_gray().italic(),
+                crate::Pass1::Off => "".into(),
+            },
+            " re-decoded".into(),
             " · boundary-fixed".green(),
             if s.llm {
                 " · LLM-fixed".fg(LLM_BLUE)

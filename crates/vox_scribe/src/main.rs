@@ -360,6 +360,8 @@ pub struct Session {
     pub diarize: bool,
     /// --pass1: how streaming text is shown.
     pub pass1: Pass1,
+    /// --denoise, with its limit in dB (infinite for none).
+    pub denoise: Option<f32>,
     /// --record: the audio is being saved too.
     pub recording: bool,
     /// --speakers N, or the number of sources.
@@ -1237,6 +1239,7 @@ fn main() -> Result<()> {
         live: cli.live,
         diarize: cli.diarize,
         pass1: cli.pass1,
+        denoise,
         recording: record.is_some(),
         num_speakers,
         pumps: Mutex::new(pumps),
