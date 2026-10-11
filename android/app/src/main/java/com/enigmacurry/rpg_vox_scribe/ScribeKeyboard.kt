@@ -20,7 +20,10 @@ import android.text.Spanned
 import android.text.style.ForegroundColorSpan
 import android.util.Log
 import android.util.TypedValue
+import android.view.ActionMode
 import android.view.Gravity
+import android.view.Menu
+import android.view.MenuItem
 import android.view.View
 import android.view.WindowInsets
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
@@ -35,13 +38,16 @@ import org.json.JSONObject
 
 private const val TAG = "ScribeKeyboard"
 private const val RATE = 16_000
+private const val DELETE = 1
 
 /**
  * Voice keyboard: pick Scribe as the input method in any app and it
  * starts listening, shows the live transcript (partials dimmed), and
  * Insert types the finished text into the field once passes 2 and 3 are
  * done, then switches back to the previous keyboard. Pause mutes the mic
- * without closing it, so Resume picks up at once. Uses the models
+ * without closing it, so Resume picks up at once. Selecting text offers
+ * Delete for its finished words; the cut is by time, so it holds when
+ * later passes rewrite the paragraph. Uses the models
  * the app loaded, loading them if needed.
  */
 class ScribeKeyboard : InputMethodService() {
@@ -54,6 +60,14 @@ class ScribeKeyboard : InputMethodService() {
     private lateinit var pauseButton: Button
 
     private var session: Dictation? = null
+    /** The latest paragraphs, to redraw after a cut. */
+    private var paras: List<KPara> = emptyList()
+    /** Spans of the session's audio (ms) whose words were deleted. */
+    private val cuts = mutableListOf<LongRange>()
+    /** Where each finished word is in [transcript]'s text, and its time. */
+    private var placed: List<Pair<IntRange, Word>> = emptyList()
+    /** A selection is open: updates wait, so it isn't wiped by a redraw. */
+    private var selecting = false
     /** Waiting for the models to load before starting. */
     private var waiting = false
     private var dark = false
@@ -74,7 +88,8 @@ class ScribeKeyboard : InputMethodService() {
         transcript = TextView(this).apply {
             setTextColor(fg)
             textSize = 18f
-            setTextIsSelectable(false)
+            setTextIsSelectable(true)
+            customSelectionActionModeCallback = DeleteAction()
         }
         scroll = ScrollView(this).apply {
             addView(transcript, MATCH_PARENT, WRAP_CONTENT)
@@ -152,6 +167,8 @@ class ScribeKeyboard : InputMethodService() {
 
     private fun begin() {
         transcript.text = ""
+        paras = emptyList()
+        cuts.clear()
         insertButton.isEnabled = false
         pauseButton.isEnabled = false
         pauseButton.text = "Pause"
@@ -221,25 +238,68 @@ class ScribeKeyboard : InputMethodService() {
         ).also { it.start() }
     }
 
-    private fun render(paras: List<Para>) {
+    private fun isCut(w: Word) = cuts.any { w.startMs in it }
+
+    /** [c]'s words that weren't deleted, each with its time if it has one. */
+    private fun kept(c: KClip): List<Pair<String, Word?>> =
+        c.words.mapIndexedNotNull { i, s ->
+            val t = c.times.getOrNull(i)
+            if (t != null && isCut(t)) null else s to t
+        }
+
+    private fun render(paras: List<KPara>) {
+        this.paras = paras
+        if (selecting) return
         val dim = 0xFF888888.toInt()
         val sb = SpannableStringBuilder()
+        val placed = mutableListOf<Pair<IntRange, Word>>()
         for (p in paras) {
-            val clips = p.clips.filter { it.text.isNotBlank() }
-            if (clips.isEmpty()) continue
+            val words = p.clips.flatMap { c -> kept(c).map { Triple(it.first, it.second, c.partial) } }
+            if (words.isEmpty()) continue
             if (sb.isNotEmpty()) sb.append("\n\n")
-            clips.forEachIndexed { i, c ->
+            words.forEachIndexed { i, (s, t, partial) ->
                 if (i > 0) sb.append(' ')
                 val at = sb.length
-                sb.append(c.text)
-                if (c.partial) sb.setSpan(ForegroundColorSpan(dim), at, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                sb.append(s)
+                when {
+                    partial -> sb.setSpan(ForegroundColorSpan(dim), at, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                    t != null -> placed += (at until sb.length) to t
+                }
             }
         }
         // Follow new text only while already at the bottom, so scrolling
         // up to reread earlier text isn't undone by the next update.
         val atBottom = !scroll.canScrollVertically(1)
         transcript.text = sb
+        this.placed = placed
         if (atBottom) scroll.post { scroll.fullScroll(View.FOCUS_DOWN) }
+    }
+
+    /** Adds Delete to the selection's menu: it cuts every finished word the selection touches. */
+    private inner class DeleteAction : ActionMode.Callback {
+        override fun onCreateActionMode(mode: ActionMode, menu: Menu): Boolean {
+            selecting = true
+            menu.add(Menu.NONE, DELETE, 0, "Delete")
+            return true
+        }
+
+        override fun onPrepareActionMode(mode: ActionMode, menu: Menu) = false
+
+        override fun onActionItemClicked(mode: ActionMode, item: MenuItem): Boolean {
+            if (item.itemId != DELETE) return false
+            val a = minOf(transcript.selectionStart, transcript.selectionEnd)
+            val b = maxOf(transcript.selectionStart, transcript.selectionEnd)
+            for ((at, w) in placed) {
+                if (at.first < b && at.last >= a) cuts += w.startMs..maxOf(w.startMs, w.endMs - 1)
+            }
+            mode.finish()
+            return true
+        }
+
+        override fun onDestroyActionMode(mode: ActionMode) {
+            selecting = false
+            render(paras)
+        }
     }
 
     private fun togglePause() {
@@ -258,7 +318,8 @@ class ScribeKeyboard : InputMethodService() {
         s.finish { paras ->
             val ic = currentInputConnection
             val multiLine = (currentInputEditorInfo?.inputType ?: 0) and EditorInfo.TYPE_TEXT_FLAG_MULTI_LINE != 0
-            var text = paras.map { it.text.trim() }.filter { it.isNotEmpty() }
+            var text = paras.map { p -> p.clips.flatMap { c -> kept(c).map { it.first } }.joinToString(" ") }
+                .filter { it.isNotEmpty() }
                 .joinToString(if (multiLine) "\n\n" else " ")
             if (ic != null && text.isNotEmpty()) {
                 val before = ic.getTextBeforeCursor(1, 0)
@@ -287,7 +348,7 @@ private class Dictation(
     private val boost: Boost,
     private val route: MicRoute,
     private val main: Handler,
-    private val onChange: (List<Para>) -> Unit,
+    private val onChange: (List<KPara>) -> Unit,
 ) {
     private var session = 0L
     @Volatile private var capturing = true
@@ -297,7 +358,7 @@ private class Dictation(
     @Volatile var paused = false
     private var capture: Thread? = null
     private var poller: Thread? = null
-    private val paras = LinkedHashMap<String, Para>()
+    private val paras = LinkedHashMap<String, KPara>()
 
     fun start() {
         session = Native.start(models, RATE, true, null)
@@ -374,7 +435,7 @@ private class Dictation(
     }
 
     /** Stop listening, let the passes finish, then hand back the final paragraphs on [main]. */
-    fun finish(done: (List<Para>) -> Unit) = end { json ->
+    fun finish(done: (List<KPara>) -> Unit) = end { json ->
         val list = JSONObject(json).optJSONArray("paragraphs") ?: JSONArray()
         val final = (0 until list.length()).map { parse(list.getJSONObject(it)) }
         main.post { done(final) }
@@ -398,14 +459,41 @@ private class Dictation(
         }, "ime-finish").start()
     }
 
-    private fun parse(o: JSONObject): Para {
+    private fun parse(o: JSONObject): KPara {
         val clips = o.getJSONArray("clips")
-        return Para(
+        return KPara(
             id = o.getString("id"),
-            clips = (0 until clips.length()).map {
-                val c = clips.getJSONObject(it)
-                ClipUi(c.getString("text"), c.getString("stage") == "partial")
-            },
+            clips = (0 until clips.length()).map { clip(clips.getJSONObject(it)) },
         )
     }
+
+    private fun clip(c: JSONObject): KClip {
+        val text = c.getString("text")
+        val partial = c.getString("stage") == "partial"
+        val words = text.split(Regex("\\s+")).filter { it.isNotEmpty() }
+        if (partial || words.isEmpty()) return KClip(partial, words, emptyList())
+        val timed = parseWords(c.optJSONArray("words"))
+        val times = if (timed.size == words.size) {
+            timed
+        } else {
+            // A pass changed the words without timing them: spread the
+            // new ones over the clip, keeping the times of those that match.
+            val start = c.getLong("start_ms")
+            val end = start + c.optLong("duration_ms", 0)
+            runCatching { parseWords(Native.alignWords(timed.toJson(), text, start, end)) }
+                .getOrDefault(emptyList())
+                .takeIf { it.size == words.size }
+                .orEmpty()
+        }
+        return KClip(partial, words, times)
+    }
 }
+
+/** A keyboard paragraph, in the order its clips were said. */
+private class KPara(val id: String, val clips: List<KClip>)
+
+/**
+ * One clip's [words] as shown, with their [times] in the session's audio
+ * when known (finished clips); a word without a time can't be tapped away.
+ */
+private class KClip(val partial: Boolean, val words: List<String>, val times: List<Word>)
