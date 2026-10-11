@@ -137,12 +137,10 @@ class ScribeKeyboard : InputMethodService() {
         transcript.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
             if (follow) scroll.post { revealCaret() }
         }
+        // Back to the other keyboard, dropping what was said: Cancel and
+        // switch keyboards in one.
         val keyboards = Button(this).apply {
             text = "⌨"
-            setOnClickListener { leave() }
-        }
-        val cancel = Button(this).apply {
-            text = "Cancel"
             setOnClickListener {
                 session?.cancel()
                 session = null
@@ -165,7 +163,7 @@ class ScribeKeyboard : InputMethodService() {
         val buttons = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             // All the same width, sharing the row, so each is easy to hit.
-            for (b in listOf(keyboards, cancel, breakButton, pauseButton, insertButton)) {
+            for (b in listOf(keyboards, breakButton, pauseButton, insertButton)) {
                 b.minWidth = 0
                 b.minimumWidth = 0
                 b.setPadding(0, b.paddingTop, 0, b.paddingBottom)
@@ -233,7 +231,7 @@ class ScribeKeyboard : InputMethodService() {
 
     override fun onFinishInputView(finishingInput: Boolean) {
         // Hidden: keep listening (unless paused), so you can switch apps
-        // to read something out; Insert or Cancel ends it.
+        // to read something out; Insert or ⌨ ends it.
         waiting = false
         showLoading(false)
         super.onFinishInputView(finishingInput)
