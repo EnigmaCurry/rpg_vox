@@ -45,6 +45,7 @@ import org.json.JSONObject
 private const val TAG = "ScribeKeyboard"
 private const val RATE = 16_000
 private const val DELETE = 1
+private const val EDIT = 2
 /**
  * Stands in for the cursor in the transcript's text, drawn by [CaretSpan].
  * Not a space: a space ending a line isn't drawn, so the cursor vanished
@@ -59,8 +60,10 @@ private const val CARET = '|'
  * done, then switches back to the previous keyboard. Pause mutes the mic
  * without closing it, so Resume picks up at once. Selecting text offers
  * Delete for its finished words, and a tap moves the purple cursor, where
- * new speech goes, to the nearest gap between words. Both work by time in
- * the session's audio, so they hold when later passes rewrite the text. Uses the models
+ * new speech goes, to the nearest gap between words. Edit, also on the
+ * selection's menu, pauses and retypes the words on a small built-in
+ * keyboard. All of it works by time in the session's audio, so it holds
+ * when later passes rewrite the text. Uses the models
  * the app loaded, loading them if needed.
  */
 class ScribeKeyboard : InputMethodService() {
@@ -75,6 +78,10 @@ class ScribeKeyboard : InputMethodService() {
     /** The transcript and buttons, hidden behind [loading] while the models load. */
     private lateinit var content: LinearLayout
     private lateinit var loading: TextView
+    /** Edit mode: the line being typed and Scribe's own keys, over [content]. */
+    private lateinit var editPanel: LinearLayout
+    private lateinit var editLine: TextView
+    private val letterKeys = mutableListOf<Button>()
 
     private var session: Dictation? = null
     /** The latest paragraphs, to redraw after a cut. */
@@ -83,6 +90,10 @@ class ScribeKeyboard : InputMethodService() {
     private val cuts = mutableListOf<LongRange>()
     /** Paragraph breaks, each at a time on the session's audio clock (ms). */
     private val breaks = mutableListOf<Long>()
+    /** Words retyped in edit mode, standing where the first word they replace was said. */
+    private val edits = mutableListOf<Edit>()
+    /** The open edit, or null outside edit mode. */
+    private var editing: PendingEdit? = null
     /** Cursor moves, in order: speech from each one's [Insertion.fromMs] on goes there. */
     private val inserts = mutableListOf<Insertion>()
     /** The transcript as last drawn, in order, hidden words and marks included. */
@@ -203,12 +214,145 @@ class ScribeKeyboard : InputMethodService() {
                 gravity = Gravity.CENTER
                 visibility = View.GONE
             }
-            // Stacked, so the keyboard keeps its height while loading.
+            editPanel = buildEditPanel(fg, dp)
+            // Stacked, so the keyboard keeps its height while loading or editing.
             addView(FrameLayout(context).apply {
                 addView(content, MATCH_PARENT, WRAP_CONTENT)
                 addView(loading, MATCH_PARENT, MATCH_PARENT)
+                addView(editPanel, MATCH_PARENT, MATCH_PARENT)
             }, MATCH_PARENT, WRAP_CONTENT)
         }
+    }
+
+    /** The edit line over four rows of keys: a plain layout, no prediction. */
+    private fun buildEditPanel(fg: Int, dp: (Int) -> Int): LinearLayout {
+        editLine = TextView(this).apply {
+            setTextColor(fg)
+            textSize = 20f
+            setSingleLine()
+            setPadding(dp(4), dp(6), dp(4), dp(6))
+            setOnTouchListener { v, e ->
+                if (e.action == MotionEvent.ACTION_UP) {
+                    val ed = editing
+                    if (ed != null) {
+                        var at = (v as TextView).getOffsetForPosition(e.x, e.y)
+                        if (at > ed.cursor) at-- // past the caret's own character
+                        ed.cursor = at.coerceIn(0, ed.text.length)
+                        drawEdit()
+                    }
+                }
+                true
+            }
+        }
+        fun key(label: String, weight: Float = 1f, onTap: () -> Unit) = Button(this).apply {
+            text = label
+            isAllCaps = false
+            textSize = 17f
+            minWidth = 0
+            minimumWidth = 0
+            minHeight = 0
+            minimumHeight = 0
+            setPadding(0, 0, 0, 0)
+            setOnClickListener { onTap() }
+            layoutParams = LinearLayout.LayoutParams(0, MATCH_PARENT, weight).apply { marginEnd = dp(3) }
+        }
+        fun row(vararg keys: Button) = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            keys.forEach { addView(it) }
+        }
+        fun letters(chars: String) = chars.map { c ->
+            key(c.toString()) { typeKey(if (c.isLetter() && editing?.shift == true) c.uppercaseChar() else c) }
+                .also { if (c.isLetter()) letterKeys += it }
+        }.toTypedArray()
+        letterKeys.clear()
+        val rows = listOf(
+            row(*letters("qwertyuiop")),
+            row(*letters("asdfghjkl'")),
+            row(key("⇧") { editing?.let { it.shift = !it.shift; drawEdit() } }, *letters("zxcvbnm-"), key("⌫") { backspace() }),
+            row(
+                key("Cancel", 2f) { closeEdit(apply = false) },
+                key(",") { typeKey(',') },
+                key("space", 4f) { typeKey(' ') },
+                key(".") { typeKey('.') },
+                key("OK", 2f) { closeEdit(apply = true) }.apply { setTypeface(typeface, Typeface.BOLD) },
+            ),
+        )
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+            setBackgroundColor(if (dark) 0xFF1E1F22.toInt() else 0xFFF1F3F4.toInt())
+            addView(editLine, MATCH_PARENT, WRAP_CONTENT)
+            rows.forEach { addView(it, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f).apply { bottomMargin = dp(3) }) }
+        }
+    }
+
+    /**
+     * Edit the selection's words: pause, and retype them on the built-in
+     * keys. Partial words and breaks in the selection are left as they are.
+     */
+    private fun openEdit(a: Int, b: Int) {
+        val s = session ?: return
+        val picked = placed.filter { (at, i) -> at.first < b && at.last >= a && !doc[i].brk }.map { doc[it.second] }
+        if (picked.isEmpty()) return
+        val text = picked.joinToString(" ") { it.text }
+        editing = PendingEdit(
+            cut = picked.mapNotNull { t -> t.time?.let { it.startMs..maxOf(it.startMs, it.endMs - 1) } },
+            drop = picked.mapNotNull { it.edit },
+            ms = picked.minOf { it.ms },
+            wasPaused = s.paused,
+            text = StringBuilder(text),
+            cursor = text.length,
+        )
+        s.paused = true
+        editPanel.visibility = View.VISIBLE
+        content.visibility = View.INVISIBLE
+        drawEdit()
+    }
+
+    /** Leave edit mode, replacing the words with what was typed if [apply]; listening resumes unless it was paused before. */
+    private fun closeEdit(apply: Boolean) {
+        val ed = editing ?: return
+        editing = null
+        editPanel.visibility = View.GONE
+        content.visibility = View.VISIBLE
+        if (apply) {
+            cuts += ed.cut
+            edits.removeAll(ed.drop)
+            val text = ed.text.split(' ').filter { it.isNotEmpty() }.joinToString(" ")
+            if (text.isNotEmpty()) edits += Edit(ed.ms, text)
+        }
+        session?.let {
+            it.paused = ed.wasPaused
+            pauseButton.text = if (it.paused) "Resume" else "Pause"
+            status.text = if (it.paused) "Paused" else "Listening…"
+        }
+        render(paras)
+    }
+
+    private fun typeKey(c: Char) {
+        val ed = editing ?: return
+        ed.text.insert(ed.cursor, c)
+        ed.cursor++
+        ed.shift = false
+        drawEdit()
+    }
+
+    private fun backspace() {
+        val ed = editing ?: return
+        if (ed.cursor == 0) return
+        ed.text.deleteCharAt(ed.cursor - 1)
+        ed.cursor--
+        drawEdit()
+    }
+
+    private fun drawEdit() {
+        val ed = editing ?: return
+        val sb = SpannableStringBuilder(ed.text)
+        sb.insert(ed.cursor, CARET.toString())
+        val purple = if (dark) 0xFFCE93D8.toInt() else 0xFF8E24AA.toInt()
+        sb.setSpan(CaretSpan(purple, resources.displayMetrics.density * 2), ed.cursor, ed.cursor + 1, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        editLine.text = sb
+        for (k in letterKeys) k.text = k.text.toString().let { if (ed.shift) it.uppercase() else it.lowercase() }
     }
 
     private fun showLoading(on: Boolean) {
@@ -250,7 +394,9 @@ class ScribeKeyboard : InputMethodService() {
     private fun begin() {
         transcript.text = ""
         paras = emptyList()
+        if (editing != null) closeEdit(apply = false)
         cuts.clear()
+        edits.clear()
         breaks.clear()
         inserts.clear()
         insertButton.isEnabled = false
@@ -353,7 +499,8 @@ class ScribeKeyboard : InputMethodService() {
                     Tok(w, t, ms, c.partial, segOf(ms), head = i == 0)
                 }
             }
-        } + breaks.map { Tok("\n\n", null, it, false, segOf(it), brk = true) }
+        } + breaks.map { Tok("\n\n", null, it, false, segOf(it), brk = true) } +
+            edits.map { Tok(it.text, null, it.ms, false, segOf(it.ms), edit = it) }
         // sortedBy is stable: words of one clip keep their order.
         val bySeg = toks.sortedBy { it.ms }.groupBy { it.seg }
         val doc = mutableListOf(Tok.mark(0))
@@ -406,6 +553,7 @@ class ScribeKeyboard : InputMethodService() {
             while (m < words.size) {
                 val t = doc[words[m]]
                 if (m > k && (t.head || t.brk || t.partial || t.seg != doc[words[k]].seg)) break
+                if (t.edit != null) break // typed by hand: as typed
                 if (!upper(t) || name(t.text)) break
                 out[words[m]] = out[words[m]].withText(out[words[m]].text.replaceFirstChar { it.lowercaseChar() })
                 m++
@@ -417,7 +565,7 @@ class ScribeKeyboard : InputMethodService() {
             val j = words[k]
             val prev = doc[i]
             val t = doc[j]
-            if (t.brk || prev.brk || t.partial || prev.partial) continue
+            if (t.brk || prev.brk || t.partial || prev.partial || t.edit != null || prev.edit != null) continue
             val head = t.text
             if (t.seg == prev.seg) {
                 // An utterance within a fragment: carry the sentence on.
@@ -473,7 +621,7 @@ class ScribeKeyboard : InputMethodService() {
             sb.append(t.text)
             when {
                 t.partial -> sb.setSpan(ForegroundColorSpan(dim), at, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-                t.time != null || t.brk -> placed += (at until sb.length) to i
+                t.time != null || t.brk || t.edit != null -> placed += (at until sb.length) to i
             }
         }
         if (cursor == doc.size) caret()
@@ -530,26 +678,38 @@ class ScribeKeyboard : InputMethodService() {
         render(paras)
     }
 
-    /** Adds Delete to the selection's menu: it cuts every finished word the selection touches. */
+    /**
+     * Adds Delete and Edit to the selection's menu. Delete cuts every
+     * finished word the selection touches; Edit retypes them.
+     */
     private inner class DeleteAction : ActionMode.Callback {
         override fun onCreateActionMode(mode: ActionMode, menu: Menu): Boolean {
             selecting = true
             menu.add(Menu.NONE, DELETE, 0, "Delete")
+            menu.add(Menu.NONE, EDIT, 1, "Edit")
             return true
         }
 
         override fun onPrepareActionMode(mode: ActionMode, menu: Menu) = false
 
         override fun onActionItemClicked(mode: ActionMode, item: MenuItem): Boolean {
-            if (item.itemId != DELETE) return false
             val a = minOf(transcript.selectionStart, transcript.selectionEnd)
             val b = maxOf(transcript.selectionStart, transcript.selectionEnd)
+            if (item.itemId == EDIT) {
+                // Before finish(): that redraws with any held-back updates,
+                // and a and b are offsets in the text as it is now.
+                openEdit(a, b)
+                mode.finish()
+                return true
+            }
+            if (item.itemId != DELETE) return false
             for ((at, i) in placed) {
                 if (at.first >= b || at.last < a) continue
                 val t = doc[i]
                 val w = t.time
                 when {
                     t.brk -> breaks.remove(t.ms)
+                    t.edit != null -> edits.remove(t.edit)
                     w != null -> cuts += w.startMs..maxOf(w.startMs, w.endMs - 1)
                 }
             }
@@ -652,13 +812,32 @@ private class Tok(
     val brk: Boolean = false,
     /** First word of its clip (utterance). */
     val head: Boolean = false,
+    /** Typed in edit mode, not heard. */
+    val edit: Edit? = null,
 ) {
-    fun withText(text: String) = Tok(text, time, ms, partial, seg, mark, brk, head)
+    fun withText(text: String) = Tok(text, time, ms, partial, seg, mark, brk, head, edit)
 
     companion object {
         fun mark(seg: Int) = Tok("", null, Long.MIN_VALUE, false, seg, mark = true)
     }
 }
+
+/** Words typed in edit mode, placed at [ms] on the session's audio clock. */
+private class Edit(val ms: Long, val text: String)
+
+/**
+ * An open edit: the words it replaces ([cut] spans and earlier [drop]
+ * edits), where its text goes ([ms]), and the line being typed.
+ */
+private class PendingEdit(
+    val cut: List<LongRange>,
+    val drop: List<Edit>,
+    val ms: Long,
+    val wasPaused: Boolean,
+    val text: StringBuilder,
+    var cursor: Int,
+    var shift: Boolean = false,
+)
 
 /** The cursor: a full-height bar [width] px wide. */
 private class CaretSpan(color: Int, private val width: Float) : ReplacementSpan() {
