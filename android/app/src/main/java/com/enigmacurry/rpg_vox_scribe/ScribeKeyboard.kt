@@ -276,7 +276,8 @@ class ScribeKeyboard : InputMethodService() {
         for (p in paras) {
             val words = p.clips.flatMap { c -> kept(c).map { Triple(it.first, it.second, c.partial) } }
             if (words.isEmpty()) continue
-            if (sb.isNotEmpty()) sb.append("\n\n")
+            // One running paragraph: the engine's breaks are pauses, not intent.
+            if (sb.isNotEmpty()) sb.append(' ')
             words.forEachIndexed { i, (s, t, partial) ->
                 if (i > 0) sb.append(' ')
                 val at = sb.length
@@ -336,10 +337,9 @@ class ScribeKeyboard : InputMethodService() {
         status.text = "Finishing…"
         s.finish { paras ->
             val ic = currentInputConnection
-            val multiLine = (currentInputEditorInfo?.inputType ?: 0) and EditorInfo.TYPE_TEXT_FLAG_MULTI_LINE != 0
             var text = paras.map { p -> p.clips.flatMap { c -> kept(c).map { it.first } }.joinToString(" ") }
                 .filter { it.isNotEmpty() }
-                .joinToString(if (multiLine) "\n\n" else " ")
+                .joinToString(" ")
             if (ic != null && text.isNotEmpty()) {
                 val before = ic.getTextBeforeCursor(1, 0)
                 if (!before.isNullOrEmpty() && !before.last().isWhitespace()) text = " $text"
