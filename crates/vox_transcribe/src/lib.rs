@@ -18,6 +18,7 @@
 
 pub mod boundary;
 pub mod correct;
+pub mod denoise;
 pub mod diarize;
 pub mod digits;
 pub mod engine;

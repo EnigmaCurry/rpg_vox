@@ -17,6 +17,9 @@ section after the version it releases.
 - **Pass 2 doesn't wait on sound without words.** When the live
   transcription (pass 1) has heard no new word for 1.5 seconds, the
   utterance closes even if it's still loud, and pass 2 runs on it.
+- **`--denoise` (experimental)** runs the DeepFilterNet 3 noise filter
+  on the audio before transcribing it, to push background music down
+  and keep the voice. `--denoise-limit DB` caps how much it removes.
 
 ## v0.1.3 (2026-10-11)
 

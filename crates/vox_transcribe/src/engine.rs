@@ -23,6 +23,7 @@ use uuid::Uuid;
 
 use crate::boundary::{self, BoundaryConfig, WindowClip};
 use crate::correct::{apply_edits, Corrector, Edit};
+use crate::denoise::Denoiser;
 use crate::digits::spoken_digits;
 use crate::filters::{count_words, ends_on_sentence, is_junk};
 use crate::model::{Clip, Paragraph, Pass4, Stage, Transcript};
@@ -87,6 +88,11 @@ pub struct EngineConfig {
     /// words pass 1 missed are kept.
     /// 0 turns it off.
     pub word_stall_ms: u64,
+    /// Experimental: run the DeepFilterNet noise filter on the audio
+    /// before everything else, pushing background down by at most this
+    /// many dB (`f32::INFINITY` for all it can). Needs the `deepfilter`
+    /// feature; without it a warning is logged and audio is left alone.
+    pub denoise: Option<f32>,
 }
 
 impl EngineConfig {
@@ -101,6 +107,7 @@ impl EngineConfig {
             level_interval_ms: 50,
             spoken_digits: true,
             word_stall_ms: 1_500,
+            denoise: None,
         }
     }
 }
@@ -398,6 +405,7 @@ struct Core {
     pass3_pending: HashSet<String>,
     level_max: f32,
     level_next: u64,
+    denoiser: Option<Denoiser>,
 }
 
 impl Core {
@@ -409,7 +417,14 @@ impl Core {
         bound_tx: Sender<Job>,
     ) -> Self {
         let rate = cfg.sample_rate;
+        let denoiser = cfg.denoise.and_then(|db| {
+            let lim = db.is_finite().then_some(db);
+            Denoiser::new(rate, lim)
+                .inspect_err(|e| warn!(error = %e, "no noise filter"))
+                .ok()
+        });
         Self {
+            denoiser,
             vad: Vad::new(cfg.vad.clone(), rate),
             ring: AudioRing::new((rate as u64 * cfg.ring_ms / 1000) as usize),
             streaming,
@@ -517,6 +532,14 @@ impl Core {
     // ----- audio path ----------------------------------------------------
 
     fn on_audio(&mut self, mono: &[f32]) {
+        let cleaned;
+        let mono = match self.denoiser.as_mut() {
+            Some(d) => {
+                cleaned = d.process(mono);
+                &cleaned[..]
+            }
+            None => mono,
+        };
         self.ring.push(mono);
         let mut evs = Vec::new();
         self.vad.push(mono, &mut evs);

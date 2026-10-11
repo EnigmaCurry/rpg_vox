@@ -10,6 +10,11 @@ description = "Live layered transcription in the terminal, saved as markdown"
 name = "scribe"
 path = "src/main.rs"
 
+[features]
+default = ["denoise"]
+# --denoise (DeepFilterNet 3, built in).
+denoise = ["vox_transcribe/deepfilter"]
+
 [dependencies]
 vox_transcribe = { path = "../vox_transcribe", features = ["llm", "sherpa-static"] }
 vox_audio = { path = "../vox_audio" }

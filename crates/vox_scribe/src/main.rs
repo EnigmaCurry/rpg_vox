@@ -137,6 +137,20 @@ struct Cli {
     /// Start new paragraphs only on Enter, not on silence (toggle with `m`).
     #[arg(long)]
     manual: bool,
+    /// Experimental: filter background music and noise out of the audio
+    /// (DeepFilterNet 3) before transcribing it. The recording (--record)
+    /// stays unfiltered.
+    #[arg(long, env = "VOX_SCRIBE_DENOISE")]
+    denoise: bool,
+    /// With --denoise: push the background down by at most this many dB
+    /// rather than all the way, e.g. 20 leaves a little in.
+    #[arg(
+        long,
+        value_name = "DB",
+        requires = "denoise",
+        env = "VOX_SCRIBE_DENOISE_LIMIT"
+    )]
+    denoise_limit: Option<f32>,
     /// One-shot: record a single manual paragraph until Enter, then
     /// finish every pass, copy the text to the clipboard and exit.
     /// q / Esc / Ctrl-C cancels without copying. Only one runs at a time:
@@ -372,18 +386,23 @@ struct Spawner {
     corrector: Option<Arc<dyn Corrector>>,
     /// --record: the mix every live source goes into.
     mixer: Option<Arc<Mutex<sources::Mixer>>>,
+    /// --denoise, with its limit (see [`EngineConfig::denoise`]).
+    denoise: Option<f32>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn new_engine(
     rate: u32,
     manual: bool,
     chat: bool,
+    denoise: Option<f32>,
     zipformer: Option<&Zipformer>,
     offline: &Arc<dyn vox_transcribe::OfflineRecognizer>,
     corrector: &Option<Arc<dyn Corrector>>,
     tagger: Option<Box<dyn SpeakerTagger>>,
 ) -> Engine {
     let mut cfg = EngineConfig::new(rate);
+    cfg.denoise = denoise;
     if manual {
         cfg.paragraph.mode = ParagraphMode::Manual;
     }
@@ -487,6 +506,7 @@ impl Session {
             rate,
             self.manual.load(Ordering::Relaxed),
             false,
+            sp.denoise,
             sp.zipformer.as_ref(),
             &sp.offline,
             &sp.corrector,
@@ -1044,6 +1064,9 @@ fn main() -> Result<()> {
     };
 
     let manual = cli.manual || cli.once || cli.chat.is_some();
+    let denoise = cli
+        .denoise
+        .then(|| cli.denoise_limit.unwrap_or(f32::INFINITY));
     let mut tagger = tagger;
     let engines: Vec<Engine> = srcs
         .iter()
@@ -1052,6 +1075,7 @@ fn main() -> Result<()> {
                 *rate,
                 manual,
                 cli.chat.is_some(),
+                denoise,
                 zipformer.as_ref(),
                 &offline,
                 &corrector,
@@ -1152,6 +1176,7 @@ fn main() -> Result<()> {
         zipformer,
         corrector: corrector.clone(),
         mixer: mixer.clone(),
+        denoise,
     });
     let labelled = engine.labelled();
 
