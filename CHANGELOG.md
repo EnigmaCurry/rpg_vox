@@ -6,6 +6,26 @@ section after the version it releases.
 
 ## Unreleased
 
+### Scribe for Android
+
+- **Voice keyboard: Pause.** Pause stops transcribing without losing
+  what you have; the mic stays open so Resume picks up at once.
+- **Keeps going when hidden.** Switching apps no longer throws the
+  dictation away: it keeps listening (unless paused), so you can switch
+  to read something out, and the text is there when you come back.
+- **Purple cursor.** It marks where new speech goes. Tap between words
+  to move it; what you say next goes there. Capitals and full stops
+  where speech lands mid-sentence are fixed up ("a Brown dog." becomes
+  "a brown dog").
+- **Delete and Edit** in the text selection menu. Edit pauses and
+  retypes the selected words on a small built-in keyboard.
+- **¶ button** for a paragraph break at the cursor; otherwise the text
+  is one paragraph, with no automatic breaks.
+- The transcript follows the cursor as it grows. While the speech models
+  load, the keyboard shows "Loading models…".
+- Buttons are ⌨ (back to your other keyboard, discarding the dictation),
+  ¶, Pause and Done (formerly Insert), all the same width.
+
 ## v0.1.2 (2026-10-08)
 
 ### Scribe for Android
