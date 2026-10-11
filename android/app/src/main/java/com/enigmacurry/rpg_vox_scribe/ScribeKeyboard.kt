@@ -68,6 +68,8 @@ class ScribeKeyboard : InputMethodService() {
     private var placed: List<Pair<IntRange, Word>> = emptyList()
     /** A selection is open: updates wait, so it isn't wiped by a redraw. */
     private var selecting = false
+    /** Keep the newest text in view: the transcript was at its bottom when last updated. */
+    private var follow = true
     /** Waiting for the models to load before starting. */
     private var waiting = false
     private var dark = false
@@ -91,8 +93,16 @@ class ScribeKeyboard : InputMethodService() {
             setTextIsSelectable(true)
             customSelectionActionModeCallback = DeleteAction()
         }
-        scroll = ScrollView(this).apply {
+        scroll = object : ScrollView(this) {
+            // The selectable text's cursor sits at its start; don't let
+            // it drag the view back to the top on every update.
+            override fun requestChildRectangleOnScreen(child: View, rect: android.graphics.Rect, immediate: Boolean) = false
+        }.apply {
             addView(transcript, MATCH_PARENT, WRAP_CONTENT)
+        }
+        // Scroll once the new text is laid out, not before.
+        transcript.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
+            if (follow) scroll.post { scroll.scrollTo(0, maxOf(0, transcript.height - scroll.height)) }
         }
         val keyboards = Button(this).apply {
             text = "⌨"
@@ -279,10 +289,9 @@ class ScribeKeyboard : InputMethodService() {
         }
         // Follow new text only while already at the bottom, so scrolling
         // up to reread earlier text isn't undone by the next update.
-        val atBottom = !scroll.canScrollVertically(1)
+        follow = !scroll.canScrollVertically(1)
         transcript.text = sb
         this.placed = placed
-        if (atBottom) scroll.post { scroll.fullScroll(View.FOCUS_DOWN) }
     }
 
     /** Adds Delete to the selection's menu: it cuts every finished word the selection touches. */
