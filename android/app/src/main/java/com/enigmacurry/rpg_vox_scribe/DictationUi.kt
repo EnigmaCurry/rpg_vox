@@ -169,19 +169,33 @@ private object DeleteItem
  * Typing mode: the text in an ordinary field, for the phone's keyboard,
  * focused with the keyboard up.
  */
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun Typing(value: TextFieldValue, modifier: Modifier) {
     val focus = remember { FocusRequester() }
     LaunchedEffect(Unit) { focus.requestFocus() }
-    BasicTextField(
-        value = value,
-        onValueChange = Dictations::type,
-        textStyle = MaterialTheme.typography.bodyLarge.scaled(FONT_SCALES[Scribe.fontStep])
-            .copy(color = MaterialTheme.colorScheme.onSurface),
-        cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
-        keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences),
-        modifier = modifier.padding(16.dp).focusRequester(focus),
-    )
+    var layout by remember { mutableStateOf<TextLayoutResult?>(null) }
+    val requester = remember { BringIntoViewRequester() }
+    // Keep the cursor in view as the keyboard comes up over it, and as it moves.
+    val ime = WindowInsets.isImeVisible
+    LaunchedEffect(ime, value.selection, layout) {
+        val l = layout ?: return@LaunchedEffect
+        val at = value.selection.end.coerceIn(0, l.layoutInput.text.length)
+        val r = l.getCursorRect(at)
+        requester.bringIntoView(Rect(r.left, r.top, r.right, r.bottom + r.height))
+    }
+    Box(modifier.verticalScroll(rememberScrollState()).padding(16.dp)) {
+        BasicTextField(
+            value = value,
+            onValueChange = Dictations::type,
+            textStyle = MaterialTheme.typography.bodyLarge.scaled(FONT_SCALES[Scribe.fontStep])
+                .copy(color = MaterialTheme.colorScheme.onSurface),
+            cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
+            keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences),
+            onTextLayout = { layout = it },
+            modifier = Modifier.fillMaxWidth().focusRequester(focus).bringIntoViewRequester(requester),
+        )
+    }
 }
 
 /**
