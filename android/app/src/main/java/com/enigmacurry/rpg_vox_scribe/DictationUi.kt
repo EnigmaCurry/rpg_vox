@@ -94,6 +94,20 @@ fun DictationScreen() {
     }
     if (Dictations.listening) KeepScreenOn()
     val typing = Dictations.typing
+    // Closing the keyboard ends typing: back to dictating. Only once it
+    // has been up, not while it's still opening.
+    val ime = WindowInsets.isImeVisible
+    var imeWasUp by remember { mutableStateOf(false) }
+    LaunchedEffect(ime, typing != null) {
+        when {
+            typing == null -> imeWasUp = false
+            ime -> imeWasUp = true
+            imeWasUp -> {
+                imeWasUp = false
+                Dictations.dictateMode()
+            }
+        }
+    }
     val hasText = if (typing != null) typing.text.isNotBlank() else Dictations.laid.toks.isNotEmpty()
     Column(Modifier.fillMaxSize().imePadding()) {
         if (typing != null) {
@@ -102,7 +116,7 @@ fun DictationScreen() {
             Editor(Modifier.weight(1f).fillMaxWidth())
         }
         // Out of the way while the keyboard is up; ⌨️/🎙️ above still switches.
-        if (!WindowInsets.isImeVisible) Surface(tonalElevation = 3.dp) {
+        if (!ime) Surface(tonalElevation = 3.dp) {
             Column(
                 Modifier.fillMaxWidth().navigationBarsPadding().padding(16.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
