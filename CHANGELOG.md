@@ -33,25 +33,42 @@ section after the version it releases.
 - The voice keyboard shares scribe's engine, so it gets the same two
   background-music fixes: pauses count as silence over steady
   background, and audio with no new words closes after 1.5 seconds.
-- **One row of controls on every screen.** Recording, playback and
-  dictation each have a single row of round buttons mirrored around a
-  big one in the middle, under a short status line. A ring around the
-  big button shows the mic level while recording, or how far playback
-  or a file's transcription has got. Recording: source and Clear, then
-  record/stop, pause and Copy. Playback: stop and back 10 s, then
-  play/pause, ahead 10 s and Copy. Share, Rename, Delete and the
-  settings are in the ⋮ menu at the top.
-- **Dictations**, a second kind of document beside threads, for
-  writing by voice rather than transcribing. The drawer lists both
-  together, newest first, transcriptions marked 🎙️ and dictations ✍️;
-  its New button asks which to start. It edits like the voice keyboard, but the
-  text is saved, so you can come back and keep going: tap the text to
-  move the purple cursor where new speech goes (lowercased where it
-  lands mid-sentence), select words to Delete them, and ¶ starts a new
-  paragraph at the cursor. ⌨️ switches to typing with the phone's
-  keyboard at the cursor; closing the keyboard comes back to dictating
-  where you left off, listening again if you were.
-  Threads stay as they were, for recording in order.
+- **Dictations**, a second kind of thread beside transcriptions, for
+  writing by voice rather than recording in order. Each is saved, so
+  you can come back and keep going.
+  - Tap the text to move the purple cursor where new speech goes
+    (lowercased where it lands mid-sentence); a tap below the text puts
+    it at the end. It works on text from earlier sessions too.
+  - ¶ starts a paragraph at the cursor. ⌫ deletes the sentence before
+    the cursor, the paragraph break right before it, or the selection
+    if there is one. Selected words can also be deleted from the
+    selection menu, across paragraphs.
+  - ⌨ opens your keyboard to edit the text by hand, starting at the
+    cursor. Closing the keyboard goes back to dictating where you left
+    off, listening again if you were. The controls hide while the
+    keyboard is up, and the text keeps the cursor in view as it opens
+    and closes.
+  - Record and stop is all it needs; there's no pause. Leaving the app
+    stops listening and saves.
+  - The voice keyboard and dictations share the same editing code. A
+    cursor move or ¶ made while the keyboard is paused now stays where
+    it was made.
+- **One list of threads.** The drawer lists dictations (✍️) and
+  transcriptions (🎙️) together, most recently changed first. **+ New**
+  asks which to start, Dictation first.
+- **Start recording on New** (Settings › Recording, off by default): a
+  new dictation or transcription starts listening as soon as it opens.
+- **One row of controls on every screen**, under a short status line:
+  four round icon buttons mirrored around a big one in the middle,
+  whose ring shows the mic level while recording, or how far playback
+  or a file's transcription has got.
+  - Dictation: ¶, ⌫, dictate/stop, ⌨, Copy.
+  - Transcription: source (Mic, Phone or Both), Clear, record/stop,
+    pause, Copy.
+  - Playback: stop, back 10 s, play/pause, ahead 10 s, Copy.
+  - Share, Rename, Delete and the settings pages move to a ⋮ menu at
+    the top (it replaces ⚙). The separate level bar, source picker,
+    playback bar and Copy/Share links are gone.
 
 ## v0.1.3 (2026-10-11)
 
