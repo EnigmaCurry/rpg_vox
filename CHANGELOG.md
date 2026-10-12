@@ -40,9 +40,9 @@ section after the version it releases.
   text is saved, so you can come back and keep going: tap the text to
   move the purple cursor where new speech goes (lowercased where it
   lands mid-sentence), select words to Delete them, and ¶ starts a new
-  paragraph at the cursor. ⌨️ in the title bar switches to typing with
-  the phone's keyboard, and 🎙️ (or the record button) back, the cursor
-  carried across.
+  paragraph at the cursor. ⌨️ switches to typing with the phone's
+  keyboard at the cursor; closing the keyboard comes back to dictating
+  where you left off, listening again if you were.
   Threads stay as they were, for recording in order.
 
 ## v0.1.3 (2026-10-11)

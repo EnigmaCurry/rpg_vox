@@ -53,6 +53,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Offset
@@ -116,7 +118,7 @@ fun DictationScreen() {
         } else {
             Editor(Modifier.weight(1f).fillMaxWidth())
         }
-        // Out of the way while the keyboard is up; ⌨️/🎙️ above still switches.
+        // Out of the way while the keyboard is up; closing it comes back to them.
         if (!ime) Surface(tonalElevation = 3.dp) {
             Column(
                 Modifier.fillMaxWidth().navigationBarsPadding().padding(16.dp),
@@ -127,7 +129,7 @@ fun DictationScreen() {
                         Dictations.finishing -> "Finishing…"
                         Dictations.paused -> "Paused"
                         Dictations.listening -> "Listening · tap the text to move the cursor"
-                        typing != null -> "Typing · tap to dictate at the cursor"
+                        typing != null -> "Typing"
                         hasText -> "Tap to dictate at the cursor"
                         else -> "Tap to dictate"
                     },
@@ -145,16 +147,24 @@ fun DictationScreen() {
                         TextButton(onClick = { shareText(context, Dictations.text()) }, enabled = hasText) { Text("Share") }
                     }
                     RecordButton(recording = Dictations.listening, enabled = !Dictations.finishing, onClick = toggle)
-                    Box(Modifier.width(96.dp), contentAlignment = Alignment.Center) {
+                    Box(Modifier.width(120.dp), contentAlignment = Alignment.Center) {
                         Column(horizontalAlignment = Alignment.CenterHorizontally) {
                             if (Dictations.listening) {
                                 OutlinedButton(onClick = Dictations::togglePause) {
                                     Text(if (Dictations.paused) "▶" else "❚❚")
                                 }
                             }
-                            // A new paragraph at the cursor (typing has Enter for that).
-                            if (typing == null) {
-                                OutlinedButton(onClick = Dictations::paragraphBreak, enabled = hasText) { Text("¶") }
+                            val pad = androidx.compose.foundation.layout.PaddingValues(horizontal = 12.dp)
+                            Row {
+                                // A new paragraph at the cursor.
+                                OutlinedButton(onClick = Dictations::paragraphBreak, enabled = hasText, contentPadding = pad) { Text("¶") }
+                                Spacer(Modifier.width(4.dp))
+                                // Type at the cursor; closing the keyboard comes back here.
+                                OutlinedButton(
+                                    onClick = Dictations::typeMode,
+                                    contentPadding = pad,
+                                    modifier = Modifier.semantics { contentDescription = "Type" },
+                                ) { Text("⌨️") }
                             }
                         }
                     }
@@ -202,8 +212,8 @@ private fun Typing(value: TextFieldValue, modifier: Modifier) {
 /**
  * The text, as one block: a tap moves the purple cursor, where new speech
  * goes, to the nearest gap between words; selected words (and the breaks
- * between paragraphs) can be deleted. To change words by hand, switch to
- * typing (⌨ above).
+ * between paragraphs) can be deleted. To change words by hand, ⌨️ below
+ * switches to typing.
  */
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
