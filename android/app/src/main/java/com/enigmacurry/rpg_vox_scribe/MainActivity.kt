@@ -199,6 +199,16 @@ private fun App() {
                         }
                     },
                     actions = {
+                        // A dictation: switch between speaking and typing.
+                        if (ready && Dictations.open != null) {
+                            val typing = Dictations.typing != null
+                            IconButton(
+                                onClick = { if (typing) Dictations.dictateMode() else Dictations.typeMode() },
+                                modifier = Modifier.semantics {
+                                    contentDescription = if (typing) "Dictate" else "Type"
+                                },
+                            ) { Text(if (typing) "🎙️" else "⌨️") }
+                        }
                         if (ready) {
                             Box {
                                 IconButton(onClick = { menu = true }) { Text("⚙") }

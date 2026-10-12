@@ -21,6 +21,9 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
@@ -31,10 +34,8 @@ import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.contextmenu.builder.item
 import androidx.compose.foundation.text.contextmenu.modifier.appendTextContextMenuComponents
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -88,10 +89,14 @@ fun DictationScreen() {
         }
     }
     if (Dictations.listening) KeepScreenOn()
-    Dictations.retyping?.let { Retype(it) }
-    val hasText = Dictations.laid.toks.isNotEmpty()
-    Column(Modifier.fillMaxSize()) {
-        Editor(Modifier.weight(1f).fillMaxWidth())
+    val typing = Dictations.typing
+    val hasText = if (typing != null) typing.text.isNotBlank() else Dictations.laid.toks.isNotEmpty()
+    Column(Modifier.fillMaxSize().imePadding()) {
+        if (typing != null) {
+            Typing(typing, Modifier.weight(1f).fillMaxWidth())
+        } else {
+            Editor(Modifier.weight(1f).fillMaxWidth())
+        }
         Surface(tonalElevation = 3.dp) {
             Column(
                 Modifier.fillMaxWidth().navigationBarsPadding().padding(16.dp),
@@ -102,6 +107,7 @@ fun DictationScreen() {
                         Dictations.finishing -> "Finishing…"
                         Dictations.paused -> "Paused"
                         Dictations.listening -> "Listening · tap the text to move the cursor"
+                        typing != null -> "Typing · tap to dictate at the cursor"
                         hasText -> "Tap to dictate at the cursor"
                         else -> "Tap to dictate"
                     },
@@ -126,8 +132,10 @@ fun DictationScreen() {
                                     Text(if (Dictations.paused) "▶" else "❚❚")
                                 }
                             }
-                            // A new paragraph at the cursor.
-                            OutlinedButton(onClick = Dictations::paragraphBreak, enabled = hasText) { Text("¶") }
+                            // A new paragraph at the cursor (typing has Enter for that).
+                            if (typing == null) {
+                                OutlinedButton(onClick = Dictations::paragraphBreak, enabled = hasText) { Text("¶") }
+                            }
                         }
                     }
                 }
@@ -137,12 +145,31 @@ fun DictationScreen() {
 }
 
 private object DeleteItem
-private object RetypeItem
+
+/**
+ * Typing mode: the text in an ordinary field, for the phone's keyboard,
+ * focused with the keyboard up.
+ */
+@Composable
+private fun Typing(value: TextFieldValue, modifier: Modifier) {
+    val focus = remember { FocusRequester() }
+    LaunchedEffect(Unit) { focus.requestFocus() }
+    BasicTextField(
+        value = value,
+        onValueChange = Dictations::type,
+        textStyle = MaterialTheme.typography.bodyLarge.scaled(FONT_SCALES[Scribe.fontStep])
+            .copy(color = MaterialTheme.colorScheme.onSurface),
+        cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
+        keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences),
+        modifier = modifier.padding(16.dp).focusRequester(focus),
+    )
+}
 
 /**
  * The text, as one block: a tap moves the purple cursor, where new speech
  * goes, to the nearest gap between words; selected words (and the breaks
- * between paragraphs) can be deleted, or retyped with Edit.
+ * between paragraphs) can be deleted. To change words by hand, switch to
+ * typing (⌨ above).
  */
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
@@ -208,13 +235,6 @@ private fun Editor(modifier: Modifier) {
                         done()
                         close()
                     }
-                    if (picked.any { !it.brk }) {
-                        item(key = RetypeItem, label = "Edit") {
-                            Dictations.beginRetype(picked)
-                            done()
-                            close()
-                        }
-                    }
                 }
                 .drawWithContent {
                     drawContent()
@@ -244,31 +264,6 @@ private fun Editor(modifier: Modifier) {
             )
         }
     }
-}
-
-/** Retype words of the text (listening pauses meanwhile). */
-@Composable
-private fun Retype(words: String) {
-    var value by remember(words) { mutableStateOf(TextFieldValue(words, TextRange(words.length))) }
-    val focus = remember { FocusRequester() }
-    LaunchedEffect(Unit) {
-        // The dialog's window must be up before it can take focus.
-        kotlinx.coroutines.delay(100)
-        focus.requestFocus()
-    }
-    AlertDialog(
-        onDismissRequest = { Dictations.endRetype(null) },
-        title = { Text("Edit") },
-        text = {
-            OutlinedTextField(
-                value = value,
-                onValueChange = { value = it },
-                modifier = Modifier.fillMaxWidth().focusRequester(focus),
-            )
-        },
-        confirmButton = { TextButton(onClick = { Dictations.endRetype(value.text) }) { Text("OK") } },
-        dismissButton = { TextButton(onClick = { Dictations.endRetype(null) }) { Text("Cancel") } },
-    )
 }
 
 private fun copyText(context: android.content.Context, text: String) {

@@ -79,21 +79,26 @@ class DictationDoc {
         return doc
     }
 
+    companion object {
+        /** [text]'s words, and a break between each paragraph and the next (a new line starts one). */
+        fun items(text: String): List<String> {
+            val items = mutableListOf<String>()
+            for (p in text.split('\n')) {
+                val words = p.split(Regex("\\s+")).filter { it.isNotEmpty() }
+                if (words.isEmpty()) continue
+                if (items.isNotEmpty()) items += BREAK
+                items += words
+            }
+            return items
+        }
+    }
+
     /**
-     * Start over from [text] (paragraphs a blank line apart), nothing
+     * Start over from [text] (a new line starts a paragraph), nothing
      * said yet, with the cursor before its [cursor]th word or break, or
      * at the end.
      */
-    fun load(text: String, cursor: Int = Int.MAX_VALUE) {
-        val items = mutableListOf<String>()
-        for (p in text.split(Regex("\\n\\s*\\n"))) {
-            val words = p.split(Regex("\\s+")).filter { it.isNotEmpty() }
-            if (words.isEmpty()) continue
-            if (items.isNotEmpty()) items += BREAK
-            items += words
-        }
-        reset(items, cursor)
-    }
+    fun load(text: String, cursor: Int = Int.MAX_VALUE) = reset(items(text), cursor)
 
     /**
      * Fold everything said and done so far into the text from before,

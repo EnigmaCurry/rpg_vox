@@ -7,6 +7,8 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.text.TextRange
+import androidx.compose.ui.text.input.TextFieldValue
 
 /**
  * Dictations: text written by voice and edited in place, as in the voice
@@ -16,7 +18,9 @@ import androidx.compose.runtime.setValue
  *
  * The open one's text is a [DictationDoc]; a [Dictation] adds to it while
  * listening. Each session folds into the text when it ends, which is
- * saved then and a moment after each change. Main thread only.
+ * saved then and a moment after each change. In [typing] mode the text
+ * is a plain field for the phone's keyboard instead, the cursor carried
+ * across both ways. Main thread only.
  */
 object Dictations {
     private val main = Handler(Looper.getMainLooper())
@@ -38,16 +42,14 @@ object Dictations {
     /** Stopped, the last words still being transcribed. */
     var finishing by mutableStateOf(false)
         private set
-    /** The words being retyped, null when not. */
-    var retyping by mutableStateOf<String?>(null)
+    /** Typing mode: the text as an ordinary field for the keyboard, null when dictating. */
+    var typing by mutableStateOf<TextFieldValue?>(null)
         private set
 
     private val doc = DictationDoc()
     /** [doc] as last built. */
     private var built: List<Tok> = emptyList()
     private var session: Dictation? = null
-    private var retype: Retype? = null
-    private var retypeWasPaused = false
     private val saver = Runnable { save() }
     /** Runs once the session finishing has saved. */
     private var then: (() -> Unit)? = null
@@ -64,7 +66,7 @@ object Dictations {
     }
 
     /** The text as saved. */
-    fun text(): String = doc.text()
+    fun text(): String = typing?.text?.trim() ?: doc.text()
 
     fun create() = leave {
         refresh()
@@ -109,8 +111,9 @@ object Dictations {
         store.setSetting("dictation", "${d.id}")
     }
 
-    /** Finish listening and save, forget the open one if it's empty, then [next]. */
+    /** Finish listening or typing and save, forget the open one if it's empty, then [next]. */
     private fun leave(next: () -> Unit) {
+        dictateMode()
         val d = open
         val go = {
             if (d != null && store.dictation(d.id)?.text?.isEmpty() == true) {
@@ -129,6 +132,7 @@ object Dictations {
 
     /** Start listening, new speech going in at the cursor. Returns why it can't, or null. */
     fun start(): String? {
+        dictateMode()
         if (open == null || session != null || finishing) return null
         val models = Scribe.claimForDictation()
         if (models == 0L) return if (Scribe.busy()) "Scribe is recording; stop it first." else "Scribe is busy."
@@ -152,8 +156,6 @@ object Dictations {
         listening = false
         paused = false
         finishing = true
-        retype = null
-        retyping = null
         s.finish { final ->
             doc.paras = final
             doc.settle()
@@ -174,7 +176,51 @@ object Dictations {
     }
 
     /** The app left the screen: the mic can't stay on in the background. */
-    fun onHidden() = stop()
+    fun onHidden() {
+        stop()
+        save()
+    }
+
+    /**
+     * Type instead: listening stops, and the text becomes a field for the
+     * phone's keyboard with its cursor where the dictation cursor was.
+     */
+    fun typeMode() {
+        if (open == null || typing != null) return
+        if (session != null || finishing) {
+            then = ::typeMode
+            stop()
+            return
+        }
+        // The text without the cursor's own space, the cursor where it stood.
+        val c = laid.caret
+        val before = if (c >= 0) laid.text.substring(0, c).trimEnd(' ') else laid.text
+        val after = if (c >= 0) laid.text.substring(c + 1).trimStart(' ') else ""
+        val gap = if (before.isNotEmpty() && after.isNotEmpty() && !before.endsWith('\n') && !after.startsWith('\n')) " " else ""
+        val text = before + gap + after
+        typing = TextFieldValue(text, TextRange(before.length + gap.length))
+    }
+
+    /** Back to dictating: what was typed is the text, the cursor where the keyboard's was. */
+    fun dictateMode() {
+        val t = typing ?: return
+        typing = null
+        val head = t.text.substring(0, t.selection.min)
+        // A cursor within a word counts as after it; one at a line's start
+        // as past the break before that line.
+        var cursor = DictationDoc.items(head).size
+        if (head.trimEnd(' ', '\t').endsWith('\n') && cursor > 0 && t.text.substring(head.length).isNotBlank()) cursor++
+        doc.load(t.text, cursor)
+        relayout()
+        save()
+    }
+
+    /** Typed: [value] is the field's new state. */
+    fun type(value: TextFieldValue) {
+        if (typing == null) return
+        typing = value
+        saveSoon()
+    }
 
     private fun now(): Long = session?.breakNow() ?: 0
 
@@ -192,33 +238,6 @@ object Dictations {
     fun delete(picked: List<Tok>) {
         doc.delete(picked)
         changed()
-    }
-
-    /** Retype [picked]: listening pauses and their words go to [retyping]; [endRetype] finishes. */
-    fun beginRetype(picked: List<Tok>) {
-        if (retype != null) return
-        val r = doc.editOf(picked) ?: return
-        retype = r
-        val s = session
-        retypeWasPaused = s?.paused ?: true
-        s?.paused = true
-        paused = s != null
-        retyping = r.text
-    }
-
-    /** Replace the words being retyped with [text], or leave them if null; listening resumes unless it was paused before. */
-    fun endRetype(text: String?) {
-        val r = retype ?: return
-        retype = null
-        retyping = null
-        if (text != null) {
-            doc.retype(r, text)
-            changed()
-        }
-        session?.let {
-            it.paused = retypeWasPaused
-            paused = it.paused
-        }
     }
 
     private fun changed() {
@@ -242,7 +261,7 @@ object Dictations {
     private fun save() {
         main.removeCallbacks(saver)
         val d = open ?: return
-        val text = doc.text()
+        val text = text()
         if (text == store.dictation(d.id)?.text) return
         store.saveDictation(d.id, text)
         refresh()
