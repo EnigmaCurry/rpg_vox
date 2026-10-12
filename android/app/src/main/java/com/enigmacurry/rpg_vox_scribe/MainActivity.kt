@@ -156,6 +156,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onStop() {
         super.onStop()
+        Dictations.onHidden()
         Scribe.onVisible(false)
     }
 }
@@ -217,7 +218,15 @@ private fun App() {
                     },
                     // The open thread; tap to rename it.
                     title = {
-                        if (ready) {
+                        val dictation = Dictations.open
+                        if (ready && dictation != null) {
+                            Text(
+                                dictation.title,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.clickable { dialogs.renamingDictation = dictation },
+                            )
+                        } else if (ready) {
                             Text(
                                 Scribe.thread.title,
                                 maxLines = 1,
@@ -238,7 +247,7 @@ private fun App() {
                     Phase.Loading -> Centered("Loading speech models…", progress = null)
                     Phase.Unloaded -> Unloaded()
                     is Phase.Failed -> Centered("Could not load the models:\n${phase.error}", progress = null)
-                    Phase.Ready -> Dictate()
+                    Phase.Ready -> if (Dictations.open != null) DictationScreen() else Dictate()
                 }
             }
         }
@@ -339,7 +348,7 @@ private fun Unloaded() {
 }
 
 @Composable
-private fun KeepScreenOn() {
+fun KeepScreenOn() {
     val view = LocalView.current
     DisposableEffect(Unit) {
         view.keepScreenOn = true
@@ -653,7 +662,7 @@ private fun PlaybackBar() {
 }
 
 @Composable
-private fun RecordButton(recording: Boolean, enabled: Boolean, onClick: () -> Unit) {
+fun RecordButton(recording: Boolean, enabled: Boolean, onClick: () -> Unit) {
     Button(
         onClick = onClick,
         enabled = enabled,
@@ -836,7 +845,7 @@ private fun Transcript(modifier: Modifier) {
  * A quick tap, without consuming anything: where it was lifted, or null
  * for a drag past the touch slop or a press held to a long-press.
  */
-private suspend fun AwaitPointerEventScope.awaitTap(pass: PointerEventPass): Offset? {
+suspend fun AwaitPointerEventScope.awaitTap(pass: PointerEventPass): Offset? {
     val down = awaitFirstDown(requireUnconsumed = false, pass = pass)
     while (true) {
         val c = awaitPointerEvent(pass).changes.firstOrNull { it.id == down.id } ?: return null

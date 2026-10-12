@@ -132,7 +132,8 @@ object Scribe {
     lateinit var store: ModelStore
         private set
     private lateinit var app: Context
-    private lateinit var threads: ThreadStore
+    lateinit var threads: ThreadStore
+        private set
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val main = Handler(Looper.getMainLooper())
 
@@ -210,19 +211,19 @@ object Scribe {
 
     fun busy() = recording || finishing || file != null
 
-    /** The voice keyboard ([ScribeKeyboard]) holds the mic and the models. */
+    /** A [Dictation] (the voice keyboard's or the app's) holds the mic and the models. */
     @Volatile var dictating = false
         private set
 
-    /** The loaded models for the keyboard, marking them in use; 0 if not loaded or Scribe is busy. */
-    fun claimForKeyboard(): Long {
-        if (models == 0L || busy()) return 0
+    /** The loaded models for a [Dictation], marking them in use; 0 if not loaded or Scribe is busy. */
+    fun claimForDictation(): Long {
+        if (models == 0L || busy() || dictating) return 0
         dictating = true
         lastActive = SystemClock.elapsedRealtime()
         return models
     }
 
-    fun releaseFromKeyboard() {
+    fun releaseFromDictation() {
         dictating = false
         lastActive = SystemClock.elapsedRealtime()
     }
@@ -243,6 +244,7 @@ object Scribe {
         phase = if (store.ready()) Phase.Unloaded else Phase.NeedModels(resume = store.started())
         migrate()
         show(threads.current())
+        Dictations.init(app)
         scope.launch {
             InstallService.state.collect { s ->
                 when (s) {

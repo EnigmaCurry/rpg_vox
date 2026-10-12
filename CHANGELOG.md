@@ -33,6 +33,14 @@ section after the version it releases.
 - The voice keyboard shares scribe's engine, so it gets the same two
   background-music fixes: pauses count as silence over steady
   background, and audio with no new words closes after 1.5 seconds.
+- **Dictations**, a second kind of document beside threads, for
+  writing by voice rather than transcribing. Start one from the
+  drawer's "New dictation". It edits like the voice keyboard, but the
+  text is saved, so you can come back and keep going: tap the text to
+  move the purple cursor where new speech goes (lowercased where it
+  lands mid-sentence), select words to Delete or Edit them (listening
+  pauses while you type), and ¶ starts a new paragraph at the cursor.
+  Threads stay as they were, for recording in order.
 
 ## v0.1.3 (2026-10-11)
 

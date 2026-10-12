@@ -50,42 +50,86 @@ import kotlin.math.roundToInt
 class ThreadDialogs {
     var renaming by mutableStateOf<ThreadInfo?>(null)
     var deleting by mutableStateOf<ThreadInfo?>(null)
+    var renamingDictation by mutableStateOf<DictationInfo?>(null)
+    var deletingDictation by mutableStateOf<DictationInfo?>(null)
 }
 
 /**
- * The thread list: New thread, then every thread (most recent first)
- * with its time and last line. Tap opens one; long-press offers Rename
- * and Delete. While recording only the open thread is reachable.
+ * The drawer: dictations (New dictation, then each, most recently changed
+ * first), then threads (New thread, then each, most recent first, with
+ * its time and last line). Tap opens one; long-press offers Rename and
+ * Delete. While recording only the open thread is reachable.
  */
 @Composable
 fun ThreadDrawer(dialogs: ThreadDialogs, close: () -> Unit) {
     val locked = Scribe.busy()
+    val dictation = Dictations.open
     ModalDrawerSheet {
-        Text(
-            "Threads",
-            style = MaterialTheme.typography.titleLarge,
-            modifier = Modifier.padding(start = 24.dp, top = 24.dp, bottom = 8.dp),
-        )
-        if (locked) {
-            Text(
-                "Stop recording to switch threads",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.error,
-                modifier = Modifier.padding(start = 24.dp, bottom = 8.dp),
-            )
-        }
-        ThreadRow(
-            title = "+ New thread",
-            subtitle = null,
-            selected = false,
-            enabled = !locked,
-            onClick = {
-                Scribe.newThread()
-                close()
-            },
-        )
-        HorizontalDivider(Modifier.padding(vertical = 8.dp))
         LazyColumn {
+            item(key = "dictations") { Heading("Dictations") }
+            item(key = "new-dictation") {
+                ThreadRow(
+                    title = "+ New dictation",
+                    subtitle = null,
+                    selected = false,
+                    enabled = !locked,
+                    onClick = {
+                        Dictations.create()
+                        close()
+                    },
+                )
+            }
+            items(Dictations.list, key = { "d${it.id}" }) { d ->
+                var menu by remember { mutableStateOf(false) }
+                Box {
+                    ThreadRow(
+                        title = d.title,
+                        subtitle = d.updated + d.text.take(80).replace('\n', ' ').let { if (it.isNotBlank()) " · $it" else "" },
+                        selected = d.id == dictation?.id,
+                        enabled = !locked,
+                        onClick = {
+                            Dictations.openDictation(d.id)
+                            close()
+                        },
+                        onLongClick = { menu = true },
+                    )
+                    DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                        DropdownMenuItem(text = { Text("Rename") }, onClick = {
+                            menu = false
+                            dialogs.renamingDictation = d
+                        })
+                        DropdownMenuItem(text = { Text("Delete") }, onClick = {
+                            menu = false
+                            dialogs.deletingDictation = d
+                        })
+                    }
+                }
+            }
+            item(key = "divider") { HorizontalDivider(Modifier.padding(vertical = 8.dp)) }
+            item(key = "threads") { Heading("Threads") }
+            if (locked) {
+                item(key = "locked") {
+                    Text(
+                        "Stop recording to switch threads",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                        modifier = Modifier.padding(start = 24.dp, bottom = 8.dp),
+                    )
+                }
+            }
+            item(key = "new-thread") {
+                ThreadRow(
+                    title = "+ New thread",
+                    subtitle = null,
+                    selected = false,
+                    enabled = !locked,
+                    onClick = {
+                        Dictations.close()
+                        Scribe.newThread()
+                        close()
+                    },
+                )
+            }
             items(Scribe.threadList, key = { it.id }) { t ->
                 val open = t.id == Scribe.thread.id
                 var menu by remember { mutableStateOf(false) }
@@ -93,9 +137,10 @@ fun ThreadDrawer(dialogs: ThreadDialogs, close: () -> Unit) {
                     ThreadRow(
                         title = t.title,
                         subtitle = t.last + if (t.preview.isNotBlank()) " · ${t.preview}" else "",
-                        selected = open,
+                        selected = open && dictation == null,
                         enabled = open || !locked,
                         onClick = {
+                            Dictations.close()
                             Scribe.switchTo(t.id)
                             close()
                         },
@@ -119,6 +164,15 @@ fun ThreadDrawer(dialogs: ThreadDialogs, close: () -> Unit) {
             }
         }
     }
+}
+
+@Composable
+private fun Heading(text: String) {
+    Text(
+        text,
+        style = MaterialTheme.typography.titleLarge,
+        modifier = Modifier.padding(start = 24.dp, top = 24.dp, bottom = 8.dp),
+    )
 }
 
 @OptIn(ExperimentalFoundationApi::class)
@@ -165,61 +219,86 @@ private fun ThreadRow(
 @Composable
 fun ThreadDialogHost(dialogs: ThreadDialogs) {
     dialogs.renaming?.let { t ->
-        // Whole title selected, so typing replaces it.
-        var text by remember(t.id) { mutableStateOf(TextFieldValue(t.title, TextRange(0, t.title.length))) }
-        AlertDialog(
-            onDismissRequest = { dialogs.renaming = null },
-            title = { Text("Rename thread") },
-            text = {
-                // Focused with the keyboard up, ready to type; Done renames.
-                val focus = remember { FocusRequester() }
-                val keyboard = LocalSoftwareKeyboardController.current
-                LaunchedEffect(Unit) {
-                    // The dialog's window must be up before it can take focus.
-                    delay(100)
-                    focus.requestFocus()
-                    keyboard?.show()
-                }
-                OutlinedTextField(
-                    value = text,
-                    onValueChange = { text = it },
-                    singleLine = true,
-                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
-                    keyboardActions = KeyboardActions(onDone = {
-                        if (text.text.isNotBlank()) {
-                            Scribe.rename(t.id, text.text)
-                            dialogs.renaming = null
-                        }
-                    }),
-                    modifier = Modifier.focusRequester(focus),
-                )
-            },
-            confirmButton = {
-                TextButton(
-                    onClick = {
-                        Scribe.rename(t.id, text.text)
-                        dialogs.renaming = null
-                    },
-                    enabled = text.text.isNotBlank(),
-                ) { Text("Rename") }
-            },
-            dismissButton = { TextButton(onClick = { dialogs.renaming = null }) { Text("Cancel") } },
-        )
+        Rename("Rename thread", t.title, close = { dialogs.renaming = null }) { Scribe.rename(t.id, it) }
+    }
+    dialogs.renamingDictation?.let { d ->
+        Rename("Rename dictation", d.title, close = { dialogs.renamingDictation = null }) { Dictations.rename(d.id, it) }
     }
     dialogs.deleting?.let { t ->
-        AlertDialog(
-            onDismissRequest = { dialogs.deleting = null },
-            title = { Text("Delete thread?") },
-            text = { Text("\"${t.title}\" and its ${t.count} paragraph(s) will be deleted. This can't be undone.") },
-            confirmButton = {
-                TextButton(onClick = {
-                    Scribe.delete(t.id)
-                    dialogs.deleting = null
-                }) { Text("Delete", color = MaterialTheme.colorScheme.error) }
-            },
-            dismissButton = { TextButton(onClick = { dialogs.deleting = null }) { Text("Cancel") } },
-        )
+        ConfirmDelete(
+            "Delete thread?",
+            "\"${t.title}\" and its ${t.count} paragraph(s) will be deleted. This can't be undone.",
+            close = { dialogs.deleting = null },
+        ) { Scribe.delete(t.id) }
     }
+    dialogs.deletingDictation?.let { d ->
+        ConfirmDelete(
+            "Delete dictation?",
+            "\"${d.title}\" and its text will be deleted. This can't be undone.",
+            close = { dialogs.deletingDictation = null },
+        ) { Dictations.delete(d.id) }
+    }
+}
+
+/** Asks for a new name for [current]; [rename] takes it. */
+@Composable
+private fun Rename(heading: String, current: String, close: () -> Unit, rename: (String) -> Unit) {
+    // Whole title selected, so typing replaces it.
+    var text by remember(current) { mutableStateOf(TextFieldValue(current, TextRange(0, current.length))) }
+    AlertDialog(
+        onDismissRequest = close,
+        title = { Text(heading) },
+        text = {
+            // Focused with the keyboard up, ready to type; Done renames.
+            val focus = remember { FocusRequester() }
+            val keyboard = LocalSoftwareKeyboardController.current
+            LaunchedEffect(Unit) {
+                // The dialog's window must be up before it can take focus.
+                delay(100)
+                focus.requestFocus()
+                keyboard?.show()
+            }
+            OutlinedTextField(
+                value = text,
+                onValueChange = { text = it },
+                singleLine = true,
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+                keyboardActions = KeyboardActions(onDone = {
+                    if (text.text.isNotBlank()) {
+                        rename(text.text)
+                        close()
+                    }
+                }),
+                modifier = Modifier.focusRequester(focus),
+            )
+        },
+        confirmButton = {
+            TextButton(
+                onClick = {
+                    rename(text.text)
+                    close()
+                },
+                enabled = text.text.isNotBlank(),
+            ) { Text("Rename") }
+        },
+        dismissButton = { TextButton(onClick = close) { Text("Cancel") } },
+    )
+}
+
+@Composable
+private fun ConfirmDelete(heading: String, detail: String, close: () -> Unit, delete: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = close,
+        title = { Text(heading) },
+        text = { Text(detail) },
+        confirmButton = {
+            TextButton(onClick = {
+                delete()
+                close()
+            }) { Text("Delete", color = MaterialTheme.colorScheme.error) }
+        },
+        dismissButton = { TextButton(onClick = close) { Text("Cancel") } },
+    )
 }
 
 /** The pages of settings, listed under ⚙. */

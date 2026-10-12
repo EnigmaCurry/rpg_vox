@@ -105,6 +105,16 @@ class ThreadStore(file: File) {
         )
         // Stretches of a kept file whose text was cut: skipped on playback.
         execSQL("CREATE TABLE IF NOT EXISTS cuts (file TEXT NOT NULL, start_ms INTEGER NOT NULL, end_ms INTEGER NOT NULL)")
+        // Dictations: text written by voice and edited in place (the app's
+        // own, unknown to the desktop).
+        execSQL(
+            """CREATE TABLE IF NOT EXISTS dictations (
+                id         INTEGER PRIMARY KEY,
+                title      TEXT NOT NULL,
+                text       TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+            )""",
+        )
         for ((column, default) in listOf("length_ms" to 0, "sound_start_ms" to -1, "sound_end_ms" to -1)) {
             rawQuery("SELECT 1 FROM pragma_table_info('audio') WHERE name = ?", arrayOf(column)).use {
                 if (!it.moveToFirst()) execSQL("ALTER TABLE audio ADD COLUMN $column INTEGER NOT NULL DEFAULT $default")
@@ -316,4 +326,44 @@ class ThreadStore(file: File) {
             SQLiteDatabase.CONFLICT_REPLACE,
         )
     }
+
+    // ---- dictations ----------------------------------------------------
+
+    /** Every dictation, the most recently changed first. */
+    fun dictations(): List<DictationInfo> =
+        db.rawQuery(
+            """SELECT id, title, strftime('%Y-%m-%d %H:%M', updated_at, 'localtime'), text
+               FROM dictations ORDER BY updated_at DESC, id DESC""",
+            null,
+        ).use { c ->
+            buildList {
+                while (c.moveToNext()) add(DictationInfo(c.getLong(0), c.getString(1), c.getString(2), c.getString(3)))
+            }
+        }
+
+    /** A new, empty dictation titled with the local date and time. */
+    fun createDictation(): Long =
+        db.insert("dictations", null, ContentValues().apply {
+            put("title", SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.ROOT).format(Date()))
+        })
+
+    fun dictation(id: Long): DictationInfo? = dictations().firstOrNull { it.id == id }
+
+    fun saveDictation(id: Long, text: String) {
+        db.update("dictations", ContentValues().apply {
+            put("text", text)
+            put("updated_at", isoAt(System.currentTimeMillis()))
+        }, "id = ?", arrayOf("$id"))
+    }
+
+    fun renameDictation(id: Long, title: String) {
+        db.update("dictations", ContentValues().apply { put("title", title) }, "id = ?", arrayOf("$id"))
+    }
+
+    fun deleteDictation(id: Long) {
+        db.delete("dictations", "id = ?", arrayOf("$id"))
+    }
 }
+
+/** A dictation: [updated] is local "YYYY-MM-DD HH:MM" of its last change. */
+data class DictationInfo(val id: Long, val title: String, val updated: String, val text: String)
