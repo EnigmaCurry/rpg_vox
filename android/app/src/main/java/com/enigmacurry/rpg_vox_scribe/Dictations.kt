@@ -44,6 +44,13 @@ object Dictations {
     /** Stopped, the last words still being transcribed. */
     var finishing by mutableStateOf(false)
         private set
+    /** What's selected in the text, as offsets in [held]'s. */
+    var selection by mutableStateOf(TextRange.Zero)
+        private set
+    /** The text as laid out when the selection began, held while it lasts so new words don't shift it. */
+    var held by mutableStateOf<Laid?>(null)
+        private set
+
     /** Typing mode: the text as an ordinary field for the keyboard, null when dictating. */
     var typing by mutableStateOf<TextFieldValue?>(null)
         private set
@@ -109,6 +116,7 @@ object Dictations {
     }
 
     private fun show(d: DictationInfo) {
+        select(TextRange.Zero)
         open = d
         doc.load(d.text)
         relayout()
@@ -244,8 +252,22 @@ object Dictations {
         if (doc.paragraphBreak(built, ::now)) changed()
     }
 
-    /** ⌫: delete the sentence before the cursor (or the break right before it). */
+    /** The selection in the text changed to [range]. */
+    fun select(range: TextRange) {
+        selection = range
+        held = if (range.collapsed) null else held ?: laid
+    }
+
+    /** ⌫: delete the selection if there is one, else the sentence before the cursor (or the break right before it). */
     fun deleteSentence() {
+        val sel = selection
+        val from = held ?: laid
+        select(TextRange.Zero)
+        if (!sel.collapsed) {
+            val picked = from.toks.filter { (r, t) -> t.placed && r.first < sel.max && r.last >= sel.min }.map { it.second }
+            if (picked.isNotEmpty()) delete(picked)
+            return
+        }
         if (doc.deleteSentence(built)) changed()
     }
 

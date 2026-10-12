@@ -130,8 +130,8 @@ fun DictationScreen() {
                 live = Dictations.listening,
                 // A new paragraph at the cursor.
                 l2 = { DockButton(DockIcons.Paragraph, "New paragraph", enabled = hasText, onClick = Dictations::paragraphBreak) },
-                // The sentence before the cursor.
-                l1 = { DockButton(DockIcons.Backspace, "Delete the last sentence", enabled = hasText, onClick = Dictations::deleteSentence) },
+                // The selection, or else the sentence before the cursor.
+                l1 = { DockButton(DockIcons.Backspace, if (Dictations.selection.collapsed) "Delete the last sentence" else "Delete the selection", enabled = hasText, onClick = Dictations::deleteSentence) },
                 center = {
                     BigButton(
                         label = if (Dictations.listening) "Stop dictating" else "Dictate",
@@ -194,9 +194,9 @@ private fun Typing(value: TextFieldValue, modifier: Modifier) {
 @Composable
 private fun Editor(modifier: Modifier) {
     val laid = Dictations.laid
-    var selection by remember { mutableStateOf(TextRange.Zero) }
+    val selection = Dictations.selection
     // Held while selecting, so new words don't shift the text under it.
-    var held by remember { mutableStateOf<Laid?>(null) }
+    val held = Dictations.held
     val shown = held ?: laid
     val current by rememberUpdatedState(laid)
     val faint = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.45f)
@@ -228,15 +228,13 @@ private fun Editor(modifier: Modifier) {
         requester.bringIntoView(Rect(r.left, r.top, r.right, r.bottom + r.height))
     }
     fun done() {
-        selection = TextRange.Zero
-        held = null
+        Dictations.select(TextRange.Zero)
     }
     Box(modifier.onSizeChanged { height = it.height }.verticalScroll(scroll).padding(16.dp)) {
         BasicTextField(
             value = TextFieldValue(text, sel),
             onValueChange = {
-                selection = it.selection
-                held = if (it.selection.collapsed) null else held ?: current
+                Dictations.select(it.selection)
             },
             readOnly = true,
             textStyle = MaterialTheme.typography.bodyLarge.scaled(FONT_SCALES[Scribe.fontStep])
