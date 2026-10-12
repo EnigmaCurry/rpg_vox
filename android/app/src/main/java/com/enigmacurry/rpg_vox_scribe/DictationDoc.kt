@@ -156,7 +156,6 @@ class DictationDoc {
     private fun polish(doc: List<Tok>): List<Tok> {
         val out = doc.toMutableList()
         val words = doc.indices.filter { shown(doc[it]) }
-        fun ends(t: Tok) = t.brk || t.text.trimEnd('"', '\'', ')', '”', '’').let { it.endsWith('.') || it.endsWith('?') || it.endsWith('!') || it.endsWith('…') }
         fun upper(t: Tok) = t.text.firstOrNull()?.isUpperCase() == true
         // Words the engine capitalized mid-utterance after a lowercase word,
         // so likely names. Not after a capital: an utterance's first word is
@@ -306,6 +305,27 @@ class DictationDoc {
         return spans
     }
 
+    /**
+     * Delete the sentence before the cursor: back to the end of the one
+     * before it or the paragraph's start. Right after a break, the break
+     * goes instead, joining the paragraphs. False if there's nothing.
+     */
+    fun deleteSentence(doc: List<Tok>): Boolean {
+        val before = doc.subList(0, cursorAt(doc)).filter { shown(it) && it.placed }.asReversed()
+        val last = before.firstOrNull() ?: return false
+        if (last.brk) {
+            delete(listOf(last))
+            return true
+        }
+        val picked = mutableListOf(last)
+        for (t in before.drop(1)) {
+            if (ends(t)) break
+            picked += t
+        }
+        delete(picked)
+        return true
+    }
+
     /** What retyping [picked] replaces, and its text; null if none of it can be. Partial words and breaks are left as they are. */
     fun editOf(picked: List<Tok>): Retype? {
         val words = picked.filter { !it.brk && !it.mark && !it.partial && (it.time != null || it.edit != null) }
@@ -388,6 +408,9 @@ class Edit(val ms: Long, val text: String, val endMs: Long = ms)
 class Retype(val cut: List<LongRange>, val drop: List<Edit>, val ms: Long, val endMs: Long, val text: String)
 
 private const val BREAK = "\n\n"
+
+/** [t] ends a sentence (or is a break). */
+private fun ends(t: Tok) = t.brk || t.text.trimEnd('"', '\'', ')', '”', '’').let { it.endsWith('.') || it.endsWith('?') || it.endsWith('!') || it.endsWith('…') }
 
 /** A dictation's paragraph as the engine sent it, in the order its clips were said. */
 class KPara(val id: String, val clips: List<KClip>)

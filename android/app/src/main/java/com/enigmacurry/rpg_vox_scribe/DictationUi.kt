@@ -147,23 +147,31 @@ fun DictationScreen() {
                         TextButton(onClick = { shareText(context, Dictations.text()) }, enabled = hasText) { Text("Share") }
                     }
                     RecordButton(recording = Dictations.listening, enabled = !Dictations.finishing, onClick = toggle)
-                    Box(Modifier.width(120.dp), contentAlignment = Alignment.Center) {
+                    Box(Modifier.width(156.dp), contentAlignment = Alignment.Center) {
                         Column(horizontalAlignment = Alignment.CenterHorizontally) {
                             if (Dictations.listening) {
                                 OutlinedButton(onClick = Dictations::togglePause) {
                                     Text(if (Dictations.paused) "▶" else "❚❚")
                                 }
                             }
-                            val pad = androidx.compose.foundation.layout.PaddingValues(horizontal = 12.dp)
+                            val pad = androidx.compose.foundation.layout.PaddingValues(0.dp)
                             Row {
                                 // A new paragraph at the cursor.
-                                OutlinedButton(onClick = Dictations::paragraphBreak, enabled = hasText, contentPadding = pad) { Text("¶") }
+                                OutlinedButton(onClick = Dictations::paragraphBreak, enabled = hasText, contentPadding = pad, modifier = Modifier.width(48.dp)) { Text("¶") }
+                                Spacer(Modifier.width(4.dp))
+                                // The sentence before the cursor.
+                                OutlinedButton(
+                                    onClick = Dictations::deleteSentence,
+                                    enabled = hasText,
+                                    contentPadding = pad,
+                                    modifier = Modifier.width(48.dp).semantics { contentDescription = "Delete the last sentence" },
+                                ) { Text("⌫") }
                                 Spacer(Modifier.width(4.dp))
                                 // Type at the cursor; closing the keyboard comes back here.
                                 OutlinedButton(
                                     onClick = Dictations::typeMode,
                                     contentPadding = pad,
-                                    modifier = Modifier.semantics { contentDescription = "Type" },
+                                    modifier = Modifier.width(48.dp).semantics { contentDescription = "Type" },
                                 ) { Text("⌨️") }
                             }
                         }

@@ -250,6 +250,11 @@ object Dictations {
         if (doc.paragraphBreak(built, ::now)) changed()
     }
 
+    /** ⌫: delete the sentence before the cursor (or the break right before it). */
+    fun deleteSentence() {
+        if (doc.deleteSentence(built)) changed()
+    }
+
     fun delete(picked: List<Tok>) {
         doc.delete(picked)
         changed()
