@@ -22,6 +22,9 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.isImeVisible
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.foundation.layout.navigationBarsPadding
@@ -69,6 +72,7 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 
 /** The open dictation: its text, with the record button and the rest below. */
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun DictationScreen() {
     val context = LocalContext.current
@@ -97,7 +101,8 @@ fun DictationScreen() {
         } else {
             Editor(Modifier.weight(1f).fillMaxWidth())
         }
-        Surface(tonalElevation = 3.dp) {
+        // Out of the way while the keyboard is up; ⌨️/🎙️ above still switches.
+        if (!WindowInsets.isImeVisible) Surface(tonalElevation = 3.dp) {
             Column(
                 Modifier.fillMaxWidth().navigationBarsPadding().padding(16.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
