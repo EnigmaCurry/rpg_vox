@@ -50,6 +50,9 @@ object Dictations {
     /** [doc] as last built. */
     private var built: List<Tok> = emptyList()
     private var session: Dictation? = null
+    /** Listening (and whether paused) when typing began, to take up again after. */
+    private var listenAfterTyping = false
+    private var pausedAfterTyping = false
     private val saver = Runnable { save() }
     /** Runs once the session finishing has saved. */
     private var then: (() -> Unit)? = null
@@ -113,7 +116,7 @@ object Dictations {
 
     /** Finish listening or typing and save, forget the open one if it's empty, then [next]. */
     private fun leave(next: () -> Unit) {
-        dictateMode()
+        dictateMode(resume = false)
         val d = open
         val go = {
             if (d != null && store.dictation(d.id)?.text?.isEmpty() == true) {
@@ -132,7 +135,7 @@ object Dictations {
 
     /** Start listening, new speech going in at the cursor. Returns why it can't, or null. */
     fun start(): String? {
-        dictateMode()
+        dictateMode(resume = false)
         if (open == null || session != null || finishing) return null
         val models = Scribe.claimForDictation()
         if (models == 0L) return if (Scribe.busy()) "Scribe is recording; stop it first." else "Scribe is busy."
@@ -187,6 +190,10 @@ object Dictations {
      */
     fun typeMode() {
         if (open == null || typing != null) return
+        if (session != null) {
+            listenAfterTyping = true
+            pausedAfterTyping = paused
+        }
         if (session != null || finishing) {
             then = ::typeMode
             stop()
@@ -201,10 +208,17 @@ object Dictations {
         typing = TextFieldValue(text, TextRange(before.length + gap.length))
     }
 
-    /** Back to dictating: what was typed is the text, the cursor where the keyboard's was. */
-    fun dictateMode() {
+    /**
+     * Back to dictating: what was typed is the text, the cursor where the
+     * keyboard's was. If listening when typing began, and [resume], it
+     * starts again (paused if it was).
+     */
+    fun dictateMode(resume: Boolean = true) {
         val t = typing ?: return
         typing = null
+        val listen = listenAfterTyping && resume
+        val wasPaused = pausedAfterTyping
+        listenAfterTyping = false
         val head = t.text.substring(0, t.selection.min)
         // A cursor within a word counts as after it; one at a line's start
         // as past the break before that line.
@@ -213,6 +227,7 @@ object Dictations {
         doc.load(t.text, cursor)
         relayout()
         save()
+        if (listen && start() == null && wasPaused) togglePause()
     }
 
     /** Typed: [value] is the field's new state. */
