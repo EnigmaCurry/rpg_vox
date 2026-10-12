@@ -4,9 +4,8 @@
 
 A collection of voice tools for tabletop RPGs played over a video
 call, as well as for general transcription tasks, built on PipeWire
-and local speech models. This repository holds two separate apps built
-with the same core, an Android version of scribe, plus an LLM responder
-for scribe's chat mode:
+and local speech models. This repository holds several separate apps built
+with the same core. 
 
 > [!NOTE]
 > These tools are produced with the assistance of Claude Code and other AI tools. 
