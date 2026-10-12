@@ -212,14 +212,14 @@ fun ThreadDialogHost(dialogs: ThreadDialogs) {
             title = { Text("New") },
             text = {
                 Column {
+                    NewChoice(PEN, "Dictation", "Write by voice, and keep editing anywhere in the text.") {
+                        done()
+                        Dictations.create()
+                    }
                     NewChoice(MIC, "Transcription", "Record and transcribe in order: talks, meetings, videos.") {
                         done()
                         Dictations.close()
                         Scribe.newThread()
-                    }
-                    NewChoice(PEN, "Dictation", "Write by voice, and keep editing anywhere in the text.") {
-                        done()
-                        Dictations.create()
                     }
                 }
             },
