@@ -33,6 +33,14 @@ section after the version it releases.
 - The voice keyboard shares scribe's engine, so it gets the same two
   background-music fixes: pauses count as silence over steady
   background, and audio with no new words closes after 1.5 seconds.
+- **One row of controls on every screen.** Recording, playback and
+  dictation each have a single row of round buttons mirrored around a
+  big one in the middle, under a short status line. A ring around the
+  big button shows the mic level while recording, or how far playback
+  or a file's transcription has got. Recording: source and Clear, then
+  record/stop, pause and Copy. Playback: stop and back 10 s, then
+  play/pause, ahead 10 s and Copy. Share, Rename, Delete and the
+  settings are in the ⋮ menu at the top.
 - **Dictations**, a second kind of document beside threads, for
   writing by voice rather than transcribing. The drawer lists both
   together, newest first, transcriptions marked 🎙️ and dictations ✍️;

@@ -4,6 +4,7 @@ import android.media.AudioManager
 import android.os.Handler
 import android.os.Looper
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -36,6 +37,9 @@ object Dictations {
     var laid by mutableStateOf(Laid("", emptyList(), -1))
         private set
     var listening by mutableStateOf(false)
+        private set
+    /** The mic's level while listening (RMS). */
+    var level by mutableFloatStateOf(0f)
         private set
     /** Stopped, the last words still being transcribed. */
     var finishing by mutableStateOf(false)
@@ -138,11 +142,15 @@ object Dictations {
         if (models == 0L) return if (Scribe.busy()) "Scribe is recording; stop it first." else "Scribe is busy."
         // A new session's clock starts at zero: fold the last one in first.
         doc.settle()
-        session = Dictation(models, audio, Scribe.boost, Scribe.route, main) { paras ->
-            doc.paras = paras
-            relayout()
-            saveSoon()
-        }.also { it.start() }
+        session = Dictation(
+            models, audio, Scribe.boost, Scribe.route, main,
+            onChange = { paras ->
+                doc.paras = paras
+                relayout()
+                saveSoon()
+            },
+            onLevel = { level = it },
+        ).also { it.start() }
         listening = true
         relayout()
         return null
@@ -153,6 +161,7 @@ object Dictations {
         val s = session ?: return
         session = null
         listening = false
+        level = 0f
         finishing = true
         s.finish { final ->
             doc.paras = final

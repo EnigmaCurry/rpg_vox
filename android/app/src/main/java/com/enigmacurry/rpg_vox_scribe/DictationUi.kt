@@ -119,59 +119,32 @@ fun DictationScreen() {
             Editor(Modifier.weight(1f).fillMaxWidth())
         }
         // Out of the way while the keyboard is up; closing it comes back to them.
-        if (!ime) Surface(tonalElevation = 3.dp) {
-            Column(
-                Modifier.fillMaxWidth().navigationBarsPadding().padding(16.dp),
-                horizontalAlignment = Alignment.CenterHorizontally,
-            ) {
-                Text(
-                    when {
-                        Dictations.finishing -> "Finishing…"
-                        Dictations.listening -> "Listening · tap the text to move the cursor"
-                        typing != null -> "Typing"
-                        hasText -> "Tap to dictate at the cursor"
-                        else -> "Tap to dictate"
-                    },
-                    style = MaterialTheme.typography.labelLarge,
-                    maxLines = 1,
-                )
-                Spacer(Modifier.height(12.dp))
-                Row(
-                    Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceEvenly,
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        TextButton(onClick = { copyText(context, Dictations.text()) }, enabled = hasText) { Text("Copy") }
-                        TextButton(onClick = { shareText(context, Dictations.text()) }, enabled = hasText) { Text("Share") }
-                    }
-                    RecordButton(recording = Dictations.listening, enabled = !Dictations.finishing, onClick = toggle)
-                    Box(Modifier.width(156.dp), contentAlignment = Alignment.Center) {
-                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                            val pad = androidx.compose.foundation.layout.PaddingValues(0.dp)
-                            Row {
-                                // A new paragraph at the cursor.
-                                OutlinedButton(onClick = Dictations::paragraphBreak, enabled = hasText, contentPadding = pad, modifier = Modifier.width(48.dp)) { Text("¶") }
-                                Spacer(Modifier.width(4.dp))
-                                // The sentence before the cursor.
-                                OutlinedButton(
-                                    onClick = Dictations::deleteSentence,
-                                    enabled = hasText,
-                                    contentPadding = pad,
-                                    modifier = Modifier.width(48.dp).semantics { contentDescription = "Delete the last sentence" },
-                                ) { Text("⌫") }
-                                Spacer(Modifier.width(4.dp))
-                                // Type at the cursor; closing the keyboard comes back here.
-                                OutlinedButton(
-                                    onClick = Dictations::typeMode,
-                                    contentPadding = pad,
-                                    modifier = Modifier.width(48.dp).semantics { contentDescription = "Type" },
-                                ) { Text("⌨️") }
-                            }
-                        }
-                    }
-                }
-            }
+        if (!ime) {
+            Dock(
+                status = when {
+                    Dictations.finishing -> "Finishing…"
+                    Dictations.listening -> "Listening"
+                    hasText -> "Tap ● to dictate at the cursor"
+                    else -> "Tap ● to dictate"
+                },
+                live = Dictations.listening,
+                // A new paragraph at the cursor.
+                l2 = { DockButton(DockIcons.Paragraph, "New paragraph", enabled = hasText, onClick = Dictations::paragraphBreak) },
+                // The sentence before the cursor.
+                l1 = { DockButton(DockIcons.Backspace, "Delete the last sentence", enabled = hasText, onClick = Dictations::deleteSentence) },
+                center = {
+                    BigButton(
+                        label = if (Dictations.listening) "Stop dictating" else "Dictate",
+                        enabled = !Dictations.finishing,
+                        onClick = toggle,
+                        recording = Dictations.listening,
+                        ring = Dictations.level * 8f,
+                    )
+                },
+                // Type at the cursor; closing the keyboard comes back here.
+                r1 = { DockButton(DockIcons.Keyboard, "Type", onClick = Dictations::typeMode) },
+                r2 = { DockButton(DockIcons.Copy, "Copy", enabled = hasText) { copyText(context, Dictations.text()) } },
+            )
         }
     }
 }

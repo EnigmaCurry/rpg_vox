@@ -201,8 +201,42 @@ private fun App() {
                     actions = {
                         if (ready) {
                             Box {
-                                IconButton(onClick = { menu = true }) { Text("⚙") }
+                                IconButton(onClick = { menu = true }) {
+                                    androidx.compose.material3.Icon(DockIcons.More, contentDescription = "More")
+                                }
                                 androidx.compose.material3.DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                                    // The open dictation or transcription, then the settings.
+                                    val dictation = Dictations.open
+                                    val context = LocalContext.current
+                                    val text = if (dictation != null) Dictations.text() else Scribe.text()
+                                    androidx.compose.material3.DropdownMenuItem(
+                                        text = { Text("Share") },
+                                        enabled = text.isNotBlank(),
+                                        onClick = {
+                                            menu = false
+                                            share(context, text)
+                                        },
+                                    )
+                                    androidx.compose.material3.DropdownMenuItem(
+                                        text = { Text("Rename") },
+                                        onClick = {
+                                            menu = false
+                                            if (dictation != null) dialogs.renamingDictation = dictation else dialogs.renaming = Scribe.thread
+                                        },
+                                    )
+                                    androidx.compose.material3.DropdownMenuItem(
+                                        text = { Text("Delete") },
+                                        enabled = dictation != null || !Scribe.busy(),
+                                        onClick = {
+                                            menu = false
+                                            if (dictation != null) {
+                                                dialogs.deletingDictation = dictation
+                                            } else {
+                                                dialogs.deleting = Scribe.threadList.firstOrNull { it.id == Scribe.thread.id } ?: Scribe.thread
+                                            }
+                                        },
+                                    )
+                                    androidx.compose.material3.HorizontalDivider()
                                     SettingsPage.entries.forEach { page ->
                                         androidx.compose.material3.DropdownMenuItem(
                                             text = { Text(page.title) },
@@ -405,126 +439,123 @@ private fun Dictate() {
 
     Column(Modifier.fillMaxSize()) {
         Transcript(Modifier.weight(1f).fillMaxWidth())
-        Surface(tonalElevation = 3.dp) {
-            Column(
-                Modifier.fillMaxWidth().navigationBarsPadding().padding(16.dp),
-                horizontalAlignment = Alignment.CenterHorizontally,
-            ) {
-                // Ticks the elapsed time once a second while a session is open.
-                var now by remember { mutableLongStateOf(0L) }
-                LaunchedEffect(Scribe.recording) {
-                    while (Scribe.recording) {
-                        now = Scribe.elapsedMs()
-                        delay(1_000 - now % 1_000)
-                    }
-                }
-                LaunchedEffect(playing) {
-                    while (Playback.playing != null) {
-                        now = Playback.positionMs()
-                        delay(250)
-                    }
-                }
-                val time = clock(if (Scribe.recording) now else 0)
-                val status = when {
-                    playing && Playback.paused -> "Paused · ${playTime(now)}"
-                    playing -> "${playTime(now)} · tap the text to pause"
+        // Ticks the elapsed time once a second while a session is open.
+        var now by remember { mutableLongStateOf(0L) }
+        LaunchedEffect(Scribe.recording) {
+            while (Scribe.recording) {
+                now = Scribe.elapsedMs()
+                delay(1_000 - now % 1_000)
+            }
+        }
+        LaunchedEffect(playing) {
+            while (Playback.playing != null) {
+                now = Playback.positionMs()
+                delay(250)
+            }
+        }
+        val time = clock(if (Scribe.recording) now else 0)
+        val hasText = Scribe.paragraphs.isNotEmpty()
+        val copyButton: @Composable () -> Unit = {
+            DockButton(DockIcons.Copy, "Copy", enabled = hasText) { copy(context, Scribe.text()) }
+        }
+        when {
+            // Playback: its own controls; Stop leaves it.
+            playing -> Dock(
+                status = (if (Playback.paused) "Paused · " else "") + playTime(now),
+                live = false,
+                l2 = { DockButton(DockIcons.Stop, "Stop playing", onClick = Playback::stop) },
+                l1 = { DockButton(DockIcons.Back, "Back 10 seconds") { Playback.skip(-10_000) } },
+                center = {
+                    BigButton(
+                        label = if (Playback.paused) "Resume" else "Pause",
+                        enabled = true,
+                        onClick = { if (Playback.paused) Playback.resume() else Playback.pause() },
+                        icon = if (Playback.paused) DockIcons.Play else DockIcons.Pause,
+                        ring = if (Playback.lengthMs > 0) now.toFloat() / Playback.lengthMs else 0f,
+                    )
+                },
+                r1 = { DockButton(DockIcons.Ahead, "Ahead 10 seconds") { Playback.skip(10_000) } },
+                r2 = copyButton,
+            )
+            // Recording, or transcribing a file.
+            Scribe.busy() -> Dock(
+                status = when {
                     job != null -> "Transcribing ${job.name}" +
-                        if (job.progress >= 0) " · ${(job.progress * 100).toInt()}%" else "…"
+                        (job.detail()?.let { " · $it" } ?: if (job.progress >= 0) " · ${(job.progress * 100).toInt()}%" else "…")
                     Scribe.finishing -> "Finishing…"
-                    Scribe.paused -> "Paused · $time"
-                    Scribe.recording -> "Listening · $time" + (Scribe.micName?.let { " · $it" } ?: "")
-                    Scribe.paragraphs.any { it.playable() } -> "Tap to start · tap a word to play from it"
-                    else -> "Tap to start · keeps going in the background"
-                }
-                if (playing) {
-                    PlaybackBar()
-                    Spacer(Modifier.height(8.dp))
-                } else if (Build.VERSION.SDK_INT >= 29) {
-                    SourcePicker(enabled = !Scribe.busy())
-                    Spacer(Modifier.height(8.dp))
-                }
-                Text(status, style = MaterialTheme.typography.labelLarge, maxLines = 1)
-                job?.detail()?.let {
-                    Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                }
-                if (playing && Playback.paused) {
-                    Text(
-                        "tap text to seek and resume",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
-                // Playback shows only its own controls; Stop leaves it.
-                if (!playing) {
-                    Spacer(Modifier.height(8.dp))
-                    LinearProgressIndicator(
-                        progress = {
-                            when {
-                                job != null -> job.progress.coerceAtLeast(0f)
-                                Scribe.recording -> (Scribe.level * 8f).coerceIn(0f, 1f)
-                                else -> 0f
-                            }
+                    Scribe.paused -> "Paused $time"
+                    else -> "Listening $time" + (Scribe.micName?.let { " · $it" } ?: "")
+                },
+                live = Scribe.recording && !Scribe.paused && !Scribe.finishing,
+                l2 = null,
+                l1 = null,
+                center = {
+                    BigButton(
+                        label = if (job != null) "Stop transcribing" else "Stop recording",
+                        enabled = !Scribe.finishing,
+                        onClick = toggle,
+                        recording = true,
+                        ring = when {
+                            job != null -> job.progress.coerceAtLeast(0f)
+                            Scribe.recording && !Scribe.paused -> Scribe.level * 8f
+                            else -> 0f
                         },
-                        modifier = Modifier.fillMaxWidth(0.6f),
-                        gapSize = 0.dp,
-                        drawStopIndicator = {},
                     )
-                    Spacer(Modifier.height(12.dp))
-                    Row(
-                        Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceEvenly,
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        val idle = !Scribe.busy()
-                        val hasText = Scribe.paragraphs.isNotEmpty()
-                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                            TextButton(onClick = { copy(context, Scribe.text()) }, enabled = hasText) { Text("Copy") }
-                            TextButton(onClick = { share(context, Scribe.text()) }, enabled = hasText) { Text("Share") }
-                        }
-                        RecordButton(
-                            recording = Scribe.recording || job != null,
-                            enabled = !Scribe.finishing,
-                            onClick = toggle,
-                        )
-                        // Pause while recording, Clear otherwise: one spot.
-                        Box(Modifier.width(96.dp), contentAlignment = Alignment.Center) {
-                            if (Scribe.recording) {
-                                OutlinedButton(
-                                    onClick = { if (Scribe.paused) Scribe.resume() else Scribe.pause() },
-                                    enabled = !Scribe.finishing,
-                                ) { Text(if (Scribe.paused) "▶" else "❚❚") }
-                            } else {
-                                // Also clears audio that has no text with it.
-                                var confirm by remember { mutableStateOf(false) }
-                                TextButton(
-                                    onClick = { confirm = true },
-                                    enabled = idle && (hasText || Scribe.threadAudio.isNotEmpty()),
-                                ) { Text("Clear") }
-                                if (confirm) ConfirmClear(close = { confirm = false })
-                            }
-                        }
+                },
+                r1 = if (Scribe.recording && !Scribe.finishing) {
+                    {
+                        DockButton(
+                            if (Scribe.paused) DockIcons.Play else DockIcons.Pause,
+                            if (Scribe.paused) "Resume" else "Pause",
+                        ) { if (Scribe.paused) Scribe.resume() else Scribe.pause() }
                     }
-                }
+                } else {
+                    null
+                },
+                r2 = copyButton,
+            )
+            else -> Dock(
+                status = if (Scribe.paragraphs.any { it.playable() }) "Tap ● to record · tap a word to play" else "Tap ● to record",
+                live = false,
+                l2 = if (Build.VERSION.SDK_INT >= 29) { { SourceButton() } } else null,
+                l1 = {
+                    // Also clears audio that has no text with it.
+                    var confirm by remember { mutableStateOf(false) }
+                    DockButton(DockIcons.Clear, "Clear", enabled = hasText || Scribe.threadAudio.isNotEmpty()) { confirm = true }
+                    if (confirm) ConfirmClear(close = { confirm = false })
+                },
+                center = { BigButton(label = "Start recording", enabled = true, onClick = toggle) },
+                r1 = null,
+                r2 = copyButton,
+            )
+        }
+    }
+}
+
+/** What to record from (Mic, Phone, Both): its icon, tapped for a menu. */
+@Composable
+private fun SourceButton() {
+    var menu by remember { mutableStateOf(false) }
+    val modes = listOf(Triple(Mode.MIC, "Mic", DockIcons.Mic), Triple(Mode.PHONE, "Phone audio", DockIcons.Phone), Triple(Mode.BOTH, "Mic and phone audio", DockIcons.Both))
+    val current = modes.first { it.first == Scribe.mode }
+    Box {
+        DockButton(current.third, "Record from: ${current.second}") { menu = true }
+        androidx.compose.material3.DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+            modes.forEach { (m, label, icon) ->
+                androidx.compose.material3.DropdownMenuItem(
+                    text = { Text(label) },
+                    leadingIcon = { androidx.compose.material3.Icon(icon, null) },
+                    trailingIcon = { if (m == Scribe.mode) Text("✓") },
+                    onClick = {
+                        menu = false
+                        Scribe.choose(m)
+                    },
+                )
             }
         }
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-private fun SourcePicker(enabled: Boolean) {
-    val modes = listOf(Mode.MIC to "Mic", Mode.PHONE to "Phone", Mode.BOTH to "Both")
-    SingleChoiceSegmentedButtonRow {
-        modes.forEachIndexed { i, (m, label) ->
-            SegmentedButton(
-                selected = Scribe.mode == m,
-                onClick = { Scribe.choose(m) },
-                enabled = enabled,
-                shape = SegmentedButtonDefaults.itemShape(i, modes.size),
-            ) { Text(label, maxLines = 1) }
-        }
-    }
-}
 
 /** Play [recording] from 0:00: small above its first paragraph, or [big] when it has no words. */
 @OptIn(ExperimentalFoundationApi::class)
@@ -646,43 +677,7 @@ fun TextStyle.scaled(scale: Float): TextStyle =
 private fun playTime(now: Long): String =
     clock(now) + Playback.lengthMs.let { if (it > 0) " / ${clock(it)}" else "" }
 
-/** In place of the source picker while a recording plays: back/ahead 10 s, pause/resume, stop. */
-@Composable
-private fun PlaybackBar() {
-    val pad = androidx.compose.foundation.layout.PaddingValues(horizontal = 12.dp)
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        TextButton(onClick = { Playback.skip(-10_000) }, contentPadding = pad) { Text("« 10s") }
-        FilledTonalButton(onClick = { if (Playback.paused) Playback.resume() else Playback.pause() }, contentPadding = pad) {
-            Text(if (Playback.paused) "▶ Resume" else "❚❚ Pause")
-        }
-        TextButton(onClick = { Playback.skip(10_000) }, contentPadding = pad) { Text("10s »") }
-        Spacer(Modifier.size(4.dp))
-        OutlinedButton(onClick = Playback::stop, contentPadding = pad) { Text("■ Stop") }
-    }
-}
 
-@Composable
-fun RecordButton(recording: Boolean, enabled: Boolean, onClick: () -> Unit) {
-    Button(
-        onClick = onClick,
-        enabled = enabled,
-        shape = CircleShape,
-        modifier = Modifier.size(88.dp).semantics {
-            contentDescription = if (recording) "Stop dictation" else "Start dictation"
-        },
-        colors = androidx.compose.material3.ButtonDefaults.buttonColors(
-            // Red only while recording (the stop button); idle it's a red dot.
-            containerColor = if (recording) Color(0xFFD32F2F) else MaterialTheme.colorScheme.surfaceVariant,
-            contentColor = Color.White,
-        ),
-    ) {
-        if (recording) {
-            Box(Modifier.size(28.dp).background(Color.White, RoundedCornerShape(4.dp)))
-        } else {
-            Box(Modifier.size(30.dp).background(Color(0xFFD32F2F), CircleShape))
-        }
-    }
-}
 
 @Composable
 private fun Transcript(modifier: Modifier) {

@@ -26,6 +26,8 @@ class Dictation(
     private val route: MicRoute,
     private val main: Handler,
     private val onChange: (List<KPara>) -> Unit,
+    /** The mic's level (RMS), every 50 ms or so. */
+    private val onLevel: (Float) -> Unit = {},
 ) {
     private var session = 0L
     @Volatile private var capturing = true
@@ -119,6 +121,7 @@ class Dictation(
             when (ev.getString("t")) {
                 "paragraph" -> parseKPara(ev.getJSONObject("p")).let { paras[it.id] = it; changed = true }
                 "removed" -> changed = paras.remove(ev.getString("id")) != null || changed
+                "level" -> if (!paused) onLevel(ev.getDouble("rms").toFloat())
             }
         }
         // Level events arrive every 50 ms; only text changes redraw.
