@@ -233,7 +233,9 @@ private fun Editor(modifier: Modifier) {
             if (it is DragInteraction.Start) follow = false
         }
     }
-    LaunchedEffect(shown, layout, follow) {
+    // Also as the view changes size: the keyboard closing, the controls coming back.
+    var height by remember { mutableStateOf(0) }
+    LaunchedEffect(shown, layout, follow, height) {
         val l = layout ?: return@LaunchedEffect
         if (!follow || held != null || shown.caret !in 0..l.layoutInput.text.length) return@LaunchedEffect
         val r = l.getCursorRect(shown.caret)
@@ -244,7 +246,7 @@ private fun Editor(modifier: Modifier) {
         selection = TextRange.Zero
         held = null
     }
-    Box(modifier.verticalScroll(scroll).padding(16.dp)) {
+    Box(modifier.onSizeChanged { height = it.height }.verticalScroll(scroll).padding(16.dp)) {
         BasicTextField(
             value = TextFieldValue(text, sel),
             onValueChange = {
