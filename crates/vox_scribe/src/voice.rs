@@ -234,12 +234,22 @@ fn play(mut out: Output, rate: u32, shared: &Shared, audio: Receiver<Audio>) {
                         resampler.process(&c.samples, &mut buf);
                     }
                     Some(Audio::End(_)) => {
-                        let _ =
-                            shared
-                                .pending
-                                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-                                    n.checked_sub(1)
-                                });
+                        // One less pending, never below zero. A plain
+                        // compare-exchange loop: `fetch_update` is
+                        // deprecated on new toolchains, and its
+                        // replacement `try_update` is missing on older ones.
+                        let mut n = shared.pending.load(Ordering::SeqCst);
+                        while n > 0 {
+                            match shared.pending.compare_exchange_weak(
+                                n,
+                                n - 1,
+                                Ordering::SeqCst,
+                                Ordering::SeqCst,
+                            ) {
+                                Ok(_) => break,
+                                Err(now) => n = now,
+                            }
+                        }
                         continue;
                     }
                     None => break,
