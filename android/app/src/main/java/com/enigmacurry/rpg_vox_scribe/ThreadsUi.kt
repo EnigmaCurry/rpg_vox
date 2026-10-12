@@ -52,111 +52,100 @@ class ThreadDialogs {
     var deleting by mutableStateOf<ThreadInfo?>(null)
     var renamingDictation by mutableStateOf<DictationInfo?>(null)
     var deletingDictation by mutableStateOf<DictationInfo?>(null)
+    /** New was tapped: transcription or dictation? */
+    var choosingNew by mutableStateOf(false)
 }
 
+/** A transcription (thread) and a dictation, as the drawer marks them. */
+private const val MIC = "🎙️"
+private const val PEN = "✍️"
+
 /**
- * The drawer: dictations (New dictation, then each, most recently changed
- * first), then threads (New thread, then each, most recent first, with
- * its time and last line). Tap opens one; long-press offers Rename and
- * Delete. While recording only the open thread is reachable.
+ * The drawer: New, which asks whether for a transcription or a
+ * dictation, then both kinds in one list, the most recently changed
+ * first, each with its time and last words and marked by its icon. Tap
+ * opens one; long-press offers Rename and Delete. While recording only
+ * the open transcription is reachable.
  */
 @Composable
 fun ThreadDrawer(dialogs: ThreadDialogs, close: () -> Unit) {
     val locked = Scribe.busy()
     val dictation = Dictations.open
+    // Both kinds' times are local "YYYY-MM-DD HH:MM", so they sort as text.
+    val entries = (Scribe.threadList.map { it.last to it } + Dictations.list.map { it.updated to it })
+        .sortedByDescending { it.first }
+        .map { it.second }
     ModalDrawerSheet {
+        Text(
+            "Scribe",
+            style = MaterialTheme.typography.titleLarge,
+            modifier = Modifier.padding(start = 24.dp, top = 24.dp, bottom = 8.dp),
+        )
+        if (locked) {
+            Text(
+                "Stop recording to switch",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+                modifier = Modifier.padding(start = 24.dp, bottom = 8.dp),
+            )
+        }
+        ThreadRow(
+            icon = null,
+            title = "+ New",
+            subtitle = null,
+            selected = false,
+            enabled = !locked,
+            onClick = {
+                dialogs.choosingNew = true
+                close()
+            },
+        )
+        HorizontalDivider(Modifier.padding(vertical = 8.dp))
         LazyColumn {
-            item(key = "dictations") { Heading("Dictations") }
-            item(key = "new-dictation") {
-                ThreadRow(
-                    title = "+ New dictation",
-                    subtitle = null,
-                    selected = false,
-                    enabled = !locked,
-                    onClick = {
-                        Dictations.create()
-                        close()
-                    },
-                )
-            }
-            items(Dictations.list, key = { "d${it.id}" }) { d ->
+            items(entries, key = { if (it is DictationInfo) "d${it.id}" else "t${(it as ThreadInfo).id}" }) { e ->
                 var menu by remember { mutableStateOf(false) }
                 Box {
-                    ThreadRow(
-                        title = d.title,
-                        subtitle = d.updated + d.text.take(80).replace('\n', ' ').let { if (it.isNotBlank()) " · $it" else "" },
-                        selected = d.id == dictation?.id,
-                        enabled = !locked,
-                        onClick = {
-                            Dictations.openDictation(d.id)
-                            close()
-                        },
-                        onLongClick = { menu = true },
-                    )
-                    DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
-                        DropdownMenuItem(text = { Text("Rename") }, onClick = {
-                            menu = false
-                            dialogs.renamingDictation = d
-                        })
-                        DropdownMenuItem(text = { Text("Delete") }, onClick = {
-                            menu = false
-                            dialogs.deletingDictation = d
-                        })
+                    when (e) {
+                        is DictationInfo -> ThreadRow(
+                            icon = PEN,
+                            title = e.title,
+                            subtitle = e.updated + e.text.take(80).replace('\n', ' ').let { if (it.isNotBlank()) " · $it" else "" },
+                            selected = e.id == dictation?.id,
+                            enabled = !locked,
+                            onClick = {
+                                Dictations.openDictation(e.id)
+                                close()
+                            },
+                            onLongClick = { menu = true },
+                        )
+                        is ThreadInfo -> {
+                            val open = e.id == Scribe.thread.id
+                            ThreadRow(
+                                icon = MIC,
+                                title = e.title,
+                                subtitle = e.last + if (e.preview.isNotBlank()) " · ${e.preview}" else "",
+                                selected = open && dictation == null,
+                                enabled = open || !locked,
+                                onClick = {
+                                    Dictations.close()
+                                    Scribe.switchTo(e.id)
+                                    close()
+                                },
+                                onLongClick = { menu = true },
+                            )
+                        }
                     }
-                }
-            }
-            item(key = "divider") { HorizontalDivider(Modifier.padding(vertical = 8.dp)) }
-            item(key = "threads") { Heading("Threads") }
-            if (locked) {
-                item(key = "locked") {
-                    Text(
-                        "Stop recording to switch threads",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.error,
-                        modifier = Modifier.padding(start = 24.dp, bottom = 8.dp),
-                    )
-                }
-            }
-            item(key = "new-thread") {
-                ThreadRow(
-                    title = "+ New thread",
-                    subtitle = null,
-                    selected = false,
-                    enabled = !locked,
-                    onClick = {
-                        Dictations.close()
-                        Scribe.newThread()
-                        close()
-                    },
-                )
-            }
-            items(Scribe.threadList, key = { it.id }) { t ->
-                val open = t.id == Scribe.thread.id
-                var menu by remember { mutableStateOf(false) }
-                Box {
-                    ThreadRow(
-                        title = t.title,
-                        subtitle = t.last + if (t.preview.isNotBlank()) " · ${t.preview}" else "",
-                        selected = open && dictation == null,
-                        enabled = open || !locked,
-                        onClick = {
-                            Dictations.close()
-                            Scribe.switchTo(t.id)
-                            close()
-                        },
-                        onLongClick = { menu = true },
-                    )
                     DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
                         DropdownMenuItem(text = { Text("Rename") }, onClick = {
                             menu = false
-                            dialogs.renaming = t
+                            if (e is DictationInfo) dialogs.renamingDictation = e else dialogs.renaming = e as ThreadInfo
                         })
                         DropdownMenuItem(
                             text = { Text("Delete") },
-                            enabled = !(open && locked),
+                            enabled = !(e is ThreadInfo && e.id == Scribe.thread.id && locked),
                             onClick = {
                                 menu = false
-                                dialogs.deleting = t
+                                if (e is DictationInfo) dialogs.deletingDictation = e else dialogs.deleting = e as ThreadInfo
                             },
                         )
                     }
@@ -166,18 +155,10 @@ fun ThreadDrawer(dialogs: ThreadDialogs, close: () -> Unit) {
     }
 }
 
-@Composable
-private fun Heading(text: String) {
-    Text(
-        text,
-        style = MaterialTheme.typography.titleLarge,
-        modifier = Modifier.padding(start = 24.dp, top = 24.dp, bottom = 8.dp),
-    )
-}
-
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun ThreadRow(
+    icon: String?,
     title: String,
     subtitle: String?,
     selected: Boolean,
@@ -195,7 +176,12 @@ private fun ThreadRow(
             // Long-press works even when tapping is locked (rename while recording).
             .combinedClickable(onClick = { if (enabled) onClick() }, onLongClick = onLongClick),
     ) {
-        Column(Modifier.padding(horizontal = 16.dp, vertical = 12.dp)) {
+        androidx.compose.foundation.layout.Row(
+            Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
+            verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
+        ) {
+            if (icon != null) Text(icon, style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(end = 12.dp))
+        Column {
             Text(
                 title,
                 style = MaterialTheme.typography.titleSmall,
@@ -213,20 +199,43 @@ private fun ThreadRow(
                 )
             }
         }
+        }
     }
 }
 
 @Composable
 fun ThreadDialogHost(dialogs: ThreadDialogs) {
+    if (dialogs.choosingNew) {
+        val done = { dialogs.choosingNew = false }
+        AlertDialog(
+            onDismissRequest = done,
+            title = { Text("New") },
+            text = {
+                Column {
+                    NewChoice(MIC, "Transcription", "Record and transcribe in order: talks, meetings, videos.") {
+                        done()
+                        Dictations.close()
+                        Scribe.newThread()
+                    }
+                    NewChoice(PEN, "Dictation", "Write by voice, and keep editing anywhere in the text.") {
+                        done()
+                        Dictations.create()
+                    }
+                }
+            },
+            confirmButton = {},
+            dismissButton = { TextButton(onClick = done) { Text("Cancel") } },
+        )
+    }
     dialogs.renaming?.let { t ->
-        Rename("Rename thread", t.title, close = { dialogs.renaming = null }) { Scribe.rename(t.id, it) }
+        Rename("Rename transcription", t.title, close = { dialogs.renaming = null }) { Scribe.rename(t.id, it) }
     }
     dialogs.renamingDictation?.let { d ->
         Rename("Rename dictation", d.title, close = { dialogs.renamingDictation = null }) { Dictations.rename(d.id, it) }
     }
     dialogs.deleting?.let { t ->
         ConfirmDelete(
-            "Delete thread?",
+            "Delete transcription?",
             "\"${t.title}\" and its ${t.count} paragraph(s) will be deleted. This can't be undone.",
             close = { dialogs.deleting = null },
         ) { Scribe.delete(t.id) }
@@ -237,6 +246,27 @@ fun ThreadDialogHost(dialogs: ThreadDialogs) {
             "\"${d.title}\" and its text will be deleted. This can't be undone.",
             close = { dialogs.deletingDictation = null },
         ) { Dictations.delete(d.id) }
+    }
+}
+
+@Composable
+private fun NewChoice(icon: String, title: String, detail: String, onClick: () -> Unit) {
+    Surface(
+        shape = RoundedCornerShape(12.dp),
+        color = MaterialTheme.colorScheme.secondaryContainer,
+        onClick = onClick,
+        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+    ) {
+        androidx.compose.foundation.layout.Row(
+            Modifier.padding(16.dp),
+            verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
+        ) {
+            Text(icon, style = MaterialTheme.typography.headlineSmall, modifier = Modifier.padding(end = 16.dp))
+            Column {
+                Text(title, style = MaterialTheme.typography.titleMedium)
+                Text(detail, style = MaterialTheme.typography.bodySmall)
+            }
+        }
     }
 }
 

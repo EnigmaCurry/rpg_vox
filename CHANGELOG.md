@@ -34,8 +34,9 @@ section after the version it releases.
   background-music fixes: pauses count as silence over steady
   background, and audio with no new words closes after 1.5 seconds.
 - **Dictations**, a second kind of document beside threads, for
-  writing by voice rather than transcribing. Start one from the
-  drawer's "New dictation". It edits like the voice keyboard, but the
+  writing by voice rather than transcribing. The drawer lists both
+  together, newest first, transcriptions marked 🎙️ and dictations ✍️;
+  its New button asks which to start. It edits like the voice keyboard, but the
   text is saved, so you can come back and keep going: tap the text to
   move the purple cursor where new speech goes (lowercased where it
   lands mid-sentence), select words to Delete or Edit them (listening
