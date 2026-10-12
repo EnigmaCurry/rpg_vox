@@ -6,6 +6,8 @@ section after the version it releases.
 
 ## Unreleased
 
+## v0.1.4 (2026-10-12)
+
 ### scribe
 
 - **Pass 2 keeps up with background music.** The voice detector's
