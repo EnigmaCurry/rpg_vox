@@ -95,6 +95,12 @@ fun DictationScreen() {
             else -> ask.launch(Manifest.permission.RECORD_AUDIO)
         }
     }
+    // Made with New, with "Start recording on New" on: once the last one has finished.
+    LaunchedEffect(Scribe.startWhenOpen, Dictations.open?.id, Dictations.finishing) {
+        if (Scribe.startWhenOpen != "dictation" || Dictations.open == null || Dictations.finishing) return@LaunchedEffect
+        Scribe.startWhenOpen = null
+        if (!Dictations.listening) toggle()
+    }
     if (Dictations.listening) KeepScreenOn()
     val typing = Dictations.typing
     // Closing the keyboard ends typing: back to dictating. Only once it

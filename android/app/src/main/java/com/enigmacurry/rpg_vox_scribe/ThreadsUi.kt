@@ -209,17 +209,19 @@ fun ThreadDialogHost(dialogs: ThreadDialogs) {
         val done = { dialogs.choosingNew = false }
         AlertDialog(
             onDismissRequest = done,
-            title = { Text("New") },
+            title = { Text("New thread") },
             text = {
                 Column {
                     NewChoice(PEN, "Dictation", "Write by voice, and keep editing anywhere in the text.") {
                         done()
                         Dictations.create()
+                        if (Scribe.autoStart) Scribe.startWhenOpen = "dictation"
                     }
                     NewChoice(MIC, "Transcription", "Record and transcribe in order: talks, meetings, videos.") {
                         done()
                         Dictations.close()
                         Scribe.newThread()
+                        if (Scribe.autoStart) Scribe.startWhenOpen = "transcription"
                     }
                 }
             },
@@ -406,6 +408,12 @@ private fun RecordingPage() {
         Scribe.keepNonSpeech,
         Scribe::chooseKeepNonSpeech,
         enabled = Scribe.keepAudio,
+    )
+    Toggle(
+        "Start recording on New",
+        "A new dictation or transcription starts listening as soon as it opens.",
+        Scribe.autoStart,
+        Scribe::chooseAutoStart,
     )
 }
 

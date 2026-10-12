@@ -433,6 +433,12 @@ private fun Dictate() {
             else -> ask.launch(wanted.toTypedArray())
         }
     }
+    // Made with New, with "Start recording on New" on.
+    LaunchedEffect(Scribe.startWhenOpen) {
+        if (Scribe.startWhenOpen != "transcription") return@LaunchedEffect
+        Scribe.startWhenOpen = null
+        if (!Scribe.busy()) toggle()
+    }
     if (Scribe.recording) KeepScreenOn()
     val job = Scribe.file
     val playing = Playback.playing != null

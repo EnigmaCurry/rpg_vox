@@ -151,6 +151,14 @@ object Scribe {
     /** With [keepAudio], also keep recordings in which no words were detected. */
     var keepNonSpeech by mutableStateOf(false)
         private set
+    /** Start recording (or dictating) as soon as a new one is made with New. */
+    var autoStart by mutableStateOf(false)
+        private set
+    /**
+     * Just made with New and [autoStart] is on: the screen for it ("dictation"
+     * or "transcription") starts recording once it's up, and clears this.
+     */
+    var startWhenOpen by mutableStateOf<String?>(null)
     /** Transcript text size, an index into [FONT_SCALES]. */
     var fontStep by mutableIntStateOf(FONT_SCALES.size / 2)
         private set
@@ -240,6 +248,7 @@ object Scribe {
         route = runCatching { MicRoute.valueOf(prefs.getString("route", "AUTO")!!) }.getOrDefault(MicRoute.AUTO)
         keepAudio = prefs.getBoolean("keep_audio", false)
         keepNonSpeech = prefs.getBoolean("keep_non_speech", false)
+        autoStart = prefs.getBoolean("auto_start", false)
         fontStep = prefs.getInt("font_step", FONT_SCALES.size / 2).coerceIn(0, FONT_SCALES.size - 1)
         phase = if (store.ready()) Phase.Unloaded else Phase.NeedModels(resume = store.started())
         migrate()
@@ -271,6 +280,11 @@ object Scribe {
     fun chooseKeepNonSpeech(keep: Boolean) {
         keepNonSpeech = keep
         app.getSharedPreferences("scribe", Context.MODE_PRIVATE).edit().putBoolean("keep_non_speech", keep).apply()
+    }
+
+    fun chooseAutoStart(on: Boolean) {
+        autoStart = on
+        app.getSharedPreferences("scribe", Context.MODE_PRIVATE).edit().putBoolean("auto_start", on).apply()
     }
 
     fun chooseFontStep(step: Int) {
