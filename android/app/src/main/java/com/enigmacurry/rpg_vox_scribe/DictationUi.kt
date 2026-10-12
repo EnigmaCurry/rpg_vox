@@ -296,8 +296,9 @@ private fun Editor(modifier: Modifier) {
         if (laid.toks.isEmpty() && !Dictations.listening) {
             Text(
                 "Dictate text you can keep editing: tap the text to move the cursor, " +
-                    "where new speech goes, and select words to delete or edit them. " +
-                    "¶ starts a new paragraph.",
+                    "where new speech goes, and select words to delete them. " +
+                    "¶ starts a new paragraph, ⌫ deletes the last sentence, and the " +
+                    "keyboard button opens your keyboard to edit the text by hand.",
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(top = 32.dp),
