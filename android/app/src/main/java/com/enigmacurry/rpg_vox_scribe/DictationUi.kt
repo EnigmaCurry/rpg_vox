@@ -230,7 +230,22 @@ private fun Editor(modifier: Modifier) {
     fun done() {
         Dictations.select(TextRange.Zero)
     }
-    Box(modifier.onSizeChanged { height = it.height }.verticalScroll(scroll).padding(16.dp)) {
+    Box(
+        modifier
+            .onSizeChanged { height = it.height }
+            .pointerInput(Unit) {
+                // A tap in the empty space below the text: the cursor to the end.
+                awaitEachGesture {
+                    val up = awaitTap(PointerEventPass.Main) ?: return@awaitEachGesture
+                    val l = layout ?: return@awaitEachGesture
+                    if (up.y + scroll.value <= 16.dp.toPx() + l.size.height) return@awaitEachGesture
+                    follow = true
+                    Dictations.moveCursor(Dictations.laid.text.length)
+                }
+            }
+            .verticalScroll(scroll)
+            .padding(16.dp),
+    ) {
         BasicTextField(
             value = TextFieldValue(text, sel),
             onValueChange = {
