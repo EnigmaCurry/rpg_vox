@@ -6,6 +6,15 @@ section after the version it releases.
 
 ## Unreleased
 
+### scribe
+
+- Builds without a deprecation warning on the newest Rust toolchains.
+
+### Scribe for Android
+
+- **App icon**: the rpg_vox logo (the hooded figure with the mic), in
+  place of Android's default.
+
 ## v0.1.4 (2026-10-12)
 
 ### scribe
