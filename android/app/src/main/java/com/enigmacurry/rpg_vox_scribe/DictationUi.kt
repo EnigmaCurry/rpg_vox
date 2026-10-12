@@ -52,6 +52,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Offset
@@ -169,22 +170,22 @@ private object DeleteItem
  * Typing mode: the text in an ordinary field, for the phone's keyboard,
  * focused with the keyboard up.
  */
-@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun Typing(value: TextFieldValue, modifier: Modifier) {
     val focus = remember { FocusRequester() }
     LaunchedEffect(Unit) { focus.requestFocus() }
     var layout by remember { mutableStateOf<TextLayoutResult?>(null) }
     val requester = remember { BringIntoViewRequester() }
-    // Keep the cursor in view as the keyboard comes up over it, and as it moves.
-    val ime = WindowInsets.isImeVisible
-    LaunchedEffect(ime, value.selection, layout) {
+    // Keep the cursor in view as the keyboard comes up over it (the view
+    // shrinking as it slides in), and as it moves.
+    var height by remember { mutableStateOf(0) }
+    LaunchedEffect(height, value.selection, layout) {
         val l = layout ?: return@LaunchedEffect
         val at = value.selection.end.coerceIn(0, l.layoutInput.text.length)
         val r = l.getCursorRect(at)
         requester.bringIntoView(Rect(r.left, r.top, r.right, r.bottom + r.height))
     }
-    Box(modifier.verticalScroll(rememberScrollState()).padding(16.dp)) {
+    Box(modifier.onSizeChanged { height = it.height }.verticalScroll(rememberScrollState()).padding(16.dp)) {
         BasicTextField(
             value = value,
             onValueChange = Dictations::type,
