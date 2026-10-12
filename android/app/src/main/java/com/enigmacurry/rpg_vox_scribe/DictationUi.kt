@@ -127,7 +127,6 @@ fun DictationScreen() {
                 Text(
                     when {
                         Dictations.finishing -> "Finishing…"
-                        Dictations.paused -> "Paused"
                         Dictations.listening -> "Listening · tap the text to move the cursor"
                         typing != null -> "Typing"
                         hasText -> "Tap to dictate at the cursor"
@@ -149,11 +148,6 @@ fun DictationScreen() {
                     RecordButton(recording = Dictations.listening, enabled = !Dictations.finishing, onClick = toggle)
                     Box(Modifier.width(156.dp), contentAlignment = Alignment.Center) {
                         Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                            if (Dictations.listening) {
-                                OutlinedButton(onClick = Dictations::togglePause) {
-                                    Text(if (Dictations.paused) "▶" else "❚❚")
-                                }
-                            }
                             val pad = androidx.compose.foundation.layout.PaddingValues(0.dp)
                             Row {
                                 // A new paragraph at the cursor.

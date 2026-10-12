@@ -37,8 +37,6 @@ object Dictations {
         private set
     var listening by mutableStateOf(false)
         private set
-    var paused by mutableStateOf(false)
-        private set
     /** Stopped, the last words still being transcribed. */
     var finishing by mutableStateOf(false)
         private set
@@ -50,9 +48,8 @@ object Dictations {
     /** [doc] as last built. */
     private var built: List<Tok> = emptyList()
     private var session: Dictation? = null
-    /** Listening (and whether paused) when typing began, to take up again after. */
+    /** Listening when typing began, to take up again after. */
     private var listenAfterTyping = false
-    private var pausedAfterTyping = false
     private val saver = Runnable { save() }
     /** Runs once the session finishing has saved. */
     private var then: (() -> Unit)? = null
@@ -147,7 +144,6 @@ object Dictations {
             saveSoon()
         }.also { it.start() }
         listening = true
-        paused = false
         relayout()
         return null
     }
@@ -157,7 +153,6 @@ object Dictations {
         val s = session ?: return
         session = null
         listening = false
-        paused = false
         finishing = true
         s.finish { final ->
             doc.paras = final
@@ -172,12 +167,6 @@ object Dictations {
         }
     }
 
-    fun togglePause() {
-        val s = session ?: return
-        s.paused = !s.paused
-        paused = s.paused
-    }
-
     /** The app left the screen: the mic can't stay on in the background. */
     fun onHidden() {
         stop()
@@ -190,10 +179,7 @@ object Dictations {
      */
     fun typeMode() {
         if (open == null || typing != null) return
-        if (session != null) {
-            listenAfterTyping = true
-            pausedAfterTyping = paused
-        }
+        if (session != null) listenAfterTyping = true
         if (session != null || finishing) {
             then = ::typeMode
             stop()
@@ -211,13 +197,12 @@ object Dictations {
     /**
      * Back to dictating: what was typed is the text, the cursor where the
      * keyboard's was. If listening when typing began, and [resume], it
-     * starts again (paused if it was).
+     * starts again.
      */
     fun dictateMode(resume: Boolean = true) {
         val t = typing ?: return
         typing = null
         val listen = listenAfterTyping && resume
-        val wasPaused = pausedAfterTyping
         listenAfterTyping = false
         val head = t.text.substring(0, t.selection.min)
         // A cursor within a word counts as after it; one at a line's start
@@ -227,7 +212,7 @@ object Dictations {
         doc.load(t.text, cursor)
         relayout()
         save()
-        if (listen && start() == null && wasPaused) togglePause()
+        if (listen) start()
     }
 
     /** Typed: [value] is the field's new state. */
