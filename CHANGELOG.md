@@ -6,6 +6,8 @@ section after the version it releases.
 
 ## Unreleased
 
+## v0.1.5 (2026-10-12)
+
 ### scribe
 
 - Builds without a deprecation warning on the newest Rust toolchains.
