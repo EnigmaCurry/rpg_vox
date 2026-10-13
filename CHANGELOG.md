@@ -6,6 +6,8 @@ section after the version it releases.
 
 ## Unreleased
 
+## v0.1.7 (2026-10-13)
+
 ### scribe
 
 - **PulseAudio systems.** On Linux without PipeWire running, scribe
