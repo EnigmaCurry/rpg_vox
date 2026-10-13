@@ -1,4 +1,6 @@
-//! CoreAudio input through cpal.
+//! Input through cpal: CoreAudio on macOS; on Linux, ALSA where
+//! PipeWire isn't running (see [`crate::pipewire::running`]), which on a
+//! PulseAudio system reaches its default source through the ALSA plugin.
 
 use std::sync::atomic::Ordering;
 
@@ -12,7 +14,7 @@ use tracing::warn;
 use crate::AppInfo;
 use crate::{push_rt, Backend, Capture, DeviceInfo, OpenOptions, Plumbing};
 
-pub struct CoreAudio;
+pub struct Cpal;
 
 fn device_name(d: &cpal::Device) -> String {
     d.description()
@@ -44,9 +46,13 @@ fn find_device(host: &cpal::Host, want: Option<&str>) -> Result<cpal::Device> {
     fuzzy.ok_or_else(|| anyhow!("no input device matching {want:?} (try `devices`)"))
 }
 
-impl Backend for CoreAudio {
+impl Backend for Cpal {
     fn name(&self) -> &'static str {
-        "coreaudio"
+        if cfg!(target_os = "linux") {
+            "alsa"
+        } else {
+            "coreaudio"
+        }
     }
 
     fn list_devices(&self) -> Result<Vec<DeviceInfo>> {
@@ -71,22 +77,29 @@ impl Backend for CoreAudio {
 
     fn open(&self, opts: &OpenOptions) -> Result<Capture> {
         if opts.virtual_sink {
+            if cfg!(target_os = "linux") {
+                bail!("--virtual-sink needs PipeWire, which isn't running");
+            }
             bail!("--virtual-sink is PipeWire-only; on macOS use --app, or route apps through a loopback device such as BlackHole and pick it with --device");
         }
         #[cfg(target_os = "macos")]
         if let Some(app) = &opts.app {
             return crate::process_tap::open(app);
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "linux")]
+        if opts.app.is_some() {
+            bail!("--app needs PipeWire, which isn't running");
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         if opts.app.is_some() {
             bail!("--app is not supported on this OS");
         }
-        // cpal::Stream is !Send on macOS, so it lives on its own thread
-        // for the whole capture.
+        // cpal::Stream is !Send, so it lives on its own thread for the
+        // whole capture.
         let want = opts.device.clone();
         let (ready_tx, ready_rx) = bounded::<Result<(u32, String, crate::CaptureParts)>>(1);
         let thread = std::thread::Builder::new()
-            .name("vox-coreaudio".into())
+            .name("vox-cpal".into())
             .spawn(move || {
                 let started = (|| -> Result<_> {
                     let host = cpal::default_host();

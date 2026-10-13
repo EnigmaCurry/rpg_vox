@@ -19,6 +19,9 @@ ogg = "0.9"
 [target.'cfg(target_os = "linux")'.dependencies]
 pipewire.workspace = true
 libspa.workspace = true
+# The mic and speakers through ALSA where PipeWire isn't running
+# (PulseAudio systems, through its ALSA plugin).
+cpal = "0.18"
 
 [target.'cfg(target_os = "android")'.dependencies]
 cpal = "0.18"

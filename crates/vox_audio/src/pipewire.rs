@@ -53,6 +53,60 @@ fn pw_dump() -> Result<serde_json::Value> {
 
 pub struct PipeWire;
 
+/// PipeWire is running and handles audio: a daemon answers and has at
+/// least one audio node. On a PulseAudio system it's either not running
+/// or there only for screen sharing (Ubuntu 22.04), with no audio nodes;
+/// then capture and playback go through ALSA instead (see
+/// [`crate::cpal_input`]). `VOX_AUDIO_BACKEND=alsa` or `pipewire` skips
+/// the check. Asked once per process.
+pub fn running() -> bool {
+    static RUNNING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *RUNNING.get_or_init(|| {
+        let forced = std::env::var("VOX_AUDIO_BACKEND").unwrap_or_default();
+        let running = match forced.to_ascii_lowercase().as_str() {
+            "alsa" => false,
+            "pipewire" => true,
+            _ => has_audio_nodes().unwrap_or(false),
+        };
+        info!(running, "PipeWire for audio");
+        running
+    })
+}
+
+/// Connects and lists the graph's nodes until the daemon has sent them all.
+fn has_audio_nodes() -> Result<bool> {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    pw::init();
+    let mainloop = MainLoop::new(None).context("MainLoop::new")?;
+    let context = Context::new(&mainloop).context("Context::new")?;
+    let core = context.connect(None).context("Context::connect")?;
+    let registry = core.get_registry().context("get_registry")?;
+    let found = Rc::new(Cell::new(false));
+    let f = found.clone();
+    let _globals = registry
+        .add_listener_local()
+        .global(move |g| {
+            let class = g.props.and_then(|p| p.get("media.class"));
+            if class.is_some_and(|c| c.starts_with("Audio/")) {
+                f.set(true);
+            }
+        })
+        .register();
+    let pending = core.sync(0).context("sync")?;
+    let ml = mainloop.clone();
+    let _done = core
+        .add_listener_local()
+        .done(move |id, seq| {
+            if id == pw::core::PW_ID_CORE && seq == pending {
+                ml.quit();
+            }
+        })
+        .register();
+    mainloop.run();
+    Ok(found.get())
+}
+
 impl Backend for PipeWire {
     fn name(&self) -> &'static str {
         "pipewire"

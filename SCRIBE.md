@@ -90,7 +90,10 @@ Digits read out one at a time become numerals in passes 2 and 3, with
 `192.168.1.1`. A lone digit word ("one of them") is left alone.
 
 Audio comes from CoreAudio on macOS and PipeWire on Linux (the
-`vox_audio` crate). The first run downloads the models (about 580 MB) if
+`vox_audio` crate). A Linux system still on PulseAudio works through
+ALSA instead, for the mic and playback; capturing an app (`--app`) and
+`--virtual-sink` need PipeWire. Set `VOX_AUDIO_BACKEND=alsa` (or
+`pipewire`) to choose rather than have scribe check what's running. The first run downloads the models (about 580 MB) if
 none are found; `scribe download-models` does the same thing up front.
 
 ## Install
@@ -116,8 +119,10 @@ Each archive has a `.sha256` beside it to check the download against
 (`shasum -a 256 -c scribe-$VERSION-$TARGET.tar.gz.sha256`). The macOS
 binary is not signed: if you downloaded it with a browser instead of
 `curl`, clear the quarantine flag with `xattr -d com.apple.quarantine
-~/.local/bin/scribe`. The Linux binaries need PipeWire (`libpipewire-0.3`)
-and glibc 2.39 or newer (Ubuntu 24.04, Fedora 40, or later).
+~/.local/bin/scribe`. The Linux binaries need the PipeWire library
+(`libpipewire-0.3`, installed even on most PulseAudio systems), ALSA
+(`libasound2`) and glibc 2.39 or newer (Ubuntu 24.04, Fedora 40, or
+later); on older systems, build from source.
 
 </details>
 

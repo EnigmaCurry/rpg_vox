@@ -294,8 +294,8 @@ Notes:
 
 ### Linux
 
-No special permissions are needed: PipeWire gives the mic to anything in
-your session. Copying needs `wl-copy` (wl-clipboard) on Wayland or
+No special permissions are needed: PipeWire (or PulseAudio) gives the
+mic to anything in your session. Copying needs `wl-copy` (wl-clipboard) on Wayland or
 `xclip` on X11. Bind any key to a command that finishes a running
 recorder or else opens your terminal running `scribe --once`, e.g.
 `sh -c 'scribe stop-once || foot scribe --once'` (without the

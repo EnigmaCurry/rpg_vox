@@ -6,6 +6,14 @@ section after the version it releases.
 
 ## Unreleased
 
+### scribe
+
+- **PulseAudio systems.** On Linux without PipeWire running, scribe
+  records from the mic and plays back through ALSA, which PulseAudio
+  routes as usual. Capturing an app (`--app`) and `--virtual-sink`
+  still need PipeWire. `VOX_AUDIO_BACKEND=alsa` or `pipewire` picks one
+  without checking.
+
 ## v0.1.6 (2026-10-13)
 
 ### scribe

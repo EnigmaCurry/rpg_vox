@@ -1,8 +1,10 @@
 //! Audio capture for vox_scribe: every backend delivers mono `f32`
 //! chunks (~20 ms) on a channel, at whatever rate the device runs.
 //!
-//! * Linux: native PipeWire stream ([`pipewire`]).
-//! * macOS: CoreAudio through cpal ([`coreaudio`]); one app's output
+//! * Linux: native PipeWire stream ([`pipewire`]), or ALSA through cpal
+//!   ([`cpal_input`]) where PipeWire isn't running, as on PulseAudio
+//!   systems: the mic only, no app capture or virtual sink.
+//! * macOS: CoreAudio through cpal ([`cpal_input`]); one app's output
 //!   through a Core Audio process tap ([`process_tap`], macOS 14.4+).
 //! * Any OS: decode a file ([`file`]).
 //!
@@ -20,8 +22,8 @@ use std::time::Duration;
 use anyhow::Result;
 use crossbeam_channel::{bounded, Receiver, Sender};
 
-#[cfg(any(target_os = "macos", target_os = "android"))]
-pub mod coreaudio;
+#[cfg(any(target_os = "macos", target_os = "android", target_os = "linux"))]
+pub mod cpal_input;
 pub mod file;
 pub mod opus_file;
 #[cfg(target_os = "linux")]
@@ -96,17 +98,17 @@ pub trait Backend {
 
 /// The native backend for this OS.
 pub fn default_backend() -> Result<Box<dyn Backend>> {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "android"))]
     {
-        Ok(Box::new(coreaudio::CoreAudio))
+        Ok(Box::new(cpal_input::Cpal))
     }
     #[cfg(target_os = "linux")]
     {
-        Ok(Box::new(pipewire::PipeWire))
-    }
-    #[cfg(target_os = "android")]
-    {
-        Ok(Box::new(coreaudio::CoreAudio))
+        if pipewire::running() {
+            Ok(Box::new(pipewire::PipeWire))
+        } else {
+            Ok(Box::new(cpal_input::Cpal))
+        }
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
     {

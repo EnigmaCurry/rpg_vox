@@ -45,7 +45,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             pkg-config clang libclang-dev cmake \
-            libpipewire-0.3-dev libspa-0.2-dev libopus-dev
+            libpipewire-0.3-dev libspa-0.2-dev libopus-dev libasound2-dev
 
       # rpg_vox's build.rs builds the Svelte UI with pnpm.
       - uses: pnpm/action-setup@v4

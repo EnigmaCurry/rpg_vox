@@ -18,6 +18,8 @@ pkgs.mkShell {
   buildInputs = with pkgs; [
     pipewire
     pipewire.dev
+    alsa-lib
+    alsa-lib.dev
     openssl
     openssl.dev
     libopus

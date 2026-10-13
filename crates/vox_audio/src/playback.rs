@@ -1,5 +1,6 @@
 //! Mono `f32` playback to the default output: CoreAudio through cpal on
-//! macOS, a native PipeWire stream on Linux.
+//! macOS, a native PipeWire stream on Linux (ALSA through cpal where
+//! PipeWire isn't running).
 //!
 //! The caller pushes samples into an SPSC ring; the device callback
 //! pulls from it and counts what it actually played, which is the clock
@@ -150,6 +151,20 @@ fn ring_for(rate: u32) -> (rtrb::Producer<f32>, rtrb::Consumer<f32>) {
 
 #[cfg(any(target_os = "macos", target_os = "android"))]
 fn open_backend(shared: Arc<Shared>) -> Result<Opened> {
+    open_cpal(shared)
+}
+
+#[cfg(target_os = "linux")]
+fn open_backend(shared: Arc<Shared>) -> Result<Opened> {
+    if crate::pipewire::running() {
+        open_pipewire(shared)
+    } else {
+        open_cpal(shared)
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "android", target_os = "linux"))]
+fn open_cpal(shared: Arc<Shared>) -> Result<Opened> {
     use anyhow::{anyhow, bail};
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
     use cpal::{FromSample, SampleFormat, SizedSample};
@@ -179,7 +194,7 @@ fn open_backend(shared: Arc<Shared>) -> Result<Opened> {
 
     let (ready_tx, ready_rx) =
         crossbeam_channel::bounded::<Result<(u32, String, rtrb::Producer<f32>)>>(1);
-    // cpal::Stream is !Send on macOS, so it lives on its own thread.
+    // cpal::Stream is !Send, so it lives on its own thread.
     let thread = std::thread::Builder::new()
         .name("vox-playback".into())
         .spawn(move || {
@@ -228,7 +243,7 @@ fn open_backend(shared: Arc<Shared>) -> Result<Opened> {
 }
 
 #[cfg(target_os = "linux")]
-fn open_backend(shared: Arc<Shared>) -> Result<Opened> {
+fn open_pipewire(shared: Arc<Shared>) -> Result<Opened> {
     use libspa::param::audio::{AudioFormat, AudioInfoRaw};
     use libspa::pod::{serialize::PodSerializer, Object, Pod, Value};
     use pipewire as pw;
