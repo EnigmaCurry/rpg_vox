@@ -6,6 +6,8 @@ section after the version it releases.
 
 ## Unreleased
 
+## v0.1.6 (2026-10-13)
+
 ### scribe
 
 - **Dictation**, as in Scribe for Android: `scribe --dictate NAME`
