@@ -44,6 +44,7 @@ scribe [OPTIONS] [COMMAND]
 | `-r, --record NAME` | Record a session: `NAME.md`, `NAME.srt`, `NAME.ass` and `NAME.opus`. See [output files](SCRIBE.md#output-files). Conflicts with `-o`, `--append`.                          |
 | `-p, --play NAME`   | Play a recording made with `-r`: the audio with the subtitles shown word by word. With no `NAME.opus`, reads `NAME.md` aloud instead (see [reading a transcript aloud](SCRIBE.md#reading-a-transcript-aloud)). Conflicts with every input and output option, `--once` and `--no-tui`. |
 | `--voices LIST`     | With `--play` reading `NAME.md` aloud: Kokoro voices for the speakers in order of appearance, e.g. `am_adam,bf_emma`. Unlisted speakers get af_heart, am_michael, bf_emma, bm_george, af_bella, am_fenrir, bf_isabella, bm_lewis in turn. |
+| `--dictate NAME`    | Dictate into `NAME.md` (`.md` is added if missing), editing it as you go; an existing file is opened to keep going. See [dictation](SCRIBE.md#dictation). Takes one source; conflicts with `-o`, `-r`, `-p`, `-i`, `--once`, `--chat`, `--no-tui`, `--llm`, `--diarize`, `--manual`. |
 | `--chat NAME`       | Talk with a responder through `NAME.db` (`.db` is added if missing). See [chat](SCRIBE.md#chat-with-a-responder). Conflicts with `-o`, `-r`, `-p`, `-i`, `--once`, `--no-tui`. |
 | `--append`          | Add to an existing `-o` file, after a `---` rule and a new date line. The TUI shows the file's earlier content in grey. Without it, an existing file is an error. |
 | `--title TEXT`      | Heading for the markdown file.                                                                                                                                    |
@@ -176,6 +177,29 @@ stdin (`enter`) finishes and `ctrl+c` cancels.
 
 The speaker list works as in the recording TUI, except that renames are
 written to the files immediately.
+
+### `--dictate`
+
+| Key                         | Action                                                                                              |
+|-----------------------------|-----------------------------------------------------------------------------------------------------|
+| `space`                     | Start / stop listening. Stopping releases the mic; there's no pause.                                |
+| `←` / `→`                   | Move the cursor (where new speech goes) a word back / ahead.                                        |
+| `↑` / `↓`                   | Move the cursor a line up / down.                                                                   |
+| `home` / `end`              | To the start / end of the line.                                                                     |
+| `g` / `G` (`ctrl+home` / `ctrl+end`) | To the start / end of the text.                                                            |
+| click                       | Put the cursor at the nearest gap between words; below the text, at the end. Drag to select.        |
+| `shift` + arrows, `home`, `end` | Select words.                                                                                   |
+| `enter`                     | Start a paragraph at the cursor.                                                                    |
+| `backspace`                 | Delete the selection, else the sentence before the cursor (or the paragraph break right before it). |
+| `del`                       | Delete the selection.                                                                               |
+| `tab` / `i`                 | Type by hand: the text opens as a plain buffer at the cursor. `esc` or `tab` goes back to dictating. |
+| `y` / `c`                   | Copy the selection, or the whole text when nothing is selected.                                     |
+| `pgup` / `pgdn`, mouse wheel | Scroll; an arrow key returns to the cursor.                                                       |
+| `esc`                       | Drop the selection; with none, quit.                                                                |
+| `q` / `ctrl+c`              | Quit, saving the text once the last words are in.                                                  |
+
+While typing by hand: the usual editing keys, `enter` for a new
+paragraph, `ctrl+a` / `ctrl+e` for the start and end of the paragraph.
 
 ### `--chat`
 

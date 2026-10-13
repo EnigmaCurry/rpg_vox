@@ -6,6 +6,23 @@ section after the version it releases.
 
 ## Unreleased
 
+### scribe
+
+- **Dictation**, as in Scribe for Android: `scribe --dictate NAME`
+  writes `NAME.md` by voice and keeps it, so you can come back and keep
+  going.
+  - The arrow keys or a click move the cursor where new speech goes
+    (lowercased where it lands mid-sentence); a click below the text
+    puts it at the end.
+  - `enter` starts a paragraph at the cursor. `backspace` deletes the
+    sentence before the cursor, the paragraph break right before it,
+    or the selection if there is one. Select with `shift` and the
+    arrows, or by dragging.
+  - `tab` opens the text for typing by hand at the cursor; `esc` goes
+    back to dictating there, listening again if you were.
+  - `space` starts and stops listening, with no pause. `y` copies the
+    selection, or the whole text.
+
 ## v0.1.5 (2026-10-12)
 
 ### scribe

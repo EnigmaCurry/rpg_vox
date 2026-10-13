@@ -108,6 +108,7 @@ pub struct Loading<'a> {
     pub recording: bool,
     pub once: bool,
     pub saving: bool,
+    pub dictate: bool,
 }
 
 /// The transcript view before the session exists: same layout, no
@@ -121,6 +122,8 @@ fn draw_loading(f: &mut Frame, v: &Loading, elapsed: Duration) {
     .areas(f.area());
     let (badge, badge_style) = if v.recording {
         (" ● REC ", Style::new().white().on_red())
+    } else if v.dictate {
+        (" ✍ DICTATION ", Style::new().black().on_magenta())
     } else if v.once {
         (" ⧉ CLIPBOARD ", Style::new().black().on_magenta())
     } else if v.saving {
@@ -135,7 +138,12 @@ fn draw_loading(f: &mut Frame, v: &Loading, elapsed: Duration) {
     f.render_widget(
         Line::from(vec![
             Span::styled(" ◉ LISTENING ", Style::new().black().on_green()),
-            format!(" {}  ", timestamp(0)).bold(),
+            // Dictation has no clock.
+            if v.dictate {
+                "  ".into()
+            } else {
+                format!(" {}  ", timestamp(0)).bold()
+            },
             Span::raw(v.device.to_string()),
         ]),
         header,

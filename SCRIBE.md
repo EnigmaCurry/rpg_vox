@@ -24,6 +24,8 @@ subtitles and audio if you want them.
   speaker so crosstalk is transcribed in full.
 * **Your names, spelled right.** A vocabulary file teaches it names and
   terms it couldn't know.
+* **Dictation you can edit.** `--dictate` writes a file by voice with a
+  cursor you move to where new speech goes, and keeps it to come back to.
 * **One-key dictation.** Press a key, talk, press enter, and the text is
   on your clipboard.
 
@@ -37,6 +39,7 @@ its transcription passes, with nothing RPG-specific in it.
 * [Install](#install)
 * [Audio sources](#audio-sources)
 * [Output files](#output-files)
+* [Dictation](#dictation)
 * [Pass 4: LLM proofreading](#pass-4-llm-proofreading-optional)
 * [Vocabulary](#vocabulary-optional)
 * [Speakers](#speakers-optional)
@@ -58,6 +61,7 @@ scribe -r session             # record session.md/.srt/.ass/.opus
 scribe -p session             # play the recording back with karaoke subtitles
 scribe -p notes               # no notes.opus: read notes.md aloud instead
 scribe -i talk.mp3 -o talk    # transcribe a file without the TUI
+scribe --dictate letter       # write letter.md by voice, editing as you go
 scribe --once                 # dictate one paragraph to the clipboard
 ```
 
@@ -226,6 +230,37 @@ use into the models directory.
 
 Copying (`y`, `--once`) uses `pbcopy`, `wl-copy` or `xclip`, falling back
 to the OSC 52 terminal escape (e.g. over ssh).
+
+## Dictation
+
+`scribe --dictate NAME` is for writing by voice rather than recording
+in order, like Scribe for Android's dictations. It edits `NAME.md`:
+an existing file opens where you left it, and the text is saved a
+couple of seconds after each change and when you quit. It starts
+listening straight away.
+
+* The magenta `▌` is the cursor, where new speech goes. Move it with
+  the arrow keys, `home` / `end` (the line), `g` / `G` (the whole text),
+  or a click; a click below the text puts it at the end. Speech put
+  mid-sentence is lowercased to fit, and a full stop the recognizer
+  added before a lowercase word is dropped.
+* `enter` starts a paragraph at the cursor. `backspace` deletes the
+  sentence before the cursor, the paragraph break right before it, or
+  the selection if there is one.
+* Select words with `shift` and the arrows, or by dragging, then
+  `backspace` or `del` deletes them, across paragraphs too. `esc`
+  drops the selection.
+* `tab` stops listening and opens the text for typing by hand, with
+  the cursor where the dictation cursor was. `esc` or `tab` goes back
+  to dictating there, listening again if you were.
+* `space` starts and stops listening. There's no pause: stopping
+  releases the mic, and the last words are finished first.
+* `y` copies the selection, or the whole text when nothing is selected.
+
+The file is plain text, one paragraph per line with a blank line
+between, so it reads as markdown. Lines you wrap by hand are joined
+again when it is opened. `--dictate` takes `-d` or `-a` for one source,
+but not the options for transcripts (`-o`, `-r`, `--llm`, `--diarize`).
 
 ## Chat with a responder
 

@@ -12,6 +12,8 @@ mod chat;
 mod chatdb;
 mod clipboard;
 mod diarize;
+mod dictate;
+mod dictation;
 mod markdown;
 mod models;
 #[cfg(unix)]
@@ -108,6 +110,12 @@ struct Cli {
     /// `scribe chat-echo` for a stand-in responder.
     #[arg(long, conflicts_with_all = ["output", "record", "play", "input", "once", "no_tui", "append", "live"])]
     chat: Option<PathBuf>,
+    /// Dictate into NAME.md (`.md` is added if missing), editing it as
+    /// you go: move the cursor where new speech goes, delete selected
+    /// words or the last sentence, break paragraphs, type by hand. An
+    /// existing file is opened to keep going; the text is saved as you go.
+    #[arg(long, value_name = "NAME", conflicts_with_all = ["output", "record", "play", "input", "once", "no_tui", "append", "live", "chat", "llm", "diarize", "speakers", "manual"])]
+    dictate: Option<PathBuf>,
     /// Add to the -o file if it already exists (normally an error).
     #[arg(long)]
     append: bool,
@@ -846,6 +854,9 @@ fn main() -> Result<()> {
     };
     let per_source = n_sources > 1;
     if per_source {
+        if cli.dictate.is_some() {
+            anyhow::bail!("--dictate listens to one source");
+        }
         if cli.diarize {
             anyhow::bail!(
                 "--diarize tells speakers apart within one source; with several sources each one is its own speaker already"
@@ -944,6 +955,7 @@ fn main() -> Result<()> {
         recording: record.is_some(),
         once: cli.once,
         saving: output.is_some(),
+        dictate: cli.dictate.is_some(),
     };
     let mut screen = tui_mode.then(|| tui::Screen::splash(&view("")));
     if !cli.input.is_empty() && !tui_mode {
@@ -1254,6 +1266,11 @@ fn main() -> Result<()> {
             let path = chatdb::path_for(name);
             let (voice, voice_name) = chat_voice(&models_dir, &cli.voices, &path)?;
             return chat::run(screen, session, &path, voice, voice_name);
+        }
+    }
+    if let Some(name) = &cli.dictate {
+        if let Some(screen) = screen.take() {
+            return dictate::run(screen, session, markdown_path(name));
         }
     }
     let mut outcome = match screen {
