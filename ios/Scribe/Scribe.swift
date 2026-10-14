@@ -111,7 +111,9 @@ final class Scribe: ObservableObject {
         guard let models, session == nil else { return }
         do {
             let audio = AVAudioSession.sharedInstance()
-            try audio.setCategory(.record, mode: .measurement)
+            // .measurement would switch off the mic's own gain, which
+            // leaves speech too quiet for the voice detector.
+            try audio.setCategory(.record, mode: .default)
             try audio.setActive(true)
         } catch {
             phase = .failed("audio session: \(error.localizedDescription)")
@@ -143,6 +145,7 @@ final class Scribe: ObservableObject {
             phase = .failed("can't convert \(from) to 16 kHz mono")
             return
         }
+        print("mic: \(AVAudioSession.sharedInstance().currentRoute.inputs.map(\.portName)) \(from)")
         input.installTap(onBus: 0, bufferSize: 4096, format: from, block: Self.tap(s, converter, pushed))
         do {
             engine.prepare()
@@ -163,6 +166,9 @@ final class Scribe: ObservableObject {
     ) -> AVAudioNodeTapBlock {
         let to = converter.outputFormat
         let ratio = to.sampleRate / converter.inputFormat.sampleRate
+        let gain = MicGain()
+        var logged = 0
+        var peak: Float = 0
         return { buf, _ in
             let cap = AVAudioFrameCount(Double(buf.frameLength) * ratio) + 16
             guard let out = AVAudioPCMBuffer(pcmFormat: to, frameCapacity: cap) else { return }
@@ -178,8 +184,18 @@ final class Scribe: ObservableObject {
                 return buf
             }
             guard error == nil, let ch = out.floatChannelData, out.frameLength > 0 else { return }
-            vox_push(s, ch[0], Int(out.frameLength))
-            pushed.add(Int(out.frameLength))
+            let n = Int(out.frameLength)
+            for i in 0..<n { peak = max(peak, abs(ch[0][i])) }
+            gain.process(ch[0], n)
+            vox_push(s, ch[0], n)
+            pushed.add(n)
+            // Once a second: the raw peak and the gain, for tuning.
+            logged += n
+            if logged >= Int(rate) {
+                print(String(format: "mic: peak %.4f gain %.1f dB", peak, 20 * log10(gain.gain)))
+                logged = 0
+                peak = 0
+            }
         }
     }
 
