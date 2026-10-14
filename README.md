@@ -34,6 +34,16 @@ model download. Arm64, Android 8.0 or newer.
 
 [Read more →](ANDROID.md)
 
+## [Scribe for iOS](IOS.md)
+
+The Android app on iPhone and iPad (work in progress): live
+transcription of the mic or shared audio and video files, dictations
+you can keep editing by voice, threads, and playback of kept audio.
+Everything runs on the device after a one-time model download. iOS 17
+or newer, built and installed from source for now.
+
+[Read more →](IOS.md)
+
 ## [agent](AGENT.md)
 
 The other side of `scribe --chat`: answers what you say with any
