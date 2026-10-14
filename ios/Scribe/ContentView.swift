@@ -41,6 +41,9 @@ struct ContentView: View {
     @Environment(Scribe.self) private var scribe
     @Environment(Dictations.self) private var dictations
     @State private var columns = NavigationSplitViewVisibility.automatic
+    /// Narrow (Slide Over, a small split, a phone): one column at a time,
+    /// the open thread first, the list behind its back button.
+    @State private var compactColumn = NavigationSplitViewColumn.detail
     @State private var settings: SettingsPage?
     @State private var renaming: Target?
     @State private var newTitle = ""
@@ -48,8 +51,9 @@ struct ContentView: View {
     @State private var importing = false
 
     var body: some View {
-        NavigationSplitView(columnVisibility: $columns) {
+        NavigationSplitView(columnVisibility: $columns, preferredCompactColumn: $compactColumn) {
             ThreadList(newDictation: newDictation, newTranscription: newTranscription,
+                       opened: { compactColumn = .detail },
                        renaming: rename, deleting: { deleting = $0 })
                 .navigationTitle("Scribe")
         } detail: {
@@ -107,6 +111,7 @@ struct ContentView: View {
         dictations.create()
         if scribe.autoStart { scribe.startWhenOpen = "dictation" }
         columns = .detailOnly
+        compactColumn = .detail
     }
 
     private func newTranscription() {
@@ -114,6 +119,7 @@ struct ContentView: View {
         scribe.newThread()
         if scribe.autoStart { scribe.startWhenOpen = "transcription" }
         columns = .detailOnly
+        compactColumn = .detail
     }
 
     private var notice: String? { scribe.notice ?? dictations.notice }
@@ -209,6 +215,8 @@ private struct ThreadList: View {
     @Environment(Dictations.self) private var dictations
     let newDictation: () -> Void
     let newTranscription: () -> Void
+    /// A row was tapped: show it (when only one column fits).
+    let opened: () -> Void
     let renaming: (Target) -> Void
     let deleting: (Target) -> Void
 
@@ -266,6 +274,7 @@ private struct ThreadList: View {
                 dictations.close()
                 scribe.switchTo(t.id)
             }
+            opened()
         } label: {
             HStack(spacing: 12) {
                 Text(icon).font(.title3)
