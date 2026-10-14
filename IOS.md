@@ -13,7 +13,7 @@ only, builds into `target/ios`, and the app embeds the xcframework.
 
 ## Build and install
 
-Needs Xcode signed in to an Apple ID (Settings > Accounts; a free
+Needs Xcode (xcode-select may stay on the Command Line Tools) signed in to an Apple ID (Settings > Accounts; a free
 Personal Team works), `brew install xcodegen`, `rustup target add
 aarch64-apple-ios`, and the device paired once over USB (Trust) with
 Developer Mode on; after that it installs over Wi-Fi.

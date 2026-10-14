@@ -251,8 +251,10 @@ final class Scribe: ObservableObject {
             }
             // The poller may be inside vox_poll; free once it's out.
             stopped.set()
-            stopped.done.wait()
-            vox_free(s)
+            DispatchQueue.global().async {
+                stopped.done.wait()
+                vox_free(s)
+            }
         }
     }
 

@@ -559,7 +559,7 @@ _android-jni:
 ios-app INSTALL="yes":
     #!/usr/bin/env bash
     set -euo pipefail
-    xcodebuild -version >/dev/null 2>&1 || { echo "needs Xcode: install it, then sudo xcode-select -s /Applications/Xcode.app/Contents/Developer" >&2; exit 1; }
+    source <(just _ios-xcode)
     # Its own target dir: sherpa-onnx-sys caches prebuilt libs per target
     # dir and would take the Android ones for iOS.
     export CARGO_TARGET_DIR="$PWD/target/ios"
@@ -594,6 +594,7 @@ ios-models MODELS="":
     models="{{MODELS}}"
     models="${models:-$HOME/Library/Application Support/vox_scribe/models}"
     bundle="${SCRIBE_BUNDLE_ID:-com.enigmacurry.rpg-vox-scribe}"
+    source <(just _ios-xcode)
     device="$(just _ios-device)"
     for m in parakeet-tdt-0.6b-v2 streaming-zipformer; do
       for f in "$models/$m"/*; do
@@ -603,10 +604,21 @@ ios-models MODELS="":
       done
     done
 
+# Exports DEVELOPER_DIR=/Applications/Xcode.app/... when xcode-select
+# still points at the Command Line Tools, which have no iOS SDK.
+_ios-xcode:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! xcodebuild -version >/dev/null 2>&1; then
+      [ -d /Applications/Xcode.app ] || { echo "needs Xcode from the App Store" >&2; exit 1; }
+      echo "export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer"
+    fi
+
 # SCRIBE_DEVICE, else the first paired iPhone/iPad devicectl lists.
 _ios-device:
     #!/usr/bin/env bash
     set -euo pipefail
+    source <(just _ios-xcode)
     if [ -n "${SCRIBE_DEVICE:-}" ]; then echo "$SCRIBE_DEVICE"; exit 0; fi
     json="$(mktemp)"
     trap 'rm -f "$json"' EXIT
