@@ -30,3 +30,21 @@ free team expire after 7 days; `just ios-app` again re-signs.
 Models live in the app's Documents/models (`parakeet-tdt-0.6b-v2/`,
 `streaming-zipformer/`), which Finder's file sharing and the Files app
 can also reach. There's no in-app downloader yet.
+
+## Benchmark
+
+Launched with `--bench`, the app transcribes Documents/bench.wav (16 kHz
+mono) as fast as it can, with and without pass 1, and logs the speed and
+peak memory to the console:
+
+```
+ffmpeg -i talk.opus -ac 1 -ar 16000 -c:a pcm_f32le bench.wav
+xcrun devicectl device copy to --device <udid> --domain-type appDataContainer \
+  --domain-identifier com.enigmacurry.rpg-vox-scribe --source bench.wav --destination Documents/bench.wav
+xcrun devicectl device process launch --device <udid> --terminate-existing --console \
+  com.enigmacurry.rpg-vox-scribe --bench
+```
+
+iPad Pro 2nd gen (A10X, 4 GB, iPadOS 17), 106 s of speech: models load in
+3.6 s (714 MB); passes 2+3 alone run 3.4x realtime, with pass 1 too 2.6x;
+peak footprint about 890 MB.

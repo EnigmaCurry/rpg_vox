@@ -98,6 +98,8 @@ final class Scribe: ObservableObject {
                     self.loadSeconds = secs
                     self.phase = .idle
                     self.updateStats()
+                    print("stats: \(self.stats)")
+                    if CommandLine.arguments.contains("--bench") { self.bench() }
                 } else {
                     self.phase = .failed(message ?? "loading the models failed")
                 }
@@ -258,12 +260,65 @@ final class Scribe: ObservableObject {
         }
     }
 
+    /// `--bench`: transcribes Documents/bench.wav (16 kHz mono) as fast
+    /// as it'll go, with and without pass 1, and logs the speed and the
+    /// peak memory.
+    func bench() {
+        guard let models else { return }
+        let url = Self.modelsDir.deletingLastPathComponent().appendingPathComponent("bench.wav")
+        Task.detached(priority: .userInitiated) {
+            guard let file = try? AVAudioFile(forReading: url, commonFormat: .pcmFormatFloat32, interleaved: false),
+                  file.processingFormat.sampleRate == rate, file.processingFormat.channelCount == 1,
+                  let buf = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: AVAudioFrameCount(file.length)),
+                  (try? file.read(into: buf)) != nil, let ch = buf.floatChannelData
+            else {
+                print("bench: need \(url.path) as 16 kHz mono")
+                return
+            }
+            let n = Int(buf.frameLength)
+            let audioSecs = Double(n) / rate
+            print(String(format: "bench: %.1f s of audio, memory %d MB", audioSecs, footprintMB()))
+            for streaming in [false, true] {
+                let peak = Peak()
+                let s = vox_start(models, UInt32(rate), streaming)!
+                let t0 = Date()
+                var at = 0
+                while at < n {
+                    let k = min(1600, n - at)
+                    vox_push(s, ch[0] + at, k)
+                    at += k
+                    peak.sample()
+                }
+                let done = Flag()
+                Thread.detachNewThread {
+                    while !done.value {
+                        if let raw = vox_poll(s, 100) { vox_string_free(raw) }
+                        peak.sample()
+                    }
+                    done.done.signal()
+                }
+                let raw = vox_finish(s)
+                let secs = Date().timeIntervalSince(t0)
+                done.set()
+                done.done.wait()
+                let text = raw.flatMap { try? JSONDecoder().decode(Transcript.self, from: Data(String(cString: $0).utf8)) }?
+                    .paragraphs.map(\.text).joined(separator: " ") ?? ""
+                vox_string_free(raw)
+                vox_free(s)
+                print(String(format: "bench: streaming=%@ %.1f s for %.1f s of audio (%.2fx realtime), peak memory %d MB, %d words",
+                             streaming ? "yes" : "no", secs, audioSecs, audioSecs / secs, peak.mb, text.split(separator: " ").count))
+                print("bench: text: \(text.prefix(300))")
+            }
+        }
+    }
+
     private func updateStats(finish: Double? = nil) {
         var parts = [String(format: "models %.1f s", loadSeconds)]
         if let lastLagMs { parts.append("pass-2 lag \(lastLagMs) ms") }
         if let finish { parts.append(String(format: "finish %.1f s", finish)) }
         parts.append("memory \(footprintMB()) MB")
         stats = parts.joined(separator: " · ")
+        if finish != nil { print("stats: \(stats)") }
     }
 }
 
@@ -274,6 +329,17 @@ final class Flag: @unchecked Sendable {
     let done = DispatchSemaphore(value: 0)
     var value: Bool { lock.withLock { on } }
     func set() { lock.withLock { on = true } }
+}
+
+/// Highest footprint seen.
+final class Peak: @unchecked Sendable {
+    private let lock = NSLock()
+    private var max = 0
+    var mb: Int { lock.withLock { max } }
+    func sample() {
+        let now = footprintMB()
+        lock.withLock { if now > max { max = now } }
+    }
 }
 
 /// Samples pushed, shared with the audio tap and the poller.

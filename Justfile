@@ -573,15 +573,21 @@ ios-app INSTALL="yes":
       | sed -n 's/^ *organizationalUnitName *= *//p' | head -1)}"
     [ -n "$team" ] || { echo "no signing team: sign in under Xcode > Settings > Accounts, or set SCRIBE_TEAM" >&2; exit 1; }
     bundle="${SCRIBE_BUNDLE_ID:-com.enigmacurry.rpg-vox-scribe}"
+    # Building for the device registers it with the team, which a free
+    # team's provisioning profile needs.
+    destination=generic/platform=iOS
+    if [ "{{INSTALL}}" = yes ]; then
+      device="$(just _ios-device)"
+      destination="id=$device"
+    fi
     xcodegen generate --quiet --spec ios/project.yml
     xcodebuild -quiet -project ios/Scribe.xcodeproj -scheme Scribe -configuration Release \
-      -destination generic/platform=iOS -derivedDataPath ios/build -allowProvisioningUpdates \
+      -destination "$destination" -derivedDataPath ios/build -allowProvisioningUpdates -allowProvisioningDeviceRegistration \
       DEVELOPMENT_TEAM="$team" PRODUCT_BUNDLE_IDENTIFIER="$bundle" \
       MARKETING_VERSION="$(git describe --tags --abbrev=0 | sed 's/^v//')" build
     app=ios/build/Build/Products/Release-iphoneos/Scribe.app
     du -sh "$app"
     [ "{{INSTALL}}" = yes ] || exit 0
-    device="$(just _ios-device)"
     xcrun devicectl device install app --device "$device" "$app"
     xcrun devicectl device process launch --device "$device" --terminate-existing "$bundle"
 
@@ -627,10 +633,12 @@ _ios-device:
     import json, sys
     devs = json.load(open(sys.argv[1]))["result"]["devices"]
     for d in devs:
-        if d.get("hardwareProperties", {}).get("platform") == "iOS" and d.get("connectionProperties", {}).get("pairingState") == "paired":
-            print(d["identifier"]); break
+        hw = d.get("hardwareProperties", {})
+        if hw.get("platform") == "iOS" and hw.get("reality") != "simulated" \
+                and d.get("connectionProperties", {}).get("pairingState") == "paired":
+            print(d["hardwareProperties"]["udid"]); break
     else:
-        sys.exit("no paired iOS device: connect it by USB once, unlock it and tap Trust (or set SCRIBE_DEVICE)")
+        sys.exit("no paired iOS device: connect it by USB, unlock it, tap Trust, then `xcrun devicectl manage pair --device <udid>` (or set SCRIBE_DEVICE)")
     PY
 
 # --- discord_vox (PipeWire sink → Discord voice) ---
