@@ -45,12 +45,12 @@ struct ContentView: View {
     @State private var renaming: Target?
     @State private var newTitle = ""
     @State private var deleting: Target?
-    @State private var choosingNew = false
     @State private var importing = false
 
     var body: some View {
         NavigationSplitView(columnVisibility: $columns) {
-            ThreadList(choosingNew: $choosingNew, renaming: rename, deleting: { deleting = $0 })
+            ThreadList(newDictation: newDictation, newTranscription: newTranscription,
+                       renaming: rename, deleting: { deleting = $0 })
                 .navigationTitle("Scribe")
         } detail: {
             NavigationStack {
@@ -58,21 +58,6 @@ struct ContentView: View {
                     .navigationBarTitleDisplayMode(.inline)
                     .toolbar { toolbar }
             }
-        }
-        .confirmationDialog("New", isPresented: $choosingNew, titleVisibility: .visible) {
-            Button("\(PEN) Dictation") {
-                dictations.create()
-                if scribe.autoStart { scribe.startWhenOpen = "dictation" }
-                columns = .detailOnly
-            }
-            Button("\(MIC) Transcription") {
-                dictations.close()
-                scribe.newThread()
-                if scribe.autoStart { scribe.startWhenOpen = "transcription" }
-                columns = .detailOnly
-            }
-        } message: {
-            Text("A dictation is written by voice, and you can keep editing it anywhere. A transcription records and transcribes in order: talks, meetings, videos.")
         }
         .alert(renamingTitle, isPresented: Binding(get: { renaming != nil }, set: { if !$0 { renaming = nil } })) {
             TextField("Title", text: $newTitle)
@@ -116,6 +101,19 @@ struct ContentView: View {
                 scribe.notice = scribe.transcribe(url)
             }
         }
+    }
+
+    private func newDictation() {
+        dictations.create()
+        if scribe.autoStart { scribe.startWhenOpen = "dictation" }
+        columns = .detailOnly
+    }
+
+    private func newTranscription() {
+        dictations.close()
+        scribe.newThread()
+        if scribe.autoStart { scribe.startWhenOpen = "transcription" }
+        columns = .detailOnly
     }
 
     private var notice: String? { scribe.notice ?? dictations.notice }
@@ -201,7 +199,7 @@ struct ContentView: View {
     }
 }
 
-/// The list: New, which asks whether for a transcription or a dictation,
+/// The list: New, which offers a transcription or a dictation,
 /// then both kinds together, the most recently changed first, each with
 /// its time and last words and marked by its icon. Tap opens one; its
 /// menu offers Rename and Delete. While recording only the open
@@ -209,7 +207,8 @@ struct ContentView: View {
 private struct ThreadList: View {
     @Environment(Scribe.self) private var scribe
     @Environment(Dictations.self) private var dictations
-    @Binding var choosingNew: Bool
+    let newDictation: () -> Void
+    let newTranscription: () -> Void
     let renaming: (Target) -> Void
     let deleting: (Target) -> Void
 
@@ -223,8 +222,17 @@ private struct ThreadList: View {
             if locked {
                 Text("Stop recording to switch").font(.footnote).foregroundStyle(.red)
             }
-            Button {
-                choosingNew = true
+            // A menu on the button itself: a dialog from the whole split
+            // view doesn't always show on iPad.
+            Menu {
+                Button(action: newDictation) {
+                    Text("\(PEN) Dictation")
+                    Text("Write by voice, and keep editing anywhere.")
+                }
+                Button(action: newTranscription) {
+                    Text("\(MIC) Transcription")
+                    Text("Record and transcribe in order: talks, meetings, videos.")
+                }
             } label: {
                 Label("New", systemImage: "plus")
             }
