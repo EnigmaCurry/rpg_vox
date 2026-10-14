@@ -6984,6 +6984,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "vox_ios"
+version = "0.1.7"
+dependencies = [
+ "anyhow",
+ "crossbeam-channel",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber",
+ "vox_transcribe",
+]
+
+[[package]]
 name = "vox_scribe"
 version = "0.1.7"
 dependencies = [

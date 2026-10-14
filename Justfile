@@ -548,6 +548,79 @@ _android-jni:
     cp target/aarch64-linux-android/release/libvox_android.so \
       "$libs/libsherpa-onnx-c-api.so" "$libs/libonnxruntime.so" "$jni/"
 
+# iOS dictation app (ios/): builds crates/vox_ios for arm64 devices,
+# generates ios/Scribe.xcodeproj (xcodegen), builds and signs it and, with
+# INSTALL=yes, installs and launches it on SCRIBE_DEVICE (name or UDID;
+# default: the first paired iPhone/iPad). Needs Xcode signed in to an
+# Apple ID (a free Personal Team works), `brew install xcodegen` and
+# `rustup target add aarch64-apple-ios`. SCRIBE_TEAM defaults to the team
+# of the first Apple Development certificate; SCRIBE_BUNDLE_ID to
+# com.enigmacurry.rpg-vox-scribe (a free team may need its own).
+ios-app INSTALL="yes":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    xcodebuild -version >/dev/null 2>&1 || { echo "needs Xcode: install it, then sudo xcode-select -s /Applications/Xcode.app/Contents/Developer" >&2; exit 1; }
+    # Its own target dir: sherpa-onnx-sys caches prebuilt libs per target
+    # dir and would take the Android ones for iOS.
+    export CARGO_TARGET_DIR="$PWD/target/ios"
+    export IPHONEOS_DEPLOYMENT_TARGET=17.0
+    cargo build --release --locked -p vox_ios --target aarch64-apple-ios
+    mkdir -p ios/Frameworks
+    rsync -a --delete "$CARGO_TARGET_DIR"/sherpa-onnx-prebuilt/sherpa-onnx-v*-ios-shared-onnxruntime-static/SherpaOnnxC.xcframework/ \
+      ios/Frameworks/SherpaOnnxC.xcframework/
+    team="${SCRIBE_TEAM:-$(security find-certificate -c "Apple Development" -p 2>/dev/null \
+      | openssl x509 -noout -subject -nameopt multiline 2>/dev/null \
+      | sed -n 's/^ *organizationalUnitName *= *//p' | head -1)}"
+    [ -n "$team" ] || { echo "no signing team: sign in under Xcode > Settings > Accounts, or set SCRIBE_TEAM" >&2; exit 1; }
+    bundle="${SCRIBE_BUNDLE_ID:-com.enigmacurry.rpg-vox-scribe}"
+    xcodegen generate --quiet --spec ios/project.yml
+    xcodebuild -quiet -project ios/Scribe.xcodeproj -scheme Scribe -configuration Release \
+      -destination generic/platform=iOS -derivedDataPath ios/build -allowProvisioningUpdates \
+      DEVELOPMENT_TEAM="$team" PRODUCT_BUNDLE_IDENTIFIER="$bundle" \
+      MARKETING_VERSION="$(git describe --tags --abbrev=0 | sed 's/^v//')" build
+    app=ios/build/Build/Products/Release-iphoneos/Scribe.app
+    du -sh "$app"
+    [ "{{INSTALL}}" = yes ] || exit 0
+    device="$(just _ios-device)"
+    xcrun devicectl device install app --device "$device" "$app"
+    xcrun devicectl device process launch --device "$device" --terminate-existing "$bundle"
+
+# Copy Parakeet and the streaming Zipformer from MODELS (default: Scribe's
+# models dir on this Mac) into the iOS app's Documents/models on
+# SCRIBE_DEVICE. The app must be installed; relaunch it afterwards.
+ios-models MODELS="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    models="{{MODELS}}"
+    models="${models:-$HOME/Library/Application Support/vox_scribe/models}"
+    bundle="${SCRIBE_BUNDLE_ID:-com.enigmacurry.rpg-vox-scribe}"
+    device="$(just _ios-device)"
+    for m in parakeet-tdt-0.6b-v2 streaming-zipformer; do
+      for f in "$models/$m"/*; do
+        echo "$m/$(basename "$f")"
+        xcrun devicectl device copy to --device "$device" --domain-type appDataContainer \
+          --domain-identifier "$bundle" --source "$f" --destination "Documents/models/$m/$(basename "$f")"
+      done
+    done
+
+# SCRIBE_DEVICE, else the first paired iPhone/iPad devicectl lists.
+_ios-device:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ -n "${SCRIBE_DEVICE:-}" ]; then echo "$SCRIBE_DEVICE"; exit 0; fi
+    json="$(mktemp)"
+    trap 'rm -f "$json"' EXIT
+    xcrun devicectl list devices --quiet --json-output "$json" >/dev/null
+    python3 -I - "$json" <<'PY'
+    import json, sys
+    devs = json.load(open(sys.argv[1]))["result"]["devices"]
+    for d in devs:
+        if d.get("hardwareProperties", {}).get("platform") == "iOS" and d.get("connectionProperties", {}).get("pairingState") == "paired":
+            print(d["identifier"]); break
+    else:
+        sys.exit("no paired iOS device: connect it by USB once, unlock it and tap Trust (or set SCRIBE_DEVICE)")
+    PY
+
 # --- discord_vox (PipeWire sink → Discord voice) ---
 
 # Run the discord_vox release binary. Expects DISCORD_VOX_TOKEN /

@@ -9,6 +9,7 @@ members = [
     "crates/vox_chat",
     "crates/vox_agent",
     "crates/vox_android",
+    "crates/vox_ios",
 ]
 
 [workspace.package]

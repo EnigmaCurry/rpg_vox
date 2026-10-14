@@ -1,0 +1,27 @@
+[package]
+name = "vox_ios"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "C ABI from the iOS dictation app (ios/) to vox_transcribe"
+
+[lib]
+# staticlib for the app; rlib so `cargo check`/`test` work on the host.
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+anyhow.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+crossbeam-channel = "0.5"
+
+# sherpa-onnx ships iOS only as a shared xcframework (SherpaOnnxC, with
+# onnxruntime inside), while the rest of the workspace links it
+# statically. Target-specific features aren't unified with other
+# targets', so an iOS build gets `shared` and host builds stay `static`.
+[target.'cfg(target_os = "ios")'.dependencies]
+vox_transcribe = { path = "../vox_transcribe", features = ["sherpa-shared"] }
+
+[target.'cfg(not(target_os = "ios"))'.dependencies]
+vox_transcribe = { path = "../vox_transcribe", features = ["sherpa-static"] }
