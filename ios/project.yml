@@ -21,6 +21,9 @@ targets:
     platform: iOS
     sources:
       - Scribe
+      # Shown under About.
+      - path: ../CHANGELOG.md
+        buildPhase: resources
     dependencies:
       # Copied here from sherpa-onnx-sys's download by `just ios-app`.
       - framework: Frameworks/SherpaOnnxC.xcframework
@@ -61,3 +64,9 @@ targets:
         # app, or `just ios-models`.
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
+        # "Open in Scribe" for audio and video, from the share sheet and Files.
+        CFBundleDocumentTypes:
+          - CFBundleTypeName: Audio or video
+            CFBundleTypeRole: Viewer
+            LSHandlerRank: Alternate
+            LSItemContentTypes: [public.audio, public.movie, public.audiovisual-content]
