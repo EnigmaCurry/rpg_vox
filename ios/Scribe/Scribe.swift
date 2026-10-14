@@ -252,10 +252,26 @@ final class Scribe {
                         self.pendingFile = nil
                         self.startFile(url)
                     }
+                    self.testHooks()
                 case .failure(let e):
                     self.phase = .failed(e.localizedDescription)
                 }
             }
+        }
+    }
+
+    /// For testing without touch (the Simulator, CI): launched with
+    /// `-transcribe_at_launch NAME`, transcribes Documents/NAME; with
+    /// `-play_at_launch YES` too, then plays it from the start.
+    private func testHooks() {
+        let args = UserDefaults(suiteName: nil)
+        guard let name = args?.volatileDomain(forName: UserDefaults.argumentDomain)["transcribe_at_launch"] as? String else { return }
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        notice = transcribe(docs.appendingPathComponent(name))
+        guard args?.volatileDomain(forName: UserDefaults.argumentDomain)["play_at_launch"] != nil else { return }
+        Task {
+            while file != nil { try? await Task.sleep(nanoseconds: 200_000_000) }
+            if let rec = recordings.first { playFromStart(rec) }
         }
     }
 

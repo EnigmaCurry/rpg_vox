@@ -591,6 +591,34 @@ ios-app INSTALL="yes":
     xcrun devicectl device install app --device "$device" "$app"
     xcrun devicectl device process launch --device "$device" --terminate-existing "$bundle"
 
+# The iOS app in the Simulator (DEVICE, default an iPad Pro), booting
+# it if needed, with the models copied from this Mac's Scribe models dir
+# the first time. Needs `rustup target add aarch64-apple-ios-sim`.
+ios-sim DEVICE="iPad Pro 11-inch (M5)":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    source <(just _ios-xcode)
+    export CARGO_TARGET_DIR="$PWD/target/ios"
+    export IPHONEOS_DEPLOYMENT_TARGET=17.0
+    cargo build --release --locked -p vox_ios --target aarch64-apple-ios-sim
+    mkdir -p ios/Frameworks
+    rsync -a --delete "$CARGO_TARGET_DIR"/sherpa-onnx-prebuilt/sherpa-onnx-v*-ios-shared-onnxruntime-static/SherpaOnnxC.xcframework/ \
+      ios/Frameworks/SherpaOnnxC.xcframework/
+    bundle="${SCRIBE_BUNDLE_ID:-com.enigmacurry.rpg-vox-scribe}"
+    xcodegen generate --quiet --spec ios/project.yml
+    xcodebuild -quiet -project ios/Scribe.xcodeproj -scheme Scribe -configuration Release \
+      -destination "platform=iOS Simulator,name={{DEVICE}}" -derivedDataPath ios/build \
+      PRODUCT_BUNDLE_IDENTIFIER="$bundle" CODE_SIGNING_ALLOWED=NO build
+    xcrun simctl boot "{{DEVICE}}" 2>/dev/null || true
+    xcrun simctl install "{{DEVICE}}" ios/build/Build/Products/Release-iphonesimulator/Scribe.app
+    data="$(xcrun simctl get_app_container "{{DEVICE}}" "$bundle" data)"
+    if [ ! -d "$data/Library/Application Support/models/parakeet-tdt-0.6b-v2" ]; then
+      mkdir -p "$data/Documents/models"
+      cp -R "$HOME/Library/Application Support/vox_scribe/models/parakeet-tdt-0.6b-v2" \
+        "$HOME/Library/Application Support/vox_scribe/models/streaming-zipformer" "$data/Documents/models/"
+    fi
+    xcrun simctl launch --terminate-running-process "{{DEVICE}}" "$bundle"
+
 # Copy Parakeet and the streaming Zipformer from MODELS (default: Scribe's
 # models dir on this Mac) into the iOS app's Documents/models on
 # SCRIBE_DEVICE. The app must be installed; relaunch it afterwards.

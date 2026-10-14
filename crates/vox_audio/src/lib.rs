@@ -14,6 +14,13 @@
 //! The realtime callback only writes into an SPSC ring; a reader thread
 //! downmixes and forwards, so nothing allocates on the audio thread.
 
+// Elsewhere (iOS) there's no device backend; the iOS app takes only the
+// file and Opus code and leaves the capture plumbing unused.
+#![cfg_attr(
+    not(any(target_os = "macos", target_os = "android", target_os = "linux")),
+    allow(dead_code, unused_imports)
+)]
+
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;

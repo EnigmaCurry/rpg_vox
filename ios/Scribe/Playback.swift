@@ -289,8 +289,10 @@ private final class Worker: @unchecked Sendable {
         let engine = AVAudioEngine()
         let player = AVAudioPlayerNode()
         let format = AVAudioFormat(standardFormatWithSampleRate: Double(PLAY_RATE), channels: 1)!
+        var why = "stopped"
         defer {
             let at = positionMs()
+            print("playback: \(why) at \(at) ms\(died ? " (output died)" : "")")
             lock.withLock { node = nil }
             player.stop()
             engine.stop()
@@ -308,8 +310,11 @@ private final class Worker: @unchecked Sendable {
             sources.append(Source(handle: h, startMs: f.offsetMs, endMs: end))
         }
         if sources.isEmpty { return }
+        let end = sources.map(\.endMs).max() ?? 0
         // Starting inside a cut starts after it.
         var pos = skips.first { $0.contains(from) }?.upperBound ?? from
+        print("playback: from \(pos) ms of \(end) ms")
+        if pos >= end { return }
         lock.withLock { startMs = pos }
         sources.forEach { $0.place(pos) }
 
@@ -333,8 +338,13 @@ private final class Worker: @unchecked Sendable {
         var posSamples = pos * Int64(PLAY_RATE) / 1000
         while !run.value {
             pos = posSamples * 1000 / Int64(PLAY_RATE)
-            // At a cut: jump past it.
+            // At a cut: jump past it, unless that's past the end (the
+            // quiet after the last word runs on "forever").
             if let cut = skips.first(where: { $0.contains(pos) && $0.upperBound > pos }) {
+                if cut.upperBound >= end {
+                    why = "past the last word"
+                    break
+                }
                 sources.forEach { $0.place(cut.upperBound) }
                 posSamples = cut.upperBound * Int64(PLAY_RATE) / 1000
                 let w = written
@@ -351,7 +361,10 @@ private final class Worker: @unchecked Sendable {
             mix.initialize(repeating: 0, count: room)
             var produced = 0
             for s in sources { produced = max(produced, add(s, mix, &got, room)) }
-            if produced == 0 { break }
+            if produced == 0 {
+                why = "end of audio"
+                break
+            }
             posSamples += Int64(produced)
             for i in 0..<produced { mix[i] = min(max(mix[i], -1), 1) }
             buf.frameLength = AVAudioFrameCount(produced)

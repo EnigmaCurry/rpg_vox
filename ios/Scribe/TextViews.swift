@@ -68,8 +68,11 @@ struct ParagraphText: UIViewRepresentable {
 
     func updateUIView(_ v: FitTextView, context: Context) {
         context.coordinator.view = self
+        // Against what was last set: UIKit normalizes attributedText, so it
+        // never compares equal, and resetting it would close the edit menu.
         let text = attributed()
-        if v.attributedText != text {
+        if context.coordinator.shown != text {
+            context.coordinator.shown = text
             let sel = v.selectedRange
             v.attributedText = text
             if sel.upperBound <= text.length { v.selectedRange = sel }
@@ -114,6 +117,7 @@ struct ParagraphText: UIViewRepresentable {
 
     final class Coordinator: NSObject, UITextViewDelegate, UIGestureRecognizerDelegate {
         var view: ParagraphText?
+        var shown: NSAttributedString?
 
         @MainActor @objc func tapped(_ g: UITapGestureRecognizer) {
             guard let view, let v = g.view as? FitTextView else { return }
@@ -145,7 +149,8 @@ struct ParagraphText: UIViewRepresentable {
                 Scribe.shared.cut(view.para, from: range.location, to: range.upperBound)
                 textView.selectedRange = NSRange(location: 0, length: 0)
             })
-            return UIMenu(children: suggestedActions + [UIMenu(options: .displayInline, children: mine)])
+            // Ours first: the bar shows only the first few.
+            return UIMenu(children: [UIMenu(options: .displayInline, children: mine)] + suggestedActions)
         }
     }
 }
@@ -164,7 +169,11 @@ struct DictationEditor: UIViewRepresentable {
     func makeCoordinator() -> Coordinator { Coordinator() }
 
     func makeUIView(context: Context) -> UITextView {
-        let v = UITextView()
+        let v = LaidOutTextView()
+        v.onLayout = { [weak c = context.coordinator] v in
+            guard let c, let e = c.editor else { return }
+            c.placeCaret(v, (e.held ?? e.laid).caret)
+        }
         v.isEditable = false
         v.isSelectable = true
         v.alwaysBounceVertical = true
@@ -194,7 +203,8 @@ struct DictationEditor: UIViewRepresentable {
             text.addAttributes([.foregroundColor: UIColor.secondaryLabel, .font: italic(font)],
                                range: NSRange(location: r.lowerBound, length: r.count))
         }
-        if v.attributedText != text {
+        if c.shown != text {
+            c.shown = text
             c.updating = true
             v.attributedText = text
             if selection.length > 0 && selection.upperBound <= text.length { v.selectedRange = selection }
@@ -214,6 +224,7 @@ struct DictationEditor: UIViewRepresentable {
 
     final class Coordinator: NSObject, UITextViewDelegate, UIGestureRecognizerDelegate {
         var editor: DictationEditor?
+        var shown: NSAttributedString?
         var caret: UIView?
         var updating = false
         /// Keep the cursor in view, until the reader scrolls away from it.
@@ -265,7 +276,21 @@ struct DictationEditor: UIViewRepresentable {
             let picked = d.picked(d.held ?? d.laid, range)
             guard range.length > 0, !picked.isEmpty else { return UIMenu(children: suggestedActions) }
             let delete = UIAction(title: "Delete", attributes: .destructive) { _ in d.delete(picked) }
-            return UIMenu(children: suggestedActions + [UIMenu(options: .displayInline, children: [delete])])
+            return UIMenu(children: [UIMenu(options: .displayInline, children: [delete])] + suggestedActions)
+        }
+    }
+}
+
+/// A text view that reports its layout (a new width moves the caret).
+final class LaidOutTextView: UITextView {
+    var onLayout: ((UITextView) -> Void)?
+    private var lastWidth: CGFloat = 0
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        if bounds.width != lastWidth {
+            lastWidth = bounds.width
+            onLayout?(self)
         }
     }
 }
@@ -296,7 +321,8 @@ struct TypingEditor: UIViewRepresentable {
     }
 
     func updateUIView(_ v: UITextView, context: Context) {
-        v.font = transcriptFont()
+        let font = transcriptFont()
+        if v.font != font { v.font = font }
     }
 
     final class Coordinator: NSObject, UITextViewDelegate {

@@ -50,8 +50,13 @@ struct Dock<L2: View, L1: View, Center: View, R1: View, R2: View>: View {
         .background(.bar)
     }
 
+    /// Keeps its place when empty (EmptyView alone takes no room).
     private func slot<V: View>(@ViewBuilder _ v: () -> V) -> some View {
-        v().frame(width: 52, height: 52)
+        ZStack {
+            Color.clear
+            v()
+        }
+        .frame(width: 52, height: 52)
     }
 }
 

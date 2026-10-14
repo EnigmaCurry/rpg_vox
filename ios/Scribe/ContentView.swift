@@ -60,17 +60,19 @@ struct ContentView: View {
             }
         }
         .confirmationDialog("New", isPresented: $choosingNew, titleVisibility: .visible) {
-            Button("\(PEN) Dictation: write by voice, and keep editing anywhere") {
+            Button("\(PEN) Dictation") {
                 dictations.create()
                 if scribe.autoStart { scribe.startWhenOpen = "dictation" }
                 columns = .detailOnly
             }
-            Button("\(MIC) Transcription: record and transcribe in order") {
+            Button("\(MIC) Transcription") {
                 dictations.close()
                 scribe.newThread()
                 if scribe.autoStart { scribe.startWhenOpen = "transcription" }
                 columns = .detailOnly
             }
+        } message: {
+            Text("A dictation is written by voice, and you can keep editing it anywhere. A transcription records and transcribes in order: talks, meetings, videos.")
         }
         .alert(renamingTitle, isPresented: Binding(get: { renaming != nil }, set: { if !$0 { renaming = nil } })) {
             TextField("Title", text: $newTitle)

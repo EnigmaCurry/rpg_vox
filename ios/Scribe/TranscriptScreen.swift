@@ -226,7 +226,7 @@ private struct Transcript: View {
         }
         let busy = scribe.busy()
         let held = playback.paused
-        return ScrollViewReader { proxy in
+        return GeometryReader { geo in ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 12) {
                     ForEach(Array(paras.enumerated()), id: \.element.id) { i, p in
@@ -253,7 +253,9 @@ private struct Transcript: View {
                 }
                 .padding(16)
                 .frame(maxWidth: 820, alignment: .leading)
-                .frame(maxWidth: .infinity)
+                // At least the view's height, so scrolling to the end of a
+                // short transcript leaves it at the top.
+                .frame(maxWidth: .infinity, minHeight: geo.size.height, alignment: .top)
             }
             .simultaneousGesture(DragGesture(minimumDistance: 8).onChanged { _ in
                 if playback.playing == nil { follow = false }
@@ -296,7 +298,7 @@ private struct Transcript: View {
             .onChange(of: held) {
                 if !held, let id = at?.para { withAnimation { proxy.scrollTo(id, anchor: .center) } }
             }
-        }
+        } }
         .sheet(item: $editing) { p in
             EditParagraph(para: p)
         }

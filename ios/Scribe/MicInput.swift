@@ -151,6 +151,10 @@ final class MicCapture: @unchecked Sendable {
     }
 
     func start() throws {
+        if let name = UserDefaults.standard.volatileDomain(forName: UserDefaults.argumentDomain)["mic_file"] as? String {
+            feed(name)
+            return
+        }
         try activateRecordingSession(route)
         try run()
         running = true
@@ -213,6 +217,45 @@ final class MicCapture: @unchecked Sendable {
         }
         print("mic: \(inputName() ?? "?") \(from)")
         onName(inputName())
+    }
+
+    /// For testing without a mic (the Simulator): launched with
+    /// `-mic_file NAME`, Documents/NAME stands in for it, played in real
+    /// time, then silence.
+    private func feed(_ name: String) {
+        running = true
+        onName("Test file \(name)")
+        let url = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent(name)
+        Thread.detachNewThread { [self] in
+            var samples: [Float] = []
+            try? decodeAudio(url, rate: RATE, durationMs: { _ in }, cancelled: { false }) { buf, n in
+                samples.append(contentsOf: UnsafeBufferPointer(start: buf, count: n))
+            }
+            let block = RATE / 10
+            var at = 0
+            var silence = [Float](repeating: 0, count: block)
+            let start = Date()
+            var sent = 0
+            while true {
+                gate.lock()
+                let open = self.open
+                gate.unlock()
+                if !open { break }
+                var chunk = at < samples.count ? Array(samples[at..<min(at + block, samples.count)]) : silence
+                at += block
+                chunk.withUnsafeMutableBufferPointer { p in
+                    gain.process(p.baseAddress!, p.count)
+                    gate.lock()
+                    if self.open { onSamples(p.baseAddress!, p.count) }
+                    gate.unlock()
+                }
+                sent += chunk.count
+                silence = [Float](repeating: 0, count: block)
+                // Real time: wait until this much audio would have been heard.
+                let due = Double(sent) / Double(RATE) - Date().timeIntervalSince(start)
+                if due > 0 { usleep(useconds_t(due * 1_000_000)) }
+            }
+        }
     }
 
     /// Stops the mic; no `onSamples` call starts after this returns.
