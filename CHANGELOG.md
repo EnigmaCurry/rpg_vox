@@ -6,6 +6,8 @@ section after the version it releases.
 
 ## Unreleased
 
+## v0.1.9 (2026-10-15)
+
 ### scribe
 
 - **Sentence starts are capitalized.** The recognizers punctuate text
