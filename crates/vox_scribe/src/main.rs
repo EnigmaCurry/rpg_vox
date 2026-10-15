@@ -181,6 +181,25 @@ struct Cli {
         env = "VOX_SCRIBE_PARAGRAPH_GAP"
     )]
     paragraph_gap: Option<u64>,
+    /// Words after which a paragraph ends at the next real pause in auto
+    /// mode (default 100, off with --chat). `0` turns the cap off.
+    #[arg(
+        long,
+        value_name = "WORDS",
+        value_parser = parse_words,
+        env = "VOX_SCRIBE_PARAGRAPH_SOFT_WORDS"
+    )]
+    paragraph_soft_words: Option<usize>,
+    /// Words after which a paragraph ends whatever the audio is doing
+    /// (default 200, off with --chat), for speech that never pauses. `0`
+    /// turns the cap off. Can't be below --paragraph-soft-words.
+    #[arg(
+        long,
+        value_name = "WORDS",
+        value_parser = parse_words,
+        env = "VOX_SCRIBE_PARAGRAPH_HARD_WORDS"
+    )]
+    paragraph_hard_words: Option<usize>,
     /// Experimental: filter background music and noise out of the audio
     /// (DeepFilterNet 3) before transcribing it. The recording (--record)
     /// stays unfiltered.
@@ -291,6 +310,16 @@ fn parse_gap(arg: &str) -> Result<u64, String> {
         return Err("expected 0.1 to 60 seconds".into());
     }
     Ok((secs * 1000.0).round() as u64)
+}
+
+/// `--paragraph-soft-words` / `--paragraph-hard-words`, where `0` reads
+/// as "never cap" — the same `usize::MAX` --chat uses.
+fn parse_words(arg: &str) -> Result<usize, String> {
+    let words: usize = arg
+        .trim()
+        .parse()
+        .map_err(|_| "expected a number of words, e.g. 120 (0 for no cap)".to_string())?;
+    Ok(if words == 0 { usize::MAX } else { words })
 }
 
 fn parse_speakers(arg: &str) -> Result<Speakers, String> {
@@ -478,8 +507,27 @@ struct Spawner {
     mixer: Option<Arc<Mutex<sources::Mixer>>>,
     /// --denoise, with its limit (see [`EngineConfig::denoise`]).
     denoise: Option<f32>,
-    /// --paragraph-gap, in milliseconds; None leaves the default.
+    /// The --paragraph-* options, for an engine started later.
+    paragraph: ParagraphOpts,
+}
+
+/// What the command line said about paragraphs. `None` anywhere leaves
+/// that part of [`vox_transcribe::ParagraphConfig`] at its default.
+#[derive(Debug, Clone, Copy, Default)]
+struct ParagraphOpts {
     gap_ms: Option<u64>,
+    soft_words: Option<usize>,
+    hard_words: Option<usize>,
+}
+
+impl ParagraphOpts {
+    fn from_cli(cli: &Cli) -> Self {
+        Self {
+            gap_ms: cli.paragraph_gap,
+            soft_words: cli.paragraph_soft_words,
+            hard_words: cli.paragraph_hard_words,
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -487,7 +535,7 @@ fn new_engine(
     rate: u32,
     manual: bool,
     chat: bool,
-    gap_ms: Option<u64>,
+    paragraph: ParagraphOpts,
     denoise: Option<f32>,
     zipformer: Option<&Zipformer>,
     offline: &Arc<dyn vox_transcribe::OfflineRecognizer>,
@@ -506,10 +554,16 @@ fn new_engine(
         cfg.paragraph.soft_max_words = usize::MAX;
         cfg.paragraph.hard_max_words = usize::MAX;
     }
-    // --paragraph-gap is explicit, so it wins over both defaults,
-    // chat's included; chat's word caps stay off either way.
-    if let Some(ms) = gap_ms {
+    // The paragraph options are explicit, so each one wins over both
+    // defaults, chat's included.
+    if let Some(ms) = paragraph.gap_ms {
         cfg.paragraph.gap_ms = ms;
+    }
+    if let Some(words) = paragraph.soft_words {
+        cfg.paragraph.soft_max_words = words;
+    }
+    if let Some(words) = paragraph.hard_words {
+        cfg.paragraph.hard_max_words = words;
     }
     let streaming = zipformer.map(|z| Box::new(z.session()) as Box<dyn StreamingRecognizer>);
     Engine::spawn_full(cfg, streaming, offline.clone(), corrector.clone(), tagger)
@@ -604,7 +658,7 @@ impl Session {
             rate,
             self.manual.load(Ordering::Relaxed),
             false,
-            sp.gap_ms,
+            sp.paragraph,
             sp.denoise,
             sp.zipformer.as_ref(),
             &sp.offline,
@@ -951,6 +1005,15 @@ fn main() -> Result<()> {
         }
     }
 
+    if let (Some(soft), Some(hard)) = (cli.paragraph_soft_words, cli.paragraph_hard_words) {
+        if hard < soft {
+            anyhow::bail!(
+                "--paragraph-hard-words {hard} is below --paragraph-soft-words {soft}, which would \
+                 end every paragraph at {hard} words without ever waiting for a pause"
+            );
+        }
+    }
+
     let now = chrono::Local::now();
     let record = cli.record.as_deref().map(RecordPaths::new);
     let output = match (&cli.output, &record) {
@@ -1199,7 +1262,7 @@ fn main() -> Result<()> {
                 *rate,
                 manual,
                 cli.chat.is_some(),
-                cli.paragraph_gap,
+                ParagraphOpts::from_cli(&cli),
                 denoise,
                 zipformer.as_ref(),
                 &offline,
@@ -1302,7 +1365,7 @@ fn main() -> Result<()> {
         corrector: corrector.clone(),
         mixer: mixer.clone(),
         denoise,
-        gap_ms: cli.paragraph_gap,
+        paragraph: ParagraphOpts::from_cli(&cli),
     });
     let labelled = engine.labelled();
 

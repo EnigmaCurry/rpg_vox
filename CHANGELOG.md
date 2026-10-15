@@ -14,6 +14,18 @@ section after the version it releases.
   included, so a shorter gap also gets text into the `-o` file sooner.
   `--chat` still starts from 0.3 s; passing the option overrides that
   too.
+- **`--paragraph-soft-words` and `--paragraph-hard-words`** (env
+  `VOX_SCRIBE_PARAGRAPH_SOFT_WORDS`, `VOX_SCRIBE_PARAGRAPH_HARD_WORDS`)
+  set the word counts that end a paragraph, until now a fixed 100 at the
+  next pause and 200 regardless. `0` turns a cap off, as `--chat` does
+  with both.
+- **A word cap now holds while the re-decode lags.** A clip joins its
+  paragraph as soon as the live pass opens it, but the caps were only
+  checked when pass 2 landed, so a paragraph swallowed every utterance
+  the decoder was behind on — every utterance of an `--input` file,
+  which is pushed faster than real time, leaving one 103-word paragraph
+  where a 15-word cap was asked for. rpg_vox's transcription and Scribe
+  for Android get the same fix.
 
 ## v0.1.8 (2026-10-15)
 

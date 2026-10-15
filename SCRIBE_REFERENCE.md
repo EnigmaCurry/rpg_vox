@@ -59,9 +59,17 @@ scribe [OPTIONS] [COMMAND]
 |------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `--manual` | Start new paragraphs only on Enter, not on silence or word count. Toggle in the TUI with `m`; the header shows `¶ AUTO` or `¶ MANUAL`.                                                                                                                                                                                                 |
 | `--paragraph-gap SECONDS` | Quiet that ends a paragraph in auto mode (default `2`, `0.3` with `--chat`), between `0.1` and `60`. It is also how long any paragraph waits before it settles and is written, manual ones included, so a short gap also writes sooner. Below the 0.7 s the recognizer itself waits for the end of an utterance, every utterance becomes its own paragraph. Env `VOX_SCRIBE_PARAGRAPH_GAP`. |
+| `--paragraph-soft-words WORDS` | Words after which a paragraph ends at the next real pause (default `100`, off with `--chat`). `0` turns the cap off. Only an utterance that ended on silence counts as a pause, so on speech that never stops this one rarely fires and the hard cap below does the breaking. Env `VOX_SCRIBE_PARAGRAPH_SOFT_WORDS`. |
+| `--paragraph-hard-words WORDS` | Words after which a paragraph ends whatever the audio is doing (default `200`, off with `--chat`), for speech with no pause to break on. `0` turns the cap off; below `--paragraph-soft-words` is an error. Env `VOX_SCRIBE_PARAGRAPH_HARD_WORDS`. |
 | `--denoise` | Experimental: filter background music and noise out of the audio with [DeepFilterNet 3](https://github.com/Rikorose/DeepFilterNet) before transcribing it. The `--record` file stays unfiltered. Env `VOX_SCRIBE_DENOISE`. |
 | `--denoise-limit DB` | With `--denoise`: push the background down by at most this many dB instead of all the way (e.g. `20`). Env `VOX_SCRIBE_DENOISE_LIMIT`. |
 | `--once`   | One-shot dictation: record a single manual paragraph until Enter, finish every pass (including `--llm`), print the text, copy it to the clipboard and exit. Nothing is saved to disk. Only one runs at a time: launching a second one (or `scribe stop-once`) finishes the running one instead. Conflicts with `-o`, `--append`, `-r`. |
+
+Either cap ends the paragraph at the next utterance boundary rather
+than mid-sentence, so a paragraph runs up to one utterance (12 s of
+speech) past the number given — a little further with `--input`, where
+the re-decode runs behind a file pushed faster than real time and the
+words counted are still pass 1's.
 
 ### Recognition
 

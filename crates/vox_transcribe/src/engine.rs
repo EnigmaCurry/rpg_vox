@@ -395,6 +395,11 @@ struct Core {
     streaming: Option<Box<dyn StreamingRecognizer>>,
     transcript: Transcript,
     current: Option<Current>,
+    /// How the last utterance ended, known as soon as the VAD says so
+    /// and before pass 2 returns. The soft word cap waits for a real
+    /// pause, and [`Core::upsert_clip`] has to judge that when it places
+    /// the next clip rather than when the decode lands.
+    last_end: Option<EndReason>,
     events: Sender<Event>,
     final_tx: Sender<Job>,
     bound_tx: Sender<Job>,
@@ -430,6 +435,7 @@ impl Core {
             streaming,
             transcript: Transcript::default(),
             current: None,
+            last_end: None,
             events,
             final_tx,
             bound_tx,
@@ -639,6 +645,7 @@ impl Core {
                 samples,
                 reason,
             } => {
+                self.last_end = Some(reason);
                 if let Some(s) = self.streaming.as_mut() {
                     s.reset();
                 }
@@ -704,6 +711,25 @@ impl Core {
 
     // ----- paragraph bookkeeping -----------------------------------------
 
+    /// Whether `p` has reached a word cap. The hard cap fires on any
+    /// utterance, the soft one only where the utterance ended on a real
+    /// pause — `silence_closed` — which is a natural place to break.
+    ///
+    /// Only meaningful in [`ParagraphMode::Auto`]; callers check the mode.
+    fn cap_reached(&self, p: &Paragraph, silence_closed: bool) -> bool {
+        let pc = &self.cfg.paragraph;
+        let words = count_words(&p.text);
+        words >= pc.hard_max_words || (silence_closed && words >= pc.soft_max_words)
+    }
+
+    /// Whether the utterance that just ended did so on a real pause.
+    fn silence_closed(&self) -> bool {
+        matches!(
+            self.last_end,
+            Some(EndReason::Silence | EndReason::Flush | EndReason::Stall)
+        )
+    }
+
     /// Insert or update a clip. Returns the paragraph index and whether
     /// it was opened or just changed; `None` for a stale partial.
     fn upsert_clip(
@@ -745,10 +771,24 @@ impl Core {
         };
         let max_utt = self.cfg.vad.max_utterance_ms as u64;
         let gap = self.cfg.paragraph.gap_ms;
+        // A clip joins its paragraph here, as soon as pass 1 opens it,
+        // while `on_final` only sees paragraphs pass 2 has caught up
+        // with. Checking the caps there alone lets a paragraph swallow
+        // every utterance the decoder is behind on — which is every
+        // utterance of an `--input` file, pushed faster than real time.
+        // The count includes the open clip's pass-1 text, close enough
+        // to the words pass 2 will land on it.
+        let capped = self.cfg.paragraph.mode == ParagraphMode::Auto
+            && self
+                .transcript
+                .paragraphs
+                .last()
+                .is_some_and(|p| self.cap_reached(p, self.silence_closed()));
         let need_new = match self.transcript.paragraphs.last() {
             None => true,
             Some(p) if p.closed || p.hardened => true,
             Some(_) if self.cfg.paragraph.mode == ParagraphMode::Manual => false,
+            Some(_) if capped => true,
             Some(p) => match p.clips.last() {
                 None => true,
                 Some(last) => {
@@ -765,6 +805,16 @@ impl Core {
             },
         };
         if need_new {
+            // A paragraph left behind for being full is finished, the
+            // way `on_final`'s caps finish one.
+            if capped {
+                let idx = self.transcript.paragraphs.len() - 1;
+                let p = &mut self.transcript.paragraphs[idx];
+                if !p.closed && !p.hardened {
+                    p.closed = true;
+                    self.emit(idx, Change::Closed);
+                }
+            }
             self.transcript
                 .paragraphs
                 .push(Paragraph::new(Uuid::new_v4().to_string(), clip));
@@ -1005,17 +1055,14 @@ impl Core {
             Some(s) => self.set_speaker(&clip_id, s).unwrap_or((idx, change)),
             None => (idx, change),
         };
-        // Word caps. The soft cap only fires on a silence-closed
-        // utterance (a real pause); the hard cap fires regardless, for
-        // non-stop speech where every utterance is a length split.
-        let pc = &self.cfg.paragraph;
-        let p = &mut self.transcript.paragraphs[idx];
-        let words = count_words(&p.text);
+        // Word caps, for the text pass 2 landed: what pass 1 heard while
+        // the clip was open was only an estimate, and the clip may have
+        // joined its paragraph before the cap was in reach.
         let silence_closed = !matches!(reason, EndReason::MaxLength | EndReason::Pause);
-        if pc.mode == ParagraphMode::Auto
-            && !p.closed
-            && (words >= pc.hard_max_words || (silence_closed && words >= pc.soft_max_words))
-        {
+        let full = self.cfg.paragraph.mode == ParagraphMode::Auto
+            && self.cap_reached(&self.transcript.paragraphs[idx], silence_closed);
+        let p = &mut self.transcript.paragraphs[idx];
+        if full && !p.closed {
             p.closed = true;
         }
         let id = p.id.clone();

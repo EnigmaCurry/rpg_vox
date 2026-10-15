@@ -263,6 +263,100 @@ const TWO_CLOSE_UTTERANCES: &[(u32, f32)] = &[
     (3000, 0.0),
 ];
 
+/// Decodes like [`FakeOffline`] but slowly, so pass 2 falls behind the
+/// VAD the way it does on a file pushed faster than real time.
+struct SlowOffline;
+
+impl OfflineRecognizer for SlowOffline {
+    fn transcribe(&self, samples: &[f32], rate: u32) -> anyhow::Result<String> {
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        FakeOffline.transcribe(samples, rate)
+    }
+}
+
+/// A cap has to hold while pass 2 lags: a clip joins its paragraph when
+/// pass 1 opens it, so waiting for the finalize to check would let a
+/// paragraph swallow every utterance the decoder is still behind on.
+#[test]
+fn word_caps_hold_while_pass2_lags() {
+    let utterances: &[(u32, f32)] = &[
+        (500, 0.0),
+        (1200, 0.2),
+        (800, 0.0),
+        (1200, 0.2),
+        (800, 0.0),
+        (1200, 0.2),
+        (3000, 0.0),
+    ];
+    let run_capped = |soft: usize, hard: usize| {
+        let mut cfg = EngineConfig::new(SR);
+        cfg.partial_interval = std::time::Duration::ZERO;
+        cfg.paragraph.soft_max_words = soft;
+        cfg.paragraph.hard_max_words = hard;
+        let engine = Engine::spawn(
+            cfg,
+            Some(Box::new(FakeStreaming { fed: 0 })),
+            Arc::new(SlowOffline),
+        );
+        for &(ms, amp) in utterances {
+            for chunk in tone(ms, amp).chunks(SR as usize / 50) {
+                engine.push(chunk);
+            }
+        }
+        engine.finish()
+    };
+    // Uncapped the three utterances are 800 ms apart, so they share a
+    // paragraph however far behind pass 2 is.
+    let t = run_capped(usize::MAX, usize::MAX);
+    assert_eq!(t.paragraphs.len(), 1, "{t:#?}");
+    // Capped, each utterance is past the cap by itself, so the next one
+    // opens a paragraph — and the one it leaves is closed.
+    for (soft, hard) in [(2, usize::MAX), (usize::MAX, 2)] {
+        let t = run_capped(soft, hard);
+        assert_eq!(t.paragraphs.len(), 3, "soft={soft} hard={hard}: {t:#?}");
+        assert!(t.paragraphs.iter().all(|p| p.hardened), "{t:#?}");
+    }
+}
+
+/// The word caps `--paragraph-soft-words` / `--paragraph-hard-words`
+/// set. Each utterance here decodes to the two words "Alpha beta", and
+/// the 800 ms between them is short enough that the gap alone would
+/// keep them in one paragraph.
+#[test]
+fn word_caps_close_paragraphs() {
+    let run_capped = |soft: usize, hard: usize| {
+        let mut cfg = EngineConfig::new(SR);
+        cfg.partial_interval = std::time::Duration::ZERO;
+        cfg.paragraph.soft_max_words = soft;
+        cfg.paragraph.hard_max_words = hard;
+        let engine = Engine::spawn(
+            cfg,
+            Some(Box::new(FakeStreaming { fed: 0 })),
+            Arc::new(FakeOffline),
+        );
+        for &(ms, amp) in TWO_CLOSE_UTTERANCES {
+            for chunk in tone(ms, amp).chunks(SR as usize / 50) {
+                engine.push(chunk);
+            }
+        }
+        engine.finish()
+    };
+    // Defaults: one paragraph, two clips, four words.
+    let t = run_capped(100, 200);
+    assert_eq!(t.paragraphs.len(), 1, "{t:#?}");
+    // A two-word cap is reached by the first clip, so the second opens
+    // a paragraph of its own. Both caps do it on an utterance that
+    // ended on silence.
+    for (soft, hard) in [(2, 200), (100, 2)] {
+        let t = run_capped(soft, hard);
+        assert_eq!(t.paragraphs.len(), 2, "soft={soft} hard={hard}: {t:#?}");
+        assert!(t.paragraphs.iter().all(|p| p.clips.len() == 1), "{t:#?}");
+    }
+    // Off, the way --chat turns them off.
+    let t = run_capped(usize::MAX, usize::MAX);
+    assert_eq!(t.paragraphs.len(), 1, "{t:#?}");
+}
+
 #[test]
 fn speaker_change_opens_new_paragraph() {
     let t = run_tagged(vec!["A", "B"], TWO_CLOSE_UTTERANCES);
