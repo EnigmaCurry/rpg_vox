@@ -6,6 +6,8 @@ section after the version it releases.
 
 ## Unreleased
 
+## v0.1.8 (2026-10-15)
+
 ### scribe
 
 - **speech-dispatcher reads `--chat` replies**, in whatever voices the
