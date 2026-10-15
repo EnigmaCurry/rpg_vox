@@ -8,6 +8,14 @@ section after the version it releases.
 
 ### scribe
 
+- **Sentence starts are capitalized.** The recognizers punctuate text
+  they don't re-case, so a sentence break pass 3 found inside a
+  re-decoded window came out as "... in Hell. the surrounding land ...".
+  The first letter after a `.`, `!` or `?` is now capitalized in passes
+  2 and 3 — but not after `3.5`, `etc.` or a trailing-off `...` — and
+  pass 3 no longer drops the capital from a clip that opens a sentence
+  its window began on. rpg_vox's transcription does the same.
+
 - **`--paragraph-gap SECONDS`** (env `VOX_SCRIBE_PARAGRAPH_GAP`) sets the
   quiet that ends a paragraph in auto mode, until now a fixed 2 s. It is
   the same wait a paragraph takes to settle and be written, manual ones

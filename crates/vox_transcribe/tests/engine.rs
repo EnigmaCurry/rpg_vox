@@ -48,13 +48,16 @@ fn tone(ms: u32, amp: f32) -> Vec<f32> {
 }
 
 fn run(chunks: &[(u32, f32)]) -> (Vec<Event>, vox_transcribe::Transcript) {
+    run_with(Arc::new(FakeOffline), chunks)
+}
+
+fn run_with(
+    offline: Arc<dyn OfflineRecognizer>,
+    chunks: &[(u32, f32)],
+) -> (Vec<Event>, vox_transcribe::Transcript) {
     let mut cfg = EngineConfig::new(SR);
     cfg.partial_interval = std::time::Duration::ZERO;
-    let engine = Engine::spawn(
-        cfg,
-        Some(Box::new(FakeStreaming { fed: 0 })),
-        Arc::new(FakeOffline),
-    );
+    let engine = Engine::spawn(cfg, Some(Box::new(FakeStreaming { fed: 0 })), offline);
     let events = engine.events().clone();
     for &(ms, amp) in chunks {
         for chunk in tone(ms, amp).chunks(SR as usize / 50) {
@@ -96,6 +99,40 @@ fn three_passes_in_one_paragraph() {
     assert!(p.clips.iter().all(|c| c.stage == Stage::Revised));
     assert_eq!(p.text, "Alpha beta, alpha beta.");
     assert!(p.hardened);
+}
+
+/// Punctuates the joined window without re-casing it, the way the real
+/// recognizers do: a sentence break arrives mid-text, the word after it
+/// lowercase.
+struct UncasedOffline;
+
+impl OfflineRecognizer for UncasedOffline {
+    fn transcribe(&self, samples: &[f32], rate: u32) -> anyhow::Result<String> {
+        let secs = samples.len() as f32 / rate as f32;
+        Ok(if secs < 1.5 {
+            String::new()
+        } else if secs < 3.0 {
+            "Alpha beta.".into()
+        } else {
+            "Alpha beta. alpha beta.".into()
+        })
+    }
+}
+
+#[test]
+fn pass3_capitalizes_a_sentence_it_punctuated() {
+    let (_, t) = run_with(
+        Arc::new(UncasedOffline),
+        &[
+            (500, 0.0),
+            (1200, 0.2),
+            (800, 0.0),
+            (1200, 0.2),
+            (3000, 0.0),
+        ],
+    );
+    let p = &t.paragraphs[0];
+    assert_eq!(p.text, "Alpha beta. Alpha beta.");
 }
 
 #[test]

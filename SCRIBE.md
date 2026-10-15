@@ -89,6 +89,11 @@ Digits read out one at a time become numerals in passes 2 and 3, with
 `07840-1503`, and "one nine two dot one six eight dot one dot one" is
 `192.168.1.1`. A lone digit word ("one of them") is left alone.
 
+A sentence the recognizer punctuated without re-casing is capitalized
+in the same two passes: pass 3 re-decodes 2–3 utterances as one buffer
+and can find a sentence break inside it, which used to leave the next
+sentence starting in lowercase.
+
 Audio comes from CoreAudio on macOS and PipeWire on Linux (the
 `vox_audio` crate). A Linux system still on PulseAudio works through
 ALSA instead, for the mic and playback; capturing an app (`--app`) and

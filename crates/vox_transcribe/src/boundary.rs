@@ -11,7 +11,7 @@
 //! Everything here is pure; the engine owns the audio ring, the
 //! recognizer call and applying the result.
 
-use crate::filters::{count_words, is_false_positive};
+use crate::filters::{capitalize_first, count_words, ends_on_sentence, is_false_positive};
 use crate::model::Paragraph;
 use crate::timing::{align_words, offset, Word};
 
@@ -169,6 +169,30 @@ pub struct ClipRevision {
     pub text: String,
     /// Absolute times; empty when the decode had no timings.
     pub words: Vec<Word>,
+}
+
+impl ClipRevision {
+    /// Uppercase the revision's first letter, text and first timed word
+    /// together.
+    pub fn capitalize_first(&mut self) {
+        self.text = capitalize_first(&self.text);
+        if let Some(w) = self.words.first_mut() {
+            w.text = capitalize_first(&w.text);
+        }
+    }
+}
+
+/// True when the clip before `clip_id` ends a sentence, so a revision of
+/// `clip_id` opens one. False for the paragraph's first clip: nothing
+/// here can tell whether the paragraph itself opens mid-sentence.
+pub fn opens_sentence(paragraph: &Paragraph, clip_id: &str) -> bool {
+    paragraph
+        .clips
+        .iter()
+        .position(|c| c.id == clip_id)
+        .and_then(|i| i.checked_sub(1))
+        .and_then(|i| paragraph.clips.get(i))
+        .is_some_and(|prev| ends_on_sentence(&prev.text))
 }
 
 /// Validate a joined re-decode against the window and split it back

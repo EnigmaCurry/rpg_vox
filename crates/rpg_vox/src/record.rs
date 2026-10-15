@@ -44,7 +44,9 @@ use crate::mixer::AtomicMixer;
 use crate::paragraph::LlmScheduler;
 use crate::stt::{StreamingSession, StreamingSttHandle, SttHandle};
 use vox_transcribe::boundary::split_boundary_text;
-use vox_transcribe::filters::{count_words, ends_on_sentence, is_false_positive};
+use vox_transcribe::filters::{
+    capitalize_first, capitalize_sentences, count_words, ends_on_sentence, is_false_positive,
+};
 
 /// Silence gap (ms) that forces a paragraph break on a given channel. A
 /// new clip whose start is more than this far past the previous clip's end
@@ -1773,7 +1775,7 @@ impl RecordState {
         speaker: Option<String>,
         start_wall_ms: u64,
     ) {
-        let trimmed = text.trim().to_string();
+        let trimmed = capitalize_sentences(text.trim());
         let is_junk = trimmed.is_empty()
             || !trimmed.chars().any(|c| c.is_alphanumeric())
             || is_false_positive(&trimmed);
@@ -2485,7 +2487,11 @@ impl RecordState {
             let res =
                 tokio::task::spawn_blocking(move || stt.transcribe(&samples, sr)).await;
             let text = match res {
-                Ok(Ok(t)) => t.trim().to_string(),
+                // SenseVoice punctuates the window without re-casing it,
+                // so a sentence break it finds inside the window comes
+                // back followed by a lowercase word. Fix it before the
+                // split, which can land on that very boundary.
+                Ok(Ok(t)) => capitalize_sentences(t.trim()),
                 Ok(Err(err)) => {
                     warn!(err = %format!("{err:#}"), "pass3: STT decode failed");
                     state.clear_pass3_inflight(&paragraph_id_for_task);
@@ -2665,6 +2671,28 @@ impl RecordState {
                     new = %new_text,
                     "pass3-diag: per-clip old→new"
                 );
+            }
+
+            // The decode starts at the window's first sample, so it
+            // can't see that the window opens a sentence either: it may
+            // come back lowercase where the clip before the first
+            // writable one ends one.
+            let mut split_texts = split_texts;
+            if let Some(first) = clip_refs
+                .iter()
+                .position(|(_, pid)| pid == &paragraph_id_for_task)
+            {
+                let paragraph = &g.channels[ci].paragraphs[pi];
+                let opens_sentence = paragraph
+                    .clips
+                    .iter()
+                    .position(|c| c.id == clip_refs[first].0)
+                    .and_then(|i| i.checked_sub(1))
+                    .and_then(|i| paragraph.clips.get(i))
+                    .is_some_and(|prev| ends_on_sentence(&prev.text));
+                if opens_sentence {
+                    split_texts[first] = capitalize_first(&split_texts[first]);
+                }
             }
 
             // Apply the split — ONLY to clips in the trigger paragraph.

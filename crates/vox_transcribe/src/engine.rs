@@ -25,7 +25,7 @@ use crate::boundary::{self, BoundaryConfig, WindowClip};
 use crate::correct::{apply_edits, Corrector, Edit};
 use crate::denoise::Denoiser;
 use crate::digits::spoken_digits;
-use crate::filters::{count_words, ends_on_sentence, is_junk};
+use crate::filters::{capitalize_sentences, count_words, ends_on_sentence, is_junk};
 use crate::model::{Clip, Paragraph, Pass4, Stage, Transcript};
 use crate::recognizer::{OfflineRecognizer, SpeakerTagger, StreamingRecognizer, Transcription};
 use crate::ring::AudioRing;
@@ -1035,6 +1035,7 @@ impl Core {
         if self.cfg.spoken_digits {
             text = spoken_digits(&text);
         }
+        text = capitalize_sentences(&text);
         if is_junk(&text) {
             self.remove_clip(&clip_id);
             return;
@@ -1123,6 +1124,11 @@ impl Core {
                 if self.cfg.spoken_digits {
                     t.text = spoken_digits(&t.text);
                 }
+                // The recognizer punctuates the window without re-casing
+                // it, so a sentence break it found inside the window is
+                // followed by a lowercase word. Fix it before the split,
+                // which can land on that very boundary.
+                t.text = capitalize_sentences(&t.text);
                 boundary::plan_revision(&window, &t.text, &t.words).map_err(|r| {
                     debug!(paragraph = %paragraph_id, reason = ?r, output = %t.text, "pass 3 rejected");
                 })
@@ -1142,10 +1148,18 @@ impl Core {
             let soft = self.cfg.paragraph.soft_max_words;
             let p = &mut self.transcript.paragraphs[idx];
             let mut changed = false;
-            for (w, rev) in window.iter().zip(split) {
+            let mut first_writable = true;
+            for (w, mut rev) in window.iter().zip(split) {
                 if !w.writable {
                     continue;
                 }
+                // The decode starts at the window's first sample, so it
+                // can't see that the window opens a sentence; it may come
+                // back lowercase where the clip before ends one.
+                if first_writable && boundary::opens_sentence(p, &w.clip_id) {
+                    rev.capitalize_first();
+                }
+                first_writable = false;
                 debug!(clip = %w.clip_id, before = %w.text, after = %rev.text, "pass 3");
                 if let Some(c) = p.clips.iter_mut().find(|c| c.id == w.clip_id) {
                     changed |= c.text != rev.text;
