@@ -301,7 +301,7 @@ impl ClickGenerator {
         // Snapshot queue length so mid-loop pushes (there aren't any
         // now, but future-proofing) don't affect the iteration bound.
         let n_events = self.events.len();
-        for i in 0..frames {
+        for (i, frame) in out.iter_mut().enumerate() {
             let n = start + i as u64;
 
             // Sum the sine drops. Each event's stereo pair is already
@@ -326,8 +326,8 @@ impl ClickGenerator {
             self.fizz_hp_prev_in = lp_out;
             let fizz = fizz_amp * hp_out;
 
-            out[i][0] = (l + fizz).clamp(-1.0, 1.0);
-            out[i][1] = (r + fizz).clamp(-1.0, 1.0);
+            frame[0] = (l + fizz).clamp(-1.0, 1.0);
+            frame[1] = (r + fizz).clamp(-1.0, 1.0);
         }
 
         // Drop events whose envelope has fully decayed by the end of

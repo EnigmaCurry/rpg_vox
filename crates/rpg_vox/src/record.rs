@@ -936,9 +936,7 @@ impl RecordState {
     /// sees `playback: null` without a separate reaper task.
     pub fn playback_snapshot(&self) -> Option<RecordPlaybackSnapshot> {
         let mut guard = self.playback.lock().expect("playback mutex poisoned");
-        let Some(p) = guard.as_ref() else {
-            return None;
-        };
+        let p = guard.as_ref()?;
         let latest_seq = self.mixer.latest_play_seq();
         if p.play_seq != latest_seq {
             *guard = None;
@@ -1744,7 +1742,7 @@ impl RecordState {
         // hardening is its job in that mode.
         let harden_prev = new_paragraph.is_some() && !recording && !self.llm_when_idle();
         if harden_prev {
-            harden_prev_paragraph(&mut *g, ChannelKind::Vox(slot));
+            harden_prev_paragraph(&mut g, ChannelKind::Vox(slot));
         }
         drop(g);
         if recording {
@@ -1813,7 +1811,7 @@ impl RecordState {
         // UI's next poll observes a coherent state.
         let harden_prev = new_paragraph.is_some() && !recording && !self.llm_when_idle();
         if harden_prev {
-            harden_prev_paragraph(&mut *g, ChannelKind::Vox(slot));
+            harden_prev_paragraph(&mut g, ChannelKind::Vox(slot));
         }
         // Second, independent soft-cap trigger: VAD silence-close (a
         // real user pause, not a max-length rollover) at word count ≥
@@ -1870,9 +1868,9 @@ impl RecordState {
             .map(|p| count_words(&p.text))
             .unwrap_or(0);
         if cur_words >= PARAGRAPH_HARD_MAX_WORDS {
-            mark_paragraph_closed(&mut *g, "hard-cap");
+            mark_paragraph_closed(&mut g, "hard-cap");
         } else if silence_closed && cur_words >= PARAGRAPH_SOFT_MAX_WORDS {
-            mark_paragraph_closed(&mut *g, "silence-close");
+            mark_paragraph_closed(&mut g, "silence-close");
         }
         drop(g);
         // Snapshot whether a fresh paragraph was opened (which happens
@@ -2158,12 +2156,12 @@ impl RecordState {
         // this slot's previous end.
         let end = (target_offset + chunk.len()).min(max_samples);
         let take = end.saturating_sub(target_offset);
-        for i in 0..take {
+        for (i, sample) in chunk.iter().take(take).enumerate() {
             let dst_idx = target_offset + i;
             if dst_idx >= active.audio.len() {
-                active.audio.push(chunk[i]);
+                active.audio.push(*sample);
             } else {
-                active.audio[dst_idx] += chunk[i];
+                active.audio[dst_idx] += *sample;
             }
         }
         // Advance the slot's cursor by the frames we actually wrote

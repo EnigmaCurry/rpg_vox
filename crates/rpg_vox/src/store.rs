@@ -1522,6 +1522,7 @@ impl Store {
     /// Collects widget ids from TWO paths so nothing leaks:
     ///   1. Assistant-turn speech takes (character/narrator TTS clips).
     ///   2. User-turn `widget_id` (recorded voice memos + GM proxy synths).
+    ///
     /// The FK cascade drops the rows, but WAV files live on disk under
     /// `data/clips/` and the caller has to unlink them explicitly.
     pub async fn clear_script(&self, script_id: String) -> Result<Vec<String>> {
@@ -2070,6 +2071,8 @@ impl Store {
     /// `mixed_wav_bytes` may be empty (nothing cleared the silence gate
     /// during the session) — in that case the sidecar file is skipped
     /// so a stat on disk cleanly says "no mixed track".
+    // One parameter per column of the row being written.
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_recording(
         &self,
         id: String,

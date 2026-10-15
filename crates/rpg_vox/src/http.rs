@@ -586,7 +586,7 @@ fn apply_dictionary_substitutions(text: &str, entries: &[(String, String)]) -> S
     if prepared.is_empty() {
         return text.to_string();
     }
-    prepared.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+    prepared.sort_by_key(|p| std::cmp::Reverse(p.1.len()));
 
     let chars: Vec<char> = text.chars().collect();
     let mut out = String::with_capacity(text.len());
@@ -892,6 +892,9 @@ struct ActionResponse {
     error: Option<String>,
 }
 
+// Every subsystem the handlers reach lands in `AppState` right below;
+// listing them one by one here is the plumbing, not a signature to trim.
+#[allow(clippy::too_many_arguments)]
 pub async fn serve(
     bind: String,
     tts: Sender<Command>,
@@ -2131,7 +2134,7 @@ async fn scripts_generate_title(
         .replace("<speak>", "")
         .replace("</speak>", "")
         .trim()
-        .trim_end_matches(|c: char| c == '.' || c == '!' || c == '?')
+        .trim_end_matches(['.', '!', '?'])
         .to_string();
     let name = if cleaned.chars().count() > 60 {
         let truncated: String = cleaned.chars().take(60).collect();

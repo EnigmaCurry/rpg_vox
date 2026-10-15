@@ -102,11 +102,9 @@ async fn generate_and_push(
                 Ok(chunk) => sink.push(chunk).await?,
                 Err(err) => warn!(?err, "failed to decode audio chunk"),
             },
-            Message::Text(txt) => {
-                if is_terminal_for(&txt, &prompt_id)? {
-                    debug!("prompt execution complete");
-                    break;
-                }
+            Message::Text(txt) if is_terminal_for(&txt, &prompt_id)? => {
+                debug!("prompt execution complete");
+                break;
             }
             Message::Close(_) => break,
             _ => {}

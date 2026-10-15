@@ -78,19 +78,6 @@ pub enum Command {
     SavePrompt(SavePromptRequest),
 }
 
-/// One voice recipe within a profile. A profile with N of these fans out
-/// into N concurrent synth calls that are mixed together per-config
-/// pan/gain/delay in [`synthesize_profile`].
-///
-/// * `speaker`/`language`/`instruct` are TTS-backend inputs. Only [`qwen3`]
-///   consumes them — other backends silently ignore.
-/// * `pitch_semitones` + `detune_cents/100` are combined into a single
-///   pitch shift and applied to the rendered PCM by [`apply_effects`].
-/// * `time_ratio` is a duration multiplier applied after pitch shift.
-/// * `gain_db` scales the mono buffer before the pan/delay mix.
-/// * `pan` positions the voice in the stereo field via equal-power law
-///   (`-1.0` = full L, `+1.0` = full R, `0.0` = center).
-/// * `delay_ms` staggers the voice's start relative to the profile's mix.
 /// Which synthesis workflow to route this config through. Only [`qwen3`]
 /// looks at this — comfyui ignores mode and always synthesizes plain
 /// text through their single-model pipeline.
@@ -99,9 +86,10 @@ pub enum Command {
 /// [`VoiceConfig`]. `Clone` and `Design` carry mode-specific data inline
 /// because they don't reuse those fields (and hoisting them to the top
 /// level would leak clone-only data into preset paths).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub enum SynthMode {
     /// Preset speaker enum + optional `instruct` style prompt. Default.
+    #[default]
     Preset,
     /// Reference-audio clone. `voice_name` is the name the caller
     /// registered with vLLM-Omni via `POST /v1/audio/voices` (the sample
@@ -148,12 +136,19 @@ pub enum SynthMode {
     },
 }
 
-impl Default for SynthMode {
-    fn default() -> Self {
-        Self::Preset
-    }
-}
-
+/// One voice recipe within a profile. A profile with N of these fans out
+/// into N concurrent synth calls that are mixed together per-config
+/// pan/gain/delay in [`synthesize_profile`].
+///
+/// * `speaker`/`language`/`instruct` are TTS-backend inputs. Only [`qwen3`]
+///   consumes them — other backends silently ignore.
+/// * `pitch_semitones` + `detune_cents/100` are combined into a single
+///   pitch shift and applied to the rendered PCM by [`apply_effects`].
+/// * `time_ratio` is a duration multiplier applied after pitch shift.
+/// * `gain_db` scales the mono buffer before the pan/delay mix.
+/// * `pan` positions the voice in the stereo field via equal-power law
+///   (`-1.0` = full L, `+1.0` = full R, `0.0` = center).
+/// * `delay_ms` staggers the voice's start relative to the profile's mix.
 #[derive(Debug, Clone)]
 pub struct VoiceConfig {
     /// Synthesis mode. Preset uses the fields below; Clone/Design carry
@@ -877,6 +872,11 @@ async fn handle_play_pcm(
     let _ = reply.send(Ok(frames_pushed));
 }
 
+/// One `Sample` voice's decode + resample, running on the blocking pool
+/// while the backend synthesizes. `Err` carries a message naming the
+/// voice and file for the caller to surface.
+type SampleDecode = tokio::task::JoinHandle<Result<Vec<f32>, String>>;
+
 /// Fan a voice profile out into N synth calls, apply each config's DSP, and
 /// sum the results into a single stereo buffer at the pipewire target rate.
 ///
@@ -960,9 +960,8 @@ async fn synthesize_profile(
     // sample_bytes is behind a `&[VoiceConfig]` borrow — a few MB memcpy
     // is negligible next to the multi-second backend call it overlaps.
     let render_span = tracing::Span::current();
-    let mut sample_decode_handles: Vec<
-        Option<tokio::task::JoinHandle<Result<Vec<f32>, String>>>,
-    > = (0..configs.len()).map(|_| None).collect();
+    let mut sample_decode_handles: Vec<Option<SampleDecode>> =
+        (0..configs.len()).map(|_| None).collect();
     for (i, cc) in configs.iter().enumerate() {
         if let SynthMode::Sample { sample_bytes, sample_file_name } = &cc.mode {
             let bytes = sample_bytes.clone();
@@ -1592,7 +1591,7 @@ fn apply_reverb(buf: &mut Vec<f32>, sample_rate: u32, mix: f32, room: f32, damp:
     let mut out: Vec<f32> = Vec::with_capacity(total_len);
     let tail_denom = tail_samples.max(1) as f32;
     for i in 0..total_len {
-        let dry = if i < dry_len { buf[i] } else { 0.0 };
+        let dry = buf.get(i).copied().unwrap_or(0.0);
         let x = dry * input_gain;
 
         // 8 parallel combs, each a delay line with a one-pole LPF in

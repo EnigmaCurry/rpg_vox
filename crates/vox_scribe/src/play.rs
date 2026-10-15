@@ -495,10 +495,10 @@ fn play(paths: &RecordPaths, mut screen: Screen, track: Track, mut cues: Vec<Cue
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     search.prompt = None
                 }
+                // Backspace on an empty prompt closes it.
+                KeyCode::Backspace if typed.is_empty() => search.prompt = None,
                 KeyCode::Backspace => {
-                    if typed.pop().is_none() {
-                        search.prompt = None;
-                    }
+                    typed.pop();
                 }
                 KeyCode::Char(c) => typed.push(c),
                 _ => {}

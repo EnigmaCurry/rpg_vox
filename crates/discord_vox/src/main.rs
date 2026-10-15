@@ -555,7 +555,7 @@ impl Handler {
         let raw = RawAdapter::new(source, self.sample_rate, self.channels);
         let input: Input = raw.into();
         let input = match input
-            .make_playable_async(&get_codec_registry(), &get_probe())
+            .make_playable_async(get_codec_registry(), get_probe())
             .await
         {
             Ok(i) => i,

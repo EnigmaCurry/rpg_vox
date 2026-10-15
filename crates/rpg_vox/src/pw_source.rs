@@ -764,22 +764,22 @@ fn on_global(
                 );
             }
         }
-        ObjectType::Metadata => {
-            // Bind the `default` metadata object so we can write
-            // `target.object` on it to drive WirePlumber's routing. Other
-            // metadata objects (settings, sm-settings, ...) are ignored.
+        // Bind the `default` metadata object so we can write
+        // `target.object` on it to drive WirePlumber's routing. Other
+        // metadata objects (settings, sm-settings, ...) are ignored, as
+        // is a second `default` once we hold one.
+        ObjectType::Metadata
             if dict_get(obj.props, "metadata.name") == Some("default")
-                && graph.borrow().default_metadata.is_none()
-            {
-                if let Ok(proxy) = registry.bind::<Metadata, _>(obj) {
-                    // Keep an (unused) empty listener registered so the
-                    // proxy has a hook installed; some session managers
-                    // consider a proxy without a listener as inactive.
-                    let listener = proxy.add_listener_local().register();
-                    let mut g = graph.borrow_mut();
-                    g.default_metadata = Some(proxy);
-                    g._default_metadata_listener = Some(listener);
-                }
+                && graph.borrow().default_metadata.is_none() =>
+        {
+            if let Ok(proxy) = registry.bind::<Metadata, _>(obj) {
+                // Keep an (unused) empty listener registered so the
+                // proxy has a hook installed; some session managers
+                // consider a proxy without a listener as inactive.
+                let listener = proxy.add_listener_local().register();
+                let mut g = graph.borrow_mut();
+                g.default_metadata = Some(proxy);
+                g._default_metadata_listener = Some(listener);
             }
         }
         _ => {}
@@ -1436,10 +1436,10 @@ fn run(
                 let mut vox_state: [(f32, f32, bool, bool); 16] =
                     [(0.0, 0.0, false, false); 16];
                 let effective_slots = slot_count.min(16);
-                for i in 0..effective_slots {
+                for (i, snapshot) in vox_state.iter_mut().take(effective_slots).enumerate() {
                     let slot = &state.mixer.vox[i];
                     let (l, r) = slot.channel.stereo_gains();
-                    vox_state[i] = (l, r, slot.enabled(), slot.to_output());
+                    *snapshot = (l, r, slot.enabled(), slot.to_output());
                 }
 
                 // Buffer the final stereo mic feed so we can broadcast it to
@@ -1460,14 +1460,16 @@ fn run(
                 // allocations.
                 let mut input_tap_bufs: [Option<Vec<f32>>; 16] =
                     [const { None }; 16];
-                for slot_i in 0..effective_slots {
+                for (slot_i, tap_buf) in
+                    input_tap_bufs.iter_mut().take(effective_slots).enumerate()
+                {
                     if state
                         .input_taps
                         .get(slot_i)
                         .map(|t| t.receiver_count() > 0)
                         .unwrap_or(false)
                     {
-                        input_tap_bufs[slot_i] = Some(Vec::with_capacity(
+                        *tap_buf = Some(Vec::with_capacity(
                             frames * SOURCE_CHANNELS as usize,
                         ));
                     }
@@ -1606,10 +1608,8 @@ fn run(
                 state.mixer.tts.observe_peak(tts_peak);
                 state.mixer.add_tts_frames_played(tts_pops);
                 state.mixer.music.observe_peak(music_peak);
-                for slot_i in 0..effective_slots {
-                    state.mixer.vox[slot_i]
-                        .channel
-                        .observe_peak(vox_peaks[slot_i]);
+                for (slot_i, peak) in vox_peaks.iter().take(effective_slots).enumerate() {
+                    state.mixer.vox[slot_i].channel.observe_peak(*peak);
                 }
                 state.mixer.observe_master_peak(master_l_peak, master_r_peak);
 
@@ -1622,8 +1622,10 @@ fn run(
                 // that reaches the strip. No-op for slots without
                 // subscribers because we didn't allocate a buffer for
                 // them above.
-                for slot_i in 0..effective_slots {
-                    if let Some(buf) = input_tap_bufs[slot_i].take() {
+                for (slot_i, tap_buf) in
+                    input_tap_bufs.iter_mut().take(effective_slots).enumerate()
+                {
+                    if let Some(buf) = tap_buf.take() {
                         if !buf.is_empty() {
                             if let Some(tap) = state.input_taps.get(slot_i) {
                                 let _ = tap.send(Arc::from(buf));
