@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::Result;
-pub use vox_chat::{path_for, Conversation, Db, Kind, Role, Row};
+pub use vox_chat::{path_for, Conversation, Db, Kind, Role, Row, RESPONDER_STALE};
 
 /// `scribe chat-echo NAME`: a stand-in responder. Each thing the user
 /// says is read back a sentence per row, then, after a pause during
@@ -13,6 +13,8 @@ pub use vox_chat::{path_for, Conversation, Db, Kind, Role, Row};
 /// soon as the user interrupts it or says something new.
 pub fn echo(path: &Path) -> Result<()> {
     let db = Db::open(path)?;
+    // So `scribe --chat` sees a responder is listening.
+    vox_chat::beat(path, &format!("chat-echo {}", std::process::id()))?;
     let mut last = db.last_id()?;
     println!("echoing replies in {} (ctrl+c to stop)", path.display());
     loop {

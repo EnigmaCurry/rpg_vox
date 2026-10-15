@@ -14,13 +14,20 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
 
-/// Ring size: how far ahead of the speaker the caller can run.
-const BUFFER: Duration = Duration::from_millis(200);
+/// Ring size: how far ahead of the speaker the caller can run. Also has
+/// to be bigger than one of the device's buffers, which is what the
+/// callback falls back to filling when the graph asks for no particular
+/// number of frames — PipeWire here hands out 12288-frame (256 ms)
+/// buffers for a 256-frame quantum.
+const BUFFER: Duration = Duration::from_millis(500);
 
 #[derive(Default)]
 pub(crate) struct Shared {
     /// Frames played since the last flush.
     pub played: AtomicU64,
+    /// Frames of silence the device was handed because the ring was
+    /// empty: gaps, heard as choppy speech.
+    pub starved: AtomicU64,
     pub paused: AtomicBool,
     /// Set by [`Output::flush`]; the callback empties the ring, zeroes
     /// `played` and clears it.
@@ -46,6 +53,7 @@ impl Shared {
         }
         let paused = self.paused.load(Ordering::Relaxed);
         let mut played = 0;
+        let mut starved = 0;
         for f in 0..frames {
             let s = if paused {
                 0.0
@@ -55,13 +63,19 @@ impl Shared {
                         played += 1;
                         s
                     }
-                    Err(_) => 0.0,
+                    Err(_) => {
+                        starved += 1;
+                        0.0
+                    }
                 }
             };
             put(f, s);
         }
         if played > 0 {
             self.played.fetch_add(played, Ordering::Release);
+        }
+        if starved > 0 {
+            self.starved.fetch_add(starved, Ordering::Release);
         }
     }
 }
@@ -112,6 +126,13 @@ impl Output {
     /// Frames played since the last [`Output::flush`].
     pub fn played(&self) -> u64 {
         self.shared.played.load(Ordering::Acquire)
+    }
+
+    /// Frames of silence played because nothing was queued: what a
+    /// listener hears as a gap. Counted from the stream being opened,
+    /// including the moments before anything has been pushed.
+    pub fn starved(&self) -> u64 {
+        self.shared.starved.load(Ordering::Acquire)
     }
 
     /// Samples queued but not yet played.
@@ -288,13 +309,27 @@ fn open_pipewire(shared: Arc<Shared>) -> Result<Opened> {
                         let Some(mut buffer) = stream.dequeue_buffer() else {
                             return;
                         };
+                        // Frames the graph wants this cycle — one quantum,
+                        // 256 of them here. The buffer it hands over is far
+                        // bigger (12288 frames, 256 ms), and filling that
+                        // instead drained the ring dry every cycle and
+                        // padded the rest with zeros: a fifth of the speech
+                        // came out as holes. Zero means the server didn't
+                        // say, so fall back to the whole buffer. Read
+                        // before `datas_mut()`, which borrows the buffer
+                        // mutably.
+                        let requested = buffer.requested() as usize;
                         let datas = buffer.datas_mut();
                         let Some(data) = datas.first_mut() else {
                             return;
                         };
                         let frames = match data.data() {
                             Some(bytes) => {
-                                let frames = bytes.len() / 4;
+                                let room = bytes.len() / 4;
+                                let frames = match requested {
+                                    0 => room,
+                                    want => want.min(room),
+                                };
                                 state.shared.fill(&mut state.ring, frames, |f, s| {
                                     bytes[f * 4..f * 4 + 4].copy_from_slice(&s.to_le_bytes());
                                 });
@@ -367,4 +402,49 @@ fn open_pipewire(shared: Arc<Shared>) -> Result<Opened> {
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
 fn open_backend(_shared: Arc<Shared>) -> Result<Opened> {
     anyhow::bail!("no audio output backend for this OS")
+}
+
+/// Needs an output device (and plays two seconds of silence):
+/// `cargo test -p vox_audio -- --ignored plays_in_real_time`.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn plays_in_real_time() {
+        let mut out = Output::open().unwrap();
+        let rate = out.sample_rate as usize;
+        let total = rate * 2;
+        let silence = vec![0.0f32; rate / 10];
+        let mut pushed = 0;
+        let start = Instant::now();
+        while pushed < total && start.elapsed() < Duration::from_secs(10) {
+            let want = (total - pushed).min(silence.len());
+            pushed += out.push(&silence[..want]);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        while out.queued() > 0 && start.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let took = start.elapsed();
+        let gaps = out.starved() * 1000 / rate as u64;
+        eprintln!(
+            "device={} rate={rate} pushed={pushed} played={} starved={gaps}ms took={took:?}",
+            out.device,
+            out.played()
+        );
+        // Nothing but the moment before the first push should be
+        // missing: a device handed more frames per cycle than the ring
+        // holds pads the rest with silence, and that is heard as holes
+        // in the middle of every sentence.
+        assert!(gaps < 100, "{gaps} ms of the two seconds came out silent");
+        // Two seconds of samples take two seconds to come out of the
+        // speaker. Faster means the device is being handed more frames
+        // per cycle than it plays, and what it drops is heard as gaps.
+        assert!(
+            took > Duration::from_millis(1800) && took < Duration::from_millis(2600),
+            "two seconds of audio took {took:?}"
+        );
+    }
 }

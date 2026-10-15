@@ -28,6 +28,12 @@
 //!   `reply_to` (by talking over it). The responder should stop writing
 //!   that reply; scribe ignores any more rows for it. A new `say` from
 //!   the user also supersedes any reply still in progress.
+//!
+//! A responder also says it is there, every [`RESPONDER_BEAT`], with
+//! [`Db::responding`]; scribe reads it with [`Db::responder`] and
+//! refuses to open a chat nobody is listening to. Nothing else depends
+//! on it, so a responder written elsewhere works without one — it just
+//! has to be started with `--no-responder` on scribe's side.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -52,7 +58,9 @@ CREATE TABLE IF NOT EXISTS messages (
     at       TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 -- Choices kept with the database: `conversation` (the one last open),
--- `voice.<conversation id>` (the Kokoro voice of its replies).
+-- `voice.<conversation id>` (the voice of its replies), and the
+-- responder's heartbeat: `responder` (what it calls itself) and
+-- `responder_at` (unix seconds, by the database's clock).
 CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -97,6 +105,27 @@ pub fn path_for(name: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// Say `who` is listening to the database at `path`, now and every
+/// [`RESPONDER_BEAT`] after, on a connection of its own so a long reply
+/// doesn't hold the beat up. Returns once the first beat is in, which is
+/// what scribe looks for when it opens a chat.
+pub fn beat(path: &Path, who: &str) -> Result<()> {
+    let db = Db::open(path)?;
+    db.responding(who)?;
+    let who = who.to_string();
+    std::thread::Builder::new()
+        .name("beat".into())
+        .spawn(move || loop {
+            std::thread::sleep(RESPONDER_BEAT);
+            if let Err(e) = db.responding(&who) {
+                // Nothing to be done about it here; scribe will say
+                // the responder has gone quiet.
+                eprintln!("saying we are here failed: {e:#}");
+            }
+        })?;
+    Ok(())
+}
+
 /// A conversation, for listing.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Conversation {
@@ -109,6 +138,13 @@ pub struct Conversation {
 
 /// A new conversation's title until it is renamed: the local date and time.
 const NOW_TITLE: &str = "strftime('%Y-%m-%d %H:%M', 'now', 'localtime')";
+
+/// How often a responder should say it is still there.
+pub const RESPONDER_BEAT: Duration = Duration::from_secs(2);
+
+/// A heartbeat older than this is taken for nobody. Several beats'
+/// worth, so a busy machine's late beat doesn't look like a death.
+pub const RESPONDER_STALE: Duration = Duration::from_secs(15);
 
 pub struct Db {
     conn: Connection,
@@ -300,6 +336,35 @@ impl Db {
         Ok(())
     }
 
+    /// Say that `who` is listening to this database, now — every
+    /// [`RESPONDER_BEAT`] for as long as it runs. The time is the
+    /// database's own, so the two sides needn't agree on the clock.
+    pub fn responding(&self, who: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO settings (key, value)
+             VALUES ('responder', ?1), ('responder_at', strftime('%s', 'now'))
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![who],
+        )?;
+        Ok(())
+    }
+
+    /// Who is answering this database, if their heartbeat is younger
+    /// than `stale`; `None` when nobody is, or nobody lately.
+    pub fn responder(&self, stale: Duration) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT (SELECT value FROM settings WHERE key = 'responder')
+                 WHERE CAST((SELECT value FROM settings WHERE key = 'responder_at')
+                           AS INTEGER) > CAST(strftime('%s', 'now') AS INTEGER) - ?1",
+                [stale.as_secs() as i64],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
     pub fn last_id(&self) -> Result<i64> {
         Ok(self
             .conn
@@ -321,6 +386,31 @@ mod tests {
         assert_eq!(path_for(Path::new("talk")), PathBuf::from("talk.db"));
         assert_eq!(path_for(Path::new("talk.db")), PathBuf::from("talk.db"));
         assert_eq!(path_for(Path::new("a.b")), PathBuf::from("a.b.db"));
+    }
+
+    #[test]
+    fn a_responder_is_only_there_while_it_beats() {
+        let dir = std::env::temp_dir().join(format!("scribe-responder-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.db");
+        let _ = std::fs::remove_file(&path);
+        let db = Db::open(&path).unwrap();
+        // Nobody has said anything yet.
+        assert_eq!(db.responder(RESPONDER_STALE).unwrap(), None);
+        db.responding("agent 123").unwrap();
+        assert_eq!(
+            db.responder(RESPONDER_STALE).unwrap().as_deref(),
+            Some("agent 123")
+        );
+        // Beats stop: a moment later nobody is answering.
+        assert_eq!(db.responder(Duration::ZERO).unwrap(), None);
+        // And a new responder takes over by beating itself.
+        db.responding("chat-echo 456").unwrap();
+        assert_eq!(
+            db.responder(RESPONDER_STALE).unwrap().as_deref(),
+            Some("chat-echo 456")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

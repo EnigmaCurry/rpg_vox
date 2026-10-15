@@ -231,6 +231,7 @@ impl App<'_> {
                         continue;
                     }
                     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                    let alt = key.modifiers.contains(KeyModifiers::ALT);
                     // Shift selects with the arrows; a capital G is just G.
                     let shift = key.modifiers.contains(KeyModifiers::SHIFT)
                         && !matches!(key.code, KeyCode::Char(_));
@@ -248,7 +249,7 @@ impl App<'_> {
                         self.typed_ahead.push((key.code, ctrl));
                     } else if self.typing.is_some() {
                         self.typing_key(key.code, ctrl);
-                    } else if !self.key(key.code, ctrl, shift) {
+                    } else if !self.key(key.code, ctrl, shift, alt) {
                         return Ok(());
                     }
                 }
@@ -286,7 +287,7 @@ impl App<'_> {
     }
 
     /// A key while dictating; false to quit.
-    fn key(&mut self, code: KeyCode, ctrl: bool, shift: bool) -> bool {
+    fn key(&mut self, code: KeyCode, ctrl: bool, shift: bool, alt: bool) -> bool {
         let view = self.view();
         match code {
             KeyCode::Char('q') => return false,
@@ -300,8 +301,8 @@ impl App<'_> {
                     self.edited();
                 }
             }
-            KeyCode::Backspace | KeyCode::Delete => self.delete(code == KeyCode::Backspace),
-            KeyCode::Tab | KeyCode::Char('i') => self.type_mode(),
+            KeyCode::Backspace | KeyCode::Delete => self.delete(code, alt, shift || ctrl),
+            KeyCode::Tab | KeyCode::Char('e') | KeyCode::Char('i') => self.type_mode(),
             KeyCode::Char('y') | KeyCode::Char('c') => self.copy(),
             KeyCode::PageUp | KeyCode::PageDown => {
                 let page = self.body.get().height.saturating_sub(3).max(1) as usize;
@@ -443,9 +444,12 @@ impl App<'_> {
         }
     }
 
-    /// Backspace: the selection, else the sentence before the cursor (or
-    /// the break right before it). Delete: only the selection.
-    fn delete(&mut self, sentence: bool) {
+    /// The selection if there is one, else what the key says: backspace
+    /// takes the word before the cursor and del the word after it, alt
+    /// narrows either to one character, and shift (or ctrl) widens
+    /// backspace to the whole sentence — only terminals speaking the
+    /// kitty keyboard protocol can report that one.
+    fn delete(&mut self, code: KeyCode, alt: bool, sentence: bool) {
         let view = self.view();
         if let Some((a, b)) = self.sel.take() {
             let (a, b) = (self.resolve(&view, a), self.resolve(&view, b));
@@ -460,7 +464,15 @@ impl App<'_> {
             }
             return;
         }
-        if sentence && self.doc.delete_sentence(&self.built) {
+        let ahead = code != KeyCode::Backspace;
+        let cut = if alt {
+            self.doc.delete_char(&self.built, ahead)
+        } else if sentence && !ahead {
+            self.doc.delete_sentence(&self.built)
+        } else {
+            self.doc.delete_word(&self.built, ahead)
+        };
+        if cut {
             self.edited();
         }
     }
@@ -499,7 +511,7 @@ impl App<'_> {
         self.set_status(msg);
     }
 
-    /// Tab: stop listening, and once the last words are in, type.
+    /// `e` / tab / `i`: stop listening, and once the last words are in, type.
     fn type_mode(&mut self) {
         self.sel = None;
         if self.listening {
@@ -898,9 +910,9 @@ impl App<'_> {
         let keys = if self.typing.is_some() {
             " type · enter new paragraph · arrows move · esc / tab back to dictating · ctrl+c quit"
         } else if self.listening {
-            " space stop · arrows/click cursor · shift/drag select · enter ¶ · ⌫ sentence · tab type · y copy · q quit"
+            " space stop · arrows/click cursor · shift/drag select · enter ¶ · ⌫/del word · alt+⌫ char · e type · y copy · q quit"
         } else {
-            " space dictate · arrows/click cursor · shift/drag select · enter ¶ · ⌫ sentence · tab type · y copy · q quit"
+            " space dictate · arrows/click cursor · shift/drag select · enter ¶ · ⌫/del word · alt+⌫ char · e type · y copy · q quit"
         };
         f.render_widget(Line::from(keys.dark_gray()), help_line);
     }

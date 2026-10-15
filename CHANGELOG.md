@@ -6,6 +6,64 @@ section after the version it releases.
 
 ## Unreleased
 
+### scribe
+
+- **speech-dispatcher reads `--chat` replies**, in whatever voices the
+  desktop's own speech daemon is set up with, so a machine where speech
+  already works chats without the 350 MB Kokoro download. `--tts`
+  (env `VOX_SCRIBE_TTS`) picks the engine: the default asks
+  speech-dispatcher and falls back to Kokoro when it doesn't answer —
+  and only asks, leaving a daemon that isn't running alone rather than
+  starting one.
+  - `scribe voices` lists the names `--voices` and `v` take for the
+    engine that would speak; speech-dispatcher's are `module:voice`
+    (`pocket-tts:vera`, `espeak-ng:English (America)+Alex`), for the
+    module and language the daemon is set to.
+  - Where the module reports index marks (espeak-ng does, pocket-tts
+    doesn't) the reply's words light up as they are really spoken;
+    where it doesn't they are spread over the reply by length, timed
+    from the replies spoken so far.
+  - Reading a transcript aloud (`-p NAME` with no `NAME.opus`) stays
+    Kokoro's: that player seeks and changes speed through the samples,
+    and speech-dispatcher plays its speech itself.
+- **Speech no longer comes out choppy on PipeWire.** The playback
+  stream filled each buffer the server handed it (12288 frames, 256 ms
+  here) instead of the frames the graph asked for (one 256-frame
+  quantum), so every cycle drained the 200 ms ring dry and padded the
+  rest with silence: in a measured two seconds of audio, 560 ms came
+  out as holes. It now fills `Buffer::requested()`, and the ring holds
+  500 ms so the fallback for servers that ask for nothing in
+  particular still fits a whole buffer. Affects everything scribe
+  plays — Kokoro replies in `--chat`, `--play` (a recording or a
+  transcript read aloud) and `--live`. The same mistake, and the same
+  fix, as rpg_vox's source stream.
+- **A chat needs a responder.** `--chat NAME` waits a few seconds for
+  one to say it is listening and then exits with the commands that
+  start one, rather than opening a conversation that would never be
+  answered. `agent` and `scribe chat-echo` say so in `NAME.db` every
+  couple of seconds; `--no-responder` opens the chat regardless, for a
+  responder of your own.
+- **Dictation deletes by the word, or by the character.** `backspace`
+  takes the word before the cursor and `del` the word after it (where
+  `del` used to only delete the selection); `alt+backspace` and
+  `alt+del` take a single character, like a notepad. `backspace` no
+  longer takes the whole sentence — that moved to `shift+backspace`
+  (or `ctrl+backspace`), which only terminals speaking the kitty
+  keyboard protocol can tell from a plain `backspace`.
+- **`e` opens a dictation for typing**, beside the `tab` and `i` that
+  already did.
+
+### agent
+
+- **It checks the model answers before taking the conversation.** One
+  request at startup, so a wrong URL, a missing API key, a server that
+  isn't running or a model it hasn't got exits 1 with the server's own
+  message — instead of surfacing mid-conversation as "Sorry, I couldn't
+  get an answer just now." Reasoning models that reject `max_tokens`
+  are asked again with `max_completion_tokens`, then with neither.
+- **It says it is listening** in the chat database every couple of
+  seconds, which is what `scribe --chat` now waits for at startup.
+
 ## v0.1.7 (2026-10-13)
 
 ### scribe

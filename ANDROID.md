@@ -215,6 +215,13 @@ just android-app          # debug APK, installed with adb if a device is connect
 just android-apk          # release APK in dist/
 ```
 
+The Android recipes build into `target/android`, their own Cargo target
+dir: sherpa-onnx-sys caches its prebuilt libs per target dir, and the
+Android ones would otherwise shadow the host's — its build script takes
+the Android `jniLibs/` for a lib dir whatever the target is, so a later
+host build goes looking for `.a` files among Android `.so` files.
+`target/ios` is separate for the same reason.
+
 `just android-apk` signs with the keystore in `SCRIBE_KEYSTORE` (plus
 `SCRIBE_KEYSTORE_PASSWORD`, `SCRIBE_KEY_ALIAS` and `SCRIBE_KEY_PASSWORD`)
 when it is set, and with the debug key otherwise. The release workflow

@@ -233,6 +233,11 @@ Word highlighting is approximate, spread over each sentence by word
 length. The model (about 350 MB, English only) is downloaded on first
 use into the models directory.
 
+This is Kokoro's work whatever `--tts` says: the player seeks through
+the speech and changes its speed, and speech-dispatcher — the other
+engine, which `--chat` can use — plays what it synthesizes itself and
+hands no audio back.
+
 Copying (`y`, `--once`) uses `pbcopy`, `wl-copy` or `xclip`, falling back
 to the OSC 52 terminal escape (e.g. over ssh).
 
@@ -250,13 +255,21 @@ listening straight away.
   mid-sentence is lowercased to fit, and a full stop the recognizer
   added before a lowercase word is dropped.
 * `enter` starts a paragraph at the cursor. `backspace` deletes the
-  sentence before the cursor, the paragraph break right before it, or
-  the selection if there is one.
+  word before the cursor and `del` the word after it; with `alt` they
+  go by the character instead, like a notepad. Either deletes the
+  selection when there is one, and the paragraph break right beside the
+  cursor when that's what it meets. `shift+backspace` (or
+  `ctrl+backspace`) takes the whole sentence before the cursor, but
+  only terminals with the kitty keyboard protocol (Ghostty, kitty,
+  WezTerm, iTerm2) can tell it from a plain `backspace`; `alt` works
+  anywhere, because it goes out as `esc` and the key.
 * Select words with `shift` and the arrows, or by dragging, then
   `backspace` or `del` deletes them, across paragraphs too. `esc`
   drops the selection.
-* `tab` stops listening and opens the text for typing by hand, with
-  the cursor where the dictation cursor was. `esc` or `tab` goes back
+* `e` (or `tab`, or `i`) stops listening and opens the text for typing
+  by hand — a plain editor, with the cursor where the dictation cursor
+  was, the arrows and `home` / `end` to move, `enter` for a new
+  paragraph and `backspace` by the character. `esc` or `tab` goes back
   to dictating there, listening again if you were.
 * `space` starts and stops listening. There's no pause: stopping
   releases the mic, and the last words are finished first.
@@ -275,7 +288,7 @@ deletes the last sentence; hold it to delete them all), or, after `m` switches t
 for 1.5 seconds. The message is written to `NAME.db`, a SQLite file that
 a separate responder process (an LLM bridge, say) watches; its reply is
 written back to the same file, a sentence or so at a time, and scribe
-reads it aloud with Kokoro as it arrives.
+reads it aloud as it arrives.
 
 It's half duplex: from `enter` until the reply has been spoken, the mic
 is muted so scribe doesn't hear itself. `space` holds the reply and
@@ -297,7 +310,8 @@ of the one open is shown above it, `t` renames it (a new conversation is
 titled with its date and time), and whichever is open when you quit
 opens next time.
 
-`v` picks the voice replies are read in. The choice is saved with the
+`v` picks the voice replies are read in, from what the engine offers;
+the menu's title says which engine that is. The choice is saved with the
 conversation and used every time it is opened.
 
 `e` exports the conversation to `NAME-<title>.md` (or a name you type),
@@ -311,6 +325,40 @@ try the plumbing first, use the stand-in responder in another terminal:
 scribe chat-echo talk     # reads back what you say, then asks for more
 scribe --chat talk
 ```
+
+**The responder goes first.** A chat with nobody answering would take
+everything you said and never reply, so `--chat` waits a few seconds
+for a responder and then gives up with the commands that start one.
+`agent` and `chat-echo` say they are listening in the database every
+couple of seconds (the `responder` setting); a responder of your own
+either does the same or is opened with `--no-responder`. Only the start
+is checked — a responder that stops later leaves the chat as it was,
+waiting.
+
+### Which voice engine speaks
+
+Replies are read by one of two engines:
+
+* **speech-dispatcher**, the speech daemon a Linux desktop already runs
+  for its screen reader, in the voices it is set up with (espeak-ng,
+  pocket-tts, pico, a paid synthesizer). Nothing is downloaded.
+* **Kokoro**, the 82M model above, which sounds the same everywhere and
+  is what `-p` uses.
+
+`--tts auto`, the default, asks speech-dispatcher and falls back to
+Kokoro when it doesn't answer, so a desktop where speech already works
+chats without the 350 MB download. It only asks: a daemon that isn't
+running is left alone rather than started. `--tts speech-dispatcher`
+(`spd`) or `--tts kokoro` (env `VOX_SCRIBE_TTS`) says which to use.
+
+`scribe voices` lists the names `--voices` takes for whichever engine
+would speak. speech-dispatcher's are `module:voice` — `pocket-tts:vera`,
+`espeak-ng:English (America)+Alex` — and the menu and the list offer the
+voices of the module and language the daemon is set to. Where that
+module reports index marks (espeak-ng does, pocket-tts doesn't) the
+words light up as they are really spoken; where it doesn't, they are
+spread over the reply by length, timed from the replies spoken so far,
+as Kokoro's words always are.
 
 ### The database
 

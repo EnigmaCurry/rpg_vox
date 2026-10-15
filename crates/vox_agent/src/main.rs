@@ -26,6 +26,10 @@ it unless asked.";
 /// Shown to the model after a reply the user talked over.
 const CUT_NOTE: &str = " [the user interrupted here]";
 
+/// How long the startup check waits for the few words it asks for. Long
+/// enough for a local server that loads the model on the first request.
+const CHECK_TIMEOUT: Duration = Duration::from_secs(60);
+
 #[derive(Parser)]
 #[command(name = "agent", version, about)]
 struct Cli {
@@ -64,6 +68,7 @@ struct Cli {
 }
 
 struct Llm {
+    /// Base URL ending in `/v1`.
     url: String,
     model: String,
     key: Option<String>,
@@ -71,6 +76,83 @@ struct Llm {
     think: bool,
     /// The server rejected `chat_template_kwargs`; leave it out.
     no_kwargs: std::cell::Cell<bool>,
+}
+
+impl Llm {
+    /// Where the chat completions are asked for.
+    fn chat_url(&self) -> String {
+        format!("{}/chat/completions", self.url.trim_end_matches('/'))
+    }
+
+    /// A POST to `url`, with the API key if there is one.
+    fn post(&self, url: &str) -> ureq::Request {
+        let req = self.http.post(url);
+        match &self.key {
+            Some(key) => req.set("Authorization", &format!("Bearer {key}")),
+            None => req,
+        }
+    }
+}
+
+/// The server's complaint, from an OpenAI-style `error.message` where it
+/// sent one, else the body as it came.
+fn refusal(resp: ureq::Response) -> String {
+    let body = resp.into_string().unwrap_or_default();
+    serde_json::from_str::<Value>(&body)
+        .ok()
+        .and_then(|v| v["error"]["message"].as_str().map(String::from))
+        .unwrap_or(body)
+}
+
+/// Whether a 400 is the server turning down the token limit we sent,
+/// which is worth asking again without it.
+fn limit_refused(detail: &str) -> bool {
+    LIMITS.iter().any(|limit| detail.contains(limit))
+}
+
+/// Ways to cap the answer: reasoning models reject `max_tokens` and want
+/// `max_completion_tokens`, older servers know only the first, and a few
+/// take neither. Only the startup check sends one.
+const LIMITS: [&str; 2] = ["max_tokens", "max_completion_tokens"];
+
+/// Ask the model for a word before the conversation opens, so a wrong
+/// URL, a missing key, a server that isn't running or a model it hasn't
+/// got fails here — not in the middle of a conversation, where all the
+/// user hears is "Sorry, I couldn't get an answer just now."
+fn check(llm: &Llm) -> Result<()> {
+    let url = llm.chat_url();
+    let start = Instant::now();
+    let mut limits = LIMITS.iter();
+    let mut limit = limits.next();
+    loop {
+        let mut body = json!({
+            "model": llm.model,
+            "messages": [{ "role": "user", "content": "Say OK." }],
+            "stream": false,
+        });
+        if let Some(limit) = limit {
+            body[*limit] = json!(16);
+        }
+        match llm.post(&url).timeout(CHECK_TIMEOUT).send_json(body) {
+            Ok(_) => {
+                info!(
+                    ms = start.elapsed().as_millis() as u64,
+                    "the model answered"
+                );
+                return Ok(());
+            }
+            Err(ureq::Error::Status(code, resp)) => {
+                let detail = refusal(resp);
+                if code == 400 && limit.is_some() && limit_refused(&detail) {
+                    debug!("server turned down {limit:?}; asking without it");
+                    limit = limits.next();
+                    continue;
+                }
+                bail!("{url}: HTTP {code}: {detail}");
+            }
+            Err(e) => return Err(e).with_context(|| format!("POST {url}")),
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -104,8 +186,18 @@ fn main() -> Result<()> {
         think: cli.think,
         no_kwargs: std::cell::Cell::new(false),
     };
+    // Before anything else: a model that doesn't answer is no responder.
+    check(&llm).with_context(|| {
+        format!(
+            "{} has nothing to say as {:?} (--url / VOX_SCRIBE_LLM_URL, \
+             --model / VOX_SCRIBE_LLM_MODEL, VOX_SCRIBE_LLM_KEY)",
+            llm.url, llm.model
+        )
+    })?;
     let path = vox_chat::path_for(&cli.name);
     let db = Db::open(&path)?;
+    // scribe won't open a chat that nothing is answering.
+    vox_chat::beat(&path, &format!("agent {}", std::process::id()))?;
     info!(db = %path.display(), url = %llm.url, model = %llm.model, "agent ready");
     serve(&db, &llm, &prompt, cli.history)
 }
@@ -191,11 +283,8 @@ fn superseded(db: &Db, id: i64) -> Result<bool> {
 
 /// Stream the model's answer to user message `id` into the database.
 fn reply(db: &Db, llm: &Llm, messages: &[Value], id: i64) -> Result<()> {
-    let url = format!("{}/chat/completions", llm.url.trim_end_matches('/'));
-    let mut req = llm.http.post(&url);
-    if let Some(key) = &llm.key {
-        req = req.set("Authorization", &format!("Bearer {key}"));
-    }
+    let url = llm.chat_url();
+    let req = llm.post(&url);
     let chars: usize = messages
         .iter()
         .map(|m| m["content"].as_str().map_or(0, str::len))
@@ -215,12 +304,8 @@ fn reply(db: &Db, llm: &Llm, messages: &[Value], id: i64) -> Result<()> {
         }
         match req.clone().send_json(body) {
             Ok(r) => break r,
-            Err(ureq::Error::Status(code, r)) => {
-                let body = r.into_string().unwrap_or_default();
-                let detail = serde_json::from_str::<Value>(&body)
-                    .ok()
-                    .and_then(|v| v["error"]["message"].as_str().map(String::from))
-                    .unwrap_or(body);
+            Err(ureq::Error::Status(code, resp)) => {
+                let detail = refusal(resp);
                 if code == 400 && !llm.no_kwargs.get() && detail.contains("chat_template_kwargs") {
                     warn!("server rejected chat_template_kwargs; retrying without it");
                     llm.no_kwargs.set(true);
@@ -415,6 +500,51 @@ mod tests {
             more: false,
             at: String::new(),
         }
+    }
+
+    fn llm(url: &str) -> Llm {
+        Llm {
+            url: url.into(),
+            model: "m".into(),
+            key: None,
+            http: ureq::AgentBuilder::new().build(),
+            think: false,
+            no_kwargs: std::cell::Cell::new(false),
+        }
+    }
+
+    #[test]
+    fn asks_one_path_whatever_the_url_ends_in() {
+        assert_eq!(
+            llm("http://h/v1").chat_url(),
+            "http://h/v1/chat/completions"
+        );
+        assert_eq!(
+            llm("http://h/v1/").chat_url(),
+            "http://h/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn knows_a_refused_token_limit_from_other_complaints() {
+        assert!(limit_refused(
+            "Unsupported parameter: 'max_tokens' is not supported with this model. \
+             Use 'max_completion_tokens' instead."
+        ));
+        assert!(limit_refused("unknown field `max_completion_tokens`"));
+        // Anything else is the server's real answer, not worth retrying.
+        assert!(!limit_refused("context length exceeded"));
+        assert!(!limit_refused(""));
+    }
+
+    #[test]
+    fn reads_the_servers_complaint_out_of_its_body() {
+        let json = r#"{"error":{"message":"nope","type":"invalid_request_error"}}"#;
+        let resp = ureq::Response::new(400, "Bad Request", json).unwrap();
+        assert_eq!(refusal(resp), "nope");
+        // A server that sends something else is quoted as it is.
+        let plain = ureq::Response::new(502, "Bad Gateway", "upstream died").unwrap();
+        assert_eq!(refusal(plain), "upstream died");
     }
 
     #[test]

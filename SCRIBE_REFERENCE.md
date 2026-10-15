@@ -22,8 +22,9 @@ scribe [OPTIONS] [COMMAND]
 | `devices`         | List input devices for the native audio backend.                                                     |
 | `apps`            | List apps whose audio `--app` can capture; ones playing now are marked `*`.                          |
 | `download-models` | Download the Zipformer model and the `--model` recognizer, plus the speaker models with `--diarize`. |
-| `chat-echo NAME`  | A stand-in `--chat` responder: reads back whatever is said in `NAME.db` (`.db` optional), a sentence at a time, then after a pause asks for more. |
+| `chat-echo NAME`  | A stand-in `--chat` responder: reads back whatever is said in `NAME.db` (`.db` optional), a sentence at a time, then after a pause asks for more. Says it is listening, as `agent` does. |
 | `stop-once`       | Finish the running `--once` recorder, as if Enter were pressed. Exits 1 if none is running.          |
+| `voices`          | List the voices `--voices` can name, for the `--tts` engine that would speak.                        |
 | `help`            | Print help, or the help of a subcommand.                                                             |
 
 ### Input
@@ -43,9 +44,11 @@ scribe [OPTIONS] [COMMAND]
 | `-o, --output NAME` | Write the transcript to `NAME.md` (`.md` is added if missing). Without `-o` or `-r` nothing is saved to disk (but `s` in the TUI can start a file).               |
 | `-r, --record NAME` | Record a session: `NAME.md`, `NAME.srt`, `NAME.ass` and `NAME.opus`. See [output files](SCRIBE.md#output-files). Conflicts with `-o`, `--append`.                          |
 | `-p, --play NAME`   | Play a recording made with `-r`: the audio with the subtitles shown word by word. With no `NAME.opus`, reads `NAME.md` aloud instead (see [reading a transcript aloud](SCRIBE.md#reading-a-transcript-aloud)). Conflicts with every input and output option, `--once` and `--no-tui`. |
-| `--voices LIST`     | With `--play` reading `NAME.md` aloud: Kokoro voices for the speakers in order of appearance, e.g. `am_adam,bf_emma`. Unlisted speakers get af_heart, am_michael, bf_emma, bm_george, af_bella, am_fenrir, bf_isabella, bm_lewis in turn. |
+| `--voices LIST`     | With `--play` reading `NAME.md` aloud: Kokoro voices for the speakers in order of appearance, e.g. `am_adam,bf_emma`. Unlisted speakers get af_heart, am_michael, bf_emma, bm_george, af_bella, am_fenrir, bf_isabella, bm_lewis in turn. With `--chat`, the first one is the voice of the replies, named as the `--tts` engine names it (`scribe voices`). |
+| `--tts ENGINE`      | Engine that reads `--chat` replies aloud: `speech-dispatcher` (the desktop's speech daemon, in the voices it already has; `spd` for short) or `kokoro` (an 82M model, about 350 MB, downloaded on first use). Default `auto`: speech-dispatcher when it answers, else Kokoro. Reading a transcript aloud (`-p`) is Kokoro's either way. Env `VOX_SCRIBE_TTS`. |
 | `--dictate NAME`    | Dictate into `NAME.md` (`.md` is added if missing), editing it as you go; an existing file is opened to keep going. See [dictation](SCRIBE.md#dictation). Takes one source; conflicts with `-o`, `-r`, `-p`, `-i`, `--once`, `--chat`, `--no-tui`, `--llm`, `--diarize`, `--manual`. |
-| `--chat NAME`       | Talk with a responder through `NAME.db` (`.db` is added if missing). See [chat](SCRIBE.md#chat-with-a-responder). Conflicts with `-o`, `-r`, `-p`, `-i`, `--once`, `--no-tui`. |
+| `--chat NAME`       | Talk with a responder through `NAME.db` (`.db` is added if missing). A responder (`agent`, or `scribe chat-echo`) has to be listening already: scribe waits a few seconds for one and then exits. See [chat](SCRIBE.md#chat-with-a-responder). Conflicts with `-o`, `-r`, `-p`, `-i`, `--once`, `--no-tui`. |
+| `--no-responder`    | Open `--chat` even though nothing says it is answering `NAME.db` — for a responder of your own that doesn't write the `responder` setting. Needs `--chat`. |
 | `--append`          | Add to an existing `-o` file, after a `---` rule and a new date line. The TUI shows the file's earlier content in grey. Without it, an existing file is an error. |
 | `--title TEXT`      | Heading for the markdown file.                                                                                                                                    |
 | `--no-tui`          | Print finished paragraphs to stdout instead of the full-screen UI. Always the case with `--input` (unless `--live`), which shows brief progress on stderr.        |
@@ -103,6 +106,8 @@ scribe [OPTIONS] [COMMAND]
 | `VOX_SCRIBE_LLM_URL`                          | LLM endpoint for pass 4 and `agent`, default `http://127.0.0.1:9931/v1`. |
 | `VOX_SCRIBE_LLM_MODEL`                        | LLM model name (required with `--llm`, and by `agent`).  |
 | `VOX_SCRIBE_LLM_KEY`, `OPENAI_API_KEY`        | LLM API key, optional for local servers. `OPENAI_API_KEY` is only sent to OpenAI's URL. |
+| `VOX_SCRIBE_TTS`                              | Same as `--tts`.                                        |
+| `SPEECHD_ADDRESS`                             | Where speech-dispatcher listens, as `unix_socket:PATH`. Default `$XDG_RUNTIME_DIR/speech-dispatcher/speechd.sock`. |
 | `VOX_SCRIBE_LOG`                              | Log filter.                                             |
 | `VOX_SCRIBE_TERMINAL`, `VOX_SCRIBE_FONT_SIZE` | macOS dictation key setup; see [below](#macos--f5-key). |
 
@@ -190,9 +195,11 @@ written to the files immediately.
 | click                       | Put the cursor at the nearest gap between words; below the text, at the end. Drag to select.        |
 | `shift` + arrows, `home`, `end` | Select words.                                                                                   |
 | `enter`                     | Start a paragraph at the cursor.                                                                    |
-| `backspace`                 | Delete the selection, else the sentence before the cursor (or the paragraph break right before it). |
-| `del`                       | Delete the selection.                                                                               |
-| `tab` / `i`                 | Type by hand: the text opens as a plain buffer at the cursor. `esc` or `tab` goes back to dictating. |
+| `backspace`                 | Delete the selection, else the word before the cursor (or the paragraph break right before it).     |
+| `del`                       | Delete the selection, else the word after the cursor (or the paragraph break right there).          |
+| `alt+backspace` / `alt+del` | The same by the character, like a notepad. `alt` goes out as `esc` and the key, which any terminal sends. |
+| `shift+backspace` (`ctrl+backspace`) | Delete the selection, else the whole sentence before the cursor. Needs a terminal with the kitty keyboard protocol (Ghostty, kitty, WezTerm, iTerm2) — it's the only way to tell this from a plain `backspace`. |
+| `e` / `tab` / `i`           | Type by hand: the text opens as a plain buffer at the cursor (arrows, `home` / `end`, `enter`, `backspace`). `esc` or `tab` goes back to dictating there. |
 | `y` / `c`                   | Copy the selection, or the whole text when nothing is selected.                                     |
 | `pgup` / `pgdn`, mouse wheel | Scroll; an arrow key returns to the cursor.                                                       |
 | `esc`                       | Drop the selection; with none, quit.                                                                |
@@ -210,7 +217,7 @@ paragraph, `ctrl+a` / `ctrl+e` for the start and end of the paragraph.
 | `backspace`    | Delete the last sentence of the unsent text; hold it down to delete the lot.                                 |
 | `space`        | During the reply: hold it and open the mic; talk to cut it off, or `space` again to hear the reply again from the start. Between turns: pause the mic. |
 | `i`            | Mute the mic and open a box to type a message, or fix the unsent transcribed text. `enter` puts it back as the unsent text (a second `enter` sends it); `esc` / `ctrl+q` closes the box, dropping the edit. |
-| `v`            | Choose the voice replies are read in (Kokoro's American and British voices). Enter picks one and says a line in it; the choice is saved in `NAME.db` and used whenever that chat is opened (`--voices` overrides it). |
+| `v`            | Choose the voice replies are read in — what the `--tts` engine offers, named in the menu's title (Kokoro's American and British voices; speech-dispatcher's for the module and language in use). Enter picks one and says a line in it; the choice is saved in `NAME.db` and used whenever that chat is opened (`--voices` overrides it, and a voice the engine in use hasn't got is passed over). |
 | `c`            | List the conversations in `NAME.db`, the most recently active first, with "+ New conversation" at the top; `enter` opens one. The one open when you quit opens next time. |
 | `t`            | Rename this conversation (a new one is titled with its date and time); `enter` saves, `esc` cancels. |
 | `e`            | Export this conversation to a markdown file (default `NAME-<title>.md`; `enter` saves, `esc` cancels, `enter` twice replaces an existing file). `scribe -p NAME` reads it back in two voices. |

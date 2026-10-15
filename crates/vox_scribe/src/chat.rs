@@ -22,8 +22,8 @@ use unicode_width::UnicodeWidthStr;
 use vox_transcribe::{Change, Event, Stage, Transcript};
 
 use crate::chatdb::{Conversation, Db, Kind, Role, Row};
+use crate::tts::Voice;
 use crate::tui::{normalize_key, Screen};
-use crate::voice::Voice;
 use crate::Session;
 
 const STATUS_TTL: Duration = Duration::from_secs(3);
@@ -96,7 +96,7 @@ struct Chat<'a> {
     draft: Option<String>,
     /// The `i` editor, while open.
     editor: Option<Editor>,
-    /// The Kokoro voice replies are read in.
+    /// The voice replies are read in, as the engine names it.
     voice_name: String,
     /// The `v` voice menu, while open: the highlighted entry.
     voices: Option<usize>,
@@ -131,36 +131,6 @@ fn slug(title: &str) -> String {
         .filter(|p| !p.is_empty())
         .collect::<Vec<_>>()
         .join("-")
-}
-
-/// Voices offered by `v`: Kokoro's English ones (American and British).
-fn voice_choices() -> Vec<&'static str> {
-    vox_transcribe::tts::VOICES
-        .iter()
-        .copied()
-        .filter(|v| matches!(&v[..2], "af" | "am" | "bf" | "bm"))
-        .collect()
-}
-
-/// "af_heart" → "Heart · American female".
-fn voice_label(v: &str) -> String {
-    let accent = if v.starts_with('a') {
-        "American"
-    } else {
-        "British"
-    };
-    let sex = if v.as_bytes().get(1) == Some(&b'f') {
-        "female"
-    } else {
-        "male"
-    };
-    let name = v.get(3..).unwrap_or(v);
-    let mut chars = name.chars();
-    let name = chars
-        .next()
-        .map(|c| c.to_uppercase().chain(chars).collect::<String>())
-        .unwrap_or_default();
-    format!("{name} · {accent} {sex}")
 }
 
 /// `i`: a text box over the chat for typing or fixing the unsent text.
@@ -392,7 +362,7 @@ impl Chat<'_> {
             }
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
             if let Some(sel) = self.voices {
-                let n = voice_choices().len();
+                let n = self.voice.choices().len();
                 match key.code {
                     KeyCode::Char('c') if ctrl => return Ok(()),
                     KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('v') => self.voices = None,
@@ -485,7 +455,11 @@ impl Chat<'_> {
                 }
                 KeyCode::Char('t') => self.retitle = Some(self.conv_title.clone()),
                 KeyCode::Char('v') => {
-                    let at = voice_choices().iter().position(|v| *v == self.voice_name);
+                    let at = self
+                        .voice
+                        .choices()
+                        .iter()
+                        .position(|c| c.name == self.voice_name);
                     self.voices = Some(at.unwrap_or(0));
                 }
                 KeyCode::Char('m') => {
@@ -596,16 +570,16 @@ impl Chat<'_> {
     /// Enter in the `v` menu: reply in this voice from now on, in this
     /// conversation (saved in its database), and say a line in it.
     fn choose_voice(&mut self, sel: usize) {
-        let Some(&name) = voice_choices().get(sel) else {
+        let Some(choice) = self.voice.choices().get(sel) else {
             return;
         };
-        let Some(sid) = vox_transcribe::tts::voice_id(name) else {
+        let (name, label) = (choice.name.clone(), choice.label.clone());
+        if !self.voice.set_voice(&name) {
             return;
-        };
-        self.voice.set_voice(sid);
-        self.voice_name = name.to_string();
-        match self.db.set_setting(&format!("voice.{}", self.conv), name) {
-            Ok(()) => self.set_status(format!("replies now in {}", voice_label(name))),
+        }
+        self.voice_name = name.clone();
+        match self.db.set_setting(&format!("voice.{}", self.conv), &name) {
+            Ok(()) => self.set_status(format!("replies now in {label}")),
             Err(e) => self.set_status(format!("saving the voice failed: {e:#}")),
         }
         // A sample, unless a reply is under way.
@@ -644,10 +618,10 @@ impl Chat<'_> {
                     format!("new conversation: {title} (t to rename)")
                 });
                 self.conv_title = title;
-                // Its own reply voice, if one was chosen.
+                // Its own reply voice, if one was chosen in an engine
+                // that can still speak it.
                 if let Ok(Some(name)) = saved_voice(&self.db, id) {
-                    if let Some(sid) = vox_transcribe::tts::voice_id(&name) {
-                        self.voice.set_voice(sid);
+                    if self.voice.set_voice(&name) {
                         self.voice_name = name;
                     }
                 }
@@ -1040,9 +1014,18 @@ impl Chat<'_> {
     /// The `v` menu over the chat.
     fn draw_voices(&self, f: &mut Frame, area: ratatui::layout::Rect, sel: usize) {
         use ratatui::widgets::Clear;
-        let choices = voice_choices();
+        let choices = self.voice.choices();
         let h = (choices.len() as u16 + 2).min(area.height);
-        let w = 44.min(area.width);
+        // Wide enough for the longest name on offer; speech-dispatcher's
+        // run far longer than Kokoro's ("English (America)+Alex").
+        let widest = choices
+            .iter()
+            .map(|c| c.label.chars().count())
+            .max()
+            .unwrap_or(0);
+        let w = (widest as u16 + 6)
+            .clamp(26, 44.max(area.width / 2))
+            .min(area.width);
         let rect = ratatui::layout::Rect {
             x: area.x + area.width.saturating_sub(w) / 2,
             y: area.y + area.height.saturating_sub(h) / 2,
@@ -1056,9 +1039,13 @@ impl Chat<'_> {
             .enumerate()
             .skip(first)
             .take(rows)
-            .map(|(i, v)| {
-                let mark = if *v == self.voice_name { "● " } else { "  " };
-                let line = Line::from(format!("{mark}{}", voice_label(v)));
+            .map(|(i, c)| {
+                let mark = if c.name == self.voice_name {
+                    "● "
+                } else {
+                    "  "
+                };
+                let line = Line::from(format!("{mark}{}", c.label));
                 if i == sel {
                     line.style(Style::new().add_modifier(Modifier::REVERSED))
                 } else {
@@ -1070,7 +1057,7 @@ impl Chat<'_> {
         f.render_widget(
             Paragraph::new(lines).block(
                 Block::bordered()
-                    .title(" Reply voice ")
+                    .title(format!(" Reply voice · {} ", self.voice.engine()))
                     .title_bottom(Line::from(" ↑↓ · enter choose · esc close ").dark_gray()),
             ),
             rect,

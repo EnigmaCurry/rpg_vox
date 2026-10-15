@@ -9,7 +9,7 @@
 //! [`Doc::load`]) stands just before the clock's `origin`, so the same
 //! cursor and cuts work on it.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use vox_transcribe::Paragraph;
 
@@ -130,6 +130,11 @@ pub struct Doc {
     base: Vec<(String, i64)>,
     /// Spans of audio (inclusive) whose words were deleted.
     cuts: Vec<(i64, i64)>,
+    /// Words trimmed character by character (see [`Doc::delete_char`]),
+    /// by the audio start of each: the text to show instead of the
+    /// engine's. Never empty — a word is cut once its last character
+    /// goes.
+    edits: HashMap<i64, String>,
     /// Paragraph breaks, each at a time on the clock.
     breaks: Vec<i64>,
     /// Cursor moves, in order.
@@ -215,6 +220,11 @@ impl Doc {
                 head: false,
             });
         }
+        for t in &mut toks {
+            if let Some(text) = t.time.and_then(|(s, _)| self.edits.get(&s)) {
+                t.text = text.clone();
+            }
+        }
         // Stable: words of one clip keep their order.
         toks.sort_by_key(|t| t.ms);
         let mut by_seg: Vec<Vec<Tok>> = vec![Vec::new(); self.inserts.len() + 1];
@@ -254,6 +264,7 @@ impl Doc {
     fn reset(&mut self, items: Vec<String>, cursor: usize, origin: i64) {
         self.clips.clear();
         self.cuts.clear();
+        self.edits.clear();
         self.breaks.clear();
         self.inserts.clear();
         self.stamped = i64::MIN;
@@ -532,6 +543,7 @@ impl Doc {
                 self.breaks.retain(|&b| b != t.ms);
             } else if let Some((s, e)) = t.time {
                 self.cuts.push((s, s.max(e - 1)));
+                self.edits.remove(&s);
             }
         }
         // Breaks now side by side become one, so deleting it later
@@ -548,6 +560,65 @@ impl Doc {
             }
             last_brk = t.brk;
         }
+    }
+
+    /// The word or paragraph break beside the cursor: the one before it,
+    /// or with `ahead` the one after it. Only placed text, the only
+    /// kind that can be deleted.
+    fn beside(&self, doc: &[Tok], ahead: bool) -> Option<Tok> {
+        let cursor = self.cursor_at(doc);
+        let next = |t: &&Tok| self.shown(t) && t.placed();
+        if ahead {
+            doc[cursor..].iter().find(next).cloned()
+        } else {
+            doc[..cursor].iter().rev().find(next).cloned()
+        }
+    }
+
+    /// Delete the whole word beside the cursor — the one before it, or
+    /// with `ahead` the one after it — or the paragraph break right
+    /// there, joining the paragraphs. False if there's nothing that way.
+    pub fn delete_word(&mut self, doc: &[Tok], ahead: bool) -> bool {
+        let Some(t) = self.beside(doc, ahead) else {
+            return false;
+        };
+        self.delete(&[&t]);
+        true
+    }
+
+    /// Delete the character beside the cursor: the last one of the word
+    /// before it, or with `ahead` the first one of the word after it.
+    /// The word itself goes once that was the last of it, and a
+    /// paragraph break right there goes whole, joining the paragraphs.
+    /// False if there's nothing that way. What it trims is the text as
+    /// shown, so what goes is the character the cursor sits beside on
+    /// screen.
+    pub fn delete_char(&mut self, doc: &[Tok], ahead: bool) -> bool {
+        let Some(t) = self.beside(doc, ahead) else {
+            return false;
+        };
+        if t.brk {
+            self.delete(&[&t]);
+            return true;
+        }
+        let Some((start, _)) = t.time else {
+            return false;
+        };
+        let text = if ahead {
+            let mut cs = t.text.chars();
+            cs.next();
+            cs.as_str().to_string()
+        } else {
+            let mut text = t.text.clone();
+            text.pop();
+            text
+        };
+        if text.is_empty() {
+            self.delete(&[&t]);
+        } else {
+            self.edits.insert(start, text);
+        }
+        true
     }
 
     /// Delete the sentence before the cursor: back to the end of the one
@@ -754,6 +825,128 @@ mod tests {
         assert_eq!(shown(&d), "|");
         let doc = d.build();
         assert!(!d.delete_sentence(&doc));
+    }
+
+    #[test]
+    fn trims_characters_back_one_at_a_time() {
+        let mut d = Doc::default();
+        d.load("", usize::MAX, 0);
+        d.clips = vec![clip(0, "Hello there world.")];
+        assert_eq!(shown(&d), "Hello there world. |");
+        for want in [
+            "Hello there world |",
+            "Hello there worl |",
+            "Hello there wor |",
+        ] {
+            let doc = d.build();
+            assert!(d.delete_char(&doc, false));
+            assert_eq!(shown(&d), want);
+        }
+        // The text keeps the trim, and a trimmed word is still a word.
+        assert_eq!(d.text(), "Hello there wor");
+        for _ in 0..3 {
+            let doc = d.build();
+            assert!(d.delete_char(&doc, false));
+        }
+        // Nothing left of it: the word goes, the next one is trimmed.
+        assert_eq!(shown(&d), "Hello there |");
+        let doc = d.build();
+        assert!(d.delete_char(&doc, false));
+        assert_eq!(shown(&d), "Hello ther |");
+    }
+
+    #[test]
+    fn char_delete_over_a_break_joins_the_paragraphs() {
+        let mut d = Doc::default();
+        d.load("One two.\nThree", 2, 0);
+        assert_eq!(shown(&d), "One two. | ¶ Three");
+        // The cursor is before the break: the word before it goes first.
+        let doc = d.build();
+        assert!(d.delete_char(&doc, false));
+        assert_eq!(shown(&d), "One two | ¶ Three");
+        let mut d = Doc::default();
+        d.load("One two.\nThree", 3, 0);
+        assert_eq!(shown(&d), "One two. ¶ | Three");
+        let doc = d.build();
+        assert!(d.delete_char(&doc, false));
+        assert_eq!(shown(&d), "One two. | Three");
+    }
+
+    #[test]
+    fn trims_characters_ahead_one_at_a_time() {
+        let mut d = Doc::default();
+        d.load("One two.\nThree", 0, 0);
+        assert_eq!(shown(&d), "| One two. ¶ Three");
+        for want in ["| ne two. ¶ Three", "| e two. ¶ Three"] {
+            let doc = d.build();
+            assert!(d.delete_char(&doc, true));
+            assert_eq!(shown(&d), want);
+        }
+        // Nothing left of it: the word goes, then the next is trimmed.
+        let doc = d.build();
+        assert!(d.delete_char(&doc, true));
+        assert_eq!(shown(&d), "| two. ¶ Three");
+        let doc = d.build();
+        assert!(d.delete_char(&doc, true));
+        assert_eq!(shown(&d), "| wo. ¶ Three");
+        // The break ahead goes whole.
+        let mut d = Doc::default();
+        d.load("One two.\nThree", 2, 0);
+        assert_eq!(shown(&d), "One two. | ¶ Three");
+        let doc = d.build();
+        assert!(d.delete_char(&doc, true));
+        assert_eq!(shown(&d), "One two. | Three");
+    }
+
+    #[test]
+    fn char_delete_at_the_end_of_the_text_does_nothing() {
+        let mut d = Doc::default();
+        d.load("a", usize::MAX, 0);
+        assert_eq!(shown(&d), "a |");
+        let doc = d.build();
+        assert!(!d.delete_char(&doc, true));
+    }
+
+    #[test]
+    fn word_delete_takes_the_word_either_way() {
+        let mut d = Doc::default();
+        d.load("One two.\nThree four", 3, 0);
+        assert_eq!(shown(&d), "One two. ¶ | Three four");
+        let doc = d.build();
+        assert!(d.delete_word(&doc, true));
+        assert_eq!(shown(&d), "One two. ¶ | four");
+        // Backwards from the cursor it's the break that's next.
+        let doc = d.build();
+        assert!(d.delete_word(&doc, false));
+        assert_eq!(shown(&d), "One two. | four");
+        let doc = d.build();
+        assert!(d.delete_word(&doc, false));
+        assert_eq!(shown(&d), "One | four");
+        // A word half trimmed by `delete_char` goes whole.
+        let doc = d.build();
+        assert!(d.delete_char(&doc, true));
+        assert_eq!(shown(&d), "One | our");
+        let doc = d.build();
+        assert!(d.delete_word(&doc, true));
+        assert_eq!(shown(&d), "One |");
+        let doc = d.build();
+        assert!(!d.delete_word(&doc, true));
+        let doc = d.build();
+        assert!(d.delete_word(&doc, false));
+        assert_eq!(shown(&d), "|");
+        let doc = d.build();
+        assert!(!d.delete_word(&doc, false));
+    }
+
+    #[test]
+    fn char_delete_on_empty_text_does_nothing() {
+        let mut d = Doc::default();
+        d.load("a", usize::MAX, 0);
+        let doc = d.build();
+        assert!(d.delete_char(&doc, false));
+        assert_eq!(shown(&d), "|");
+        let doc = d.build();
+        assert!(!d.delete_char(&doc, false));
     }
 
     #[test]

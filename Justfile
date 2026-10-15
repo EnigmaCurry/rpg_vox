@@ -422,12 +422,17 @@ android:
     export ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-/opt/homebrew/share/android-ndk}"
     # libopus is built by CMake, which needs the ABI and API level pinned.
     export CMAKE_TOOLCHAIN_FILE="$PWD/android/toolchain.cmake"
+    # Its own target dir, like ios-app: sherpa-onnx-sys caches prebuilt libs
+    # per target dir, and its Android jniLibs/ shadow every other target's
+    # lib dir (the build script checks that path whatever the target is, so
+    # a host build then looks for .a files among Android .so files).
+    export CARGO_TARGET_DIR="$PWD/target/android"
     cargo ndk -t arm64-v8a --platform 26 build --release -p vox_scribe
     out=dist/android-arm64
     rm -rf "$out"
     mkdir -p "$out"
-    libs=target/sherpa-onnx-prebuilt/jniLibs/arm64-v8a
-    cp target/aarch64-linux-android/release/scribe "$out/"
+    libs="$CARGO_TARGET_DIR/sherpa-onnx-prebuilt/jniLibs/arm64-v8a"
+    cp "$CARGO_TARGET_DIR/aarch64-linux-android/release/scribe" "$out/"
     cp "$libs/libsherpa-onnx-c-api.so" "$libs/libonnxruntime.so" "$out/"
     cp SCRIBE.md "$out/"
     printf '%s\n' '#!/system/bin/sh' \
@@ -541,11 +546,13 @@ _android-jni:
     set -euo pipefail
     export ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-/opt/homebrew/share/android-ndk}"
     export CMAKE_TOOLCHAIN_FILE="$PWD/android/toolchain.cmake"
+    # Its own target dir; see the `android` recipe for why.
+    export CARGO_TARGET_DIR="$PWD/target/android"
     cargo ndk -t arm64-v8a --platform 26 build --release --locked -p vox_android
     jni=android/app/src/main/jniLibs/arm64-v8a
-    libs=target/sherpa-onnx-prebuilt/jniLibs/arm64-v8a
+    libs="$CARGO_TARGET_DIR/sherpa-onnx-prebuilt/jniLibs/arm64-v8a"
     mkdir -p "$jni"
-    cp target/aarch64-linux-android/release/libvox_android.so \
+    cp "$CARGO_TARGET_DIR/aarch64-linux-android/release/libvox_android.so" \
       "$libs/libsherpa-onnx-c-api.so" "$libs/libonnxruntime.so" "$jni/"
 
 # iOS dictation app (ios/): builds crates/vox_ios for arm64 devices,

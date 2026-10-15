@@ -1,34 +1,39 @@
 //! Speaks text as it arrives, for `--chat`: one thread turns each
 //! sentence into audio with Kokoro, another plays it and reports which
 //! word is being heard (times spread over each sentence by word length,
-//! as in [`crate::speak`]). Playback can be paused, and [`Voice::stop`]
-//! drops everything not yet heard.
+//! as in [`crate::speak`]). Playback can be paused, and
+//! [`Kokoro::stop`] drops everything not yet heard.
+//!
+//! The one engine that hands its samples over; [`crate::spd`] is the
+//! other way `--chat` can speak, and [`crate::tts`] picks between them.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
 use crossbeam_channel::{Receiver, Sender};
 use tracing::warn;
 use vox_audio::playback::Output;
 use vox_audio::resample::Linear;
-use vox_transcribe::tts::Kokoro;
+use vox_transcribe::tts::{voice_id, VOICES};
+
+use crate::tts::{one_less, Choice};
 
 /// Silence between sentences.
 const GAP_MS: u64 = 150;
 
 #[derive(Default)]
 struct Shared {
-    /// Bumped by [`Voice::stop`]; work from an older generation is dropped.
+    /// Bumped by [`Kokoro::stop`]; work from an older generation is dropped.
     generation: AtomicU64,
-    /// Texts handed to [`Voice::say`] and not yet fully played.
+    /// Texts handed to [`Kokoro::say`] and not yet fully played.
     pending: AtomicUsize,
     /// Audio is queued or still coming out of the speaker.
     sounding: AtomicBool,
     paused: AtomicBool,
-    /// Kokoro speaker id; [`Voice::set_voice`] changes it.
+    /// Kokoro speaker id; [`Kokoro::set_voice`] changes it.
     sid: AtomicI32,
     /// (key, index of the word being heard among all the words said
     /// under that key).
@@ -47,7 +52,7 @@ struct Clip {
 
 enum Audio {
     Clip(u64, Clip),
-    /// Everything for one [`Voice::say`] has been queued.
+    /// Everything for one [`Kokoro::say`] has been queued.
     End(u64),
 }
 
@@ -60,14 +65,49 @@ struct Mark {
     ends: Vec<u64>,
 }
 
-pub struct Voice {
+/// Kokoro reading text as it arrives.
+pub struct Kokoro {
     jobs: Sender<(u64, i64, String)>,
     shared: Arc<Shared>,
+    choices: Vec<Choice>,
 }
 
-impl Voice {
+/// The voices `v` offers: Kokoro's English ones (American and British).
+pub fn choices() -> Vec<Choice> {
+    VOICES
+        .iter()
+        .filter(|v| matches!(&v[..2], "af" | "am" | "bf" | "bm"))
+        .map(|v| Choice {
+            name: v.to_string(),
+            label: label(v),
+        })
+        .collect()
+}
+
+/// "af_heart" → "Heart · American female".
+fn label(voice: &str) -> String {
+    let accent = if voice.starts_with('a') {
+        "American"
+    } else {
+        "British"
+    };
+    let sex = if voice.as_bytes().get(1) == Some(&b'f') {
+        "female"
+    } else {
+        "male"
+    };
+    let name = voice.get(3..).unwrap_or(voice);
+    let mut chars = name.chars();
+    let name = chars
+        .next()
+        .map(|c| c.to_uppercase().chain(chars).collect::<String>())
+        .unwrap_or_default();
+    format!("{name} · {accent} {sex}")
+}
+
+impl Kokoro {
     /// Speak with voice `sid` of `tts`.
-    pub fn new(tts: Kokoro, sid: i32) -> Result<Self> {
+    pub fn new(tts: vox_transcribe::tts::Kokoro, sid: i32) -> Result<Self> {
         let shared = Arc::new(Shared::default());
         shared.sid.store(sid, Ordering::SeqCst);
         let (jobs, job_rx) = crossbeam_channel::unbounded::<(u64, i64, String)>();
@@ -96,7 +136,11 @@ impl Voice {
                 })?;
         }
         ready_rx.recv()??;
-        Ok(Self { jobs, shared })
+        Ok(Self {
+            jobs,
+            shared,
+            choices: choices(),
+        })
     }
 
     /// Queue `text` to be spoken after anything already queued. Its
@@ -125,9 +169,20 @@ impl Voice {
         self.shared.paused.store(paused, Ordering::SeqCst);
     }
 
-    /// Speak with Kokoro voice `sid` from the next sentence on.
-    pub fn set_voice(&self, sid: i32) {
-        self.shared.sid.store(sid, Ordering::SeqCst);
+    /// Speak in `name` from the next sentence on; false if Kokoro has no
+    /// such voice.
+    pub fn set_voice(&self, name: &str) -> bool {
+        match voice_id(name) {
+            Some(sid) => {
+                self.shared.sid.store(sid, Ordering::SeqCst);
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub fn choices(&self) -> &[Choice] {
+        &self.choices
     }
 
     /// Drop everything not yet heard.
@@ -138,7 +193,12 @@ impl Voice {
     }
 }
 
-fn synth(tts: Kokoro, shared: &Shared, jobs: Receiver<(u64, i64, String)>, out: Sender<Audio>) {
+fn synth(
+    tts: vox_transcribe::tts::Kokoro,
+    shared: &Shared,
+    jobs: Receiver<(u64, i64, String)>,
+    out: Sender<Audio>,
+) {
     let current = |g: u64| shared.generation.load(Ordering::SeqCst) == g;
     let rate = tts.sample_rate() as u64;
     let gap = vec![0.0f32; (GAP_MS * rate / 1000) as usize];
@@ -197,6 +257,13 @@ fn play(mut out: Output, rate: u32, shared: &Shared, audio: Receiver<Audio>) {
     let mut marks: VecDeque<Mark> = VecDeque::new();
     let out_rate = out.sample_rate as u64;
     let frames = |ms: u64| ms * out_rate / 1000;
+    // Gaps in the middle of speech, reported once a second at most: the
+    // synthesis thread, or the machine, isn't keeping up. Only counted
+    // between two rounds that both had audio, so the silence before the
+    // first sample of a reply isn't reported as a hole in it.
+    let mut starved = out.starved();
+    let mut was_sounding = false;
+    let mut said = Instant::now();
     loop {
         match audio.recv_timeout(Duration::from_millis(10)) {
             Ok(a) => queue.push_back(a),
@@ -234,22 +301,7 @@ fn play(mut out: Output, rate: u32, shared: &Shared, audio: Receiver<Audio>) {
                         resampler.process(&c.samples, &mut buf);
                     }
                     Some(Audio::End(_)) => {
-                        // One less pending, never below zero. A plain
-                        // compare-exchange loop: `fetch_update` is
-                        // deprecated on new toolchains, and its
-                        // replacement `try_update` is missing on older ones.
-                        let mut n = shared.pending.load(Ordering::SeqCst);
-                        while n > 0 {
-                            match shared.pending.compare_exchange_weak(
-                                n,
-                                n - 1,
-                                Ordering::SeqCst,
-                                Ordering::SeqCst,
-                            ) {
-                                Ok(_) => break,
-                                Err(now) => n = now,
-                            }
-                        }
+                        one_less(&shared.pending);
                         continue;
                     }
                     None => break,
@@ -266,6 +318,18 @@ fn play(mut out: Output, rate: u32, shared: &Shared, audio: Receiver<Audio>) {
             || queue.iter().any(|a| matches!(a, Audio::Clip(..)))
             || out.queued() > 0;
         shared.sounding.store(sounding, Ordering::SeqCst);
+        let gaps = out.starved();
+        if sounding && was_sounding && gaps > starved && said.elapsed() >= Duration::from_secs(1) {
+            warn!(
+                ms = (gaps - starved) * 1000 / out_rate,
+                queued = out.queued(),
+                clips = queue.len(),
+                "the speaker ran dry while speaking"
+            );
+            said = Instant::now();
+        }
+        starved = gaps;
+        was_sounding = sounding;
         // The clip being heard is the last one started.
         let played = out.played();
         while marks.len() > 1 && marks[1].start <= played {
@@ -290,7 +354,8 @@ mod tests {
     #[ignore]
     fn hears_words_in_order() {
         let dir = crate::models::kokoro_dir(&crate::models::resolve(None));
-        let voice = Voice::new(Kokoro::load(&dir, 4).unwrap(), 3).unwrap();
+        let tts = vox_transcribe::tts::Kokoro::load(&dir, 4).unwrap();
+        let voice = Kokoro::new(tts, 3).unwrap();
         voice.say(7, "One two three.");
         voice.say(7, "Four five six seven.");
         let mut seen: Vec<usize> = Vec::new();

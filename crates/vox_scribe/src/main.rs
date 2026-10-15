@@ -22,9 +22,12 @@ mod picker;
 mod play;
 mod progress;
 mod sources;
+#[cfg(unix)]
+mod spd;
 mod speak;
 mod speakers;
 mod subtitles;
+mod tts;
 mod tui;
 mod voice;
 
@@ -102,14 +105,31 @@ struct Cli {
     /// With --play reading a transcript aloud: Kokoro voices for the
     /// speakers in order of appearance, e.g. `am_adam,bf_emma`. The rest
     /// get the built-in cast (af_heart, am_michael, bf_emma, bm_george, …).
-    /// With --chat, the first one is the voice of the replies.
+    /// With --chat, the first one is the voice of the replies, named as
+    /// the --tts engine names it (`scribe voices` lists them).
     #[arg(long, value_delimiter = ',')]
     voices: Vec<String>,
+    /// Engine that reads --chat replies aloud: speech-dispatcher (the
+    /// desktop's speech daemon, in the voices it already has) or kokoro
+    /// (an 82M model downloaded once, about 350 MB). Default: ask
+    /// speech-dispatcher, and fall back to kokoro when it doesn't
+    /// answer. Reading a transcript aloud (--play) is Kokoro's either
+    /// way: that player seeks through the samples, which the daemon
+    /// keeps to itself.
+    #[arg(long, value_enum, default_value = "auto", env = "VOX_SCRIBE_TTS")]
+    tts: tts::Engine,
     /// Talk with a responder through NAME.db (`.db` is added if missing):
     /// Enter sends what you said, the reply is read aloud. See
-    /// `scribe chat-echo` for a stand-in responder.
+    /// `scribe chat-echo` for a stand-in responder. A responder has to
+    /// be listening already, or scribe won't open the chat.
     #[arg(long, conflicts_with_all = ["output", "record", "play", "input", "once", "no_tui", "append", "live"])]
     chat: Option<PathBuf>,
+    /// Open --chat even though nothing says it is answering NAME.db.
+    /// For a responder of your own: `agent` and `scribe chat-echo` say
+    /// so every couple of seconds (the `responder` setting in the
+    /// database), but nothing else has to.
+    #[arg(long, requires = "chat")]
+    no_responder: bool,
     /// Dictate into NAME.md (`.md` is added if missing), editing it as
     /// you go: move the cursor where new speech goes, delete selected
     /// words or the last sentence, break paragraphs, type by hand. An
@@ -323,6 +343,8 @@ enum Cmd {
     /// Finish the running --once recorder (as if Enter were pressed).
     /// Exits 1 if none is running.
     StopOnce,
+    /// List the voices --voices can name, for the --tts engine in use.
+    Voices,
 }
 
 /// Audio source feeding an engine.
@@ -799,6 +821,7 @@ fn main() -> Result<()> {
             return Ok(());
         }
         Some(Cmd::ChatEcho { name }) => return chatdb::echo(&chatdb::path_for(&name)),
+        Some(Cmd::Voices) => return tts::list(cli.tts),
         Some(Cmd::StopOnce) => {
             #[cfg(unix)]
             if once::signal_finish() {
@@ -828,6 +851,15 @@ fn main() -> Result<()> {
             return play::run(&paths);
         }
         let models_dir = models::resolve(cli.models_dir.as_deref());
+        // Reading a transcript aloud is Kokoro's work whatever --tts
+        // says: the player seeks and stretches the samples, and
+        // speech-dispatcher hands none back.
+        if cli.tts == tts::Engine::SpeechDispatcher {
+            eprintln!(
+                "speech-dispatcher gives scribe no audio to seek through; reading {} with Kokoro",
+                paths.md.display()
+            );
+        }
         if !models::has_kokoro(&models_dir) {
             eprintln!(
                 "no {} to play; reading {} aloud instead",
@@ -923,6 +955,14 @@ fn main() -> Result<()> {
 
     let llm = corrector.is_some();
 
+    // Before the models are fetched and the mic is opened: a chat with
+    // nobody answering would listen to the user and say nothing back.
+    if let Some(name) = cli.chat.as_deref().filter(|_| !cli.no_responder) {
+        let path = chatdb::path_for(name);
+        let who = wait_for_responder(&path)?;
+        info!(db = %path.display(), responder = %who, "responder listening");
+    }
+
     let models_dir = models::resolve(cli.models_dir.as_deref());
     // First run: fetch the models rather than failing.
     let streaming = !cli.no_streaming && cli.pass1 != Pass1::Off;
@@ -937,7 +977,10 @@ fn main() -> Result<()> {
         eprintln!("speaker models not found, downloading them once (about 77 MB)…");
         models::download_speakers(&models_dir)?;
     }
-    if cli.chat.is_some() && !models::has_kokoro(&models_dir) {
+    // Which engine will read replies aloud, asked before the download
+    // below: speech-dispatcher needs none.
+    let speaking = cli.chat.is_some().then(|| tts::resolve(cli.tts));
+    if speaking == Some(tts::Engine::Kokoro) && !models::has_kokoro(&models_dir) {
         eprintln!("voice model not found, downloading it once (about 350 MB)…");
         models::download_kokoro(&models_dir)?;
     }
@@ -1264,7 +1307,8 @@ fn main() -> Result<()> {
     if let Some(name) = &cli.chat {
         if let Some(screen) = screen.take() {
             let path = chatdb::path_for(name);
-            let (voice, voice_name) = chat_voice(&models_dir, &cli.voices, &path)?;
+            let engine = speaking.expect("--chat settles on an engine");
+            let (voice, voice_name) = tts::chat_voice(engine, &models_dir, &cli.voices, &path)?;
             return chat::run(screen, session, &path, voice, voice_name);
         }
     }
@@ -1880,29 +1924,36 @@ fn headless(session: Session) -> Result<Outcome> {
     })
 }
 
-/// The voice --chat replies in: the first of `--voices`, else the one
-/// chosen for this conversation with `v`, else af_heart.
-fn chat_voice(models_dir: &Path, voices: &[String], db: &Path) -> Result<(voice::Voice, String)> {
-    let saved = match voices.first() {
-        Some(_) => None,
-        None => {
-            let db = chatdb::Db::open(db)?;
-            chat::saved_voice(&db, db.current()?)?
+/// How long to wait for a responder's first heartbeat, so starting both
+/// at once (`agent talk & scribe --chat talk`) works.
+const RESPONDER_WAIT: Duration = Duration::from_secs(5);
+
+/// What is answering `db`, waited for briefly; an error naming the ways
+/// to start one when nothing is.
+fn wait_for_responder(db: &Path) -> Result<String> {
+    let open = chatdb::Db::open(db)?;
+    let start = std::time::Instant::now();
+    let mut waited = false;
+    loop {
+        if let Some(who) = open.responder(chatdb::RESPONDER_STALE)? {
+            return Ok(who);
         }
-    };
-    let name = voices
-        .first()
-        .cloned()
-        .or(saved)
-        .unwrap_or_else(|| "af_heart".into());
-    let name = name.as_str();
-    let sid =
-        vox_transcribe::tts::voice_id(name).with_context(|| format!("no Kokoro voice {name:?}"))?;
-    let threads = std::thread::available_parallelism()
-        .map(|n| n.get().min(4))
-        .unwrap_or(2) as i32;
-    let tts = vox_transcribe::tts::Kokoro::load(&models::kokoro_dir(models_dir), threads)?;
-    Ok((voice::Voice::new(tts, sid)?, name.to_string()))
+        if start.elapsed() >= RESPONDER_WAIT {
+            let name = db.file_stem().unwrap_or(db.as_os_str()).to_string_lossy();
+            anyhow::bail!(
+                "nothing is answering {}; start a responder first:\n  \
+                 agent {name}               # answers with an LLM (see AGENT.md)\n  \
+                 scribe chat-echo {name}    # a stand-in that reads back what you say\n\
+                 \nor --no-responder to open the chat anyway",
+                db.display()
+            );
+        }
+        if !waited {
+            waited = true;
+            eprintln!("waiting for a responder on {}…", db.display());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 /// Build the pass-4 corrector when `--llm` is given.

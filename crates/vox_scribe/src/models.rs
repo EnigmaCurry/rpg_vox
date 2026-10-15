@@ -6,7 +6,7 @@
 //! <dir>/parakeet-tdt-0.6b-v2/{encoder,decoder,joiner}.int8.onnx + tokens.txt
 //! <dir>/streaming-zipformer/{encoder,decoder,joiner}.onnx + tokens.txt
 //! <dir>/speaker-diarization/{segmentation,embedding-eres2netv2}.onnx   (--diarize)
-//! <dir>/kokoro/{model.onnx,voices.bin,…}                              (--play NAME.md)
+//! <dir>/kokoro/{model.onnx,voices.bin,…}        (--play NAME.md, --tts kokoro)
 //! ```
 
 use std::path::{Path, PathBuf};
