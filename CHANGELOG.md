@@ -6,6 +6,15 @@ section after the version it releases.
 
 ## Unreleased
 
+### scribe
+
+- **`--paragraph-gap SECONDS`** (env `VOX_SCRIBE_PARAGRAPH_GAP`) sets the
+  quiet that ends a paragraph in auto mode, until now a fixed 2 s. It is
+  the same wait a paragraph takes to settle and be written, manual ones
+  included, so a shorter gap also gets text into the `-o` file sooner.
+  `--chat` still starts from 0.3 s; passing the option overrides that
+  too.
+
 ## v0.1.8 (2026-10-15)
 
 ### scribe

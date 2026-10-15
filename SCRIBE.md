@@ -204,7 +204,8 @@ order, since sources settle out of step.
 ## Output files
 
 With `-o NAME`, each paragraph is appended to `NAME.md` once it settles
-(2 s of quiet; in manual mode, 2 s of quiet after `enter`), so
+(2 s of quiet, or `--paragraph-gap`; in manual mode, that same quiet
+after `enter`), so
 `tail -f NAME.md` follows along. Quitting appends whatever is still open.
 Paragraphs are wrapped to 79 columns.
 

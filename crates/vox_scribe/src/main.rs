@@ -171,6 +171,16 @@ struct Cli {
     /// Start new paragraphs only on Enter, not on silence (toggle with `m`).
     #[arg(long)]
     manual: bool,
+    /// Quiet that ends a paragraph in auto mode, in seconds (default 2,
+    /// or 0.3 with --chat). It is also how long a paragraph waits before
+    /// it settles and is written, in manual mode too.
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        value_parser = parse_gap,
+        env = "VOX_SCRIBE_PARAGRAPH_GAP"
+    )]
+    paragraph_gap: Option<u64>,
     /// Experimental: filter background music and noise out of the audio
     /// (DeepFilterNet 3) before transcribing it. The recording (--record)
     /// stays unfiltered.
@@ -265,6 +275,22 @@ impl Pass1 {
 struct Speakers {
     count: usize,
     names: Vec<String>,
+}
+
+/// `--paragraph-gap`: seconds of quiet, kept as the milliseconds the
+/// engine's paragraph config wants. Below the VAD's own end-of-utterance
+/// silence (0.7 s) every utterance becomes a paragraph of its own, which
+/// is what --chat's 0.3 relies on, so that is allowed rather than
+/// clamped.
+fn parse_gap(arg: &str) -> Result<u64, String> {
+    let secs: f64 = arg
+        .trim()
+        .parse()
+        .map_err(|_| "expected seconds, e.g. 2 or 1.5".to_string())?;
+    if !(0.1..=60.0).contains(&secs) {
+        return Err("expected 0.1 to 60 seconds".into());
+    }
+    Ok((secs * 1000.0).round() as u64)
 }
 
 fn parse_speakers(arg: &str) -> Result<Speakers, String> {
@@ -452,6 +478,8 @@ struct Spawner {
     mixer: Option<Arc<Mutex<sources::Mixer>>>,
     /// --denoise, with its limit (see [`EngineConfig::denoise`]).
     denoise: Option<f32>,
+    /// --paragraph-gap, in milliseconds; None leaves the default.
+    gap_ms: Option<u64>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -459,6 +487,7 @@ fn new_engine(
     rate: u32,
     manual: bool,
     chat: bool,
+    gap_ms: Option<u64>,
     denoise: Option<f32>,
     zipformer: Option<&Zipformer>,
     offline: &Arc<dyn vox_transcribe::OfflineRecognizer>,
@@ -476,6 +505,11 @@ fn new_engine(
         cfg.paragraph.gap_ms = 300;
         cfg.paragraph.soft_max_words = usize::MAX;
         cfg.paragraph.hard_max_words = usize::MAX;
+    }
+    // --paragraph-gap is explicit, so it wins over both defaults,
+    // chat's included; chat's word caps stay off either way.
+    if let Some(ms) = gap_ms {
+        cfg.paragraph.gap_ms = ms;
     }
     let streaming = zipformer.map(|z| Box::new(z.session()) as Box<dyn StreamingRecognizer>);
     Engine::spawn_full(cfg, streaming, offline.clone(), corrector.clone(), tagger)
@@ -570,6 +604,7 @@ impl Session {
             rate,
             self.manual.load(Ordering::Relaxed),
             false,
+            sp.gap_ms,
             sp.denoise,
             sp.zipformer.as_ref(),
             &sp.offline,
@@ -1164,6 +1199,7 @@ fn main() -> Result<()> {
                 *rate,
                 manual,
                 cli.chat.is_some(),
+                cli.paragraph_gap,
                 denoise,
                 zipformer.as_ref(),
                 &offline,
@@ -1266,6 +1302,7 @@ fn main() -> Result<()> {
         corrector: corrector.clone(),
         mixer: mixer.clone(),
         denoise,
+        gap_ms: cli.paragraph_gap,
     });
     let labelled = engine.labelled();
 
