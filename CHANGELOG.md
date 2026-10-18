@@ -6,6 +6,8 @@ section after the version it releases.
 
 ## Unreleased
 
+## v0.1.10 (2026-10-18)
+
 ### scribe
 
 - **Windows (x86_64).** scribe and agent now build and run on Windows,
