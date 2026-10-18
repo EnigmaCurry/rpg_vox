@@ -144,7 +144,8 @@ colours and resizing, which the old console window does not.
 <summary>Checksums, the macOS quarantine flag, Linux and Windows requirements</summary>
 
 Each archive has a `.sha256` beside it to check the download against
-(`shasum -a 256 -c scribe-$VERSION-$TARGET.tar.gz.sha256`). The macOS
+(`shasum -a 256 -c scribe-$VERSION-$TARGET.tar.gz.sha256`; in PowerShell,
+`Get-FileHash "$Name.zip"` and compare it with what the `.sha256` says). The macOS
 binary is not signed: if you downloaded it with a browser instead of
 `curl`, clear the quarantine flag with `xattr -d com.apple.quarantine
 ~/.local/bin/scribe`. The Linux binaries need the PipeWire library

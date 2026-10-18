@@ -73,11 +73,19 @@ dist VERSION=`git describe --tags --always --dirty`:
           fi
         done
         # A .zip, which Explorer opens on its own. Git's bash has no
-        # `zip`, and PowerShell is there whatever else isn't.
+        # `zip`, and its `tar` is GNU tar, which writes no zip either;
+        # Windows' own tar is libarchive's, and `-a` takes the format
+        # from the name. PowerShell's Compress-Archive would do it in
+        # one call, but writes `dir\file` with a backslash, which
+        # Explorer reads and `unzip` anywhere else takes for part of
+        # the filename.
         archive="$name.zip"
         rm -f "dist/$archive"
-        (cd dist && powershell.exe -NoProfile -Command \
-          "Compress-Archive -Path '$name' -DestinationPath '$archive' -Force")
+        if [ ! -x "$sys32/tar.exe" ]; then
+          echo "no $sys32/tar.exe to make the .zip with" >&2
+          exit 1
+        fi
+        (cd dist && "$sys32/tar.exe" -a -cf "$archive" "$name")
       else
         archive="$name.tar.gz"
         tar -czf "dist/$archive" -C dist "$name"
