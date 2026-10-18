@@ -24,7 +24,7 @@ struct Console {
 fn console() -> &'static Mutex<Console> {
     static CONSOLE: OnceLock<Mutex<Console>> = OnceLock::new();
     CONSOLE.get_or_init(|| {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         if let Some(f) = vox_transcribe::stderr::console() {
             let tty = f.is_terminal() && std::io::stdout().is_terminal();
             return Mutex::new(Console {

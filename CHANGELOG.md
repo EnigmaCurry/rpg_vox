@@ -6,6 +6,36 @@ section after the version it releases.
 
 ## Unreleased
 
+### scribe
+
+- **Windows (x86_64).** scribe and agent now build and run on Windows,
+  and each release has a `.zip` of them for `x86_64-pc-windows-msvc`
+  beside the macOS and Linux archives. It carries the two C runtime
+  DLLs as well, so the folder it unpacks to needs nothing installed.
+  Use it from Windows Terminal.
+  - The mic, the speakers and the device list come from WASAPI, through
+    cpal as on macOS.
+  - **System audio without a virtual device**: an output device opened
+    for input hands back what it is playing, so `-d loopback` (the
+    default output) or `-d "<output device>"` transcribes a call, a
+    video or anything else coming out of the speakers. `scribe devices`
+    lists them and marks which ones work that way, and the TUI's `a`
+    menu offers them. That is the job `--virtual-sink` does on PipeWire
+    and `--app` on macOS, neither of which Windows has: WASAPI can't
+    single out one app.
+  - Models live in `%LOCALAPPDATA%\vox_scribe\models`, the clipboard
+    is written through Win32 (`clip.exe` would mangle everything that
+    isn't ASCII), and sherpa-onnx's C++ log lines are kept off the TUI
+    the same way as on unix, by swapping descriptor 2.
+  - Not available there: `--app`, `--virtual-sink`,
+    `--tts speech-dispatcher` and `scribe stop-once`. Each says so
+    rather than misbehaving. `--once` itself records, copies and exits
+    as it does elsewhere; what it loses is being finished by a second
+    press of the key that started it, which signals the first process.
+- **`scribe download-models` unpacks the model archives itself** instead
+  of running `tar`, so nothing has to be installed for it. It skips
+  anything in them that isn't a plain file or a directory.
+
 ## v0.1.9 (2026-10-15)
 
 ### scribe

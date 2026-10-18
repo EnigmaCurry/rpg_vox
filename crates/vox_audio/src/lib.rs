@@ -6,6 +6,9 @@
 //!   systems: the mic only, no app capture or virtual sink.
 //! * macOS: CoreAudio through cpal ([`cpal_input`]); one app's output
 //!   through a Core Audio process tap ([`process_tap`], macOS 14.4+).
+//! * Windows: WASAPI through cpal ([`cpal_input`]), which also captures
+//!   what an output device is playing (loopback) when asked to record
+//!   one, so system audio needs no virtual device.
 //! * Any OS: decode a file ([`file`]).
 //!
 //! Also: playback to the default output ([`playback`]) and Ogg Opus
@@ -17,7 +20,12 @@
 // Elsewhere (iOS) there's no device backend; the iOS app takes only the
 // file and Opus code and leaves the capture plumbing unused.
 #![cfg_attr(
-    not(any(target_os = "macos", target_os = "android", target_os = "linux")),
+    not(any(
+        target_os = "macos",
+        target_os = "android",
+        target_os = "linux",
+        target_os = "windows"
+    )),
     allow(dead_code, unused_imports)
 )]
 
@@ -29,7 +37,12 @@ use std::time::Duration;
 use anyhow::Result;
 use crossbeam_channel::{bounded, Receiver, Sender};
 
-#[cfg(any(target_os = "macos", target_os = "android", target_os = "linux"))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "android",
+    target_os = "linux",
+    target_os = "windows"
+))]
 pub mod cpal_input;
 pub mod file;
 pub mod opus_file;
@@ -49,12 +62,17 @@ pub struct DeviceInfo {
     pub id: String,
     pub name: String,
     pub is_default: bool,
+    /// An output device that records what it plays rather than an
+    /// input: WASAPI loopback, on Windows only.
+    pub loopback: bool,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct OpenOptions {
     /// Device id or a case-insensitive substring of its name. `None`
-    /// uses the system default input.
+    /// uses the system default input. On Windows, an output device
+    /// records what it is playing, and `"loopback"` names the default
+    /// output without having to look its name up.
     pub device: Option<String>,
     /// PipeWire only: register a virtual `Audio/Sink` node that other
     /// apps can play into, instead of capturing from a source.
@@ -117,7 +135,16 @@ pub fn default_backend() -> Result<Box<dyn Backend>> {
             Ok(Box::new(cpal_input::Cpal))
         }
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
+    #[cfg(target_os = "windows")]
+    {
+        Ok(Box::new(cpal_input::Cpal))
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "windows"
+    )))]
     {
         anyhow::bail!("no live audio backend for this OS; use a file input")
     }

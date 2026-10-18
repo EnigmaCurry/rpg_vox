@@ -23,7 +23,7 @@ scribe [OPTIONS] [COMMAND]
 | `apps`            | List apps whose audio `--app` can capture; ones playing now are marked `*`.                          |
 | `download-models` | Download the Zipformer model and the `--model` recognizer, plus the speaker models with `--diarize`. |
 | `chat-echo NAME`  | A stand-in `--chat` responder: reads back whatever is said in `NAME.db` (`.db` optional), a sentence at a time, then after a pause asks for more. Says it is listening, as `agent` does. |
-| `stop-once`       | Finish the running `--once` recorder, as if Enter were pressed. Exits 1 if none is running.          |
+| `stop-once`       | Finish the running `--once` recorder, as if Enter were pressed. Exits 1 if none is running. Unix only: it signals the recorder.          |
 | `voices`          | List the voices `--voices` can name, for the `--tts` engine that would speak.                        |
 | `help`            | Print help, or the help of a subcommand.                                                             |
 
@@ -31,9 +31,9 @@ scribe [OPTIONS] [COMMAND]
 
 | Option              | Description                                                                                                                                                                                                                                               |
 |---------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `-d, --device NAME` | Input device by id or name substring (see `devices`). Default: the system input. On Linux, a sink's node name captures what is playing on it. Repeatable: see [one source per speaker](SCRIBE.md#one-source-per-speaker).                                          |
-| `-a, --app NAME`    | Transcribe what one app is playing: a PID, or a substring of its process name or bundle id (see `apps`). The app keeps playing to your speakers. macOS 14.4+ or PipeWire. Repeatable, and combines with `-d`. Conflicts with `--virtual-sink`, `--input`. |
-| `--virtual-sink`    | PipeWire only: register a `vox_scribe` sink and transcribe whatever apps play into it.                                                                                                                                                                    |
+| `-d, --device NAME` | Input device by id or name substring (see `devices`). Default: the system input. On Linux, a sink's node name captures what is playing on it. On Windows an output device records what it is playing instead (WASAPI loopback), and `loopback` names the default output. Repeatable: see [one source per speaker](SCRIBE.md#one-source-per-speaker).                                          |
+| `-a, --app NAME`    | Transcribe what one app is playing: a PID, or a substring of its process name or bundle id (see `apps`). The app keeps playing to your speakers. macOS 14.4+ or PipeWire; not on Windows, where `-d loopback` takes everything the speakers play. Repeatable, and combines with `-d`. Conflicts with `--virtual-sink`, `--input`. |
+| `--virtual-sink`    | PipeWire only: register a `vox_scribe` sink and transcribe whatever apps play into it. On macOS use `-a`, on Windows `-d loopback`.                                                                                                                                                                    |
 | `-i, --input FILE`  | Transcribe a wav, flac, mp3 or ogg file instead of a device. Repeat it for per-speaker tracks of one session (all starting at the same moment). No TUI unless `--live`. Conflicts with `-d`, `--virtual-sink`.                                            |
 | `--live`            | With `--input`: open the TUI and play the file to the speakers, transcribing it in real time as if it came from the mic. Times stay in file time; no seeking. Conflicts with `--no-tui`.                                                                  |
 
@@ -45,7 +45,7 @@ scribe [OPTIONS] [COMMAND]
 | `-r, --record NAME` | Record a session: `NAME.md`, `NAME.srt`, `NAME.ass` and `NAME.opus`. See [output files](SCRIBE.md#output-files). Conflicts with `-o`, `--append`.                          |
 | `-p, --play NAME`   | Play a recording made with `-r`: the audio with the subtitles shown word by word. With no `NAME.opus`, reads `NAME.md` aloud instead (see [reading a transcript aloud](SCRIBE.md#reading-a-transcript-aloud)). Conflicts with every input and output option, `--once` and `--no-tui`. |
 | `--voices LIST`     | With `--play` reading `NAME.md` aloud: Kokoro voices for the speakers in order of appearance, e.g. `am_adam,bf_emma`. Unlisted speakers get af_heart, am_michael, bf_emma, bm_george, af_bella, am_fenrir, bf_isabella, bm_lewis in turn. With `--chat`, the first one is the voice of the replies, named as the `--tts` engine names it (`scribe voices`). |
-| `--tts ENGINE`      | Engine that reads `--chat` replies aloud: `speech-dispatcher` (the desktop's speech daemon, in the voices it already has; `spd` for short) or `kokoro` (an 82M model, about 350 MB, downloaded on first use). Default `auto`: speech-dispatcher when it answers, else Kokoro. Reading a transcript aloud (`-p`) is Kokoro's either way. Env `VOX_SCRIBE_TTS`. |
+| `--tts ENGINE`      | Engine that reads `--chat` replies aloud: `speech-dispatcher` (the desktop's speech daemon, in the voices it already has; `spd` for short) or `kokoro` (an 82M model, about 350 MB, downloaded on first use). Default `auto`: speech-dispatcher when it answers, else Kokoro. speech-dispatcher is unix only; on Windows `auto` is always Kokoro. Reading a transcript aloud (`-p`) is Kokoro's either way. Env `VOX_SCRIBE_TTS`. |
 | `--dictate NAME`    | Dictate into `NAME.md` (`.md` is added if missing), editing it as you go; an existing file is opened to keep going. See [dictation](SCRIBE.md#dictation). Takes one source; conflicts with `-o`, `-r`, `-p`, `-i`, `--once`, `--chat`, `--no-tui`, `--llm`, `--diarize`, `--manual`. |
 | `--chat NAME`       | Talk with a responder through `NAME.db` (`.db` is added if missing). A responder (`agent`, or `scribe chat-echo`) has to be listening already: scribe waits a few seconds for one and then exits. See [chat](SCRIBE.md#chat-with-a-responder). Conflicts with `-o`, `-r`, `-p`, `-i`, `--once`, `--no-tui`. |
 | `--no-responder`    | Open `--chat` even though nothing says it is answering `NAME.db` — for a responder of your own that doesn't write the `responder` setting. Needs `--chat`. |
@@ -63,7 +63,7 @@ scribe [OPTIONS] [COMMAND]
 | `--paragraph-hard-words WORDS` | Words after which a paragraph ends whatever the audio is doing (default `200`, off with `--chat`), for speech with no pause to break on. `0` turns the cap off; below `--paragraph-soft-words` is an error. Env `VOX_SCRIBE_PARAGRAPH_HARD_WORDS`. |
 | `--denoise` | Experimental: filter background music and noise out of the audio with [DeepFilterNet 3](https://github.com/Rikorose/DeepFilterNet) before transcribing it. The `--record` file stays unfiltered. Env `VOX_SCRIBE_DENOISE`. |
 | `--denoise-limit DB` | With `--denoise`: push the background down by at most this many dB instead of all the way (e.g. `20`). Env `VOX_SCRIBE_DENOISE_LIMIT`. |
-| `--once`   | One-shot dictation: record a single manual paragraph until Enter, finish every pass (including `--llm`), print the text, copy it to the clipboard and exit. Nothing is saved to disk. Only one runs at a time: launching a second one (or `scribe stop-once`) finishes the running one instead. Conflicts with `-o`, `--append`, `-r`. |
+| `--once`   | One-shot dictation: record a single manual paragraph until Enter, finish every pass (including `--llm`), print the text, copy it to the clipboard and exit. Nothing is saved to disk. Only one runs at a time: launching a second one (or `scribe stop-once`) finishes the running one instead — unix only, as it works by signalling the running recorder; on Windows each `--once` is finished with Enter and runs on its own. Conflicts with `-o`, `--append`, `-r`. |
 
 Either cap ends the paragraph at the next utterance boundary rather
 than mid-sentence, so a paragraph runs up to one utterance (12 s of
@@ -102,7 +102,7 @@ words counted are still pass 1's.
 
 | Option          | Description                                                                                                                                                                       |
 |-----------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `--log FILE`    | Log file. Default: `$TMPDIR/vox_scribe.log` in TUI mode, stderr otherwise. The level is set with `VOX_SCRIBE_LOG` (a `tracing` filter such as `debug` or `vox_transcribe=trace`). |
+| `--log FILE`    | Log file. Default: `$TMPDIR/vox_scribe.log` in TUI mode (`%TEMP%\vox_scribe.log` on Windows), stderr otherwise. The level is set with `VOX_SCRIBE_LOG` (a `tracing` filter such as `debug` or `vox_transcribe=trace`). |
 | `-h, --help`    | Print help (`-h` for the short form).                                                                                                                                             |
 | `-V, --version` | Print the version.                                                                                                                                                                |
 
@@ -116,7 +116,7 @@ words counted are still pass 1's.
 | `VOX_SCRIBE_LLM_MODEL`                        | LLM model name (required with `--llm`, and by `agent`).  |
 | `VOX_SCRIBE_LLM_KEY`, `OPENAI_API_KEY`        | LLM API key, optional for local servers. `OPENAI_API_KEY` is only sent to OpenAI's URL. |
 | `VOX_SCRIBE_TTS`                              | Same as `--tts`.                                        |
-| `SPEECHD_ADDRESS`                             | Where speech-dispatcher listens, as `unix_socket:PATH`. Default `$XDG_RUNTIME_DIR/speech-dispatcher/speechd.sock`. |
+| `SPEECHD_ADDRESS`                             | Where speech-dispatcher listens, as `unix_socket:PATH`. Default `$XDG_RUNTIME_DIR/speech-dispatcher/speechd.sock`. Unix only. |
 | `VOX_SCRIBE_LOG`                              | Log filter.                                             |
 | `VOX_SCRIBE_TERMINAL`, `VOX_SCRIBE_FONT_SIZE` | macOS dictation key setup; see [below](#macos--f5-key). |
 

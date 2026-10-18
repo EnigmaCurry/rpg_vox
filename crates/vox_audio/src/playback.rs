@@ -170,7 +170,7 @@ fn ring_for(rate: u32) -> (rtrb::Producer<f32>, rtrb::Consumer<f32>) {
     rtrb::RingBuffer::new((rate as u128 * BUFFER.as_millis() / 1000) as usize)
 }
 
-#[cfg(any(target_os = "macos", target_os = "android"))]
+#[cfg(any(target_os = "macos", target_os = "android", target_os = "windows"))]
 fn open_backend(shared: Arc<Shared>) -> Result<Opened> {
     open_cpal(shared)
 }
@@ -184,7 +184,12 @@ fn open_backend(shared: Arc<Shared>) -> Result<Opened> {
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "android", target_os = "linux"))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "android",
+    target_os = "linux",
+    target_os = "windows"
+))]
 fn open_cpal(shared: Arc<Shared>) -> Result<Opened> {
     use anyhow::{anyhow, bail};
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -399,7 +404,12 @@ fn open_pipewire(shared: Arc<Shared>) -> Result<Opened> {
     Ok((RATE, "PipeWire default output".into(), producer, thread))
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "linux",
+    target_os = "android",
+    target_os = "windows"
+)))]
 fn open_backend(_shared: Arc<Shared>) -> Result<Opened> {
     anyhow::bail!("no audio output backend for this OS")
 }

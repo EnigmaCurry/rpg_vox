@@ -32,7 +32,7 @@ pub mod ring;
 #[cfg(feature = "sherpa")]
 pub mod sherpa;
 pub mod speaker;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub mod stderr;
 pub mod subtitle;
 pub mod timing;

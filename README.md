@@ -16,7 +16,7 @@ A standalone live transcription app for the terminal, with nothing
 RPG-specific in it. It shows what is being said as it is said, refines
 the text in the same layered passes as rpg_vox, and saves it as
 markdown, optionally with subtitles, audio and speaker labels. It also
-works as a one-key dictation tool. macOS and Linux.
+works as a one-key dictation tool. macOS, Linux and Windows.
 
 ```bash
 just install-scribe

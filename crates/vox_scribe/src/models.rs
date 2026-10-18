@@ -64,16 +64,35 @@ pub const EMBEDDING_FILE: &str = "embedding-eres2netv2.onnx";
 
 /// Per-user data directory for downloaded models.
 pub fn user_models_dir() -> PathBuf {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_default();
-    if cfg!(target_os = "macos") {
-        home.join("Library/Application Support/vox_scribe/models")
-    } else {
-        std::env::var_os("XDG_DATA_HOME")
+    // Hundreds of megabytes that belong to this machine: LOCALAPPDATA,
+    // not the roaming APPDATA that follows the user between them.
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var_os("LOCALAPPDATA")
             .map(PathBuf::from)
-            .unwrap_or_else(|| home.join(".local/share"))
-            .join("vox_scribe/models")
+            .unwrap_or_else(|| {
+                std::env::var_os("USERPROFILE")
+                    .map(PathBuf::from)
+                    .unwrap_or_default()
+                    .join("AppData")
+                    .join("Local")
+            })
+            .join("vox_scribe")
+            .join("models")
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_default();
+        if cfg!(target_os = "macos") {
+            home.join("Library/Application Support/vox_scribe/models")
+        } else {
+            std::env::var_os("XDG_DATA_HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join(".local/share"))
+                .join("vox_scribe/models")
+        }
     }
 }
 
@@ -177,11 +196,17 @@ pub fn has_zipformer(dir: &Path) -> bool {
         .all(|f| dir.join(ZIPFORMER).join(f).is_file())
 }
 
-/// Download `offline` and Zipformer into `dir` with `curl` + `tar`,
-/// skipping any that are already present.
+/// Download `offline` and Zipformer into `dir` with `curl`, skipping
+/// any that are already present.
 pub fn download(dir: &Path, offline: Offline) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     let shown = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    // Windows canonicalizes to the `\\?\C:\…` extended-length form.
+    let shown = shown
+        .to_str()
+        .and_then(|s| s.strip_prefix(r"\\?\"))
+        .map(PathBuf::from)
+        .unwrap_or(shown);
     println!("models directory: {}", shown.display());
     let sv = dir.join(SENSE_VOICE);
     let pk = dir.join(PARAKEET);
@@ -255,16 +280,7 @@ fn fetch_in(release: &str, stem: &str, dest: &Path, files: &[(&str, &str)]) -> R
     std::fs::create_dir_all(&tmp)?;
     let archive = tmp.join(format!("{stem}.tar.bz2"));
     curl(&format!("{RELEASES}/{release}/{stem}.tar.bz2"), &archive)?;
-    let ok = Command::new("tar")
-        .arg("-xjf")
-        .arg(&archive)
-        .arg("-C")
-        .arg(&tmp)
-        .status()?
-        .success();
-    if !ok {
-        bail!("extract failed: {}", archive.display());
-    }
+    untar_bz2(&archive, &tmp)?;
     std::fs::create_dir_all(dest)?;
     for (from, to) in files {
         copy_all(&tmp.join(stem).join(from), &dest.join(to))
@@ -272,6 +288,33 @@ fn fetch_in(release: &str, stem: &str, dest: &Path, files: &[(&str, &str)]) -> R
     }
     let _ = std::fs::remove_dir_all(&tmp);
     println!("installed {}", dest.display());
+    Ok(())
+}
+
+/// Unpack a `.tar.bz2`. Done in process rather than by running `tar`,
+/// which isn't on every machine (and whose bzip2 support, where it is,
+/// can be a separate matter).
+fn untar_bz2(archive: &Path, into: &Path) -> Result<()> {
+    // `unpack_in` canonicalizes `into` to keep entries inside it, so it
+    // has to be there first.
+    std::fs::create_dir_all(into).with_context(|| format!("create {}", into.display()))?;
+    let file =
+        std::fs::File::open(archive).with_context(|| format!("open {}", archive.display()))?;
+    let reader = bzip2::read::BzDecoder::new(std::io::BufReader::new(file));
+    let mut tar = tar::Archive::new(reader);
+    let what = || format!("extract {}", archive.display());
+    for entry in tar.entries().with_context(what)? {
+        let mut entry = entry.with_context(what)?;
+        // The bundles hold plain files and directories. Skipping
+        // everything else means a stray symlink can't fail the install
+        // on Windows, where making one needs a privilege.
+        let kind = entry.header().entry_type();
+        if !kind.is_file() && !kind.is_dir() {
+            continue;
+        }
+        // `unpack_in` refuses to write outside `into`.
+        entry.unpack_in(into).with_context(what)?;
+    }
     Ok(())
 }
 
@@ -287,4 +330,59 @@ fn copy_all(from: &Path, to: &Path) -> Result<()> {
         std::fs::copy(from, to)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A bundle like the ones on the sherpa-onnx releases page: a
+    /// directory named after the archive, with a stray symlink in it.
+    fn bundle(path: &Path) {
+        let bz = bzip2::write::BzEncoder::new(
+            std::fs::File::create(path).expect("create archive"),
+            bzip2::Compression::fast(),
+        );
+        let mut tar = tar::Builder::new(bz);
+        let mut file = |name: &str, body: &[u8]| {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(body.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            tar.append_data(&mut header, name, body).expect("append");
+        };
+        file("bundle/tokens.txt", b"a b c\n");
+        file("bundle/test_wavs/one.wav", b"RIFF");
+        let mut link = tar::Header::new_gnu();
+        link.set_entry_type(tar::EntryType::Symlink);
+        link.set_size(0);
+        link.set_cksum();
+        tar.append_link(&mut link, "bundle/latest.onnx", "tokens.txt")
+            .expect("append link");
+        tar.into_inner()
+            .expect("finish tar")
+            .finish()
+            .expect("finish bzip2");
+    }
+
+    #[test]
+    fn untar_bz2_unpacks_files_and_skips_links() {
+        let tmp = std::env::temp_dir().join("vox_scribe-untar-test");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).expect("create tmp");
+        let archive = tmp.join("bundle.tar.bz2");
+        bundle(&archive);
+
+        let into = tmp.join("out");
+        untar_bz2(&archive, &into).expect("untar");
+
+        assert_eq!(
+            std::fs::read_to_string(into.join("bundle/tokens.txt")).expect("tokens.txt"),
+            "a b c\n"
+        );
+        assert!(into.join("bundle/test_wavs/one.wav").is_file());
+        // Skipped, not followed: nothing of it is written at all.
+        assert!(!into.join("bundle/latest.onnx").exists());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }

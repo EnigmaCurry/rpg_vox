@@ -33,6 +33,11 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+          # sherpa-onnx's prebuilt Windows archive is MSVC's, so this is
+          # an MSVC build. `just dist` puts the two C runtime DLLs in the
+          # archive beside each .exe (see .cargo/config.toml).
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
     steps:
       - uses: actions/checkout@v4
 
@@ -63,7 +68,11 @@ jobs:
           key: ${{ matrix.target }}
       - uses: extractions/setup-just@v2
 
+      # bash on every runner: Windows defaults to PowerShell, which
+      # reads `$GITHUB_REF_NAME` as a variable of its own, and the
+      # recipes are bash whatever starts them.
       - name: Build and package
+        shell: bash
         run: just dist "$GITHUB_REF_NAME"
 
       - uses: actions/upload-artifact@v4

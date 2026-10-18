@@ -130,6 +130,7 @@ impl Backend for PipeWire {
             };
             let desc = props["node.description"].as_str().unwrap_or(name);
             devices.push(DeviceInfo {
+                loopback: false,
                 id: name.to_string(),
                 name: format!("{desc} ({kind})"),
                 is_default: false,

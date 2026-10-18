@@ -62,10 +62,13 @@ impl SourcesMenu {
         }];
         for d in devices {
             rows.push(Row {
-                label: if d.is_default {
-                    format!("{} (default)", d.name)
-                } else {
-                    d.name
+                // A loopback device says so in its label rather than in
+                // `kind`, which `Row::is` matches a running source by.
+                label: match (d.loopback, d.is_default) {
+                    (true, true) => format!("{} (loopback, default output)", d.name),
+                    (true, false) => format!("{} (loopback)", d.name),
+                    (false, true) => format!("{} (default)", d.name),
+                    (false, false) => d.name,
                 },
                 kind: "input",
                 opts: OpenOptions {

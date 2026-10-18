@@ -66,6 +66,13 @@ struct Cli {
     /// Repeat it (and/or -a) to transcribe several sources at once, each
     /// on its own as one speaker: Speaker A, B, … in the order given, or
     /// the names from --speakers.
+    // On Windows an output device records what it plays rather than
+    // anything played into it, which is how system audio is transcribed
+    // there; `loopback` saves looking the default output's name up.
+    #[cfg_attr(
+        target_os = "windows",
+        doc = "An output device is transcribed as it plays (WASAPI loopback), and `loopback` is the default output."
+    )]
     #[arg(short, long)]
     device: Vec<String>,
     /// PipeWire only: register a virtual sink named `vox_scribe` and
@@ -916,7 +923,13 @@ fn main() -> Result<()> {
             if once::signal_finish() {
                 return Ok(());
             }
+            #[cfg(unix)]
             eprintln!("no scribe --once recorder is running");
+            #[cfg(not(unix))]
+            eprintln!(
+                "stop-once finishes a recorder by signalling it, which is unix only; \
+                 press Enter in its own window instead"
+            );
             std::process::exit(1);
         }
         None => {}
@@ -959,7 +972,7 @@ fn main() -> Result<()> {
             models::download_kokoro(&models_dir)?;
         }
         // sherpa-onnx logs to fd 2 while loading; keep it off the TUI.
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let _stderr_restore = match &log_file {
             Some(f) => Some(vox_transcribe::stderr::redirect_to(f)?),
             None => None,
@@ -1086,7 +1099,7 @@ fn main() -> Result<()> {
     // Put the TUI on screen now so the mic and models load behind it
     // rather than behind a blank terminal. sherpa-onnx's C++ code writes to
     // fd 2 directly; send it to the log while the TUI owns the screen.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     let _stderr_restore = match (&log_file, tui_mode) {
         (Some(f), true) => Some(vox_transcribe::stderr::redirect_to(f)?),
         _ => None,
@@ -2107,9 +2120,17 @@ fn list_apps() -> Result<()> {
 fn list_devices() -> Result<()> {
     let backend = vox_audio::default_backend()?;
     println!("{} input devices:", backend.name());
-    for d in backend.list_devices()? {
+    let devices = backend.list_devices()?;
+    let loopback = devices.iter().any(|d| d.loopback);
+    for d in devices {
         let mark = if d.is_default { "*" } else { " " };
-        println!("{mark} {}\n      id: {}", d.name, d.id);
+        let kind = if d.loopback { "  (loopback)" } else { "" };
+        println!("{mark} {}{kind}\n      id: {}", d.name, d.id);
+    }
+    if loopback {
+        println!(
+            "\nA loopback device is transcribed as it plays; `-d loopback` takes the default one."
+        );
     }
     Ok(())
 }
@@ -2150,10 +2171,13 @@ fn init_logging(cli: &Cli, tui_mode: bool) -> Result<Option<std::fs::File>> {
             Ok(for_tui)
         }
         None => {
+            // The sherpa log filter is unix-only (see its module
+            // docs); elsewhere stderr is left alone and only asked
+            // whether colour is worth writing.
             #[cfg(unix)]
             let ansi = vox_transcribe::stderr::install();
             #[cfg(not(unix))]
-            let ansi = true;
+            let ansi = std::io::IsTerminal::is_terminal(&std::io::stderr());
             tracing_subscriber::fmt()
                 .with_env_filter(filter)
                 .with_ansi(ansi)

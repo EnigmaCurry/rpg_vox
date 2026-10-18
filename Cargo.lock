@@ -7003,6 +7003,7 @@ name = "vox_scribe"
 version = "0.1.9"
 dependencies = [
  "anyhow",
+ "bzip2 0.4.4",
  "chrono",
  "clap",
  "crossbeam-channel",
@@ -7010,12 +7011,14 @@ dependencies = [
  "libc",
  "ratatui",
  "signal-hook",
+ "tar",
  "tracing",
  "tracing-subscriber",
  "unicode-width 0.2.2",
  "vox_audio",
  "vox_chat",
  "vox_transcribe",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

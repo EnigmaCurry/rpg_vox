@@ -41,21 +41,55 @@ dist VERSION=`git describe --tags --always --dirty`:
       $build
     fi
     target="$(rustc -vV | sed -n 's/^host: //p')"
+    exe=""
+    case "$target" in *-windows-*) exe=".exe" ;; esac
     mkdir -p dist
     for bin in "${bins[@]}"; do
       name="$bin-{{VERSION}}-$target"
-      stage="$(mktemp -d)/$name"
+      stage="dist/$name"
+      rm -rf "$stage"
       mkdir -p "$stage"
-      cp "target/release/$bin" LICENSE.txt README.md "$stage/"
+      cp "target/release/$bin$exe" LICENSE.txt README.md "$stage/"
       case "$bin" in
         scribe) cp SCRIBE.md SCRIBE_REFERENCE.md "$stage/" ;;
         agent) cp AGENT.md "$stage/" ;;
         rpg_vox) cp RPG_VOX.md "$stage/" ;;
       esac
-      tar -czf "dist/$name.tar.gz" -C "$(dirname "$stage")" "$name"
-      rm -rf "$(dirname "$stage")"
-      (cd dist && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256")
-      echo "packaged dist/$name.tar.gz"
+      if [ -n "$exe" ]; then
+        # The C runtime the binaries link against (see
+        # .cargo/config.toml) is in a Microsoft redistributable rather
+        # than in Windows itself, so a copy goes beside them: a
+        # program's own directory is the first place Windows looks for
+        # a DLL, so the unpacked folder needs nothing installed.
+        sys32="$(cygpath -S 2>/dev/null || true)"
+        : "${sys32:=/c/Windows/System32}"
+        for dll in vcruntime140.dll vcruntime140_1.dll; do
+          if [ -f "$sys32/$dll" ]; then
+            cp "$sys32/$dll" "$stage/"
+          else
+            echo "warning: no $sys32/$dll to ship alongside $bin$exe;" \
+                 "unpacking this archive will need the Visual C++" \
+                 "redistributable installed" >&2
+          fi
+        done
+        # A .zip, which Explorer opens on its own. Git's bash has no
+        # `zip`, and PowerShell is there whatever else isn't.
+        archive="$name.zip"
+        rm -f "dist/$archive"
+        (cd dist && powershell.exe -NoProfile -Command \
+          "Compress-Archive -Path '$name' -DestinationPath '$archive' -Force")
+      else
+        archive="$name.tar.gz"
+        tar -czf "dist/$archive" -C dist "$name"
+      fi
+      rm -rf "$stage"
+      sum=shasum
+      command -v shasum >/dev/null || sum=sha256sum
+      case "$sum" in
+        shasum) (cd dist && shasum -a 256 "$archive" > "$archive.sha256") ;;
+        *) (cd dist && sha256sum "$archive" > "$archive.sha256") ;;
+      esac
+      echo "packaged dist/$archive"
     done
 
 # Cut a release from master: bump the workspace version (prompts, default
@@ -410,6 +444,57 @@ install-scribe BIN="~/.local/bin": release-scribe
       *":$bin:"*) ;;
       *) echo "note: $bin is not on your PATH" ;;
     esac
+
+# --- Windows (x86_64) ---
+
+# Cross-build scribe.exe (and agent.exe) for 64-bit Windows from this
+# machine, with cargo-xwin: it fetches Microsoft's CRT and Windows SDK
+# headers and libraries, and clang-cl / lld-link stand in for MSVC.
+# Needs nix (for the LLVM tools) and rustup. Release only: a debug
+# build wants the debug C runtime, which cargo-xwin doesn't fetch.
+#
+# Release builds happen natively on a Windows runner (.github/workflows/
+# release.yml), which needs none of this; `just win64` is for trying a
+# change without pushing one. Pass different packages as ARGS, e.g.
+#   just win64 "-p vox_scribe"
+win64 ARGS="-p vox_scribe -p vox_agent":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    target=x86_64-pc-windows-msvc
+    if ! rustup target list --installed | grep -qx "$target"; then
+      rustup target add "$target"
+    fi
+    # libopus's CMake tells MSVC that its SSE4.1 and AVX files need those
+    # instruction sets, and says it in a way only MSVC understands;
+    # clang-cl has to be told in its own words. `CL` goes in front of
+    # every clang-cl command line.
+    export CL="/clang:-msse4.1 /clang:-mavx"
+    shell=(
+      nix shell
+      nixpkgs#cargo-xwin
+      nixpkgs#llvmPackages.clang-unwrapped  # clang-cl
+      nixpkgs#llvmPackages.llvm             # llvm-lib
+      nixpkgs#lld                           # lld-link
+      # audiopus_sys builds the libopus it bundles.
+      nixpkgs#cmake
+      nixpkgs#ninja
+      --command
+    )
+    # Fetch the CRT and SDK before patching the names below.
+    "${shell[@]}" cargo xwin cache xwin
+    # cargo-xwin unpacks the SDK under lowercase, Capitalised and
+    # UPPERCASE names and nothing else, so the mixed-case libraries that
+    # onnxruntime asks for are missed on a case-sensitive filesystem.
+    # Windows itself never notices the difference.
+    um="${XWIN_CACHE_DIR:-$HOME/.cache/cargo-xwin}/xwin/sdk/lib/um/x86_64"
+    for lib in PathCch; do
+      lower="$(printf %s "$lib" | tr "[:upper:]" "[:lower:]")"
+      if [ -e "$um/$lower.lib" ] && [ ! -e "$um/$lib.lib" ]; then
+        ln -s "$lower.lib" "$um/$lib.lib"
+      fi
+    done
+    "${shell[@]}" cargo xwin build --release --locked --target "$target" {{ARGS}}
+    ls -l "target/$target/release/"*.exe
 
 # Android arm64 (API 26+) scribe bundle in dist/android-arm64/: scribe, the
 # sherpa-onnx / onnxruntime .so files it loads, and run.sh, which sets

@@ -29,8 +29,8 @@ subtitles and audio if you want them.
 * **One-key dictation.** Press a key, talk, press enter, and the text is
   on your clipboard.
 
-macOS (Apple Silicon) and Linux, prebuilt binaries on the
-[releases page](https://github.com/EnigmaCurry/rpg_vox/releases).
+macOS (Apple Silicon), Linux and Windows (x86_64), prebuilt binaries on
+the [releases page](https://github.com/EnigmaCurry/rpg_vox/releases).
 `scribe` is the standalone companion to [rpg_vox](RPG_VOX.md) and shares
 its transcription passes, with nothing RPG-specific in it.
 
@@ -94,19 +94,24 @@ in the same two passes: pass 3 re-decodes 2–3 utterances as one buffer
 and can find a sentence break inside it, which used to leave the next
 sentence starting in lowercase.
 
-Audio comes from CoreAudio on macOS and PipeWire on Linux (the
-`vox_audio` crate). A Linux system still on PulseAudio works through
-ALSA instead, for the mic and playback; capturing an app (`--app`) and
-`--virtual-sink` need PipeWire. Set `VOX_AUDIO_BACKEND=alsa` (or
-`pipewire`) to choose rather than have scribe check what's running. The first run downloads the models (about 580 MB) if
+Audio comes from CoreAudio on macOS, PipeWire on Linux and WASAPI on
+Windows (the `vox_audio` crate). A Linux system still on PulseAudio
+works through ALSA instead, for the mic and playback; capturing an app
+(`--app`) and `--virtual-sink` need PipeWire. Set
+`VOX_AUDIO_BACKEND=alsa` (or `pipewire`) to choose rather than have
+scribe check what's running. On Windows an *output* device recorded for
+input hands back what it is playing — WASAPI loopback — which is how
+system audio is transcribed there; see
+[audio sources](#audio-sources). The first run downloads the models (about 580 MB) if
 none are found; `scribe download-models` does the same thing up front.
 
 ## Install
 
 Prebuilt binaries are attached to each
 [GitHub release](https://github.com/EnigmaCurry/rpg_vox/releases) for
-macOS (Apple Silicon) and Linux (x86_64 and aarch64). Pick the archive for
-your platform, unpack it, put `scribe` on your `PATH` and fetch the models:
+macOS (Apple Silicon), Linux (x86_64 and aarch64) and Windows (x86_64).
+Pick the archive for your platform, unpack it, put `scribe` on your
+`PATH` and fetch the models:
 
 ```bash
 VERSION=v0.1.0
@@ -117,8 +122,26 @@ install -m 755 "scribe-$VERSION-$TARGET/scribe" ~/.local/bin/scribe
 scribe download-models
 ```
 
+On Windows the archive is a `.zip` holding `scribe.exe`, which
+PowerShell can unpack:
+
+```powershell
+$Version = "v0.1.0"
+$Name = "scribe-$Version-x86_64-pc-windows-msvc"
+curl.exe -fLO "https://github.com/EnigmaCurry/rpg_vox/releases/download/$Version/$Name.zip"
+Expand-Archive "$Name.zip" -DestinationPath .
+mkdir -Force "$env:LOCALAPPDATA\Programs\scribe" | Out-Null
+Copy-Item "$Name\scribe.exe", "$Name\*.dll" "$env:LOCALAPPDATA\Programs\scribe\"
+& "$env:LOCALAPPDATA\Programs\scribe\scribe.exe" download-models
+```
+
+Add that directory to your `Path` (Settings → System → About → Advanced
+system settings → Environment Variables) to type `scribe` anywhere. Use
+it from Windows Terminal: the TUI wants a terminal that understands
+colours and resizing, which the old console window does not.
+
 <details>
-<summary>Checksums, the macOS quarantine flag, Linux requirements</summary>
+<summary>Checksums, the macOS quarantine flag, Linux and Windows requirements</summary>
 
 Each archive has a `.sha256` beside it to check the download against
 (`shasum -a 256 -c scribe-$VERSION-$TARGET.tar.gz.sha256`). The macOS
@@ -128,6 +151,16 @@ binary is not signed: if you downloaded it with a browser instead of
 (`libpipewire-0.3`, installed even on most PulseAudio systems), ALSA
 (`libasound2`) and glibc 2.39 or newer (Ubuntu 24.04, Fedora 40, or
 later); on older systems, build from source.
+
+The Windows archive holds `scribe.exe` and the two C runtime DLLs it
+links against (`vcruntime140.dll`, `vcruntime140_1.dll`), so the folder
+it unpacks to needs nothing installed; keep them next to the binary, or
+install the [Visual C++
+redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe) once
+and copy only the `.exe`. Windows 10 or newer. It isn't code-signed, so
+SmartScreen warns the first time: *More info → Run anyway*.
+`scribe download-models` fetches with `curl.exe`, which Windows has had
+since 10 1803.
 
 </details>
 
@@ -148,10 +181,13 @@ also installs `scribe-once.terminal` next to the binary and drops the
 Karabiner rule for the [dictation key](#one-shot-dictation-key) into
 `~/.config/karabiner/assets/complex_modifications/`.
 
-On macOS, build with plain cargo (no nix-shell), and use `-p vox_scribe`:
-the rpg_vox and discord_vox crates need PipeWire and only build on Linux.
-sherpa-onnx is linked statically, so the binary is self-contained on both
-macOS and Linux:
+On macOS and Windows, build with plain cargo (no nix-shell), and use
+`-p vox_scribe`: the rpg_vox and discord_vox crates need PipeWire and
+only build on Linux. Windows needs the MSVC toolchain
+(`x86_64-pc-windows-msvc`, i.e. Visual Studio's C++ build tools) and
+CMake, which libopus is built with; sherpa-onnx's prebuilt archive is
+MSVC's. sherpa-onnx is linked statically, so the binary is
+self-contained everywhere:
 
 ```bash
 cargo build -p vox_scribe --release        # target/release/scribe
@@ -159,13 +195,19 @@ cargo install --path crates/vox_scribe     # or install into ~/.cargo/bin
 ```
 
 From a checkout, `just scribe ARGS` runs it (fetching the models first
-and loading `.env`).
+and loading `.env`). `just win64` cross-builds `scribe.exe` from Linux
+with [cargo-xwin](https://github.com/rust-cross/cargo-xwin), for trying
+a change without a Windows machine; releases are built natively.
 
 ## Audio sources
 
 * **Default**: the system input.
 * `--device NAME`: an input by id or name substring (see `devices`). On
-  Linux, a sink's node name captures what is playing on it.
+  Linux, a sink's node name captures what is playing on it. On Windows
+  an output device can be named too, and is then recorded as it plays
+  (WASAPI loopback); `--device loopback` is the default output, which is
+  the short way to transcribe a call, a video or anything else coming
+  out of the speakers. `devices` marks the ones that work this way.
 * `--app NAME`: transcribe what one app is playing (see `apps`). Every
   matching process is captured, so `--app chrome` also gets Chrome's
   helper processes, and new ones are picked up while running.
@@ -178,9 +220,11 @@ and loading `.env`).
     apps there. An app only shows up once it has opened an audio output.
   * Linux: scribe's PipeWire stream is linked to the app's output streams
     with `pw-link`.
+  * Windows: not available. WASAPI can't single out one app's audio;
+    `--device loopback` captures everything the speakers play.
 * `--virtual-sink` (Linux): a `vox_scribe` PipeWire sink; route apps into
   it. On macOS use `--app`, or a loopback device such as BlackHole with
-  `--device`.
+  `--device`; on Windows use `--device loopback`.
 * `--input FILE`: a wav/flac/mp3/ogg file, transcribed as fast as
   possible without the TUI, or in real time with `--live`.
 
@@ -347,7 +391,8 @@ Replies are read by one of two engines:
 
 * **speech-dispatcher**, the speech daemon a Linux desktop already runs
   for its screen reader, in the voices it is set up with (espeak-ng,
-  pocket-tts, pico, a paid synthesizer). Nothing is downloaded.
+  pocket-tts, pico, a paid synthesizer). Nothing is downloaded. Unix
+  only; on Windows Kokoro does the speaking.
 * **Kokoro**, the 82M model above, which sounds the same everywhere and
   is what `-p` uses.
 
@@ -484,16 +529,21 @@ The speaker models (~77 MB) are fetched on first use, or with
 
 Models are looked up in `--models-dir`, `$VOX_SCRIBE_MODELS`, the
 per-user data dir (`~/Library/Application Support/vox_scribe/models` on
-macOS, `${XDG_DATA_HOME:-~/.local/share}/vox_scribe/models` on Linux),
-then `./models` (so an rpg_vox checkout's models work as-is). In TUI
-mode, logs go to `$TMPDIR/vox_scribe.log` unless `--log` says otherwise.
+macOS, `${XDG_DATA_HOME:-~/.local/share}/vox_scribe/models` on Linux,
+`%LOCALAPPDATA%\vox_scribe\models` on Windows), then `./models` (so an
+rpg_vox checkout's models work as-is). In TUI mode, logs go to
+`$TMPDIR/vox_scribe.log` (`%TEMP%\vox_scribe.log` on Windows) unless
+`--log` says otherwise.
 
 ## One-shot dictation key
 
 `scribe --once` works as a push-to-talk dictation tool: bind a key that
 opens a terminal running it, speak, press `enter`, and the text is on the
 clipboard when the window closes. A second press of the same key can run
-`scribe stop-once` to finish it.
+`scribe stop-once` to finish it. That second press is unix only: it
+works by signalling the running recorder, so on Windows `--once` has to
+be finished with Enter in its own window, and nothing stops a second one
+starting alongside it.
 
 Setup for the macOS 🎤 / F5 key (with Karabiner-Elements) and for GNOME,
 KDE, Sway, i3 and Hyprland is in the

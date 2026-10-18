@@ -3,7 +3,7 @@ name = "vox_audio"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Mono f32 audio capture and playback: PipeWire on Linux, CoreAudio on macOS (devices or one app), plus file decode and Ogg Opus recordings"
+description = "Mono f32 audio capture and playback: PipeWire on Linux, CoreAudio on macOS (devices or one app), WASAPI on Windows (devices or loopback), plus file decode and Ogg Opus recordings"
 
 [dependencies]
 anyhow.workspace = true
@@ -34,3 +34,8 @@ objc2-core-audio = "0.3"
 objc2-core-audio-types = "0.3"
 objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFDictionary"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSDictionary", "NSObject", "NSString", "NSUUID", "NSValue"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# WASAPI: the microphones, and an output device's own mix when opened
+# for input (loopback), which is how system audio is captured.
+cpal = "0.18"

@@ -3,3 +3,21 @@
 # can't find a system one (e.g. macOS without pkg-config). Its
 # CMakeLists predates CMake 3.5, which CMake 4 refuses without this.
 CMAKE_POLICY_VERSION_MINIMUM = "3.5"
+
+[target.x86_64-pc-windows-msvc]
+rustflags = [
+  # LNK4099: Microsoft ships no PDBs for the CRT import libraries. Only
+  # a cross-build (`just win64`, lld-link) says anything about it.
+  "-C", "link-arg=/IGNORE:4099",
+]
+
+# Windows links the C runtime as a DLL (/MD), which is what every C
+# dependency here agrees on: cc builds sqlite, bzip2 and ring that way,
+# and libopus comes out that way whatever cc is told, because its own
+# CMake appends /MD after cc's flags. Linking it statically instead
+# (+crt-static) would make each .exe standalone, but then libopus alone
+# would still want the DLL's import thunks — enough to fail a link, as
+# the test binaries do. One runtime for everything also keeps
+# `vox_transcribe::stderr` working: swapping descriptor 2 only reaches
+# sherpa-onnx's C++ `fprintf(stderr, …)` because it is the same runtime.
+# The cost is VCRUNTIME140.dll, which `just dist` puts in the archive.
