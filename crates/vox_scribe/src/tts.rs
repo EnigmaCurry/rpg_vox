@@ -100,6 +100,27 @@ impl Voice {
         }
     }
 
+    /// Whether this engine can be held mid-word and then go on from
+    /// there — what `--chat` ducks a reply with while it works out
+    /// whether a sound over it was really an interruption.
+    ///
+    /// Kokoro can: the samples are ours, so pausing is a gain ramp and
+    /// the ring is left where it is. speech-dispatcher cannot be used
+    /// that way, even though `PAUSE`/`RESUME` work on their own:
+    /// cancelling a message that has been paused wedges the client,
+    /// and pocket-tts then takes every message after it and says
+    /// nothing — `BEGIN` and `END` in the same instant. Nothing
+    /// recovers it short of a new connection. So a voice that cannot
+    /// pause is simply left talking until the words are in, and then
+    /// cut off for good.
+    pub fn can_pause(&self) -> bool {
+        match self {
+            Voice::Kokoro(_) => true,
+            #[cfg(unix)]
+            Voice::Spd(_) => false,
+        }
+    }
+
     pub fn set_paused(&self, paused: bool) {
         match self {
             Voice::Kokoro(v) => v.set_paused(paused),

@@ -13,15 +13,16 @@ use anyhow::{bail, Context as _, Result};
 use clap::Parser;
 use serde_json::{json, Value};
 use tracing::{debug, info, warn};
-use vox_chat::{Db, Kind, Role, Row};
+use vox_chat::{Db, Role, Turn};
 
 const DEFAULT_PROMPT: &str = "\
 You are talking with the user by voice. Their messages come from \
 speech-to-text, so expect recognition errors and read past them. Your replies \
 are read aloud by a text-to-speech voice: answer conversationally, in plain \
 spoken sentences, usually briefly. Never use markdown, lists, headings, code \
-blocks, emoji, or URLs. If the user cut off your previous reply, don't repeat \
-it unless asked.";
+blocks, emoji, or URLs. If the user talked over one of your replies, you are \
+shown only the part they actually heard, marked as interrupted — carry on from \
+there rather than repeating it.";
 
 /// Shown to the model after a reply the user talked over.
 const CUT_NOTE: &str = " [the user interrupted here]";
@@ -204,85 +205,66 @@ fn main() -> Result<()> {
 
 /// Answer each new thing the user says, forever.
 fn serve(db: &Db, llm: &Llm, prompt: &str, history: usize) -> Result<()> {
-    let mut last = db.last_id()?;
+    // What we last took up. Whatever was said before we started is
+    // only ours to answer if nobody has taken it up yet.
+    let mut answered = match db.unanswered()? {
+        Some(_) => 0,
+        None => db.newest_user()?.map_or(0, |t| t.id),
+    };
     loop {
-        let rows = db.since(last)?;
-        // Only the newest thing said gets a reply.
-        let Some(say) = rows
-            .iter()
-            .rev()
-            .find(|r| r.role == Role::User && r.kind == Kind::Say)
-            .cloned()
+        // The newest thing said, once they have finished saying it and
+        // if it isn't the one we are already on. Asking which turn is
+        // last in the file instead would miss a turn whenever a reply
+        // we had begun landed after it.
+        let Some(say) = db
+            .newest_user()?
+            .filter(|t| t.done && t.id != answered)
         else {
-            if let Some(r) = rows.last() {
-                last = r.id;
-            }
             std::thread::sleep(Duration::from_millis(50));
             continue;
         };
-        last = say.id;
+        answered = say.id;
         info!(id = say.id, text = %say.text, "user");
-        // Tell scribe it's being worked on (shown as thinking).
-        db.reply(say.id, "", true)?;
-        let messages = conversation(prompt, &db.rows_in(say.conversation)?, say.id, history);
-        if let Err(e) = reply(db, llm, &messages, say.id) {
+        // An empty turn: scribe shows it as thinking until words arrive.
+        let reply = db.start(say.conversation, Role::Assistant, "", false)?;
+        let messages = conversation(prompt, &db.turns_in(say.conversation)?, say.id, history);
+        if let Err(e) = answer(db, llm, &messages, &say, reply) {
             warn!("reply failed: {e:#}");
-            if !superseded(db, say.id)? {
-                db.reply(say.id, "Sorry, I couldn't get an answer just now.", false)?;
+            if !db.said_since(say.rev)? {
+                db.extend(reply, "Sorry, I couldn't get an answer just now.", true)?;
+            } else {
+                db.extend(reply, "", true)?;
             }
         }
     }
 }
 
 /// The chat messages for the model: the system prompt, then up to
-/// `history` earlier messages and the user message `upto`.
-fn conversation(prompt: &str, rows: &[Row], upto: i64, history: usize) -> Vec<Value> {
-    // (role, reply_to, text, cut)
-    let mut turns: Vec<(Role, Option<i64>, String, bool)> = Vec::new();
-    for r in rows.iter().filter(|r| r.id <= upto) {
-        let text = r.text.trim();
-        match (r.role, r.kind) {
-            (Role::User, Kind::Say) => turns.push((Role::User, None, text.into(), false)),
-            (Role::User, Kind::Interrupt) => {
-                if let Some(t) = turns
-                    .iter_mut()
-                    .rev()
-                    .find(|t| t.0 == Role::Assistant && t.1 == r.reply_to)
-                {
-                    t.3 = true;
-                }
-            }
-            (Role::Assistant, _) => match turns.last_mut() {
-                Some(t) if t.0 == Role::Assistant && t.1 == r.reply_to => {
-                    if !text.is_empty() {
-                        t.2 = format!("{} {text}", t.2).trim().to_string();
-                    }
-                }
-                _ => turns.push((Role::Assistant, r.reply_to, text.into(), false)),
-            },
-        }
-    }
-    turns.retain(|t| !t.2.is_empty());
-    let skip = turns.len().saturating_sub(history + 1);
+/// `history` earlier turns and the user turn `upto`.
+///
+/// A reply the user talked over goes in as the part they actually
+/// heard ([`vox_chat::Turn::heard`]) — all they can be answering.
+fn conversation(prompt: &str, turns: &[Turn], upto: i64, history: usize) -> Vec<Value> {
+    let kept: Vec<&Turn> = turns
+        .iter()
+        .filter(|t| t.id <= upto && !t.heard().trim().is_empty())
+        .collect();
+    let skip = kept.len().saturating_sub(history + 1);
     let mut out = vec![json!({ "role": "system", "content": prompt })];
-    for (role, _, text, cut) in turns.into_iter().skip(skip) {
-        let (role, content) = match role {
-            Role::User => ("user", text),
-            Role::Assistant if cut => ("assistant", format!("{text}{CUT_NOTE}")),
-            Role::Assistant => ("assistant", text),
+    for t in kept.into_iter().skip(skip) {
+        let heard = t.heard().trim();
+        let (role, content) = match t.role {
+            Role::User => ("user", heard.to_string()),
+            Role::Assistant if t.cut() => ("assistant", format!("{heard}{CUT_NOTE}")),
+            Role::Assistant => ("assistant", heard.to_string()),
         };
         out.push(json!({ "role": role, "content": content }));
     }
     out
 }
 
-/// The user interrupted the reply to `id`, or said something new.
-fn superseded(db: &Db, id: i64) -> Result<bool> {
-    Ok(db.since(id)?.iter().any(|r| r.role == Role::User))
-}
-
-/// Stream the model's answer to user message `id` into the database.
-fn reply(db: &Db, llm: &Llm, messages: &[Value], id: i64) -> Result<()> {
+/// Stream the model's answer to `say` into turn `reply`.
+fn answer(db: &Db, llm: &Llm, messages: &[Value], say: &Turn, reply: i64) -> Result<()> {
     let url = llm.chat_url();
     let req = llm.post(&url);
     let chars: usize = messages
@@ -290,7 +272,8 @@ fn reply(db: &Db, llm: &Llm, messages: &[Value], id: i64) -> Result<()> {
         .map(|m| m["content"].as_str().map_or(0, str::len))
         .sum();
     info!(
-        id,
+        id = say.id,
+        reply,
         messages = messages.len(),
         prompt_chars = chars,
         think = llm.think,
@@ -316,17 +299,18 @@ fn reply(db: &Db, llm: &Llm, messages: &[Value], id: i64) -> Result<()> {
             Err(e) => return Err(e).with_context(|| format!("POST {url}")),
         }
     };
-    info!(id, ms = start.elapsed().as_millis() as u64, "stream opened");
+    info!(id = say.id, ms = start.elapsed().as_millis() as u64, "stream opened");
     let mut stats = Stats::default();
-    let result = stream(db, id, resp, start, &mut stats);
+    let result = stream(db, say.rev, reply, resp, start, &mut stats);
     info!(
-        id,
+        id = say.id,
+        reply,
         total_ms = start.elapsed().as_millis() as u64,
         first_thought_ms = stats.first_thought,
         first_word_ms = stats.first_word,
         reasoning_chars = stats.reasoning,
         answer_chars = stats.answer,
-        rows = stats.rows,
+        writes = stats.writes,
         finish = %stats.finish.as_deref().unwrap_or("-"),
         interrupted = stats.interrupted,
         "reply done"
@@ -334,7 +318,7 @@ fn reply(db: &Db, llm: &Llm, messages: &[Value], id: i64) -> Result<()> {
     if let Some(t) = &stats.timings {
         // llama.cpp's own numbers: prompt and generation speed.
         info!(
-            id,
+            id = say.id,
             cached = t["cache_n"].as_u64(),
             prompt_tokens = t["prompt_n"].as_u64(),
             prompt_ms = t["prompt_ms"].as_f64().map(|v| v as u64),
@@ -347,7 +331,7 @@ fn reply(db: &Db, llm: &Llm, messages: &[Value], id: i64) -> Result<()> {
     }
     if let Some(u) = &stats.usage {
         info!(
-            id,
+            id = say.id,
             prompt_tokens = u["prompt_tokens"].as_u64(),
             completion_tokens = u["completion_tokens"].as_u64(),
             "usage"
@@ -363,17 +347,35 @@ struct Stats {
     first_word: Option<u64>,
     reasoning: usize,
     answer: usize,
-    rows: usize,
+    writes: usize,
     finish: Option<String>,
     interrupted: bool,
     timings: Option<Value>,
     usage: Option<Value>,
 }
 
-/// Read the server-sent events of `resp` into rows for user message `id`.
-fn stream(db: &Db, id: i64, resp: ureq::Response, start: Instant, st: &mut Stats) -> Result<()> {
+/// How long deltas are gathered before the turn is written again.
+/// Short enough that scribe starts speaking promptly, long enough that
+/// a fast model isn't one database write per token.
+const FLUSH: Duration = Duration::from_millis(120);
+
+/// Read the server-sent events of `resp` into turn `reply`, which grows
+/// as they arrive. Stops as soon as the user has written anything since
+/// revision `said_at`: the answer is no longer the one that was wanted.
+///
+/// Deltas go in exactly as they come, spacing included; it is scribe
+/// that decides where the sentences are and speaks them.
+fn stream(
+    db: &Db,
+    said_at: i64,
+    reply: i64,
+    resp: ureq::Response,
+    start: Instant,
+    st: &mut Stats,
+) -> Result<()> {
     let ms = || start.elapsed().as_millis() as u64;
     let mut pending = String::new();
+    let mut flushed = Instant::now();
     let mut checked = Instant::now();
     let mut thinking_logged = Instant::now();
     for line in std::io::BufReader::new(resp.into_reader()).lines() {
@@ -394,27 +396,27 @@ fn stream(db: &Db, id: i64, resp: ureq::Response, start: Instant, st: &mut Stats
         {
             if st.first_thought.is_none() {
                 st.first_thought = Some(ms());
-                info!(id, ms = ms(), "model is thinking (reasoning, not spoken)");
+                info!(reply, ms = ms(), "model is thinking (reasoning, not spoken)");
             }
             st.reasoning += r.len();
             if thinking_logged.elapsed() >= Duration::from_secs(5) {
                 thinking_logged = Instant::now();
                 info!(
-                    id,
+                    reply,
                     ms = ms(),
                     reasoning_chars = st.reasoning,
                     "still thinking"
                 );
             }
-            debug!(id, piece = r, "reasoning");
+            debug!(reply, piece = r, "reasoning");
         }
         if let Some(piece) = delta["content"].as_str().filter(|p| !p.is_empty()) {
             if st.first_word.is_none() {
                 st.first_word = Some(ms());
-                info!(id, ms = ms(), "first words");
+                info!(reply, ms = ms(), "first words");
             }
             st.answer += piece.len();
-            debug!(id, piece, "content");
+            debug!(reply, piece, "content");
             pending.push_str(piece);
         }
         if let Some(f) = v["choices"][0]["finish_reason"].as_str() {
@@ -429,75 +431,47 @@ fn stream(db: &Db, id: i64, resp: ureq::Response, start: Instant, st: &mut Stats
         // Stop as soon as the user talks over the reply.
         if checked.elapsed() >= Duration::from_millis(100) {
             checked = Instant::now();
-            if superseded(db, id)? {
+            if db.said_since(said_at)? {
                 st.interrupted = true;
+                db.extend(reply, "", true)?;
                 return Ok(());
             }
         }
-        while let Some(end) = sentence_end(&pending) {
-            let sentence: String = pending.drain(..end).collect();
-            if superseded(db, id)? {
-                st.interrupted = true;
-                return Ok(());
-            }
-            info!(id, ms = ms(), text = %sentence.trim(), "reply");
-            db.reply(id, sentence.trim(), true)?;
-            st.rows += 1;
+        if !pending.is_empty() && flushed.elapsed() >= FLUSH {
+            flushed = Instant::now();
+            info!(reply, ms = ms(), text = %pending.trim(), "reply");
+            db.extend(reply, &pending, false)?;
+            pending.clear();
+            st.writes += 1;
         }
     }
-    if superseded(db, id)? {
+    if db.said_since(said_at)? {
         st.interrupted = true;
+        db.extend(reply, "", true)?;
         return Ok(());
     }
-    let rest = pending.trim();
-    if !rest.is_empty() {
-        info!(id, ms = ms(), text = %rest, "reply");
+    if !pending.trim().is_empty() {
+        info!(reply, ms = ms(), text = %pending.trim(), "reply");
     }
-    // The last row says the reply is complete, even if it's empty.
-    db.reply(id, rest, false)?;
-    st.rows += 1;
+    // The last write says the reply is complete, even if it adds nothing.
+    db.extend(reply, &pending, true)?;
+    st.writes += 1;
     Ok(())
-}
-
-/// Byte length of the first whole sentence in `text`: up to a `.`, `?`,
-/// `!` (and closing quotes) followed by whitespace, or a line break.
-fn sentence_end(text: &str) -> Option<usize> {
-    let mut chars = text.char_indices().peekable();
-    while let Some((i, c)) = chars.next() {
-        if c == '\n' && !text[..i].trim().is_empty() {
-            return Some(i + 1);
-        }
-        if matches!(c, '.' | '?' | '!') {
-            let mut end = i + c.len_utf8();
-            while let Some(&(j, q)) = chars.peek() {
-                if matches!(q, '"' | '\'' | ')' | '”' | '’' | '.' | '?' | '!') {
-                    end = j + q.len_utf8();
-                    chars.next();
-                } else {
-                    break;
-                }
-            }
-            if text[end..].starts_with(char::is_whitespace) {
-                return Some(end);
-            }
-        }
-    }
-    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn row(id: i64, role: Role, kind: Kind, reply_to: Option<i64>, text: &str) -> Row {
-        Row {
+    fn turn(id: i64, role: Role, text: &str, spoken: Option<usize>) -> Turn {
+        Turn {
             id,
             conversation: 1,
             role,
-            kind,
-            reply_to,
             text: text.into(),
-            more: false,
+            rev: id,
+            done: true,
+            spoken,
             at: String::new(),
         }
     }
@@ -548,40 +522,51 @@ mod tests {
     }
 
     #[test]
-    fn finds_sentence_ends() {
-        assert_eq!(sentence_end("Hello there. How"), Some(12));
-        assert_eq!(sentence_end("Is it \"good?\" Yes"), Some(13));
-        assert_eq!(sentence_end("See d.rymcg.tech now"), None);
-        assert_eq!(sentence_end("Wait... what"), Some(7));
-        assert_eq!(sentence_end("Line one\nnext"), Some(9));
-        assert_eq!(sentence_end("No end yet."), None);
-    }
-
-    #[test]
     fn builds_the_conversation() {
-        let rows = [
-            row(1, Role::User, Kind::Say, None, "Hi."),
-            row(2, Role::Assistant, Kind::Say, Some(1), "Hello."),
-            row(3, Role::Assistant, Kind::Say, Some(1), "How can I"),
-            row(4, Role::User, Kind::Interrupt, Some(1), ""),
-            row(5, Role::User, Kind::Say, None, "Tell me a joke."),
-            row(6, Role::User, Kind::Say, None, "Later."),
+        let turns = [
+            turn(1, Role::User, "Hi.", None),
+            turn(2, Role::Assistant, "Hello. How can I help you today?", Some(2)),
+            turn(3, Role::User, "Tell me a joke.", None),
         ];
-        let m = conversation("P", &rows, 5, 40);
+        let m = conversation("P", &turns, 3, 40);
         let pairs: Vec<(&str, &str)> = m
             .iter()
             .map(|v| (v["role"].as_str().unwrap(), v["content"].as_str().unwrap()))
             .collect();
+        // The reply goes in as the two words that reached the ear.
         assert_eq!(
             pairs,
             vec![
                 ("system", "P"),
                 ("user", "Hi."),
-                ("assistant", "Hello. How can I [the user interrupted here]"),
+                ("assistant", "Hello. How [the user interrupted here]"),
                 ("user", "Tell me a joke."),
             ]
         );
-        // History keeps only the newest messages.
-        assert_eq!(conversation("P", &rows, 5, 1).len(), 3);
+        // Nothing after the turn being answered, and history is capped
+        // at the newest messages.
+        assert_eq!(conversation("P", &turns, 1, 40).len(), 2);
+        assert_eq!(conversation("P", &turns, 3, 1).len(), 3);
+    }
+
+    /// A reply heard to the end is quoted plainly, and one the user
+    /// never heard a word of is left out of the history altogether.
+    #[test]
+    fn whole_replies_and_unheard_ones() {
+        let turns = [
+            turn(1, Role::User, "Hi.", None),
+            turn(2, Role::Assistant, "Hello there.", Some(2)),
+            turn(3, Role::User, "Again.", None),
+            turn(4, Role::Assistant, "Hello there.", Some(0)),
+            turn(5, Role::User, "Once more.", None),
+        ];
+        let contents: Vec<String> = conversation("P", &turns, 5, 40)
+            .iter()
+            .map(|v| v["content"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            contents,
+            vec!["P", "Hi.", "Hello there.", "Again.", "Once more."]
+        );
     }
 }

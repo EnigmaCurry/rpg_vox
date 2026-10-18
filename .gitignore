@@ -23,3 +23,5 @@ transcript-*.md
 /dist/
 # Android signing keystores.
 *.jks
+*.db
+*.db-*

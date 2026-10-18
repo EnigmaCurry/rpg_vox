@@ -57,6 +57,13 @@ pub fn paragraphs(md: &str) -> Vec<Para> {
         .collect()
 }
 
+/// Whether `word` ends a sentence: a stop, question or exclamation
+/// mark, through any closing quote or bracket after it.
+pub fn ends_sentence(word: &str) -> bool {
+    word.trim_end_matches(['"', '\'', ')', '”', '’'])
+        .ends_with(['.', '?', '!'])
+}
+
 /// `text` cut after each `.`, `?` or `!` (and any closing quote) that is
 /// followed by a space, so "d.rymcg.tech" stays whole.
 pub fn sentences(text: &str) -> Vec<String> {
@@ -64,9 +71,7 @@ pub fn sentences(text: &str) -> Vec<String> {
     let mut cur: Vec<&str> = Vec::new();
     for w in text.split_whitespace() {
         cur.push(w);
-        if w.trim_end_matches(['"', '\'', ')', '”', '’'])
-            .ends_with(['.', '?', '!'])
-        {
+        if ends_sentence(w) {
             out.push(cur.join(" "));
             cur.clear();
         }

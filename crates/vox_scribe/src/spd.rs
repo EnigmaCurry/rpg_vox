@@ -414,6 +414,8 @@ enum Job {
     Voice(String),
     Paused(bool),
     Stop,
+    /// Said goodbye to properly: see [`Spd::drop`].
+    Quit,
 }
 
 #[derive(Default)]
@@ -490,6 +492,8 @@ impl Utterance {
 pub struct Spd {
     jobs: Sender<Job>,
     shared: Arc<Shared>,
+    /// The thread talking to the daemon, waited for on the way out.
+    thread: Option<std::thread::JoinHandle<()>>,
     choices: Vec<Choice>,
     /// Voice in use when the chat opens: the one asked for, else the
     /// daemon's own, which it will not name.
@@ -536,15 +540,16 @@ impl Spd {
         };
         let shared = Arc::new(Shared::default());
         let (jobs, job_rx) = crossbeam_channel::unbounded();
-        {
+        let thread = {
             let shared = shared.clone();
             std::thread::Builder::new()
                 .name("spd-speak".into())
-                .spawn(move || speak_jobs(conn, &shared, job_rx))?;
-        }
+                .spawn(move || speak_jobs(conn, &shared, job_rx))?
+        };
         Ok(Self {
             jobs,
             shared,
+            thread: Some(thread),
             choices,
             name,
         })
@@ -611,6 +616,22 @@ impl Spd {
     }
 }
 
+impl Drop for Spd {
+    /// Stop talking, and wait until the daemon has been told.
+    ///
+    /// The queue lives in the daemon, not here, and it outlives
+    /// scribe: quitting without cancelling leaves it to read out
+    /// everything it was handed, long after the terminal is back.
+    /// Dropping the channel alone isn't enough — the process can exit
+    /// before the thread gets to the socket — so say so and wait.
+    fn drop(&mut self) {
+        let _ = self.jobs.send(Job::Quit);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
 /// Hands text to the daemon one message at a time and follows the events
 /// it sends back, so [`Spd::heard`] keeps up with the voice.
 fn speak_jobs(mut conn: Conn, shared: &Shared, jobs: Receiver<Job>) {
@@ -623,6 +644,9 @@ fn speak_jobs(mut conn: Conn, shared: &Shared, jobs: Receiver<Job>) {
     // Learned from the messages that have been spoken, for the modules
     // that report no index marks.
     let mut ms_per_char = MS_PER_CHAR;
+    // Whether the daemon is holding our speech. Its own state, not
+    // [`Shared::paused`], which a stop clears without telling it.
+    let mut paused = false;
     loop {
         crossbeam_channel::select! {
             recv(jobs) -> job => match job {
@@ -669,20 +693,37 @@ fn speak_jobs(mut conn: Conn, shared: &Shared, jobs: Receiver<Job>) {
                         warn!("speaking in {name:?} failed: {e:#}");
                     }
                 }
-                Ok(Job::Paused(paused)) => {
-                    let asked = if paused { conn.pause() } else { conn.resume() };
+                Ok(Job::Paused(want)) => {
+                    let asked = if want { conn.pause() } else { conn.resume() };
                     if let Err(e) = asked {
                         warn!("pausing speech-dispatcher failed: {e:#}");
                     }
+                    paused = want;
                     if let Some(u) = queue.front_mut() {
-                        u.set_paused(paused);
+                        u.set_paused(want);
                     }
                 }
                 Ok(Job::Stop) => {
+                    if paused {
+                        if let Err(e) = conn.resume() {
+                            warn!("resuming speech-dispatcher failed: {e:#}");
+                        }
+                        paused = false;
+                    }
                     if let Err(e) = conn.cancel() {
                         warn!("stopping speech-dispatcher failed: {e:#}");
                     }
+                    // And lift any pause with it. The daemon's pause
+                    // is per client, not per message: left on, it
+                    // holds every reply after this one — silently, and
+                    // then says the lot when scribe exits and the
+                    // socket closes.
                     queue.clear();
+                }
+                Ok(Job::Quit) => {
+                    let _ = conn.cancel();
+                    conn.quit();
+                    return;
                 }
             },
             recv(events) -> event => match event {
@@ -768,6 +809,119 @@ mod tests {
                 Event::Mark(37, "2".into()),
                 Event::End(37)
             ]
+        );
+    }
+
+    /// A daemon that says OK to everything and remembers what it was
+    /// asked, so a worker can be driven without speech-dispatcher.
+    fn fake_daemon() -> (Conn, Arc<Mutex<Vec<String>>>, std::thread::JoinHandle<()>) {
+        let (client, daemon) = UnixStream::pair().unwrap();
+        let (reply_tx, replies) = crossbeam_channel::unbounded();
+        let (event_tx, events) = crossbeam_channel::unbounded();
+        let read = client.try_clone().unwrap();
+        std::thread::spawn(move || read_lines(read, &reply_tx, &event_tx));
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let mut writer = daemon.try_clone().unwrap();
+        let thread = std::thread::spawn(move || {
+            for line in BufReader::new(daemon).lines().map_while(Result::ok) {
+                let line = line.trim().to_string();
+                if line.is_empty() {
+                    continue;
+                }
+                seen.lock().unwrap().push(line.clone());
+                if line == "QUIT" {
+                    break;
+                }
+                let _ = writer.write_all(b"208 OK\r\n");
+            }
+        });
+        let conn = Conn {
+            sock: client,
+            replies,
+            events,
+        };
+        (conn, asked, thread)
+    }
+
+    /// The daemon's pause is per client, not per message, so a stop
+    /// has to lift it: left on, it holds everything said afterwards
+    /// and then lets the lot out when the socket closes. (It does not
+    /// rescue a module wedged by `PAUSE` + `CANCEL` — see
+    /// [`crate::tts::Voice::can_pause`] — it just keeps the daemon's
+    /// own state honest.)
+    #[test]
+    fn stopping_while_paused_lifts_the_pause() {
+        let (conn, asked, daemon) = fake_daemon();
+        let shared = Arc::new(Shared::default());
+        let (jobs, job_rx) = crossbeam_channel::unbounded();
+        let worker = {
+            let shared = shared.clone();
+            std::thread::spawn(move || speak_jobs(conn, &shared, job_rx))
+        };
+        jobs.send(Job::Paused(true)).unwrap();
+        jobs.send(Job::Stop).unwrap();
+        jobs.send(Job::Quit).unwrap();
+        worker.join().unwrap();
+        daemon.join().unwrap();
+        assert_eq!(
+            *asked.lock().unwrap(),
+            vec![
+                "PAUSE SELF",
+                // Lifted before the cancel, so the daemon is never
+                // left holding what comes next.
+                "RESUME SELF",
+                "CANCEL SELF",
+                // Job::Quit, on the way out.
+                "CANCEL SELF",
+                "QUIT",
+            ]
+        );
+    }
+
+    /// The queue lives in the daemon and outlives scribe, so going
+    /// away has to mean cancelling — and waiting until it has been
+    /// said, or the process can exit first and leave the daemon
+    /// reading the backlog aloud to an empty terminal.
+    #[test]
+    fn dropping_cancels_and_waits_for_the_daemon() {
+        let (conn, asked, daemon) = fake_daemon();
+        let shared = Arc::new(Shared::default());
+        let (jobs, job_rx) = crossbeam_channel::unbounded();
+        let thread = {
+            let shared = shared.clone();
+            std::thread::spawn(move || speak_jobs(conn, &shared, job_rx))
+        };
+        let voice = Spd {
+            jobs,
+            shared,
+            thread: Some(thread),
+            choices: Vec::new(),
+            name: "test".into(),
+        };
+        drop(voice);
+        // Already finished: Drop waited for it.
+        daemon.join().unwrap();
+        assert_eq!(*asked.lock().unwrap(), vec!["CANCEL SELF", "QUIT"]);
+    }
+
+    /// Nothing to lift when it was never paused.
+    #[test]
+    fn stopping_unpaused_does_not_resume() {
+        let (conn, asked, daemon) = fake_daemon();
+        let shared = Arc::new(Shared::default());
+        let (jobs, job_rx) = crossbeam_channel::unbounded();
+        let worker = {
+            let shared = shared.clone();
+            std::thread::spawn(move || speak_jobs(conn, &shared, job_rx))
+        };
+        jobs.send(Job::Stop).unwrap();
+        jobs.send(Job::Quit).unwrap();
+        worker.join().unwrap();
+        daemon.join().unwrap();
+        assert_eq!(
+            *asked.lock().unwrap(),
+            vec!["CANCEL SELF", "CANCEL SELF", "QUIT"]
         );
     }
 
@@ -885,6 +1039,50 @@ mod tests {
 #[cfg(test)]
 mod daemon_tests {
     use super::*;
+
+    /// How far into a message the voice really got, and how long it
+    /// really sounded for. Zero time and nothing heard means the
+    /// module took the message and said nothing.
+    fn timed(voice: &Spd, key: i64, text: &str) -> (u128, Option<usize>) {
+        let t = Instant::now();
+        voice.say(key, text);
+        let mut last = None;
+        while voice.busy() && t.elapsed() < Duration::from_secs(30) {
+            if let Some((k, i)) = voice.heard() {
+                if k == key {
+                    last = Some(last.map_or(i, |w: usize| w.max(i)));
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        (t.elapsed().as_millis(), last)
+    }
+
+    /// Cutting a reply off has to leave the next one speakable. The
+    /// way to get this wrong is to pause first: `PAUSE` then `CANCEL`
+    /// wedges the client for good, which is why [`Voice::can_pause`]
+    /// is false here and `--chat` never ducks this engine. Speaks
+    /// aloud; needs a running speech-dispatcher:
+    /// `cargo test -p vox_scribe -- --ignored speaks_again_after`
+    #[test]
+    #[ignore]
+    fn speaks_again_after_a_reply_is_cut_off() {
+        let voice = Spd::open(None).unwrap();
+        voice.say(1, "Talk over this one.");
+        let t = Instant::now();
+        while voice.heard().is_none() && t.elapsed() < Duration::from_secs(20) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(voice.heard().is_some(), "the daemon never started speaking");
+        voice.stop();
+
+        let (ms, heard) = timed(&voice, 2, "And this one is really heard.");
+        assert!(
+            heard.is_some_and(|i| i >= 3) && ms > 300,
+            "the reply after a cut one was never spoken \
+             (heard {heard:?} in {ms}ms)"
+        );
+    }
 
     #[test]
     #[ignore]

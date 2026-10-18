@@ -4,10 +4,10 @@
 conversation with an LLM. It watches the chat's SQLite database for
 what you say, sends it to any OpenAI-compatible chat endpoint (OpenAI,
 llama.cpp, ollama, vLLM, …) together with a system prompt and the
-conversation so far, and streams the reply back into the database a
-sentence at a time, so scribe starts speaking before the reply is done.
-When you talk over a reply, agent stops it and the model is told on the
-next turn where you cut in.
+conversation so far, and streams the reply back into the database as it
+arrives, so scribe starts speaking before the reply is done. When you
+talk over a reply, agent stops it — and on the next turn the model is
+shown only the part you actually heard, marked as interrupted.
 
 ```sh
 agent talk          # in one terminal: answers talk.db

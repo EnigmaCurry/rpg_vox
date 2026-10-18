@@ -296,11 +296,49 @@ a separate responder process (an LLM bridge, say) watches; its reply is
 written back to the same file, a sentence or so at a time, and scribe
 reads it aloud as it arrives.
 
-It's half duplex: from `enter` until the reply has been spoken, the mic
-is muted so scribe doesn't hear itself. `space` holds the reply and
-opens the mic. Start talking and the reply is cut off (and the
-responder is told), or press `space` again to hear the reply again
-from the start.
+By default it's half duplex: from `enter` until the reply has been
+spoken, the mic is muted so scribe doesn't hear itself. `space` holds
+the reply and opens the mic. Start talking and the reply is cut off
+(and the responder is told), or press `space` again to hear the reply
+again from the start.
+
+### Talking over a reply
+
+`--duplex`, or `d` in the chat, leaves the mic open through the reply,
+and then talking over it is all it takes to stop it — no key first.
+**Wear headphones.** On speakers the recognizer hears the reply and the
+responder interrupts itself for ever.
+
+Deciding to stop from sound alone would cut the reply off every time
+you breathed, and waiting for the recognizer would let it talk over you
+for a word or two. So it does both. Any sound ducks the reply at once —
+silent within about 8 ms, and resumable to the sample, because the
+audio is only faded out, not thrown away. Then it waits to see what the
+sound was:
+
+* **Words of your own** stop it for good. Where you got to is written
+  to the database, so the responder drops the rest and the model is
+  shown only what you heard.
+* **An acknowledgement** — "mm-hmm", "yeah", "right", "okay" — doesn't.
+  The reply picks up mid-word, usually before you notice it paused.
+  Three in a row is taken for insistence and does stop it.
+* **A cough, a door, a breath** — anything that never becomes words —
+  and it resumes 400 ms after the noise stops. A noise that goes on
+  without ever becoming speech gives up after two seconds and lets the
+  reply finish, rather than let a noisy room silence it.
+
+The header shows `⇄ DUPLEX` when it's on, and `❚❚ LISTENING OVER` for
+the moment it's waiting to find out.
+
+Ducking needs an engine that can be held mid-word and go on from
+there, which is Kokoro: the samples are scribe's own, so a pause is a
+gain ramp and nothing is thrown away. With `--tts speech-dispatcher`
+there is no duck — the reply is left talking until the words are in
+and then cut off for good, so it talks over you for about a word.
+`PAUSE`/`RESUME` work there on their own, but cancelling a message
+that has been paused wedges the client: pocket-tts then accepts every
+message after it and says nothing, and nothing short of a new
+connection brings it back.
 
 `↑` / `↓` step through the replies in the scrollback, highlighting one;
 `enter` plays it again. `pgup` / `pgdn` scroll. `esc` or `q` returns to
@@ -368,20 +406,36 @@ as Kokoro's words always are.
 
 ### The database
 
-Messages are one table, `messages(id, conversation, role, kind,
-reply_to, text, more, at)`, in WAL mode. Neither side is notified of the
-other's writes: poll for rows with `id` above the last one seen (scribe
-checks every 30 ms). `conversations(id, title, created_at)` names the
-conversations; a reply or interrupt belongs to the conversation of the
-user message it refers to, so a responder only needs to read that
-conversation's rows for context. `settings(key, value)` keeps the
-conversation last open and each one's voice.
+The conversation is one table, `turns(id, conversation, role, text, rev,
+done, spoken, at)`, in WAL mode. One row is one turn, and it grows: a
+responder starts its answer the moment it takes a question up and
+appends to it as the words arrive, so scribe can speak the beginning
+while the end is still being written. Scribe does the same with what it
+hears, rewriting the turn as the transcript firms up.
 
-| Row                                   | Written by | Meaning                                                                                                                                         |
-|---------------------------------------|------------|-------------------------------------------------------------------------------------------------------------------------------------------------|
-| `role='user', kind='say'`             | scribe     | Something the user said and sent.                                                                                                               |
-| `role='assistant', kind='say'`        | responder  | Part of the reply to user row `reply_to`, spoken in `id` order. `more=1` means more is coming and scribe keeps waiting; the last row has `more=0`. An empty row with `more=1` means "thinking": scribe shows a spinner until text arrives (send one as soon as you start on a reply). |
-| `role='user', kind='interrupt'`       | scribe     | The user cut off the reply to `reply_to`. Stop writing it; scribe ignores any more rows for it. A new `say` also supersedes any reply in progress. |
+Neither side is notified of the other's writes. Every insert and every
+update stamps the row with the next `rev`, so one poll for rows with
+`rev` above the last one seen catches new turns and growing ones alike
+(scribe checks every 30 ms). `conversations(id, title, created_at)`
+names the conversations and `settings(key, value)` keeps the one last
+open and each one's voice.
+
+| Column    | Written by | Meaning                                                                                                                                          |
+|-----------|------------|--------------------------------------------------------------------------------------------------------------------------------------------------|
+| `text`    | both       | The turn so far. A responder appends its deltas exactly as they come — spacing included — and scribe decides where the sentences are and speaks them. |
+| `done`    | both       | Nothing more is coming. An assistant turn that is empty and not done is the responder thinking: scribe shows a spinner until words arrive.        |
+| `spoken`  | scribe     | Words of `text` that reached the ear, written when scribe stops playing the turn. Short of the whole turn means the user talked over it, and where. |
+
+A responder's loop is two questions: is the newest turn the user's and
+finished (nothing has been written after it, so nobody has taken it up),
+and has the user written — or rewritten — anything since the revision I
+started from? The second going true means the answer in progress is no
+longer the one that was wanted: stop, and mark the turn done.
+
+Because speech is interruptible, the record has to say how much of a
+reply reached the ear, not just what was written. A reply the user
+talked over goes into the model's history as the part they actually
+heard, marked as interrupted — all they can be answering.
 
 ## Pass 4: LLM proofreading (optional)
 

@@ -130,6 +130,12 @@ struct Cli {
     /// database), but nothing else has to.
     #[arg(long, requires = "chat")]
     no_responder: bool,
+    /// Leave the mic open while a --chat reply is spoken, so talking
+    /// over it is all it takes to stop it. Wear headphones: on speakers
+    /// the recognizer hears the reply and it interrupts itself for
+    /// ever. `d` turns it on and off while the chat is open.
+    #[arg(long, requires = "chat", env = "VOX_SCRIBE_DUPLEX")]
+    duplex: bool,
     /// Dictate into NAME.md (`.md` is added if missing), editing it as
     /// you go: move the cursor where new speech goes, delete selected
     /// words or the last sentence, break paragraphs, type by hand. An
@@ -1409,7 +1415,7 @@ fn main() -> Result<()> {
             let path = chatdb::path_for(name);
             let engine = speaking.expect("--chat settles on an engine");
             let (voice, voice_name) = tts::chat_voice(engine, &models_dir, &cli.voices, &path)?;
-            return chat::run(screen, session, &path, voice, voice_name);
+            return chat::run(screen, session, &path, voice, voice_name, cli.duplex);
         }
     }
     if let Some(name) = &cli.dictate {

@@ -7,7 +7,7 @@
 //! the caller shows. Pausing and flushing (for seeks) are flags the
 //! callback obeys, so the realtime side never blocks or allocates.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -21,6 +21,10 @@ use anyhow::{Context as _, Result};
 /// buffers for a 256-frame quantum.
 const BUFFER: Duration = Duration::from_millis(500);
 
+/// Frames the pause ramp takes: about 8 ms at 48 kHz, short enough not
+/// to be heard as a fade and long enough not to be heard as a click.
+const FADE_FRAMES: u32 = 384;
+
 #[derive(Default)]
 pub(crate) struct Shared {
     /// Frames played since the last flush.
@@ -29,6 +33,10 @@ pub(crate) struct Shared {
     /// empty: gaps, heard as choppy speech.
     pub starved: AtomicU64,
     pub paused: AtomicBool,
+    /// Playback gain, ramped toward 0 while paused and back to 1 after,
+    /// so stopping mid-word fades instead of clicking. Only the device
+    /// callback touches it; it holds the bits of an `f32`.
+    pub gain: AtomicU32,
     /// Set by [`Output::flush`]; the callback empties the ring, zeroes
     /// `played` and clears it.
     pub flush: AtomicBool,
@@ -49,19 +57,34 @@ impl Shared {
                 chunk.commit_all();
             }
             self.played.store(0, Ordering::Release);
+            // Silent again, so whatever is queued next fades in.
+            self.gain.store(0f32.to_bits(), Ordering::Relaxed);
             self.flush.store(false, Ordering::Release);
         }
-        let paused = self.paused.load(Ordering::Relaxed);
+        let target = if self.paused.load(Ordering::Relaxed) {
+            0.0
+        } else {
+            1.0
+        };
+        let mut gain = f32::from_bits(self.gain.load(Ordering::Relaxed));
+        let step = 1.0 / FADE_FRAMES as f32;
         let mut played = 0;
         let mut starved = 0;
         for f in 0..frames {
-            let s = if paused {
+            gain = if gain < target {
+                (gain + step).min(target)
+            } else {
+                (gain - step).max(target)
+            };
+            // Silent and staying silent: leave the ring where it is, so
+            // letting go picks the word up mid-breath.
+            let s = if gain <= 0.0 {
                 0.0
             } else {
                 match ring.pop() {
                     Ok(s) => {
                         played += 1;
-                        s
+                        s * gain
                     }
                     Err(_) => {
                         starved += 1;
@@ -71,6 +94,7 @@ impl Shared {
             };
             put(f, s);
         }
+        self.gain.store(gain.to_bits(), Ordering::Relaxed);
         if played > 0 {
             self.played.fetch_add(played, Ordering::Release);
         }
@@ -409,6 +433,55 @@ fn open_backend(_shared: Arc<Shared>) -> Result<Opened> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Feed `frames` through `shared` and give back what came out.
+    fn pull(shared: &Shared, ring: &mut rtrb::Consumer<f32>, frames: usize) -> Vec<f32> {
+        let mut out = vec![0.0; frames];
+        shared.fill(ring, frames, |f, s| out[f] = s);
+        out
+    }
+
+    /// Ducking a reply has to be silent almost at once, but not so at
+    /// once that it clicks — and letting go has to pick the word up
+    /// where it stopped, not a buffer later.
+    #[test]
+    fn pausing_fades_out_and_resumes_where_it_stopped() {
+        let n = FADE_FRAMES as usize * 8;
+        let (mut tx, mut rx) = rtrb::RingBuffer::<f32>::new(n);
+        for _ in 0..n {
+            tx.push(1.0).unwrap();
+        }
+        let shared = Shared::default();
+
+        // It fades in rather than starting on a step.
+        let start = pull(&shared, &mut rx, FADE_FRAMES as usize);
+        assert!(start[0] < 0.01, "started at {}", start[0]);
+        assert!(start[start.len() - 1] > 0.99);
+        let full = pull(&shared, &mut rx, 100);
+        assert!(full.iter().all(|&s| (s - 1.0).abs() < 1e-6));
+
+        // Ducked: silent within the ramp, and no step on the way.
+        shared.paused.store(true, Ordering::Relaxed);
+        let fade = pull(&shared, &mut rx, FADE_FRAMES as usize + 50);
+        assert_eq!(fade.last(), Some(&0.0));
+        assert!(
+            fade.windows(2).all(|w| (w[0] - w[1]).abs() < 0.01),
+            "fade-out steps instead of ramping"
+        );
+
+        // Silent, and the ring is left alone: nothing is thrown away
+        // while it waits to see what the sound was.
+        let eaten = n - rx.slots();
+        assert!(pull(&shared, &mut rx, 1000).iter().all(|&s| s == 0.0));
+        assert_eq!(rx.slots(), n - eaten, "ate the reply while ducked");
+
+        // Letting go: back up, and it is the same word.
+        shared.paused.store(false, Ordering::Relaxed);
+        let back = pull(&shared, &mut rx, FADE_FRAMES as usize);
+        assert!(back[0] < 0.01);
+        assert!(back[back.len() - 1] > 0.99);
+        assert!(rx.slots() < n - eaten, "resumed without reading on");
+    }
 
     #[test]
     #[ignore]

@@ -1,35 +1,43 @@
-//! The `scribe --chat` database: a table of messages that scribe and a
-//! responder (`agent`, or `scribe chat-echo`) both write. Neither side is
-//! notified of the other's writes; each polls for rows after the last
-//! id it has seen, which is cheap and well under the time a reply takes.
+//! The `scribe --chat` database: one table of turns that scribe and a
+//! responder (`agent`, or `scribe chat-echo`) both write. Neither side
+//! is notified of the other's writes; each polls for whatever has
+//! changed since the revision it last saw.
 //!
 //! ```sql
-//! messages(id, conversation, role, kind, reply_to, text, more, at)
+//! turns(id, conversation, role, text, rev, done, spoken, at)
 //! conversations(id, title, created_at)
 //! settings(key, value)
 //! ```
 //!
-//! One database holds any number of conversations; every message belongs
-//! to one. A reply or interrupt belongs to the conversation of the user
-//! message it refers to (`reply_to`), filled in by [`Db::reply`] and
-//! [`Db::interrupt`], so a responder needn't track conversations.
+//! One row is one turn of the conversation, and it grows: the responder
+//! [`Db::start`]s its answer the moment it begins and [`Db::extend`]s it
+//! as the words arrive, so scribe can speak the beginning while the end
+//! is still being written. Scribe does the same with what it hears,
+//! [`Db::revise`]ing the turn as the transcript firms up. `done` says
+//! nothing more is coming.
 //!
-//! * `role = 'user', kind = 'say'`: something the user said and sent
-//!   with Enter.
-//! * `role = 'assistant', kind = 'say'`: part of the reply to user row
-//!   `reply_to`, spoken in id order. A reply may come in any number of
-//!   rows (a sentence at a time, or several separate utterances); every
-//!   row but the last has `more = 1`, and scribe keeps waiting for the
-//!   rest. The last has `more = 0`, and scribe listens again once it has
-//!   been spoken. An empty row with `more = 1` means "thinking": scribe
-//!   shows a spinner until text (or `more = 0`) arrives. A responder
-//!   should send one as soon as it starts on a reply.
-//! * `role = 'user', kind = 'interrupt'`: the user cut off the reply to
-//!   `reply_to` (by talking over it). The responder should stop writing
-//!   that reply; scribe ignores any more rows for it. A new `say` from
-//!   the user also supersedes any reply still in progress.
+//! Every insert and every update stamps the row with the next `rev`, so
+//! one `WHERE rev > ?` (see [`Db::since`]) sees new turns and growing
+//! ones alike. That is the only thing either side has to poll.
 //!
-//! A responder also says it is there, every [`RESPONDER_BEAT`], with
+//! # Where the listener got to
+//!
+//! Speech is interruptible, so the record has to say how much of a
+//! reply reached the ear, not just what was written. `spoken` is that:
+//! the number of words of `text` scribe actually played. A turn with
+//! `spoken` short of its word count was cut off ([`Turn::cut`]), and
+//! [`Turn::heard`] is the part the user got — which is what a responder
+//! should put in the model's history, since it is all the user can be
+//! answering.
+//!
+//! Scribe writes `spoken` when it *stops* playing a turn: cut off, or
+//! finished. It must not write it merely because it has caught up with
+//! a turn still being written, or the turn would read as interrupted.
+//! That contract is the one thing the schema can't enforce.
+//!
+//! # Who is listening
+//!
+//! A responder says it is there, every [`RESPONDER_BEAT`], with
 //! [`Db::responding`]; scribe reads it with [`Db::responder`] and
 //! refuses to open a chat nobody is listening to. Nothing else depends
 //! on it, so a responder written elsewhere works without one — it just
@@ -47,16 +55,24 @@ CREATE TABLE IF NOT EXISTS conversations (
     title      TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
-CREATE TABLE IF NOT EXISTS messages (
-    id       INTEGER PRIMARY KEY,
-    conversation INTEGER REFERENCES conversations(id),
-    role     TEXT    NOT NULL CHECK (role IN ('user', 'assistant')),
-    kind     TEXT    NOT NULL DEFAULT 'say' CHECK (kind IN ('say', 'interrupt')),
-    reply_to INTEGER REFERENCES messages(id),
-    text     TEXT    NOT NULL DEFAULT '',
-    more     INTEGER NOT NULL DEFAULT 0,
-    at       TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+CREATE TABLE IF NOT EXISTS turns (
+    id           INTEGER PRIMARY KEY,
+    conversation INTEGER NOT NULL REFERENCES conversations(id),
+    role         TEXT    NOT NULL CHECK (role IN ('user', 'assistant')),
+    -- Grows as it is written; empty while the responder is still thinking.
+    text         TEXT    NOT NULL DEFAULT '',
+    -- Bumped past every other row's on each insert and update: what
+    -- both sides poll on.
+    rev          INTEGER NOT NULL,
+    -- Nothing more is coming.
+    done         INTEGER NOT NULL DEFAULT 0,
+    -- Words of `text` that reached the ear; NULL until it stopped being
+    -- spoken. Short of the whole turn means the listener cut it off.
+    spoken       INTEGER,
+    at           TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
+CREATE INDEX IF NOT EXISTS turns_by_rev ON turns (rev);
+CREATE INDEX IF NOT EXISTS turns_by_conversation ON turns (conversation, id);
 -- Choices kept with the database: `conversation` (the one last open),
 -- `voice.<conversation id>` (the voice of its replies), and the
 -- responder's heartbeat: `responder` (what it calls itself) and
@@ -67,29 +83,80 @@ CREATE TABLE IF NOT EXISTS settings (
 );
 ";
 
+/// The next revision, for the row being written. A single statement, so
+/// two writers can't land on the same number: SQLite serializes them.
+const NEXT_REV: &str = "(SELECT coalesce(max(rev), 0) + 1 FROM turns)";
+
+/// The columns [`Db::read`] expects, in order.
+const COLS: &str = "id, conversation, role, text, rev, done, spoken, at";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     User,
     Assistant,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Kind {
-    Say,
-    Interrupt,
+impl Role {
+    fn as_str(self) -> &'static str {
+        match self {
+            Role::User => "user",
+            Role::Assistant => "assistant",
+        }
+    }
 }
 
+/// One turn of the conversation.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Row {
+pub struct Turn {
     pub id: i64,
     pub conversation: i64,
     pub role: Role,
-    pub kind: Kind,
-    pub reply_to: Option<i64>,
+    /// What has been written of it so far.
     pub text: String,
-    pub more: bool,
-    /// When it was written, UTC: `2026-10-06T17:09:24.123Z`.
+    /// Stamped afresh every time the row is written.
+    pub rev: i64,
+    /// Nothing more is coming.
+    pub done: bool,
+    /// Words of `text` that reached the ear, once it stopped being
+    /// spoken. `None` while it hasn't been, or is still being, played.
+    pub spoken: Option<usize>,
+    /// When it was started, UTC: `2026-10-06T17:09:24.123Z`.
     pub at: String,
+}
+
+impl Turn {
+    /// Words in the whole turn.
+    pub fn words(&self) -> usize {
+        self.text.split_whitespace().count()
+    }
+
+    /// Playback stopped short: the listener only got [`Turn::heard`].
+    pub fn cut(&self) -> bool {
+        self.spoken.is_some_and(|n| n < self.words())
+    }
+
+    /// The part of the turn that reached the ear. The whole of it
+    /// unless it was cut off — including while it is still being
+    /// spoken, when nothing is known yet and all of it may still be.
+    pub fn heard(&self) -> &str {
+        let Some(n) = self.spoken else {
+            return self.text.trim_end();
+        };
+        if n == 0 {
+            return "";
+        }
+        // Scanning on from the last word found keeps the cut between
+        // words, wherever the whitespace falls.
+        let mut end = 0;
+        for (seen, w) in self.text.split_whitespace().enumerate() {
+            let at = self.text[end..].find(w).map_or(end, |i| end + i);
+            end = at + w.len();
+            if seen + 1 == n {
+                break;
+            }
+        }
+        &self.text[..end]
+    }
 }
 
 /// `NAME.db`, unless NAME already ends in `.db`.
@@ -131,9 +198,9 @@ pub fn beat(path: &Path, who: &str) -> Result<()> {
 pub struct Conversation {
     pub id: i64,
     pub title: String,
-    /// Its last message (or its creation), local time, `2026-10-06 17:09`.
+    /// Its last turn (or its creation), local time, `2026-10-06 17:09`.
     pub last: String,
-    pub messages: i64,
+    pub turns: i64,
 }
 
 /// A new conversation's title until it is renamed: the local date and time.
@@ -193,12 +260,12 @@ impl Db {
     pub fn conversations(&self) -> Result<Vec<Conversation>> {
         let mut stmt = self.conn.prepare(
             "SELECT c.id, c.title,
-                    strftime('%Y-%m-%d %H:%M', coalesce(max(m.at), c.created_at), 'localtime')
+                    strftime('%Y-%m-%d %H:%M', coalesce(max(t.at), c.created_at), 'localtime')
                         AS last,
-                    count(m.id)
-             FROM conversations c LEFT JOIN messages m ON m.conversation = c.id
+                    count(t.id)
+             FROM conversations c LEFT JOIN turns t ON t.conversation = c.id
              GROUP BY c.id
-             ORDER BY coalesce(max(m.at), c.created_at) DESC, c.id DESC",
+             ORDER BY coalesce(max(t.at), c.created_at) DESC, c.id DESC",
         )?;
         let list = stmt
             .query_map([], |r| {
@@ -206,7 +273,7 @@ impl Db {
                     id: r.get(0)?,
                     title: r.get(1)?,
                     last: r.get(2)?,
-                    messages: r.get(3)?,
+                    turns: r.get(3)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -235,66 +302,128 @@ impl Db {
         self.set_setting("conversation", &conversation.to_string())
     }
 
-    /// The user said `text` in `conversation`. Returns its id.
-    pub fn say(&self, conversation: i64, text: &str) -> Result<i64> {
-        self.insert(Some(conversation), Role::User, Kind::Say, None, text, false)
-    }
-
-    /// The user cut off the reply to `reply_to`.
-    pub fn interrupt(&self, reply_to: i64) -> Result<i64> {
-        self.insert(None, Role::User, Kind::Interrupt, Some(reply_to), "", false)
-    }
-
-    /// Part of the reply to `reply_to`; `more` if the rest is coming.
-    pub fn reply(&self, reply_to: i64, text: &str, more: bool) -> Result<i64> {
-        self.insert(None, Role::Assistant, Kind::Say, Some(reply_to), text, more)
-    }
-
-    /// `conversation` defaults to that of `reply_to`.
-    fn insert(
-        &self,
-        conversation: Option<i64>,
-        role: Role,
-        kind: Kind,
-        reply_to: Option<i64>,
-        text: &str,
-        more: bool,
-    ) -> Result<i64> {
-        let role = match role {
-            Role::User => "user",
-            Role::Assistant => "assistant",
-        };
-        let kind = match kind {
-            Kind::Say => "say",
-            Kind::Interrupt => "interrupt",
-        };
+    /// Begin a turn, with as much of it as is known. Returns its id, to
+    /// pass to [`Db::extend`], [`Db::revise`] and [`Db::spoken`].
+    pub fn start(&self, conversation: i64, role: Role, text: &str, done: bool) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO messages (conversation, role, kind, reply_to, text, more)
-             VALUES (coalesce(?1, (SELECT conversation FROM messages WHERE id = ?3)),
-                     ?2, ?4, ?3, ?5, ?6)",
-            params![conversation, role, reply_to, kind, text, more as i64],
+            &format!(
+                "INSERT INTO turns (conversation, role, text, rev, done)
+                 VALUES (?1, ?2, ?3, {NEXT_REV}, ?4)"
+            ),
+            params![conversation, role.as_str(), text, done as i64],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
 
-    /// Rows after `id`, in every conversation, oldest first.
-    pub fn since(&self, id: i64) -> Result<Vec<Row>> {
-        self.rows("WHERE id > ?1", id)
+    /// Add `piece` to the end of a turn, exactly as given: the caller
+    /// owns the spacing, so a stream of deltas reads back as it came.
+    pub fn extend(&self, turn: i64, piece: &str, done: bool) -> Result<()> {
+        self.conn.execute(
+            &format!(
+                "UPDATE turns SET text = text || ?2, done = ?3, rev = {NEXT_REV} WHERE id = ?1"
+            ),
+            params![turn, piece, done as i64],
+        )?;
+        Ok(())
     }
 
-    /// Every row of `conversation`, oldest first.
-    pub fn rows_in(&self, conversation: i64) -> Result<Vec<Row>> {
-        self.rows("WHERE conversation = ?1", conversation)
+    /// Replace a turn's text: what a transcript does as it firms up.
+    pub fn revise(&self, turn: i64, text: &str, done: bool) -> Result<()> {
+        self.conn.execute(
+            &format!("UPDATE turns SET text = ?2, done = ?3, rev = {NEXT_REV} WHERE id = ?1"),
+            params![turn, text, done as i64],
+        )?;
+        Ok(())
     }
 
-    fn rows(&self, filter: &str, arg: i64) -> Result<Vec<Row>> {
-        let mut stmt = self.conn.prepare_cached(&format!(
-            "SELECT id, coalesce(conversation, 0), role, kind, reply_to, text, more, at
-             FROM messages {filter} ORDER BY id"
-        ))?;
-        let rows = stmt
-            .query_map([arg], |r| {
-                Ok(Row {
+    /// Record that `words` of the turn reached the ear. Only ever
+    /// raised: hearing an earlier reply again doesn't unhear it.
+    ///
+    /// Scribe calls this when it stops playing a turn — never while it
+    /// is only waiting for more of one, which would read as a cut.
+    pub fn spoken(&self, turn: i64, words: usize) -> Result<()> {
+        self.conn.execute(
+            &format!(
+                "UPDATE turns SET spoken = max(coalesce(spoken, 0), ?2), rev = {NEXT_REV}
+                 WHERE id = ?1"
+            ),
+            params![turn, words as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Everything written or rewritten since revision `rev`, oldest
+    /// change first. The one thing both sides poll.
+    pub fn since(&self, rev: i64) -> Result<Vec<Turn>> {
+        self.read("WHERE rev > ?1 ORDER BY rev", [rev])
+    }
+
+    /// Every turn of `conversation`, oldest first.
+    pub fn turns_in(&self, conversation: i64) -> Result<Vec<Turn>> {
+        self.read("WHERE conversation = ?1 ORDER BY id", [conversation])
+    }
+
+    pub fn turn(&self, id: i64) -> Result<Option<Turn>> {
+        Ok(self.read("WHERE id = ?1", [id])?.pop())
+    }
+
+    /// The newest thing the user said, answered or not. A responder
+    /// tracks which one it last took up, rather than reading that off
+    /// the order of the rows: a reply begun just as the user said
+    /// something new lands *after* that new turn, which would leave it
+    /// looking answered for ever.
+    pub fn newest_user(&self) -> Result<Option<Turn>> {
+        Ok(self
+            .read("WHERE role = 'user' ORDER BY id DESC LIMIT 1", [])?
+            .pop())
+    }
+
+    /// The newest turn, if the user is the one waiting: nothing has
+    /// been written after it, so nobody has taken it up. What a
+    /// responder checks when it starts, to tell a conversation that
+    /// is waiting on it from one that is finished with.
+    pub fn unanswered(&self) -> Result<Option<Turn>> {
+        Ok(self
+            .read(
+                "WHERE id = (SELECT max(id) FROM turns) AND role = 'user'",
+                [],
+            )?
+            .pop())
+    }
+
+    /// The user has written, or rewritten, something since revision
+    /// `rev`: a reply begun before it is answering the wrong thing.
+    pub fn said_since(&self, rev: i64) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM turns WHERE role = 'user' AND rev > ?1 LIMIT 1",
+                [rev],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// The newest revision in the database; 0 when it is empty.
+    pub fn rev(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("SELECT max(rev) FROM turns", [], |r| {
+                r.get::<_, Option<i64>>(0)
+            })
+            .optional()?
+            .flatten()
+            .unwrap_or(0))
+    }
+
+    fn read(&self, filter: &str, args: impl rusqlite::Params) -> Result<Vec<Turn>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached(&format!("SELECT {COLS} FROM turns {filter}"))?;
+        let turns = stmt
+            .query_map(args, |r| {
+                Ok(Turn {
                     id: r.get(0)?,
                     conversation: r.get(1)?,
                     role: if r.get::<_, String>(2)? == "assistant" {
@@ -302,19 +431,15 @@ impl Db {
                     } else {
                         Role::User
                     },
-                    kind: if r.get::<_, String>(3)? == "interrupt" {
-                        Kind::Interrupt
-                    } else {
-                        Kind::Say
-                    },
-                    reply_to: r.get(4)?,
-                    text: r.get(5)?,
-                    more: r.get::<_, i64>(6)? != 0,
+                    text: r.get(3)?,
+                    rev: r.get(4)?,
+                    done: r.get::<_, i64>(5)? != 0,
+                    spoken: r.get::<_, Option<i64>>(6)?.map(|n| n as usize),
                     at: r.get(7)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
+        Ok(turns)
     }
 
     /// A setting kept with the database.
@@ -364,22 +489,21 @@ impl Db {
             .optional()?
             .flatten())
     }
-
-    pub fn last_id(&self) -> Result<i64> {
-        Ok(self
-            .conn
-            .query_row("SELECT max(id) FROM messages", [], |r| {
-                r.get::<_, Option<i64>>(0)
-            })
-            .optional()?
-            .flatten()
-            .unwrap_or(0))
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A database of its own per test, so they can run at once.
+    fn db(name: &str) -> (PathBuf, Db) {
+        let dir = std::env::temp_dir().join(format!("vox-chat-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.db");
+        let _ = std::fs::remove_file(&path);
+        let open = Db::open(&path).unwrap();
+        (path, open)
+    }
 
     #[test]
     fn names_get_db() {
@@ -390,11 +514,7 @@ mod tests {
 
     #[test]
     fn a_responder_is_only_there_while_it_beats() {
-        let dir = std::env::temp_dir().join(format!("scribe-responder-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("t.db");
-        let _ = std::fs::remove_file(&path);
-        let db = Db::open(&path).unwrap();
+        let (_p, db) = db("responder");
         // Nobody has said anything yet.
         assert_eq!(db.responder(RESPONDER_STALE).unwrap(), None);
         db.responding("agent 123").unwrap();
@@ -410,51 +530,184 @@ mod tests {
             db.responder(RESPONDER_STALE).unwrap().as_deref(),
             Some("chat-echo 456")
         );
-        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The whole point of `rev`: one poll sees a turn appear and then
+    /// sees it grow, without the reader having to ask about it again.
+    #[test]
+    fn one_poll_sees_new_turns_and_growing_ones() {
+        let (path, a) = db("rev");
+        let b = Db::open(&path).unwrap();
+        let conv = a.current().unwrap();
+        let mut seen = b.rev().unwrap();
+        assert_eq!(seen, 0);
+
+        let said = a.start(conv, Role::User, "Tell me a", false).unwrap();
+        let new = b.since(seen).unwrap();
+        assert_eq!(new.len(), 1);
+        assert!(!new[0].done);
+        seen = new[0].rev;
+
+        // The transcript firms up: the same row, a later revision.
+        a.revise(said, "Tell me a joke.", true).unwrap();
+        let new = b.since(seen).unwrap();
+        assert_eq!(new.len(), 1);
+        assert_eq!(new[0].id, said);
+        assert_eq!(new[0].text, "Tell me a joke.");
+        assert!(new[0].done);
+        seen = new[0].rev;
+        assert!(seen > 1);
+
+        // A reply begins empty — that is what "thinking" looks like —
+        // and is appended to verbatim, spacing and all.
+        let reply = b.start(conv, Role::Assistant, "", false).unwrap();
+        b.extend(reply, "Why did the", false).unwrap();
+        b.extend(reply, " chicken cross the road?", true).unwrap();
+        let turn = a.turn(reply).unwrap().unwrap();
+        assert_eq!(turn.text, "Why did the chicken cross the road?");
+        assert!(turn.done);
+        // Three writes to one row, but only the one row to catch up on.
+        assert_eq!(a.since(seen).unwrap().len(), 1);
+        assert!(turn.rev > seen);
     }
 
     #[test]
-    fn round_trips_rows() {
-        let dir = std::env::temp_dir().join(format!("scribe-chatdb-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("t.db");
-        let _ = std::fs::remove_file(&path);
-        let a = Db::open(&path).unwrap();
+    fn a_turn_knows_how_much_of_it_was_heard() {
+        let (_p, db) = db("heard");
+        let conv = db.current().unwrap();
+        let id = db
+            .start(conv, Role::Assistant, "One two three four five.", true)
+            .unwrap();
+
+        // Nothing is known until playback stops: all of it may yet be.
+        let t = db.turn(id).unwrap().unwrap();
+        assert_eq!(t.spoken, None);
+        assert!(!t.cut());
+        assert_eq!(t.heard(), "One two three four five.");
+
+        db.spoken(id, 2).unwrap();
+        let t = db.turn(id).unwrap().unwrap();
+        assert!(t.cut());
+        assert_eq!(t.heard(), "One two");
+
+        // Heard again, further in: it only ever rises.
+        db.spoken(id, 4).unwrap();
+        assert_eq!(db.turn(id).unwrap().unwrap().heard(), "One two three four");
+        db.spoken(id, 1).unwrap();
+        assert_eq!(db.turn(id).unwrap().unwrap().heard(), "One two three four");
+
+        // Spoken to the end: not a cut.
+        db.spoken(id, 5).unwrap();
+        let t = db.turn(id).unwrap().unwrap();
+        assert!(!t.cut());
+        assert_eq!(t.heard(), "One two three four five.");
+    }
+
+    #[test]
+    fn nothing_heard_is_not_the_whole_turn() {
+        let (_p, db) = db("unheard");
+        let conv = db.current().unwrap();
+        let id = db.start(conv, Role::Assistant, "Never mind.", false).unwrap();
+        db.spoken(id, 0).unwrap();
+        let t = db.turn(id).unwrap().unwrap();
+        assert_eq!(t.heard(), "");
+        assert!(t.cut());
+    }
+
+    /// A responder's two questions: is there anything to answer, and is
+    /// the answer I am writing still the one that was wanted?
+    #[test]
+    fn a_responder_knows_what_to_answer_and_when_to_stop() {
+        let (_p, db) = db("answering");
+        let conv = db.current().unwrap();
+        assert_eq!(db.unanswered().unwrap(), None);
+
+        let said = db.start(conv, Role::User, "Hello.", true).unwrap();
+        let waiting = db.unanswered().unwrap().unwrap();
+        assert_eq!(waiting.id, said);
+        assert!(waiting.done);
+
+        // Taking it up is enough to stop it being unanswered.
+        let reply = db.start(conv, Role::Assistant, "", false).unwrap();
+        assert_eq!(db.unanswered().unwrap(), None);
+        assert!(!db.said_since(waiting.rev).unwrap());
+
+        // The user talks over it: the reply in progress is stale.
+        db.start(conv, Role::User, "Actually, no.", true).unwrap();
+        assert!(db.said_since(waiting.rev).unwrap());
+        db.extend(reply, "Hi there.", true).unwrap();
+        db.spoken(reply, 1).unwrap();
+        // ...and the newest thing said is waiting for an answer.
+        assert_eq!(
+            db.unanswered().unwrap().map(|t| t.text),
+            Some("Actually, no.".into())
+        );
+    }
+
+    /// Revising a message counts as saying something: a reply begun
+    /// against the half-heard version of it is answering the wrong text.
+    #[test]
+    fn rewriting_what_was_said_supersedes_a_reply_too() {
+        let (_p, db) = db("revised");
+        let conv = db.current().unwrap();
+        let said = db.start(conv, Role::User, "Play the", false).unwrap();
+        let at = db.turn(said).unwrap().unwrap().rev;
+        db.start(conv, Role::Assistant, "", false).unwrap();
+        assert!(!db.said_since(at).unwrap());
+        db.revise(said, "Play the second one.", true).unwrap();
+        assert!(db.said_since(at).unwrap());
+    }
+
+    /// A reply begun just as the user says something new is written
+    /// after it, so the row order alone makes the new turn look
+    /// answered. That is why a responder tracks what it took up.
+    #[test]
+    fn a_late_reply_hides_the_turn_it_did_not_answer() {
+        let (_p, db) = db("late");
+        let conv = db.current().unwrap();
+        let first = db.start(conv, Role::User, "Hello.", true).unwrap();
+        // The user carries on before the responder has written a word.
+        let second = db.start(conv, Role::User, "Actually, wait.", true).unwrap();
+        // ...and only now does the reply to the *first* turn appear.
+        db.start(conv, Role::Assistant, "", false).unwrap();
+
+        // Nothing is the newest row, so nothing looks unanswered —
+        // though the second turn has had no answer at all.
+        assert_eq!(db.unanswered().unwrap(), None);
+        let newest = db.newest_user().unwrap().unwrap();
+        assert_eq!(newest.id, second);
+        assert_ne!(newest.id, first);
+    }
+
+    #[test]
+    fn conversations_keep_their_own_turns() {
+        let (path, a) = db("conversations");
         let b = Db::open(&path).unwrap();
         let conv = a.current().unwrap();
-        let said = a.say(conv, "hello").unwrap();
-        b.reply(said, "hi", true).unwrap();
-        a.interrupt(said).unwrap();
-        let rows = a.since(0).unwrap();
-        assert_eq!(rows.len(), 3);
-        assert_eq!(rows[1].role, Role::Assistant);
-        assert_eq!(rows[1].reply_to, Some(said));
-        assert!(rows[1].more);
-        assert_eq!(rows[2].kind, Kind::Interrupt);
-        assert_eq!(b.last_id().unwrap(), rows[2].id);
-        assert_eq!(a.since(rows[1].id).unwrap().len(), 1);
-        assert_eq!(a.setting("voice").unwrap(), None);
-        a.set_setting("voice", "af_heart").unwrap();
-        b.set_setting("voice", "bm_george").unwrap();
-        assert_eq!(a.setting("voice").unwrap().as_deref(), Some("bm_george"));
-        // Replies and interrupts land in the user message's conversation.
-        assert!(rows.iter().all(|r| r.conversation == conv));
+        a.start(conv, Role::User, "Hi.", true).unwrap();
+        a.start(conv, Role::Assistant, "Hello.", true).unwrap();
         let other = b.new_conversation().unwrap();
-        let said2 = b.say(other, "elsewhere").unwrap();
-        a.reply(said2, "there", false).unwrap();
-        assert_eq!(a.rows_in(other).unwrap().len(), 2);
-        assert_eq!(a.rows_in(conv).unwrap().len(), 3);
-        // Most recent first, and the current one is remembered.
+        b.start(other, Role::User, "Elsewhere.", true).unwrap();
+        assert_eq!(a.turns_in(conv).unwrap().len(), 2);
+        assert_eq!(a.turns_in(other).unwrap().len(), 1);
+
+        // Most recent first, with its turns counted.
         let list = a.conversations().unwrap();
         assert_eq!(
             list.iter().map(|c| c.id).collect::<Vec<_>>(),
             vec![other, conv]
         );
-        assert_eq!(list[0].messages, 2);
+        assert_eq!(list[0].turns, 1);
+
         a.rename(conv, "Dragons").unwrap();
         assert_eq!(b.title(conv).unwrap().as_deref(), Some("Dragons"));
         a.set_current(conv).unwrap();
         assert_eq!(b.current().unwrap(), conv);
-        let _ = std::fs::remove_dir_all(&dir);
+
+        // Settings are shared by whoever has the file open.
+        assert_eq!(a.setting("voice").unwrap(), None);
+        a.set_setting("voice", "af_heart").unwrap();
+        b.set_setting("voice", "bm_george").unwrap();
+        assert_eq!(a.setting("voice").unwrap().as_deref(), Some("bm_george"));
     }
 }

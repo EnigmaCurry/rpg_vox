@@ -1,10 +1,14 @@
 //! `--chat NAME`: talk with a responder through NAME.db (see
 //! [`crate::chatdb`]). What you say is held until Enter sends it. Then
-//! it's the responder's turn: the mic is muted (half duplex, so it
-//! doesn't hear the reply) until the reply has been read aloud and the
-//! responder says it has no more. Space holds the reply and opens the
-//! mic: start talking and the reply is cut off, or press space again to
-//! hear it again from the start.
+//! it's the responder's turn, until the reply has been read aloud and
+//! the responder says it has no more. Space holds the reply and opens
+//! the mic: start talking and the reply is cut off, or press space
+//! again to hear it again from the start.
+//!
+//! With `--duplex` (`d`) the mic never closes and talking over a reply
+//! is all it takes to stop it — see [`Chat::barge_in`]. That needs
+//! headphones: on speakers the recogniser hears the reply and the
+//! responder interrupts itself for ever.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -21,7 +25,7 @@ use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 use vox_transcribe::{Change, Event, Stage, Transcript};
 
-use crate::chatdb::{Conversation, Db, Kind, Role, Row};
+use crate::chatdb::{Conversation, Db, Role, Turn as Row};
 use crate::tts::Voice;
 use crate::tui::{normalize_key, Screen};
 use crate::Session;
@@ -32,19 +36,36 @@ const STATUS_TTL: Duration = Duration::from_secs(3);
 const TAIL: Duration = Duration::from_millis(300);
 /// Auto mode (`m`): send once there has been no speech for this long.
 const AUTO_SEND: Duration = Duration::from_millis(1500);
+/// Duplex (`d`): how long a sound that ducked the reply has to turn
+/// into words before the reply picks up again.
+const BARGE_DECIDE: Duration = Duration::from_millis(400);
+/// A sound that goes on this long without a word in it was never
+/// speech — a fan, a door, music — so stop waiting on it and let the
+/// reply go on rather than be silenced by a noisy room.
+const BARGE_GIVE_UP: Duration = Duration::from_secs(2);
 const YOU: Color = Color::Cyan;
 const THEM: Color = Color::Indexed(117);
 const GUTTER: usize = 11;
 /// [`Voice`] key for the `v` menu's sample line (no reply has it).
 const SAMPLE: i64 = -1;
 
+/// A turn as shown: the database row, and how much of it the voice has
+/// been given. Rows grow, so `said` is where speaking has got to.
 struct Turn {
-    role: Role,
-    /// The user message this answers (assistant turns).
-    reply_to: Option<i64>,
-    text: String,
-    /// Cut off by the user.
-    cut: bool,
+    row: Row,
+    /// Words of `row.text` already handed to the voice.
+    said: usize,
+}
+
+impl Turn {
+    fn text(&self) -> &str {
+        &self.row.text
+    }
+
+    /// Cut off by the user; the rest never reached the ear.
+    fn cut(&self) -> bool {
+        self.row.cut()
+    }
 }
 
 struct Chat<'a> {
@@ -53,11 +74,13 @@ struct Chat<'a> {
     voice: Voice,
     transcript: Transcript,
     turns: Vec<Turn>,
-    /// Last database row seen.
-    last_row: i64,
-    /// The user message whose reply is expected or playing.
+    /// Last database revision seen.
+    last_rev: i64,
+    /// The turn we said, whose reply is expected or playing.
     awaiting: Option<i64>,
-    /// The responder said more is coming for `awaiting`.
+    /// The reply to `awaiting`, once the responder has begun it.
+    reply: Option<i64>,
+    /// That reply is still being written.
     more: bool,
     /// The responder is working on a reply and has said nothing yet
     /// (its last row was empty with more to come).
@@ -66,6 +89,18 @@ struct Chat<'a> {
     born: Instant,
     /// `m`: send on a pause in speech instead of on Enter.
     auto: bool,
+    /// `d`: leave the mic open through the reply, so talking over it
+    /// stops it.
+    duplex: bool,
+    /// Duplex: when a sound over the reply started the wait to see
+    /// what it was, and the words already said at that moment —
+    /// anything past them is the interruption.
+    ducked: Option<Instant>,
+    ducked_words: usize,
+    /// The reply really was silenced for it (see [`Voice::can_pause`]);
+    /// an engine that can't be held just talks on until the words are
+    /// in.
+    silenced: bool,
     /// When speech was last heard, or the unsent text last changed.
     last_voice: Instant,
     last_input: String,
@@ -73,13 +108,13 @@ struct Chat<'a> {
     done: HashSet<String>,
     /// Paragraphs sent with Enter, waiting for their last pass.
     sending: Vec<String>,
-    /// The reply word last heard: (user message it answers, word index).
+    /// The reply word last heard: (the turn it is in, word index).
     heard: Option<(i64, usize)>,
     /// Space during the responder's turn: reply paused, mic open.
     held: bool,
     /// ↑/↓: the reply highlighted in the scrollback (index into `turns`).
     selected: Option<usize>,
-    /// An earlier reply being played again with enter (its `reply_to`).
+    /// An earlier reply being played again with enter (its turn id).
     playing: Option<i64>,
     /// When the mic was last wanted open, for [`TAIL`].
     open_since: Option<Instant>,
@@ -224,9 +259,10 @@ pub fn run(
     db_path: &Path,
     voice: Voice,
     voice_name: String,
+    duplex: bool,
 ) -> Result<()> {
     let db = Db::open(db_path)?;
-    let last_row = db.last_id()?;
+    let last_rev = db.rev()?;
     let conv = db.current()?;
     db.set_current(conv)?;
     let conv_title = db.title(conv)?.unwrap_or_default();
@@ -242,12 +278,17 @@ pub fn run(
         transcript: Transcript::default(),
         turns: history(&db, conv)?,
         db,
-        last_row,
+        last_rev,
         awaiting: None,
+        reply: None,
         more: false,
         thinking: false,
         born: Instant::now(),
         auto: false,
+        duplex,
+        ducked: None,
+        ducked_words: 0,
+        silenced: false,
         last_voice: Instant::now(),
         last_input: String::new(),
         done: HashSet::new(),
@@ -283,54 +324,84 @@ pub fn run(
     Ok(())
 }
 
-/// The turns of conversation `conv` so far.
+/// The turns of conversation `conv` so far, all of them long since
+/// spoken (or never to be).
 fn history(db: &Db, conv: i64) -> Result<Vec<Turn>> {
-    let mut turns: Vec<Turn> = Vec::new();
-    for r in db.rows_in(conv)? {
-        match (r.role, r.kind) {
-            (Role::User, Kind::Say) => turns.push(Turn {
-                role: Role::User,
-                reply_to: None,
-                text: r.text,
-                cut: false,
-            }),
-            (Role::User, Kind::Interrupt) => {
-                if let Some(t) = turns
-                    .iter_mut()
-                    .rev()
-                    .find(|t| t.role == Role::Assistant && t.reply_to == r.reply_to)
-                {
-                    t.cut = true;
-                }
-            }
-            (Role::Assistant, _) => push_reply(&mut turns, r.reply_to, &r.text),
-        }
-    }
-    Ok(turns)
+    Ok(db
+        .turns_in(conv)?
+        .into_iter()
+        .map(|r| Turn {
+            said: r.words(),
+            row: r,
+        })
+        .collect())
 }
 
-/// Add a reply chunk to the reply it continues, or start one.
-fn push_reply(turns: &mut Vec<Turn>, reply_to: Option<i64>, text: &str) {
-    let text = text.trim();
-    if text.is_empty() {
-        return;
+/// Words that don't stop a reply by themselves: this is how a listener
+/// says "go on", not "wait".
+const BACKCHANNEL: [&str; 17] = [
+    "ah", "aha", "hmm", "huh", "mhm", "mm", "mmhmm", "oh", "ok", "okay", "right", "sure", "uh",
+    "uhhuh", "yeah", "yep", "yes",
+];
+
+/// What to do about a sound heard over a reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Barge {
+    /// Carry on as we are.
+    Wait,
+    /// Silence the reply, but keep it: this may yet turn out to be
+    /// nothing.
+    Duck,
+    /// It was nothing. Pick up where it left off.
+    Resume,
+    /// They are talking. Stop the reply for good.
+    Cut,
+}
+
+/// The duplex decision, given how long ago the reply was ducked (`None`
+/// if it is still sounding normally), whether a voice is being heard,
+/// whether there is any reply left to silence, and whatever has been
+/// recognised since the duck.
+fn barge(ducked: Option<Duration>, speaking: bool, sounding: bool, fresh: &str) -> Barge {
+    match ducked {
+        None if speaking && sounding => Barge::Duck,
+        None => Barge::Wait,
+        // Words of their own, however late they arrive.
+        Some(_) if interrupting(fresh) => Barge::Cut,
+        // Quiet again with nothing to show for it, or a noise that was
+        // never going to become words.
+        Some(d) if (!speaking && d >= BARGE_DECIDE) || d >= BARGE_GIVE_UP => Barge::Resume,
+        Some(_) => Barge::Wait,
     }
-    match turns.last_mut() {
-        Some(t) if t.role == Role::Assistant && t.reply_to == reply_to => {
-            if !text.is_empty() {
-                if !t.text.is_empty() {
-                    t.text.push(' ');
-                }
-                t.text.push_str(text);
-            }
-        }
-        _ => turns.push(Turn {
-            role: Role::Assistant,
-            reply_to,
-            text: text.to_string(),
-            cut: false,
-        }),
-    }
+}
+
+/// Whether what was heard over a reply means to stop it. Anything with
+/// something of its own to say does; a single acknowledgement doesn't,
+/// though a run of them is taken for insistence. Punctuation and case
+/// are ignored, so "Mm-hmm." and "uh huh" read alike.
+fn interrupting(heard: &str) -> bool {
+    let words: Vec<String> = heard
+        .split_whitespace()
+        .map(|w| {
+            w.chars()
+                .filter(char::is_ascii_alphanumeric)
+                .collect::<String>()
+                .to_lowercase()
+        })
+        .filter(|w| !w.is_empty())
+        .collect();
+    words.len() > 2 || words.iter().any(|w| !BACKCHANNEL.contains(&w.as_str()))
+}
+
+/// How many of `words` make up whole sentences: everything up to and
+/// including the last one that ends in a stop. A reply still being
+/// written is spoken this far and no further, so the voice never gets
+/// half a sentence.
+fn complete_words(words: &[&str]) -> usize {
+    words
+        .iter()
+        .rposition(|w| crate::speak::ends_sentence(w))
+        .map_or(0, |i| i + 1)
 }
 
 impl Chat<'_> {
@@ -461,6 +532,17 @@ impl Chat<'_> {
                         .iter()
                         .position(|c| c.name == self.voice_name);
                     self.voices = Some(at.unwrap_or(0));
+                }
+                KeyCode::Char('d') => {
+                    self.duplex = !self.duplex;
+                    if !self.duplex {
+                        self.unduck();
+                    }
+                    self.set_status(if self.duplex {
+                        "duplex: the mic stays open; talk over a reply to stop it"
+                    } else {
+                        "half duplex: the mic closes while a reply is spoken"
+                    });
                 }
                 KeyCode::Char('m') => {
                     self.auto = !self.auto;
@@ -666,7 +748,7 @@ impl Chat<'_> {
         let mut rows: Vec<Line> = vec![Line::from("  + New conversation".to_string()).fg(THEM)];
         for c in list {
             let mark = if c.id == self.conv { "● " } else { "  " };
-            let right = format!("{} · {} ", c.last, c.messages);
+            let right = format!("{} · {} ", c.last, c.turns);
             let room = inner.saturating_sub(mark.width() + right.width() + 1);
             let mut title: String = c.title.chars().collect();
             while title.width() > room {
@@ -779,19 +861,14 @@ impl Chat<'_> {
         self.deliver(text);
     }
 
-    /// Write `text` as the user's message and wait for the reply.
+    /// Write `text` as the user's turn and wait for the reply. The
+    /// turn itself comes back on the next poll, like any other.
     fn deliver(&mut self, text: String) {
         self.cut_reply();
-        match self.db.say(self.conv, &text) {
+        match self.db.start(self.conv, Role::User, &text, true) {
             Ok(id) => {
-                self.last_row = self.last_row.max(id);
-                self.turns.push(Turn {
-                    role: Role::User,
-                    reply_to: None,
-                    text,
-                    cut: false,
-                });
                 self.awaiting = Some(id);
+                self.reply = None;
                 self.more = true;
                 self.thinking = false;
                 self.scroll_back = 0;
@@ -822,13 +899,19 @@ impl Chat<'_> {
     /// Space: hold the reply, or play it again from the start; between
     /// turns, pause the mic.
     fn space(&mut self) {
-        if let Some(id) = self.awaiting {
+        if self.awaiting.is_some() {
             self.held = !self.held;
-            if self.held {
-                self.voice.set_paused(true);
-                self.set_status("reply held: talk to interrupt, space to hear it again");
-            } else {
-                self.replay(id);
+            match (self.held, self.reply) {
+                (true, _) => {
+                    if self.voice.can_pause() {
+                        self.voice.set_paused(true);
+                    } else {
+                        self.voice.stop();
+                    }
+                    self.set_status("reply held: talk to interrupt, space to hear it again");
+                }
+                (false, Some(reply)) => self.replay(reply),
+                (false, None) => self.voice.set_paused(false),
             }
         } else if self.playing.take().is_some() {
             self.voice.stop();
@@ -845,7 +928,7 @@ impl Chat<'_> {
             .turns
             .iter()
             .enumerate()
-            .filter(|(_, t)| t.role == Role::Assistant && !t.text.trim().is_empty())
+            .filter(|(_, t)| t.row.role == Role::Assistant && !t.text().trim().is_empty())
             .map(|(i, _)| i)
             .collect();
         self.scroll_back = 0;
@@ -869,50 +952,163 @@ impl Chat<'_> {
             return;
         }
         let Some(t) = self.turns.get(i) else { return };
-        let Some(key) = t.reply_to else { return };
-        let text = t.text.clone();
+        if t.row.role != Role::Assistant {
+            return;
+        }
+        let (key, text) = (t.row.id, t.text().to_string());
         self.voice.stop();
         self.heard = None;
         self.playing = Some(key);
         self.voice.say(key, &text);
     }
 
-    /// Speak the reply to `id`, as much as has arrived, from the top.
-    /// Rows still to come are spoken after it as usual.
+    /// Speak reply turn `id` again from the top, as much of it as has
+    /// arrived; the rest is spoken after it as usual.
     fn replay(&mut self, id: i64) {
         self.voice.stop();
         self.heard = None;
-        if let Some(t) = self
-            .turns
-            .iter()
-            .rev()
-            .find(|t| t.role == Role::Assistant && t.reply_to == Some(id))
-        {
-            self.voice.say(id, &t.text);
+        if let Some(t) = self.turns.iter_mut().find(|t| t.row.id == id) {
+            t.said = 0;
+        }
+        self.speak_new(id);
+    }
+
+    /// Hand the voice whatever of reply turn `id` can now be spoken:
+    /// the whole sentences written so far, or the rest of it once the
+    /// responder says there is no more.
+    fn speak_new(&mut self, id: i64) {
+        let Some(t) = self.turns.iter_mut().find(|t| t.row.id == id) else {
+            return;
+        };
+        let words: Vec<&str> = t.row.text.split_whitespace().collect();
+        let upto = if t.row.done {
+            words.len()
+        } else {
+            complete_words(&words)
+        };
+        if upto <= t.said {
+            return;
+        }
+        let chunk = words[t.said..upto].join(" ");
+        t.said = upto;
+        self.voice.say(id, &chunk);
+    }
+
+    /// Words of reply turn `id` that reached the ear: those already
+    /// heard, and the one sounding now.
+    fn heard_words(&self, id: i64) -> usize {
+        match self.heard {
+            Some((key, i)) if key == id => i + 1,
+            _ => 0,
         }
     }
 
-    /// Stop the reply in progress, if any, and tell the responder.
+    /// Record in the database how far into reply turn `id` the
+    /// listener got; it only ever rises. This is what tells the
+    /// responder it was cut off, and where.
+    fn record_spoken(&mut self, id: i64, words: usize) {
+        if let Err(e) = self.db.spoken(id, words) {
+            self.set_status(format!("saving what was heard failed: {e:#}"));
+        }
+        if let Some(t) = self.turns.iter_mut().find(|t| t.row.id == id) {
+            t.row.spoken = Some(t.row.spoken.unwrap_or(0).max(words));
+        }
+    }
+
+    /// Duplex: the mic is open through the reply, so talking over it
+    /// is all it takes to stop it.
+    ///
+    /// Deciding that from sound alone would stop the reply every time
+    /// the listener breathed, and waiting for the recogniser would let
+    /// it talk over them for a word or two. So it does both: any sound
+    /// ducks the reply at once — silent within a few milliseconds, and
+    /// resumable to the sample — and only then does it wait to see
+    /// what the sound was. Words of their own stop the reply for good;
+    /// a cough or an "mm-hmm" and it picks up where it left off,
+    /// usually before the listener notices it paused.
+    fn barge_in(&mut self) {
+        // Holding the reply owns the pause from here; everything else
+        // that gives up on the duck has to lift it.
+        if self.held {
+            self.ducked = None;
+            self.silenced = false;
+            return;
+        }
+        if !self.duplex || self.editor.is_some() {
+            self.unduck();
+            return;
+        }
+        // Talking over a reply being heard again just stops it.
+        if self.playing.is_some() && self.speaking {
+            self.voice.stop();
+            self.playing = None;
+            return;
+        }
+        // The reply ended while we were making up our mind — the last
+        // of it drained as it faded out. Nothing to go back to, but
+        // the pause still has to come off.
+        if self.reply.is_none() {
+            self.unduck();
+            return;
+        }
+        // Whatever has been recognised since the duck. Counting words
+        // rather than matching text, so a later pass rewriting what
+        // came before doesn't read as something new.
+        let said = self.input_text();
+        let words: Vec<&str> = said.split_whitespace().collect();
+        let fresh = match self.ducked {
+            Some(_) => words.get(self.ducked_words..).unwrap_or_default().join(" "),
+            None => String::new(),
+        };
+        match barge(
+            self.ducked.map(|at| at.elapsed()),
+            self.speaking,
+            self.voice.busy(),
+            &fresh,
+        ) {
+            Barge::Wait => {}
+            Barge::Duck => {
+                if self.voice.can_pause() {
+                    self.voice.set_paused(true);
+                    self.silenced = true;
+                }
+                self.ducked = Some(Instant::now());
+                self.ducked_words = words.len();
+            }
+            Barge::Resume => self.unduck(),
+            Barge::Cut => self.cut_reply(),
+        }
+    }
+
+    /// Stop ducking, and let whatever is left of the reply be heard.
+    ///
+    /// Every path that forgets the duck goes through here. Forgetting
+    /// it without lifting the pause leaves the voice silent for the
+    /// rest of the session: replies still arrive and are still shown,
+    /// but nothing is ever spoken again.
+    fn unduck(&mut self) {
+        if self.ducked.take().is_some() && std::mem::take(&mut self.silenced) {
+            self.voice.set_paused(false);
+        }
+    }
+
+    /// Stop the reply in progress, if any, and record where it was cut
+    /// off. The responder sees that and drops the rest.
     fn cut_reply(&mut self) {
-        let Some(id) = self.awaiting.take() else {
+        self.awaiting = None;
+        self.thinking = false;
+        self.more = false;
+        self.held = false;
+        self.unduck();
+        self.heard = None;
+        let Some(id) = self.reply.take() else {
             return;
         };
         let audible = self.voice.busy();
+        let words = self.heard_words(id);
         self.voice.stop();
-        self.more = false;
-        self.thinking = false;
-        self.held = false;
-        if let Some(t) = self
-            .turns
-            .iter_mut()
-            .rev()
-            .find(|t| t.role == Role::Assistant && t.reply_to == Some(id))
-        {
-            t.cut = true;
-        }
-        if let Err(e) = self.db.interrupt(id) {
-            self.set_status(format!("interrupt failed: {e:#}"));
-        } else if audible {
+        self.record_spoken(id, words);
+        if audible {
             self.set_status("interrupted");
         }
     }
@@ -943,34 +1139,67 @@ impl Chat<'_> {
         {
             self.send();
         }
-        for r in self.db.since(self.last_row)? {
-            self.last_row = r.id;
-            if r.role != Role::Assistant || r.reply_to.is_none() || r.reply_to != self.awaiting {
+        // One poll sees new turns and turns that have grown.
+        for r in self.db.since(self.last_rev)? {
+            self.last_rev = self.last_rev.max(r.rev);
+            if r.conversation != self.conv {
                 continue;
             }
-            // An empty row with more to come: the responder is thinking.
-            self.thinking = r.more && r.text.trim().is_empty();
-            push_reply(&mut self.turns, r.reply_to, &r.text);
-            if let Some(key) = r.reply_to {
-                self.voice.say(key, &r.text);
+            // The reply to what we said, the moment the responder
+            // takes it up: an empty turn of its own after ours.
+            let is_reply = r.role == Role::Assistant
+                && self.reply.is_none()
+                && self.awaiting.is_some_and(|said| r.id > said);
+            if is_reply {
+                self.reply = Some(r.id);
             }
-            self.more = r.more;
+            let id = r.id;
+            match self.turns.iter_mut().find(|t| t.row.id == id) {
+                Some(t) => t.row = r,
+                None => self.turns.push(Turn { row: r, said: 0 }),
+            }
+            if Some(id) == self.reply {
+                let t = self.turns.iter().find(|t| t.row.id == id);
+                self.thinking = t.is_some_and(|t| t.text().trim().is_empty() && !t.row.done);
+                self.more = t.is_some_and(|t| !t.row.done);
+                if !self.held {
+                    self.speak_new(id);
+                }
+            }
             self.scroll_back = 0;
         }
         if let Some(h) = self.voice.heard() {
             self.heard = Some(h);
         }
-        if self.awaiting.is_some() && !self.more && !self.voice.busy() {
-            self.awaiting = None;
+        self.barge_in();
+        // The reply is over: all of it written, and all of it heard.
+        // Ducked doesn't count — it is paused, not finished.
+        if self.awaiting.is_some() && !self.more && self.ducked.is_none() && !self.voice.busy() {
+            let finished = self.reply.take();
+            let turn = finished.and_then(|id| self.turns.iter().find(|t| t.row.id == id));
+            // A reply that closed without a word in it was never an
+            // answer to what we said: the responder gave it up, or was
+            // finishing one for an older turn. Wait for the real one
+            // rather than drop ours on the floor.
+            let abandoned = turn.is_some_and(|t| t.text().trim().is_empty());
+            let words = turn.map_or(0, |t| t.row.words());
+            if let Some(id) = finished.filter(|_| !abandoned) {
+                self.record_spoken(id, words);
+            }
+            if !abandoned {
+                self.awaiting = None;
+                self.thinking = false;
+            }
             self.held = false;
         }
         if self.playing.is_some() && !self.voice.busy() {
             self.playing = None;
         }
-        // Half duplex: muted for the responder's whole turn unless held,
-        // while an earlier reply is played again, and while typing.
+        // Half duplex: muted for the responder's whole turn unless
+        // held, while an earlier reply is played again, and while
+        // typing. In duplex only typing closes it.
         let open = self.editor.is_none()
-            && (self.held || (self.awaiting.is_none() && self.playing.is_none()));
+            && (self.duplex || self.held || (self.awaiting.is_none() && self.playing.is_none()));
         if !open {
             self.open_since = None;
         } else if self.open_since.is_none() {
@@ -1000,7 +1229,7 @@ impl Chat<'_> {
         let title = self.conv_title.clone();
         let result = self
             .db
-            .rows_in(self.conv)
+            .turns_in(self.conv)
             .and_then(|rows| Ok(std::fs::write(&path, render(&title, &rows))?));
         match result {
             Ok(()) => {
@@ -1082,7 +1311,9 @@ impl Chat<'_> {
         ])
         .areas(f.area());
         let busy = self.voice.busy();
-        let state = if self.held {
+        let state = if self.ducked.is_some() {
+            Span::styled(" ❚❚ LISTENING OVER ", Style::new().black().on_yellow())
+        } else if self.held {
             Span::styled(" ❚❚ REPLY HELD ", Style::new().black().on_yellow())
         } else if busy {
             Span::styled(" ♪ SPEAKING ", Style::new().black().bg(THEM))
@@ -1108,6 +1339,11 @@ impl Chat<'_> {
                 } else {
                     Span::styled(" ¶ MANUAL ", Style::new().black().on_magenta())
                 },
+                if self.duplex {
+                    Span::styled(" ⇄ DUPLEX ", Style::new().black().on_blue())
+                } else {
+                    Span::raw("")
+                },
                 Span::raw(format!("  {}", self.s.device())),
                 format!("  → {name}").dark_gray(),
             ]),
@@ -1123,7 +1359,10 @@ impl Chat<'_> {
         let mut prev_start = 0;
         let mut seen_reply = false;
         for (i, t) in self.turns.iter().enumerate() {
-            let (label, color) = match t.role {
+            if t.text().trim().is_empty() {
+                continue;
+            }
+            let (label, color) = match t.row.role {
                 Role::User => ("You", YOU),
                 Role::Assistant => ("Reply", THEM),
             };
@@ -1135,14 +1374,14 @@ impl Chat<'_> {
             let start = lines.len();
             wrap_words(label, label_style, self.turn_words(t), width, &mut lines);
             if self.selected == Some(i) {
-                let from = match (seen_reply, i.checked_sub(1).map(|j| self.turns[j].role)) {
+                let from = match (seen_reply, i.checked_sub(1).map(|j| self.turns[j].row.role)) {
                     (false, _) => 0,
                     (true, Some(Role::User)) => prev_start,
                     _ => start,
                 };
                 range = Some((from, lines.len()));
             }
-            if t.role == Role::Assistant && !t.text.trim().is_empty() {
+            if t.row.role == Role::Assistant {
                 seen_reply = true;
             }
             prev_start = start;
@@ -1229,6 +1468,8 @@ impl Chat<'_> {
                 "muted while typing ".dark_gray()
             } else if muted {
                 "muted: their turn ".dark_gray()
+            } else if self.ducked.is_some() {
+                Span::styled("listening over the reply ", Style::new().yellow())
             } else {
                 Span::styled(
                     format!("{}{}", "█".repeat(filled), "░".repeat(16 - filled)),
@@ -1276,12 +1517,14 @@ impl Chat<'_> {
             " space stop · ↑↓ replies · q quit"
         } else if self.held {
             " talk to interrupt · space hear it again · q quit"
+        } else if self.awaiting.is_some() && self.duplex {
+            " talk to interrupt · space hold the reply · q quit"
         } else if self.awaiting.is_some() {
             " space hold the reply (then talk to interrupt) · q quit"
         } else {
             // The full list, or a shorter one that fits a narrow terminal.
-            let full = " enter send · backspace drop a sentence · space pause mic · m mode · ↑↓ replies · i type · c chats · t title · v voice · e export · q quit";
-            let short = " enter send · ⌫ sentence · space mic · m mode · i type · c chats · t title · v voice · e export · q quit";
+            let full = " enter send · backspace drop a sentence · space pause mic · m mode · d duplex · ↑↓ replies · i type · c chats · t title · v voice · e export · q quit";
+            let short = " enter send · ⌫ sentence · space mic · m mode · d duplex · i type · c chats · t title · v voice · e export · q quit";
             if full.width() <= help_line.width as usize {
                 full
             } else {
@@ -1294,22 +1537,21 @@ impl Chat<'_> {
     /// A turn's words, styled. The reply being spoken lights up like
     /// `--play`: heard words plain, the current one yellow, the rest dim.
     fn turn_words(&self, t: &Turn) -> Vec<(String, Style)> {
-        let base = if t.cut {
+        let base = if t.cut() {
             Style::new().add_modifier(Modifier::DIM)
         } else {
             Style::new()
         };
-        let live = t.role == Role::Assistant
-            && !t.cut
-            && t.reply_to.is_some()
-            && (t.reply_to == self.awaiting || t.reply_to == self.playing);
+        let live = t.row.role == Role::Assistant
+            && !t.cut()
+            && (Some(t.row.id) == self.reply || Some(t.row.id) == self.playing);
         let at = match self.heard {
-            Some((key, i)) if Some(key) == t.reply_to => Some(i),
+            Some((key, i)) if key == t.row.id => Some(i),
             _ => None,
         };
         let sounding = self.voice.heard().is_some();
         let mut words: Vec<(String, Style)> = t
-            .text
+            .text()
             .split_whitespace()
             .enumerate()
             .map(|(i, w)| {
@@ -1325,7 +1567,7 @@ impl Chat<'_> {
                 (w.to_string(), style)
             })
             .collect();
-        if t.cut {
+        if t.cut() {
             words.push(("—".into(), base));
         }
         words
@@ -1373,54 +1615,31 @@ impl Chat<'_> {
 }
 
 /// The chat as scribe markdown, `**[hh:mm:ss] You:** …` per turn (times
-/// from the first message), so `scribe -p` can read it back in two
-/// voices. A reply that was cut off ends in a dash.
-fn render(title: &str, rows: &[Row]) -> String {
+/// from the first one), so `scribe -p` can read it back in two voices.
+/// A reply that was cut off is quoted as far as it was heard, and ends
+/// in a dash.
+fn render(title: &str, turns: &[Row]) -> String {
     let parse = |at: &str| chrono::NaiveDateTime::parse_from_str(at, "%Y-%m-%dT%H:%M:%S%.fZ").ok();
-    let start = rows.first().and_then(|r| parse(&r.at));
+    let start = turns.first().and_then(|t| parse(&t.at));
     let subtitle = match start {
         Some(t) => format!("Chat · {} UTC", t.format("%Y-%m-%d %H:%M")),
         None => "Chat".into(),
     };
     let mut out = crate::markdown::header(title, &subtitle);
-    // (role, reply_to, start ms, text, cut)
-    let mut turns: Vec<(Role, Option<i64>, u64, String, bool)> = Vec::new();
-    for r in rows {
-        let ms = match (start, parse(&r.at)) {
-            (Some(s), Some(t)) => (t - s).num_milliseconds().max(0) as u64,
-            _ => 0,
-        };
-        let text = r.text.trim();
-        match (r.role, r.kind) {
-            (Role::User, Kind::Say) => turns.push((Role::User, None, ms, text.into(), false)),
-            (Role::User, Kind::Interrupt) => {
-                if let Some(t) = turns
-                    .iter_mut()
-                    .rev()
-                    .find(|t| t.0 == Role::Assistant && t.1 == r.reply_to)
-                {
-                    t.4 = true;
-                }
-            }
-            (Role::Assistant, _) => match turns.last_mut() {
-                Some(t) if t.0 == Role::Assistant && t.1 == r.reply_to => {
-                    if !text.is_empty() {
-                        t.3 = format!("{} {text}", t.3).trim().to_string();
-                    }
-                }
-                _ => turns.push((Role::Assistant, r.reply_to, ms, text.into(), false)),
-            },
-        }
-    }
-    for (role, _, ms, text, cut) in turns {
+    for t in turns {
+        let text = t.heard().trim();
         if text.is_empty() {
             continue;
         }
-        let who = match role {
+        let ms = match (start, parse(&t.at)) {
+            (Some(s), Some(at)) => (at - s).num_milliseconds().max(0) as u64,
+            _ => 0,
+        };
+        let who = match t.role {
             Role::User => "You",
             Role::Assistant => "Reply",
         };
-        let dash = if cut { " —" } else { "" };
+        let dash = if t.cut() { " —" } else { "" };
         let line = format!(
             "**[{}] {who}:** {text}{dash}",
             crate::markdown::timestamp(ms)
@@ -1488,68 +1707,106 @@ fn wrap_words(
 mod tests {
     use super::*;
 
-    #[test]
-    fn renders_markdown_scribe_can_play() {
-        let row = |id, role, kind, reply_to, text: &str, at: &str| Row {
+    fn turn(id: i64, role: Role, text: &str, spoken: Option<usize>, at: &str) -> Row {
+        Row {
             id,
             conversation: 1,
             role,
-            kind,
-            reply_to,
             text: text.into(),
-            more: false,
+            rev: id,
+            done: true,
+            spoken,
             at: at.into(),
-        };
-        let rows = [
-            row(
-                1,
-                Role::User,
-                Kind::Say,
-                None,
-                "Hi there.",
-                "2026-10-06T17:00:00.000Z",
-            ),
-            row(
+        }
+    }
+
+    #[test]
+    fn renders_markdown_scribe_can_play() {
+        let turns = [
+            turn(1, Role::User, "Hi there.", None, "2026-10-06T17:00:00.000Z"),
+            turn(
                 2,
                 Role::Assistant,
-                Kind::Say,
-                Some(1),
-                "Hello.",
+                "Hello. And more.",
+                Some(2),
                 "2026-10-06T17:00:02.500Z",
             ),
-            row(
-                3,
-                Role::Assistant,
-                Kind::Say,
-                Some(1),
-                "And more.",
-                "2026-10-06T17:00:03.000Z",
-            ),
-            row(
-                4,
-                Role::User,
-                Kind::Interrupt,
-                Some(1),
-                "",
-                "2026-10-06T17:00:04.000Z",
-            ),
-            row(
-                5,
-                Role::User,
-                Kind::Say,
-                None,
-                "Stop.",
-                "2026-10-06T17:01:05.000Z",
-            ),
+            turn(3, Role::User, "Stop.", None, "2026-10-06T17:01:05.000Z"),
         ];
-        let md = render("talk", &rows);
+        let md = render("talk", &turns);
         assert!(md.starts_with("# talk\n\n*Chat · 2026-10-06 17:00 UTC*\n"));
         assert!(md.contains("\n**[00:00:00] You:** Hi there.\n"));
-        assert!(md.contains("\n**[00:00:02] Reply:** Hello. And more. —\n"));
+        // Only as far as it was heard, and it ends in a dash.
+        assert!(md.contains("\n**[00:00:02] Reply:** Hello. And —\n"));
         assert!(md.contains("\n**[00:01:05] You:** Stop.\n"));
         let paras = crate::speak::paragraphs(&md);
         assert_eq!(paras.len(), 3);
         assert_eq!(paras[1].speaker.as_deref(), Some("Reply"));
+    }
+
+    /// The whole duplex sequence: sound ducks the reply, and what the
+    /// sound turns out to be decides whether it comes back.
+    #[test]
+    fn a_noise_ducks_the_reply_and_only_words_end_it() {
+        let ms = Duration::from_millis;
+        // Nothing happening.
+        assert_eq!(barge(None, false, true, ""), Barge::Wait);
+        // A sound, while there is something to silence.
+        assert_eq!(barge(None, true, true, ""), Barge::Duck);
+        // Nothing left to silence: the reply is already over.
+        assert_eq!(barge(None, true, false, ""), Barge::Wait);
+
+        // Ducked, and still making the noise: hold on a moment.
+        assert_eq!(barge(Some(ms(50)), true, true, ""), Barge::Wait);
+        // Quiet again, but not for long enough to be sure.
+        assert_eq!(barge(Some(ms(100)), false, true, ""), Barge::Wait);
+        // Quiet, and nothing was recognised: it was a cough.
+        assert_eq!(barge(Some(ms(500)), false, true, ""), Barge::Resume);
+        // An acknowledgement is not an interruption either.
+        assert_eq!(barge(Some(ms(500)), false, true, "mm-hmm"), Barge::Resume);
+        // Words of their own, as soon as they are heard.
+        assert_eq!(barge(Some(ms(80)), true, true, "no wait"), Barge::Cut);
+        // A noise that goes on and on without ever becoming speech:
+        // let the reply finish rather than be silenced by the room.
+        assert_eq!(barge(Some(ms(2_500)), true, true, ""), Barge::Resume);
+    }
+
+    /// What ducking the reply has to hear before it stops it for good.
+    #[test]
+    fn an_acknowledgement_is_not_an_interruption() {
+        // Nothing recognised yet: a breath, a cough, a door.
+        assert!(!interrupting(""));
+        assert!(!interrupting("  "));
+        // "go on" — punctuation and case make no difference.
+        for go_on in ["mm-hmm", "Uh huh", "yeah", "Okay.", "right", "mhm mhm"] {
+            assert!(!interrupting(go_on), "{go_on:?} should not stop the reply");
+        }
+        // Something of their own to say.
+        for stop in ["no", "wait stop", "actually, hold on", "that's not what I meant"] {
+            assert!(interrupting(stop), "{stop:?} should stop the reply");
+        }
+        // Said often enough, even an acknowledgement is insistence.
+        assert!(interrupting("yeah yeah yeah"));
+    }
+
+    /// A reply still being written is spoken a whole sentence at a
+    /// time; the tail waits until there is a stop, or until the
+    /// responder says there is no more.
+    #[test]
+    fn only_whole_sentences_are_spoken_early() {
+        let words = |t: &str| {
+            t.split_whitespace()
+                .map(String::from)
+                .collect::<Vec<_>>()
+        };
+        let n = |t: &str| {
+            let w = words(t);
+            complete_words(&w.iter().map(String::as_str).collect::<Vec<_>>())
+        };
+        assert_eq!(n("Hello there. How can"), 2);
+        assert_eq!(n("Nothing finished yet"), 0);
+        assert_eq!(n("Is it \"good?\" Yes"), 3);
+        assert_eq!(n("One. Two! Three?"), 3);
     }
 
     #[test]
@@ -1589,15 +1846,4 @@ mod tests {
         assert_eq!(drop_last_sentence("One."), None);
     }
 
-    #[test]
-    fn reply_chunks_join_one_turn() {
-        let mut turns = Vec::new();
-        push_reply(&mut turns, Some(1), "Hello.");
-        push_reply(&mut turns, Some(1), "");
-        push_reply(&mut turns, Some(1), "More.");
-        push_reply(&mut turns, Some(2), "Next.");
-        assert_eq!(turns.len(), 2);
-        assert_eq!(turns[0].text, "Hello. More.");
-        assert_eq!(turns[1].reply_to, Some(2));
-    }
 }
