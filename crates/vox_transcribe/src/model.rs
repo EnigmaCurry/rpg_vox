@@ -180,6 +180,17 @@ impl Transcript {
     pub fn remove(&mut self, id: &str) {
         self.paragraphs.retain(|p| p.id != id);
     }
+
+    /// The whole transcript as plain text: the non-empty paragraphs, a
+    /// blank line between them.
+    pub fn text(&self) -> String {
+        self.paragraphs
+            .iter()
+            .map(|p| p.text.trim())
+            .filter(|t| !t.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
 }
 
 #[cfg(test)]
@@ -213,5 +224,17 @@ mod tests {
         // Replacing keeps the slot.
         t.upsert(&para("c", 41_000));
         assert_eq!(t.paragraphs.len(), 3);
+    }
+
+    #[test]
+    fn text_skips_the_empty_paragraphs() {
+        let mut t = Transcript::default();
+        t.upsert(&para("a", 0));
+        let mut blank = para("blank", 1_000);
+        blank.text = "  ".into();
+        t.upsert(&blank);
+        t.upsert(&para("b", 2_000));
+        assert_eq!(t.text(), "a\n\nb");
+        assert_eq!(Transcript::default().text(), "");
     }
 }

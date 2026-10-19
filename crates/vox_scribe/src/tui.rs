@@ -617,18 +617,28 @@ impl App {
         self.scroll_back = 0;
     }
 
-    /// Copy the highlighted paragraph, or the newest one if none is.
+    /// Copy the highlighted paragraph, or the whole transcript when
+    /// nothing is selected (`End` clears the selection).
     fn copy_selected(&mut self) {
-        let ids = self.visible_ids();
-        let Some(id) = self.selected.as_deref().or(ids.last().copied()) else {
-            return;
+        let one = self.selected.is_some();
+        let text = match self.selected.as_deref() {
+            Some(id) => self
+                .transcript
+                .paragraphs
+                .iter()
+                .find(|p| p.id == id)
+                .map(|p| p.text.trim().to_string())
+                .unwrap_or_default(),
+            None => self.transcript.text(),
         };
-        let Some(p) = self.transcript.paragraphs.iter().find(|p| p.id == id) else {
+        if text.is_empty() {
+            self.set_status("nothing to copy".into());
             return;
-        };
-        let words = p.text.split_whitespace().count();
-        let msg = match crate::clipboard::copy(p.text.trim()) {
-            Ok(how) => format!("copied {words} words ({how})"),
+        }
+        let words = text.split_whitespace().count();
+        let what = if one { "row" } else { "transcript" };
+        let msg = match crate::clipboard::copy(&text) {
+            Ok(how) => format!("copied {what}: {words} words ({how})"),
             Err(e) => format!("copy failed: {e}"),
         };
         self.set_status(msg);
@@ -717,7 +727,7 @@ fn draw(f: &mut Frame, app: &App, s: &Session) {
         }
     }
     let title = if app.selected.is_some() {
-        " Transcript (y copy, End to follow) "
+        " Transcript (y copy row, End to follow) "
     } else if app.scroll_back > 0 {
         " Transcript (scrolled, End to follow) "
     } else {

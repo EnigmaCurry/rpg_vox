@@ -6,6 +6,14 @@ section after the version it releases.
 
 ## Unreleased
 
+### scribe
+
+- **`y` copies the whole transcript** in the recording TUI (and
+  `--once`), unless a paragraph is selected with `↑`/`↓` — then it
+  copies just that row. `End` clears the selection to get the whole
+  text back. It used to copy the newest paragraph when nothing was
+  selected.
+
 ## v0.1.10 (2026-10-18)
 
 ### scribe

@@ -1595,14 +1595,7 @@ fn copy_transcript(outcome: &Outcome) {
         say!("cancelled, nothing copied");
         return;
     }
-    let text = outcome
-        .transcript
-        .paragraphs
-        .iter()
-        .map(|p| p.text.trim())
-        .filter(|t| !t.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n\n");
+    let text = outcome.transcript.text();
     if text.is_empty() {
         say!("nothing transcribed, clipboard unchanged");
         return;
