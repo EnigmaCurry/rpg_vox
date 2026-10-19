@@ -19,7 +19,7 @@ use tracing::warn;
 
 #[cfg(target_os = "macos")]
 use crate::AppInfo;
-use crate::{push_rt, Backend, Capture, DeviceInfo, OpenOptions, Plumbing};
+use crate::{push_rt, Backend, Capture, DeviceInfo, Mix, OpenOptions, Plumbing};
 
 pub struct Cpal;
 
@@ -132,6 +132,10 @@ impl Backend for Cpal {
                 is_default: default.as_deref() == Some(id.as_str()),
                 loopback: chosen.loopback,
                 name: device_name(&chosen.device),
+                // Finding out would mean asking every device for its
+                // config just to list it; `open` reads the real count
+                // off the one device it opens.
+                channels: 0,
                 id,
             });
         }
@@ -172,6 +176,7 @@ impl Backend for Cpal {
         // cpal::Stream is !Send, so it lives on its own thread for the
         // whole capture.
         let want = opts.device.clone();
+        let channel = opts.channel;
         let (ready_tx, ready_rx) = bounded::<Result<(u32, String, crate::CaptureParts)>>(1);
         let thread = std::thread::Builder::new()
             .name("vox-cpal".into())
@@ -182,6 +187,10 @@ impl Backend for Cpal {
                     let name = match loopback {
                         true => format!("{} (loopback)", device_name(&device)),
                         false => device_name(&device),
+                    };
+                    let name = match channel {
+                        Some(c) => format!("{name}:{}", crate::channel_label(c)),
+                        None => name,
                     };
                     // A WASAPI output device has no input format of its
                     // own — `default_input_config` on one is an error.
@@ -198,7 +207,9 @@ impl Backend for Cpal {
                     let rate = config.sample_rate();
                     let channels = config.channels() as usize;
                     let format = config.sample_format();
-                    let plumbing = Plumbing::new(rate, channels);
+                    let mix =
+                        Mix::of(channel, channels).with_context(|| format!("device {name:?}"))?;
+                    let plumbing = Plumbing::new(rate, channels, mix);
                     let (mut producer, parts) = plumbing.into_parts();
                     let overruns = parts.overruns.clone();
                     let err_fn = |e: cpal::Error| warn!("audio stream error: {e}");

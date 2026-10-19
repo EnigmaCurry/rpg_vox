@@ -209,6 +209,8 @@ a change without a Windows machine; releases are built natively.
   (WASAPI loopback); `--device loopback` is the default output, which is
   the short way to transcribe a call, a video or anything else coming
   out of the speakers. `devices` marks the ones that work this way.
+  A multichannel device is mixed down to one speaker unless a channel of
+  it is named: see [one channel per speaker](#one-channel-per-speaker).
 * `--app NAME`: transcribe what one app is playing (see `apps`). Every
   matching process is captured, so `--app chrome` also gets Chrome's
   helper processes, and new ones are picked up while running.
@@ -250,6 +252,32 @@ and in the files). `--speakers` takes their names in the same order, and
 combine). The level meter shows the loudest source, `--record` mixes
 them all into one `.opus`, and at the end the files are rewritten in time
 order, since sources settle out of step.
+
+### One channel per speaker
+
+Two mics on one interface — a dual-channel wireless receiver in split
+mode, a two-input audio interface — arrive as a single stereo device, not
+as two. Name a channel after the device to transcribe it on its own, and
+each becomes a speaker as above:
+
+```bash
+scribe -d rx:FL -d rx:FR --speakers "Me,Party" -r session
+```
+
+`:FL` and `:FR` are the first two channels; past those, `:ch3`, `:ch4`, …
+(`:L`, `:left`, `:R` and `:right` also work). `scribe devices` lists the
+channels of anything with more than one, spelled the way `-d` takes them,
+and the `a` menu in the TUI offers them as rows of their own. Numbers
+need the `ch` so an ALSA id like `hw:1` still names a device.
+
+Without a channel, every channel of the device is mixed down into the one
+speaker — which is what you want for a single multi-capsule mic, and what
+you don't for two people.
+
+Note that splitting the channels only separates the speakers as well as
+the mics do. Two transmitters sitting next to each other both hear the
+whole room, so each engine transcribes both voices and the quieter bleed
+comes out as filler. Clip them to two people a good distance apart.
 
 ## Output files
 

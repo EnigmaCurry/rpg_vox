@@ -21,6 +21,21 @@ pub struct SourcesMenu {
     single: bool,
 }
 
+/// How many of a device's channels get a row of their own. A stereo pair
+/// of mics is the point of them; a 32-channel interface would bury the
+/// rest of the menu, and `-d <id>:ch17` still reaches those.
+const MAX_CHANNELS: usize = 8;
+
+/// A channel of a device in the menu, next to the `-d` spelling of it.
+fn channel_name(c: usize) -> String {
+    let spec = vox_audio::channel_label(c);
+    match c {
+        0 => format!("left ({spec})"),
+        1 => format!("right ({spec})"),
+        n => format!("channel {} ({spec})", n + 1),
+    }
+}
+
 struct Row {
     label: String,
     kind: &'static str,
@@ -61,24 +76,46 @@ impl SourcesMenu {
             app: None,
         }];
         for d in devices {
+            // A loopback device says so in its label rather than in
+            // `kind`, which `Row::is` matches a running source by.
+            let label = match (d.loopback, d.is_default) {
+                (true, true) => format!("{} (loopback, default output)", d.name),
+                (true, false) => format!("{} (loopback)", d.name),
+                (false, true) => format!("{} (default)", d.name),
+                (false, false) => d.name.clone(),
+            };
             rows.push(Row {
-                // A loopback device says so in its label rather than in
-                // `kind`, which `Row::is` matches a running source by.
-                label: match (d.loopback, d.is_default) {
-                    (true, true) => format!("{} (loopback, default output)", d.name),
-                    (true, false) => format!("{} (loopback)", d.name),
-                    (false, true) => format!("{} (default)", d.name),
-                    (false, false) => d.name,
-                },
+                label,
                 kind: "input",
                 opts: OpenOptions {
-                    device: Some(d.id),
+                    device: Some(d.id.clone()),
                     ..Default::default()
                 },
                 slot: None,
                 checked: false,
                 app: None,
             });
+            // A multichannel device also offers its channels one at a
+            // time, under the row for the whole thing: two mics on one
+            // stereo receiver are two speakers that way.
+            let channels = match d.channels {
+                0 | 1 => 0,
+                n => usize::from(n).min(MAX_CHANNELS),
+            };
+            for c in 0..channels {
+                rows.push(Row {
+                    label: format!("{} — {}", d.name, channel_name(c)),
+                    kind: "channel",
+                    opts: OpenOptions {
+                        device: Some(d.id.clone()),
+                        channel: Some(c),
+                        ..Default::default()
+                    },
+                    slot: None,
+                    checked: false,
+                    app: None,
+                });
+            }
         }
         // One row per app (by bundle id, else name), as `-a` matches
         // them: all its processes, and ones it starts later. Apps playing
@@ -247,11 +284,16 @@ impl Row {
         if o.virtual_sink {
             return false;
         }
+        // A channel of a device is its own source: the row for the whole
+        // device is not the row for its left channel.
+        if self.opts.channel != o.channel {
+            return false;
+        }
         match (&o.device, &o.app) {
             (_, Some(want)) => self.app.as_ref().is_some_and(|a| a.matches(want)),
             (Some(d), None) => {
                 self.opts.device.as_deref() == Some(d.as_str())
-                    || (self.kind == "input"
+                    || (matches!(self.kind, "input" | "channel")
                         && self.opts.device.is_some()
                         && self.label.to_lowercase().contains(&d.to_lowercase()))
             }

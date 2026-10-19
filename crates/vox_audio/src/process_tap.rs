@@ -51,7 +51,7 @@ use objc2_core_audio_types::{
 use objc2_foundation::{NSArray, NSDictionary, NSNumber, NSString, NSUUID};
 use tracing::{info, warn};
 
-use crate::{push_rt, AppInfo, Capture, CaptureParts, Plumbing};
+use crate::{push_rt, AppInfo, Capture, CaptureParts, Mix, Plumbing};
 
 const RESCAN: Duration = Duration::from_secs(2);
 /// How often the output device and its rate are checked.
@@ -231,7 +231,11 @@ impl Tap {
         }
         tap.device_rate.store(tap.rate, Ordering::Relaxed);
 
-        let plumbing = Plumbing::with_input_rate(tap.rate, channels, tap.device_rate.clone());
+        // What an app plays is already mixed: there are no separate
+        // mics in it to single out, only its own channels to fold
+        // together.
+        let plumbing =
+            Plumbing::with_input_rate(tap.rate, channels, Mix::Down, tap.device_rate.clone());
         let (producer, parts) = plumbing.into_parts();
         tap.state = Box::into_raw(Box::new(RtState {
             producer,

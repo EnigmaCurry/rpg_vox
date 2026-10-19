@@ -66,6 +66,9 @@ struct Cli {
     /// Repeat it (and/or -a) to transcribe several sources at once, each
     /// on its own as one speaker: Speaker A, B, … in the order given, or
     /// the names from --speakers.
+    /// Add `:FL` / `:FR` (or `:ch3`) to transcribe one channel of a
+    /// multichannel device rather than all of them mixed: two mics on
+    /// one stereo receiver are two speakers that way, `-d rx:FL -d rx:FR`.
     // On Windows an output device records what it plays rather than
     // anything played into it, which is how system audio is transcribed
     // there; `loopback` saves looking the default output's name up.
@@ -360,13 +363,7 @@ fn live_sources(cli: &Cli, matches: &clap::ArgMatches) -> Vec<OpenOptions> {
     };
     let mut list: Vec<(usize, OpenOptions)> = Vec::new();
     for (i, d) in at("device").into_iter().zip(&cli.device) {
-        list.push((
-            i,
-            OpenOptions {
-                device: Some(d.clone()),
-                ..Default::default()
-            },
-        ));
+        list.push((i, OpenOptions::for_device(d)));
     }
     for (i, a) in at("app").into_iter().zip(&cli.app) {
         list.push((
@@ -2115,17 +2112,35 @@ fn list_devices() -> Result<()> {
     println!("{} input devices:", backend.name());
     let devices = backend.list_devices()?;
     let loopback = devices.iter().any(|d| d.loopback);
+    let multi = devices.iter().any(|d| d.channels > 1);
     for d in devices {
         let mark = if d.is_default { "*" } else { " " };
         let kind = if d.loopback { "  (loopback)" } else { "" };
         println!("{mark} {}{kind}\n      id: {}", d.name, d.id);
+        if d.channels > 1 {
+            println!("      {} channels: {}", d.channels, channel_specs(&d));
+        }
     }
     if loopback {
         println!(
             "\nA loopback device is transcribed as it plays; `-d loopback` takes the default one."
         );
     }
+    if multi {
+        println!(
+            "\nA multichannel device is mixed down to one speaker. Name a channel to \
+             transcribe it on its\nown instead, one speaker each: `-d <id>:FL -d <id>:FR`."
+        );
+    }
     Ok(())
+}
+
+/// How to name each channel of a multichannel device to `-d`.
+fn channel_specs(d: &vox_audio::DeviceInfo) -> String {
+    (0..d.channels)
+        .map(|c| format!("{}:{}", d.id, vox_audio::channel_label(usize::from(c))))
+        .collect::<Vec<_>>()
+        .join("  ")
 }
 
 /// Returns the log file in TUI mode, for redirecting fd 2 into it.

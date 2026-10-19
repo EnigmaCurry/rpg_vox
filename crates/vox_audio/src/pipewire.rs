@@ -1,7 +1,15 @@
 //! Native PipeWire capture.
 //!
-//! Opens a mono `F32LE` stream on a dedicated main-loop thread; PipeWire's
-//! adapter handles downmix and format conversion. By default the stream
+//! Opens an `F32LE` stream on a dedicated main-loop thread, in the
+//! channel layout the source itself runs in, and mixes it down to mono
+//! in the reader thread. Matching the source's layout is what gets
+//! every channel linked: the session manager links ports by channel
+//! position, so a lone `MONO` port on a stereo source matches `FL` and
+//! leaves `FR` — the other half of the room — unlinked and unheard.
+//! [`OpenOptions::channel`] keeps one channel instead of mixing, which
+//! is how two mics on one stereo receiver become two speakers.
+//!
+//! By default the stream
 //! is a capture client that autoconnects to the default source (or the
 //! node named by `--device`) and can be relinked in qpwgraph/Helvum.
 //! With `virtual_sink` it instead registers an `Audio/Sink` node that
@@ -28,7 +36,8 @@ use pw::{
 };
 use tracing::{error, info};
 
-use crate::{push_rt, pw_dump, AppInfo, Backend, Capture, DeviceInfo, OpenOptions, Plumbing};
+use crate::pw_dump::Layout;
+use crate::{push_rt, pw_dump, AppInfo, Backend, Capture, DeviceInfo, Mix, OpenOptions, Plumbing};
 
 /// Rate we ask PipeWire for; it resamples whatever the graph runs at.
 const RATE: u32 = 48_000;
@@ -134,6 +143,8 @@ impl Backend for PipeWire {
                 id: name.to_string(),
                 name: format!("{desc} ({kind})"),
                 is_default: false,
+                channels: pw_dump::layout_of(obj)
+                    .map_or(0, |l| l.channels.min(u16::MAX as usize) as u16),
             });
         }
         Ok(devices)
@@ -150,7 +161,19 @@ impl Backend for PipeWire {
                 anyhow::bail!("no PipeWire output stream matching {app:?} (try `apps`)");
             }
         }
-        let plumbing = Plumbing::new(RATE, 1);
+        let layout = layout(opts)?;
+        let mix = Mix::of(opts.channel, layout.channels).with_context(|| {
+            format!(
+                "capturing {}",
+                opts.device.as_deref().unwrap_or("the default source")
+            )
+        })?;
+        info!(
+            channels = layout.channels,
+            ?mix,
+            "PipeWire capture channel layout"
+        );
+        let plumbing = Plumbing::new(RATE, layout.channels, mix);
         let (producer, parts) = plumbing.into_parts();
         let stop = parts.stop.clone();
         let overruns = parts.overruns.clone();
@@ -159,7 +182,7 @@ impl Backend for PipeWire {
         let thread = std::thread::Builder::new()
             .name("vox-pipewire".into())
             .spawn(move || {
-                if let Err(err) = run(opts_t, producer, stop, overruns, &ready_tx) {
+                if let Err(err) = run(opts_t, layout, producer, stop, overruns, &ready_tx) {
                     error!(?err, "PipeWire capture thread exited with error");
                     let _ = ready_tx.send(Err(err));
                 }
@@ -169,15 +192,89 @@ impl Backend for PipeWire {
         let label = match (&opts.app, &opts.device, opts.virtual_sink) {
             (Some(app), _, _) => format!("PipeWire app {app:?}"),
             (_, _, true) => format!("PipeWire sink '{NODE_NAME}'"),
-            (_, Some(d), false) => format!("PipeWire {d}"),
-            (_, None, false) => "PipeWire default source".to_string(),
+            (_, Some(d), false) => opts.label(&format!("PipeWire {d}")),
+            (_, None, false) => opts.label("PipeWire default source"),
         };
         Ok(parts.finish(RATE, label, thread))
     }
 }
 
+/// A single `MONO` channel: what app capture and the virtual sink want,
+/// and the fallback when the graph won't say what a source runs in.
+const MONO: Layout = Layout {
+    channels: 1,
+    positions: Vec::new(),
+};
+
+/// The channel layout to open the stream in.
+///
+/// App capture and the virtual sink are fed by links into our own node,
+/// and PipeWire sums everything linked to one port: a single mono port
+/// is right, and more would have every app port linked to every one of
+/// ours and counted once per port. Only a source has a layout of its
+/// own to match.
+///
+/// A source whose layout the graph won't say falls back to mono, as the
+/// stream always asked for — unless one channel of it was asked for by
+/// name, where guessing would transcribe the wrong mic.
+fn layout(opts: &OpenOptions) -> Result<Layout> {
+    if opts.app.is_some() || opts.virtual_sink {
+        if opts.channel.is_some() {
+            anyhow::bail!(
+                "a single channel can only be taken from an input device, not from app capture or the virtual sink (both arrive already mixed)"
+            );
+        }
+        return Ok(MONO);
+    }
+    let found = pw_dump().ok().and_then(|dump| {
+        let node = match &opts.device {
+            Some(device) => pw_dump::find_source(&dump, device)?,
+            None => pw_dump::default_source(&dump)?.to_string(),
+        };
+        pw_dump::layout(&dump, &node)
+    });
+    match (found, opts.channel) {
+        (Some(layout), _) => Ok(layout),
+        (None, None) => Ok(MONO),
+        (None, Some(_)) => anyhow::bail!(
+            "can't tell how many channels {} has, so one channel of it can't be singled out",
+            opts.device.as_deref().unwrap_or("the default source")
+        ),
+    }
+}
+
+/// A channel position as PipeWire names it (`FL`, `MONO`, `AUX7`), as
+/// the SPA id a format pod wants. Mirroring the source's own positions
+/// is what gets all of its ports linked to ours: the session manager
+/// matches them up by position. Anything unrecognised becomes the `AUX`
+/// channel at its own index, which links by order instead.
+fn position_id(name: &str, index: usize) -> u32 {
+    use libspa::sys as spa;
+    let aux = |n: usize| spa::SPA_AUDIO_CHANNEL_AUX0 + n.min(63) as u32;
+    match name.to_ascii_uppercase().as_str() {
+        "MONO" => spa::SPA_AUDIO_CHANNEL_MONO,
+        "FL" => spa::SPA_AUDIO_CHANNEL_FL,
+        "FR" => spa::SPA_AUDIO_CHANNEL_FR,
+        "FC" => spa::SPA_AUDIO_CHANNEL_FC,
+        "LFE" => spa::SPA_AUDIO_CHANNEL_LFE,
+        "SL" => spa::SPA_AUDIO_CHANNEL_SL,
+        "SR" => spa::SPA_AUDIO_CHANNEL_SR,
+        "FLC" => spa::SPA_AUDIO_CHANNEL_FLC,
+        "FRC" => spa::SPA_AUDIO_CHANNEL_FRC,
+        "RC" => spa::SPA_AUDIO_CHANNEL_RC,
+        "RL" => spa::SPA_AUDIO_CHANNEL_RL,
+        "RR" => spa::SPA_AUDIO_CHANNEL_RR,
+        "TC" => spa::SPA_AUDIO_CHANNEL_TC,
+        other => other
+            .strip_prefix("AUX")
+            .and_then(|n| n.parse::<usize>().ok())
+            .map_or_else(|| aux(index), aux),
+    }
+}
+
 fn run(
     opts: OpenOptions,
+    layout: Layout,
     producer: rtrb::Producer<f32>,
     stop: Arc<AtomicBool>,
     overruns: Arc<AtomicU64>,
@@ -245,7 +342,22 @@ fn run(
     let mut info = AudioInfoRaw::new();
     info.set_format(AudioFormat::F32LE);
     info.set_rate(RATE);
-    info.set_channels(1);
+    info.set_channels(layout.channels as u32);
+    // Only when the source named its channels: left unset, PipeWire
+    // names a single channel MONO, which is what this always asked for
+    // and what app capture and the virtual sink still want.
+    if !layout.positions.is_empty() {
+        let mut position = [0u32; 64];
+        for (i, slot) in position
+            .iter_mut()
+            .enumerate()
+            .take(layout.channels.min(64))
+        {
+            let name = layout.positions.get(i).map_or("", String::as_str);
+            *slot = position_id(name, i);
+        }
+        info.set_position(position);
+    }
     let obj = Object {
         type_: libspa::sys::SPA_TYPE_OBJECT_Format,
         id: libspa::sys::SPA_PARAM_EnumFormat,

@@ -8,6 +8,21 @@ section after the version it releases.
 
 ### scribe
 
+- **Every channel of a multichannel input is heard now.** On PipeWire,
+  capture asked for a single mono channel and let the graph sort it out;
+  the session manager links ports by channel position, so a lone `MONO`
+  port on a stereo source matched `FL` and left `FR` unlinked. Half the
+  room was silently dropped — a stereo device transcribed only its left
+  channel. The stream now opens in the source's own channel layout and
+  mixes it down itself.
+
+- **One channel per speaker**: `-d <device>:FL` transcribes a single
+  channel of a multichannel input instead of all of them mixed, so two
+  mics on one stereo receiver become two speakers, `-d rx:FL -d rx:FR`.
+  `:FR`, `:L`, `:right` and `:ch3`… also work. `scribe devices` lists the
+  channels of anything with more than one, and the `a` menu offers them
+  as rows of their own.
+
 - **`y` copies the whole transcript** in the recording TUI (and
   `--once`), unless a paragraph is selected with `↑`/`↓` — then it
   copies just that row. `End` clears the selection to get the whole
