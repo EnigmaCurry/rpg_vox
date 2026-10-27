@@ -81,6 +81,7 @@ enum Command {
     Stop(Option<Value>),
     Ping(Option<Value>),
     DeleteWord(Option<Value>),
+    SetText(String, Option<Value>),
     /// stdin closed.
     Eof,
 }
@@ -111,6 +112,13 @@ fn read_commands() -> Receiver<Command> {
                     Some("stop") => Command::Stop(id),
                     Some("ping") => Command::Ping(id),
                     Some("delete_word") => Command::DeleteWord(id),
+                    Some("set_text") => match cmd.get("text").and_then(Value::as_str) {
+                        Some(text) => Command::SetText(text.to_string(), id),
+                        None => {
+                            emit(json!({"type": "error", "code": "bad_command", "message": "set_text needs a text string", "fatal": false, "request_id": id}));
+                            continue;
+                        }
+                    },
                     other => {
                         let mut e = json!({"type": "error", "code": "unknown_command", "message": format!("unknown command type {other:?}"), "fatal": false});
                         if let Some(id) = id {
@@ -173,6 +181,9 @@ struct Segments {
     heard: HashMap<String, Vec<u64>>,
     /// The audio clock, from the engine's level events.
     now_ms: u64,
+    /// Speech before this (on the audio clock) is in the text the other
+    /// side set with `set_text`, as it was edited there.
+    floor_ms: u64,
 }
 
 /// A word as shown, and where it came from.
@@ -225,6 +236,7 @@ impl Segments {
             hidden: HashMap::new(),
             heard: HashMap::new(),
             now_ms: 0,
+            floor_ms: 0,
         }
     }
 
@@ -319,7 +331,18 @@ impl Segments {
             all
         };
         all.into_iter()
-            .filter(|w| !matches!(w.from, From::Time(start, _) if is_cut(&self.cuts, start)))
+            .filter(|w| match &w.from {
+                From::Time(start, end) => {
+                    !is_cut(&self.cuts, *start) && (start + end) / 2 >= self.floor_ms
+                }
+                // Shown before the text was set: it is in that text.
+                From::Pass1(clip, n) => self
+                    .heard
+                    .get(clip)
+                    .and_then(|h| h.get(*n))
+                    .is_none_or(|&at| at > self.floor_ms || self.floor_ms == 0),
+                From::Untimed => true,
+            })
             .collect()
     }
 
@@ -345,6 +368,11 @@ impl Segments {
             .filter(|t| !t.is_empty())
             .collect::<Vec<_>>()
             .join(" ");
+        let partial = if partial.is_empty() {
+            partial
+        } else {
+            format!("{}{partial}", self.gap())
+        };
         if partial != self.partial {
             emit(
                 json!({"type": "partial", "text": partial, "segment_id": self.open.first().map(|p| p.id.clone())}),
@@ -363,11 +391,30 @@ impl Segments {
             return;
         }
         // The trailing space keeps it apart from the next segment.
-        let text = format!("{text} ");
+        let text = format!("{}{text} ", self.gap());
         emit(json!({"type": "final", "text": text, "segment_id": p.id}));
         self.committed_text.push_str(&text);
         // A final clears the partial on the other side.
         self.partial.clear();
+    }
+
+    /// A space before new words when the text so far (as `set_text`
+    /// left it) doesn't end in one.
+    fn gap(&self) -> &'static str {
+        match self.committed_text.chars().last() {
+            Some(c) if !c.is_whitespace() => " ",
+            _ => "",
+        }
+    }
+
+    /// The other side edited the text: `text` is all of it now, and
+    /// speech heard so far is in it as edited. New speech goes after it.
+    fn set_text(&mut self, text: String) {
+        self.committed_text = text;
+        self.floor_ms = self.now_ms;
+        // The other side's partial is gone with the edit.
+        self.partial.clear();
+        self.flush();
     }
 
     /// Delete the last word: from the partial while there is one, else
@@ -460,6 +507,16 @@ pub fn run(session: Session, ready: Ready) -> Result<Outcome> {
                     e["request_id"] = id;
                 }
                 emit(e);
+            }
+            Ok(Command::SetText(text, id)) => {
+                // Acknowledged first: partials and finals sent before
+                // this line are about the text as it was.
+                let mut e = json!({"type": "text_set"});
+                if let Some(id) = id {
+                    e["request_id"] = id;
+                }
+                emit(e);
+                segs.set_text(text);
             }
             Ok(Command::DeleteWord(id)) => {
                 if !segs.delete_word() {
@@ -675,6 +732,30 @@ mod tests {
         s.flush();
         assert_eq!(s.partial, "Could you this");
         assert!(s.hidden.is_empty());
+    }
+
+    #[test]
+    fn set_text_takes_what_was_heard_and_new_speech_follows_it() {
+        let mut s = Segments::new(Pass1::Text);
+        s.now_ms = 650;
+        s.update(para("a", 0, &[("COULD YOU INSPECT", Stage::Partial)]));
+        s.flush();
+        // Edited by hand, ending without a space.
+        s.set_text("Could we inspect".into());
+        assert_eq!(s.partial, "");
+        s.now_ms = 850;
+        s.update(para("a", 0, &[("COULD YOU INSPECT THIS", Stage::Partial)]));
+        s.flush();
+        assert_eq!(s.partial, " this");
+        // Pass 2: words said before the edit stay out.
+        let mut a = para("a", 0, &[("Could you inspect this", Stage::Final)]);
+        a.hardened = true;
+        s.update(a);
+        s.flush();
+        assert_eq!(s.committed_text, "Could we inspect this ");
+        assert!(s.delete_word());
+        assert!(s.delete_word());
+        assert_eq!(s.committed_text, "Could we ");
     }
 
     #[test]
