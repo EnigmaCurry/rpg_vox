@@ -8,7 +8,7 @@
 //! so a later one that hardens first waits in the partial for the one
 //! before it.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead as _, Write as _};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -80,6 +80,7 @@ enum Command {
     Cancel(Option<Value>),
     Stop(Option<Value>),
     Ping(Option<Value>),
+    DeleteWord(Option<Value>),
     /// stdin closed.
     Eof,
 }
@@ -109,6 +110,7 @@ fn read_commands() -> Receiver<Command> {
                     Some("cancel") => Command::Cancel(id),
                     Some("stop") => Command::Stop(id),
                     Some("ping") => Command::Ping(id),
+                    Some("delete_word") => Command::DeleteWord(id),
                     other => {
                         let mut e = json!({"type": "error", "code": "unknown_command", "message": format!("unknown command type {other:?}"), "fatal": false});
                         if let Some(id) = id {
@@ -148,19 +150,89 @@ fn end_now(session: &Session, reason: &str, id: Option<Value>) -> ! {
 
 /// Paragraphs any pass may still change, oldest first, and what has
 /// been committed.
-#[derive(Default)]
+///
+/// Deleted words (`delete_word`) are kept the way `--dictate` keeps
+/// them: by their span of audio, so a later pass that re-decodes the
+/// sentence leaves them out too. A pass-1 word has no span yet, so it is
+/// hidden by its place in its clip until pass 2 times the clip, and then
+/// cut by time like any other.
 struct Segments {
+    pass1: Pass1,
     open: Vec<Paragraph>,
     committed: HashSet<String>,
+    /// Everything sent as `final`, for deleting back into it.
+    committed_text: String,
     /// The partial last sent, so an unchanged one isn't repeated.
     partial: String,
+    /// Spans of audio (inclusive) whose words were deleted.
+    cuts: Vec<(u64, u64)>,
+    /// Deleted pass-1 words, by clip: each one's place in the clip and
+    /// when it was first heard.
+    hidden: HashMap<String, Vec<(usize, u64)>>,
+    /// When each word of a pass-1 clip was first heard.
+    heard: HashMap<String, Vec<u64>>,
+    /// The audio clock, from the engine's level events.
+    now_ms: u64,
+}
+
+/// A word as shown, and where it came from.
+struct Shown {
+    text: String,
+    from: From,
+}
+
+enum From {
+    /// A finished word's span of audio.
+    Time(u64, u64),
+    /// Word `n` of pass-1 clip `id`.
+    Pass1(String, usize),
+    /// A finished word with no time, which can't be deleted.
+    Untimed,
+}
+
+/// Whether a word starting at `start` was deleted.
+fn is_cut(cuts: &[(u64, u64)], start: u64) -> bool {
+    cuts.iter().any(|&(a, b)| (a..=b).contains(&start))
+}
+
+/// `text`'s words, with `times` when there is one per word.
+fn timed(text: &str, times: &[vox_transcribe::Word]) -> Vec<Shown> {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let fits = times.len() == words.len();
+    words
+        .into_iter()
+        .enumerate()
+        .map(|(i, w)| Shown {
+            text: w.to_string(),
+            from: if fits {
+                From::Time(times[i].start_ms, times[i].end_ms)
+            } else {
+                From::Untimed
+            },
+        })
+        .collect()
 }
 
 impl Segments {
+    fn new(pass1: Pass1) -> Self {
+        Self {
+            pass1,
+            open: Vec::new(),
+            committed: HashSet::new(),
+            committed_text: String::new(),
+            partial: String::new(),
+            cuts: Vec::new(),
+            hidden: HashMap::new(),
+            heard: HashMap::new(),
+            now_ms: 0,
+        }
+    }
+
     fn update(&mut self, p: Paragraph) {
         if self.committed.contains(&p.id) {
             return;
         }
+        self.track(&p);
         match self.open.iter_mut().find(|o| o.id == p.id) {
             Some(o) => *o = p,
             None => {
@@ -170,13 +242,98 @@ impl Segments {
         }
     }
 
+    /// Note when new pass-1 words are heard, and turn the hidden ones of
+    /// a clip pass 2 has finished into cuts by time.
+    fn track(&mut self, p: &Paragraph) {
+        for c in &p.clips {
+            if c.is_partial() {
+                let n = c.text.split_whitespace().count();
+                let heard = self.heard.entry(c.id.clone()).or_default();
+                while heard.len() < n {
+                    heard.push(self.now_ms);
+                }
+                continue;
+            }
+            self.heard.remove(&c.id);
+            let Some(hidden) = self.hidden.remove(&c.id) else {
+                continue;
+            };
+            let words = c.timed_words();
+            for (_, at_ms) in hidden {
+                // Pass 1 shows a word about when it ends, a little before
+                // or after; the word pass 2 has ending nearest then.
+                let pick = words
+                    .iter()
+                    .filter(|w| !is_cut(&self.cuts, w.start_ms))
+                    .min_by_key(|w| w.end_ms.abs_diff(at_ms));
+                if let Some(w) = pick {
+                    self.cuts
+                        .push((w.start_ms, w.start_ms.max(w.end_ms.saturating_sub(1))));
+                }
+            }
+        }
+    }
+
     fn remove(&mut self, id: &str) {
         self.open.retain(|o| o.id != id);
     }
 
+    /// A paragraph's words as shown, deleted ones left out: finished
+    /// clips as they are (or as pass 4 corrected them), pass 1's ALL
+    /// CAPS guesses in lowercase (or as --pass1 says).
+    fn words(&self, p: &Paragraph) -> Vec<Shown> {
+        let all = if !p.clips.iter().any(|c| c.is_partial())
+            && p.words.len() == p.text.split_whitespace().count()
+        {
+            timed(&p.text, &p.words)
+        } else {
+            let mut all = Vec::new();
+            for c in &p.clips {
+                if c.is_partial() {
+                    let hidden = self.hidden.get(&c.id);
+                    let kept: Vec<String> = c
+                        .text
+                        .split_whitespace()
+                        .enumerate()
+                        .filter(|(i, _)| !hidden.is_some_and(|h| h.iter().any(|(n, _)| n == i)))
+                        .map(|(_, w)| w.to_lowercase())
+                        .collect();
+                    // Shown words map back to their place in the clip only
+                    // as plain text; ellipsis and hidden show no words.
+                    let places: Vec<usize> = (0..c.text.split_whitespace().count())
+                        .filter(|i| !hidden.is_some_and(|h| h.iter().any(|(n, _)| n == i)))
+                        .collect();
+                    let shown = self.pass1.words(&kept.join(" "));
+                    let plain = self.pass1 == Pass1::Text;
+                    for (j, w) in shown.into_iter().enumerate() {
+                        let from = match places.get(j) {
+                            Some(&n) if plain => From::Pass1(c.id.clone(), n),
+                            _ => From::Untimed,
+                        };
+                        all.push(Shown { text: w, from });
+                    }
+                } else {
+                    all.extend(timed(&c.text, &c.timed_words()));
+                }
+            }
+            all
+        };
+        all.into_iter()
+            .filter(|w| !matches!(w.from, From::Time(start, _) if is_cut(&self.cuts, start)))
+            .collect()
+    }
+
+    fn text(&self, p: &Paragraph) -> String {
+        self.words(p)
+            .into_iter()
+            .map(|w| w.text)
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     /// Commit the hardened paragraphs at the front, then send what is
     /// left as the partial if it changed.
-    fn flush(&mut self, pass1: Pass1) {
+    fn flush(&mut self) {
         while self.open.first().is_some_and(|p| p.hardened) {
             let p = self.open.remove(0);
             self.commit(&p);
@@ -184,7 +341,7 @@ impl Segments {
         let partial = self
             .open
             .iter()
-            .map(|p| shown(p, pass1))
+            .map(|p| self.text(p))
             .filter(|t| !t.is_empty())
             .collect::<Vec<_>>()
             .join(" ");
@@ -197,34 +354,65 @@ impl Segments {
     }
 
     fn commit(&mut self, p: &Paragraph) {
+        self.track(p);
         if !self.committed.insert(p.id.clone()) {
             return;
         }
-        let text = p.text.trim();
+        let text = self.text(p);
         if text.is_empty() {
             return;
         }
         // The trailing space keeps it apart from the next segment.
-        emit(json!({"type": "final", "text": format!("{text} "), "segment_id": p.id}));
+        let text = format!("{text} ");
+        emit(json!({"type": "final", "text": text, "segment_id": p.id}));
+        self.committed_text.push_str(&text);
         // A final clears the partial on the other side.
         self.partial.clear();
     }
-}
 
-/// A paragraph as the partial shows it: finished clips as they are,
-/// pass 1's ALL CAPS guesses in lowercase (or as --pass1 says).
-fn shown(p: &Paragraph, pass1: Pass1) -> String {
-    p.clips
-        .iter()
-        .flat_map(|c| {
-            if c.is_partial() {
-                pass1.words(&c.text.to_lowercase())
-            } else {
-                c.text.split_whitespace().map(str::to_string).collect()
+    /// Delete the last word: from the partial while there is one, else
+    /// from the committed text, which is taken back with `retract`.
+    /// False when there is nothing to delete.
+    fn delete_word(&mut self) -> bool {
+        let last = self.open.iter().rev().find_map(|p| {
+            self.words(p)
+                .into_iter()
+                .rev()
+                .find(|w| !matches!(w.from, From::Untimed))
+        });
+        match last.map(|w| w.from) {
+            Some(From::Time(start, end)) => {
+                self.cuts.push((start, start.max(end.saturating_sub(1))));
             }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+            Some(From::Pass1(clip, n)) => {
+                let at = self
+                    .heard
+                    .get(&clip)
+                    .and_then(|h| h.get(n).copied())
+                    .unwrap_or(self.now_ms);
+                self.hidden.entry(clip).or_default().push((n, at));
+            }
+            _ if !self.partial.is_empty() => {
+                // Words with no time to hold a cut by: nothing to do.
+                return false;
+            }
+            _ => {
+                let kept = self.committed_text.trim_end();
+                let Some(cut) = kept
+                    .rfind(char::is_whitespace)
+                    .map(|i| i + 1)
+                    .or((!kept.is_empty()).then_some(0))
+                else {
+                    return false;
+                };
+                let gone = self.committed_text.split_off(cut);
+                emit(json!({"type": "retract", "text": gone}));
+                return true;
+            }
+        }
+        self.flush();
+        true
+    }
 }
 
 pub fn run(session: Session, ready: Ready) -> Result<Outcome> {
@@ -252,7 +440,7 @@ pub fn run(session: Session, ready: Ready) -> Result<Outcome> {
     );
 
     let events = session.engine.events().clone();
-    let mut segs = Segments::default();
+    let mut segs = Segments::new(session.pass1);
     let mut speaking = false;
     // Why the session is being finished, and the request that asked.
     let (reason, id) = loop {
@@ -273,6 +461,16 @@ pub fn run(session: Session, ready: Ready) -> Result<Outcome> {
                 }
                 emit(e);
             }
+            Ok(Command::DeleteWord(id)) => {
+                if !segs.delete_word() {
+                    let mut e =
+                        json!({"type": "status", "level": "info", "message": "Nothing to delete"});
+                    if let Some(id) = id {
+                        e["request_id"] = id;
+                    }
+                    emit(e);
+                }
+            }
             // Whoever started us closed stdin: give them what was said.
             // A file has its own end, so it is left to run out.
             Ok(Command::Eof) if !file => break ("stdin_closed", None),
@@ -284,15 +482,22 @@ pub fn run(session: Session, ready: Ready) -> Result<Outcome> {
                     session.write(&paragraph)?;
                 }
                 segs.update(paragraph);
-                segs.flush(session.pass1);
+                segs.flush();
             }
             Ok(Event::ParagraphRemoved { id }) => {
                 segs.remove(&id);
-                segs.flush(session.pass1);
+                segs.flush();
             }
-            Ok(Event::Level { speaking: now, .. }) if now != speaking => {
-                speaking = now;
-                emit(json!({"type": if now { "vad_start" } else { "vad_end" }}));
+            Ok(Event::Level {
+                speaking: now,
+                position_ms,
+                ..
+            }) => {
+                segs.now_ms = position_ms;
+                if now != speaking {
+                    speaking = now;
+                    emit(json!({"type": if now { "vad_start" } else { "vad_end" }}));
+                }
             }
             _ => {}
         }
@@ -355,7 +560,19 @@ mod tests {
                 duration_ms: Some(900),
                 text: text.to_string(),
                 stage: *stage,
-                words: Vec::new(),
+                // Finished words 200 ms apart, as pass 2 would time them.
+                words: if *stage == Stage::Partial {
+                    Vec::new()
+                } else {
+                    text.split_whitespace()
+                        .enumerate()
+                        .map(|(j, w)| vox_transcribe::Word {
+                            text: w.into(),
+                            start_ms: start_ms + i as u64 * 1000 + j as u64 * 200,
+                            end_ms: start_ms + i as u64 * 1000 + j as u64 * 200 + 180,
+                        })
+                        .collect()
+                },
                 speaker: None,
             })
             .collect();
@@ -389,31 +606,88 @@ mod tests {
                 ("THIS PROJECT", Stage::Partial),
             ],
         );
-        assert_eq!(shown(&p, Pass1::Text), "Could you inspect this project");
-        assert_eq!(shown(&p, Pass1::Hidden), "Could you inspect");
-        assert_eq!(shown(&p, Pass1::Ellipsis), "Could you inspect ……");
+        assert_eq!(
+            Segments::new(Pass1::Text).text(&p),
+            "Could you inspect this project"
+        );
+        assert_eq!(Segments::new(Pass1::Hidden).text(&p), "Could you inspect");
+        assert_eq!(
+            Segments::new(Pass1::Ellipsis).text(&p),
+            "Could you inspect ……"
+        );
     }
 
     #[test]
     fn paragraphs_commit_in_order() {
-        let mut s = Segments::default();
+        let mut s = Segments::new(Pass1::Text);
         s.update(para("a", 0, &[("One.", Stage::Final)]));
         let mut b = para("b", 5000, &[("Two.", Stage::Final)]);
         b.hardened = true;
         s.update(b);
-        s.flush(Pass1::Text);
+        s.flush();
         // b hardened first, but waits for a.
         assert!(s.committed.is_empty());
         assert_eq!(s.partial, "One. Two.");
         let mut a = para("a", 0, &[("One!", Stage::Final)]);
         a.hardened = true;
         s.update(a);
-        s.flush(Pass1::Text);
+        s.flush();
         assert!(s.committed.contains("a") && s.committed.contains("b"));
         assert!(s.open.is_empty());
         assert_eq!(s.partial, "");
+        assert_eq!(s.committed_text, "One! Two. ");
         // Late updates to a committed paragraph are ignored.
         s.update(para("a", 0, &[("changed", Stage::Final)]));
         assert!(s.open.is_empty());
+    }
+
+    #[test]
+    fn deleted_words_stay_deleted_when_re_decoded() {
+        let mut s = Segments::new(Pass1::Text);
+        s.update(para("a", 0, &[("Could you inspect this", Stage::Final)]));
+        s.flush();
+        assert!(s.delete_word());
+        assert_eq!(s.partial, "Could you inspect");
+        // Pass 3 rewrites the clip; the cut holds by time.
+        s.update(para("a", 0, &[("Could you inspect these", Stage::Revised)]));
+        s.flush();
+        assert_eq!(s.partial, "Could you inspect");
+    }
+
+    #[test]
+    fn pass1_words_are_deleted_and_then_cut_by_time() {
+        let mut s = Segments::new(Pass1::Text);
+        s.now_ms = 300;
+        s.update(para("a", 0, &[("COULD YOU", Stage::Partial)]));
+        // "inspect" is said 400-580 ms, "this" 600-780 (see `para`).
+        s.now_ms = 650;
+        s.update(para("a", 0, &[("COULD YOU INSPECT", Stage::Partial)]));
+        s.flush();
+        assert!(s.delete_word());
+        assert_eq!(s.partial, "could you");
+        // More pass-1 words keep the deleted one out.
+        s.now_ms = 850;
+        s.update(para("a", 0, &[("COULD YOU INSPECT THIS", Stage::Partial)]));
+        s.flush();
+        assert_eq!(s.partial, "could you this");
+        // Pass 2 times the clip: the last word said by 650 ms goes.
+        s.update(para("a", 0, &[("Could you inspect this", Stage::Final)]));
+        s.flush();
+        assert_eq!(s.partial, "Could you this");
+        assert!(s.hidden.is_empty());
+    }
+
+    #[test]
+    fn with_no_partial_the_committed_text_is_retracted() {
+        let mut s = Segments::new(Pass1::Text);
+        let mut a = para("a", 0, &[("Hello there.", Stage::Final)]);
+        a.hardened = true;
+        s.update(a);
+        s.flush();
+        assert!(s.delete_word());
+        assert_eq!(s.committed_text, "Hello ");
+        assert!(s.delete_word());
+        assert_eq!(s.committed_text, "");
+        assert!(!s.delete_word());
     }
 }

@@ -254,13 +254,14 @@ Events on stdout:
 | `session_start` | `session_id`                               | Right after `ready`: dictation has begun.                                                             |
 | `partial`       | `text`, `segment_id`                       | Text not yet settled. Each one replaces the last; it holds every paragraph still open, pass 1's guesses in lowercase. |
 | `final`         | `text`, `segment_id`                       | A paragraph has settled (after `--paragraph-gap` of quiet and every pass): append it. Ends in a space. Clears the partial. |
+| `retract`     | `text`                                     | Answer to `delete_word` when the last word was already committed: take `text` off the end of the finals. |
 | `vad_start` / `vad_end` |                                    | Speech starts / stops.                                                                                |
 | `pong`          | `request_id`                               | Answer to `ping`.                                                                                     |
 | `error`         | `code`, `message`, `fatal`                 | A bad command (`fatal: false`), or what stopped scribe (`fatal: true`, then `session_end` and exit 1). |
 | `session_end`   | `reason`, `request_id`                     | The last line.                                                                                        |
 
-The text so far is every `final` appended in order, then the latest
-`partial`. A paragraph is only committed once the ones before it are,
+The text so far is every `final` appended in order, minus what
+`retract` took back, then the latest `partial`. A paragraph is only committed once the ones before it are,
 so finals always arrive in the order things were said.
 
 Commands on stdin (each may carry a `request_id`, echoed back):
@@ -270,6 +271,7 @@ Commands on stdin (each may carry a `request_id`, echoed back):
 | `finish` | Stops listening, finishes every pass on what was heard (`--llm` too), sends the rest as `final`s, exits 0.        | `finished`             |
 | `cancel` | Stops at once; nothing more is sent. Finals already sent stay sent. Exits 0.                                       | `cancelled`            |
 | `stop`   | The same as `cancel`, for a program shutting down.                                                                 | `stop_requested`       |
+| `delete_word` | Deletes the last word: from the partial while there is one (a new `partial` follows), else from what was committed (a `retract` follows). A deleted word is held by its time in the audio, so it stays out when a later pass re-decodes the sentence; a pass-1 guess is held by its place until pass 2 times it. With nothing to delete, a `status` says so. |  |
 | `ping`   | Answers `pong`.                                                                                                    |                        |
 
 Closing stdin works like `finish` (reason `stdin_closed`), except with
