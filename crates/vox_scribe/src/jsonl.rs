@@ -82,8 +82,9 @@ pub struct Ready {
 
 /// A line read from stdin.
 enum Command {
-    /// --standby: listen, finishing by itself after this much quiet.
-    Start(Option<u64>, Option<Value>),
+    /// --standby: listen, finishing by itself after this much quiet;
+    /// or start paused, with the mic released until `resume`.
+    Start(Option<u64>, bool, Option<Value>),
     Finish(Option<Value>),
     Cancel(Option<Value>),
     Stop(Option<Value>),
@@ -120,6 +121,7 @@ fn read_commands() -> Receiver<Command> {
                 let c = match cmd.get("type").and_then(Value::as_str) {
                     Some("start") => Command::Start(
                         cmd.get("auto_finish_ms").and_then(Value::as_u64),
+                        cmd.get("paused").and_then(Value::as_bool).unwrap_or(false),
                         id,
                     ),
                     Some("finish") => Command::Finish(id),
@@ -514,24 +516,28 @@ fn begin(
     session: &Session,
     segs: &mut Segments,
     auto_finish_ms: Option<u64>,
+    paused: bool,
     id: Option<Value>,
 ) -> Turn {
     segs.set_text(String::new());
-    session.paused.store(false, Ordering::SeqCst);
+    session.paused.store(paused, Ordering::SeqCst);
     let session_id = format!("voice-{}", chrono::Utc::now().to_rfc3339());
     emit(answer(
         json!({"type": "session_start", "session_id": session_id}),
         id,
     ));
     let file = session.input_ms.is_some();
-    emit(
-        json!({"type": "status", "level": "info", "message": if file { "Transcribing" } else { "Listening" }}),
-    );
+    let message = match (file, paused) {
+        (true, _) => "Transcribing",
+        (_, true) => "Paused",
+        _ => "Listening",
+    };
+    emit(json!({"type": "status", "level": "info", "message": message}));
     Turn {
         auto_finish_ms,
         words: false,
         voice_ms: segs.now_ms,
-        paused: false,
+        paused,
     }
 }
 
@@ -656,7 +662,13 @@ pub fn run(session: Session, ready: Ready) -> Result<Outcome> {
         emit(json!({"type": "status", "level": "info", "message": "Standing by"}));
         None
     } else {
-        Some(begin(&session, &mut segs, ready.auto_finish_ms, None))
+        Some(begin(
+            &session,
+            &mut segs,
+            ready.auto_finish_ms,
+            false,
+            None,
+        ))
     };
     // Why the session is being finished, and the request that asked.
     let (reason, id) = loop {
@@ -675,7 +687,7 @@ pub fn run(session: Session, ready: Ready) -> Result<Outcome> {
             session_end("error", None);
         }
         match commands.try_recv() {
-            Ok(Command::Start(auto, id)) => {
+            Ok(Command::Start(auto, paused, id)) => {
                 if !ready.standby {
                     refuse(
                         "start needs --standby; this session started listening at launch",
@@ -688,6 +700,7 @@ pub fn run(session: Session, ready: Ready) -> Result<Outcome> {
                         &session,
                         &mut segs,
                         auto.or(ready.auto_finish_ms),
+                        paused,
                         id,
                     ));
                 }

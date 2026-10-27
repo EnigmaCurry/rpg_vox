@@ -272,7 +272,7 @@ Commands on stdin (each may carry a `request_id`, echoed back):
 
 | `type`   | What scribe does                                                                                                   | `session_end` `reason` |
 |----------|--------------------------------------------------------------------------------------------------------------------|------------------------|
-| `start`  | `--standby` only: opens the mic and starts a dictation on a clean slate, answered by `session_start`. `auto_finish_ms` finishes it after that much quiet once something was said (overriding `--auto-finish`). | |
+| `start`  | `--standby` only: opens the mic and starts a dictation on a clean slate, answered by `session_start`. `auto_finish_ms` finishes it after that much quiet once something was said (overriding `--auto-finish`). `"paused": true` starts it with the mic still released, until `resume`. | |
 | `finish` | Stops listening, finishes every pass on what was heard (`--llm` too), sends the rest as `final`s, exits 0. With `--standby` it releases the mic and stays running instead; the last words settle as soon as recognition is done, without waiting out `--paragraph-gap`. | `finished` (`silence` when `--auto-finish` did it) |
 | `cancel` | Stops at once; nothing more is sent. Finals already sent stay sent. Exits 0, or with `--standby` releases the mic and stays running. | `cancelled`            |
 | `pause` / `resume` | Releases the mic within a dictation and opens it again, answered by a `status` (`Paused` / `Listening`). What was heard keeps settling; quiet while paused doesn't count toward auto-finish. | |
