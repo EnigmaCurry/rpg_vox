@@ -1,4 +1,9 @@
-"""Speak text for Pi with Qwen3-TTS (mlx-audio), driven over JSONL.
+"""Speak text for Pi with Qwen3-TTS, driven over JSONL.
+
+Two ways to run the model: locally with mlx-audio (macOS, Apple Silicon),
+or on a Qwen3-TTS server speaking vllm-omni's /v1/audio/speech (rpg_vox's
+qwen3-tts/ stack, CustomVoice model), set by PI_TTS_URL. The server works
+from any machine, Linux included.
 
 stdin, one JSON object per line:
   {"type": "say", "text": "...", "id": 7}   queue a sentence to speak
@@ -23,11 +28,12 @@ stdout, one JSON object per line:
   {"type": "voice", "voice": "ryan", "instruct": "..."}   the voice is now this one
   {"type": "error", "message": "...", "fatal": false}
 
-Logs go to stderr. Runs in a venv with mlx-audio 0.6.2 (`just pi-tts-venv`).
+Logs go to stderr. Runs in the venv `just pi-tts-venv` makes.
 
-Environment: PI_TTS_MODEL, PI_TTS_VOICE (Aiden), PI_TTS_LANG (English),
+Environment: PI_TTS_URL (a Qwen3-TTS server; without it, mlx-audio),
+PI_TTS_MODEL (mlx), PI_TTS_VOICE (Aiden), PI_TTS_LANG (English),
 PI_TTS_INSTRUCT (delivery instruction for every sentence; empty for none),
-PI_TTS_STREAM_INTERVAL (0.32).
+PI_TTS_STREAM_INTERVAL (0.32, mlx).
 """
 
 import json
@@ -59,16 +65,82 @@ VOICE = os.environ.get("PI_TTS_VOICE", "Aiden")
 LANG = os.environ.get("PI_TTS_LANG", "English")
 INSTRUCT = os.environ.get("PI_TTS_INSTRUCT", "")
 INTERVAL = float(os.environ.get("PI_TTS_STREAM_INTERVAL", "0.32"))
+URL = os.environ.get("PI_TTS_URL", "").rstrip("/")
 
 emit({"type": "status", "message": "Loading voice"})
 
-import mlx.core as mx  # noqa: E402
 import numpy as np  # noqa: E402
 import sounddevice as sd  # noqa: E402
-from mlx_audio.tts.utils import load_model  # noqa: E402
 
-# Without a cap MLX's cache grows until the machine swaps (see the spike).
-mx.set_cache_limit(int(0.5e9))
+
+class MlxVoice:
+    """Qwen3-TTS on this Mac, through mlx-audio, streamed as it is made."""
+
+    def __init__(self):
+        import mlx.core as mx
+        from mlx_audio.tts.utils import load_model
+
+        self.mx = mx
+        # Without a cap MLX's cache grows until the machine swaps.
+        mx.set_cache_limit(int(0.5e9))
+        self.model = load_model(MODEL)
+        self.name = MODEL
+        self.sample_rate = self.model.sample_rate
+
+    def voices(self):
+        return [str(n).lower() for n in self.model.get_supported_speakers()]
+
+    def generate(self, text, voice, instruct):
+        kw = dict(voice=voice, lang_code=LANG)
+        if instruct:
+            kw["instruct"] = instruct
+        for r in self.model.generate(text=text, stream=True, streaming_interval=INTERVAL, **kw):
+            self.mx.eval(r.audio)
+            yield np.asarray(r.audio, dtype=np.float32).reshape(-1)
+
+
+class ServerVoice:
+    """Qwen3-TTS on a server (vllm-omni's /v1/audio/speech, as rpg_vox
+    uses it): a sentence at a time, as WAV."""
+
+    sample_rate = 24_000
+
+    def __init__(self, url):
+        self.url = url
+        self.name = url
+
+    def voices(self):
+        return list(NATIVE)
+
+    def generate(self, text, voice, instruct):
+        import io
+        import urllib.error
+        import urllib.request
+
+        import soundfile as sf
+
+        body = {"input": text, "voice": voice, "language": LANG, "response_format": "wav"}
+        if instruct:
+            body["instructions"] = instruct
+        req = urllib.request.Request(
+            f"{self.url}/v1/audio/speech",
+            data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                wav = resp.read()
+        except urllib.error.HTTPError as e:
+            raise RuntimeError(f"{self.url} answered {e.code}: {e.read()[:300]!r}") from None
+        audio, rate = sf.read(io.BytesIO(wav), dtype="float32", always_2d=True)
+        audio = audio.mean(axis=1)
+        if rate != self.sample_rate:
+            n = round(len(audio) * self.sample_rate / rate)
+            audio = np.interp(np.linspace(0, len(audio) - 1, n), np.arange(len(audio)), audio).astype(np.float32)
+        # Handed over a third of a second at a time, so progress is smooth.
+        step = self.sample_rate // 3
+        for i in range(0, len(audio), step):
+            yield audio[i : i + step]
 
 
 class Player:
@@ -178,16 +250,7 @@ class Speaker:
                 continue
             self.busy = True
             try:
-                kw = dict(voice=self.voice, lang_code=LANG)
-                if self.instruct:
-                    kw["instruct"] = self.instruct
-                for r in self.model.generate(
-                    text=text, stream=True, streaming_interval=INTERVAL, **kw
-                ):
-                    if epoch != self.epoch:
-                        break
-                    mx.eval(r.audio)
-                    audio = np.asarray(r.audio, dtype=np.float32).reshape(-1)
+                for audio in self.model.generate(text, self.voice, self.instruct):
                     if epoch != self.epoch:
                         break
                     self.player.add(sid, audio)
@@ -247,13 +310,14 @@ class Speaker:
 
 def main():
     t0 = time.perf_counter()
-    model = load_model(MODEL)
-    # The first generation compiles Metal kernels; do it before anyone waits.
-    for r in model.generate(text="Ready.", voice=VOICE, lang_code=LANG):
-        mx.eval(r.audio)
-    print(f"loaded {MODEL} in {time.perf_counter() - t0:.1f}s", file=sys.stderr)
+    model = ServerVoice(URL) if URL else MlxVoice()
+    # The first generation compiles Metal kernels (or, with a server,
+    # checks it answers); do it before anyone waits.
+    for _ in model.generate("Ready.", VOICE.lower(), ""):
+        pass
+    print(f"loaded {model.name} in {time.perf_counter() - t0:.1f}s", file=sys.stderr)
     speaker = Speaker(model)
-    emit({"type": "ready", "model": MODEL, "voice": VOICE, "sample_rate_hz": model.sample_rate})
+    emit({"type": "ready", "model": model.name, "voice": VOICE, "sample_rate_hz": model.sample_rate})
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -271,7 +335,7 @@ def main():
         elif kind == "stop":
             speaker.stop()
         elif kind == "voices":
-            names = [str(n) for n in model.get_supported_speakers()]
+            names = model.voices()
             emit({
                 "type": "voices",
                 "voices": [{"name": n, "native": NATIVE.get(n)} for n in names],
@@ -280,7 +344,7 @@ def main():
             })
         elif kind == "set_voice":
             want = str(cmd.get("voice") or "").strip().lower().replace(" ", "_")
-            names = [str(n).lower() for n in model.get_supported_speakers()]
+            names = model.voices()
             if want in names:
                 speaker.voice = want
                 if "instruct" in cmd:

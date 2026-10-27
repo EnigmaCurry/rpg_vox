@@ -4,13 +4,34 @@
 coding agent that turns it into a voice conversation: what you say is
 transcribed live by [scribe](SCRIBE.md) and sent when you stop talking,
 and replies are read aloud by a local Qwen3-TTS voice, appearing on
-screen as they are spoken. macOS (Apple Silicon) only, for the voice.
+screen as they are spoken.
+
+On a Mac (Apple Silicon) the voice runs locally:
 
 ```bash
-just install-scribe     # scribe with --jsonl, on your PATH
+just install-scribe     # scribe with --jsonl, on your PATH, and its models
 just pi-tts-venv        # Python venv with mlx-audio, and the voice model (2.2 GB)
 just pi                 # pi with the extension
 ```
+
+## Linux
+
+scribe and Pi run on Linux as they are (scribe hears the mic through
+PipeWire). MLX doesn't, so the voice comes from a Qwen3-TTS server
+instead: the `qwen3-tts/` stack in this repo (vllm-omni, an NVIDIA GPU),
+the same `presets` service rpg_vox uses, on this machine or another.
+
+```bash
+sudo apt install libportaudio2       # or your distro's portaudio, for playback
+just install-scribe
+just pi-tts-venv                     # only playback here; the model is on the server
+export PI_TTS_URL=https://qwen3-tts.example.com   # the presets service
+just pi
+```
+
+The voices and `/voice NAME style` work the same. Each sentence is
+fetched whole, so a reply starts as soon as the server has made its
+first sentence.
 
 ## Using it
 
@@ -43,11 +64,12 @@ spoken before the agent goes on.
   mic only while you dictate. Its protocol (`start`, `pause`, `finish`,
   `set_text`, `delete_word`, …) is in the
   [reference](SCRIBE_REFERENCE.md#--jsonl-dictation-over-a-pipe).
-- `pi/pi-tts.py` speaks sentences it is sent over stdin with
+- `pi/pi-tts.py` speaks sentences it is sent over stdin, with
   [mlx-audio](https://github.com/Blaizzy/mlx-audio) and
-  `mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-4bit`, streaming, and
-  reports how far it has played each one so the text can keep pace.
-  About 5.3 GB of memory at peak.
+  `mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-4bit` (streaming, about
+  5.3 GB of memory at peak), or with the Qwen3-TTS server at
+  `PI_TTS_URL`. It reports how far it has played each sentence so the
+  text can keep pace.
 
 ## Environment
 
@@ -56,6 +78,7 @@ spoken before the agent goes on.
 | `SCRIBE_BIN` | `scribe` on your PATH |
 | `SCRIBE_ARGS` | extra scribe arguments, e.g. `--paragraph-gap 1` |
 | `SCRIBE_AUTO_FINISH_MS` | `1500`: quiet that sends what you said |
+| `PI_TTS_URL` | none: the voice runs locally with mlx-audio. Set, a Qwen3-TTS server (`/v1/audio/speech`) |
 | `PI_TTS_PYTHON` | `pi/.venv/bin/python`, else `~/tts-spike/.venv/bin/python` |
 | `PI_TTS_MODEL` | `mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-4bit` |
 | `PI_TTS_VOICE`, `PI_TTS_INSTRUCT` | the voice and style before `/voice` has picked any |

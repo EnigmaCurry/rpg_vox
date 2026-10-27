@@ -421,13 +421,23 @@ release-scribe:
 pi *ARGS:
     pi -e pi/scribe-voice.ts {{ARGS}}
 
-# Python venv for pi/pi-tts.py (mlx-audio) and its voice model, macOS only.
+# On macOS: mlx-audio and the voice model, run locally. Elsewhere: only
+# playback, for a Qwen3-TTS server set by PI_TTS_URL (see qwen3-tts/);
+# sounddevice needs PortAudio (libportaudio2 / portaudio).
+# Python venv for pi/pi-tts.py (see PI.md).
 pi-tts-venv:
     #!/usr/bin/env bash
     set -euo pipefail
     uv venv --python 3.12 pi/.venv
-    uv pip install --python pi/.venv/bin/python "mlx-audio==0.6.2" soundfile sounddevice
-    pi/.venv/bin/hf download mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-4bit
+    if [ "$(uname)" = Darwin ]; then
+      uv pip install --python pi/.venv/bin/python "mlx-audio==0.6.2" soundfile sounddevice
+      pi/.venv/bin/hf download mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-4bit
+    else
+      uv pip install --python pi/.venv/bin/python numpy soundfile sounddevice
+      pi/.venv/bin/python -c "import sounddevice" \
+        || echo "sounddevice can't find PortAudio: install libportaudio2 (or your distro's portaudio)" >&2
+      [ -n "${PI_TTS_URL:-}" ] || echo "set PI_TTS_URL to your Qwen3-TTS server (see qwen3-tts/)" >&2
+    fi
 
 # Build vox_scribe, install it to BIN and download its models.
 install-scribe BIN="~/.local/bin": release-scribe

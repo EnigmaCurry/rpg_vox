@@ -62,7 +62,8 @@ agent talk & scribe --chat talk
 An extension for the Pi coding agent that turns it into a voice
 conversation: scribe hears you and sends what you said when you pause,
 and a local Qwen3-TTS voice reads the replies, shown as they are
-spoken. Talk over it to cut it off. macOS.
+spoken. Talk over it to cut it off. macOS, or Linux with a Qwen3-TTS
+server for the voice.
 
 ```bash
 just pi-tts-venv

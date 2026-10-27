@@ -41,7 +41,8 @@
  * - SCRIBE_VOICE_SETTINGS: where the mode, voice and style are kept.
  * - PI_TTS_PYTHON: the Python with mlx-audio (default pi/.venv, made by
  *   `just pi-tts-venv`, else ~/tts-spike/.venv).
- * - PI_TTS_MODEL: see pi-tts.py. PI_TTS_VOICE / PI_TTS_INSTRUCT are the
+ * - PI_TTS_URL: a Qwen3-TTS server (vllm-omni) to speak with instead of
+ *   mlx-audio, e.g. on Linux. PI_TTS_MODEL: see pi-tts.py. PI_TTS_VOICE / PI_TTS_INSTRUCT are the
  *   defaults before /voice has picked any.
  */
 
