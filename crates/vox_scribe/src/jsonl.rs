@@ -91,6 +91,8 @@ enum Command {
     DeleteWord(Option<Value>),
     SetText(String, Option<Value>),
     Reset(Option<Value>),
+    Pause(Option<Value>),
+    Resume(Option<Value>),
     /// stdin closed.
     Eof,
 }
@@ -126,6 +128,8 @@ fn read_commands() -> Receiver<Command> {
                     Some("ping") => Command::Ping(id),
                     Some("delete_word") => Command::DeleteWord(id),
                     Some("reset") => Command::Reset(id),
+                    Some("pause") => Command::Pause(id),
+                    Some("resume") => Command::Resume(id),
                     Some("set_text") => match cmd.get("text").and_then(Value::as_str) {
                         Some(text) => Command::SetText(text.to_string(), id),
                         None => {
@@ -488,6 +492,10 @@ impl Segments {
     }
 }
 
+/// After `resume`, how long before quiet starts to count toward
+/// auto-finish.
+const RESUME_GRACE_MS: u64 = 1500;
+
 /// One stretch of listening: from `start` (or launch, without
 /// --standby) to the end of the dictation.
 struct Turn {
@@ -497,6 +505,8 @@ struct Turn {
     words: bool,
     /// When speech was last heard, on the audio clock.
     voice_ms: u64,
+    /// `pause`: the mic is released until `resume`.
+    paused: bool,
 }
 
 /// Open the mic and start a turn on a clean slate.
@@ -521,6 +531,7 @@ fn begin(
         auto_finish_ms,
         words: false,
         voice_ms: segs.now_ms,
+        paused: false,
     }
 }
 
@@ -656,7 +667,7 @@ pub fn run(session: Session, ready: Ready) -> Result<Outcome> {
             break ("end_of_input", None);
         }
         // The mic couldn't be opened for a turn (the pump gave up).
-        if ready.standby && turn.is_some() && session.paused.load(Ordering::SeqCst) {
+        if turn.as_ref().is_some_and(|t| !t.paused) && session.paused.load(Ordering::SeqCst) {
             turn = None;
             emit(
                 json!({"type": "error", "code": "mic_unavailable", "message": "couldn't open the microphone", "fatal": false}),
@@ -706,6 +717,32 @@ pub fn run(session: Session, ready: Ready) -> Result<Outcome> {
             },
             Ok(Command::Cancel(id)) => end_now(&session, "cancelled", id),
             Ok(Command::Stop(id)) => end_now(&session, "stop_requested", id),
+            Ok(Command::Pause(id)) => match turn.as_mut() {
+                Some(t) => {
+                    t.paused = true;
+                    session.paused.store(true, Ordering::SeqCst);
+                    emit(answer(
+                        json!({"type": "status", "level": "info", "message": "Paused"}),
+                        id,
+                    ));
+                }
+                None => refuse("not listening", id),
+            },
+            Ok(Command::Resume(id)) => match turn.as_mut() {
+                Some(t) => {
+                    t.paused = false;
+                    // Quiet while paused doesn't count toward --auto-finish,
+                    // nor the moment it takes to reopen the mic and start
+                    // talking again.
+                    t.voice_ms = segs.now_ms + RESUME_GRACE_MS;
+                    session.paused.store(false, Ordering::SeqCst);
+                    emit(answer(
+                        json!({"type": "status", "level": "info", "message": "Listening"}),
+                        id,
+                    ));
+                }
+                None => refuse("not listening", id),
+            },
             Ok(Command::Ping(id)) => emit(answer(json!({"type": "pong"}), id)),
             Ok(Command::SetText(text, id)) => {
                 // Acknowledged first: partials and finals sent before
@@ -736,7 +773,7 @@ pub fn run(session: Session, ready: Ready) -> Result<Outcome> {
         // Quiet long enough after words: the turn finishes itself.
         let quiet = turn.as_ref().is_some_and(|t| {
             t.auto_finish_ms.is_some_and(|ms| {
-                t.words && !speaking && segs.now_ms.saturating_sub(t.voice_ms) >= ms
+                t.words && !t.paused && !speaking && segs.now_ms.saturating_sub(t.voice_ms) >= ms
             })
         });
         if quiet {

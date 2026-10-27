@@ -17,8 +17,9 @@ section after the version it releases.
   one a later pass is still rewriting, and `set_text` hands over text
   edited by hand for new speech to follow. With `--standby` it stays
   running between dictations, mic released, so the models load once:
-  `start` opens the mic, `finish` / `cancel` release it, `reset` clears
-  the text. `--auto-finish SECONDS` (or `start`'s `auto_finish_ms`)
+  `start` opens the mic, `finish` / `cancel` release it, `pause` and
+  `resume` release and reopen it mid-dictation, `reset` clears the
+  text. `--auto-finish SECONDS` (or `start`'s `auto_finish_ms`)
   finishes a dictation by itself once you stop talking. stdout carries nothing else; logs
   stay on stderr. See
   the [reference](SCRIBE_REFERENCE.md#--jsonl-dictation-over-a-pipe).
