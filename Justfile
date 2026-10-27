@@ -417,6 +417,18 @@ release-scribe:
       cargo build -p vox_scribe --release
     fi
 
+# Pi with the voice extension (see PI.md): talk to it, hear the replies.
+pi *ARGS:
+    pi -e pi/scribe-voice.ts {{ARGS}}
+
+# Python venv for pi/pi-tts.py (mlx-audio) and its voice model, macOS only.
+pi-tts-venv:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    uv venv --python 3.12 pi/.venv
+    uv pip install --python pi/.venv/bin/python "mlx-audio==0.6.2" soundfile sounddevice
+    pi/.venv/bin/hf download mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-4bit
+
 # Build vox_scribe, install it to BIN and download its models.
 install-scribe BIN="~/.local/bin": release-scribe
     #!/usr/bin/env bash

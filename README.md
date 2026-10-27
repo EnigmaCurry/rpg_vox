@@ -57,6 +57,20 @@ agent talk & scribe --chat talk
 
 [Read more →](AGENT.md)
 
+## [Pi voice](PI.md)
+
+An extension for the Pi coding agent that turns it into a voice
+conversation: scribe hears you and sends what you said when you pause,
+and a local Qwen3-TTS voice reads the replies, shown as they are
+spoken. Talk over it to cut it off. macOS.
+
+```bash
+just pi-tts-venv
+just pi
+```
+
+[Read more →](PI.md)
+
 ## [rpg_vox](RPG_VOX.md)
 
 status: **EXPERIMENTAL**

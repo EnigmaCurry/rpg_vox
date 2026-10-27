@@ -23,3 +23,5 @@ transcript-*.md
 /dist/
 # Android signing keystores.
 *.jks
+# pi/pi-tts.py's Python (just pi-tts-venv).
+pi/.venv/
