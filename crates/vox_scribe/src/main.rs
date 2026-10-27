@@ -238,6 +238,18 @@ struct Cli {
     /// reference for the protocol.
     #[arg(long, conflicts_with_all = ["play", "chat", "dictate", "once", "live"])]
     jsonl: bool,
+    /// With --jsonl: stay running between dictations. The mic is
+    /// released until a `start` command; `finish` and `cancel` end that
+    /// dictation and release it again, and `stop` (or closing stdin)
+    /// exits. The models load once.
+    #[arg(long, requires = "jsonl", conflicts_with = "input")]
+    standby: bool,
+    /// With --jsonl: finish a dictation by itself once this many seconds
+    /// pass without speech after something was said (`session_end`
+    /// reason `silence`). A `start` command's `auto_finish_ms` overrides
+    /// it for that dictation.
+    #[arg(long, value_name = "SECONDS", requires = "jsonl", value_parser = parse_gap)]
+    auto_finish: Option<u64>,
     /// Enable pass 4: LLM proofreading of each paragraph before it is
     /// written. Configured by VOX_SCRIBE_LLM_URL (default
     /// http://127.0.0.1:9931/v1), VOX_SCRIBE_LLM_MODEL (required) and
@@ -1462,6 +1474,11 @@ fn run() -> Result<()> {
             jsonl::Ready {
                 model: cli.model.name().into(),
                 sample_rate_hz: first_rate,
+                standby: cli.standby,
+                auto_finish_ms: cli.auto_finish,
+                gap_ms: cli
+                    .paragraph_gap
+                    .unwrap_or(vox_transcribe::ParagraphConfig::default().gap_ms),
             },
         )?,
         None => headless(session)?,

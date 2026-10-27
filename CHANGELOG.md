@@ -15,7 +15,11 @@ section after the version it releases.
   `set_text` or `ping` on stdin. `finish` runs every pass on what was heard and sends the rest
   before exiting, `delete_word` takes back the last word said, even
   one a later pass is still rewriting, and `set_text` hands over text
-  edited by hand for new speech to follow. stdout carries nothing else; logs
+  edited by hand for new speech to follow. With `--standby` it stays
+  running between dictations, mic released, so the models load once:
+  `start` opens the mic, `finish` / `cancel` release it, `reset` clears
+  the text. `--auto-finish SECONDS` (or `start`'s `auto_finish_ms`)
+  finishes a dictation by itself once you stop talking. stdout carries nothing else; logs
   stay on stderr. See
   the [reference](SCRIBE_REFERENCE.md#--jsonl-dictation-over-a-pipe).
 

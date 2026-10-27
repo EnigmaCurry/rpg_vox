@@ -65,6 +65,8 @@ scribe [OPTIONS] [COMMAND]
 | `--denoise-limit DB` | With `--denoise`: push the background down by at most this many dB instead of all the way (e.g. `20`). Env `VOX_SCRIBE_DENOISE_LIMIT`. |
 | `--once`   | One-shot dictation: record a single manual paragraph until Enter, finish every pass (including `--llm`), print the text, copy it to the clipboard and exit. Nothing is saved to disk. Only one runs at a time: launching a second one (or `scribe stop-once`) finishes the running one instead — unix only, as it works by signalling the running recorder; on Windows each `--once` is finished with Enter and runs on its own. Conflicts with `-o`, `--append`, `-r`. |
 | `--jsonl` | Dictation for another program: transcript events on stdout and commands on stdin, one JSON object per line, until the program asks scribe to finish. Logs and progress stay on stderr. See [`--jsonl` (dictation over a pipe)](#--jsonl-dictation-over-a-pipe). Works with `-o` / `-r` (paragraphs are saved as they settle) and `-i` (the file is transcribed and the session ends with it). Conflicts with `-p`, `--chat`, `--dictate`, `--once`, `--live`. |
+| `--standby` | With `--jsonl`: stay running between dictations, with the mic released until a `start` command. `finish` and `cancel` end that dictation and release it again; `stop` or closing stdin exits. The models load once. Conflicts with `-i`. |
+| `--auto-finish SECONDS` | With `--jsonl`: once something was said, finish the dictation by itself after this much quiet (`session_end` reason `silence`). Between `0.1` and `60`. A `start` command's `auto_finish_ms` overrides it. |
 
 Either cap ends the paragraph at the next utterance boundary rather
 than mid-sentence, so a paragraph runs up to one utterance (12 s of
@@ -250,8 +252,8 @@ Events on stdout:
 | `type`          | Fields                                     | When                                                                                                  |
 |-----------------|--------------------------------------------|-------------------------------------------------------------------------------------------------------|
 | `status`        | `level`, `message`                         | `Loading models` at start, then `Listening` (`Transcribing` with `-i`).                               |
-| `ready`         | `version` (1), `engine`, `model`, `sample_rate_hz` | The models are loaded and the mic is open.                                                     |
-| `session_start` | `session_id`                               | Right after `ready`: dictation has begun.                                                             |
+| `ready`         | `version` (1), `engine`, `model`, `sample_rate_hz`, `standby` | The models are loaded.                                                              |
+| `session_start` | `session_id`, `request_id`                 | Dictation has begun and the mic is open: right after `ready`, or with `--standby` on each `start`.   |
 | `partial`       | `text`, `segment_id`                       | Text not yet settled. Each one replaces the last; it holds every paragraph still open, pass 1's guesses in lowercase. |
 | `final`         | `text`, `segment_id`                       | A paragraph has settled (after `--paragraph-gap` of quiet and every pass): append it. Ends in a space. Clears the partial. |
 | `retract`     | `text`                                     | Answer to `delete_word` when the last word was already committed: take `text` off the end of the finals. |
@@ -259,7 +261,7 @@ Events on stdout:
 | `vad_start` / `vad_end` |                                    | Speech starts / stops.                                                                                |
 | `pong`          | `request_id`                               | Answer to `ping`.                                                                                     |
 | `error`         | `code`, `message`, `fatal`                 | A bad command (`fatal: false`), or what stopped scribe (`fatal: true`, then `session_end` and exit 1). |
-| `session_end`   | `reason`, `request_id`                     | The last line.                                                                                        |
+| `session_end`   | `reason`, `request_id`                     | The dictation is over. Without `--standby` it is the last line; with it, scribe waits for the next `start`. |
 
 The text so far is every `final` appended in order, minus what
 `retract` took back, then the latest `partial`. After `set_text` it
@@ -270,9 +272,11 @@ Commands on stdin (each may carry a `request_id`, echoed back):
 
 | `type`   | What scribe does                                                                                                   | `session_end` `reason` |
 |----------|--------------------------------------------------------------------------------------------------------------------|------------------------|
-| `finish` | Stops listening, finishes every pass on what was heard (`--llm` too), sends the rest as `final`s, exits 0.        | `finished`             |
-| `cancel` | Stops at once; nothing more is sent. Finals already sent stay sent. Exits 0.                                       | `cancelled`            |
-| `stop`   | The same as `cancel`, for a program shutting down.                                                                 | `stop_requested`       |
+| `start`  | `--standby` only: opens the mic and starts a dictation on a clean slate, answered by `session_start`. `auto_finish_ms` finishes it after that much quiet once something was said (overriding `--auto-finish`). | |
+| `finish` | Stops listening, finishes every pass on what was heard (`--llm` too), sends the rest as `final`s, exits 0. With `--standby` it releases the mic and stays running instead; the last words settle as soon as recognition is done, without waiting out `--paragraph-gap`. | `finished` (`silence` when `--auto-finish` did it) |
+| `cancel` | Stops at once; nothing more is sent. Finals already sent stay sent. Exits 0, or with `--standby` releases the mic and stays running. | `cancelled`            |
+| `reset`  | Clears the text so far and drops what was heard, answered by `text_set`: the same as `set_text` with `""`. | |
+| `stop`   | The same as `cancel`, for a program shutting down; it exits with `--standby` too.                                                                 | `stop_requested`       |
 | `delete_word` | Deletes the last word: from the partial while there is one (a new `partial` follows), else from what was committed (a `retract` follows). A deleted word is held by its time in the audio, so it stays out when a later pass re-decodes the sentence; a pass-1 guess is held by its place until pass 2 times it. With nothing to delete, a `status` says so. |  |
 | `set_text` | Takes `text`, the whole text as the other side has it now, edited by hand. Speech heard so far is taken to be in it as edited and is not sent again; new speech is appended after it (with a space if it doesn't end in one), and `delete_word` can delete back into it. Answers `text_set`, then a `partial` for any speech not yet in the text. |  |
 | `ping`   | Answers `pong`.                                                                                                    |                        |

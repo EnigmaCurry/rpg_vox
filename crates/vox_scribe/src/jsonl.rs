@@ -68,20 +68,29 @@ pub fn fail(e: &anyhow::Error) {
     emit(json!({"type": "session_end", "reason": "error"}));
 }
 
-/// What `ready` reports.
+/// What `ready` reports, and how the session runs.
 pub struct Ready {
     pub model: String,
     pub sample_rate_hz: u32,
+    /// --standby: wait for `start`, and keep running between turns.
+    pub standby: bool,
+    /// --auto-finish: quiet that finishes a turn by itself.
+    pub auto_finish_ms: Option<u64>,
+    /// The paragraph gap: quiet before the last words settle.
+    pub gap_ms: u64,
 }
 
 /// A line read from stdin.
 enum Command {
+    /// --standby: listen, finishing by itself after this much quiet.
+    Start(Option<u64>, Option<Value>),
     Finish(Option<Value>),
     Cancel(Option<Value>),
     Stop(Option<Value>),
     Ping(Option<Value>),
     DeleteWord(Option<Value>),
     SetText(String, Option<Value>),
+    Reset(Option<Value>),
     /// stdin closed.
     Eof,
 }
@@ -107,11 +116,16 @@ fn read_commands() -> Receiver<Command> {
                 };
                 let id = cmd.get("request_id").cloned();
                 let c = match cmd.get("type").and_then(Value::as_str) {
+                    Some("start") => Command::Start(
+                        cmd.get("auto_finish_ms").and_then(Value::as_u64),
+                        id,
+                    ),
                     Some("finish") => Command::Finish(id),
                     Some("cancel") => Command::Cancel(id),
                     Some("stop") => Command::Stop(id),
                     Some("ping") => Command::Ping(id),
                     Some("delete_word") => Command::DeleteWord(id),
+                    Some("reset") => Command::Reset(id),
                     Some("set_text") => match cmd.get("text").and_then(Value::as_str) {
                         Some(text) => Command::SetText(text.to_string(), id),
                         None => {
@@ -138,13 +152,25 @@ fn read_commands() -> Receiver<Command> {
     rx
 }
 
+/// `event` with the command's `request_id`, if it had one.
+fn answer(mut event: Value, id: Option<Value>) -> Value {
+    if let Some(id) = id {
+        event["request_id"] = id;
+    }
+    event
+}
+
 /// `session_end`, with the command's `request_id` if it had one.
 fn session_end(reason: &str, id: Option<Value>) {
-    let mut e = json!({"type": "session_end", "reason": reason});
-    if let Some(id) = id {
-        e["request_id"] = id;
-    }
-    emit(e);
+    emit(answer(json!({"type": "session_end", "reason": reason}), id));
+}
+
+/// A command that doesn't fit the moment.
+fn refuse(message: &str, id: Option<Value>) {
+    emit(answer(
+        json!({"type": "error", "code": "bad_state", "message": message, "fatal": false}),
+        id,
+    ));
 }
 
 /// End at once without draining the passes: a cancel, a stop, a signal.
@@ -462,6 +488,135 @@ impl Segments {
     }
 }
 
+/// One stretch of listening: from `start` (or launch, without
+/// --standby) to the end of the dictation.
+struct Turn {
+    /// Finish by itself after this much quiet, once words were heard.
+    auto_finish_ms: Option<u64>,
+    /// Some speech has come out as words.
+    words: bool,
+    /// When speech was last heard, on the audio clock.
+    voice_ms: u64,
+}
+
+/// Open the mic and start a turn on a clean slate.
+fn begin(
+    session: &Session,
+    segs: &mut Segments,
+    auto_finish_ms: Option<u64>,
+    id: Option<Value>,
+) -> Turn {
+    segs.set_text(String::new());
+    session.paused.store(false, Ordering::SeqCst);
+    let session_id = format!("voice-{}", chrono::Utc::now().to_rfc3339());
+    emit(answer(
+        json!({"type": "session_start", "session_id": session_id}),
+        id,
+    ));
+    let file = session.input_ms.is_some();
+    emit(
+        json!({"type": "status", "level": "info", "message": if file { "Transcribing" } else { "Listening" }}),
+    );
+    Turn {
+        auto_finish_ms,
+        words: false,
+        voice_ms: segs.now_ms,
+    }
+}
+
+/// Take one engine event into the segments, and the turn if listening.
+fn handle(
+    ev: Event,
+    session: &Session,
+    segs: &mut Segments,
+    speaking: &mut bool,
+    turn: Option<&mut Turn>,
+) -> Result<()> {
+    match ev {
+        Event::Paragraph { paragraph, .. } => {
+            let live = paragraph.clips.iter().any(|c| c.is_partial());
+            if paragraph.hardened {
+                session.write(&paragraph)?;
+            }
+            segs.update(paragraph);
+            segs.flush();
+            if let Some(t) = turn {
+                t.words |= !segs.partial.is_empty() || !segs.committed_text.trim().is_empty();
+                // Pass 1 at work is speech too, and can come before the
+                // level event that says so.
+                if live {
+                    t.voice_ms = t.voice_ms.max(segs.now_ms);
+                }
+            }
+        }
+        Event::ParagraphRemoved { id } => {
+            segs.remove(&id);
+            segs.flush();
+        }
+        Event::Level {
+            speaking: now,
+            position_ms,
+            ..
+        } => {
+            segs.now_ms = position_ms;
+            if let Some(t) = turn {
+                if now {
+                    t.voice_ms = position_ms;
+                }
+            }
+            if now != *speaking {
+                *speaking = now;
+                emit(json!({"type": if now { "vad_start" } else { "vad_end" }}));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// End a --standby turn and keep running: release the mic, let every
+/// pass finish on what was heard, commit it, `session_end`.
+#[allow(clippy::too_many_arguments)]
+fn finish_turn(
+    session: &Session,
+    segs: &mut Segments,
+    events: &Receiver<Event>,
+    speaking: &mut bool,
+    gap_ms: u64,
+    signalled: &AtomicBool,
+    reason: &str,
+    id: Option<Value>,
+) -> Result<()> {
+    session.paused.store(true, Ordering::SeqCst);
+    // The last words settle after a paragraph gap of quiet; push that
+    // quiet now rather than wait it out on the clock.
+    for (i, slot) in session.slots.lock().expect("slots lock").iter().enumerate() {
+        let n = (gap_ms + 1000) * slot.rate as u64 / 1000;
+        session.engine.pusher(i).push(&vec![0.0; n as usize]);
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !segs.open.is_empty() {
+        if signalled.load(Ordering::SeqCst) {
+            end_now(session, "sigterm", None);
+        }
+        if std::time::Instant::now() > deadline {
+            warn!("a turn's last passes didn't finish; committing them as they are");
+            for p in std::mem::take(&mut segs.open) {
+                segs.commit(&p);
+            }
+            break;
+        }
+        if let Ok(ev) = events.recv_timeout(Duration::from_millis(50)) {
+            handle(ev, session, segs, speaking, None)?;
+        }
+    }
+    if *speaking {
+        *speaking = false;
+        emit(json!({"type": "vad_end"}));
+    }
+    session_end(reason, id);
+    Ok(())
+}
+
 pub fn run(session: Session, ready: Ready) -> Result<Outcome> {
     // SIGTERM (and Ctrl-C) end the session without draining.
     let signalled = Arc::new(AtomicBool::new(false));
@@ -478,17 +633,20 @@ pub fn run(session: Session, ready: Ready) -> Result<Outcome> {
         "engine": "scribe",
         "model": ready.model,
         "sample_rate_hz": ready.sample_rate_hz,
+        "standby": ready.standby,
     }));
-    let session_id = format!("voice-{}", chrono::Utc::now().to_rfc3339());
-    emit(json!({"type": "session_start", "session_id": session_id}));
     let file = session.input_ms.is_some();
-    emit(
-        json!({"type": "status", "level": "info", "message": if file { "Transcribing" } else { "Listening" }}),
-    );
-
     let events = session.engine.events().clone();
     let mut segs = Segments::new(session.pass1);
     let mut speaking = false;
+    let mut turn = if ready.standby {
+        // The mic is released until `start`.
+        session.paused.store(true, Ordering::SeqCst);
+        emit(json!({"type": "status", "level": "info", "message": "Standing by"}));
+        None
+    } else {
+        Some(begin(&session, &mut segs, ready.auto_finish_ms, None))
+    };
     // Why the session is being finished, and the request that asked.
     let (reason, id) = loop {
         if signalled.load(Ordering::SeqCst) {
@@ -497,35 +655,74 @@ pub fn run(session: Session, ready: Ready) -> Result<Outcome> {
         if session.source_done.load(Ordering::SeqCst) {
             break ("end_of_input", None);
         }
+        // The mic couldn't be opened for a turn (the pump gave up).
+        if ready.standby && turn.is_some() && session.paused.load(Ordering::SeqCst) {
+            turn = None;
+            emit(
+                json!({"type": "error", "code": "mic_unavailable", "message": "couldn't open the microphone", "fatal": false}),
+            );
+            session_end("error", None);
+        }
         match commands.try_recv() {
+            Ok(Command::Start(auto, id)) => {
+                if !ready.standby {
+                    refuse(
+                        "start needs --standby; this session started listening at launch",
+                        id,
+                    );
+                } else if turn.is_some() {
+                    refuse("already listening", id);
+                } else {
+                    turn = Some(begin(
+                        &session,
+                        &mut segs,
+                        auto.or(ready.auto_finish_ms),
+                        id,
+                    ));
+                }
+            }
+            Ok(Command::Finish(id)) if ready.standby => match turn.take() {
+                Some(_) => finish_turn(
+                    &session,
+                    &mut segs,
+                    &events,
+                    &mut speaking,
+                    ready.gap_ms,
+                    &signalled,
+                    "finished",
+                    id,
+                )?,
+                None => refuse("not listening", id),
+            },
             Ok(Command::Finish(id)) => break ("finished", id),
+            Ok(Command::Cancel(id)) if ready.standby => match turn.take() {
+                Some(_) => {
+                    // Release the mic; what is still open is dropped.
+                    session.paused.store(true, Ordering::SeqCst);
+                    segs.set_text(String::new());
+                    session_end("cancelled", id);
+                }
+                None => refuse("not listening", id),
+            },
             Ok(Command::Cancel(id)) => end_now(&session, "cancelled", id),
             Ok(Command::Stop(id)) => end_now(&session, "stop_requested", id),
-            Ok(Command::Ping(id)) => {
-                let mut e = json!({"type": "pong"});
-                if let Some(id) = id {
-                    e["request_id"] = id;
-                }
-                emit(e);
-            }
+            Ok(Command::Ping(id)) => emit(answer(json!({"type": "pong"}), id)),
             Ok(Command::SetText(text, id)) => {
                 // Acknowledged first: partials and finals sent before
                 // this line are about the text as it was.
-                let mut e = json!({"type": "text_set"});
-                if let Some(id) = id {
-                    e["request_id"] = id;
-                }
-                emit(e);
+                emit(answer(json!({"type": "text_set"}), id));
                 segs.set_text(text);
+            }
+            Ok(Command::Reset(id)) => {
+                emit(answer(json!({"type": "text_set"}), id));
+                segs.set_text(String::new());
             }
             Ok(Command::DeleteWord(id)) => {
                 if !segs.delete_word() {
-                    let mut e =
-                        json!({"type": "status", "level": "info", "message": "Nothing to delete"});
-                    if let Some(id) = id {
-                        e["request_id"] = id;
-                    }
-                    emit(e);
+                    emit(answer(
+                        json!({"type": "status", "level": "info", "message": "Nothing to delete"}),
+                        id,
+                    ));
                 }
             }
             // Whoever started us closed stdin: give them what was said.
@@ -533,30 +730,31 @@ pub fn run(session: Session, ready: Ready) -> Result<Outcome> {
             Ok(Command::Eof) if !file => break ("stdin_closed", None),
             Ok(Command::Eof) | Err(_) => {}
         }
-        match events.recv_timeout(Duration::from_millis(50)) {
-            Ok(Event::Paragraph { paragraph, .. }) => {
-                if paragraph.hardened {
-                    session.write(&paragraph)?;
-                }
-                segs.update(paragraph);
-                segs.flush();
+        if let Ok(ev) = events.recv_timeout(Duration::from_millis(50)) {
+            handle(ev, &session, &mut segs, &mut speaking, turn.as_mut())?;
+        }
+        // Quiet long enough after words: the turn finishes itself.
+        let quiet = turn.as_ref().is_some_and(|t| {
+            t.auto_finish_ms.is_some_and(|ms| {
+                t.words && !speaking && segs.now_ms.saturating_sub(t.voice_ms) >= ms
+            })
+        });
+        if quiet {
+            if ready.standby {
+                turn = None;
+                finish_turn(
+                    &session,
+                    &mut segs,
+                    &events,
+                    &mut speaking,
+                    ready.gap_ms,
+                    &signalled,
+                    "silence",
+                    None,
+                )?;
+            } else {
+                break ("silence", None);
             }
-            Ok(Event::ParagraphRemoved { id }) => {
-                segs.remove(&id);
-                segs.flush();
-            }
-            Ok(Event::Level {
-                speaking: now,
-                position_ms,
-                ..
-            }) => {
-                segs.now_ms = position_ms;
-                if now != speaking {
-                    speaking = now;
-                    emit(json!({"type": if now { "vad_start" } else { "vad_end" }}));
-                }
-            }
-            _ => {}
         }
     };
 
