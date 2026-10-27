@@ -520,6 +520,18 @@ fn begin(
     id: Option<Value>,
 ) -> Turn {
     segs.set_text(String::new());
+    // Audio from before this turn (heard while the models loaded, or
+    // still queued from the last turn) isn't part of it, however far the
+    // engine has got with it.
+    let fed = session
+        .slots
+        .lock()
+        .expect("slots lock")
+        .iter()
+        .map(|s| s.fed_ms())
+        .max()
+        .unwrap_or(0);
+    segs.floor_ms = segs.floor_ms.max(fed);
     session.paused.store(paused, Ordering::SeqCst);
     let session_id = format!("voice-{}", chrono::Utc::now().to_rfc3339());
     emit(answer(
