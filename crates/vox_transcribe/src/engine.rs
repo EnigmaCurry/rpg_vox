@@ -769,6 +769,14 @@ impl Core {
             words,
             speaker: None,
         };
+        // Pass 2 can land a clip pass 1 never opened (too short for a
+        // partial) after the next utterance has started, or on a file
+        // pushed faster than real time, paragraphs later. It goes where it
+        // was said, not after what has come since.
+        let later = |p: &Paragraph| p.clips.iter().any(|c| c.start_ms > start_ms);
+        if self.transcript.paragraphs.last().is_some_and(later) {
+            return Some(self.insert_in_order(clip, change));
+        }
         let max_utt = self.cfg.vad.max_utterance_ms as u64;
         let gap = self.cfg.paragraph.gap_ms;
         // A clip joins its paragraph here, as soon as pass 1 opens it,
@@ -853,6 +861,23 @@ impl Core {
         q.rebuild();
         self.transcript.paragraphs.insert(pi + 1, q);
         Some((pi + 1, Change::Opened))
+    }
+
+    /// Put `clip` in the paragraph it was said in, among its clips in time
+    /// order; in a paragraph of its own when that one has hardened (or it
+    /// came before them all).
+    fn insert_in_order(&mut self, clip: Clip, change: Change) -> (usize, Change) {
+        let paras = &mut self.transcript.paragraphs;
+        let at = paras.partition_point(|p| p.start_ms <= clip.start_ms);
+        if let Some(pi) = at.checked_sub(1).filter(|&i| !paras[i].hardened) {
+            let p = &mut paras[pi];
+            let ci = p.clips.partition_point(|c| c.start_ms <= clip.start_ms);
+            p.clips.insert(ci, clip);
+            p.rebuild();
+            return (pi, change);
+        }
+        paras.insert(at, Paragraph::new(Uuid::new_v4().to_string(), clip));
+        (at, Change::Opened)
     }
 
     fn remove_clip(&mut self, clip_id: &str) {

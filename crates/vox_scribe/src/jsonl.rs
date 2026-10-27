@@ -517,12 +517,14 @@ fn begin(
     segs: &mut Segments,
     auto_finish_ms: Option<u64>,
     paused: bool,
+    standby: bool,
     id: Option<Value>,
 ) -> Turn {
     segs.set_text(String::new());
-    // Audio from before this turn (heard while the models loaded, or
-    // still queued from the last turn) isn't part of it, however far the
-    // engine has got with it.
+    // With --standby, audio from before this turn (heard while the models
+    // loaded, or still queued from the last turn) isn't part of it,
+    // however far the engine has got with it. Without, speech while the
+    // models loaded is the start of the dictation.
     let fed = session
         .slots
         .lock()
@@ -531,7 +533,9 @@ fn begin(
         .map(|s| s.fed_ms())
         .max()
         .unwrap_or(0);
-    segs.floor_ms = segs.floor_ms.max(fed);
+    if standby {
+        segs.floor_ms = segs.floor_ms.max(fed);
+    }
     session.paused.store(paused, Ordering::SeqCst);
     let session_id = format!("voice-{}", chrono::Utc::now().to_rfc3339());
     emit(answer(
@@ -679,6 +683,7 @@ pub fn run(session: Session, ready: Ready) -> Result<Outcome> {
             &mut segs,
             ready.auto_finish_ms,
             false,
+            false,
             None,
         ))
     };
@@ -713,6 +718,7 @@ pub fn run(session: Session, ready: Ready) -> Result<Outcome> {
                         &mut segs,
                         auto.or(ready.auto_finish_ms),
                         paused,
+                        true,
                         id,
                     ));
                 }

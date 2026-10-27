@@ -462,3 +462,65 @@ fn loud_utterance_without_new_words_is_cut() {
     assert!((2_000..3_500).contains(&durations[0]), "{durations:?}");
     assert!(durations.iter().all(|&d| d < 3_500), "{durations:?}");
 }
+
+/// Hears nothing in the first utterance (too short for a partial, say),
+/// then one "WORD" per 200 ms like [`FakeStreaming`].
+struct DeafFirst {
+    total: usize,
+    fed: usize,
+}
+
+impl StreamingRecognizer for DeafFirst {
+    fn reset(&mut self) {
+        self.fed = 0;
+    }
+    fn feed(&mut self, samples: &[f32], _rate: u32) {
+        self.fed += samples.len();
+        self.total += samples.len();
+    }
+    fn partial(&self) -> String {
+        // The first utterance ends 2.1 s in.
+        if self.total < SR as usize * 22 / 10 {
+            return String::new();
+        }
+        vec!["WORD"; self.fed / (SR as usize / 5)].join(" ")
+    }
+}
+
+/// An utterance pass 1 never opened gets its clip from pass 2, which on a
+/// file lags behind the utterances after it: the clip still goes first,
+/// where it was said, not after them.
+#[test]
+fn clip_without_a_partial_keeps_its_place() {
+    let mut cfg = EngineConfig::new(SR);
+    cfg.partial_interval = std::time::Duration::ZERO;
+    let engine = Engine::spawn(
+        cfg,
+        Some(Box::new(DeafFirst { total: 0, fed: 0 })),
+        Arc::new(SlowOffline),
+    );
+    for &(ms, amp) in &[
+        (500, 0.0),
+        (1600, 0.2),
+        (800, 0.0),
+        (1600, 0.2),
+        (800, 0.0),
+        (1600, 0.2),
+        (3000, 0.0),
+    ] {
+        for chunk in tone(ms, amp).chunks(SR as usize / 50) {
+            engine.push(chunk);
+        }
+    }
+    let t = engine.finish();
+    let starts: Vec<u64> = t
+        .paragraphs
+        .iter()
+        .flat_map(|p| p.clips.iter().map(|c| c.start_ms))
+        .collect();
+    assert_eq!(starts.len(), 3, "{t:#?}");
+    assert!(
+        starts.windows(2).all(|w| w[0] < w[1]),
+        "clips out of order: {starts:?}"
+    );
+}

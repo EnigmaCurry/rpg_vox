@@ -8,6 +8,12 @@ section after the version it releases.
 
 ### scribe
 
+- **Words no longer come out of order.** A short utterance that the
+  live pass never showed (too quick for it) only reached the transcript
+  when its re-decode finished, and was added after whatever had been said
+  since: a word or phrase from the start of a sentence could turn up at
+  its end, or, on a file, paragraphs later. It now goes where it was said.
+
 - **`--jsonl`: dictation over a pipe.** Another program (an editor, a
   chat client) can start `scribe --jsonl`, read what you say as JSON
   lines on stdout (`partial` text while it is still settling, `final`
