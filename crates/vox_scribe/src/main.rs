@@ -14,6 +14,7 @@ mod clipboard;
 mod diarize;
 mod dictate;
 mod dictation;
+mod jsonl;
 mod markdown;
 mod models;
 #[cfg(unix)]
@@ -231,6 +232,12 @@ struct Cli {
     /// saved to disk.
     #[arg(long, conflicts_with_all = ["output", "append", "record"])]
     once: bool,
+    /// Dictation for another program: transcript events on stdout and
+    /// commands on stdin, one JSON object per line (finish, cancel,
+    /// stop, ping). Logs and progress stay on stderr. See the
+    /// reference for the protocol.
+    #[arg(long, conflicts_with_all = ["play", "chat", "dictate", "once", "live"])]
+    jsonl: bool,
     /// Enable pass 4: LLM proofreading of each paragraph before it is
     /// written. Configured by VOX_SCRIBE_LLM_URL (default
     /// http://127.0.0.1:9931/v1), VOX_SCRIBE_LLM_MODEL (required) and
@@ -891,12 +898,28 @@ pub struct Outcome {
 }
 
 fn main() -> Result<()> {
+    let result = run();
+    // A program reading --jsonl hears why scribe stopped, too.
+    if let Err(e) = &result {
+        if jsonl::claimed() {
+            jsonl::fail(e);
+        }
+    }
+    result
+}
+
+fn run() -> Result<()> {
     let started = std::time::Instant::now();
     let matches = Cli::command().get_matches();
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+    // Before anything can print: stdout carries only the protocol.
+    if cli.jsonl && cli.cmd.is_none() {
+        jsonl::claim_stdout();
+    }
     // A file is transcribed without the TUI, with brief progress on
     // stderr, unless --live plays it through the TUI in real time.
-    let tui_mode = cli.cmd.is_none() && !cli.no_tui && (cli.input.is_empty() || cli.live);
+    let tui_mode =
+        cli.cmd.is_none() && !cli.no_tui && !cli.jsonl && (cli.input.is_empty() || cli.live);
     let log_file = init_logging(&cli, tui_mode)?;
 
     match cli.cmd {
@@ -1109,6 +1132,11 @@ fn main() -> Result<()> {
         dictate: cli.dictate.is_some(),
     };
     let mut screen = tui_mode.then(|| tui::Screen::splash(&view("")));
+    if cli.jsonl {
+        jsonl::emit(
+            serde_json::json!({"type": "status", "level": "info", "message": "Loading models"}),
+        );
+    }
     if !cli.input.is_empty() && !tui_mode {
         say!("loading models…");
     }
@@ -1429,6 +1457,13 @@ fn main() -> Result<()> {
     }
     let mut outcome = match screen {
         Some(screen) => tui::run(screen, session)?,
+        None if cli.jsonl => jsonl::run(
+            session,
+            jsonl::Ready {
+                model: cli.model.name().into(),
+                sample_rate_hz: first_rate,
+            },
+        )?,
         None => headless(session)?,
     };
     let transcribed = started.elapsed();

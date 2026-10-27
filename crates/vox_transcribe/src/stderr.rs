@@ -108,6 +108,23 @@ pub fn redirect_to(file: &std::fs::File) -> std::io::Result<RestoreStderr> {
     Ok(RestoreStderr(saved))
 }
 
+/// Keep stdout for the caller alone: returns a handle on the original
+/// fd 1 and points fd 1 at stderr, so a stray `println!` (or C++ code
+/// writing to stdout) lands with the logs instead of in the middle of a
+/// machine-read stream.
+pub fn take_stdout() -> std::io::Result<std::fs::File> {
+    let saved = sys::dup(sys::STDOUT_FD);
+    if saved < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if sys::dup2(sys::STDERR_FD, sys::STDOUT_FD) < 0 {
+        let e = std::io::Error::last_os_error();
+        sys::close(saved);
+        return Err(e);
+    }
+    Ok(sys::file_from_fd(saved))
+}
+
 /// Restores the original fd 2 on drop.
 pub struct RestoreStderr(sys::Fd);
 
@@ -125,6 +142,7 @@ mod sys {
     pub type Fd = libc::c_int;
 
     pub const STDERR_FD: Fd = libc::STDERR_FILENO;
+    pub const STDOUT_FD: Fd = libc::STDOUT_FILENO;
 
     pub fn dup(fd: Fd) -> Fd {
         // SAFETY: a dup of a descriptor we were given; the new one is ours.
@@ -175,6 +193,7 @@ mod sys {
     pub type Fd = c_int;
 
     pub const STDERR_FD: Fd = 2;
+    pub const STDOUT_FD: Fd = 1;
 
     /// `_O_BINARY`: nothing is to be done to the newlines on the way
     /// through to the log file.

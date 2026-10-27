@@ -7010,6 +7010,7 @@ dependencies = [
  "ctrlc",
  "libc",
  "ratatui",
+ "serde_json",
  "signal-hook",
  "tar",
  "tracing",

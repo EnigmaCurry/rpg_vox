@@ -8,6 +8,14 @@ section after the version it releases.
 
 ### scribe
 
+- **`--jsonl`: dictation over a pipe.** Another program (an editor, a
+  chat client) can start `scribe --jsonl`, read what you say as JSON
+  lines on stdout (`partial` text while it is still settling, `final`
+  once a paragraph is done) and send `finish`, `cancel` or `ping` on
+  stdin. `finish` runs every pass on what was heard and sends the rest
+  before exiting. stdout carries nothing else; logs stay on stderr. See
+  the [reference](SCRIBE_REFERENCE.md#--jsonl-dictation-over-a-pipe).
+
 - **Every channel of a multichannel input is heard now.** On PipeWire,
   capture asked for a single mono channel and let the graph sort it out;
   the session manager links ports by channel position, so a lone `MONO`

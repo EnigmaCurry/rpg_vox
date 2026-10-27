@@ -64,6 +64,7 @@ scribe [OPTIONS] [COMMAND]
 | `--denoise` | Experimental: filter background music and noise out of the audio with [DeepFilterNet 3](https://github.com/Rikorose/DeepFilterNet) before transcribing it. The `--record` file stays unfiltered. Env `VOX_SCRIBE_DENOISE`. |
 | `--denoise-limit DB` | With `--denoise`: push the background down by at most this many dB instead of all the way (e.g. `20`). Env `VOX_SCRIBE_DENOISE_LIMIT`. |
 | `--once`   | One-shot dictation: record a single manual paragraph until Enter, finish every pass (including `--llm`), print the text, copy it to the clipboard and exit. Nothing is saved to disk. Only one runs at a time: launching a second one (or `scribe stop-once`) finishes the running one instead — unix only, as it works by signalling the running recorder; on Windows each `--once` is finished with Enter and runs on its own. Conflicts with `-o`, `--append`, `-r`. |
+| `--jsonl` | Dictation for another program: transcript events on stdout and commands on stdin, one JSON object per line, until the program asks scribe to finish. Logs and progress stay on stderr. See [`--jsonl` (dictation over a pipe)](#--jsonl-dictation-over-a-pipe). Works with `-o` / `-r` (paragraphs are saved as they settle) and `-i` (the file is transcribed and the session ends with it). Conflicts with `-p`, `--chat`, `--dictate`, `--once`, `--live`. |
 
 Either cap ends the paragraph at the next utterance boundary rather
 than mid-sentence, so a paragraph runs up to one utterance (12 s of
@@ -234,6 +235,60 @@ paragraph, `ctrl+a` / `ctrl+e` for the start and end of the paragraph.
 | `enter` (reply highlighted) | Play that reply again, its words lit up as they're spoken; `space` stops it.                   |
 | `pgup` / `pgdn` / `end` | Scroll.                                                                                             |
 | `esc` / `q`    | In the scrollback: back to the bottom. At the bottom: quit (also `ctrl+c`).                                  |
+
+### `--jsonl` (dictation over a pipe)
+
+`scribe --jsonl` is live dictation driven by another program: an editor
+or a chat client starts it, reads what is said as it is said, and tells
+it when to stop. stdout carries only protocol lines (anything else scribe
+would print goes to stderr), stdin takes commands, and both are one JSON
+object per line. Every event has a `type` and a `timestamp` (UTC,
+RFC 3339).
+
+Events on stdout:
+
+| `type`          | Fields                                     | When                                                                                                  |
+|-----------------|--------------------------------------------|-------------------------------------------------------------------------------------------------------|
+| `status`        | `level`, `message`                         | `Loading models` at start, then `Listening` (`Transcribing` with `-i`).                               |
+| `ready`         | `version` (1), `engine`, `model`, `sample_rate_hz` | The models are loaded and the mic is open.                                                     |
+| `session_start` | `session_id`                               | Right after `ready`: dictation has begun.                                                             |
+| `partial`       | `text`, `segment_id`                       | Text not yet settled. Each one replaces the last; it holds every paragraph still open, pass 1's guesses in lowercase. |
+| `final`         | `text`, `segment_id`                       | A paragraph has settled (after `--paragraph-gap` of quiet and every pass): append it. Ends in a space. Clears the partial. |
+| `vad_start` / `vad_end` |                                    | Speech starts / stops.                                                                                |
+| `pong`          | `request_id`                               | Answer to `ping`.                                                                                     |
+| `error`         | `code`, `message`, `fatal`                 | A bad command (`fatal: false`), or what stopped scribe (`fatal: true`, then `session_end` and exit 1). |
+| `session_end`   | `reason`, `request_id`                     | The last line.                                                                                        |
+
+The text so far is every `final` appended in order, then the latest
+`partial`. A paragraph is only committed once the ones before it are,
+so finals always arrive in the order things were said.
+
+Commands on stdin (each may carry a `request_id`, echoed back):
+
+| `type`   | What scribe does                                                                                                   | `session_end` `reason` |
+|----------|--------------------------------------------------------------------------------------------------------------------|------------------------|
+| `finish` | Stops listening, finishes every pass on what was heard (`--llm` too), sends the rest as `final`s, exits 0.        | `finished`             |
+| `cancel` | Stops at once; nothing more is sent. Finals already sent stay sent. Exits 0.                                       | `cancelled`            |
+| `stop`   | The same as `cancel`, for a program shutting down.                                                                 | `stop_requested`       |
+| `ping`   | Answers `pong`.                                                                                                    |                        |
+
+Closing stdin works like `finish` (reason `stdin_closed`), except with
+`-i`, where the session ends with the file instead (`end_of_input`).
+SIGTERM and `ctrl+c` end it like `cancel` (reason `sigterm`). An error
+before the session starts (no mic, no models) is still reported as an
+`error` and a `session_end` with reason `error`.
+
+```console
+$ scribe --jsonl 2>/dev/null
+{"type":"status","level":"info","message":"Loading models",…}
+{"type":"ready","version":1,"engine":"scribe","model":"parakeet","sample_rate_hz":48000,…}
+{"type":"session_start","session_id":"voice-2026-10-27T05:12:17.001193+00:00",…}
+{"type":"partial","text":"u inspect this project","segment_id":"7bf31b88-…",…}
+{"type":"partial","text":"u inspect this project and summerize how it works","segment_id":"7bf31b88-…",…}
+{"type":"finish","request_id":"finish-1"}                          ← typed on stdin
+{"type":"final","text":"Could you inspect this project and summarize how it works? ","segment_id":"7bf31b88-…",…}
+{"type":"session_end","reason":"finished","request_id":"finish-1",…}
+```
 
 ### Headless (`--no-tui`, `--input`)
 

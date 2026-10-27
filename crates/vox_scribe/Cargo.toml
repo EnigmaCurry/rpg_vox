@@ -28,6 +28,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 ratatui = "0.30"
 unicode-width = "0.2"
 ctrlc = "3"
+serde_json.workspace = true
 # `scribe download-models` unpacks the sherpa-onnx .tar.bz2 bundles
 # itself, so no `tar` has to be installed.
 tar = "0.4"

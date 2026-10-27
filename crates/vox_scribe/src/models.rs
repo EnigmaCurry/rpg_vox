@@ -38,6 +38,14 @@ impl Offline {
         }
     }
 
+    /// As `--model` spells it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Offline::SenseVoice => "sensevoice",
+            Offline::Parakeet => "parakeet",
+        }
+    }
+
     /// Approximate download for this model plus Zipformer.
     pub fn download_size(self) -> &'static str {
         match self {
