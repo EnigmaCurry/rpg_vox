@@ -9,7 +9,7 @@
 //! or a new turn began).
 
 use std::io::BufRead as _;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -248,6 +248,12 @@ fn echo(turn: &Turn, tx: &Sender<Speak>) -> Result<()> {
 /// Rounds of tool calls in one reply before the model must just talk.
 const TOOL_ROUNDS: usize = 4;
 
+/// The endpoint only takes tools with reasoning off (OpenAI's reasoning
+/// models on /chat/completions): learned once, then sent every time.
+static REASONING_OFF: AtomicBool = AtomicBool::new(false);
+/// The endpoint refused tools and the room has been told.
+static TOOLS_REFUSED: AtomicBool = AtomicBool::new(false);
+
 /// The model, one reply: stream it into sentences, and in the lobby run
 /// the game tools it calls and let it carry on with their results.
 #[allow(clippy::too_many_arguments)]
@@ -282,6 +288,9 @@ fn stream_reply(
             }
             if tools && round < TOOL_ROUNDS {
                 body["tools"] = game_tools();
+                if REASONING_OFF.load(Ordering::Relaxed) {
+                    body["reasoning_effort"] = json!("none");
+                }
             }
             match req.send_json(body) {
                 Ok(r) => break r,
@@ -291,8 +300,23 @@ fn stream_reply(
                         kwargs = false;
                         continue;
                     }
+                    if code == 400
+                        && tools
+                        && !think
+                        && detail.contains("reasoning_effort")
+                        && !REASONING_OFF.swap(true, Ordering::Relaxed)
+                    {
+                        info!("{chat} only takes tools without reasoning; turning it off");
+                        continue;
+                    }
                     if code == 400 && tools && detail.contains("tool") {
                         warn!("{chat} refuses tools, so games can't be saved: {detail}");
+                        if !TOOLS_REFUSED.swap(true, Ordering::Relaxed) {
+                            room.error(&format!(
+                                "{model} won't take tools here, so games can't be saved: {}",
+                                error_message(&detail)
+                            ));
+                        }
                         tools = false;
                         continue;
                     }
@@ -408,6 +432,14 @@ impl ToolCall {
             self.id.clone()
         }
     }
+}
+
+/// The `error.message` of an OpenAI-style error body, else the body.
+fn error_message(detail: &str) -> String {
+    serde_json::from_str::<Value>(detail)
+        .ok()
+        .and_then(|v| v["error"]["message"].as_str().map(str::to_string))
+        .unwrap_or_else(|| detail.chars().take(300).collect())
 }
 
 /// The tools the model has in the lobby, for designing games.
