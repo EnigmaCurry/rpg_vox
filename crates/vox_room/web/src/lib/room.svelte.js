@@ -20,6 +20,8 @@ export const room = $state({
   notice: null,
   // A question waiting for the user's answer: { text, yes, resolve }.
   asking: null,
+  // A game's prompt this person asked to see: { name, summary, prompt }.
+  peek: null,
   audio: 'off', // off | starting | on | error
   audioError: null,
   mic: false,
@@ -90,6 +92,18 @@ export function answer(ok) {
   const a = room.asking;
   room.asking = null;
   a?.resolve(ok);
+}
+
+/// Fetch a game's hidden prompt, for this person only.
+export async function peekGame(name) {
+  try {
+    const r = await fetch(`/api/games/${encodeURIComponent(name)}/prompt`);
+    if (!r.ok) throw new Error(await r.text());
+    room.peek = await r.json();
+  } catch (e) {
+    console.error('[room] peek', e);
+    room.notice = { text: `Can't show ${name}'s prompt: ${e.message || e}`, error: true };
+  }
 }
 
 export async function enterGame(name) {

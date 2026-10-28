@@ -60,6 +60,7 @@ pub fn router(room: Arc<Room>) -> Router {
     Router::new()
         .route("/join/:token", get(join))
         .route("/api/me", get(me))
+        .route("/api/games/:name/prompt", get(game_prompt))
         .route("/room.ws", get(ws))
         .route("/healthz", get(|| async { "ok" }))
         .fallback(assets)
@@ -109,6 +110,26 @@ async fn me(State(app): State<App>, headers: HeaderMap) -> Response {
             Json(json!({ "error": "no invite" })),
         )
             .into_response(),
+    }
+}
+
+/// A game's hidden prompt, for one person who asked to peek. It is never
+/// broadcast to the room.
+async fn game_prompt(
+    State(app): State<App>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(who) = person(&app, &headers) else {
+        return (StatusCode::UNAUTHORIZED, "no invite").into_response();
+    };
+    match app.room.game_with_prompt(&name) {
+        Some((game, prompt)) => {
+            info!(person = %who, game = %game.name, "peeked at a game's prompt");
+            Json(json!({ "name": game.name, "summary": game.summary, "prompt": prompt }))
+                .into_response()
+        }
+        None => (StatusCode::NOT_FOUND, "no such game").into_response(),
     }
 }
 

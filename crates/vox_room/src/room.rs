@@ -332,6 +332,11 @@ impl Room {
         })
     }
 
+    /// A saved game and its prompt, for someone who asks to see it.
+    pub fn game_with_prompt(&self, name: &str) -> Option<(crate::store::Game, String)> {
+        self.store().game(name).ok().flatten()
+    }
+
     /// The saved games, for the agent.
     pub fn list_games(&self) -> Vec<crate::store::Game> {
         self.games()

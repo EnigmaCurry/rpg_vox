@@ -1,6 +1,6 @@
 <script>
   import { onMount } from 'svelte';
-  import { room, connect, command, enterGame, ask, answer, whoami, joinAudio, leaveAudio, setMuted, setVolume, setNoHeadset } from './lib/room.svelte.js';
+  import { room, connect, command, enterGame, peekGame, ask, answer, whoami, joinAudio, leaveAudio, setMuted, setVolume, setNoHeadset } from './lib/room.svelte.js';
   import { supported } from './lib/audio.js';
   import Log from './components/Log.svelte';
   import Strip from './components/Strip.svelte';
@@ -33,6 +33,13 @@
     if (await ask(`Delete ${name} for good?`, 'Delete')) command({ type: 'delete_game', name });
   }
 
+  let peekDialog = $state();
+  $effect(() => {
+    if (!peekDialog) return;
+    if (room.peek && !peekDialog.open) peekDialog.showModal();
+    if (!room.peek && peekDialog.open) peekDialog.close();
+  });
+
   let dialog = $state();
   $effect(() => {
     if (!dialog) return;
@@ -49,6 +56,19 @@
 </script>
 
 <svelte:window {onkeydown} />
+
+<dialog class="ask peek" bind:this={peekDialog} oncancel={(e) => { e.preventDefault(); room.peek = null; }}
+  onclick={(e) => { if (e.target === peekDialog) room.peek = null; }}>
+  {#if room.peek}
+    <h2 class="peek-title">{room.peek.name}</h2>
+    <p class="peek-summary">{room.peek.summary}</p>
+    <div class="peek-prompt">{room.peek.prompt}</div>
+    <div class="ask-actions">
+      <span class="hint">Only you can see this. It may spoil the game.</span>
+      <button class="primary" onclick={() => (room.peek = null)}>Close</button>
+    </div>
+  {/if}
+</dialog>
 
 <dialog class="ask" bind:this={dialog} oncancel={(e) => { e.preventDefault(); answer(false); }}>
   {#if room.asking}
@@ -118,7 +138,12 @@
             {#if room.game !== g.name}
               <div class="gact">
                 {#if !room.game}<button onclick={() => enterGame(g.name)}>Play</button>{/if}
+                <button onclick={() => peekGame(g.name)} title="Show the game's hidden prompt, to you only">Peek</button>
                 <button class="danger" onclick={() => deleteGame(g.name)}>Delete</button>
+              </div>
+            {:else}
+              <div class="gact">
+                <button onclick={() => peekGame(g.name)} title="Show the game's hidden prompt, to you only">Peek</button>
               </div>
             {/if}
           </li>
@@ -212,7 +237,24 @@
   .ask { border: 1px solid var(--line); border-radius: 12px; padding: 18px 20px; max-width: min(28em, calc(100vw - 32px)); background: var(--bg, var(--bubble)); color: inherit; }
   .ask::backdrop { background: rgb(0 0 0 / 35%); }
   .ask p { margin: 0 0 14px; }
-  .ask-actions { display: flex; justify-content: flex-end; gap: 8px; }
+  .ask-actions { display: flex; justify-content: flex-end; align-items: center; gap: 8px; }
+  .ask-actions .hint { margin-right: auto; }
+  .ask.peek { width: min(46em, calc(100vw - 32px)); max-width: none; }
+  .peek-title { font-size: 17px; text-transform: none; letter-spacing: 0; color: inherit; margin: 0 0 4px; }
+  .peek-summary { color: var(--muted); margin: 0 0 12px !important; }
+  .peek-prompt {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    max-height: 60vh;
+    overflow-y: auto;
+    background: var(--bubble);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 12px 14px;
+    margin-bottom: 14px;
+    font-size: 14px;
+    line-height: 1.5;
+  }
   .games-head { margin-top: 10px; }
   .games { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
   .games li { border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; background: var(--bubble); }

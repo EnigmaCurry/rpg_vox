@@ -77,8 +77,8 @@ reads its prompt back to itself, rewrites it, and replaces the card.
 Entering moves everyone into a fresh conversation run by that prompt
 alone (the AI opens the scene), and fixes the game for good.
 
-The **Games** list (right) plays any saved game from the start, or
-deletes it. **Back to lobby** leaves a game; **Restart game** starts it
+The **Games** list (right) plays any saved game from the start,
+deletes it, or lets you **Peek** at its prompt (shown only to you). **Back to lobby** leaves a game; **Restart game** starts it
 over. Saving needs a model with tool calling (llama.cpp needs `--jinja`);
 without it the AI can talk about games but not save them.
 
