@@ -72,6 +72,21 @@ just pi
 
 [Read more →](PI.md)
 
+## [Voice room](ROOM.md)
+
+A voice chat in the browser for a few people and an AI. Everyone joins
+with an invite link and a headset, hears everyone else and the AI, and
+sees one live transcript of who said what. The AI answers out loud and
+can be interrupted just by talking; the log keeps only what it actually
+said. macOS and Linux.
+
+```bash
+just room-invite Ryan
+just room
+```
+
+[Read more →](ROOM.md)
+
 ## [rpg_vox](RPG_VOX.md)
 
 status: **EXPERIMENTAL**

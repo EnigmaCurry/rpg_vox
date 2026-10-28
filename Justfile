@@ -826,3 +826,28 @@ install-agent BIN="~/.local/bin":
     mkdir -p "$bin"
     install -m 755 target/release/agent "$bin/agent"
     echo "installed $bin/agent"
+
+# --- vox_room (voice room in the browser, see ROOM.md) ---
+
+# Run the voice room on http://127.0.0.1:7340, e.g. `just room --echo`.
+room *ARGS:
+    cargo run -p vox_room --release -- {{ARGS}}
+
+# Print the invite link for NAME (made on first use).
+room-invite NAME:
+    cargo run -p vox_room --release -- invite "{{NAME}}"
+
+# The room's web app with hot reload on :5173, against `just room`.
+room-ui:
+    cd crates/vox_room/web && pnpm install && pnpm dev
+
+# Build vox_room and install it to BIN.
+install-room BIN="~/.local/bin":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build -p vox_room --release
+    bin="{{BIN}}"
+    bin="${bin/#\~/$HOME}"
+    mkdir -p "$bin"
+    install -m 755 target/release/vox_room "$bin/vox_room"
+    echo "installed $bin/vox_room"

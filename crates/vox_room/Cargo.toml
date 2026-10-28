@@ -1,0 +1,35 @@
+[package]
+name = "vox_room"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "A voice room in the browser: people talk through their headsets, hear each other and an AI that talks back, and share one live transcript"
+build = "build.rs"
+
+[[bin]]
+name = "vox_room"
+path = "src/main.rs"
+
+[dependencies]
+vox_transcribe = { path = "../vox_transcribe", features = ["llm", "sherpa-static"] }
+tokio.workspace = true
+axum = { version = "0.7", features = ["ws"] }
+futures-util = "0.3"
+# The Svelte SPA (web/), built by build.rs into dist-ui/.
+rust-embed = { version = "8", features = ["mime-guess"] }
+# Mic frames in, each listener's mix out: 20 ms Opus frames.
+opus = "0.3"
+# Pinned to share libsqlite3-sys with the rest of the workspace.
+rusqlite = { version = "0.31", features = ["bundled"] }
+# Blocking HTTP for the LLM stream and the TTS server, on their own threads.
+ureq = { version = "2", features = ["json"] }
+hound = "3"
+rubato = "0.15"
+crossbeam-channel = "0.5"
+uuid = { version = "1", features = ["v4"] }
+anyhow.workspace = true
+clap = { workspace = true, features = ["env"] }
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

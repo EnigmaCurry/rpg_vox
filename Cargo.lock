@@ -6999,6 +6999,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "vox_room"
+version = "0.1.10"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "crossbeam-channel",
+ "futures-util",
+ "hound",
+ "opus",
+ "rubato 0.15.0",
+ "rusqlite",
+ "rust-embed",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "ureq",
+ "uuid",
+ "vox_transcribe",
+]
+
+[[package]]
 name = "vox_scribe"
 version = "0.1.10"
 dependencies = [
