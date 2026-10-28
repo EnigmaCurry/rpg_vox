@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
 use tracing::{error, info, warn};
-use vox_transcribe::{Paragraph, Pusher};
+use vox_transcribe::{Paragraph, ParagraphMode, Pusher};
 
 use crate::mixer::{AiProgress, Mixer, Strip, AGENT_STRIP};
 use crate::store::Store;
@@ -157,6 +157,9 @@ struct Person {
     /// Muted their own mic. Their audio still arrives (as silence), but
     /// the room doesn't transcribe it or count it as talking.
     muted: bool,
+    /// Push to talk: unmuted means holding the key, and everything said
+    /// until release is one entry, however long the pauses.
+    ptt: bool,
     speaking: bool,
     speaking_since: Option<Instant>,
     /// Last time a streaming guess with words in it came in.
@@ -413,8 +416,26 @@ impl Room {
         p.muted = muted;
         if muted {
             p.speaking = false;
+            // Let go of push to talk: what they said is done.
+            if p.ptt {
+                if let Some(e) = &p.engine {
+                    e.break_paragraph();
+                }
+            }
         }
         self.emit_people(&st);
+    }
+
+    /// `person` turned push to talk on or off.
+    pub fn set_ptt(&self, person: &str, on: bool) {
+        let mut st = self.lock();
+        let Some(p) = st.people.get_mut(person) else {
+            return;
+        };
+        p.ptt = on;
+        if let Some(e) = &p.engine {
+            e.set_paragraph_mode(paragraph_mode(on));
+        }
     }
 
     /// Decoded mic audio (48 kHz mono) from `person`.
@@ -434,7 +455,10 @@ impl Room {
             if p.engine.is_none() {
                 if let Some(make) = &self.stt {
                     match make(person, self.clone()) {
-                        Ok(e) => p.engine = Some(e),
+                        Ok(e) => {
+                            e.set_paragraph_mode(paragraph_mode(p.ptt));
+                            p.engine = Some(e);
+                        }
                         Err(err) => {
                             error!(person, "no transcription: {err:#}");
                             self.error(&format!("Can't transcribe {person}: {err:#}"));
@@ -1051,7 +1075,7 @@ impl Room {
     /// and ask the AI to answer when it should.
     fn hand_over(&self, st: &mut State, now: Instant) {
         if st.reply.is_some()
-            || st.people.values().any(|p| p.speaking)
+            || st.people.values().any(|p| p.speaking || p.holding())
             || now.duration_since(st.last_change) < self.cfg.reply_after
         {
             return;
@@ -1169,7 +1193,7 @@ impl Room {
             .iter()
             .filter(|e| e.kind == Kind::Human && !e.sent && !e.text.is_empty())
             .peekable();
-        !st.people.values().any(|p| p.speaking)
+        !st.people.values().any(|p| p.speaking || p.holding())
             && pending.peek().is_some()
             && (st.mode == Mode::Always || pending.any(|e| self.named(&e.text)))
     }
@@ -1187,6 +1211,21 @@ impl Room {
 
 /// Push a second of silence so the engine closes an utterance whose
 /// audio just stopped (a mic turned off, a tab closed).
+impl Person {
+    /// Holding push to talk: not done talking, however long the pause.
+    fn holding(&self) -> bool {
+        self.ptt && !self.muted && self.mic
+    }
+}
+
+fn paragraph_mode(ptt: bool) -> ParagraphMode {
+    if ptt {
+        ParagraphMode::Manual
+    } else {
+        ParagraphMode::Auto
+    }
+}
+
 fn close_utterance(e: &Pusher) {
     e.push(&vec![0.0; crate::mixer::RATE as usize]);
 }
@@ -1360,6 +1399,29 @@ mod tests {
 
     fn quiet(room: &Room) -> Instant {
         Instant::now() + room.cfg.reply_after + Duration::from_millis(10)
+    }
+
+    #[test]
+    fn push_to_talk_waits_for_release() {
+        let (r, turns) = room(Mode::Always);
+        r.set_mic("Ryan", true);
+        r.set_ptt("Ryan", true);
+        r.set_muted("Ryan", false);
+        r.on_paragraph("Ryan", &para("p1", "Let me think about", false));
+        r.tick(quiet(&r));
+        assert!(
+            turns.try_recv().is_err(),
+            "a pause while holding isn't the end"
+        );
+        assert_eq!(r.lock().agent_state, "listening");
+        r.on_paragraph(
+            "Ryan",
+            &para("p1", "Let me think about it. Okay, go.", false),
+        );
+        r.set_muted("Ryan", true);
+        r.tick(quiet(&r));
+        let t = turns.try_recv().expect("answered after release");
+        assert!(t.messages.last().unwrap().1.contains("Okay, go."));
     }
 
     #[test]

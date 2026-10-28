@@ -338,6 +338,11 @@ impl Pusher {
     pub fn break_paragraph(&self) {
         let _ = self.cmd_tx.send(Cmd::Break);
     }
+
+    /// See [`Engine::set_paragraph_mode`].
+    pub fn set_paragraph_mode(&self, mode: ParagraphMode) {
+        let _ = self.cmd_tx.send(Cmd::Mode(mode));
+    }
 }
 
 fn offline_worker(

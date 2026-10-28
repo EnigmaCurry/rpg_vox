@@ -57,6 +57,7 @@ export function connect() {
     room.connected = true;
     retry = 0;
     if (room.mic) command({ type: 'mic', on: true });
+    command({ type: 'ptt', on: room.pushToTalk });
     command({ type: 'mute', on: room.muted });
   };
   ws.onmessage = (ev) => {
@@ -237,6 +238,7 @@ export function setPushToTalk(on) {
   writePref('vox_room.push_to_talk', on);
   clearTimeout(releaseTimer);
   room.talking = false;
+  command({ type: 'ptt', on });
   setMuted(on);
 }
 

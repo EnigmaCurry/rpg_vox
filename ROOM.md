@@ -61,7 +61,8 @@ it and `vox_room people` lists everyone.
 - **Mixer** (right): a level and mute for each person and the AI, shared
   by the whole room. **Your volume** (bottom) is only yours. Space mutes
   your mic, or with **Push to talk** on, your mic is open only while you
-  hold Space (or the talk button).
+  hold Space (or the talk button): everything said in one hold is one
+  entry, and the AI waits for you to let go however long you pause.
 - **New conversation** clears the screen and the AI's memory. Old
   conversations stay in the database.
 
