@@ -1,0 +1,5 @@
+# pnpm 11+ requires explicit approval for packages that run install scripts.
+# esbuild ships a prebuilt native binary via its postinstall; the Vite build
+# won't work without it.
+allowBuilds:
+  esbuild: true
