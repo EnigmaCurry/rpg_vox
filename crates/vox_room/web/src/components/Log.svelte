@@ -12,6 +12,7 @@
   $effect(() => {
     // Follow new text while the view is at the bottom.
     room.log.map((e) => e.text).join();
+    room.agent.state;
     if (stick && box) queueMicrotask(() => (box.scrollTop = box.scrollHeight));
   });
 
@@ -36,6 +37,12 @@
       </div>
     </div>
   {/each}
+  {#if room.agent.state === 'waiting'}
+    <div class="entry agent waiting" aria-live="polite">
+      <div class="who"><span class="name">{room.agent.name}</span><span class="time">waiting for a pause</span></div>
+      <div class="text"><span class="dots"><i></i><i></i><i></i></span></div>
+    </div>
+  {/if}
 </div>
 
 <style>
@@ -66,9 +73,19 @@
   .text.partial { color: var(--muted); }
   .text.live { box-shadow: 0 0 0 1px hsl(var(--h) 55% 55% / 40%); }
   .agent .text.live { box-shadow: 0 0 0 1px color-mix(in srgb, var(--agent) 40%, transparent); }
-  .dots { display: inline-flex; gap: 4px; padding: 4px 0; }
-  .dots i { width: 6px; height: 6px; border-radius: 50%; background: var(--muted); animation: blink 1.2s infinite; }
-  .dots i:nth-child(2) { animation-delay: 0.2s; }
-  .dots i:nth-child(3) { animation-delay: 0.4s; }
-  @keyframes blink { 0%, 80%, 100% { opacity: 0.25; } 40% { opacity: 1; } }
+  /* Thinking: an empty reply bubble with bouncing dots and a breathing edge. */
+  .agent .text.live:empty, .agent .text.live:has(> .dots) { animation: breathe 1.6s ease-in-out infinite; }
+  .dots { display: inline-flex; gap: 5px; padding: 6px 2px; }
+  .dots i { width: 8px; height: 8px; border-radius: 50%; background: var(--agent); animation: bounce 1s ease-in-out infinite; }
+  .dots i:nth-child(2) { animation-delay: 0.15s; }
+  .dots i:nth-child(3) { animation-delay: 0.3s; }
+  /* Waiting for the pause: the same bubble, fainter and slower. */
+  .waiting .text { animation: none; opacity: 0.6; }
+  .waiting .dots i { animation-duration: 1.8s; background: var(--muted); }
+  @keyframes bounce { 0%, 60%, 100% { transform: translateY(0); opacity: 0.4; } 30% { transform: translateY(-5px); opacity: 1; } }
+  @keyframes breathe {
+    0%, 100% { box-shadow: 0 0 0 1px color-mix(in srgb, var(--agent) 40%, transparent); }
+    50% { box-shadow: 0 0 0 4px color-mix(in srgb, var(--agent) 20%, transparent); }
+  }
+  @media (prefers-reduced-motion: reduce) { .dots i, .text { animation: none !important; } }
 </style>

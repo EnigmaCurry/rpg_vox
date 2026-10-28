@@ -10,7 +10,12 @@
   });
 
   const agentLabel = $derived(
-    { listening: 'listening', thinking: 'thinking…', speaking: 'speaking' }[room.agent.state] ?? room.agent.state,
+    {
+      listening: 'listening',
+      waiting: 'about to answer',
+      thinking: 'thinking',
+      speaking: 'speaking',
+    }[room.agent.state] ?? room.agent.state,
   );
 
   function newConversation() {
@@ -38,8 +43,15 @@
   <div class="app">
     <header>
       <h1>Voice room</h1>
-      <span class="pill {room.agent.state}" aria-live="polite">{room.agent.name} is {agentLabel}</span>
-      {#if room.agent.state !== 'listening'}
+      <span class="pill {room.agent.state}" aria-live="polite">
+        {#if room.agent.state === 'thinking' || room.agent.state === 'waiting'}
+          <span class="dots" aria-hidden="true"><i></i><i></i><i></i></span>
+        {:else if room.agent.state === 'speaking'}
+          <span class="bars" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+        {/if}
+        {room.agent.name} is {agentLabel}
+      </span>
+      {#if room.agent.state === 'thinking' || room.agent.state === 'speaking'}
         <button class="danger" onclick={() => command({ type: 'stop' })}>Stop {room.agent.name}</button>
       {/if}
       <div class="spacer"></div>
@@ -124,9 +136,24 @@
   h1 { font-size: 17px; margin: 0; }
   h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin: 0 0 4px; }
   .spacer { flex: 1; }
-  .pill { font-size: 13px; padding: 3px 10px; border-radius: 999px; background: var(--bubble); color: var(--muted); }
-  .pill.thinking { color: var(--agent); }
+  .pill { font-size: 13px; padding: 3px 10px; border-radius: 999px; background: var(--bubble); color: var(--muted); display: inline-flex; align-items: center; gap: 6px; }
+  .pill.waiting { color: var(--agent); }
+  .pill.thinking { color: var(--agent); box-shadow: 0 0 0 1px var(--agent); animation: glow 1.6s ease-in-out infinite; }
   .pill.speaking { background: var(--agent); color: var(--accent-ink); }
+  .pill .dots { display: inline-flex; gap: 3px; }
+  .pill .dots i { width: 5px; height: 5px; border-radius: 50%; background: currentColor; animation: hop 1s ease-in-out infinite; }
+  .pill.waiting .dots i { animation-duration: 1.8s; opacity: 0.6; }
+  .pill .dots i:nth-child(2) { animation-delay: 0.15s; }
+  .pill .dots i:nth-child(3) { animation-delay: 0.3s; }
+  .pill .bars { display: inline-flex; align-items: center; gap: 2px; height: 12px; }
+  .pill .bars i { width: 3px; height: 100%; border-radius: 2px; background: currentColor; transform-origin: center; animation: talk 0.9s ease-in-out infinite; }
+  .pill .bars i:nth-child(2) { animation-delay: 0.2s; }
+  .pill .bars i:nth-child(3) { animation-delay: 0.45s; }
+  .pill .bars i:nth-child(4) { animation-delay: 0.1s; }
+  @keyframes hop { 0%, 60%, 100% { transform: translateY(0); } 30% { transform: translateY(-3px); } }
+  @keyframes talk { 0%, 100% { transform: scaleY(0.3); } 50% { transform: scaleY(1); } }
+  @keyframes glow { 0%, 100% { box-shadow: 0 0 0 1px var(--agent); } 50% { box-shadow: 0 0 0 3px color-mix(in srgb, var(--agent) 35%, transparent); } }
+  @media (prefers-reduced-motion: reduce) { .pill *, .pill { animation: none !important; } }
   .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
   .seg button { border: 0; border-radius: 0; padding: 5px 10px; }
   .seg button.on { background: var(--accent); color: var(--accent-ink); }

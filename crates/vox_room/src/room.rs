@@ -119,6 +119,8 @@ pub struct RoomConfig {
 pub struct Turn {
     pub generation: u64,
     pub messages: Vec<(Role, String)>,
+    /// When the room handed the turn over, for the reply's timings.
+    pub asked: Instant,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -154,6 +156,9 @@ struct Reply {
     sentences: Vec<Said>,
     /// The agent has sent everything it is going to say.
     complete: bool,
+    /// The last words it answers, and when it was asked: for timings.
+    heard: Instant,
+    asked: Instant,
 }
 
 struct State {
@@ -163,6 +168,8 @@ struct State {
     mode: Mode,
     reply: Option<Reply>,
     last_change: Instant,
+    /// When the last person to speak stopped.
+    quiet_since: Instant,
     ducked: bool,
     /// The AI state last broadcast.
     agent_state: &'static str,
@@ -221,6 +228,7 @@ impl Room {
                 mode,
                 reply: None,
                 last_change: Instant::now(),
+                quiet_since: Instant::now(),
                 ducked: false,
                 agent_state: "listening",
             }),
@@ -470,6 +478,9 @@ impl Room {
         p.speaking = speaking;
         p.speaking_since = speaking.then(Instant::now);
         st.last_change = Instant::now();
+        if !speaking {
+            st.quiet_since = st.last_change;
+        }
         self.emit_people(&st);
     }
 
@@ -575,10 +586,21 @@ impl Room {
         self.barge_in(&mut st, now);
         self.hand_over(&mut st, now);
         let state = match &st.reply {
+            None if self.will_answer(&st) => "waiting",
             None => "listening",
             Some(r) if r.sentences.iter().any(|s| s.played > 0) => "speaking",
             Some(_) => "thinking",
         };
+        if state == "speaking" && st.agent_state != "speaking" {
+            if let Some(r) = &st.reply {
+                info!(
+                    generation = r.generation,
+                    after_words_ms = r.heard.elapsed().as_millis() as u64,
+                    after_asking_ms = r.asked.elapsed().as_millis() as u64,
+                    "reply: first audio"
+                );
+            }
+        }
         if state != st.agent_state {
             st.agent_state = state;
             self.emit(json!({ "type": "agent", "state": state }));
@@ -757,15 +779,23 @@ impl Room {
             entry: entry.id.clone(),
             sentences: Vec::new(),
             complete: false,
+            heard: st.quiet_since,
+            asked: now,
         });
         st.log.push(entry);
         trim_log(&mut st.log);
-        info!(generation, "asking the agent");
+        info!(
+            generation,
+            after_words_ms = now.duration_since(st.quiet_since).as_millis() as u64,
+            after_transcript_ms = now.duration_since(st.last_change).as_millis() as u64,
+            "reply: asking the agent"
+        );
         if self
             .agent
             .send(Turn {
                 generation,
                 messages,
+                asked: now,
             })
             .is_err()
         {
@@ -775,6 +805,19 @@ impl Room {
                 self.cfg.agent_name
             ));
         }
+    }
+
+    /// Everyone has stopped talking and what they said since the last turn
+    /// will get an answer: the room is only waiting out the pause.
+    fn will_answer(&self, st: &State) -> bool {
+        let mut pending = st
+            .log
+            .iter()
+            .filter(|e| e.kind == Kind::Human && !e.sent && !e.text.is_empty())
+            .peekable();
+        !st.people.values().any(|p| p.speaking)
+            && pending.peek().is_some()
+            && (st.mode == Mode::Always || pending.any(|e| self.named(&e.text)))
     }
 
     /// Someone said the AI's name (or one of its aliases).
@@ -986,6 +1029,7 @@ mod tests {
         r.on_paragraph("Ryan", &para("p1", "What do you think, Alex?", false));
         r.tick(quiet(&r));
         assert!(turns.try_recv().is_err(), "not addressed");
+        assert_eq!(r.lock().agent_state, "listening");
         r.on_paragraph("Alex", &para("p2", "Let's ask vox.", false));
         r.tick(quiet(&r));
         let t = turns.try_recv().expect("named");
@@ -1015,6 +1059,7 @@ mod tests {
         r.on_paragraph("Ryan", &para("p1", "Hello there.", false));
         r.tick(Instant::now());
         assert!(turns.try_recv().is_err(), "not quiet long enough");
+        assert_eq!(r.lock().agent_state, "waiting", "shown as about to answer");
         r.on_level("Ryan", true);
         r.tick(quiet(&r));
         assert!(turns.try_recv().is_err(), "still talking");

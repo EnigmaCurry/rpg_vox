@@ -11,7 +11,7 @@
 use std::io::BufRead as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context as _, Result};
 use crossbeam_channel::{Receiver, Sender};
@@ -94,6 +94,7 @@ impl Agent {
                             *think,
                             &messages,
                             g,
+                            turn.asked,
                             &self.generation,
                             &tx,
                         ),
@@ -156,8 +157,16 @@ fn speak(
                 if generation.load(Ordering::SeqCst) != g || failed == Some(g) {
                     continue;
                 }
+                let started = Instant::now();
                 match voice.speak(&text) {
                     Ok(samples) => {
+                        info!(
+                            g,
+                            chars = text.len(),
+                            ms = started.elapsed().as_millis() as u64,
+                            audio_ms = samples.len() as u64 * 1000 / crate::mixer::RATE as u64,
+                            "reply: sentence synthesized"
+                        );
                         if !room.agent_speak(g, &text, samples) {
                             debug!(g, "reply dropped while it was synthesized");
                         }
@@ -204,6 +213,7 @@ fn stream_reply(
     think: bool,
     messages: &[Value],
     g: u64,
+    asked: Instant,
     generation: &AtomicU64,
     tx: &Sender<Speak>,
 ) -> Result<()> {
@@ -234,8 +244,12 @@ fn stream_reply(
             Err(e) => return Err(e).with_context(|| format!("POST {chat}")),
         }
     };
-    info!(g, "reply stream opened");
+    let ms = || asked.elapsed().as_millis() as u64;
+    info!(g, after_asking_ms = ms(), "reply: stream opened");
     let mut pending = String::new();
+    // Nothing is spoken yet: the first clause goes on its own, so the voice
+    // can start before the model finishes a long first sentence.
+    let mut first = true;
     for line in std::io::BufReader::new(resp.into_reader()).lines() {
         if generation.load(Ordering::SeqCst) != g {
             info!(g, "reply dropped");
@@ -252,10 +266,24 @@ fn stream_reply(
             continue;
         };
         if let Some(piece) = v["choices"][0]["delta"]["content"].as_str() {
+            if pending.is_empty() && first && !piece.trim().is_empty() {
+                info!(g, after_asking_ms = ms(), "reply: first words");
+            }
             pending.push_str(piece);
         }
-        while let Some(end) = sentence_end(&pending) {
+        while let Some(end) =
+            sentence_end(&pending).or_else(|| first.then(|| clause_end(&pending)).flatten())
+        {
             let s: String = pending.drain(..end).collect();
+            if first {
+                info!(
+                    g,
+                    after_asking_ms = ms(),
+                    chars = s.len(),
+                    "reply: first sentence"
+                );
+                first = false;
+            }
             send_sentence(tx, g, &s);
         }
     }
@@ -305,6 +333,33 @@ fn sentence_end(text: &str) -> Option<usize> {
     None
 }
 
+/// Words a clause needs before it is worth speaking on its own.
+const CLAUSE_WORDS: usize = 4;
+
+/// Byte length of the first clause in `text`: up to a `,`, `;`, `:` or
+/// dash followed by whitespace, once there are a few words before it.
+fn clause_end(text: &str) -> Option<usize> {
+    let mut words = 0;
+    let mut in_word = false;
+    for (i, c) in text.char_indices() {
+        if c.is_whitespace() {
+            in_word = false;
+            continue;
+        }
+        if !in_word {
+            in_word = true;
+            words += 1;
+        }
+        if matches!(c, ',' | ';' | ':' | '—' | '–') && words >= CLAUSE_WORDS {
+            let end = i + c.len_utf8();
+            if text[end..].starts_with(char::is_whitespace) {
+                return Some(end);
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -314,6 +369,13 @@ mod tests {
         assert_eq!(sentence_end("Hello there. How"), Some(12));
         assert_eq!(sentence_end("Wait... what"), Some(7));
         assert_eq!(sentence_end("No end yet."), None);
+    }
+
+    #[test]
+    fn finds_clause_ends() {
+        assert_eq!(clause_end("Well, that is a fine question, and"), Some(30));
+        assert_eq!(clause_end("Well, sure"), None);
+        assert_eq!(clause_end("It costs 1,000 coins, or"), Some(21));
     }
 
     #[test]

@@ -75,8 +75,13 @@ it and `vox_room people` lists everyone.
   said them with no diarization.
 - When nobody has spoken for `--reply-after-ms` (1.2 s), what was said is
   handed to the conversation, and the AI may answer. Its reply streams
-  from the model a sentence at a time into the TTS, and each synthesized
-  sentence is queued in the mixer.
+  from the model a sentence at a time into the TTS (the first clause on
+  its own, so the voice starts sooner), and each synthesized sentence is
+  queued in the mixer.
+- Every reply logs where its time went, as `reply:` lines: how long after
+  the last words it was asked (`after_words_ms`), when the model's stream
+  opened and its first words and first sentence arrived, how long each
+  sentence took to synthesize, and when its first audio played.
 - The mixer counts how much of each sentence it has played. That count,
   not the model's text, is what the conversation records: whole
   sentences, then the words of the current one that have been heard in
