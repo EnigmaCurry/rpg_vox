@@ -131,8 +131,7 @@
           <li class:current={room.game === g.name}>
             <div class="gname">
               <span>{g.name}</span>
-              {#if room.game === g.name}<span class="tag">playing</span>
-              {:else if !g.played}<span class="tag" title="Not played yet: {room.agent.name} can still change it">draft</span>{/if}
+              {#if room.game === g.name}<span class="tag">playing</span>{/if}
             </div>
             <p class="gsum">{g.summary}</p>
             {#if room.game !== g.name}

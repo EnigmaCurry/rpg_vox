@@ -70,12 +70,15 @@ In the lobby (the room's ordinary conversation) the AI can design a game
 with you. Talk it through; it fills in what you leave open, checks the
 name is free, and once you've confirmed it writes the game's prompt
 itself and saves it. The prompt never reaches a browser: what appears in
-the chat is a card with the game's summary and an **Enter** button.
+the chat is a card with the game's name and summary.
 
-Until anyone enters it, a game is a draft: ask for changes and the AI
-reads its prompt back to itself, rewrites it, and replaces the card.
-Entering moves everyone into a fresh conversation run by that prompt
-alone (the AI opens the scene), and fixes the game for good.
+Everything else is by voice too, in the lobby: ask the AI to start a
+game ("let's play Quick Draw") and, once its reply has been heard,
+everyone moves into a fresh conversation run by that prompt alone (the
+AI opens the scene). Ask it to change a game and it reads the prompt to
+itself, rewrites it, and replaces the card; ask it to delete one and it
+checks which game you mean before deleting. Inside a game the AI only
+plays it: go back to the lobby to change games.
 
 The **Games** list (right) plays any saved game from the start,
 deletes it, or lets you **Peek** at its prompt (shown only to you). **Back to lobby** leaves a game; **Restart game** starts it

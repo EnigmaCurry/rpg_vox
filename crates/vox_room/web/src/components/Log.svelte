@@ -1,5 +1,5 @@
 <script>
-  import { room, enterGame } from '../lib/room.svelte.js';
+  import { room } from '../lib/room.svelte.js';
   import { hue } from '../lib/color.js';
 
   let box;
@@ -27,7 +27,7 @@
       {:else}
         Nothing said yet. Join the audio and start talking; say <strong>{room.agent.name}</strong>
         {room.mode === 'named' ? 'to bring it in' : 'or just talk, and it answers when you pause'}.
-        Ask it to design a game with you, and it'll save one you can enter.
+        Ask it to design a game with you, then ask it to start, change or delete games by voice.
       {/if}
     </p>
   {/if}
@@ -44,7 +44,7 @@
           {:else if room.game}
             <span class="hint">Go back to the lobby to play it.</span>
           {:else}
-            <button class="primary" onclick={() => enterGame(g.name)}>Enter {g.name}</button>
+            <span class="hint">Ask {room.agent.name} to start it when you're ready.</span>
           {/if}
         </div>
       </div>

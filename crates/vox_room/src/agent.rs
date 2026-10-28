@@ -43,10 +43,14 @@ save it with save_game. The prompt becomes your complete instructions when the \
 room enters the game, and you won't remember this conversation then, so put \
 everything in it: premise, setting, rules, how to run turns among several \
 players, and how to open. The players never see the prompt, so never read it \
-aloud or describe its secrets; a button to enter the game appears in the \
-chat. Until someone enters a game the players can ask for changes: use \
-read_game and revise_game, which replaces its button. Once a game has been \
-played it is fixed. list_games shows the saved games. Whatever you say \
+aloud or describe its secrets; a card with its name and summary appears in \
+the chat. The players run everything by voice: when they ask to play a game, \
+start it with start_game (that ends this conversation, so don't say more \
+than a few words first). When they want a game changed, use read_game and \
+revise_game. When they want one deleted, say which game you mean and call \
+delete_game only after they confirm; it can't be undone. list_games shows \
+the saved games; speech recognition mangles names, so match what you hear \
+to the closest saved one, and ask if it's unclear. Whatever you say \
 before calling a tool is spoken straight away, so after the tool answers, \
 carry on without repeating it.";
 
@@ -431,8 +435,19 @@ fn stream_reply(
             }
             messages.push(json!({ "role": "tool", "tool_call_id": c.id(i), "content": result }));
         }
+        if room.is_starting(g) {
+            info!(g, "reply: started a game, so it ends here");
+            return Ok(());
+        }
+        if generation.load(Ordering::SeqCst) != g {
+            info!(g, "reply dropped");
+            return Ok(());
+        }
         if answered {
-            info!(g, "reply: already answered, so not asking again after the tools");
+            info!(
+                g,
+                "reply: already answered, so not asking again after the tools"
+            );
             return Ok(());
         }
     }
@@ -490,8 +505,10 @@ fn game_tools() -> Value {
         tool("list_games", "List the saved games: name, summary, and whether they have been played (and so are fixed).", json!({}), &[]),
         tool("check_game_name", "Check whether a name is free for a new game.", json!({ "name": name }), &["name"]),
         tool("save_game", "Save a new game once the players have confirmed it. Its button appears in the chat.", game, &["name", "summary", "prompt"]),
-        tool("read_game", "Read the summary and hidden prompt of a game nobody has played yet, to revise it.", json!({ "name": name }), &["name"]),
-        tool("revise_game", "Replace a game nobody has played yet with a revised version; its old button is replaced by a new one.", revise, &["name", "summary", "prompt"]),
+        tool("read_game", "Read the summary and hidden prompt of a saved game, to revise it.", json!({ "name": name }), &["name"]),
+        tool("revise_game", "Replace a saved game with a revised version; its card in the chat is replaced by a new one.", revise, &["name", "summary", "prompt"]),
+        tool("start_game", "Start playing a saved game: everyone moves into a fresh conversation run by its prompt.", json!({ "name": name }), &["name"]),
+        tool("delete_game", "Delete a saved game for good, once the players have confirmed which one.", json!({ "name": name }), &["name"]),
     ])
 }
 
@@ -519,6 +536,12 @@ fn run_tool(room: &Room, g: u64, call: &ToolCall) -> String {
                 &arg("prompt"),
             )
             .map(|name| json!({ "saved": name })),
+        "start_game" => room
+            .start_game(g, &arg("name"))
+            .map(|name| json!({ "started": name })),
+        "delete_game" => room
+            .remove_game(g, &arg("name"))
+            .map(|name| json!({ "deleted": name })),
         other => Err(format!("there is no tool called {other:?}")),
     };
     match result {

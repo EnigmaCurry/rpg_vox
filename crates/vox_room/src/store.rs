@@ -222,6 +222,28 @@ impl Store {
         )? > 0)
     }
 
+    /// Replace a game's name, summary and prompt, keeping when it was made
+    /// and whether it has been played; its conversations follow a rename.
+    pub fn update_game(
+        &self,
+        name: &str,
+        new_name: &str,
+        summary: &str,
+        prompt: &str,
+    ) -> Result<bool> {
+        let changed = self.db.execute(
+            "UPDATE games SET name = ?2, summary = ?3, prompt = ?4 WHERE name = ?1",
+            params![name, new_name, summary, prompt],
+        )? > 0;
+        if changed {
+            self.db.execute(
+                "UPDATE conversations SET game = ?2 WHERE game = ?1",
+                params![name, new_name],
+            )?;
+        }
+        Ok(changed)
+    }
+
     pub fn delete_game(&self, name: &str) -> Result<bool> {
         Ok(self
             .db
