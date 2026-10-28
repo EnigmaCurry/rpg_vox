@@ -153,7 +153,11 @@ fn to_room_rate(samples: &[f32], rate: u32) -> Result<Vec<f32>> {
         out.extend_from_slice(&rs.process(&[&samples[pos..pos + chunk]], None)?[0]);
         pos += chunk;
     }
-    out.extend_from_slice(&rs.process_partial(Some(&[&samples[pos..]]), None)?[0]);
+    // rubato refuses an empty partial chunk, so a length that is a whole
+    // number of chunks skips straight to the flush.
+    if pos < samples.len() {
+        out.extend_from_slice(&rs.process_partial(Some(&[&samples[pos..]]), None)?[0]);
+    }
     // Flush the filter's delay so the last word isn't clipped.
     out.extend_from_slice(&rs.process_partial::<&[f32]>(None, None)?[0]);
     let delay = (rs.output_delay()).min(out.len());
@@ -175,6 +179,14 @@ mod tests {
         assert_eq!(out.len(), 48_000);
         let peak = out[1000..47_000].iter().fold(0.0f32, |m, s| m.max(s.abs()));
         assert!((peak - 0.5).abs() < 0.02, "peak {peak}");
+    }
+
+    #[test]
+    fn resamples_any_length() {
+        for n in [1, 100, 1023, 1024, 1025, 2048, 48_000] {
+            let out = to_room_rate(&vec![0.1; n], 24_000).unwrap();
+            assert_eq!(out.len(), n * 2, "{n} samples");
+        }
     }
 
     #[test]

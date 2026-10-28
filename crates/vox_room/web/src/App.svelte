@@ -94,7 +94,10 @@
         {#if room.audio === 'starting'}<span class="hint">starting…</span>{/if}
       {/if}
       {#if room.audioError}<span class="warn">Mic: {room.audioError}</span>{/if}
-      {#if room.notice}<span class="warn">{room.notice}</span>{/if}
+      {#if room.notice}
+        <span class={room.notice.error ? 'warn' : 'hint'}>{room.notice.text}</span>
+        {#if room.notice.error}<button class="dismiss" title="Dismiss" onclick={() => (room.notice = null)}>×</button>{/if}
+      {/if}
     </footer>
   </div>
 {/if}
@@ -154,6 +157,7 @@
   kbd { font-size: 11px; opacity: 0.7; border: 1px solid currentColor; border-radius: 4px; padding: 0 4px; margin-left: 4px; }
   .vol { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); }
   .warn { color: var(--danger); font-size: 13px; }
+  .dismiss { padding: 0 6px; line-height: 1.4; }
   .hear { width: 80px; height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; }
   .hear span { display: block; height: 100%; background: var(--meter); transition: width 80ms linear; }
   @media (max-width: 760px) {

@@ -16,7 +16,7 @@ use std::time::Duration;
 use anyhow::{bail, Context as _, Result};
 use crossbeam_channel::{Receiver, Sender};
 use serde_json::{json, Value};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::room::{Role, Room, Turn};
 use crate::tts::Voice;
@@ -163,8 +163,7 @@ fn speak(
                         }
                     }
                     Err(e) => {
-                        warn!("voice failed: {e:#}");
-                        room.agent_failed(g, &format!("the voice failed: {e:#}"));
+                        room.agent_failed(g, &format!("the voice failed on {text:?}: {e:#}"));
                         failed = Some(g);
                     }
                 }

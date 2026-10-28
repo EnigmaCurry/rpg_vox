@@ -116,9 +116,12 @@ function apply(ev) {
       room.levels = ev.levels;
       break;
     case 'notice':
-      room.notice = ev.text;
+      // Errors stay until dismissed; anything else fades.
+      if (ev.level === 'error') console.error('[room]', ev.text);
+      else console.info('[room]', ev.text);
+      room.notice = { text: ev.text, error: ev.level === 'error' };
       clearTimeout(noticeTimer);
-      noticeTimer = setTimeout(() => (room.notice = null), 8000);
+      if (!room.notice.error) noticeTimer = setTimeout(() => (room.notice = null), 8000);
       break;
   }
 }

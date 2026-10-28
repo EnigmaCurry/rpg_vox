@@ -29,7 +29,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use vox_transcribe::{Paragraph, Pusher};
 
 use crate::mixer::{AiProgress, Mixer, Strip, AGENT_STRIP};
@@ -376,7 +376,8 @@ impl Room {
                     match make(person, self.clone()) {
                         Ok(e) => p.engine = Some(e),
                         Err(err) => {
-                            warn!(person, "no transcription: {err:#}");
+                            error!(person, "no transcription: {err:#}");
+                            self.error(&format!("Can't transcribe {person}: {err:#}"));
                             return;
                         }
                     }
@@ -521,8 +522,9 @@ impl Room {
         self.emit(json!({ "type": "reset", "log": [] }));
     }
 
-    pub fn notice(&self, text: &str) {
-        self.emit(json!({ "type": "notice", "text": text }));
+    /// A notice that stays on everyone's screen until dismissed.
+    pub fn error(&self, text: &str) {
+        self.emit(json!({ "type": "notice", "level": "error", "text": text }));
     }
 
     pub fn emit_levels(&self) {
@@ -560,8 +562,8 @@ impl Room {
     }
 
     pub fn agent_failed(&self, generation: u64, error: &str) {
-        warn!(generation, "reply failed: {error}");
-        self.notice(&format!("{} couldn't answer: {error}", self.cfg.agent_name));
+        error!(generation, "reply failed: {error}");
+        self.error(&format!("{} couldn't answer: {error}", self.cfg.agent_name));
         self.agent_done(generation);
     }
 
@@ -767,7 +769,11 @@ impl Room {
             })
             .is_err()
         {
-            warn!("agent thread is gone");
+            error!("agent thread is gone");
+            self.error(&format!(
+                "{} has stopped: restart the room",
+                self.cfg.agent_name
+            ));
         }
     }
 
