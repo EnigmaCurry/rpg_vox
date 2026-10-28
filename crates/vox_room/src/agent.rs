@@ -402,6 +402,10 @@ fn stream_reply(
         if calls.is_empty() {
             return Ok(());
         }
+        // Having answered after one tool call, a model that calls another
+        // tends to start its answer over in new words: run the calls (a
+        // save still makes its card) but let this reply end here.
+        let answered = round > 0 && !said.trim().is_empty();
         // The model's text so far stays in its turn, with the calls.
         messages.push(json!({
             "role": "assistant",
@@ -416,6 +420,9 @@ fn stream_reply(
         for (i, c) in calls.iter().enumerate() {
             let mut result = run_tool(room, g, c);
             info!(g, tool = c.name, %result, "reply: tool");
+            if answered {
+                continue;
+            }
             if spoke {
                 result.push_str(
                     "\n(What you said before this call has already been spoken aloud. \
@@ -423,6 +430,10 @@ fn stream_reply(
                 );
             }
             messages.push(json!({ "role": "tool", "tool_call_id": c.id(i), "content": result }));
+        }
+        if answered {
+            info!(g, "reply: already answered, so not asking again after the tools");
+            return Ok(());
         }
     }
     Ok(())
@@ -542,9 +553,14 @@ fn sentence_words(s: &str) -> Vec<String> {
 /// Shortest sentence that counts as a repeat: short ones ("Sure.") recur
 /// for real.
 const REPEAT_MIN_WORDS: usize = 5;
+/// A shorter one said again word for word ("Quick Draw is available.").
+const EXACT_REPEAT_MIN_WORDS: usize = 3;
 
 /// `b` says nearly the same as `a`: most of the longer one's words shared.
 fn repeats(a: &[String], b: &[String]) -> bool {
+    if a == b && a.len() >= EXACT_REPEAT_MIN_WORDS {
+        return true;
+    }
     if a.len().min(b.len()) < REPEAT_MIN_WORDS {
         return false;
     }
@@ -649,6 +665,8 @@ mod tests {
             "Sure.",
             "One idea is Quick Draw: I give you a category and we take turns naming things.",
             "Does that sound fun, or would you rather play something else?",
+            "Quick Draw is available.",
+            "Quick Draw is available.",
         ] {
             send_sentence(&tx, 1, s, &mut spoken);
         }
@@ -660,7 +678,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(said.len(), 4, "{said:?}");
+        assert_eq!(said.len(), 5, "{said:?}");
         assert_eq!(said[2], "Sure.", "short sentences may recur");
     }
 
