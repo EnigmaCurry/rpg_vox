@@ -1,6 +1,6 @@
 <script>
   import { onMount } from 'svelte';
-  import { room, connect, command, enterGame, whoami, joinAudio, leaveAudio, setMuted, setVolume, setNoHeadset } from './lib/room.svelte.js';
+  import { room, connect, command, enterGame, ask, answer, whoami, joinAudio, leaveAudio, setMuted, setVolume, setNoHeadset } from './lib/room.svelte.js';
   import { supported } from './lib/audio.js';
   import Log from './components/Log.svelte';
   import Strip from './components/Strip.svelte';
@@ -18,20 +18,27 @@
     }[room.agent.state] ?? room.agent.state,
   );
 
-  function newConversation() {
-    const ask = room.game
+  async function newConversation() {
+    const question = room.game
       ? `Restart ${room.game} from the beginning, for everyone?`
       : 'Start a new conversation? The current one is kept in the database but cleared from the screen.';
-    if (confirm(ask)) command({ type: 'new_conversation' });
+    if (await ask(question, room.game ? 'Restart' : 'New conversation')) command({ type: 'new_conversation' });
   }
 
-  function lobby() {
-    if (confirm(`Leave ${room.game} and take everyone back to the lobby?`)) command({ type: 'lobby' });
+  async function lobby() {
+    if (await ask(`Leave ${room.game} and take everyone back to the lobby?`, 'Back to lobby')) command({ type: 'lobby' });
   }
 
-  function deleteGame(name) {
-    if (confirm(`Delete ${name} for good?`)) command({ type: 'delete_game', name });
+  async function deleteGame(name) {
+    if (await ask(`Delete ${name} for good?`, 'Delete')) command({ type: 'delete_game', name });
   }
+
+  let dialog = $state();
+  $effect(() => {
+    if (!dialog) return;
+    if (room.asking && !dialog.open) dialog.showModal();
+    if (!room.asking && dialog.open) dialog.close();
+  });
 
   // Space toggles your mute, unless you're typing somewhere.
   function onkeydown(e) {
@@ -42,6 +49,16 @@
 </script>
 
 <svelte:window {onkeydown} />
+
+<dialog class="ask" bind:this={dialog} oncancel={(e) => { e.preventDefault(); answer(false); }}>
+  {#if room.asking}
+    <p>{room.asking.text}</p>
+    <div class="ask-actions">
+      <button onclick={() => answer(false)}>Cancel</button>
+      <button class="primary" onclick={() => answer(true)}>{room.asking.yes}</button>
+    </div>
+  {/if}
+</dialog>
 
 {#if room.denied}
   <main class="gate">
@@ -192,6 +209,10 @@
   .seg button.on { background: var(--accent); color: var(--accent-ink); }
   .offline { color: var(--danger); font-size: 13px; }
   :global(.log) { grid-area: log; }
+  .ask { border: 1px solid var(--line); border-radius: 12px; padding: 18px 20px; max-width: min(28em, calc(100vw - 32px)); background: var(--bg, var(--bubble)); color: inherit; }
+  .ask::backdrop { background: rgb(0 0 0 / 35%); }
+  .ask p { margin: 0 0 14px; }
+  .ask-actions { display: flex; justify-content: flex-end; gap: 8px; }
   .games-head { margin-top: 10px; }
   .games { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
   .games li { border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; background: var(--bubble); }

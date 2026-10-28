@@ -18,6 +18,8 @@ export const room = $state({
   game: null,
   games: [],
   notice: null,
+  // A question waiting for the user's answer: { text, yes, resolve }.
+  asking: null,
   audio: 'off', // off | starting | on | error
   audioError: null,
   mic: false,
@@ -75,8 +77,23 @@ export function command(msg) {
   if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
 }
 
-export function enterGame(name) {
-  if (confirm(`Enter ${name}? Everyone in the room goes into the game, and this chat is cleared.`)) {
+/// Ask the user to confirm, in the page. (The browser's own confirm()
+/// blocks the page, and with it the room's audio.)
+export function ask(text, yes = 'OK') {
+  return new Promise((resolve) => {
+    room.asking?.resolve(false);
+    room.asking = { text, yes, resolve };
+  });
+}
+
+export function answer(ok) {
+  const a = room.asking;
+  room.asking = null;
+  a?.resolve(ok);
+}
+
+export async function enterGame(name) {
+  if (await ask(`Enter ${name}? Everyone in the room goes into the game, and this chat is cleared.`, `Enter ${name}`)) {
     command({ type: 'enter_game', name });
   }
 }
@@ -151,6 +168,9 @@ export async function joinAudio() {
       if (ws?.readyState === WebSocket.OPEN) ws.send(bytes);
     });
     await audio.start(room.volume);
+    // Any click or key brings back audio the browser stopped.
+    addEventListener('pointerdown', resumeAudio);
+    addEventListener('keydown', resumeAudio);
     room.audio = 'on';
     hearTimer = setInterval(() => (room.hearing = audio?.takeHeard() ?? 0), 100);
     await audio.startMic({ echoCancellation: room.noHeadset });
@@ -168,7 +188,13 @@ export async function joinAudio() {
   }
 }
 
+function resumeAudio() {
+  audio?.resume();
+}
+
 export async function leaveAudio() {
+  removeEventListener('pointerdown', resumeAudio);
+  removeEventListener('keydown', resumeAudio);
   command({ type: 'mic', on: false });
   room.mic = false;
   clearInterval(hearTimer);

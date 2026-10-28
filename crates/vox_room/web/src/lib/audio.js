@@ -56,6 +56,24 @@ export class RoomAudio {
     this.player.port.onmessage = (ev) => this.onStats?.(ev.data);
     this.volume = new GainNode(this.ctx, { gain: volume });
     this.player.connect(this.volume).connect(this.ctx.destination);
+    // A context the browser suspends or interrupts (a modal dialog, an
+    // audio device change) is started again at once, or on the next click.
+    this.ctx.onstatechange = () => {
+      if (!this.ctx) return;
+      console.info('[room] audio', this.ctx.state);
+      if (this.ctx.state !== 'running' && this.ctx.state !== 'closed') this.resume();
+    };
+    this.makeDecoder();
+  }
+
+  /// Start the audio again if the browser stopped it.
+  resume() {
+    if (this.ctx && this.ctx.state !== 'running' && this.ctx.state !== 'closed') {
+      this.ctx.resume().catch(() => {});
+    }
+  }
+
+  makeDecoder() {
     this.decoder = new AudioDecoder({
       output: (data) => {
         const pcm = new Float32Array(data.numberOfFrames);
@@ -76,6 +94,12 @@ export class RoomAudio {
 
   /// One Opus frame of this tab's mix.
   frame(bytes) {
+    if (!this.ctx) return;
+    // A decoder that hit an error is closed for good: make a new one.
+    if (this.decoder?.state === 'closed') {
+      console.warn('[room] decoder closed; starting a new one');
+      this.makeDecoder();
+    }
     if (this.decoder?.state !== 'configured') return;
     try {
       this.decoder.decode(new EncodedAudioChunk({ type: 'key', timestamp: this.inTs, duration: FRAME_US, data: bytes }));
