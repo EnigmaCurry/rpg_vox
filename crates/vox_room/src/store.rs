@@ -1,9 +1,11 @@
-//! SQLite: who is invited, the conversation log, and room settings.
+//! SQLite: who is invited, the conversation log, games, and room settings.
 //!
 //! ```sql
 //! people(name, token)
 //! entries(conversation, id, who, kind, text, cut, at)
 //! settings(key, value)
+//! games(name, summary, prompt, created, played)  -- names unique, ignoring case
+//! conversations(id, game)                 -- no row: the lobby
 //! ```
 //!
 //! Only finished entries are written: a person's paragraph once it has
@@ -40,7 +42,30 @@ CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS games (
+    name    TEXT PRIMARY KEY COLLATE NOCASE,
+    summary TEXT NOT NULL,
+    prompt  TEXT NOT NULL,
+    created INTEGER NOT NULL,
+    -- Entered at least once: from then on the game is fixed.
+    played  INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS conversations (
+    id   INTEGER PRIMARY KEY,
+    game TEXT NOT NULL
+);
 ";
+
+/// A saved game, without its prompt (which never leaves the server).
+#[derive(Debug, Clone, serde::Serialize, PartialEq)]
+pub struct Game {
+    pub name: String,
+    pub summary: String,
+    /// Unix milliseconds.
+    pub created: u64,
+    /// Entered at least once, and so fixed.
+    pub played: bool,
+}
 
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
@@ -128,11 +153,80 @@ impl Store {
             .unwrap_or(1))
     }
 
-    /// Start a new, empty conversation. The old one stays in the database.
-    pub fn new_conversation(&self) -> Result<i64> {
+    /// Start a new, empty conversation, in the lobby or playing `game`.
+    /// The old one stays in the database.
+    pub fn new_conversation(&self, game: Option<&str>) -> Result<i64> {
         let next = self.conversation()? + 1;
         self.set_setting("conversation", &next.to_string())?;
+        if let Some(g) = game {
+            self.db.execute(
+                "INSERT OR REPLACE INTO conversations (id, game) VALUES (?1, ?2)",
+                params![next, g],
+            )?;
+        }
         Ok(next)
+    }
+
+    /// The game `conversation` plays, if any.
+    pub fn conversation_game(&self, conversation: i64) -> Result<Option<String>> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT game FROM conversations WHERE id = ?1",
+                [conversation],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Every saved game, newest first.
+    pub fn games(&self) -> Result<Vec<Game>> {
+        let mut q = self
+            .db
+            .prepare("SELECT name, summary, created, played FROM games ORDER BY created DESC")?;
+        let rows = q.query_map([], game_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The game called `name` (matched ignoring case) and its prompt.
+    pub fn game(&self, name: &str) -> Result<Option<(Game, String)>> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT name, summary, created, played, prompt FROM games WHERE name = ?1",
+                [name],
+                |r| Ok((game_row(r)?, r.get(4)?)),
+            )
+            .optional()?)
+    }
+
+    pub fn mark_played(&self, name: &str) -> Result<()> {
+        self.db
+            .execute("UPDATE games SET played = 1 WHERE name = ?1", [name])?;
+        Ok(())
+    }
+
+    pub fn delete_entry(&self, conversation: i64, id: &str) -> Result<()> {
+        self.db.execute(
+            "DELETE FROM entries WHERE conversation = ?1 AND id = ?2",
+            params![conversation, id],
+        )?;
+        Ok(())
+    }
+
+    /// Save a game; false when the name (ignoring case) is taken.
+    pub fn save_game(&self, name: &str, summary: &str, prompt: &str, created: u64) -> Result<bool> {
+        Ok(self.db.execute(
+            "INSERT OR IGNORE INTO games (name, summary, prompt, created) VALUES (?1, ?2, ?3, ?4)",
+            params![name, summary, prompt, created as i64],
+        )? > 0)
+    }
+
+    pub fn delete_game(&self, name: &str) -> Result<bool> {
+        Ok(self
+            .db
+            .execute("DELETE FROM games WHERE name = ?1", [name])?
+            > 0)
     }
 
     pub fn put_entry(&self, conversation: i64, e: &Entry) -> Result<()> {
@@ -165,11 +259,7 @@ impl Store {
             Ok(Entry {
                 id: r.get(0)?,
                 who: r.get(1)?,
-                kind: if kind == "agent" {
-                    Kind::Agent
-                } else {
-                    Kind::Human
-                },
+                kind: Kind::parse(&kind),
                 text: r.get(3)?,
                 live: false,
                 partial: false,
@@ -182,6 +272,15 @@ impl Store {
         out.reverse();
         Ok(out)
     }
+}
+
+fn game_row(r: &rusqlite::Row) -> rusqlite::Result<Game> {
+    Ok(Game {
+        name: r.get(0)?,
+        summary: r.get(1)?,
+        created: r.get::<_, i64>(2)? as u64,
+        played: r.get::<_, i64>(3)? != 0,
+    })
 }
 
 #[cfg(test)]
@@ -224,7 +323,38 @@ mod tests {
             ["a", "b"]
         );
         assert_eq!(got[0].text, "revised");
-        assert_eq!(s.new_conversation().unwrap(), 2);
+        assert_eq!(s.new_conversation(None).unwrap(), 2);
         assert_eq!(s.entries(2, 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn games_have_unique_names_and_stay_with_their_conversations() {
+        let s = Store::memory();
+        assert!(s
+            .save_game("Dragon Heist", "A heist.", "secret", 1)
+            .unwrap());
+        assert!(!s.save_game("dragon heist", "Again.", "other", 2).unwrap());
+        assert!(s.save_game("Zork", "Caves.", "dark", 3).unwrap());
+        assert_eq!(
+            s.games()
+                .unwrap()
+                .iter()
+                .map(|g| g.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Zork", "Dragon Heist"]
+        );
+        let (g, prompt) = s.game("DRAGON HEIST").unwrap().unwrap();
+        assert_eq!(
+            (g.name.as_str(), prompt.as_str(), g.played),
+            ("Dragon Heist", "secret", false)
+        );
+        s.mark_played("dragon heist").unwrap();
+        assert!(s.game("Dragon Heist").unwrap().unwrap().0.played);
+        let c = s.new_conversation(Some("Zork")).unwrap();
+        assert_eq!(s.conversation_game(c).unwrap().as_deref(), Some("Zork"));
+        let lobby = s.new_conversation(None).unwrap();
+        assert_eq!(s.conversation_game(lobby).unwrap(), None);
+        assert!(s.delete_game("zork").unwrap());
+        assert_eq!(s.games().unwrap().len(), 1);
     }
 }

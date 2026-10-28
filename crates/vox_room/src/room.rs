@@ -41,12 +41,19 @@ const EVENT_CAPACITY: usize = 512;
 const LOG_LIMIT: usize = 500;
 /// Shown to the model after a reply someone talked over.
 const CUT_NOTE: &str = " [interrupted here]";
+/// What the model is told when the room enters a game: it speaks first.
+const OPENING: &str =
+    "(Everyone has just entered the game. Open it: set the scene and bring the players in.)";
+/// Longest game name the AI may save.
+const GAME_NAME_MAX: usize = 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
     Human,
     Agent,
+    /// A game the AI saved; the entry's text is its name.
+    Game,
 }
 
 impl Kind {
@@ -54,6 +61,15 @@ impl Kind {
         match self {
             Kind::Human => "human",
             Kind::Agent => "agent",
+            Kind::Game => "game",
+        }
+    }
+
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "agent" => Kind::Agent,
+            "game" => Kind::Game,
+            _ => Kind::Human,
         }
     }
 }
@@ -121,6 +137,11 @@ pub struct Turn {
     pub messages: Vec<(Role, String)>,
     /// When the room handed the turn over, for the reply's timings.
     pub asked: Instant,
+    /// The game being played, with its hidden prompt; None in the lobby,
+    /// where the AI can design and save games.
+    pub game: Option<(String, String)>,
+    /// Who is in the room.
+    pub people: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,6 +184,8 @@ struct Reply {
 
 struct State {
     conversation: i64,
+    /// The game this conversation plays; None is the lobby.
+    game: Option<String>,
     people: BTreeMap<String, Person>,
     log: Vec<Entry>,
     mode: Mode,
@@ -205,6 +228,7 @@ impl Room {
         stt: Option<EngineFactory>,
     ) -> anyhow::Result<Arc<Self>> {
         let conversation = store.conversation()?;
+        let game = store.conversation_game(conversation)?;
         let log = store.entries(conversation, LOG_LIMIT)?;
         let mode = store
             .setting("mode")?
@@ -223,6 +247,7 @@ impl Room {
         Ok(Arc::new(Self {
             st: Mutex::new(State {
                 conversation,
+                game,
                 people,
                 log,
                 mode,
@@ -302,7 +327,25 @@ impl Room {
             "people": Self::people_json(&st),
             "strips": self.mixer.strips(),
             "log": st.log,
+            "game": st.game,
+            "games": self.games(),
         })
+    }
+
+    /// The saved games, for the agent.
+    pub fn list_games(&self) -> Vec<crate::store::Game> {
+        self.games()
+    }
+
+    fn games(&self) -> Vec<crate::store::Game> {
+        self.store().games().unwrap_or_else(|err| {
+            warn!("list games: {err:#}");
+            Vec::new()
+        })
+    }
+
+    fn emit_games(&self) {
+        self.emit(json!({ "type": "games", "games": self.games() }));
     }
 
     /// A tab of `person` connected.
@@ -513,24 +556,233 @@ impl Room {
         self.interrupt(&mut st);
     }
 
-    /// Clear the log and start a fresh conversation.
+    /// Clear the log and start a fresh conversation: the game from the
+    /// top when in one, else a fresh lobby.
     pub fn new_conversation(&self) {
         let mut st = self.lock();
-        self.interrupt(&mut st);
-        match self.store().new_conversation() {
+        let game = st.game.clone();
+        self.start_conversation(&mut st, game);
+    }
+
+    /// Everyone into a fresh conversation playing `name`.
+    pub fn enter_game(&self, name: &str) {
+        let game = match self.store().game(name) {
+            Ok(Some((g, _))) => g.name,
+            Ok(None) => {
+                self.error(&format!("There's no game called {name:?} any more."));
+                return;
+            }
+            Err(err) => {
+                self.error(&format!("Can't open {name:?}: {err:#}"));
+                return;
+            }
+        };
+        info!(game, "entering game");
+        // From now on the game is fixed.
+        if let Err(err) = self.store().mark_played(&game) {
+            warn!("mark played: {err:#}");
+        }
+        self.emit_games();
+        let mut st = self.lock();
+        self.start_conversation(&mut st, Some(game));
+    }
+
+    /// Everyone out of the game, into a fresh lobby.
+    pub fn lobby(&self) {
+        let mut st = self.lock();
+        self.start_conversation(&mut st, None);
+    }
+
+    pub fn delete_game(&self, name: &str) {
+        if self
+            .lock()
+            .game
+            .as_deref()
+            .is_some_and(|g| g.eq_ignore_ascii_case(name))
+        {
+            self.error(&format!(
+                "{name} is being played: go back to the lobby first."
+            ));
+            return;
+        }
+        match self.store().delete_game(name) {
+            Ok(true) => info!(game = name, "deleted game"),
+            Ok(false) => {}
+            Err(err) => self.error(&format!("Can't delete {name:?}: {err:#}")),
+        }
+        self.emit_games();
+    }
+
+    fn start_conversation(&self, st: &mut State, game: Option<String>) {
+        self.interrupt(st);
+        match self.store().new_conversation(game.as_deref()) {
             Ok(c) => st.conversation = c,
             Err(err) => {
-                warn!("new conversation: {err:#}");
+                self.error(&format!("Can't start a new conversation: {err:#}"));
                 return;
             }
         }
         st.log.clear();
+        st.game = game;
         for p in st.people.values() {
             if let Some(e) = &p.engine {
                 e.break_paragraph();
             }
         }
-        self.emit(json!({ "type": "reset", "log": [] }));
+        // Anything said before the switch belongs to the old conversation.
+        st.last_change = Instant::now();
+        self.emit(json!({ "type": "reset", "log": [], "game": st.game }));
+        if st.game.is_some() {
+            self.ask(st, Instant::now());
+        }
+    }
+
+    // -- games, for the agent -----------------------------------------------
+
+    /// Whether `name` could be saved as a new game. Err says why not.
+    pub fn check_game_name(&self, name: &str) -> Result<(), String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("a game needs a name".into());
+        }
+        if name.chars().count() > GAME_NAME_MAX {
+            return Err(format!("names are at most {GAME_NAME_MAX} characters"));
+        }
+        match self.store().game(name) {
+            Ok(Some((taken, _))) => Err(format!("there is already a game called {:?}", taken.name)),
+            Ok(None) => Ok(()),
+            Err(err) => Err(format!("{err:#}")),
+        }
+    }
+
+    /// Save a game the agent designed during reply `generation`, and put
+    /// its button in the conversation. Err says why it wasn't saved.
+    pub fn save_game(
+        &self,
+        generation: u64,
+        name: &str,
+        summary: &str,
+        prompt: &str,
+    ) -> Result<(), String> {
+        let name = name.trim();
+        self.check_game_name(name)?;
+        if prompt.trim().is_empty() {
+            return Err("the game needs a prompt".into());
+        }
+        let mut st = self.lock();
+        if self.generation.load(Ordering::SeqCst) != generation {
+            return Err("the players talked over you; the game was not saved".into());
+        }
+        match self
+            .store()
+            .save_game(name, summary.trim(), prompt.trim(), now_ms())
+        {
+            Ok(true) => {}
+            Ok(false) => return Err(format!("there is already a game called {name:?}")),
+            Err(err) => return Err(format!("{err:#}")),
+        }
+        info!(game = name, "saved game");
+        self.emit_games();
+        self.add_game_card(&mut st, name);
+        Ok(())
+    }
+
+    /// The summary and hidden prompt of a game nobody has played yet, so
+    /// the agent can revise it.
+    pub fn read_game(&self, name: &str) -> Result<(String, String), String> {
+        match self.store().game(name.trim()) {
+            Ok(Some((g, _))) if g.played => Err(format!(
+                "{:?} has been played, so it is fixed; design a new game instead",
+                g.name
+            )),
+            Ok(Some((g, prompt))) => Ok((g.summary, prompt)),
+            Ok(None) => Err(format!("there is no game called {name:?}")),
+            Err(err) => Err(format!("{err:#}")),
+        }
+    }
+
+    /// Replace a game nobody has played yet, possibly renaming it. Its
+    /// old button leaves the conversation and a new one comes in.
+    pub fn revise_game(
+        &self,
+        generation: u64,
+        name: &str,
+        new_name: Option<&str>,
+        summary: &str,
+        prompt: &str,
+    ) -> Result<String, String> {
+        self.read_game(name)?;
+        let old_name = match self.store().game(name.trim()) {
+            Ok(Some((g, _))) => g.name,
+            _ => return Err(format!("there is no game called {name:?}")),
+        };
+        let new_name = new_name
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .unwrap_or(&old_name)
+            .to_string();
+        if !new_name.eq_ignore_ascii_case(&old_name) {
+            self.check_game_name(&new_name)?;
+        } else if new_name.chars().count() > GAME_NAME_MAX {
+            return Err(format!("names are at most {GAME_NAME_MAX} characters"));
+        }
+        if prompt.trim().is_empty() {
+            return Err("the game needs a prompt".into());
+        }
+        let mut st = self.lock();
+        if self.generation.load(Ordering::SeqCst) != generation {
+            return Err("the players talked over you; the game was not changed".into());
+        }
+        let saved = {
+            let store = self.store();
+            store
+                .delete_game(&old_name)
+                .and_then(|_| store.save_game(&new_name, summary.trim(), prompt.trim(), now_ms()))
+        };
+        match saved {
+            Ok(true) => {}
+            Ok(false) => return Err(format!("there is already a game called {new_name:?}")),
+            Err(err) => return Err(format!("{err:#}")),
+        }
+        info!(game = old_name, new = new_name, "revised game");
+        let conversation = st.conversation;
+        let old_cards: Vec<String> = st
+            .log
+            .iter()
+            .filter(|e| e.kind == Kind::Game && e.text.eq_ignore_ascii_case(&old_name))
+            .map(|e| e.id.clone())
+            .collect();
+        for id in &old_cards {
+            if let Err(err) = self.store().delete_entry(conversation, id) {
+                warn!("delete entry: {err:#}");
+            }
+            self.emit(json!({ "type": "entry_removed", "id": id }));
+        }
+        st.log.retain(|e| !old_cards.contains(&e.id));
+        self.emit_games();
+        self.add_game_card(&mut st, &new_name);
+        Ok(new_name)
+    }
+
+    /// A game's button, at the end of the conversation.
+    fn add_game_card(&self, st: &mut State, name: &str) {
+        let entry = Entry {
+            id: format!("game-{}", uuid::Uuid::new_v4().simple()),
+            who: self.cfg.agent_name.clone(),
+            kind: Kind::Game,
+            text: name.to_string(),
+            live: false,
+            partial: false,
+            cut: false,
+            at: now_ms(),
+            sent: true,
+        };
+        if let Err(err) = self.store().put_entry(st.conversation, &entry) {
+            warn!("store entry: {err:#}");
+        }
+        self.emit_entry(&entry);
+        st.log.push(entry);
+        trim_log(&mut st.log);
     }
 
     /// A notice that stays on everyone's screen until dismissed.
@@ -757,11 +1009,28 @@ impl Room {
             }
         }
         let wanted = st.mode == Mode::Always || self.named(&said);
-        if !wanted {
-            return;
+        if wanted {
+            self.ask(st, now);
         }
+    }
+
+    /// Ask the AI for a reply to the conversation so far.
+    fn ask(&self, st: &mut State, now: Instant) {
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
-        let messages = conversation_messages(&st.log, self.cfg.history);
+        let mut messages = conversation_messages(&st.log, self.cfg.history);
+        let game = match &st.game {
+            Some(name) => match self.store().game(name) {
+                Ok(Some((g, prompt))) => Some((g.name, prompt)),
+                _ => {
+                    self.error(&format!("The game {name:?} is gone: go back to the lobby."));
+                    return;
+                }
+            },
+            None => None,
+        };
+        if game.is_some() && messages.first().is_none_or(|(r, _)| *r != Role::User) {
+            messages.insert(0, (Role::User, OPENING.to_string()));
+        }
         let entry = Entry {
             id: format!("agent-{}", uuid::Uuid::new_v4().simple()),
             who: self.cfg.agent_name.clone(),
@@ -796,6 +1065,13 @@ impl Room {
                 generation,
                 messages,
                 asked: now,
+                game,
+                people: st
+                    .people
+                    .iter()
+                    .filter(|(_, p)| p.clients > 0)
+                    .map(|(n, _)| n.clone())
+                    .collect(),
             })
             .is_err()
         {
@@ -911,6 +1187,7 @@ fn conversation_messages(log: &[Entry], history: usize) -> Vec<(Role, String)> {
         .filter(|e| match e.kind {
             Kind::Human => e.sent && !e.text.trim().is_empty(),
             Kind::Agent => !e.live && !e.text.trim().is_empty(),
+            Kind::Game => true,
         })
         .collect();
     let start = done.len().saturating_sub(history);
@@ -934,6 +1211,19 @@ fn conversation_messages(log: &[Entry], history: usize) -> Vec<(Role, String)> {
                     text.push_str(CUT_NOTE);
                 }
                 out.push((Role::Assistant, text));
+            }
+            Kind::Game => {
+                let note = format!(
+                    "[You saved the game \"{}\"; its button is in the chat.]",
+                    e.text
+                );
+                match out.last_mut() {
+                    Some((Role::Assistant, text)) => {
+                        text.push(' ');
+                        text.push_str(&note);
+                    }
+                    _ => out.push((Role::Assistant, note)),
+                }
             }
         }
     }
@@ -1189,5 +1479,77 @@ mod tests {
             "Once upon a time there was a dragon. It was very old."
         );
         assert!(r.lock().reply.is_none());
+    }
+
+    fn cards(r: &Room) -> Vec<String> {
+        r.lock()
+            .log
+            .iter()
+            .filter(|e| e.kind == Kind::Game)
+            .map(|e| e.text.clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_saved_game_can_be_revised_until_it_is_played() {
+        let (r, turns) = room(Mode::Always);
+        let g = r.generation.load(Ordering::SeqCst);
+        assert_eq!(r.check_game_name("Dragon Heist"), Ok(()));
+        r.save_game(g, "Dragon Heist", "A heist.", "Run a heist.")
+            .unwrap();
+        assert!(
+            r.check_game_name("dragon heist").is_err(),
+            "names are unique"
+        );
+        assert!(r.save_game(g, "DRAGON HEIST", "x", "y").is_err());
+        assert_eq!(cards(&r), ["Dragon Heist"]);
+
+        // Revised (and renamed): the old button goes, a new one comes.
+        assert_eq!(r.read_game("dragon heist").unwrap().1, "Run a heist.");
+        let name = r
+            .revise_game(
+                g,
+                "Dragon Heist",
+                Some("Dragon Caper"),
+                "A caper.",
+                "Run a caper.",
+            )
+            .unwrap();
+        assert_eq!(name, "Dragon Caper");
+        assert_eq!(cards(&r), ["Dragon Caper"]);
+        assert!(r.read_game("Dragon Heist").is_err());
+
+        // The model is told about the button in later turns.
+        let msgs = conversation_messages(&r.lock().log, 50);
+        assert!(msgs.last().unwrap().1.contains("\"Dragon Caper\""));
+
+        // Entering: a fresh conversation, and the AI opens with the prompt.
+        r.enter_game("dragon caper");
+        let t = turns.try_recv().expect("the AI opens the game");
+        assert_eq!(t.game, Some(("Dragon Caper".into(), "Run a caper.".into())));
+        assert_eq!(t.messages, vec![(Role::User, OPENING.to_string())]);
+        assert!(cards(&r).is_empty());
+        assert!(r.read_game("Dragon Caper").is_err(), "fixed once played");
+        assert!(r.revise_game(g, "Dragon Caper", None, "s", "p").is_err());
+
+        // It can't be deleted while it's being played.
+        r.delete_game("Dragon Caper");
+        assert_eq!(r.list_games().len(), 1);
+
+        // Back in the lobby the AI has its tools again, and it can go.
+        r.stop_agent();
+        r.lobby();
+        assert_eq!(r.lock().game, None);
+        r.delete_game("Dragon Caper");
+        assert!(r.list_games().is_empty());
+    }
+
+    #[test]
+    fn a_game_isnt_saved_by_a_reply_that_was_talked_over() {
+        let (r, _turns) = room(Mode::Always);
+        let g = r.generation.load(Ordering::SeqCst);
+        r.generation.fetch_add(1, Ordering::SeqCst);
+        assert!(r.save_game(g, "Zork", "Caves.", "Dark.").is_err());
+        assert!(r.list_games().is_empty());
     }
 }

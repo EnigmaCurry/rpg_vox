@@ -12,6 +12,9 @@
 //! {"type": "mode", "mode": "always"}
 //! {"type": "stop"}
 //! {"type": "new_conversation"}
+//! {"type": "enter_game", "name": "Dragon Heist"}
+//! {"type": "lobby"}
+//! {"type": "delete_game", "name": "Dragon Heist"}
 //! ```
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -155,6 +158,13 @@ enum Command {
     },
     Stop,
     NewConversation,
+    EnterGame {
+        name: String,
+    },
+    Lobby,
+    DeleteGame {
+        name: String,
+    },
 }
 
 async fn client(room: Arc<Room>, socket: WebSocket, id: u64, name: String) -> anyhow::Result<()> {
@@ -208,6 +218,9 @@ async fn client(room: Arc<Room>, socket: WebSocket, id: u64, name: String) -> an
                     Ok(Command::Mode { mode }) => room.set_mode(&mode),
                     Ok(Command::Stop) => room.stop_agent(),
                     Ok(Command::NewConversation) => room.new_conversation(),
+                    Ok(Command::EnterGame { name }) => room.enter_game(&name),
+                    Ok(Command::Lobby) => room.lobby(),
+                    Ok(Command::DeleteGame { name }) => room.delete_game(&name),
                     Err(e) => debug!(id, "bad command {text:?}: {e}"),
                 },
                 Message::Close(_) => break,

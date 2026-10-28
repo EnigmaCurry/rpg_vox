@@ -1,6 +1,6 @@
 <script>
   import { onMount } from 'svelte';
-  import { room, connect, command, whoami, joinAudio, leaveAudio, setMuted, setVolume, setNoHeadset } from './lib/room.svelte.js';
+  import { room, connect, command, enterGame, whoami, joinAudio, leaveAudio, setMuted, setVolume, setNoHeadset } from './lib/room.svelte.js';
   import { supported } from './lib/audio.js';
   import Log from './components/Log.svelte';
   import Strip from './components/Strip.svelte';
@@ -19,9 +19,18 @@
   );
 
   function newConversation() {
-    if (confirm('Start a new conversation? The current one is kept in the database but cleared from the screen.')) {
-      command({ type: 'new_conversation' });
-    }
+    const ask = room.game
+      ? `Restart ${room.game} from the beginning, for everyone?`
+      : 'Start a new conversation? The current one is kept in the database but cleared from the screen.';
+    if (confirm(ask)) command({ type: 'new_conversation' });
+  }
+
+  function lobby() {
+    if (confirm(`Leave ${room.game} and take everyone back to the lobby?`)) command({ type: 'lobby' });
+  }
+
+  function deleteGame(name) {
+    if (confirm(`Delete ${name} for good?`)) command({ type: 'delete_game', name });
   }
 
   // Space toggles your mute, unless you're typing somewhere.
@@ -42,7 +51,8 @@
 {:else}
   <div class="app">
     <header>
-      <h1>Voice room</h1>
+      <h1>{room.game ?? 'Voice room'}</h1>
+      {#if room.game}<button onclick={lobby}>Back to lobby</button>{/if}
       <span class="pill {room.agent.state}" aria-live="polite">
         {#if room.agent.state === 'thinking' || room.agent.state === 'waiting'}
           <span class="dots" aria-hidden="true"><i></i><i></i><i></i></span>
@@ -61,7 +71,7 @@
         <button role="radio" aria-checked={room.mode === 'always'} class:on={room.mode === 'always'}
           onclick={() => command({ type: 'mode', mode: 'always' })}>After every pause</button>
       </div>
-      <button onclick={newConversation}>New conversation</button>
+      <button onclick={newConversation}>{room.game ? 'Restart game' : 'New conversation'}</button>
       {#if !room.connected}<span class="offline">reconnecting…</span>{/if}
     </header>
 
@@ -74,6 +84,29 @@
       {/each}
       <Strip key={room.agent.strip} label={room.agent.name} agent />
       <p class="hint">Levels and mutes here change the room for everyone, and a muted person isn't transcribed. You never hear yourself.</p>
+
+      <h2 class="games-head">Games</h2>
+      {#if room.games.length === 0}
+        <p class="hint">None yet. In the lobby, ask {room.agent.name} to design one with you.</p>
+      {/if}
+      <ul class="games">
+        {#each room.games as g (g.name)}
+          <li class:current={room.game === g.name}>
+            <div class="gname">
+              <span>{g.name}</span>
+              {#if room.game === g.name}<span class="tag">playing</span>
+              {:else if !g.played}<span class="tag" title="Not played yet: {room.agent.name} can still change it">draft</span>{/if}
+            </div>
+            <p class="gsum">{g.summary}</p>
+            {#if room.game !== g.name}
+              <div class="gact">
+                {#if !room.game}<button onclick={() => enterGame(g.name)}>Play</button>{/if}
+                <button class="danger" onclick={() => deleteGame(g.name)}>Delete</button>
+              </div>
+            {/if}
+          </li>
+        {/each}
+      </ul>
     </aside>
 
     <footer>
@@ -159,6 +192,15 @@
   .seg button.on { background: var(--accent); color: var(--accent-ink); }
   .offline { color: var(--danger); font-size: 13px; }
   :global(.log) { grid-area: log; }
+  .games-head { margin-top: 10px; }
+  .games { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+  .games li { border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; background: var(--bubble); }
+  .games li.current { border-color: var(--agent); }
+  .gname { display: flex; align-items: center; gap: 6px; font-weight: 600; }
+  .tag { font-size: 11px; font-weight: 500; color: var(--agent); border: 1px solid currentColor; border-radius: 999px; padding: 0 6px; }
+  .gsum { margin: 4px 0 6px; font-size: 13px; color: var(--muted); }
+  .gact { display: flex; gap: 6px; }
+  .gact button { padding: 2px 10px; font-size: 13px; }
   aside {
     grid-area: side;
     border-left: 1px solid var(--line);

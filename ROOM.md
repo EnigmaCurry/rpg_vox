@@ -64,6 +64,24 @@ it and `vox_room people` lists everyone.
 - **New conversation** clears the screen and the AI's memory. Old
   conversations stay in the database.
 
+### Games
+
+In the lobby (the room's ordinary conversation) the AI can design a game
+with you. Talk it through; it fills in what you leave open, checks the
+name is free, and once you've confirmed it writes the game's prompt
+itself and saves it. The prompt never reaches a browser: what appears in
+the chat is a card with the game's summary and an **Enter** button.
+
+Until anyone enters it, a game is a draft: ask for changes and the AI
+reads its prompt back to itself, rewrites it, and replaces the card.
+Entering moves everyone into a fresh conversation run by that prompt
+alone (the AI opens the scene), and fixes the game for good.
+
+The **Games** list (right) plays any saved game from the start, or
+deletes it. **Back to lobby** leaves a game; **Restart game** starts it
+over. Saving needs a model with tool calling (llama.cpp needs `--jinja`);
+without it the AI can talk about games but not save them.
+
 ## How it works
 
 - One WebSocket per tab carries 20 ms mono Opus frames both ways

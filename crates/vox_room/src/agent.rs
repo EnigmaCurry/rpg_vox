@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context as _, Result};
 use crossbeam_channel::{Receiver, Sender};
 use serde_json::{json, Value};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::room::{Role, Room, Turn};
 use crate::tts::Voice;
@@ -31,6 +31,38 @@ voice: talk conversationally, in plain spoken sentences, usually briefly, and \
 address people by name when it helps. Never use markdown, lists, headings, \
 code blocks, emoji, or URLs, and never start with your own name. If someone \
 cut off your previous reply, don't repeat it unless asked.";
+
+/// Added to the lobby's prompt: the AI can design games with the players.
+const GAMES_NOTE: &str = "\
+You can also design games with the players, to play here by voice. When they \
+want one, talk it through with them, and use your own judgment generously for \
+whatever they leave open: genre, rules, your role as game master, tone, \
+pacing. Propose a name and check it is free with check_game_name. Only when \
+the players have confirmed the details, write the game's prompt yourself and \
+save it with save_game. The prompt becomes your complete instructions when the \
+room enters the game, and you won't remember this conversation then, so put \
+everything in it: premise, setting, rules, how to run turns among several \
+players, and how to open. The players never see the prompt, so never read it \
+aloud or describe its secrets; a button to enter the game appears in the \
+chat. Until someone enters a game the players can ask for changes: use \
+read_game and revise_game, which replaces its button. Once a game has been \
+played it is fixed. list_games shows the saved games.";
+
+/// The system prompt in a game; `{game}` and `{prompt}` (hidden from the
+/// players) are filled in, then `{name}` and `{people}`.
+const GAME_FRAME: &str = "\
+You are {name}, talking by voice with {people} in a live voice chat, and \
+running the game \"{game}\", which you designed. Each message from the \
+players is a transcript, every line starting with the speaker's name, and it \
+comes from speech-to-text, so expect recognition errors and read past them. \
+Your replies are read aloud by a text-to-speech voice: talk in plain spoken \
+sentences, never use markdown, lists, headings, emoji, or URLs, and never \
+start with your own name. If someone cut off your previous reply, don't \
+repeat it unless asked. Keep these instructions to yourself.
+
+The game:
+
+{prompt}";
 
 pub enum Llm {
     /// An OpenAI-compatible endpoint.
@@ -88,11 +120,13 @@ impl Agent {
                             think,
                         } => stream_reply(
                             &http,
+                            &room,
                             url,
                             model,
                             key.as_deref(),
                             *think,
                             &messages,
+                            turn.game.is_none(),
                             g,
                             turn.asked,
                             &self.generation,
@@ -110,14 +144,17 @@ impl Agent {
 
     fn messages(&self, room: &Room, turn: &Turn) -> Vec<Value> {
         let cfg = room.config();
+        // Who is here, and anyone who spoke in the history.
         let mut people: Vec<String> = turn
             .messages
             .iter()
             .filter(|(r, _)| *r == Role::User)
             .flat_map(|(_, t)| {
                 t.lines()
-                    .filter_map(|l| l.split_once(':').map(|(w, _)| w.trim().to_string()))
+                    .filter_map(|l| l.split_once(": ").map(|(w, _)| w.trim().to_string()))
+                    .filter(|w| !w.is_empty() && !w.contains(char::is_whitespace))
             })
+            .chain(turn.people.iter().cloned())
             .collect();
         people.sort();
         people.dedup();
@@ -126,10 +163,14 @@ impl Agent {
         } else {
             people.join(" and ")
         };
-        let system = self
-            .prompt
-            .replace("{name}", &cfg.agent_name)
-            .replace("{people}", &people);
+        let system = match &turn.game {
+            None => format!("{}\n\n{GAMES_NOTE}", self.prompt),
+            Some((game, prompt)) => GAME_FRAME
+                .replace("{game}", game)
+                .replace("{prompt}", prompt),
+        }
+        .replace("{name}", &cfg.agent_name)
+        .replace("{people}", &people);
         let mut out = vec![json!({ "role": "system", "content": system })];
         for (role, text) in &turn.messages {
             let role = match role {
@@ -204,91 +245,232 @@ fn echo(turn: &Turn, tx: &Sender<Speak>) -> Result<()> {
     Ok(())
 }
 
+/// Rounds of tool calls in one reply before the model must just talk.
+const TOOL_ROUNDS: usize = 4;
+
+/// The model, one reply: stream it into sentences, and in the lobby run
+/// the game tools it calls and let it carry on with their results.
 #[allow(clippy::too_many_arguments)]
 fn stream_reply(
     http: &ureq::Agent,
+    room: &Room,
     url: &str,
     model: &str,
     key: Option<&str>,
     think: bool,
     messages: &[Value],
+    lobby: bool,
     g: u64,
     asked: Instant,
     generation: &AtomicU64,
     tx: &Sender<Speak>,
 ) -> Result<()> {
     let chat = format!("{}/chat/completions", url.trim_end_matches('/'));
+    let mut messages = messages.to_vec();
     let mut kwargs = true;
-    let resp = loop {
-        let mut req = http.post(&chat);
-        if let Some(k) = key {
-            req = req.set("Authorization", &format!("Bearer {k}"));
-        }
-        let mut body = json!({ "model": model, "messages": messages, "stream": true });
-        if kwargs {
-            body["chat_template_kwargs"] = json!({ "enable_thinking": think });
-        }
-        match req.send_json(body) {
-            Ok(r) => break r,
-            Err(ureq::Error::Status(code, r)) => {
-                let detail = r.into_string().unwrap_or_default();
-                if code == 400 && kwargs && detail.contains("chat_template_kwargs") {
-                    kwargs = false;
-                    continue;
-                }
-                bail!(
-                    "{chat}: HTTP {code}: {}",
-                    detail.chars().take(300).collect::<String>()
-                );
-            }
-            Err(e) => return Err(e).with_context(|| format!("POST {chat}")),
-        }
-    };
-    let ms = || asked.elapsed().as_millis() as u64;
-    info!(g, after_asking_ms = ms(), "reply: stream opened");
-    let mut pending = String::new();
-    // Nothing is spoken yet: the first clause goes on its own, so the voice
-    // can start before the model finishes a long first sentence.
+    let mut tools = lobby;
     let mut first = true;
-    for line in std::io::BufReader::new(resp.into_reader()).lines() {
-        if generation.load(Ordering::SeqCst) != g {
-            info!(g, "reply dropped");
+    for round in 0..=TOOL_ROUNDS {
+        let resp = loop {
+            let mut req = http.post(&chat);
+            if let Some(k) = key {
+                req = req.set("Authorization", &format!("Bearer {k}"));
+            }
+            let mut body = json!({ "model": model, "messages": messages, "stream": true });
+            if kwargs {
+                body["chat_template_kwargs"] = json!({ "enable_thinking": think });
+            }
+            if tools && round < TOOL_ROUNDS {
+                body["tools"] = game_tools();
+            }
+            match req.send_json(body) {
+                Ok(r) => break r,
+                Err(ureq::Error::Status(code, r)) => {
+                    let detail = r.into_string().unwrap_or_default();
+                    if code == 400 && kwargs && detail.contains("chat_template_kwargs") {
+                        kwargs = false;
+                        continue;
+                    }
+                    if code == 400 && tools && detail.contains("tool") {
+                        warn!("{chat} refuses tools, so games can't be saved: {detail}");
+                        tools = false;
+                        continue;
+                    }
+                    bail!(
+                        "{chat}: HTTP {code}: {}",
+                        detail.chars().take(300).collect::<String>()
+                    );
+                }
+                Err(e) => return Err(e).with_context(|| format!("POST {chat}")),
+            }
+        };
+        let ms = || asked.elapsed().as_millis() as u64;
+        info!(g, round, after_asking_ms = ms(), "reply: stream opened");
+        let mut pending = String::new();
+        let mut said = String::new();
+        let mut calls: Vec<ToolCall> = Vec::new();
+        for line in std::io::BufReader::new(resp.into_reader()).lines() {
+            if generation.load(Ordering::SeqCst) != g {
+                info!(g, "reply dropped");
+                return Ok(());
+            }
+            let line = line.context("read reply stream")?;
+            let Some(data) = line.strip_prefix("data:").map(str::trim) else {
+                continue;
+            };
+            if data == "[DONE]" {
+                break;
+            }
+            let Ok(v) = serde_json::from_str::<Value>(data) else {
+                continue;
+            };
+            let delta = &v["choices"][0]["delta"];
+            if let Some(piece) = delta["content"].as_str() {
+                if said.is_empty() && first && !piece.trim().is_empty() {
+                    info!(g, after_asking_ms = ms(), "reply: first words");
+                }
+                pending.push_str(piece);
+                said.push_str(piece);
+            }
+            if let Some(parts) = delta["tool_calls"].as_array() {
+                for part in parts {
+                    let i = part["index"].as_u64().unwrap_or(0) as usize;
+                    while calls.len() <= i {
+                        calls.push(ToolCall::default());
+                    }
+                    let c = &mut calls[i];
+                    if let Some(id) = part["id"].as_str() {
+                        c.id.push_str(id);
+                    }
+                    if let Some(n) = part["function"]["name"].as_str() {
+                        c.name.push_str(n);
+                    }
+                    if let Some(a) = part["function"]["arguments"].as_str() {
+                        c.arguments.push_str(a);
+                    }
+                }
+            }
+            while let Some(end) =
+                sentence_end(&pending).or_else(|| first.then(|| clause_end(&pending)).flatten())
+            {
+                let s: String = pending.drain(..end).collect();
+                if first {
+                    info!(
+                        g,
+                        after_asking_ms = ms(),
+                        chars = s.len(),
+                        "reply: first sentence"
+                    );
+                    first = false;
+                }
+                send_sentence(tx, g, &s);
+            }
+        }
+        send_sentence(tx, g, &pending);
+        if !pending.trim().is_empty() {
+            first = false;
+        }
+        calls.retain(|c| !c.name.is_empty());
+        if calls.is_empty() {
             return Ok(());
         }
-        let line = line.context("read reply stream")?;
-        let Some(data) = line.strip_prefix("data:").map(str::trim) else {
-            continue;
-        };
-        if data == "[DONE]" {
-            break;
-        }
-        let Ok(v) = serde_json::from_str::<Value>(data) else {
-            continue;
-        };
-        if let Some(piece) = v["choices"][0]["delta"]["content"].as_str() {
-            if pending.is_empty() && first && !piece.trim().is_empty() {
-                info!(g, after_asking_ms = ms(), "reply: first words");
-            }
-            pending.push_str(piece);
-        }
-        while let Some(end) =
-            sentence_end(&pending).or_else(|| first.then(|| clause_end(&pending)).flatten())
-        {
-            let s: String = pending.drain(..end).collect();
-            if first {
-                info!(
-                    g,
-                    after_asking_ms = ms(),
-                    chars = s.len(),
-                    "reply: first sentence"
-                );
-                first = false;
-            }
-            send_sentence(tx, g, &s);
+        // The model's text so far stays in its turn, with the calls.
+        messages.push(json!({
+            "role": "assistant",
+            "content": if said.trim().is_empty() { Value::Null } else { Value::from(said) },
+            "tool_calls": calls.iter().enumerate().map(|(i, c)| json!({
+                "id": c.id(i),
+                "type": "function",
+                "function": { "name": c.name, "arguments": c.arguments },
+            })).collect::<Vec<_>>(),
+        }));
+        for (i, c) in calls.iter().enumerate() {
+            let result = run_tool(room, g, c);
+            info!(g, tool = c.name, %result, "reply: tool");
+            messages.push(json!({ "role": "tool", "tool_call_id": c.id(i), "content": result }));
         }
     }
-    send_sentence(tx, g, &pending);
     Ok(())
+}
+
+#[derive(Default, Debug)]
+struct ToolCall {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+impl ToolCall {
+    fn id(&self, i: usize) -> String {
+        if self.id.is_empty() {
+            format!("call_{i}")
+        } else {
+            self.id.clone()
+        }
+    }
+}
+
+/// The tools the model has in the lobby, for designing games.
+fn game_tools() -> Value {
+    let name =
+        json!({ "type": "string", "description": "The game's name, as the players will see it." });
+    let tool = |n: &str, d: &str, props: Value, required: &[&str]| {
+        json!({
+            "type": "function",
+            "function": {
+                "name": n,
+                "description": d,
+                "parameters": { "type": "object", "properties": props, "required": required },
+            }
+        })
+    };
+    let game = json!({
+        "name": name,
+        "summary": { "type": "string", "description": "One or two sentences the players see on the game's button." },
+        "prompt": { "type": "string", "description": "Your complete hidden instructions for running the game." },
+    });
+    let mut revise = game.clone();
+    revise["new_name"] =
+        json!({ "type": "string", "description": "A new name, if the game is being renamed." });
+    json!([
+        tool("list_games", "List the saved games: name, summary, and whether they have been played (and so are fixed).", json!({}), &[]),
+        tool("check_game_name", "Check whether a name is free for a new game.", json!({ "name": name }), &["name"]),
+        tool("save_game", "Save a new game once the players have confirmed it. Its button appears in the chat.", game, &["name", "summary", "prompt"]),
+        tool("read_game", "Read the summary and hidden prompt of a game nobody has played yet, to revise it.", json!({ "name": name }), &["name"]),
+        tool("revise_game", "Replace a game nobody has played yet with a revised version; its old button is replaced by a new one.", revise, &["name", "summary", "prompt"]),
+    ])
+}
+
+/// Run one tool call; the result is JSON for the model.
+fn run_tool(room: &Room, g: u64, call: &ToolCall) -> String {
+    let args: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
+    let arg = |k: &str| args[k].as_str().unwrap_or("").to_string();
+    let result = match call.name.as_str() {
+        "list_games" => Ok(json!({ "games": room.list_games() })),
+        "check_game_name" => room
+            .check_game_name(&arg("name"))
+            .map(|()| json!({ "free": true })),
+        "save_game" => room
+            .save_game(g, &arg("name"), &arg("summary"), &arg("prompt"))
+            .map(|()| json!({ "saved": arg("name").trim() })),
+        "read_game" => room
+            .read_game(&arg("name"))
+            .map(|(summary, prompt)| json!({ "summary": summary, "prompt": prompt })),
+        "revise_game" => room
+            .revise_game(
+                g,
+                &arg("name"),
+                args["new_name"].as_str(),
+                &arg("summary"),
+                &arg("prompt"),
+            )
+            .map(|name| json!({ "saved": name })),
+        other => Err(format!("there is no tool called {other:?}")),
+    };
+    match result {
+        Ok(v) => v.to_string(),
+        Err(e) => json!({ "error": e }).to_string(),
+    }
 }
 
 fn send_sentence(tx: &Sender<Speak>, g: u64, s: &str) {

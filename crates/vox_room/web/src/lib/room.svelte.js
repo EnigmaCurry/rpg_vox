@@ -14,6 +14,9 @@ export const room = $state({
   strips: {},
   levels: {},
   log: [],
+  // The game being played (null: the lobby), and every saved game.
+  game: null,
+  games: [],
   notice: null,
   audio: 'off', // off | starting | on | error
   audioError: null,
@@ -72,6 +75,12 @@ export function command(msg) {
   if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
 }
 
+export function enterGame(name) {
+  if (confirm(`Enter ${name}? Everyone in the room goes into the game, and this chat is cleared.`)) {
+    command({ type: 'enter_game', name });
+  }
+}
+
 function upsert(entry) {
   const i = room.log.findIndex((e) => e.id === entry.id);
   if (i >= 0) room.log[i] = entry;
@@ -90,6 +99,8 @@ function apply(ev) {
       room.people = ev.people;
       room.strips = ev.strips;
       room.log = ev.log;
+      room.game = ev.game ?? null;
+      room.games = ev.games ?? [];
       break;
     case 'people':
       room.people = ev.people;
@@ -102,6 +113,10 @@ function apply(ev) {
       break;
     case 'reset':
       room.log = ev.log;
+      room.game = ev.game ?? null;
+      break;
+    case 'games':
+      room.games = ev.games;
       break;
     case 'agent':
       room.agent.state = ev.state;

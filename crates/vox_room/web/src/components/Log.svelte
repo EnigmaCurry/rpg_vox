@@ -1,5 +1,5 @@
 <script>
-  import { room } from '../lib/room.svelte.js';
+  import { room, enterGame } from '../lib/room.svelte.js';
   import { hue } from '../lib/color.js';
 
   let box;
@@ -22,11 +22,33 @@
 <div class="log" bind:this={box} {onscroll}>
   {#if room.log.length === 0}
     <p class="empty">
-      Nothing said yet. Join the audio and start talking; say <strong>{room.agent.name}</strong>
-      {room.mode === 'named' ? 'to bring it in' : 'or just talk, and it answers when you pause'}.
+      {#if room.game}
+        Entering <strong>{room.game}</strong>…
+      {:else}
+        Nothing said yet. Join the audio and start talking; say <strong>{room.agent.name}</strong>
+        {room.mode === 'named' ? 'to bring it in' : 'or just talk, and it answers when you pause'}.
+        Ask it to design a game with you, and it'll save one you can enter.
+      {/if}
     </p>
   {/if}
   {#each room.log as e (e.id)}
+    {#if e.kind === 'game'}
+      {@const g = room.games.find((g) => g.name.toLowerCase() === e.text.toLowerCase())}
+      <div class="entry agent game-entry">
+        <div class="who"><span class="name">{e.who}</span><span class="time">{time(e.at)} · new game</span></div>
+        <div class="card">
+          <div class="title">{e.text}</div>
+          {#if g}<p class="summary">{g.summary}</p>{/if}
+          {#if !g}
+            <span class="hint">This game was deleted.</span>
+          {:else if room.game}
+            <span class="hint">Go back to the lobby to play it.</span>
+          {:else}
+            <button class="primary" onclick={() => enterGame(g.name)}>Enter {g.name}</button>
+          {/if}
+        </div>
+      </div>
+    {:else}
     <div class="entry" class:agent={e.kind === 'agent'} class:you={e.who === room.you} style="--h: {hue(e.who)}">
       <div class="who">
         <span class="name">{e.who}</span>
@@ -36,6 +58,7 @@
         {#if e.text}{e.text}{:else if e.kind === 'agent'}<span class="dots"><i></i><i></i><i></i></span>{/if}
       </div>
     </div>
+    {/if}
   {/each}
   {#if room.agent.state === 'waiting'}
     <div class="entry agent waiting" aria-live="polite">
@@ -55,6 +78,19 @@
     min-height: 0;
   }
   .empty { color: var(--muted); text-align: center; margin: auto; max-width: 28em; }
+  .card {
+    border: 1px solid color-mix(in srgb, var(--agent) 45%, var(--line));
+    background: color-mix(in srgb, var(--agent) 8%, var(--bubble));
+    border-radius: 12px;
+    padding: 12px 14px;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 8px;
+  }
+  .card .title { font-weight: 650; font-size: 16px; }
+  .card .summary { margin: 0; color: var(--muted); }
+  .hint { color: var(--muted); font-size: 13px; }
   .entry { max-width: min(42em, 92%); }
   .entry.you { align-self: flex-end; }
   .who { font-size: 12px; color: var(--muted); display: flex; gap: 8px; margin: 0 4px 2px; }
