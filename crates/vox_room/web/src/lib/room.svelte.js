@@ -27,15 +27,20 @@ export const room = $state({
   mic: false,
   muted: false,
   volume: 1,
-  // Playing through speakers, not a headset: the browser's echo
-  // cancellation keeps the room's sound out of the mic.
-  noHeadset: readNoHeadset(),
+  // Push to talk: the mic stays muted except while Space (or the talk
+  // button) is held.
+  pushToTalk: readPref('vox_room.push_to_talk'),
+  talking: false,
   // Peak level of what this tab hears, for its meter.
   hearing: 0,
 });
 
-function readNoHeadset() {
-  try { return localStorage.getItem('vox_room.no_headset') === 'on'; } catch { return false; }
+function readPref(key) {
+  try { return localStorage.getItem(key) === 'on'; } catch { return false; }
+}
+
+function writePref(key, on) {
+  try { localStorage.setItem(key, on ? 'on' : 'off'); } catch {}
 }
 
 let ws = null;
@@ -187,7 +192,8 @@ export async function joinAudio() {
     addEventListener('keydown', resumeAudio);
     room.audio = 'on';
     hearTimer = setInterval(() => (room.hearing = audio?.takeHeard() ?? 0), 100);
-    await audio.startMic({ echoCancellation: room.noHeadset });
+    await audio.startMic();
+    if (room.pushToTalk) setMuted(true);
     audio.muted = room.muted;
     room.mic = true;
     command({ type: 'mic', on: true });
@@ -224,18 +230,32 @@ export function setMuted(m) {
   command({ type: 'mute', on: m });
 }
 
-/// Switch the browser's echo cancellation on (speakers) or off (headset),
-/// reopening the mic if it's open.
-export async function setNoHeadset(on) {
-  room.noHeadset = on;
-  try { localStorage.setItem('vox_room.no_headset', on ? 'on' : 'off'); } catch {}
-  if (audio?.stream) {
-    audio.stopMic();
-    try {
-      await audio.startMic({ echoCancellation: on });
-    } catch (e) {
-      room.audioError = e?.message || String(e);
-    }
+/// Push to talk on: muted until Space or the talk button is held. Off:
+/// back to an open mic.
+export function setPushToTalk(on) {
+  room.pushToTalk = on;
+  writePref('vox_room.push_to_talk', on);
+  clearTimeout(releaseTimer);
+  room.talking = false;
+  setMuted(on);
+}
+
+// After letting go, the mic stays open a moment so the last word gets
+// through.
+const RELEASE_MS = 300;
+let releaseTimer = null;
+
+export function talk(on) {
+  if (!room.pushToTalk || !room.mic) return;
+  clearTimeout(releaseTimer);
+  if (on) {
+    room.talking = true;
+    if (room.muted) setMuted(false);
+  } else if (room.talking) {
+    room.talking = false;
+    releaseTimer = setTimeout(() => {
+      if (room.pushToTalk && !room.talking) setMuted(true);
+    }, RELEASE_MS);
   }
 }
 

@@ -113,19 +113,18 @@ export class RoomAudio {
     if (this.volume) this.volume.gain.value = v;
   }
 
-  /// Open the mic and start sending it. On a headset, echo cancellation
-  /// and noise suppression stay off so the voice comes through as it is;
-  /// through speakers, `echoCancellation` has the browser take the
-  /// room's sound back out of the mic.
-  async startMic({ deviceId, echoCancellation = false } = {}) {
+  /// Open the mic and start sending it. Echo cancellation and noise
+  /// suppression stay off so the voice comes through as it is (on
+  /// speakers, push to talk keeps the room's sound out).
+  async startMic({ deviceId } = {}) {
     if (this.stream) return;
     this.stream = await navigator.mediaDevices.getUserMedia({
       audio: {
         deviceId: deviceId ? { exact: deviceId } : undefined,
         channelCount: 1,
         sampleRate: RATE,
-        echoCancellation,
-        noiseSuppression: echoCancellation,
+        echoCancellation: false,
+        noiseSuppression: false,
         autoGainControl: false,
       },
     });

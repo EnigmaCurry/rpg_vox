@@ -1,6 +1,6 @@
 <script>
   import { onMount } from 'svelte';
-  import { room, connect, command, enterGame, peekGame, ask, answer, whoami, joinAudio, leaveAudio, setMuted, setVolume, setNoHeadset } from './lib/room.svelte.js';
+  import { room, connect, command, enterGame, peekGame, ask, answer, whoami, joinAudio, leaveAudio, setMuted, setVolume, setPushToTalk, talk } from './lib/room.svelte.js';
   import { supported } from './lib/audio.js';
   import Log from './components/Log.svelte';
   import Strip from './components/Strip.svelte';
@@ -47,15 +47,25 @@
     if (!room.asking && dialog.open) dialog.close();
   });
 
-  // Space toggles your mute, unless you're typing somewhere.
+  // Space toggles your mute (or, with push to talk, talks while held),
+  // unless you're typing somewhere.
+  function spaceKey(e) {
+    return e.code === 'Space' && room.audio === 'on' && !e.target.closest('input, textarea, button, dialog');
+  }
   function onkeydown(e) {
-    if (e.code !== 'Space' || room.audio !== 'on' || e.target.closest('input, textarea, button')) return;
+    if (!spaceKey(e)) return;
     e.preventDefault();
-    setMuted(!room.muted);
+    if (room.pushToTalk) talk(true);
+    else if (!e.repeat) setMuted(!room.muted);
+  }
+  function onkeyup(e) {
+    if (e.code !== 'Space' || !room.pushToTalk) return;
+    e.preventDefault();
+    talk(false);
   }
 </script>
 
-<svelte:window {onkeydown} />
+<svelte:window {onkeydown} {onkeyup} onblur={() => talk(false)} />
 
 <dialog class="ask peek" bind:this={peekDialog} oncancel={(e) => { e.preventDefault(); room.peek = null; }}
   onclick={(e) => { if (e.target === peekDialog) room.peek = null; }}>
@@ -155,15 +165,29 @@
         <span class="warn">This browser can't do the room's audio (it needs WebCodecs: a recent Chrome, Firefox or Safari).</span>
       {:else if room.audio === 'off' || room.audio === 'error'}
         <button class="primary big" onclick={joinAudio}>Join audio</button>
-        <span class="hint">Best with a headset: anyone can interrupt {room.agent.name} just by talking.</span>
-        <label class="vol">
-          <input type="checkbox" checked={room.noHeadset} onchange={(e) => setNoHeadset(e.currentTarget.checked)} />
-          No headset
+        <span class="hint">Best with a headset: anyone can interrupt {room.agent.name} just by talking. On speakers, use push to talk.</span>
+        <label class="vol" title="Your mic stays muted except while you hold Space or the talk button.">
+          <input type="checkbox" checked={room.pushToTalk} onchange={(e) => { setPushToTalk(e.currentTarget.checked); e.currentTarget.blur(); }} />
+          Push to talk
         </label>
       {:else}
-        <button class="big" class:muted={room.muted} onclick={() => setMuted(!room.muted)} disabled={!room.mic}>
-          {room.muted ? 'Unmute' : 'Mute'} <kbd>Space</kbd>
-        </button>
+        {#if room.pushToTalk}
+          <button class="big ptt" class:talking={room.talking} disabled={!room.mic}
+            onpointerdown={(e) => { e.currentTarget.setPointerCapture(e.pointerId); talk(true); }}
+            onpointerup={() => talk(false)} onpointercancel={() => talk(false)}
+            onkeydown={(e) => { if (e.code === 'Space' || e.code === 'Enter') { e.preventDefault(); talk(true); } }}
+            onkeyup={(e) => { if (e.code === 'Space' || e.code === 'Enter') { e.preventDefault(); talk(false); } }}>
+            {room.talking ? 'Talking…' : 'Hold to talk'} <kbd>Space</kbd>
+          </button>
+        {:else}
+          <button class="big" class:muted={room.muted} onclick={() => setMuted(!room.muted)} disabled={!room.mic}>
+            {room.muted ? 'Unmute' : 'Mute'} <kbd>Space</kbd>
+          </button>
+        {/if}
+        <label class="vol" title="Your mic stays muted except while you hold Space or the talk button.">
+          <input type="checkbox" checked={room.pushToTalk} onchange={(e) => { setPushToTalk(e.currentTarget.checked); e.currentTarget.blur(); }} />
+          Push to talk
+        </label>
         <span class="vol">You hear</span>
         <span class="hear" title="What you hear: everyone but you">
           <span style="width: {room.hearing > 0 ? Math.max(0, Math.min(100, ((20 * Math.log10(room.hearing) + 60) / 60) * 100)) : 0}%"></span>
@@ -171,10 +195,6 @@
         <label class="vol">Your volume
           <input type="range" min="0" max="1.5" step="0.01" value={room.volume}
             oninput={(e) => setVolume(Number(e.currentTarget.value))} />
-        </label>
-        <label class="vol" title="Playing through speakers? This has the browser keep the room's sound out of your mic, so {room.agent.name} doesn't hear itself.">
-          <input type="checkbox" checked={room.noHeadset} onchange={(e) => setNoHeadset(e.currentTarget.checked)} />
-          No headset
         </label>
         <button onclick={leaveAudio}>Leave audio</button>
         {#if room.audio === 'starting'}<span class="hint">starting…</span>{/if}
@@ -285,6 +305,8 @@
   }
   .big { padding: 9px 18px; font-size: 15px; }
   .big.muted { background: var(--danger); color: #fff; border-color: var(--danger); }
+  .big.ptt { touch-action: none; user-select: none; -webkit-user-select: none; }
+  .big.ptt.talking { background: var(--ok); color: var(--accent-ink); border-color: var(--ok); }
   kbd { font-size: 11px; opacity: 0.7; border: 1px solid currentColor; border-radius: 4px; padding: 0 4px; margin-left: 4px; }
   .vol { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); }
   .warn { color: var(--danger); font-size: 13px; }
