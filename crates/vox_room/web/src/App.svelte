@@ -1,6 +1,6 @@
 <script>
   import { onMount } from 'svelte';
-  import { room, connect, command, whoami, joinAudio, leaveAudio, setMuted, setVolume } from './lib/room.svelte.js';
+  import { room, connect, command, whoami, joinAudio, leaveAudio, setMuted, setVolume, setNoHeadset } from './lib/room.svelte.js';
   import { supported } from './lib/audio.js';
   import Log from './components/Log.svelte';
   import Strip from './components/Strip.svelte';
@@ -58,10 +58,10 @@
     <aside>
       <h2>In the room</h2>
       {#each room.people as p (p.name)}
-        <Strip key={p.name} label={p.name} online={p.online} mic={p.mic} speaking={p.speaking} />
+        <Strip key={p.name} label={p.name} online={p.online} mic={p.mic} muted={p.muted} speaking={p.speaking} />
       {/each}
       <Strip key={room.agent.strip} label={room.agent.name} agent />
-      <p class="hint">Levels and mutes here change the room for everyone. You never hear yourself.</p>
+      <p class="hint">Levels and mutes here change the room for everyone, and a muted person isn't transcribed. You never hear yourself.</p>
     </aside>
 
     <footer>
@@ -69,7 +69,11 @@
         <span class="warn">This browser can't do the room's audio (it needs WebCodecs: a recent Chrome, Firefox or Safari).</span>
       {:else if room.audio === 'off' || room.audio === 'error'}
         <button class="primary big" onclick={joinAudio}>Join audio</button>
-        <span class="hint">Use a headset: anyone can interrupt {room.agent.name} just by talking.</span>
+        <span class="hint">Best with a headset: anyone can interrupt {room.agent.name} just by talking.</span>
+        <label class="vol">
+          <input type="checkbox" checked={room.noHeadset} onchange={(e) => setNoHeadset(e.currentTarget.checked)} />
+          No headset
+        </label>
       {:else}
         <button class="big" class:muted={room.muted} onclick={() => setMuted(!room.muted)} disabled={!room.mic}>
           {room.muted ? 'Unmute' : 'Mute'} <kbd>Space</kbd>
@@ -81,6 +85,10 @@
         <label class="vol">Your volume
           <input type="range" min="0" max="1.5" step="0.01" value={room.volume}
             oninput={(e) => setVolume(Number(e.currentTarget.value))} />
+        </label>
+        <label class="vol" title="Playing through speakers? This has the browser keep the room's sound out of your mic, so {room.agent.name} doesn't hear itself.">
+          <input type="checkbox" checked={room.noHeadset} onchange={(e) => setNoHeadset(e.currentTarget.checked)} />
+          No headset
         </label>
         <button onclick={leaveAudio}>Leave audio</button>
         {#if room.audio === 'starting'}<span class="hint">starting…</span>{/if}

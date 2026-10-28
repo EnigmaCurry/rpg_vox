@@ -7,6 +7,7 @@
 //!
 //! ```json
 //! {"type": "mic", "on": true}
+//! {"type": "mute", "on": true}
 //! {"type": "strip", "name": "Alex", "gain": 0.8, "mute": false}
 //! {"type": "mode", "mode": "always"}
 //! {"type": "stop"}
@@ -141,6 +142,9 @@ enum Command {
     Mic {
         on: bool,
     },
+    Mute {
+        on: bool,
+    },
     Strip {
         name: String,
         gain: Option<f32>,
@@ -195,6 +199,7 @@ async fn client(room: Arc<Room>, socket: WebSocket, id: u64, name: String) -> an
                 },
                 Message::Text(text) => match serde_json::from_str::<Command>(&text) {
                     Ok(Command::Mic { on }) => room.set_mic(&name, on),
+                    Ok(Command::Mute { on }) => room.set_muted(&name, on),
                     Ok(Command::Strip {
                         name: strip,
                         gain,

@@ -131,6 +131,9 @@ pub enum Role {
 struct Person {
     clients: usize,
     mic: bool,
+    /// Muted their own mic. Their audio still arrives (as silence), but
+    /// the room doesn't transcribe it or count it as talking.
+    muted: bool,
     speaking: bool,
     speaking_since: Option<Instant>,
     /// Last time a streaming guess with words in it came in.
@@ -264,6 +267,7 @@ impl Room {
                         "name": name,
                         "online": p.clients > 0,
                         "mic": p.mic,
+                        "muted": p.muted,
                         "speaking": p.speaking,
                     })
                 })
@@ -337,10 +341,32 @@ impl Room {
         self.emit_people(&st);
     }
 
+    /// `person` muted or unmuted their mic.
+    pub fn set_muted(&self, person: &str, muted: bool) {
+        let mut st = self.lock();
+        let Some(p) = st.people.get_mut(person) else {
+            return;
+        };
+        if p.muted == muted {
+            return;
+        }
+        p.muted = muted;
+        if muted {
+            p.speaking = false;
+        }
+        self.emit_people(&st);
+    }
+
     /// Decoded mic audio (48 kHz mono) from `person`.
     pub fn mic_audio(self: &Arc<Self>, person: &str, pcm: &[f32]) {
         self.mixer.push_mic(person, pcm);
-        let pusher = {
+        // Muted (by themselves, or on the mixer for everyone): transcribe
+        // silence instead, so whatever the mic picks up (the AI from their
+        // speakers, say) is neither written down nor taken for talking
+        // over the AI. The engine still gets audio, so its clock runs on
+        // and an utterance in progress closes.
+        let silent = self.mixer.is_muted(person);
+        let (pusher, muted) = {
             let mut st = self.lock();
             let Some(p) = st.people.get_mut(person) else {
                 return;
@@ -356,10 +382,14 @@ impl Room {
                     }
                 }
             }
-            p.engine.clone()
+            (p.engine.clone(), p.muted || silent)
         };
         if let Some(e) = pusher {
-            e.push(pcm);
+            if muted {
+                e.push(&vec![0.0; pcm.len()]);
+            } else {
+                e.push(pcm);
+            }
         }
     }
 
@@ -426,10 +456,13 @@ impl Room {
 
     /// Voice activity of `person`, about every 50 ms of their audio.
     pub fn on_level(&self, person: &str, speaking: bool) {
+        let silent = self.mixer.is_muted(person);
         let mut st = self.lock();
         let Some(p) = st.people.get_mut(person) else {
             return;
         };
+        // What the engine still had in hand when the mute began.
+        let speaking = speaking && !p.muted && !silent;
         if p.speaking == speaking {
             return;
         }
@@ -1041,6 +1074,28 @@ mod tests {
         r.tick(Instant::now());
         assert!(!r.lock().ducked);
         assert!(r.lock().reply.is_some());
+    }
+
+    #[test]
+    fn a_muted_mic_never_interrupts() {
+        let (r, turns) = room(Mode::Named);
+        speaking(&r, &turns);
+        // Muted on the mixer: the AI coming back through their speakers.
+        r.set_strip("Alex", None, Some(true));
+        r.on_level("Alex", true);
+        r.tick(Instant::now() + Duration::from_millis(400));
+        assert!(!r.lock().ducked);
+        assert!(r.lock().reply.is_some());
+        // Muted by themselves.
+        r.set_strip("Alex", None, Some(false));
+        r.set_muted("Ryan", true);
+        r.on_level("Ryan", true);
+        r.tick(Instant::now() + Duration::from_millis(400));
+        assert!(r.lock().reply.is_some());
+        r.set_muted("Ryan", false);
+        r.on_level("Ryan", true);
+        r.tick(Instant::now() + Duration::from_millis(400));
+        assert!(r.lock().reply.is_none(), "unmuted, they interrupt again");
     }
 
     #[test]

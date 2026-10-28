@@ -3,7 +3,7 @@
   import { hue } from '../lib/color.js';
 
   // key: the strip's name in the mixer; label: what to show.
-  let { key, label, online = true, mic = false, speaking = false, agent = false } = $props();
+  let { key, label, online = true, mic = false, muted = false, speaking = false, agent = false } = $props();
 
   const strip = $derived(room.strips[key] ?? { gain: 1, mute: false });
   const level = $derived(room.levels[key] ?? 0);
@@ -23,14 +23,15 @@
   <div class="top">
     <span class="dot" title={online ? 'here' : 'away'}></span>
     <span class="label">{label}{#if label === room.you}<em>&nbsp;(you)</em>{/if}</span>
-    <span class="state">{agent ? room.agent.state : speaking ? 'talking' : mic ? 'mic on' : online ? 'no mic' : 'away'}</span>
+    <span class="state">{agent ? room.agent.state : speaking ? 'talking' : mic && muted ? 'muted' : mic ? 'mic on' : online ? 'no mic' : 'away'}</span>
   </div>
   <div class="meter"><div class="fill" style="width: {pct}%"></div></div>
   <div class="controls">
     <input type="range" min="0" max="2" step="0.01" value={strip.gain} oninput={gain}
       ondblclick={() => command({ type: 'strip', name: key, gain: 1 })} aria-label="{label} level" />
     <span class="db">{db}</span>
-    <button class:on={strip.mute} onclick={mute} aria-pressed={strip.mute}>{strip.mute ? 'Muted' : 'Mute'}</button>
+    <button class:on={strip.mute} onclick={mute} aria-pressed={strip.mute}
+      title={strip.mute ? `Unmute ${label} for everyone` : `Mute ${label} for everyone (and stop transcribing them)`}>{strip.mute ? 'Muted' : 'Mute'}</button>
   </div>
 </div>
 

@@ -272,6 +272,11 @@ impl Mixer {
         self.lock().listeners.retain(|l| l.id != id);
     }
 
+    /// The strip `name` is muted on the mixer.
+    pub fn is_muted(&self, name: &str) -> bool {
+        self.lock().strips.get(name).is_some_and(|s| s.mute)
+    }
+
     pub fn strips(&self) -> BTreeMap<String, Strip> {
         self.lock().strips.clone()
     }

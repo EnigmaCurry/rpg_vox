@@ -20,9 +20,16 @@ export const room = $state({
   mic: false,
   muted: false,
   volume: 1,
+  // Playing through speakers, not a headset: the browser's echo
+  // cancellation keeps the room's sound out of the mic.
+  noHeadset: readNoHeadset(),
   // Peak level of what this tab hears, for its meter.
   hearing: 0,
 });
+
+function readNoHeadset() {
+  try { return localStorage.getItem('vox_room.no_headset') === 'on'; } catch { return false; }
+}
 
 let ws = null;
 let audio = null;
@@ -38,6 +45,7 @@ export function connect() {
     room.connected = true;
     retry = 0;
     if (room.mic) command({ type: 'mic', on: true });
+    command({ type: 'mute', on: room.muted });
   };
   ws.onmessage = (ev) => {
     if (typeof ev.data === 'string') apply(JSON.parse(ev.data));
@@ -127,7 +135,7 @@ export async function joinAudio() {
     await audio.start(room.volume);
     room.audio = 'on';
     hearTimer = setInterval(() => (room.hearing = audio?.takeHeard() ?? 0), 100);
-    await audio.startMic();
+    await audio.startMic({ echoCancellation: room.noHeadset });
     audio.muted = room.muted;
     room.mic = true;
     command({ type: 'mic', on: true });
@@ -155,6 +163,22 @@ export async function leaveAudio() {
 export function setMuted(m) {
   room.muted = m;
   if (audio) audio.muted = m;
+  command({ type: 'mute', on: m });
+}
+
+/// Switch the browser's echo cancellation on (speakers) or off (headset),
+/// reopening the mic if it's open.
+export async function setNoHeadset(on) {
+  room.noHeadset = on;
+  try { localStorage.setItem('vox_room.no_headset', on ? 'on' : 'off'); } catch {}
+  if (audio?.stream) {
+    audio.stopMic();
+    try {
+      await audio.startMic({ echoCancellation: on });
+    } catch (e) {
+      room.audioError = e?.message || String(e);
+    }
+  }
 }
 
 export function setVolume(v) {
