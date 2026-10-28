@@ -46,7 +46,9 @@ players, and how to open. The players never see the prompt, so never read it \
 aloud or describe its secrets; a button to enter the game appears in the \
 chat. Until someone enters a game the players can ask for changes: use \
 read_game and revise_game, which replaces its button. Once a game has been \
-played it is fixed. list_games shows the saved games.";
+played it is fixed. list_games shows the saved games. Whatever you say \
+before calling a tool is spoken straight away, so after the tool answers, \
+carry on without repeating it.";
 
 /// The system prompt in a game; `{game}` and `{prompt}` (hidden from the
 /// players) are filled in, then `{name}` and `{people}`.
@@ -276,6 +278,8 @@ fn stream_reply(
     let mut kwargs = true;
     let mut tools = lobby;
     let mut first = true;
+    // What this reply has said, across tool rounds.
+    let mut spoken: Vec<Vec<String>> = Vec::new();
     for round in 0..=TOOL_ROUNDS {
         let resp = loop {
             let mut req = http.post(&chat);
@@ -387,10 +391,10 @@ fn stream_reply(
                     );
                     first = false;
                 }
-                send_sentence(tx, g, &s);
+                send_sentence(tx, g, &s, &mut spoken);
             }
         }
-        send_sentence(tx, g, &pending);
+        send_sentence(tx, g, &pending, &mut spoken);
         if !pending.trim().is_empty() {
             first = false;
         }
@@ -408,9 +412,16 @@ fn stream_reply(
                 "function": { "name": c.name, "arguments": c.arguments },
             })).collect::<Vec<_>>(),
         }));
+        let spoke = !spoken.is_empty();
         for (i, c) in calls.iter().enumerate() {
-            let result = run_tool(room, g, c);
+            let mut result = run_tool(room, g, c);
             info!(g, tool = c.name, %result, "reply: tool");
+            if spoke {
+                result.push_str(
+                    "\n(What you said before this call has already been spoken aloud. \
+                     Carry on from there; don't repeat it.)",
+                );
+            }
             messages.push(json!({ "role": "tool", "tool_call_id": c.id(i), "content": result }));
         }
     }
@@ -505,11 +516,47 @@ fn run_tool(room: &Room, g: u64, call: &ToolCall) -> String {
     }
 }
 
-fn send_sentence(tx: &Sender<Speak>, g: u64, s: &str) {
+/// Hand a sentence to the voice, unless it repeats one this reply has
+/// already said (models tend to start over after a tool call).
+fn send_sentence(tx: &Sender<Speak>, g: u64, s: &str, spoken: &mut Vec<Vec<String>>) {
     let s = clean(s);
-    if !s.is_empty() {
-        let _ = tx.send(Speak::Sentence(g, s));
+    if s.is_empty() {
+        return;
     }
+    let w = sentence_words(&s);
+    if spoken.iter().any(|old| repeats(old, &w)) {
+        info!(g, sentence = %s, "reply: dropped a repeated sentence");
+        return;
+    }
+    spoken.push(w);
+    let _ = tx.send(Speak::Sentence(g, s));
+}
+
+fn sentence_words(s: &str) -> Vec<String> {
+    s.split(|c: char| !c.is_alphanumeric() && c != '\'')
+        .filter(|w| !w.is_empty())
+        .map(str::to_lowercase)
+        .collect()
+}
+
+/// Shortest sentence that counts as a repeat: short ones ("Sure.") recur
+/// for real.
+const REPEAT_MIN_WORDS: usize = 5;
+
+/// `b` says nearly the same as `a`: most of the longer one's words shared.
+fn repeats(a: &[String], b: &[String]) -> bool {
+    if a.len().min(b.len()) < REPEAT_MIN_WORDS {
+        return false;
+    }
+    let mut rest: Vec<&String> = a.iter().collect();
+    let mut shared = 0;
+    for w in b {
+        if let Some(i) = rest.iter().position(|r| *r == w) {
+            rest.swap_remove(i);
+            shared += 1;
+        }
+    }
+    shared * 4 >= a.len().max(b.len()) * 3
 }
 
 /// Strip markdown that shouldn't be read aloud.
@@ -590,6 +637,31 @@ mod tests {
         assert_eq!(clause_end("Well, that is a fine question, and"), Some(30));
         assert_eq!(clause_end("Well, sure"), None);
         assert_eq!(clause_end("It costs 1,000 coins, or"), Some(21));
+    }
+
+    #[test]
+    fn drops_a_sentence_said_again_after_a_tool_call() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut spoken = Vec::new();
+        for s in [
+            "Sure.",
+            "One idea is Quick Draw: I give you a category, and we take turns naming something.",
+            "Sure.",
+            "One idea is Quick Draw: I give you a category and we take turns naming things.",
+            "Does that sound fun, or would you rather play something else?",
+        ] {
+            send_sentence(&tx, 1, s, &mut spoken);
+        }
+        drop(tx);
+        let said: Vec<String> = rx
+            .iter()
+            .filter_map(|m| match m {
+                Speak::Sentence(_, s) => Some(s),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(said.len(), 4, "{said:?}");
+        assert_eq!(said[2], "Sure.", "short sentences may recur");
     }
 
     #[test]
