@@ -184,6 +184,12 @@ lobby and in a game alike:
 - `read_cards` — what it has given out, in full. A long game outruns the
   conversation the model can still see, and a game master that has
   forgotten who the traitor is cannot run the game.
+- `post_card` — the opposite: a card written into the **conversation**,
+  for the whole room, which stays there and cannot be taken back. It is
+  where anything everyone should be looking at belongs — the rules as
+  agreed, the standings, the cast of a scene — and it saves the AI
+  reading a list aloud. It is shown to the model as its own, in full, so
+  it keeps playing by what the room can see.
 
 It has one more tool everywhere, `wait_until_named`, which is how it ends
 a back-and-forth by itself (above).

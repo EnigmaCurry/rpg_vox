@@ -2,7 +2,7 @@
 //!
 //! ```sql
 //! people(name, token)
-//! entries(conversation, id, who, kind, text, cut, at)
+//! entries(conversation, id, who, kind, title, text, cut, at)
 //! settings(key, value)
 //! games(name, summary, prompt, settings, created, played)  -- names unique, ignoring case
 //! conversations(id, game)                 -- no row: the lobby
@@ -34,6 +34,8 @@ CREATE TABLE IF NOT EXISTS entries (
     id   TEXT NOT NULL,
     who  TEXT NOT NULL,
     kind TEXT NOT NULL,
+    -- A posted card's heading; empty for everything that was said.
+    title TEXT NOT NULL DEFAULT '',
     text TEXT NOT NULL,
     cut  INTEGER NOT NULL DEFAULT 0,
     at   INTEGER NOT NULL,
@@ -281,8 +283,8 @@ impl Store {
 
     pub fn put_entry(&self, conversation: i64, e: &Entry) -> Result<()> {
         self.db.execute(
-            "INSERT INTO entries (conversation, id, who, kind, text, cut, at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "INSERT INTO entries (conversation, id, who, kind, title, text, cut, at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(conversation, id) DO UPDATE SET
                text = excluded.text, cut = excluded.cut",
             params![
@@ -290,6 +292,7 @@ impl Store {
                 e.id,
                 e.who,
                 e.kind.as_str(),
+                e.title,
                 e.text,
                 e.cut as i64,
                 e.at as i64
@@ -301,7 +304,7 @@ impl Store {
     /// The last `limit` entries of `conversation`, oldest first.
     pub fn entries(&self, conversation: i64, limit: usize) -> Result<Vec<Entry>> {
         let mut q = self.db.prepare(
-            "SELECT id, who, kind, text, cut, at FROM entries
+            "SELECT id, who, kind, title, text, cut, at FROM entries
              WHERE conversation = ?1 ORDER BY at DESC, rowid DESC LIMIT ?2",
         )?;
         let rows = q.query_map(params![conversation, limit as i64], |r| {
@@ -310,11 +313,12 @@ impl Store {
                 id: r.get(0)?,
                 who: r.get(1)?,
                 kind: Kind::parse(&kind),
-                text: r.get(3)?,
+                title: r.get(3)?,
+                text: r.get(4)?,
                 live: false,
                 partial: false,
-                cut: r.get::<_, i64>(4)? != 0,
-                at: r.get::<_, i64>(5)? as u64,
+                cut: r.get::<_, i64>(5)? != 0,
+                at: r.get::<_, i64>(6)? as u64,
                 sent: true,
             })
         })?;
@@ -417,6 +421,13 @@ fn migrate(db: &Connection) -> Result<()> {
     if !columns.iter().any(|c| c == "settings") {
         db.execute_batch("ALTER TABLE games ADD COLUMN settings TEXT NOT NULL DEFAULT '{}'")?;
     }
+    let mut q = db.prepare("SELECT name FROM pragma_table_info('entries')")?;
+    let columns: Vec<String> = q
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    if !columns.iter().any(|c| c == "title") {
+        db.execute_batch("ALTER TABLE entries ADD COLUMN title TEXT NOT NULL DEFAULT ''")?;
+    }
     Ok(())
 }
 
@@ -445,6 +456,7 @@ mod tests {
             id: id.into(),
             who: "Ryan".into(),
             kind: Kind::Human,
+            title: String::new(),
             text: format!("text {id}"),
             live: false,
             partial: false,

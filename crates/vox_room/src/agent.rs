@@ -81,7 +81,13 @@ holds rewrites that card in place -- that is how a hand or a standing order \
 changes -- and take_back_card removes one when it no longer applies. \
 read_cards tells you what you have given out, which you will need in a long \
 game, when what you dealt has scrolled out of the conversation you can see. \
-Cards last until you take them back or the conversation starts over.";
+Cards last until you take them back or the conversation starts over. \
+post_card is the opposite of all this: it writes a card into the \
+conversation for the whole room, which is where anything everyone should \
+be looking at belongs -- the rules as agreed, the standings, a scene \
+everyone can see. A posted card cannot be taken back. Keep the two \
+straight: send_card is for one person's eyes, post_card is for the \
+room's, and reading either aloud is what you must not do.";
 
 /// The last thing the AI is shown when the room is leaving it to decide
 /// whether this pause is its moment.
@@ -656,6 +662,22 @@ fn room_tools() -> Vec<Value> {
             &["to", "title", "body"],
         ),
         tool(
+            "post_card",
+            "Write a card into the conversation for the whole room to \
+             read. Use it for what the people will want in front of them \
+             rather than held in their heads, and what you would \
+             otherwise have to read out in a list: the rules you have \
+             just agreed, the standings, a map in words, the cast of a \
+             scene. It stays in the conversation and cannot be taken \
+             back, so post what will still be true. Say a line about it \
+             aloud -- nobody hears a card appear.",
+            json!({
+                "title": { "type": "string", "description": "A few words heading the card, e.g. \"The rules\" or \"Scores after round 2\"." },
+                "body": { "type": "string", "description": "What the room is to read. Written to be read, not spoken; short lines on their own line are fine." },
+            }),
+            &["title", "body"],
+        ),
+        tool(
             "take_back_card",
             "Take one card back: it leaves that person's screen at once. \
              Nobody in the room can clear a card themselves, so what each \
@@ -901,6 +923,9 @@ fn run_tool(room: &Room, cfg: &Chat, g: u64, call: &ToolCall) -> String {
         "send_card" => room
             .send_card(&arg("to"), &arg("title"), &arg("body"))
             .map(|to| json!({ "sent": true, "to": to })),
+        "post_card" => room
+            .post_card(&arg("title"), &arg("body"))
+            .map(|title| json!({ "posted": title })),
         "take_back_card" => room
             .take_back_card(&arg("to"), &arg("title"))
             .map(|title| json!({ "taken_back": title })),
@@ -1191,6 +1216,7 @@ mod tests {
             [
                 "list_people",
                 "send_card",
+                "post_card",
                 "take_back_card",
                 "read_cards",
                 "wait_until_named"

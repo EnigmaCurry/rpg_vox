@@ -48,6 +48,16 @@
           {/if}
         </div>
       </div>
+    {:else if e.kind === 'card'}
+      <!-- A card the AI posted for the whole room; it stays in the
+           conversation like anything that was said. -->
+      <div class="entry agent card-entry">
+        <div class="who"><span class="name">{e.who}</span><span class="time">{time(e.at)} · for the room</span></div>
+        <div class="card posted">
+          <div class="title">{e.title}</div>
+          <p class="body">{e.text}</p>
+        </div>
+      </div>
     {:else}
     <div class="entry" class:agent={e.kind === 'agent'} class:you={e.who === room.you} style="--h: {hue(e.who)}">
       <div class="who">
@@ -91,6 +101,16 @@
     gap: 8px;
   }
   .card .title { font-weight: 650; font-size: 16px; }
+  /* A posted card is wider than a bubble: it is meant to be read, not
+     heard, and often has lines of its own. */
+  .card-entry { max-width: min(46em, 96%); align-self: stretch; }
+  .card.posted { width: 100%; }
+  .card.posted .body {
+    margin: 0;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    line-height: 1.5;
+  }
   .card .summary { margin: 0; color: var(--muted); }
   .hint { color: var(--muted); font-size: 13px; }
   .entry { max-width: min(42em, 92%); }

@@ -67,6 +67,10 @@ pub enum Kind {
     Agent,
     /// A game the AI saved; the entry's text is its name.
     Game,
+    /// A card the AI posted for the whole room: the entry's title and
+    /// text are the card's. It stays in the conversation like anything
+    /// that was said.
+    Card,
 }
 
 impl Kind {
@@ -75,6 +79,7 @@ impl Kind {
             Kind::Human => "human",
             Kind::Agent => "agent",
             Kind::Game => "game",
+            Kind::Card => "card",
         }
     }
 
@@ -82,6 +87,7 @@ impl Kind {
         match s {
             "agent" => Kind::Agent,
             "game" => Kind::Game,
+            "card" => Kind::Card,
             _ => Kind::Human,
         }
     }
@@ -244,6 +250,9 @@ pub struct Entry {
     pub id: String,
     pub who: String,
     pub kind: Kind,
+    /// A posted card's heading; empty for everything that was said.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub title: String,
     pub text: String,
     /// Still changing: a person still talking, or the AI still speaking.
     pub live: bool,
@@ -753,6 +762,45 @@ impl Room {
         Ok(card.title)
     }
 
+    /// Post a card to the whole room: it goes into the conversation
+    /// where everyone can read it, and stays there. Err says why not.
+    ///
+    /// Unlike a private card there is no taking it back -- it is part of
+    /// what the room has been told, like anything that was said.
+    pub fn post_card(&self, title: &str, body: &str) -> Result<String, String> {
+        let (title, body) = (title.trim(), body.trim());
+        if title.is_empty() || body.is_empty() {
+            return Err("a card needs a title and a body".into());
+        }
+        if title.chars().count() > CARD_TITLE_MAX {
+            return Err(format!("titles are at most {CARD_TITLE_MAX} characters"));
+        }
+        if body.chars().count() > CARD_BODY_MAX {
+            return Err(format!("a card is at most {CARD_BODY_MAX} characters"));
+        }
+        let mut st = self.lock();
+        let entry = Entry {
+            id: format!("card-{}", uuid::Uuid::new_v4().simple()),
+            who: self.cfg.agent_name.clone(),
+            kind: Kind::Card,
+            title: title.to_string(),
+            text: body.to_string(),
+            live: false,
+            partial: false,
+            cut: false,
+            at: now_ms(),
+            sent: true,
+        };
+        if let Err(err) = self.store().put_entry(st.conversation, &entry) {
+            return Err(format!("{err:#}"));
+        }
+        info!(title, "posted a card to the room");
+        self.emit_entry(&entry);
+        st.log.push(entry);
+        trim_log(&mut st.log);
+        Ok(title.to_string())
+    }
+
     /// What people are holding, for the AI: one person's cards, or
     /// everyone's. The AI wrote them, but a long game outruns what it
     /// can still see of its own conversation.
@@ -997,6 +1045,7 @@ impl Room {
                     id: para.id.clone(),
                     who: person.to_string(),
                     kind: Kind::Human,
+                    title: String::new(),
                     text: String::new(),
                     live: true,
                     partial: true,
@@ -1453,6 +1502,7 @@ impl Room {
             id: format!("game-{}", uuid::Uuid::new_v4().simple()),
             who: self.cfg.agent_name.clone(),
             kind: Kind::Game,
+            title: String::new(),
             text: name.to_string(),
             live: false,
             partial: false,
@@ -1752,6 +1802,7 @@ impl Room {
             id: format!("agent-{}", uuid::Uuid::new_v4().simple()),
             who: self.cfg.agent_name.clone(),
             kind: Kind::Agent,
+            title: String::new(),
             text: String::new(),
             live: true,
             partial: false,
@@ -1929,7 +1980,7 @@ fn conversation_messages(log: &[Entry], history: usize) -> Vec<(Role, String)> {
         .filter(|e| match e.kind {
             Kind::Human => e.sent && !e.text.trim().is_empty(),
             Kind::Agent => !e.live && !e.text.trim().is_empty(),
-            Kind::Game => true,
+            Kind::Game | Kind::Card => true,
         })
         .collect();
     let start = done.len().saturating_sub(history);
@@ -1966,6 +2017,17 @@ fn conversation_messages(log: &[Entry], history: usize) -> Vec<(Role, String)> {
                     }
                     _ => out.push((Role::Assistant, note)),
                 }
+            }
+            Kind::Card => {
+                // The card is written down where everyone can see it, so
+                // the model is shown it as its own, and in full: this is
+                // what the room is looking at.
+                let note = format!(
+                    "[You posted a card to the whole room, headed \"{}\":\n{}]",
+                    e.title,
+                    e.text.trim()
+                );
+                out.push((Role::Assistant, note));
             }
         }
     }
@@ -2771,6 +2833,38 @@ mod tests {
         assert!(events_of(&mut events, "card_removed")[0].contains(&first));
         let err = r.take_back_card("Ryan", "Your hand").unwrap_err();
         assert!(err.contains("none at all"), "{err}");
+    }
+
+    #[test]
+    fn a_posted_card_is_in_the_conversation_for_good() {
+        let (r, _turns) = room(Mode::Named);
+        let mut events = r.subscribe();
+        assert!(r.post_card("  ", "nothing titled").is_err());
+        assert!(r.post_card("The rules", "   ").is_err());
+        assert_eq!(
+            r.post_card(" The rules ", " One card each.\nAces are low. "),
+            Ok("The rules".into())
+        );
+
+        // It is in the conversation, for everyone -- not addressed to
+        // anyone, the way a private card is.
+        let posted = events_of(&mut events, "entry");
+        assert_eq!(posted.len(), 1);
+        assert!(posted[0].contains(r#""kind":"card""#), "{}", posted[0]);
+        assert!(posted[0].contains(r#""title":"The rules""#));
+        assert!(posted[0].contains("Aces are low."));
+
+        let entry = r.lock().log.last().cloned().unwrap();
+        assert_eq!(entry.kind, Kind::Card);
+        assert_eq!((entry.title.as_str(), entry.live), ("The rules", false));
+
+        // And the AI is shown its own card in full, so it can go on
+        // playing by what the room is looking at.
+        let said = conversation_messages(&r.lock().log, 50);
+        assert_eq!(said.len(), 1);
+        assert_eq!(said[0].0, Role::Assistant);
+        assert!(said[0].1.contains("The rules"), "{}", said[0].1);
+        assert!(said[0].1.contains("Aces are low."));
     }
 
     #[test]
