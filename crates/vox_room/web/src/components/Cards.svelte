@@ -1,5 +1,5 @@
 <script>
-  import { room, discardCard } from '../lib/room.svelte.js';
+  import { room } from '../lib/room.svelte.js';
 
   const time = (ms) => new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 </script>
@@ -21,13 +21,13 @@
         a secret role, a hand, what only you noticed.
       </p>
     {/if}
-    {#each room.cards as c (c.id)}
+    <!-- Keyed by when it was dealt as well as which card it is, so one
+         the AI has rewritten comes in with the same glow as a new one. -->
+    {#each room.cards as c (`${c.id}-${c.at}`)}
       <article class="card">
         <div class="top">
           <span class="title">{c.title}</span>
           <span class="time">{time(c.at)}</span>
-          <button class="x" title="Discard this card" aria-label="Discard {c.title}"
-            onclick={() => discardCard(c.id)}>×</button>
         </div>
         <p class="body">{c.body}</p>
       </article>
@@ -86,7 +86,6 @@
   .top { display: flex; align-items: baseline; gap: 8px; }
   .title { font-weight: 650; font-size: 16px; flex: 1; min-width: 0; overflow-wrap: anywhere; }
   .time { font-size: 11px; color: var(--muted); }
-  .x { padding: 0 6px; line-height: 1.3; color: var(--muted); }
   .body {
     margin: 6px 0 0;
     line-height: 1.5;

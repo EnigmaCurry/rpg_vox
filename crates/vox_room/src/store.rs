@@ -350,22 +350,41 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// How many cards each person holds in `conversation`.
-    pub fn card_counts(&self, conversation: i64) -> Result<Vec<(String, usize)>> {
+    /// What each person is holding in `conversation`: who, and the
+    /// card's title, oldest first.
+    pub fn card_titles(&self, conversation: i64) -> Result<Vec<(String, String)>> {
         let mut q = self
             .db
-            .prepare("SELECT who, COUNT(*) FROM cards WHERE conversation = ?1 GROUP BY who")?;
-        let rows = q.query_map([conversation], |r| {
-            Ok((r.get(0)?, r.get::<_, i64>(1)? as usize))
-        })?;
+            .prepare("SELECT who, title FROM cards WHERE conversation = ?1 ORDER BY at, rowid")?;
+        let rows = q.query_map([conversation], |r| Ok((r.get(0)?, r.get(1)?)))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// Discard one of `who`'s own cards; false when it isn't theirs.
-    pub fn delete_card(&self, conversation: i64, who: &str, id: &str) -> Result<bool> {
+    /// The card `who` is holding under `title`, matched ignoring case:
+    /// dealing that title again replaces this one rather than stacking
+    /// another copy beside it.
+    pub fn card_titled(&self, conversation: i64, who: &str, title: &str) -> Result<Option<Card>> {
+        Ok(self
+            .cards(conversation, who)?
+            .into_iter()
+            .find(|c| c.title.eq_ignore_ascii_case(title.trim())))
+    }
+
+    /// Rewrite a card in place, keeping where it sits on screen.
+    pub fn update_card(&self, conversation: i64, c: &Card) -> Result<()> {
+        self.db.execute(
+            "UPDATE cards SET title = ?3, body = ?4, at = ?5
+             WHERE conversation = ?1 AND id = ?2",
+            params![conversation, c.id, c.title, c.body, c.at as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Take one card back; false when there was no such card.
+    pub fn delete_card(&self, conversation: i64, id: &str) -> Result<bool> {
         Ok(self.db.execute(
-            "DELETE FROM cards WHERE conversation = ?1 AND who = ?2 AND id = ?3",
-            params![conversation, who, id],
+            "DELETE FROM cards WHERE conversation = ?1 AND id = ?2",
+            params![conversation, id],
         )? > 0)
     }
 }

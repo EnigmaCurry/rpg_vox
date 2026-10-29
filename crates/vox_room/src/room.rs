@@ -605,15 +605,17 @@ impl Room {
     /// to, whether they are here, and what they are already holding.
     pub fn people_here(&self) -> Vec<Value> {
         let st = self.lock();
-        let counts: BTreeMap<String, usize> = self
+        let mut holding: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (who, title) in self
             .store()
-            .card_counts(st.conversation)
+            .card_titles(st.conversation)
             .unwrap_or_else(|err| {
-                warn!("count cards: {err:#}");
+                warn!("read cards: {err:#}");
                 Vec::new()
             })
-            .into_iter()
-            .collect();
+        {
+            holding.entry(who).or_default().push(title);
+        }
         st.people
             .iter()
             .map(|(name, p)| {
@@ -622,7 +624,9 @@ impl Room {
                     "here": p.clients > 0,
                     // Being heard: a mic open and not muted.
                     "listening": p.mic && !p.muted,
-                    "cards": counts.get(name).copied().unwrap_or(0),
+                    // The titles of what they are holding, which is
+                    // what a card is addressed by.
+                    "cards": holding.get(name).cloned().unwrap_or_default(),
                 })
             })
             .collect()
@@ -664,26 +668,116 @@ impl Room {
                 }
             ));
         };
-        let holding = self.cards_for(&st, &to).len();
-        if holding >= CARDS_MAX {
+        // Dealing a title they already hold rewrites that card where it
+        // sits, rather than stacking another copy beside it.
+        let existing = self
+            .store()
+            .card_titled(st.conversation, &to, title)
+            .unwrap_or_else(|err| {
+                warn!("read cards: {err:#}");
+                None
+            });
+        let held = self.cards_for(&st, &to).len();
+        if existing.is_none() && held >= CARDS_MAX {
             return Err(format!(
-                "{to} is already holding {holding} cards; they have to clear some first"
+                "{to} is already holding {held} cards; take some back first"
             ));
         }
+        let replaced = existing.is_some();
         let card = Card {
-            id: format!("card-{}", uuid::Uuid::new_v4().simple()),
+            id: existing.map_or_else(
+                || format!("card-{}", uuid::Uuid::new_v4().simple()),
+                |c| c.id,
+            ),
             to: to.clone(),
             title: title.to_string(),
             body: body.to_string(),
             at: now_ms(),
         };
-        if let Err(err) = self.store().put_card(st.conversation, &card) {
+        let wrote = {
+            let store = self.store();
+            if replaced {
+                store.update_card(st.conversation, &card)
+            } else {
+                store.put_card(st.conversation, &card)
+            }
+        };
+        if let Err(err) = wrote {
             return Err(format!("{err:#}"));
         }
-        info!(to = %to, title = %card.title, "dealt a card");
+        info!(to = %to, title = %card.title, replaced, "dealt a card");
         // Only their tabs; the body never reaches another browser.
-        self.emit_to(&to, json!({ "type": "card", "card": card }));
+        self.emit_to(
+            &to,
+            json!({ "type": "card", "card": card, "replaced": replaced }),
+        );
         Ok(to)
+    }
+
+    /// Take a card back: it leaves that person's screen at once. The
+    /// cards are the AI's to give and to withdraw, and nobody in the
+    /// room can clear one themselves. Err says there was no such card.
+    pub fn take_back_card(&self, to: &str, title: &str) -> Result<String, String> {
+        let st = self.lock();
+        let Some(to) = st
+            .people
+            .keys()
+            .find(|n| n.eq_ignore_ascii_case(to.trim()))
+            .cloned()
+        else {
+            return Err(format!("there is nobody called {to:?} in the room"));
+        };
+        let card = self
+            .store()
+            .card_titled(st.conversation, &to, title)
+            .map_err(|err| format!("{err:#}"))?;
+        let Some(card) = card else {
+            let held = self.cards_for(&st, &to);
+            return Err(format!(
+                "{to} isn't holding a card called {title:?}; they have {}",
+                if held.is_empty() {
+                    "none at all".to_string()
+                } else {
+                    held.iter()
+                        .map(|c| format!("{:?}", c.title))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }
+            ));
+        };
+        if let Err(err) = self.store().delete_card(st.conversation, &card.id) {
+            return Err(format!("{err:#}"));
+        }
+        info!(to = %to, title = %card.title, "took a card back");
+        self.emit_to(&to, json!({ "type": "card_removed", "id": card.id }));
+        Ok(card.title)
+    }
+
+    /// What people are holding, for the AI: one person's cards, or
+    /// everyone's. The AI wrote them, but a long game outruns what it
+    /// can still see of its own conversation.
+    pub fn read_cards(&self, to: Option<&str>) -> Vec<Value> {
+        let st = self.lock();
+        let names: Vec<String> = match to.map(str::trim).filter(|t| !t.is_empty()) {
+            Some(one) => st
+                .people
+                .keys()
+                .filter(|n| n.eq_ignore_ascii_case(one))
+                .cloned()
+                .collect(),
+            None => st.people.keys().cloned().collect(),
+        };
+        names
+            .into_iter()
+            .map(|name| {
+                let cards: Vec<Value> = self
+                    .cards_for(&st, &name)
+                    .into_iter()
+                    .map(|c| json!({ "title": c.title, "body": c.body }))
+                    .collect();
+                json!({ "name": name, "cards": cards })
+            })
+            .collect()
     }
 
     // -- the AI's own turn taking ------------------------------------------
@@ -740,16 +834,6 @@ impl Room {
             return;
         }
         self.ask(st, now, Cue::Decide { lull: Some(lull) });
-    }
-
-    /// `person` discarded one of their own cards.
-    pub fn dismiss_card(&self, person: &str, id: &str) {
-        let st = self.lock();
-        match self.store().delete_card(st.conversation, person, id) {
-            Ok(true) => self.emit_to(person, json!({ "type": "card_removed", "id": id })),
-            Ok(false) => {}
-            Err(err) => warn!("discard card: {err:#}"),
-        }
     }
 
     /// A saved game and its prompt, for someone who asks to see it.
@@ -2630,11 +2714,13 @@ mod tests {
         assert_eq!(held(&r, "Ryan"), ["Your role: You are the traitor."]);
         assert!(held(&r, "Alex").is_empty());
 
-        // Only the person holding it can discard it.
-        let id = r.cards_for(&r.lock(), "Ryan")[0].id.clone();
-        r.dismiss_card("Alex", &id);
-        assert_eq!(held(&r, "Ryan").len(), 1, "not Alex's card to discard");
-        r.dismiss_card("Ryan", &id);
+        // The cards are the AI's to give and to take back; the person
+        // holding one has no way to clear it.
+        assert!(r.take_back_card("Ryan", "no such card").is_err());
+        assert_eq!(
+            r.take_back_card("ryan", " your role "),
+            Ok("Your role".into())
+        );
         assert!(held(&r, "Ryan").is_empty());
     }
 
@@ -2655,20 +2741,73 @@ mod tests {
     }
 
     #[test]
+    fn the_ai_decides_what_stays_in_the_private_area() {
+        let (r, _turns) = room(Mode::Named);
+        let mut events = r.subscribe();
+        r.send_card("Ryan", "Your hand", "Two aces.").unwrap();
+        let first = r.cards_for(&r.lock(), "Ryan")[0].id.clone();
+
+        // The same title again rewrites that card rather than stacking
+        // another beside it, so a hand can change as it is played.
+        r.send_card("Ryan", "your hand", "Two aces and the queen.")
+            .unwrap();
+        assert_eq!(held(&r, "Ryan"), ["your hand: Two aces and the queen."]);
+        assert_eq!(
+            r.cards_for(&r.lock(), "Ryan")[0].id,
+            first,
+            "the same card, so it stays where it is on screen"
+        );
+        let card_events = events_of(&mut events, "card");
+        assert_eq!(card_events.len(), 2);
+        assert!(card_events[0].contains(r#""replaced":false"#));
+        assert!(card_events[1].contains(r#""replaced":true"#));
+
+        // And the AI can take it back, which is the only way one goes.
+        assert_eq!(
+            r.take_back_card("Ryan", "Your Hand"),
+            Ok("your hand".into())
+        );
+        assert!(held(&r, "Ryan").is_empty());
+        assert!(events_of(&mut events, "card_removed")[0].contains(&first));
+        let err = r.take_back_card("Ryan", "Your hand").unwrap_err();
+        assert!(err.contains("none at all"), "{err}");
+    }
+
+    #[test]
+    fn the_ai_can_read_back_what_it_has_dealt() {
+        let (r, _turns) = room(Mode::Named);
+        r.send_card("Ryan", "Your role", "You are the traitor.")
+            .unwrap();
+        r.send_card("Alex", "Your hand", "Two aces.").unwrap();
+
+        let all = r.read_cards(None);
+        assert_eq!(all.len(), 2, "everyone, holding or not");
+        assert_eq!(all[1]["name"], "Ryan");
+        assert_eq!(all[1]["cards"][0]["body"], "You are the traitor.");
+
+        let one = r.read_cards(Some("alex"));
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0]["cards"][0]["title"], "Your hand");
+        assert!(
+            r.read_cards(Some("Morgan")).is_empty(),
+            "nobody by that name"
+        );
+    }
+
+    #[test]
     fn cards_belong_to_the_conversation_that_dealt_them() {
         let (r, _turns) = room(Mode::Named);
         r.send_card("Ryan", "Your role", "You are the traitor.")
             .unwrap();
         r.send_card("Alex", "Your hand", "Two aces.").unwrap();
+        // What the AI is shown: who is here, and the title of each card
+        // it has given them, which is how it addresses one again.
         assert_eq!(
             r.people_here()
                 .iter()
-                .map(|p| (
-                    p["name"].as_str().unwrap().to_string(),
-                    p["cards"].as_u64().unwrap()
-                ))
+                .map(|p| format!("{}: {}", p["name"], p["cards"]))
                 .collect::<Vec<_>>(),
-            [("Alex".to_string(), 1), ("Ryan".to_string(), 1)],
+            [r#""Alex": ["Your hand"]"#, r#""Ryan": ["Your role"]"#],
         );
         r.new_conversation();
         assert!(

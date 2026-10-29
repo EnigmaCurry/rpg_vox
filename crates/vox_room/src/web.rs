@@ -16,7 +16,6 @@
 //! {"type": "enter_game", "name": "Dragon Heist"}
 //! {"type": "lobby"}
 //! {"type": "delete_game", "name": "Dragon Heist"}
-//! {"type": "discard_card", "id": "card-…"}
 //! ```
 //!
 //! Events are filtered here: one addressed to a person (a card the AI
@@ -194,9 +193,6 @@ enum Command {
     DeleteGame {
         name: String,
     },
-    DiscardCard {
-        id: String,
-    },
 }
 
 async fn client(room: Arc<Room>, socket: WebSocket, id: u64, name: String) -> anyhow::Result<()> {
@@ -255,7 +251,6 @@ async fn client(room: Arc<Room>, socket: WebSocket, id: u64, name: String) -> an
                     Ok(Command::EnterGame { name }) => room.enter_game(&name),
                     Ok(Command::Lobby) => room.lobby(),
                     Ok(Command::DeleteGame { name }) => room.delete_game(&name),
-                    Ok(Command::DiscardCard { id }) => room.dismiss_card(&name, &id),
                     Err(e) => debug!(id, "bad command {text:?}: {e}"),
                 },
                 Message::Close(_) => break,

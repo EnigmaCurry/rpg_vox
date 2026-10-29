@@ -29,7 +29,9 @@ export const room = $state({
   // A game's prompt this person asked to see: { name, summary, prompt }.
   peek: null,
   // Cards the AI dealt to you alone: { id, to, title, body, at }. The
-  // server only ever sends these to your own tabs.
+  // server only ever sends these to your own tabs, and they are the AI's
+  // to give, rewrite and take back -- there is nothing here that clears
+  // one.
   cards: [],
   audio: 'off', // off | starting | on | error
   audioError: null,
@@ -145,12 +147,6 @@ export async function enterGame(name) {
   }
 }
 
-/// Discard one of your own cards.
-export function discardCard(id) {
-  room.cards = room.cards.filter((c) => c.id !== id);
-  command({ type: 'discard_card', id });
-}
-
 /// Show a message in the footer for a while.
 function notify(text, error = false) {
   room.notice = { text, error };
@@ -199,10 +195,12 @@ function apply(ev) {
       break;
     case 'card': {
       // Only this person's tabs are sent it; say so, without the contents.
+      // A card the AI rewrote keeps its place in the list.
       const i = room.cards.findIndex((c) => c.id === ev.card.id);
       if (i >= 0) room.cards[i] = ev.card;
       else room.cards.push(ev.card);
-      notify(`${room.agent.name} sent you a card: ${ev.card.title}`);
+      const what = ev.replaced ? 'changed your card' : 'sent you a card';
+      notify(`${room.agent.name} ${what}: ${ev.card.title}`);
       break;
     }
     case 'card_removed':

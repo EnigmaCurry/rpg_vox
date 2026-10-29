@@ -72,10 +72,16 @@ person alone: their secret role, their hand, what only their character \
 notices, a private instruction. Say nothing aloud about what is on a card -- \
 the whole room hears your voice -- but do say that you have sent one when \
 they should go and look, without giving it away. list_people is who is in the \
-room, with the exact name to address a card to and how many cards each is \
+room, with the exact name to address a card to and the titles of what each is \
 already holding; speech recognition mangles names, so match what you hear to \
-the closest name on that list, and check it there rather than guessing. Cards \
-stay until the person discards one or the conversation starts over.";
+the closest name on that list, and check it there rather than guessing. \
+What is in that area is yours alone to decide: nobody in the room can clear \
+a card, so keep it to what is still true. Sending a title someone already \
+holds rewrites that card in place -- that is how a hand or a standing order \
+changes -- and take_back_card removes one when it no longer applies. \
+read_cards tells you what you have given out, which you will need in a long \
+game, when what you dealt has scrolled out of the conversation you can see. \
+Cards last until you take them back or the conversation starts over.";
 
 /// The last thing the AI is shown when the room is leaving it to decide
 /// whether this pause is its moment.
@@ -639,13 +645,38 @@ fn room_tools() -> Vec<Value> {
              they can see. Use it for anything meant for them alone -- a secret \
              role, a hand, what only their character notices, a private \
              instruction -- and never say aloud what is on it. One person per \
-             card: to tell two people different things, send two cards.",
+             card: to tell two people different things, send two cards. \
+             Sending a title they already hold rewrites that card in place, \
+             which is how you keep a hand or a standing order up to date.",
             json!({
                 "to": { "type": "string", "description": "Exactly the name list_people gives for that person." },
                 "title": { "type": "string", "description": "A few words naming the card, e.g. \"Your role\" or \"What you notice\"." },
                 "body": { "type": "string", "description": "What that person alone is to read. Written to be read, not spoken." },
             }),
             &["to", "title", "body"],
+        ),
+        tool(
+            "take_back_card",
+            "Take one card back: it leaves that person's screen at once. \
+             Nobody in the room can clear a card themselves, so what each \
+             of them is looking at is yours to keep right -- take a card \
+             back once it no longer applies.",
+            json!({
+                "to": { "type": "string", "description": "Exactly the name list_people gives for that person." },
+                "title": { "type": "string", "description": "The title of the card to take back, as list_people gives it." },
+            }),
+            &["to", "title"],
+        ),
+        tool(
+            "read_cards",
+            "Read the cards you have dealt, in full. Use it when you need \
+             what you told someone privately and it has fallen out of the \
+             conversation you can still see -- who has which role, what is \
+             in whose hand.",
+            json!({
+                "to": { "type": "string", "description": "One person's cards. Leave it out for everyone's." },
+            }),
+            &[],
         ),
         tool(
             "wait_until_named",
@@ -870,6 +901,10 @@ fn run_tool(room: &Room, cfg: &Chat, g: u64, call: &ToolCall) -> String {
         "send_card" => room
             .send_card(&arg("to"), &arg("title"), &arg("body"))
             .map(|to| json!({ "sent": true, "to": to })),
+        "take_back_card" => room
+            .take_back_card(&arg("to"), &arg("title"))
+            .map(|title| json!({ "taken_back": title })),
+        "read_cards" => Ok(json!({ "people": room.read_cards(args["to"].as_str()) })),
         "look_up" => {
             let question = arg("question");
             info!(g, %question, "reply: looking it up");
@@ -1151,7 +1186,16 @@ mod tests {
     #[test]
     fn the_room_tools_are_offered_in_a_game_and_the_game_tools_are_not() {
         let in_game = tool_names(false, true);
-        assert_eq!(in_game, ["list_people", "send_card", "wait_until_named"]);
+        assert_eq!(
+            in_game,
+            [
+                "list_people",
+                "send_card",
+                "take_back_card",
+                "read_cards",
+                "wait_until_named"
+            ]
+        );
         // In the lobby they are there as well, alongside the games.
         let lobby = tool_names(true, false);
         for t in &in_game {

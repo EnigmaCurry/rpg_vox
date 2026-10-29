@@ -165,15 +165,25 @@ them.
 
 Each person has their own half of the room, **Just for you**, that is on
 nobody else's screen (its own column on a wide monitor, its own tab on a
-narrow one). The AI deals cards into it: a
-secret role, a hand, what only your character notices, an instruction
-meant for you alone. It has two tools for this, in the lobby and in a
-game alike:
+narrow one). The AI deals cards into it: a secret role, a hand, what only
+your character notices, an instruction meant for you alone.
+
+What is in that area is the AI's to decide, and only the AI's — there is
+no way for the person holding a card to clear it. The four tools, in the
+lobby and in a game alike:
 
 - `list_people` — everyone on the roster, with the exact name to address
-  a card to, whether they are here with a mic open, and how many cards
-  they are already holding.
-- `send_card` — a title and a body, to one person.
+  a card to, whether they are here with a mic open, and the titles of
+  what each is already holding.
+- `send_card` — a title and a body, to one person. Sending a title they
+  already hold **rewrites that card where it sits**, which is how a hand
+  or a standing order changes without stacking copies; the card glows
+  again so they notice, and the footer says it changed rather than
+  arrived.
+- `take_back_card` — removes one by title, once it no longer applies.
+- `read_cards` — what it has given out, in full. A long game outruns the
+  conversation the model can still see, and a game master that has
+  forgotten who the traitor is cannot run the game.
 
 It has one more tool everywhere, `wait_until_named`, which is how it ends
 a back-and-forth by itself (above).
@@ -188,7 +198,8 @@ never reads one aloud.
 
 Cards belong to the conversation they were dealt in: **New conversation**,
 **Restart game** and moving between the lobby and a game all clear
-everyone's private area. A player can discard one with the **×** on it.
+everyone's private area. Short of that, a card stays until the AI takes
+it back.
 
 ### What judging a pause costs
 
