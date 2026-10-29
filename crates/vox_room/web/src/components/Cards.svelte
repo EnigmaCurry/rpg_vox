@@ -4,9 +4,9 @@
   const time = (ms) => new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 </script>
 
-<!-- The private half of the room: the server sends these events to this
-     person's tabs and nobody else's, so nothing here is in another
-     browser at all. -->
+<!-- The cards one person is holding: the server sends these events to
+     their tabs and nobody else's, so nothing here is in another browser
+     at all. -->
 <section class="cards" aria-label="Just for you">
   <header>
     <h2>Just for you</h2>

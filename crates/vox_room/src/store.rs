@@ -6,7 +6,7 @@
 //! settings(key, value)
 //! games(name, summary, prompt, settings, created, played)  -- names unique, ignoring case
 //! conversations(id, game)                 -- no row: the lobby
-//! cards(conversation, id, who, title, body, at)  -- one person's private cards
+//! cards(conversation, id, who, title, body, at)  -- the cards one person holds
 //! ```
 //!
 //! Only finished entries are written: a person's paragraph once it has

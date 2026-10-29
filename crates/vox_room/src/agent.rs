@@ -64,20 +64,24 @@ to the closest saved one, and ask if it's unclear. Whatever you say \
 before calling a tool is spoken straight away, so after the tool answers, \
 carry on without repeating it.";
 
-/// Added to the prompt, in the lobby and in a game: the private cards.
+/// Added to the prompt, in the lobby and in a game: the cards.
 const CARDS_NOTE: &str = "\
-Everyone has a private area of their own screen that nobody else can see, and \
-send_card puts a card in one person's. Use it for anything meant for one \
-person alone: their secret role, their hand, what only their character \
-notices, a private instruction. Say nothing aloud about what is on a card -- \
-the whole room hears your voice -- but do say that you have sent one when \
-they should go and look, without giving it away. list_people is who is in the \
-room, with the exact name to address a card to and the titles of what each is \
-already holding; speech recognition mangles names, so match what you hear to \
-the closest name on that list, and check it there rather than guessing. \
-What is in that area is yours alone to decide: nobody in the room can clear \
-a card, so keep it to what is still true. Sending a title someone already \
-holds rewrites that card in place -- that is how a hand or a standing order \
+Everyone has their own cards, which only they can see, and send_card puts \
+one in somebody's. Use it for anything meant for one person alone: their \
+secret role, their hand, what only their character notices, an instruction \
+for them. Say nothing aloud about what is on a card -- the whole room hears \
+your voice -- but do say that you have sent one when they should go and \
+look, without giving it away. Call them someone's cards when you say so: \
+\"Ryan, check your cards\", \"there is something in your cards\". \
+Never call that part of the screen their private area, and never tell \
+anyone to check their private area; it does not mean in speech what it \
+means on a screen. list_people is who is in the room, with the exact name \
+to address a card to and the titles of what each is already holding; speech \
+recognition mangles names, so match what you hear to the closest name on \
+that list, and check it there rather than guessing. What somebody is \
+holding is yours alone to decide: nobody in the room can clear a card, so \
+keep it to what is still true. Sending a title someone already holds \
+rewrites that card in place -- that is how a hand or a standing order \
 changes -- and take_back_card removes one when it no longer applies. \
 read_cards tells you what you have given out, which you will need in a long \
 game, when what you dealt has scrolled out of the conversation you can see. \
@@ -86,8 +90,8 @@ post_card is the opposite of all this: it writes a card into the \
 conversation for the whole room, which is where anything everyone should \
 be looking at belongs -- the rules as agreed, the standings, a scene \
 everyone can see. A posted card cannot be taken back. Keep the two \
-straight: send_card is for one person's eyes, post_card is for the \
-room's, and reading either aloud is what you must not do.";
+straight: send_card goes to one person's cards, post_card goes to the \
+room, and reading either aloud is what you must not do.";
 
 /// The last thing the AI is shown when the room is leaving it to decide
 /// whether this pause is its moment.
@@ -647,13 +651,13 @@ fn room_tools() -> Vec<Value> {
         ),
         tool(
             "send_card",
-            "Put a card in one person's private area of the screen, which only \
-             they can see. Use it for anything meant for them alone -- a secret \
-             role, a hand, what only their character notices, a private \
-             instruction -- and never say aloud what is on it. One person per \
-             card: to tell two people different things, send two cards. \
-             Sending a title they already hold rewrites that card in place, \
-             which is how you keep a hand or a standing order up to date.",
+            "Put a card in one person's cards, where only they can see it. \
+             Use it for anything meant for them alone -- a secret role, a \
+             hand, what only their character notices, an instruction for them \
+             -- and never say aloud what is on it. One person per card: to \
+             tell two people different things, send two cards. Sending a \
+             title they already hold rewrites that card in place, which is \
+             how you keep a hand or a standing order up to date.",
             json!({
                 "to": { "type": "string", "description": "Exactly the name list_people gives for that person." },
                 "title": { "type": "string", "description": "A few words naming the card, e.g. \"Your role\" or \"What you notice\"." },
@@ -679,10 +683,10 @@ fn room_tools() -> Vec<Value> {
         ),
         tool(
             "take_back_card",
-            "Take one card back: it leaves that person's screen at once. \
+            "Take one card back: it leaves that person's cards at once. \
              Nobody in the room can clear a card themselves, so what each \
-             of them is looking at is yours to keep right -- take a card \
-             back once it no longer applies.",
+             of them is holding is yours to keep right -- take a card back \
+             once it no longer applies.",
             json!({
                 "to": { "type": "string", "description": "Exactly the name list_people gives for that person." },
                 "title": { "type": "string", "description": "The title of the card to take back, as list_people gives it." },
@@ -692,7 +696,7 @@ fn room_tools() -> Vec<Value> {
         tool(
             "read_cards",
             "Read the cards you have dealt, in full. Use it when you need \
-             what you told someone privately and it has fallen out of the \
+             what you told one person alone and it has fallen out of the \
              conversation you can still see -- who has which role, what is \
              in whose hand.",
             json!({
@@ -1190,6 +1194,22 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("stay_quiet"));
+    }
+
+    #[test]
+    fn the_cards_are_called_cards_where_the_room_can_hear() {
+        // Everything the AI is told to do is said in a voice the whole
+        // room hears, and "check your private area" is not a thing to
+        // say to a room. The prompt hands it the words to use instead.
+        assert!(CARDS_NOTE.contains("check your cards"));
+        assert!(CARDS_NOTE.contains("never tell anyone to check their private area"));
+
+        // The tools are read as instructions for what to do, so nothing
+        // in them is phrased that way at all.
+        for (lobby, deciding) in [(true, true), (false, false)] {
+            let tools = tools_for(lobby, true, deciding).to_string();
+            assert!(!tools.contains("private"), "{tools}");
+        }
     }
 
     #[test]

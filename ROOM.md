@@ -163,10 +163,14 @@ them.
 
 ### Cards, just for you
 
-Each person has their own half of the room, **Just for you**, that is on
-nobody else's screen (its own column on a wide monitor, its own tab on a
-narrow one). The AI deals cards into it: a secret role, a hand, what only
-your character notices, an instruction meant for you alone.
+Each person has their own cards, under **Just for you** — its own column
+on a wide monitor, its own tab on a narrow one, and on nobody else's
+screen. The AI deals them: a secret role, a hand, what only your
+character notices, an instruction meant for you alone.
+
+They are *cards*, and the prompt tells the AI to call them that out loud
+— "Ryan, check your cards" — because the obvious name for a region of
+somebody's screen is a phrase no voice should ever say to a room.
 
 What is in that area is the AI's to decide, and only the AI's — there is
 no way for the person holding a card to clear it. The four tools, in the
@@ -204,7 +208,7 @@ never reads one aloud.
 
 Cards belong to the conversation they were dealt in: **New conversation**,
 **Restart game** and moving between the lobby and a game all clear
-everyone's private area. Short of that, a card stays until the AI takes
+everyone holding nothing. Short of that, a card stays until the AI takes
 it back.
 
 ### What judging a pause costs

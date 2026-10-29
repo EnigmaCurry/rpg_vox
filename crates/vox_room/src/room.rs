@@ -54,8 +54,8 @@ const OPENING: &str =
 const GAME_NAME_MAX: usize = 60;
 /// Longest title on a card the AI deals.
 const CARD_TITLE_MAX: usize = 60;
-/// Longest body on a card: it is read on screen, not aloud, but the
-/// private area is a column in the sidebar.
+/// Longest body on a card: it is read on screen, not aloud, and a card
+/// shares its column with everything else someone is holding.
 const CARD_BODY_MAX: usize = 2000;
 /// Cards one person may be holding in a conversation at once.
 const CARDS_MAX: usize = 50;
@@ -267,8 +267,8 @@ pub struct Entry {
     pub sent: bool,
 }
 
-/// A card the AI dealt to one person, shown only in their own private
-/// area of the screen. It belongs to the conversation it was dealt in.
+/// A card the AI dealt to one person, shown among their own cards and
+/// nobody else's. It belongs to the conversation it was dealt in.
 #[derive(Debug, Clone, Serialize)]
 pub struct Card {
     pub id: String,
@@ -641,8 +641,8 @@ impl Room {
             .collect()
     }
 
-    /// Deal a card to one person: it appears in their private area and
-    /// nowhere else. Err says why it wasn't dealt.
+    /// Deal a card to one person: it joins their own cards and nobody
+    /// else's. Err says why it wasn't dealt.
     ///
     /// Unlike saving a game, this goes through even if the players talked
     /// over the reply that called it: the card is the point, and losing
@@ -765,7 +765,8 @@ impl Room {
     /// Post a card to the whole room: it goes into the conversation
     /// where everyone can read it, and stays there. Err says why not.
     ///
-    /// Unlike a private card there is no taking it back -- it is part of
+    /// Unlike a card dealt to one person there is no taking it back: it
+    /// is part of
     /// what the room has been told, like anything that was said.
     pub fn post_card(&self, title: &str, body: &str) -> Result<String, String> {
         let (title, body) = (title.trim(), body.trim());
@@ -1357,7 +1358,7 @@ impl Room {
         // Anything said before the switch belongs to the old conversation.
         st.last_change = Instant::now();
         // Cards belong to the conversation they were dealt in, so a fresh
-        // one leaves everyone's private area empty.
+        // one leaves everyone holding nothing.
         self.emit(json!({ "type": "reset", "log": [], "cards": [], "game": st.game }));
         if st.game.is_some() {
             // A game opens with the AI setting the scene, whatever the
@@ -2803,7 +2804,7 @@ mod tests {
     }
 
     #[test]
-    fn the_ai_decides_what_stays_in_the_private_area() {
+    fn the_ai_decides_what_everyone_is_holding() {
         let (r, _turns) = room(Mode::Named);
         let mut events = r.subscribe();
         r.send_card("Ryan", "Your hand", "Two aces.").unwrap();
@@ -2847,7 +2848,7 @@ mod tests {
         );
 
         // It is in the conversation, for everyone -- not addressed to
-        // anyone, the way a private card is.
+        // anyone, the way a dealt card is.
         let posted = events_of(&mut events, "entry");
         assert_eq!(posted.len(), 1);
         assert!(posted[0].contains(r#""kind":"card""#), "{}", posted[0]);
