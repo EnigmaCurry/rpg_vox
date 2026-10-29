@@ -66,10 +66,18 @@ See ROOM_DOCKER.md.
 ## In the room
 
 - **The door**: the room is voice only, so a tab that hasn't joined the
-  audio sits behind a **Join audio** card and can't do anything else —
-  everyone in the room is in it by ear. The card says who is already in,
-  and is where you choose push to talk before you come in. **Leave
-  audio** puts you back at the door.
+  audio sits behind a **Join Audio** card and can't do anything else —
+  everyone in the room is in it by ear. Pick your microphone and speakers
+  there (both are remembered for next time), and push to talk, before you
+  come in. The card also says who is already in. **Leave audio** puts you
+  back at the door. Choosing a speaker needs `AudioContext.setSinkId`,
+  which today means Chrome; elsewhere the room follows the system default
+  and the list isn't offered.
+- **The three areas**: what is yours alone on the left, the room's
+  conversation on the right, the mixer beside them. On a narrow screen
+  only one shows at a time, with a switch above it — **Conversation**,
+  **Just for you** (with a count when you are holding cards), **In the
+  room**.
 - **When named / When it fits / Every pause** (top right, shared by
   everyone): who gets the turn when the room goes quiet.
   - **When named** — the AI says nothing until someone says its name, so
@@ -103,7 +111,8 @@ See ROOM_DOCKER.md.
   once and stops for good once your speech is confirmed (300 ms of voice
   or the first recognised word), so a cough only dips it. **Stop** does
   the same with a click.
-- **Mixer** (right): a level and mute for each person and the AI, shared
+- **Mixer** (right, the only thing in the sidebar): a level and mute for
+  each person and the AI, shared
   by the whole room. **Your volume** (bottom) is only yours. Space mutes
   your mic, or with **Push to talk** on, your mic is open only while you
   hold Space (or the talk button): everything said in one hold is one
@@ -138,19 +147,25 @@ A game also carries settings, not just a prompt. Today that is
 | `named` | the AI speaks only when a player says its name |
 
 The AI picks one as it designs the game and can be told which you want.
-A game that sets either of the last two shows it as a tag in the games
-list, and while it is being played the mode buttons are locked to it;
-going back to the lobby restores the mode you chose.
+While a game that sets one of the last three is being played the mode
+buttons are locked to it; going back to the lobby restores the mode you
+chose. A game also records how many players it is for (`players_min` and
+`players_max`, either end open), which the AI works out with you.
 
-The **Games** list (right) plays any saved game from the start,
-deletes it, or lets you **Peek** at its prompt (shown only to you). **Back to lobby** leaves a game; **Restart game** starts it
-over. Saving needs a model with tool calling (llama.cpp needs `--jinja`);
-without it the AI can talk about games but not save them.
+**Games** in the top bar is the menu of what is saved, each with its
+player count. Pick one and its card opens: the name, who it is for, how
+many are here now, how it runs the room, whether it has been played, and
+what it is about — with **Play**, **Delete**, and **Peek** at its hidden
+prompt (shown only to you). **Back to lobby** leaves a game; **Restart
+game** starts it over. Saving needs a model with tool calling (llama.cpp
+needs `--jinja`); without it the AI can talk about games but not save
+them.
 
 ### Cards, just for you
 
-Each person has a private area at the top of the sidebar, **Just for
-you**, that is on nobody else's screen. The AI deals cards into it: a
+Each person has their own half of the room, **Just for you**, that is on
+nobody else's screen (its own column on a wide monitor, its own tab on a
+narrow one). The AI deals cards into it: a
 secret role, a hand, what only your character notices, an instruction
 meant for you alone. It has two tools for this, in the lobby and in a
 game alike:

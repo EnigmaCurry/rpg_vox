@@ -17,6 +17,47 @@ export function supported() {
     && !!navigator.mediaDevices?.getUserMedia;
 }
 
+/// Whether this browser can send the room's sound to a chosen speaker.
+/// AudioContext.setSinkId is Chrome's; elsewhere the output follows the
+/// system default and the room doesn't offer the choice.
+export function canChooseSpeaker() {
+  return typeof AudioContext !== 'undefined'
+    && typeof AudioContext.prototype.setSinkId === 'function';
+}
+
+/// Ask for the microphone once, without keeping it: until permission has
+/// been given the device list has ids but no names, so there is nothing
+/// to choose between. Returns the error if it was refused.
+export async function permitMic() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    for (const t of stream.getTracks()) t.stop();
+    return null;
+  } catch (e) {
+    return e?.message || String(e);
+  }
+}
+
+/// The microphones and speakers to choose from, named where the browser
+/// will name them.
+export async function listDevices() {
+  const devices = await navigator.mediaDevices.enumerateDevices().catch(() => []);
+  const of = (kind, fallback) =>
+    devices
+      .filter((d) => d.kind === kind && d.deviceId)
+      .map((d, i) => ({ id: d.deviceId, label: d.label || `${fallback} ${i + 1}` }));
+  return {
+    mics: of('audioinput', 'Microphone'),
+    speakers: canChooseSpeaker() ? of('audiooutput', 'Speaker') : [],
+  };
+}
+
+/// Tell the room when a device is plugged in or pulled out.
+export function onDeviceChange(fn) {
+  navigator.mediaDevices?.addEventListener?.('devicechange', fn);
+  return () => navigator.mediaDevices?.removeEventListener?.('devicechange', fn);
+}
+
 export class RoomAudio {
   constructor(send) {
     // send(bytes): put one encoded mic frame on the WebSocket.
@@ -43,8 +84,9 @@ export class RoomAudio {
 
   /// Start hearing the room. Call from a click: browsers only start audio
   /// after a gesture.
-  async start(volume = 1) {
+  async start(volume = 1, speakerId = null) {
     this.ctx = new AudioContext({ sampleRate: RATE, latencyHint: 'interactive' });
+    await this.setSpeaker(speakerId);
     if (this.ctx.state === 'suspended') await this.ctx.resume().catch(() => {});
     await this.ctx.audioWorklet.addModule(playerUrl);
     await this.ctx.audioWorklet.addModule(micUrl);
@@ -64,6 +106,17 @@ export class RoomAudio {
       if (this.ctx.state !== 'running' && this.ctx.state !== 'closed') this.resume();
     };
     this.makeDecoder();
+  }
+
+  /// Play the room through one speaker. A device that has gone away
+  /// falls back to the system default rather than failing to start.
+  async setSpeaker(id) {
+    if (!this.ctx || !canChooseSpeaker()) return;
+    try {
+      await this.ctx.setSinkId(id || '');
+    } catch (e) {
+      console.warn('[room] speaker', e);
+    }
   }
 
   /// Start the audio again if the browser stopped it.

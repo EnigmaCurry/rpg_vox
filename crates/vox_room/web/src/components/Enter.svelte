@@ -1,12 +1,23 @@
 <script>
-  import { room, joinAudio, setPushToTalk } from '../lib/room.svelte.js';
-  import { supported } from '../lib/audio.js';
+  import { onMount } from 'svelte';
+  import {
+    room, joinAudio, setPushToTalk, loadDevices, watchDevices, setMicDevice, setSpeakerDevice,
+  } from '../lib/room.svelte.js';
+  import { supported, canChooseSpeaker } from '../lib/audio.js';
   import { hue } from '../lib/color.js';
 
   // The room is voice only, so this stands in front of it until you have
   // joined the audio: everyone in the room is in it by ear, not reading.
   let join = $state();
   $effect(() => join?.focus());
+
+  onMount(() => {
+    // Asking for the mic now is what fills the device list with names,
+    // and gets the permission prompt out of the way before the click
+    // that matters.
+    if (supported()) loadDevices({ permit: true });
+    return watchDevices();
+  });
 
   const here = $derived(room.people.filter((p) => p.online && p.name !== room.you));
   const starting = $derived(room.audio === 'starting');
@@ -23,15 +34,46 @@
       </p>
     {:else}
       <p class="lead">
-        This room is talked, not typed. Join the audio to come in — you'll hear
-        everyone here and {room.agent.name}, and they'll hear you.
+        You are entering a voice conference room. Select your device and click
+        <strong>Join Audio</strong> to enter the room.
       </p>
+
+      <div class="devices">
+        <label>
+          <span>Microphone</span>
+          <select value={room.micId} onchange={(e) => setMicDevice(e.currentTarget.value)}>
+            <option value="">System default</option>
+            {#each room.devices.mics as d (d.id)}
+              <option value={d.id}>{d.label}</option>
+            {/each}
+          </select>
+        </label>
+        {#if canChooseSpeaker()}
+          <label>
+            <span>Speakers</span>
+            <select value={room.speakerId} onchange={(e) => setSpeakerDevice(e.currentTarget.value)}>
+              <option value="">System default</option>
+              {#each room.devices.speakers as d (d.id)}
+                <option value={d.id}>{d.label}</option>
+              {/each}
+            </select>
+          </label>
+        {/if}
+        {#if room.devicesError}
+          <p class="warn">
+            The browser wouldn't give us the microphone ({room.devicesError}), so your
+            devices can't be listed by name. Allow it and reload to choose.
+          </p>
+        {/if}
+      </div>
+
       <button class="primary join" bind:this={join} onclick={joinAudio} disabled={starting}>
-        {starting ? 'Starting…' : 'Join audio'}
+        {starting ? 'Starting…' : 'Join Audio'}
       </button>
       {#if room.audioError}
         <p class="warn">Your microphone: {room.audioError}</p>
       {/if}
+
       <label class="ptt">
         <input type="checkbox" checked={room.pushToTalk}
           onchange={(e) => setPushToTalk(e.currentTarget.checked)} />
@@ -45,6 +87,7 @@
         </span>
       </label>
     {/if}
+
     <p class="who">
       {#if !room.connected}
         Connecting to the room…
@@ -67,10 +110,11 @@
   .enter {
     position: fixed;
     inset: 0;
-    z-index: 10;
+    z-index: 30;
     display: grid;
     place-items: center;
     padding: 24px;
+    overflow-y: auto;
     background: color-mix(in srgb, var(--bg) 82%, transparent);
     backdrop-filter: blur(6px);
   }
@@ -91,7 +135,21 @@
     margin: 0 0 2px;
   }
   h1 { font-size: 24px; margin: 0 0 10px; }
-  .lead { color: var(--muted); margin: 0 0 20px; }
+  .lead { color: var(--muted); margin: 0 0 18px; }
+  .lead strong { color: var(--ink); font-weight: 600; white-space: nowrap; }
+  .devices { display: flex; flex-direction: column; gap: 10px; margin-bottom: 18px; text-align: left; }
+  .devices label { display: flex; flex-direction: column; gap: 4px; }
+  .devices span { font-size: 12px; color: var(--muted); }
+  select {
+    font: inherit;
+    width: 100%;
+    color: var(--ink);
+    background: var(--bg);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 8px 10px;
+  }
+  select:hover { border-color: var(--muted); }
   .join {
     width: 100%;
     font-size: 17px;
@@ -111,7 +169,8 @@
   }
   .ptt input { margin-top: 3px; }
   .ptt small { display: block; font-size: 12px; color: var(--muted); line-height: 1.45; }
-  .warn { color: var(--danger); font-size: 13px; margin: 12px 0 0; }
+  .warn { color: var(--danger); font-size: 13px; margin: 12px 0 0; text-align: left; }
+  .devices .warn { margin: 2px 0 0; }
   .who {
     font-size: 13px;
     color: var(--muted);

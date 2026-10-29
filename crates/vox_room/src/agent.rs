@@ -18,7 +18,7 @@ use crossbeam_channel::{Receiver, Sender};
 use serde_json::{json, Value};
 use tracing::{debug, info, warn};
 
-use crate::room::{Cue, GameSettings, ReplyMode, Role, Room, RoomConfig, Turn};
+use crate::room::{Cue, GameSettings, Players, ReplyMode, Role, Room, RoomConfig, Turn};
 use crate::tts::Voice;
 
 /// The default instructions; `{name}` and `{people}` are filled in.
@@ -48,7 +48,10 @@ reply_mode, which is how the room runs while it is played: \"always\" for a \
 game you deal the turns in, where you answer every pause; \"named\" for one \
 where you only speak when a player calls you; \"room\" (the default) to \
 leave it however the people have the room set. Decide it from how the game \
-actually plays and say which you picked when you propose it. The players never \
+actually plays and say which you picked when you propose it. Set \
+players_min and players_max to the number of people the game is for, \
+leaving either out when that end is open; the players see it on the \
+game's card, so work it out with them rather than guessing. The players never \
 see the prompt, so never read it aloud or describe its secrets; a card with \
 its name and summary appears in the chat. The players run everything by \
 voice: when they ask to play a game, start it with start_game (that ends \
@@ -703,6 +706,8 @@ fn tools_for(lobby: bool, search: bool, deciding: bool) -> Value {
         "summary": { "type": "string", "description": "One or two sentences the players see on the game's button." },
         "prompt": { "type": "string", "description": "Your complete hidden instructions for running the game." },
         "reply_mode": reply_mode_arg(),
+        "players_min": { "type": "integer", "minimum": 1, "maximum": 99, "description": "Fewest players the game works with. Leave out if any number will do." },
+        "players_max": { "type": "integer", "minimum": 1, "maximum": 99, "description": "Most players the game works with. Leave out if there is no upper limit." },
     });
     let mut revise = game.clone();
     revise["new_name"] =
@@ -804,14 +809,19 @@ fn run_tool(room: &Room, cfg: &Chat, g: u64, call: &ToolCall) -> String {
     let args: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
     let arg = |k: &str| args[k].as_str().unwrap_or("").to_string();
     // An unknown reply_mode would quietly become the default, so say so.
-    let settings = || match args["reply_mode"].as_str() {
-        None => Ok(GameSettings::default()),
-        Some(m) => match ReplyMode::parse(m) {
-            Some(reply) => Ok(GameSettings { reply }),
-            None => Err(format!(
-                "reply_mode is \"room\", \"always\" or \"named\", not {m:?}"
-            )),
-        },
+    let settings = || {
+        let reply = match args["reply_mode"].as_str() {
+            None => ReplyMode::default(),
+            Some(m) => ReplyMode::parse(m).ok_or_else(|| {
+                format!("reply_mode is \"room\", \"auto\", \"always\" or \"named\", not {m:?}")
+            })?,
+        };
+        let players = Players {
+            min: args["players_min"].as_u64().map(|n| n as u32),
+            max: args["players_max"].as_u64().map(|n| n as u32),
+        }
+        .check()?;
+        Ok(GameSettings { reply, players })
     };
     let result = match call.name.as_str() {
         "list_games" => Ok(json!({ "games": room.list_games() })),
@@ -823,7 +833,12 @@ fn run_tool(room: &Room, cfg: &Chat, g: u64, call: &ToolCall) -> String {
                 .map(|()| json!({ "saved": arg("name").trim() }))
         }),
         "read_game" => room.read_game(&arg("name")).map(|(summary, s, prompt)| {
-            json!({ "summary": summary, "reply_mode": s.reply.as_str(), "prompt": prompt })
+            json!({
+                "summary": summary,
+                "reply_mode": s.reply.as_str(),
+                "players": s.players.describe(),
+                "prompt": prompt,
+            })
         }),
         "revise_game" => settings().and_then(|s| {
             room.revise_game(

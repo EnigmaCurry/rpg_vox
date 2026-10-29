@@ -1,10 +1,14 @@
 <script>
   import { onMount } from 'svelte';
-  import { room, connect, command, enterGame, peekGame, ask, answer, whoami, leaveAudio, setMuted, setVolume, setPushToTalk, talk } from './lib/room.svelte.js';
+  import { room, connect, command, ask, answer, whoami, leaveAudio, setMuted, setVolume, setPushToTalk, talk } from './lib/room.svelte.js';
   import Log from './components/Log.svelte';
   import Strip from './components/Strip.svelte';
   import Cards from './components/Cards.svelte';
   import Enter from './components/Enter.svelte';
+  import Games from './components/Games.svelte';
+
+  // Narrow screens show one area at a time; wide ones show all three.
+  let view = $state('chat');
 
   onMount(async () => {
     if (await whoami()) connect();
@@ -55,10 +59,6 @@
 
   async function lobby() {
     if (await ask(`Leave ${room.game} and take everyone back to the lobby?`, 'Back to lobby')) command({ type: 'lobby' });
-  }
-
-  async function deleteGame(name) {
-    if (await ask(`Delete ${name} for good?`, 'Delete')) command({ type: 'delete_game', name });
   }
 
   let peekDialog = $state();
@@ -126,7 +126,7 @@
 {:else}
   <!-- Until the audio is joined the room is behind the door: visible,
        but not to be clicked, tabbed into, or read out. -->
-  <div class="app" inert={room.audio !== 'on'}>
+  <div class="app show-{view}" inert={room.audio !== 'on'}>
     <header>
       <h1>{room.game ?? 'Voice room'}</h1>
       {#if room.game}<button onclick={lobby}>Back to lobby</button>{/if}
@@ -152,53 +152,35 @@
           </button>
         {/each}
       </div>
+      <Games />
       <button onclick={newConversation}>{room.game ? 'Restart game' : 'New conversation'}</button>
       {#if !room.connected}<span class="offline">reconnecting…</span>{/if}
     </header>
 
+    <nav class="views" aria-label="Which area to show">
+      {#each [
+        { id: 'chat', label: 'Conversation' },
+        { id: 'cards', label: 'Just for you' },
+        { id: 'room', label: 'In the room' },
+      ] as v (v.id)}
+        <button aria-pressed={view === v.id} class:on={view === v.id} onclick={() => (view = v.id)}>
+          {v.label}
+          {#if v.id === 'cards' && room.cards.length}<span class="badge">{room.cards.length}</span>{/if}
+        </button>
+      {/each}
+    </nav>
+
+    <Cards />
+
     <Log />
 
     <aside>
-      <Cards />
-
       <h2>In the room</h2>
       {#each room.people as p (p.name)}
         <Strip key={p.name} label={p.name} online={p.online} mic={p.mic} muted={p.muted} speaking={p.speaking} />
       {/each}
       <Strip key={room.agent.strip} label={room.agent.name} agent />
       <p class="hint">Levels and mutes here change the room for everyone, and a muted person isn't transcribed. You never hear yourself.</p>
-
-      <h2 class="games-head">Games</h2>
-      {#if room.games.length === 0}
-        <p class="hint">None yet. In the lobby, ask {room.agent.name} to design one with you.</p>
-      {/if}
-      <ul class="games">
-        {#each room.games as g (g.name)}
-          <li class:current={room.game === g.name}>
-            <div class="gname">
-              <span>{g.name}</span>
-              {#if room.game === g.name}<span class="tag">playing</span>{/if}
-              {#if g.settings?.reply && g.settings.reply !== 'room'}
-                <span class="tag mode" title={modes.find((m) => m.mode === g.settings.reply)?.hint}>
-                  {modes.find((m) => m.mode === g.settings.reply)?.label}
-                </span>
-              {/if}
-            </div>
-            <p class="gsum">{g.summary}</p>
-            {#if room.game !== g.name}
-              <div class="gact">
-                {#if !room.game}<button onclick={() => enterGame(g.name)}>Play</button>{/if}
-                <button onclick={() => peekGame(g.name)} title="Show the game's hidden prompt, to you only">Peek</button>
-                <button class="danger" onclick={() => deleteGame(g.name)}>Delete</button>
-              </div>
-            {:else}
-              <div class="gact">
-                <button onclick={() => peekGame(g.name)} title="Show the game's hidden prompt, to you only">Peek</button>
-              </div>
-            {/if}
-          </li>
-        {/each}
-      </ul>
     </aside>
 
     <footer>
@@ -251,10 +233,15 @@
   .app {
     height: 100%;
     display: grid;
-    grid-template-columns: 1fr 300px;
+    /* Wide: what is yours alone on the left, the room's conversation on
+       the right, the two the same size, and the mixer beside them. */
+    grid-template-columns: 1fr 1fr 300px;
     grid-template-rows: auto 1fr auto;
-    grid-template-areas: "head head" "log side" "foot foot";
+    grid-template-areas: "head head head" "cards log side" "foot foot foot";
   }
+  :global(.cards) { grid-area: cards; border-right: 1px solid var(--line); }
+  /* One area at a time is a narrow-screen idea; here all three show. */
+  .views { display: none; }
   header {
     grid-area: head;
     display: flex;
@@ -305,11 +292,6 @@
   @media (prefers-reduced-motion: reduce) { .seg .dot { animation: none; } }
   .offline { color: var(--danger); font-size: 13px; }
   :global(.log) { grid-area: log; }
-  .ask { border: 1px solid var(--line); border-radius: 12px; padding: 18px 20px; max-width: min(28em, calc(100vw - 32px)); background: var(--bg, var(--bubble)); color: inherit; }
-  .ask::backdrop { background: rgb(0 0 0 / 35%); }
-  .ask p { margin: 0 0 14px; }
-  .ask-actions { display: flex; justify-content: flex-end; align-items: center; gap: 8px; }
-  .ask-actions .hint { margin-right: auto; }
   .ask.peek { width: min(46em, calc(100vw - 32px)); max-width: none; }
   .peek-title { font-size: 17px; text-transform: none; letter-spacing: 0; color: inherit; margin: 0 0 4px; }
   .peek-summary { color: var(--muted); margin: 0 0 12px !important; }
@@ -326,16 +308,6 @@
     font-size: 14px;
     line-height: 1.5;
   }
-  .games-head { margin-top: 10px; }
-  .games { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
-  .games li { border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; background: var(--bubble); }
-  .games li.current { border-color: var(--agent); }
-  .gname { display: flex; align-items: center; gap: 6px; font-weight: 600; }
-  .tag.mode { color: var(--muted); font-weight: 400; }
-  .tag { font-size: 11px; font-weight: 500; color: var(--agent); border: 1px solid currentColor; border-radius: 999px; padding: 0 6px; }
-  .gsum { margin: 4px 0 6px; font-size: 13px; color: var(--muted); }
-  .gact { display: flex; gap: 6px; }
-  .gact button { padding: 2px 10px; font-size: 13px; }
   aside {
     grid-area: side;
     border-left: 1px solid var(--line);
@@ -368,13 +340,45 @@
   .dismiss { padding: 0 6px; line-height: 1.4; }
   .hear { width: 80px; height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; }
   .hear span { display: block; height: 100%; background: var(--meter); transition: width 80ms linear; }
-  @media (max-width: 760px) {
+  .views { grid-area: views; gap: 0; padding: 0 16px 10px; }
+  .views button {
+    flex: 1;
+    font-size: 13px;
+    padding: 7px 6px;
+    white-space: nowrap;
+    border-radius: 0;
+    border-width: 1px 0 1px 1px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+  }
+  .views button:first-child { border-radius: 8px 0 0 8px; }
+  .views button:last-child { border-radius: 0 8px 8px 0; border-right-width: 1px; }
+  .views button.on { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+  .views .badge {
+    font-size: 11px;
+    border-radius: 999px;
+    padding: 0 6px;
+    background: var(--agent);
+    color: var(--accent-ink);
+  }
+  .views button.on .badge { background: var(--accent-ink); color: var(--accent); }
+
+  /* Narrow: one area at a time, with the switch above it. */
+  @media (max-width: 860px) {
     .app {
       grid-template-columns: 1fr;
-      grid-template-rows: auto 1fr auto auto;
-      grid-template-areas: "head" "log" "side" "foot";
+      grid-template-rows: auto auto 1fr auto;
+      grid-template-areas: "head" "views" "main" "foot";
     }
-    aside { border-left: 0; border-top: 1px solid var(--line); max-height: 35vh; }
+    .views { display: flex; }
+    :global(.log), :global(.cards), aside { grid-area: main; min-height: 0; }
+    :global(.cards) { border-right: 0; }
+    aside { border-left: 0; }
+    .app:not(.show-chat) :global(.log) { display: none; }
+    .app:not(.show-cards) :global(.cards) { display: none; }
+    .app:not(.show-room) aside { display: none; }
     header, footer { padding: 8px 16px; }
   }
 </style>

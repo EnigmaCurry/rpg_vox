@@ -192,6 +192,51 @@ impl ReplyMode {
 pub struct GameSettings {
     /// How the AI takes its turn while this game is being played.
     pub reply: ReplyMode,
+    /// How many players the game is for.
+    pub players: Players,
+}
+
+/// How many people a game is designed for. Either end may be open: a
+/// game for three or more, or for up to six, or for any number at all.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Players {
+    pub min: Option<u32>,
+    pub max: Option<u32>,
+}
+
+/// More players than any game here is for; past this it is a typo.
+const PLAYERS_MAX: u32 = 99;
+
+impl Players {
+    /// Err says what is wrong with the pair.
+    pub fn check(self) -> Result<Self, String> {
+        if let Some(n) = self.min.or(self.max) {
+            if n == 0 {
+                return Err("a game needs at least one player".into());
+            }
+        }
+        if self.min.unwrap_or(0) > PLAYERS_MAX || self.max.unwrap_or(0) > PLAYERS_MAX {
+            return Err(format!("at most {PLAYERS_MAX} players"));
+        }
+        match (self.min, self.max) {
+            (Some(lo), Some(hi)) if lo > hi => Err(format!(
+                "players_min ({lo}) is more than players_max ({hi})"
+            )),
+            _ => Ok(self),
+        }
+    }
+
+    /// How it reads, for the model that is revising it.
+    pub fn describe(self) -> String {
+        match (self.min, self.max) {
+            (Some(lo), Some(hi)) if lo == hi => format!("{lo}"),
+            (Some(lo), Some(hi)) => format!("{lo} to {hi}"),
+            (Some(lo), None) => format!("{lo} or more"),
+            (None, Some(hi)) => format!("up to {hi}"),
+            (None, None) => "any number".into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2368,6 +2413,7 @@ mod tests {
             "Run a heist.",
             GameSettings {
                 reply: ReplyMode::Always,
+                ..GameSettings::default()
             },
         )
         .unwrap();
@@ -2396,6 +2442,22 @@ mod tests {
     }
 
     #[test]
+    fn how_many_players_a_game_is_for() {
+        let p = |min, max| Players { min, max };
+        assert_eq!(p(Some(4), Some(4)).describe(), "4");
+        assert_eq!(p(Some(2), Some(5)).describe(), "2 to 5");
+        assert_eq!(p(Some(3), None).describe(), "3 or more");
+        assert_eq!(p(None, Some(6)).describe(), "up to 6");
+        assert_eq!(p(None, None).describe(), "any number");
+
+        assert!(p(Some(5), Some(2)).check().is_err(), "backwards");
+        assert!(p(Some(0), None).check().is_err(), "nobody can play it");
+        assert!(p(None, Some(500)).check().is_err(), "a typo, not a game");
+        assert!(p(Some(2), Some(5)).check().is_ok());
+        assert!(p(None, None).check().is_ok());
+    }
+
+    #[test]
     fn a_games_mode_is_part_of_what_is_saved() {
         let (r, _turns) = room(Mode::Named);
         let g = r.generation.load(Ordering::SeqCst);
@@ -2406,6 +2468,7 @@ mod tests {
             "Run it.",
             GameSettings {
                 reply: ReplyMode::Always,
+                ..GameSettings::default()
             },
         )
         .unwrap();

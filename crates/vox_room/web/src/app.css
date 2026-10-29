@@ -54,3 +54,19 @@ button.primary { background: var(--accent); color: var(--accent-ink); border-col
 button.danger { color: var(--danger); }
 button:disabled { opacity: 0.5; cursor: default; }
 input[type="range"] { accent-color: var(--accent); }
+
+/* The room's dialogs: the question, a game's card, a game's prompt. They
+   are raised from more than one component, so the look is global. */
+dialog.ask {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 18px 20px;
+  max-width: min(28em, calc(100vw - 32px));
+  background: var(--bg, var(--bubble));
+  color: inherit;
+  box-shadow: 0 12px 40px rgb(0 0 0 / 18%);
+}
+dialog.ask::backdrop { background: rgb(0 0 0 / 35%); }
+dialog.ask p { margin: 0 0 14px; }
+.ask-actions { display: flex; justify-content: flex-end; align-items: center; gap: 8px; }
+.ask-actions .hint { margin-right: auto; }

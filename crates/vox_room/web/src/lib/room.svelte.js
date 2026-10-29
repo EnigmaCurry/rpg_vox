@@ -2,7 +2,7 @@
 // (JSON) and this tab's audio (binary), and the state every component
 // reads. The server owns the state; this only applies its events.
 
-import { RoomAudio } from './audio.js';
+import { RoomAudio, listDevices, onDeviceChange, permitMic } from './audio.js';
 
 export const room = $state({
   connected: false,
@@ -36,6 +36,14 @@ export const room = $state({
   mic: false,
   // What the browser calls the mic in use, e.g. "Jabra SPEAK 410".
   micName: null,
+  // The devices to choose between at the door, and the choices, which
+  // are this browser's and are remembered for next time.
+  devices: { mics: [], speakers: [] },
+  micId: readChoice('vox_room.mic'),
+  speakerId: readChoice('vox_room.speaker'),
+  // Set when the browser refused the microphone, so the door can say so
+  // rather than offering a list of nameless devices.
+  devicesError: null,
   muted: false,
   volume: 1,
   // Push to talk: the mic stays muted except while Space (or the talk
@@ -45,6 +53,14 @@ export const room = $state({
   // Peak level of what this tab hears, for its meter.
   hearing: 0,
 });
+
+function readChoice(key) {
+  try { return localStorage.getItem(key) || ''; } catch { return ''; }
+}
+
+function writeChoice(key, id) {
+  try { localStorage.setItem(key, id || ''); } catch {}
+}
 
 function readPref(key) {
   try { return localStorage.getItem(key) === 'on'; } catch { return false; }
@@ -218,6 +234,35 @@ function apply(ev) {
   }
 }
 
+/// Find the microphones and speakers to choose between. Needs the mic
+/// permission first, or the browser gives ids with no names.
+export async function loadDevices({ permit = false } = {}) {
+  if (permit) room.devicesError = await permitMic();
+  room.devices = await listDevices();
+  // A device that has been unplugged since last time: back to the
+  // system default rather than a choice that no longer exists.
+  const keep = (list, id) => (list.some((d) => d.id === id) ? id : '');
+  room.micId = keep(room.devices.mics, room.micId);
+  room.speakerId = keep(room.devices.speakers, room.speakerId);
+  return room.devices;
+}
+
+/// Watch for a headset being plugged in or pulled out.
+export function watchDevices() {
+  return onDeviceChange(() => loadDevices());
+}
+
+export function setMicDevice(id) {
+  room.micId = id;
+  writeChoice('vox_room.mic', id);
+}
+
+export function setSpeakerDevice(id) {
+  room.speakerId = id;
+  writeChoice('vox_room.speaker', id);
+  audio?.setSpeaker(id);
+}
+
 /// Join the audio: hear the room, and open the mic.
 export async function joinAudio() {
   if (audio) return;
@@ -227,13 +272,13 @@ export async function joinAudio() {
     audio = new RoomAudio((bytes) => {
       if (ws?.readyState === WebSocket.OPEN) ws.send(bytes);
     });
-    await audio.start(room.volume);
+    await audio.start(room.volume, room.speakerId);
     // Any click or key brings back audio the browser stopped.
     addEventListener('pointerdown', resumeAudio);
     addEventListener('keydown', resumeAudio);
     room.audio = 'on';
     hearTimer = setInterval(() => (room.hearing = audio?.takeHeard() ?? 0), 100);
-    await audio.startMic();
+    await audio.startMic({ deviceId: room.micId });
     room.micName = await audio.micName();
     if (room.pushToTalk) setMuted(true);
     audio.muted = room.muted;
