@@ -94,19 +94,30 @@ straight: send_card goes to one person's cards, post_card goes to the \
 room, and reading either aloud is what you must not do.";
 
 /// The last thing the AI is shown when the room is leaving it to decide
-/// whether this pause is its moment.
+/// whether this pause is its moment. `{here}` and `{engaged}` are filled
+/// in with what the room knows: judging a pause without being told who
+/// is in it is guesswork, and the guess a model makes is silence.
 const DECIDE: &str = "\
-(The room has gone quiet for a moment and nobody has said your name. You are \
-being shown this gap so you can judge it, not because anyone asked you to \
-speak. Stay out of it unless there is a real reason to come in: the people \
-are talking with each other, and a pause between them is theirs, not an \
-opening for you. Reasons to speak are things like a question you are the one \
-to answer, a plain mistake worth correcting, something you were asked to \
-watch for, or a conversation that has genuinely run out and wants a hand. \
-Otherwise call stay_quiet and say nothing at all -- and if you would rather \
-see a longer silence before judging, set ask_again_in_seconds on it. If you \
-do speak, speak as yourself and never mention this note or the fact that you \
-were deciding.)";
+(Nobody has said your name, so this turn is yours to judge: the room has \
+gone quiet for a moment, and you may either take it or let it pass. \
+{here}{engaged}\
+Take it when the last thing said was meant for you -- a question, a \
+request, a follow-up to what you were saying, something you were asked to \
+watch for -- or when there is nobody else here it could have been meant \
+for. Let it pass when the people are talking with each other and the pause \
+between them is theirs, or when nothing has been put that is worth \
+breaking in on: then call stay_quiet and say nothing at all, with \
+ask_again_in_seconds if you would rather be shown a longer silence first. \
+If you take the turn, simply answer, in your own voice, without mentioning \
+this note or that you were deciding.)";
+
+/// Added to [`DECIDE`] when the AI is already mid-conversation: it was
+/// named, and has kept the turn since, so they are talking to it until
+/// they plainly stop.
+const DECIDE_ENGAGED: &str = "\
+You are in the middle of a conversation with them: they called you in and \
+have carried on without naming you again, so the turn is yours unless they \
+have plainly turned to each other. ";
 
 /// The same, on the second look at a silence the AI asked to be shown.
 const DECIDE_LULL: &str = "\
@@ -307,12 +318,32 @@ impl Agent {
         // rest of the turn is the same prompt either way.
         if let Cue::Decide { lull } = turn.cue {
             let note = match lull {
-                None => DECIDE.to_string(),
+                None => DECIDE
+                    .replace("{here}", &who_is_here(&turn.people))
+                    .replace("{engaged}", if turn.engaged { DECIDE_ENGAGED } else { "" }),
                 Some(s) => DECIDE_LULL.replace("{lull}", &s.to_string()),
             };
             out.push(json!({ "role": "user", "content": note }));
         }
         out
+    }
+}
+
+/// Who the AI is judging the pause among. With one other person there is
+/// nobody else the room could have been talking to; with several, some of
+/// what is said is between them.
+fn who_is_here(people: &[String]) -> String {
+    match people {
+        [] => String::new(),
+        [one] => format!(
+            "{one} is the only person here, so there is nobody else they could \
+             be talking to. "
+        ),
+        many => format!(
+            "{} and {} are here, so some of what is said is between them. ",
+            many[..many.len() - 1].join(", "),
+            many[many.len() - 1],
+        ),
     }
 }
 
@@ -1139,6 +1170,10 @@ mod tests {
     }
 
     fn turn(cue: Cue) -> (Agent, RoomConfig, Turn) {
+        turn_with(cue, &["Ryan", "Alex"], false)
+    }
+
+    fn turn_with(cue: Cue, people: &[&str], engaged: bool) -> (Agent, RoomConfig, Turn) {
         let agent = Agent {
             llm: Llm::Echo,
             prompt: DEFAULT_PROMPT.to_string(),
@@ -1157,10 +1192,147 @@ mod tests {
             messages: vec![(Role::User, "Ryan: so what did you make of it?".into())],
             asked: Instant::now(),
             game: None,
-            people: vec!["Ryan".into(), "Alex".into()],
+            people: people.iter().map(|p| p.to_string()).collect(),
+            engaged,
             cue,
         };
         (agent, cfg, turn)
+    }
+
+    /// Put a decide turn to the configured model and see what it does
+    /// with it. Not run by default: it talks to the endpoint in
+    /// VOX_SCRIBE_LLM_URL and costs whatever that costs.
+    ///
+    /// ```text
+    /// cargo test -p vox_room -- --ignored --nocapture judges
+    /// ```
+    #[test]
+    #[ignore = "asks the configured model to judge some pauses"]
+    fn the_model_judges_a_pause_the_way_the_room_needs() {
+        let Ok(url) = std::env::var("VOX_SCRIBE_LLM_URL") else {
+            panic!("set VOX_SCRIBE_LLM_URL, VOX_SCRIBE_LLM_MODEL and VOX_SCRIBE_LLM_KEY");
+        };
+        let chat = Chat {
+            url,
+            model: std::env::var("VOX_SCRIBE_LLM_MODEL").expect("VOX_SCRIBE_LLM_MODEL"),
+            key: std::env::var("VOX_SCRIBE_LLM_KEY").ok(),
+            think: false,
+            search: false,
+        };
+        // (said, who is here, mid-conversation, should it take the turn)
+        let cases: &[(&str, &[&str], bool, bool)] = &[
+            ("Ryan: So what do you make of that?", &["Ryan"], false, true),
+            (
+                "Ryan: Right, and how long would that take?",
+                &["Ryan"],
+                true,
+                true,
+            ),
+            (
+                "Ryan: Did you get the tickets?\nAlex: Yeah, two for Saturday.",
+                &["Ryan", "Alex"],
+                false,
+                false,
+            ),
+            (
+                "Ryan: I'm going to make some tea.\nAlex: Grab me one.",
+                &["Ryan", "Alex"],
+                false,
+                false,
+            ),
+        ];
+        let mut wrong = Vec::new();
+        let mut queue: Vec<_> = cases.iter().rev().collect();
+        while let Some(case) = queue.pop() {
+            let (said, people, engaged, want_turn) = case;
+            let (agent, cfg, mut t) = turn_with(Cue::Decide { lull: None }, people, *engaged);
+            t.messages = vec![(Role::User, said.to_string())];
+            // What the room settles on for this endpoint, once it has
+            // learned what it will take (see REASONING_OFF).
+            let mut body = json!({
+                "model": chat.model,
+                "messages": agent.messages(&cfg, &t),
+                "tools": tools_for(true, false, true),
+            });
+            if REASONING_OFF.load(Ordering::Relaxed) {
+                body["reasoning_effort"] = json!("none");
+            }
+            let resp: Value = match chat
+                .authorize(ureq::post(&chat.endpoint("chat/completions")))
+                .send_json(body)
+            {
+                Ok(r) => r.into_json().expect("read the answer"),
+                Err(ureq::Error::Status(code, r)) => {
+                    let detail = r.into_string().unwrap_or_default();
+                    // The same lesson the room learns on its first call.
+                    if code == 400
+                        && detail.contains("reasoning_effort")
+                        && !REASONING_OFF.swap(true, Ordering::Relaxed)
+                    {
+                        println!("(this endpoint only takes tools with reasoning off)");
+                        queue.push(case);
+                        continue;
+                    }
+                    panic!("HTTP {code}: {detail}")
+                }
+                Err(e) => panic!("{e}"),
+            };
+            let message = &resp["choices"][0]["message"];
+            let quiet = message["tool_calls"]
+                .as_array()
+                .is_some_and(|c| c.iter().any(|c| c["function"]["name"] == "stay_quiet"));
+            let took_turn = !quiet;
+            println!(
+                "{} {said:?}\n   -> {}",
+                if took_turn == *want_turn {
+                    "ok  "
+                } else {
+                    "WRONG"
+                },
+                if quiet {
+                    "stayed quiet".to_string()
+                } else {
+                    format!(
+                        "spoke: {}",
+                        message["content"].as_str().unwrap_or("").trim()
+                    )
+                },
+            );
+            if took_turn != *want_turn {
+                wrong.push(*said);
+            }
+        }
+        assert!(wrong.is_empty(), "judged wrongly: {wrong:#?}");
+    }
+
+    #[test]
+    fn a_turn_to_judge_says_who_it_is_being_judged_among() {
+        let note = |people: &[&str], engaged| {
+            let (agent, cfg, t) = turn_with(Cue::Decide { lull: None }, people, engaged);
+            agent.messages(&cfg, &t).pop().unwrap()["content"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+
+        // One person and nobody else: the room cannot be talking to
+        // anyone but the AI, which is what it was getting wrong.
+        let alone = note(&["Ryan"], false);
+        assert!(alone.contains("Ryan is the only person here"), "{alone}");
+        assert!(alone.contains("nobody else they could be talking to"));
+        assert!(!alone.contains("some of what is said is between them"));
+
+        // Several, and a pause may well be theirs.
+        let crowd = note(&["Ryan", "Alex", "Sam"], false);
+        assert!(crowd.contains("Ryan, Alex and Sam are here"), "{crowd}");
+        assert!(crowd.contains("between them"));
+
+        // Mid-conversation, the turn is the AI's unless they turn away.
+        assert!(!alone.contains("in the middle of a conversation"));
+        let mid = note(&["Ryan", "Alex"], true);
+        assert!(mid.contains("in the middle of a conversation"), "{mid}");
+        assert!(mid.contains("carried on without naming you"));
+        assert!(!mid.contains("{engaged}") && !mid.contains("{here}"));
     }
 
     #[test]
@@ -1171,7 +1343,7 @@ mod tests {
         assert_eq!(last["role"], "user");
         let note = last["content"].as_str().unwrap();
         assert!(note.contains("stay_quiet"), "{note}");
-        assert!(note.contains("nobody has said your name"));
+        assert!(note.contains("Nobody has said your name"));
         // The conversation itself is untouched, and the note is last, so
         // the rest of the prompt is the same either way.
         assert_eq!(messages[1]["content"], "Ryan: so what did you make of it?");

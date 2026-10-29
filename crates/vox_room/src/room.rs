@@ -323,6 +323,9 @@ pub struct Turn {
     pub game: Option<(String, String)>,
     /// Who is in the room.
     pub people: Vec<String>,
+    /// A back-and-forth is on: the AI has the turn at every pause
+    /// because it was named, not because the room is set that way.
+    pub engaged: bool,
     /// Whether the AI is to speak, or to decide whether to speak at all.
     pub cue: Cue,
 }
@@ -1848,6 +1851,7 @@ impl Room {
                     .filter(|(_, p)| p.clients > 0)
                     .map(|(n, _)| n.clone())
                     .collect(),
+                engaged: st.engaged.is_some(),
                 cue,
             })
             .is_err()

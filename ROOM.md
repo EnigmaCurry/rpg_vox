@@ -84,12 +84,13 @@ See ROOM_DOCKER.md.
     two people can talk without it butting in. The default.
   - **When it fits** — at every pause the AI is *given the turn* and
     decides for itself whether the moment is its own. It is shown the
-    conversation and one extra instruction: the pause between two people
-    is theirs, so stay out of it unless there is a real reason to come in
-    — a question you are the one to answer, a mistake worth correcting,
-    something you were asked to watch for, a conversation that has run
-    out. If it passes, it calls `stay_quiet` and **nothing happens at
-    all**: no bubble, no "thinking", nothing on anyone's screen. It can
+    conversation, **who is in the room**, and whether it is already
+    mid-conversation, because a pause means different things in different
+    rooms: with one person there is nobody else they could be talking to,
+    while three people talking among themselves own the gaps between
+    them. Take the turn when the last thing said was meant for it; let it
+    pass otherwise. If it passes, it calls `stay_quiet` and **nothing
+    happens at all**: no bubble, no "thinking", nothing on anyone's screen. It can
     also pass with `ask_again_in_seconds`, and the room shows it the
     conversation again if the quiet actually lasts that long — how it
     waits for a real silence instead of the 1.2 s gap it was shown. Only
@@ -225,6 +226,23 @@ If that turns out to be too expensive, the seam to replace is narrow: the
 room hands out a turn with a `Cue::Decide`, and anything that can answer
 "speak or stay quiet" can sit behind it — a small local model, or a
 turn-taking model, without the room or the UI changing.
+
+The judgment is only as good as what the model is told, and the failure
+is silent: a model that is told a pause is probably not its own says
+nothing, for ever, and the mode looks broken rather than wrong. There is
+a test for it that puts real pauses to the configured endpoint and checks
+which way it goes, off by default because it costs what that endpoint
+costs:
+
+```bash
+cargo test -p vox_room -- --ignored --nocapture judges
+```
+
+Run it after changing anything the model reads. One thing it turned up:
+OpenAI's reasoning models refuse function tools on `/v1/chat/completions`
+unless `reasoning_effort` is `none`, so with one of those the room is
+judging pauses with reasoning off (it learns this from the first 400 and
+retries). `/v1/responses` is the endpoint that would allow both.
 
 ## How it works
 
