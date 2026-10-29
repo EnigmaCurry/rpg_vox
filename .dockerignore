@@ -1,0 +1,25 @@
+# Everything the vox_room image builds from is source; keep the context small.
+.git
+.direnv
+result
+result-*
+.env
+target
+models
+recordings
+hold_music
+dist
+data
+ios
+android
+qwen3-tts
+pi/.venv
+*.db
+*.db-shm
+*.db-wal
+*.wav
+*.srt
+*.ass
+*.jks
+crates/*/dist-ui
+**/node_modules

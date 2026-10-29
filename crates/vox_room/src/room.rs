@@ -2,7 +2,9 @@
 //!
 //! Every browser in the room sees the same state. A new tab gets a
 //! snapshot ([`Room::hello`]); after that every change goes out to all of
-//! them as a JSON event on one broadcast channel.
+//! them as a JSON event on one broadcast channel. An [`Event`] may name
+//! one person, and then only their own tabs are sent it: that is how a
+//! card the AI dealt reaches nobody else's browser.
 //!
 //! The conversation is a list of entries. A person's entry is one
 //! paragraph from their transcription engine, live while they talk. The
@@ -15,13 +17,17 @@
 //!   the paragraphs since the last hand-over join the conversation (each
 //!   engine starts a new paragraph), and the AI is asked for a reply if
 //!   the room is in "always" mode or someone said its name.
+//! * **Staying in**: in `Named` mode, addressing the AI by name puts the
+//!   room in a back-and-forth -- it answers every pause from then on,
+//!   without being named again, until the room has been idle for
+//!   `engaged_for` (or the AI itself bows out).
 //! * **Barge-in**: while the AI is replying, anyone who starts talking
 //!   ducks it at once. Once their speech is confirmed (`confirm` of
 //!   continuous voice, or a first recognised word) the reply is cut where
 //!   the mixer had got to, and what was still queued is dropped. A cough
 //!   that isn't confirmed lets the AI carry on at full level.
 
-use std::collections::BTreeMap;
+use std::collections::{btree_map, BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -46,6 +52,13 @@ const OPENING: &str =
     "(Everyone has just entered the game. Open it: set the scene and bring the players in.)";
 /// Longest game name the AI may save.
 const GAME_NAME_MAX: usize = 60;
+/// Longest title on a card the AI deals.
+const CARD_TITLE_MAX: usize = 60;
+/// Longest body on a card: it is read on screen, not aloud, but the
+/// private area is a column in the sidebar.
+const CARD_BODY_MAX: usize = 2000;
+/// Cards one person may be holding in a conversation at once.
+const CARDS_MAX: usize = 50;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -100,6 +113,59 @@ impl Mode {
     }
 }
 
+/// How the AI takes its turn in a game.
+///
+/// A game is run by its own rules, so it may need the AI answering every
+/// pause (it is dealing the turns) or never unless called. `Room` leaves
+/// it to whatever the people picked, back-and-forth and all.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReplyMode {
+    #[default]
+    Room,
+    Always,
+    Named,
+}
+
+impl ReplyMode {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "room" | "" => Some(ReplyMode::Room),
+            "always" => Some(ReplyMode::Always),
+            "named" => Some(ReplyMode::Named),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReplyMode::Room => "room",
+            ReplyMode::Always => "always",
+            ReplyMode::Named => "named",
+        }
+    }
+
+    /// The mode this requires of the room, for as long as the game is
+    /// being played; `None` leaves the room's own mode alone.
+    fn forces(self) -> Option<Mode> {
+        match self {
+            ReplyMode::Room => None,
+            ReplyMode::Always => Some(Mode::Always),
+            ReplyMode::Named => Some(Mode::Named),
+        }
+    }
+}
+
+/// What a saved game is, besides its prompt: the parts the room acts on
+/// rather than the model. Unknown and missing fields default, so a game
+/// saved before a setting existed still loads.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GameSettings {
+    /// How the AI takes its turn while this game is being played.
+    pub reply: ReplyMode,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Entry {
     pub id: String,
@@ -119,6 +185,36 @@ pub struct Entry {
     pub sent: bool,
 }
 
+/// A card the AI dealt to one person, shown only in their own private
+/// area of the screen. It belongs to the conversation it was dealt in.
+#[derive(Debug, Clone, Serialize)]
+pub struct Card {
+    pub id: String,
+    /// The one person who ever sees it.
+    pub to: String,
+    pub title: String,
+    pub body: String,
+    /// Unix milliseconds when it was dealt.
+    pub at: u64,
+}
+
+/// One room event, and who may see it.
+///
+/// `to` is `None` for everything the whole room shares, and `Some(name)`
+/// for an event only that person's tabs are sent -- the filtering is here
+/// on the server, so a secret never reaches another browser at all.
+#[derive(Debug, Clone)]
+pub struct Event {
+    pub to: Option<Arc<str>>,
+    pub json: Arc<str>,
+}
+
+impl Event {
+    pub fn is_for(&self, person: &str) -> bool {
+        self.to.as_deref().is_none_or(|to| to == person)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RoomConfig {
     pub agent_name: String,
@@ -126,6 +222,9 @@ pub struct RoomConfig {
     pub aliases: Vec<String>,
     pub reply_after: Duration,
     pub confirm: Duration,
+    /// How long the room may be idle before a back-and-forth lapses and
+    /// the AI goes back to waiting for its name.
+    pub engaged_for: Duration,
     /// Entries of history the model is shown.
     pub history: usize,
 }
@@ -189,8 +288,14 @@ struct State {
     conversation: i64,
     /// The game this conversation plays; None is the lobby.
     game: Option<String>,
+    /// The mode that game requires, if it requires one.
+    game_mode: Option<Mode>,
     people: BTreeMap<String, Person>,
     log: Vec<Entry>,
+    /// What the people picked, and what a restart comes back to.
+    chosen: Mode,
+    /// What the room is actually doing: `chosen`, unless the game being
+    /// played requires a mode, or a back-and-forth is on.
     mode: Mode,
     reply: Option<Reply>,
     last_change: Instant,
@@ -202,11 +307,16 @@ struct State {
     /// A game the AI started in reply `.0`: entered once that reply has
     /// been heard (or cut off).
     starting: Option<(u64, String)>,
+    /// In a back-and-forth: `Named` mode was flipped to `Always` because
+    /// someone said the AI's name, and goes back once the room has been
+    /// idle for `engaged_for`. The instant is the last thing that kept it
+    /// going. `None` is the room's own mode, as chosen.
+    engaged: Option<Instant>,
 }
 
 pub struct Room {
     st: Mutex<State>,
-    events: broadcast::Sender<Arc<str>>,
+    events: broadcast::Sender<Event>,
     pub mixer: Arc<Mixer>,
     store: Mutex<Store>,
     cfg: RoomConfig,
@@ -236,10 +346,15 @@ impl Room {
         let conversation = store.conversation()?;
         let game = store.conversation_game(conversation)?;
         let log = store.entries(conversation, LOG_LIMIT)?;
-        let mode = store
+        let chosen = store
             .setting("mode")?
             .and_then(|m| Mode::parse(&m))
             .unwrap_or(Mode::Named);
+        // The game the room was left playing may require its own mode.
+        let game_mode = game
+            .as_deref()
+            .and_then(|g| store.game(g).ok().flatten())
+            .and_then(|(g, _)| g.settings.reply.forces());
         let strips: BTreeMap<String, Strip> = store
             .setting("strips")?
             .and_then(|s| serde_json::from_str(&s).ok())
@@ -254,15 +369,18 @@ impl Room {
             st: Mutex::new(State {
                 conversation,
                 game,
+                game_mode,
                 people,
                 log,
-                mode,
+                chosen,
+                mode: game_mode.unwrap_or(chosen),
                 reply: None,
                 last_change: Instant::now(),
                 quiet_since: Instant::now(),
                 ducked: false,
                 agent_state: "listening",
                 starting: None,
+                engaged: None,
             }),
             events,
             mixer: Mixer::new(strips),
@@ -286,12 +404,24 @@ impl Room {
         self.store.lock().expect("store mutex poisoned")
     }
 
-    pub fn subscribe(&self) -> broadcast::Receiver<Arc<str>> {
+    pub fn subscribe(&self) -> broadcast::Receiver<Event> {
         self.events.subscribe()
     }
 
+    /// To the whole room.
     fn emit(&self, v: Value) {
-        let _ = self.events.send(Arc::from(v.to_string()));
+        let _ = self.events.send(Event {
+            to: None,
+            json: Arc::from(v.to_string()),
+        });
+    }
+
+    /// To one person's tabs only. Nobody else's browser is sent it.
+    fn emit_to(&self, person: &str, v: Value) {
+        let _ = self.events.send(Event {
+            to: Some(Arc::from(person)),
+            json: Arc::from(v.to_string()),
+        });
     }
 
     pub fn person_for_token(&self, token: &str) -> Option<String> {
@@ -315,6 +445,40 @@ impl Room {
         )
     }
 
+    /// Bring the roster back in line with who is actually invited.
+    ///
+    /// `vox_room invite` and `uninvite` run in their own process and write
+    /// straight to the database, so the running room only learns about
+    /// them by looking. Someone newly invited appears, and someone
+    /// uninvited disappears once their last tab has gone -- while they are
+    /// still connected they stay on the roster, because they are still in
+    /// the room and still being heard.
+    pub fn reconcile_people(&self) {
+        let mut st = self.lock();
+        // State first, then the store: the order everything else here uses.
+        let invited: BTreeSet<String> = match self.store().people() {
+            Ok(people) => people.into_iter().map(|(name, _)| name).collect(),
+            Err(err) => {
+                warn!("couldn't read the invite list: {err:#}");
+                return;
+            }
+        };
+        let before = st.people.len();
+        st.people
+            .retain(|name, p| p.clients > 0 || invited.contains(name));
+        let mut changed = st.people.len() != before;
+        for name in invited {
+            if let btree_map::Entry::Vacant(slot) = st.people.entry(name) {
+                info!(person = %slot.key(), "invited");
+                slot.insert(Person::default());
+                changed = true;
+            }
+        }
+        if changed {
+            self.emit_people(&st);
+        }
+    }
+
     fn emit_people(&self, st: &State) {
         self.emit(json!({ "type": "people", "people": Self::people_json(st) }));
     }
@@ -331,12 +495,122 @@ impl Room {
             "you": person,
             "agent": { "name": self.cfg.agent_name, "state": st.agent_state, "strip": AGENT_STRIP },
             "mode": st.mode.as_str(),
+            "engaged": st.engaged.is_some(),
+            "locked": st.game_mode.is_some(),
             "people": Self::people_json(&st),
             "strips": self.mixer.strips(),
             "log": st.log,
             "game": st.game,
             "games": self.games(),
+            "cards": self.cards_for(&st, person),
         })
+    }
+
+    // -- cards: what the AI tells one person alone -------------------------
+
+    /// The cards `person` is holding in this conversation.
+    fn cards_for(&self, st: &State, person: &str) -> Vec<Card> {
+        self.store()
+            .cards(st.conversation, person)
+            .unwrap_or_else(|err| {
+                warn!("read cards: {err:#}");
+                Vec::new()
+            })
+    }
+
+    /// Everyone on the roster, for the agent: the name to address a card
+    /// to, whether they are here, and what they are already holding.
+    pub fn people_here(&self) -> Vec<Value> {
+        let st = self.lock();
+        let counts: BTreeMap<String, usize> = self
+            .store()
+            .card_counts(st.conversation)
+            .unwrap_or_else(|err| {
+                warn!("count cards: {err:#}");
+                Vec::new()
+            })
+            .into_iter()
+            .collect();
+        st.people
+            .iter()
+            .map(|(name, p)| {
+                json!({
+                    "name": name,
+                    "here": p.clients > 0,
+                    // Being heard: a mic open and not muted.
+                    "listening": p.mic && !p.muted,
+                    "cards": counts.get(name).copied().unwrap_or(0),
+                })
+            })
+            .collect()
+    }
+
+    /// Deal a card to one person: it appears in their private area and
+    /// nowhere else. Err says why it wasn't dealt.
+    ///
+    /// Unlike saving a game, this goes through even if the players talked
+    /// over the reply that called it: the card is the point, and losing
+    /// one silently is worse than one arriving after an interruption.
+    pub fn send_card(&self, to: &str, title: &str, body: &str) -> Result<String, String> {
+        let (title, body) = (title.trim(), body.trim());
+        if title.is_empty() || body.is_empty() {
+            return Err("a card needs a title and a body".into());
+        }
+        if title.chars().count() > CARD_TITLE_MAX {
+            return Err(format!("titles are at most {CARD_TITLE_MAX} characters"));
+        }
+        if body.chars().count() > CARD_BODY_MAX {
+            return Err(format!("a card is at most {CARD_BODY_MAX} characters"));
+        }
+        let st = self.lock();
+        // Speech-to-text mangles names, so match the roster loosely; the
+        // error names everyone, so the model can pick again.
+        let Some(to) = st
+            .people
+            .keys()
+            .find(|n| n.eq_ignore_ascii_case(to.trim()))
+            .cloned()
+        else {
+            let who: Vec<&str> = st.people.keys().map(String::as_str).collect();
+            return Err(format!(
+                "there is nobody called {to:?} in the room; it is {}",
+                if who.is_empty() {
+                    "empty".to_string()
+                } else {
+                    who.join(", ")
+                }
+            ));
+        };
+        let holding = self.cards_for(&st, &to).len();
+        if holding >= CARDS_MAX {
+            return Err(format!(
+                "{to} is already holding {holding} cards; they have to clear some first"
+            ));
+        }
+        let card = Card {
+            id: format!("card-{}", uuid::Uuid::new_v4().simple()),
+            to: to.clone(),
+            title: title.to_string(),
+            body: body.to_string(),
+            at: now_ms(),
+        };
+        if let Err(err) = self.store().put_card(st.conversation, &card) {
+            return Err(format!("{err:#}"));
+        }
+        info!(to = %to, title = %card.title, "dealt a card");
+        // Only their tabs; the body never reaches another browser.
+        self.emit_to(&to, json!({ "type": "card", "card": card }));
+        Ok(to)
+    }
+
+    /// `person` discarded one of their own cards.
+    pub fn dismiss_card(&self, person: &str, id: &str) {
+        let st = self.lock();
+        match self.store().delete_card(st.conversation, person, id) {
+            Ok(true) => self.emit_to(person, json!({ "type": "card_removed", "id": id })),
+            Ok(false) => {}
+            Err(err) => warn!("discard card: {err:#}"),
+        }
     }
 
     /// A saved game and its prompt, for someone who asks to see it.
@@ -560,16 +834,93 @@ impl Room {
         self.emit_people(&st);
     }
 
+    /// Someone picked a mode: that is the room's own, and it ends any
+    /// back-and-forth. The game being played may still require another.
     pub fn set_mode(&self, mode: &str) {
         let Some(mode) = Mode::parse(mode) else {
             return;
         };
         let mut st = self.lock();
-        st.mode = mode;
+        st.chosen = mode;
+        st.engaged = None;
         if let Err(err) = self.store().set_setting("mode", mode.as_str()) {
             warn!("store mode: {err:#}");
         }
-        self.emit(json!({ "type": "mode", "mode": mode.as_str() }));
+        self.refresh_mode(&mut st);
+    }
+
+    /// The AI standing down by itself: back to answering only when it is
+    /// named. It changes the room's own mode, as if someone picked it,
+    /// and answers with what the room is actually doing afterwards --
+    /// which is still `always` if the game being played requires it.
+    pub fn wait_until_named(&self) -> &'static str {
+        let mut st = self.lock();
+        if st.chosen != Mode::Named || st.engaged.is_some() {
+            info!("the AI stood down: answering only when named again");
+        }
+        st.chosen = Mode::Named;
+        st.engaged = None;
+        if let Err(err) = self.store().set_setting("mode", Mode::Named.as_str()) {
+            warn!("store mode: {err:#}");
+        }
+        self.refresh_mode(&mut st);
+        st.mode.as_str()
+    }
+
+    /// Work out what the room should be doing and tell every tab.
+    ///
+    /// A back-and-forth wins over the game being played, which wins over
+    /// what the people picked. Only the last of those is stored, so a
+    /// restart comes back to what was actually chosen.
+    fn refresh_mode(&self, st: &mut State) {
+        st.mode = if st.engaged.is_some() {
+            Mode::Always
+        } else {
+            st.game_mode.unwrap_or(st.chosen)
+        };
+        self.emit(json!({
+            "type": "mode",
+            "mode": st.mode.as_str(),
+            "engaged": st.engaged.is_some(),
+            // The game requires this one: the buttons are not the room's
+            // to change while it is being played.
+            "locked": st.game_mode.is_some(),
+        }));
+    }
+
+    /// Someone said the AI's name in `Named` mode: it answers every pause
+    /// from now on, so they can talk back and forth without saying it
+    /// again, until the room has been idle for `engaged_for`.
+    fn engage(&self, st: &mut State, now: Instant) {
+        info!(
+            for_ms = self.cfg.engaged_for.as_millis() as u64,
+            "named: answering every pause until the room goes quiet"
+        );
+        st.engaged = Some(now);
+        self.refresh_mode(st);
+    }
+
+    /// Keep a back-and-forth going while anything is happening, and end
+    /// it once the room has been idle long enough.
+    fn follow_engagement(&self, st: &mut State, now: Instant) {
+        let Some(since) = st.engaged else {
+            return;
+        };
+        // Someone talking, or the AI answering: the countdown only starts
+        // once the room actually falls quiet.
+        if st.reply.is_some() || st.people.values().any(|p| p.speaking || p.holding()) {
+            st.engaged = Some(now);
+            return;
+        }
+        if now.duration_since(since) < self.cfg.engaged_for {
+            return;
+        }
+        info!(
+            quiet_ms = now.duration_since(since).as_millis() as u64,
+            "quiet: back to answering only when named"
+        );
+        st.engaged = None;
+        self.refresh_mode(st);
     }
 
     pub fn set_strip(&self, name: &str, gain: Option<f32>, mute: Option<bool>) {
@@ -714,7 +1065,15 @@ impl Room {
             }
         }
         st.log.clear();
+        // A game may require its own mode for as long as it is played;
+        // leaving it puts the room back the way the people had it.
+        st.game_mode = game
+            .as_deref()
+            .and_then(|g| self.store().game(g).ok().flatten())
+            .and_then(|(g, _)| g.settings.reply.forces());
+        st.engaged = None;
         st.game = game;
+        self.refresh_mode(st);
         for p in st.people.values() {
             if let Some(e) = &p.engine {
                 e.break_paragraph();
@@ -722,7 +1081,9 @@ impl Room {
         }
         // Anything said before the switch belongs to the old conversation.
         st.last_change = Instant::now();
-        self.emit(json!({ "type": "reset", "log": [], "game": st.game }));
+        // Cards belong to the conversation they were dealt in, so a fresh
+        // one leaves everyone's private area empty.
+        self.emit(json!({ "type": "reset", "log": [], "cards": [], "game": st.game }));
         if st.game.is_some() {
             self.ask(st, Instant::now());
         }
@@ -754,6 +1115,7 @@ impl Room {
         name: &str,
         summary: &str,
         prompt: &str,
+        settings: GameSettings,
     ) -> Result<(), String> {
         let name = name.trim();
         self.check_game_name(name)?;
@@ -766,7 +1128,7 @@ impl Room {
         }
         match self
             .store()
-            .save_game(name, summary.trim(), prompt.trim(), now_ms())
+            .save_game(name, summary.trim(), prompt.trim(), &settings, now_ms())
         {
             Ok(true) => {}
             Ok(false) => return Err(format!("there is already a game called {name:?}")),
@@ -778,10 +1140,11 @@ impl Room {
         Ok(())
     }
 
-    /// The summary and hidden prompt of a game, so the agent can revise it.
-    pub fn read_game(&self, name: &str) -> Result<(String, String), String> {
+    /// The summary, settings and hidden prompt of a game, so the agent
+    /// can revise it.
+    pub fn read_game(&self, name: &str) -> Result<(String, GameSettings, String), String> {
         match self.store().game(name.trim()) {
-            Ok(Some((g, prompt))) => Ok((g.summary, prompt)),
+            Ok(Some((g, prompt))) => Ok((g.summary, g.settings, prompt)),
             Ok(None) => Err(format!("there is no game called {name:?}")),
             Err(err) => Err(format!("{err:#}")),
         }
@@ -796,6 +1159,7 @@ impl Room {
         new_name: Option<&str>,
         summary: &str,
         prompt: &str,
+        settings: GameSettings,
     ) -> Result<String, String> {
         self.read_game(name)?;
         let old_name = match self.store().game(name.trim()) {
@@ -819,10 +1183,13 @@ impl Room {
         if self.generation.load(Ordering::SeqCst) != generation {
             return Err("the players talked over you; the game was not changed".into());
         }
-        match self
-            .store()
-            .update_game(&old_name, &new_name, summary.trim(), prompt.trim())
-        {
+        match self.store().update_game(
+            &old_name,
+            &new_name,
+            summary.trim(),
+            prompt.trim(),
+            &settings,
+        ) {
             Ok(true) => {}
             Ok(false) => return Err(format!("there is no game called {name:?}")),
             Err(err) => return Err(format!("{err:#}")),
@@ -925,6 +1292,7 @@ impl Room {
         self.follow_reply(&mut st, None);
         self.barge_in(&mut st, now);
         self.hand_over(&mut st, now);
+        self.follow_engagement(&mut st, now);
         let state = match &st.reply {
             None if self.will_answer(&st) => "waiting",
             None => "listening",
@@ -1110,8 +1478,12 @@ impl Room {
                 e.break_paragraph();
             }
         }
-        let wanted = st.mode == Mode::Always || self.named(&said);
-        if wanted {
+        // Being addressed by name starts a back-and-forth: from here on
+        // the AI answers every pause, until the room goes quiet.
+        if st.mode == Mode::Named && self.named(&said) {
+            self.engage(st, now);
+        }
+        if st.mode == Mode::Always {
             self.ask(st, now);
         }
     }
@@ -1363,10 +1735,16 @@ mod tests {
             aliases: vec!["box".into()],
             reply_after: Duration::from_millis(1000),
             confirm: Duration::from_millis(300),
+            engaged_for: Duration::from_millis(5000),
             history: 50,
         };
         let r = Room::new(store, cfg, Arc::new(AtomicU64::new(0)), tx, None).unwrap();
         (r, rx)
+    }
+
+    /// A game that leaves the room's mode alone.
+    fn lobby_game() -> GameSettings {
+        GameSettings::default()
     }
 
     fn para(id: &str, text: &str, partial: bool) -> Paragraph {
@@ -1399,6 +1777,36 @@ mod tests {
 
     fn quiet(room: &Room) -> Instant {
         Instant::now() + room.cfg.reply_after + Duration::from_millis(10)
+    }
+
+    #[test]
+    fn the_roster_follows_the_invite_list() {
+        let (r, _turns) = room(Mode::Named);
+        let names = |r: &Room| {
+            r.lock()
+                .people
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        assert_eq!(names(&r), "Alex,Ryan");
+
+        // Invited while the room is running: appears on the next look.
+        r.store().invite("Sam").unwrap();
+        r.reconcile_people();
+        assert_eq!(names(&r), "Alex,Ryan,Sam");
+
+        // Uninvited while connected: stays, because they are still here.
+        r.join("Sam");
+        r.store().uninvite("Sam").unwrap();
+        r.reconcile_people();
+        assert_eq!(names(&r), "Alex,Ryan,Sam");
+
+        // ...and goes once their last tab does.
+        r.leave("Sam");
+        r.reconcile_people();
+        assert_eq!(names(&r), "Alex,Ryan");
     }
 
     #[test]
@@ -1635,17 +2043,19 @@ mod tests {
         let (r, turns) = room(Mode::Always);
         let g = r.generation.load(Ordering::SeqCst);
         assert_eq!(r.check_game_name("Dragon Heist"), Ok(()));
-        r.save_game(g, "Dragon Heist", "A heist.", "Run a heist.")
+        r.save_game(g, "Dragon Heist", "A heist.", "Run a heist.", lobby_game())
             .unwrap();
         assert!(
             r.check_game_name("dragon heist").is_err(),
             "names are unique"
         );
-        assert!(r.save_game(g, "DRAGON HEIST", "x", "y").is_err());
+        assert!(r
+            .save_game(g, "DRAGON HEIST", "x", "y", lobby_game())
+            .is_err());
         assert_eq!(cards(&r), ["Dragon Heist"]);
 
         // Revised (and renamed): the old card goes, a new one comes.
-        assert_eq!(r.read_game("dragon heist").unwrap().1, "Run a heist.");
+        assert_eq!(r.read_game("dragon heist").unwrap().2, "Run a heist.");
         let name = r
             .revise_game(
                 g,
@@ -1653,6 +2063,7 @@ mod tests {
                 Some("Dragon Caper"),
                 "A caper.",
                 "Run a caper.",
+                lobby_game(),
             )
             .unwrap();
         assert_eq!(name, "Dragon Caper");
@@ -1680,11 +2091,18 @@ mod tests {
         assert_eq!(r.lock().game, None);
         // Played games can still be revised in the lobby.
         let g = r.generation.load(Ordering::SeqCst);
-        r.revise_game(g, "Dragon Caper", None, "A caper.", "Run a better caper.")
-            .unwrap();
+        r.revise_game(
+            g,
+            "Dragon Caper",
+            None,
+            "A caper.",
+            "Run a better caper.",
+            lobby_game(),
+        )
+        .unwrap();
         assert!(r.list_games()[0].played, "still marked played");
         assert_eq!(
-            r.read_game("Dragon Caper").unwrap().1,
+            r.read_game("Dragon Caper").unwrap().2,
             "Run a better caper."
         );
         r.delete_game("Dragon Caper");
@@ -1695,8 +2113,14 @@ mod tests {
     fn a_game_started_by_voice_opens_after_the_reply_is_heard() {
         let (r, turns) = room(Mode::Named);
         let g0 = r.generation.load(Ordering::SeqCst);
-        r.save_game(g0, "Quick Draw", "A showdown.", "Run a showdown.")
-            .unwrap();
+        r.save_game(
+            g0,
+            "Quick Draw",
+            "A showdown.",
+            "Run a showdown.",
+            lobby_game(),
+        )
+        .unwrap();
         r.on_paragraph("Ryan", &para("p1", "Vox, let's play quick draw.", false));
         r.tick(quiet(&r));
         let g = turns.try_recv().unwrap().generation;
@@ -1719,7 +2143,8 @@ mod tests {
     fn a_game_deleted_by_voice_leaves_the_chat() {
         let (r, _turns) = room(Mode::Named);
         let g = r.generation.load(Ordering::SeqCst);
-        r.save_game(g, "Zork", "Caves.", "Dark.").unwrap();
+        r.save_game(g, "Zork", "Caves.", "Dark.", lobby_game())
+            .unwrap();
         assert_eq!(cards(&r), ["Zork"]);
         assert_eq!(r.remove_game(g, "zork"), Ok("Zork".into()));
         assert!(cards(&r).is_empty());
@@ -1732,7 +2157,229 @@ mod tests {
         let (r, _turns) = room(Mode::Always);
         let g = r.generation.load(Ordering::SeqCst);
         r.generation.fetch_add(1, Ordering::SeqCst);
-        assert!(r.save_game(g, "Zork", "Caves.", "Dark.").is_err());
+        assert!(r
+            .save_game(g, "Zork", "Caves.", "Dark.", lobby_game())
+            .is_err());
         assert!(r.list_games().is_empty());
+    }
+
+    /// The room's effective mode, and whether a back-and-forth is on.
+    fn mode_now(r: &Room) -> (Mode, bool) {
+        let st = r.lock();
+        (st.mode, st.engaged.is_some())
+    }
+
+    #[test]
+    fn naming_it_starts_a_back_and_forth_that_lapses_when_quiet() {
+        let (r, turns) = room(Mode::Named);
+        // The room's clock, so the quiet can be waited out without
+        // sleeping. reply_after is 1 s here and engaged_for 5 s.
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        assert_eq!(mode_now(&r), (Mode::Named, false));
+
+        // Addressed by name: from here on it answers every pause.
+        let mut events = r.subscribe();
+        r.on_paragraph("Ryan", &para("p1", "Vox, what's the weather?", false));
+        r.tick(at(1_100));
+        assert!(turns.try_recv().is_ok(), "named");
+        assert_eq!(mode_now(&r), (Mode::Always, true));
+        // What the tabs are told, which is what the buttons read.
+        let mode_events: Vec<String> = std::iter::from_fn(|| events.try_recv().ok())
+            .map(|e| e.json.to_string())
+            .filter(|j| j.contains("\"type\":\"mode\""))
+            .collect();
+        assert_eq!(
+            mode_events,
+            [r#"{"engaged":true,"locked":false,"mode":"always","type":"mode"}"#],
+        );
+
+        // The next thing said needs no name at all.
+        r.stop_agent();
+        r.on_paragraph("Ryan", &para("p2", "And tomorrow?", false));
+        r.tick(at(2_200));
+        assert!(turns.try_recv().is_ok(), "answered without being named");
+
+        // While the AI is still answering, the quiet doesn't count.
+        r.tick(at(20_000));
+        assert_eq!(mode_now(&r), (Mode::Always, true), "still replying");
+
+        // Once it has stopped, a quiet room ends the back-and-forth...
+        r.stop_agent();
+        r.tick(at(22_000));
+        assert_eq!(mode_now(&r), (Mode::Always, true), "not quiet long enough");
+        r.tick(at(26_000));
+        assert_eq!(mode_now(&r), (Mode::Named, false));
+
+        // ...and it is back to needing its name.
+        r.on_paragraph("Ryan", &para("p3", "What do you think, Alex?", false));
+        r.tick(at(27_200));
+        assert!(turns.try_recv().is_err(), "not addressed");
+    }
+
+    #[test]
+    fn the_ai_can_stand_down_by_itself() {
+        let (r, turns) = room(Mode::Named);
+        r.on_paragraph("Ryan", &para("p1", "Thanks Vox, that's all.", false));
+        r.tick(quiet(&r));
+        assert!(turns.try_recv().is_ok());
+        assert_eq!(mode_now(&r), (Mode::Always, true));
+
+        assert_eq!(r.wait_until_named(), "named");
+        assert_eq!(mode_now(&r), (Mode::Named, false));
+        r.stop_agent();
+        r.on_paragraph("Ryan", &para("p2", "So where were we, Alex?", false));
+        r.tick(quiet(&r));
+        assert!(turns.try_recv().is_err(), "stood down");
+    }
+
+    #[test]
+    fn a_game_can_require_its_own_mode() {
+        let (r, turns) = room(Mode::Named);
+        let g = r.generation.load(Ordering::SeqCst);
+        r.save_game(
+            g,
+            "Dragon Heist",
+            "A heist.",
+            "Run a heist.",
+            GameSettings {
+                reply: ReplyMode::Always,
+            },
+        )
+        .unwrap();
+        r.enter_game("Dragon Heist");
+        // The game opens by itself, and answers every pause while it is
+        // played -- without anyone having said the AI's name.
+        assert!(turns.try_recv().is_ok(), "the game opens");
+        assert_eq!(mode_now(&r), (Mode::Always, false));
+        assert!(r.lock().game_mode.is_some(), "the buttons are locked");
+        r.stop_agent();
+        r.on_paragraph("Ryan", &para("p1", "I check the door.", false));
+        r.tick(quiet(&r));
+        assert!(turns.try_recv().is_ok(), "no name needed in this game");
+
+        // A quiet room doesn't end what the game requires.
+        r.stop_agent();
+        r.tick(Instant::now() + r.cfg.engaged_for * 2);
+        assert_eq!(mode_now(&r), (Mode::Always, false), "the game still rules");
+        // Nor does the AI standing down.
+        assert_eq!(r.wait_until_named(), "always");
+
+        // Back in the lobby it is the people's mode again.
+        r.lobby();
+        assert_eq!(mode_now(&r), (Mode::Named, false));
+        assert!(r.lock().game_mode.is_none());
+    }
+
+    #[test]
+    fn a_games_mode_is_part_of_what_is_saved() {
+        let (r, _turns) = room(Mode::Named);
+        let g = r.generation.load(Ordering::SeqCst);
+        r.save_game(
+            g,
+            "Quick Draw",
+            "A showdown.",
+            "Run it.",
+            GameSettings {
+                reply: ReplyMode::Always,
+            },
+        )
+        .unwrap();
+        assert_eq!(r.list_games()[0].settings.reply, ReplyMode::Always);
+        assert_eq!(
+            r.read_game("quick draw").unwrap().1.reply,
+            ReplyMode::Always
+        );
+        // Revising keeps whatever it is revised to.
+        r.revise_game(
+            g,
+            "Quick Draw",
+            None,
+            "A showdown.",
+            "Run it.",
+            lobby_game(),
+        )
+        .unwrap();
+        assert_eq!(r.list_games()[0].settings.reply, ReplyMode::Room);
+    }
+
+    /// The cards one person is holding.
+    fn held(r: &Room, person: &str) -> Vec<String> {
+        let st = r.lock();
+        r.cards_for(&st, person)
+            .into_iter()
+            .map(|c| format!("{}: {}", c.title, c.body))
+            .collect()
+    }
+
+    #[test]
+    fn a_card_is_sent_to_one_person_and_to_nobody_else() {
+        let (r, _turns) = room(Mode::Named);
+        let mut events = r.subscribe();
+        assert_eq!(
+            r.send_card("ryan", " Your role ", " You are the traitor. "),
+            Ok("Ryan".into()),
+            "the name is matched ignoring case"
+        );
+
+        // The one event it made is addressed to Ryan, so only Ryan's tabs
+        // are written to -- Alex's socket never sees the body at all.
+        let ev = events.try_recv().expect("one event");
+        assert!(ev.is_for("Ryan") && !ev.is_for("Alex"));
+        assert!(ev.json.contains("You are the traitor."));
+        assert!(events.try_recv().is_err(), "nothing was broadcast");
+
+        assert_eq!(held(&r, "Ryan"), ["Your role: You are the traitor."]);
+        assert!(held(&r, "Alex").is_empty());
+
+        // Only the person holding it can discard it.
+        let id = r.cards_for(&r.lock(), "Ryan")[0].id.clone();
+        r.dismiss_card("Alex", &id);
+        assert_eq!(held(&r, "Ryan").len(), 1, "not Alex's card to discard");
+        r.dismiss_card("Ryan", &id);
+        assert!(held(&r, "Ryan").is_empty());
+    }
+
+    #[test]
+    fn a_card_needs_somebody_to_send_it_to() {
+        let (r, _turns) = room(Mode::Named);
+        let err = r.send_card("Morgan", "Your role", "You are the traitor.");
+        assert!(
+            err.as_ref().is_err_and(|e| e.contains("Alex, Ryan")),
+            "the error names who is here: {err:?}"
+        );
+        assert!(r.send_card("Ryan", "", "nothing titled").is_err());
+        assert!(r.send_card("Ryan", "Empty", "   ").is_err());
+        assert!(r
+            .send_card("Ryan", &"x".repeat(CARD_TITLE_MAX + 1), "body")
+            .is_err());
+        assert!(held(&r, "Ryan").is_empty());
+    }
+
+    #[test]
+    fn cards_belong_to_the_conversation_that_dealt_them() {
+        let (r, _turns) = room(Mode::Named);
+        r.send_card("Ryan", "Your role", "You are the traitor.")
+            .unwrap();
+        r.send_card("Alex", "Your hand", "Two aces.").unwrap();
+        assert_eq!(
+            r.people_here()
+                .iter()
+                .map(|p| (
+                    p["name"].as_str().unwrap().to_string(),
+                    p["cards"].as_u64().unwrap()
+                ))
+                .collect::<Vec<_>>(),
+            [("Alex".to_string(), 1), ("Ryan".to_string(), 1)],
+        );
+        r.new_conversation();
+        assert!(
+            held(&r, "Ryan").is_empty(),
+            "a fresh conversation deals nothing"
+        );
+        assert!(r.hello("Ryan")["cards"].as_array().unwrap().is_empty());
+        // The old conversation's cards are still in the database, for it.
+        r.send_card("Ryan", "Again", "A new secret.").unwrap();
+        assert_eq!(held(&r, "Ryan"), ["Again: A new secret."]);
     }
 }

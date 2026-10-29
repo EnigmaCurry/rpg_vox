@@ -18,7 +18,7 @@ use crossbeam_channel::{Receiver, Sender};
 use serde_json::{json, Value};
 use tracing::{debug, info, warn};
 
-use crate::room::{Role, Room, Turn};
+use crate::room::{GameSettings, ReplyMode, Role, Room, Turn};
 use crate::tts::Voice;
 
 /// The default instructions; `{name}` and `{people}` are filled in.
@@ -42,10 +42,17 @@ the players have confirmed the details, write the game's prompt yourself and \
 save it with save_game. The prompt becomes your complete instructions when the \
 room enters the game, and you won't remember this conversation then, so put \
 everything in it: premise, setting, rules, how to run turns among several \
-players, and how to open. The players never see the prompt, so never read it \
-aloud or describe its secrets; a card with its name and summary appears in \
-the chat. The players run everything by voice: when they ask to play a game, \
-start it with start_game (that ends this conversation, so don't say more \
+players, and how to open. If the game has anything meant for one player \
+alone, say in its prompt how to deal it with send_card. A game also sets \
+reply_mode, which is how the room runs while it is played: \"always\" for a \
+game you deal the turns in, where you answer every pause; \"named\" for one \
+where you only speak when a player calls you; \"room\" (the default) to \
+leave it however the people have the room set. Decide it from how the game \
+actually plays and say which you picked when you propose it. The players never \
+see the prompt, so never read it aloud or describe its secrets; a card with \
+its name and summary appears in the chat. The players run everything by \
+voice: when they ask to play a game, start it with start_game (that ends \
+this conversation, so don't say more \
 than a few words first). When they want a game changed, use read_game and \
 revise_game. When they want one deleted, say which game you mean and call \
 delete_game only after they confirm; it can't be undone. list_games shows \
@@ -54,8 +61,45 @@ to the closest saved one, and ask if it's unclear. Whatever you say \
 before calling a tool is spoken straight away, so after the tool answers, \
 carry on without repeating it.";
 
-/// The system prompt in a game; `{game}` and `{prompt}` (hidden from the
-/// players) are filled in, then `{name}` and `{people}`.
+/// Added to the prompt, in the lobby and in a game: the private cards.
+const CARDS_NOTE: &str = "\
+Everyone has a private area of their own screen that nobody else can see, and \
+send_card puts a card in one person's. Use it for anything meant for one \
+person alone: their secret role, their hand, what only their character \
+notices, a private instruction. Say nothing aloud about what is on a card -- \
+the whole room hears your voice -- but do say that you have sent one when \
+they should go and look, without giving it away. list_people is who is in the \
+room, with the exact name to address a card to and how many cards each is \
+already holding; speech recognition mangles names, so match what you hear to \
+the closest name on that list, and check it there rather than guessing. Cards \
+stay until the person discards one or the conversation starts over.";
+
+/// Added to the prompt, in the lobby and in a game: how the room decides
+/// the AI's turn, and how it bows out.
+const TURN_NOTE: &str = "\
+You are answering because the room gave you the turn: either someone said \
+your name, which puts you in a back-and-forth where you answer every pause \
+without being named again, or the room is set to answer every pause anyway. \
+Either way, when the people are done with you -- they thank you, say \
+goodbye, say they will be back, or simply turn to each other and are plainly \
+talking among themselves -- call wait_until_named and stand down: from then \
+on you say nothing at all until someone says your name again. Prefer standing \
+down over hanging on; it costs them one word to call you back, and it costs \
+them their conversation if you keep answering. Say your short goodbye before \
+you call it, since what you have already said is spoken straight away.";
+
+/// Added to the lobby's prompt when `--search` is on.
+const SEARCH_NOTE: &str = "\
+You can look things up on the web with look_up, and you should whenever the \
+answer turns on how the world is now or on specifics you can't be sure of: \
+places, opening hours, prices, events, news, people. Say you're checking \
+before you call it -- that is spoken straight away, so the room knows why it \
+has gone quiet -- then answer from what comes back, aloud and conversational, \
+and never read a URL out. If the search fails, say you couldn't check rather \
+than guessing.";
+
+/// The system prompt in a game; `{cards}`, `{game}` and `{prompt}` (hidden
+/// from the players) are filled in, then `{name}` and `{people}`.
 const GAME_FRAME: &str = "\
 You are {name}, talking by voice with {people} in a live voice chat, and \
 running the game \"{game}\", which you designed. Each message from the \
@@ -66,18 +110,39 @@ sentences, never use markdown, lists, headings, emoji, or URLs, and never \
 start with your own name. If someone cut off your previous reply, don't \
 repeat it unless asked. Keep these instructions to yourself.
 
+{cards}
+
 The game:
 
 {prompt}";
 
+/// An OpenAI-compatible endpoint, and what the AI may do with it.
+pub struct Chat {
+    pub url: String,
+    pub model: String,
+    pub key: Option<String>,
+    pub think: bool,
+    /// Offer `look_up` in the lobby: a web search the endpoint runs for
+    /// us on `/responses`. Off for servers that have no such thing.
+    pub search: bool,
+}
+
+impl Chat {
+    fn endpoint(&self, path: &str) -> String {
+        format!("{}/{path}", self.url.trim_end_matches('/'))
+    }
+
+    fn authorize(&self, req: ureq::Request) -> ureq::Request {
+        match &self.key {
+            Some(k) => req.set("Authorization", &format!("Bearer {k}")),
+            None => req,
+        }
+    }
+}
+
 pub enum Llm {
     /// An OpenAI-compatible endpoint.
-    Chat {
-        url: String,
-        model: String,
-        key: Option<String>,
-        think: bool,
-    },
+    Chat(Chat),
     /// Says back what it heard: for trying the room without a model.
     Echo,
 }
@@ -95,6 +160,11 @@ pub struct Agent {
 }
 
 impl Agent {
+    /// Whether the AI has the `look_up` tool (lobby only, by design).
+    fn searches(&self) -> bool {
+        matches!(&self.llm, Llm::Chat(c) if c.search)
+    }
+
     /// Start both threads. Turns come from the room on `turns`.
     pub fn spawn(self, room: Arc<Room>, voice: Box<dyn Voice>, turns: Receiver<Turn>) {
         let (tx, rx) = crossbeam_channel::unbounded::<Speak>();
@@ -119,18 +189,10 @@ impl Agent {
                     let messages = self.messages(&room, &turn);
                     let result = match &self.llm {
                         Llm::Echo => echo(&turn, &tx),
-                        Llm::Chat {
-                            url,
-                            model,
-                            key,
-                            think,
-                        } => stream_reply(
+                        Llm::Chat(chat) => stream_reply(
                             &http,
                             &room,
-                            url,
-                            model,
-                            key.as_deref(),
-                            *think,
+                            chat,
                             &messages,
                             turn.game.is_none(),
                             g,
@@ -169,11 +231,17 @@ impl Agent {
         } else {
             people.join(" and ")
         };
+        let search = if self.searches() {
+            format!("\n\n{SEARCH_NOTE}")
+        } else {
+            String::new()
+        };
         let system = match &turn.game {
-            None => format!("{}\n\n{GAMES_NOTE}", self.prompt),
-            Some((game, prompt)) => GAME_FRAME
-                .replace("{game}", game)
-                .replace("{prompt}", prompt),
+            None => format!(
+                "{}\n\n{GAMES_NOTE}\n\n{CARDS_NOTE}\n\n{TURN_NOTE}{search}",
+                self.prompt
+            ),
+            Some((game, prompt)) => game_prompt(game, prompt),
         }
         .replace("{name}", &cfg.agent_name)
         .replace("{people}", &people);
@@ -187,6 +255,15 @@ impl Agent {
         }
         out
     }
+}
+
+/// The whole system prompt for a game: the frame, the notes the AI has
+/// wherever it is, and the game's own hidden instructions.
+fn game_prompt(game: &str, prompt: &str) -> String {
+    GAME_FRAME
+        .replace("{cards}", &format!("{CARDS_NOTE}\n\n{TURN_NOTE}"))
+        .replace("{game}", game)
+        .replace("{prompt}", prompt)
 }
 
 /// The voice thread: synthesize each sentence and hand it to the room.
@@ -261,15 +338,12 @@ static REASONING_OFF: AtomicBool = AtomicBool::new(false);
 static TOOLS_REFUSED: AtomicBool = AtomicBool::new(false);
 
 /// The model, one reply: stream it into sentences, and in the lobby run
-/// the game tools it calls and let it carry on with their results.
+/// the tools it calls and let it carry on with their results.
 #[allow(clippy::too_many_arguments)]
 fn stream_reply(
     http: &ureq::Agent,
     room: &Room,
-    url: &str,
-    model: &str,
-    key: Option<&str>,
-    think: bool,
+    cfg: &Chat,
     messages: &[Value],
     lobby: bool,
     g: u64,
@@ -277,25 +351,24 @@ fn stream_reply(
     generation: &AtomicU64,
     tx: &Sender<Speak>,
 ) -> Result<()> {
-    let chat = format!("{}/chat/completions", url.trim_end_matches('/'));
+    let (model, think) = (cfg.model.as_str(), cfg.think);
+    let chat = cfg.endpoint("chat/completions");
     let mut messages = messages.to_vec();
     let mut kwargs = true;
-    let mut tools = lobby;
+    // The cards are offered in a game too; the game tools are the lobby's.
+    let mut tools = true;
     let mut first = true;
     // What this reply has said, across tool rounds.
     let mut spoken: Vec<Vec<String>> = Vec::new();
     for round in 0..=TOOL_ROUNDS {
         let resp = loop {
-            let mut req = http.post(&chat);
-            if let Some(k) = key {
-                req = req.set("Authorization", &format!("Bearer {k}"));
-            }
+            let req = cfg.authorize(http.post(&chat));
             let mut body = json!({ "model": model, "messages": messages, "stream": true });
             if kwargs {
                 body["chat_template_kwargs"] = json!({ "enable_thinking": think });
             }
             if tools && round < TOOL_ROUNDS {
-                body["tools"] = game_tools();
+                body["tools"] = tools_for(lobby, cfg.search);
                 if REASONING_OFF.load(Ordering::Relaxed) {
                     body["reasoning_effort"] = json!("none");
                 }
@@ -318,10 +391,10 @@ fn stream_reply(
                         continue;
                     }
                     if code == 400 && tools && detail.contains("tool") {
-                        warn!("{chat} refuses tools, so games can't be saved: {detail}");
+                        warn!("{chat} refuses tools, so games and cards won't work: {detail}");
                         if !TOOLS_REFUSED.swap(true, Ordering::Relaxed) {
                             room.error(&format!(
-                                "{model} won't take tools here, so games can't be saved: {}",
+                                "{model} won't take tools here, so games and cards won't work: {}",
                                 error_message(&detail)
                             ));
                         }
@@ -422,7 +495,7 @@ fn stream_reply(
         }));
         let spoke = !spoken.is_empty();
         for (i, c) in calls.iter().enumerate() {
-            let mut result = run_tool(room, g, c);
+            let mut result = run_tool(room, cfg, g, c);
             info!(g, tool = c.name, %result, "reply: tool");
             if answered {
                 continue;
@@ -479,29 +552,90 @@ fn error_message(detail: &str) -> String {
         .unwrap_or_else(|| detail.chars().take(300).collect())
 }
 
-/// The tools the model has in the lobby, for designing games.
-fn game_tools() -> Value {
+/// How long to wait for a web search before giving up on it. Long enough
+/// for a real search, short enough that the room isn't silent for ever.
+const SEARCH_TIMEOUT: Duration = Duration::from_secs(30);
+/// Cap the answer: it gets read aloud, and the model has to speak it.
+const SEARCH_TOKENS: u32 = 700;
+
+/// A function tool, as the endpoint wants it.
+fn tool(n: &str, d: &str, props: Value, required: &[&str]) -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": n,
+            "description": d,
+            "parameters": { "type": "object", "properties": props, "required": required },
+        }
+    })
+}
+
+/// The tools the model has everywhere: who is here, the cards it can deal
+/// them one at a time, and standing down.
+fn room_tools() -> Vec<Value> {
+    vec![
+        tool(
+            "list_people",
+            "List everyone in the room: their exact name, whether they have the \
+             room open, whether their microphone is open, and how many cards \
+             they are holding. Use it to get a name right before sending a \
+             card.",
+            json!({}),
+            &[],
+        ),
+        tool(
+            "send_card",
+            "Put a card in one person's private area of the screen, which only \
+             they can see. Use it for anything meant for them alone -- a secret \
+             role, a hand, what only their character notices, a private \
+             instruction -- and never say aloud what is on it. One person per \
+             card: to tell two people different things, send two cards.",
+            json!({
+                "to": { "type": "string", "description": "Exactly the name list_people gives for that person." },
+                "title": { "type": "string", "description": "A few words naming the card, e.g. \"Your role\" or \"What you notice\"." },
+                "body": { "type": "string", "description": "What that person alone is to read. Written to be read, not spoken." },
+            }),
+            &["to", "title", "body"],
+        ),
+        tool(
+            "wait_until_named",
+            "Stop answering, and say nothing at all until someone says your \
+             name again. Call it when the people are done talking to you -- \
+             they thank you, say goodbye, or turn to talking among themselves \
+             -- so that you don't answer a conversation that isn't yours.",
+            json!({}),
+            &[],
+        ),
+    ]
+}
+
+/// The `reply_mode` a game is saved with.
+fn reply_mode_arg() -> Value {
+    json!({
+        "type": "string",
+        "enum": ["room", "always", "named"],
+        "description": "How the room runs while this game is played: \"always\" (you answer every pause, for a game you deal the turns in), \"named\" (you speak only when a player says your name), or \"room\" (leave it however the people have it set). Defaults to \"room\".",
+    })
+}
+
+/// Everything the model may do this turn: the cards anywhere, and in the
+/// lobby designing games and looking things up when `search` is on.
+fn tools_for(lobby: bool, search: bool) -> Value {
     let name =
         json!({ "type": "string", "description": "The game's name, as the players will see it." });
-    let tool = |n: &str, d: &str, props: Value, required: &[&str]| {
-        json!({
-            "type": "function",
-            "function": {
-                "name": n,
-                "description": d,
-                "parameters": { "type": "object", "properties": props, "required": required },
-            }
-        })
-    };
+    if !lobby {
+        return Value::Array(room_tools());
+    }
     let game = json!({
         "name": name,
         "summary": { "type": "string", "description": "One or two sentences the players see on the game's button." },
         "prompt": { "type": "string", "description": "Your complete hidden instructions for running the game." },
+        "reply_mode": reply_mode_arg(),
     });
     let mut revise = game.clone();
     revise["new_name"] =
         json!({ "type": "string", "description": "A new name, if the game is being renamed." });
-    json!([
+    let mut tools = json!([
         tool("list_games", "List the saved games: name, summary, and whether they have been played (and so are fixed).", json!({}), &[]),
         tool("check_game_name", "Check whether a name is free for a new game.", json!({ "name": name }), &["name"]),
         tool("save_game", "Save a new game once the players have confirmed it. Its button appears in the chat.", game, &["name", "summary", "prompt"]),
@@ -509,39 +643,158 @@ fn game_tools() -> Value {
         tool("revise_game", "Replace a saved game with a revised version; its card in the chat is replaced by a new one.", revise, &["name", "summary", "prompt"]),
         tool("start_game", "Start playing a saved game: everyone moves into a fresh conversation run by its prompt.", json!({ "name": name }), &["name"]),
         tool("delete_game", "Delete a saved game for good, once the players have confirmed which one.", json!({ "name": name }), &["name"]),
-    ])
+    ]);
+    tools
+        .as_array_mut()
+        .expect("tools is an array")
+        .extend(room_tools());
+    if search {
+        tools.as_array_mut().expect("tools is an array").push(tool(
+            "look_up",
+            "Search the web and answer one question from what it finds. Use it \
+             whenever the answer depends on the world as it is now or on \
+             specifics you can't be sure of -- places, opening hours, prices, \
+             events, news, people, anything recent. Prefer it over guessing. \
+             Ask one plain question, with the place or date in it.",
+            json!({ "question": {
+                "type": "string",
+                "description": "The question, in full, as you would ask a person: \"good restaurants in Boulder, Colorado\".",
+            }}),
+            &["question"],
+        ));
+    }
+    tools
+}
+
+/// Answer one question with a web search, letting the endpoint do the
+/// searching (OpenAI's `/responses` with its hosted `web_search` tool).
+/// Not streamed: the model is waiting on the result, and the room shows
+/// it as thinking until it comes back.
+fn look_up(cfg: &Chat, question: &str) -> Result<String> {
+    // Not the shared agent: that one waits 120s for the model to stream,
+    // and a search that hung for 120s would leave the room silent.
+    let http = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(10))
+        .timeout(SEARCH_TIMEOUT)
+        .build();
+    let url = cfg.endpoint("responses");
+    let body = json!({
+        "model": cfg.model,
+        "input": question,
+        "tools": [{ "type": "web_search" }],
+        "max_output_tokens": SEARCH_TOKENS,
+    });
+    let resp = match cfg.authorize(http.post(&url)).send_json(body) {
+        Ok(r) => r,
+        Err(ureq::Error::Status(code, r)) => {
+            let detail = r.into_string().unwrap_or_default();
+            bail!(
+                "{url}: HTTP {code}: {}",
+                detail.chars().take(200).collect::<String>()
+            );
+        }
+        Err(e) => return Err(e).with_context(|| format!("POST {url}")),
+    };
+    let v: Value = resp.into_json().context("read the search result")?;
+    let text = search_text(&v);
+    if text.trim().is_empty() {
+        bail!("the search came back empty");
+    }
+    Ok(text)
+}
+
+/// The answer out of a `/responses` body: the `output_text` of its
+/// message items, and nothing else.
+///
+/// `/responses` returns a list of output items -- `reasoning`,
+/// `web_search_call`, `message`. Only the message is the answer. The
+/// reasoning item carries a `content` array of its own, empty in
+/// practice but not by contract, and whatever the model thought on its
+/// way to an answer must never reach the voice.
+fn search_text(v: &Value) -> String {
+    v["output"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter(|i| i["type"] == "message")
+                .flat_map(|i| i["content"].as_array().into_iter().flatten())
+                .filter(|c| c["type"] == "output_text")
+                .filter_map(|c| c["text"].as_str())
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default()
 }
 
 /// Run one tool call; the result is JSON for the model.
-fn run_tool(room: &Room, g: u64, call: &ToolCall) -> String {
+fn run_tool(room: &Room, cfg: &Chat, g: u64, call: &ToolCall) -> String {
     let args: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
     let arg = |k: &str| args[k].as_str().unwrap_or("").to_string();
+    // An unknown reply_mode would quietly become the default, so say so.
+    let settings = || match args["reply_mode"].as_str() {
+        None => Ok(GameSettings::default()),
+        Some(m) => match ReplyMode::parse(m) {
+            Some(reply) => Ok(GameSettings { reply }),
+            None => Err(format!(
+                "reply_mode is \"room\", \"always\" or \"named\", not {m:?}"
+            )),
+        },
+    };
     let result = match call.name.as_str() {
         "list_games" => Ok(json!({ "games": room.list_games() })),
         "check_game_name" => room
             .check_game_name(&arg("name"))
             .map(|()| json!({ "free": true })),
-        "save_game" => room
-            .save_game(g, &arg("name"), &arg("summary"), &arg("prompt"))
-            .map(|()| json!({ "saved": arg("name").trim() })),
-        "read_game" => room
-            .read_game(&arg("name"))
-            .map(|(summary, prompt)| json!({ "summary": summary, "prompt": prompt })),
-        "revise_game" => room
-            .revise_game(
+        "save_game" => settings().and_then(|s| {
+            room.save_game(g, &arg("name"), &arg("summary"), &arg("prompt"), s)
+                .map(|()| json!({ "saved": arg("name").trim() }))
+        }),
+        "read_game" => room.read_game(&arg("name")).map(|(summary, s, prompt)| {
+            json!({ "summary": summary, "reply_mode": s.reply.as_str(), "prompt": prompt })
+        }),
+        "revise_game" => settings().and_then(|s| {
+            room.revise_game(
                 g,
                 &arg("name"),
                 args["new_name"].as_str(),
                 &arg("summary"),
                 &arg("prompt"),
+                s,
             )
-            .map(|name| json!({ "saved": name })),
+            .map(|name| json!({ "saved": name }))
+        }),
         "start_game" => room
             .start_game(g, &arg("name"))
             .map(|name| json!({ "started": name })),
         "delete_game" => room
             .remove_game(g, &arg("name"))
             .map(|name| json!({ "deleted": name })),
+        "list_people" => Ok(json!({ "people": room.people_here() })),
+        "wait_until_named" => {
+            // What the room is doing afterwards: a game that answers at
+            // every pause still does, and the model should know.
+            let mode = room.wait_until_named();
+            Ok(json!({ "answering": mode }))
+        }
+        "send_card" => room
+            .send_card(&arg("to"), &arg("title"), &arg("body"))
+            .map(|to| json!({ "sent": true, "to": to })),
+        "look_up" => {
+            let question = arg("question");
+            info!(g, %question, "reply: looking it up");
+            match look_up(cfg, &question) {
+                Ok(answer) => Ok(json!({ "answer": answer })),
+                Err(err) => {
+                    // The model is told, so it can say it couldn't check
+                    // rather than inventing an answer.
+                    warn!(g, "look_up failed: {err:#}");
+                    Err(format!(
+                        "the search failed ({err}); say you couldn't look it up, and don't guess"
+                    ))
+                }
+            }
+        }
         other => Err(format!("there is no tool called {other:?}")),
     };
     match result {
@@ -703,6 +956,85 @@ mod tests {
             .collect();
         assert_eq!(said.len(), 5, "{said:?}");
         assert_eq!(said[2], "Sure.", "short sentences may recur");
+    }
+
+    fn tool_names(lobby: bool, search: bool) -> Vec<String> {
+        tools_for(lobby, search)
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn look_up_is_offered_only_when_search_is_on() {
+        let without = tool_names(true, false);
+        assert!(without.contains(&"save_game".to_string()));
+        assert!(!without.contains(&"look_up".to_string()));
+
+        let with = tool_names(true, true);
+        // The game and card tools are untouched; look_up is added to them.
+        assert_eq!(with.len(), without.len() + 1);
+        assert_eq!(&with[..without.len()], &without[..]);
+        assert_eq!(with.last().unwrap(), "look_up");
+    }
+
+    #[test]
+    fn the_room_tools_are_offered_in_a_game_and_the_game_tools_are_not() {
+        let in_game = tool_names(false, true);
+        assert_eq!(in_game, ["list_people", "send_card", "wait_until_named"]);
+        // In the lobby they are there as well, alongside the games.
+        let lobby = tool_names(true, false);
+        for t in &in_game {
+            assert!(lobby.contains(t), "{t} is missing from the lobby");
+        }
+        assert!(lobby.contains(&"save_game".to_string()));
+    }
+
+    #[test]
+    fn a_game_is_told_about_the_cards_without_being_told_about_games() {
+        let frame = game_prompt("Dragon Heist", "Run a heist.");
+        assert!(frame.contains("send_card"));
+        assert!(frame.contains("list_people"));
+        assert!(frame.contains("wait_until_named"));
+        assert!(!frame.contains("{cards}"));
+        assert!(!frame.contains("save_game"));
+    }
+
+    /// The shape a real /responses search comes back in (field names and
+    /// item order captured from the live endpoint).
+    #[test]
+    fn a_search_answer_is_the_message_and_never_the_reasoning() {
+        let body = json!({
+            "status": "completed",
+            "output": [
+                {
+                    "type": "reasoning",
+                    "summary": [],
+                    // Empty from the live endpoint, but not by contract:
+                    // if it ever fills, it must not be spoken.
+                    "content": [{ "type": "reasoning_text", "text": "they probably mean the city" }],
+                },
+                { "type": "web_search_call", "status": "completed" },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "Gaia Masala and Burger is well liked in Boulder.",
+                        "annotations": [{ "type": "url_citation", "url": "https://example.com" }],
+                    }],
+                },
+            ],
+        });
+        assert_eq!(
+            search_text(&body),
+            "Gaia Masala and Burger is well liked in Boulder."
+        );
+        // Nothing to say is an error upstream, not an empty reply.
+        assert_eq!(search_text(&json!({ "output": [] })), "");
+        assert_eq!(search_text(&json!({ "error": { "message": "nope" } })), "");
     }
 
     #[test]

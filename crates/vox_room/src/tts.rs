@@ -27,16 +27,29 @@ pub struct Qwen3 {
     voice: String,
     instruct: String,
     language: String,
+    /// Bearer token, for a server that is not wide open.
+    key: Option<String>,
+    /// Named in the request only when the server serves more than one.
+    model: Option<String>,
     http: ureq::Agent,
 }
 
 impl Qwen3 {
-    pub fn new(url: &str, voice: &str, instruct: &str, language: &str) -> Self {
+    pub fn new(
+        url: &str,
+        voice: &str,
+        instruct: &str,
+        language: &str,
+        key: Option<String>,
+        model: Option<String>,
+    ) -> Self {
         Self {
             url: url.trim_end_matches('/').to_string(),
             voice: voice.to_string(),
             instruct: instruct.to_string(),
             language: language.to_string(),
+            key,
+            model,
             http: ureq::AgentBuilder::new()
                 .timeout(Duration::from_secs(60))
                 .build(),
@@ -55,8 +68,15 @@ impl Voice for Qwen3 {
         if !self.instruct.is_empty() {
             body["instructions"] = self.instruct.clone().into();
         }
+        if let Some(model) = &self.model {
+            body["model"] = model.clone().into();
+        }
         let url = format!("{}/v1/audio/speech", self.url);
-        let resp = match self.http.post(&url).send_json(body) {
+        let mut req = self.http.post(&url);
+        if let Some(key) = &self.key {
+            req = req.set("Authorization", &format!("Bearer {key}"));
+        }
+        let resp = match req.send_json(body) {
             Ok(r) => r,
             Err(ureq::Error::Status(code, r)) => {
                 let detail = r.into_string().unwrap_or_default();

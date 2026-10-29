@@ -48,12 +48,37 @@ Proxy everything, including WebSocket upgrades on `/room.ws`. The invite
 link sets a cookie and goes to the room; `vox_room uninvite NAME` revokes
 it and `vox_room people` lists everyone.
 
+### In Docker
+
+`docker/` has a compose deployment behind Traefik, with the labels
+interpolated from `docker/.env` and the speech-to-text models downloaded
+into a volume on first start:
+
+```bash
+cd docker
+just config                    # asks about each setting, writes .env
+just install
+just room-invite Alex
+```
+
+See ROOM_DOCKER.md.
+
 ## In the room
 
 - **When named / After every pause** (top right, shared by everyone): by
   default the AI only answers when someone says its name, so two people
   can talk to each other without it butting in. "After every pause"
   makes it answer whenever the room goes quiet.
+- **The back-and-forth**: saying its name doesn't buy you one answer, it
+  starts a conversation. From then on the AI answers every pause without
+  being named again — the button moves to "After every pause" with a dot
+  beside it — until the room has been idle for 30 seconds
+  (`--engaged-for-ms`), when it goes back to waiting for its name. You can
+  also end it in words: "thanks", "goodbye", "that's all", or just turning
+  to talk to someone else, and the AI stands down by itself with its
+  `wait_until_named` tool. Only the mode you pick with the buttons is
+  remembered; a back-and-forth is never stored, so a restart comes back to
+  what you chose.
 - **Interrupting**: start talking while it speaks. It drops in volume at
   once and stops for good once your speech is confirmed (300 ms of voice
   or the first recognised word), so a cough only dips it. **Stop** does
@@ -82,10 +107,52 @@ itself, rewrites it, and replaces the card; ask it to delete one and it
 checks which game you mean before deleting. Inside a game the AI only
 plays it: go back to the lobby to change games.
 
+A game also carries settings, not just a prompt. Today that is
+`reply_mode`, how the room is run while the game is played:
+
+| `reply_mode` | |
+|---|---|
+| `room` (default) | however the people have the room set, back-and-forth and all |
+| `always` | the AI answers every pause: for a game where it deals the turns |
+| `named` | the AI speaks only when a player says its name |
+
+The AI picks one as it designs the game and can be told which you want.
+A game that sets either of the last two shows it as a tag in the games
+list, and while it is being played the mode buttons are locked to it;
+going back to the lobby restores the mode you chose.
+
 The **Games** list (right) plays any saved game from the start,
 deletes it, or lets you **Peek** at its prompt (shown only to you). **Back to lobby** leaves a game; **Restart game** starts it
 over. Saving needs a model with tool calling (llama.cpp needs `--jinja`);
 without it the AI can talk about games but not save them.
+
+### Cards, just for you
+
+Each person has a private area at the top of the sidebar, **Just for
+you**, that is on nobody else's screen. The AI deals cards into it: a
+secret role, a hand, what only your character notices, an instruction
+meant for you alone. It has two tools for this, in the lobby and in a
+game alike:
+
+- `list_people` — everyone on the roster, with the exact name to address
+  a card to, whether they are here with a mic open, and how many cards
+  they are already holding.
+- `send_card` — a title and a body, to one person.
+
+It has one more tool everywhere, `wait_until_named`, which is how it ends
+a back-and-forth by itself (above).
+
+Nothing about a card is broadcast. The server tags the event with the one
+person it is for and writes it only to their own sockets, so another
+browser never receives the text at all — the secrecy doesn't depend on
+the page hiding anything. A card is silent, so the AI is told to say that
+it sent one without saying what is on it ("Ryan, take a look at your
+card"), and the sender's own voice is heard by the whole room, so it
+never reads one aloud.
+
+Cards belong to the conversation they were dealt in: **New conversation**,
+**Restart game** and moving between the lobby and a game all clear
+everyone's private area. A player can discard one with the **×** on it.
 
 ## How it works
 
@@ -123,6 +190,7 @@ without it the AI can talk about games but not save them.
 | `VOX_ROOM_AGENT_ALIASES` | | other spellings that count as its name, comma-separated (what speech-to-text hears, e.g. `box,fox`) |
 | `VOX_ROOM_REPLY_AFTER_MS` | `1200` | quiet before what was said is handed over |
 | `VOX_ROOM_CONFIRM_MS` | `300` | continuous speech that cuts the AI off |
+| `VOX_ROOM_ENGAGED_FOR_MS` | `30000` | idle time that ends a back-and-forth and goes back to "when named" |
 | `VOX_ROOM_HISTORY` | `60` | entries of the conversation sent to the model |
 | `VOX_SCRIBE_LLM_URL`, `VOX_SCRIBE_LLM_MODEL`, `VOX_SCRIBE_LLM_KEY` | as for scribe and `agent` | the model |
 | `VOX_ROOM_PROMPT`, `VOX_ROOM_PROMPT_FILE` | a short one for spoken group chat | system prompt; `{name}` and `{people}` are filled in |

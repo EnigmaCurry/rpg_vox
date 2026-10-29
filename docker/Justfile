@@ -1,0 +1,177 @@
+# vox_room in Docker behind Traefik. See ROOM_DOCKER.md.
+#
+#   just config      # answer questions, writes .env
+#   just install     # build and start
+#   just logs -f     # the first start downloads the speech-to-text models
+#   just room-invite Ryan
+
+_default:
+    @just --list --unsorted
+
+# Ask about each setting and write .env. Safe to re-run.
+config:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    template=.env.example
+    out=.env
+    tmp="$(mktemp)"
+    trap 'rm -f "$tmp"' EXIT
+
+    if [[ -f $out ]]; then
+        echo "Editing $out. Press enter to keep each value in [brackets]."
+    else
+        echo "Writing a new $out. Press enter to take each default in [brackets]."
+    fi
+    echo
+
+    # .env.example is the source of truth for the keys, their order, the
+    # defaults and the help text. Comments pass through untouched, and so
+    # do commented-out keys: blank is not the same as unset (see
+    # ROOM_DOCKER.md), so a key is either answered or left commented out.
+    help=""
+    declare -A answers=()
+    while IFS= read -r line <&3; do
+        if [[ $line =~ ^[A-Z][A-Z0-9_]*= ]]; then
+            key=${line%%=*}
+            default=${line#*=}
+            # What .env says now wins over the template's default.
+            if [[ -f $out ]]; then
+                current=$(sed -n "s/^${key}=//p" "$out" | tail -1)
+                [[ -n $current ]] && default=$current
+            fi
+            # A default may refer to keys already answered, e.g.
+            # VOX_ROOM_URL=https://${VOX_ROOM_TRAEFIK_HOST}:${VOX_ROOM_PUBLIC_PORT}
+            while [[ $default =~ \$\{([A-Z][A-Z0-9_]*)\} ]]; do
+                ref=${BASH_REMATCH[1]}
+                default=${default//"${BASH_REMATCH[0]}"/${answers[$ref]-}}
+            done
+            [[ -n $help ]] && printf '%s' "$help"
+            if [[ $key == *_KEY || $key == *_TOKEN || $key == *_PASSWORD ]]; then
+                # Don't echo a secret back at them.
+                [[ -n $default ]] && hint=unchanged || hint=blank
+                printf '%s [%s]: ' "$key" "$hint"
+            else
+                printf '%s [%s]: ' "$key" "$default"
+            fi
+            IFS= read -r answer || true
+            [[ -z $answer ]] && answer=$default
+            answers[$key]=$answer
+            printf '%s=%s\n' "$key" "$answer" >> "$tmp"
+            echo
+            help=""
+        elif [[ -z $line ]]; then
+            printf '\n' >> "$tmp"
+            help=""
+        else
+            printf '%s\n' "$line" >> "$tmp"
+            # A run of ## lines is the help for the key that follows.
+            [[ $line == \#\#* ]] && help+="${line#\#\# }"$'\n'
+        fi
+    done 3< "$template"
+
+    cp "$tmp" "$out"
+    echo "wrote $out"
+    if docker compose config --quiet 2>/dev/null; then
+        echo "compose config is valid; \`just install\` to bring the room up"
+    else
+        echo
+        echo "compose still won't interpolate -- what it objects to:" >&2
+        docker compose config --quiet || true
+        exit 1
+    fi
+
+# Build the image and start the room; nothing if it is already up.
+install:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    [[ -f .env ]] || { echo "no .env yet: run \`just config\` first" >&2; exit 1; }
+    if [[ -n "$(docker compose ps --quiet --status running)" ]]; then
+        echo "already running; \`just reinstall\` to recreate it"
+        exit 0
+    fi
+    if [[ -n "$(docker compose ps --all --quiet)" ]]; then
+        echo "the containers exist but are stopped; starting them"
+        exec docker compose start
+    fi
+    docker compose up --detach --build
+    echo
+    echo "The first start downloads the speech-to-text models (minutes)."
+    echo "Watch it with \`just logs -f\`, then \`just room-invite NAME\`."
+
+# Throw the containers away and build them again, keeping the volumes.
+reinstall:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    [[ -f .env ]] || { echo "no .env yet: run \`just config\` first" >&2; exit 1; }
+    docker compose down --remove-orphans
+    docker compose up --detach --build
+    echo "recreated; the data and models volumes were left alone"
+
+# Destroy the containers AND the volumes. Asks first.
+destroy:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Cleaning up shouldn't depend on a .env still being there. These are
+    # only ever read by the Traefik labels, which no longer matter.
+    if [[ ! -f .env ]]; then
+        export VOX_ROOM_TRAEFIK_HOST=unset VOX_ROOM_URL=unset
+    fi
+    echo "This deletes the room's volumes for good:"
+    echo "  data   - every invite, the whole conversation log, the saved games"
+    echo "  models - the downloaded speech-to-text models (re-downloaded next install)"
+    echo
+    printf 'Type "yes" to destroy them: '
+    IFS= read -r answer || true
+    if [[ $answer != yes ]]; then
+        echo "left alone"
+        exit 0
+    fi
+    docker compose down --volumes --remove-orphans
+    echo "destroyed"
+
+# Print the container's logs. `just logs -f` follows them.
+logs *ARGS:
+    @docker compose logs {{ARGS}}
+
+# What exists, what is running, and which volumes are there.
+status:
+    @docker compose ps --all
+    @echo
+    @docker volume ls --filter label=com.docker.compose.project=vox_room \
+        --quiet | sed 's/^/volume: /'
+
+# Start the room again after `just stop`.
+start:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ -z "$(docker compose ps --all --quiet)" ]]; then
+        echo "nothing to start: run \`just install\` first" >&2
+        exit 1
+    fi
+    docker compose start
+
+# Stop the room, leaving the containers and the volumes in place.
+stop:
+    @docker compose stop
+
+# A shell in the running container. `just shell -u root` goes in as root.
+shell *ARGS:
+    docker compose exec {{ARGS}} vox_room bash
+
+# --- the room's own CLI, inside the running container ---
+
+# Print the invite link for NAME, making one if needed.
+room-invite NAME:
+    @docker compose exec vox_room vox_room invite "{{NAME}}"
+
+# Revoke NAME's invite link.
+room-uninvite NAME:
+    @docker compose exec vox_room vox_room uninvite "{{NAME}}"
+
+# List everyone invited, with their links.
+room-people:
+    @docker compose exec vox_room vox_room people
+
+# The fully interpolated compose file, Traefik labels and all.
+show-config:
+    @docker compose config

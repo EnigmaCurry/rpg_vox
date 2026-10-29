@@ -9,7 +9,13 @@ export const room = $state({
   denied: false,
   you: null,
   agent: { name: 'AI', state: 'listening', strip: '@agent' },
+  // How the AI takes its turn. `mode` is what the room is actually doing;
+  // `engaged` is true while a back-and-forth (started by saying its name)
+  // has it answering every pause, and `locked` while the game being
+  // played requires the mode and the buttons can't change it.
   mode: 'named',
+  engaged: false,
+  locked: false,
   people: [],
   strips: {},
   levels: {},
@@ -22,9 +28,14 @@ export const room = $state({
   asking: null,
   // A game's prompt this person asked to see: { name, summary, prompt }.
   peek: null,
+  // Cards the AI dealt to you alone: { id, to, title, body, at }. The
+  // server only ever sends these to your own tabs.
+  cards: [],
   audio: 'off', // off | starting | on | error
   audioError: null,
   mic: false,
+  // What the browser calls the mic in use, e.g. "Jabra SPEAK 410".
+  micName: null,
   muted: false,
   volume: 1,
   // Push to talk: the mic stays muted except while Space (or the talk
@@ -118,6 +129,19 @@ export async function enterGame(name) {
   }
 }
 
+/// Discard one of your own cards.
+export function discardCard(id) {
+  room.cards = room.cards.filter((c) => c.id !== id);
+  command({ type: 'discard_card', id });
+}
+
+/// Show a message in the footer for a while.
+function notify(text, error = false) {
+  room.notice = { text, error };
+  clearTimeout(noticeTimer);
+  if (!error) noticeTimer = setTimeout(() => (room.notice = null), 8000);
+}
+
 function upsert(entry) {
   const i = room.log.findIndex((e) => e.id === entry.id);
   if (i >= 0) room.log[i] = entry;
@@ -133,11 +157,14 @@ function apply(ev) {
       room.you = ev.you;
       room.agent = ev.agent;
       room.mode = ev.mode;
+      room.engaged = ev.engaged ?? false;
+      room.locked = ev.locked ?? false;
       room.people = ev.people;
       room.strips = ev.strips;
       room.log = ev.log;
       room.game = ev.game ?? null;
       room.games = ev.games ?? [];
+      room.cards = ev.cards ?? [];
       break;
     case 'people':
       room.people = ev.people;
@@ -151,6 +178,19 @@ function apply(ev) {
     case 'reset':
       room.log = ev.log;
       room.game = ev.game ?? null;
+      // Cards belong to the conversation that dealt them.
+      room.cards = ev.cards ?? [];
+      break;
+    case 'card': {
+      // Only this person's tabs are sent it; say so, without the contents.
+      const i = room.cards.findIndex((c) => c.id === ev.card.id);
+      if (i >= 0) room.cards[i] = ev.card;
+      else room.cards.push(ev.card);
+      notify(`${room.agent.name} sent you a card: ${ev.card.title}`);
+      break;
+    }
+    case 'card_removed':
+      room.cards = room.cards.filter((c) => c.id !== ev.id);
       break;
     case 'games':
       room.games = ev.games;
@@ -160,6 +200,8 @@ function apply(ev) {
       break;
     case 'mode':
       room.mode = ev.mode;
+      room.engaged = ev.engaged ?? false;
+      room.locked = ev.locked ?? false;
       break;
     case 'strips':
       room.strips = ev.strips;
@@ -171,9 +213,7 @@ function apply(ev) {
       // Errors stay until dismissed; anything else fades.
       if (ev.level === 'error') console.error('[room]', ev.text);
       else console.info('[room]', ev.text);
-      room.notice = { text: ev.text, error: ev.level === 'error' };
-      clearTimeout(noticeTimer);
-      if (!room.notice.error) noticeTimer = setTimeout(() => (room.notice = null), 8000);
+      notify(ev.text, ev.level === 'error');
       break;
   }
 }
@@ -194,6 +234,7 @@ export async function joinAudio() {
     room.audio = 'on';
     hearTimer = setInterval(() => (room.hearing = audio?.takeHeard() ?? 0), 100);
     await audio.startMic();
+    room.micName = await audio.micName();
     if (room.pushToTalk) setMuted(true);
     audio.muted = room.muted;
     room.mic = true;
@@ -218,6 +259,7 @@ export async function leaveAudio() {
   removeEventListener('keydown', resumeAudio);
   command({ type: 'mic', on: false });
   room.mic = false;
+  room.micName = null;
   clearInterval(hearTimer);
   room.hearing = 0;
   await audio?.stop();

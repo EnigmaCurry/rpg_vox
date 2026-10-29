@@ -4,8 +4,9 @@
 //! people(name, token)
 //! entries(conversation, id, who, kind, text, cut, at)
 //! settings(key, value)
-//! games(name, summary, prompt, created, played)  -- names unique, ignoring case
+//! games(name, summary, prompt, settings, created, played)  -- names unique, ignoring case
 //! conversations(id, game)                 -- no row: the lobby
+//! cards(conversation, id, who, title, body, at)  -- one person's private cards
 //! ```
 //!
 //! Only finished entries are written: a person's paragraph once it has
@@ -17,7 +18,7 @@ use std::path::Path;
 use anyhow::{Context as _, Result};
 use rusqlite::{params, Connection, OptionalExtension as _};
 
-use crate::room::{Entry, Kind};
+use crate::room::{Card, Entry, GameSettings, Kind};
 
 pub struct Store {
     db: Connection,
@@ -48,11 +49,24 @@ CREATE TABLE IF NOT EXISTS games (
     prompt  TEXT NOT NULL,
     created INTEGER NOT NULL,
     -- Entered at least once: from then on the game is fixed.
-    played  INTEGER NOT NULL DEFAULT 0
+    played  INTEGER NOT NULL DEFAULT 0,
+    -- The game's own settings, as JSON; see room::GameSettings.
+    settings TEXT NOT NULL DEFAULT '{}'
 );
 CREATE TABLE IF NOT EXISTS conversations (
     id   INTEGER PRIMARY KEY,
     game TEXT NOT NULL
+);
+-- A card the AI dealt to one person. Only they are ever sent it, and it
+-- belongs to the conversation it was dealt in.
+CREATE TABLE IF NOT EXISTS cards (
+    conversation INTEGER NOT NULL,
+    id    TEXT NOT NULL,
+    who   TEXT NOT NULL,
+    title TEXT NOT NULL,
+    body  TEXT NOT NULL,
+    at    INTEGER NOT NULL,
+    PRIMARY KEY (conversation, id)
 );
 ";
 
@@ -65,6 +79,9 @@ pub struct Game {
     pub created: u64,
     /// Entered at least once, and so fixed.
     pub played: bool,
+    /// How the game wants the room run. Unlike the prompt, the browsers
+    /// see this: it is the room's behaviour, not the game's secrets.
+    pub settings: GameSettings,
 }
 
 impl Store {
@@ -74,6 +91,7 @@ impl Store {
         }
         let db = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
         db.execute_batch(SCHEMA)?;
+        migrate(&db)?;
         Ok(Self { db })
     }
 
@@ -81,6 +99,7 @@ impl Store {
     pub fn memory() -> Self {
         let db = Connection::open_in_memory().unwrap();
         db.execute_batch(SCHEMA).unwrap();
+        migrate(&db).unwrap();
         Self { db }
     }
 
@@ -181,9 +200,9 @@ impl Store {
 
     /// Every saved game, newest first.
     pub fn games(&self) -> Result<Vec<Game>> {
-        let mut q = self
-            .db
-            .prepare("SELECT name, summary, created, played FROM games ORDER BY created DESC")?;
+        let mut q = self.db.prepare(
+            "SELECT name, summary, created, played, settings FROM games ORDER BY created DESC",
+        )?;
         let rows = q.query_map([], game_row)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
@@ -193,9 +212,9 @@ impl Store {
         Ok(self
             .db
             .query_row(
-                "SELECT name, summary, created, played, prompt FROM games WHERE name = ?1",
+                "SELECT name, summary, created, played, settings, prompt FROM games WHERE name = ?1",
                 [name],
-                |r| Ok((game_row(r)?, r.get(4)?)),
+                |r| Ok((game_row(r)?, r.get(5)?)),
             )
             .optional()?)
     }
@@ -215,10 +234,18 @@ impl Store {
     }
 
     /// Save a game; false when the name (ignoring case) is taken.
-    pub fn save_game(&self, name: &str, summary: &str, prompt: &str, created: u64) -> Result<bool> {
+    pub fn save_game(
+        &self,
+        name: &str,
+        summary: &str,
+        prompt: &str,
+        settings: &GameSettings,
+        created: u64,
+    ) -> Result<bool> {
         Ok(self.db.execute(
-            "INSERT OR IGNORE INTO games (name, summary, prompt, created) VALUES (?1, ?2, ?3, ?4)",
-            params![name, summary, prompt, created as i64],
+            "INSERT OR IGNORE INTO games (name, summary, prompt, settings, created)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![name, summary, prompt, json(settings), created as i64],
         )? > 0)
     }
 
@@ -230,10 +257,11 @@ impl Store {
         new_name: &str,
         summary: &str,
         prompt: &str,
+        settings: &GameSettings,
     ) -> Result<bool> {
         let changed = self.db.execute(
-            "UPDATE games SET name = ?2, summary = ?3, prompt = ?4 WHERE name = ?1",
-            params![name, new_name, summary, prompt],
+            "UPDATE games SET name = ?2, summary = ?3, prompt = ?4, settings = ?5 WHERE name = ?1",
+            params![name, new_name, summary, prompt, json(settings)],
         )? > 0;
         if changed {
             self.db.execute(
@@ -294,20 +322,92 @@ impl Store {
         out.reverse();
         Ok(out)
     }
+
+    pub fn put_card(&self, conversation: i64, c: &Card) -> Result<()> {
+        self.db.execute(
+            "INSERT INTO cards (conversation, id, who, title, body, at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![conversation, c.id, c.to, c.title, c.body, c.at as i64],
+        )?;
+        Ok(())
+    }
+
+    /// The cards `who` holds in `conversation`, oldest first.
+    pub fn cards(&self, conversation: i64, who: &str) -> Result<Vec<Card>> {
+        let mut q = self.db.prepare(
+            "SELECT id, who, title, body, at FROM cards
+             WHERE conversation = ?1 AND who = ?2 ORDER BY at, rowid",
+        )?;
+        let rows = q.query_map(params![conversation, who], |r| {
+            Ok(Card {
+                id: r.get(0)?,
+                to: r.get(1)?,
+                title: r.get(2)?,
+                body: r.get(3)?,
+                at: r.get::<_, i64>(4)? as u64,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// How many cards each person holds in `conversation`.
+    pub fn card_counts(&self, conversation: i64) -> Result<Vec<(String, usize)>> {
+        let mut q = self
+            .db
+            .prepare("SELECT who, COUNT(*) FROM cards WHERE conversation = ?1 GROUP BY who")?;
+        let rows = q.query_map([conversation], |r| {
+            Ok((r.get(0)?, r.get::<_, i64>(1)? as usize))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Discard one of `who`'s own cards; false when it isn't theirs.
+    pub fn delete_card(&self, conversation: i64, who: &str, id: &str) -> Result<bool> {
+        Ok(self.db.execute(
+            "DELETE FROM cards WHERE conversation = ?1 AND who = ?2 AND id = ?3",
+            params![conversation, who, id],
+        )? > 0)
+    }
 }
 
 fn game_row(r: &rusqlite::Row) -> rusqlite::Result<Game> {
+    let settings: String = r.get(4)?;
     Ok(Game {
         name: r.get(0)?,
         summary: r.get(1)?,
         created: r.get::<_, i64>(2)? as u64,
         played: r.get::<_, i64>(3)? != 0,
+        // A game saved before a setting existed still loads: every field
+        // defaults, so the worst case is the default settings.
+        settings: serde_json::from_str(&settings).unwrap_or_default(),
     })
+}
+
+fn json(settings: &GameSettings) -> String {
+    serde_json::to_string(settings).unwrap_or_else(|_| "{}".into())
+}
+
+/// Columns added after the first release. `CREATE TABLE IF NOT EXISTS`
+/// does nothing to a table that is already there, so a database from
+/// before a column existed needs it added.
+fn migrate(db: &Connection) -> Result<()> {
+    let mut q = db.prepare("SELECT name FROM pragma_table_info('games')")?;
+    let columns: Vec<String> = q
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    if !columns.iter().any(|c| c == "settings") {
+        db.execute_batch("ALTER TABLE games ADD COLUMN settings TEXT NOT NULL DEFAULT '{}'")?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn plain() -> GameSettings {
+        GameSettings::default()
+    }
 
     #[test]
     fn invites_are_stable_and_revocable() {
@@ -353,10 +453,12 @@ mod tests {
     fn games_have_unique_names_and_stay_with_their_conversations() {
         let s = Store::memory();
         assert!(s
-            .save_game("Dragon Heist", "A heist.", "secret", 1)
+            .save_game("Dragon Heist", "A heist.", "secret", &plain(), 1)
             .unwrap());
-        assert!(!s.save_game("dragon heist", "Again.", "other", 2).unwrap());
-        assert!(s.save_game("Zork", "Caves.", "dark", 3).unwrap());
+        assert!(!s
+            .save_game("dragon heist", "Again.", "other", &plain(), 2)
+            .unwrap());
+        assert!(s.save_game("Zork", "Caves.", "dark", &plain(), 3).unwrap());
         assert_eq!(
             s.games()
                 .unwrap()

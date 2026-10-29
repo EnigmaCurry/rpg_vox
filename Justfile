@@ -841,6 +841,12 @@ room-invite NAME:
 room-ui:
     cd crates/vox_room/web && pnpm install && pnpm dev
 
+# --- vox_room in Docker behind Traefik (see ROOM_DOCKER.md) ---
+
+# A docker/Justfile recipe: config, install, logs -f, room-invite NAME, ...
+room-docker *ARGS:
+    cd docker && just {{ARGS}}
+
 # Build vox_room and install it to BIN.
 install-room BIN="~/.local/bin":
     #!/usr/bin/env bash

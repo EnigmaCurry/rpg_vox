@@ -169,6 +169,25 @@ export class RoomAudio {
     this.micNodes = [src, cap];
   }
 
+  /// What the browser calls the mic it actually gave us. Labels are only
+  /// filled in once permission has been granted, which it has by the time
+  /// the stream exists.
+  async micName() {
+    const track = this.stream?.getAudioTracks?.()[0];
+    if (!track) return null;
+    if (track.label) return track.label;
+    // Some platforms leave the track's own label blank; the device list
+    // still has it, under the id the track settled on.
+    const id = track.getSettings?.().deviceId;
+    if (!id) return null;
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      return devices.find((d) => d.kind === 'audioinput' && d.deviceId === id)?.label || null;
+    } catch {
+      return null;
+    }
+  }
+
   stopMic() {
     for (const n of this.micNodes || []) n.disconnect();
     this.micNodes = null;

@@ -10,6 +10,7 @@ mod stt;
 mod tts;
 mod web;
 
+use std::ffi::OsString;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
@@ -17,7 +18,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context as _, Result};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory as _, Parser, Subcommand, ValueEnum};
 use tracing::{info, warn};
 
 use crate::room::{Room, RoomConfig};
@@ -70,6 +71,11 @@ struct Cli {
     /// turned down.
     #[arg(long, env = "VOX_ROOM_CONFIRM_MS", default_value_t = 300)]
     confirm_ms: u64,
+    /// Idle time that ends a back-and-forth: once someone has said the
+    /// AI's name in "when named" mode it answers every pause, until the
+    /// room has been this quiet.
+    #[arg(long, env = "VOX_ROOM_ENGAGED_FOR_MS", default_value_t = 30_000)]
+    engaged_for_ms: u64,
     /// Entries of the conversation sent to the model with each turn.
     #[arg(long, env = "VOX_ROOM_HISTORY", default_value_t = 60)]
     history: usize,
@@ -84,6 +90,11 @@ struct Cli {
     /// Let a reasoning model think before it answers (never spoken).
     #[arg(long, env = "VOX_AGENT_THINK")]
     think: bool,
+    /// Let the AI look things up in the lobby, by asking the endpoint's
+    /// own web search (OpenAI's `/responses`). Off by default: a local
+    /// llama.cpp has no such thing, and each search costs a request.
+    #[arg(long, env = "VOX_ROOM_SEARCH")]
+    search: bool,
     /// No model: the AI says back what it heard. For trying the room.
     #[arg(long)]
     echo: bool,
@@ -100,6 +111,13 @@ struct Cli {
     /// A Qwen3-TTS server (vllm-omni's /v1/audio/speech), as for pi-tts.
     #[arg(long, env = "VOX_ROOM_TTS_URL")]
     tts_url: Option<String>,
+    /// Bearer token for the Qwen3-TTS server, if it wants one.
+    #[arg(long, env = "VOX_ROOM_TTS_KEY")]
+    tts_key: Option<String>,
+    /// Model to ask that server for. Leave it out and the request doesn't
+    /// name one, which is right for a server with a single model.
+    #[arg(long, env = "VOX_ROOM_TTS_MODEL")]
+    tts_model: Option<String>,
     /// Qwen3 voice.
     #[arg(long, env = "VOX_ROOM_VOICE", default_value = "aiden")]
     voice: String,
@@ -147,6 +165,36 @@ fn data_dir(cli: &Cli) -> PathBuf {
     }
 }
 
+/// Every environment variable the command line reads, including the
+/// subcommands' (they have none today, but this way it can't rot).
+fn env_names(cmd: &clap::Command, out: &mut Vec<OsString>) {
+    out.extend(
+        cmd.get_arguments()
+            .filter_map(|a| a.get_env())
+            .map(OsString::from),
+    );
+    for sub in cmd.get_subcommands() {
+        env_names(sub, out);
+    }
+}
+
+/// Forget the variables that are set but blank, before clap reads them.
+///
+/// `FOO=` in a `.env` file or a compose service is how you say "leave
+/// this one alone", but to clap a set-but-empty variable is a value like
+/// any other: a blank `VOX_ROOM_PROMPT` becomes an empty system prompt, a
+/// blank `VOX_ROOM_TTS_URL` a voice server at no address, and a blank
+/// `VOX_ROOM_TTS` won't parse at all, so the room refuses to start.
+fn forget_blank_env() {
+    let mut names = Vec::new();
+    env_names(&Cli::command(), &mut names);
+    for name in names {
+        if std::env::var(&name).is_ok_and(|v| v.trim().is_empty()) {
+            std::env::remove_var(&name);
+        }
+    }
+}
+
 fn base_url(cli: &Cli) -> String {
     cli.url
         .clone()
@@ -162,6 +210,7 @@ fn main() -> Result<()> {
                 .unwrap_or_else(|_| "info,ort=warn".into()),
         )
         .init();
+    forget_blank_env();
     let cli = Cli::parse();
     let db = data_dir(&cli).join("room.db");
     let store = Store::open(&db)?;
@@ -205,12 +254,16 @@ fn serve(cli: Cli, store: Store) -> Result<()> {
             bail!("set VOX_SCRIBE_LLM_MODEL (or --model), or pass --echo to try the room without a model");
         };
         let endpoint = vox_transcribe::openai::Endpoint::at(cli.llm_url.clone());
-        agent::Llm::Chat {
+        if cli.search {
+            info!("the AI can look things up in the lobby, with the endpoint's web search");
+        }
+        agent::Llm::Chat(agent::Chat {
             url: endpoint.url,
             model,
             key: endpoint.api_key,
             think: cli.think,
-        }
+            search: cli.search,
+        })
     };
     let prompt = match (&cli.prompt, &cli.prompt_file) {
         (Some(p), _) => p.clone(),
@@ -241,12 +294,20 @@ fn serve(cli: Cli, store: Store) -> Result<()> {
             let Some(url) = tts_url else {
                 bail!("--tts qwen3 needs --tts-url (or VOX_ROOM_TTS_URL)");
             };
-            info!(%url, voice = %cli.voice, "voice: Qwen3-TTS");
+            info!(
+                %url,
+                voice = %cli.voice,
+                model = cli.tts_model.as_deref().unwrap_or("(unnamed)"),
+                key = cli.tts_key.is_some(),
+                "voice: Qwen3-TTS"
+            );
             Box::new(tts::Qwen3::new(
                 &url,
                 &cli.voice,
                 &cli.instruct,
                 &cli.language,
+                cli.tts_key.clone(),
+                cli.tts_model.clone(),
             ))
         }
         TtsKind::Kokoro => {
@@ -277,6 +338,7 @@ fn serve(cli: Cli, store: Store) -> Result<()> {
             .collect(),
         reply_after: Duration::from_millis(cli.reply_after_ms),
         confirm: Duration::from_millis(cli.confirm_ms),
+        engaged_for: Duration::from_millis(cli.engaged_for_ms),
         history: cli.history,
     };
     let room = Room::new(store, cfg, generation.clone(), turn_tx, factory)?;
@@ -293,12 +355,20 @@ fn serve(cli: Cli, store: Store) -> Result<()> {
         .name("vox-room-tick".into())
         .spawn(move || {
             let mut meters = false;
+            let mut ticks: u32 = 0;
             loop {
                 r.tick(Instant::now());
                 // Meters at 10 per second.
                 meters = !meters;
                 if meters {
                     r.emit_levels();
+                }
+                // `vox_room invite` and `uninvite` write to the database
+                // from their own process, so look for their work now and
+                // then rather than only at startup.
+                ticks = ticks.wrapping_add(1);
+                if ticks.is_multiple_of(40) {
+                    r.reconcile_people();
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
@@ -321,4 +391,41 @@ fn serve(cli: Cli, store: Store) -> Result<()> {
             .await?;
         anyhow::Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One test, because it mutates the process environment.
+    #[test]
+    fn blank_environment_variables_count_as_unset() {
+        // A blank one of each shape that used to go wrong: no default, a
+        // default to fall back to, and a value that has to parse.
+        std::env::set_var("VOX_ROOM_PROMPT", "");
+        std::env::set_var("VOX_ROOM_TTS_URL", "   ");
+        std::env::set_var("VOX_ROOM_AGENT_NAME", "");
+        std::env::set_var("VOX_ROOM_TTS", "");
+        // ...and one that is really set, to be sure it survives.
+        std::env::set_var("VOX_ROOM_VOICE", "cherry");
+
+        forget_blank_env();
+        let cli = Cli::try_parse_from(["vox_room"]).expect("blank VOX_ROOM_TTS must not fail");
+
+        assert_eq!(cli.prompt, None, "an empty prompt is not a prompt");
+        assert_eq!(cli.tts_url, None);
+        assert!(cli.tts.is_none());
+        assert_eq!(cli.name, "Vox", "falls back to the default");
+        assert_eq!(cli.voice, "cherry", "a real value is left alone");
+
+        for v in [
+            "VOX_ROOM_PROMPT",
+            "VOX_ROOM_TTS_URL",
+            "VOX_ROOM_AGENT_NAME",
+            "VOX_ROOM_TTS",
+            "VOX_ROOM_VOICE",
+        ] {
+            std::env::remove_var(v);
+        }
+    }
 }

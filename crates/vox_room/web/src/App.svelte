@@ -4,6 +4,7 @@
   import { supported } from './lib/audio.js';
   import Log from './components/Log.svelte';
   import Strip from './components/Strip.svelte';
+  import Cards from './components/Cards.svelte';
 
   onMount(async () => {
     if (await whoami()) connect();
@@ -16,6 +17,15 @@
       thinking: 'thinking',
       speaking: 'speaking',
     }[room.agent.state] ?? room.agent.state,
+  );
+
+  // Why the mode is what it is, when the room and not a click decided it.
+  const modeHint = $derived(
+    room.locked
+      ? `${room.game} decides when ${room.agent.name} answers, so this can't be changed until you go back to the lobby.`
+      : room.engaged
+        ? `You said its name, so ${room.agent.name} is answering every pause until the room has been quiet a while. Say "thanks" or "goodbye" and it goes back to waiting for its name.`
+        : `When ${room.agent.name} answers.`,
   );
 
   async function newConversation() {
@@ -112,11 +122,14 @@
         <button class="danger" onclick={() => command({ type: 'stop' })}>Stop {room.agent.name}</button>
       {/if}
       <div class="spacer"></div>
-      <div class="seg" role="radiogroup" aria-label="When {room.agent.name} answers">
+      <div class="seg" class:locked={room.locked} role="radiogroup" title={modeHint}
+        aria-label="When {room.agent.name} answers">
         <button role="radio" aria-checked={room.mode === 'named'} class:on={room.mode === 'named'}
+          disabled={room.locked}
           onclick={() => command({ type: 'mode', mode: 'named' })}>When named</button>
         <button role="radio" aria-checked={room.mode === 'always'} class:on={room.mode === 'always'}
-          onclick={() => command({ type: 'mode', mode: 'always' })}>After every pause</button>
+          disabled={room.locked}
+          onclick={() => command({ type: 'mode', mode: 'always' })}>After every pause{#if room.engaged}<span class="dot" aria-hidden="true"></span>{/if}</button>
       </div>
       <button onclick={newConversation}>{room.game ? 'Restart game' : 'New conversation'}</button>
       {#if !room.connected}<span class="offline">reconnecting…</span>{/if}
@@ -125,6 +138,8 @@
     <Log />
 
     <aside>
+      <Cards />
+
       <h2>In the room</h2>
       {#each room.people as p (p.name)}
         <Strip key={p.name} label={p.name} online={p.online} mic={p.mic} muted={p.muted} speaking={p.speaking} />
@@ -142,6 +157,11 @@
             <div class="gname">
               <span>{g.name}</span>
               {#if room.game === g.name}<span class="tag">playing</span>{/if}
+              {#if g.settings?.reply === 'always'}
+                <span class="tag mode" title="In this game {room.agent.name} answers every pause.">every pause</span>
+              {:else if g.settings?.reply === 'named'}
+                <span class="tag mode" title="In this game {room.agent.name} speaks only when you say its name.">when named</span>
+              {/if}
             </div>
             <p class="gsum">{g.summary}</p>
             {#if room.game !== g.name}
@@ -188,6 +208,11 @@
           <input type="checkbox" checked={room.pushToTalk} onchange={(e) => { setPushToTalk(e.currentTarget.checked); e.currentTarget.blur(); }} />
           Push to talk
         </label>
+        {#if room.micName}
+          <span class="vol mic-name" title="The microphone the browser gave the room: {room.micName}">
+            Mic: {room.micName}
+          </span>
+        {/if}
         <span class="vol">You hear</span>
         <span class="hear" title="What you hear: everyone but you">
           <span style="width: {room.hearing > 0 ? Math.max(0, Math.min(100, ((20 * Math.log10(room.hearing) + 60) / 60) * 100)) : 0}%"></span>
@@ -251,6 +276,20 @@
   .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
   .seg button { border: 0; border-radius: 0; padding: 5px 10px; }
   .seg button.on { background: var(--accent); color: var(--accent-ink); }
+  .seg.locked { opacity: 0.75; }
+  .seg button:disabled { cursor: default; }
+  /* A back-and-forth the room started, rather than a mode anyone picked. */
+  .seg .dot {
+    display: inline-block;
+    width: 6px;
+    height: 6px;
+    margin-left: 6px;
+    border-radius: 50%;
+    background: currentColor;
+    animation: pulse 2s ease-in-out infinite;
+  }
+  @keyframes pulse { 0%, 100% { opacity: 0.35; } 50% { opacity: 1; } }
+  @media (prefers-reduced-motion: reduce) { .seg .dot { animation: none; } }
   .offline { color: var(--danger); font-size: 13px; }
   :global(.log) { grid-area: log; }
   .ask { border: 1px solid var(--line); border-radius: 12px; padding: 18px 20px; max-width: min(28em, calc(100vw - 32px)); background: var(--bg, var(--bubble)); color: inherit; }
@@ -279,6 +318,7 @@
   .games li { border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; background: var(--bubble); }
   .games li.current { border-color: var(--agent); }
   .gname { display: flex; align-items: center; gap: 6px; font-weight: 600; }
+  .tag.mode { color: var(--muted); font-weight: 400; }
   .tag { font-size: 11px; font-weight: 500; color: var(--agent); border: 1px solid currentColor; border-radius: 999px; padding: 0 6px; }
   .gsum { margin: 4px 0 6px; font-size: 13px; color: var(--muted); }
   .gact { display: flex; gap: 6px; }
@@ -309,6 +349,8 @@
   .big.ptt.talking { background: var(--ok); color: var(--accent-ink); border-color: var(--ok); }
   kbd { font-size: 11px; opacity: 0.7; border: 1px solid currentColor; border-radius: 4px; padding: 0 4px; margin-left: 4px; }
   .vol { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); }
+  /* Device names run long; keep one from pushing the controls off. */
+  .mic-name { max-width: 22ch; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: inline-block; }
   .warn { color: var(--danger); font-size: 13px; }
   .dismiss { padding: 0 6px; line-height: 1.4; }
   .hear { width: 80px; height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; }

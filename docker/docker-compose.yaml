@@ -1,0 +1,117 @@
+## vox_room behind Traefik. Everything configurable lives in docker/.env
+## (copy .env.example), and the Traefik labels below are interpolated
+## from it. See ROOM.md for what the room does and ROOM_DOCKER.md for the
+## deployment notes.
+
+## Names the compose project, so the container, the volumes and the
+## network alias are vox_room_* rather than docker_* after this directory.
+name: vox_room
+
+volumes:
+  ## The room database: who is invited, the conversation log, saved games.
+  data:
+  ## The sherpa-onnx speech-to-text models, fetched on first start.
+  models:
+
+services:
+  vox_room:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: ${VOX_ROOM_IMAGE:-vox_room:latest}
+    restart: unless-stopped
+    ## No networks block: Traefik runs on the host network and reaches
+    ## this container on the compose project's own bridge network, by the
+    ## address the Docker provider reads off the container itself.
+
+    ## Everything in .env reaches the room; see .env.example for the vars
+    ## it reads. The entries below are fixed by the image's layout and
+    ## override anything .env says about them.
+    ## Not required, so tearing the room down still works if .env is gone.
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      - VOX_ROOM_LISTEN=0.0.0.0:7340
+      - VOX_ROOM_DATA=/data
+      - VOX_SCRIBE_MODELS=/models
+      ## Invite links have to point at the public address, not the
+      ## container -- including the port, when the Traefik entrypoint
+      ## isn't on 443. `just config` builds it from the host and the
+      ## public port; this fails loudly rather than mailing people a link
+      ## that goes nowhere.
+      - VOX_ROOM_URL=${VOX_ROOM_URL:?set VOX_ROOM_URL in docker/.env (run `just config`)}
+
+    ## Named volumes, not bind mounts: the docker context may be remote,
+    ## where host paths mean nothing. The models arrive by download on
+    ## first start (see docker/entrypoint.sh).
+    volumes:
+      - data:/data
+      - models:/models
+
+    ## host.docker.internal is the machine the Docker *daemon* runs on, so
+    ## this only helps when the model server lives on that same host. With
+    ## a remote docker context it is the remote host, not your workstation:
+    ## point VOX_SCRIBE_LLM_URL and VOX_ROOM_TTS_URL at names the remote
+    ## host can actually resolve.
+    ##
+    ## The second entry pins one name to one address, for split-horizon
+    ## DNS: a container on the public resolver gets the public IP of a
+    ## service it can only reach privately. The URL keeps the name, so TLS
+    ## and the Host header still work -- only the lookup is overridden.
+    ## Unset, it is an inert .invalid line. See ROOM_DOCKER.md.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+      - "${VOX_ROOM_PIN_HOST:-unpinned.invalid}:${VOX_ROOM_PIN_IP:-127.0.0.1}"
+
+    ## vox_room's graceful shutdown waits on ctrl_c, i.e. SIGINT, and as
+    ## PID 1 it ignores the SIGTERM docker would otherwise send -- so
+    ## every stop sat out the grace period and ended in SIGKILL.
+    stop_signal: SIGINT
+    stop_grace_period: 15s
+
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:7340/healthz"]
+      ## The first start downloads the models, so give it room.
+      start_period: 15m
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+    labels:
+      - "traefik.enable=true"
+
+      - "traefik.http.routers.${VOX_ROOM_ROUTER:-vox-room}.rule=Host(`${VOX_ROOM_TRAEFIK_HOST:?set VOX_ROOM_TRAEFIK_HOST in docker/.env}`)"
+      - "traefik.http.routers.${VOX_ROOM_ROUTER:-vox-room}.entrypoints=${VOX_ROOM_TRAEFIK_ENTRYPOINT:-websecure}"
+      ## No certresolver: the domain's certificate is already in Traefik's
+      ## store, and tls=true is enough for it to be picked by SNI.
+      - "traefik.http.routers.${VOX_ROOM_ROUTER:-vox-room}.tls=true"
+      ## The room's own port; /room.ws upgrades on the same one.
+      - "traefik.http.services.${VOX_ROOM_ROUTER:-vox-room}.loadbalancer.server.port=7340"
+
+      ## Who may reach the room at all, before the invite cookie is even
+      ## looked at. 0.0.0.0/0 is everyone.
+      - "traefik.http.middlewares.${VOX_ROOM_ROUTER:-vox-room}-ipallowlist.ipallowlist.sourcerange=${VOX_ROOM_IP_SOURCERANGE:-0.0.0.0/0}"
+
+      ## The room sets its session cookie Secure only when it sees
+      ## X-Forwarded-Proto: https, which Traefik sends. HSTS, nosniff and
+      ## a silent Referer keep the invite token out of other sites' logs.
+      - "traefik.http.middlewares.${VOX_ROOM_ROUTER:-vox-room}-headers.headers.stsSeconds=31536000"
+      - "traefik.http.middlewares.${VOX_ROOM_ROUTER:-vox-room}-headers.headers.stsIncludeSubdomains=true"
+      - "traefik.http.middlewares.${VOX_ROOM_ROUTER:-vox-room}-headers.headers.contentTypeNosniff=true"
+      - "traefik.http.middlewares.${VOX_ROOM_ROUTER:-vox-room}-headers.headers.referrerPolicy=no-referrer"
+
+      ## Generous enough that a tab reconnecting its WebSocket never trips
+      ## it; raise VOX_ROOM_RATELIMIT_AVERAGE if you have a crowd.
+      - "traefik.http.middlewares.${VOX_ROOM_ROUTER:-vox-room}-ratelimit.ratelimit.average=${VOX_ROOM_RATELIMIT_AVERAGE:-20}"
+      - "traefik.http.middlewares.${VOX_ROOM_ROUTER:-vox-room}-ratelimit.ratelimit.burst=${VOX_ROOM_RATELIMIT_BURST:-60}"
+
+      ## Apply them, in order.
+      - "traefik.http.routers.${VOX_ROOM_ROUTER:-vox-room}.middlewares=${VOX_ROOM_ROUTER:-vox-room}-ipallowlist,${VOX_ROOM_ROUTER:-vox-room}-headers,${VOX_ROOM_ROUTER:-vox-room}-ratelimit"

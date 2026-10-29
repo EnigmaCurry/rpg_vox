@@ -71,7 +71,9 @@
 <style>
   .log {
     overflow-y: auto;
-    padding: 16px;
+    /* Keep the conversation in a centered band; on a wide monitor the extra
+       space becomes equal margins instead of a line you have to scan across. */
+    padding: 16px max(16px, calc((100% - 64em) / 2));
     display: flex;
     flex-direction: column;
     gap: 12px;
