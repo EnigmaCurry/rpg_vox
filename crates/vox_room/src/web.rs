@@ -20,6 +20,15 @@
 //!
 //! Events are filtered here: one addressed to a person (a card the AI
 //! dealt them) is only written to that person's own sockets.
+//!
+//! The door is three requests. An invite link (`/join/<token>`) only
+//! remembers the token in a short-lived cookie and sends the browser to
+//! the room; `GET /api/door` says whose link it is (or who this browser
+//! already is, which is all the room will answer about itself before the
+//! cookie exists); and `POST /api/door/join` -- Join Audio -- trades the
+//! link for the lasting cookie, which is the only thing the room asks
+//! for afterwards. The link works once. `POST /api/door/name` is the
+//! name they want to be called, which they may set before spending it.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -30,8 +39,8 @@ use axum::{
         Path, State,
     },
     http::{header, HeaderMap, StatusCode, Uri},
-    response::{IntoResponse, Redirect, Response},
-    routing::get,
+    response::{AppendHeaders, IntoResponse, Redirect, Response},
+    routing::{get, post},
     Json, Router,
 };
 use futures_util::{SinkExt as _, StreamExt as _};
@@ -44,7 +53,15 @@ use tracing::{debug, info, warn};
 use crate::mixer::{LISTENER_QUEUE, RATE};
 use crate::room::Room;
 
+/// This browser's own cookie, traded for an invite link at the door.
 const COOKIE: &str = "vox_room";
+/// The link just clicked, until Join Audio spends it. A dead token is
+/// kept here too, so a browser coming back can be told it is dead.
+const PENDING: &str = "vox_room_invite";
+/// A browser is remembered for a year.
+const SESSION_MAX_AGE: u32 = 31_536_000;
+/// A year is far too long to hold a link that is about to be spent.
+const PENDING_MAX_AGE: u32 = 86_400;
 
 #[derive(RustEmbed)]
 #[folder = "dist-ui/"]
@@ -63,7 +80,9 @@ pub fn router(room: Arc<Room>) -> Router {
     };
     Router::new()
         .route("/join/:token", get(join))
-        .route("/api/me", get(me))
+        .route("/api/door", get(door))
+        .route("/api/door/join", post(door_join))
+        .route("/api/door/name", post(door_name))
         .route("/api/games/:name/prompt", get(game_prompt))
         .route("/room.ws", get(ws))
         .route("/healthz", get(|| async { "ok" }))
@@ -71,49 +90,137 @@ pub fn router(room: Arc<Room>) -> Router {
         .with_state(app)
 }
 
-fn token(headers: &HeaderMap) -> Option<String> {
+fn cookie(headers: &HeaderMap, name: &str) -> Option<String> {
     headers
         .get_all(header::COOKIE)
         .iter()
         .filter_map(|v| v.to_str().ok())
         .flat_map(|v| v.split(';'))
         .filter_map(|kv| kv.trim().split_once('='))
-        .find(|(k, _)| *k == COOKIE)
+        .find(|(k, _)| *k == name)
         .map(|(_, v)| v.to_string())
 }
 
-fn person(app: &App, headers: &HeaderMap) -> Option<String> {
-    token(headers).and_then(|t| app.room.person_for_token(&t))
-}
-
-/// An invite link: remember the token and go to the room.
-async fn join(State(app): State<App>, Path(t): Path<String>, headers: HeaderMap) -> Response {
-    if app.room.person_for_token(&t).is_none() {
-        return (
-            StatusCode::FORBIDDEN,
-            "This invite link isn't valid any more.",
-        )
-            .into_response();
-    }
-    let secure = headers
+/// HTTPS, as far as the proxy in front of us is concerned: a cookie we
+/// mark `Secure` on a plain-HTTP room would never come back.
+fn secure(headers: &HeaderMap) -> bool {
+    headers
         .get("x-forwarded-proto")
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|p| p == "https");
-    let cookie = format!(
-        "{COOKIE}={t}; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000{}",
-        if secure { "; Secure" } else { "" }
-    );
-    ([(header::SET_COOKIE, cookie)], Redirect::to("/")).into_response()
+        .is_some_and(|p| p == "https")
 }
 
-async fn me(State(app): State<App>, headers: HeaderMap) -> Response {
+fn set_cookie(name: &str, value: &str, max_age: u32, headers: &HeaderMap) -> String {
+    format!(
+        "{name}={value}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}{}",
+        if secure(headers) { "; Secure" } else { "" }
+    )
+}
+
+/// The name the room knows this browser by, from its own cookie.
+fn person(app: &App, headers: &HeaderMap) -> Option<String> {
+    cookie(headers, COOKIE)
+        .and_then(|id| app.room.person_for_session(&id))
+        .map(|p| p.display)
+}
+
+/// An invite link. Nothing is spent here: the token is only remembered,
+/// so the door can say whose link it is and let them look around before
+/// Join Audio trades it in. Even a dead token is remembered, so the door
+/// can say that it has expired.
+async fn join(Path(t): Path<String>, headers: HeaderMap) -> Response {
+    let pending = set_cookie(PENDING, &t, PENDING_MAX_AGE, &headers);
+    ([(header::SET_COOKIE, pending)], Redirect::to("/")).into_response()
+}
+
+/// Who this browser is, or whose invite it is holding.
+async fn door(State(app): State<App>, headers: HeaderMap) -> Response {
+    // A link just clicked comes first: they navigated here to come in as
+    // whoever it names, and the card says who that is before anything is
+    // spent.
+    if let Some(t) = cookie(&headers, PENDING) {
+        if let Some(invite) = app.room.invite_at_door(&t) {
+            return Json(json!({
+                "state": "invited",
+                "name": invite.name,
+                "display": invite.display,
+            }))
+            .into_response();
+        }
+        if person(&app, &headers).is_none() {
+            // Used once already, or revoked, and this browser never kept
+            // a cookie of its own.
+            return (StatusCode::GONE, Json(json!({ "state": "expired" }))).into_response();
+        }
+    }
     match person(&app, &headers) {
-        Some(name) => Json(json!({ "name": name })).into_response(),
+        Some(display) => Json(json!({ "state": "in", "display": display })).into_response(),
         None => (
             StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "no invite" })),
+            Json(json!({ "state": "none", "error": "no invite" })),
         )
             .into_response(),
+    }
+}
+
+/// Join Audio: trade the invite link for this browser's own cookie. The
+/// link is spent here and nowhere else.
+async fn door_join(State(app): State<App>, headers: HeaderMap) -> Response {
+    let Some(t) = cookie(&headers, PENDING) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "no invite link" })),
+        )
+            .into_response();
+    };
+    let Some((id, invite)) = app.room.claim(&t) else {
+        return (
+            StatusCode::GONE,
+            Json(json!({ "state": "expired", "error": "This link is expired." })),
+        )
+            .into_response();
+    };
+    info!(person = %invite.name, called = %invite.display, "came in on their invite link");
+    // Two cookies of the same name, so they must be appended: a plain
+    // array of headers would insert, and the second would replace the
+    // first.
+    (
+        AppendHeaders([
+            (
+                header::SET_COOKIE,
+                set_cookie(COOKIE, &id, SESSION_MAX_AGE, &headers),
+            ),
+            // Spent: nothing left to remember.
+            (header::SET_COOKIE, set_cookie(PENDING, "", 0, &headers)),
+        ]),
+        Json(json!({ "state": "in", "display": invite.display })),
+    )
+        .into_response()
+}
+
+#[derive(Deserialize)]
+struct Rename {
+    display: String,
+}
+
+/// What they want the room to call them, asked at the door before the
+/// link is spent. Their invite's name doesn't move: it is the key the
+/// cookie hangs on, and what `vox_room uninvite` names.
+async fn door_name(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(body): Json<Rename>,
+) -> Response {
+    let Some(invite) = cookie(&headers, PENDING).and_then(|t| app.room.invite_at_door(&t)) else {
+        return (
+            StatusCode::GONE,
+            Json(json!({ "error": "This link is expired." })),
+        )
+            .into_response();
+    };
+    match app.room.rename(&invite.name, &body.display) {
+        Ok(display) => Json(json!({ "display": display })).into_response(),
+        Err(why) => (StatusCode::CONFLICT, Json(json!({ "error": why }))).into_response(),
     }
 }
 

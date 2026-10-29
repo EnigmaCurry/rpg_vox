@@ -1,7 +1,8 @@
 //! SQLite: who is invited, the conversation log, games, and room settings.
 //!
 //! ```sql
-//! people(name, token)
+//! people(name, display, token, used)   -- an invite, and whose it is
+//! sessions(id, name)                   -- a browser that traded its link in
 //! entries(conversation, id, who, kind, title, text, cut, at)
 //! settings(key, value)
 //! games(name, summary, prompt, settings, created, played)  -- names unique, ignoring case
@@ -15,7 +16,7 @@
 
 use std::path::Path;
 
-use anyhow::{Context as _, Result};
+use anyhow::{bail, Context as _, Result};
 use rusqlite::{params, Connection, OptionalExtension as _};
 
 use crate::room::{Card, Entry, GameSettings, Kind};
@@ -26,9 +27,24 @@ pub struct Store {
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS people (
+    -- The key, and what `vox_room uninvite` names. It never changes.
     name  TEXT PRIMARY KEY,
-    token TEXT NOT NULL UNIQUE
+    -- The one-time invite link. It stays here once spent, so a browser
+    -- coming back to a dead link can be told that it is dead.
+    token TEXT NOT NULL UNIQUE,
+    -- Traded for a cookie: the link no longer works.
+    used  INTEGER NOT NULL DEFAULT 0,
+    -- What the room calls them, which is theirs to set at the door.
+    display TEXT NOT NULL DEFAULT ''
 );
+-- A browser that pressed Join Audio: the cookie it was given, and whose
+-- invite it spent. One person may have several (another browser, another
+-- link); uninviting them drops the lot.
+CREATE TABLE IF NOT EXISTS sessions (
+    id   TEXT PRIMARY KEY,
+    name TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS sessions_by_name ON sessions (name);
 CREATE TABLE IF NOT EXISTS entries (
     conversation INTEGER NOT NULL,
     id   TEXT NOT NULL,
@@ -86,6 +102,19 @@ pub struct Game {
     pub settings: GameSettings,
 }
 
+/// Somebody invited to the room.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Invited {
+    /// The key: what `vox_room uninvite` names, and what their cookie is
+    /// tied to. It never changes.
+    pub name: String,
+    /// What the room calls them, theirs to set at the door. The same as
+    /// `name` until they change it.
+    pub display: String,
+    /// Their invite link, while it is still unspent.
+    pub link: Option<String>,
+}
+
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(dir) = path.parent() {
@@ -105,46 +134,144 @@ impl Store {
         Self { db }
     }
 
-    /// The invite token for `name`, made on first use.
+    /// `name`'s live invite link, made if they haven't got one.
+    ///
+    /// Asking twice gives the same link, so an invite can be printed
+    /// again; asking for one whose link has already been traded in mints
+    /// a second link rather than disturbing the browser holding the
+    /// first (which is how someone gets onto a second device).
     pub fn invite(&self, name: &str) -> Result<String> {
         if let Some(t) = self
             .db
-            .query_row("SELECT token FROM people WHERE name = ?1", [name], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT token FROM people WHERE name = ?1 AND used = 0",
+                [name],
+                |r| r.get(0),
+            )
             .optional()?
         {
             return Ok(t);
         }
+        // The room calls people by their display name, so a new invite
+        // can't take a name somebody else already answers to.
+        if let Some(other) = self.person_called(name)? {
+            if other != name {
+                bail!("{other} is already in the room as {name}");
+            }
+        }
         let token = uuid::Uuid::new_v4().simple().to_string();
         self.db.execute(
-            "INSERT INTO people (name, token) VALUES (?1, ?2)",
+            "INSERT INTO people (name, token, display) VALUES (?1, ?2, ?1)
+             ON CONFLICT(name) DO UPDATE SET token = excluded.token, used = 0",
             params![name, token],
         )?;
         Ok(token)
     }
 
+    /// Revoke `name`: their link stops working, and so does every cookie
+    /// traded for one.
     pub fn uninvite(&self, name: &str) -> Result<bool> {
-        Ok(self
-            .db
-            .execute("DELETE FROM people WHERE name = ?1", [name])?
-            > 0)
+        let tx = self.db.unchecked_transaction()?;
+        let gone = tx.execute("DELETE FROM people WHERE name = ?1", [name])? > 0;
+        tx.execute("DELETE FROM sessions WHERE name = ?1", [name])?;
+        tx.commit()?;
+        Ok(gone)
     }
 
-    pub fn person_for_token(&self, token: &str) -> Result<Option<String>> {
+    /// Who this browser's cookie belongs to.
+    pub fn person_for_session(&self, id: &str) -> Result<Option<Invited>> {
         Ok(self
             .db
-            .query_row("SELECT name FROM people WHERE token = ?1", [token], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT p.name, p.display, p.token, p.used FROM sessions s
+                 JOIN people p ON p.name = s.name WHERE s.id = ?1",
+                [id],
+                invited_row,
+            )
             .optional()?)
     }
 
-    pub fn people(&self) -> Result<Vec<(String, String)>> {
+    /// The invite `token` opens, while it is still unspent.
+    pub fn live_invite(&self, token: &str) -> Result<Option<Invited>> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT name, display, token, used FROM people
+                 WHERE token = ?1 AND used = 0",
+                [token],
+                invited_row,
+            )
+            .optional()?)
+    }
+
+    /// Trade `token` for a cookie: the link is spent here and nowhere
+    /// else. Returns the new session's id and whose it is, or None when
+    /// the link had already been used (or never existed).
+    pub fn claim_invite(&self, token: &str) -> Result<Option<(String, Invited)>> {
+        let tx = self.db.unchecked_transaction()?;
+        // One statement decides it, so two browsers racing on the same
+        // link can't both win.
+        if tx.execute(
+            "UPDATE people SET used = 1 WHERE token = ?1 AND used = 0",
+            [token],
+        )? == 0
+        {
+            return Ok(None);
+        }
+        let invited: Invited = tx.query_row(
+            "SELECT name, display, token, used FROM people WHERE token = ?1",
+            [token],
+            invited_row,
+        )?;
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        tx.execute(
+            "INSERT INTO sessions (id, name) VALUES (?1, ?2)",
+            params![id, invited.name],
+        )?;
+        tx.commit()?;
+        Ok(Some((id, invited)))
+    }
+
+    /// What `name` is called in the room. False when somebody else
+    /// already answers to it.
+    pub fn rename(&self, name: &str, display: &str) -> Result<bool> {
+        if self.person_called(display)?.is_some_and(|who| who != name) {
+            return Ok(false);
+        }
+        Ok(self.db.execute(
+            "UPDATE people SET display = ?2 WHERE name = ?1",
+            params![name, display],
+        )? > 0)
+    }
+
+    /// Whose display name this is, ignoring case.
+    fn person_called(&self, display: &str) -> Result<Option<String>> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT name FROM people WHERE display = ?1 COLLATE NOCASE",
+                [display],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn person(&self, name: &str) -> Result<Option<Invited>> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT name, display, token, used FROM people WHERE name = ?1",
+                [name],
+                invited_row,
+            )
+            .optional()?)
+    }
+
+    pub fn people(&self) -> Result<Vec<Invited>> {
         let mut q = self
             .db
-            .prepare("SELECT name, token FROM people ORDER BY name")?;
-        let rows = q.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            .prepare("SELECT name, display, token, used FROM people ORDER BY name")?;
+        let rows = q.query_map([], invited_row)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
@@ -393,6 +520,24 @@ impl Store {
     }
 }
 
+fn invited_row(r: &rusqlite::Row) -> rusqlite::Result<Invited> {
+    let name: String = r.get(0)?;
+    let display: String = r.get(1)?;
+    let token: String = r.get(2)?;
+    let used: i64 = r.get(3)?;
+    Ok(Invited {
+        // A row from before display names had their own column, or one
+        // written by hand: the name is the name.
+        display: if display.is_empty() {
+            name.clone()
+        } else {
+            display
+        },
+        name,
+        link: (used == 0).then_some(token),
+    })
+}
+
 fn game_row(r: &rusqlite::Row) -> rusqlite::Result<Game> {
     let settings: String = r.get(4)?;
     Ok(Game {
@@ -414,21 +559,38 @@ fn json(settings: &GameSettings) -> String {
 /// does nothing to a table that is already there, so a database from
 /// before a column existed needs it added.
 fn migrate(db: &Connection) -> Result<()> {
-    let mut q = db.prepare("SELECT name FROM pragma_table_info('games')")?;
-    let columns: Vec<String> = q
-        .query_map([], |r| r.get(0))?
-        .collect::<rusqlite::Result<_>>()?;
-    if !columns.iter().any(|c| c == "settings") {
+    if !has_column(db, "games", "settings")? {
         db.execute_batch("ALTER TABLE games ADD COLUMN settings TEXT NOT NULL DEFAULT '{}'")?;
     }
-    let mut q = db.prepare("SELECT name FROM pragma_table_info('entries')")?;
-    let columns: Vec<String> = q
-        .query_map([], |r| r.get(0))?
-        .collect::<rusqlite::Result<_>>()?;
-    if !columns.iter().any(|c| c == "title") {
+    if !has_column(db, "entries", "title")? {
         db.execute_batch("ALTER TABLE entries ADD COLUMN title TEXT NOT NULL DEFAULT ''")?;
     }
+    if !has_column(db, "people", "used")? {
+        db.execute_batch("ALTER TABLE people ADD COLUMN used INTEGER NOT NULL DEFAULT 0")?;
+    }
+    // Invite links used to be reusable, and the cookie was the token
+    // itself. Every browser already holding one keeps its place by
+    // turning that token into a session; the link stays live as well,
+    // because there is no way to tell who has used theirs.
+    if !has_column(db, "people", "display")? {
+        db.execute_batch(
+            "ALTER TABLE people ADD COLUMN display TEXT NOT NULL DEFAULT '';
+             UPDATE people SET display = name;
+             INSERT OR IGNORE INTO sessions (id, name) SELECT token, name FROM people;",
+        )?;
+    }
     Ok(())
+}
+
+fn has_column(db: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut q = db.prepare("SELECT name FROM pragma_table_info(?1)")?;
+    let mut rows = q.query([table])?;
+    while let Some(r) = rows.next()? {
+        if r.get::<_, String>(0)? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -440,13 +602,59 @@ mod tests {
     }
 
     #[test]
-    fn invites_are_stable_and_revocable() {
+    fn an_invite_link_works_once_and_leaves_a_session() {
         let s = Store::memory();
-        let t = s.invite("Ryan").unwrap();
-        assert_eq!(s.invite("Ryan").unwrap(), t);
-        assert_eq!(s.person_for_token(&t).unwrap().as_deref(), Some("Ryan"));
+        let link = s.invite("Ryan").unwrap();
+        assert_eq!(s.invite("Ryan").unwrap(), link, "printing it again");
+        assert_eq!(
+            s.live_invite(&link).unwrap().unwrap().name,
+            "Ryan",
+            "unspent, so the door opens"
+        );
+
+        let (cookie, who) = s.claim_invite(&link).unwrap().unwrap();
+        assert_eq!(who.display, "Ryan");
+        assert_eq!(s.live_invite(&link).unwrap(), None, "spent");
+        assert!(s.claim_invite(&link).unwrap().is_none(), "and only once");
+        assert_eq!(
+            s.person_for_session(&cookie).unwrap().unwrap().name,
+            "Ryan",
+            "but the cookie it was traded for lasts"
+        );
+        assert_eq!(s.person("Ryan").unwrap().unwrap().link, None);
+
+        // Asking again mints a second link, leaving the cookie alone.
+        let again = s.invite("Ryan").unwrap();
+        assert_ne!(again, link);
+        assert!(s.person_for_session(&cookie).unwrap().is_some());
+
+        // Uninvite takes the link and the cookie.
         assert!(s.uninvite("Ryan").unwrap());
-        assert_eq!(s.person_for_token(&t).unwrap(), None);
+        assert_eq!(s.live_invite(&again).unwrap(), None);
+        assert_eq!(s.person_for_session(&cookie).unwrap(), None);
+        assert!(!s.uninvite("Ryan").unwrap());
+    }
+
+    #[test]
+    fn a_display_name_is_theirs_alone_and_the_key_stays_put() {
+        let s = Store::memory();
+        let link = s.invite("Mike").unwrap();
+        s.invite("Alex").unwrap();
+
+        assert!(s.rename("Mike", "Mikey").unwrap());
+        assert_eq!(s.live_invite(&link).unwrap().unwrap().display, "Mikey");
+        assert_eq!(
+            s.person("Mike").unwrap().unwrap().name,
+            "Mike",
+            "the key for uninvite doesn't move"
+        );
+        assert!(!s.rename("Mike", "alex").unwrap(), "Alex answers to that");
+        assert!(s.rename("Mike", "MIKEY").unwrap(), "their own, recased");
+
+        // ...nor can a new invite take a name somebody answers to.
+        assert!(s.invite("mikey").is_err());
+        assert!(s.uninvite("Mike").unwrap());
+        assert!(s.invite("mikey").is_ok());
     }
 
     #[test]

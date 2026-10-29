@@ -1,15 +1,38 @@
 <script>
   import { onMount } from 'svelte';
   import {
-    room, joinAudio, setPushToTalk, loadDevices, watchDevices, setMicDevice, setSpeakerDevice,
+    room, joinAudio, setName, setPushToTalk, loadDevices, watchDevices, setMicDevice, setSpeakerDevice,
   } from '../lib/room.svelte.js';
   import { supported, canChooseSpeaker } from '../lib/audio.js';
   import { hue } from '../lib/color.js';
+  import { NAME_MAX } from '../lib/names.js';
 
   // The room is voice only, so this stands in front of it until you have
   // joined the audio: everyone in the room is in it by ear, not reading.
   let join = $state();
   $effect(() => join?.focus());
+
+  // The name they want to be called, while they are typing it; until
+  // they type, it is whatever the invite says, which arrives after this
+  // card has been drawn. Only a link not yet spent can set one:
+  // afterwards it is who they are to the room, to the conversation, and
+  // to the cards they are holding.
+  let typed = $state(null);
+  const draft = $derived(typed ?? room.door?.display ?? '');
+
+  async function save() {
+    const ok = await setName(draft);
+    // Saved, trimmed and all: show what the room took.
+    if (ok) typed = null;
+    return ok;
+  }
+
+  // Join Audio spends the link, so take a name typed but never blurred
+  // with it; if the room won't have that name, nothing is spent.
+  async function enter() {
+    if (room.door && !(await save())) return;
+    await joinAudio();
+  }
 
   onMount(() => {
     // Asking for the mic now is what fills the device list with names,
@@ -19,7 +42,9 @@
     return watchDevices();
   });
 
-  const here = $derived(room.people.filter((p) => p.online && p.name !== room.you));
+  const here = $derived(
+    room.people.filter((p) => p.online && p.name !== room.you).map((p) => p.name),
+  );
   const starting = $derived(room.audio === 'starting');
 </script>
 
@@ -27,6 +52,11 @@
   <div class="card">
     <p class="eyebrow">{room.game ? 'Playing' : 'Voice room'}</p>
     <h1 id="enter-title">{room.game ?? 'Voice room'}</h1>
+    {#if room.door}
+      <p class="hi">Hi, {room.door.name}!</p>
+    {:else if room.you}
+      <p class="hi">Hi, {room.you}!</p>
+    {/if}
     {#if !supported()}
       <p class="lead">
         This browser can't do the room's audio: it needs WebCodecs, which means a
@@ -36,7 +66,29 @@
       <p class="lead">
         You are entering a voice conference room. Select your device and click
         <strong>Join Audio</strong> to enter the room.
+        {#if room.door}
+          Your link works once: pressing it is what spends it, and this
+          browser is remembered from then on.
+        {/if}
       </p>
+
+      {#if room.door}
+        <div class="devices name">
+          <label>
+            <span>Your name in the room</span>
+            <input type="text" maxlength={NAME_MAX} value={draft}
+              oninput={(e) => (typed = e.currentTarget.value)} onblur={save}
+              onkeydown={(e) => { if (e.key === 'Enter') { e.preventDefault(); save(); } }} />
+            <small>
+              Everyone in the room sees this. Your invite stays {room.door.name}'s,
+              whatever you call yourself.
+            </small>
+          </label>
+        </div>
+      {/if}
+      {#if room.doorError}
+        <p class="warn door">{room.doorError}</p>
+      {/if}
 
       <div class="devices">
         <label>
@@ -67,7 +119,7 @@
         {/if}
       </div>
 
-      <button class="primary join" bind:this={join} onclick={joinAudio} disabled={starting}>
+      <button class="primary join" bind:this={join} onclick={enter} disabled={starting}>
         {starting ? 'Starting…' : 'Join Audio'}
       </button>
       {#if room.audioError}
@@ -88,6 +140,10 @@
       </label>
     {/if}
 
+    <!-- Who is in is the room telling you, live. A link not yet spent has
+         no socket to hear it on, so the card says nothing rather than
+         something that was true once. -->
+    {#if !room.door}
     <p class="who">
       {#if !room.connected}
         Connecting to the room…
@@ -95,14 +151,15 @@
         Nobody else is here yet.
       {:else}
         <span class="dots" aria-hidden="true">
-          {#each here as p (p.name)}
-            <span class="pip" style="--h: {hue(p.name)}" title={p.name}></span>
+          {#each here as name (name)}
+            <span class="pip" style="--h: {hue(name)}" title={name}></span>
           {/each}
         </span>
-        {here.map((p) => p.name).join(', ')}
+        {here.join(', ')}
         {here.length === 1 ? 'is' : 'are'} already in.
       {/if}
     </p>
+    {/if}
   </div>
 </div>
 
@@ -135,6 +192,7 @@
     margin: 0 0 2px;
   }
   h1 { font-size: 24px; margin: 0 0 10px; }
+  .hi { font-size: 15px; font-weight: 600; margin: 0 0 8px; }
   .lead { color: var(--muted); margin: 0 0 18px; }
   .lead strong { color: var(--ink); font-weight: 600; white-space: nowrap; }
   .devices { display: flex; flex-direction: column; gap: 10px; margin-bottom: 18px; text-align: left; }
@@ -150,6 +208,19 @@
     padding: 8px 10px;
   }
   select:hover { border-color: var(--muted); }
+  .devices.name { margin-bottom: 14px; }
+  .devices.name small { font-size: 12px; color: var(--muted); line-height: 1.45; }
+  input[type='text'] {
+    font: inherit;
+    width: 100%;
+    color: var(--ink);
+    background: var(--bg);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 8px 10px;
+  }
+  input[type='text']:hover { border-color: var(--muted); }
+  .warn.door { margin: 0 0 14px; }
   .join {
     width: 100%;
     font-size: 17px;

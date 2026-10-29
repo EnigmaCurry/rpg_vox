@@ -118,7 +118,15 @@
   {/if}
 </dialog>
 
-{#if room.denied}
+{#if room.expired}
+  <main class="gate">
+    <h1>This link is expired</h1>
+    <p>
+      An invite link works once, on the browser that uses it — and this browser
+      hasn't been in before. Ask whoever runs the room for a new link.
+    </p>
+  </main>
+{:else if room.denied}
   <main class="gate">
     <h1>Voice room</h1>
     <p>You need an invite link to come in. Ask whoever runs the room for one.</p>

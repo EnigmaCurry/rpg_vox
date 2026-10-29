@@ -6,7 +6,19 @@ import { RoomAudio, listDevices, onDeviceChange, permitMic } from './audio.js';
 
 export const room = $state({
   connected: false,
+  // No invite link and no cookie: there is nothing to let this browser in.
   denied: false,
+  // A link that has already been traded for a cookie, in a browser that
+  // hasn't got one.
+  expired: false,
+  // The invite at the door, until Join Audio spends it: { name, display }.
+  // `name` is the name on the link, which stays the key the room is
+  // revoked by; `display` is what they will be called, and is theirs to
+  // change here and only here.
+  door: null,
+  // Why the door wouldn't take something: a name somebody else has, or a
+  // link that expired between opening it and pressing the button.
+  doorError: null,
   you: null,
   agent: { name: 'AI', state: 'listening', strip: '@agent' },
   // How the AI takes its turn. `mode` is what the room is actually doing;
@@ -99,15 +111,72 @@ export function connect() {
   };
 }
 
-/// Who this browser is, from its invite cookie; false when it has none.
+/// Who this browser is, from its own cookie, or whose invite link it is
+/// holding. True when there is a cookie, and so a room to connect to.
 export async function whoami() {
-  const r = await fetch('/api/me');
-  if (r.status === 401) {
-    room.denied = true;
+  let d;
+  try {
+    d = await (await fetch('/api/door')).json();
+  } catch (e) {
+    // The room isn't answering -- restarting, perhaps. Say nothing about
+    // invites: this browser may well be perfectly welcome.
+    console.error('[room] door', e);
     return false;
   }
-  room.you = (await r.json()).name;
-  return true;
+  if (d.state === 'in') {
+    room.you = d.display;
+    return true;
+  }
+  // An invite spends nothing until Join Audio: see `enterOnInvite`.
+  if (d.state === 'invited') room.door = { name: d.name, display: d.display };
+  else if (d.state === 'expired') room.expired = true;
+  else room.denied = true;
+  return false;
+}
+
+/// The name the room should call you, asked at the door while the invite
+/// link is still unspent. False (with `room.doorError` set) when the
+/// room wouldn't have it.
+export async function setName(display) {
+  room.doorError = null;
+  if (!room.door || display.trim() === room.door.display) return true;
+  try {
+    const r = await fetch('/api/door/name', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ display }),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(d.error || r.statusText);
+    room.door.display = d.display;
+    return true;
+  } catch (e) {
+    room.doorError = e.message || String(e);
+    return false;
+  }
+}
+
+/// Trade the invite link for this browser's own cookie. The link is
+/// spent here, which is why it happens on the way through the door and
+/// not when the link was opened.
+async function enterOnInvite() {
+  try {
+    const r = await fetch('/api/door/join', { method: 'POST' });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      // Somebody else got there first, or it was revoked while the card
+      // was open: there is nothing left to come in on.
+      if (d.state === 'expired') room.expired = true;
+      throw new Error(d.error || r.statusText);
+    }
+    room.you = d.display;
+    room.door = null;
+    connect();
+    return true;
+  } catch (e) {
+    room.doorError = e.message || String(e);
+    return false;
+  }
 }
 
 export function command(msg) {
@@ -266,6 +335,11 @@ export async function joinAudio() {
   if (audio) return;
   room.audio = 'starting';
   room.audioError = null;
+  // First time in on a link: the button is what spends it.
+  if (room.door && !(await enterOnInvite())) {
+    room.audio = 'off';
+    return;
+  }
   try {
     audio = new RoomAudio((bytes) => {
       if (ws?.readyState === WebSocket.OPEN) ws.send(bytes);

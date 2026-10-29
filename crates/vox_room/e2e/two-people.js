@@ -3,6 +3,9 @@
 // Prints, twice a second, how loud each tab's mix is (each should hear
 // the other and the AI, never themselves), the AI's state, and the
 // conversation as one tab sees it. Needs `playwright` (with Chromium).
+// Each browser is new, so each run wants new links: invite links are
+// spent by the Join Audio click, and a second run on the same pair gets
+// the expired page.
 const path = require('path');
 const { chromium } = require('playwright');
 const [ryanUrl, alexUrl, secs = '40', ryanWav = 'ryan.wav', alexWav = 'alex.wav', shot = 'room.png'] = process.argv.slice(2);

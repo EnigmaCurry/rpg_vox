@@ -147,11 +147,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Print the invite link for NAME, making one if needed.
+    /// Print the one-time invite link for NAME, making one if needed.
     Invite { name: String },
-    /// Revoke NAME's invite link.
+    /// Revoke NAME: their link and their browsers' cookies.
     Uninvite { name: String },
-    /// List everyone invited, with their links.
+    /// List everyone invited, with the links not yet used.
     People,
 }
 
@@ -246,6 +246,14 @@ fn main() -> Result<()> {
             if name.is_empty() || name.starts_with('@') {
                 bail!("give the person a name");
             }
+            if name.chars().count() > room::NAME_MAX {
+                bail!("names are at most {} characters", room::NAME_MAX);
+            }
+            // A second link for somebody who has already traded one in
+            // is a deliberate thing (another browser), so say so.
+            if store.person(name)?.is_some_and(|p| p.link.is_none()) {
+                eprintln!("{name} has joined already; this is a second link for them.");
+            }
             println!("{}/join/{}", base_url(&cli), store.invite(name)?);
             return Ok(());
         }
@@ -254,13 +262,21 @@ fn main() -> Result<()> {
                 bail!("{name} wasn't invited");
             }
             println!(
-                "{name}'s link no longer works (an open tab stays connected until it reloads)"
+                "{name}'s link and cookie are gone (an open tab stays connected until it reloads)"
             );
             return Ok(());
         }
         Some(Cmd::People) => {
-            for (name, token) in store.people()? {
-                println!("{name}\t{}/join/{token}", base_url(&cli));
+            for p in store.people()? {
+                let who = if p.display == p.name {
+                    p.name.clone()
+                } else {
+                    format!("{} (in the room as {})", p.name, p.display)
+                };
+                match p.link {
+                    Some(token) => println!("{who}\t{}/join/{token}", base_url(&cli)),
+                    None => println!("{who}\tjoined; `vox_room invite {}` for a new link", p.name),
+                }
             }
             return Ok(());
         }

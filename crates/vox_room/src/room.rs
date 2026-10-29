@@ -39,7 +39,7 @@ use tracing::{error, info, warn};
 use vox_transcribe::{Paragraph, ParagraphMode, Pusher};
 
 use crate::mixer::{AiProgress, Mixer, Strip, AGENT_STRIP};
-use crate::store::Store;
+use crate::store::{Invited, Store};
 
 /// Room events waiting for a slow tab before it starts skipping.
 const EVENT_CAPACITY: usize = 512;
@@ -50,6 +50,9 @@ const CUT_NOTE: &str = " [interrupted here]";
 /// What the model is told when the room enters a game: it speaks first.
 const OPENING: &str =
     "(Everyone has just entered the game. Open it: set the scene and bring the players in.)";
+/// Longest name anyone may give themselves at the door. It goes beside
+/// everything they say, and on a strip in the mixer.
+pub const NAME_MAX: usize = 24;
 /// Longest game name the AI may save.
 const GAME_NAME_MAX: usize = 60;
 /// Longest title on a card the AI deals.
@@ -456,7 +459,7 @@ impl Room {
         let people = store
             .people()?
             .into_iter()
-            .map(|(name, _)| (name, Person::default()))
+            .map(|p| (p.display, Person::default()))
             .collect();
         let (events, _) = broadcast::channel(EVENT_CAPACITY);
         Ok(Arc::new(Self {
@@ -519,8 +522,64 @@ impl Room {
         });
     }
 
-    pub fn person_for_token(&self, token: &str) -> Option<String> {
-        self.store().person_for_token(token).ok().flatten()
+    // -- the door: an invite link, traded once for a cookie --------------
+
+    /// Who this browser's cookie belongs to: the name the room calls
+    /// them, which is the only name anything else here knows.
+    pub fn person_for_session(&self, id: &str) -> Option<Invited> {
+        self.store().person_for_session(id).ok().flatten()
+    }
+
+    /// The invite a link opens, while it is still unspent. Looking is
+    /// free: the link is only spent by [`Room::claim`].
+    pub fn invite_at_door(&self, token: &str) -> Option<Invited> {
+        self.store().live_invite(token).ok().flatten()
+    }
+
+    /// Trade an invite link for this browser's own cookie. None when the
+    /// link has already been used.
+    pub fn claim(&self, token: &str) -> Option<(String, Invited)> {
+        match self.store().claim_invite(token) {
+            Ok(claimed) => claimed,
+            Err(err) => {
+                warn!("claim an invite: {err:#}");
+                None
+            }
+        }
+    }
+
+    /// What `name` is called in the room, as asked for at the door. Err
+    /// is the reason it can't be, to show on the card.
+    pub fn rename(&self, name: &str, wanted: &str) -> Result<String, String> {
+        let wanted = wanted.trim();
+        if wanted.is_empty() {
+            return Err("A name, please.".into());
+        }
+        if wanted.chars().count() > NAME_MAX {
+            return Err(format!("At most {NAME_MAX} characters."));
+        }
+        if wanted.starts_with('@') {
+            return Err("Names don't start with @.".into());
+        }
+        if wanted.chars().any(char::is_control) {
+            return Err("One line, no tabs.".into());
+        }
+        if wanted.eq_ignore_ascii_case(&self.cfg.agent_name) {
+            return Err(format!("{} is the AI's name.", self.cfg.agent_name));
+        }
+        match self.store().rename(name, wanted) {
+            Ok(true) => {}
+            Ok(false) => return Err("Somebody here is already called that.".into()),
+            Err(err) => {
+                warn!(person = %name, "rename: {err:#}");
+                return Err("The room couldn't save that.".into());
+            }
+        }
+        info!(person = %name, called = %wanted, "renamed themselves at the door");
+        // The roster lists everyone invited, so it has their old name on
+        // it until it is brought back in line.
+        self.reconcile_people();
+        Ok(wanted.to_string())
     }
 
     fn people_json(st: &State) -> Value {
@@ -552,7 +611,7 @@ impl Room {
         let mut st = self.lock();
         // State first, then the store: the order everything else here uses.
         let invited: BTreeSet<String> = match self.store().people() {
-            Ok(people) => people.into_iter().map(|(name, _)| name).collect(),
+            Ok(people) => people.into_iter().map(|p| p.display).collect(),
             Err(err) => {
                 warn!("couldn't read the invite list: {err:#}");
                 return;
@@ -2127,6 +2186,50 @@ mod tests {
         r.leave("Sam");
         r.reconcile_people();
         assert_eq!(names(&r), "Alex,Ryan");
+    }
+
+    #[test]
+    fn a_name_picked_at_the_door_is_the_name_the_room_uses() {
+        let (r, _turns) = room(Mode::Named);
+        let link = r.store().invite("Mike").unwrap();
+        let invite = r.invite_at_door(&link).expect("unspent");
+        assert_eq!(
+            (invite.name.as_str(), invite.display.as_str()),
+            ("Mike", "Mike")
+        );
+
+        // Their own, before the link is spent.
+        assert_eq!(r.rename("Mike", "  Mikey "), Ok("Mikey".into()));
+        assert!(
+            r.lock().people.contains_key("Mikey"),
+            "and so is the roster"
+        );
+        assert!(!r.lock().people.contains_key("Mike"));
+
+        // Not somebody else's, nor the AI's.
+        assert!(r.rename("Mike", "alex").is_err());
+        assert!(r.rename("Mike", "vox").is_err());
+        assert!(r.rename("Mike", "@agent").is_err());
+        assert!(r.rename("Mike", "   ").is_err());
+        assert!(r.rename("Mike", &"x".repeat(NAME_MAX + 1)).is_err());
+
+        // Join Audio: the link is spent, and what it leaves behind knows
+        // them by the name they picked.
+        let (cookie, who) = r.claim(&link).expect("still good");
+        assert_eq!(who.display, "Mikey");
+        assert_eq!(r.invite_at_door(&link), None, "a link works once");
+        assert!(r.claim(&link).is_none());
+        assert_eq!(
+            r.person_for_session(&cookie).map(|p| p.display),
+            Some("Mikey".into())
+        );
+
+        // Uninvite names the key, not the name in the room, and takes
+        // the cookie with it.
+        assert!(r.store().uninvite("Mike").unwrap());
+        assert_eq!(r.person_for_session(&cookie), None);
+        r.reconcile_people();
+        assert!(!r.lock().people.contains_key("Mikey"));
     }
 
     #[test]

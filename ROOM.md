@@ -24,7 +24,7 @@ export VOX_ROOM_TTS_URL=https://qwen3-tts.example.com
 just room
 ```
 
-Open your link, press **Join audio** at the door, and talk. The speech-to-text models
+Open your link, press **Join Audio** at the door, and talk. The speech-to-text models
 are the ones scribe downloads (run `scribe` once if you haven't). Building
 needs `pnpm` for the web app (`corepack enable` gives you one).
 
@@ -44,9 +44,21 @@ export VOX_ROOM_URL=https://room.example.com
 just room-invite Alex          # https://room.example.com/join/…
 ```
 
-Proxy everything, including WebSocket upgrades on `/room.ws`. The invite
-link sets a cookie and goes to the room; `vox_room uninvite NAME` revokes
-it and `vox_room people` lists everyone.
+Proxy everything, including WebSocket upgrades on `/room.ws`.
+
+A link works **once**. Opening it spends nothing: it takes them to the
+door, which says whose link it is and lets them set the name the room
+will use. (That door doesn't say who is in yet — it has no cookie, and
+so no socket to be told on.) **Join Audio** is what trades the link for a cookie, and from
+then on that browser is who comes in — the link is dead, and anyone
+opening it without the cookie is told it has expired.
+
+`vox_room people` lists everyone, with the links nobody has used yet.
+`vox_room uninvite NAME` revokes them: the link and every cookie traded
+for one. The name there is the name on the invite, whatever they call
+themselves in the room, and it stays theirs until they are uninvited.
+`vox_room invite NAME` again, after they have joined, is a second link —
+how somebody gets onto a second device, without disturbing the first.
 
 ### In Docker
 
@@ -70,7 +82,12 @@ See ROOM_DOCKER.md.
   everyone in the room is in it by ear. Pick your microphone and speakers
   there (both are remembered for next time), and push to talk, before you
   come in. The card also says who is already in. **Leave audio** puts you
-  back at the door. Choosing a speaker needs `AudioContext.setSinkId`,
+  back at the door. The first time, on an invite link, it says *Hi,
+  Mike* and offers **your name in the room**: that is the name everyone
+  sees, the one beside everything you say, and the one the AI deals your
+  cards to. Change it there and nowhere else — once the link is spent it
+  is who you are. (The name on the invite doesn't move with it: that is
+  the key `vox_room uninvite` names.) Choosing a speaker needs `AudioContext.setSinkId`,
   which today means Chrome; elsewhere the room follows the system default
   and the list isn't offered.
 - **The three areas**: what is yours alone on the left, the room's

@@ -29,7 +29,9 @@ just room-invite Ryan
 | `room-invite` / `room-uninvite` / `room-people` | the room's CLI inside the container |
 | `show-config` | the fully interpolated compose file, Traefik labels and all |
 
-`just room-invite NAME` prints the link to send someone. All three CLI
+`just room-invite NAME` prints the link to send someone, which works
+once: their browser trades it for a cookie when they press **Join
+Audio**, and `just room-uninvite NAME` takes both away. All three CLI
 recipes read and write the same SQLite file the running room has open,
 which is fine — they are brief writes.
 
@@ -105,7 +107,7 @@ Things worth knowing:
   no `certresolver`: the certificate for the host is already in Traefik's
   store, and `tls=true` is enough for it to be matched by SNI.
 - **The room must be at the domain root.** The SPA fetches absolute
-  `/api/me` and `wss://{host}/room.ws`, and the session cookie is
+  `/api/door` and `wss://{host}/room.ws`, and the session cookie is
   `Path=/`. A `StripPrefix` mount at `/room/` breaks all three. Give it
   its own host.
 - **The public port belongs in the invite links.** Invites are built
@@ -124,7 +126,7 @@ Things worth knowing:
 - **WebSockets need no configuration** — Traefik upgrades `/room.ws` on
   the same port natively. Don't add a buffering middleware; it would
   break the audio stream. An idle socket (a tab that hasn't pressed
-  **Join audio**) can hit `respondingTimeouts.idleTimeout`, but the
+  **Join Audio**) can hit `respondingTimeouts.idleTimeout`, but the
   client reconnects with backoff, so it self-heals.
 - **`VOX_ROOM_IP_SOURCERANGE`** gates who may reach the room at all,
   before the invite cookie is even looked at. `0.0.0.0/0` is everyone;
@@ -134,8 +136,10 @@ Things worth knowing:
   room is a few HTTP requests plus one long-lived WebSocket per tab, so
   it never trips, but it stops anyone hammering `/join/`.
 - **Keep the invite token out of your access log.** Invites are
-  `/join/<token>`, and the token *is* the credential. If you log request
-  paths, redact or drop `/join/`.
+  `/join/<token>`, and the token *is* the credential until it is spent.
+  It works once — whoever presses **Join Audio** with it gets the cookie
+  and nobody else can — but a link sitting unused in a log is a way in.
+  If you log request paths, redact or drop `/join/`.
 
 There is no `networks:` block and no `traefik.docker.network` label:
 Traefik is assumed to run on the host network, so it reaches the
