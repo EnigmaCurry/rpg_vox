@@ -191,6 +191,16 @@ impl Store {
             .optional()?)
     }
 
+    /// Forget one browser: the cookie stops working, and nobody else's
+    /// does. Their invite stays spent, so they need a new link to come
+    /// back.
+    pub fn end_session(&self, id: &str) -> Result<bool> {
+        Ok(self
+            .db
+            .execute("DELETE FROM sessions WHERE id = ?1", [id])?
+            > 0)
+    }
+
     /// The invite `token` opens, while it is still unspent.
     pub fn live_invite(&self, token: &str) -> Result<Option<Invited>> {
         Ok(self
@@ -621,6 +631,14 @@ mod tests {
             "Ryan",
             "but the cookie it was traded for lasts"
         );
+
+        // Logging out forgets this browser and nothing else.
+        let (other, _) = s.claim_invite(&s.invite("Ryan").unwrap()).unwrap().unwrap();
+        assert!(s.end_session(&cookie).unwrap());
+        assert_eq!(s.person_for_session(&cookie).unwrap(), None);
+        assert!(s.person_for_session(&other).unwrap().is_some());
+        assert!(!s.end_session(&cookie).unwrap());
+        let (cookie, _) = s.claim_invite(&s.invite("Ryan").unwrap()).unwrap().unwrap();
         assert_eq!(s.person("Ryan").unwrap().unwrap().link, None);
 
         // Asking again mints a second link, leaving the cookie alone.

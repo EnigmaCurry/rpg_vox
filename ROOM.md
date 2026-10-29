@@ -87,7 +87,10 @@ See ROOM_DOCKER.md.
   sees, the one beside everything you say, and the one the AI deals your
   cards to. Change it there and nowhere else — once the link is spent it
   is who you are. (The name on the invite doesn't move with it: that is
-  the key `vox_room uninvite` names.) Choosing a speaker needs `AudioContext.setSinkId`,
+  the key `vox_room uninvite` names.) **Log out**, at the foot of the
+  card, hands this browser's cookie back and forgets it — only this one,
+  so another device stays in. The link it came in on is spent, so coming
+  back takes a new one. Choosing a speaker needs `AudioContext.setSinkId`,
   which today means Chrome; elsewhere the room follows the system default
   and the list isn't offered.
 - **The three areas**: what is yours alone on the left, the room's

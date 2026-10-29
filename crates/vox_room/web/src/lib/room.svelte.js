@@ -179,6 +179,24 @@ async function enterOnInvite() {
   }
 }
 
+/// Give this browser's cookie back. The link it came in on is spent, so
+/// coming back takes a new one -- which is worth asking about first.
+export async function logOut() {
+  if (!(await ask(
+    'Log out of the room on this browser? Your invite link has been used, so you need a new one to come back.',
+    'Log out',
+  ))) return;
+  try {
+    await fetch('/api/door/logout', { method: 'POST' });
+  } catch (e) {
+    room.doorError = e.message || String(e);
+    return;
+  }
+  // Start over with no cookie rather than unpicking the socket, the
+  // audio and the room by hand: the door is the whole page as it is.
+  location.reload();
+}
+
 export function command(msg) {
   if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
 }

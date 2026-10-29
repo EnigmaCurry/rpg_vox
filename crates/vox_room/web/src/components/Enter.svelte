@@ -1,7 +1,8 @@
 <script>
   import { onMount } from 'svelte';
   import {
-    room, joinAudio, setName, setPushToTalk, loadDevices, watchDevices, setMicDevice, setSpeakerDevice,
+    room, joinAudio, setName, logOut, setPushToTalk, loadDevices, watchDevices,
+    setMicDevice, setSpeakerDevice,
   } from '../lib/room.svelte.js';
   import { supported, canChooseSpeaker } from '../lib/audio.js';
   import { hue } from '../lib/color.js';
@@ -160,6 +161,17 @@
       {/if}
     </p>
     {/if}
+
+    <!-- The way out of a browser that is signed in. An invite not yet
+         spent has nothing to give back. -->
+    {#if !room.door}
+      <p class="out">
+        <button class="logout" onclick={logOut}
+          title="Forget this browser. Your invite link is spent, so coming back takes a new one.">
+          Log out
+        </button>
+      </p>
+    {/if}
   </div>
 </div>
 
@@ -252,6 +264,15 @@
     gap: 6px;
     flex-wrap: wrap;
   }
+  .out { margin: 14px 0 0; padding-top: 12px; border-top: 1px solid var(--line); }
+  .logout {
+    font-size: 13px;
+    color: var(--muted);
+    background: none;
+    border: 0;
+    padding: 4px 8px;
+  }
+  .logout:hover { color: var(--danger); }
   .dots { display: inline-flex; gap: 3px; }
   .pip { width: 8px; height: 8px; border-radius: 50%; background: hsl(var(--h) 55% 55%); }
 </style>

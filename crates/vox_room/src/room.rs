@@ -548,6 +548,18 @@ impl Room {
         }
     }
 
+    /// Forget one browser. Nobody else's cookie is touched, and the
+    /// invite stays spent: they need a new link to come back.
+    pub fn log_out(&self, id: &str) -> bool {
+        match self.store().end_session(id) {
+            Ok(gone) => gone,
+            Err(err) => {
+                warn!("log out: {err:#}");
+                false
+            }
+        }
+    }
+
     /// What `name` is called in the room, as asked for at the door. Err
     /// is the reason it can't be, to show on the card.
     pub fn rename(&self, name: &str, wanted: &str) -> Result<String, String> {

@@ -29,6 +29,9 @@
 //! link for the lasting cookie, which is the only thing the room asks
 //! for afterwards. The link works once. `POST /api/door/name` is the
 //! name they want to be called, which they may set before spending it.
+//! `POST /api/door/logout` gives the cookie back: this browser is
+//! forgotten, and since the link it came in on is spent, coming back
+//! takes a new one.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -83,6 +86,7 @@ pub fn router(room: Arc<Room>) -> Router {
         .route("/api/door", get(door))
         .route("/api/door/join", post(door_join))
         .route("/api/door/name", post(door_name))
+        .route("/api/door/logout", post(door_logout))
         .route("/api/games/:name/prompt", get(game_prompt))
         .route("/room.ws", get(ws))
         .route("/healthz", get(|| async { "ok" }))
@@ -194,6 +198,28 @@ async fn door_join(State(app): State<App>, headers: HeaderMap) -> Response {
             (header::SET_COOKIE, set_cookie(PENDING, "", 0, &headers)),
         ]),
         Json(json!({ "state": "in", "display": invite.display })),
+    )
+        .into_response()
+}
+
+/// Log out: forget this browser, and hand back both cookies cleared.
+/// Nobody else's is touched, and the invite stays spent -- coming back
+/// takes a new link.
+async fn door_logout(State(app): State<App>, headers: HeaderMap) -> Response {
+    if let Some(id) = cookie(&headers, COOKIE) {
+        if let Some(who) = app.room.person_for_session(&id) {
+            info!(person = %who.name, "logged out of a browser");
+        }
+        app.room.log_out(&id);
+    }
+    (
+        AppendHeaders([
+            (header::SET_COOKIE, set_cookie(COOKIE, "", 0, &headers)),
+            // A link left over from the way in goes with it, or the door
+            // would offer to spend it again.
+            (header::SET_COOKIE, set_cookie(PENDING, "", 0, &headers)),
+        ]),
+        Json(json!({ "state": "none" })),
     )
         .into_response()
 }
