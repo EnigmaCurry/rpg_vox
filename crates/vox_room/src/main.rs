@@ -87,9 +87,22 @@ struct Cli {
     /// Model name.
     #[arg(long, env = "VOX_SCRIBE_LLM_MODEL")]
     model: Option<String>,
-    /// Let a reasoning model think before it answers (never spoken).
+    /// How hard the model may think before it answers: none, low,
+    /// medium or high. Never spoken, and it costs latency either way.
+    /// On a local server this turns its chat template's thinking on or
+    /// off; on OpenAI it is the reasoning effort.
+    #[arg(long, env = "VOX_ROOM_REASONING", default_value = "low")]
+    reasoning: String,
+    /// Think before answering: the old name for `--reasoning medium`.
     #[arg(long, env = "VOX_AGENT_THINK")]
     think: bool,
+    /// Which API to speak: auto, responses or chat. `/responses` is the
+    /// one that takes tools and thinking together, which OpenAI's
+    /// reasoning models refuse on `/chat/completions`; a local llama.cpp
+    /// or vLLM has only `/chat/completions`. `auto` tries `/responses`
+    /// and remembers if there isn't one.
+    #[arg(long, env = "VOX_ROOM_LLM_API", default_value = "auto")]
+    llm_api: String,
     /// Let the AI look things up in the lobby, by asking the endpoint's
     /// own web search (OpenAI's `/responses`). Off by default: a local
     /// llama.cpp has no such thing, and each search costs a request.
@@ -257,11 +270,32 @@ fn serve(cli: Cli, store: Store) -> Result<()> {
         if cli.search {
             info!("the AI can look things up in the lobby, with the endpoint's web search");
         }
+        // --think was the old name, and meant "think about it".
+        let reasoning = match agent::Reasoning::parse(&cli.reasoning) {
+            Some(_) if cli.think && cli.reasoning == "low" => agent::Reasoning::Medium,
+            Some(r) => r,
+            None => bail!(
+                "--reasoning is none, low, medium or high, not {:?}",
+                cli.reasoning
+            ),
+        };
+        let Some(api) = agent::Api::parse(&cli.llm_api) else {
+            bail!(
+                "--llm-api is auto, responses or chat, not {:?}",
+                cli.llm_api
+            );
+        };
+        info!(
+            reasoning = reasoning.as_str(),
+            api = ?api,
+            "the AI's endpoint"
+        );
         agent::Llm::Chat(agent::Chat {
             url: endpoint.url,
             model,
             key: endpoint.api_key,
-            think: cli.think,
+            reasoning,
+            api,
             search: cli.search,
         })
     };

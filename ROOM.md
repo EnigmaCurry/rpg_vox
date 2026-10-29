@@ -238,11 +238,10 @@ costs:
 cargo test -p vox_room -- --ignored --nocapture judges
 ```
 
-Run it after changing anything the model reads. One thing it turned up:
-OpenAI's reasoning models refuse function tools on `/v1/chat/completions`
-unless `reasoning_effort` is `none`, so with one of those the room is
-judging pauses with reasoning off (it learns this from the first 400 and
-retries). `/v1/responses` is the endpoint that would allow both.
+Run it after changing anything the model reads. There is a second live
+test, `whole_reply`, that puts a real reply through the whole path — the
+room's own request, the stream parsed as it arrives, a tool run from it,
+and the model carrying on from the tool's answer.
 
 ## How it works
 
@@ -267,6 +266,31 @@ retries). `/v1/responses` is the endpoint that would allow both.
   sentences, then the words of the current one that have been heard in
   full.
 
+### Thinking, and which API
+
+Two different things used to share one name, so they now have two.
+
+`--reasoning none|low|medium|high` (default `low`) is how hard the model
+may think before it answers. On a local server it turns the chat
+template's thinking on or off (`chat_template_kwargs.enable_thinking`,
+which is a llama.cpp and vLLM convention and nothing else knows it); on
+OpenAI it is the reasoning effort. `--think` is the old name for
+`--reasoning medium`.
+
+`--llm-api auto|responses|chat` is which API to speak. It matters
+because **OpenAI's reasoning models refuse function tools on
+`/chat/completions`** unless the thinking is switched off entirely — and
+the room puts tools on every reply, for the cards and the games — so on
+that API the AI runs every game, and judges every pause, without
+thinking. `/responses` takes both together. A local llama.cpp or vLLM has
+only `/chat/completions`.
+
+`auto` asks `/responses` first and remembers, once per run, if the
+endpoint hasn't got one, so neither kind needs configuring. Against
+OpenAI it is also the faster of the two: thinking at `low` through
+`/responses` beat thinking switched off through `/chat/completions`, which
+pays for a rejected request before every reply.
+
 ## Options
 
 `vox_room --help` lists them all; each also reads an environment variable.
@@ -283,6 +307,8 @@ retries). `/v1/responses` is the endpoint that would allow both.
 | `VOX_ROOM_ENGAGED_FOR_MS` | `30000` | idle time that ends a back-and-forth and goes back to "when named" |
 | `VOX_ROOM_HISTORY` | `60` | entries of the conversation sent to the model |
 | `VOX_SCRIBE_LLM_URL`, `VOX_SCRIBE_LLM_MODEL`, `VOX_SCRIBE_LLM_KEY` | as for scribe and `agent` | the model |
+| `VOX_ROOM_REASONING` | `low` | how hard it thinks: `none`, `low`, `medium`, `high` |
+| `VOX_ROOM_LLM_API` | `auto` | which API: `auto`, `responses`, `chat` |
 | `VOX_ROOM_PROMPT`, `VOX_ROOM_PROMPT_FILE` | a short one for spoken group chat | system prompt; `{name}` and `{people}` are filled in |
 | `VOX_ROOM_TTS` | see above | `qwen3`, `kokoro` or `none` |
 | `VOX_ROOM_TTS_URL` | `PI_TTS_URL` | Qwen3-TTS server (`/v1/audio/speech`) |

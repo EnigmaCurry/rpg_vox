@@ -176,10 +176,74 @@ pub struct Chat {
     pub url: String,
     pub model: String,
     pub key: Option<String>,
-    pub think: bool,
+    /// How hard the model may think before it answers. Never spoken.
+    pub reasoning: Reasoning,
+    /// Which API to talk. `Auto` tries `/responses` and remembers if the
+    /// endpoint hasn't got one.
+    pub api: Api,
     /// Offer `look_up` in the lobby: a web search the endpoint runs for
     /// us on `/responses`. Off for servers that have no such thing.
     pub search: bool,
+}
+
+/// The two OpenAI-compatible APIs the room can speak.
+///
+/// `/responses` is the one that takes tools and reasoning together --
+/// OpenAI's reasoning models refuse the pair on `/chat/completions` --
+/// but a local llama.cpp or vLLM only has `/chat/completions`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Api {
+    #[default]
+    Auto,
+    Chat,
+    Responses,
+}
+
+impl Api {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "auto" | "" => Some(Api::Auto),
+            "chat" | "chat/completions" => Some(Api::Chat),
+            "responses" => Some(Api::Responses),
+            _ => None,
+        }
+    }
+}
+
+/// How much thinking the model does before it answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Reasoning {
+    None,
+    #[default]
+    Low,
+    Medium,
+    High,
+}
+
+impl Reasoning {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "none" | "off" => Some(Reasoning::None),
+            "low" | "" => Some(Reasoning::Low),
+            "medium" | "med" => Some(Reasoning::Medium),
+            "high" => Some(Reasoning::High),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Reasoning::None => "none",
+            Reasoning::Low => "low",
+            Reasoning::Medium => "medium",
+            Reasoning::High => "high",
+        }
+    }
+
+    /// Whether a local server's chat template should think at all.
+    fn thinks(self) -> bool {
+        self != Reasoning::None
+    }
 }
 
 impl Chat {
@@ -426,6 +490,160 @@ const TOOL_ROUNDS: usize = 4;
 static REASONING_OFF: AtomicBool = AtomicBool::new(false);
 /// The endpoint refused tools and the room has been told.
 static TOOLS_REFUSED: AtomicBool = AtomicBool::new(false);
+/// The endpoint has no `/responses` (a local llama.cpp or vLLM), so the
+/// room speaks `/chat/completions` from here on.
+static NO_RESPONSES: AtomicBool = AtomicBool::new(false);
+/// The endpoint doesn't know `chat_template_kwargs` (anything that isn't
+/// a local server). Learned once for the process, not once per reply.
+static NO_KWARGS: AtomicBool = AtomicBool::new(false);
+
+impl Chat {
+    /// Which API this endpoint actually speaks, as far as the room has
+    /// found out.
+    fn api(&self) -> Api {
+        match self.api {
+            Api::Auto if NO_RESPONSES.load(Ordering::Relaxed) => Api::Chat,
+            Api::Auto => Api::Responses,
+            chosen => chosen,
+        }
+    }
+}
+
+/// `/responses` wants a function tool flat; `/chat/completions` wants it
+/// wrapped. The room writes them wrapped and unwraps here.
+fn flatten_tools(tools: &Value) -> Value {
+    Value::Array(
+        tools
+            .as_array()
+            .map(|all| {
+                all.iter()
+                    .map(|t| {
+                        let f = &t["function"];
+                        json!({
+                            "type": "function",
+                            "name": f["name"],
+                            "description": f["description"],
+                            "parameters": f["parameters"],
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+    )
+}
+
+/// One streamed event, from either API, folded into the reply so far.
+/// Returns true when the stream is over.
+fn fold_event(
+    api: Api,
+    v: &Value,
+    said: &mut String,
+    pending: &mut String,
+    calls: &mut Vec<ToolCall>,
+) -> bool {
+    let at = |calls: &mut Vec<ToolCall>, i: usize| -> usize {
+        while calls.len() <= i {
+            calls.push(ToolCall::default());
+        }
+        i
+    };
+    match api {
+        Api::Chat | Api::Auto => {
+            let delta = &v["choices"][0]["delta"];
+            if let Some(piece) = delta["content"].as_str() {
+                pending.push_str(piece);
+                said.push_str(piece);
+            }
+            if let Some(parts) = delta["tool_calls"].as_array() {
+                for part in parts {
+                    let i = at(calls, part["index"].as_u64().unwrap_or(0) as usize);
+                    let c = &mut calls[i];
+                    if let Some(id) = part["id"].as_str() {
+                        c.id.push_str(id);
+                    }
+                    if let Some(n) = part["function"]["name"].as_str() {
+                        c.name.push_str(n);
+                    }
+                    if let Some(a) = part["function"]["arguments"].as_str() {
+                        c.arguments.push_str(a);
+                    }
+                }
+            }
+            false
+        }
+        Api::Responses => {
+            // Reasoning items are never read out: only output_text is.
+            match v["type"].as_str().unwrap_or_default() {
+                "response.output_text.delta" => {
+                    if let Some(piece) = v["delta"].as_str() {
+                        pending.push_str(piece);
+                        said.push_str(piece);
+                    }
+                }
+                // A finished item carries the whole call, arguments and
+                // all, so the argument deltas need no assembling.
+                "response.output_item.done" if v["item"]["type"] == "function_call" => {
+                    let item = &v["item"];
+                    let i = at(calls, v["output_index"].as_u64().unwrap_or(0) as usize);
+                    calls[i] = ToolCall {
+                        id: item["call_id"].as_str().unwrap_or_default().to_string(),
+                        name: item["name"].as_str().unwrap_or_default().to_string(),
+                        arguments: item["arguments"].as_str().unwrap_or_default().to_string(),
+                    };
+                }
+                "response.completed" | "response.incomplete" | "response.failed" => return true,
+                _ => {}
+            }
+            false
+        }
+    }
+}
+
+/// What the model said and called, put back into the conversation so it
+/// can carry on from its own tool results.
+fn push_turn(api: Api, convo: &mut Vec<Value>, said: &str, calls: &[ToolCall]) {
+    let said = said.trim();
+    match api {
+        Api::Responses => {
+            if !said.is_empty() {
+                convo.push(json!({ "role": "assistant", "content": said }));
+            }
+            for c in calls {
+                convo.push(json!({
+                    "type": "function_call",
+                    "call_id": c.id,
+                    "name": c.name,
+                    "arguments": c.arguments,
+                }));
+            }
+        }
+        _ => convo.push(json!({
+            "role": "assistant",
+            "content": if said.is_empty() { Value::Null } else { Value::from(said) },
+            "tool_calls": calls.iter().enumerate().map(|(i, c)| json!({
+                "id": c.id(i),
+                "type": "function",
+                "function": { "name": c.name, "arguments": c.arguments },
+            })).collect::<Vec<_>>(),
+        })),
+    }
+}
+
+/// One tool's answer, in the shape its API takes it back.
+fn push_result(api: Api, convo: &mut Vec<Value>, call: &ToolCall, i: usize, result: String) {
+    match api {
+        Api::Responses => convo.push(json!({
+            "type": "function_call_output",
+            "call_id": call.id,
+            "output": result,
+        })),
+        _ => convo.push(json!({
+            "role": "tool",
+            "tool_call_id": call.id(i),
+            "content": result,
+        })),
+    }
+}
 
 /// The model, one reply: stream it into sentences, and in the lobby run
 /// the tools it calls and let it carry on with their results.
@@ -442,47 +660,95 @@ fn stream_reply(
     generation: &AtomicU64,
     tx: &Sender<Speak>,
 ) -> Result<()> {
-    let (model, think) = (cfg.model.as_str(), cfg.think);
-    let chat = cfg.endpoint("chat/completions");
-    let mut messages = messages.to_vec();
-    let mut kwargs = true;
+    let model = cfg.model.as_str();
+    let mut convo = messages.to_vec();
     // The cards are offered in a game too; the game tools are the lobby's.
     let mut tools = true;
     let mut first = true;
     // What this reply has said, across tool rounds.
     let mut spoken: Vec<Vec<String>> = Vec::new();
     for round in 0..=TOOL_ROUNDS {
-        let resp = loop {
-            let req = cfg.authorize(http.post(&chat));
-            let mut body = json!({ "model": model, "messages": messages, "stream": true });
-            if kwargs {
-                body["chat_template_kwargs"] = json!({ "enable_thinking": think });
+        let mut api = cfg.api();
+        let (resp, api) = loop {
+            let url = cfg.endpoint(match api {
+                Api::Responses => "responses",
+                _ => "chat/completions",
+            });
+            let mut body = match api {
+                Api::Responses => json!({ "model": model, "input": convo, "stream": true }),
+                _ => json!({ "model": model, "messages": convo, "stream": true }),
+            };
+            match api {
+                // The one that takes thinking and tools together.
+                Api::Responses => {
+                    body["reasoning"] = json!({ "effort": cfg.reasoning.as_str() });
+                }
+                // A local server's chat template takes it this way, and
+                // nothing else knows the parameter at all.
+                _ if !NO_KWARGS.load(Ordering::Relaxed) => {
+                    body["chat_template_kwargs"] =
+                        json!({ "enable_thinking": cfg.reasoning.thinks() });
+                }
+                _ => {}
             }
             if tools && round < TOOL_ROUNDS {
-                body["tools"] = tools_for(lobby, cfg.search, cue.deciding());
-                if REASONING_OFF.load(Ordering::Relaxed) {
+                let offered = tools_for(lobby, cfg.search, cue.deciding());
+                body["tools"] = match api {
+                    Api::Responses => flatten_tools(&offered),
+                    _ => offered,
+                };
+                if api != Api::Responses && REASONING_OFF.load(Ordering::Relaxed) {
                     body["reasoning_effort"] = json!("none");
                 }
             }
-            match req.send_json(body) {
-                Ok(r) => break r,
+            match cfg.authorize(http.post(&url)).send_json(body) {
+                Ok(r) => break (r, api),
                 Err(ureq::Error::Status(code, r)) => {
                     let detail = r.into_string().unwrap_or_default();
-                    if code == 400 && kwargs && detail.contains("chat_template_kwargs") {
-                        kwargs = false;
+                    // No /responses here: a local llama.cpp or vLLM. Said
+                    // once for the process, then the room speaks chat.
+                    if api == Api::Responses
+                        && cfg.api == Api::Auto
+                        && matches!(code, 404 | 405 | 501)
+                    {
+                        if !NO_RESPONSES.swap(true, Ordering::Relaxed) {
+                            info!("{url} has no /responses; speaking chat/completions");
+                        }
+                        api = Api::Chat;
                         continue;
                     }
                     if code == 400
+                        && api != Api::Responses
+                        && !NO_KWARGS.load(Ordering::Relaxed)
+                        && detail.contains("chat_template_kwargs")
+                    {
+                        NO_KWARGS.store(true, Ordering::Relaxed);
+                        continue;
+                    }
+                    // Reasoning models refuse tools on /chat/completions
+                    // unless the thinking is off. /responses is the way
+                    // to have both, so say so rather than silently
+                    // dropping either.
+                    if code == 400
+                        && api != Api::Responses
                         && tools
-                        && !think
                         && detail.contains("reasoning_effort")
                         && !REASONING_OFF.swap(true, Ordering::Relaxed)
                     {
-                        info!("{chat} only takes tools without reasoning; turning it off");
+                        warn!(
+                            "{url} won't take tools while {model} is thinking; \
+                             turning thinking off (--llm-api responses keeps both)"
+                        );
+                        if cfg.reasoning.thinks() {
+                            room.error(&format!(
+                                "{model} won't think and use tools on this API; \
+                                 run with --llm-api responses to have both."
+                            ));
+                        }
                         continue;
                     }
                     if code == 400 && tools && detail.contains("tool") {
-                        warn!("{chat} refuses tools, so games and cards won't work: {detail}");
+                        warn!("{url} refuses tools, so games and cards won't work: {detail}");
                         if !TOOLS_REFUSED.swap(true, Ordering::Relaxed) {
                             room.error(&format!(
                                 "{model} won't take tools here, so games and cards won't work: {}",
@@ -493,11 +759,11 @@ fn stream_reply(
                         continue;
                     }
                     bail!(
-                        "{chat}: HTTP {code}: {}",
+                        "{url}: HTTP {code}: {}",
                         detail.chars().take(300).collect::<String>()
                     );
                 }
-                Err(e) => return Err(e).with_context(|| format!("POST {chat}")),
+                Err(e) => return Err(e).with_context(|| format!("POST {url}")),
             }
         };
         let ms = || asked.elapsed().as_millis() as u64;
@@ -520,31 +786,13 @@ fn stream_reply(
             let Ok(v) = serde_json::from_str::<Value>(data) else {
                 continue;
             };
-            let delta = &v["choices"][0]["delta"];
-            if let Some(piece) = delta["content"].as_str() {
-                if said.is_empty() && first && !piece.trim().is_empty() {
-                    info!(g, after_asking_ms = ms(), "reply: first words");
-                }
-                pending.push_str(piece);
-                said.push_str(piece);
+            let was_silent = said.is_empty();
+            let over = fold_event(api, &v, &mut said, &mut pending, &mut calls);
+            if was_silent && first && !said.trim().is_empty() {
+                info!(g, after_asking_ms = ms(), "reply: first words");
             }
-            if let Some(parts) = delta["tool_calls"].as_array() {
-                for part in parts {
-                    let i = part["index"].as_u64().unwrap_or(0) as usize;
-                    while calls.len() <= i {
-                        calls.push(ToolCall::default());
-                    }
-                    let c = &mut calls[i];
-                    if let Some(id) = part["id"].as_str() {
-                        c.id.push_str(id);
-                    }
-                    if let Some(n) = part["function"]["name"].as_str() {
-                        c.name.push_str(n);
-                    }
-                    if let Some(a) = part["function"]["arguments"].as_str() {
-                        c.arguments.push_str(a);
-                    }
-                }
+            if over {
+                break;
             }
             while let Some(end) =
                 sentence_end(&pending).or_else(|| first.then(|| clause_end(&pending)).flatten())
@@ -575,15 +823,7 @@ fn stream_reply(
         // save still makes its card) but let this reply end here.
         let answered = round > 0 && !said.trim().is_empty();
         // The model's text so far stays in its turn, with the calls.
-        messages.push(json!({
-            "role": "assistant",
-            "content": if said.trim().is_empty() { Value::Null } else { Value::from(said) },
-            "tool_calls": calls.iter().enumerate().map(|(i, c)| json!({
-                "id": c.id(i),
-                "type": "function",
-                "function": { "name": c.name, "arguments": c.arguments },
-            })).collect::<Vec<_>>(),
-        }));
+        push_turn(api, &mut convo, &said, &calls);
         let spoke = !spoken.is_empty();
         for (i, c) in calls.iter().enumerate() {
             let mut result = run_tool(room, cfg, g, c);
@@ -597,7 +837,7 @@ fn stream_reply(
                      Carry on from there; don't repeat it.)",
                 );
             }
-            messages.push(json!({ "role": "tool", "tool_call_id": c.id(i), "content": result }));
+            push_result(api, &mut convo, c, i, result);
         }
         if room.is_starting(g) {
             info!(g, "reply: started a game, so it ends here");
@@ -624,7 +864,7 @@ fn stream_reply(
     Ok(())
 }
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone)]
 struct ToolCall {
     id: String,
     name: String,
@@ -1169,6 +1409,27 @@ mod tests {
         assert_eq!(with.last().unwrap(), "look_up");
     }
 
+    /// The endpoint the environment points at, for the live tests.
+    fn configured_chat() -> Chat {
+        let Ok(url) = std::env::var("VOX_SCRIBE_LLM_URL") else {
+            panic!("set VOX_SCRIBE_LLM_URL, VOX_SCRIBE_LLM_MODEL and VOX_SCRIBE_LLM_KEY");
+        };
+        Chat {
+            url,
+            model: std::env::var("VOX_SCRIBE_LLM_MODEL").expect("VOX_SCRIBE_LLM_MODEL"),
+            key: std::env::var("VOX_SCRIBE_LLM_KEY").ok(),
+            reasoning: std::env::var("VOX_ROOM_REASONING")
+                .ok()
+                .and_then(|r| Reasoning::parse(&r))
+                .unwrap_or(Reasoning::Low),
+            api: std::env::var("VOX_ROOM_LLM_API")
+                .ok()
+                .and_then(|a| Api::parse(&a))
+                .unwrap_or_default(),
+            search: false,
+        }
+    }
+
     fn turn(cue: Cue) -> (Agent, RoomConfig, Turn) {
         turn_with(cue, &["Ryan", "Alex"], false)
     }
@@ -1199,6 +1460,91 @@ mod tests {
         (agent, cfg, turn)
     }
 
+    /// A whole reply, through the real thing: the room's own request,
+    /// the stream parsed as it arrives, a tool run from it, and the
+    /// model carrying on from the tool's answer. Not run by default:
+    /// it talks to the configured endpoint.
+    ///
+    /// ```text
+    /// cargo test -p vox_room -- --ignored --nocapture whole_reply
+    /// ```
+    #[test]
+    #[ignore = "asks the configured model for a whole reply"]
+    fn a_whole_reply_goes_out_and_comes_back() {
+        let chat = configured_chat();
+        println!("speaking {:?} to {}", chat.api(), chat.url);
+        let store = crate::store::Store::memory();
+        store.invite("Ryan").unwrap();
+        let (turns_tx, _turns) = crossbeam_channel::unbounded();
+        let generation = Arc::new(AtomicU64::new(7));
+        let room = Room::new(
+            store,
+            RoomConfig {
+                agent_name: "Vox".into(),
+                aliases: vec![],
+                reply_after: Duration::from_millis(1200),
+                confirm: Duration::from_millis(300),
+                engaged_for: Duration::from_secs(30),
+                history: 60,
+            },
+            generation.clone(),
+            turns_tx,
+            None,
+        )
+        .unwrap();
+
+        let (agent, cfg, mut t) = turn_with(Cue::Speak, &["Ryan"], false);
+        t.messages = vec![(
+            Role::User,
+            "Ryan: Vox, put the rules up for everyone: one card each, aces low. \
+             Use post_card, then tell me in one short sentence that it is up."
+                .into(),
+        )];
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let http = ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(10))
+            .timeout_read(Duration::from_secs(120))
+            .build();
+        stream_reply(
+            &http,
+            &room,
+            &chat,
+            &agent.messages(&cfg, &t),
+            true,
+            t.cue,
+            7,
+            Instant::now(),
+            &generation,
+            &tx,
+        )
+        .expect("the reply");
+        drop(tx);
+
+        let said: Vec<String> = rx
+            .iter()
+            .filter_map(|s| match s {
+                Speak::Sentence(_, s) => Some(s),
+                _ => None,
+            })
+            .collect();
+        let posted = room.read_cards(None); // not these: the card went to the room
+        let log = room.hello("Ryan")["log"].to_string();
+        println!("  said: {said:?}");
+        println!("  posted: {}", &log[..log.len().min(300)]);
+        assert!(posted
+            .iter()
+            .all(|p| p["cards"].as_array().unwrap().is_empty()));
+        assert!(log.contains("\"kind\":\"card\""), "the tool ran: {log}");
+        assert!(
+            log.contains("aces") || log.contains("Aces"),
+            "with its body: {log}"
+        );
+        assert!(
+            !said.is_empty(),
+            "it carried on talking after the tool answered"
+        );
+    }
+
     /// Put a decide turn to the configured model and see what it does
     /// with it. Not run by default: it talks to the endpoint in
     /// VOX_SCRIBE_LLM_URL and costs whatever that costs.
@@ -1209,16 +1555,7 @@ mod tests {
     #[test]
     #[ignore = "asks the configured model to judge some pauses"]
     fn the_model_judges_a_pause_the_way_the_room_needs() {
-        let Ok(url) = std::env::var("VOX_SCRIBE_LLM_URL") else {
-            panic!("set VOX_SCRIBE_LLM_URL, VOX_SCRIBE_LLM_MODEL and VOX_SCRIBE_LLM_KEY");
-        };
-        let chat = Chat {
-            url,
-            model: std::env::var("VOX_SCRIBE_LLM_MODEL").expect("VOX_SCRIBE_LLM_MODEL"),
-            key: std::env::var("VOX_SCRIBE_LLM_KEY").ok(),
-            think: false,
-            search: false,
-        };
+        let chat = configured_chat();
         // (said, who is here, mid-conversation, should it take the turn)
         let cases: &[(&str, &[&str], bool, bool)] = &[
             ("Ryan: So what do you make of that?", &["Ryan"], false, true),
@@ -1247,18 +1584,33 @@ mod tests {
             let (said, people, engaged, want_turn) = case;
             let (agent, cfg, mut t) = turn_with(Cue::Decide { lull: None }, people, *engaged);
             t.messages = vec![(Role::User, said.to_string())];
-            // What the room settles on for this endpoint, once it has
-            // learned what it will take (see REASONING_OFF).
-            let mut body = json!({
-                "model": chat.model,
-                "messages": agent.messages(&cfg, &t),
-                "tools": tools_for(true, false, true),
-            });
-            if REASONING_OFF.load(Ordering::Relaxed) {
+            // Ask the way the room asks, on whichever API it speaks.
+            let offered = tools_for(true, false, true);
+            let messages = agent.messages(&cfg, &t);
+            let (path, mut body) = match chat.api() {
+                Api::Responses => (
+                    "responses",
+                    json!({
+                        "model": chat.model,
+                        "input": messages,
+                        "tools": flatten_tools(&offered),
+                        "reasoning": { "effort": chat.reasoning.as_str() },
+                    }),
+                ),
+                _ => (
+                    "chat/completions",
+                    json!({
+                        "model": chat.model,
+                        "messages": messages,
+                        "tools": offered,
+                    }),
+                ),
+            };
+            if chat.api() != Api::Responses && REASONING_OFF.load(Ordering::Relaxed) {
                 body["reasoning_effort"] = json!("none");
             }
             let resp: Value = match chat
-                .authorize(ureq::post(&chat.endpoint("chat/completions")))
+                .authorize(ureq::post(&chat.endpoint(path)))
                 .send_json(body)
             {
                 Ok(r) => r.into_json().expect("read the answer"),
@@ -1277,10 +1629,32 @@ mod tests {
                 }
                 Err(e) => panic!("{e}"),
             };
-            let message = &resp["choices"][0]["message"];
-            let quiet = message["tool_calls"]
-                .as_array()
-                .is_some_and(|c| c.iter().any(|c| c["function"]["name"] == "stay_quiet"));
+            // Either API's answer: did it call stay_quiet, or talk?
+            let (quiet, spoke) = match chat.api() {
+                Api::Responses => {
+                    let out = resp["output"].as_array().cloned().unwrap_or_default();
+                    let said: String = out
+                        .iter()
+                        .filter(|i| i["type"] == "message")
+                        .flat_map(|i| i["content"].as_array().cloned().unwrap_or_default())
+                        .filter_map(|c| c["text"].as_str().map(str::to_string))
+                        .collect();
+                    (
+                        out.iter()
+                            .any(|i| i["type"] == "function_call" && i["name"] == "stay_quiet"),
+                        said,
+                    )
+                }
+                _ => {
+                    let m = &resp["choices"][0]["message"];
+                    (
+                        m["tool_calls"].as_array().is_some_and(|c| {
+                            c.iter().any(|c| c["function"]["name"] == "stay_quiet")
+                        }),
+                        m["content"].as_str().unwrap_or_default().to_string(),
+                    )
+                }
+            };
             let took_turn = !quiet;
             println!(
                 "{} {said:?}\n   -> {}",
@@ -1292,10 +1666,7 @@ mod tests {
                 if quiet {
                     "stayed quiet".to_string()
                 } else {
-                    format!(
-                        "spoke: {}",
-                        message["content"].as_str().unwrap_or("").trim()
-                    )
+                    format!("spoke: {}", spoke.trim())
                 },
             );
             if took_turn != *want_turn {
@@ -1303,6 +1674,163 @@ mod tests {
             }
         }
         assert!(wrong.is_empty(), "judged wrongly: {wrong:#?}");
+    }
+
+    #[test]
+    fn each_api_is_fed_and_read_in_its_own_shape() {
+        // One function tool, wrapped for chat and flat for responses.
+        let offered = tools_for(false, false, false);
+        let flat = flatten_tools(&offered);
+        assert_eq!(offered[0]["function"]["name"], "list_people");
+        assert_eq!(flat[0]["name"], "list_people");
+        assert_eq!(flat[0]["type"], "function");
+        assert!(flat[0]["function"].is_null(), "not wrapped twice");
+        assert_eq!(flat[0]["parameters"], offered[0]["function"]["parameters"]);
+
+        // Reading a streamed answer: text, then a call, then the end.
+        let fold = |api, events: &[Value]| {
+            let (mut said, mut pending, mut calls) = (String::new(), String::new(), Vec::new());
+            let over = events
+                .iter()
+                .map(|e| fold_event(api, e, &mut said, &mut pending, &mut calls))
+                .collect::<Vec<_>>()
+                .contains(&true);
+            (said, calls, over)
+        };
+        let (said, calls, over) = fold(
+            Api::Responses,
+            &[
+                json!({ "type": "response.output_text.delta", "delta": "Dealing " }),
+                json!({ "type": "response.output_text.delta", "delta": "you in." }),
+                json!({ "type": "response.reasoning_summary_text.delta", "delta": "never spoken" }),
+                json!({
+                    "type": "response.output_item.done",
+                    "output_index": 1,
+                    "item": {
+                        "type": "function_call",
+                        "call_id": "call_2",
+                        "name": "send_card",
+                        "arguments": "{\"to\":\"Alex\"}",
+                    },
+                }),
+                json!({
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": {
+                        "type": "function_call",
+                        "call_id": "call_1",
+                        "name": "post_card",
+                        "arguments": "{\"title\":\"Rules\"}",
+                    },
+                }),
+                json!({ "type": "response.completed" }),
+            ],
+        );
+        assert_eq!(said, "Dealing you in.", "the thinking is not the answer");
+        assert!(over, "the stream says when it is done");
+        // Each call lands at its own output_index, in order.
+        assert_eq!(
+            calls
+                .iter()
+                .map(|c| (c.name.as_str(), c.id.as_str()))
+                .collect::<Vec<_>>(),
+            [("post_card", "call_1"), ("send_card", "call_2")]
+        );
+
+        // The same, assembled from chat's deltas.
+        let (said, calls, over) = fold(
+            Api::Chat,
+            &[
+                json!({ "choices": [{ "delta": { "content": "Dealing " } }] }),
+                json!({ "choices": [{ "delta": { "content": "you in." } }] }),
+                json!({ "choices": [{ "delta": { "tool_calls": [{
+                    "index": 0, "id": "call_1",
+                    "function": { "name": "post_card", "arguments": "{\"title\":" },
+                }] } }] }),
+                json!({ "choices": [{ "delta": { "tool_calls": [{
+                    "index": 0, "function": { "arguments": "\"Rules\"}" },
+                }] } }] }),
+            ],
+        );
+        assert_eq!(said, "Dealing you in.");
+        assert!(!over, "chat ends on [DONE], not an event");
+        assert_eq!(calls[0].arguments, r#"{"title":"Rules"}"#);
+
+        // And handing the results back, each API's way.
+        let call = ToolCall {
+            id: "call_1".into(),
+            name: "post_card".into(),
+            arguments: "{}".into(),
+        };
+        let mut convo = Vec::new();
+        push_turn(
+            Api::Responses,
+            &mut convo,
+            "Here you go.",
+            std::slice::from_ref(&call),
+        );
+        push_result(
+            Api::Responses,
+            &mut convo,
+            &call,
+            0,
+            "{\"posted\":true}".into(),
+        );
+        assert_eq!(
+            convo[0],
+            json!({ "role": "assistant", "content": "Here you go." })
+        );
+        assert_eq!(convo[1]["type"], "function_call");
+        assert_eq!(convo[1]["call_id"], "call_1");
+        assert_eq!(
+            convo[2],
+            json!({ "type": "function_call_output", "call_id": "call_1", "output": "{\"posted\":true}" })
+        );
+
+        let mut convo = Vec::new();
+        push_turn(
+            Api::Chat,
+            &mut convo,
+            "Here you go.",
+            std::slice::from_ref(&call),
+        );
+        push_result(Api::Chat, &mut convo, &call, 0, "{}".into());
+        assert_eq!(convo[0]["role"], "assistant");
+        assert_eq!(convo[0]["tool_calls"][0]["function"]["name"], "post_card");
+        assert_eq!(convo[1]["role"], "tool");
+        assert_eq!(convo[1]["tool_call_id"], "call_1");
+    }
+
+    #[test]
+    fn the_endpoint_is_asked_for_as_configured() {
+        let chat = |api| Chat {
+            url: "http://x/v1".into(),
+            model: "m".into(),
+            key: None,
+            reasoning: Reasoning::Medium,
+            api,
+            search: false,
+        };
+        assert_eq!(chat(Api::Chat).api(), Api::Chat);
+        assert_eq!(chat(Api::Responses).api(), Api::Responses);
+        // Auto reaches for /responses until an endpoint hasn't got one.
+        NO_RESPONSES.store(false, Ordering::Relaxed);
+        assert_eq!(chat(Api::Auto).api(), Api::Responses);
+        NO_RESPONSES.store(true, Ordering::Relaxed);
+        assert_eq!(chat(Api::Auto).api(), Api::Chat);
+        assert_eq!(
+            chat(Api::Responses).api(),
+            Api::Responses,
+            "asked for, so used"
+        );
+        NO_RESPONSES.store(false, Ordering::Relaxed);
+
+        assert_eq!(Reasoning::parse("HIGH"), Some(Reasoning::High));
+        assert_eq!(Reasoning::parse("off"), Some(Reasoning::None));
+        assert_eq!(Reasoning::parse("sure"), None);
+        assert!(!Reasoning::None.thinks() && Reasoning::Low.thinks());
+        assert_eq!(Api::parse("responses"), Some(Api::Responses));
+        assert_eq!(Api::parse("nope"), None);
     }
 
     #[test]
