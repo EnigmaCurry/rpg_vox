@@ -94,7 +94,8 @@ struct Cli {
     #[arg(long, env = "VOX_ROOM_REASONING", default_value = "low")]
     reasoning: String,
     /// Think before answering: the old name for `--reasoning medium`.
-    #[arg(long, env = "VOX_AGENT_THINK")]
+    /// VOX_AGENT_THINK is still read, leniently (see `thinks`).
+    #[arg(long)]
     think: bool,
     /// Which API to speak: auto, responses or chat. `/responses` is the
     /// one that takes tools and thinking together, which OpenAI's
@@ -195,6 +196,18 @@ fn env_names(cmd: &clap::Command, out: &mut Vec<OsString>) {
 ///
 /// `FOO=` in a `.env` file or a compose service is how you say "leave
 /// this one alone", but to clap a set-but-empty variable is a value like
+/// The old `VOX_AGENT_THINK`, read by hand and leniently: as a clap flag
+/// anything but exactly `true` or `false` stopped the room from starting
+/// at all, which an old `.env` saying `0` should not do.
+fn thinks(flag: bool) -> bool {
+    flag || std::env::var("VOX_AGENT_THINK").is_ok_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
 /// any other: a blank `VOX_ROOM_PROMPT` becomes an empty system prompt, a
 /// blank `VOX_ROOM_TTS_URL` a voice server at no address, and a blank
 /// `VOX_ROOM_TTS` won't parse at all, so the room refuses to start.
@@ -272,7 +285,7 @@ fn serve(cli: Cli, store: Store) -> Result<()> {
         }
         // --think was the old name, and meant "think about it".
         let reasoning = match agent::Reasoning::parse(&cli.reasoning) {
-            Some(_) if cli.think && cli.reasoning == "low" => agent::Reasoning::Medium,
+            Some(_) if thinks(cli.think) && cli.reasoning == "low" => agent::Reasoning::Medium,
             Some(r) => r,
             None => bail!(
                 "--reasoning is none, low, medium or high, not {:?}",

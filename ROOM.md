@@ -271,11 +271,15 @@ and the model carrying on from the tool's answer.
 Two different things used to share one name, so they now have two.
 
 `--reasoning none|low|medium|high` (default `low`) is how hard the model
-may think before it answers. On a local server it turns the chat
+may think before it answers. Note the default: before, thinking was off
+unless you asked for it, and now a little of it is on. `--reasoning none`
+is the old off. On a local server it turns the chat
 template's thinking on or off (`chat_template_kwargs.enable_thinking`,
 which is a llama.cpp and vLLM convention and nothing else knows it); on
 OpenAI it is the reasoning effort. `--think` is the old name for
-`--reasoning medium`.
+`--reasoning medium`, and `VOX_AGENT_THINK` is still read — leniently,
+since as a flag anything but exactly `true` or `false` used to stop the
+room from starting.
 
 `--llm-api auto|responses|chat` is which API to speak. It matters
 because **OpenAI's reasoning models refuse function tools on
