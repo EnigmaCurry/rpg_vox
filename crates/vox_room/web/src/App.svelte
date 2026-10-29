@@ -1,10 +1,10 @@
 <script>
   import { onMount } from 'svelte';
-  import { room, connect, command, enterGame, peekGame, ask, answer, whoami, joinAudio, leaveAudio, setMuted, setVolume, setPushToTalk, talk } from './lib/room.svelte.js';
-  import { supported } from './lib/audio.js';
+  import { room, connect, command, enterGame, peekGame, ask, answer, whoami, leaveAudio, setMuted, setVolume, setPushToTalk, talk } from './lib/room.svelte.js';
   import Log from './components/Log.svelte';
   import Strip from './components/Strip.svelte';
   import Cards from './components/Cards.svelte';
+  import Enter from './components/Enter.svelte';
 
   onMount(async () => {
     if (await whoami()) connect();
@@ -124,7 +124,9 @@
     <p>You need an invite link to come in. Ask whoever runs the room for one.</p>
   </main>
 {:else}
-  <div class="app">
+  <!-- Until the audio is joined the room is behind the door: visible,
+       but not to be clicked, tabbed into, or read out. -->
+  <div class="app" inert={room.audio !== 'on'}>
     <header>
       <h1>{room.game ?? 'Voice room'}</h1>
       {#if room.game}<button onclick={lobby}>Back to lobby</button>{/if}
@@ -200,16 +202,7 @@
     </aside>
 
     <footer>
-      {#if !supported()}
-        <span class="warn">This browser can't do the room's audio (it needs WebCodecs: a recent Chrome, Firefox or Safari).</span>
-      {:else if room.audio === 'off' || room.audio === 'error'}
-        <button class="primary big" onclick={joinAudio}>Join audio</button>
-        <span class="hint">Best with a headset: anyone can interrupt {room.agent.name} just by talking. On speakers, use push to talk.</span>
-        <label class="vol" title="Your mic stays muted except while you hold Space or the talk button.">
-          <input type="checkbox" checked={room.pushToTalk} onchange={(e) => { setPushToTalk(e.currentTarget.checked); e.currentTarget.blur(); }} />
-          Push to talk
-        </label>
-      {:else}
+      {#if room.audio === 'on'}
         {#if room.pushToTalk}
           <button class="big ptt" class:talking={room.talking} disabled={!room.mic}
             onpointerdown={(e) => { e.currentTarget.setPointerCapture(e.pointerId); talk(true); }}
@@ -240,8 +233,7 @@
           <input type="range" min="0" max="1.5" step="0.01" value={room.volume}
             oninput={(e) => setVolume(Number(e.currentTarget.value))} />
         </label>
-        <button onclick={leaveAudio}>Leave audio</button>
-        {#if room.audio === 'starting'}<span class="hint">starting…</span>{/if}
+        <button onclick={leaveAudio} title="Leave the audio and go back to the door.">Leave audio</button>
       {/if}
       {#if room.audioError}<span class="warn">Mic: {room.audioError}</span>{/if}
       {#if room.notice}
@@ -250,6 +242,8 @@
       {/if}
     </footer>
   </div>
+
+  {#if room.audio !== 'on'}<Enter />{/if}
 {/if}
 
 <style>

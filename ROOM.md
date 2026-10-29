@@ -24,7 +24,7 @@ export VOX_ROOM_TTS_URL=https://qwen3-tts.example.com
 just room
 ```
 
-Open your link, press **Join audio**, and talk. The speech-to-text models
+Open your link, press **Join audio** at the door, and talk. The speech-to-text models
 are the ones scribe downloads (run `scribe` once if you haven't). Building
 needs `pnpm` for the web app (`corepack enable` gives you one).
 
@@ -65,6 +65,11 @@ See ROOM_DOCKER.md.
 
 ## In the room
 
+- **The door**: the room is voice only, so a tab that hasn't joined the
+  audio sits behind a **Join audio** card and can't do anything else —
+  everyone in the room is in it by ear. The card says who is already in,
+  and is where you choose push to talk before you come in. **Leave
+  audio** puts you back at the door.
 - **When named / When it fits / Every pause** (top right, shared by
   everyone): who gets the turn when the room goes quiet.
   - **When named** — the AI says nothing until someone says its name, so

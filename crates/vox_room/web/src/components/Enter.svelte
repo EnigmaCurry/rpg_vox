@@ -1,0 +1,127 @@
+<script>
+  import { room, joinAudio, setPushToTalk } from '../lib/room.svelte.js';
+  import { supported } from '../lib/audio.js';
+  import { hue } from '../lib/color.js';
+
+  // The room is voice only, so this stands in front of it until you have
+  // joined the audio: everyone in the room is in it by ear, not reading.
+  let join = $state();
+  $effect(() => join?.focus());
+
+  const here = $derived(room.people.filter((p) => p.online && p.name !== room.you));
+  const starting = $derived(room.audio === 'starting');
+</script>
+
+<div class="enter" role="dialog" aria-modal="true" aria-labelledby="enter-title">
+  <div class="card">
+    <p class="eyebrow">{room.game ? 'Playing' : 'Voice room'}</p>
+    <h1 id="enter-title">{room.game ?? 'Voice room'}</h1>
+    {#if !supported()}
+      <p class="lead">
+        This browser can't do the room's audio: it needs WebCodecs, which means a
+        recent Chrome, Firefox or Safari.
+      </p>
+    {:else}
+      <p class="lead">
+        This room is talked, not typed. Join the audio to come in — you'll hear
+        everyone here and {room.agent.name}, and they'll hear you.
+      </p>
+      <button class="primary join" bind:this={join} onclick={joinAudio} disabled={starting}>
+        {starting ? 'Starting…' : 'Join audio'}
+      </button>
+      {#if room.audioError}
+        <p class="warn">Your microphone: {room.audioError}</p>
+      {/if}
+      <label class="ptt">
+        <input type="checkbox" checked={room.pushToTalk}
+          onchange={(e) => setPushToTalk(e.currentTarget.checked)} />
+        <span>
+          Push to talk
+          <small>
+            On speakers, turn this on: your mic opens only while you hold Space.
+            With a headset, leave it off — anyone can interrupt {room.agent.name}
+            just by talking.
+          </small>
+        </span>
+      </label>
+    {/if}
+    <p class="who">
+      {#if !room.connected}
+        Connecting to the room…
+      {:else if here.length === 0}
+        Nobody else is here yet.
+      {:else}
+        <span class="dots" aria-hidden="true">
+          {#each here as p (p.name)}
+            <span class="pip" style="--h: {hue(p.name)}" title={p.name}></span>
+          {/each}
+        </span>
+        {here.map((p) => p.name).join(', ')}
+        {here.length === 1 ? 'is' : 'are'} already in.
+      {/if}
+    </p>
+  </div>
+</div>
+
+<style>
+  .enter {
+    position: fixed;
+    inset: 0;
+    z-index: 10;
+    display: grid;
+    place-items: center;
+    padding: 24px;
+    background: color-mix(in srgb, var(--bg) 82%, transparent);
+    backdrop-filter: blur(6px);
+  }
+  .card {
+    width: min(26em, 100%);
+    text-align: center;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 16px;
+    box-shadow: var(--shadow), 0 12px 40px rgb(0 0 0 / 12%);
+    padding: 28px 28px 22px;
+  }
+  .eyebrow {
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--muted);
+    margin: 0 0 2px;
+  }
+  h1 { font-size: 24px; margin: 0 0 10px; }
+  .lead { color: var(--muted); margin: 0 0 20px; }
+  .join {
+    width: 100%;
+    font-size: 17px;
+    font-weight: 600;
+    padding: 14px 20px;
+    border-radius: 10px;
+  }
+  .join:not(:disabled):hover { filter: brightness(1.08); }
+  .ptt {
+    display: flex;
+    gap: 10px;
+    text-align: left;
+    margin-top: 18px;
+    padding-top: 16px;
+    border-top: 1px solid var(--line);
+    cursor: pointer;
+  }
+  .ptt input { margin-top: 3px; }
+  .ptt small { display: block; font-size: 12px; color: var(--muted); line-height: 1.45; }
+  .warn { color: var(--danger); font-size: 13px; margin: 12px 0 0; }
+  .who {
+    font-size: 13px;
+    color: var(--muted);
+    margin: 18px 0 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+  .dots { display: inline-flex; gap: 3px; }
+  .pip { width: 8px; height: 8px; border-radius: 50%; background: hsl(var(--h) 55% 55%); }
+</style>
