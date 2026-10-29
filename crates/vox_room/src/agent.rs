@@ -18,7 +18,7 @@ use crossbeam_channel::{Receiver, Sender};
 use serde_json::{json, Value};
 use tracing::{debug, info, warn};
 
-use crate::room::{GameSettings, ReplyMode, Role, Room, Turn};
+use crate::room::{Cue, GameSettings, ReplyMode, Role, Room, RoomConfig, Turn};
 use crate::tts::Voice;
 
 /// The default instructions; `{name}` and `{people}` are filled in.
@@ -74,19 +74,44 @@ already holding; speech recognition mangles names, so match what you hear to \
 the closest name on that list, and check it there rather than guessing. Cards \
 stay until the person discards one or the conversation starts over.";
 
+/// The last thing the AI is shown when the room is leaving it to decide
+/// whether this pause is its moment.
+const DECIDE: &str = "\
+(The room has gone quiet for a moment and nobody has said your name. You are \
+being shown this gap so you can judge it, not because anyone asked you to \
+speak. Stay out of it unless there is a real reason to come in: the people \
+are talking with each other, and a pause between them is theirs, not an \
+opening for you. Reasons to speak are things like a question you are the one \
+to answer, a plain mistake worth correcting, something you were asked to \
+watch for, or a conversation that has genuinely run out and wants a hand. \
+Otherwise call stay_quiet and say nothing at all -- and if you would rather \
+see a longer silence before judging, set ask_again_in_seconds on it. If you \
+do speak, speak as yourself and never mention this note or the fact that you \
+were deciding.)";
+
+/// The same, on the second look at a silence the AI asked to be shown.
+const DECIDE_LULL: &str = "\
+(The room has now been quiet for {lull} seconds, which is the silence you \
+asked to be shown. Nobody has said anything in it. Speak now if this is the \
+moment you were waiting for; if it isn't, call stay_quiet and let the room \
+be. Never mention this note.)";
+
 /// Added to the prompt, in the lobby and in a game: how the room decides
 /// the AI's turn, and how it bows out.
 const TURN_NOTE: &str = "\
-You are answering because the room gave you the turn: either someone said \
-your name, which puts you in a back-and-forth where you answer every pause \
-without being named again, or the room is set to answer every pause anyway. \
-Either way, when the people are done with you -- they thank you, say \
-goodbye, say they will be back, or simply turn to each other and are plainly \
-talking among themselves -- call wait_until_named and stand down: from then \
-on you say nothing at all until someone says your name again. Prefer standing \
-down over hanging on; it costs them one word to call you back, and it costs \
-them their conversation if you keep answering. Say your short goodbye before \
-you call it, since what you have already said is spoken straight away.";
+You are speaking because the room gave you the turn. It does that when \
+someone says your name -- which also puts you in a back-and-forth, where you \
+keep the turn at every pause without being named again -- and, in its \
+automatic mode, at every pause regardless, leaving it to you to decide \
+whether the moment is yours; you are told when that is what is being asked. \
+Treat the turn as something to give back. When the people are done with you \
+-- they thank you, say goodbye, say they will be back, or simply turn to \
+each other and are plainly talking among themselves -- call wait_until_named \
+and stand down: from then on you say nothing at all until someone says your \
+name again. Prefer standing down over hanging on; it costs them one word to \
+call you back, and it costs them their conversation if you keep answering. \
+Say your short goodbye before you call it, since what you have already said \
+is spoken straight away.";
 
 /// Added to the lobby's prompt when `--search` is on.
 const SEARCH_NOTE: &str = "\
@@ -186,8 +211,14 @@ impl Agent {
                     if self.generation.load(Ordering::SeqCst) != g {
                         continue;
                     }
-                    let messages = self.messages(&room, &turn);
+                    let messages = self.messages(room.config(), &turn);
                     let result = match &self.llm {
+                        // Echo has no judgment to offer, so it hands a
+                        // turn it was asked to judge straight back.
+                        Llm::Echo if turn.cue.deciding() => {
+                            let _ = room.stay_quiet(g, None);
+                            Ok(())
+                        }
                         Llm::Echo => echo(&turn, &tx),
                         Llm::Chat(chat) => stream_reply(
                             &http,
@@ -195,6 +226,7 @@ impl Agent {
                             chat,
                             &messages,
                             turn.game.is_none(),
+                            turn.cue,
                             g,
                             turn.asked,
                             &self.generation,
@@ -210,8 +242,7 @@ impl Agent {
             .expect("spawn agent thread");
     }
 
-    fn messages(&self, room: &Room, turn: &Turn) -> Vec<Value> {
-        let cfg = room.config();
+    fn messages(&self, cfg: &RoomConfig, turn: &Turn) -> Vec<Value> {
         // Who is here, and anyone who spoke in the history.
         let mut people: Vec<String> = turn
             .messages
@@ -252,6 +283,15 @@ impl Agent {
                 Role::Assistant => "assistant",
             };
             out.push(json!({ "role": role, "content": text }));
+        }
+        // Last, so it is the thing the model has just read, and so the
+        // rest of the turn is the same prompt either way.
+        if let Cue::Decide { lull } = turn.cue {
+            let note = match lull {
+                None => DECIDE.to_string(),
+                Some(s) => DECIDE_LULL.replace("{lull}", &s.to_string()),
+            };
+            out.push(json!({ "role": "user", "content": note }));
         }
         out
     }
@@ -346,6 +386,7 @@ fn stream_reply(
     cfg: &Chat,
     messages: &[Value],
     lobby: bool,
+    cue: Cue,
     g: u64,
     asked: Instant,
     generation: &AtomicU64,
@@ -368,7 +409,7 @@ fn stream_reply(
                 body["chat_template_kwargs"] = json!({ "enable_thinking": think });
             }
             if tools && round < TOOL_ROUNDS {
-                body["tools"] = tools_for(lobby, cfg.search);
+                body["tools"] = tools_for(lobby, cfg.search, cue.deciding());
                 if REASONING_OFF.load(Ordering::Relaxed) {
                     body["reasoning_effort"] = json!("none");
                 }
@@ -512,6 +553,12 @@ fn stream_reply(
             info!(g, "reply: started a game, so it ends here");
             return Ok(());
         }
+        // It judged the pause not to be its own: nothing more to say, and
+        // the room has already dropped whatever was queued.
+        if calls.iter().any(|c| c.name == "stay_quiet") {
+            info!(g, "reply: stayed quiet");
+            return Ok(());
+        }
         if generation.load(Ordering::SeqCst) != g {
             info!(g, "reply dropped");
             return Ok(());
@@ -609,6 +656,27 @@ fn room_tools() -> Vec<Value> {
     ]
 }
 
+/// Offered only when the room is leaving the AI to judge the moment.
+fn quiet_tool() -> Value {
+    tool(
+        "stay_quiet",
+        "Say nothing this turn: the pause you were shown is not yours. \
+         Call it instead of writing anything at all -- then nothing of \
+         yours is spoken and nothing appears on screen, as though the \
+         room had never asked. Use it whenever the people are talking \
+         with each other rather than with you.",
+        json!({
+            "ask_again_in_seconds": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 120,
+                "description": "Ask to be shown the room again if nobody says anything for this many seconds -- how you wait for a real silence instead of the short gap you were just shown. Leave it out to simply stay out.",
+            },
+        }),
+        &[],
+    )
+}
+
 /// The `reply_mode` a game is saved with.
 fn reply_mode_arg() -> Value {
     json!({
@@ -620,11 +688,15 @@ fn reply_mode_arg() -> Value {
 
 /// Everything the model may do this turn: the cards anywhere, and in the
 /// lobby designing games and looking things up when `search` is on.
-fn tools_for(lobby: bool, search: bool) -> Value {
+fn tools_for(lobby: bool, search: bool, deciding: bool) -> Value {
     let name =
         json!({ "type": "string", "description": "The game's name, as the players will see it." });
+    let mut extra = room_tools();
+    if deciding {
+        extra.push(quiet_tool());
+    }
     if !lobby {
-        return Value::Array(room_tools());
+        return Value::Array(extra);
     }
     let game = json!({
         "name": name,
@@ -647,7 +719,7 @@ fn tools_for(lobby: bool, search: bool) -> Value {
     tools
         .as_array_mut()
         .expect("tools is an array")
-        .extend(room_tools());
+        .extend(extra);
     if search {
         tools.as_array_mut().expect("tools is an array").push(tool(
             "look_up",
@@ -771,6 +843,9 @@ fn run_tool(room: &Room, cfg: &Chat, g: u64, call: &ToolCall) -> String {
             .remove_game(g, &arg("name"))
             .map(|name| json!({ "deleted": name })),
         "list_people" => Ok(json!({ "people": room.people_here() })),
+        "stay_quiet" => room
+            .stay_quiet(g, args["ask_again_in_seconds"].as_u64())
+            .map(|()| json!({ "quiet": true })),
         "wait_until_named" => {
             // What the room is doing afterwards: a game that answers at
             // every pause still does, and the model should know.
@@ -959,7 +1034,11 @@ mod tests {
     }
 
     fn tool_names(lobby: bool, search: bool) -> Vec<String> {
-        tools_for(lobby, search)
+        tool_names_deciding(lobby, search, false)
+    }
+
+    fn tool_names_deciding(lobby: bool, search: bool, deciding: bool) -> Vec<String> {
+        tools_for(lobby, search, deciding)
             .as_array()
             .unwrap()
             .iter()
@@ -978,6 +1057,80 @@ mod tests {
         assert_eq!(with.len(), without.len() + 1);
         assert_eq!(&with[..without.len()], &without[..]);
         assert_eq!(with.last().unwrap(), "look_up");
+    }
+
+    fn turn(cue: Cue) -> (Agent, RoomConfig, Turn) {
+        let agent = Agent {
+            llm: Llm::Echo,
+            prompt: DEFAULT_PROMPT.to_string(),
+            generation: Arc::new(AtomicU64::new(0)),
+        };
+        let cfg = RoomConfig {
+            agent_name: "Vox".into(),
+            aliases: vec![],
+            reply_after: Duration::from_millis(1200),
+            confirm: Duration::from_millis(300),
+            engaged_for: Duration::from_secs(30),
+            history: 60,
+        };
+        let turn = Turn {
+            generation: 1,
+            messages: vec![(Role::User, "Ryan: so what did you make of it?".into())],
+            asked: Instant::now(),
+            game: None,
+            people: vec!["Ryan".into(), "Alex".into()],
+            cue,
+        };
+        (agent, cfg, turn)
+    }
+
+    #[test]
+    fn a_turn_to_judge_ends_with_what_makes_it_a_judgment() {
+        let (agent, cfg, t) = turn(Cue::Decide { lull: None });
+        let messages = agent.messages(&cfg, &t);
+        let last = messages.last().unwrap();
+        assert_eq!(last["role"], "user");
+        let note = last["content"].as_str().unwrap();
+        assert!(note.contains("stay_quiet"), "{note}");
+        assert!(note.contains("nobody has said your name"));
+        // The conversation itself is untouched, and the note is last, so
+        // the rest of the prompt is the same either way.
+        assert_eq!(messages[1]["content"], "Ryan: so what did you make of it?");
+
+        // The silence it asked for says how long it has lasted.
+        let (agent, cfg, t) = turn(Cue::Decide { lull: Some(8) });
+        let note = agent.messages(&cfg, &t);
+        let note = note.last().unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(note.contains("quiet for 8 seconds"), "{note}");
+        assert!(!note.contains("{lull}"));
+
+        // A turn it was told to take carries no such note at all.
+        let (agent, cfg, t) = turn(Cue::Speak);
+        let messages = agent.messages(&cfg, &t);
+        assert_eq!(messages.len(), 2, "system and the conversation");
+        assert!(!messages[1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("stay_quiet"));
+    }
+
+    #[test]
+    fn staying_quiet_is_offered_only_when_the_room_leaves_it_to_the_ai() {
+        for lobby in [true, false] {
+            assert!(
+                !tool_names(lobby, true).contains(&"stay_quiet".to_string()),
+                "a turn it was told to take has no way to decline it"
+            );
+            let deciding = tool_names_deciding(lobby, true, true);
+            assert!(deciding.contains(&"stay_quiet".to_string()));
+            // Everything else it had, it still has: it may well speak.
+            for t in tool_names(lobby, true) {
+                assert!(deciding.contains(&t), "{t} went missing");
+            }
+        }
     }
 
     #[test]

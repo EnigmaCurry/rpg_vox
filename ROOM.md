@@ -65,14 +65,29 @@ See ROOM_DOCKER.md.
 
 ## In the room
 
-- **When named / After every pause** (top right, shared by everyone): by
-  default the AI only answers when someone says its name, so two people
-  can talk to each other without it butting in. "After every pause"
-  makes it answer whenever the room goes quiet.
+- **When named / When it fits / Every pause** (top right, shared by
+  everyone): who gets the turn when the room goes quiet.
+  - **When named** — the AI says nothing until someone says its name, so
+    two people can talk without it butting in. The default.
+  - **When it fits** — at every pause the AI is *given the turn* and
+    decides for itself whether the moment is its own. It is shown the
+    conversation and one extra instruction: the pause between two people
+    is theirs, so stay out of it unless there is a real reason to come in
+    — a question you are the one to answer, a mistake worth correcting,
+    something you were asked to watch for, a conversation that has run
+    out. If it passes, it calls `stay_quiet` and **nothing happens at
+    all**: no bubble, no "thinking", nothing on anyone's screen. It can
+    also pass with `ask_again_in_seconds`, and the room shows it the
+    conversation again if the quiet actually lasts that long — how it
+    waits for a real silence instead of the 1.2 s gap it was shown. Only
+    once per silence, so a quiet room can't loop.
+  - **Every pause** — answers whenever the room goes quiet, no judgment
+    involved. The cheapest, and what a game that deals the turns wants.
 - **The back-and-forth**: saying its name doesn't buy you one answer, it
-  starts a conversation. From then on the AI answers every pause without
-  being named again — the button moves to "After every pause" with a dot
-  beside it — until the room has been idle for 30 seconds
+  starts a conversation. From then on the AI keeps the turn at every pause
+  without being named again — the button moves to "When it fits" with a
+  dot beside it, so it is still judging each pause rather than answering
+  every one — until the room has been idle for 30 seconds
   (`--engaged-for-ms`), when it goes back to waiting for its name. You can
   also end it in words: "thanks", "goodbye", "that's all", or just turning
   to talk to someone else, and the AI stands down by itself with its
@@ -113,6 +128,7 @@ A game also carries settings, not just a prompt. Today that is
 | `reply_mode` | |
 |---|---|
 | `room` (default) | however the people have the room set, back-and-forth and all |
+| `auto` | the AI is shown every pause and judges whether to come in |
 | `always` | the AI answers every pause: for a game where it deals the turns |
 | `named` | the AI speaks only when a player says its name |
 
@@ -153,6 +169,21 @@ never reads one aloud.
 Cards belong to the conversation they were dealt in: **New conversation**,
 **Restart game** and moving between the lobby and a game all clear
 everyone's private area. A player can discard one with the **×** on it.
+
+### What judging a pause costs
+
+"When it fits" asks the model at every pause, so a conversation between
+two people is a model call every time they stop for breath — a whole
+prompt in, usually a single tool call out. That is the trade: the
+judgment is a semantic one ("is this mine to answer?"), which is what a
+language model is for, and asking the same model that would answer means
+a pause it *does* take costs nothing extra — it just keeps talking,
+with no second round trip.
+
+If that turns out to be too expensive, the seam to replace is narrow: the
+room hands out a turn with a `Cue::Decide`, and anything that can answer
+"speak or stay quiet" can sit behind it — a small local model, or a
+turn-taking model, without the room or the UI changing.
 
 ## How it works
 

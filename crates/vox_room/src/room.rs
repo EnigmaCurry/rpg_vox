@@ -93,7 +93,11 @@ impl Kind {
 pub enum Mode {
     /// Only when someone says its name.
     Named,
-    /// Whenever the room goes quiet.
+    /// At every pause the AI is given the turn and decides for itself
+    /// whether this is its moment, so three people can talk with it in
+    /// the room without it answering every gap.
+    Auto,
+    /// Whenever the room goes quiet, no judgment involved.
     Always,
 }
 
@@ -101,6 +105,7 @@ impl Mode {
     fn parse(s: &str) -> Option<Self> {
         match s {
             "named" => Some(Mode::Named),
+            "auto" => Some(Mode::Auto),
             "always" => Some(Mode::Always),
             _ => None,
         }
@@ -108,8 +113,27 @@ impl Mode {
     fn as_str(self) -> &'static str {
         match self {
             Mode::Named => "named",
+            Mode::Auto => "auto",
             Mode::Always => "always",
         }
+    }
+}
+
+/// Why the AI has been given the turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cue {
+    /// Say something: it was named, it is opening a game, or the room
+    /// answers every pause.
+    Speak,
+    /// Decide first whether this is its moment at all, and stay quiet if
+    /// it isn't. `lull` is how many seconds the room has been quiet, on
+    /// the second look at a silence the AI asked to be shown again.
+    Decide { lull: Option<u64> },
+}
+
+impl Cue {
+    pub fn deciding(self) -> bool {
+        matches!(self, Cue::Decide { .. })
     }
 }
 
@@ -123,6 +147,7 @@ impl Mode {
 pub enum ReplyMode {
     #[default]
     Room,
+    Auto,
     Always,
     Named,
 }
@@ -131,6 +156,7 @@ impl ReplyMode {
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_lowercase().as_str() {
             "room" | "" => Some(ReplyMode::Room),
+            "auto" => Some(ReplyMode::Auto),
             "always" => Some(ReplyMode::Always),
             "named" => Some(ReplyMode::Named),
             _ => None,
@@ -140,6 +166,7 @@ impl ReplyMode {
     pub fn as_str(self) -> &'static str {
         match self {
             ReplyMode::Room => "room",
+            ReplyMode::Auto => "auto",
             ReplyMode::Always => "always",
             ReplyMode::Named => "named",
         }
@@ -150,6 +177,7 @@ impl ReplyMode {
     fn forces(self) -> Option<Mode> {
         match self {
             ReplyMode::Room => None,
+            ReplyMode::Auto => Some(Mode::Auto),
             ReplyMode::Always => Some(Mode::Always),
             ReplyMode::Named => Some(Mode::Named),
         }
@@ -241,6 +269,8 @@ pub struct Turn {
     pub game: Option<(String, String)>,
     /// Who is in the room.
     pub people: Vec<String>,
+    /// Whether the AI is to speak, or to decide whether to speak at all.
+    pub cue: Cue,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -276,6 +306,10 @@ struct Said {
 struct Reply {
     generation: u64,
     entry: String,
+    /// The AI is deciding whether to speak at all. Until it says
+    /// something its entry is held back, so a turn it passes on leaves
+    /// nothing on anyone's screen.
+    cue: Cue,
     sentences: Vec<Said>,
     /// The agent has sent everything it is going to say.
     complete: bool,
@@ -312,6 +346,9 @@ struct State {
     /// idle for `engaged_for`. The instant is the last thing that kept it
     /// going. `None` is the room's own mode, as chosen.
     engaged: Option<Instant>,
+    /// The AI passed on its turn but asked to be shown the room again if
+    /// the quiet lasted: when to look, and how long that is in seconds.
+    reconsider: Option<(Instant, u64)>,
 }
 
 pub struct Room {
@@ -381,6 +418,7 @@ impl Room {
                 agent_state: "listening",
                 starting: None,
                 engaged: None,
+                reconsider: None,
             }),
             events,
             mixer: Mixer::new(strips),
@@ -601,6 +639,62 @@ impl Room {
         // Only their tabs; the body never reaches another browser.
         self.emit_to(&to, json!({ "type": "card", "card": card }));
         Ok(to)
+    }
+
+    // -- the AI's own turn taking ------------------------------------------
+
+    /// The longest silence the AI may ask to be shown again after.
+    const LULL_MAX: u64 = 120;
+
+    /// The AI passing on its turn: it decided this pause wasn't its
+    /// moment, so nothing is said and nothing appears on screen.
+    ///
+    /// `ask_again_in` has the room give it the turn once more if the
+    /// quiet lasts that many seconds -- how it waits for a real silence
+    /// rather than the gap it was just shown. Only once per silence: a
+    /// second look that passes again is the end of it, so this can't
+    /// turn into a loop while nobody is saying anything.
+    pub fn stay_quiet(&self, generation: u64, ask_again_in: Option<u64>) -> Result<(), String> {
+        let mut st = self.lock();
+        let Some(r) = st.reply.as_ref().filter(|r| r.generation == generation) else {
+            return Err("that turn is over; the room has moved on".into());
+        };
+        if !r.cue.deciding() {
+            return Err("you were asked to answer, not whether to answer".into());
+        }
+        let again = match r.cue {
+            // A second look that passes is the end of this silence.
+            Cue::Decide { lull: Some(_) } => None,
+            _ => ask_again_in
+                .filter(|s| *s > 0)
+                .map(|s| s.min(Self::LULL_MAX)),
+        };
+        self.cut_reply(&mut st);
+        st.reconsider = again.map(|s| (Instant::now() + Duration::from_secs(s), s));
+        info!(generation, again, "reply: stayed quiet");
+        Ok(())
+    }
+
+    /// Give the AI the turn again once a silence it asked about has
+    /// actually lasted.
+    fn reconsider(&self, st: &mut State, now: Instant) {
+        let Some((at, lull)) = st.reconsider else {
+            return;
+        };
+        if now < at {
+            return;
+        }
+        st.reconsider = None;
+        // Only into a room that is still quiet: anyone talking, or
+        // anything waiting to be handed over, means the silence is over
+        // and hand_over is the one to decide.
+        if st.reply.is_some()
+            || st.people.values().any(|p| p.speaking || p.holding())
+            || st.log.iter().any(|e| e.kind == Kind::Human && !e.sent)
+        {
+            return;
+        }
+        self.ask(st, now, Cue::Decide { lull: Some(lull) });
     }
 
     /// `person` discarded one of their own cards.
@@ -874,7 +968,9 @@ impl Room {
     /// restart comes back to what was actually chosen.
     fn refresh_mode(&self, st: &mut State) {
         st.mode = if st.engaged.is_some() {
-            Mode::Always
+            // It keeps the turn, but it still judges each pause: the
+            // people may well have turned to each other.
+            Mode::Auto
         } else {
             st.game_mode.unwrap_or(st.chosen)
         };
@@ -888,13 +984,13 @@ impl Room {
         }));
     }
 
-    /// Someone said the AI's name in `Named` mode: it answers every pause
-    /// from now on, so they can talk back and forth without saying it
-    /// again, until the room has been idle for `engaged_for`.
+    /// Someone said the AI's name in `Named` mode: it keeps the turn at
+    /// every pause from now on, so they can talk back and forth without
+    /// saying it again, until the room has been idle for `engaged_for`.
     fn engage(&self, st: &mut State, now: Instant) {
         info!(
             for_ms = self.cfg.engaged_for.as_millis() as u64,
-            "named: answering every pause until the room goes quiet"
+            "named: it keeps the turn at every pause until the room goes quiet"
         );
         st.engaged = Some(now);
         self.refresh_mode(st);
@@ -1056,6 +1152,7 @@ impl Room {
 
     fn start_conversation(&self, st: &mut State, game: Option<String>) {
         st.starting = None;
+        st.reconsider = None;
         self.cut_reply(st);
         match self.store().new_conversation(game.as_deref()) {
             Ok(c) => st.conversation = c,
@@ -1085,7 +1182,9 @@ impl Room {
         // one leaves everyone's private area empty.
         self.emit(json!({ "type": "reset", "log": [], "cards": [], "game": st.game }));
         if st.game.is_some() {
-            self.ask(st, Instant::now());
+            // A game opens with the AI setting the scene, whatever the
+            // room's mode: nobody can have asked for it yet.
+            self.ask(st, Instant::now(), Cue::Speak);
         }
     }
 
@@ -1292,11 +1391,16 @@ impl Room {
         self.follow_reply(&mut st, None);
         self.barge_in(&mut st, now);
         self.hand_over(&mut st, now);
+        self.reconsider(&mut st, now);
         self.follow_engagement(&mut st, now);
         let state = match &st.reply {
             None if self.will_answer(&st) => "waiting",
             None => "listening",
             Some(r) if r.sentences.iter().any(|s| s.played > 0) => "speaking",
+            // Still only deciding whether to speak: the room shouldn't
+            // flash "thinking" at every pause of a conversation that may
+            // well not be with it.
+            Some(r) if r.cue.deciding() && r.sentences.is_empty() => "listening",
             Some(_) => "thinking",
         };
         if state == "speaking" && st.agent_state != "speaking" {
@@ -1479,17 +1583,27 @@ impl Room {
             }
         }
         // Being addressed by name starts a back-and-forth: from here on
-        // the AI answers every pause, until the room goes quiet.
-        if st.mode == Mode::Named && self.named(&said) {
+        // the AI is given the turn at every pause, until the room goes
+        // quiet. Someone speaking also cancels a silence it was waiting
+        // on -- the silence didn't happen.
+        let named = self.named(&said);
+        st.reconsider = None;
+        if st.mode == Mode::Named && named {
             self.engage(st, now);
         }
-        if st.mode == Mode::Always {
-            self.ask(st, now);
+        match st.mode {
+            // Not its name, so not its turn.
+            Mode::Named => {}
+            // Named, so it answers; otherwise it judges for itself
+            // whether this pause is its moment.
+            Mode::Auto if named => self.ask(st, now, Cue::Speak),
+            Mode::Auto => self.ask(st, now, Cue::Decide { lull: None }),
+            Mode::Always => self.ask(st, now, Cue::Speak),
         }
     }
 
-    /// Ask the AI for a reply to the conversation so far.
-    fn ask(&self, st: &mut State, now: Instant) {
+    /// Give the AI the turn: to answer, or to decide whether to.
+    fn ask(&self, st: &mut State, now: Instant, cue: Cue) {
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         let mut messages = conversation_messages(&st.log, self.cfg.history);
         let game = match &st.game {
@@ -1516,10 +1630,16 @@ impl Room {
             at: now_ms(),
             sent: true,
         };
-        self.emit_entry(&entry);
+        // While it is only deciding, its entry is held back: a turn it
+        // passes on must leave nothing behind. follow_reply puts it on
+        // screen as soon as there is something to show.
+        if !cue.deciding() {
+            self.emit_entry(&entry);
+        }
         st.reply = Some(Reply {
             generation,
             entry: entry.id.clone(),
+            cue,
             sentences: Vec::new(),
             complete: false,
             heard: st.quiet_since,
@@ -1531,6 +1651,7 @@ impl Room {
             generation,
             after_words_ms = now.duration_since(st.quiet_since).as_millis() as u64,
             after_transcript_ms = now.duration_since(st.last_change).as_millis() as u64,
+            deciding = cue.deciding(),
             "reply: asking the agent"
         );
         if self
@@ -1546,6 +1667,7 @@ impl Room {
                     .filter(|(_, p)| p.clients > 0)
                     .map(|(n, _)| n.clone())
                     .collect(),
+                cue,
             })
             .is_err()
         {
@@ -1567,6 +1689,8 @@ impl Room {
             .peekable();
         !st.people.values().any(|p| p.speaking || p.holding())
             && pending.peek().is_some()
+            // In `Auto` it is the AI's call, so the room doesn't promise
+            // an answer it may not give.
             && (st.mode == Mode::Always || pending.any(|e| self.named(&e.text)))
     }
 
@@ -2183,7 +2307,7 @@ mod tests {
         r.on_paragraph("Ryan", &para("p1", "Vox, what's the weather?", false));
         r.tick(at(1_100));
         assert!(turns.try_recv().is_ok(), "named");
-        assert_eq!(mode_now(&r), (Mode::Always, true));
+        assert_eq!(mode_now(&r), (Mode::Auto, true));
         // What the tabs are told, which is what the buttons read.
         let mode_events: Vec<String> = std::iter::from_fn(|| events.try_recv().ok())
             .map(|e| e.json.to_string())
@@ -2191,7 +2315,7 @@ mod tests {
             .collect();
         assert_eq!(
             mode_events,
-            [r#"{"engaged":true,"locked":false,"mode":"always","type":"mode"}"#],
+            [r#"{"engaged":true,"locked":false,"mode":"auto","type":"mode"}"#],
         );
 
         // The next thing said needs no name at all.
@@ -2202,12 +2326,12 @@ mod tests {
 
         // While the AI is still answering, the quiet doesn't count.
         r.tick(at(20_000));
-        assert_eq!(mode_now(&r), (Mode::Always, true), "still replying");
+        assert_eq!(mode_now(&r), (Mode::Auto, true), "still replying");
 
         // Once it has stopped, a quiet room ends the back-and-forth...
         r.stop_agent();
         r.tick(at(22_000));
-        assert_eq!(mode_now(&r), (Mode::Always, true), "not quiet long enough");
+        assert_eq!(mode_now(&r), (Mode::Auto, true), "not quiet long enough");
         r.tick(at(26_000));
         assert_eq!(mode_now(&r), (Mode::Named, false));
 
@@ -2223,7 +2347,7 @@ mod tests {
         r.on_paragraph("Ryan", &para("p1", "Thanks Vox, that's all.", false));
         r.tick(quiet(&r));
         assert!(turns.try_recv().is_ok());
-        assert_eq!(mode_now(&r), (Mode::Always, true));
+        assert_eq!(mode_now(&r), (Mode::Auto, true));
 
         assert_eq!(r.wait_until_named(), "named");
         assert_eq!(mode_now(&r), (Mode::Named, false));
@@ -2301,6 +2425,117 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r.list_games()[0].settings.reply, ReplyMode::Room);
+    }
+
+    /// Everything the tabs were told since `events` was taken.
+    fn events_of(events: &mut broadcast::Receiver<Event>, kind: &str) -> Vec<String> {
+        std::iter::from_fn(|| events.try_recv().ok())
+            .map(|e| e.json.to_string())
+            .filter(|j| j.contains(&format!("\"type\":\"{kind}\"")))
+            .collect()
+    }
+
+    #[test]
+    fn in_auto_mode_the_ai_is_given_the_turn_and_may_hand_it_straight_back() {
+        let (r, turns) = room(Mode::Auto);
+        let mut events = r.subscribe();
+        r.on_paragraph(
+            "Ryan",
+            &para("p1", "So what did you make of it, Alex?", false),
+        );
+        r.tick(quiet(&r));
+
+        // The room doesn't promise an answer it isn't sure of...
+        assert_eq!(r.lock().agent_state, "listening");
+        // ...but the AI does get the turn, to judge for itself.
+        let t = turns.try_recv().expect("given the turn");
+        assert_eq!(t.cue, Cue::Decide { lull: None });
+        assert_eq!(r.lock().agent_state, "listening", "not even thinking");
+        assert!(
+            events_of(&mut events, "entry")
+                .iter()
+                .all(|e| !e.contains("\"agent\"")),
+            "nothing of the AI's is on screen yet",
+        );
+
+        // It judges the pause to be the people's, and says so.
+        r.stay_quiet(t.generation, None).unwrap();
+        assert!(r.lock().reply.is_none());
+        assert_eq!(r.lock().agent_state, "listening");
+        // The conversation is exactly what the people said.
+        assert_eq!(
+            r.lock()
+                .log
+                .iter()
+                .map(|e| (e.kind, e.text.clone()))
+                .collect::<Vec<_>>(),
+            [(Kind::Human, "So what did you make of it, Alex?".to_string())],
+            "the turn it passed on left nothing behind",
+        );
+    }
+
+    #[test]
+    fn it_can_ask_to_be_shown_a_longer_silence() {
+        let (r, turns) = room(Mode::Auto);
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        r.on_paragraph(
+            "Ryan",
+            &para("p1", "I don't know what that was about.", false),
+        );
+        r.tick(at(1_100));
+        let t = turns.try_recv().expect("given the turn");
+
+        // Not now -- but show me the room again if the quiet lasts.
+        r.stay_quiet(t.generation, Some(3)).unwrap();
+        r.tick(at(2_000));
+        assert!(turns.try_recv().is_err(), "not yet");
+        r.tick(at(5_000));
+        let again = turns.try_recv().expect("shown the silence it asked for");
+        assert_eq!(again.cue, Cue::Decide { lull: Some(3) });
+
+        // A second pass is the end of it: the room doesn't go round again
+        // while nobody is saying anything.
+        r.stay_quiet(again.generation, Some(3)).unwrap();
+        r.tick(at(30_000));
+        assert!(turns.try_recv().is_err(), "once per silence");
+        assert!(r.lock().reconsider.is_none());
+    }
+
+    #[test]
+    fn someone_speaking_cancels_the_silence_it_was_waiting_on() {
+        let (r, turns) = room(Mode::Auto);
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        r.on_paragraph("Ryan", &para("p1", "Anyway.", false));
+        r.tick(at(1_100));
+        let t = turns.try_recv().expect("given the turn");
+        r.stay_quiet(t.generation, Some(5)).unwrap();
+
+        // The silence didn't happen: someone carried on talking, so the
+        // next turn comes from what they said, not from the old wait.
+        r.on_paragraph("Alex", &para("p2", "Where were we?", false));
+        r.tick(at(2_300));
+        assert!(r.lock().reconsider.is_none());
+        let next = turns.try_recv().expect("the new pause");
+        assert_eq!(next.cue, Cue::Decide { lull: None });
+        assert!(next.messages[0].1.contains("Where were we?"));
+    }
+
+    #[test]
+    fn staying_quiet_is_only_for_a_turn_it_was_asked_to_judge() {
+        let (r, turns) = room(Mode::Always);
+        r.on_paragraph("Ryan", &para("p1", "Go on then.", false));
+        r.tick(quiet(&r));
+        let t = turns.try_recv().expect("answers every pause");
+        assert_eq!(t.cue, Cue::Speak);
+        assert!(
+            r.stay_quiet(t.generation, None).is_err(),
+            "it was told to answer, not asked whether to"
+        );
+        assert!(r.lock().reply.is_some(), "the reply stands");
+        // And a turn the room has moved past is nobody's to pass on.
+        assert!(r.stay_quiet(t.generation + 99, None).is_err());
     }
 
     /// The cards one person is holding.

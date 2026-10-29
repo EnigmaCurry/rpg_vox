@@ -19,13 +19,31 @@
     }[room.agent.state] ?? room.agent.state,
   );
 
+  const modes = $derived([
+    {
+      mode: 'named',
+      label: 'When named',
+      hint: `${room.agent.name} says nothing until someone says its name.`,
+    },
+    {
+      mode: 'auto',
+      label: 'When it fits',
+      hint: `${room.agent.name} is shown every pause and decides for itself whether the moment is its own, so it can sit in a conversation without answering every gap.`,
+    },
+    {
+      mode: 'always',
+      label: 'Every pause',
+      hint: `${room.agent.name} answers whenever the room goes quiet, with no judgment about whose turn it is.`,
+    },
+  ]);
+
   // Why the mode is what it is, when the room and not a click decided it.
   const modeHint = $derived(
     room.locked
       ? `${room.game} decides when ${room.agent.name} answers, so this can't be changed until you go back to the lobby.`
       : room.engaged
-        ? `You said its name, so ${room.agent.name} is answering every pause until the room has been quiet a while. Say "thanks" or "goodbye" and it goes back to waiting for its name.`
-        : `When ${room.agent.name} answers.`,
+        ? `You said its name, so ${room.agent.name} has the turn at every pause — judging each one — until the room has been quiet a while. Say "thanks" or "goodbye" and it goes back to waiting for its name.`
+        : `When ${room.agent.name} speaks.`,
   );
 
   async function newConversation() {
@@ -123,13 +141,14 @@
       {/if}
       <div class="spacer"></div>
       <div class="seg" class:locked={room.locked} role="radiogroup" title={modeHint}
-        aria-label="When {room.agent.name} answers">
-        <button role="radio" aria-checked={room.mode === 'named'} class:on={room.mode === 'named'}
-          disabled={room.locked}
-          onclick={() => command({ type: 'mode', mode: 'named' })}>When named</button>
-        <button role="radio" aria-checked={room.mode === 'always'} class:on={room.mode === 'always'}
-          disabled={room.locked}
-          onclick={() => command({ type: 'mode', mode: 'always' })}>After every pause{#if room.engaged}<span class="dot" aria-hidden="true"></span>{/if}</button>
+        aria-label="When {room.agent.name} speaks">
+        {#each modes as m (m.mode)}
+          <button role="radio" aria-checked={room.mode === m.mode} class:on={room.mode === m.mode}
+            disabled={room.locked} title={m.hint}
+            onclick={() => command({ type: 'mode', mode: m.mode })}>
+            {m.label}{#if room.engaged && room.mode === m.mode}<span class="dot" aria-hidden="true"></span>{/if}
+          </button>
+        {/each}
       </div>
       <button onclick={newConversation}>{room.game ? 'Restart game' : 'New conversation'}</button>
       {#if !room.connected}<span class="offline">reconnecting…</span>{/if}
@@ -157,10 +176,10 @@
             <div class="gname">
               <span>{g.name}</span>
               {#if room.game === g.name}<span class="tag">playing</span>{/if}
-              {#if g.settings?.reply === 'always'}
-                <span class="tag mode" title="In this game {room.agent.name} answers every pause.">every pause</span>
-              {:else if g.settings?.reply === 'named'}
-                <span class="tag mode" title="In this game {room.agent.name} speaks only when you say its name.">when named</span>
+              {#if g.settings?.reply && g.settings.reply !== 'room'}
+                <span class="tag mode" title={modes.find((m) => m.mode === g.settings.reply)?.hint}>
+                  {modes.find((m) => m.mode === g.settings.reply)?.label}
+                </span>
               {/if}
             </div>
             <p class="gsum">{g.summary}</p>
@@ -274,7 +293,7 @@
   @keyframes glow { 0%, 100% { box-shadow: 0 0 0 1px var(--agent); } 50% { box-shadow: 0 0 0 3px color-mix(in srgb, var(--agent) 35%, transparent); } }
   @media (prefers-reduced-motion: reduce) { .pill *, .pill { animation: none !important; } }
   .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
-  .seg button { border: 0; border-radius: 0; padding: 5px 10px; }
+  .seg button { border: 0; border-radius: 0; padding: 5px 10px; white-space: nowrap; }
   .seg button.on { background: var(--accent); color: var(--accent-ink); }
   .seg.locked { opacity: 0.75; }
   .seg button:disabled { cursor: default; }
