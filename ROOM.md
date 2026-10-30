@@ -206,6 +206,23 @@ See ROOM_DOCKER.md.
   Which also means a cut lands where each voice was: the dash that
   marks it is in a different place in each language.
 
+  So that nobody has to guess at that, a reply still being spoken
+  carries **a small bar per language** under it, saying how far that
+  language has been heard and how much of it is left:
+
+  ```
+  ENGLISH ▬▬▬▬▬ heard    RUSSIAN ▬▬▬░░ 2s
+  ```
+
+  Everyone sees the same row, whichever language they are listening in,
+  and it goes when every language has heard the reply out — which is the
+  same moment the turn ends and the AI will take another. An English
+  speaker can see that the Russian still has a sentence to go before
+  saying anything; a Russian listener can see that the room is waiting
+  for them rather than that something has stalled. A language whose
+  translation hasn't come back yet says `translating…` rather than
+  pretending to be at nought seconds.
+
   Underneath, the room's own language is still the record: it is what
   the AI is shown of the conversation, and what it is stored as having
   said, however many languages it was heard in. What people say out loud
@@ -526,4 +543,8 @@ hears and the conversation as it unfolds (see the top of the script).
 `e2e/share-screen.js` is the same idea for desktop sharing: one shares,
 the other watches, and it reads the pixels off each canvas to check the
 picture really arrived — and that opening it was one person's doing
-alone.
+alone. `e2e/hear-out.js` needs no microphone at all: two tabs on
+different languages, a typed question, and it reads the per-language row
+off both screens to check that one language is shown heard out while the
+other is still going, that both tabs are shown the same thing, and that
+the row goes when the turn does.

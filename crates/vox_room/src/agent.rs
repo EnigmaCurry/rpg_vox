@@ -635,11 +635,20 @@ fn speak(
                     Err(e) => warn!(g, language, "the voice failed on {say:?}: {e:#}"),
                 }
             }
-            // Only the room's own language finishes the turn.
-            Speak::Done(g) if own && failed != Some(g) => room.agent_done(g),
-            Speak::Done(_) => {}
+            // The room's own language finishes the turn; the others say
+            // so for themselves, because the room cannot tell a voice
+            // that has finished from one whose next sentence is still
+            // being translated -- both have an empty queue.
+            Speak::Done(g) if own => {
+                if failed != Some(g) {
+                    room.agent_done(g);
+                }
+            }
+            Speak::Done(g) => room.agent_done_in(g, language),
             Speak::Failed(g, e) if own => room.agent_failed(g, &e),
-            Speak::Failed(..) => {}
+            // Nothing more is coming in this language either, so the
+            // turn is not left waiting on a voice that has given up.
+            Speak::Failed(g, _) => room.agent_done_in(g, language),
         }
     }
 }
@@ -1565,6 +1574,7 @@ mod tests {
             history: 60,
             language: "English".into(),
             languages: vec!["English".into()],
+            spoken: vec!["English".into()],
         };
         let turn = Turn {
             generation: 1,
@@ -1608,6 +1618,7 @@ mod tests {
                 history: 60,
                 language: "English".into(),
                 languages: vec!["English".into()],
+                spoken: vec!["English".into()],
             },
             generation.clone(),
             turns_tx,

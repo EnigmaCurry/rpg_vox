@@ -155,6 +155,11 @@ async fn door(State(app): State<App>, headers: HeaderMap) -> Response {
                 "state": "invited",
                 "name": invite.name,
                 "display": invite.display,
+                // The door offers the language as well as the devices,
+                // and this is the only place it can learn the list: the
+                // socket that would otherwise carry it wants a session,
+                // and the invite is not spent until Join Audio.
+                "languages": app.room.config().languages,
             }))
             .into_response();
         }

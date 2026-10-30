@@ -554,6 +554,10 @@ fn serve(cli: Cli, store: Store) -> Result<()> {
         history: cli.history,
         language: language.clone(),
         languages: cfg_languages.clone(),
+        // What the voices above can actually say, which is not always
+        // what the door offers: one voice means one language, however
+        // many are on the list.
+        spoken: voices.iter().map(|(l, _)| l.clone()).collect(),
     };
     // Who translates, when there is more than one language and a model
     // to do it with. Built once and shared: the local one is 75 MB of

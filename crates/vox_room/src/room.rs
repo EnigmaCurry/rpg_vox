@@ -38,11 +38,23 @@ use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 use vox_transcribe::{Paragraph, ParagraphMode, Pusher};
 
-use crate::mixer::{AiProgress, Mixer, Strip, AGENT_STRIP};
+use crate::mixer::{AiProgress, Mixer, Strip, AGENT_STRIP, RATE};
 use crate::store::{Invited, Store};
 
 /// Room events waiting for a slow tab before it starts skipping.
 const EVENT_CAPACITY: usize = 512;
+
+/// How finely playback is reported to the browsers: a fifth of a second,
+/// which is finer than the seconds-remaining they show and finer than a
+/// pixel of the bar they draw. The frames are 20 ms, so this is the
+/// difference between a report ten times a second and fifty.
+const REPORT_STEP: u64 = 200;
+
+/// How long the room waits for a translation that every other language
+/// has already outlasted, before it gives up on it and ends the turn.
+/// Long enough that no translator reaches it: it is there so that a
+/// voice thread dying cannot wedge the room, nothing else.
+const TRANSLATION_TAIL: Duration = Duration::from_secs(30);
 /// Entries a new tab is sent, and kept in memory.
 const LOG_LIMIT: usize = 500;
 /// Shown to the model after a reply someone talked over.
@@ -333,6 +345,12 @@ pub struct RoomConfig {
     /// The languages the door offers, [`RoomConfig::language`] first.
     /// One of them means nothing to translate.
     pub languages: Vec<String>,
+    /// The languages the AI is actually spoken in, the room's own first.
+    /// Shorter than `languages` when the voice speaks only one tongue,
+    /// and this is the list the room has to go by: a language with no
+    /// voice is never translated, so waiting to hear the reply in it
+    /// would be waiting for something nobody is making.
+    pub spoken: Vec<String>,
 }
 
 /// A turn for the agent: the conversation so far, as chat messages.
@@ -424,6 +442,19 @@ struct Reply {
     translated: BTreeMap<String, Vec<Said>>,
     /// The agent has sent everything it is going to say.
     complete: bool,
+    /// The languages whose voice has handed over everything it is going
+    /// to for this turn -- the room's own aside, which is `complete`. A
+    /// translation runs a sentence or two behind, so its voice says when
+    /// it has finished rather than the room guessing from a queue that
+    /// has momentarily run dry.
+    spoken: BTreeSet<String>,
+    /// The last playback report sent out, rounded to [`REPORT_STEP`], so
+    /// one goes out when it has something new to say rather than on
+    /// every frame of audio.
+    reported: Vec<(String, usize, usize, bool)>,
+    /// When every language ran out of audio with one of them still owing
+    /// a translation. The backstop below, nothing more.
+    dry_since: Option<Instant>,
     /// The last words it answers, and when it was asked: for timings.
     heard: Instant,
     asked: Instant,
@@ -2057,6 +2088,17 @@ impl Room {
         }
     }
 
+    /// A voice other than the room's own has nothing more to say for
+    /// `generation`: everything it was given has been translated and
+    /// queued, or dropped trying. Until it says so the room keeps the
+    /// turn open, because a translated sentence is still on its way.
+    pub fn agent_done_in(&self, generation: u64, language: &str) {
+        let mut st = self.lock();
+        if let Some(r) = st.reply.as_mut().filter(|r| r.generation == generation) {
+            r.spoken.insert(language.to_string());
+        }
+    }
+
     pub fn agent_failed(&self, generation: u64, error: &str) {
         error!(generation, "reply failed: {error}");
         self.error(&format!("{} couldn't answer: {error}", self.cfg.agent_name));
@@ -2101,44 +2143,121 @@ impl Room {
     /// Bring the AI's entry up to what the mixer has played; finish the
     /// reply once everything has been.
     fn follow_reply(&self, st: &mut State, progress: Option<BTreeMap<String, AiProgress>>) {
+        if st.reply.is_none() {
+            return;
+        }
+        let all = progress.unwrap_or_else(|| self.mixer.ai_progress());
+        // Every language this turn is being said in: the room's own, and
+        // each other one somebody is listening in. A language nobody has
+        // picked is never spoken, so there is nothing of it to wait for
+        // or to report. Worked out before the reply is taken, because
+        // the roster is next to it in the same lock.
+        let mut langs: Vec<(String, bool)> = self
+            .cfg
+            .spoken
+            .iter()
+            .filter(|l| {
+                **l == self.cfg.language
+                    || st
+                        .people
+                        .values()
+                        .any(|p| p.online() && self.language_of(p) == l.as_str())
+            })
+            .map(|l| (l.clone(), true))
+            .collect();
         let Some(r) = st.reply.as_mut() else {
             return;
         };
-        let all = progress.unwrap_or_else(|| self.mixer.ai_progress());
+        // Something was queued in a language nobody is listening in any
+        // more: followed, so whoever was reading it until a moment ago
+        // sees it out, but no longer part of the reckoning.
+        for l in r.translated.keys() {
+            if !langs.iter().any(|(k, _)| k == l) {
+                langs.push((l.clone(), false));
+            }
+        }
         // Each language's sentences advance by its own queue: a
         // translation is a different length from the words it
         // translates, so they are at different points in the reply.
-        let mut idle = true;
-        let mut played_out = true;
-        for (language, said) in std::iter::once((&self.cfg.language, &mut r.sentences)).chain(
-            r.translated
-                .iter_mut()
-                .map(|(language, said)| (language, said)),
-        ) {
-            let Some(p) = all.get(language.as_str()) else {
-                // Nothing of it in the mixer at all, so there is nothing
-                // left to play. Whether it has been *said* is the
-                // played-out test below: a sentence translated a moment
-                // ago is on this list before its audio reaches the
-                // mixer, and that counts as unfinished.
+        let mut finished = true;
+        let mut dry = true;
+        let mut report: Vec<(String, usize, usize, bool)> = Vec::new();
+        for (language, counts) in &langs {
+            let own = *language == self.cfg.language;
+            let said_everything = if own {
+                r.complete
+            } else {
+                r.spoken.contains(language)
+            };
+            let said = if own {
+                Some(&mut r.sentences)
+            } else {
+                r.translated.get_mut(language)
+            };
+            let p = all.get(language.as_str());
+            let Some(said) = said else {
+                // Nothing of it queued at all: either it is still being
+                // translated, and the turn waits for it, or the voice
+                // came back with nothing in the end, which is as
+                // finished as that language will get. Nothing to play
+                // either way, so it holds nothing up on that count.
+                if *counts {
+                    finished &= said_everything;
+                    report.push((language.clone(), 0, 0, said_everything));
+                }
                 continue;
             };
-            for (g, i, n) in &p.finished {
-                if *g == r.generation {
-                    if let Some(s) = said.get_mut(*i) {
-                        s.played = *n;
+            if let Some(p) = p {
+                for (g, i, n) in &p.finished {
+                    if *g == r.generation {
+                        if let Some(s) = said.get_mut(*i) {
+                            s.played = *n;
+                        }
+                    }
+                }
+                if let Some((g, i, played, _)) = p.current {
+                    if g == r.generation {
+                        if let Some(s) = said.get_mut(i) {
+                            s.played = played;
+                        }
                     }
                 }
             }
-            if let Some((g, i, played, _)) = p.current {
-                if g == r.generation {
-                    if let Some(s) = said.get_mut(i) {
-                        s.played = played;
-                    }
-                }
+            let total: usize = said.iter().map(|s| s.samples).sum();
+            let played: usize = said.iter().map(|s| s.played.min(s.samples)).sum();
+            // Idle as well as played out: a queue the mixer has not
+            // reached yet has played nothing of a sentence that counts.
+            let idle = p.is_none_or(|p| p.idle);
+            let heard_out = idle && played >= total;
+            if *counts {
+                finished &= said_everything && heard_out;
+                dry &= heard_out;
+                report.push((
+                    language.clone(),
+                    played,
+                    total,
+                    said_everything && heard_out,
+                ));
             }
-            idle &= p.idle;
-            played_out &= said.iter().all(|s| s.played >= s.samples);
+        }
+        // Every language has played all it has, and one of them still
+        // owes a translation. Normally that is a sentence on its way and
+        // worth the wait; if the voice that owed it has died it is a turn
+        // that would stay open for ever, and with it every turn after it,
+        // since the room gives out one at a time. So there is a limit --
+        // a backstop, not part of the reckoning above, and far longer
+        // than any translation takes.
+        r.dry_since = match (finished, dry, r.dry_since) {
+            (false, true, Some(t)) => Some(t),
+            (false, true, None) => Some(Instant::now()),
+            _ => None,
+        };
+        if r.dry_since.is_some_and(|t| t.elapsed() > TRANSLATION_TAIL) {
+            warn!(
+                generation = r.generation,
+                "a voice never finished its translation: ending the turn without it"
+            );
+            finished = true;
         }
         // What each language has been heard to say so far, for whoever
         // is reading in it.
@@ -2147,12 +2266,22 @@ impl Room {
             .iter()
             .map(|(language, said)| (language.clone(), heard(said)))
             .collect();
+        // How far each is through it, for everyone: the room's own
+        // language may be over while a translation is still going, and
+        // both sides should be able to see that rather than guess at it.
+        // Only worth saying in a room where there is more than one.
+        let quantized: Vec<(String, usize, usize, bool)> = report
+            .iter()
+            .map(|(l, played, total, done)| {
+                let step = RATE as usize * REPORT_STEP as usize / 1000;
+                (l.clone(), played / step, total / step, *done)
+            })
+            .collect();
+        let tell = report.len() > 1 && quantized != r.reported;
+        if tell {
+            r.reported = quantized;
+        }
         let text = heard(&r.sentences);
-        // Over when every language is: the turn is still being spoken
-        // while anyone is still hearing it. Waiting costs the next turn
-        // a moment, and buys a translated listener the whole reply
-        // instead of as much of it as the room's own language took.
-        let finished = r.complete && idle && played_out;
         let id = r.entry.clone();
         let conversation = st.conversation;
         let Some(e) = st.log.iter_mut().find(|e| e.id == id) else {
@@ -2182,6 +2311,25 @@ impl Room {
                 }
             }
             self.emit_entry(e);
+        }
+        // After the entry, so a tab that has never seen this reply has
+        // it before it is told how far along it is. Not when the turn is
+        // over: the entry it belongs to has stopped being live, and the
+        // row goes with it.
+        if tell && !finished {
+            self.emit(json!({
+                "type": "heard",
+                "id": id,
+                "of": report
+                    .iter()
+                    .map(|(language, played, total, done)| json!({
+                        "language": language,
+                        "ms": played * 1000 / RATE as usize,
+                        "total": total * 1000 / RATE as usize,
+                        "done": done,
+                    }))
+                    .collect::<Vec<_>>(),
+            }));
         }
         if finished {
             let generation = st.reply.take().map(|r| r.generation);
@@ -2401,6 +2549,9 @@ impl Room {
             sentences: Vec::new(),
             translated: BTreeMap::new(),
             complete: false,
+            spoken: BTreeSet::new(),
+            reported: Vec::new(),
+            dry_since: None,
             heard: st.quiet_since,
             asked: now,
         });
@@ -2727,6 +2878,7 @@ mod tests {
             history: 50,
             language: "English".into(),
             languages: vec!["English".into(), "Russian".into()],
+            spoken: vec!["English".into(), "Russian".into()],
         };
         let r = Room::new(store, cfg, Arc::new(AtomicU64::new(0)), tx, None, None).unwrap();
         (r, rx)
@@ -3126,9 +3278,99 @@ mod tests {
         assert_eq!(e.translations["Russian"], "Жил-был —");
     }
 
+    /// The latest playback report the room has broadcast, if any.
+    fn last_heard(events: &mut broadcast::Receiver<Event>) -> Option<Vec<Value>> {
+        let mut last = None;
+        while let Ok(e) = events.try_recv() {
+            let v: Value = serde_json::from_str(&e.json).unwrap();
+            if v["type"] == "heard" {
+                last = Some(v["of"].as_array().unwrap().clone());
+            }
+        }
+        last
+    }
+
+    #[test]
+    fn the_room_says_how_far_the_reply_has_been_heard_in_each_language() {
+        let (r, turns) = room(Mode::Named);
+        r.set_language("Alex", "Russian").unwrap();
+        r.join("Alex", 1);
+        let mut events = r.subscribe();
+        let g = speaking(&r, &turns);
+        // Four seconds of Russian against two of English, all of it
+        // translated and queued already.
+        assert!(r.agent_speak_translated(g, "Russian", 0, "Жил-был дракон.", vec![0.1; 192_000]));
+        r.agent_done_in(g, "Russian");
+
+        for _ in 0..25 {
+            r.mixer.tick();
+        }
+        r.tick(Instant::now());
+        let of = last_heard(&mut events).expect("a report, in a room with two languages");
+        assert_eq!(of[0]["language"], "English", "the room's own first");
+        assert_eq!(of[0]["ms"], 500);
+        assert_eq!(of[0]["total"], 2000);
+        assert_eq!(of[1]["language"], "Russian");
+        assert_eq!(of[1]["ms"], 500);
+        assert_eq!(of[1]["total"], 4000, "the same reply, twice as long to say");
+        assert_eq!(of[0]["done"], false);
+
+        // The English is over while the Russian is half said. This is
+        // the moment the whole report exists for: whoever is reading in
+        // either language can see that the room has not finished with
+        // the turn, and can see when it has.
+        for _ in 0..76 {
+            r.mixer.tick();
+        }
+        r.tick(Instant::now());
+        let of = last_heard(&mut events).expect("a report");
+        assert_eq!(of[0]["ms"], of[0]["total"]);
+        assert_eq!(of[0]["done"], true, "the English has been heard out");
+        assert_eq!(of[1]["done"], false, "the Russian has not");
+        assert!(agent_entry(&r).live, "so the turn is not over");
+    }
+
+    #[test]
+    fn a_turn_waits_for_a_voice_that_still_owes_a_translation() {
+        let (r, turns) = room(Mode::Named);
+        r.set_language("Alex", "Russian").unwrap();
+        r.join("Alex", 1);
+        let g = speaking(&r, &turns);
+        // The English is said and heard to the end, and the translator
+        // has not come back with a word of it yet. An empty queue is not
+        // a voice that has finished -- and ending the turn here is how a
+        // listener came to be left with a reply that never arrived.
+        for _ in 0..200 {
+            r.mixer.tick();
+        }
+        r.tick(Instant::now());
+        let e = agent_entry(&r);
+        assert!(e.live, "still owed a translation");
+        assert_eq!(
+            e.text,
+            "Once upon a time there was a dragon. It was very old."
+        );
+
+        // It arrives, is heard, and then the turn is over.
+        assert!(r.agent_speak_translated(g, "Russian", 0, "Жил-был дракон.", vec![0.1; 48_000]));
+        r.agent_done_in(g, "Russian");
+        r.tick(Instant::now());
+        assert!(agent_entry(&r).live, "not until it has been heard");
+        for _ in 0..60 {
+            r.mixer.tick();
+        }
+        r.tick(Instant::now());
+        assert!(!agent_entry(&r).live, "now it has been heard in both");
+        assert!(r.lock().reply.is_none());
+    }
+
     #[test]
     fn a_translation_is_read_at_the_pace_it_is_heard() {
         let (r, turns) = room(Mode::Named);
+        // Alex is here and listening in Russian, which is what makes the
+        // room say the reply in it at all.
+        r.set_language("Alex", "Russian").unwrap();
+        r.join("Alex", 1);
         let g = speaking(&r, &turns);
         // The whole reply in Russian, queued in a moment -- translating
         // on the CPU takes about fifty milliseconds a sentence -- and
@@ -3137,6 +3379,9 @@ mod tests {
         let ru1 = "Он был очень стар.";
         assert!(r.agent_speak_translated(g, "Russian", 0, ru0, vec![0.1; 96_000]));
         assert!(r.agent_speak_translated(g, "Russian", 1, ru1, vec![0.1; 96_000]));
+        // And that voice has nothing further to translate, which is what
+        // lets the room know the only thing left is the hearing of it.
+        r.agent_done_in(g, "Russian");
 
         // Half of the English played, and so a quarter of the Russian.
         // Whoever is reading in Russian reads it as they hear it -- not
@@ -3198,9 +3443,9 @@ mod tests {
         );
 
         // A translation that turns up after the turn has closed still
-        // arrives. It has to: a sentence the translator was slow with
-        // has nothing left to follow, and dropping it here left a
-        // listener with a translation that never came and never spoke.
+        // arrives. A voice that says it is done says it after its last
+        // sentence, so this is the backstop's case: the turn was ended
+        // without a voice that owed one, and then the sentence came.
         let ru2 = "И всё.";
         assert!(r.agent_speak_translated(g, "Russian", 2, ru2, vec![0.1; 4800]));
         assert_eq!(

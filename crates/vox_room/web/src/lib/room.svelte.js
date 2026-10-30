@@ -33,6 +33,13 @@ export const room = $state({
   strips: {},
   levels: {},
   log: [],
+  // How far the AI's turn has been heard, in each language it is being
+  // said in, by entry id: [{ language, ms, total, done }]. A translation
+  // is a different length from the words it translates, so one language
+  // can be over while another is still going, and everyone can see which
+  // -- there is nothing private about it. Only here while the entry is
+  // live; the room says nothing about a turn it has finished.
+  heard: {},
   // The game being played (null: the lobby), and every saved game.
   game: null,
   games: [],
@@ -146,8 +153,15 @@ export async function whoami() {
     return true;
   }
   // An invite spends nothing until Join Audio: see `enterOnInvite`.
-  if (d.state === 'invited') room.door = { name: d.name, display: d.display };
-  else if (d.state === 'expired') room.expired = true;
+  if (d.state === 'invited') {
+    room.door = { name: d.name, display: d.display };
+    // There is no socket yet -- it wants a session, and the invite is
+    // still unspent -- so the door's own answer is where the languages
+    // come from, and a browser the room has never seen starts at its
+    // own language.
+    room.languages = d.languages ?? [];
+    room.lang = room.lang || browserLanguage(room.languages);
+  } else if (d.state === 'expired') room.expired = true;
   else room.denied = true;
   return false;
 }
@@ -301,6 +315,10 @@ function apply(ev) {
       room.people = ev.people;
       room.strips = ev.strips;
       room.log = ev.log;
+      // A tab that has just arrived is told the room as it stands, and
+      // playback is not part of that: the next report brings it up to
+      // date within the frame.
+      room.heard = {};
       room.game = ev.game ?? null;
       room.games = ev.games ?? [];
       room.cards = ev.cards ?? [];
@@ -319,12 +337,20 @@ function apply(ev) {
       break;
     case 'entry':
       upsert(ev.entry);
+      // A turn that is over is over in every language: nothing left to
+      // say about how far along it is.
+      if (!ev.entry.live) delete room.heard[ev.entry.id];
       break;
     case 'entry_removed':
       room.log = room.log.filter((e) => e.id !== ev.id);
+      delete room.heard[ev.id];
+      break;
+    case 'heard':
+      room.heard[ev.id] = ev.of;
       break;
     case 'reset':
       room.log = ev.log;
+      room.heard = {};
       room.game = ev.game ?? null;
       // Cards belong to the conversation that dealt them.
       room.cards = ev.cards ?? [];

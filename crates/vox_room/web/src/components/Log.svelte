@@ -41,6 +41,16 @@
   /// having asked -- and the one it was written in once you say so.
   const showing = (e) => (asWritten[e.id] ? 'from' : 'mine');
 
+  /// How far the AI's reply has been heard in each language it is being
+  /// said in, while it still is. One language is no news to anybody, and
+  /// a turn the room has finished with has none of this to report.
+  const tracks = (e) => (e.live && room.heard[e.id]) || [];
+  const width = (t) => (t.total ? Math.min(100, Math.round((t.ms / t.total) * 100)) : 0);
+  /// What is left of it: seconds while it is being said, and otherwise
+  /// either that it is over or that it is still being translated.
+  const left = (t) =>
+    t.done ? 'heard' : t.total ? `${Math.max(1, Math.ceil((t.total - t.ms) / 1000))}s` : 'translating…';
+
   function send(ev) {
     ev.preventDefault();
     if (sendText(draft)) draft = '';
@@ -53,6 +63,9 @@
   $effect(() => {
     // Follow new text while the view is at the bottom.
     room.log.map((e) => e.text).join();
+    // And when a reply grows or loses its row of languages, which is a
+    // line of height appearing under the last thing said.
+    room.log.map((e) => tracks(e).length).join();
     room.agent.state;
     if (stick && box) queueMicrotask(() => (box.scrollTop = box.scrollHeight));
   });
@@ -137,6 +150,21 @@
       {:else}
         <div class="text" class:partial={e.partial} class:live={e.live}>
           {#if e.text}{e.text}{:else if e.kind === 'agent'}<span class="dots"><i></i><i></i><i></i></span>{/if}
+        </div>
+      {/if}
+      {#if tracks(e).length > 1}
+        <!-- The same reply takes a different time to say in each
+             language, so whichever one you are listening to, this is
+             where the others have got to. It goes when they are all
+             done, which is the thing it is here to show. -->
+        <div class="tracks" title="How far {room.agent.name}'s reply has been heard in each language. The turn is over once every language has heard it out.">
+          {#each tracks(e) as t (t.language)}
+            <span class="track" class:done={t.done} class:waiting={!t.total && !t.done}>
+              <span class="lang">{t.language}</span>
+              <span class="bar"><i style="width: {width(t)}%"></i></span>
+              <span class="left">{left(t)}</span>
+            </span>
+          {/each}
         </div>
       {/if}
     </div>
@@ -264,6 +292,20 @@
   .swap { display: block; }
   .entry.you .swap { margin-left: auto; }
   .pending { font-style: italic; opacity: 0.7; }
+
+  /* Where each language has got to, under the bubble: one small bar per
+     language, and the row goes when every one of them is done. */
+  .tracks { display: flex; flex-wrap: wrap; gap: 4px 12px; margin: 4px 4px 0; font-size: 11px; color: var(--muted); }
+  .entry.you .tracks { justify-content: flex-end; }
+  .track { display: inline-flex; align-items: center; gap: 5px; }
+  .lang { font-variant-caps: all-small-caps; letter-spacing: 0.04em; }
+  .bar { width: 46px; height: 4px; border-radius: 2px; background: var(--line); overflow: hidden; }
+  .bar i { display: block; height: 100%; background: var(--agent); transition: width 200ms linear; }
+  .left { font-variant-numeric: tabular-nums; }
+  .track.done { color: var(--ok); }
+  .track.done .bar i { background: var(--ok); }
+  .track.waiting .left { font-style: italic; }
+  @media (prefers-reduced-motion: reduce) { .bar i { transition: none; } }
 
   .composer {
     position: sticky;
