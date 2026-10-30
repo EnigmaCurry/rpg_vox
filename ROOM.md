@@ -247,12 +247,24 @@ See ROOM_DOCKER.md.
   neither; what is waiting keeps its place and follows on.
 
   The same bar appears under a line somebody is still being heard
-  saying, so the speaker can see when the room has caught up with them —
-  and `--interpret false` turns the whole thing off, for a room that
-  would rather read than be talked over. It costs a translation and a
-  voice per utterance per language, which is the same arithmetic as the
-  AI's replies and the same two requirements: a translator and
-  `--tts qwen3`.
+  saying, so the speaker can see when the room has caught up with them.
+  It costs a translation and a voice per utterance per language, which
+  is the same arithmetic as the AI's replies and the same two
+  requirements: a translator and `--tts qwen3`.
+
+  **The fader is the control.** Every language goes through one
+  **Interpreter** strip in the mixer, beside the AI's, and the duck
+  follows it: at unity the voices being interpreted drop the usual
+  14 dB, and every unit you add to the fader takes another 14 dB off
+  them — a louder interpreter is a quieter floor, which is the only way
+  louder is any use. Pulled all the way down (or muted) it is **off**:
+  nothing is spoken, nothing ducks, and no voice is paid for. What
+  people say is still put into the other languages and written down, so
+  everyone keeps reading the room in their own — turning the voices off
+  is not the same as turning the room monolingual, and the fader is
+  everyone's, so it had better not take the reading away with it. For
+  that, `--interpret false`: no interpreters at all, and a line spoken
+  in a language you don't read is shown as it was said.
 
   What the AI is shown is the room's own language throughout: where an
   interpretation into it exists, that is the line the model gets, so a

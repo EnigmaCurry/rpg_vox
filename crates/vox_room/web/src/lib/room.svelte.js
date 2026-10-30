@@ -22,6 +22,10 @@ export const room = $state({
   doorError: null,
   you: null,
   agent: { name: 'AI', state: 'listening', strip: '@agent' },
+  // The interpreters, when the room has any: { strip, languages }. One
+  // fader for all of them, and pulling it down turns the voices off
+  // without turning off the reading.
+  interpreter: null,
   // How the AI takes its turn. `mode` is what the room is actually doing;
   // `engaged` is true while a back-and-forth (started by saying its name)
   // has it answering every pause, and `locked` while the game being
@@ -314,6 +318,7 @@ function apply(ev) {
     case 'hello':
       room.you = ev.you;
       room.agent = ev.agent;
+      room.interpreter = ev.interpreter ?? null;
       room.mode = ev.mode;
       room.engaged = ev.engaged ?? false;
       room.locked = ev.locked ?? false;

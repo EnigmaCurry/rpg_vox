@@ -79,6 +79,14 @@
 
   // Space toggles your mute (or, with push to talk, talks while held),
   // unless you're typing somewhere.
+  /// What the interpreter strip says it is doing. All the way down (or
+  /// muted) it is off: nobody is spoken over, and what people say is
+  /// still put into the other languages to be read.
+  function interpreting() {
+    const s = room.strips[room.interpreter?.strip] ?? { gain: 1, mute: false };
+    return s.mute || s.gain <= 0 ? 'off' : 'on';
+  }
+
   function spaceKey(e) {
     return e.code === 'Space' && room.audio === 'on' && !e.target.closest('input, textarea, button, dialog');
   }
@@ -192,7 +200,20 @@
         <Strip key={p.name} label={p.name} online={p.online} mic={p.mic} muted={p.muted} speaking={p.speaking} />
       {/each}
       <Strip key={room.agent.strip} label={room.agent.name} agent />
-      <p class="hint">Levels and mutes here change the room for everyone, and a muted person isn't transcribed. You never hear yourself.</p>
+      {#if room.interpreter}
+        <!-- One fader for every language being interpreted. All the way
+             down it is off: nobody is spoken over, and what people say
+             is still put into the other languages to be read. -->
+        <Strip key={room.interpreter.strip} label="Interpreter" agent doing={interpreting()} />
+      {/if}
+      <p class="hint">
+        Levels and mutes here change the room for everyone, and a muted person isn't transcribed.
+        You never hear yourself.
+        {#if room.interpreter}
+          The louder the interpreter, the further the voices it is speaking over drop under it;
+          all the way down turns it off, and the words are still written down for everyone.
+        {/if}
+      </p>
     </aside>
 
     <footer>

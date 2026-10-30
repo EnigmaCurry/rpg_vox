@@ -72,6 +72,15 @@ pub fn spawn(
                 if context.len() > CONTEXT {
                     context.remove(0);
                 }
+                // Pulled all the way down, the interpreter is off: there
+                // is nothing to pay a voice for. The words still go to
+                // the screen, because reading the room is a different
+                // thing from being talked over.
+                if room.mixer.silent(crate::mixer::INTERP_STRIP) {
+                    info!(who = %job.who, into = %job.into, translated_ms, "interpreted, silently");
+                    room.interp_spoke(&job.entry, &job.into, &say, Vec::new());
+                    continue;
+                }
                 match voice.speak(&say, None) {
                     Ok(samples) => {
                         info!(

@@ -38,7 +38,7 @@ use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 use vox_transcribe::{Paragraph, ParagraphMode, Pusher, Stage};
 
-use crate::mixer::{Mixer, Strip, TrackProgress, AGENT_STRIP, RATE};
+use crate::mixer::{Mixer, Strip, TrackProgress, AGENT_STRIP, INTERP_STRIP, RATE};
 use crate::store::{Invited, Store};
 
 /// Room events waiting for a slow tab before it starts skipping.
@@ -953,6 +953,13 @@ impl Room {
             "type": "hello",
             "you": person,
             "agent": { "name": self.cfg.agent_name, "state": st.agent_state, "strip": AGENT_STRIP },
+            // The interpreters, when the room has any: one fader for all
+            // of them, and pulling it down is how the room turns the
+            // voices off without turning the reading off with them.
+            "interpreter": (!self.interp.is_empty()).then(|| json!({
+                "strip": INTERP_STRIP,
+                "languages": self.interp.keys().collect::<Vec<_>>(),
+            })),
             "mode": st.mode.as_str(),
             // Whether what people say out loud is put into the other
             // languages as well as the AI's replies. A reader waits for
@@ -1615,7 +1622,12 @@ impl Room {
             played: 0,
         });
         drop(st);
-        self.mixer.interp_push(into, stream, index, samples);
+        // Nothing to play: the interpreter is turned down, and this is
+        // the words alone. On screen at once, since nobody is going to
+        // be hearing them at any particular pace.
+        if !samples.is_empty() {
+            self.mixer.interp_push(into, stream, index, samples);
+        }
     }
 
     /// An interpreter could not manage one utterance. Nothing is spoken
@@ -3770,6 +3782,38 @@ mod tests {
         );
         let of = last_heard(&mut events).expect("a last report");
         assert!(of.is_empty(), "nothing left to hear: {of:?}");
+    }
+
+    #[test]
+    fn with_the_interpreter_down_the_words_still_arrive() {
+        let (r, _turns, interp) = room_with(Mode::Named, &["English", "Russian"]);
+        r.set_language("Alex", "Russian").unwrap();
+        r.join("Alex", 1);
+        r.join("Ryan", 2);
+        let mut events = r.subscribe();
+        // Pulled all the way down. The interpreter asks before it pays
+        // a voice for anything, and comes back with the words alone.
+        r.set_strip(crate::mixer::INTERP_STRIP, Some(0.0), None);
+        assert!(r.mixer.silent(crate::mixer::INTERP_STRIP));
+
+        r.on_paragraph("Ryan", &para("p1", "The door is locked.", false));
+        let job = interp["Russian"]
+            .try_recv()
+            .expect("still translated, for reading");
+        r.interp_spoke(&job.entry, &job.into, "Дверь заперта.", Vec::new());
+        r.tick(Instant::now());
+
+        // On screen whole: nobody is hearing it at any pace, so there
+        // is no pace to read it at.
+        assert_eq!(
+            agent_entry_of(&r, "p1")
+                .translations
+                .get("Russian")
+                .map(String::as_str),
+            Some("Дверь заперта.")
+        );
+        let of = last_heard(&mut events).expect("a report");
+        assert!(of.is_empty(), "nothing is being heard: {of:?}");
     }
 
     #[test]
