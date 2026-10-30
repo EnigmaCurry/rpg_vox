@@ -36,9 +36,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
 use tracing::{error, info, warn};
-use vox_transcribe::{Paragraph, ParagraphMode, Pusher};
+use vox_transcribe::{Paragraph, ParagraphMode, Pusher, Stage};
 
-use crate::mixer::{AiProgress, Mixer, Strip, AGENT_STRIP, RATE};
+use crate::mixer::{Mixer, Strip, TrackProgress, AGENT_STRIP, RATE};
 use crate::store::{Invited, Store};
 
 /// Room events waiting for a slow tab before it starts skipping.
@@ -419,6 +419,31 @@ struct Person {
     language: String,
 }
 
+/// Somebody's run of talk being interpreted for the people in the room
+/// who don't speak it. One per paragraph: it lasts as long as the line
+/// on screen does, because what has been interpreted is read there.
+#[derive(Default)]
+struct Interp {
+    /// What the mixer knows this run of talk by.
+    stream: u64,
+    /// The utterances spoken in each language it is being interpreted
+    /// into, followed by how much of each has played -- exactly as the
+    /// AI's reply is, and for the same reason: it is read at the pace it
+    /// is heard.
+    said: BTreeMap<String, Vec<Said>>,
+    /// Utterances being translated or synthesized, per language. Not
+    /// over while any of these is outstanding.
+    pending: BTreeMap<String, usize>,
+    /// The clips already handed to an interpreter. Pass 3 rewrites the
+    /// text of a clip that has been spoken, and what has been heard
+    /// cannot be unheard.
+    clips: BTreeSet<String>,
+    /// The last report sent out, as the reply's.
+    reported: Vec<(String, usize, usize, bool)>,
+    /// The room has said there is nothing left to hear.
+    told_over: bool,
+}
+
 #[derive(Debug, Clone)]
 struct Said {
     text: String,
@@ -500,6 +525,11 @@ struct State {
     /// gone at that point, so this is what a late translation is still
     /// able to find its entry by.
     last_reply: Option<(u64, String)>,
+    /// What is being interpreted for the people who don't speak it, by
+    /// the line on screen it was said in.
+    interp: BTreeMap<String, Interp>,
+    /// Names the next run of talk handed to an interpreter.
+    next_stream: u64,
 }
 
 pub struct Room {
@@ -515,12 +545,31 @@ pub struct Room {
     /// model to translate with, and then a typed message is simply
     /// shown as it was typed.
     typing: Option<crossbeam_channel::Sender<TypedJob>>,
+    /// One queue per language the room interprets into. Empty when it
+    /// interprets nothing, which is a room with one language in it, or
+    /// one with no way to translate or no voice to speak with. Separate
+    /// queues because each language is one voice speaking in turn, and
+    /// what is said has to be heard in the order it was said.
+    interp: BTreeMap<String, crossbeam_channel::Sender<InterpJob>>,
     stt: Option<EngineFactory>,
 }
 
 /// A typed message waiting to be put into one other language: which
 /// entry it belongs to, what it says, and what to say it in.
 #[derive(Debug, Clone)]
+/// One utterance of what somebody said, for an interpreter to put into
+/// `into` and speak. One per listening language, because each is a
+/// different translation and a different voice.
+pub struct InterpJob {
+    /// The line on screen it belongs to, which is the paragraph it was
+    /// said in.
+    pub entry: String,
+    pub who: String,
+    pub from: String,
+    pub into: String,
+    pub text: String,
+}
+
 pub struct TypedJob {
     pub id: String,
     pub text: String,
@@ -549,6 +598,7 @@ impl Room {
         generation: Arc<AtomicU64>,
         agent: crossbeam_channel::Sender<Turn>,
         typing: Option<crossbeam_channel::Sender<TypedJob>>,
+        interp: BTreeMap<String, crossbeam_channel::Sender<InterpJob>>,
         stt: Option<EngineFactory>,
     ) -> anyhow::Result<Arc<Self>> {
         let conversation = store.conversation()?;
@@ -597,6 +647,8 @@ impl Room {
                 engaged: None,
                 reconsider: None,
                 last_reply: None,
+                interp: BTreeMap::new(),
+                next_stream: 0,
             }),
             events,
             mixer: Mixer::new(strips, &cfg.language),
@@ -605,6 +657,7 @@ impl Room {
             generation,
             agent,
             typing,
+            interp,
             stt,
         }))
     }
@@ -901,6 +954,10 @@ impl Room {
             "you": person,
             "agent": { "name": self.cfg.agent_name, "state": st.agent_state, "strip": AGENT_STRIP },
             "mode": st.mode.as_str(),
+            // Whether what people say out loud is put into the other
+            // languages as well as the AI's replies. A reader waits for
+            // a translation only of what one is coming for.
+            "interprets": !self.interp.is_empty(),
             "engaged": st.engaged.is_some(),
             "locked": st.game_mode.is_some(),
             "people": self.people_json(&st),
@@ -1408,6 +1465,285 @@ impl Room {
             }
         }
         self.emit_entry(e);
+        self.interpret(&mut st, person, para);
+    }
+
+    /// Hand what somebody has finished saying to the interpreters, for
+    /// everybody in the room who doesn't speak it.
+    ///
+    /// Pass 2 is the trigger: a clip stops being a streaming partial
+    /// when the whole utterance has been decoded, which is the first
+    /// point there is a sentence worth translating rather than a guess
+    /// that is still growing. Pass 3 rewrites clips afterwards and is
+    /// deliberately ignored here -- by then the words have been spoken,
+    /// and nobody can unhear them.
+    fn interpret(&self, st: &mut State, person: &str, para: &Paragraph) {
+        if self.interp.is_empty() {
+            return;
+        }
+        let from = st
+            .people
+            .get(person)
+            .map_or(self.cfg.language.as_str(), |p| self.language_of(p))
+            .to_string();
+        // Who it is for: every language somebody is here and listening
+        // in, other than the one it was said in. Nobody listening in it
+        // means nothing to interpret, however many the door offers.
+        let into: Vec<String> = self
+            .interp
+            .keys()
+            .filter(|l| **l != from)
+            .filter(|l| {
+                st.people
+                    .values()
+                    .any(|p| p.online() && self.language_of(p) == l.as_str())
+            })
+            .cloned()
+            .collect();
+        if into.is_empty() {
+            return;
+        }
+        let stream = match st.interp.get(&para.id) {
+            Some(i) => i.stream,
+            None => {
+                if !para
+                    .clips
+                    .iter()
+                    .any(|c| c.stage != Stage::Partial && !c.text.trim().is_empty())
+                {
+                    // Nothing decoded yet, so nothing to open a run of
+                    // talk for.
+                    return;
+                }
+                st.next_stream += 1;
+                let stream = st.next_stream;
+                // An interpretation lasts as long as the line it belongs
+                // to, because that is where it is read; the log is
+                // trimmed, so these are too. Here rather than every
+                // frame: a new one of these is a new paragraph, which is
+                // a few times a minute.
+                let gone: Vec<String> = st
+                    .interp
+                    .keys()
+                    .filter(|id| !st.log.iter().any(|e| &&e.id == id))
+                    .cloned()
+                    .collect();
+                for id in gone {
+                    st.interp.remove(&id);
+                }
+                st.interp.insert(
+                    para.id.clone(),
+                    Interp {
+                        stream,
+                        ..Interp::default()
+                    },
+                );
+                stream
+            }
+        };
+        let _ = stream;
+        let mut jobs: Vec<InterpJob> = Vec::new();
+        if let Some(i) = st.interp.get_mut(&para.id) {
+            for clip in &para.clips {
+                if clip.stage == Stage::Partial {
+                    continue;
+                }
+                let text = clip.text.trim();
+                if text.is_empty() {
+                    continue;
+                }
+                if !i.clips.insert(clip.id.clone()) {
+                    continue;
+                }
+                for language in &into {
+                    *i.pending.entry(language.clone()).or_insert(0) += 1;
+                    jobs.push(InterpJob {
+                        entry: para.id.clone(),
+                        who: person.to_string(),
+                        from: from.clone(),
+                        into: language.clone(),
+                        text: text.to_string(),
+                    });
+                }
+            }
+        }
+        for job in jobs {
+            let into = job.into.clone();
+            let sent = match self.interp.get(&into) {
+                Some(tx) => tx.try_send(job).is_ok(),
+                None => false,
+            };
+            if sent {
+                continue;
+            }
+            // The interpreter is further behind than its queue is long.
+            // Dropped rather than waited on: a room is a conversation,
+            // and an interpretation minutes late is worse than none --
+            // the words are on screen either way.
+            warn!(language = %into, "the interpreter is behind: an utterance was dropped");
+            if let Some(n) = st
+                .interp
+                .get_mut(&para.id)
+                .and_then(|i| i.pending.get_mut(&into))
+            {
+                *n = n.saturating_sub(1);
+            }
+        }
+    }
+
+    /// An interpreter has put one utterance into `into` and spoken it.
+    /// Queued for whoever is listening in that language, and written
+    /// down for them to read at the pace they hear it.
+    pub fn interp_spoke(&self, entry: &str, into: &str, text: &str, samples: Vec<f32>) {
+        let mut st = self.lock();
+        let Some(i) = st.interp.get_mut(entry) else {
+            // The line is gone from the log: nobody is reading it, and
+            // the words that went with it are long past.
+            return;
+        };
+        let stream = i.stream;
+        if let Some(n) = i.pending.get_mut(into) {
+            *n = n.saturating_sub(1);
+        }
+        let said = i.said.entry(into.to_string()).or_default();
+        // Its place in the queue is where it lands, not where it was
+        // asked for: an utterance that failed to translate leaves no gap.
+        let index = said.len();
+        said.push(Said {
+            text: text.trim().to_string(),
+            samples: samples.len(),
+            played: 0,
+        });
+        drop(st);
+        self.mixer.interp_push(into, stream, index, samples);
+    }
+
+    /// An interpreter could not manage one utterance. Nothing is spoken
+    /// and nothing is written; the line is on screen in the language it
+    /// was said in, which is what reading it there is for.
+    pub fn interp_failed(&self, entry: &str, into: &str) {
+        let mut st = self.lock();
+        if let Some(n) = st
+            .interp
+            .get_mut(entry)
+            .and_then(|i| i.pending.get_mut(into))
+        {
+            *n = n.saturating_sub(1);
+        }
+    }
+
+    /// Bring every interpretation up to what the mixer has played: the
+    /// words on screen in each language, and how far each has been
+    /// heard, for the person being interpreted as much as for the people
+    /// hearing it.
+    fn follow_interp(&self, st: &mut State) {
+        if st.interp.is_empty() {
+            return;
+        }
+        let all = self.mixer.interp_progress();
+        let step = RATE as usize * REPORT_STEP as usize / 1000;
+        type Update = (
+            String,
+            Vec<(String, String)>,
+            Vec<(String, usize, usize, bool)>,
+        );
+        let mut updates: Vec<Update> = Vec::new();
+        for (entry, i) in st.interp.iter_mut() {
+            let mut languages: BTreeSet<String> = i.said.keys().cloned().collect();
+            languages.extend(
+                i.pending
+                    .iter()
+                    .filter(|(_, n)| **n > 0)
+                    .map(|(l, _)| l.clone()),
+            );
+            if languages.is_empty() {
+                continue;
+            }
+            let mut report: Vec<(String, usize, usize, bool)> = Vec::new();
+            let mut over = true;
+            for language in &languages {
+                let waiting = i.pending.get(language).copied().unwrap_or(0) > 0;
+                let p = all.get(language.as_str());
+                let said = i.said.entry(language.clone()).or_default();
+                if let Some(p) = p {
+                    for (g, n, samples) in &p.finished {
+                        if *g == i.stream {
+                            if let Some(s) = said.get_mut(*n) {
+                                s.played = *samples;
+                            }
+                        }
+                    }
+                    if let Some((g, n, played, _)) = p.current {
+                        if g == i.stream {
+                            if let Some(s) = said.get_mut(n) {
+                                s.played = played;
+                            }
+                        }
+                    }
+                }
+                let total: usize = said.iter().map(|s| s.samples).sum();
+                let played: usize = said.iter().map(|s| s.played.min(s.samples)).sum();
+                // Not over while anything is still being translated: an
+                // empty queue is not an interpreter who has finished.
+                let done = !waiting && played >= total;
+                over &= done;
+                report.push((language.clone(), played, total, done));
+            }
+            let quantized: Vec<(String, usize, usize, bool)> = report
+                .iter()
+                .map(|(l, played, total, done)| (l.clone(), played / step, total / step, *done))
+                .collect();
+            let tell = quantized != i.reported || (over && !i.told_over);
+            if !tell {
+                continue;
+            }
+            i.reported = quantized;
+            i.told_over = over;
+            let text: Vec<(String, String)> = i
+                .said
+                .iter()
+                .map(|(l, said)| (l.clone(), heard(said)))
+                .collect();
+            // Over is said with an empty report: there is nobody left to
+            // wait for, and the row goes.
+            updates.push((entry.clone(), text, if over { Vec::new() } else { report }));
+        }
+        for (id, text, report) in updates {
+            let conversation = st.conversation;
+            let Some(e) = st.log.iter_mut().find(|e| e.id == id) else {
+                continue;
+            };
+            let changed = text
+                .iter()
+                .any(|(l, t)| !t.is_empty() && e.translations.get(l) != Some(t));
+            for (language, said) in text {
+                if said.is_empty() {
+                    continue;
+                }
+                e.translations.insert(language, said);
+            }
+            if changed {
+                if e.sent {
+                    if let Err(err) = self.store().put_entry(conversation, e) {
+                        warn!("store entry: {err:#}");
+                    }
+                }
+                self.emit_entry(e);
+            }
+            self.emit(json!({
+                "type": "heard",
+                "id": id,
+                "of": report
+                    .iter()
+                    .map(|(language, played, total, done)| json!({
+                        "language": language,
+                        "ms": played * 1000 / RATE as usize,
+                        "total": total * 1000 / RATE as usize,
+                        "done": done,
+                    }))
+                    .collect::<Vec<_>>(),
+            }));
+        }
     }
 
     pub fn on_paragraph_removed(&self, id: &str) {
@@ -2110,6 +2446,7 @@ impl Room {
     pub fn tick(&self, now: Instant) {
         let mut st = self.lock();
         self.follow_reply(&mut st, None);
+        self.follow_interp(&mut st);
         self.barge_in(&mut st, now);
         self.hand_over(&mut st, now);
         self.reconsider(&mut st, now);
@@ -2142,7 +2479,7 @@ impl Room {
 
     /// Bring the AI's entry up to what the mixer has played; finish the
     /// reply once everything has been.
-    fn follow_reply(&self, st: &mut State, progress: Option<BTreeMap<String, AiProgress>>) {
+    fn follow_reply(&self, st: &mut State, progress: Option<BTreeMap<String, TrackProgress>>) {
         if st.reply.is_none() {
             return;
         }
@@ -2313,14 +2650,15 @@ impl Room {
             self.emit_entry(e);
         }
         // After the entry, so a tab that has never seen this reply has
-        // it before it is told how far along it is. Not when the turn is
-        // over: the entry it belongs to has stopped being live, and the
-        // row goes with it.
-        if tell && !finished {
+        // it before it is told how far along it is.
+        if tell {
+            // An empty report is how the room says there is nothing left
+            // to hear: the row goes, in both languages at once.
+            let of = if finished { &[][..] } else { &report[..] };
             self.emit(json!({
                 "type": "heard",
                 "id": id,
-                "of": report
+                "of": of
                     .iter()
                     .map(|(language, played, total, done)| json!({
                         "language": language,
@@ -2507,7 +2845,7 @@ impl Room {
     /// Give the AI the turn: to answer, or to decide whether to.
     fn ask(&self, st: &mut State, now: Instant, cue: Cue) {
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
-        let mut messages = conversation_messages(&st.log, self.cfg.history);
+        let mut messages = conversation_messages(&st.log, self.cfg.history, &self.cfg.language);
         let game = match &st.game {
             Some(name) => match self.store().game(name) {
                 Ok(Some((g, prompt))) => Some((g.name, prompt)),
@@ -2798,7 +3136,10 @@ fn heard_prefix(text: &str, frac: f64) -> &str {
 /// The last `history` entries of the conversation as chat messages: what
 /// people said, each line marked with who said it (a run of them in one
 /// user message), and the AI's replies as far as they were heard.
-fn conversation_messages(log: &[Entry], history: usize) -> Vec<(Role, String)> {
+/// `language` is the room's own: what somebody said in another is given
+/// to the model in it where an interpretation exists, so a conversation
+/// the room heard in two languages reads as one.
+fn conversation_messages(log: &[Entry], history: usize, language: &str) -> Vec<(Role, String)> {
     let done: Vec<&Entry> = log
         .iter()
         .filter(|e| match e.kind {
@@ -2812,7 +3153,16 @@ fn conversation_messages(log: &[Entry], history: usize) -> Vec<(Role, String)> {
     for e in &done[start..] {
         match e.kind {
             Kind::Human => {
-                let line = format!("{}: {}", e.who, e.text.trim());
+                // Whatever is there by now: an interpretation that has
+                // not come back yet is not worth holding the AI's turn
+                // for, and the model is told who is speaking what.
+                let said = e
+                    .translations
+                    .get(language)
+                    .map(|t| t.trim())
+                    .filter(|t| !t.is_empty())
+                    .unwrap_or_else(|| e.text.trim());
+                let line = format!("{}: {}", e.who, said);
                 match out.last_mut() {
                     Some((Role::User, text)) => {
                         text.push('\n');
@@ -2864,6 +3214,17 @@ mod tests {
     use vox_transcribe::{Clip, Stage};
 
     fn room(mode: Mode) -> (Arc<Room>, crossbeam_channel::Receiver<Turn>) {
+        let (r, turns, _) = room_with(mode, &[]);
+        (r, turns)
+    }
+
+    /// A room with an interpreter for each of `interpreters`, whose
+    /// queues come back so a test can be the voice at the other end.
+    type Interpreters = BTreeMap<String, crossbeam_channel::Receiver<InterpJob>>;
+    fn room_with(
+        mode: Mode,
+        interpreters: &[&str],
+    ) -> (Arc<Room>, crossbeam_channel::Receiver<Turn>, Interpreters) {
         let store = Store::memory();
         store.invite("Ryan").unwrap();
         store.invite("Alex").unwrap();
@@ -2880,8 +3241,24 @@ mod tests {
             languages: vec!["English".into(), "Russian".into()],
             spoken: vec!["English".into(), "Russian".into()],
         };
-        let r = Room::new(store, cfg, Arc::new(AtomicU64::new(0)), tx, None, None).unwrap();
-        (r, rx)
+        let mut interp_tx = BTreeMap::new();
+        let mut interp_rx = BTreeMap::new();
+        for language in interpreters {
+            let (tx, rx) = crossbeam_channel::bounded(16);
+            interp_tx.insert(language.to_string(), tx);
+            interp_rx.insert(language.to_string(), rx);
+        }
+        let r = Room::new(
+            store,
+            cfg,
+            Arc::new(AtomicU64::new(0)),
+            tx,
+            None,
+            interp_tx,
+            None,
+        )
+        .unwrap();
+        (r, rx, interp_rx)
     }
 
     /// A game that leaves the room's mode alone.
@@ -3160,6 +3537,15 @@ mod tests {
         g
     }
 
+    fn agent_entry_of(r: &Room, id: &str) -> Entry {
+        let st = r.lock();
+        st.log
+            .iter()
+            .find(|e| e.id == id)
+            .cloned()
+            .unwrap_or_else(|| panic!("no entry {id}: {:?}", st.log))
+    }
+
     fn agent_entry(r: &Room) -> Entry {
         let st = r.lock();
         st.log
@@ -3191,7 +3577,7 @@ mod tests {
         assert!(e.text.ends_with(" —"), "{:?}", e.text);
         assert!(r.lock().reply.is_none());
         // The model hears where it was cut off.
-        let msgs = conversation_messages(&r.lock().log, 50);
+        let msgs = conversation_messages(&r.lock().log, 50, "English");
         assert!(msgs.last().unwrap().1.ends_with(CUT_NOTE));
     }
 
@@ -3288,6 +3674,156 @@ mod tests {
             }
         }
         last
+    }
+
+    #[test]
+    fn what_somebody_says_is_given_to_the_interpreters_once_it_is_decoded() {
+        let (r, _turns, interp) = room_with(Mode::Named, &["English", "Russian"]);
+        r.set_language("Alex", "Russian").unwrap();
+        r.join("Alex", 1);
+        r.join("Ryan", 2);
+
+        // While it is still a streaming guess there is nothing to
+        // translate: the words are still changing.
+        r.on_paragraph("Ryan", &para("p1", "THE DOOR IS", true));
+        assert!(interp["Russian"].try_recv().is_err(), "not from a partial");
+
+        // Decoded whole, it goes to the people who don't speak it.
+        r.on_paragraph("Ryan", &para("p1", "The door is locked.", false));
+        let job = interp["Russian"]
+            .try_recv()
+            .expect("an utterance to interpret");
+        assert_eq!(job.text, "The door is locked.");
+        assert_eq!(job.from, "English");
+        assert_eq!(job.into, "Russian");
+        assert_eq!(job.who, "Ryan");
+        assert_eq!(job.entry, "p1");
+        // And not to the language it was said in: Ryan is not
+        // interpreted for Ryan.
+        assert!(interp["English"].try_recv().is_err());
+
+        // Pass 3 rewrites the clip afterwards. It is not said again:
+        // what has been heard cannot be unheard.
+        r.on_paragraph("Ryan", &para("p1", "The door is locked!", false));
+        assert!(
+            interp["Russian"].try_recv().is_err(),
+            "the same clip once only"
+        );
+    }
+
+    #[test]
+    fn nothing_is_interpreted_into_a_language_nobody_is_in() {
+        let (r, _turns, interp) = room_with(Mode::Named, &["English", "Russian"]);
+        // Alex reads Russian but isn't here, so there is nobody to
+        // interpret for and nothing to pay a translator for.
+        r.set_language("Alex", "Russian").unwrap();
+        r.join("Ryan", 2);
+        r.on_paragraph("Ryan", &para("p1", "Anyone there?", false));
+        assert!(interp["Russian"].try_recv().is_err());
+
+        // They arrive, and from then on they are heard out.
+        r.join("Alex", 1);
+        r.on_paragraph("Ryan", &para("p2", "There you are.", false));
+        assert_eq!(interp["Russian"].try_recv().unwrap().text, "There you are.");
+    }
+
+    #[test]
+    fn an_interpretation_is_read_at_the_pace_it_is_heard_too() {
+        let (r, _turns, interp) = room_with(Mode::Named, &["English", "Russian"]);
+        r.set_language("Alex", "Russian").unwrap();
+        r.join("Alex", 1);
+        r.join("Ryan", 2);
+        let mut events = r.subscribe();
+        r.on_paragraph("Ryan", &para("p1", "The door is locked.", false));
+        let job = interp["Russian"].try_recv().unwrap();
+
+        // The interpreter comes back with two seconds of Russian.
+        let ru = "Дверь заперта накрепко.";
+        r.interp_spoke(&job.entry, &job.into, ru, vec![0.1; 96_000]);
+        for _ in 0..25 {
+            r.mixer.tick();
+        }
+        r.tick(Instant::now());
+        let e = agent_entry_of(&r, "p1");
+        assert_eq!(
+            e.translations.get("Russian").map(String::as_str),
+            Some("Дверь"),
+            "a quarter of the way in, a word of it has been heard"
+        );
+        let of = last_heard(&mut events).expect("a report for the person being interpreted");
+        assert_eq!(of.len(), 1, "only the language it is being said in");
+        assert_eq!(of[0]["language"], "Russian");
+        assert_eq!(of[0]["total"], 2000);
+        assert_eq!(of[0]["done"], false);
+
+        // Heard out: the whole of it on screen, and the row goes.
+        for _ in 0..80 {
+            r.mixer.tick();
+        }
+        r.tick(Instant::now());
+        assert_eq!(
+            agent_entry_of(&r, "p1")
+                .translations
+                .get("Russian")
+                .map(String::as_str),
+            Some(ru)
+        );
+        let of = last_heard(&mut events).expect("a last report");
+        assert!(of.is_empty(), "nothing left to hear: {of:?}");
+    }
+
+    #[test]
+    fn a_turn_is_not_over_while_an_interpretation_is_still_coming() {
+        let (r, _turns, interp) = room_with(Mode::Named, &["English", "Russian"]);
+        r.set_language("Alex", "Russian").unwrap();
+        r.join("Alex", 1);
+        r.join("Ryan", 2);
+        let mut events = r.subscribe();
+        r.on_paragraph("Ryan", &para("p1", "The door is locked.", false));
+        let job = interp["Russian"].try_recv().unwrap();
+        // Still being translated: no audio, and nothing of it heard.
+        r.tick(Instant::now());
+        let of = last_heard(&mut events).expect("a report");
+        assert_eq!(of[0]["total"], 0);
+        assert_eq!(of[0]["done"], false, "waiting on the interpreter");
+
+        // One it cannot manage is not waited on for ever.
+        r.interp_failed(&job.entry, &job.into);
+        r.tick(Instant::now());
+        let of = last_heard(&mut events).expect("a last report");
+        assert!(of.is_empty(), "nothing is coming: {of:?}");
+    }
+
+    #[test]
+    fn the_model_is_told_what_was_said_in_the_rooms_own_language() {
+        let (r, _turns, interp) = room_with(Mode::Named, &["English", "Russian"]);
+        r.set_language("Alex", "Russian").unwrap();
+        r.join("Alex", 1);
+        r.join("Ryan", 2);
+        // Alex speaks Russian; the English in the room hear it
+        // interpreted, and so does the model.
+        r.on_paragraph("Alex", &para("p1", "Дверь заперта.", false));
+        let job = interp["English"]
+            .try_recv()
+            .expect("interpreted for the room");
+        assert_eq!(job.from, "Russian");
+        r.interp_spoke(
+            &job.entry,
+            &job.into,
+            "The door is locked.",
+            vec![0.1; 4800],
+        );
+        for _ in 0..10 {
+            r.mixer.tick();
+        }
+        r.tick(Instant::now());
+        {
+            let mut st = r.lock();
+            let e = st.log.iter_mut().find(|e| e.id == "p1").unwrap();
+            e.sent = true;
+        }
+        let msgs = conversation_messages(&r.lock().log, 50, "English");
+        assert_eq!(msgs.last().unwrap().1, "Alex: The door is locked.");
     }
 
     #[test]
@@ -3435,7 +3971,7 @@ mod tests {
         assert_eq!(e.translations["Russian"], format!("{ru0} {ru1}"));
         // What the model is shown is still the one language it writes
         // in: a translation of its own words is not news to it.
-        let msgs = conversation_messages(&r.lock().log, 50);
+        let msgs = conversation_messages(&r.lock().log, 50, "English");
         let last = &msgs.last().unwrap().1;
         assert_eq!(
             last,
@@ -3723,7 +4259,7 @@ mod tests {
         assert!(r.read_game("Dragon Heist").is_err());
 
         // The model is told about the button in later turns.
-        let msgs = conversation_messages(&r.lock().log, 50);
+        let msgs = conversation_messages(&r.lock().log, 50, "English");
         assert!(msgs.last().unwrap().1.contains("\"Dragon Caper\""));
 
         // Entering: a fresh conversation, and the AI opens with the prompt.
@@ -4197,7 +4733,7 @@ mod tests {
 
         // And the AI is shown its own card in full, so it can go on
         // playing by what the room is looking at.
-        let said = conversation_messages(&r.lock().log, 50);
+        let said = conversation_messages(&r.lock().log, 50, "English");
         assert_eq!(said.len(), 1);
         assert_eq!(said[0].0, Role::Assistant);
         assert!(said[0].1.contains("The rules"), "{}", said[0].1);

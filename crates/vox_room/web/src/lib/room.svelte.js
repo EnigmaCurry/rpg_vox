@@ -29,6 +29,11 @@ export const room = $state({
   mode: 'named',
   engaged: false,
   locked: false,
+  // Whether what people say out loud is put into the other languages as
+  // well as the AI's replies. False means a line spoken in a language
+  // you don't read is shown as it was said, because no translation of
+  // it is coming.
+  interprets: false,
   people: [],
   strips: {},
   levels: {},
@@ -312,6 +317,7 @@ function apply(ev) {
       room.mode = ev.mode;
       room.engaged = ev.engaged ?? false;
       room.locked = ev.locked ?? false;
+      room.interprets = ev.interprets ?? false;
       room.people = ev.people;
       room.strips = ev.strips;
       room.log = ev.log;
@@ -337,9 +343,6 @@ function apply(ev) {
       break;
     case 'entry':
       upsert(ev.entry);
-      // A turn that is over is over in every language: nothing left to
-      // say about how far along it is.
-      if (!ev.entry.live) delete room.heard[ev.entry.id];
       break;
     case 'entry_removed':
       room.log = room.log.filter((e) => e.id !== ev.id);

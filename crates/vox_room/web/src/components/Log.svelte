@@ -21,12 +21,14 @@
   ///
   /// The AI writes in the room's own language whatever it was asked in,
   /// so its replies are translated for anyone reading in another; a
-  /// typed message is in whatever its author reads in. What people say
-  /// out loud is not translated yet.
+  /// typed message is in whatever its author reads in; and what people
+  /// say out loud is interpreted, when the room is interpreting -- when
+  /// it isn't, there is no translation coming and the line is shown as
+  /// it was said.
   function pair(e) {
     const from = e.kind === 'agent' ? roomLanguage : languageOf(e.who);
     if (!from || from === mine) return null;
-    if (e.kind !== 'agent' && !e.typed) return null;
+    if (e.kind !== 'agent' && !e.typed && !room.interprets) return null;
     return { from, text: e.translations?.[mine] ?? null };
   }
 
@@ -41,10 +43,11 @@
   /// having asked -- and the one it was written in once you say so.
   const showing = (e) => (asWritten[e.id] ? 'from' : 'mine');
 
-  /// How far the AI's reply has been heard in each language it is being
-  /// said in, while it still is. One language is no news to anybody, and
-  /// a turn the room has finished with has none of this to report.
-  const tracks = (e) => (e.live && room.heard[e.id]) || [];
+  /// How far a line has been heard in each language it is being said
+  /// in, while it still is being. The room sends an empty one when
+  /// there is nothing left to wait for, which is what takes the row
+  /// away.
+  const tracks = (e) => room.heard[e.id] ?? [];
   const width = (t) => (t.total ? Math.min(100, Math.round((t.ms / t.total) * 100)) : 0);
   /// What is left of it: seconds while it is being said, and otherwise
   /// either that it is over or that it is still being translated.
@@ -152,12 +155,14 @@
           {#if e.text}{e.text}{:else if e.kind === 'agent'}<span class="dots"><i></i><i></i><i></i></span>{/if}
         </div>
       {/if}
-      {#if tracks(e).length > 1}
-        <!-- The same reply takes a different time to say in each
+      {#if tracks(e).length > 0}
+        <!-- The same words take a different time to say in each
              language, so whichever one you are listening to, this is
              where the others have got to. It goes when they are all
              done, which is the thing it is here to show. -->
-        <div class="tracks" title="How far {room.agent.name}'s reply has been heard in each language. The turn is over once every language has heard it out.">
+        <div class="tracks" title={e.kind === 'agent'
+          ? `How far ${room.agent.name}'s reply has been heard in each language. The turn is over once every language has heard it out.`
+          : `How far ${e.who} has been heard in each language. Anyone listening in one of these is hearing it now, a phrase behind.`}>
           {#each tracks(e) as t (t.language)}
             <span class="track" class:done={t.done} class:waiting={!t.total && !t.done}>
               <span class="lang">{t.language}</span>

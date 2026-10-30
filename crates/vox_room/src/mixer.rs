@@ -12,7 +12,7 @@
 //! conversation log: [`Mixer::ai_clear`] stops the AI and returns exactly
 //! how far it got.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -63,9 +63,10 @@ impl Default for Strip {
     }
 }
 
-/// How far the AI's speech has got, for the conversation log.
+/// How far a queue of speech has got, for the conversation log and for
+/// everyone's screen.
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct AiProgress {
+pub struct TrackProgress {
     /// Sentences played to the end since the last report: (generation, index, samples).
     pub finished: Vec<(u64, usize, usize)>,
     /// The sentence playing now: (generation, index, samples played, samples).
@@ -81,7 +82,10 @@ struct Segment {
     pos: usize,
 }
 
-struct Ai {
+/// One voice's queue: the AI in one language, or the interpreter in one
+/// language. Both are heard by whoever picked that language and by
+/// nobody else, so both are a queue of their own.
+struct Track {
     queue: VecDeque<Segment>,
     finished: Vec<(u64, usize, usize)>,
     ducked: bool,
@@ -89,7 +93,7 @@ struct Ai {
     duck: f32,
 }
 
-impl Default for Ai {
+impl Default for Track {
     /// Written out rather than derived because `duck` starts at full:
     /// a derived zero would be a queue that fades up from silence every
     /// time a language is first spoken in.
@@ -103,9 +107,9 @@ impl Default for Ai {
     }
 }
 
-impl Ai {
-    fn progress(&mut self) -> AiProgress {
-        AiProgress {
+impl Track {
+    fn progress(&mut self) -> TrackProgress {
+        TrackProgress {
             finished: std::mem::take(&mut self.finished),
             current: self
                 .queue
@@ -202,7 +206,15 @@ struct State {
     /// The AI's speech, one queue per language the room is listening in.
     /// Every listener hears the one in their own language and no other,
     /// so these are alternatives rather than parts of a mix.
-    ai: BTreeMap<String, Ai>,
+    ai: BTreeMap<String, Track>,
+    /// What the people who don't speak the floor's language are hearing
+    /// in place of understanding it: one queue per language being
+    /// interpreted into, the same shape as the AI's.
+    interp: BTreeMap<String, Track>,
+    /// How much of the floor each language is hearing, ramped per
+    /// sample: the voices being interpreted drop away under the voice
+    /// interpreting them, and come back when it stops.
+    floor: BTreeMap<String, f32>,
     /// The language whose queue is the AI's turn as the room records it:
     /// what [`Mixer::ai_progress`] counts, and so what the conversation
     /// log and a barge-in are measured against. The others are spoken
@@ -226,7 +238,9 @@ impl Mixer {
                 inputs: HashMap::new(),
                 strips,
                 listeners: Vec::new(),
-                ai: BTreeMap::from([(canonical.to_string(), Ai::default())]),
+                ai: BTreeMap::from([(canonical.to_string(), Track::default())]),
+                interp: BTreeMap::new(),
+                floor: BTreeMap::new(),
                 canonical: canonical.to_string(),
                 peaks: HashMap::new(),
             }),
@@ -363,7 +377,7 @@ impl Mixer {
     /// in. Per language because each is read by whoever is listening in
     /// it, and they drift: a translation is a different number of
     /// syllables from the words it translates.
-    pub fn ai_progress(&self) -> BTreeMap<String, AiProgress> {
+    pub fn ai_progress(&self) -> BTreeMap<String, TrackProgress> {
         let mut st = self.lock();
         st.ai
             .iter_mut()
@@ -373,7 +387,7 @@ impl Mixer {
 
     /// Stop the AI now, in every language. Returns how far each got, as
     /// [`Mixer::ai_progress`].
-    pub fn ai_clear(&self) -> BTreeMap<String, AiProgress> {
+    pub fn ai_clear(&self) -> BTreeMap<String, TrackProgress> {
         let mut st = self.lock();
         let mut progress = BTreeMap::new();
         for (language, ai) in st.ai.iter_mut() {
@@ -386,6 +400,34 @@ impl Mixer {
             progress.insert(language.clone(), p);
         }
         progress
+    }
+
+    /// Queue one utterance of interpreted speech in `language`. `stream`
+    /// names what is being interpreted -- one person's run of talk -- so
+    /// the room can follow it back to the line on screen; `index` is the
+    /// utterance's place in it.
+    pub fn interp_push(&self, language: &str, stream: u64, index: usize, samples: Vec<f32>) {
+        let mut st = self.lock();
+        st.interp
+            .entry(language.to_string())
+            .or_default()
+            .queue
+            .push_back(Segment {
+                generation: stream,
+                index,
+                samples,
+                pos: 0,
+            });
+    }
+
+    /// How far the interpreter has got in each language it is speaking,
+    /// so whoever is being interpreted can see when they have been heard.
+    pub fn interp_progress(&self) -> BTreeMap<String, TrackProgress> {
+        let mut st = self.lock();
+        st.interp
+            .iter_mut()
+            .map(|(language, t)| (language.clone(), t.progress()))
+            .collect()
     }
 
     pub(crate) fn tick(&self) {
@@ -430,6 +472,21 @@ impl Mixer {
             let p = st.peaks.entry(AGENT_STRIP.to_string()).or_insert(0.0);
             *p = p.max(ai_peak);
         }
+        // The interpreter, held back while the AI is speaking in the
+        // same language. Both are in that listener's language, and two
+        // voices at once is neither of them; the AI's turn is short, and
+        // what is waiting keeps its place in the queue.
+        let mut interp: BTreeMap<String, [f32; FRAME]> = BTreeMap::new();
+        for (language, queue) in st.interp.iter_mut() {
+            if st.ai.get(language).is_some_and(|a| !a.queue.is_empty()) {
+                continue;
+            }
+            let mut f = [0.0f32; FRAME];
+            if !queue.pull(&mut f) {
+                continue;
+            }
+            interp.insert(language.clone(), f);
+        }
         if st.listeners.is_empty() {
             return;
         }
@@ -439,6 +496,60 @@ impl Mixer {
             for (t, s) in total.iter_mut().zip(f.iter()) {
                 *t += s;
             }
+        }
+        // What language each person is in, which is what says whether
+        // they are being interpreted for a given listener.
+        let mut speaks: HashMap<String, String> = HashMap::new();
+        for l in &st.listeners {
+            speaks.insert(l.person.clone(), l.language.clone());
+        }
+        // The floor ducks under the interpreter, for the people hearing
+        // it and nobody else: the same 10 ms ramp down and back as the
+        // AI's own duck. A language with the floor at full and no
+        // interpreter talking needs no envelope at all, which is every
+        // language in a room that shares one.
+        let languages: BTreeSet<String> = st.listeners.iter().map(|l| l.language.clone()).collect();
+        let mut env: BTreeMap<String, [f32; FRAME]> = BTreeMap::new();
+        for language in languages {
+            let target = if interp.contains_key(&language) {
+                DUCK_GAIN
+            } else {
+                1.0
+            };
+            let g = st.floor.entry(language.clone()).or_insert(1.0);
+            if *g == 1.0 && target == 1.0 {
+                continue;
+            }
+            let mut e = [0.0f32; FRAME];
+            for s in e.iter_mut() {
+                if *g < target {
+                    *g = (*g + DUCK_STEP).min(target);
+                } else if *g > target {
+                    *g = (*g - DUCK_STEP).max(target);
+                }
+                *s = *g;
+            }
+            env.insert(language, e);
+        }
+        // And only the voices being interpreted duck: somebody speaking
+        // your own language is understood, and nothing is being said
+        // over them.
+        let mut foreign: BTreeMap<String, [f32; FRAME]> = BTreeMap::new();
+        for language in env.keys() {
+            let mut f = [0.0f32; FRAME];
+            for (person, frame) in &frames {
+                let theirs = speaks
+                    .get(person)
+                    .map(String::as_str)
+                    .unwrap_or(&st.canonical);
+                if theirs == language {
+                    continue;
+                }
+                for (t, s) in f.iter_mut().zip(frame.iter()) {
+                    *t += s;
+                }
+            }
+            foreign.insert(language.clone(), f);
         }
         let mut out = [0.0f32; FRAME];
         let mut packet = [0u8; 4000];
@@ -456,7 +567,11 @@ impl Mixer {
             // queues are at different sentences. Quiet until their own
             // words arrive is the honest alternative, and the reply is
             // on screen meanwhile.
-            let theirs = ai.get(&l.language);
+            let theirs = Theirs {
+                ai: ai.get(&l.language),
+                interp: interp.get(&l.language),
+                duck: env.get(&l.language).zip(foreign.get(&l.language)),
+            };
             mix_minus(&total, own, theirs, &mut out);
             match l.encoder.encode_float(&out, &mut packet) {
                 Ok(n) => {
@@ -471,14 +586,28 @@ impl Mixer {
 
 /// `total` without `own` and with `ai` -- everyone in the room but
 /// yourself, plus the AI in your language -- clamped to full scale.
+/// What one listener hears over the room: the AI in their language, the
+/// interpreter in their language, and how far the voices being
+/// interpreted are taken down under it.
+#[derive(Default, Clone, Copy)]
+struct Theirs<'a> {
+    ai: Option<&'a [f32; FRAME]>,
+    interp: Option<&'a [f32; FRAME]>,
+    duck: Option<(&'a [f32; FRAME], &'a [f32; FRAME])>,
+}
+
 fn mix_minus(
     total: &[f32; FRAME],
     own: Option<&[f32; FRAME]>,
-    ai: Option<&[f32; FRAME]>,
+    theirs: Theirs,
     out: &mut [f32; FRAME],
 ) {
     for i in 0..FRAME {
-        let s = total[i] - own.map_or(0.0, |o| o[i]) + ai.map_or(0.0, |a| a[i]);
+        let mut s = total[i] - own.map_or(0.0, |o| o[i]);
+        if let Some((env, foreign)) = theirs.duck {
+            s -= (1.0 - env[i]) * foreign[i];
+        }
+        s += theirs.ai.map_or(0.0, |a| a[i]) + theirs.interp.map_or(0.0, |v| v[i]);
         out[i] = s.clamp(-1.0, 1.0);
     }
 }
@@ -496,12 +625,19 @@ mod tests {
             total[i] = a[i] + b[i];
         }
         let mut out = [0.0f32; FRAME];
-        mix_minus(&total, Some(&a), None, &mut out);
+        mix_minus(&total, Some(&a), Theirs::default(), &mut out);
         assert!(out.iter().all(|s| (s - 0.5).abs() < 1e-6));
-        mix_minus(&total, Some(&b), None, &mut out);
+        mix_minus(&total, Some(&b), Theirs::default(), &mut out);
         assert!(out.iter().all(|s| (s - 0.25).abs() < 1e-6));
-        mix_minus(&total, None, None, &mut out);
+        mix_minus(&total, None, Theirs::default(), &mut out);
         assert!(out.iter().all(|s| (s - 0.75).abs() < 1e-6));
+    }
+
+    fn ai_of(frame: &[f32; FRAME]) -> Theirs<'_> {
+        Theirs {
+            ai: Some(frame),
+            ..Theirs::default()
+        }
     }
 
     #[test]
@@ -512,13 +648,130 @@ mod tests {
         let mut out = [0.0f32; FRAME];
         // The AI's languages are alternatives, never summed: whichever
         // one a listener is on is the only one they hear.
-        mix_minus(&mics, None, Some(&english), &mut out);
+        mix_minus(&mics, None, ai_of(&english), &mut out);
         assert!(out.iter().all(|s| (s - 0.35).abs() < 1e-6));
-        mix_minus(&mics, None, Some(&russian), &mut out);
+        mix_minus(&mics, None, ai_of(&russian), &mut out);
         assert!(out.iter().all(|s| (s - 0.6).abs() < 1e-6));
         // And a mix still leaves out your own mic.
-        mix_minus(&mics, Some(&mics), Some(&russian), &mut out);
+        mix_minus(&mics, Some(&mics), ai_of(&russian), &mut out);
         assert!(out.iter().all(|s| (s - 0.5).abs() < 1e-6));
+    }
+
+    #[test]
+    fn the_duck_is_only_on_the_voices_being_interpreted() {
+        // Somebody speaking a language this listener hasn't got, and
+        // somebody speaking the one they have.
+        let foreign = [0.4f32; FRAME];
+        let same = [0.2f32; FRAME];
+        let mut total = [0.0f32; FRAME];
+        for i in 0..FRAME {
+            total[i] = foreign[i] + same[i];
+        }
+        let voice = [0.1f32; FRAME];
+        let env = [DUCK_GAIN; FRAME];
+        let mut out = [0.0f32; FRAME];
+        mix_minus(
+            &total,
+            None,
+            Theirs {
+                ai: None,
+                interp: Some(&voice),
+                duck: Some((&env, &foreign)),
+            },
+            &mut out,
+        );
+        // The interpreted voice down to a fifth, the one they can
+        // follow left exactly where it was, and the interpreter over
+        // the top of both.
+        let want = 0.4 * DUCK_GAIN + 0.2 + 0.1;
+        assert!(out.iter().all(|s| (s - want).abs() < 1e-6), "{}", out[0]);
+    }
+
+    #[test]
+    fn an_interpretation_waits_while_the_ai_is_speaking_the_same_language() {
+        let mixer = Mixer::new(BTreeMap::new(), "English");
+        mixer.ai_push("English", 1, 0, vec![0.5; 5 * FRAME]);
+        mixer.interp_push("English", 7, 0, vec![0.3; 2 * FRAME]);
+        for _ in 0..3 {
+            mixer.tick();
+        }
+        // Both are in this listener's language, and two voices at once
+        // is neither of them. The interpreter keeps its place.
+        let p = mixer.interp_progress();
+        assert_eq!(p["English"].current, Some((7, 0, 0, 2 * FRAME)));
+        assert!(p["English"].finished.is_empty());
+
+        // The AI finishes, and it is heard out from where it was.
+        for _ in 0..4 {
+            mixer.tick();
+        }
+        let p = mixer.interp_progress();
+        assert!(
+            !p["English"].finished.is_empty()
+                || p["English"]
+                    .current
+                    .is_some_and(|(_, _, played, _)| played > 0),
+            "the interpreter speaks once the AI has stopped: {:?}",
+            p["English"]
+        );
+    }
+
+    /// A steady tone, which is what survives Opus well enough to compare
+    /// one frame with the next. Flat DC does not: the codec high-passes
+    /// it away and leaves only the edges, which ring.
+    fn tone(frames: usize, amp: f32, at: &mut usize) -> Vec<f32> {
+        let mut out = Vec::with_capacity(frames * FRAME);
+        for _ in 0..frames * FRAME {
+            let t = *at as f32 / RATE as f32;
+            out.push(amp * (std::f32::consts::TAU * 300.0 * t).sin());
+            *at += 1;
+        }
+        out
+    }
+
+    #[test]
+    fn an_interpretation_is_heard_by_the_people_it_is_for_and_nobody_else() {
+        let mixer = Mixer::new(BTreeMap::new(), "English");
+        let (tx, mut to_ryan) = mpsc::channel(LISTENER_QUEUE);
+        mixer.add_listener(1, "Ryan", "English", tx).unwrap();
+        let (tx, mut to_anya) = mpsc::channel(LISTENER_QUEUE);
+        mixer.add_listener(2, "Anya", "Russian", tx).unwrap();
+        let mut d1 = opus::Decoder::new(RATE, opus::Channels::Mono).unwrap();
+        let mut d2 = opus::Decoder::new(RATE, opus::Channels::Mono).unwrap();
+        // Anya is talking, in Russian, and keeps talking throughout.
+        let mut at = 0;
+        mixer.push_mic("Anya", &tone(3, 0.4, &mut at));
+        let mut turn = |mixer: &Mixer, at: &mut usize| {
+            mixer.push_mic("Anya", &tone(1, 0.4, at));
+            mixer.tick();
+            (
+                peak(&heard_by(&mut to_ryan, &mut d1)),
+                peak(&heard_by(&mut to_anya, &mut d2)),
+            )
+        };
+        let mut before = 0.0;
+        for _ in 0..4 {
+            before = turn(&mixer, &mut at).0;
+        }
+        assert!(before > 0.3, "Ryan hears her as she is: {before}");
+
+        // What she said, in English, for the people who don't have her
+        // language. Her voice goes down under it; Anya's own mix has no
+        // interpreter in it and is left alone.
+        mixer.interp_push("English", 7, 0, tone(8, 0.05, &mut 0));
+        let (mut ryan, mut anya) = (0.0, 0.0);
+        for _ in 0..4 {
+            (ryan, anya) = turn(&mixer, &mut at);
+        }
+        assert!(
+            ryan < before / 2.0,
+            "the voice being interpreted drops: {ryan} against {before}"
+        );
+        assert!(
+            anya < 0.02,
+            "and Anya, who has no interpreter, hears what she always did: \
+             nothing but the room, which is only herself"
+        );
     }
 
     /// What one listener's socket actually received this tick, decoded
@@ -653,7 +906,7 @@ mod tests {
 
     #[test]
     fn counts_what_the_ai_has_said() {
-        let mut ai = Ai::default();
+        let mut ai = Track::default();
         ai.queue.push_back(Segment {
             generation: 7,
             index: 0,
@@ -680,7 +933,7 @@ mod tests {
 
     #[test]
     fn ducking_ramps_instead_of_clicking() {
-        let mut ai = Ai::default();
+        let mut ai = Track::default();
         ai.queue.push_back(Segment {
             generation: 1,
             index: 0,

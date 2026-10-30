@@ -3,6 +3,7 @@
 //! talks back, and share one live transcript. See ROOM.md.
 
 mod agent;
+mod interp;
 mod mixer;
 mod room;
 mod screen;
@@ -11,6 +12,7 @@ mod stt;
 mod tts;
 mod web;
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -153,6 +155,23 @@ struct Cli {
         value_delimiter = ','
     )]
     languages: Vec<String>,
+    /// Say what people say to the people who don't speak it: a voice in
+    /// each language the room is listening in, reading an utterance a
+    /// phrase behind the person who said it, with the voices it is
+    /// interpreting ducked under it. Needs `--tts qwen3` and a
+    /// translator, like the AI's own languages do.
+    #[arg(
+        long,
+        env = "VOX_ROOM_INTERPRET",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    interpret: bool,
+    /// The interpreters' Qwen3 voice. Different from `--voice` on
+    /// purpose: an interpretation is not the AI talking, and the one
+    /// thing a listener needs to be able to tell is which is which.
+    #[arg(long, env = "VOX_ROOM_INTERPRETER_VOICE", default_value = "ryan")]
+    interpreter_voice: String,
     /// Kokoro voice.
     #[arg(long, env = "VOX_ROOM_KOKORO_VOICE", default_value = "am_michael")]
     kokoro_voice: String,
@@ -468,7 +487,7 @@ fn serve(cli: Cli, store: Store) -> Result<()> {
     // one after another. A Qwen3 voice is only an HTTP client, so having
     // several costs nothing; Kokoro would be the whole model again, and
     // it only speaks English anyway, so it stays alone.
-    let make_voice = |language: &str| -> anyhow::Result<Box<dyn tts::Voice>> {
+    let make_voice = |language: &str, preset: &str| -> anyhow::Result<Box<dyn tts::Voice>> {
         Ok(match kind {
             TtsKind::Qwen3 => {
                 let Some(url) = tts_url.clone() else {
@@ -477,14 +496,14 @@ fn serve(cli: Cli, store: Store) -> Result<()> {
                 info!(
                     %url,
                     language,
-                    voice = %cli.voice,
+                    voice = %preset,
                     model = cli.tts_model.as_deref().unwrap_or("(unnamed)"),
                     key = cli.tts_key.is_some(),
                     "voice: Qwen3-TTS"
                 );
                 Box::new(tts::Qwen3::new(
                     &url,
-                    &cli.voice,
+                    preset,
                     &cli.instruct,
                     language,
                     cli.tts_key.clone(),
@@ -501,7 +520,7 @@ fn serve(cli: Cli, store: Store) -> Result<()> {
             }
         })
     };
-    let mut voices = vec![(language.clone(), make_voice(&language)?)];
+    let mut voices = vec![(language.clone(), make_voice(&language, &cli.voice)?)];
     let others: Vec<String> = cfg_languages
         .iter()
         .filter(|l| **l != language)
@@ -510,7 +529,7 @@ fn serve(cli: Cli, store: Store) -> Result<()> {
     if !others.is_empty() {
         if voices[0].1.multilingual() {
             for language in others {
-                let voice = make_voice(&language)?;
+                let voice = make_voice(&language, &cli.voice)?;
                 voices.push((language, voice));
             }
         } else {
@@ -593,11 +612,48 @@ fn serve(cli: Cli, store: Store) -> Result<()> {
         Some((tx, rx)) => (Some(tx), Some(rx)),
         None => (None, None),
     };
-    let room = Room::new(store, cfg, generation.clone(), turn_tx, typing_tx, factory)?;
+    // The interpreters: one per language the room is listening in,
+    // including its own -- a Russian speaker's words have to reach the
+    // English listeners as much as the other way about. Same two
+    // conditions as the AI's own languages, for the same reasons: a
+    // translator to put it into words, and a voice that can say them.
+    let mut interp_tx = BTreeMap::new();
+    let mut interp_rx = Vec::new();
+    if cli.interpret && translate.is_some() && voices.len() > 1 {
+        for (language, _) in &voices {
+            let (tx, rx) = interp::queue();
+            interp_tx.insert(language.clone(), tx);
+            interp_rx.push((language.clone(), rx));
+        }
+        info!(
+            languages = %voices.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>().join(", "),
+            voice = %cli.interpreter_voice,
+            "interpreting: what people say is spoken to whoever doesn't speak it"
+        );
+    }
+    let room = Room::new(
+        store,
+        cfg,
+        generation.clone(),
+        turn_tx,
+        typing_tx,
+        interp_tx,
+        factory,
+    )?;
     if let Some(rx) = typing_rx {
         if let Some(t) = translate.clone() {
             agent::spawn_typists(room.clone(), t, rx, 2);
         }
+    }
+    for (language, rx) in interp_rx {
+        let Some(t) = translate.clone() else { break };
+        interp::spawn(
+            room.clone(),
+            &language,
+            make_voice(&language, &cli.interpreter_voice)?,
+            t,
+            rx,
+        );
     }
     room.mixer.spawn();
     agent::Agent {

@@ -215,8 +215,8 @@ See ROOM_DOCKER.md.
   ```
 
   Everyone sees the same row, whichever language they are listening in,
-  and it goes when every language has heard the reply out — which is the
-  same moment the turn ends and the AI will take another. An English
+  and it goes when every language has heard the reply out — which, for
+  the AI, is the same moment the turn ends and it will take another. An English
   speaker can see that the Russian still has a sentence to go before
   saying anything; a Russian listener can see that the room is waiting
   for them rather than that something has stalled. A language whose
@@ -224,9 +224,41 @@ See ROOM_DOCKER.md.
   pretending to be at nought seconds.
 
   Underneath, the room's own language is still the record: it is what
-  the AI is shown of the conversation, and what it is stored as having
-  said, however many languages it was heard in. What people say out loud
-  is not translated — only the AI's replies and what is typed.
+  it is stored as having said, however many languages it was heard in.
+
+  **People are interpreted too.** What anyone says out loud is said
+  again, by a separate voice, to everybody in the room who doesn't speak
+  it — the way a booth at a conference does it, and with the same
+  ducking: the voices being interpreted drop to a fifth under their
+  interpreter, and come back when it stops. Only *those* voices duck.
+  Somebody speaking your own language stays exactly where they were,
+  because you can follow them and nothing is being said over them.
+
+  It starts when an utterance has been decoded whole — pass 2, so a
+  phrase behind the speaker rather than word by word, since the words of
+  a streaming guess are still changing. The text arrives with it, so
+  everyone reads the room in their own language and keeps the **Show
+  English** link to what was actually said. Pass 3 rewrites the
+  transcript afterwards and is deliberately not spoken again: by then
+  the words have been heard, and nobody can unhear them.
+
+  An interpretation waits while the AI is speaking in that same
+  language. Both of them are in your language and two voices at once is
+  neither; what is waiting keeps its place and follows on.
+
+  The same bar appears under a line somebody is still being heard
+  saying, so the speaker can see when the room has caught up with them —
+  and `--interpret false` turns the whole thing off, for a room that
+  would rather read than be talked over. It costs a translation and a
+  voice per utterance per language, which is the same arithmetic as the
+  AI's replies and the same two requirements: a translator and
+  `--tts qwen3`.
+
+  What the AI is shown is the room's own language throughout: where an
+  interpretation into it exists, that is the line the model gets, so a
+  conversation the room heard in two languages reads to it as one. It is
+  not waited for — a turn is not held up for a translation that hasn't
+  come back — and the model is told who is listening in what either way.
 
   **Who translates.** By default the same model that writes the replies
   (`--translate openai`). `--translate local` asks Marian models on this
@@ -531,6 +563,8 @@ pays for a rejected request before every reply.
 | `VOX_ROOM_VOICE`, `VOX_ROOM_INSTRUCT`, `VOX_ROOM_LANGUAGE` | `aiden`, none, `English` | Qwen3 voice, delivery and language |
 | `VOX_ROOM_LANGUAGES` | | other languages the door offers, comma-separated and spelled out in English (`Russian`). The AI answers in each one somebody is listening in; needs `--tts qwen3` |
 | `VOX_ROOM_TRANSLATE` | `openai` | who translates: `openai` asks the reply model, `local` asks Marian models on the CPU (see below) |
+| `VOX_ROOM_INTERPRET` | `true` | say what people say to the people who don't speak it, with the voices being interpreted ducked under it. `false` to translate only the AI and what is typed |
+| `VOX_ROOM_INTERPRETER_VOICE` | `ryan` | the interpreters' Qwen3 voice. Not the AI's, on purpose: the one thing to be able to tell by ear is which is which |
 | `VOX_ROOM_KOKORO_VOICE` | `am_michael` | Kokoro voice |
 | `VOX_SCRIBE_MODELS` | scribe's models dir | speech-to-text models |
 
@@ -547,4 +581,8 @@ alone. `e2e/hear-out.js` needs no microphone at all: two tabs on
 different languages, a typed question, and it reads the per-language row
 off both screens to check that one language is shown heard out while the
 other is still going, that both tabs are shown the same thing, and that
-the row goes when the turn does.
+the row goes when the turn does. `e2e/interpret.js` is the other half:
+one tab's mic is a WAV of somebody talking and the other is listening in
+another language, and it checks that what was said reaches that screen in
+that language, that there is a voice saying it, and that the speaker is
+shown how far it has got.

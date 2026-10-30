@@ -1623,6 +1623,7 @@ mod tests {
             generation.clone(),
             turns_tx,
             None,
+            std::collections::BTreeMap::new(),
             None,
         )
         .unwrap();
