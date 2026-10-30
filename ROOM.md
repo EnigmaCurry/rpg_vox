@@ -175,15 +175,24 @@ See ROOM_DOCKER.md.
   kept, so coming back to a conversation shows what everyone was shown
   at the time.
 
-  Two things are worth knowing. A translation is a sentence or two
-  behind — it is written, then spoken, after the original — so **if you
-  are listening in a translation you cannot talk the AI down**: starting
-  to speak neither dips it nor cuts it, because you would be stopping it
-  in the middle of something you haven't heard yet. **Stop** still works
-  for you, since a click says where to cut without guessing. And the
-  conversation on screen is the room's own language, which is what the AI
-  reads and what it is recorded as having said, however many languages it
-  was heard in.
+  Three things are worth knowing. **You hear your own language or
+  nothing** — never a word of anybody else's. A translation has to be
+  written before it can be spoken, so it begins about three seconds
+  after the original does, and in those seconds you hear silence rather
+  than the opening of the reply in a language you didn't ask for. The
+  reply is on screen the whole time. (Measured on a real room: the AI's
+  first English audio at 3.6 s, the same reply's first Russian audio at
+  6.3 s.)
+
+  Second, **if you are listening in a translation you cannot talk the AI
+  down**: starting to speak neither dips it nor cuts it, because you
+  would be stopping it in the middle of something you haven't heard yet.
+  **Stop** still works for you, since a click says where to cut without
+  guessing.
+
+  Third, the conversation on screen is the room's own language, which is
+  what the AI reads and what it is recorded as having said, however many
+  languages it was heard in.
 
   Your words are transcribed in whatever you speak: Parakeet works out
   the language from the audio. The text that appears *while* you are

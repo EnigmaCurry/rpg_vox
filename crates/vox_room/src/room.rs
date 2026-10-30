@@ -782,6 +782,9 @@ impl Room {
         st.people
             .retain(|name, p| p.clients > 0 || invited.contains_key(name));
         let mut changed = st.people.len() != before;
+        // Anyone whose language the roster has just learned, so the
+        // mixer can be told which queue their tabs listen to.
+        let mut retrack: Vec<String> = Vec::new();
         for (name, language) in invited {
             match st.people.entry(name) {
                 btree_map::Entry::Vacant(slot) => {
@@ -795,10 +798,25 @@ impl Room {
                 btree_map::Entry::Occupied(mut slot) => {
                     if slot.get().language != language {
                         slot.get_mut().language = language;
+                        // The mixer feeds each tab from a language it was
+                        // told once, when the tab joined. A roster that
+                        // has only just caught up with the store -- one
+                        // of their own tabs choosing, or a rename -- must
+                        // tell it again, or they stay on the wrong queue
+                        // for as long as they are here.
+                        retrack.push(slot.key().clone());
                         changed = true;
                     }
                 }
             }
+        }
+        for name in &retrack {
+            let heard = st
+                .people
+                .get(name)
+                .map(|p| self.language_of(p).to_string())
+                .unwrap_or_else(|| self.cfg.language.clone());
+            self.mixer.set_listener_language(name, &heard);
         }
         if changed {
             self.emit_people(&st);

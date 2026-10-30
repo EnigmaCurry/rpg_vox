@@ -449,10 +449,19 @@ impl Mixer {
         let mut packet = [0u8; 4000];
         for l in st.listeners.iter_mut() {
             let own = frames.iter().find(|(n, _)| *n == l.person).map(|(_, f)| f);
-            // Their own language's AI, or the canonical one when the room
-            // isn't saying anything in theirs (nothing to translate, or
-            // the translation is still on its way).
-            let theirs = ai.get(&l.language).or_else(|| ai.get(&st.canonical));
+            // Their own language and no other, or nothing at all.
+            //
+            // There is deliberately no falling back to the room's own
+            // language while a translation is still on its way. A
+            // translation lands a sentence or two behind the original,
+            // so a fallback plays the opening of the reply in a language
+            // this listener didn't ask for and then cuts to theirs
+            // mid-sentence -- which is both the one thing the feature
+            // exists to avoid and a garble, since by then the two
+            // queues are at different sentences. Quiet until their own
+            // words arrive is the honest alternative, and the reply is
+            // on screen meanwhile.
+            let theirs = ai.get(&l.language);
             mix_minus(&total, own, theirs, &mut out);
             match l.encoder.encode_float(&out, &mut packet) {
                 Ok(n) => {
@@ -515,6 +524,52 @@ mod tests {
         // And a mix still leaves out your own mic.
         mix_minus(&mics, Some(&mics), Some(&russian), &mut out);
         assert!(out.iter().all(|s| (s - 0.5).abs() < 1e-6));
+    }
+
+    /// What one listener's socket actually received this tick, decoded
+    /// back from the Opus the mixer sent it.
+    fn heard_by(rx: &mut mpsc::Receiver<Vec<u8>>, decoder: &mut opus::Decoder) -> Vec<f32> {
+        let packet = rx.try_recv().expect("a frame for this listener");
+        let mut pcm = vec![0.0f32; FRAME];
+        let n = decoder
+            .decode_float(&packet, &mut pcm, false)
+            .expect("opus");
+        pcm.truncate(n);
+        pcm
+    }
+
+    fn peak(samples: &[f32]) -> f32 {
+        samples.iter().fold(0.0f32, |m, s| m.max(s.abs()))
+    }
+
+    #[test]
+    fn a_listener_waiting_on_a_translation_hears_nothing_rather_than_another_language() {
+        let mixer = Mixer::new(BTreeMap::new(), "English");
+        let (tx, mut rx) = mpsc::channel(LISTENER_QUEUE);
+        mixer.add_listener(1, "Anya", "Russian", tx).unwrap();
+        let mut decoder = opus::Decoder::new(RATE, opus::Channels::Mono).unwrap();
+
+        // The reply has begun in the room's own language; the Russian is
+        // still being translated, so there is no Russian queue yet.
+        mixer.ai_push("English", 1, 0, vec![0.5; 20 * FRAME]);
+        mixer.tick();
+        assert!(
+            peak(&heard_by(&mut rx, &mut decoder)) < 0.02,
+            "a listener who asked for Russian must not be handed English \
+             while the translation is on its way"
+        );
+
+        // Their own words arrive, and now they hear them.
+        mixer.ai_push("Russian", 1, 0, vec![0.5; 20 * FRAME]);
+        mixer.tick();
+        assert!(peak(&heard_by(&mut rx, &mut decoder)) > 0.1);
+
+        // And someone on the room's own language heard it all along.
+        let (tx, mut rx2) = mpsc::channel(LISTENER_QUEUE);
+        mixer.add_listener(2, "Ryan", "English", tx).unwrap();
+        let mut d2 = opus::Decoder::new(RATE, opus::Channels::Mono).unwrap();
+        mixer.tick();
+        assert!(peak(&heard_by(&mut rx2, &mut d2)) > 0.1);
     }
 
     #[test]
