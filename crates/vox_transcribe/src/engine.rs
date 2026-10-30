@@ -1241,3 +1241,94 @@ impl Core {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SR: u32 = 16_000;
+
+    /// A second of sound at `amp`, or of digital silence at 0.
+    fn tone(ms: u32, amp: f32) -> Vec<f32> {
+        let n = (SR * ms / 1000) as usize;
+        (0..n).map(|i| amp * (i as f32 * 0.3).sin()).collect()
+    }
+
+    /// Pass 1, which always hears the same thing: enough for a line to
+    /// be on screen before pass 2 has its say about it.
+    struct Heard(&'static str);
+
+    impl StreamingRecognizer for Heard {
+        fn reset(&mut self) {}
+        fn feed(&mut self, _: &[f32], _: u32) {}
+        fn partial(&self) -> String {
+            self.0.to_string()
+        }
+    }
+
+    /// Passes 2 and 3, as a test wants them: working, mute, or broken.
+    enum Decode {
+        /// What a recognizer that ran out of memory does -- or one whose
+        /// model is the wrong shape, or whose thread was killed.
+        Fails,
+        Hears(&'static str),
+    }
+
+    struct Offline(Decode);
+
+    impl OfflineRecognizer for Offline {
+        fn transcribe(&self, _: &[f32], _: u32) -> anyhow::Result<String> {
+            match self.0 {
+                Decode::Fails => anyhow::bail!("onnxruntime: out of memory"),
+                Decode::Hears(text) => Ok(text.to_string()),
+            }
+        }
+    }
+
+    /// One utterance through the whole engine: a second of quiet, a
+    /// second of speech, a second of quiet, then flush and wait for
+    /// every pass to have finished with it.
+    fn one_utterance(offline: Decode) -> Transcript {
+        let mut cfg = EngineConfig::new(SR);
+        // Three seconds of audio go in with no wall time passing at all,
+        // so the throttle would hold pass 1 to a single update -- or to
+        // none before the utterance closed.
+        cfg.partial_interval = Duration::ZERO;
+        let engine = Engine::spawn(
+            cfg,
+            Some(Box::new(Heard("hello there"))),
+            Arc::new(Offline(offline)),
+        );
+        engine.push(&tone(1000, 0.0));
+        engine.push(&tone(1000, 0.2));
+        engine.push(&tone(1000, 0.0));
+        engine.finish()
+    }
+
+    #[test]
+    fn a_pass_2_that_failed_keeps_what_pass_1_heard() {
+        let t = one_utterance(Decode::Fails);
+        // A decode that failed does not know what was said, which is not
+        // the same as nothing having been said. Taking the line away
+        // here is how a transcript somebody was reading came to empty
+        // itself a moment after appearing.
+        assert_eq!(t.paragraphs.len(), 1, "the line is still there");
+        assert_eq!(t.paragraphs[0].text, "hello there");
+    }
+
+    #[test]
+    fn a_pass_2_that_heard_nothing_takes_the_line_away() {
+        // The other side of it: a decode that worked and found silence
+        // means the VAD fired on something that wasn't speech, and the
+        // line should go.
+        let t = one_utterance(Decode::Hears(""));
+        assert!(t.paragraphs.is_empty(), "{:?}", t.paragraphs);
+    }
+
+    #[test]
+    fn a_pass_2_that_worked_replaces_what_pass_1_heard() {
+        let t = one_utterance(Decode::Hears("Hello there, world."));
+        assert_eq!(t.paragraphs.len(), 1);
+        assert_eq!(t.paragraphs[0].text, "Hello there, world.");
+    }
+}
