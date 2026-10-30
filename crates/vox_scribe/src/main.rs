@@ -158,7 +158,7 @@ struct Cli {
     /// progress on stderr.
     #[arg(long)]
     no_tui: bool,
-    /// Directory holding the model bundles (sense-voice/, parakeet-tdt-0.6b-v2/, streaming-zipformer/).
+    /// Directory holding the model bundles (sense-voice/, parakeet-tdt-0.6b-v3/, streaming-zipformer/).
     #[arg(long, env = "VOX_SCRIBE_MODELS")]
     models_dir: Option<PathBuf>,
     /// Recognizer for passes 2 and 3 (re-decode and boundary fix).
@@ -414,7 +414,12 @@ enum Cmd {
     Apps,
     /// Download the Zipformer model and the --model recognizer (and the
     /// speaker models with --diarize).
-    DownloadModels,
+    DownloadModels {
+        /// Also fetch the Russian streaming model, which `vox_room` needs
+        /// to show live text for a Russian speaker. ~28 MB.
+        #[arg(long)]
+        russian: bool,
+    },
     /// A stand-in --chat responder: reads back whatever is said in
     /// NAME.db, a sentence at a time, then asks for more.
     ChatEcho { name: PathBuf },
@@ -937,12 +942,15 @@ fn run() -> Result<()> {
     match cli.cmd {
         Some(Cmd::Devices) => return list_devices(),
         Some(Cmd::Apps) => return list_apps(),
-        Some(Cmd::DownloadModels) => {
+        Some(Cmd::DownloadModels { russian }) => {
             let dir = cli
                 .models_dir
                 .clone()
                 .unwrap_or_else(models::user_models_dir);
             models::download(&dir, cli.model)?;
+            if russian {
+                models::download_zipformer_ru(&dir)?;
+            }
             if cli.diarize {
                 models::download_speakers(&dir)?;
             }

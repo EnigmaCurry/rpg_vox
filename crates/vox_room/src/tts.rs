@@ -19,7 +19,16 @@ use rubato::{
 use crate::mixer::RATE;
 
 pub trait Voice: Send {
-    fn speak(&mut self, text: &str) -> Result<Vec<f32>>;
+    /// `language` overrides the voice's own, for a room that is listening
+    /// in more than one. Spelled out in English, as Qwen3 wants it.
+    fn speak(&mut self, text: &str, language: Option<&str>) -> Result<Vec<f32>>;
+
+    /// Whether this voice can be asked for a language other than its
+    /// own. Only Qwen3 can, so it is the only voice a room can translate
+    /// with.
+    fn multilingual(&self) -> bool {
+        false
+    }
 }
 
 pub struct Qwen3 {
@@ -58,11 +67,15 @@ impl Qwen3 {
 }
 
 impl Voice for Qwen3 {
-    fn speak(&mut self, text: &str) -> Result<Vec<f32>> {
+    fn multilingual(&self) -> bool {
+        true
+    }
+
+    fn speak(&mut self, text: &str, language: Option<&str>) -> Result<Vec<f32>> {
         let mut body = serde_json::json!({
             "input": text,
             "voice": self.voice,
-            "language": self.language,
+            "language": language.unwrap_or(&self.language),
             "response_format": "wav",
         });
         if !self.instruct.is_empty() {
@@ -113,7 +126,9 @@ impl Kokoro {
 }
 
 impl Voice for Kokoro {
-    fn speak(&mut self, text: &str) -> Result<Vec<f32>> {
+    // Language comes from the voice id, and the bundle scribe downloads
+    // is trimmed to English, so an override has nothing to offer here.
+    fn speak(&mut self, text: &str, _language: Option<&str>) -> Result<Vec<f32>> {
         let samples = self.tts.speak(text, self.sid, 1.0)?;
         to_room_rate(&samples, self.tts.sample_rate())
     }
@@ -126,7 +141,7 @@ pub struct Silent;
 const READING_CPS: f32 = 15.0;
 
 impl Voice for Silent {
-    fn speak(&mut self, text: &str) -> Result<Vec<f32>> {
+    fn speak(&mut self, text: &str, _language: Option<&str>) -> Result<Vec<f32>> {
         let secs = (text.chars().count() as f32 / READING_CPS).max(0.3);
         Ok(vec![0.0; (secs * RATE as f32) as usize])
     }
@@ -231,9 +246,50 @@ mod tests {
         assert!((s[0] - 0.5).abs() < 1e-4);
     }
 
+    /// The voice a translated room needs, through the real server: one
+    /// sentence asked for in two languages, which is the per-call
+    /// override the voice threads rely on. Not run by default.
+    ///
+    /// ```text
+    /// VOX_ROOM_TTS_URL=… cargo test -p vox_room -- --ignored --nocapture speaks_two
+    /// ```
+    #[test]
+    #[ignore = "asks the configured Qwen3-TTS server for two languages"]
+    fn speaks_two_languages_from_one_voice() {
+        let url = std::env::var("VOX_ROOM_TTS_URL")
+            .or_else(|_| std::env::var("PI_TTS_URL"))
+            .expect("VOX_ROOM_TTS_URL");
+        let voice = std::env::var("VOX_ROOM_VOICE").unwrap_or_else(|_| "aiden".into());
+        let key = std::env::var("VOX_ROOM_TTS_KEY")
+            .ok()
+            .filter(|k| !k.is_empty());
+        let model = std::env::var("VOX_ROOM_TTS_MODEL")
+            .ok()
+            .filter(|m| !m.is_empty());
+        let mut qwen3 = Qwen3::new(&url, &voice, "", "English", key, model);
+        assert!(qwen3.multilingual(), "or a room can't be translated");
+
+        // Its own language, as every room has always asked for it.
+        let english = qwen3
+            .speak("The dragon was very old.", None)
+            .expect("English");
+        // And another, asked for per call: the same voice, the same
+        // server, one word in the body different.
+        let russian = qwen3
+            .speak("Дракон был очень старым.", Some("Russian"))
+            .expect("Russian");
+        for (language, samples) in [("English", &english), ("Russian", &russian)] {
+            let secs = samples.len() as f32 / RATE as f32;
+            let peak = samples.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+            println!("{language}: {secs:.2}s at {RATE} Hz, peak {peak:.3}");
+            assert!(secs > 0.3, "{language} came back {secs:.2}s long");
+            assert!(peak > 0.01, "{language} came back silent");
+        }
+    }
+
     #[test]
     fn silence_lasts_as_long_as_reading() {
-        let s = Silent.speak("fifteen chars!!").unwrap();
+        let s = Silent.speak("fifteen chars!!", None).unwrap();
         assert_eq!(s.len(), RATE as usize);
     }
 }

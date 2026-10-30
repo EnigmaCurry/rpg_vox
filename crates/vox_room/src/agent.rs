@@ -17,8 +17,10 @@ use anyhow::{bail, Context as _, Result};
 use crossbeam_channel::{Receiver, Sender};
 use serde_json::{json, Value};
 use tracing::{debug, info, warn};
+use vox_transcribe::filters::{clause_end, sentence_end};
+use vox_transcribe::openai::{OpenAiConfig, OpenAiTranslator};
 
-use crate::room::{Cue, GameSettings, Players, ReplyMode, Role, Room, RoomConfig, Turn};
+use crate::room::{Cue, GameSettings, Players, ReplyMode, Role, Room, RoomConfig, Turn, TypedJob};
 use crate::tts::Voice;
 
 /// The default instructions; `{name}` and `{people}` are filled in.
@@ -125,6 +127,17 @@ const DECIDE_LULL: &str = "\
 asked to be shown. Nobody has said anything in it. Speak now if this is the \
 moment you were waiting for; if it isn't, call stay_quiet and let the room \
 be. Never mention this note.)";
+
+/// Added to the prompt when somebody in the room is listening in
+/// another language. `{who}` is who, and `{language}` what the AI
+/// writes in.
+const LANGUAGE_NOTE: &str = "\
+{who} Each of them hears you in their own language: what you say is \
+translated and spoken to them by a separate voice, a sentence behind. So \
+write everything in {language}, however you were spoken to, and write it \
+once -- do not translate yourself, and do not say the same thing twice in \
+two languages. Plain spoken sentences translate best; a pun or a play on \
+words will not survive, so make the point another way when it matters.";
 
 /// Added to the prompt, in the lobby and in a game: how the room decides
 /// the AI's turn, and how it bows out.
@@ -266,10 +279,85 @@ pub enum Llm {
     Echo,
 }
 
+#[derive(Clone)]
 enum Speak {
     Sentence(u64, String),
     Done(u64),
     Failed(u64, String),
+}
+
+/// A translator against the same endpoint as the replies. Its own
+/// shorter timeout: these sit in front of something somebody is waiting
+/// to read or hear, so two minutes of patience is no use to anyone.
+fn translator(llm: &Llm) -> Option<OpenAiTranslator> {
+    let Llm::Chat(c) = llm else {
+        return None;
+    };
+    Some(OpenAiTranslator::new(OpenAiConfig {
+        base_url: c.url.clone(),
+        model: c.model.clone(),
+        api_key: c.key.clone(),
+        vocabulary: Vec::new(),
+        timeout: Duration::from_secs(30),
+    }))
+}
+
+/// Typed messages waiting to be translated. Bounded: if translation
+/// falls this far behind, the room drops the work rather than let the
+/// queue grow without end -- the messages are on everyone's screen as
+/// they were typed either way.
+const TYPING_QUEUE: usize = 64;
+
+/// The queue typed messages are translated on, when there is a model to
+/// translate with. The two ends come out separately because the room
+/// needs the sending end to be built and the workers need the room.
+pub fn typing_queue(llm: &Llm) -> Option<(Sender<TypedJob>, Receiver<TypedJob>)> {
+    translator(llm)
+        .is_some()
+        .then(|| crossbeam_channel::bounded(TYPING_QUEUE))
+}
+
+/// Translators for the messages people type, away from the voices so a
+/// long one can't hold up the AI's own speech. A few of them, because a
+/// message typed in a room listening in three languages is three
+/// translations that may as well happen at once.
+pub fn spawn_typists(room: Arc<Room>, llm: &Llm, rx: Receiver<TypedJob>, workers: usize) {
+    for n in 0..workers.max(1) {
+        let Some(t) = translator(llm) else { return };
+        let room = room.clone();
+        let rx = rx.clone();
+        std::thread::Builder::new()
+            .name(format!("vox-room-typist-{n}"))
+            .spawn(move || {
+                for job in rx {
+                    match t.translate(&job.text, &job.into, &[]) {
+                        Ok(text) => room.typed_translated(&job.id, &job.into, &text),
+                        // Logged once and no further: the message is
+                        // readable as it was typed, which is the whole
+                        // reason typing is there.
+                        Err(e) => {
+                            warn!(id = %job.id, into = %job.into, "couldn't translate: {e:#}")
+                        }
+                    }
+                }
+            })
+            .expect("spawn typist thread");
+    }
+}
+
+/// The voice threads, one per language the room is listening in. Every
+/// sentence goes to all of them, in the room's own language: each turns
+/// it into its own language and speaks it, so the languages are
+/// synthesized at the same time rather than one after another.
+#[derive(Clone)]
+struct Voices(Vec<Sender<Speak>>);
+
+impl Voices {
+    fn send(&self, msg: Speak) {
+        for tx in &self.0 {
+            let _ = tx.send(msg.clone());
+        }
+    }
 }
 
 pub struct Agent {
@@ -284,15 +372,40 @@ impl Agent {
         matches!(&self.llm, Llm::Chat(c) if c.search)
     }
 
-    /// Start both threads. Turns come from the room on `turns`.
-    pub fn spawn(self, room: Arc<Room>, voice: Box<dyn Voice>, turns: Receiver<Turn>) {
-        let (tx, rx) = crossbeam_channel::unbounded::<Speak>();
-        let generation = self.generation.clone();
-        let r = room.clone();
-        std::thread::Builder::new()
-            .name("vox-room-voice".into())
-            .spawn(move || speak(r, voice, rx, generation))
-            .expect("spawn voice thread");
+    /// A translator against the same endpoint as the replies, for the
+    /// voices that speak a language the AI doesn't write in. Its own
+    /// shorter timeout: this one sits in front of the next sentence
+    /// being spoken, so waiting two minutes for it is no use to anyone.
+    fn translator(&self) -> Option<OpenAiTranslator> {
+        translator(&self.llm)
+    }
+
+    /// Start the agent thread and one voice thread per language. Turns
+    /// come from the room on `turns`; `voices` is the room's own
+    /// language first, then any others it is listening in.
+    pub fn spawn(
+        self,
+        room: Arc<Room>,
+        voices: Vec<(String, Box<dyn Voice>)>,
+        turns: Receiver<Turn>,
+    ) {
+        let canonical = room.config().language.clone();
+        let mut senders = Vec::new();
+        for (language, voice) in voices {
+            let (tx, rx) = crossbeam_channel::unbounded::<Speak>();
+            senders.push(tx);
+            // The room's own language is what the AI already wrote, so
+            // that one is spoken as it is.
+            let translate = (language != canonical).then(|| self.translator()).flatten();
+            let generation = self.generation.clone();
+            let r = room.clone();
+            let canonical = canonical.clone();
+            std::thread::Builder::new()
+                .name(format!("vox-room-voice-{language}"))
+                .spawn(move || speak(r, &canonical, &language, voice, translate, rx, generation))
+                .expect("spawn voice thread");
+        }
+        let tx = Voices(senders);
         std::thread::Builder::new()
             .name("vox-room-agent".into())
             .spawn(move || {
@@ -327,7 +440,7 @@ impl Agent {
                             &tx,
                         ),
                     };
-                    let _ = tx.send(match result {
+                    tx.send(match result {
                         Ok(()) => Speak::Done(g),
                         Err(e) => Speak::Failed(g, format!("{e:#}")),
                     });
@@ -361,12 +474,30 @@ impl Agent {
         } else {
             String::new()
         };
+        // Only when somebody is actually listening in another language,
+        // so a room where everyone shares one gets the prompt it always had.
+        let translated = if turn.speaks.is_empty() {
+            String::new()
+        } else {
+            let who = turn
+                .speaks
+                .iter()
+                .map(|(person, language)| format!("{person} is listening in {language}."))
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!(
+                "\n\n{}",
+                LANGUAGE_NOTE
+                    .replace("{who}", &who)
+                    .replace("{language}", &turn.language)
+            )
+        };
         let system = match &turn.game {
             None => format!(
-                "{}\n\n{GAMES_NOTE}\n\n{CARDS_NOTE}\n\n{TURN_NOTE}{search}",
+                "{}\n\n{GAMES_NOTE}\n\n{CARDS_NOTE}\n\n{TURN_NOTE}{search}{translated}",
                 self.prompt
             ),
-            Some((game, prompt)) => game_prompt(game, prompt),
+            Some((game, prompt)) => format!("{}{translated}", game_prompt(game, prompt)),
         }
         .replace("{name}", &cfg.agent_name)
         .replace("{people}", &people);
@@ -420,49 +551,111 @@ fn game_prompt(game: &str, prompt: &str) -> String {
         .replace("{prompt}", prompt)
 }
 
-/// The voice thread: synthesize each sentence and hand it to the room.
+/// A voice thread: one language. Each sentence of the reply arrives in
+/// the room's own language; this turns it into `language` if that is a
+/// different one, synthesizes it, and hands it to the room.
+///
+/// Only the thread speaking the room's own language reports what was
+/// said: that is the turn the conversation records, and a translation of
+/// it is the same turn in other words. A failure in a translated voice
+/// is therefore logged and dropped rather than failing the reply, so one
+/// language's trouble doesn't silence the room.
+#[allow(clippy::too_many_arguments)]
 fn speak(
     room: Arc<Room>,
+    canonical: &str,
+    language: &str,
     mut voice: Box<dyn Voice>,
+    translate: Option<OpenAiTranslator>,
     rx: Receiver<Speak>,
     generation: Arc<AtomicU64>,
 ) {
+    let own = language == canonical;
     // A reply whose voice failed: the rest of it is skipped.
     let mut failed = None;
+    // Sentences of this reply already spoken, oldest first, as context
+    // for translating the next one: it is what lets a language that
+    // inflects agree with what the AI has already said.
+    let mut context: Vec<String> = Vec::new();
+    let mut spoken_for = None;
+    // Which sentence of the reply this is. The room's own language gets
+    // its index from the log; a translated one counts for itself, since
+    // it is never logged.
+    let mut index = 0;
     for job in rx {
         match job {
             Speak::Sentence(g, text) => {
                 if generation.load(Ordering::SeqCst) != g || failed == Some(g) {
                     continue;
                 }
+                if spoken_for != Some(g) {
+                    spoken_for = Some(g);
+                    context.clear();
+                    index = 0;
+                }
+                // Nobody here wants it in this language: skip the
+                // translation and the voice rather than pay for both and
+                // play to an empty queue. Checked per sentence, so
+                // somebody arriving mid-reply is heard out from there.
+                if !own && !room.is_heard_in(language) {
+                    continue;
+                }
                 let started = Instant::now();
-                match voice.speak(&text) {
+                // Translate first, if this voice speaks another language.
+                let say = match &translate {
+                    None => text.clone(),
+                    Some(t) => match t.translate(&text, language, &context) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            warn!(g, language, "couldn't translate {text:?}: {e:#}");
+                            continue;
+                        }
+                    },
+                };
+                context.push(say.clone());
+                // Dropped while it was being translated.
+                if generation.load(Ordering::SeqCst) != g {
+                    continue;
+                }
+                let translated_ms = started.elapsed().as_millis() as u64;
+                match voice.speak(&say, (!own).then_some(language)) {
                     Ok(samples) => {
                         info!(
                             g,
-                            chars = text.len(),
+                            language,
+                            chars = say.len(),
+                            translated_ms,
                             ms = started.elapsed().as_millis() as u64,
                             audio_ms = samples.len() as u64 * 1000 / crate::mixer::RATE as u64,
                             "reply: sentence synthesized"
                         );
-                        if !room.agent_speak(g, &text, samples) {
-                            debug!(g, "reply dropped while it was synthesized");
+                        let kept = if own {
+                            room.agent_speak(g, &say, samples)
+                        } else {
+                            room.agent_speak_translated(g, language, index, samples)
+                        };
+                        if !kept {
+                            debug!(g, language, "reply dropped while it was synthesized");
                         }
+                        index += 1;
                     }
-                    Err(e) => {
-                        room.agent_failed(g, &format!("the voice failed on {text:?}: {e:#}"));
+                    Err(e) if own => {
+                        room.agent_failed(g, &format!("the voice failed on {say:?}: {e:#}"));
                         failed = Some(g);
                     }
+                    Err(e) => warn!(g, language, "the voice failed on {say:?}: {e:#}"),
                 }
             }
-            Speak::Done(g) if failed != Some(g) => room.agent_done(g),
+            // Only the room's own language finishes the turn.
+            Speak::Done(g) if own && failed != Some(g) => room.agent_done(g),
             Speak::Done(_) => {}
-            Speak::Failed(g, e) => room.agent_failed(g, &e),
+            Speak::Failed(g, e) if own => room.agent_failed(g, &e),
+            Speak::Failed(..) => {}
         }
     }
 }
 
-fn echo(turn: &Turn, tx: &Sender<Speak>) -> Result<()> {
+fn echo(turn: &Turn, tx: &Voices) -> Result<()> {
     let last = turn
         .messages
         .iter()
@@ -471,11 +664,11 @@ fn echo(turn: &Turn, tx: &Sender<Speak>) -> Result<()> {
         .and_then(|(_, t)| t.lines().last())
         .unwrap_or("nothing");
     let (who, what) = last.split_once(':').unwrap_or(("someone", last));
-    let _ = tx.send(Speak::Sentence(
+    tx.send(Speak::Sentence(
         turn.generation,
         format!("{} said {}", who.trim(), what.trim()),
     ));
-    let _ = tx.send(Speak::Sentence(
+    tx.send(Speak::Sentence(
         turn.generation,
         "That is all I heard.".into(),
     ));
@@ -658,7 +851,7 @@ fn stream_reply(
     g: u64,
     asked: Instant,
     generation: &AtomicU64,
-    tx: &Sender<Speak>,
+    tx: &Voices,
 ) -> Result<()> {
     let model = cfg.model.as_str();
     let mut convo = messages.to_vec();
@@ -1230,7 +1423,7 @@ fn run_tool(room: &Room, cfg: &Chat, g: u64, call: &ToolCall) -> String {
 
 /// Hand a sentence to the voice, unless it repeats one this reply has
 /// already said (models tend to start over after a tool call).
-fn send_sentence(tx: &Sender<Speak>, g: u64, s: &str, spoken: &mut Vec<Vec<String>>) {
+fn send_sentence(tx: &Voices, g: u64, s: &str, spoken: &mut Vec<Vec<String>>) {
     let s = clean(s);
     if s.is_empty() {
         return;
@@ -1241,7 +1434,7 @@ fn send_sentence(tx: &Sender<Speak>, g: u64, s: &str, spoken: &mut Vec<Vec<Strin
         return;
     }
     spoken.push(w);
-    let _ = tx.send(Speak::Sentence(g, s));
+    tx.send(Speak::Sentence(g, s));
 }
 
 fn sentence_words(s: &str) -> Vec<String> {
@@ -1284,81 +1477,14 @@ fn clean(s: &str) -> String {
         .join(" ")
 }
 
-/// Byte length of the first whole sentence in `text`: up to a `.`, `?`,
-/// `!` (and closing quotes) followed by whitespace, or a line break.
-/// (The same rule as the `agent` responder.)
-fn sentence_end(text: &str) -> Option<usize> {
-    let mut chars = text.char_indices().peekable();
-    while let Some((i, c)) = chars.next() {
-        if c == '\n' && !text[..i].trim().is_empty() {
-            return Some(i + 1);
-        }
-        if matches!(c, '.' | '?' | '!') {
-            let mut end = i + c.len_utf8();
-            while let Some(&(j, q)) = chars.peek() {
-                if matches!(q, '"' | '\'' | ')' | '”' | '’' | '.' | '?' | '!') {
-                    end = j + q.len_utf8();
-                    chars.next();
-                } else {
-                    break;
-                }
-            }
-            if text[end..].starts_with(char::is_whitespace) {
-                return Some(end);
-            }
-        }
-    }
-    None
-}
-
-/// Words a clause needs before it is worth speaking on its own.
-const CLAUSE_WORDS: usize = 4;
-
-/// Byte length of the first clause in `text`: up to a `,`, `;`, `:` or
-/// dash followed by whitespace, once there are a few words before it.
-fn clause_end(text: &str) -> Option<usize> {
-    let mut words = 0;
-    let mut in_word = false;
-    for (i, c) in text.char_indices() {
-        if c.is_whitespace() {
-            in_word = false;
-            continue;
-        }
-        if !in_word {
-            in_word = true;
-            words += 1;
-        }
-        if matches!(c, ',' | ';' | ':' | '—' | '–') && words >= CLAUSE_WORDS {
-            let end = i + c.len_utf8();
-            if text[end..].starts_with(char::is_whitespace) {
-                return Some(end);
-            }
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn finds_sentence_ends() {
-        assert_eq!(sentence_end("Hello there. How"), Some(12));
-        assert_eq!(sentence_end("Wait... what"), Some(7));
-        assert_eq!(sentence_end("No end yet."), None);
-    }
-
-    #[test]
-    fn finds_clause_ends() {
-        assert_eq!(clause_end("Well, that is a fine question, and"), Some(30));
-        assert_eq!(clause_end("Well, sure"), None);
-        assert_eq!(clause_end("It costs 1,000 coins, or"), Some(21));
-    }
-
-    #[test]
     fn drops_a_sentence_said_again_after_a_tool_call() {
-        let (tx, rx) = crossbeam_channel::unbounded();
+        let (sender, rx) = crossbeam_channel::unbounded();
+        let tx = Voices(vec![sender]);
         let mut spoken = Vec::new();
         for s in [
             "Sure.",
@@ -1447,6 +1573,8 @@ mod tests {
             confirm: Duration::from_millis(300),
             engaged_for: Duration::from_secs(30),
             history: 60,
+            language: "English".into(),
+            languages: vec!["English".into()],
         };
         let turn = Turn {
             generation: 1,
@@ -1454,6 +1582,8 @@ mod tests {
             asked: Instant::now(),
             game: None,
             people: people.iter().map(|p| p.to_string()).collect(),
+            language: "English".into(),
+            speaks: Vec::new(),
             engaged,
             cue,
         };
@@ -1486,9 +1616,12 @@ mod tests {
                 confirm: Duration::from_millis(300),
                 engaged_for: Duration::from_secs(30),
                 history: 60,
+                language: "English".into(),
+                languages: vec!["English".into()],
             },
             generation.clone(),
             turns_tx,
+            None,
             None,
         )
         .unwrap();
@@ -1500,7 +1633,8 @@ mod tests {
              Use post_card, then tell me in one short sentence that it is up."
                 .into(),
         )];
-        let (tx, rx) = crossbeam_channel::unbounded();
+        let (sender, rx) = crossbeam_channel::unbounded();
+        let tx = Voices(vec![sender]);
         let http = ureq::AgentBuilder::new()
             .timeout_connect(Duration::from_secs(10))
             .timeout_read(Duration::from_secs(120))

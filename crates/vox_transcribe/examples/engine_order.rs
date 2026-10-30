@@ -83,7 +83,7 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(1.0);
     let offline = Parakeet::open(&ParakeetConfig::from_dir(
-        &models.join("parakeet-tdt-0.6b-v2"),
+        &models.join("parakeet-tdt-0.6b-v3"),
     ))
     .unwrap();
     let streaming = Zipformer::open(&ZipformerConfig::from_dir(

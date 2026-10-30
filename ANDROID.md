@@ -19,7 +19,8 @@ the phone. It also adds a voice keyboard for dictating into other apps.
 * **Voice typing.** A Scribe keyboard that listens as soon as it opens
   and types the finished text into any app.
 
-Arm64 phones running Android 8.0 (API 26) or newer. English only.
+Arm64 phones running Android 8.0 (API 26) or newer. The finished text
+covers 25 European languages; the live text, as you speak, is English.
 
 * [Install](#install)
 * [First run: speech models](#first-run-speech-models)
@@ -65,7 +66,7 @@ and downloaded models.
 
 Scribe needs two models from the
 [sherpa-onnx releases](https://github.com/k2-fsa/sherpa-onnx/releases):
-a streaming Zipformer for the live text and Parakeet TDT 0.6B v2 for the
+a streaming Zipformer for the live text and Parakeet TDT 0.6B v3 for the
 corrected text. Tap **Download models** to fetch them, about 610 MB in
 all, into the app's private storage. Wi-Fi is recommended. The download
 continues if you switch apps, and if it fails, **Retry** resumes where it

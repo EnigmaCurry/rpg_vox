@@ -2,6 +2,7 @@
 //! sharing the same loaded models. Headsets make every mic a clean,
 //! single-speaker source, so there is no diarization.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -17,8 +18,18 @@ use crate::room::{EngineFactory, Room};
 
 // Directory names inside the models dir, as `scribe` downloads them.
 const SENSE_VOICE: &str = "sense-voice";
-const ZIPFORMER: &str = "streaming-zipformer";
-const PARAKEET: &str = "parakeet-tdt-0.6b-v2";
+const PARAKEET: &str = "parakeet-tdt-0.6b-v3";
+
+/// The streaming (pass-1) model for each language, by the name the room
+/// gives that language. Pass 1 is the only pass that needs one per
+/// language: Parakeet, which does passes 2 and 3, detects the language
+/// from the audio. A language with no model here still gets its words
+/// written down, once each utterance is decoded -- only the text that
+/// appears while someone is still talking is missing.
+const STREAMING: [(&str, &str); 2] = [
+    ("English", "streaming-zipformer"),
+    ("Russian", "streaming-zipformer-ru"),
+];
 
 /// The same per-user models directory `scribe` downloads into, so a
 /// machine that has run scribe has the models already.
@@ -41,7 +52,9 @@ pub fn default_models_dir() -> PathBuf {
 
 pub struct Models {
     offline: Arc<dyn OfflineRecognizer>,
-    streaming: Option<Zipformer>,
+    /// Pass 1 by language, for those whose model is downloaded. Each is
+    /// loaded once and shared: a session per person comes off it.
+    streaming: BTreeMap<String, Zipformer>,
 }
 
 fn present(dir: &Path, files: &[&str]) -> bool {
@@ -72,30 +85,53 @@ impl Models {
                     dir.display()
                 );
         };
-        let zf = dir.join(ZIPFORMER);
-        let streaming = if present(
-            &zf,
-            &["encoder.onnx", "decoder.onnx", "joiner.onnx", "tokens.txt"],
-        ) {
-            Some(Zipformer::open(&ZipformerConfig::from_dir(&zf)).context("load Zipformer")?)
-        } else {
+        let mut streaming = BTreeMap::new();
+        for (language, bundle) in STREAMING {
+            let zf = dir.join(bundle);
+            if !present(
+                &zf,
+                &["encoder.onnx", "decoder.onnx", "joiner.onnx", "tokens.txt"],
+            ) {
+                continue;
+            }
+            let model = Zipformer::open(&ZipformerConfig::from_dir(&zf))
+                .with_context(|| format!("load the {language} Zipformer"))?;
+            streaming.insert(language.to_string(), model);
+        }
+        if streaming.is_empty() {
             info!("no streaming model: text appears once each utterance is decoded");
-            None
-        };
+        } else {
+            info!(
+                languages = %streaming.keys().cloned().collect::<Vec<_>>().join(", "),
+                "streaming text"
+            );
+        }
         Ok(Self { offline, streaming })
     }
 
-    /// A factory the room calls the first time each person's audio arrives.
+    /// A factory the room calls the first time each person's audio
+    /// arrives, with the language they speak.
     pub fn factory(self) -> EngineFactory {
         let models = Arc::new(self);
-        Box::new(move |person: &str, room: Arc<Room>| models.engine(person, room))
+        Box::new(move |person: &str, language: &str, room: Arc<Room>| {
+            models.engine(person, language, room)
+        })
     }
 
-    fn engine(&self, person: &str, room: Arc<Room>) -> Result<Pusher> {
+    fn engine(&self, person: &str, language: &str, room: Arc<Room>) -> Result<Pusher> {
         let cfg = EngineConfig::new(RATE);
+        // No model for their language: they still get the decoded text,
+        // just not while they are still speaking. Worth saying out loud,
+        // because the difference is visible to everyone in the room.
+        if !self.streaming.contains_key(language) {
+            info!(
+                person,
+                language, "no streaming model for this language: text appears a phrase behind"
+            );
+        }
         let streaming = self
             .streaming
-            .as_ref()
+            .get(language)
             .map(|z| Box::new(z.session()) as Box<dyn StreamingRecognizer>);
         let engine = Engine::spawn(cfg, streaming, self.offline.clone());
         let pusher = engine.pusher();

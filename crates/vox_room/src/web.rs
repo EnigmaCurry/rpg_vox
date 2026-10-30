@@ -55,6 +55,7 @@ use tracing::{debug, info, warn};
 
 use crate::mixer::{LISTENER_QUEUE, RATE};
 use crate::room::Room;
+use crate::screen::{Screen, Size};
 
 /// This browser's own cookie, traded for an invite link at the door.
 const COOKIE: &str = "vox_room";
@@ -73,12 +74,16 @@ struct Assets;
 #[derive(Clone)]
 struct App {
     room: Arc<Room>,
+    screen: Arc<Screen>,
     next_id: Arc<AtomicU64>,
 }
 
-pub fn router(room: Arc<Room>) -> Router {
+pub fn router(room: Arc<Room>, screen: Arc<Screen>) -> Router {
     let app = App {
         room,
+        screen,
+        // One counter for both sockets, so a tab's audio and its desktop
+        // are never confused for each other in the logs.
         next_id: Arc::new(AtomicU64::new(1)),
     };
     Router::new()
@@ -86,9 +91,11 @@ pub fn router(room: Arc<Room>) -> Router {
         .route("/api/door", get(door))
         .route("/api/door/join", post(door_join))
         .route("/api/door/name", post(door_name))
+        .route("/api/door/language", post(door_language))
         .route("/api/door/logout", post(door_logout))
         .route("/api/games/:name/prompt", get(game_prompt))
         .route("/room.ws", get(ws))
+        .route("/screen.ws", get(screen_ws))
         .route("/healthz", get(|| async { "ok" }))
         .fallback(assets)
         .with_state(app)
@@ -250,6 +257,38 @@ async fn door_name(
     }
 }
 
+#[derive(Deserialize)]
+struct SetLanguage {
+    language: String,
+}
+
+/// The language they speak and want to hear, chosen at the door. Unlike
+/// the name it is not spent with the link, so it can be changed later by
+/// a browser the room already knows -- which is why both the pending
+/// invite and an established cookie are accepted here.
+async fn door_language(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(body): Json<SetLanguage>,
+) -> Response {
+    let who = person(&app, &headers).or_else(|| {
+        cookie(&headers, PENDING)
+            .and_then(|t| app.room.invite_at_door(&t))
+            .map(|i| i.display)
+    });
+    let Some(who) = who else {
+        return (
+            StatusCode::GONE,
+            Json(json!({ "error": "This link is expired." })),
+        )
+            .into_response();
+    };
+    match app.room.set_language(&who, &body.language) {
+        Ok(language) => Json(json!({ "language": language })).into_response(),
+        Err(why) => (StatusCode::CONFLICT, Json(json!({ "error": why }))).into_response(),
+    }
+}
+
 /// A game's hidden prompt, for one person who asked to peek. It is never
 /// broadcast to the room.
 async fn game_prompt(
@@ -317,6 +356,10 @@ enum Command {
     Mode {
         mode: String,
     },
+    /// Typed into the room rather than said to it.
+    Text {
+        text: String,
+    },
     Stop,
     NewConversation,
     EnterGame {
@@ -332,7 +375,8 @@ async fn client(room: Arc<Room>, socket: WebSocket, id: u64, name: String) -> an
     let (audio_tx, mut audio_rx) = mpsc::channel::<Vec<u8>>(LISTENER_QUEUE);
     let mut events = room.subscribe();
     room.join(&name);
-    room.mixer.add_listener(id, &name, audio_tx)?;
+    room.mixer
+        .add_listener(id, &name, &room.language_for(&name), audio_tx)?;
     let (mut out, mut inp) = socket.split();
     out.send(Message::Text(room.hello(&name).to_string()))
         .await?;
@@ -379,12 +423,108 @@ async fn client(room: Arc<Room>, socket: WebSocket, id: u64, name: String) -> an
                         mute,
                     }) => room.set_strip(&strip, gain, mute),
                     Ok(Command::Mode { mode }) => room.set_mode(&mode),
+                    // Only the sender hears about a message the room
+                    // wouldn't take: it is their typing, not news.
+                    Ok(Command::Text { text }) => {
+                        if let Err(why) = room.typed(&name, &text) {
+                            room.tell(&name, &why);
+                        }
+                    }
                     Ok(Command::Stop) => room.stop_agent(),
                     Ok(Command::NewConversation) => room.new_conversation(),
                     Ok(Command::EnterGame { name }) => room.enter_game(&name),
                     Ok(Command::Lobby) => room.lobby(),
                     Ok(Command::DeleteGame { name }) => room.delete_game(&name),
                     Err(e) => debug!(id, "bad command {text:?}: {e}"),
+                },
+                Message::Close(_) => break,
+                _ => {}
+            }
+        }
+        anyhow::Ok(())
+    };
+
+    tokio::select! {
+        r = send => r,
+        r = recv => r,
+    }
+}
+
+// -- the desktop socket ---------------------------------------------------
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum Share {
+    Publish {
+        codec: String,
+        thumb: Size,
+        full: Size,
+    },
+    Unpublish,
+    /// Open one desktop full size, or `null` to close what was open.
+    /// This tab's own business: nobody else's screen changes.
+    Watch {
+        id: Option<u16>,
+    },
+}
+
+/// The same cookie as the room's socket. Sharing a desktop is for
+/// whoever is already in.
+async fn screen_ws(
+    State(app): State<App>,
+    headers: HeaderMap,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    let Some(name) = person(&app, &headers) else {
+        return (StatusCode::UNAUTHORIZED, "no invite").into_response();
+    };
+    upgrade.on_upgrade(move |socket| async move {
+        let id = app.next_id.fetch_add(1, Ordering::Relaxed);
+        if let Err(e) = sharing(app.screen.clone(), socket, id, &name).await {
+            debug!(id, "screen socket ended: {e:#}");
+        }
+        app.screen.remove_client(id);
+    })
+}
+
+async fn sharing(
+    screen: Arc<Screen>,
+    socket: WebSocket,
+    id: u64,
+    person: &str,
+) -> anyhow::Result<()> {
+    let (mut frames, mut ctl) = screen.add_client(id, person);
+    let (mut out, mut inp) = socket.split();
+
+    let send = async {
+        loop {
+            tokio::select! {
+                // Frames and control messages are separate queues: a
+                // backed-up picture must not delay (or lose) the news
+                // that somebody stopped sharing.
+                frame = frames.recv() => match frame {
+                    Some(f) => out.send(Message::Binary(f)).await?,
+                    None => return anyhow::Ok(()),
+                },
+                text = ctl.recv() => match text {
+                    Some(t) => out.send(Message::Text(t)).await?,
+                    None => return Ok(()),
+                },
+            }
+        }
+    };
+
+    let recv = async {
+        while let Some(msg) = inp.next().await {
+            match msg? {
+                Message::Binary(frame) => screen.frame(id, frame),
+                Message::Text(text) => match serde_json::from_str::<Share>(&text) {
+                    Ok(Share::Publish { codec, thumb, full }) => {
+                        screen.publish(id, codec, thumb, full)
+                    }
+                    Ok(Share::Unpublish) => screen.unpublish(id),
+                    Ok(Share::Watch { id: stream }) => screen.watch(id, stream),
+                    Err(e) => debug!(id, "bad screen command {text:?}: {e}"),
                 },
                 Message::Close(_) => break,
                 _ => {}

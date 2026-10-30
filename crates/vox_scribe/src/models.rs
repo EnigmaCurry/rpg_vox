@@ -3,8 +3,9 @@
 //!
 //! ```text
 //! <dir>/sense-voice/{model.int8.onnx,tokens.txt}
-//! <dir>/parakeet-tdt-0.6b-v2/{encoder,decoder,joiner}.int8.onnx + tokens.txt
+//! <dir>/parakeet-tdt-0.6b-v3/{encoder,decoder,joiner}.int8.onnx + tokens.txt
 //! <dir>/streaming-zipformer/{encoder,decoder,joiner}.onnx + tokens.txt
+//! <dir>/streaming-zipformer-ru/{encoder,decoder,joiner}.onnx + tokens.txt
 //! <dir>/speaker-diarization/{segmentation,embedding-eres2netv2}.onnx   (--diarize)
 //! <dir>/kokoro/{model.onnx,voices.bin,…}        (--play NAME.md, --tts kokoro)
 //! ```
@@ -16,7 +17,11 @@ use anyhow::{bail, Context as _, Result};
 
 pub const SENSE_VOICE: &str = "sense-voice";
 pub const ZIPFORMER: &str = "streaming-zipformer";
-pub const PARAKEET: &str = "parakeet-tdt-0.6b-v2";
+/// The pass-1 recognizer for Russian. Pass 1 is the only pass that needs
+/// one model per language: Parakeet (passes 2 and 3) detects the language
+/// from the audio, but a streaming model cannot.
+pub const ZIPFORMER_RU: &str = "streaming-zipformer-ru";
+pub const PARAKEET: &str = "parakeet-tdt-0.6b-v3";
 pub const SPEAKERS: &str = "speaker-diarization";
 pub const KOKORO: &str = "kokoro";
 
@@ -26,7 +31,8 @@ pub enum Offline {
     /// SenseVoice Small: multilingual, fast, ~230 MB.
     #[value(name = "sensevoice")]
     SenseVoice,
-    /// NVIDIA Parakeet TDT 0.6B v2: English only, more accurate, ~660 MB.
+    /// NVIDIA Parakeet TDT 0.6B v3: 25 European languages, detected from
+    /// the audio with nothing to configure, more accurate, ~660 MB.
     Parakeet,
 }
 
@@ -199,9 +205,17 @@ pub fn download_kokoro(dir: &Path) -> Result<()> {
 }
 
 pub fn has_zipformer(dir: &Path) -> bool {
+    has_streaming(dir, ZIPFORMER)
+}
+
+pub fn has_zipformer_ru(dir: &Path) -> bool {
+    has_streaming(dir, ZIPFORMER_RU)
+}
+
+fn has_streaming(dir: &Path, bundle: &str) -> bool {
     ["encoder.onnx", "decoder.onnx", "joiner.onnx", "tokens.txt"]
         .iter()
-        .all(|f| dir.join(ZIPFORMER).join(f).is_file())
+        .all(|f| dir.join(bundle).join(f).is_file())
 }
 
 /// Download `offline` and Zipformer into `dir` with `curl`, skipping
@@ -229,7 +243,7 @@ pub fn download(dir: &Path, offline: Offline) -> Result<()> {
                 "tokens.txt",
             ]
             .map(|f| (f, f));
-            fetch("sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8", &pk, &files)?;
+            fetch("sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8", &pk, &files)?;
         }
     } else if has_sense_voice(dir) {
         println!("SenseVoice already present in {}", sv.display());
@@ -263,8 +277,55 @@ pub fn download(dir: &Path, offline: Offline) -> Result<()> {
     Ok(())
 }
 
+/// Download the Russian pass-1 model into `dir`. Separate from
+/// [`download`] because only a room with a Russian speaker in it wants
+/// this; scribe transcribes one person, in English.
+pub fn download_zipformer_ru(dir: &Path) -> Result<()> {
+    if has_zipformer_ru(dir) {
+        println!(
+            "Russian Zipformer already present in {}",
+            dir.join(ZIPFORMER_RU).display()
+        );
+        return Ok(());
+    }
+    fetch_hf(
+        VOSK_RU,
+        &dir.join(ZIPFORMER_RU),
+        &[
+            ("am-onnx/encoder.int8.onnx", "encoder.onnx"),
+            ("am-onnx/decoder.int8.onnx", "decoder.onnx"),
+            ("am-onnx/joiner.int8.onnx", "joiner.onnx"),
+            ("lang/tokens.txt", "tokens.txt"),
+        ],
+    )
+}
+
 fn fetch(stem: &str, dest: &Path, files: &[(&str, &str)]) -> Result<()> {
     fetch_in(ASR, stem, dest, files)
+}
+
+/// Vosk's small streaming Russian Zipformer: a standard sherpa-onnx
+/// `zipformer2` export, so it loads with the same `ZipformerConfig` as
+/// the English bundle. Int8, ~28 MB.
+const VOSK_RU: &str = "alphacep/vosk-model-small-streaming-ru";
+
+/// Fetch `files` from a Hugging Face repo as `(path in the repo, name on
+/// disk)`. Unlike [`fetch_in`] there is no archive to unpack: Vosk
+/// publishes the ONNX files loose, so each is downloaded on its own.
+fn fetch_hf(repo: &str, dest: &Path, files: &[(&str, &str)]) -> Result<()> {
+    std::fs::create_dir_all(dest).with_context(|| format!("create {}", dest.display()))?;
+    for (from, to) in files {
+        // Download beside the target and rename, so an interrupted fetch
+        // leaves no half a model to be found by `has_zipformer_ru`.
+        let part = dest.join(format!("{to}.part"));
+        curl(
+            &format!("https://huggingface.co/{repo}/resolve/main/{from}"),
+            &part,
+        )?;
+        std::fs::rename(&part, dest.join(to)).with_context(|| format!("install {to}"))?;
+    }
+    println!("installed {}", dest.display());
+    Ok(())
 }
 
 fn curl(url: &str, to: &Path) -> Result<()> {

@@ -1,9 +1,9 @@
 //! SQLite: who is invited, the conversation log, games, and room settings.
 //!
 //! ```sql
-//! people(name, display, token, used)   -- an invite, and whose it is
+//! people(name, display, token, used, language)  -- an invite, and whose it is
 //! sessions(id, name)                   -- a browser that traded its link in
-//! entries(conversation, id, who, kind, title, text, cut, at)
+//! entries(conversation, id, who, kind, title, text, cut, typed, translations, at)
 //! settings(key, value)
 //! games(name, summary, prompt, settings, created, played)  -- names unique, ignoring case
 //! conversations(id, game)                 -- no row: the lobby
@@ -35,7 +35,12 @@ CREATE TABLE IF NOT EXISTS people (
     -- Traded for a cookie: the link no longer works.
     used  INTEGER NOT NULL DEFAULT 0,
     -- What the room calls them, which is theirs to set at the door.
-    display TEXT NOT NULL DEFAULT ''
+    display TEXT NOT NULL DEFAULT '',
+    -- The language they speak and want to hear, spelled out in English
+    -- as Qwen3-TTS wants it: Russian, not ru. Also set at the door.
+    -- Empty: the room's own language. Kept against the name rather than
+    -- the display name, so it survives their renaming themselves.
+    language TEXT NOT NULL DEFAULT ''
 );
 -- A browser that pressed Join Audio: the cookie it was given, and whose
 -- invite it spent. One person may have several (another browser, another
@@ -54,6 +59,12 @@ CREATE TABLE IF NOT EXISTS entries (
     title TEXT NOT NULL DEFAULT '',
     text TEXT NOT NULL,
     cut  INTEGER NOT NULL DEFAULT 0,
+    -- Typed into the room rather than said to it.
+    typed INTEGER NOT NULL DEFAULT 0,
+    -- What a typed message says in the other languages the room was
+    -- listening in: a JSON object keyed by language. Kept so a reload
+    -- shows what everyone was shown at the time.
+    translations TEXT NOT NULL DEFAULT '{}',
     at   INTEGER NOT NULL,
     PRIMARY KEY (conversation, id)
 );
@@ -113,6 +124,10 @@ pub struct Invited {
     pub display: String,
     /// Their invite link, while it is still unspent.
     pub link: Option<String>,
+    /// The language they speak and want to hear, spelled out in English
+    /// ("Russian"). Empty until they choose one at the door, which means
+    /// the room's own language.
+    pub language: String,
 }
 
 impl Store {
@@ -183,7 +198,7 @@ impl Store {
         Ok(self
             .db
             .query_row(
-                "SELECT p.name, p.display, p.token, p.used FROM sessions s
+                "SELECT p.name, p.display, p.token, p.used, p.language FROM sessions s
                  JOIN people p ON p.name = s.name WHERE s.id = ?1",
                 [id],
                 invited_row,
@@ -206,7 +221,7 @@ impl Store {
         Ok(self
             .db
             .query_row(
-                "SELECT name, display, token, used FROM people
+                "SELECT name, display, token, used, language FROM people
                  WHERE token = ?1 AND used = 0",
                 [token],
                 invited_row,
@@ -229,7 +244,7 @@ impl Store {
             return Ok(None);
         }
         let invited: Invited = tx.query_row(
-            "SELECT name, display, token, used FROM people WHERE token = ?1",
+            "SELECT name, display, token, used, language FROM people WHERE token = ?1",
             [token],
             invited_row,
         )?;
@@ -254,8 +269,18 @@ impl Store {
         )? > 0)
     }
 
-    /// Whose display name this is, ignoring case.
-    fn person_called(&self, display: &str) -> Result<Option<String>> {
+    /// The language `name` speaks and wants to hear. Empty for the
+    /// room's own. False when nobody is invited under that name.
+    pub fn set_language(&self, name: &str, language: &str) -> Result<bool> {
+        Ok(self.db.execute(
+            "UPDATE people SET language = ?2 WHERE name = ?1",
+            params![name, language],
+        )? > 0)
+    }
+
+    /// Whose display name this is, ignoring case. The way back from what
+    /// the room calls somebody to the key everything is stored against.
+    pub fn person_called(&self, display: &str) -> Result<Option<String>> {
         Ok(self
             .db
             .query_row(
@@ -270,7 +295,7 @@ impl Store {
         Ok(self
             .db
             .query_row(
-                "SELECT name, display, token, used FROM people WHERE name = ?1",
+                "SELECT name, display, token, used, language FROM people WHERE name = ?1",
                 [name],
                 invited_row,
             )
@@ -280,7 +305,7 @@ impl Store {
     pub fn people(&self) -> Result<Vec<Invited>> {
         let mut q = self
             .db
-            .prepare("SELECT name, display, token, used FROM people ORDER BY name")?;
+            .prepare("SELECT name, display, token, used, language FROM people ORDER BY name")?;
         let rows = q.query_map([], invited_row)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
@@ -420,10 +445,12 @@ impl Store {
 
     pub fn put_entry(&self, conversation: i64, e: &Entry) -> Result<()> {
         self.db.execute(
-            "INSERT INTO entries (conversation, id, who, kind, title, text, cut, at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "INSERT INTO entries
+                 (conversation, id, who, kind, title, text, cut, typed, translations, at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(conversation, id) DO UPDATE SET
-               text = excluded.text, cut = excluded.cut",
+               text = excluded.text, cut = excluded.cut,
+               translations = excluded.translations",
             params![
                 conversation,
                 e.id,
@@ -432,6 +459,8 @@ impl Store {
                 e.title,
                 e.text,
                 e.cut as i64,
+                e.typed as i64,
+                serde_json::to_string(&e.translations).unwrap_or_else(|_| "{}".into()),
                 e.at as i64
             ],
         )?;
@@ -441,11 +470,12 @@ impl Store {
     /// The last `limit` entries of `conversation`, oldest first.
     pub fn entries(&self, conversation: i64, limit: usize) -> Result<Vec<Entry>> {
         let mut q = self.db.prepare(
-            "SELECT id, who, kind, title, text, cut, at FROM entries
+            "SELECT id, who, kind, title, text, cut, typed, translations, at FROM entries
              WHERE conversation = ?1 ORDER BY at DESC, rowid DESC LIMIT ?2",
         )?;
         let rows = q.query_map(params![conversation, limit as i64], |r| {
             let kind: String = r.get(2)?;
+            let translations: String = r.get(7)?;
             Ok(Entry {
                 id: r.get(0)?,
                 who: r.get(1)?,
@@ -455,7 +485,9 @@ impl Store {
                 live: false,
                 partial: false,
                 cut: r.get::<_, i64>(5)? != 0,
-                at: r.get::<_, i64>(6)? as u64,
+                typed: r.get::<_, i64>(6)? != 0,
+                translations: serde_json::from_str(&translations).unwrap_or_default(),
+                at: r.get::<_, i64>(8)? as u64,
                 sent: true,
             })
         })?;
@@ -535,6 +567,7 @@ fn invited_row(r: &rusqlite::Row) -> rusqlite::Result<Invited> {
     let display: String = r.get(1)?;
     let token: String = r.get(2)?;
     let used: i64 = r.get(3)?;
+    let language: String = r.get(4)?;
     Ok(Invited {
         // A row from before display names had their own column, or one
         // written by hand: the name is the name.
@@ -545,6 +578,7 @@ fn invited_row(r: &rusqlite::Row) -> rusqlite::Result<Invited> {
         },
         name,
         link: (used == 0).then_some(token),
+        language,
     })
 }
 
@@ -589,6 +623,16 @@ fn migrate(db: &Connection) -> Result<()> {
              INSERT OR IGNORE INTO sessions (id, name) SELECT token, name FROM people;",
         )?;
     }
+    if !has_column(db, "people", "language")? {
+        db.execute_batch("ALTER TABLE people ADD COLUMN language TEXT NOT NULL DEFAULT ''")?;
+    }
+    // Everything written before typing was possible was said out loud.
+    if !has_column(db, "entries", "typed")? {
+        db.execute_batch(
+            "ALTER TABLE entries ADD COLUMN typed INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE entries ADD COLUMN translations TEXT NOT NULL DEFAULT '{}';",
+        )?;
+    }
     Ok(())
 }
 
@@ -605,6 +649,8 @@ fn has_column(db: &Connection, table: &str, column: &str) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
 
     fn plain() -> GameSettings {
@@ -676,6 +722,70 @@ mod tests {
     }
 
     #[test]
+    fn a_language_is_remembered_against_the_key_not_the_display_name() {
+        let s = Store::memory();
+        let link = s.invite("Mike").unwrap();
+        assert_eq!(
+            s.person("Mike").unwrap().unwrap().language,
+            "",
+            "nobody has chosen one yet"
+        );
+
+        assert!(s.set_language("Mike", "Russian").unwrap());
+        assert_eq!(s.person("Mike").unwrap().unwrap().language, "Russian");
+        // Every way of reading a person back carries it, because each
+        // SELECT has its own column list.
+        assert_eq!(s.live_invite(&link).unwrap().unwrap().language, "Russian");
+        assert_eq!(s.people().unwrap()[0].language, "Russian");
+
+        // Renaming themselves at the door doesn't lose it: the language
+        // hangs off the name, which never moves.
+        assert!(s.rename("Mike", "Mikey").unwrap());
+        assert_eq!(s.person("Mike").unwrap().unwrap().language, "Russian");
+
+        let (id, invited) = s.claim_invite(&link).unwrap().unwrap();
+        assert_eq!(invited.language, "Russian");
+        assert_eq!(
+            s.person_for_session(&id).unwrap().unwrap().language,
+            "Russian",
+            "and the browser that spent the link sees it too"
+        );
+
+        // Back to the room's own language.
+        assert!(s.set_language("Mike", "").unwrap());
+        assert_eq!(s.person("Mike").unwrap().unwrap().language, "");
+        assert!(!s.set_language("Nobody", "Russian").unwrap());
+    }
+
+    #[test]
+    fn a_database_from_before_languages_opens_and_gains_the_column() {
+        // `people` as it was written before the column existed. SCHEMA
+        // is CREATE TABLE IF NOT EXISTS, so it leaves this one alone and
+        // only `migrate` can rescue it.
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE people (
+                 name TEXT PRIMARY KEY,
+                 token TEXT NOT NULL UNIQUE,
+                 used INTEGER NOT NULL DEFAULT 0,
+                 display TEXT NOT NULL DEFAULT ''
+             );
+             INSERT INTO people (name, token, used, display)
+                 VALUES ('Mike', 'tok', 1, 'Mikey');",
+        )
+        .unwrap();
+        db.execute_batch(SCHEMA).unwrap();
+        migrate(&db).unwrap();
+        let s = Store { db };
+
+        let mike = s.person("Mike").unwrap().unwrap();
+        assert_eq!(mike.display, "Mikey");
+        assert_eq!(mike.language, "", "the room's own language, as before");
+        assert!(s.set_language("Mike", "Russian").unwrap());
+        assert_eq!(s.person("Mike").unwrap().unwrap().language, "Russian");
+    }
+
+    #[test]
     fn entries_round_trip_in_order() {
         let s = Store::memory();
         let e = |id: &str, at| Entry {
@@ -687,6 +797,8 @@ mod tests {
             live: false,
             partial: false,
             cut: false,
+            typed: false,
+            translations: BTreeMap::new(),
             at,
             sent: true,
         };
@@ -704,6 +816,30 @@ mod tests {
         assert_eq!(got[0].text, "revised");
         assert_eq!(s.new_conversation(None).unwrap(), 2);
         assert_eq!(s.entries(2, 10).unwrap().len(), 1);
+
+        // A typed message keeps its mark and its translations, so coming
+        // back to a conversation shows what everyone was shown then. The
+        // translations arrive after the first write, so the update path
+        // has to carry them too.
+        let mut t = e("typed-1", 40);
+        t.typed = true;
+        s.put_entry(1, &t).unwrap();
+        t.translations
+            .insert("Russian".into(), "см. https://example.com/a_b".into());
+        s.put_entry(1, &t).unwrap();
+        let back = s.entries(1, 10).unwrap();
+        let back = back.iter().find(|e| e.id == "typed-1").unwrap();
+        assert!(back.typed);
+        assert_eq!(
+            back.translations.get("Russian").map(String::as_str),
+            Some("см. https://example.com/a_b")
+        );
+        // And everything said aloud reads back as it always did.
+        assert!(!s
+            .entries(1, 10)
+            .unwrap()
+            .iter()
+            .any(|e| e.id == "a" && (e.typed || !e.translations.is_empty())));
     }
 
     #[test]

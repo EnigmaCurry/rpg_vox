@@ -2,7 +2,7 @@
   import { onMount } from 'svelte';
   import {
     room, joinAudio, setName, logOut, setPushToTalk, loadDevices, watchDevices,
-    setMicDevice, setSpeakerDevice,
+    setMicDevice, setSpeakerDevice, setLanguage,
   } from '../lib/room.svelte.js';
   import { supported, canChooseSpeaker } from '../lib/audio.js';
   import { hue } from '../lib/color.js';
@@ -32,6 +32,10 @@
   // with it; if the room won't have that name, nothing is spent.
   async function enter() {
     if (room.door && !(await save())) return;
+    // The language shown at the door is only a suggestion until now --
+    // from this browser, for somebody the room has never seen. Save it
+    // on the way in, so the room mixes and translates by it.
+    if (room.lang && room.lang !== mine) await setLanguage(room.lang);
     await joinAudio();
   }
 
@@ -47,6 +51,11 @@
     room.people.filter((p) => p.online && p.name !== room.you).map((p) => p.name),
   );
   const starting = $derived(room.audio === 'starting');
+  // What the room already has against your name, so the door only saves
+  // a language when it is actually a change.
+  const mine = $derived(
+    room.people.find((p) => p.name === room.you)?.language ?? '',
+  );
 </script>
 
 <div class="enter" role="dialog" aria-modal="true" aria-labelledby="enter-title">
@@ -111,6 +120,19 @@
               {/each}
             </select>
           </label>
+        {/if}
+        {#if room.languages.length > 1}
+          <label>
+            <span>Language</span>
+            <select value={room.lang} onchange={(e) => setLanguage(e.currentTarget.value)}>
+              {#each room.languages as l, i (l)}
+                <option value={i === 0 ? '' : l}>{l}</option>
+              {/each}
+            </select>
+          </label>
+        {/if}
+        {#if room.langError}
+          <p class="warn">Your language: {room.langError}</p>
         {/if}
         {#if room.devicesError}
           <p class="warn">

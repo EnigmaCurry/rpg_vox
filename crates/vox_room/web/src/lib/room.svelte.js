@@ -3,6 +3,7 @@
 // reads. The server owns the state; this only applies its events.
 
 import { RoomAudio, listDevices, onDeviceChange, permitMic } from './audio.js';
+import { connect as connectScreen, stopSharing } from './screen.svelte.js';
 
 export const room = $state({
   connected: false,
@@ -55,6 +56,15 @@ export const room = $state({
   devices: { mics: [], speakers: [] },
   micId: readChoice('vox_room.mic'),
   speakerId: readChoice('vox_room.speaker'),
+  // The language you speak and want to hear, also chosen at the door.
+  // Unlike the devices this one is the room's business too, so it is
+  // saved on the server; the copy here is only what to show until the
+  // room says otherwise. Empty means the room's own language.
+  lang: readChoice('vox_room.lang'),
+  // The languages the door offers, from the room. One of them (or none)
+  // means there is nothing to translate and the select is not shown.
+  languages: [],
+  langError: null,
   // Set when the browser refused the microphone, so the door can say so
   // rather than offering a list of nameless devices.
   devicesError: null,
@@ -90,7 +100,15 @@ let retry = 0;
 let noticeTimer = null;
 let hearTimer = null;
 
-export function connect() {
+/// Open both of the room's sockets: its events and this tab's audio on
+/// /room.ws, and desktop sharing on /screen.ws. Separate connections, so
+/// a burst of video can't delay a 20 ms frame of somebody talking.
+export function open() {
+  connect();
+  connectScreen();
+}
+
+function connect() {
   const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
   ws = new WebSocket(`${scheme}://${location.host}/room.ws`);
   ws.binaryType = 'arraybuffer';
@@ -171,7 +189,7 @@ async function enterOnInvite() {
     }
     room.you = d.display;
     room.door = null;
-    connect();
+    open();
     return true;
   } catch (e) {
     room.doorError = e.message || String(e);
@@ -241,6 +259,28 @@ function notify(text, error = false) {
   if (!error) noticeTimer = setTimeout(() => (room.notice = null), 8000);
 }
 
+/// Your own language out of a roster, or undefined when the roster
+/// doesn't have you yet (the door, before the link is spent).
+function languageOf(people, you) {
+  return people?.find((p) => p.name === you)?.language;
+}
+
+/// This browser's own language, spelled the way the room spells it
+/// ("Russian"), when the room offers it. `Intl` does the naming, so
+/// there is no table of codes to keep in step with the room's list.
+/// Empty for the room's own language, which is what index 0 is.
+function browserLanguage(offered) {
+  try {
+    const tag = (navigator.language || '').split('-')[0];
+    if (!tag || offered.length < 2) return '';
+    const named = new Intl.DisplayNames(['en'], { type: 'language' }).of(tag);
+    const match = offered.find((l) => l.toLowerCase() === named?.toLowerCase());
+    return match && match !== offered[0] ? match : '';
+  } catch {
+    return '';
+  }
+}
+
 function upsert(entry) {
   const i = room.log.findIndex((e) => e.id === entry.id);
   if (i >= 0) room.log[i] = entry;
@@ -264,9 +304,18 @@ function apply(ev) {
       room.game = ev.game ?? null;
       room.games = ev.games ?? [];
       room.cards = ev.cards ?? [];
+      room.languages = ev.languages ?? [];
+      // The room is the authority on which language is yours, so once it
+      // has spoken, follow it rather than this browser's memory. Nobody
+      // the room has never seen has chosen one, so start them off at
+      // their browser's language -- shown at the door, and not saved
+      // until they come in.
+      room.lang =
+        languageOf(ev.people, ev.you) ?? browserLanguage(room.languages);
       break;
     case 'people':
       room.people = ev.people;
+      room.lang = languageOf(ev.people, room.you) ?? room.lang;
       break;
     case 'entry':
       upsert(ev.entry);
@@ -348,6 +397,43 @@ export function setSpeakerDevice(id) {
   audio?.setSpeaker(id);
 }
 
+/// Type something into the room instead of saying it: exactly the
+/// characters you meant, which is what a URL or a command wants. The
+/// room sanitizes and translates it; all this does is send it, and only
+/// once there is something to send.
+export function sendText(text) {
+  if (!text.trim()) return false;
+  command({ type: 'text', text });
+  return true;
+}
+
+/// The language you speak and want to hear. Saved on the server against
+/// your invite, so it follows you to another browser and is there for
+/// the room to mix and translate by; remembered here too, so the door
+/// shows the right one before the room has said anything.
+export async function setLanguage(language) {
+  const before = room.lang;
+  room.lang = language;
+  room.langError = null;
+  try {
+    const r = await fetch('/api/door/language', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ language }),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(d.error || r.statusText);
+    room.lang = d.language;
+    writeChoice('vox_room.lang', d.language);
+    return true;
+  } catch (e) {
+    // Put the select back to what the room still believes.
+    room.lang = before;
+    room.langError = e.message || String(e);
+    return false;
+  }
+}
+
 /// Join the audio: hear the room, and open the mic.
 export async function joinAudio() {
   if (audio) return;
@@ -390,6 +476,9 @@ function resumeAudio() {
 }
 
 export async function leaveAudio() {
+  // Back at the door is out of the room: a desktop shared from behind it
+  // would be one nobody can hear you talk about.
+  stopSharing();
   removeEventListener('pointerdown', resumeAudio);
   removeEventListener('keydown', resumeAudio);
   command({ type: 'mic', on: false });

@@ -44,7 +44,8 @@ export VOX_ROOM_URL=https://room.example.com
 just room-invite Alex          # https://room.example.com/join/…
 ```
 
-Proxy everything, including WebSocket upgrades on `/room.ws`.
+Proxy everything, including WebSocket upgrades on `/room.ws` and
+`/screen.ws`.
 
 A link works **once**. Opening it spends nothing: it takes them to the
 door, which says whose link it is and lets them set the name the room
@@ -132,6 +133,75 @@ See ROOM_DOCKER.md.
   once and stops for good once your speech is confirmed (300 ms of voice
   or the first recognised word), so a cough only dips it. **Stop** does
   the same with a click.
+- **Typing instead of saying it**: there is a box at the foot of the
+  conversation. What you send through it appears beside everything said,
+  marked **typed** — the mark is the point, because a typed line has no
+  recognition error in it. It is for everything speech-to-text is bound
+  to spoil: a URL, a path, a command, an unusual name. The AI reads it
+  like anything else, and naming the AI in one gets its attention the
+  same way.
+
+  **Typing never interrupts.** Starting to type doesn't dip the AI and
+  sending doesn't cut it off, however much you send: only a voice does
+  that. A message joins the conversation at the next pause, with the
+  same beat as speech in which to be joined by more.
+
+  Messages are flattened to one line and capped at 2000 characters.
+  That isn't tidiness: the AI is shown the conversation as `Name: what
+  they said` lines, so a message allowed to keep a line break of its own
+  could put words in somebody else's mouth. Unicode's direction
+  overrides and zero-width characters go the same way, for the same
+  reason. Everything else survives exactly as typed, because the
+  punctuation a careless filter eats is what a URL is made of.
+- **More than one language**: start the room with
+  `--language-also Russian` and the door offers a **Language** beside
+  the devices. Everyone hears the people in the room as they are — their
+  own voices, as always — and the AI in the language they picked: it
+  writes its reply once, in the room's own `--language`, and a separate
+  voice per language translates and speaks it. So two people can be in
+  the same conversation, each hearing the AI in their own language, with
+  one shared transcript. It needs `--tts qwen3`; Kokoro only speaks
+  English.
+
+  Your choice follows your invite rather than your browser, so it is
+  there on your phone too, and you can change it later from the door.
+  A language nobody has picked costs nothing: the AI is only translated
+  while somebody is listening in it.
+
+  A typed message is translated too, and there both are shown: the
+  original, and underneath it the same thing in your language. That way
+  a translation that went wrong can be seen to have gone wrong, and the
+  URL in it can be read off the line that was actually typed. Both are
+  kept, so coming back to a conversation shows what everyone was shown
+  at the time.
+
+  Two things are worth knowing. A translation is a sentence or two
+  behind — it is written, then spoken, after the original — so **if you
+  are listening in a translation you cannot talk the AI down**: starting
+  to speak neither dips it nor cuts it, because you would be stopping it
+  in the middle of something you haven't heard yet. **Stop** still works
+  for you, since a click says where to cut without guessing. And the
+  conversation on screen is the room's own language, which is what the AI
+  reads and what it is recorded as having said, however many languages it
+  was heard in.
+
+  Your words are transcribed in whatever you speak: Parakeet works out
+  the language from the audio. The text that appears *while* you are
+  still talking needs a model per language — `just
+  download-streaming-stt-model-ru`, or `scribe download-models
+  --russian` — and without it your words simply appear a phrase later,
+  once the sentence is decoded.
+- **Sharing a desktop**: **Share screen**, in the footer, offers the
+  browser's own picker of a window or a screen. Everyone in the room
+  gets a thumbnail of it under that person's name in the mixer, live;
+  click one and it opens full size where the conversation was, with the
+  mixer (and everyone else's thumbnails) still beside it. **That is
+  yours alone** — opening a desktop, or closing it, changes nothing on
+  anyone else's screen, and nothing about it is remembered. Several
+  people can share at once; each gets a thumbnail. **Stop sharing**, the
+  browser's own stop button, and **Leave audio** all end it. No sound is
+  taken from what is shared: the room's audio is the mixer's, and a
+  shared tab's would come back as another voice to transcribe.
 - **Mixer** (right, the only thing in the sidebar): a level and mute for
   each person and the AI, shared
   by the whole room. **Your volume** (bottom) is only yours. Space mutes
@@ -232,6 +302,35 @@ Cards belong to the conversation they were dealt in: **New conversation**,
 everyone holding nothing. Short of that, a card stays until the AI takes
 it back.
 
+### What a shared desktop costs
+
+The thumbnail is small (320 px wide, 2 frames a second, VP8) and goes to
+everyone all the time, which is what makes the mixer live rather than a
+list of names. The full size is only *encoded* while somebody has it
+open: the relay tells the sharer's browser whether anybody is looking,
+and with nobody looking it isn't made at all.
+
+The server never decodes any of it. It forwards frames and keeps one
+rule — **a viewer is sent no delta frames until a keyframe has reached
+them** — which is what makes dropping safe: a viewer who falls behind is
+put back to the next keyframe instead of being shown a torn picture, and
+the sharer is asked for one. That is also how somebody who arrives
+mid-stream fills in.
+
+It is a second WebSocket (`/screen.ws`), and the separate connection is
+the point: a burst of video in the audio socket's send queue would be
+head-of-line blocking applied to speech. Proxy it like `/room.ws`.
+
+What this does not have is WebRTC's congestion control. The rates are
+fixed, so a desktop that is mostly still costs little and a bad network
+degrades without a feedback loop to degrade *gracefully*. If that ever
+matters more than the simplicity does, the whole of it is `screen.rs`
+and `web/src/lib/screen.svelte.js`, and nothing in the audio path knows
+it exists.
+
+Sharing needs WebCodecs video (`VideoEncoder`), so the button is only
+offered where the browser has it. Watching needs `VideoDecoder`.
+
 ### What judging a pause costs
 
 "When it fits" asks the model at every pause, so a conversation between
@@ -267,8 +366,12 @@ and the model carrying on from the tool's answer.
 
 - One WebSocket per tab carries 20 ms mono Opus frames both ways
   (WebCodecs in the browser, libopus on the server) and JSON room events.
+  A tab sharing or watching a desktop has a second one, `/screen.ws`,
+  that carries VP8 frames and nothing else.
 - The server mixes on a 20 ms clock. For each listener it sums everyone
-  except that listener, plus the AI, and encodes it for them alone.
+  except that listener, plus the AI in that listener's language, and
+  encodes it for them alone. The AI's languages are alternatives rather
+  than parts of a mix: one queue each, and you hear exactly one of them.
 - Each person's mic feeds its own scribe transcription engine (streaming
   text, then the offline re-decode), so their lines are labelled by who
   said them with no diarization.
@@ -337,6 +440,7 @@ pays for a rejected request before every reply.
 | `VOX_ROOM_TTS` | see above | `qwen3`, `kokoro` or `none` |
 | `VOX_ROOM_TTS_URL` | `PI_TTS_URL` | Qwen3-TTS server (`/v1/audio/speech`) |
 | `VOX_ROOM_VOICE`, `VOX_ROOM_INSTRUCT`, `VOX_ROOM_LANGUAGE` | `aiden`, none, `English` | Qwen3 voice, delivery and language |
+| `VOX_ROOM_LANGUAGES` | | other languages the door offers, comma-separated and spelled out in English (`Russian`). The AI answers in each one somebody is listening in; needs `--tts qwen3` |
 | `VOX_ROOM_KOKORO_VOICE` | `am_michael` | Kokoro voice |
 | `VOX_SCRIBE_MODELS` | scribe's models dir | speech-to-text models |
 
@@ -346,3 +450,7 @@ pays for a rejected request before every reply.
 `crates/vox_room/e2e/two-people.js` runs two headless Chromiums against a
 running room, each with a WAV file as its mic, and prints what each one
 hears and the conversation as it unfolds (see the top of the script).
+`e2e/share-screen.js` is the same idea for desktop sharing: one shares,
+the other watches, and it reads the pixels off each canvas to check the
+picture really arrived — and that opening it was one person's doing
+alone.

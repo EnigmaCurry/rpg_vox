@@ -30,7 +30,7 @@ use vox_transcribe::{
 };
 
 /// Same layout as vox_scribe's models dir.
-const PARAKEET: &str = "parakeet-tdt-0.6b-v2";
+const PARAKEET: &str = "parakeet-tdt-0.6b-v3";
 const ZIPFORMER: &str = "streaming-zipformer";
 
 struct Models {

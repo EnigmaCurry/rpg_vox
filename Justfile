@@ -364,6 +364,37 @@ download-streaming-stt-model:
     cp "$tmp/$stem/tokens.txt"                       "$dest/tokens.txt"
     echo "installed streaming-zipformer model → $dest/"
 
+# Download the Russian streaming Zipformer into models/streaming-zipformer-ru/.
+# Pass 1 is the one pass that needs a model per language -- Parakeet, which
+# does passes 2 and 3, detects the language from the audio -- so this is what
+# gives a Russian speaker in the room live text as they talk. Vosk's small
+# model is a standard sherpa-onnx zipformer2 export (int8, ~28 MB), so it
+# loads with the same config as the English one. Published as loose files
+# rather than an archive, so each is fetched on its own.
+download-streaming-stt-model-ru:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dest="models/streaming-zipformer-ru"
+    if [ -f "$dest/encoder.onnx" ] && [ -f "$dest/decoder.onnx" ] \
+       && [ -f "$dest/joiner.onnx" ]  && [ -f "$dest/tokens.txt" ]; then
+      echo "streaming-zipformer-ru model already present at $dest/"
+      exit 0
+    fi
+    base="https://huggingface.co/alphacep/vosk-model-small-streaming-ru/resolve/main"
+    mkdir -p "$dest"
+    # Downloaded to .part and renamed, so an interrupted fetch doesn't leave
+    # half a model behind for the check above to find.
+    for pair in "am-onnx/encoder.int8.onnx:encoder.onnx" \
+                "am-onnx/decoder.int8.onnx:decoder.onnx" \
+                "am-onnx/joiner.int8.onnx:joiner.onnx" \
+                "lang/tokens.txt:tokens.txt"; do
+      from="${pair%%:*}"; to="${pair##*:}"
+      echo "downloading $from …"
+      curl -fL --progress-bar -o "$dest/$to.part" "$base/$from"
+      mv "$dest/$to.part" "$dest/$to"
+    done
+    echo "installed streaming-zipformer-ru model → $dest/"
+
 # --- vox_scribe (standalone live transcription TUI) ---
 
 # Download the speaker models for `scribe --diarize` into
@@ -734,9 +765,9 @@ ios-sim DEVICE="iPad Pro 11-inch (M5)":
     xcrun simctl boot "{{DEVICE}}" 2>/dev/null || true
     xcrun simctl install "{{DEVICE}}" ios/build/Build/Products/Release-iphonesimulator/Scribe.app
     data="$(xcrun simctl get_app_container "{{DEVICE}}" "$bundle" data)"
-    if [ ! -d "$data/Library/Application Support/models/parakeet-tdt-0.6b-v2" ]; then
+    if [ ! -d "$data/Library/Application Support/models/parakeet-tdt-0.6b-v3" ]; then
       mkdir -p "$data/Documents/models"
-      cp -R "$HOME/Library/Application Support/vox_scribe/models/parakeet-tdt-0.6b-v2" \
+      cp -R "$HOME/Library/Application Support/vox_scribe/models/parakeet-tdt-0.6b-v3" \
         "$HOME/Library/Application Support/vox_scribe/models/streaming-zipformer" "$data/Documents/models/"
     fi
     xcrun simctl launch --terminate-running-process "{{DEVICE}}" "$bundle"
@@ -752,7 +783,7 @@ ios-models MODELS="":
     bundle="${SCRIBE_BUNDLE_ID:-com.enigmacurry.rpg-vox-scribe}"
     source <(just _ios-xcode)
     device="$(just _ios-device)"
-    for m in parakeet-tdt-0.6b-v2 streaming-zipformer; do
+    for m in parakeet-tdt-0.6b-v3 streaming-zipformer; do
       for f in "$models/$m"/*; do
         echo "$m/$(basename "$f")"
         xcrun devicectl device copy to --device "$device" --domain-type appDataContainer \

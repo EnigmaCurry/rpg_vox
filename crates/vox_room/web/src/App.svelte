@@ -1,17 +1,19 @@
 <script>
   import { onMount } from 'svelte';
-  import { room, connect, command, ask, answer, whoami, leaveAudio, setMuted, setVolume, setPushToTalk, talk } from './lib/room.svelte.js';
+  import { room, open, command, ask, answer, whoami, leaveAudio, setMuted, setVolume, setPushToTalk, talk } from './lib/room.svelte.js';
+  import { screen, share, stopSharing, supported as canShare } from './lib/screen.svelte.js';
   import Log from './components/Log.svelte';
   import Strip from './components/Strip.svelte';
   import Cards from './components/Cards.svelte';
   import Enter from './components/Enter.svelte';
   import Games from './components/Games.svelte';
+  import Board from './components/Board.svelte';
 
   // Narrow screens show one area at a time; wide ones show all three.
   let view = $state('chat');
 
   onMount(async () => {
-    if (await whoami()) connect();
+    if (await whoami()) open();
   });
 
   const agentLabel = $derived(
@@ -134,7 +136,7 @@
 {:else}
   <!-- Until the audio is joined the room is behind the door: visible,
        but not to be clicked, tabbed into, or read out. -->
-  <div class="app show-{view}" inert={room.audio !== 'on'}>
+  <div class="app show-{view}" class:watching={screen.watching != null} inert={room.audio !== 'on'}>
     <header>
       <h1>{room.game ?? 'Voice room'}</h1>
       {#if room.game}<button onclick={lobby}>Back to lobby</button>{/if}
@@ -182,6 +184,8 @@
 
     <Log />
 
+    {#if screen.watching != null}<Board />{/if}
+
     <aside>
       <h2>In the room</h2>
       {#each room.people as p (p.name)}
@@ -223,9 +227,18 @@
           <input type="range" min="0" max="1.5" step="0.01" value={room.volume}
             oninput={(e) => setVolume(Number(e.currentTarget.value))} />
         </label>
+        {#if canShare()}
+          <button class:on={screen.sharing} onclick={() => (screen.sharing ? stopSharing() : share())}
+            title={screen.sharing
+              ? 'Stop sharing your desktop with the room.'
+              : 'Share a window or screen. Everyone sees a thumbnail of it in the mixer and can open it for themselves.'}>
+            {screen.sharing ? 'Stop sharing' : 'Share screen'}
+          </button>
+        {/if}
         <button onclick={leaveAudio} title="Leave the audio and go back to the door.">Leave audio</button>
       {/if}
       {#if room.audioError}<span class="warn">Mic: {room.audioError}</span>{/if}
+      {#if screen.error}<span class="warn">Screen: {screen.error}</span>{/if}
       {#if room.notice}
         <span class={room.notice.error ? 'warn' : 'hint'}>{room.notice.text}</span>
         {#if room.notice.error}<button class="dismiss" title="Dismiss" onclick={() => (room.notice = null)}>×</button>{/if}
@@ -300,6 +313,10 @@
   @media (prefers-reduced-motion: reduce) { .seg .dot { animation: none; } }
   .offline { color: var(--danger); font-size: 13px; }
   :global(.log) { grid-area: log; }
+  :global(.board) { grid-area: board; }
+  .app.watching { grid-template-areas: "head head head" "board board side" "foot foot foot"; }
+  .app.watching :global(.log), .app.watching :global(.cards) { display: none; }
+  footer button.on { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
   .ask.peek { width: min(46em, calc(100vw - 32px)); max-width: none; }
   .peek-title { font-size: 17px; text-transform: none; letter-spacing: 0; color: inherit; margin: 0 0 4px; }
   .peek-summary { color: var(--muted); margin: 0 0 12px !important; }
@@ -381,7 +398,14 @@
       grid-template-areas: "head" "views" "main" "foot";
     }
     .views { display: flex; }
-    :global(.log), :global(.cards), aside { grid-area: main; min-height: 0; }
+    :global(.log), :global(.cards), aside, :global(.board) { grid-area: main; min-height: 0; }
+    /* Watching takes the whole area, and the switch above it goes with
+       the areas it switched between: the board has its own way out.
+       (The wide `.app.watching` template is two classes, so it must be
+       put back here or its three columns survive into one.) */
+    .app.watching { grid-template-areas: "head" "views" "main" "foot"; }
+    .app.watching .views { display: none; }
+    .app.watching :global(.log), .app.watching :global(.cards), .app.watching aside { display: none; }
     :global(.cards) { border-right: 0; }
     aside { border-left: 0; }
     .app:not(.show-chat) :global(.log) { display: none; }

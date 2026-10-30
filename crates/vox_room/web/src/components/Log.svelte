@@ -1,9 +1,32 @@
 <script>
-  import { room } from '../lib/room.svelte.js';
+  import { room, sendText } from '../lib/room.svelte.js';
   import { hue } from '../lib/color.js';
+  import { TYPED_MAX } from '../lib/names.js';
 
   let box;
   let stick = true;
+  let draft = $state('');
+
+  // The language you are reading in, and whose language each person is
+  // speaking: between them they say whether a message needs translating
+  // for you, and so whether to wait for one.
+  const roomLanguage = $derived(room.languages[0] ?? '');
+  const mine = $derived(room.lang || roomLanguage);
+  const languageOf = (who) =>
+    room.people.find((p) => p.name === who)?.language || roomLanguage;
+
+  /// What a typed message says in your language: the translation when
+  /// there is one, `null` while it is still coming, and undefined when
+  /// the message is already in your language and needs none.
+  function forYou(e) {
+    if (!e.typed || languageOf(e.who) === mine) return undefined;
+    return e.translations?.[mine] ?? null;
+  }
+
+  function send(ev) {
+    ev.preventDefault();
+    if (sendText(draft)) draft = '';
+  }
 
   function onscroll() {
     stick = box.scrollHeight - box.scrollTop - box.clientHeight < 60;
@@ -62,11 +85,23 @@
     <div class="entry" class:agent={e.kind === 'agent'} class:you={e.who === room.you} style="--h: {hue(e.who)}">
       <div class="who">
         <span class="name">{e.who}</span>
+        {#if e.typed}<span class="typed" title="Typed, not spoken">typed</span>{/if}
         <span class="time">{time(e.at)}</span>
       </div>
       <div class="text" class:partial={e.partial} class:live={e.live}>
         {#if e.text}{e.text}{:else if e.kind === 'agent'}<span class="dots"><i></i><i></i><i></i></span>{/if}
       </div>
+      {#if forYou(e) !== undefined}
+        <!-- Beside what was typed, never instead of it: a translation
+             that went wrong can then be seen to have. -->
+        <div class="rendered" lang={mine}>
+          {#if forYou(e) === null}
+            <span class="pending">{mine}…</span>
+          {:else}
+            <span class="into">{mine}</span>{forYou(e)}
+          {/if}
+        </div>
+      {/if}
     </div>
     {/if}
   {/each}
@@ -76,6 +111,20 @@
       <div class="text"><span class="dots"><i></i><i></i><i></i></span></div>
     </div>
   {/if}
+
+  <!-- Last child of the scroller and stuck to its foot, so the grid
+       above doesn't have to know the conversation has a composer. -->
+  <form class="composer" onsubmit={send}>
+    <input
+      type="text"
+      bind:value={draft}
+      maxlength={TYPED_MAX}
+      autocomplete="off"
+      placeholder="Type instead of saying it — a URL, a name, anything that has to arrive exactly"
+      aria-label="Type a message to the room"
+    />
+    <button type="submit" class="primary" disabled={!draft.trim()}>Send</button>
+  </form>
 </div>
 
 <style>
@@ -146,4 +195,61 @@
     50% { box-shadow: 0 0 0 4px color-mix(in srgb, var(--agent) 20%, transparent); }
   }
   @media (prefers-reduced-motion: reduce) { .dots i, .text { animation: none !important; } }
+
+  /* Typed, not spoken: said quietly beside the name, because the point
+     is that there is no recognition error in it. */
+  .typed {
+    font-size: 10px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    padding: 1px 5px;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    color: var(--muted);
+  }
+  /* The same message in the reader's language, under the original and
+     indented from it, so which one is which is never in doubt. */
+  .rendered {
+    margin: 4px 4px 0 14px;
+    font-size: 14px;
+    color: var(--muted);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    border-left: 2px solid var(--line);
+    padding-left: 10px;
+  }
+  .entry.you .rendered { text-align: right; }
+  .into {
+    font-size: 10px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    margin-right: 8px;
+    opacity: 0.8;
+  }
+  .pending { font-style: italic; opacity: 0.7; }
+
+  .composer {
+    position: sticky;
+    bottom: 0;
+    display: flex;
+    gap: 8px;
+    /* Stuck to the foot of the scroller, so the messages behind it have
+       to be covered rather than showing through. */
+    background: var(--bg);
+    padding: 10px 0 2px;
+    margin-top: auto;
+  }
+  .composer input {
+    flex: 1;
+    min-width: 0;
+    font: inherit;
+    color: var(--ink);
+    background: var(--bg);
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    padding: 9px 14px;
+  }
+  .composer input:focus-visible { border-color: var(--muted); outline: none; }
+  .composer button { border-radius: 999px; padding: 9px 16px; }
+  .composer button:disabled { opacity: 0.45; cursor: default; }
 </style>

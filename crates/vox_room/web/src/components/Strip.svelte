@@ -1,6 +1,7 @@
 <script>
   import { command, room } from '../lib/room.svelte.js';
   import { hue } from '../lib/color.js';
+  import { screen, showThumb, streamOf, unwatch, watch } from '../lib/screen.svelte.js';
 
   // key: the strip's name in the mixer; label: what to show.
   let { key, label, online = true, mic = false, muted = false, speaking = false, agent = false } = $props();
@@ -17,6 +18,15 @@
   function mute() {
     command({ type: 'strip', name: key, mute: !strip.mute });
   }
+
+  // The desktop this person is sharing, if they are. Whether it is open
+  // full size is this tab's own business: clicking here opens it for
+  // nobody but you.
+  const stream = $derived(agent ? undefined : streamOf(label));
+  const open = $derived(stream && screen.watching === stream.id);
+
+  let thumb = $state();
+  $effect(() => (thumb && stream ? showThumb(stream.id, thumb) : undefined));
 </script>
 
 <div class="strip" class:offline={!online} class:speaking style="--h: {agent ? 270 : hue(label)}">
@@ -25,6 +35,13 @@
     <span class="label">{label}{#if label === room.you}<em>&nbsp;(you)</em>{/if}</span>
     <span class="state">{agent ? room.agent.state : speaking ? 'talking' : mic && muted ? 'muted' : mic ? 'mic on' : online ? 'no mic' : 'away'}</span>
   </div>
+  {#if stream}
+    <button class="desktop" class:open onclick={() => (open ? unwatch() : watch(stream.id))}
+      title={open ? `Close ${label}'s desktop` : `Open ${label}'s desktop, for you alone`}>
+      <canvas bind:this={thumb} width={stream.thumb.w} height={stream.thumb.h}></canvas>
+      <span class="what">{open ? 'Close' : 'Open'}</span>
+    </button>
+  {/if}
   <div class="meter"><div class="fill" style="width: {pct}%"></div></div>
   <div class="controls">
     <input type="range" min="0" max="2" step="0.01" value={strip.gain} oninput={gain}
@@ -45,6 +62,41 @@
   .label { font-weight: 600; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .label em { font-weight: 400; color: var(--muted); font-style: normal; }
   .state { font-size: 12px; color: var(--muted); }
+  /* The desktop they are sharing, under their name. A button, because
+     the only thing it does is open the picture on this screen. */
+  .desktop {
+    display: block;
+    position: relative;
+    width: 100%;
+    margin-top: 8px;
+    padding: 0;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    overflow: hidden;
+    background: #000;
+    line-height: 0;
+    cursor: pointer;
+  }
+  .desktop:hover, .desktop:focus-visible { border-color: hsl(var(--h) 60% 55%); }
+  .desktop.open { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+  /* As wide as the strip, but never tall enough to push the level and
+     the mute off a narrow screen, where the strip is the whole width. */
+  .desktop canvas { display: block; width: 100%; height: auto; max-height: 160px; object-fit: contain; }
+  .desktop .what {
+    position: absolute;
+    right: 4px;
+    bottom: 4px;
+    font-size: 11px;
+    line-height: 1.6;
+    padding: 0 6px;
+    border-radius: 4px;
+    background: rgb(0 0 0 / 60%);
+    color: #fff;
+    opacity: 0;
+    transition: opacity 120ms;
+  }
+  .desktop:hover .what, .desktop:focus-visible .what, .desktop.open .what { opacity: 1; }
+  @media (prefers-reduced-motion: reduce) { .desktop .what { transition: none; } }
   .meter { height: 6px; border-radius: 3px; background: var(--line); margin: 8px 0; overflow: hidden; }
   .fill { height: 100%; background: var(--meter); transition: width 80ms linear; }
   .controls { display: flex; align-items: center; gap: 8px; }

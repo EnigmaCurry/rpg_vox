@@ -70,13 +70,16 @@ layout as `crates/vox_scribe/src/models.rs`:
 
 | `VOX_ROOM_STT_MODEL` | what you get |
 | --- | --- |
-| `parakeet` (default) | Parakeet TDT 0.6B v2, English, ~660 MB, the most accurate |
+| `parakeet` (default) | Parakeet TDT 0.6B v3, 25 European languages, ~660 MB, the most accurate |
 | `sensevoice` | SenseVoice Small, multilingual, ~230 MB |
 | `none` | no transcription, and so no AI — passes `--no-stt` |
 
 Either one comes with the 20M streaming Zipformer, which is what puts
 words on screen while someone is still talking. `VOX_ROOM_TTS=kokoro`
-adds the Kokoro voice model the same way.
+adds the Kokoro voice model the same way, and a `VOX_ROOM_LANGUAGES`
+naming `Russian` adds the Russian streaming model (~28 MB) — that pass
+is the one that needs a model per language, since Parakeet works the
+language out from the audio by itself.
 
 Expect the first `up` to sit there for a few minutes. The healthcheck has
 a 15-minute `start_period` to cover it. After that the volume has them

@@ -14,6 +14,7 @@ use clap::Parser;
 use serde_json::{json, Value};
 use tracing::{debug, info, warn};
 use vox_chat::{Db, Kind, Role, Row};
+use vox_transcribe::filters::sentence_end;
 
 const DEFAULT_PROMPT: &str = "\
 You are talking with the user by voice. Their messages come from \
@@ -459,32 +460,6 @@ fn stream(db: &Db, id: i64, resp: ureq::Response, start: Instant, st: &mut Stats
     Ok(())
 }
 
-/// Byte length of the first whole sentence in `text`: up to a `.`, `?`,
-/// `!` (and closing quotes) followed by whitespace, or a line break.
-fn sentence_end(text: &str) -> Option<usize> {
-    let mut chars = text.char_indices().peekable();
-    while let Some((i, c)) = chars.next() {
-        if c == '\n' && !text[..i].trim().is_empty() {
-            return Some(i + 1);
-        }
-        if matches!(c, '.' | '?' | '!') {
-            let mut end = i + c.len_utf8();
-            while let Some(&(j, q)) = chars.peek() {
-                if matches!(q, '"' | '\'' | ')' | '”' | '’' | '.' | '?' | '!') {
-                    end = j + q.len_utf8();
-                    chars.next();
-                } else {
-                    break;
-                }
-            }
-            if text[end..].starts_with(char::is_whitespace) {
-                return Some(end);
-            }
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -545,16 +520,6 @@ mod tests {
         // A server that sends something else is quoted as it is.
         let plain = ureq::Response::new(502, "Bad Gateway", "upstream died").unwrap();
         assert_eq!(refusal(plain), "upstream died");
-    }
-
-    #[test]
-    fn finds_sentence_ends() {
-        assert_eq!(sentence_end("Hello there. How"), Some(12));
-        assert_eq!(sentence_end("Is it \"good?\" Yes"), Some(13));
-        assert_eq!(sentence_end("See d.rymcg.tech now"), None);
-        assert_eq!(sentence_end("Wait... what"), Some(7));
-        assert_eq!(sentence_end("Line one\nnext"), Some(9));
-        assert_eq!(sentence_end("No end yet."), None);
     }
 
     #[test]

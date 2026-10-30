@@ -47,12 +47,30 @@ fetch() {
     echo "vox_room: installed $dest"
 }
 
+# fetch_raw <hf-repo> <dest> <path-in-repo>:<name-on-disk>...
+# For a model published as loose files rather than a .tar.bz2, which is
+# how Vosk ships theirs. Each file is downloaded to .part and renamed, so
+# an interrupted fetch leaves no half a model for `have` to find.
+fetch_raw() {
+    repo=$1
+    dest=$2
+    shift 2
+    mkdir -p "$dest"
+    echo "vox_room: downloading $repo"
+    for pair in "$@"; do
+        curl -fL --retry 3 --progress-bar -o "$dest/${pair##*:}.part" \
+            "https://huggingface.co/$repo/resolve/main/${pair%%:*}"
+        mv "$dest/${pair##*:}.part" "$dest/${pair##*:}"
+    done
+    echo "vox_room: installed $dest"
+}
+
 case "$STT" in
     parakeet)
-        d="$MODELS/parakeet-tdt-0.6b-v2"
+        d="$MODELS/parakeet-tdt-0.6b-v3"
         have "$d/encoder.int8.onnx" "$d/decoder.int8.onnx" \
             "$d/joiner.int8.onnx" "$d/tokens.txt" ||
-            fetch asr-models sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8 "$d" \
+            fetch asr-models sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8 "$d" \
                 encoder.int8.onnx:encoder.int8.onnx \
                 decoder.int8.onnx:decoder.int8.onnx \
                 joiner.int8.onnx:joiner.int8.onnx \
@@ -81,6 +99,24 @@ if [ "$STT" != none ]; then
             decoder-epoch-99-avg-1.onnx:decoder.onnx \
             joiner-epoch-99-avg-1.int8.onnx:joiner.onnx \
             tokens.txt:tokens.txt
+fi
+
+# Pass 1 is the one pass that needs a model per language -- Parakeet, which
+# does passes 2 and 3, detects the language from the audio -- so a Russian
+# speaker needs this one to see live text as they talk. Only fetched when
+# the room offers Russian at the door.
+if [ "$STT" != none ]; then
+    case "${VOX_ROOM_LANGUAGES:-}" in
+        *[Rr]ussian*)
+            d="$MODELS/streaming-zipformer-ru"
+            have "$d/encoder.onnx" "$d/decoder.onnx" "$d/joiner.onnx" "$d/tokens.txt" ||
+                fetch_raw alphacep/vosk-model-small-streaming-ru "$d" \
+                    am-onnx/encoder.int8.onnx:encoder.onnx \
+                    am-onnx/decoder.int8.onnx:decoder.onnx \
+                    am-onnx/joiner.int8.onnx:joiner.onnx \
+                    lang/tokens.txt:tokens.txt
+            ;;
+    esac
 fi
 
 # The local voice, when there is no Qwen3-TTS server to talk to.
