@@ -178,10 +178,9 @@ See ROOM_DOCKER.md.
   nothing** — never a word of anybody else's. A translation has to be
   written before it can be spoken, so it begins about three seconds
   after the original does, and in those seconds you hear silence rather
-  than the opening of the reply in a language you didn't ask for. The
-  reply is on screen the whole time. (Measured on a real room: the AI's
-  first English audio at 3.6 s, the same reply's first Russian audio at
-  6.3 s.)
+  than the opening of the reply in a language you didn't ask for.
+  (Measured on a real room: the AI's first English audio at 3.6 s, the
+  same reply's first Russian audio at 6.3 s.)
 
   Second, **if you are listening in a translation you cannot talk the AI
   down**: starting to speak neither dips it nor cuts it, because you
@@ -197,10 +196,52 @@ See ROOM_DOCKER.md.
   copies of every line to read past. Which one you are looking at is
   yours alone and changes nobody else's screen.
 
+  The words arrive at the pace of the voice reading them *to you*. A
+  translation is a different number of syllables from the words it
+  translates, so each language fills in at its own rate, and a line
+  translated in a tenth of a second still takes as long to read as it
+  takes to say. The AI's turn is over when the last language has been
+  heard out, not when the first has — otherwise ending it would take
+  the rest of the reply away from whoever was still listening to it.
+  Which also means a cut lands where each voice was: the dash that
+  marks it is in a different place in each language.
+
   Underneath, the room's own language is still the record: it is what
   the AI is shown of the conversation, and what it is stored as having
   said, however many languages it was heard in. What people say out loud
   is not translated — only the AI's replies and what is typed.
+
+  **Who translates.** By default the same model that writes the replies
+  (`--translate openai`). `--translate local` asks Marian models on this
+  machine instead — `just download-translate-model-ru` fetches the
+  Russian pair, about 80 MB each — and then nothing anyone says leaves
+  the room. Measured side by side on one machine
+  (`cargo test -p vox_transcribe --features ct2,llm --lib -- --ignored
+  --nocapture compare`):
+
+  | | `openai` | `local` |
+  |---|---|---|
+  | A line | ~1900 ms | **~110 ms** |
+  | Network | required | **none** |
+  | Prose | best | very close |
+  | A URL | kept | **kept** |
+  | A command, bare | mostly kept | **mangled** |
+  | A command in backticks | kept | **kept** |
+  | Earlier lines for context | yes | no |
+
+  Being seventeen times faster matters more than it sounds: it is most
+  of the three-second wait above, so a translated listener hears the AI
+  almost when everyone else does.
+
+  What it costs is that a Marian model cannot be *told* anything — no
+  "copy a URL through as it stands" — so left alone it renders
+  `--language-also Russian` as the Russian for "also Russian language",
+  and `Ctrl-C` as "2-С". So **put anything that has to arrive exactly in
+  backticks**: `` `like this` ``, or a ```` ``` ```` fence. Those are
+  lifted out of the line before the model sees it and put back after,
+  which makes them safe whichever translator is in use. Backticks are
+  worth the habit either way; with `--translate local` they are the only
+  thing that works.
 
   Your words are written down in whatever you speak: Parakeet works out
   the language from the audio, and needs no telling. The text that
@@ -472,6 +513,7 @@ pays for a rejected request before every reply.
 | `VOX_ROOM_TTS_URL` | `PI_TTS_URL` | Qwen3-TTS server (`/v1/audio/speech`) |
 | `VOX_ROOM_VOICE`, `VOX_ROOM_INSTRUCT`, `VOX_ROOM_LANGUAGE` | `aiden`, none, `English` | Qwen3 voice, delivery and language |
 | `VOX_ROOM_LANGUAGES` | | other languages the door offers, comma-separated and spelled out in English (`Russian`). The AI answers in each one somebody is listening in; needs `--tts qwen3` |
+| `VOX_ROOM_TRANSLATE` | `openai` | who translates: `openai` asks the reply model, `local` asks Marian models on the CPU (see below) |
 | `VOX_ROOM_KOKORO_VOICE` | `am_michael` | Kokoro voice |
 | `VOX_SCRIBE_MODELS` | scribe's models dir | speech-to-text models |
 

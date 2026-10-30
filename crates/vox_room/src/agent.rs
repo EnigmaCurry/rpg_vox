@@ -18,7 +18,7 @@ use crossbeam_channel::{Receiver, Sender};
 use serde_json::{json, Value};
 use tracing::{debug, info, warn};
 use vox_transcribe::filters::{clause_end, sentence_end};
-use vox_transcribe::openai::{OpenAiConfig, OpenAiTranslator};
+use vox_transcribe::translate::Translate;
 
 use crate::room::{Cue, GameSettings, Players, ReplyMode, Role, Room, RoomConfig, Turn, TypedJob};
 use crate::tts::Voice;
@@ -286,22 +286,6 @@ enum Speak {
     Failed(u64, String),
 }
 
-/// A translator against the same endpoint as the replies. Its own
-/// shorter timeout: these sit in front of something somebody is waiting
-/// to read or hear, so two minutes of patience is no use to anyone.
-fn translator(llm: &Llm) -> Option<OpenAiTranslator> {
-    let Llm::Chat(c) = llm else {
-        return None;
-    };
-    Some(OpenAiTranslator::new(OpenAiConfig {
-        base_url: c.url.clone(),
-        model: c.model.clone(),
-        api_key: c.key.clone(),
-        vocabulary: Vec::new(),
-        timeout: Duration::from_secs(30),
-    }))
-}
-
 /// Typed messages waiting to be translated. Bounded: if translation
 /// falls this far behind, the room drops the work rather than let the
 /// queue grow without end -- the messages are on everyone's screen as
@@ -311,8 +295,10 @@ const TYPING_QUEUE: usize = 64;
 /// The queue typed messages are translated on, when there is a model to
 /// translate with. The two ends come out separately because the room
 /// needs the sending end to be built and the workers need the room.
-pub fn typing_queue(llm: &Llm) -> Option<(Sender<TypedJob>, Receiver<TypedJob>)> {
-    translator(llm)
+pub fn typing_queue(
+    translate: Option<&Arc<dyn Translate>>,
+) -> Option<(Sender<TypedJob>, Receiver<TypedJob>)> {
+    translate
         .is_some()
         .then(|| crossbeam_channel::bounded(TYPING_QUEUE))
 }
@@ -321,16 +307,21 @@ pub fn typing_queue(llm: &Llm) -> Option<(Sender<TypedJob>, Receiver<TypedJob>)>
 /// long one can't hold up the AI's own speech. A few of them, because a
 /// message typed in a room listening in three languages is three
 /// translations that may as well happen at once.
-pub fn spawn_typists(room: Arc<Room>, llm: &Llm, rx: Receiver<TypedJob>, workers: usize) {
+pub fn spawn_typists(
+    room: Arc<Room>,
+    translate: Arc<dyn Translate>,
+    rx: Receiver<TypedJob>,
+    workers: usize,
+) {
     for n in 0..workers.max(1) {
-        let Some(t) = translator(llm) else { return };
+        let t = translate.clone();
         let room = room.clone();
         let rx = rx.clone();
         std::thread::Builder::new()
             .name(format!("vox-room-typist-{n}"))
             .spawn(move || {
                 for job in rx {
-                    match t.translate(&job.text, &job.into, &[]) {
+                    match t.translate(&job.text, &job.from, &job.into, &[]) {
                         Ok(text) => room.typed_translated(&job.id, &job.into, &text),
                         // Logged once and no further: the message is
                         // readable as it was typed, which is the whole
@@ -364,20 +355,16 @@ pub struct Agent {
     pub llm: Llm,
     pub prompt: String,
     pub generation: Arc<AtomicU64>,
+    /// How the room puts a line into another language, or None when it
+    /// has no way to -- and then the other languages are written down
+    /// and spoken in the room's own.
+    pub translate: Option<Arc<dyn Translate>>,
 }
 
 impl Agent {
     /// Whether the AI has the `look_up` tool (lobby only, by design).
     fn searches(&self) -> bool {
         matches!(&self.llm, Llm::Chat(c) if c.search)
-    }
-
-    /// A translator against the same endpoint as the replies, for the
-    /// voices that speak a language the AI doesn't write in. Its own
-    /// shorter timeout: this one sits in front of the next sentence
-    /// being spoken, so waiting two minutes for it is no use to anyone.
-    fn translator(&self) -> Option<OpenAiTranslator> {
-        translator(&self.llm)
     }
 
     /// Start the agent thread and one voice thread per language. Turns
@@ -396,7 +383,9 @@ impl Agent {
             senders.push(tx);
             // The room's own language is what the AI already wrote, so
             // that one is spoken as it is.
-            let translate = (language != canonical).then(|| self.translator()).flatten();
+            let translate = (language != canonical)
+                .then(|| self.translate.clone())
+                .flatten();
             let generation = self.generation.clone();
             let r = room.clone();
             let canonical = canonical.clone();
@@ -566,7 +555,7 @@ fn speak(
     canonical: &str,
     language: &str,
     mut voice: Box<dyn Voice>,
-    translate: Option<OpenAiTranslator>,
+    translate: Option<Arc<dyn Translate>>,
     rx: Receiver<Speak>,
     generation: Arc<AtomicU64>,
 ) {
@@ -604,7 +593,7 @@ fn speak(
                 // Translate first, if this voice speaks another language.
                 let say = match &translate {
                     None => text.clone(),
-                    Some(t) => match t.translate(&text, language, &context) {
+                    Some(t) => match t.translate(&text, canonical, language, &context) {
                         Ok(s) => s,
                         Err(e) => {
                             warn!(g, language, "couldn't translate {text:?}: {e:#}");
@@ -1565,6 +1554,7 @@ mod tests {
             llm: Llm::Echo,
             prompt: DEFAULT_PROMPT.to_string(),
             generation: Arc::new(AtomicU64::new(0)),
+            translate: None,
         };
         let cfg = RoomConfig {
             agent_name: "Vox".into(),

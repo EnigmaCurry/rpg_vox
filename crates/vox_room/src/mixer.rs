@@ -359,38 +359,33 @@ impl Mixer {
         }
     }
 
-    /// How far the AI's turn has got, counted on the canonical queue.
-    pub fn ai_progress(&self) -> AiProgress {
+    /// How far the AI's turn has got in each language it is being said
+    /// in. Per language because each is read by whoever is listening in
+    /// it, and they drift: a translation is a different number of
+    /// syllables from the words it translates.
+    pub fn ai_progress(&self) -> BTreeMap<String, AiProgress> {
         let mut st = self.lock();
-        let canonical = st.canonical.clone();
-        match st.ai.get_mut(&canonical) {
-            Some(ai) => ai.progress(),
-            // Only before the first sentence is queued.
-            None => AiProgress {
-                idle: true,
-                ..AiProgress::default()
-            },
-        }
+        st.ai
+            .iter_mut()
+            .map(|(language, ai)| (language.clone(), ai.progress()))
+            .collect()
     }
 
-    /// Stop the AI now, in every language. Returns how far it got, as
+    /// Stop the AI now, in every language. Returns how far each got, as
     /// [`Mixer::ai_progress`].
-    pub fn ai_clear(&self) -> AiProgress {
+    pub fn ai_clear(&self) -> BTreeMap<String, AiProgress> {
         let mut st = self.lock();
-        let canonical = st.canonical.clone();
-        let mut progress = None;
+        let mut progress = BTreeMap::new();
         for (language, ai) in st.ai.iter_mut() {
-            if *language == canonical {
-                progress = Some(ai.progress());
-            }
+            let mut p = ai.progress();
             ai.queue.clear();
             ai.ducked = false;
             ai.duck = 1.0;
+            // Nothing is left to play, whatever was queued a moment ago.
+            p.idle = true;
+            progress.insert(language.clone(), p);
         }
-        progress.unwrap_or(AiProgress {
-            idle: true,
-            ..AiProgress::default()
-        })
+        progress
     }
 
     pub(crate) fn tick(&self) {
@@ -573,25 +568,35 @@ mod tests {
     }
 
     #[test]
-    fn the_ai_s_turn_is_counted_in_the_rooms_own_language_alone() {
+    fn each_language_of_the_ai_s_turn_is_counted_on_its_own() {
         let mixer = Mixer::new(BTreeMap::new(), "English");
-        // Half a frame of English, a whole frame of Russian: the same
-        // sentence of the same turn, said at different lengths.
+        // Half a frame of English, two frames of Russian: the same
+        // sentence of the same turn, said at different lengths. Whoever
+        // is reading along in Russian must be told how far the Russian
+        // has got, not how far the English has.
         mixer.ai_push("English", 7, 0, vec![0.5; FRAME / 2]);
-        mixer.ai_push("Russian", 7, 0, vec![0.5; FRAME]);
+        mixer.ai_push("Russian", 7, 0, vec![0.5; 2 * FRAME]);
         mixer.tick();
 
         let p = mixer.ai_progress();
         assert_eq!(
-            p.finished,
+            p["English"].finished,
             vec![(7, 0, FRAME / 2)],
             "the English sentence played to the end"
         );
-        assert!(p.idle, "and nothing of this turn is left in English");
-        // The Russian is still playing, but it was never the turn's
-        // measure, so the room has already recorded the turn as said.
+        assert!(p["English"].idle, "and nothing of it is left");
+        assert_eq!(
+            p["Russian"].current,
+            Some((7, 0, FRAME, 2 * FRAME)),
+            "the Russian is half said"
+        );
+        assert!(!p["Russian"].idle);
+
         mixer.tick();
-        assert!(mixer.ai_progress().finished.is_empty());
+        let p = mixer.ai_progress();
+        assert!(p["English"].finished.is_empty());
+        assert_eq!(p["Russian"].finished, vec![(7, 0, 2 * FRAME)]);
+        assert!(p["Russian"].idle, "now both are done");
     }
 
     #[test]
@@ -602,16 +607,20 @@ mod tests {
         mixer.tick();
 
         let p = mixer.ai_clear();
-        assert_eq!(
-            p.current,
-            Some((3, 0, FRAME, 10 * FRAME)),
-            "cut one frame in"
-        );
+        for language in ["English", "Russian"] {
+            assert_eq!(
+                p[language].current,
+                Some((3, 0, FRAME, 10 * FRAME)),
+                "{language} cut one frame in"
+            );
+            assert!(p[language].idle, "{language} has nothing left to play");
+        }
         // Nothing of either language is left to play: an interruption
         // ends the turn, not just the one rendition of it.
         mixer.tick();
-        let after = mixer.ai_progress();
-        assert!(after.idle && after.finished.is_empty() && after.current.is_none());
+        for (_, after) in mixer.ai_progress() {
+            assert!(after.idle && after.finished.is_empty() && after.current.is_none());
+        }
     }
 
     #[test]

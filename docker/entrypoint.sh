@@ -40,8 +40,8 @@ fetch() {
         "$RELEASES/$release/$stem.tar.bz2"
     tar -xjf "$tmp/archive.tar.bz2" -C "$tmp"
     mkdir -p "$dest"
-    for pair in "$@"; do
-        cp -r "$tmp/$stem/${pair%%:*}" "$dest/${pair##*:}"
+    for spec in "$@"; do
+        cp -r "$tmp/$stem/${spec%%:*}" "$dest/${spec##*:}"
     done
     rm -rf "$tmp"
     echo "vox_room: installed $dest"
@@ -57,10 +57,10 @@ fetch_raw() {
     shift 2
     mkdir -p "$dest"
     echo "vox_room: downloading $repo"
-    for pair in "$@"; do
-        curl -fL --retry 3 --progress-bar -o "$dest/${pair##*:}.part" \
-            "https://huggingface.co/$repo/resolve/main/${pair%%:*}"
-        mv "$dest/${pair##*:}.part" "$dest/${pair##*:}"
+    for spec in "$@"; do
+        curl -fL --retry 3 --progress-bar -o "$dest/${spec##*:}.part" \
+            "https://huggingface.co/$repo/resolve/main/${spec%%:*}"
+        mv "$dest/${spec##*:}.part" "$dest/${spec##*:}"
     done
     echo "vox_room: installed $dest"
 }
@@ -117,6 +117,31 @@ if [ "$STT" != none ]; then
                     lang/tokens.txt:tokens.txt
             ;;
     esac
+fi
+
+# Marian translation models, when the room is to translate without a
+# network. One model per direction, because that is the shape Marian
+# comes in. Their tokenizers are already in the image (see the
+# Dockerfile) and are copied in last, so a half-finished download is
+# never mistaken for a model that is ready to load.
+if [ "${VOX_ROOM_TRANSLATE:-openai}" = local ]; then
+    for pair in en-ru ru-en; do
+        baked="/usr/local/share/vox_room/translate/$pair/tokenizer.json"
+        d="$MODELS/translate/$pair"
+        if [ ! -f "$baked" ]; then
+            echo "vox_room: this image has no tokenizer for $pair" >&2
+            exit 1
+        fi
+        have "$d/model.bin" "$d/tokenizer.json" || {
+            fetch_raw "manancode/opus-mt-$pair-ctranslate2-android" "$d" \
+                model.bin:model.bin \
+                config.json:config.json \
+                shared_vocabulary.json:shared_vocabulary.json \
+                vocab.json:vocab.json
+            cp "$baked" "$d/tokenizer.json"
+            echo "vox_room: installed the $pair tokenizer"
+        }
+    done
 fi
 
 # The local voice, when there is no Qwen3-TTS server to talk to.

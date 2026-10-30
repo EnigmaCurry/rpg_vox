@@ -10,6 +10,14 @@ build = "build.rs"
 name = "vox_room"
 path = "src/main.rs"
 
+[features]
+default = ["translate-local"]
+# Marian translation on the CPU, for `--translate local`. It brings a
+# CMake build of CTranslate2 with it, linked statically, so the only
+# cost is build time -- and none of it is paid at runtime unless
+# `--translate local` is actually asked for.
+translate-local = ["vox_transcribe/ct2"]
+
 [dependencies]
 vox_transcribe = { path = "../vox_transcribe", features = ["llm", "sherpa-static"] }
 tokio.workspace = true

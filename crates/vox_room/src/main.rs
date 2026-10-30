@@ -156,6 +156,16 @@ struct Cli {
     /// Kokoro voice.
     #[arg(long, env = "VOX_ROOM_KOKORO_VOICE", default_value = "am_michael")]
     kokoro_voice: String,
+    /// Who translates, when the room is listening in more than one
+    /// language. `openai` asks the same model that writes the replies:
+    /// it follows instructions, so a URL or a command comes back
+    /// untouched, and it can be shown the lines before this one -- but
+    /// it costs a round trip, about two seconds a sentence. `local`
+    /// asks Marian models on the CPU, about forty times faster and with
+    /// no network at all, but it only leaves alone what is put in
+    /// backticks. Needs the models: see ROOM.md.
+    #[arg(long, env = "VOX_ROOM_TRANSLATE", default_value = "openai")]
+    translate: TranslateKind,
 }
 
 #[derive(Subcommand)]
@@ -166,6 +176,15 @@ enum Cmd {
     Uninvite { name: String },
     /// List everyone invited, with the links not yet used.
     People,
+}
+
+/// Who puts a line into another language.
+#[derive(Clone, Copy, ValueEnum, PartialEq)]
+enum TranslateKind {
+    /// The same chat model that writes the replies.
+    Openai,
+    /// Marian models on this machine, through CTranslate2.
+    Local,
 }
 
 #[derive(Clone, Copy, ValueEnum, PartialEq)]
@@ -210,6 +229,28 @@ fn canonical_language(name: &str) -> String {
             name.to_string()
         }
     }
+}
+
+/// The local translator, when this build has one. Behind a feature
+/// because it brings a C++ library and a CMake build with it; the flag
+/// says plainly what to do when it isn't there, rather than quietly
+/// falling back to the network the operator asked to do without.
+#[cfg(feature = "translate-local")]
+fn local_translator(
+    models_dir: &std::path::Path,
+    languages: &[String],
+) -> Result<Arc<dyn vox_transcribe::translate::Translate>> {
+    let t = vox_transcribe::ct2::Ct2Translator::load(models_dir, languages)?;
+    info!(directions = %t.directions().join(", "), "translating: locally, on the CPU");
+    Ok(Arc::new(t))
+}
+
+#[cfg(not(feature = "translate-local"))]
+fn local_translator(
+    _models_dir: &std::path::Path,
+    _languages: &[String],
+) -> Result<Arc<dyn vox_transcribe::translate::Translate>> {
+    bail!("--translate local needs a build with the `translate-local` feature")
 }
 
 fn data_dir(cli: &Cli) -> PathBuf {
@@ -512,24 +553,53 @@ fn serve(cli: Cli, store: Store) -> Result<()> {
         engaged_for: Duration::from_millis(cli.engaged_for_ms),
         history: cli.history,
         language: language.clone(),
-        languages: cfg_languages,
+        languages: cfg_languages.clone(),
     };
+    // Who translates, when there is more than one language and a model
+    // to do it with. Built once and shared: the local one is 75 MB of
+    // weights per direction, and every voice thread reads the same copy.
+    let translate: Option<Arc<dyn vox_transcribe::translate::Translate>> = match cli.translate {
+        _ if cfg_languages.len() < 2 => None,
+        TranslateKind::Openai => match &llm {
+            agent::Llm::Chat(c) => {
+                info!(model = %c.model, "translating: the reply model");
+                Some(Arc::new(vox_transcribe::openai::OpenAiTranslator::new(
+                    vox_transcribe::openai::OpenAiConfig {
+                        base_url: c.url.clone(),
+                        model: c.model.clone(),
+                        api_key: c.key.clone(),
+                        vocabulary: Vec::new(),
+                        // Shorter than a reply's: a translation sits in
+                        // front of something somebody is waiting to hear.
+                        timeout: Duration::from_secs(30),
+                    },
+                )))
+            }
+            // --echo has no model to ask.
+            agent::Llm::Echo => None,
+        },
+        TranslateKind::Local => Some(local_translator(&models_dir, &cfg_languages)?),
+    };
+
     // The two ends of the typing queue are handed out separately: the
     // room is built with the one it puts work on, the translators get
     // the other once there is a room for them to report back to.
-    let typing = agent::typing_queue(&llm);
+    let typing = agent::typing_queue(translate.as_ref());
     let (typing_tx, typing_rx) = match typing {
         Some((tx, rx)) => (Some(tx), Some(rx)),
         None => (None, None),
     };
     let room = Room::new(store, cfg, generation.clone(), turn_tx, typing_tx, factory)?;
     if let Some(rx) = typing_rx {
-        agent::spawn_typists(room.clone(), &llm, rx, 2);
+        if let Some(t) = translate.clone() {
+            agent::spawn_typists(room.clone(), t, rx, 2);
+        }
     }
     room.mixer.spawn();
     agent::Agent {
         llm,
         prompt,
+        translate,
         generation,
     }
     .spawn(room.clone(), voices, turn_rx);

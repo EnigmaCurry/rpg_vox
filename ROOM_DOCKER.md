@@ -81,6 +81,18 @@ naming `Russian` adds the Russian streaming model (~28 MB) — that pass
 is the one that needs a model per language, since Parakeet works the
 language out from the audio by itself.
 
+`VOX_ROOM_TRANSLATE=local` adds the Marian translation models, about
+80 MB a direction, and then nothing anyone says leaves the container.
+Their *tokenizers* are not downloaded: they are converted from the
+models' SentencePiece files during `docker compose build`, in a stage
+that has Python for exactly that long, and baked into the image — the
+room cannot read a `.spm` itself, because the SentencePiece library's
+protobuf and the copy inside sherpa-onnx's static libs are two versions
+of the same symbols. The entrypoint puts the baked tokenizer beside the
+weights it downloads, last, so a half-finished download is never taken
+for a model that is ready. The build fails rather than the room if a
+converted tokenizer would split text differently from the `.spm`.
+
 Expect the first `up` to sit there for a few minutes. The healthcheck has
 a 15-minute `start_period` to cover it. After that the volume has them
 and startup is seconds; the entrypoint checks for the files and skips

@@ -15,6 +15,7 @@ use serde_json::json;
 use tracing::warn;
 
 use crate::correct::{Corrector, Edit};
+use crate::translate::Translate;
 
 /// Where the LLM is unless VOX_SCRIBE_LLM_URL says otherwise: a local
 /// OpenAI-compatible server (llama.cpp, ollama, vLLM, …).
@@ -329,6 +330,26 @@ impl OpenAiTranslator {
         let out: Translated = serde_json::from_str(json_object(&reply)?)
             .with_context(|| format!("bad translation JSON: {reply}"))?;
         Ok(out.text.trim().to_string())
+    }
+}
+
+impl Translate for OpenAiTranslator {
+    /// `from` is ignored: the model reads the line and knows what it is
+    /// in, which is the whole reason it can be given mixed-language
+    /// speech and still answer in one language.
+    fn translate(&self, text: &str, _from: &str, into: &str, context: &[String]) -> Result<String> {
+        OpenAiTranslator::translate(self, text, into, context)
+    }
+
+    /// It is told to copy anything that isn't prose through character
+    /// for character, and it does: see `TRANSLATE`. Backticks help it
+    /// but are not what makes it work.
+    fn needs_backticks(&self) -> bool {
+        false
+    }
+
+    fn name(&self) -> &'static str {
+        "openai"
     }
 }
 

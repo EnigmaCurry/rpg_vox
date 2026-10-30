@@ -15,6 +15,14 @@ sherpa-shared = ["sherpa", "sherpa-onnx/shared"]
 sherpa-static = ["sherpa", "sherpa-onnx/static"]
 # OpenAI-compatible chat client for the pass-4 corrector.
 llm = ["dep:ureq", "dep:serde_json"]
+# Marian translation on the CPU through CTranslate2, for a room that
+# translates without a network. `ruy` is its own CPU backend;
+# `tokenizers` is the pure-Rust one, which is what keeps this buildable
+# at all -- see `ct2::TOKENIZER` for why a SentencePiece tokenizer
+# cannot be in the same binary as sherpa-onnx. CTranslate2 itself is
+# built by cmake and linked statically, so nothing has to be installed
+# alongside the binary, the same arrangement sherpa-onnx already uses.
+ct2 = ["dep:ct2rs"]
 # Experimental DeepFilterNet 3 noise filter (EngineConfig::denoise).
 deepfilter = ["dep:deep_filter", "dep:ndarray"]
 
@@ -32,5 +40,6 @@ sherpa-onnx = { version = "1.13.7", default-features = false, optional = true }
 # Its link mode comes from sherpa-onnx's static/shared feature.
 sherpa-onnx-sys = { version = "1.13.7", default-features = false, optional = true }
 # Not on crates.io with the tract backend; the model is built in.
+ct2rs = { version = "0.10", default-features = false, features = ["ruy", "tokenizers"], optional = true }
 deep_filter = { git = "https://github.com/Rikorose/DeepFilterNet", tag = "v0.5.6", default-features = false, features = ["tract", "default-model"], optional = true }
 ndarray = { version = "0.15", optional = true }

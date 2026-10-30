@@ -416,6 +416,12 @@ struct Reply {
     /// nothing on anyone's screen.
     cue: Cue,
     sentences: Vec<Said>,
+    /// The same reply in each other language it is being said in, by
+    /// language. Followed exactly as `sentences` is -- by how much of
+    /// each sentence's audio has played -- so that whoever is reading a
+    /// translation reads it at the pace they are hearing it, rather than
+    /// being handed the whole reply the moment it was translated.
+    translated: BTreeMap<String, Vec<Said>>,
     /// The agent has sent everything it is going to say.
     complete: bool,
     /// The last words it answers, and when it was asked: for timings.
@@ -487,6 +493,9 @@ pub struct Room {
 pub struct TypedJob {
     pub id: String,
     pub text: String,
+    /// The language it was typed in. A chat model works this out for
+    /// itself; a Marian model is one direction only and has to be told.
+    pub from: String,
     pub into: String,
 }
 
@@ -1833,7 +1842,7 @@ impl Room {
     /// is not competing for the air. Err says why not.
     pub fn typed(&self, person: &str, text: &str) -> Result<(), String> {
         let text = sanitize_typed(text)?;
-        let (entry, targets) = {
+        let (entry, targets, mine) = {
             let mut st = self.lock();
             if !st.people.contains_key(person) {
                 return Err("The room doesn't know you.".into());
@@ -1879,7 +1888,7 @@ impl Room {
                 .collect();
             st.log.push(entry.clone());
             trim_log(&mut st.log);
-            (entry, targets)
+            (entry, targets, mine)
         };
         info!(person, chars = entry.text.chars().count(), "typed");
         self.emit_entry(&entry);
@@ -1888,6 +1897,7 @@ impl Room {
                 let job = TypedJob {
                     id: entry.id.clone(),
                     text: entry.text.clone(),
+                    from: mine.clone(),
                     into,
                 };
                 // Dropped rather than waited on: a backed-up translator
@@ -1985,45 +1995,58 @@ impl Room {
             return false;
         }
         let mut st = self.lock();
-        // The reply if it is still running, and otherwise the turn it
-        // belongs to, which on a short one has already finished speaking
-        // in the room's own language while this was being translated.
-        // Dropping it here was how a listener came to be left with a
-        // translation that never arrived and never spoke.
-        let id = match st.reply.as_ref() {
-            Some(r) if r.generation == generation => r.entry.clone(),
-            Some(_) => return false,
-            None => match &st.last_reply {
-                Some((g, id)) if *g == generation => id.clone(),
-                _ => return false,
-            },
-        };
-        // Put it on the entry as well as in the queue, so whoever is
-        // listening in this language reads what they are hearing rather
-        // than the language it was written in. Sentence by sentence, as
-        // each is spoken: the room's own language is tracked finer than
-        // that, by how much of its audio has played, because that one is
-        // the record of the turn and this is a reading aid.
         let conversation = st.conversation;
-        let entry = st.log.iter_mut().find(|e| e.id == id).map(|e| {
-            let said = e.translations.entry(language.to_string()).or_default();
-            if !said.is_empty() {
-                said.push(' ');
+        match st.reply.as_mut() {
+            // The usual way: the turn is still being spoken, so this
+            // goes on its language's list and the entry picks it up from
+            // there as the audio plays, a word at a time, exactly as the
+            // room's own language does.
+            Some(r) if r.generation == generation => {
+                r.translated
+                    .entry(language.to_string())
+                    .or_default()
+                    .push(Said {
+                        text: text.to_string(),
+                        samples: samples.len(),
+                        played: 0,
+                    });
+                drop(st);
+                self.mixer.ai_push(language, generation, index, samples);
+                true
             }
-            said.push_str(text.trim());
-            e.clone()
-        });
-        drop(st);
-        self.mixer.ai_push(language, generation, index, samples);
-        if let Some(e) = entry {
-            if e.sent {
-                if let Err(err) = self.store().put_entry(conversation, &e) {
-                    warn!("store entry: {err:#}");
+            Some(_) => false,
+            // The turn finished before this came back -- a translation
+            // slower than everything there was left to play. There is
+            // nothing to follow it with any more, so it goes straight on
+            // to the entry, which is where it would have ended up.
+            None => {
+                let Some((g, id)) = st.last_reply.clone() else {
+                    return false;
+                };
+                if g != generation {
+                    return false;
                 }
+                let entry = st.log.iter_mut().find(|e| e.id == id).map(|e| {
+                    let said = e.translations.entry(language.to_string()).or_default();
+                    if !said.is_empty() {
+                        said.push(' ');
+                    }
+                    said.push_str(text.trim());
+                    e.clone()
+                });
+                drop(st);
+                self.mixer.ai_push(language, generation, index, samples);
+                if let Some(e) = entry {
+                    if e.sent {
+                        if let Err(err) = self.store().put_entry(conversation, &e) {
+                            warn!("store entry: {err:#}");
+                        }
+                    }
+                    self.emit_entry(&e);
+                }
+                true
             }
-            self.emit_entry(&e);
         }
-        true
     }
 
     /// The reply `generation` has nothing more to say.
@@ -2077,34 +2100,75 @@ impl Room {
 
     /// Bring the AI's entry up to what the mixer has played; finish the
     /// reply once everything has been.
-    fn follow_reply(&self, st: &mut State, progress: Option<AiProgress>) {
+    fn follow_reply(&self, st: &mut State, progress: Option<BTreeMap<String, AiProgress>>) {
         let Some(r) = st.reply.as_mut() else {
             return;
         };
-        let p = progress.unwrap_or_else(|| self.mixer.ai_progress());
-        for (g, i, n) in &p.finished {
-            if *g == r.generation {
-                if let Some(s) = r.sentences.get_mut(*i) {
-                    s.played = *n;
+        let all = progress.unwrap_or_else(|| self.mixer.ai_progress());
+        // Each language's sentences advance by its own queue: a
+        // translation is a different length from the words it
+        // translates, so they are at different points in the reply.
+        let mut idle = true;
+        let mut played_out = true;
+        for (language, said) in std::iter::once((&self.cfg.language, &mut r.sentences)).chain(
+            r.translated
+                .iter_mut()
+                .map(|(language, said)| (language, said)),
+        ) {
+            let Some(p) = all.get(language.as_str()) else {
+                // Nothing of it in the mixer at all, so there is nothing
+                // left to play. Whether it has been *said* is the
+                // played-out test below: a sentence translated a moment
+                // ago is on this list before its audio reaches the
+                // mixer, and that counts as unfinished.
+                continue;
+            };
+            for (g, i, n) in &p.finished {
+                if *g == r.generation {
+                    if let Some(s) = said.get_mut(*i) {
+                        s.played = *n;
+                    }
                 }
             }
-        }
-        if let Some((g, i, played, _)) = p.current {
-            if g == r.generation {
-                if let Some(s) = r.sentences.get_mut(i) {
-                    s.played = played;
+            if let Some((g, i, played, _)) = p.current {
+                if g == r.generation {
+                    if let Some(s) = said.get_mut(i) {
+                        s.played = played;
+                    }
                 }
             }
+            idle &= p.idle;
+            played_out &= said.iter().all(|s| s.played >= s.samples);
         }
+        // What each language has been heard to say so far, for whoever
+        // is reading in it.
+        let translations: Vec<(String, String)> = r
+            .translated
+            .iter()
+            .map(|(language, said)| (language.clone(), heard(said)))
+            .collect();
         let text = heard(&r.sentences);
-        let finished = r.complete && p.idle && r.sentences.iter().all(|s| s.played >= s.samples);
+        // Over when every language is: the turn is still being spoken
+        // while anyone is still hearing it. Waiting costs the next turn
+        // a moment, and buys a translated listener the whole reply
+        // instead of as much of it as the room's own language took.
+        let finished = r.complete && idle && played_out;
         let id = r.entry.clone();
         let conversation = st.conversation;
         let Some(e) = st.log.iter_mut().find(|e| e.id == id) else {
             return;
         };
-        let changed = e.text != text;
+        let changed = e.text != text
+            || translations
+                .iter()
+                .any(|(l, t)| e.translations.get(l) != Some(t));
         e.text = text;
+        for (language, said) in translations {
+            if said.is_empty() {
+                continue;
+            }
+            e.translations.insert(language, said);
+        }
         if finished {
             e.live = false;
         }
@@ -2189,9 +2253,25 @@ impl Room {
         st.ducked = false;
         self.follow_reply(st, Some(p));
         let Some(r) = st.reply.take() else {
+            // follow_reply saw the whole turn played out in every
+            // language and closed it properly. Nothing was cut.
             return;
         };
         let text = heard(&r.sentences);
+        // The turn stays open until the slowest translation has been
+        // heard, so someone on the room's own language can speak over
+        // the tail of a reply they have already heard to the end. That
+        // is not an interruption of anything they heard.
+        if r.complete && r.sentences.iter().all(|s| s.played >= s.samples) {
+            if let Some(e) = st.log.iter_mut().find(|e| e.id == r.entry) {
+                e.live = false;
+                if let Err(err) = self.store().put_entry(st.conversation, e) {
+                    warn!("store entry: {err:#}");
+                }
+                self.emit_entry(e);
+            }
+            return;
+        }
         let conversation = st.conversation;
         if text.is_empty() {
             st.log.retain(|e| e.id != r.entry);
@@ -2200,6 +2280,14 @@ impl Room {
         }
         if let Some(e) = st.log.iter_mut().find(|e| e.id == r.entry) {
             e.text = format!("{text} —");
+            // Each translation stopped where its own voice did, so each
+            // says so for itself -- a Russian reader was cut off in a
+            // different place from an English listener.
+            for said in e.translations.values_mut() {
+                if !said.is_empty() {
+                    said.push_str(" —");
+                }
+            }
             e.cut = true;
             e.live = false;
             if let Err(err) = self.store().put_entry(conversation, e) {
@@ -2311,6 +2399,7 @@ impl Room {
             entry: entry.id.clone(),
             cue,
             sentences: Vec::new(),
+            translated: BTreeMap::new(),
             complete: false,
             heard: st.quiet_since,
             asked: now,
@@ -3014,48 +3103,91 @@ mod tests {
     }
 
     #[test]
-    fn a_translated_voice_is_spoken_but_never_counted_as_the_turn() {
+    fn a_cut_reply_keeps_only_what_was_said_in_each_language() {
         let (r, turns) = room(Mode::Named);
         let g = speaking(&r, &turns);
-        // The Russian rendition of the first sentence, longer than the
-        // English one, as a translation usually is.
-        assert!(r.agent_speak_translated(g, "Russian", 0, "Жил-был дракон.", vec![0.1; 96_000]));
+        let ru = "Жил-был очень старый дракон.";
+        assert!(r.agent_speak_translated(g, "Russian", 0, ru, vec![0.1; 96_000]));
+        // Half of the English played, a quarter of the Russian.
+        for _ in 0..25 {
+            r.mixer.tick();
+        }
+        r.tick(Instant::now());
+        // Somebody on the room's own language talks over it.
+        r.on_level("Alex", true);
+        let since = Instant::now();
+        r.tick(since);
+        r.tick(since + Duration::from_millis(400));
+        let e = agent_entry(&r);
+        assert!(e.cut && !e.live);
+        assert_eq!(e.text, "Once upon a time —");
+        // The Russian stopped in a different place, because its voice
+        // was in a different place, and it says so where it stopped.
+        assert_eq!(e.translations["Russian"], "Жил-был —");
+    }
 
-        // Half of the English sentence played: the entry's own text says
-        // exactly what it said before, with nothing of the Russian in
-        // it -- that one is the record of the turn, counted by how much
-        // audio has played.
+    #[test]
+    fn a_translation_is_read_at_the_pace_it_is_heard() {
+        let (r, turns) = room(Mode::Named);
+        let g = speaking(&r, &turns);
+        // The whole reply in Russian, queued in a moment -- translating
+        // on the CPU takes about fifty milliseconds a sentence -- and
+        // twice as long to say as the English it translates.
+        let ru0 = "Жил-был очень старый дракон.";
+        let ru1 = "Он был очень стар.";
+        assert!(r.agent_speak_translated(g, "Russian", 0, ru0, vec![0.1; 96_000]));
+        assert!(r.agent_speak_translated(g, "Russian", 1, ru1, vec![0.1; 96_000]));
+
+        // Half of the English played, and so a quarter of the Russian.
+        // Whoever is reading in Russian reads it as they hear it -- not
+        // the whole reply the instant it was translated, which is what
+        // reading it at the pace of the English would mean.
         for _ in 0..25 {
             r.mixer.tick();
         }
         r.tick(Instant::now());
         assert_eq!(agent_entry(&r).text, "Once upon a time");
-        // The Russian rides alongside, for whoever is reading in it.
+        assert_eq!(russian(&r), "Жил-был");
+
+        for _ in 0..25 {
+            r.mixer.tick();
+        }
+        r.tick(Instant::now());
         assert_eq!(
-            agent_entry(&r)
-                .translations
-                .get("Russian")
-                .map(String::as_str),
-            Some("Жил-был дракон.")
+            agent_entry(&r).text,
+            "Once upon a time there was a dragon.",
+            "the English is a sentence on"
+        );
+        assert_eq!(
+            russian(&r),
+            "Жил-был очень",
+            "and the Russian is two words in"
         );
 
-        // And the reply still finishes when the English does, rather
-        // than waiting on a rendition nobody is counting.
-        for _ in 0..200 {
+        // The English finishes first. The turn is not over: half the
+        // Russian is still to be heard, and ending it here would take
+        // the rest of the reply away from whoever is listening to it.
+        for _ in 0..50 {
             r.mixer.tick();
         }
         r.tick(Instant::now());
         let e = agent_entry(&r);
-        assert!(!e.live, "the turn is over: {:?}", e.text);
         assert_eq!(
             e.text,
             "Once upon a time there was a dragon. It was very old."
         );
-        // Sentences accumulate in the order they were spoken.
-        assert_eq!(
-            e.translations.get("Russian").map(String::as_str),
-            Some("Жил-был дракон.")
-        );
+        assert!(e.live, "still being said, in Russian");
+        assert_eq!(e.translations["Russian"], ru0);
+        assert!(r.lock().reply.is_some());
+
+        for _ in 0..150 {
+            r.mixer.tick();
+        }
+        r.tick(Instant::now());
+        let e = agent_entry(&r);
+        assert!(!e.live, "now every language has been heard");
+        assert!(!e.cut, "and nobody cut it");
+        assert_eq!(e.translations["Russian"], format!("{ru0} {ru1}"));
         // What the model is shown is still the one language it writes
         // in: a translation of its own words is not news to it.
         let msgs = conversation_messages(&r.lock().log, 50);
@@ -3064,18 +3196,16 @@ mod tests {
             last,
             "Once upon a time there was a dragon. It was very old."
         );
-        // A translation that turns up after the room's own language has
-        // finished speaking still arrives. It has to: it is two or three
-        // seconds behind the words it translates, and a short reply is
-        // over in less than that, so dropping it here left a listener
-        // with a translation that never came and never spoke.
-        assert!(r.agent_speak_translated(g, "Russian", 1, "Он был стар.", vec![0.1; 4800]));
+
+        // A translation that turns up after the turn has closed still
+        // arrives. It has to: a sentence the translator was slow with
+        // has nothing left to follow, and dropping it here left a
+        // listener with a translation that never came and never spoke.
+        let ru2 = "И всё.";
+        assert!(r.agent_speak_translated(g, "Russian", 2, ru2, vec![0.1; 4800]));
         assert_eq!(
-            agent_entry(&r)
-                .translations
-                .get("Russian")
-                .map(String::as_str),
-            Some("Жил-был дракон. Он был стар."),
+            russian(&r),
+            format!("{ru0} {ru1} {ru2}"),
             "the rest of the reply, in the order it was spoken"
         );
 
@@ -3083,14 +3213,16 @@ mod tests {
         // been cut or another given out, the counter has moved on and
         // these are words nobody is waiting for.
         r.generation.fetch_add(1, Ordering::SeqCst);
-        assert!(!r.agent_speak_translated(g, "Russian", 2, "И всё.", vec![0.1; 4800]));
-        assert_eq!(
-            agent_entry(&r)
-                .translations
-                .get("Russian")
-                .map(String::as_str),
-            Some("Жил-был дракон. Он был стар.")
-        );
+        assert!(!r.agent_speak_translated(g, "Russian", 3, "Конец.", vec![0.1; 4800]));
+        assert_eq!(russian(&r), format!("{ru0} {ru1} {ru2}"));
+    }
+
+    fn russian(r: &Room) -> String {
+        agent_entry(r)
+            .translations
+            .get("Russian")
+            .cloned()
+            .unwrap_or_default()
     }
 
     #[test]

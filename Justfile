@@ -395,6 +395,41 @@ download-streaming-stt-model-ru:
     done
     echo "installed streaming-zipformer-ru model → $dest/"
 
+# Download the Russian translation models into models/translate/, for
+# `vox_room --translate local`: Marian through CTranslate2, on the CPU,
+# with no network once the files are here. Two models, because Marian is
+# one direction each (int8, ~80 MB apiece).
+#
+# Each also gets a tokenizer.json written from its source.spm. That file
+# is why this is a recipe and not a plain download: the SentencePiece
+# library cannot go in the same binary as sherpa-onnx (their protobufs
+# are different versions of the same symbols), so the room reads the
+# model with the pure-Rust tokenizer instead -- and nobody publishes a
+# tokenizer.json for opus-mt. tools/spm2tokenizer.py writes one and
+# checks it splits text exactly as the .spm does.
+download-translate-model-ru:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for pair in en-ru ru-en; do
+      dest="models/translate/$pair"
+      if [ -f "$dest/model.bin" ] && [ -f "$dest/tokenizer.json" ]; then
+        echo "translate/$pair already present at $dest/"
+        continue
+      fi
+      base="https://huggingface.co/manancode/opus-mt-$pair-ctranslate2-android/resolve/main"
+      mkdir -p "$dest"
+      for f in model.bin config.json shared_vocabulary.json source.spm target.spm vocab.json; do
+        echo "downloading $pair/$f …"
+        curl -fL --progress-bar -o "$dest/$f.part" "$base/$f"
+        mv "$dest/$f.part" "$dest/$f"
+      done
+      # Written last, so a half-finished download is never mistaken for
+      # a model that is ready to load.
+      nix-shell -p 'python3.withPackages(ps: [ps.sentencepiece ps.tokenizers])' \
+        --run "python3 tools/spm2tokenizer.py '$dest'"
+    done
+    echo "installed translation models → models/translate/"
+
 # --- vox_scribe (standalone live transcription TUI) ---
 
 # Download the speaker models for `scribe --diarize` into

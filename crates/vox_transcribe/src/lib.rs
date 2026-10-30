@@ -18,6 +18,8 @@
 
 pub mod boundary;
 pub mod correct;
+#[cfg(feature = "ct2")]
+pub mod ct2;
 pub mod denoise;
 pub mod diarize;
 pub mod digits;
@@ -36,6 +38,7 @@ pub mod speaker;
 pub mod stderr;
 pub mod subtitle;
 pub mod timing;
+pub mod translate;
 #[cfg(feature = "sherpa")]
 pub mod tts;
 pub mod vad;
