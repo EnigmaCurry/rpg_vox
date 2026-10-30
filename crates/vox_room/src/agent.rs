@@ -632,7 +632,7 @@ fn speak(
                         let kept = if own {
                             room.agent_speak(g, &say, samples)
                         } else {
-                            room.agent_speak_translated(g, language, index, samples)
+                            room.agent_speak_translated(g, language, index, &say, samples)
                         };
                         if !kept {
                             debug!(g, language, "reply dropped while it was synthesized");

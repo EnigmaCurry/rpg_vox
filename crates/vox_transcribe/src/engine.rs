@@ -1056,11 +1056,26 @@ impl Core {
         text: anyhow::Result<Transcription>,
         speaker: Option<String>,
     ) {
+        let failed = text.is_err();
         let t = text.unwrap_or_else(|err| {
             warn!(err = %format!("{err:#}"), "pass 2 decode failed");
             Transcription::default()
         });
         let mut text = t.text.trim().to_string();
+        if failed {
+            // A decode that failed does not know what was said, which is
+            // not the same as nothing having been said -- and the empty
+            // string it leaves behind would read as the latter, taking
+            // the clip, and with it usually the whole paragraph, out of
+            // a transcript somebody was already reading. Stand by what
+            // pass 1 heard instead, and let it be the final word.
+            if let Some((pi, ci)) = self.find_clip(&clip_id) {
+                let heard = self.transcript.paragraphs[pi].clips[ci].text.trim();
+                if !heard.is_empty() {
+                    text = heard.to_string();
+                }
+            }
+        }
         debug!(clip = %clip_id, start_ms, duration_ms, ?reason, %text, "pass 2");
         if self.cfg.spoken_digits {
             text = spoken_digits(&text);

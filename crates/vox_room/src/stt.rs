@@ -120,19 +120,24 @@ impl Models {
 
     fn engine(&self, person: &str, language: &str, room: Arc<Room>) -> Result<Pusher> {
         let cfg = EngineConfig::new(RATE);
+        // Found whatever case the language was spelled in: a room started
+        // with `english` in its environment must still find the model
+        // filed under `English`, rather than quietly go without.
+        let model = self
+            .streaming
+            .iter()
+            .find(|(l, _)| l.eq_ignore_ascii_case(language))
+            .map(|(_, z)| z);
         // No model for their language: they still get the decoded text,
         // just not while they are still speaking. Worth saying out loud,
         // because the difference is visible to everyone in the room.
-        if !self.streaming.contains_key(language) {
+        if model.is_none() {
             info!(
                 person,
                 language, "no streaming model for this language: text appears a phrase behind"
             );
         }
-        let streaming = self
-            .streaming
-            .get(language)
-            .map(|z| Box::new(z.session()) as Box<dyn StreamingRecognizer>);
+        let streaming = model.map(|z| Box::new(z.session()) as Box<dyn StreamingRecognizer>);
         let engine = Engine::spawn(cfg, streaming, self.offline.clone());
         let pusher = engine.pusher();
         let events = engine.events().clone();

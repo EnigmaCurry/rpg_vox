@@ -11,9 +11,18 @@ pub fn count_words(text: &str) -> usize {
     text.split_whitespace().count()
 }
 
-/// SenseVoice hallucinations on near-silent or non-speech audio: the
-/// lone "I." / "The." decodes, and tiny non-Latin fragments (one or two
-/// CJK characters, a stray digit) with no whitespace.
+/// Hallucinations on near-silent or non-speech audio: the lone "I." /
+/// "The." decodes, a stray digit, and the one or two CJK characters
+/// SenseVoice emits when it has heard nothing.
+///
+/// A one- or two-character result is only suspect where it is unlikely
+/// to be a word. In CJK it is, which is what this was written for. In an
+/// alphabetic script it is not: "Да", "Я", "Hi" and "OK" are things
+/// somebody said. This used to ask whether the text had any ASCII
+/// letters in it, which came to the same thing while the recognizer only
+/// spoke English -- but Parakeet v3 has 25 languages, and the question
+/// started deleting the most ordinary words in half of them. A line
+/// vanishing out of the log after pass 1 had shown it is how that looked.
 pub fn is_false_positive(text: &str) -> bool {
     let trimmed = text.trim();
     if matches!(trimmed, "I." | "The.") {
@@ -22,11 +31,25 @@ pub fn is_false_positive(text: &str) -> bool {
     if trimmed.chars().any(char::is_whitespace) {
         return false;
     }
-    if trimmed.chars().any(|c| c.is_ascii_alphabetic()) {
+    let content: Vec<char> = trimmed.chars().filter(|c| c.is_alphanumeric()).collect();
+    if content.is_empty() || content.len() > 2 {
         return false;
     }
-    let content_chars = trimmed.chars().filter(|c| c.is_alphanumeric()).count();
-    content_chars > 0 && content_chars <= 2
+    content.iter().all(|c| is_cjk(*c) || c.is_ascii_digit())
+}
+
+/// Chinese, Japanese or Korean: the scripts where a lone character is
+/// more likely to be a recognizer's idea of silence than a word.
+fn is_cjk(c: char) -> bool {
+    matches!(c,
+        '\u{3040}'..='\u{30ff}'   // hiragana and katakana
+        | '\u{3100}'..='\u{312f}' // bopomofo
+        | '\u{3400}'..='\u{4dbf}' // CJK extension A
+        | '\u{4e00}'..='\u{9fff}' // CJK unified ideographs
+        | '\u{ac00}'..='\u{d7af}' // hangul syllables
+        | '\u{1100}'..='\u{11ff}' // hangul jamo
+        | '\u{ff66}'..='\u{ff9d}' // halfwidth katakana
+    )
 }
 
 /// Pass-2 junk test: empty, punctuation-only, or a known false positive.
@@ -210,6 +233,30 @@ mod tests {
         assert!(!is_false_positive("I am."));
         assert!(is_junk("  ...  "));
         assert!(!is_junk("hello"));
+    }
+
+    #[test]
+    fn a_short_word_is_a_word_whatever_the_alphabet() {
+        // What the multilingual recognizer actually sends back, and what
+        // used to be deleted on the way to the log for having no ASCII
+        // letters in it. "Да" is the commonest word in Russian.
+        for said in ["Да.", "Да", "Я", "Ну", "Не", "Ок", "Hi", "OK", "I", "Nu"] {
+            assert!(!is_false_positive(said), "{said} is a word");
+            assert!(!is_junk(said), "{said} is a word");
+        }
+        // Greek and Ukrainian go the same way.
+        assert!(!is_false_positive("Ναι"));
+        assert!(!is_false_positive("Та"));
+
+        // The hallucinations this was written for are still caught: one
+        // or two characters of CJK, or a stray digit, where a decode of
+        // near-silence lands.
+        for noise in ["嗯", "好", "はい", "ん", "네", "1", "42", "I.", "The."] {
+            assert!(is_false_positive(noise), "{noise} is noise");
+            assert!(is_junk(noise), "{noise} is noise");
+        }
+        // Three characters is a phrase, not a tic, in any script.
+        assert!(!is_false_positive("你好吗"));
     }
 
     #[test]

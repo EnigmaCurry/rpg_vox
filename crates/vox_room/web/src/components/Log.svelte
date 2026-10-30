@@ -15,13 +15,31 @@
   const languageOf = (who) =>
     room.people.find((p) => p.name === who)?.language || roomLanguage;
 
-  /// What a typed message says in your language: the translation when
-  /// there is one, `null` while it is still coming, and undefined when
-  /// the message is already in your language and needs none.
-  function forYou(e) {
-    if (!e.typed || languageOf(e.who) === mine) return undefined;
-    return e.translations?.[mine] ?? null;
+  /// An entry that has a translation for you: which language it was
+  /// written in, and what it says in yours (`null` while that is still
+  /// coming). `null` for an entry that needs no translation at all.
+  ///
+  /// The AI writes in the room's own language whatever it was asked in,
+  /// so its replies are translated for anyone reading in another; a
+  /// typed message is in whatever its author reads in. What people say
+  /// out loud is not translated yet.
+  function pair(e) {
+    const from = e.kind === 'agent' ? roomLanguage : languageOf(e.who);
+    if (!from || from === mine) return null;
+    if (e.kind !== 'agent' && !e.typed) return null;
+    return { from, text: e.translations?.[mine] ?? null };
   }
+
+  // Entries you have switched to the language they were written in. One
+  // at a time and by id, so flipping a message back doesn't flip the
+  // whole conversation, and so it survives the entry being replaced as
+  // the AI speaks. Yours alone: nobody else's screen changes.
+  let asWritten = $state({});
+
+  /// Which language to read an entry in. Your own by default -- reading
+  /// the reply back in a language you don't speak is the whole point of
+  /// having asked -- and the one it was written in once you say so.
+  const showing = (e) => (asWritten[e.id] ? 'from' : 'mine');
 
   function send(ev) {
     ev.preventDefault();
@@ -88,18 +106,37 @@
         {#if e.typed}<span class="typed" title="Typed, not spoken">typed</span>{/if}
         <span class="time">{time(e.at)}</span>
       </div>
-      <div class="text" class:partial={e.partial} class:live={e.live}>
-        {#if e.text}{e.text}{:else if e.kind === 'agent'}<span class="dots"><i></i><i></i><i></i></span>{/if}
-      </div>
-      {#if forYou(e) !== undefined}
-        <!-- Beside what was typed, never instead of it: a translation
-             that went wrong can then be seen to have. -->
-        <div class="rendered" lang={mine}>
-          {#if forYou(e) === null}
-            <span class="pending">{mine}…</span>
+      {#if pair(e)}
+        {@const p = pair(e)}
+        {@const from = showing(e) === 'from'}
+        <!-- One language at a time, with a link to the other: both are
+             here, so a translation that went wrong can be seen to have
+             gone wrong, without two copies of every line to read past. -->
+        <div
+          class="text"
+          class:partial={from && e.partial}
+          class:live={e.live}
+          lang={from ? p.from : mine}
+        >
+          {#if from}
+            {#if e.text}{e.text}{:else}<span class="dots"><i></i><i></i><i></i></span>{/if}
+          {:else if p.text}
+            {p.text}
           {:else}
-            <span class="into">{mine}</span>{forYou(e)}
+            <!-- Not translated yet. Deliberately not the original: being
+                 handed a language you didn't ask for is the thing this
+                 is here to avoid. The link below reaches it. -->
+            <span class="pending">{mine}…</span>
           {/if}
+        </div>
+        {#if e.text || p.text}
+          <button type="button" class="swap" onclick={() => (asWritten[e.id] = !from)}>
+            {from ? `Show ${mine}` : `Show ${p.from}`}
+          </button>
+        {/if}
+      {:else}
+        <div class="text" class:partial={e.partial} class:live={e.live}>
+          {#if e.text}{e.text}{:else if e.kind === 'agent'}<span class="dots"><i></i><i></i><i></i></span>{/if}
         </div>
       {/if}
     </div>
@@ -207,25 +244,25 @@
     border-radius: 999px;
     color: var(--muted);
   }
-  /* The same message in the reader's language, under the original and
-     indented from it, so which one is which is never in doubt. */
-  .rendered {
-    margin: 4px 4px 0 14px;
-    font-size: 14px;
+  /* The way to the other language: a link under the bubble, quiet
+     enough to ignore until it is wanted. */
+  .swap {
+    margin: 3px 4px 0;
+    padding: 0;
+    border: 0;
+    background: none;
+    font: inherit;
+    font-size: 12px;
     color: var(--muted);
-    white-space: pre-wrap;
-    overflow-wrap: anywhere;
-    border-left: 2px solid var(--line);
-    padding-left: 10px;
+    text-decoration: underline dotted;
+    text-underline-offset: 2px;
+    cursor: pointer;
   }
-  .entry.you .rendered { text-align: right; }
-  .into {
-    font-size: 10px;
-    letter-spacing: 0.04em;
-    text-transform: uppercase;
-    margin-right: 8px;
-    opacity: 0.8;
-  }
+  .swap:hover { color: var(--ink); }
+  /* Block, so it sits under the bubble rather than beside it, and
+     pushed over for your own messages, which hang on the right. */
+  .swap { display: block; }
+  .entry.you .swap { margin-left: auto; }
   .pending { font-style: italic; opacity: 0.7; }
 
   .composer {

@@ -367,9 +367,15 @@ pub enum Role {
     Assistant,
 }
 
+/// One of somebody's open tabs. Each has its own mic, its own mute and
+/// its own push to talk, and each says so when it connects -- so these
+/// cannot be one set of flags on the person. A tab sitting at the door
+/// with push to talk on, or a stale one left open on another screen,
+/// used to be able to mute the tab that was actually being spoken into:
+/// the room went on hearing them, and nothing they said was written
+/// down, with nothing in the log to say why.
 #[derive(Default)]
-struct Person {
-    clients: usize,
+struct Tab {
     mic: bool,
     /// Muted their own mic. Their audio still arrives (as silence), but
     /// the room doesn't transcribe it or count it as talking.
@@ -377,6 +383,12 @@ struct Person {
     /// Push to talk: unmuted means holding the key, and everything said
     /// until release is one entry, however long the pauses.
     ptt: bool,
+}
+
+#[derive(Default)]
+struct Person {
+    /// Their open tabs, by the id of the socket each came in on.
+    tabs: BTreeMap<u64, Tab>,
     speaking: bool,
     speaking_since: Option<Instant>,
     /// Last time a streaming guess with words in it came in.
@@ -442,6 +454,15 @@ struct State {
     /// The AI passed on its turn but asked to be shown the room again if
     /// the quiet lasted: when to look, and how long that is in seconds.
     reconsider: Option<(Instant, u64)>,
+    /// The last turn's generation and the entry it was written into,
+    /// kept after [`State::reply`] has been let go.
+    ///
+    /// A translation arrives a couple of seconds behind the words it
+    /// translates, and the room's own language is often done speaking by
+    /// then -- on a short reply, always. The reply itself is finished and
+    /// gone at that point, so this is what a late translation is still
+    /// able to find its entry by.
+    last_reply: Option<(u64, String)>,
 }
 
 pub struct Room {
@@ -535,6 +556,7 @@ impl Room {
                 starting: None,
                 engaged: None,
                 reconsider: None,
+                last_reply: None,
             }),
             events,
             mixer: Mixer::new(strips, &cfg.language),
@@ -733,7 +755,7 @@ impl Room {
         let st = self.lock();
         st.people
             .values()
-            .any(|p| p.clients > 0 && self.language_of(p) == language)
+            .any(|p| p.online() && self.language_of(p) == language)
     }
 
     fn people_json(&self, st: &State) -> Value {
@@ -743,9 +765,9 @@ impl Room {
                 .map(|(name, p)| {
                     json!({
                         "name": name,
-                        "online": p.clients > 0,
-                        "mic": p.mic,
-                        "muted": p.muted,
+                        "online": p.online(),
+                        "mic": p.mic(),
+                        "muted": p.muted(),
                         "speaking": p.speaking,
                         "language": self.language_of(p),
                     })
@@ -780,7 +802,7 @@ impl Room {
         };
         let before = st.people.len();
         st.people
-            .retain(|name, p| p.clients > 0 || invited.contains_key(name));
+            .retain(|name, p| p.online() || invited.contains_key(name));
         let mut changed = st.people.len() != before;
         // Anyone whose language the roster has just learned, so the
         // mixer can be told which queue their tabs listen to.
@@ -883,9 +905,9 @@ impl Room {
             .map(|(name, p)| {
                 json!({
                     "name": name,
-                    "here": p.clients > 0,
+                    "here": p.online(),
                     // Being heard: a mic open and not muted.
-                    "listening": p.mic && !p.muted,
+                    "listening": p.mic() && !p.muted(),
                     // The titles of what they are holding, which is
                     // what a card is addressed by.
                     "cards": holding.get(name).cloned().unwrap_or_default(),
@@ -1161,42 +1183,46 @@ impl Room {
         self.emit(json!({ "type": "games", "games": self.games() }));
     }
 
-    /// A tab of `person` connected.
-    pub fn join(&self, person: &str) {
+    /// A tab of `person` connected, on socket `tab`.
+    pub fn join(&self, person: &str, tab: u64) {
         let mut st = self.lock();
-        st.people.entry(person.to_string()).or_default().clients += 1;
-        info!(person, "joined");
+        let p = st.people.entry(person.to_string()).or_default();
+        p.tabs.insert(tab, Tab::default());
+        let tabs = p.tabs.len();
+        info!(person, tab, tabs, "joined");
         self.emit_people(&st);
     }
 
     /// A tab of `person` went away.
-    pub fn leave(&self, person: &str) {
+    pub fn leave(&self, person: &str, tab: u64) {
         let mut st = self.lock();
         let Some(p) = st.people.get_mut(person) else {
             return;
         };
-        p.clients = p.clients.saturating_sub(1);
-        if p.clients == 0 {
-            p.mic = false;
+        p.tabs.remove(&tab);
+        if !p.mic() {
             p.speaking = false;
             if let Some(e) = &p.engine {
                 close_utterance(e);
             }
         }
-        info!(person, "left");
+        info!(person, tab, tabs = p.tabs.len(), "left");
         self.emit_people(&st);
     }
 
-    pub fn set_mic(&self, person: &str, on: bool) {
+    pub fn set_mic(&self, person: &str, tab: u64, on: bool) {
         let mut st = self.lock();
         let Some(p) = st.people.get_mut(person) else {
             return;
         };
-        if p.mic == on {
+        let Some(t) = p.tabs.get_mut(&tab) else {
+            return;
+        };
+        if t.mic == on {
             return;
         }
-        p.mic = on;
-        if !on {
+        t.mic = on;
+        if !p.mic() {
             p.speaking = false;
             if let Some(e) = &p.engine {
                 close_utterance(e);
@@ -1205,20 +1231,26 @@ impl Room {
         self.emit_people(&st);
     }
 
-    /// `person` muted or unmuted their mic.
-    pub fn set_muted(&self, person: &str, muted: bool) {
+    /// `person` muted or unmuted the mic of one of their tabs. They are
+    /// muted once every tab with its mic open says so, which is what
+    /// keeps a second tab from silencing the one being spoken into.
+    pub fn set_muted(&self, person: &str, tab: u64, muted: bool) {
         let mut st = self.lock();
         let Some(p) = st.people.get_mut(person) else {
             return;
         };
-        if p.muted == muted {
+        let Some(t) = p.tabs.get_mut(&tab) else {
+            return;
+        };
+        if t.muted == muted {
             return;
         }
-        p.muted = muted;
-        if muted {
+        let ptt = t.ptt;
+        t.muted = muted;
+        if p.muted() {
             p.speaking = false;
             // Let go of push to talk: what they said is done.
-            if p.ptt {
+            if ptt {
                 if let Some(e) = &p.engine {
                     e.break_paragraph();
                 }
@@ -1227,15 +1259,19 @@ impl Room {
         self.emit_people(&st);
     }
 
-    /// `person` turned push to talk on or off.
-    pub fn set_ptt(&self, person: &str, on: bool) {
+    /// `person` turned push to talk on or off in one of their tabs.
+    pub fn set_ptt(&self, person: &str, tab: u64, on: bool) {
         let mut st = self.lock();
         let Some(p) = st.people.get_mut(person) else {
             return;
         };
-        p.ptt = on;
+        let Some(t) = p.tabs.get_mut(&tab) else {
+            return;
+        };
+        t.ptt = on;
+        let mode = paragraph_mode(p.ptt());
         if let Some(e) = &p.engine {
-            e.set_paragraph_mode(paragraph_mode(on));
+            e.set_paragraph_mode(mode);
         }
     }
 
@@ -1264,7 +1300,7 @@ impl Room {
                     let language = self.language_of(p).to_string();
                     match make(person, &language, self.clone()) {
                         Ok(e) => {
-                            e.set_paragraph_mode(paragraph_mode(p.ptt));
+                            e.set_paragraph_mode(paragraph_mode(p.ptt()));
                             p.engine = Some(e);
                         }
                         Err(err) => {
@@ -1275,7 +1311,7 @@ impl Room {
                     }
                 }
             }
-            (p.engine.clone(), p.muted || silent)
+            (p.engine.clone(), p.muted() || silent)
         };
         if let Some(e) = pusher {
             if muted {
@@ -1358,7 +1394,7 @@ impl Room {
             return;
         };
         // What the engine still had in hand when the mute began.
-        let speaking = speaking && !p.muted && !silent;
+        let speaking = speaking && !p.muted() && !silent;
         if p.speaking == speaking {
             return;
         }
@@ -1836,7 +1872,7 @@ impl Room {
                 .chain(
                     st.people
                         .values()
-                        .filter(|p| p.clients > 0)
+                        .filter(|p| p.online())
                         .map(|p| self.language_of(p).to_string()),
                 )
                 .filter(|l| *l != mine)
@@ -1939,14 +1975,54 @@ impl Room {
         generation: u64,
         language: &str,
         index: usize,
+        text: &str,
         samples: Vec<f32>,
     ) -> bool {
-        let st = self.lock();
-        if st.reply.as_ref().is_none_or(|r| r.generation != generation) {
+        // Stale: the turn was cut, or another has been given out since.
+        // Both bump the counter, and both mean these words are no longer
+        // wanted.
+        if self.generation.load(Ordering::SeqCst) != generation {
             return false;
         }
+        let mut st = self.lock();
+        // The reply if it is still running, and otherwise the turn it
+        // belongs to, which on a short one has already finished speaking
+        // in the room's own language while this was being translated.
+        // Dropping it here was how a listener came to be left with a
+        // translation that never arrived and never spoke.
+        let id = match st.reply.as_ref() {
+            Some(r) if r.generation == generation => r.entry.clone(),
+            Some(_) => return false,
+            None => match &st.last_reply {
+                Some((g, id)) if *g == generation => id.clone(),
+                _ => return false,
+            },
+        };
+        // Put it on the entry as well as in the queue, so whoever is
+        // listening in this language reads what they are hearing rather
+        // than the language it was written in. Sentence by sentence, as
+        // each is spoken: the room's own language is tracked finer than
+        // that, by how much of its audio has played, because that one is
+        // the record of the turn and this is a reading aid.
+        let conversation = st.conversation;
+        let entry = st.log.iter_mut().find(|e| e.id == id).map(|e| {
+            let said = e.translations.entry(language.to_string()).or_default();
+            if !said.is_empty() {
+                said.push(' ');
+            }
+            said.push_str(text.trim());
+            e.clone()
+        });
         drop(st);
         self.mixer.ai_push(language, generation, index, samples);
+        if let Some(e) = entry {
+            if e.sent {
+                if let Err(err) = self.store().put_entry(conversation, &e) {
+                    warn!("store entry: {err:#}");
+                }
+            }
+            self.emit_entry(&e);
+        }
         true
     }
 
@@ -2229,6 +2305,7 @@ impl Room {
         if !cue.deciding() {
             self.emit_entry(&entry);
         }
+        st.last_reply = Some((generation, entry.id.clone()));
         st.reply = Some(Reply {
             generation,
             entry: entry.id.clone(),
@@ -2257,14 +2334,14 @@ impl Room {
                 people: st
                     .people
                     .iter()
-                    .filter(|(_, p)| p.clients > 0)
+                    .filter(|(_, p)| p.online())
                     .map(|(n, _)| n.clone())
                     .collect(),
                 language: self.cfg.language.clone(),
                 speaks: st
                     .people
                     .iter()
-                    .filter(|(_, p)| p.clients > 0)
+                    .filter(|(_, p)| p.online())
                     .filter(|(_, p)| self.language_of(p) != self.cfg.language)
                     .map(|(n, p)| (n.clone(), self.language_of(p).to_string()))
                     .collect(),
@@ -2310,9 +2387,45 @@ impl Room {
 /// Push a second of silence so the engine closes an utterance whose
 /// audio just stopped (a mic turned off, a tab closed).
 impl Person {
+    /// Any tab of theirs open.
+    fn online(&self) -> bool {
+        !self.tabs.is_empty()
+    }
+
+    /// The tabs that are actually sending audio. Everything that gates
+    /// transcription is decided among these and no others: a tab with
+    /// its mic shut has no say in what the room makes of somebody's
+    /// voice.
+    fn live(&self) -> impl Iterator<Item = &Tab> {
+        self.tabs.values().filter(|t| t.mic)
+    }
+
+    /// Their mic is open somewhere.
+    fn mic(&self) -> bool {
+        self.live().next().is_some()
+    }
+
+    /// Muted when every tab with its mic open says so.
+    fn muted(&self) -> bool {
+        let mut live = self.live();
+        match live.next() {
+            Some(first) => first.muted && live.all(|t| t.muted),
+            // No mic open anywhere, so nobody has said they are muted.
+            // Not an excuse to stop writing down what arrives: audio can
+            // reach the room a moment before the tab's `mic` does.
+            None => false,
+        }
+    }
+
+    /// Push to talk is on somewhere, which is what decides how their
+    /// words are broken into entries.
+    fn ptt(&self) -> bool {
+        self.live().any(|t| t.ptt)
+    }
+
     /// Holding push to talk: not done talking, however long the pause.
     fn holding(&self) -> bool {
-        self.ptt && !self.muted && self.mic
+        self.live().any(|t| t.ptt && !t.muted)
     }
 }
 
@@ -2586,13 +2699,13 @@ mod tests {
         assert_eq!(names(&r), "Alex,Ryan,Sam");
 
         // Uninvited while connected: stays, because they are still here.
-        r.join("Sam");
+        r.join("Sam", 1);
         r.store().uninvite("Sam").unwrap();
         r.reconcile_people();
         assert_eq!(names(&r), "Alex,Ryan,Sam");
 
         // ...and goes once their last tab does.
-        r.leave("Sam");
+        r.leave("Sam", 1);
         r.reconcile_people();
         assert_eq!(names(&r), "Alex,Ryan");
     }
@@ -2642,11 +2755,68 @@ mod tests {
     }
 
     #[test]
+    fn a_second_tab_cannot_mute_the_one_being_spoken_into() {
+        let (r, _turns) = room(Mode::Named);
+        // Two tabs, as anybody testing from a laptop and a phone has --
+        // or anybody who left one open on another screen. The second has
+        // push to talk on, so it reports itself muted the moment it
+        // joins the audio.
+        r.join("Ryan", 1);
+        r.set_mic("Ryan", 1, true);
+        r.set_muted("Ryan", 1, false);
+        r.join("Ryan", 2);
+        r.set_mic("Ryan", 2, true);
+        r.set_muted("Ryan", 2, true);
+
+        let muted = || r.lock().people["Ryan"].muted();
+        assert!(
+            !muted(),
+            "the tab being spoken into is not muted, so neither is Ryan: \
+             a tab that silenced the person silenced their transcription \
+             while the room went on hearing them, and said nothing about it"
+        );
+        // The room agrees, so nobody's mixer shows them muted either.
+        let people = r.people_json(&r.lock());
+        let ryan = people
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == "Ryan")
+            .unwrap()
+            .clone();
+        assert_eq!(ryan["muted"], false);
+        assert_eq!(ryan["mic"], true);
+
+        // Muted only once every tab with a mic open says so.
+        r.set_muted("Ryan", 1, true);
+        assert!(muted());
+
+        // A tab with its mic shut has no say: closing the unmuted one
+        // leaves only the muted tab, and shutting that one's mic leaves
+        // nobody with an opinion.
+        r.set_muted("Ryan", 1, false);
+        assert!(!muted());
+        r.set_mic("Ryan", 1, false);
+        assert!(muted(), "only the muted tab is still sending");
+
+        // And a tab going away takes its opinion with it.
+        r.leave("Ryan", 2);
+        assert!(!muted());
+        assert!(
+            r.lock().people["Ryan"].online(),
+            "the first tab is still here"
+        );
+        r.leave("Ryan", 1);
+        assert!(!r.lock().people["Ryan"].online());
+    }
+
+    #[test]
     fn push_to_talk_waits_for_release() {
         let (r, turns) = room(Mode::Always);
-        r.set_mic("Ryan", true);
-        r.set_ptt("Ryan", true);
-        r.set_muted("Ryan", false);
+        r.join("Ryan", 1);
+        r.set_mic("Ryan", 1, true);
+        r.set_ptt("Ryan", 1, true);
+        r.set_muted("Ryan", 1, false);
         r.on_paragraph("Ryan", &para("p1", "Let me think about", false));
         r.tick(quiet(&r));
         assert!(
@@ -2658,7 +2828,7 @@ mod tests {
             "Ryan",
             &para("p1", "Let me think about it. Okay, go.", false),
         );
-        r.set_muted("Ryan", true);
+        r.set_muted("Ryan", 1, true);
         r.tick(quiet(&r));
         let t = turns.try_recv().expect("answered after release");
         assert!(t.messages.last().unwrap().1.contains("Okay, go."));
@@ -2824,11 +2994,11 @@ mod tests {
         assert!(!r.is_heard_in("Russian"));
 
         r.set_language("Alex", "Russian").unwrap();
-        r.join("Alex");
+        r.join("Alex", 1);
         assert!(r.is_heard_in("Russian"));
 
         // Gone again: so is the reason to translate.
-        r.leave("Alex");
+        r.leave("Alex", 1);
         assert!(!r.is_heard_in("Russian"));
     }
 
@@ -2849,15 +3019,25 @@ mod tests {
         let g = speaking(&r, &turns);
         // The Russian rendition of the first sentence, longer than the
         // English one, as a translation usually is.
-        assert!(r.agent_speak_translated(g, "Russian", 0, vec![0.1; 96_000]));
+        assert!(r.agent_speak_translated(g, "Russian", 0, "Жил-был дракон.", vec![0.1; 96_000]));
 
-        // Half of the English sentence played: the log says exactly what
-        // it said before, with nothing of the Russian in it.
+        // Half of the English sentence played: the entry's own text says
+        // exactly what it said before, with nothing of the Russian in
+        // it -- that one is the record of the turn, counted by how much
+        // audio has played.
         for _ in 0..25 {
             r.mixer.tick();
         }
         r.tick(Instant::now());
         assert_eq!(agent_entry(&r).text, "Once upon a time");
+        // The Russian rides alongside, for whoever is reading in it.
+        assert_eq!(
+            agent_entry(&r)
+                .translations
+                .get("Russian")
+                .map(String::as_str),
+            Some("Жил-был дракон.")
+        );
 
         // And the reply still finishes when the English does, rather
         // than waiting on a rendition nobody is counting.
@@ -2871,8 +3051,46 @@ mod tests {
             e.text,
             "Once upon a time there was a dragon. It was very old."
         );
-        // A translation that turns up after the turn is dropped.
-        assert!(!r.agent_speak_translated(g, "Russian", 1, vec![0.1; 4800]));
+        // Sentences accumulate in the order they were spoken.
+        assert_eq!(
+            e.translations.get("Russian").map(String::as_str),
+            Some("Жил-был дракон.")
+        );
+        // What the model is shown is still the one language it writes
+        // in: a translation of its own words is not news to it.
+        let msgs = conversation_messages(&r.lock().log, 50);
+        let last = &msgs.last().unwrap().1;
+        assert_eq!(
+            last,
+            "Once upon a time there was a dragon. It was very old."
+        );
+        // A translation that turns up after the room's own language has
+        // finished speaking still arrives. It has to: it is two or three
+        // seconds behind the words it translates, and a short reply is
+        // over in less than that, so dropping it here left a listener
+        // with a translation that never came and never spoke.
+        assert!(r.agent_speak_translated(g, "Russian", 1, "Он был стар.", vec![0.1; 4800]));
+        assert_eq!(
+            agent_entry(&r)
+                .translations
+                .get("Russian")
+                .map(String::as_str),
+            Some("Жил-был дракон. Он был стар."),
+            "the rest of the reply, in the order it was spoken"
+        );
+
+        // What is genuinely stale is still dropped: once the turn has
+        // been cut or another given out, the counter has moved on and
+        // these are words nobody is waiting for.
+        r.generation.fetch_add(1, Ordering::SeqCst);
+        assert!(!r.agent_speak_translated(g, "Russian", 2, "И всё.", vec![0.1; 4800]));
+        assert_eq!(
+            agent_entry(&r)
+                .translations
+                .get("Russian")
+                .map(String::as_str),
+            Some("Жил-был дракон. Он был стар.")
+        );
     }
 
     #[test]
@@ -2981,8 +3199,8 @@ mod tests {
     fn a_typed_message_is_translated_for_whoever_is_reading_in_another_language() {
         let (r, _turns) = room(Mode::Named);
         r.set_language("Alex", "Russian").unwrap();
-        r.join("Alex");
-        r.join("Ryan");
+        r.join("Alex", 1);
+        r.join("Ryan", 1);
 
         let mut events = r.subscribe();
         r.typed("Ryan", "See https://example.com").unwrap();
@@ -3032,11 +3250,13 @@ mod tests {
         assert!(r.lock().reply.is_some());
         // Muted by themselves.
         r.set_strip("Alex", None, Some(false));
-        r.set_muted("Ryan", true);
+        r.join("Ryan", 1);
+        r.set_mic("Ryan", 1, true);
+        r.set_muted("Ryan", 1, true);
         r.on_level("Ryan", true);
         r.tick(Instant::now() + Duration::from_millis(400));
         assert!(r.lock().reply.is_some());
-        r.set_muted("Ryan", false);
+        r.set_muted("Ryan", 1, false);
         r.on_level("Ryan", true);
         r.tick(Instant::now() + Duration::from_millis(400));
         assert!(r.lock().reply.is_none(), "unmuted, they interrupt again");

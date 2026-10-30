@@ -332,7 +332,7 @@ async fn ws(State(app): State<App>, headers: HeaderMap, upgrade: WebSocketUpgrad
             debug!(id, "client ended: {e:#}");
         }
         app.room.mixer.remove_listener(id);
-        app.room.leave(&name);
+        app.room.leave(&name, id);
     })
 }
 
@@ -374,7 +374,7 @@ enum Command {
 async fn client(room: Arc<Room>, socket: WebSocket, id: u64, name: String) -> anyhow::Result<()> {
     let (audio_tx, mut audio_rx) = mpsc::channel::<Vec<u8>>(LISTENER_QUEUE);
     let mut events = room.subscribe();
-    room.join(&name);
+    room.join(&name, id);
     room.mixer
         .add_listener(id, &name, &room.language_for(&name), audio_tx)?;
     let (mut out, mut inp) = socket.split();
@@ -414,9 +414,9 @@ async fn client(room: Arc<Room>, socket: WebSocket, id: u64, name: String) -> an
                     Err(e) => debug!(id, "bad opus frame: {e}"),
                 },
                 Message::Text(text) => match serde_json::from_str::<Command>(&text) {
-                    Ok(Command::Mic { on }) => room.set_mic(&name, on),
-                    Ok(Command::Mute { on }) => room.set_muted(&name, on),
-                    Ok(Command::Ptt { on }) => room.set_ptt(&name, on),
+                    Ok(Command::Mic { on }) => room.set_mic(&name, id, on),
+                    Ok(Command::Mute { on }) => room.set_muted(&name, id, on),
+                    Ok(Command::Ptt { on }) => room.set_ptt(&name, id, on),
                     Ok(Command::Strip {
                         name: strip,
                         gain,

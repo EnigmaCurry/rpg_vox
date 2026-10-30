@@ -168,12 +168,11 @@ See ROOM_DOCKER.md.
   A language nobody has picked costs nothing: the AI is only translated
   while somebody is listening in it.
 
-  A typed message is translated too, and there both are shown: the
-  original, and underneath it the same thing in your language. That way
-  a translation that went wrong can be seen to have gone wrong, and the
-  URL in it can be read off the line that was actually typed. Both are
-  kept, so coming back to a conversation shows what everyone was shown
-  at the time.
+  A typed message is translated too, and both are kept, so coming back
+  to a conversation shows what everyone was shown at the time. The link
+  under it is how you get at the characters that were actually typed —
+  which is what you want when the message is a URL or a command, since
+  a translation is the one thing you must not copy those out of.
 
   Three things are worth knowing. **You hear your own language or
   nothing** — never a word of anybody else's. A translation has to be
@@ -190,16 +189,33 @@ See ROOM_DOCKER.md.
   **Stop** still works for you, since a click says where to cut without
   guessing.
 
-  Third, the conversation on screen is the room's own language, which is
-  what the AI reads and what it is recorded as having said, however many
-  languages it was heard in.
+  Third, **you read what you heard**. The AI's replies and anyone's
+  typed messages appear in your language, with a **Show English** link
+  under them for the words they were written in — and a **Show Russian**
+  link to come back. One language at a time, with the other a click
+  away: enough to catch a translation that went wrong, without two
+  copies of every line to read past. Which one you are looking at is
+  yours alone and changes nobody else's screen.
 
-  Your words are transcribed in whatever you speak: Parakeet works out
-  the language from the audio. The text that appears *while* you are
-  still talking needs a model per language — `just
-  download-streaming-stt-model-ru`, or `scribe download-models
-  --russian` — and without it your words simply appear a phrase later,
-  once the sentence is decoded.
+  Underneath, the room's own language is still the record: it is what
+  the AI is shown of the conversation, and what it is stored as having
+  said, however many languages it was heard in. What people say out loud
+  is not translated — only the AI's replies and what is typed.
+
+  Your words are written down in whatever you speak: Parakeet works out
+  the language from the audio, and needs no telling. The text that
+  appears *while* you are still talking is the exception — that pass
+  needs a model per language (`just download-streaming-stt-model-ru`,
+  or `scribe download-models --russian`), and without one your words
+  simply appear a phrase later, once the sentence is decoded.
+
+  That pass follows the language you chose at the door, so **if you
+  choose one language and speak another, the text that appears as you
+  talk will be an approximation of your words in the wrong alphabet.**
+  It is corrected a moment later, when the sentence is decoded by the
+  model that does work the language out. Nothing is lost, but it looks
+  odd while it happens; choose the language you are actually going to
+  speak.
 - **Sharing a desktop**: **Share screen**, in the footer, offers the
   browser's own picker of a window or a screen. Everyone in the room
   gets a thumbnail of it under that person's name in the mixer, live;
@@ -217,6 +233,12 @@ See ROOM_DOCKER.md.
   your mic, or with **Push to talk** on, your mic is open only while you
   hold Space (or the talk button): everything said in one hold is one
   entry, and the AI waits for you to let go however long you pause.
+
+  Mute, push to talk and the mic belong to the **tab**, not to you, so
+  two of your own tabs can't argue over them: you are muted once every
+  tab with its mic open says so, and a tab sitting at the door — or left
+  open on another screen with push to talk on — has no say in what the
+  one you are speaking into does.
 - **New conversation** clears the screen and the AI's memory. Old
   conversations stay in the database.
 

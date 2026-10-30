@@ -175,6 +175,43 @@ enum TtsKind {
     None,
 }
 
+/// The languages Qwen3-TTS answers to, spelled the way it wants them.
+/// Everything downstream matches on these strings -- the voice asked for
+/// a language, the pass-1 model looked up by one -- so they are settled
+/// here, once, rather than compared loosely in each place.
+const LANGUAGES: [&str; 11] = [
+    "Auto",
+    "Chinese",
+    "English",
+    "German",
+    "Italian",
+    "Portuguese",
+    "Spanish",
+    "Japanese",
+    "Korean",
+    "French",
+    "Russian",
+];
+
+/// `name` as [`LANGUAGES`] spells it, whatever case it was given in.
+/// An unknown language is left alone and warned about: the list is what
+/// this Qwen3 build is known to speak, not a rule about what exists.
+fn canonical_language(name: &str) -> String {
+    let name = name.trim();
+    match LANGUAGES.iter().find(|l| l.eq_ignore_ascii_case(name)) {
+        Some(l) => l.to_string(),
+        None => {
+            warn!(
+                language = name,
+                "not a language this voice is known to speak; \
+                 one of: {}",
+                LANGUAGES.join(", ")
+            );
+            name.to_string()
+        }
+    }
+}
+
 fn data_dir(cli: &Cli) -> PathBuf {
     if let Some(d) = &cli.data_dir {
         return d.clone();
@@ -366,9 +403,17 @@ fn serve(cli: Cli, store: Store) -> Result<()> {
         TtsKind::None
     });
     // The room's own language first, then the others the door offers,
-    // each at most once however it was spelled.
-    let cfg_languages: Vec<String> = std::iter::once(cli.language.clone())
-        .chain(cli.languages.iter().map(|l| l.trim().to_string()))
+    // each at most once however it was spelled -- and settled to the one
+    // spelling everything downstream matches on, so `english` in the
+    // environment can't quietly miss the model filed under `English`.
+    let language = canonical_language(&cli.language);
+    let cfg_languages: Vec<String> = std::iter::once(language.clone())
+        .chain(
+            cli.languages
+                .iter()
+                .filter(|l| !l.trim().is_empty())
+                .map(|l| canonical_language(l)),
+        )
         .filter(|l| !l.is_empty())
         .fold(Vec::new(), |mut out, l| {
             if !out.iter().any(|k: &String| k.eq_ignore_ascii_case(&l)) {
@@ -415,10 +460,10 @@ fn serve(cli: Cli, store: Store) -> Result<()> {
             }
         })
     };
-    let mut voices = vec![(cli.language.clone(), make_voice(&cli.language)?)];
+    let mut voices = vec![(language.clone(), make_voice(&language)?)];
     let others: Vec<String> = cfg_languages
         .iter()
-        .filter(|l| **l != cli.language)
+        .filter(|l| **l != language)
         .cloned()
         .collect();
     if !others.is_empty() {
@@ -432,14 +477,21 @@ fn serve(cli: Cli, store: Store) -> Result<()> {
             // that quietly come out in the room's own.
             warn!(
                 languages = %others.join(", "),
-                "this voice speaks only {}: the other languages are written down, \
-                 and said in {} (use --tts qwen3 to have them spoken)",
-                cli.language, cli.language,
+                "this voice speaks only {language}: the other languages are \
+                 written down, and said in {language} (use --tts qwen3 to have \
+                 them spoken)",
             );
         }
     }
 
     let factory = if cli.no_stt {
+        // Said out loud, because from inside the room it looks like a
+        // fault rather than a choice: everyone hears everyone, the
+        // meters move, and not a word is written down.
+        warn!(
+            "--no-stt: nothing anyone says is transcribed, so there is no \
+             conversation and the AI cannot hear the room"
+        );
         None
     } else {
         Some(stt::Models::load(&models_dir)?.factory())
@@ -459,7 +511,7 @@ fn serve(cli: Cli, store: Store) -> Result<()> {
         confirm: Duration::from_millis(cli.confirm_ms),
         engaged_for: Duration::from_millis(cli.engaged_for_ms),
         history: cli.history,
-        language: cli.language.clone(),
+        language: language.clone(),
         languages: cfg_languages,
     };
     // The two ends of the typing queue are handed out separately: the
