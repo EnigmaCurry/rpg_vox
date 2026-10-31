@@ -934,62 +934,73 @@ private fun Paragraph(p: Para, playing: Playing?, at: Karaoke?, canPlay: Boolean
         if (p.clips.any { it.partial }) Saying(p) else Said(p, playing, at, canPlay, follow)
         return
     }
-    p.readings.forEach { r ->
-        Reading(r.text, p.heardIn, own = true, at = r.startMs.takeIf { canPlay }, p = p)
-    }
-    // Something was said that has not been read yet: the sentence being
-    // spoken now, one whose reading is still on its way, or the whole
-    // paragraph while pass 1 is still typing it.
-    if (p.readings.isEmpty() || p.rows().any { it.reading == null }) {
-        Text(
-            "…",
-            style = MaterialTheme.typography.bodyLarge.scaled(FONT_SCALES[Scribe.fontStep]),
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-    }
+    Reading(p, canPlay)
 }
 
 /**
- * One sentence of a reading. [own] means it is the paragraph's own text
- * here rather than something under it, which is how the transcript shows
- * a translated paragraph.
+ * A translated paragraph, read in the language you read: its sentences
+ * as one paragraph, the way the paragraph they are of was spoken.
  *
- * [at] is when the sentence it is of was spoken: given one, tapping the
- * reading plays from there, which is the same thing tapping a word does
- * to what was said. The reading has no timings of its own -- a
- * translation has its own word count and its own order -- so it is the
- * sentence that is the unit here rather than the word.
+ * One block rather than a line per sentence. The sentences arrive one at
+ * a time, which is a reason to draw them as they come and no reason at
+ * all to leave them stacked -- what was said is a paragraph, and a
+ * reading of it that breaks every sentence onto its own line reads like
+ * a list of things nobody said that way.
+ *
+ * It ends in an ellipsis while something said has not been read yet: the
+ * sentence being spoken now, one whose reading is still on its way, or
+ * the whole paragraph while pass 1 is typing it. Inline, so it is the
+ * end of the paragraph rather than a line of its own.
+ *
+ * Tapping it plays from where the sentence tapped was spoken. A
+ * translation has its own word count and its own word order, so the
+ * sentence is as fine-grained as this can honestly be -- which is why
+ * each one's place in the text is kept here.
  */
 @Composable
-private fun Reading(text: String, heardIn: String?, own: Boolean, at: Long? = null, p: Para? = null) {
-    val style = MaterialTheme.typography.bodyLarge.scaled(FONT_SCALES[Scribe.fontStep])
-    SelectionContainer {
-        Text(
-            text,
-            style = if (own) style else style.copy(fontStyle = FontStyle.Italic),
-            color = if (own) {
-                MaterialTheme.colorScheme.onSurface
-            } else {
-                MaterialTheme.colorScheme.primary
-            },
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(top = if (own) 0.dp else 2.dp)
-                .semantics { heardIn?.let { contentDescription = "$it, read as: $text" } }
-                .pointerInput(at, p) {
-                    val from = at ?: return@pointerInput
-                    val para = p ?: return@pointerInput
-                    awaitEachGesture {
-                        val playingAtDown = Playback.playing != null && !Playback.paused
-                        awaitTap(PointerEventPass.Main) ?: return@awaitEachGesture
-                        if (playingAtDown || Playback.playing != null && !Playback.paused) {
-                            return@awaitEachGesture
-                        }
-                        Scribe.play(para, Word("", from, from))
-                    }
-                },
-        )
+private fun Reading(p: Para, canPlay: Boolean) {
+    val faint = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.45f)
+    val pending = p.readings.isEmpty() || p.rows().any { it.reading == null }
+    // Where each sentence starts in the block, for a tap to find it.
+    val starts = remember(p.readings) {
+        p.readings.runningFold(0) { at, r -> at + r.text.length + 1 }.dropLast(1)
     }
+    val text = buildAnnotatedString {
+        p.readings.forEachIndexed { i, r ->
+            if (i > 0) append(' ')
+            append(r.text)
+        }
+        if (pending) {
+            if (p.readings.isNotEmpty()) append(' ')
+            withStyle(SpanStyle(color = faint)) { append("…") }
+        }
+    }
+    var layout by remember { mutableStateOf<TextLayoutResult?>(null) }
+    Text(
+        text,
+        style = MaterialTheme.typography.bodyLarge.scaled(FONT_SCALES[Scribe.fontStep]),
+        onTextLayout = { layout = it },
+        modifier = Modifier
+            .fillMaxWidth()
+            .semantics {
+                p.heardIn?.let { contentDescription = "$it, read as: $text" }
+            }
+            .pointerInput(p.id, canPlay, starts) {
+                if (!canPlay) return@pointerInput
+                awaitEachGesture {
+                    val playingAtDown = Playback.playing != null && !Playback.paused
+                    val up = awaitTap(PointerEventPass.Main) ?: return@awaitEachGesture
+                    if (playingAtDown || Playback.playing != null && !Playback.paused) {
+                        return@awaitEachGesture
+                    }
+                    val l = layout ?: return@awaitEachGesture
+                    val c = l.getOffsetForPosition(up)
+                    val i = starts.indexOfLast { it <= c }
+                    val from = p.readings.getOrNull(i)?.startMs ?: return@awaitEachGesture
+                    Scribe.play(p, Word("", from, from))
+                }
+            },
+    )
 }
 
 /**
