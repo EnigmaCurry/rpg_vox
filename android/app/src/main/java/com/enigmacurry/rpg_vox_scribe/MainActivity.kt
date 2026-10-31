@@ -334,9 +334,11 @@ private fun Setup(phase: Phase.NeedModels) {
         Spacer(Modifier.height(12.dp))
         Text(
             "Scribe transcribes on the phone. It needs two models from the " +
-                "sherpa-onnx releases on GitHub: Parakeet TDT 0.6B v2 (English) and a " +
-                "streaming Zipformer for live text. That's a one-time download of about " +
-                "$mb MB, kept in the app's private storage. Wi-Fi recommended.",
+                "sherpa-onnx releases on GitHub: Parakeet TDT 0.6B v3, which writes the " +
+                "finished text in any of 25 languages, and a streaming Zipformer for the " +
+                "live text. That's a one-time download of about $mb MB, kept in the app's " +
+                "private storage. Wi-Fi recommended. Reading another language in your own " +
+                "is a further model each, under Settings → Languages.",
             style = MaterialTheme.typography.bodyMedium,
         )
         if (error != null) {
@@ -914,8 +916,55 @@ fun Para.wordAt(i: Int, shown: Int): Word =
  * current one highlighted, kept in view.
  */
 @OptIn(ExperimentalFoundationApi::class)
+/**
+ * One paragraph: what was said, its reading in the language you read, or
+ * both, as **Show** says ([Scribe.showing]).
+ *
+ * Only what was said can be played back, tapped into or edited -- it is
+ * the text with the word timings, and the one the passes are still
+ * working on -- so [Show.TRANSLATION] leaves all of that out rather than
+ * pretending the reading has it. A paragraph with no reading (your own
+ * language, or one that hasn't landed yet) is shown as it always was,
+ * whichever setting is on: there is nothing else to show.
+ */
 @Composable
 private fun Paragraph(p: Para, playing: Playing?, at: Karaoke?, canPlay: Boolean, follow: Boolean) {
+    val reading = p.reading
+    if (reading != null && Scribe.showing == Show.TRANSLATION) {
+        Reading(reading, p.heardIn, own = true)
+        return
+    }
+    Said(p, playing, at, canPlay, follow)
+    if (reading != null && Scribe.showing == Show.BOTH) Reading(reading, p.heardIn, own = false)
+}
+
+/**
+ * The reading, under what was said unless it is all that is shown
+ * ([own]), in which case it is the paragraph's own text and styled like
+ * one.
+ */
+@Composable
+private fun Reading(text: String, heardIn: String?, own: Boolean) {
+    val style = MaterialTheme.typography.bodyLarge.scaled(FONT_SCALES[Scribe.fontStep])
+    SelectionContainer {
+        Text(
+            text,
+            style = if (own) style else style.copy(fontStyle = FontStyle.Italic),
+            color = if (own) {
+                MaterialTheme.colorScheme.onSurface
+            } else {
+                MaterialTheme.colorScheme.primary
+            },
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(top = if (own) 0.dp else 2.dp)
+                .semantics { heardIn?.let { contentDescription = "$it, read as: $text" } },
+        )
+    }
+}
+
+@Composable
+private fun Said(p: Para, playing: Playing?, at: Karaoke?, canPlay: Boolean, follow: Boolean) {
     val shown = p.shown
     // Start offset of each shown word in the text.
     val starts = remember(shown) { shown.runningFold(0) { acc, w -> acc + w.length + 1 }.dropLast(1) }

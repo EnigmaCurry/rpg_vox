@@ -22,6 +22,9 @@ data class Saved(
     val audio: String? = null,
     val words: String? = null,
     val atMs: Long = 0,
+    /** The reading in the language you read, and the one it was heard in. */
+    val translation: String? = null,
+    val heardIn: String? = null,
 )
 
 private val iso = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.ROOT).apply {
@@ -62,10 +65,11 @@ data class AudioRow(
  * `messages.at` is when a paragraph was said rather than stored, so a
  * thread lists in speaking order even when a paragraph was finished after
  * a later one. Additions, ignored by the desktop: `messages.speaker` ("Me",
- * "Phone") for recordings with two sources, and for kept audio
- * `messages.audio` and `messages.words` (see [Saved]) plus the `audio`
- * table, which groups the files a recording made (one per source) with
- * each one's start in it, so they play back together.
+ * "Phone") for recordings with two sources, `messages.translation` and
+ * `messages.heard_in` for a paragraph read in another language, and for
+ * kept audio `messages.audio` and `messages.words` (see [Saved]) plus
+ * the `audio` table, which groups the files a recording made (one per
+ * source) with each one's start in it, so they play back together.
  */
 class ThreadStore(file: File) {
     private val db: SQLiteDatabase = SQLiteDatabase.openOrCreateDatabase(file, null).apply {
@@ -90,7 +94,7 @@ class ThreadStore(file: File) {
             )""",
         )
         execSQL("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
-        for (column in listOf("speaker", "audio", "words")) {
+        for (column in listOf("speaker", "audio", "words", "translation", "heard_in")) {
             rawQuery("SELECT 1 FROM pragma_table_info('messages') WHERE name = ?", arrayOf(column)).use {
                 if (!it.moveToFirst()) execSQL("ALTER TABLE messages ADD COLUMN $column TEXT")
             }
@@ -181,12 +185,18 @@ class ThreadStore(file: File) {
 
     fun messages(thread: Long): List<Saved> =
         db.rawQuery(
-            "SELECT id, text, speaker, audio, words, at FROM messages WHERE conversation = ? AND role = 'user' AND kind = 'say' ORDER BY at, id",
+            "SELECT id, text, speaker, audio, words, at, translation, heard_in FROM messages " +
+                "WHERE conversation = ? AND role = 'user' AND kind = 'say' ORDER BY at, id",
             arrayOf("$thread"),
         ).use { c ->
             buildList {
                 while (c.moveToNext()) {
-                    add(Saved(c.getLong(0), c.getString(1), c.getString(2), c.getString(3), c.getString(4), parseAt(c.getString(5))))
+                    add(
+                        Saved(
+                            c.getLong(0), c.getString(1), c.getString(2), c.getString(3),
+                            c.getString(4), parseAt(c.getString(5)), c.getString(6), c.getString(7),
+                        ),
+                    )
                 }
             }
         }
@@ -198,6 +208,8 @@ class ThreadStore(file: File) {
         audio: String? = null,
         words: String? = null,
         atMs: Long = 0,
+        translation: String? = null,
+        heardIn: String? = null,
     ): Long =
         db.insert("messages", null, ContentValues().apply {
             if (atMs > 0) put("at", isoAt(atMs))
@@ -208,15 +220,26 @@ class ThreadStore(file: File) {
             put("speaker", speaker)
             put("audio", audio)
             put("words", words)
+            put("translation", translation)
+            put("heard_in", heardIn)
         })
 
-    fun edit(rowId: Long, text: String, words: String? = null, atMs: Long = 0) {
+    fun edit(
+        rowId: Long,
+        text: String,
+        words: String? = null,
+        atMs: Long = 0,
+        translation: String? = null,
+        heardIn: String? = null,
+    ) {
         db.update(
             "messages",
             ContentValues().apply {
                 put("text", text)
                 put("words", words)
                 if (atMs > 0) put("at", isoAt(atMs))
+                put("translation", translation)
+                put("heard_in", heardIn)
             },
             "id = ?",
             arrayOf("$rowId"),

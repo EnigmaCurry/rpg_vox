@@ -37,11 +37,25 @@ class InstallService : Service() {
         private val _state = MutableStateFlow<Install>(Install.Idle)
         val state: StateFlow<Install> = _state.asStateFlow()
 
-        fun start(context: Context) {
+        /**
+         * Download [models], defaulting to the two nothing works
+         * without. The language models are the same job (and the same
+         * notification), so they come through here too.
+         */
+        fun start(context: Context, models: List<Model> = BUNDLES) {
             if (_state.value is Install.Running) return
-            _state.value = Install.Running(Step.Downloading(BUNDLES.first().dir, 0, 1), 0f)
+            if (models.isEmpty()) {
+                _state.value = Install.Done
+                return
+            }
+            wanted = models
+            _state.value = Install.Running(Step.Downloading(models.first().dir, 0, 1), 0f)
             context.startForegroundService(Intent(context, InstallService::class.java))
         }
+
+        /** What the running install is fetching. */
+        @Volatile
+        private var wanted: List<Model> = BUNDLES
     }
 
     private var worker: Thread? = null
@@ -66,26 +80,29 @@ class InstallService : Service() {
 
     private fun run(nm: NotificationManager) {
         val store = ModelStore(noBackupFilesDir)
-        val all = BUNDLES.sumOf { it.approxBytes }.toFloat()
+        val models = wanted
+        val all = models.sumOf { it.approxBytes }.toFloat()
         var shown = -1
         val result = runCatching {
-            store.install { step ->
-                // Bundles install in order: everything before this one is done.
+            store.install(models) { step ->
+                // Models install in order: everything before this one is done.
                 val dir = when (step) {
                     is Step.Downloading -> step.bundle
                     is Step.Unpacking -> step.bundle
+                    is Step.Converting -> step.bundle
                 }
-                val before = BUNDLES.takeWhile { it.dir != dir }.sumOf { it.approxBytes }
-                // Downloading is most of the wait; unpacking is the rest of the bar's last stretch.
+                val before = models.takeWhile { it.dir != dir }.sumOf { it.approxBytes }
+                // Downloading is most of the wait; the rest is the bar's last stretch.
                 val here = when (step) {
                     is Step.Downloading -> step.done.toFloat()
-                    is Step.Unpacking -> BUNDLES.first { it.dir == dir }.approxBytes.toFloat()
+                    else -> models.firstOrNull { it.dir == dir }?.approxBytes?.toFloat() ?: 0f
                 }
                 val s = Install.Running(step, ((before + here) / all).coerceIn(0f, 1f))
                 _state.value = s
                 val pct = (s.overall * 100).toInt() * 1000 + when (step) {
                     is Step.Downloading -> 0
                     is Step.Unpacking -> 1 + (step.fraction * 100).toInt()
+                    is Step.Converting -> 102
                 }
                 if (pct != shown) {
                     shown = pct
@@ -124,4 +141,5 @@ class InstallService : Service() {
 fun describe(step: Step): String = when (step) {
     is Step.Downloading -> "${step.bundle}: ${step.done / 1_000_000} of ${step.total / 1_000_000} MB"
     is Step.Unpacking -> "Unpacking ${step.bundle}… ${(step.fraction * 100).toInt()}%"
+    is Step.Converting -> "Reading ${step.bundle}'s tokenizer…"
 }

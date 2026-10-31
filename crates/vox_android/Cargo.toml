@@ -8,6 +8,13 @@ description = "JNI bridge from the Android dictation app (android/app) to vox_tr
 [lib]
 crate-type = ["cdylib"]
 
+[features]
+default = []
+# Marian translation on the phone, with no network: the same feature
+# vox_scribe calls `translate-local`. CTranslate2 is built for the NDK by
+# the CMake in `just _android-jni`.
+translate-local = ["vox_transcribe/ct2"]
+
 [dependencies]
 vox_transcribe = { path = "../vox_transcribe", features = ["sherpa-static"] }
 # Ogg Opus: recordings kept next to the transcript, and their playback.
@@ -17,6 +24,9 @@ serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 jni = "0.21"
+# `pthread_setaffinity_np` for the CTranslate2 build; see
+# android/ct2-affinity.h.
+libc = "0.2"
 crossbeam-channel = "0.5"
 # Unpacking the model archives: Java's bzip2 is ~50x slower on a phone.
 bzip2 = "0.6"

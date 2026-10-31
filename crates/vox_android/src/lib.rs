@@ -31,12 +31,31 @@ use vox_transcribe::{
 
 /// Same layout as vox_scribe's models dir.
 const PARAKEET: &str = "parakeet-tdt-0.6b-v3";
-const ZIPFORMER: &str = "streaming-zipformer";
 
 struct Models {
     offline: Arc<dyn OfflineRecognizer>,
     zipformer: Zipformer,
+    /// The languages `--translate local` reads, with the one copy of the
+    /// models they are read with. `None` when no other language is
+    /// chosen, which is translation off -- and always, without the
+    /// feature, where nothing then reads it.
+    #[cfg_attr(not(feature = "translate-local"), allow(dead_code))]
+    translate: Option<Translating>,
 }
+
+/// What a session needs to make its own `Interpreter`: the languages,
+/// and the translator they share.
+#[cfg(feature = "translate-local")]
+struct Translating {
+    native: String,
+    others: Vec<String>,
+    by: Arc<dyn vox_transcribe::translate::Translate>,
+}
+
+/// Without the feature nothing constructs this; `load` says so rather
+/// than translating nothing quietly.
+#[cfg(not(feature = "translate-local"))]
+struct Translating {}
 
 struct Session {
     /// Taken by `finish`; pushes after that are dropped.
@@ -48,14 +67,102 @@ struct Session {
     recorder: Mutex<Option<OpusWriter>>,
 }
 
-fn load(dir: &Path, threads: i32) -> Result<Models> {
+/// Load the recognizers, and the translators for `others` into `native`.
+///
+/// `streaming` is the pass-1 bundle's directory name, which is per
+/// language (`streaming-zipformer`, `streaming-zipformer-ru`): pass 1 is
+/// the one pass that has to be told which language to listen in, since a
+/// streaming model is chosen before anything has been said. `others`
+/// empty is translation off.
+fn load(
+    dir: &Path,
+    threads: i32,
+    streaming: &str,
+    native: &str,
+    others: &[String],
+) -> Result<Models> {
+    // Before anything is loaded: the languages are a settings mistake or
+    // they are not, and saying which should not cost the seconds the
+    // recognizers take. (vox_scribe builds its translation pass first for
+    // the same reason.)
+    check_languages(native, others)?;
     let mut pc = ParakeetConfig::from_dir(&dir.join(PARAKEET));
     pc.num_threads = threads;
     let offline = Arc::new(Parakeet::open(&pc).context("loading Parakeet")?);
-    let mut zc = ZipformerConfig::from_dir(&dir.join(ZIPFORMER));
+    let mut zc = ZipformerConfig::from_dir(&dir.join(streaming));
     zc.num_threads = threads;
-    let zipformer = Zipformer::open(&zc).context("loading Zipformer")?;
-    Ok(Models { offline, zipformer })
+    let zipformer = Zipformer::open(&zc).with_context(|| format!("loading {streaming}"))?;
+    let translate = load_translating(dir, native, others)?;
+    Ok(Models {
+        offline,
+        zipformer,
+        translate,
+    })
+}
+
+/// Whether these languages can be told apart at all, which is all of
+/// what `load` can answer without reading a file. A pair sharing an
+/// alphabet is refused rather than guessed at -- see
+/// `vox_transcribe::language` -- and the app only offers one language
+/// per alphabet for that reason.
+#[cfg(feature = "translate-local")]
+fn check_languages(native: &str, others: &[String]) -> Result<()> {
+    if others.is_empty() {
+        return Ok(());
+    }
+    vox_transcribe::language::pair(native, others)
+}
+
+#[cfg(not(feature = "translate-local"))]
+fn check_languages(_native: &str, others: &[String]) -> Result<()> {
+    if others.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!("this build has no translator (the `translate-local` feature)")
+}
+
+/// The translators, loaded once for every session to share. The slow
+/// part: each direction is about 80 MB of weights.
+#[cfg(feature = "translate-local")]
+fn load_translating(dir: &Path, native: &str, others: &[String]) -> Result<Option<Translating>> {
+    if others.is_empty() {
+        return Ok(None);
+    }
+    let mut langs = vec![native.to_string()];
+    langs.extend(others.iter().cloned());
+    let by = vox_transcribe::ct2::Ct2Translator::load(dir, &langs)?;
+    tracing::info!(directions = %by.directions().join(", "), "translating locally");
+    Ok(Some(Translating {
+        native: native.to_string(),
+        others: others.to_vec(),
+        by: Arc::new(by),
+    }))
+}
+
+#[cfg(not(feature = "translate-local"))]
+fn load_translating(_dir: &Path, _native: &str, _others: &[String]) -> Result<Option<Translating>> {
+    // `check_languages` has already refused anything but "none".
+    Ok(None)
+}
+
+/// The translation pass for one session, reading the models [`Models`]
+/// holds. One per session: an `Interpreter` remembers what it has
+/// already read.
+#[cfg(feature = "translate-local")]
+fn interpreter(models: &Models) -> Result<Option<vox_transcribe::language::Interpreter>> {
+    let Some(t) = &models.translate else {
+        return Ok(None);
+    };
+    Ok(Some(vox_transcribe::language::Interpreter::new(
+        &t.native,
+        &t.others,
+        t.by.clone(),
+    )?))
+}
+
+#[cfg(not(feature = "translate-local"))]
+fn interpreter(_models: &Models) -> Result<Option<vox_transcribe::language::Interpreter>> {
+    Ok(None)
 }
 
 /// Compressed bytes read by the running [`unpack`], for progress.
@@ -91,6 +198,37 @@ fn unpack(archive: &Path, dest: &Path, spec: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `pthread_setaffinity_np`, which Bionic has only from API 36 and
+/// CTranslate2 refers to from one function. See android/ct2-affinity.h
+/// for the whole of it; this is the definition that header promises, in
+/// terms of the two calls Bionic has had all along.
+///
+/// Nothing calls it: CTranslate2 sets affinity only for a replica pool
+/// given a core offset, and ct2rs gives none. It is a real
+/// implementation rather than a stub so that staying true does not
+/// depend on that.
+#[cfg(all(target_os = "android", feature = "translate-local"))]
+#[no_mangle]
+pub unsafe extern "C" fn pthread_setaffinity_np(
+    thread: libc::pthread_t,
+    set_size: libc::size_t,
+    set: *const libc::cpu_set_t,
+) -> libc::c_int {
+    extern "C" {
+        /// Bionic's, since API 21. The thread id `sched_setaffinity`
+        /// wants is not the `pthread_t` the caller has.
+        fn pthread_gettid_np(thread: libc::pthread_t) -> libc::pid_t;
+    }
+    let tid = pthread_gettid_np(thread);
+    if libc::sched_setaffinity(tid, set_size, set) == 0 {
+        0
+    } else {
+        // The pthread_* functions return the error rather than setting
+        // errno, and CTranslate2 puts this number in what it throws.
+        *libc::__errno()
+    }
 }
 
 fn change_name(c: Change) -> &'static str {
@@ -232,29 +370,84 @@ pub extern "system" fn Java_com_enigmacurry_rpg_1vox_1scribe_Native_unpackProgre
     UNPACKED.load(Ordering::Relaxed) as jlong
 }
 
-/// `load(modelsDir, threads)`: a models handle, or throws.
+/// `load(modelsDir, threads, streamingDir, nativeLanguage, otherLanguages)`:
+/// a models handle, or throws. `otherLanguages` is comma-separated and
+/// may be empty, which is translation off.
 #[no_mangle]
 pub extern "system" fn Java_com_enigmacurry_rpg_1vox_1scribe_Native_load(
     mut env: JNIEnv,
     _class: JClass,
     dir: JString,
     threads: jint,
+    streaming: JString,
+    native: JString,
+    others: JString,
 ) -> jlong {
     init_logging();
-    let dir: String = match env.get_string(&dir) {
-        Ok(s) => s.into(),
+    let args: Result<(String, String, String, String)> = (|| {
+        Ok((
+            env.get_string(&dir)?.into(),
+            env.get_string(&streaming)?.into(),
+            env.get_string(&native)?.into(),
+            env.get_string(&others)?.into(),
+        ))
+    })();
+    let (dir, streaming, native, others) = match args {
+        Ok(a) => a,
         Err(e) => {
-            throw(&mut env, &anyhow::anyhow!("models dir: {e}"));
+            throw(&mut env, &e.context("load arguments"));
             return 0;
         }
     };
-    match load(Path::new(&dir), threads) {
+    let others: Vec<String> = others
+        .split(',')
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    match load(Path::new(&dir), threads, &streaming, &native, &others) {
         Ok(m) => Box::into_raw(Box::new(m)) as jlong,
         Err(e) => {
             throw(&mut env, &e);
             0
         }
     }
+}
+
+/// `writeTokenizer(spm, out)`: the `tokenizer.json` a Marian model is
+/// read with, written from the `source.spm` it ships. Returns how many
+/// pieces it has; throws on failure.
+///
+/// The models are downloaded by Kotlin (`ModelStore`), which can do
+/// everything but this: see `vox_transcribe::spm` for why there is no
+/// `tokenizer.json` to download and no SentencePiece here to make one
+/// with.
+#[no_mangle]
+pub extern "system" fn Java_com_enigmacurry_rpg_1vox_1scribe_Native_writeTokenizer(
+    mut env: JNIEnv,
+    _class: JClass,
+    spm: JString,
+    out: JString,
+) -> jint {
+    init_logging();
+    let args: Result<(String, String)> =
+        (|| Ok((env.get_string(&spm)?.into(), env.get_string(&out)?.into())))();
+    match args.and_then(|(spm, out)| write_tokenizer(Path::new(&spm), Path::new(&out))) {
+        Ok(pieces) => pieces as jint,
+        Err(e) => {
+            throw(&mut env, &e);
+            0
+        }
+    }
+}
+
+#[cfg(feature = "translate-local")]
+fn write_tokenizer(spm: &Path, out: &Path) -> Result<usize> {
+    vox_transcribe::spm::write_tokenizer(spm, out)
+}
+
+#[cfg(not(feature = "translate-local"))]
+fn write_tokenizer(_spm: &Path, _out: &Path) -> Result<usize> {
+    anyhow::bail!("this build has no translator (the `translate-local` feature)")
 }
 
 #[no_mangle]
@@ -300,7 +493,24 @@ pub extern "system" fn Java_com_enigmacurry_rpg_1vox_1scribe_Native_start(
     };
     let streaming = (streaming != 0)
         .then(|| Box::new(models.zipformer.session()) as Box<dyn StreamingRecognizer>);
-    let engine = Engine::spawn(EngineConfig::new(rate as u32), streaming, models.offline.clone());
+    // The languages were settled when the models loaded, so this can
+    // only fail on something that was already reported then.
+    let interpreter = match interpreter(models) {
+        Ok(i) => i,
+        Err(e) => {
+            throw(&mut env, &e);
+            return 0;
+        }
+    };
+    let engine = Engine::spawn_passes(
+        EngineConfig::new(rate as u32),
+        streaming,
+        models.offline.clone(),
+        vox_transcribe::engine::Passes {
+            interpreter,
+            ..Default::default()
+        },
+    );
     let events = engine.events().clone();
     let pusher = engine.pusher();
     let session = Session {
@@ -650,5 +860,64 @@ mod tests {
         assert!((1340..=1410).contains(&a), "{a}");
         assert!((1640..=1710).contains(&b), "{b}");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// What `Native.load` does, with the real models: both languages
+    /// the app can read in, each with the other listened out for, and
+    /// then the per-session `Interpreter` the engine is given. The
+    /// models are the phone's, so this is the one place the three of
+    /// them are asked to load together off a phone.
+    ///
+    /// Not run by default: it wants every model downloaded.
+    ///
+    /// ```text
+    /// VOX_SCRIBE_MODELS=models cargo test -p vox_android --features translate-local \
+    ///   -- --ignored --nocapture languages
+    /// ```
+    #[test]
+    #[ignore = "loads the downloaded recognizers and translation models"]
+    #[cfg(feature = "translate-local")]
+    fn loads_the_languages_the_app_offers() {
+        let dir = std::env::var("VOX_SCRIBE_MODELS").expect("VOX_SCRIBE_MODELS");
+        let dir = Path::new(&dir);
+        for (streaming, native, other) in [
+            ("streaming-zipformer", "English", "Russian"),
+            ("streaming-zipformer-ru", "Russian", "English"),
+        ] {
+            let others = vec![other.to_string()];
+            let models = load(dir, 2, streaming, native, &others)
+                .unwrap_or_else(|e| panic!("load {native} with {other}: {e:#}"));
+            assert!(models.translate.is_some(), "{native}: no translator");
+            let i = interpreter(&models)
+                .unwrap_or_else(|e| panic!("interpreter for {native}: {e:#}"))
+                .unwrap_or_else(|| panic!("{native}: no interpreter"));
+            assert_eq!(i.into_language(), native);
+            println!("{native} reading {other}: {i:?}");
+        }
+    }
+
+    /// A pair the alphabet cannot decide between is refused by `load`,
+    /// which is why the settings page only offers one language per
+    /// alphabet. Needs no models: the check comes first. Without the
+    /// feature there is no translator to refuse for, and `load` says
+    /// that instead -- which the build the app ships never does.
+    #[test]
+    #[cfg(feature = "translate-local")]
+    fn refuses_two_languages_in_one_alphabet() {
+        let refused = load(
+            Path::new("/nonexistent"),
+            1,
+            "streaming-zipformer",
+            "English",
+            &["German".to_string()],
+        );
+        let Err(e) = refused else {
+            panic!("German against English is Latin against Latin");
+        };
+        let said = format!("{e:#}");
+        assert!(
+            said.contains("alphabet") || said.contains("Latin"),
+            "it should say why, not just fail: {said}"
+        );
     }
 }

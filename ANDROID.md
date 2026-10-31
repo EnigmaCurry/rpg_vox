@@ -18,9 +18,14 @@ the phone. It also adds a voice keyboard for dictating into other apps.
   screen off, with Pause/Resume and Stop in the notification.
 * **Voice typing.** A Scribe keyboard that listens as soon as it opens
   and types the finished text into any app.
+* **Reads another language in yours.** A paragraph heard in Russian is
+  also read in English, on the phone, with nothing asked of a network.
+  What was said is kept either way, and you choose whether to see it,
+  the reading, or both.
 
 Arm64 phones running Android 8.0 (API 26) or newer. The finished text
-covers 25 European languages; the live text, as you speak, is English.
+covers 25 European languages; the live text, as you speak, is English or
+Russian, whichever you [read in](#languages).
 
 * [Install](#install)
 * [First run: speech models](#first-run-speech-models)
@@ -29,6 +34,7 @@ covers 25 European languages; the live text, as you speak, is English.
 * [Playing back](#playing-back)
 * [Transcribing a file](#transcribing-a-file)
 * [Settings](#settings)
+* [Languages](#languages)
 * [Voice typing keyboard](#voice-typing-keyboard)
 * [Building from source](#building-from-source)
 
@@ -67,7 +73,7 @@ and downloaded models.
 Scribe needs two models from the
 [sherpa-onnx releases](https://github.com/k2-fsa/sherpa-onnx/releases):
 a streaming Zipformer for the live text and Parakeet TDT 0.6B v3 for the
-corrected text. Tap **Download models** to fetch them, about 610 MB in
+corrected text. Tap **Download models** to fetch them, about 615 MB in
 all, into the app's private storage. Wi-Fi is recommended. The download
 continues if you switch apps, and if it fails, **Retry** resumes where it
 stopped.
@@ -75,6 +81,20 @@ stopped.
 The models stay loaded while you use Scribe and are unloaded to free
 memory after it has been out of sight for 10 minutes. Tap **Load
 models** to load them again.
+
+Everything else is fetched only if a setting asks for it, from
+**Settings → Languages**:
+
+| Model | What for | Download |
+| --- | --- | --- |
+| Streaming Zipformer (English) | the live text, in English | 128 MB |
+| Parakeet TDT 0.6B v3 | the finished text, 25 languages | 487 MB |
+| Vosk streaming Russian | the live text, in Russian | 27 MB |
+| opus-mt, one per language | reading another language in yours | 81 MB each |
+
+The downloads are the same models and the same sources the desktop
+[scribe](SCRIBE.md#models-and-logs) uses, and they land in the same
+layout, so what is written here about either holds for both.
 
 ## Recording
 
@@ -176,6 +196,8 @@ resume to apply them mid-recording.
   when they finish, as is a recording once all its text has been cut. Playback
   also shortens any quiet between words to 1 second.
 
+**Languages**: see [Languages](#languages) below.
+
 **Keyboard**: a shortcut to turn on the [voice typing
 keyboard](#voice-typing-keyboard).
 
@@ -184,6 +206,52 @@ the middle.
 
 **About**: the app's version, a link to its source, and the
 [changelog](CHANGELOG.md).
+
+## Languages
+
+**Settings → Languages** has three things: the language you read in, the
+languages to listen out for, and what the transcript shows of a
+paragraph that was read.
+
+**I read in** is English or Russian. Those are the two because pass 1 --
+the live text, as you speak -- is the one pass that needs a model per
+language, and those are the two it has one for. Everything else is read
+*into* this language, and the finished text is in all 25 either way.
+
+**Also listen out for** is a language per model, about 81 MB each,
+downloaded here. A paragraph heard in one of them gets a reading in the
+language you read, a sentence at a time, on the phone.
+
+Which languages are offered is not a matter of taste. A paragraph's
+language is worked out from its alphabet, because the recognizer that
+hears 25 languages never says which one it heard -- so a language
+written in the alphabet you read could not be told from your own, and
+two written in each other's could not be told apart. Turning one on
+therefore turns off whichever other one shares its alphabet, and the
+list is only the languages with a model that reads into yours:
+
+| You read | Listen out for |
+| --- | --- |
+| English | Russian or Ukrainian; Chinese, Japanese or Korean |
+| Russian | English, French or Spanish; Korean |
+
+**Show** is what the transcript does with a paragraph that has a
+reading:
+
+* **What was said** — the transcript only, as it was spoken.
+* **The reading** — the translation only; what was said is kept, just
+  not shown.
+* **Both** (the default) — what was said, with the reading under it.
+
+What was said is always what is saved, and it is the only text with word
+timings, so tapping a word to [play it back](#playing-back), editing and
+cutting all work on it: under **The reading** a translated paragraph has
+none of those, and what was said is a setting away. A paragraph in your
+own language looks the same whatever is chosen, there being nothing else
+to show.
+
+Changing a language reloads the models, which takes a few seconds and
+waits until the current recording is finished.
 
 ## Voice typing keyboard
 

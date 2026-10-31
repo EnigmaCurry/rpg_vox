@@ -64,10 +64,34 @@ data class Para(
     val words: List<Word> = emptyList(),
     /** When it was said (epoch ms); the transcript is in this order. */
     val atMs: Long = 0,
+    /**
+     * The reading in the language you read, for a paragraph heard in
+     * another one, and the language it was heard in. Null when
+     * translation is off, when the paragraph is in your own language, or
+     * before the first reading of it has landed.
+     */
+    val translation: String? = null,
+    val heardIn: String? = null,
 ) {
     val text: String get() = clips.filter { it.text.isNotBlank() }.joinToString(" ") { it.text }
     /** [text]'s words as shown. */
     val shown: List<String> by lazy { text.split(' ').filter { it.isNotEmpty() } }
+
+    /** Whether there is a reading to show, under [Show.TRANSLATION] too. */
+    val reading: String? get() = translation?.takeIf { it.isNotBlank() }
+}
+
+/**
+ * What the transcript shows of a translated paragraph. What was said is
+ * always what is kept and what the word timings, playback and editing
+ * are about, so [TRANSLATION] hides it rather than replacing it -- and
+ * only for the paragraphs that have a reading, since a paragraph in your
+ * own language has nothing else to show.
+ */
+enum class Show(val label: String, val detail: String) {
+    TRANSCRIPT("What was said", "The transcript only, in the language it was spoken in."),
+    TRANSLATION("The reading", "The translation only, with what was said hidden."),
+    BOTH("Both", "What was said, with the reading under it."),
 }
 
 sealed interface Phase {
@@ -162,6 +186,23 @@ object Scribe {
     /** Transcript text size, an index into [FONT_SCALES]. */
     var fontStep by mutableIntStateOf(FONT_SCALES.size / 2)
         private set
+    /** The language you read in: the live text's, and what is read into. */
+    var native by mutableStateOf(Language.ENGLISH)
+        private set
+    /**
+     * The languages listened out for and read in [native]. One per
+     * alphabet, because that is what a paragraph's language is read off;
+     * only those whose model is downloaded are used.
+     */
+    var others by mutableStateOf<Set<Language>>(emptySet())
+        private set
+    /**
+     * What the transcript shows of a paragraph that has a reading.
+     * Named for the setting ("Show"), spelled so as not to collide with
+     * `show(id)`, which opens a thread.
+     */
+    var showing by mutableStateOf(Show.BOTH)
+        private set
     /** The input the mic source is recording from, while it runs. */
     var micName by mutableStateOf<String?>(null)
         private set
@@ -250,6 +291,17 @@ object Scribe {
         keepNonSpeech = prefs.getBoolean("keep_non_speech", false)
         autoStart = prefs.getBoolean("auto_start", false)
         fontStep = prefs.getInt("font_step", FONT_SCALES.size / 2).coerceIn(0, FONT_SCALES.size - 1)
+        native = Language.of(prefs.getString("native_language", null))
+        others = (prefs.getStringSet("other_languages", null) ?: emptySet())
+            .mapNotNull { name -> Language.entries.firstOrNull { it.name == name } }
+            // A language whose model was removed, or whose alphabet now
+            // clashes with a changed native language, is dropped rather
+            // than failing the load it would be part of.
+            .filter { it != native && store.installed(translation(it, native) ?: return@filter false) }
+            .distinctBy { it.script }
+            .toSet()
+        showing = runCatching { Show.valueOf(prefs.getString("show", "BOTH")!!) }
+            .getOrDefault(Show.BOTH)
         phase = if (store.ready()) Phase.Unloaded else Phase.NeedModels(resume = store.started())
         migrate()
         show(threads.current())
@@ -257,10 +309,19 @@ object Scribe {
         scope.launch {
             InstallService.state.collect { s ->
                 when (s) {
-                    is Install.Running -> phase = Phase.Installing(s.step, s.overall)
+                    // Only the models nothing works without take over
+                    // the screen; a language model is downloaded with
+                    // the app still usable, and its progress is shown on
+                    // the settings page that asked for it.
+                    is Install.Running -> if (!store.ready()) {
+                        phase = Phase.Installing(s.step, s.overall)
+                    }
                     is Install.Failed ->
                         if (phase is Phase.Installing) phase = Phase.NeedModels(s.error, resume = true)
-                    Install.Done -> if (phase is Phase.Installing) load()
+                    Install.Done -> {
+                        languageModels++
+                        if (phase is Phase.Installing) load() else reload()
+                    }
                     Install.Idle -> {}
                 }
             }
@@ -290,6 +351,77 @@ object Scribe {
     fun chooseFontStep(step: Int) {
         fontStep = step.coerceIn(0, FONT_SCALES.size - 1)
         app.getSharedPreferences("scribe", Context.MODE_PRIVATE).edit().putInt("font_step", fontStep).apply()
+    }
+
+    fun chooseShowing(s: Show) {
+        showing = s
+        app.getSharedPreferences("scribe", Context.MODE_PRIVATE).edit().putString("show", s.name).apply()
+    }
+
+    /**
+     * The language you read in. Pass 1 listens in it, so this decides
+     * which streaming model loads, and every translation reads into it,
+     * so the other languages are dropped: their models read into the old
+     * one, and a language sharing the new one's alphabet could not be
+     * told apart from it anyway.
+     */
+    fun chooseNative(l: Language) {
+        if (l == native) return
+        native = l
+        others = emptySet()
+        app.getSharedPreferences("scribe", Context.MODE_PRIVATE).edit()
+            .putString("native_language", l.label)
+            .putStringSet("other_languages", emptySet())
+            .apply()
+        reload()
+    }
+
+    /**
+     * Listen out for [l] as well, or stop. Turning one on replaces
+     * whichever other language shares its alphabet, since a paragraph in
+     * either could not be told from one in the other.
+     */
+    fun chooseOther(l: Language, on: Boolean) {
+        val next = when {
+            !on -> others - l
+            else -> others.filter { it.script != l.script }.toSet() + l
+        }
+        if (next == others) return
+        others = next
+        app.getSharedPreferences("scribe", Context.MODE_PRIVATE).edit()
+            .putStringSet("other_languages", next.map { it.name }.toSet())
+            .apply()
+        reload()
+    }
+
+    /** The models the languages now ask for, in the order they install. */
+    fun wanted(): List<Model> =
+        listOfNotNull(native.streaming) + others.mapNotNull { translation(it, native) }
+
+    /** Models downloaded for a language setting that no longer wants them. */
+    fun spare(): List<Model> {
+        val keep = (wanted() + BUNDLES).map { it.dir }.toSet()
+        return (NATIVE_LANGUAGES.mapNotNull { it.streaming } +
+            NATIVE_LANGUAGES.flatMap { into -> translatable(into).mapNotNull { translation(it, into) } })
+            .filter { it.dir !in keep && store.installed(it) }
+            .distinctBy { it.dir }
+    }
+
+    /**
+     * Load the models again, for a language setting that changed. A
+     * recording in progress keeps the engine it started with; the next
+     * one gets the new one.
+     *
+     * Nothing is unloaded until everything the new setting wants is
+     * downloaded: a language turned on before its model is fetched would
+     * otherwise leave the app with no models at all until it arrived.
+     * The download calls back here when it lands.
+     */
+    private fun reload() {
+        if (busy() || dictating) return
+        if (!store.ready() || !wanted().all(store::installed)) return
+        release()
+        if (phase == Phase.Unloaded) load()
     }
 
     /** Where kept recordings live. */
@@ -491,12 +623,57 @@ object Scribe {
 
     fun install() = InstallService.start(app)
 
+    /**
+     * Download the models the languages ask for and nothing else: the
+     * pass-1 model for the language you read in, and one translation
+     * model per other language. Already-installed ones are skipped, so
+     * this is also how a failed one is retried.
+     */
+    fun installLanguages() {
+        val missing = wanted().filterNot(store::installed)
+        if (missing.isEmpty()) {
+            // Nothing to fetch, but the setting may still be waiting for
+            // the engine to be rebuilt around it.
+            reload()
+            return
+        }
+        InstallService.start(app, missing)
+    }
+
+    /** Delete a model a language setting no longer wants. */
+    fun removeModel(m: Model) {
+        store.remove(m)
+        languageModels++
+    }
+
+    /**
+     * Bumped whenever a model is installed or removed, so the settings
+     * page is recomposed: what is on disk is not state Compose watches.
+     */
+    var languageModels by mutableIntStateOf(0)
+        private set
+
     fun load() {
         if (phase == Phase.Loading || models != 0L) return
         phase = Phase.Loading
         scope.launch {
             val result = withContext(Dispatchers.IO) {
-                runCatching { Native.load(store.dir.path, THREADS) }
+                runCatching {
+                    Native.load(
+                        store.dir.path,
+                        THREADS,
+                        // The live text falls back to English when the
+                        // model for the language chosen hasn't been
+                        // downloaded yet; the settings page is where that
+                        // is said and fixed.
+                        (native.streaming?.takeIf(store::installed) ?: ZIPFORMER_EN).dir,
+                        native.label,
+                        // Only the ones whose model is actually there:
+                        // the engine refuses a language it cannot read.
+                        others.filter { store.installed(translation(it, native)!!) }
+                            .joinToString(",") { it.label },
+                    )
+                }
             }
             result.onSuccess {
                 models = it
@@ -1031,6 +1208,8 @@ object Scribe {
                 audio = m.audio,
                 words = parseWords(m.words),
                 atMs = m.atMs,
+                translation = m.translation,
+                heardIn = m.heardIn,
             )
             paragraphs += p
             written[p.id] = m
@@ -1157,6 +1336,10 @@ object Scribe {
 
     private fun parse(src: Source, o: JSONObject): Para {
         val clips = o.getJSONArray("clips")
+        // `{"state": "done", "language": …, "text": …}` once a reading
+        // has landed; "running", "native" and "failed" have none to show,
+        // and a paragraph in your own language stays at "native".
+        val tr = o.optJSONObject("translation")?.takeIf { it.optString("state") == "done" }
         val p = Para(
             id = o.getString("id"),
             clips = (0 until clips.length()).map {
@@ -1167,6 +1350,8 @@ object Scribe {
             audio = src.audio,
             words = parseWords(o.optJSONArray("words")),
             atMs = src.baseMs + o.optLong("start_ms"),
+            translation = tr?.optString("text")?.takeIf { it.isNotEmpty() },
+            heardIn = tr?.optString("language")?.takeIf { it.isNotEmpty() },
         )
         return withoutCuts(src, p)
     }
@@ -1211,11 +1396,17 @@ object Scribe {
             val words = p.words.takeIf { it.isNotEmpty() }?.toJson()
             val w = written[p.id]
             when {
-                w == null -> written[p.id] =
-                    Saved(threads.say(id, text, p.source, p.audio, words, p.atMs), text, p.source, p.audio, words, p.atMs)
-                w.text != text || w.words != words || w.atMs != p.atMs -> {
-                    threads.edit(w.rowId, text, words, p.atMs)
-                    written[p.id] = w.copy(text = text, words = words, atMs = p.atMs)
+                w == null -> written[p.id] = Saved(
+                    threads.say(id, text, p.source, p.audio, words, p.atMs, p.translation, p.heardIn),
+                    text, p.source, p.audio, words, p.atMs, p.translation, p.heardIn,
+                )
+                w.text != text || w.words != words || w.atMs != p.atMs ||
+                    w.translation != p.translation -> {
+                    threads.edit(w.rowId, text, words, p.atMs, p.translation, p.heardIn)
+                    written[p.id] = w.copy(
+                        text = text, words = words, atMs = p.atMs,
+                        translation = p.translation, heardIn = p.heardIn,
+                    )
                 }
             }
         }

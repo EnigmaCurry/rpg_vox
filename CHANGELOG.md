@@ -163,6 +163,34 @@ section after the version it releases.
   text back. It used to copy the newest paragraph when nothing was
   selected.
 
+### Scribe for Android
+
+- **It reads another language in yours, on the phone.** The translation
+  the desktop got is in the app, with CTranslate2 built for the NDK, so
+  a paragraph heard in Russian also reads in English with nothing asked
+  of a network. **Settings → Languages** has the three choices it takes:
+  the language you *read in* (English or Russian — the two that pass 1,
+  the live text, has a model for, which is also what decides which
+  streaming model is downloaded), the languages to *listen out for* (a
+  model each, 81 MB, downloaded there), and what the transcript *shows*
+  of a paragraph that was read: what was said, the reading, or both.
+
+  The languages offered are the ones that can be told apart. A
+  paragraph's language is read off its alphabet, since the recognizer
+  that hears 25 of them never says which it heard, so a language written
+  in the alphabet you read could not be told from your own and two
+  written in each other's could not be told apart: turning one on turns
+  off whichever other one shares its alphabet. What was said is always
+  what is stored, and the only text with word timings, so playback,
+  editing and cutting stay with it — "The reading" hides it rather than
+  replacing it. Readings are saved with the transcript, in two columns
+  the desktop's chat database ignores, so a thread reopens with them.
+
+- **The app downloaded the wrong Parakeet.** It fetched
+  `parakeet-tdt-0.6b-v2` while the library had moved to v3, so a fresh
+  install downloaded 487 MB and then failed to load with the file it was
+  looking for missing. One side of that rename had been left behind.
+
 ## v0.1.10 (2026-10-18)
 
 ### scribe

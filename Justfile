@@ -819,7 +819,15 @@ _android-jni:
     export CMAKE_TOOLCHAIN_FILE="$PWD/android/toolchain.cmake"
     # Its own target dir; see the `android` recipe for why.
     export CARGO_TARGET_DIR="$PWD/target/android"
-    cargo ndk -t arm64-v8a --platform 26 build --release --locked -p vox_android
+    # `translate-local` brings CTranslate2, built here for the NDK by the
+    # CMake above. The one thing it needs that Android does not have is
+    # `pthread_setaffinity_np`, which that header declares and
+    # vox_android defines -- read it for the whole story. cc adds this to
+    # its own flags rather than replacing them, and `TARGET_` keeps it to
+    # the cross-build, where every C++ file here is.
+    export TARGET_CXXFLAGS="-include $PWD/android/ct2-affinity.h"
+    cargo ndk -t arm64-v8a --platform 26 build --release --locked \
+      -p vox_android --features translate-local
     jni=android/app/src/main/jniLibs/arm64-v8a
     libs="$CARGO_TARGET_DIR/sherpa-onnx-prebuilt/jniLibs/arm64-v8a"
     mkdir -p "$jni"

@@ -32,6 +32,7 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.input.ImeAction
 import kotlinx.coroutines.delay
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -337,6 +338,7 @@ private fun ConfirmDelete(heading: String, detail: String, close: () -> Unit, de
 enum class SettingsPage(val title: String) {
     MICROPHONE("Microphone"),
     RECORDING("Recording"),
+    LANGUAGES("Languages"),
     KEYBOARD("Keyboard"),
     DISPLAY("Display"),
     ABOUT("About"),
@@ -357,6 +359,7 @@ fun Settings(page: SettingsPage, close: () -> Unit) {
                 when (page) {
                     SettingsPage.MICROPHONE -> MicrophonePage()
                     SettingsPage.RECORDING -> RecordingPage()
+                    SettingsPage.LANGUAGES -> LanguagesPage()
                     SettingsPage.KEYBOARD -> KeyboardPage()
                     SettingsPage.DISPLAY -> DisplayPage()
                     SettingsPage.ABOUT -> {}
@@ -430,6 +433,125 @@ private fun KeyboardPage() {
                 .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK),
         )
     }) { Text("Keyboard settings") }
+}
+
+/**
+ * The language you read in, the ones to listen out for, and what the
+ * transcript shows of a paragraph that has a reading.
+ *
+ * Each other language is one model, downloaded here, that reads it in
+ * the language you read. Which languages can be offered is not a matter
+ * of taste: a paragraph's language is read off its alphabet, so one
+ * sharing the alphabet you read in could never be told apart from your
+ * own, and two sharing each other's could not be told apart either. So
+ * the list is the languages with a model into yours, and turning one on
+ * turns off whichever other one shares its alphabet.
+ */
+@Composable
+private fun LanguagesPage() {
+    val installing = InstallService.state.collectAsState().value
+    // Recomposes when a model is installed or deleted.
+    val models = Scribe.languageModels
+    val native = Scribe.native
+    Text("I read in", style = MaterialTheme.typography.titleSmall)
+    NATIVE_LANGUAGES.forEach { l ->
+        Choice(l.label, native == l) { Scribe.chooseNative(l) }
+    }
+    Text(
+        "The live text is in this language, and everything else is read into it.",
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+
+    Text(
+        "Also listen out for",
+        style = MaterialTheme.typography.titleSmall,
+        modifier = Modifier.padding(top = 16.dp),
+    )
+    val chosen = Scribe.others
+    translatable(native).forEach { l ->
+        val model = translation(l, native) ?: return@forEach
+        val on = l in chosen
+        // The language already chosen that this one could not be told
+        // apart from, if any: turning it on would replace that one.
+        val clash = if (on) null else chosen.firstOrNull { it.script == l.script }
+        val have = remember(models) { Scribe.store.installed(model) }
+        val mb = model.approxBytes / 1_000_000
+        Toggle(
+            l.label,
+            when {
+                clash != null -> "${l.script.label}, like ${clash.label}: only one of them can be told apart."
+                have -> "Downloaded, $mb MB."
+                on -> "$mb MB to download."
+                else -> "$mb MB, downloaded when you turn it on."
+            },
+            on,
+            { Scribe.chooseOther(l, it) },
+            enabled = clash == null && !Scribe.busy(),
+        )
+    }
+    if (translatable(native).isEmpty()) {
+        Text(
+            "No other language has a model that reads into ${native.label} yet.",
+            style = MaterialTheme.typography.bodySmall,
+        )
+    }
+
+    // What the choices above still want fetched, and what they left behind.
+    val missing = remember(models, chosen, native) { Scribe.wanted().filterNot(Scribe.store::installed) }
+    val spare = remember(models, chosen, native) { Scribe.spare() }
+    when {
+        installing is Install.Running -> Text(
+            describe(installing.step),
+            style = MaterialTheme.typography.bodySmall,
+            modifier = Modifier.padding(top = 8.dp),
+        )
+        installing is Install.Failed -> Text(
+            "Download failed: ${installing.error}\nTrying again resumes where it stopped.",
+            color = MaterialTheme.colorScheme.error,
+            style = MaterialTheme.typography.bodySmall,
+            modifier = Modifier.padding(top = 8.dp),
+        )
+        missing.isNotEmpty() -> Text(
+            "${missing.sumOf { it.approxBytes } / 1_000_000} MB to download. " +
+                "Wi-Fi recommended; it continues if you switch apps.",
+            style = MaterialTheme.typography.bodySmall,
+            modifier = Modifier.padding(top = 8.dp),
+        )
+    }
+    if (missing.isNotEmpty() && installing !is Install.Running) {
+        TextButton(onClick = Scribe::installLanguages) {
+            Text(if (installing is Install.Failed) "Retry" else "Download")
+        }
+    }
+    spare.forEach { m ->
+        TextButton(onClick = { Scribe.removeModel(m) }) {
+            Text("Delete ${m.dir.removePrefix("translate/")} (${m.approxBytes / 1_000_000} MB)")
+        }
+    }
+
+    Text(
+        "Show",
+        style = MaterialTheme.typography.titleSmall,
+        modifier = Modifier.padding(top = 16.dp),
+    )
+    Show.entries.forEach { s ->
+        Choice(s.label, Scribe.showing == s) { Scribe.chooseShowing(s) }
+    }
+    Text(
+        "For paragraphs that were read in another language. What was said " +
+            "is always what is kept, and what playback and editing are about.",
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+    if (Scribe.recording || Scribe.busy()) {
+        Text(
+            "Language changes apply to the next recording.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(top = 8.dp),
+        )
+    }
 }
 
 /** Transcript text size: five steps, the default in the middle. */

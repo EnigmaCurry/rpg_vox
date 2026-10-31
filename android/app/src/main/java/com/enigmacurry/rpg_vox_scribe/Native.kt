@@ -17,9 +17,28 @@ object Native {
     /** Compressed bytes the running [unpack] has read. */
     external fun unpackProgress(): Long
 
-    /** Loads Parakeet + Zipformer from [modelsDir]; throws on failure. Slow (seconds). */
-    external fun load(modelsDir: String, threads: Int): Long
+    /**
+     * Loads Parakeet and the pass-1 model in [streamingDir] from
+     * [modelsDir], and the translators that read [otherLanguages]
+     * (comma-separated, may be empty) in [nativeLanguage]. Throws on
+     * failure. Slow (seconds).
+     */
+    external fun load(
+        modelsDir: String,
+        threads: Int,
+        streamingDir: String,
+        nativeLanguage: String,
+        otherLanguages: String,
+    ): Long
     external fun freeModels(models: Long)
+
+    /**
+     * Writes the `tokenizer.json` a translation model is read with from
+     * the `source.spm` it ships; returns how many pieces it has. Throws
+     * on failure. Nobody publishes this file, which is why the download
+     * cannot simply fetch it.
+     */
+    external fun writeTokenizer(spm: String, out: String): Int
 
     /**
      * Starts one session (one source) fed at [sampleRate] Hz mono; [streaming]
