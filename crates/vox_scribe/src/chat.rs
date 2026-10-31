@@ -1349,7 +1349,7 @@ impl Chat<'_> {
             for c in &p.clips {
                 if c.stage == Stage::Partial {
                     let style = Style::new().dark_gray().italic();
-                    words.extend(self.s.pass1.words(&c.text).into_iter().map(|w| (w, style)));
+                    words.extend(self.s.pass1.shown(&c.text).into_iter().map(|w| (w, style)));
                 } else {
                     words.extend(
                         c.text

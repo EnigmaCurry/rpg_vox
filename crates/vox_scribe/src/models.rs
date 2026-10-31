@@ -212,6 +212,46 @@ pub fn has_zipformer_ru(dir: &Path) -> bool {
     has_streaming(dir, ZIPFORMER_RU)
 }
 
+/// The pass-1 bundle for a language, as a language is spelled in English
+/// ("Russian"), for the languages there is one of.
+///
+/// Pass 1 is the only pass that needs a model per language: passes 2 and
+/// 3 work the language out from the audio, but a streaming model has to
+/// be chosen before anything has been said. `vox_room` keeps the same
+/// table (`crates/vox_room/src/stt.rs`) because it is a separate binary
+/// reading the same models directory; a language added here wants adding
+/// there too.
+pub fn streaming_bundle(language: &str) -> Option<&'static str> {
+    [("English", ZIPFORMER), ("Russian", ZIPFORMER_RU)]
+        .into_iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(language.trim()))
+        .map(|(_, bundle)| bundle)
+}
+
+/// Every language [`streaming_bundle`] knows, for an error message.
+pub fn streaming_languages() -> &'static [&'static str] {
+    &["English", "Russian"]
+}
+
+/// Download the pass-1 model for `language`, if it isn't already there.
+pub fn download_streaming(dir: &Path, language: &str) -> Result<()> {
+    match streaming_bundle(language) {
+        Some(ZIPFORMER_RU) => download_zipformer_ru(dir),
+        // The English bundle comes down with the offline model, since
+        // that is the pair almost every run wants.
+        Some(_) => download_zipformer(dir),
+        None => bail!(
+            "no streaming model for {language}; one of: {}",
+            streaming_languages().join(", ")
+        ),
+    }
+}
+
+/// Whether one pass-1 bundle, named by [`streaming_bundle`], is there.
+pub fn has_streaming_bundle(dir: &Path, bundle: &str) -> bool {
+    has_streaming(dir, bundle)
+}
+
 fn has_streaming(dir: &Path, bundle: &str) -> bool {
     ["encoder.onnx", "decoder.onnx", "joiner.onnx", "tokens.txt"]
         .iter()
@@ -257,29 +297,34 @@ pub fn download(dir: &Path, offline: Offline) -> Result<()> {
             ],
         )?;
     }
+    download_zipformer(dir)
+}
+
+/// Download the English pass-1 model into `dir`, if it isn't there.
+pub fn download_zipformer(dir: &Path) -> Result<()> {
     if has_zipformer(dir) {
         println!(
             "Zipformer already present in {}",
             dir.join(ZIPFORMER).display()
         );
-    } else {
-        fetch(
-            "sherpa-onnx-streaming-zipformer-en-20M-2023-02-17",
-            &dir.join(ZIPFORMER),
-            &[
-                ("encoder-epoch-99-avg-1.int8.onnx", "encoder.onnx"),
-                ("decoder-epoch-99-avg-1.onnx", "decoder.onnx"),
-                ("joiner-epoch-99-avg-1.int8.onnx", "joiner.onnx"),
-                ("tokens.txt", "tokens.txt"),
-            ],
-        )?;
+        return Ok(());
     }
-    Ok(())
+    fetch(
+        "sherpa-onnx-streaming-zipformer-en-20M-2023-02-17",
+        &dir.join(ZIPFORMER),
+        &[
+            ("encoder-epoch-99-avg-1.int8.onnx", "encoder.onnx"),
+            ("decoder-epoch-99-avg-1.onnx", "decoder.onnx"),
+            ("joiner-epoch-99-avg-1.int8.onnx", "joiner.onnx"),
+            ("tokens.txt", "tokens.txt"),
+        ],
+    )
 }
 
-/// Download the Russian pass-1 model into `dir`. Separate from
-/// [`download`] because only a room with a Russian speaker in it wants
-/// this; scribe transcribes one person, in English.
+/// Download the Russian pass-1 model into `dir`. Not part of
+/// [`download`] because most runs never want it: it is the one
+/// `--pass1-language Russian` asks for, and the one `vox_room` needs to
+/// show live text for a Russian speaker.
 pub fn download_zipformer_ru(dir: &Path) -> Result<()> {
     if has_zipformer_ru(dir) {
         println!(
@@ -404,6 +449,22 @@ fn copy_all(from: &Path, to: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pass_1_bundle_per_language_and_nothing_invented() {
+        assert_eq!(streaming_bundle("English"), Some(ZIPFORMER));
+        assert_eq!(streaming_bundle("Russian"), Some(ZIPFORMER_RU));
+        // However it was spelled on the command line.
+        assert_eq!(streaming_bundle(" russian "), Some(ZIPFORMER_RU));
+        // Parakeet hears these at pass 2, but no streaming model here
+        // does, and saying so is the point: one engine loads one
+        // pass-1 model and it has to be chosen before anything is said.
+        assert_eq!(streaming_bundle("German"), None);
+        assert_eq!(streaming_bundle(""), None);
+        for l in streaming_languages() {
+            assert!(streaming_bundle(l).is_some(), "{l} is offered");
+        }
+    }
 
     /// A bundle like the ones on the sherpa-onnx releases page: a
     /// directory named after the archive, with a stray symlink in it.

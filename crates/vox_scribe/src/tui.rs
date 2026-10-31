@@ -1107,7 +1107,7 @@ fn transcript_lines(
                 _ => Style::new(),
             };
             if c.is_partial() {
-                words.extend(pass1.words(&c.text).into_iter().map(|w| (w, style)));
+                words.extend(pass1.shown(&c.text).into_iter().map(|w| (w, style)));
             } else {
                 words.extend(c.text.split_whitespace().map(|w| (w.to_string(), style)));
             }
@@ -1142,7 +1142,7 @@ fn transcript_lines(
     if let Some(&(start, _)) = pending.first() {
         let words = pending
             .iter()
-            .flat_map(|(_, t)| pass1.words(t))
+            .flat_map(|(_, t)| pass1.shown(t))
             .map(|w| (w, partial_style))
             .collect();
         let label = format!("[{}]", timestamp(start));

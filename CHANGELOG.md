@@ -26,6 +26,22 @@ section after the version it releases.
   of a language it was never in. See
   [translation](SCRIBE.md#translation-optional).
 
+- **`--pass1-language`: live text in the language being spoken.** Pass 1
+  is the one pass that has to be told which language it is hearing —
+  passes 2 and 3 work it out from the audio and the translation works it
+  out from their text, but a streaming model has to be loaded before
+  anything has been said. There has been a Russian pass-1 model all
+  along; scribe could only *download* it, for `vox_room`, and always
+  loaded the English one itself, so Russian speech showed ALL CAPS
+  English nonsense until each utterance was decoded. Now
+  `--pass1-language Russian` loads it (fetched on first use, ~28 MB) and
+  the live text is Russian. It is a choice, not a detection: one engine
+  loads one model, so a language this isn't set to still gets the
+  nonsense — `--pass1 ellipsis` and `--no-streaming` are the ways to
+  want neither. Pass-1 text is upper-cased for the screen now rather
+  than relying on the English model's own tokens being upper case, so
+  "dim ALL CAPS means still settling" holds in both languages.
+
 - **Words no longer come out of order.** A short utterance that the
   live pass never showed (too quick for it) only reached the transcript
   when its re-decode finished, and was added after whatever had been said

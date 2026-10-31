@@ -181,6 +181,19 @@ struct Cli {
     /// `off` (pass 1 doesn't run, like --no-streaming).
     #[arg(long, value_enum, default_value = "text", env = "VOX_SCRIBE_PASS1")]
     pass1: Pass1,
+    /// The language pass 1 listens in, spelled in English ("Russian").
+    /// Default: --native-language.
+    ///
+    /// Pass 1 is the only pass that has to be told: passes 2 and 3 work
+    /// the language out from the audio, but a streaming model has to be
+    /// chosen before anything has been said, and one engine loads one.
+    /// So a session in a language this isn't set to gets ALL CAPS
+    /// nonsense until each utterance is decoded -- `--pass1 ellipsis`
+    /// shows a dot per word instead, and `--no-streaming` shows nothing
+    /// until pass 2. The model is fetched on first use (~28 MB for
+    /// Russian).
+    #[arg(long, value_name = "NAME", env = "VOX_SCRIBE_PASS1_LANGUAGE")]
+    pass1_language: Option<String>,
     /// Start new paragraphs only on Enter, not on silence (toggle with `m`).
     #[arg(long)]
     manual: bool,
@@ -357,6 +370,25 @@ impl Pass1 {
             _ => text.split_whitespace().map(str::to_string).collect(),
         }
     }
+
+    /// [`Pass1::words`] as the full-screen UI shows them: upper case,
+    /// which with the dimming is what says a word is still pass 1's
+    /// guess.
+    ///
+    /// Not in `words` itself, because dictation (`--jsonl`) hands these
+    /// words to another program as text somebody typed, and shouting is
+    /// a thing to look at rather than a thing to insert.
+    ///
+    /// The English Zipformer's own tokens are upper case, so this used
+    /// to come for free and was never written down. The Russian one's
+    /// are not, and a convention that holds in one language only is not
+    /// one.
+    pub fn shown(self, text: &str) -> Vec<String> {
+        self.words(text)
+            .into_iter()
+            .map(|w| w.to_uppercase())
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -455,8 +487,10 @@ enum Cmd {
     /// Download the Zipformer model and the --model recognizer (and the
     /// speaker models with --diarize).
     DownloadModels {
-        /// Also fetch the Russian streaming model, which `vox_room` needs
-        /// to show live text for a Russian speaker. ~28 MB.
+        /// Also fetch the Russian streaming model, which
+        /// `--pass1-language Russian` and `vox_room` need to show live
+        /// text for a Russian speaker. ~28 MB. Fetched on first use
+        /// anyway; this is for setting a machine up in advance.
         #[arg(long)]
         russian: bool,
     },
@@ -900,7 +934,8 @@ struct Load {
     model: models::Offline,
     language: String,
     threads: i32,
-    streaming: bool,
+    /// The pass-1 bundle to load, or `None` for no pass 1 at all.
+    streaming: Option<&'static str>,
     models_dir: PathBuf,
     vocab: Option<vox_transcribe::vocab::Vocab>,
     speakers: Option<SpeakerModels>,
@@ -957,12 +992,18 @@ impl Load {
                 }
             };
         // One streaming model, a session (stream) per source.
-        let zipformer = if self.streaming {
-            let mut zc = ZipformerConfig::from_dir(&models_dir.join(models::ZIPFORMER));
-            zc.num_threads = self.threads;
-            Some(Zipformer::open(&zc)?)
-        } else {
-            None
+        let zipformer = match self.streaming {
+            Some(bundle) => {
+                let mut zc = ZipformerConfig::from_dir(&models_dir.join(bundle));
+                zc.num_threads = self.threads;
+                Some(Zipformer::open(&zc).with_context(|| {
+                    format!(
+                        "loading the {bundle} streaming model from {}",
+                        models_dir.display()
+                    )
+                })?)
+            }
+            None => None,
         };
         Ok(Loaded {
             offline,
@@ -1187,14 +1228,35 @@ fn run() -> Result<()> {
 
     let models_dir = models::resolve(cli.models_dir.as_deref());
     let interpreter = interpreter(&cli, &models_dir)?;
+    // Which language pass 1 listens in, and so which bundle it loads.
+    // Named before any model is fetched, because a language with no
+    // streaming model is a mistake on the command line and not
+    // something to find out one download later.
+    let pass1_language = cli
+        .pass1_language
+        .clone()
+        .unwrap_or_else(|| cli.native_language.clone());
+    let pass1_bundle = match cli.no_streaming || cli.pass1 == Pass1::Off {
+        true => None,
+        false => Some(models::streaming_bundle(&pass1_language).with_context(|| {
+            format!(
+                "--pass1-language {pass1_language}: no streaming model for it; one of: {}",
+                models::streaming_languages().join(", ")
+            )
+        })?),
+    };
     // First run: fetch the models rather than failing.
-    let streaming = !cli.no_streaming && cli.pass1 != Pass1::Off;
-    if !cli.model.present(&models_dir) || (streaming && !models::has_zipformer(&models_dir)) {
+    if !cli.model.present(&models_dir) {
         eprintln!(
             "models not found, downloading them once ({})…",
             cli.model.download_size()
         );
         models::download(&models_dir, cli.model)?;
+    }
+    if let Some(bundle) = pass1_bundle.filter(|b| !models::has_streaming_bundle(&models_dir, b)) {
+        eprintln!("the {pass1_language} streaming model is not here, downloading it once…");
+        models::download_streaming(&models_dir, &pass1_language)
+            .with_context(|| format!("download the {bundle} streaming model"))?;
     }
     if cli.diarize && !models::has_speakers(&models_dir) {
         eprintln!("speaker models not found, downloading them once (about 77 MB)…");
@@ -1287,7 +1349,7 @@ fn run() -> Result<()> {
             model: cli.model,
             language: cli.language.clone(),
             threads: cli.threads,
-            streaming: streaming && models::has_zipformer(&models_dir),
+            streaming: pass1_bundle.filter(|b| models::has_streaming_bundle(&models_dir, b)),
             models_dir: models_dir.clone(),
             vocab: vocab.clone(),
             speakers: speaker_models.clone(),

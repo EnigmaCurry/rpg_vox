@@ -574,11 +574,48 @@ file, because a player shows one subtitle track and somebody reading
 this one cannot read the other. There is no translated `.ass` — karaoke
 needs a time per word, and a translation's words were never spoken.
 
+### Live text in the other language
+
+Pass 1 is the one pass that has to be *told* which language it is
+hearing. Passes 2 and 3 work it out from the audio and the translation
+works it out from their text, but a streaming model has to be loaded
+before anything has been said — so `--pass1-language` says which:
+
+```bash
+just scribe-translate --pass1-language Russian -i talk.opus --live
+```
+
+Without it, pass 1 listens in `--native-language` (English), and Russian
+speech gives dim ALL CAPS nonsense until each utterance is decoded a
+moment later. The final text is unaffected either way: pass 2 re-decodes
+every utterance from the audio and replaces the partial whatever it
+said.
+
+One engine loads one streaming model, so this is a choice and not a
+detection — in a session where both languages are spoken, whichever one
+you don't pick gets the nonsense. Two ways to want neither:
+`--pass1 ellipsis` shows a `…` per word heard without the words, and
+`--no-streaming` shows nothing until pass 2.
+
+There are pass-1 models for English and Russian. The Russian one (Vosk's
+small streaming Zipformer, ~28 MB) is fetched on first use, or in
+advance with `scribe download-models --russian`. A language Parakeet
+hears but has no pass-1 model for is refused rather than guessed:
+
+```
+$ scribe --pass1-language German
+Error: --pass1-language German: no streaming model for it; one of: English, Russian
+```
+
+One thing to know when comparing runs: pass 1 helps decide where an
+utterance is cut (it is what notices that a loud stretch has stopped
+producing words), so changing `--pass1-language` can move the utterance
+boundaries and, through them, change the final text a little.
+
 ### Debugging a translation
 
-Pass 1 is English-only, so a Russian speaker's live partials are
-nonsense until pass 2 lands. That costs nothing but noise on screen, and
-`--no-streaming` turns it off for a file you are working through:
+`--no-streaming` keeps pass 1 out of the way entirely for a file you are
+working through:
 
 ```bash
 just scribe --translate local --no-streaming \
