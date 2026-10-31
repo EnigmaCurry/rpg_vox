@@ -204,6 +204,11 @@ struct TrJob {
     /// What this paragraph's sentences already read as, so a paragraph
     /// read again as it grows pays for the new sentences only.
     known: Known,
+    /// The language to assume when the text's alphabet cannot say which
+    /// it is: the one pass 1 is listening in, which is the one the last
+    /// utterances turned out to be in. `None` when pass 1 is in the
+    /// language it started in, whose name nothing here knows.
+    assume: Option<String>,
 }
 
 struct TrResult {
@@ -391,7 +396,13 @@ impl Engine {
                     .name("vox-translate".into())
                     .spawn(move || {
                         for job in job_rx {
-                            let reading = i.read(&job.text, job.words, &job.context, &job.known);
+                            let reading = i.read(
+                                &job.text,
+                                job.words,
+                                &job.context,
+                                &job.known,
+                                job.assume.as_deref(),
+                            );
                             if out_tx.send(TrResult { job, reading }).is_err() {
                                 return;
                             }
@@ -819,6 +830,14 @@ impl Core {
             None => self.streaming.as_deref(),
             Some(i) => self.streaming_also.get(i).map(|l| l.by.as_ref()),
         }
+    }
+
+    /// The language pass 1 is listening in, when it is one it was told
+    /// the name of -- which is every one but the language it started in,
+    /// whose name `spawn` is not given.
+    fn pass1_language(&self) -> Option<&str> {
+        let i = self.streaming_at?;
+        Some(self.streaming_also.get(i)?.language.as_str())
     }
 
     /// Pass 1 follows what pass 2 heard: see [`Passes::streaming_also`].
@@ -1269,6 +1288,7 @@ impl Core {
             words: p.words.len(),
             context,
             known,
+            assume: self.pass1_language().map(str::to_string),
         };
         if tx.send(job).is_err() {
             return;

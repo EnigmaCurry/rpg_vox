@@ -204,14 +204,25 @@ section after the version it releases.
   that sentence was spoken, a translation having no word timings of its
   own. Copy, Share and the notification say what the screen says.
 
-  A paragraph the engine has not ruled on yet -- one pass 1 is still
-  typing, where pass 2 has not said what language it is and the
-  translator has not read it -- goes by its alphabet, the same rule and
-  the same numbers the engine uses (`script` in the app, a majority of
-  at least eight letters). Until there are enough letters to say, it
-  shows as an ellipsis rather than risk being the other language: about
-  a word of live text, against which it was the live text that had been
-  putting Russian on an English screen all along.
+  What is shown as what was said is now what is *not known to be* in
+  another alphabet, which is two fixes in one rule. A paragraph pass 1
+  is still typing has no verdict at all, and a paragraph whose alphabet
+  could not be read -- too few letters, or too much of a mixture, which
+  `<unk>` and a stray word manage easily -- gets the same verdict as one
+  in your own language: nothing to translate. Both were shown as what
+  was said, which for Russian is Russian. The app asks the alphabet
+  itself now, by the same rule and the same numbers the engine uses
+  (`script`, a majority of at least eight letters), and shows what was
+  said unless the answer is an alphabet you don't read.
+
+  Text too short or too mixed to place is still shown -- "OK." is as
+  likely as "Да.", and hiding every short utterance to catch the second
+  would lose the first -- and the engine is told to assume the language
+  pass 1 is listening in for exactly those, so most of them are read
+  rather than left to that judgement. Only when the alphabet says
+  nothing at all: a line that is readable and in none of the languages
+  being listened out for is a line in your own, and sending that to a
+  translator would get it back unchanged.
 
   The words that appear *as you speak* come from pass 1, the one pass
   that has to be told which language to listen in -- it decodes as the

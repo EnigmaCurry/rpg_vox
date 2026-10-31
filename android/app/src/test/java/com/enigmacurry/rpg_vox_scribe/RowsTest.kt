@@ -134,7 +134,7 @@ class OwnTest {
     /**
      * The state the engine has not answered yet, which is every
      * paragraph while pass 1 is typing it: the alphabet decides, and
-     * this is the case that put Russian on the screen.
+     * this is one of the two cases that put Russian on the screen.
      */
     @Test
     fun a_paragraph_the_engine_has_not_ruled_on_goes_by_its_alphabet() {
@@ -145,10 +145,30 @@ class OwnTest {
         // Being typed in English: shown, as it always was.
         assertTrue(shown(para("Yes, of course, that is right", null)))
         assertTrue(shown(para("Yes, of course, that is right", "running")))
-        // Too few letters to say: not yet readable, which costs a word
-        // of live text and never shows the other language.
-        assertFalse(shown(para("Да", null)))
-        assertFalse(shown(para("Yes", null)))
+    }
+
+    /**
+     * "Nothing to translate" is what the engine says of a paragraph
+     * whose alphabet it could not read, as well as of one in your own
+     * language -- and the second case was showing Russian. The alphabet
+     * is asked again here rather than taken on trust.
+     */
+    @Test
+    fun nothing_to_translate_is_not_taken_to_mean_your_own_language() {
+        assertFalse(shown(para("Да, конечно, это правда", "native")))
+        assertTrue(shown(para("Yes, of course, that is right", "native")))
+    }
+
+    /**
+     * Text too short or too mixed to place is shown: "OK." is as likely
+     * as "Да.", and hiding every short utterance to catch the second
+     * would lose the first.
+     */
+    @Test
+    fun text_whose_alphabet_cannot_be_read_is_shown() {
+        assertTrue(shown(para("Да", null)))
+        assertTrue(shown(para("OK", null)))
+        assertTrue(shown(para("Да", "native")))
     }
 
     /** A word of one language in a line of another does not decide it. */

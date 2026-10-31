@@ -325,14 +325,43 @@ impl Interpreter {
         words: usize,
         context: &[String],
         known: &Known,
+        assume: Option<&str>,
     ) -> Result<Option<Reading>> {
         let sentences = sentences(text);
         // Which language the paragraph as a whole is in decides the
         // direction, so one short sentence inside it cannot send a line
         // to the wrong model. The sentences are still translated one at
         // a time; this is only the choice of which way.
-        let Some(language) = of(text, &self.from) else {
-            return Ok(None);
+        //
+        // `assume` is what to fall back on when the alphabet says
+        // nothing at all -- too few letters, or too much of a mixture.
+        // The caller knows something the text does not: which language
+        // pass 1 is listening in, which follows what the last utterances
+        // turned out to be. Without it a short "Да." in the middle of a
+        // Russian conversation is a paragraph nobody can place, and so
+        // one nobody reads.
+        //
+        // Only when the alphabet says nothing. A line whose alphabet is
+        // readable and is none of the languages listened out for is a
+        // line in the native one, and there is nothing to do with it --
+        // taking the hint there would send English to a translator to
+        // get English back.
+        let language = match of(text, &self.from) {
+            Some(l) => l,
+            None if script(text).is_none() => {
+                let Some(assumed) = assume else {
+                    return Ok(None);
+                };
+                let Some(l) = self
+                    .from
+                    .iter()
+                    .find(|f| f.eq_ignore_ascii_case(assumed.trim()))
+                else {
+                    return Ok(None);
+                };
+                l.as_str()
+            }
+            None => return Ok(None),
         };
         let mut lines = Vec::with_capacity(sentences.len());
         let mut said: Vec<String> = context.to_vec();
@@ -460,7 +489,7 @@ mod tests {
         // First pass, while she is still talking: one finished sentence.
         let said = "Я пью чай на крыше дома. Вот";
         let r = i
-            .read(complete(said), 6, &[], &known)
+            .read(complete(said), 6, &[], &known, None)
             .unwrap()
             .expect("a reading");
         for l in &r.lines {
@@ -472,7 +501,7 @@ mod tests {
         // translated again; only the new one is.
         let said = "Я пью чай на крыше дома. Вот так, друзья мои. Ну";
         let r = i
-            .read(complete(said), 11, &[], &known)
+            .read(complete(said), 11, &[], &known, None)
             .unwrap()
             .expect("a reading");
         assert_eq!(
@@ -489,7 +518,7 @@ mod tests {
         // sentence, so it is a different key, so it is read again --
         // and the untouched one still isn't.
         let said = "Я пью чай на крыше своего дома. Вот так, друзья мои. Ну";
-        i.read(complete(said), 12, &[], &known)
+        i.read(complete(said), 12, &[], &known, None)
             .unwrap()
             .expect("a reading");
         assert_eq!(
@@ -564,11 +593,47 @@ mod tests {
         }
     }
 
+    /// A line the alphabet cannot place is read in the language pass 1
+    /// is listening in, which is the one the last utterances turned out
+    /// to be in.
+    ///
+    /// Without that it is nobody's language and so nobody reads it: a
+    /// short "Да." in the middle of a Russian conversation, or a line
+    /// with enough `<unk>` in it to spoil the majority, would stay on
+    /// the screen in Russian.
+    #[test]
+    fn a_line_too_short_to_place_is_read_in_the_language_pass_1_heard() {
+        let i = interpreter();
+        let said = "Да.";
+        // Three letters: the alphabet says nothing, and nothing is read.
+        assert_eq!(script(said), None);
+        assert_eq!(i.read(said, 1, &[], &Known::new(), None).unwrap(), None);
+        // Pass 1 listening in Russian is the answer the text cannot give.
+        let r = i
+            .read(said, 1, &[], &Known::new(), Some("Russian"))
+            .unwrap()
+            .expect("read as Russian");
+        assert_eq!(r.language, "Russian");
+        // A language nobody is listening out for is no answer at all.
+        assert_eq!(
+            i.read(said, 1, &[], &Known::new(), Some("German")).unwrap(),
+            None
+        );
+        // And the alphabet still wins when it can be read: an English
+        // line stays English whatever pass 1 is listening in.
+        let english = "Hello everyone, dear friends!";
+        assert_eq!(
+            i.read(english, 4, &[], &Known::new(), Some("Russian"))
+                .unwrap(),
+            None
+        );
+    }
+
     #[test]
     fn a_paragraph_already_in_the_native_language_is_left_alone() {
         let i = interpreter();
         let said = "Hello everyone, dear friends! It is twenty past six.";
-        assert_eq!(i.read(said, 9, &[], &Known::new()).unwrap(), None);
+        assert_eq!(i.read(said, 9, &[], &Known::new(), None).unwrap(), None);
     }
 
     #[test]
@@ -576,7 +641,7 @@ mod tests {
         let i = interpreter();
         let said = "Да, конечно, дорогие друзья. Я пью чай на крыше дома.";
         let r = i
-            .read(said, 10, &[], &Known::new())
+            .read(said, 10, &[], &Known::new(), None)
             .unwrap()
             .expect("a reading");
         assert_eq!(r.language, "Russian");
@@ -609,7 +674,7 @@ mod tests {
         let said = "Я пью чай на крыше своего дома. The roof is flat. \
                     Мы живём в этой квартире уже давно.";
         let r = i
-            .read(said, 18, &[], &Known::new())
+            .read(said, 18, &[], &Known::new(), None)
             .unwrap()
             .expect("a reading");
         assert_eq!(r.lines[1].text, "The roof is flat.");
@@ -625,7 +690,7 @@ mod tests {
         // choose, and choosing one anyway is how a line gets translated
         // out of a language it was never in.
         let said = "Я пью чай на крыше. I am drinking tea on the roof.";
-        assert_eq!(i.read(said, 11, &[], &Known::new()).unwrap(), None);
+        assert_eq!(i.read(said, 11, &[], &Known::new(), None).unwrap(), None);
     }
 
     #[test]
@@ -634,7 +699,13 @@ mod tests {
         // Fewer timings than words, which is what a paragraph whose
         // clips are still partial looks like.
         let r = i
-            .read("Я пью чай на крыше дома. Вот так.", 3, &[], &Known::new())
+            .read(
+                "Я пью чай на крыше дома. Вот так.",
+                3,
+                &[],
+                &Known::new(),
+                None,
+            )
             .unwrap()
             .expect("a reading");
         assert_eq!((r.lines[1].first_word, r.lines[1].last_word), (3, 3));

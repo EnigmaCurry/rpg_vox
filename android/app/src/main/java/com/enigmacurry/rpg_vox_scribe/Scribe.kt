@@ -95,26 +95,37 @@ data class Para(
     val reading: String? get() = translation?.takeIf { it.isNotBlank() }
 
     /**
-     * Whether what was said is what to show: it is in the language you
-     * read, nothing is being translated at all, or the translator gave
-     * up on it and nothing else is coming.
+     * Whether what was said is what to show, rather than its reading.
      *
-     * [translating] is whether this recording has a translator; [native]
-     * the alphabet the reader reads. Both matter because of the state
-     * the engine has not answered yet: every paragraph starts with no
-     * translation at all -- pass 1 is typing it and pass 2 has not
-     * decided what language it is -- and showing it then is how the
-     * other language got on the screen. So while nothing is settled the
-     * app asks the question the engine will: what alphabet is this
-     * written in. An answer of "not enough letters yet" counts as not
-     * yet readable, which costs a word of latency on the live text and
-     * is the price of never showing a language the reader cannot read.
+     * The rule is: show it unless it is *known* to be in an alphabet the
+     * reader does not read. Everything else is a reason to show it --
+     * nothing being translated, a reading that will never come, or text
+     * whose alphabet cannot be read either way.
+     *
+     * The state that matters here is the one the engine has not answered
+     * yet, and the one it answers with "nothing to translate". Every
+     * paragraph starts in the first while pass 1 types it, and lands in
+     * the second whenever its alphabet cannot be read -- too few
+     * letters, or too much of a mixture, which is common enough with
+     * `<unk>` and a stray word in it. Both used to be shown as what was
+     * said, which for Russian is Russian, on a screen that is meant to
+     * be English. The alphabet is asked here instead, by the same rule
+     * and the same numbers the engine uses.
+     *
+     * Text whose alphabet cannot be read *is* shown: "OK." is as likely
+     * as "Да.", and hiding every short utterance to catch the second
+     * would lose the first. The engine is told to assume the language
+     * pass 1 is listening in for exactly those, so they are usually read
+     * rather than left for this to judge.
      */
-    fun own(translating: Boolean, native: Script): Boolean = when {
-        !translating -> true
-        translated == "native" || translated == "failed" -> true
-        translated == "done" -> false
-        else -> script(text) == native
+    fun own(translating: Boolean, native: Script): Boolean {
+        val foreign = script(text)?.let { it != native } == true
+        return when {
+            !translating -> true
+            translated == "done" -> false
+            translated == "failed" -> true
+            else -> !foreign
+        }
     }
 
     /**

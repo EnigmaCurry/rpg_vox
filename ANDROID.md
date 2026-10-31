@@ -265,12 +265,18 @@ again whenever one of those passes changes a word -- a sentence pass 3
 rewrites is read again, so what you see is of the words as they finally
 stand. It is simply not what is on the screen.
 
-A paragraph the engine hasn't ruled on yet — one pass 1 is still typing,
-before pass 2 has decided what language it is — goes by its alphabet,
-the same test the engine will apply. Until there are enough letters to
-say, it shows as `…` rather than risk being the other language, which
-costs about a word of the live text and is the whole point of the
-setting.
+What was said is shown when it is *not known to be* in an alphabet you
+don't read. That covers a paragraph pass 1 is still typing, which has no
+verdict yet, and one whose alphabet could not be read at all — too few
+letters, or too much of a mixture, which a stray `<unk>` manages — where
+the engine's answer is the same as for a paragraph in your own language:
+nothing to translate. The alphabet is asked here instead, by the same
+test the engine uses.
+
+Text too short or too mixed to place is shown: `OK.` is as likely as
+`Да.`, and hiding every short utterance to catch the second would lose
+the first. For those the engine assumes the language pass 1 is listening
+in, so most of them are read rather than left to that guess.
 
 Two more things follow:
 
