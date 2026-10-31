@@ -29,9 +29,8 @@ release:
 # scribe carries `translate-local`, so an unpacked archive reads another
 # language with no network and no service (SCRIBE.md); the CMake build of
 # CTranslate2 that costs is paid here, once per target, rather than by
-# whoever unpacks it. It still needs the Marian models, which it cannot
-# fetch the way it fetches the recognizers -- see `just
-# download-translate-model-ru`.
+# whoever unpacks it. The Marian models are not in the archive, and do
+# not need to be: scribe downloads the direction it is asked for.
 dist VERSION=`git describe --tags --always --dirty`:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -405,40 +404,26 @@ download-streaming-stt-model-ru:
     done
     echo "installed streaming-zipformer-ru model → $dest/"
 
-# Download the Russian translation models into models/translate/, for
-# `vox_room --translate local`: Marian through CTranslate2, on the CPU,
-# with no network once the files are here. Two models, because Marian is
-# one direction each (int8, ~80 MB apiece).
+# Both Russian translation models into the checkout's models/translate/,
+# Marian through CTranslate2 on the CPU with no network once they are
+# there. Two models because Marian is one direction each (int8, ~80 MB
+# apiece), and both because a room translates each way while scribe only
+# ever reads into the language you read in -- `--both-ways` is the
+# difference, and scribe fetches the one direction it needs on its own
+# anyway. So this is for having them in advance, and for the way back.
 #
-# Each also gets a tokenizer.json written from its source.spm. That file
-# is why this is a recipe and not a plain download: the SentencePiece
-# library cannot go in the same binary as sherpa-onnx (their protobufs
-# are different versions of the same symbols), so the room reads the
-# model with the pure-Rust tokenizer instead -- and nobody publishes a
-# tokenizer.json for opus-mt. tools/spm2tokenizer.py writes one and
-# checks it splits text exactly as the .spm does.
-download-translate-model-ru:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    for pair in en-ru ru-en; do
-      dest="models/translate/$pair"
-      if [ -f "$dest/model.bin" ] && [ -f "$dest/tokenizer.json" ]; then
-        echo "translate/$pair already present at $dest/"
-        continue
-      fi
-      base="https://huggingface.co/manancode/opus-mt-$pair-ctranslate2-android/resolve/main"
-      mkdir -p "$dest"
-      for f in model.bin config.json shared_vocabulary.json source.spm target.spm vocab.json; do
-        echo "downloading $pair/$f …"
-        curl -fL --progress-bar -o "$dest/$f.part" "$base/$f"
-        mv "$dest/$f.part" "$dest/$f"
-      done
-      # Written last, so a half-finished download is never mistaken for
-      # a model that is ready to load.
-      nix-shell -p 'python3.withPackages(ps: [ps.sentencepiece ps.tokenizers])' \
-        --run "python3 tools/spm2tokenizer.py '$dest'"
-    done
-    echo "installed translation models → models/translate/"
+# Unlike the recognizer recipes above this one needs scribe built: the
+# tokenizer.json each model is read with has to be written from its
+# source.spm (vox_transcribe::spm), because nobody publishes one for
+# opus-mt and the SentencePiece library that would read the .spm cannot
+# go in the same binary as sherpa-onnx -- their protobufs are different
+# versions of the same symbols. `download-models` also sees to the
+# recognizer, which is a no-op once that is there.
+# Download both Marian translation models (en-ru, ru-en) into models/.
+download-translate-model-ru: release-scribe
+    VOX_SCRIBE_MODELS=models ./target/release/scribe \
+      --native-language English --other-language Russian \
+      download-models --translate --both-ways
 
 # --- vox_scribe (standalone live transcription TUI) ---
 
@@ -479,9 +464,9 @@ download-speaker-models:
 # feature set `vox_room` turns on by default, so a `--workspace` build
 # asks vox_transcribe for nothing different (a different profile, so not
 # the same artifacts, but no extra CTranslate2 build either).
-# `--translate local` then wants only the models:
-# `just download-translate-model-ru`, or `just scribe-translate`, which
-# does both and turns it on.
+# `--translate local` then needs nothing else -- it downloads the Marian
+# model for the direction it reads -- and `just scribe-translate` is this
+# recipe with the flag already passed.
 # Run the vox_scribe live transcription TUI (fetches models first).
 scribe *ARGS: download-stt-model download-streaming-stt-model
     #!/usr/bin/env bash
@@ -495,9 +480,10 @@ scribe *ARGS: download-stt-model download-streaming-stt-model
 
 # `--translate local` reads anything heard in another language in your
 # own, with no network (see SCRIBE.md). The build is `just scribe`'s, so
-# this is that recipe plus the Marian models and the flag.
+# this is that recipe plus the flag -- the Marian model for the direction
+# it reads is fetched on first use, like every other model.
 # Like `just scribe`, with local translation turned on.
-scribe-translate *ARGS: download-stt-model download-streaming-stt-model download-translate-model-ru
+scribe-translate *ARGS: download-stt-model download-streaming-stt-model
     #!/usr/bin/env bash
     set -euo pipefail
     args="--features translate-local --release -- --translate local {{ARGS}}"
@@ -514,9 +500,8 @@ scribe-translate *ARGS: download-stt-model download-streaming-stt-model download
 # build's time; `cargo build -p vox_scribe --release` without the feature
 # is the quick way to a binary that translates through --llm only, at the
 # cost of rebuilding vox_transcribe whenever you go back. The release
-# tarballs (`just dist`) and the Windows and Android builds don't carry
-# it -- a cmake cross-build is its own piece of work and nothing there
-# has asked.
+# archives carry it too (`just dist`), on every target; Android and iOS
+# are the ones that go without.
 # Optimized vox_scribe build only, with local translation → target/release/scribe.
 release-scribe:
     #!/usr/bin/env bash
@@ -549,14 +534,14 @@ pi-tts-venv:
       [ -n "${PI_TTS_URL:-}" ] || echo "set PI_TTS_URL to your Qwen3-TTS server (see qwen3-tts/)" >&2
     fi
 
-# The translation models go to the per-user models directory as well as
-# the checkout's: an installed scribe is not run from here, so it
-# resolves models to that directory instead, and the ones it cannot fetch
-# for itself have to be put there. (It downloads the recognizers on first
-# use; the Marian models can't be, because their tokenizer is converted
-# by a Python script -- see tools/spm2tokenizer.py.)
-# Build vox_scribe, install it to BIN and put its models where it looks.
-install-scribe BIN="~/.local/bin": release-scribe download-translate-model-ru
+# The models are fetched by the installed binary rather than copied from
+# the checkout: an installed scribe is not run from here, so it resolves
+# models to the per-user directory, and it downloads into whichever
+# directory it resolves. `--translate --both-ways` is only about having
+# them in advance; a first `--translate local` would fetch the direction
+# it needs anyway.
+# Build vox_scribe, install it to BIN and fetch the models it looks for.
+install-scribe BIN="~/.local/bin": release-scribe
     #!/usr/bin/env bash
     set -euo pipefail
     bin="{{BIN}}"
@@ -573,14 +558,6 @@ install-scribe BIN="~/.local/bin": release-scribe download-translate-model-ru
     else
       models="${XDG_DATA_HOME:-$HOME/.local/share}/vox_scribe/models"
     fi
-    for pair in en-ru ru-en; do
-      if [ -f "$models/translate/$pair/model.bin" ]; then
-        continue
-      fi
-      mkdir -p "$models/translate"
-      cp -r "models/translate/$pair" "$models/translate/"
-      echo "installed $models/translate/$pair"
-    done
     if [ "$(uname)" = Darwin ]; then
       contrib=crates/vox_scribe/contrib/macos
       sed "s|@BIN@|$bin|" "$contrib/scribe-once.terminal" > "$bin/scribe-once.terminal"
@@ -602,7 +579,7 @@ install-scribe BIN="~/.local/bin": release-scribe download-translate-model-ru
       sed -e "s|@BIN@|$bin|g" -e "s|@LAUNCH@|$launch|" "$contrib/karabiner-scribe.json" > "$rules/scribe.json"
       echo "installed the Karabiner rule ($term; enable it in Karabiner-Elements)"
     fi
-    "$bin/scribe" download-models
+    "$bin/scribe" download-models --translate --both-ways
     case ":$PATH:" in
       *":$bin:"*) ;;
       *) echo "note: $bin is not on your PATH" ;;

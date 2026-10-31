@@ -8,6 +8,7 @@
 //! <dir>/streaming-zipformer-ru/{encoder,decoder,joiner}.onnx + tokens.txt
 //! <dir>/speaker-diarization/{segmentation,embedding-eres2netv2}.onnx   (--diarize)
 //! <dir>/kokoro/{model.onnx,voices.bin,…}        (--play NAME.md, --tts kokoro)
+//! <dir>/translate/en-ru/{model.bin,config.json,…}         (--translate local)
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -343,6 +344,70 @@ pub fn download_zipformer_ru(dir: &Path) -> Result<()> {
             ("lang/tokens.txt", "tokens.txt"),
         ],
     )
+}
+
+/// opus-mt, converted to CTranslate2: one repo per direction, named by
+/// the pair the way `vox_transcribe::ct2` names the directory.
+/// `-android` is the uploader's name for the conversion, not a platform;
+/// these are the ordinary int8 CTranslate2 files.
+#[cfg(feature = "translate-local")]
+fn translate_repo(pair: &str) -> String {
+    format!("manancode/opus-mt-{pair}-ctranslate2-android")
+}
+
+/// About what one direction costs, for the line printed before it.
+#[cfg(feature = "translate-local")]
+pub const TRANSLATE_SIZE: &str = "about 80 MB";
+
+/// Whether the model to translate `from` into `into` is downloaded.
+#[cfg(feature = "translate-local")]
+pub fn has_translate(dir: &Path, from: &str, into: &str) -> bool {
+    vox_transcribe::ct2::has_direction(dir, from, into)
+}
+
+/// Download the Marian model for one direction into `dir`, and write the
+/// tokenizer it is read with.
+///
+/// The tokenizer is the reason this is not simply four files: what the
+/// repo ships is a `source.spm`, and what `ct2` reads is a
+/// `tokenizer.json` (see [`vox_transcribe::spm`], which writes one from
+/// the other). It is written last, so a direction is only ever "there"
+/// once it can be loaded -- `has_direction` looks for it.
+#[cfg(feature = "translate-local")]
+pub fn download_translate(dir: &Path, from: &str, into: &str) -> Result<()> {
+    let codes = |l: &str| vox_transcribe::ct2::code(l);
+    let (Some(a), Some(b)) = (codes(from), codes(into)) else {
+        bail!(
+            "no translation model for {from} to {into}; languages with one: {}",
+            vox_transcribe::ct2::languages().join(", ")
+        );
+    };
+    let pair = format!("{a}-{b}");
+    let dest = vox_transcribe::ct2::direction_dir(dir, from, into)
+        .expect("a code for each language, checked just above");
+    if has_translate(dir, from, into) {
+        println!("the {pair} model is already present in {}", dest.display());
+        return Ok(());
+    }
+    // `vocab.json` and `target.spm` are in the repo too and neither is
+    // read: CTranslate2 maps tokens to ids from `shared_vocabulary.json`,
+    // and nothing here ever tokenizes the language being written.
+    fetch_hf(
+        &translate_repo(&pair),
+        &dest,
+        &[
+            ("config.json", "config.json"),
+            ("shared_vocabulary.json", "shared_vocabulary.json"),
+            ("source.spm", "source.spm"),
+            ("model.bin", "model.bin"),
+        ],
+    )
+    .with_context(|| format!("download the {pair} translation model"))?;
+    let tokenizer = dest.join(vox_transcribe::ct2::TOKENIZER);
+    let pieces = vox_transcribe::spm::write_tokenizer(&dest.join("source.spm"), &tokenizer)
+        .with_context(|| format!("write {}", tokenizer.display()))?;
+    println!("installed {} ({pieces} pieces)", tokenizer.display());
+    Ok(())
 }
 
 fn fetch(stem: &str, dest: &Path, files: &[(&str, &str)]) -> Result<()> {

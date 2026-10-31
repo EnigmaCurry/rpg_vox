@@ -21,7 +21,7 @@ scribe [OPTIONS] [COMMAND]
 | *(none)*          | Transcribe (the TUI, or headless with `--no-tui` / `--input`).                                       |
 | `devices`         | List input devices for the native audio backend.                                                     |
 | `apps`            | List apps whose audio `--app` can capture; ones playing now are marked `*`.                          |
-| `download-models` | Download the Zipformer model and the `--model` recognizer, plus the speaker models with `--diarize`. |
+| `download-models` | Download the Zipformer model and the `--model` recognizer; `--russian` adds Russian pass 1, `--translate` the translation model for each `--other-language` into `--native-language` (`--both-ways` the reverse of each too), and `--diarize` the speaker models. Everything here is fetched on first use anyway; this is for setting a machine up in advance. See [models](SCRIBE.md#models-and-logs). |
 | `chat-echo NAME`  | A stand-in `--chat` responder: reads back whatever is said in `NAME.db` (`.db` optional), a sentence at a time, then after a pause asks for more. Says it is listening, as `agent` does. |
 | `stop-once`       | Finish the running `--once` recorder, as if Enter were pressed. Exits 1 if none is running. Unix only: it signals the recorder.          |
 | `voices`          | List the voices `--voices` can name, for the `--tts` engine that would speak.                        |
@@ -98,7 +98,7 @@ words counted are still pass 1's.
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--translate off\|local\|openai` | `off` (env `VOX_SCRIBE_TRANSLATE`) | Also read every paragraph heard in another language in your own. `local` is Marian through CTranslate2 on the CPU, with no network (needs a build with the `translate-local` feature, and the models in `<models-dir>/translate/`); `openai` asks the `--llm` service. What was said is kept either way. See [translation](SCRIBE.md#translation-optional). |
+| `--translate off\|local\|openai` | `off` (env `VOX_SCRIBE_TRANSLATE`) | Also read every paragraph heard in another language in your own. `local` is Marian through CTranslate2 on the CPU, with no network — the model for the direction it reads is downloaded on first use, ~80 MB (needs a build with the `translate-local` feature); `openai` asks the `--llm` service. What was said is kept either way. See [translation](SCRIBE.md#translation-optional). |
 | `--native-language NAME` | `English` (env `VOX_SCRIBE_NATIVE_LANGUAGE`) | The language you read in, spelled in English. |
 | `--other-language NAME` | `Russian` | A language to listen out for and translate. Repeatable. Each one must be written in a different alphabet from yours and from the others — that is the only thing that tells them apart, so a pair that shares one is refused at startup rather than guessed at. |
 

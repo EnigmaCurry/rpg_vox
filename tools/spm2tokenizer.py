@@ -1,11 +1,20 @@
 #!/usr/bin/env python3
-"""Write a tokenizer.json beside a Marian model's source.spm.
+"""Write a tokenizer.json beside a Marian model's source.spm, and check it.
 
 CTranslate2 is given token *strings* and maps them to ids itself from
 the model's shared_vocabulary.json, so this only has to split text into
 the same SentencePiece pieces the .spm would -- which the pure-Rust
 `tokenizers` crate can do, with no protobuf and no C++ anywhere near
 the room's binary.
+
+scribe writes this file itself now (vox_transcribe::spm, so that the
+models can be downloaded rather than converted by hand), which leaves
+this script as the thing that says the conversion is right: it is the
+same `tokenizers` through its Python bindings, but with a real
+SentencePiece beside it to compare against, which is the part no Rust
+binary here can have. The two write the same bytes, and
+`tokenizer_json_matches_the_python_conversion` in vox_transcribe keeps
+it that way.
 
   spm2tokenizer.py MODEL_DIR...
 """

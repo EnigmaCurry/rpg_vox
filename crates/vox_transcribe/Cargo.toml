@@ -22,7 +22,7 @@ llm = ["dep:ureq", "dep:serde_json"]
 # cannot be in the same binary as sherpa-onnx. CTranslate2 itself is
 # built by cmake and linked statically, so nothing has to be installed
 # alongside the binary, the same arrangement sherpa-onnx already uses.
-ct2 = ["dep:ct2rs"]
+ct2 = ["dep:ct2rs", "dep:tokenizers"]
 # Experimental DeepFilterNet 3 noise filter (EngineConfig::denoise).
 deepfilter = ["dep:deep_filter", "dep:ndarray"]
 
@@ -41,5 +41,8 @@ sherpa-onnx = { version = "1.13.7", default-features = false, optional = true }
 sherpa-onnx-sys = { version = "1.13.7", default-features = false, optional = true }
 # Not on crates.io with the tract backend; the model is built in.
 ct2rs = { version = "0.10", default-features = false, features = ["ruy", "tokenizers"], optional = true }
+# The tokenizer ct2rs reads the model with, which `spm` also writes: the
+# same version ct2rs asks for, so there is one copy of it in the binary.
+tokenizers = { version = "0.22", optional = true }
 deep_filter = { git = "https://github.com/Rikorose/DeepFilterNet", tag = "v0.5.6", default-features = false, features = ["tract", "default-model"], optional = true }
 ndarray = { version = "0.15", optional = true }

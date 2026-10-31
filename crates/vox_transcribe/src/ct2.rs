@@ -57,9 +57,11 @@ pub const TRANSLATE: &str = "translate";
 /// then aborts at load, protobuf's own version check refusing 3.14
 /// against 3.21.
 ///
-/// `just download-translate-model-ru` writes this file beside the model
-/// it downloads; see `tools/spm2tokenizer.py` for how, and for the
-/// check that it splits text exactly as the .spm would.
+/// Nobody publishes one of these for opus-mt, so [`crate::spm`] writes
+/// it from the `source.spm` that comes with the model, which is what
+/// lets the models be downloaded like any other. The same conversion
+/// through the Python bindings is `tools/spm2tokenizer.py`, which also
+/// checks the result against a real SentencePiece.
 pub const TOKENIZER: &str = "tokenizer.json";
 
 /// The languages this knows a model code for, as a language is spelled
@@ -86,6 +88,11 @@ pub fn code(language: &str) -> Option<&'static str> {
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case(language.trim()))
         .map(|(_, code)| *code)
+}
+
+/// Every language [`code`] knows, for an error message.
+pub fn languages() -> Vec<&'static str> {
+    CODES.iter().map(|(name, _)| *name).collect()
 }
 
 /// The directory a direction's model lives in: `translate/en-ru`.
@@ -133,7 +140,8 @@ impl Ct2Translator {
         if models.is_empty() {
             bail!(
                 "no translation models in {} (expected e.g. {}/en-ru; \
-                 run `just download-translate-model-ru`)",
+                 `scribe download-models --translate` fetches them, or \
+                 `just download-translate-model-ru` for both directions)",
                 dir.display(),
                 dir.join(TRANSLATE).display()
             );

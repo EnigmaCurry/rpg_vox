@@ -39,6 +39,8 @@ pub mod ring;
 #[cfg(feature = "sherpa")]
 pub mod sherpa;
 pub mod speaker;
+#[cfg(feature = "ct2")]
+pub mod spm;
 #[cfg(any(unix, windows))]
 pub mod stderr;
 pub mod subtitle;

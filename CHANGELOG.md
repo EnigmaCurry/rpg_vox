@@ -32,20 +32,39 @@ section after the version it releases.
   they are one build between them rather than three variants, and the
   binary in `~/.local/bin` is the one `just scribe-translate` runs
   rather than one that answers `--translate local` with "needs a build
-  with the feature". `install-scribe` also copies the Marian models into
-  the per-user models directory, which is where an installed scribe
-  looks: it is not run from the checkout, and unlike the recognizers it
-  cannot fetch those for itself.
+  with the feature". `install-scribe` then has the installed binary
+  fetch its own models, which lands them in the per-user directory an
+  installed scribe resolves to rather than the checkout's.
+
+- **`--translate local` downloads its model, like every other model.**
+  It was the one thing in scribe you had to put in place by hand: a
+  `just` recipe, a Python with `sentencepiece` in it, and the models
+  copied to wherever the binary you were running resolves them. Now the
+  first `--translate local` fetches the direction it is about to read
+  (~80 MB) into the models directory it resolved, and says so while it
+  does — `scribe download-models --translate` takes the same download in
+  advance, `--both-ways` adds the reverse of each, and `just
+  install-scribe` copies nothing anywhere any more.
+
+  What stood in the way is that nobody publishes a `tokenizer.json` for
+  opus-mt, and the SentencePiece library that reads the `.spm` they do
+  publish cannot be in the same binary as sherpa-onnx — their protobufs
+  are different versions of the same symbols. So the conversion is in
+  Rust now (`vox_transcribe::spm`): a `.spm` is a protobuf, the pieces
+  and their scores are two fields of it, and the pure-Rust `tokenizers`
+  crate that reads the result can also write it. It produces the same
+  bytes `tools/spm2tokenizer.py` did, which is checked rather than
+  hoped for — that script keeps its place as the one that can compare
+  against a real SentencePiece, and the bytes it wrote are fingerprinted
+  in a test.
 
 - **The release archives translate locally too, Windows included.**
   `just dist` builds scribe with `translate-local` on every target, so
   the Linux, macOS and Windows archives all answer `--translate local`
   rather than "needs a build with the feature"; only Android and iOS go
-  without. The models are not in the archive — 160 MB for the pair, and
-  scribe cannot fetch them for itself — so `--translate local` from an
-  unpacked archive still wants `translate/en-ru` and `translate/ru-en`
-  put in its models directory, which [translation](SCRIBE.md#who-translates)
-  spells out. Three things had to agree before Windows would link it:
+  without. The models are not in the archive — 80 MB a direction — and
+  do not need to be: an unpacked archive downloads the one it is asked
+  for, as above. Three things had to agree before Windows would link it:
   the C runtime (sherpa-onnx's prebuilt archive and CTranslate2 are both
   built against the static one, while the C++ bridge between them took
   cc's default, and the linker refuses that pair), the CPU dispatch

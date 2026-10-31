@@ -545,7 +545,7 @@ no majority, so it is left alone: there is no direction to choose.
 | `--translate` | What it is | Speed | Notes |
 | --- | --- | --- | --- |
 | `off` (default) | nothing | — | every paragraph stands as it was said |
-| `local` | Marian models through CTranslate2, on the CPU | ~50 ms a sentence | no network at all. Needs a build with the `translate-local` feature and the models in `<models-dir>/translate/ru-en/` (`just download-translate-model-ru`) |
+| `local` | Marian models through CTranslate2, on the CPU | ~50 ms a sentence | no network at all once the model is here, and it fetches that itself on first use (~80 MB a direction). Needs a build with the `translate-local` feature |
 | `openai` | the `--llm` service | 1–2 s a sentence | same `VOX_SCRIBE_LLM_*` variables as pass 4, and it can be told to leave a command alone |
 
 The local models follow no instructions at all, so anything that is not
@@ -573,23 +573,24 @@ second one, and alternating recompiles `vox_transcribe` each way.
 cargo build -p vox_scribe --features translate-local --release
 ```
 
-What an unpacked release archive still needs is the models. The binary
-has the translator in it, but `--translate local` answers `no
-translation models in …` until `translate/en-ru` and `translate/ru-en`
-are in its models directory. From a checkout, `just
-download-translate-model-ru` writes them under `models/`; copy that
-`translate/` directory to where an installed scribe looks
-(`%LOCALAPPDATA%\vox_scribe\models` on Windows,
-`~/Library/Application Support/vox_scribe/models` on macOS,
-`~/.local/share/vox_scribe/models` on Linux), or point
-`VOX_SCRIBE_MODELS` at it.
+The models are not part of the build, and nothing has to be put in
+place: the first `--translate local` downloads the direction it is about
+to read, into whichever models directory it resolved
+([Models](#models-and-logs)), and says so while it does. One direction
+per `--other-language`, into `--native-language`; the way back is never
+fetched, because scribe never translates into a language nobody is
+reading in. `scribe download-models --translate` takes the same
+downloads in advance, and `--both-ways` adds the reverse of each, which
+is what a [room](ROOM.md) translates.
 
-`just install-scribe` also copies the Marian models into the per-user
-models directory, because an installed scribe isn't run from the
-checkout and so doesn't resolve models to `./models`. Unlike the
-recognizers it cannot fetch them for itself: their tokenizer is
-converted by a Python script (`tools/spm2tokenizer.py`), which is what
-`just download-translate-model-ru` runs.
+What makes that possible, since nobody publishes a `tokenizer.json` for
+opus-mt, is that scribe writes one from the `source.spm` that comes with
+the model (`vox_transcribe::spm`). It cannot read the `.spm` directly:
+the SentencePiece library and sherpa-onnx carry different versions of the
+same protobuf symbols and cannot be in one binary. The same conversion
+through SentencePiece's own Python bindings is `tools/spm2tokenizer.py`,
+which checks its output splits text exactly as the `.spm` does; the two
+agree byte for byte, and a test keeps them that way.
 
 ### When it runs, and what it costs
 
@@ -753,9 +754,46 @@ Models are looked up in `--models-dir`, `$VOX_SCRIBE_MODELS`, the
 per-user data dir (`~/Library/Application Support/vox_scribe/models` on
 macOS, `${XDG_DATA_HOME:-~/.local/share}/vox_scribe/models` on Linux,
 `%LOCALAPPDATA%\vox_scribe\models` on Windows), then `./models` (so an
-rpg_vox checkout's models work as-is). In TUI mode, logs go to
-`$TMPDIR/vox_scribe.log` (`%TEMP%\vox_scribe.log` on Windows) unless
-`--log` says otherwise.
+rpg_vox checkout's models work as-is). Whichever directory that lands on
+is also the one a download goes to.
+
+Every one of them is fetched the first time something asks for it, so
+there is nothing to install and nothing to put in place.
+`scribe download-models` takes the same downloads in advance — with
+`--russian`, `--translate`, `--both-ways`, and `--diarize` for the
+speaker pair — which is worth doing before a session rather than
+mid-sentence. Downloads shell out to `curl`, so it has to be on the
+PATH; the archived ones are unpacked in the temp directory and the
+archive is deleted after.
+
+| Model | Directory | What for | Fetched | Download → on disk |
+| --- | --- | --- | --- | --- |
+| NVIDIA Parakeet TDT 0.6B v3, int8 | `parakeet-tdt-0.6b-v3/` | passes 2 and 3, the default `--model`; 25 languages, worked out from the audio | first run | 465 MB → ~660 MB |
+| SenseVoice Small, int8 | `sense-voice/` | passes 2 and 3 with `--model sensevoice`; faster, five languages | first run with that flag | 156 MB → 229 MB |
+| Streaming Zipformer EN 20M, int8 | `streaming-zipformer/` | pass 1, the live partials, in English | with the pass-2/3 model | 122 MB → 44 MB |
+| Vosk small streaming RU, int8 | `streaming-zipformer-ru/` | pass 1 in Russian (`--pass1-language Russian`) | first use, or `--russian` | 27 MB → 27 MB |
+| pyannote segmentation 3.0 | `speaker-diarization/segmentation.onnx` | `--diarize`: when the speaker changed | first `--diarize` | 6.7 MB → 6 MB |
+| 3D-Speaker ERes2NetV2 | `speaker-diarization/embedding-eres2netv2.onnx` | `--diarize`: which voice each turn is | first `--diarize` | 69 MB → 69 MB |
+| Kokoro multi-lang v1.0 | `kokoro/` | the voice that reads `--chat` replies and `--play` | first use of that engine | 334 MB → ~350 MB |
+| Marian opus-mt, one model per direction, int8 | `translate/ru-en/` | `--translate local` | first use, or `--translate` | 80 MB → 84 MB each |
+
+The recognizers, the speaker pair and the voice are sherpa-onnx's own
+release downloads; Russian pass 1 is Vosk's, and the translation models
+are opus-mt converted to CTranslate2, both from Hugging Face. A
+download is larger or smaller than what is kept depending on which: the
+bundles are `.tar.bz2`, so SenseVoice unpacks to more than it
+downloaded, while the English Zipformer archive carries 32-bit and 8-bit
+copies of all three nets and test audio, of which four files are kept.
+
+Three things that look like models and are not. `--denoise`
+(DeepFilterNet 3) is compiled into the binary, so there is nothing to
+fetch and nothing to choose. The VAD that decides where an utterance
+ends has no model at all: it is an RMS threshold that follows the noise
+floor. And pass 4 (`--llm`) and `--translate openai` are a service
+somewhere else, which is the point of them.
+
+In TUI mode, logs go to `$TMPDIR/vox_scribe.log`
+(`%TEMP%\vox_scribe.log` on Windows) unless `--log` says otherwise.
 
 ## One-shot dictation key
 

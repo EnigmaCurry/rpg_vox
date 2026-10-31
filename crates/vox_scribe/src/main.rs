@@ -276,11 +276,10 @@ struct Cli {
     #[arg(long, default_value_t = 30)]
     llm_timeout: u64,
     /// Read anything heard in another language in your own as well:
-    /// `local` is a Marian model on the CPU with no network (needs a
-    /// build with the `translate-local` feature and the models from
-    /// `just download-translate-model-ru`), `openai` asks the --llm
-    /// service. What was said is kept either way; the reading goes
-    /// under it.
+    /// `local` is a Marian model on the CPU with no network, downloaded
+    /// on first use (~80 MB a direction; needs a build with the
+    /// `translate-local` feature), `openai` asks the --llm service. What
+    /// was said is kept either way; the reading goes under it.
     #[arg(long, value_enum, default_value = "off", env = "VOX_SCRIBE_TRANSLATE")]
     translate: TranslateKind,
     /// With --translate: the language you read in.
@@ -493,6 +492,17 @@ enum Cmd {
         /// anyway; this is for setting a machine up in advance.
         #[arg(long)]
         russian: bool,
+        /// Also fetch the translation model for each --other-language
+        /// into --native-language, as `--translate local` would, and the
+        /// reverse of each with --both-ways. ~80 MB a direction. Fetched
+        /// on first use anyway; this is for setting a machine up in
+        /// advance.
+        #[arg(long)]
+        translate: bool,
+        /// With --translate: the directions into each other language as
+        /// well, which is what `vox_room` translates.
+        #[arg(long, requires = "translate")]
+        both_ways: bool,
     },
     /// A stand-in --chat responder: reads back whatever is said in
     /// NAME.db, a sentence at a time, then asks for more.
@@ -1050,7 +1060,11 @@ fn run() -> Result<()> {
     match cli.cmd {
         Some(Cmd::Devices) => return list_devices(),
         Some(Cmd::Apps) => return list_apps(),
-        Some(Cmd::DownloadModels { russian }) => {
+        Some(Cmd::DownloadModels {
+            russian,
+            translate,
+            both_ways,
+        }) => {
             let dir = cli
                 .models_dir
                 .clone()
@@ -1061,6 +1075,9 @@ fn run() -> Result<()> {
             }
             if cli.diarize {
                 models::download_speakers(&dir)?;
+            }
+            if translate {
+                download_translate_models(&dir, &cli, both_ways)?;
             }
             return Ok(());
         }
@@ -2319,16 +2336,58 @@ fn llm_corrector(cli: &Cli) -> Result<Option<Arc<dyn Corrector>>> {
     Ok(Some(Arc::new(corrector)))
 }
 
-/// The local translator, when this build has one. Behind a feature
-/// because it brings a C++ library and a CMake build with it; the flag
-/// says plainly what to do when it isn't there, rather than quietly
-/// asking the network the operator chose to do without.
+/// `download-models --translate`: the directions `--translate local`
+/// would load, fetched in advance, and with `--both-ways` the reverse of
+/// each as well.
+#[cfg(feature = "translate-local")]
+fn download_translate_models(dir: &std::path::Path, cli: &Cli, both_ways: bool) -> Result<()> {
+    let native = cli.native_language.trim();
+    for other in cli.other_language.iter().map(|l| l.trim()) {
+        models::download_translate(dir, other, native)?;
+        if both_ways {
+            models::download_translate(dir, native, other)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "translate-local"))]
+fn download_translate_models(_dir: &std::path::Path, _cli: &Cli, _both: bool) -> Result<()> {
+    anyhow::bail!(
+        "download-models --translate needs a build with the `translate-local` \
+         feature (cargo build -p vox_scribe --features translate-local)"
+    )
+}
+
+/// The local translator, when this build has one, fetching any direction
+/// it hasn't got. Behind a feature because it brings a C++ library and a
+/// CMake build with it; the flag says plainly what to do when it isn't
+/// there, rather than quietly asking the network the operator chose to
+/// do without.
+///
+/// Only out of each other language and into the native one: the way back
+/// would double the weights for nothing, since scribe never translates
+/// into a language nobody is reading in. (`vox_room` is the one that
+/// wants both, and asks for both.)
 #[cfg(feature = "translate-local")]
 fn local_translator(
     models_dir: &std::path::Path,
-    languages: &[String],
+    native: &str,
+    others: &[String],
 ) -> Result<Arc<dyn vox_transcribe::translate::Translate>> {
-    let t = vox_transcribe::ct2::Ct2Translator::load(models_dir, languages)?;
+    for from in others {
+        if !models::has_translate(models_dir, from, native) {
+            eprintln!(
+                "the {from} to {native} translation model is not here, \
+                 downloading it once ({})…",
+                models::TRANSLATE_SIZE
+            );
+            models::download_translate(models_dir, from, native)?;
+        }
+    }
+    let mut languages = vec![native.to_string()];
+    languages.extend(others.iter().cloned());
+    let t = vox_transcribe::ct2::Ct2Translator::load(models_dir, &languages)?;
     info!(directions = %t.directions().join(", "), "translating: locally, on the CPU");
     Ok(Arc::new(t))
 }
@@ -2336,7 +2395,8 @@ fn local_translator(
 #[cfg(not(feature = "translate-local"))]
 fn local_translator(
     _models_dir: &std::path::Path,
-    _languages: &[String],
+    _native: &str,
+    _others: &[String],
 ) -> Result<Arc<dyn vox_transcribe::translate::Translate>> {
     anyhow::bail!(
         "--translate local needs a build with the `translate-local` feature \
@@ -2346,11 +2406,12 @@ fn local_translator(
 
 /// Build the translation pass when `--translate` asks for one.
 ///
-/// It is checked here, before the models load and the mic opens, because
-/// every way this can be wrong is a way it would otherwise be wrong
-/// quietly: a language whose alphabet gives nothing to decide on, a
-/// direction with no model downloaded, an `--llm` service that isn't
-/// there.
+/// It is built here, before the recognizers load and the mic opens,
+/// because every way this can be wrong is a way it would otherwise be
+/// wrong quietly: a language whose alphabet gives nothing to decide on,
+/// an `--llm` service that isn't there. A direction with no model is not
+/// one of them any more -- `--translate local` fetches what it hasn't
+/// got, which is also why this runs before the screen is taken.
 fn interpreter(cli: &Cli, models_dir: &std::path::Path) -> Result<Option<Interpreter>> {
     let native = cli.native_language.trim().to_string();
     let others: Vec<String> = cli
@@ -2368,15 +2429,7 @@ fn interpreter(cli: &Cli, models_dir: &std::path::Path) -> Result<Option<Interpr
     }
     let by: Arc<dyn vox_transcribe::translate::Translate> = match cli.translate {
         TranslateKind::Off => return Ok(None),
-        TranslateKind::Local => {
-            // Every direction it may be asked for, which is out of each
-            // other language and into the native one. Loading the way
-            // back too would double the weights for nothing: scribe
-            // never translates into a language nobody is reading in.
-            let mut langs = vec![native.clone()];
-            langs.extend(others.iter().cloned());
-            local_translator(models_dir, &langs)?
-        }
+        TranslateKind::Local => local_translator(models_dir, &native, &others)?,
         TranslateKind::Openai => {
             let vox_transcribe::openai::Endpoint {
                 url,

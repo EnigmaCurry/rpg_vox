@@ -7433,6 +7433,7 @@ dependencies = [
  "serde_json",
  "sherpa-onnx",
  "sherpa-onnx-sys",
+ "tokenizers",
  "tracing",
  "ureq",
  "uuid",
