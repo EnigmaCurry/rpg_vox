@@ -99,6 +99,23 @@ pub fn sentence_end(text: &str) -> Option<usize> {
     None
 }
 
+/// Whether `text` ends a sentence: a terminator, with any closing
+/// quotes or brackets after it, and nothing else.
+///
+/// [`sentence_end`] wants whitespace after a terminator, because text
+/// that is still being spoken into ends with the sentence being spoken
+/// -- and a full stop with nothing after it is where the speaker has
+/// got to, not where they stopped. Text that is settled has no
+/// whitespace coming, and this is the question to ask of it instead.
+pub fn ends_sentence(text: &str) -> bool {
+    let mut rest = text
+        .trim_end()
+        .chars()
+        .rev()
+        .skip_while(|c| matches!(c, '"' | '\'' | ')' | '”' | '’'));
+    matches!(rest.next(), Some('.' | '?' | '!'))
+}
+
 /// `text` split into whole sentences, each keeping its own punctuation
 /// and nothing trimmed away between them.
 ///

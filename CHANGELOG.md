@@ -163,6 +163,21 @@ section after the version it releases.
   text back. It used to copy the newest paragraph when nothing was
   selected.
 
+- **A reading arrives with the utterance it is of, not the one after
+  it.** A sentence counted as finished only when there was whitespace
+  after its full stop. That is right for the paragraph as it stands --
+  there the last sentence is where the speaker has got to, and
+  translating it would translate half a thought -- and wrong for the
+  text pass 2 has settled, where the speaker *ended* that sentence and
+  the clip closed. Holding it back waited for the next utterance, which
+  is a silence away rather than a sentence away: long gaps between
+  readings, and on a phone held through a monologue it looked like
+  translation only happened when the recording stopped. The live pass
+  now reads the settled text up to its last finished sentence
+  (`language::complete_settled`), where a full stop at the very end
+  counts and only an unfinished tail is held. A test fails if the first
+  reading arrives any later than the first utterance.
+
 ### Scribe for Android
 
 - **It reads another language in yours, on the phone.** The translation

@@ -37,6 +37,24 @@ pub struct Clip {
     pub speaker: Option<String>,
 }
 
+impl Paragraph {
+    /// The text of the clips an offline pass has finished, without the
+    /// pass-1 partial at the end -- the words being spoken now, which
+    /// nothing but the screen should be reading.
+    ///
+    /// Joined as [`Paragraph::text`] joins them, so a sentence of one is
+    /// a sentence of the other.
+    pub fn settled_text(&self) -> String {
+        self.clips
+            .iter()
+            .filter(|c| !c.is_partial())
+            .map(|c| c.text.as_str())
+            .filter(|t| !t.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
 impl Clip {
     pub fn is_partial(&self) -> bool {
         self.stage == Stage::Partial

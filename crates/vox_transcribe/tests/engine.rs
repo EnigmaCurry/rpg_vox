@@ -424,10 +424,14 @@ fn a_translation_that_failed_does_not_hold_the_paragraph_open() {
 #[test]
 fn a_paragraph_is_read_as_it_forms_and_not_only_once_it_settles() {
     let (events, t) = run_translated(Arc::new(RussianOffline), false);
-    // A reading that arrived while the paragraph was still two clips of
-    // one sentence each, before pass 3 merged them and before it
-    // hardened: `of` is what the paragraph said at the time, which is
-    // less than what it says now.
+    // The first reading there was, which is of the first sentence
+    // alone: it arrived while the paragraph was still being spoken,
+    // before pass 3 merged its two clips and before it hardened.
+    //
+    // Found by being first rather than by `of` being shorter than the
+    // paragraph. Those were the same thing when a reading could only
+    // arrive an utterance late; now that one arrives with the utterance
+    // it is of, the first is of exactly what the paragraph then said.
     let early = events
         .iter()
         .filter_map(|e| match e {
@@ -437,7 +441,7 @@ fn a_paragraph_is_read_as_it_forms_and_not_only_once_it_settles() {
             _ => None,
         })
         .find_map(|p| match &p.translation {
-            Some(vox_transcribe::Translation::Done { of, text, .. }) if *of != p.text => {
+            Some(vox_transcribe::Translation::Done { of, text, .. }) => {
                 Some((of.clone(), text.clone()))
             }
             _ => None,
@@ -901,4 +905,81 @@ fn each_line_of_a_reading_says_which_sentence_it_is_of() {
         }
     }
     assert!(checked > 0, "nothing was read at all");
+}
+
+/// A reading arrives while the recording is still running, not when it
+/// stops.
+///
+/// The sentence being spoken is deliberately left out of a reading
+/// ([`vox_transcribe::language::complete`]), and what makes that a
+/// sentence of delay rather than a paragraph of it is that the finished
+/// ones are read as they appear. If this only passed after `finish`, a
+/// translation would arrive when the recording ended.
+#[test]
+fn a_reading_arrives_while_the_recording_runs() {
+    let mut cfg = EngineConfig::new(SR);
+    cfg.partial_interval = std::time::Duration::ZERO;
+    let interpreter = vox_transcribe::language::Interpreter::new(
+        "English",
+        &["Russian".to_string()],
+        Arc::new(FakeTranslate { fail: false }),
+    )
+    .expect("an alphabet apart");
+    let engine = Engine::spawn_passes(
+        cfg,
+        Some(Box::new(FakeStreaming { fed: 0 })),
+        Arc::new(RussianOffline),
+        vox_transcribe::engine::Passes {
+            interpreter: Some(interpreter),
+            ..Default::default()
+        },
+    );
+    let events = engine.events().clone();
+    // Which utterance was finished when the first reading arrived.
+    let mut read_after = None;
+    let mut utterances = 0;
+    for &(ms, amp) in &[
+        (500, 0.0),
+        (1600, 0.2),
+        (900, 0.0),
+        (1600, 0.2),
+        (900, 0.0),
+        (1600, 0.2),
+        (900, 0.0),
+        (1600, 0.2),
+    ] {
+        for chunk in tone(ms, amp).chunks(SR as usize / 50) {
+            engine.push(chunk);
+        }
+        if amp > 0.0 {
+            utterances += 1;
+        }
+        // Pass 2 and the translator are on their own threads; give them
+        // the moment they need rather than racing them.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        for e in events.try_iter() {
+            let Event::Paragraph { paragraph, .. } = e else {
+                continue;
+            };
+            let read = paragraph
+                .translation
+                .as_ref()
+                .and_then(vox_transcribe::Translation::text)
+                .is_some();
+            if read && read_after.is_none() {
+                read_after = Some(utterances);
+            }
+        }
+    }
+    engine.finish();
+    // The first utterance, not the second: a sentence the speaker has
+    // ended and pass 2 has settled is read then, rather than waiting
+    // for the next utterance to put whitespace after its full stop --
+    // which is a silence away, and is what made a translation look like
+    // something that only happened when the recording stopped.
+    assert_eq!(
+        read_after,
+        Some(1),
+        "a reading should arrive with the utterance it is of"
+    );
 }

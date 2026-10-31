@@ -230,6 +230,26 @@ pub fn complete(text: &str) -> &str {
     text[..end].trim_end()
 }
 
+/// `text` up to its last finished sentence, for text that is *settled*:
+/// everything an offline pass has decoded, with nothing still being
+/// spoken at the end of it.
+///
+/// [`complete`] asks the same of a paragraph as it stands, where the
+/// last sentence is the one being spoken and is held back on purpose.
+/// That rule costs a sentence too much once the words are settled: a
+/// clip pass 2 has finished is a sentence the speaker *ended*, and
+/// holding it back waits for the next utterance -- which is a silence
+/// away, not a sentence away. So a terminator at the very end counts
+/// here, and only an unfinished tail is held.
+pub fn complete_settled(text: &str) -> &str {
+    let t = text.trim_end();
+    if crate::filters::ends_sentence(t) {
+        t
+    } else {
+        complete(t)
+    }
+}
+
 /// Puts a paragraph into one language, a sentence at a time.
 ///
 /// A sentence rather than a paragraph because that is the unit the
@@ -618,5 +638,29 @@ mod tests {
             .unwrap()
             .expect("a reading");
         assert_eq!((r.lines[1].first_word, r.lines[1].last_word), (3, 3));
+    }
+
+    /// A sentence the speaker ended is read once pass 2 has settled it,
+    /// where the same text still being spoken into would hold it back.
+    #[test]
+    fn a_settled_sentence_counts_as_finished() {
+        // Still being spoken into: the last sentence is where the
+        // speaker has got to.
+        assert_eq!(complete("Дверь заперта."), "");
+        assert_eq!(complete("Дверь заперта. Крыша"), "Дверь заперта.");
+        // Settled: a full stop at the end is a full stop.
+        assert_eq!(complete_settled("Дверь заперта."), "Дверь заперта.");
+        assert_eq!(
+            complete_settled("Дверь заперта. Крыша плоская."),
+            "Дверь заперта. Крыша плоская."
+        );
+        // An unfinished tail is still held, settled or not.
+        assert_eq!(complete_settled("Дверь заперта. Крыша"), "Дверь заперта.");
+        assert_eq!(complete_settled("Крыша"), "");
+        // Trailing quotes and brackets belong to the sentence.
+        assert_eq!(complete_settled(r#"He said "go.""#), r#"He said "go.""#);
+        // A bracket on its own does not end one.
+        assert_eq!(complete_settled("Yes. (aside)"), "Yes.");
+        assert_eq!(complete_settled(""), "");
     }
 }

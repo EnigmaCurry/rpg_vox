@@ -596,7 +596,8 @@ agree byte for byte, and a test keeps them that way.
 ### When it runs, and what it costs
 
 **A sentence is read as soon as it is finished**, not when the paragraph
-it is in is. Each time pass 2 decodes an utterance, any sentence that
+it is in is -- and finished means the speaker ended it and pass 2 has
+settled it, not that another sentence has started after it. Each time pass 2 decodes an utterance, any sentence that
 has become complete is translated and appears under the line; the
 paragraph can run to two hundred words, so waiting for it would mean
 waiting a minute to read the first thing somebody said.

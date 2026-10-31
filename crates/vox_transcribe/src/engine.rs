@@ -1308,7 +1308,12 @@ impl Core {
                 if self.tr_failed.contains(&p.id) {
                     return None;
                 }
-                let text = language::complete(&p.text);
+                // What pass 2 has settled, up to its last finished
+                // sentence: the pass-1 partial at the end of the
+                // paragraph is the words being spoken now, and the
+                // sentence they are in is nobody's to read yet.
+                let settled = p.settled_text();
+                let text = language::complete_settled(&settled);
                 if text.is_empty() || p.translation.as_ref().is_some_and(|t| t.is_of(text)) {
                     return None;
                 }
