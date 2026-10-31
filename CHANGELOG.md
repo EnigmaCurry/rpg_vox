@@ -26,6 +26,18 @@ section after the version it releases.
   of a language it was never in. See
   [translation](SCRIBE.md#translation-optional).
 
+- **Playback was in the left ear only.** On PipeWire, everything scribe
+  plays — `--live`, `--play`, and `--chat` replies read aloud — came out
+  of one speaker. The stream is fed mono samples and said so, which gets
+  it a single port whose channel position is `MONO`; the session manager
+  links ports by position, so `output_MONO` matched `playback_FL` and
+  nothing at all was linked to `playback_FR`. Nor was there an upmix to
+  be had, since the adapter had negotiated the one channel that was
+  asked for. The stream now opens as stereo with its channels named and
+  writes each sample to both, which is what the cpal backend (macOS,
+  ALSA) always did with however many channels the device has. Exactly
+  the capture-side bug fixed below, on the other side of the graph.
+
 - **The translation keeps up with the speech instead of waiting for the
   paragraph.** A sentence is read as soon as it is finished, not when
   the paragraph it is in settles — which, at up to two hundred words a

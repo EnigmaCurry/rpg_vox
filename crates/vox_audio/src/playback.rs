@@ -2,6 +2,11 @@
 //! macOS, a native PipeWire stream on Linux (ALSA through cpal where
 //! PipeWire isn't running).
 //!
+//! Mono is what the caller pushes. Both backends write each sample to
+//! every channel the device has, so it is heard in both ears -- see
+//! `CHANNELS` in the PipeWire backend for what happens when a stream
+//! says mono on a stereo sink.
+//!
 //! The caller pushes samples into an SPSC ring; the device callback
 //! pulls from it and counts what it actually played, which is the clock
 //! the caller shows. Pausing and flushing (for seeks) are flags the
@@ -170,6 +175,38 @@ fn ring_for(rate: u32) -> (rtrb::Producer<f32>, rtrb::Consumer<f32>) {
     rtrb::RingBuffer::new((rate as u128 * BUFFER.as_millis() / 1000) as usize)
 }
 
+/// Channels the PipeWire stream opens with, and the reason it is not one.
+///
+/// What the caller pushes is mono -- one sample per frame -- and a
+/// stream that says so gets one port, whose channel position is `MONO`.
+/// The session manager links ports by position, so `output_MONO` matches
+/// `playback_FL` and nothing at all is linked to `playback_FR`: every
+/// word in the left ear only, which is what this was. There is no upmix
+/// to be had either, because the adapter negotiated the one channel we
+/// asked for.
+///
+/// So the stream says stereo, with its channels named, and each sample
+/// goes to both. That is what the cpal backend has always done with
+/// however many channels the device has; this makes the two agree. The
+/// ring stays mono, so it costs one more store per frame and no memory.
+#[cfg(target_os = "linux")]
+const CHANNELS: usize = 2;
+
+/// Bytes per frame on the wire: an `f32` per channel.
+#[cfg(target_os = "linux")]
+const FRAME: usize = 4 * CHANNELS;
+
+/// Write one mono sample into every channel of frame `f` of an
+/// interleaved `f32` buffer.
+#[cfg(target_os = "linux")]
+fn put_frame(bytes: &mut [u8], f: usize, s: f32) {
+    let le = s.to_le_bytes();
+    for c in 0..CHANNELS {
+        let at = f * FRAME + c * 4;
+        bytes[at..at + 4].copy_from_slice(&le);
+    }
+}
+
 #[cfg(any(target_os = "macos", target_os = "android", target_os = "windows"))]
 fn open_backend(shared: Arc<Shared>) -> Result<Opened> {
     open_cpal(shared)
@@ -330,13 +367,13 @@ fn open_pipewire(shared: Arc<Shared>) -> Result<Opened> {
                         };
                         let frames = match data.data() {
                             Some(bytes) => {
-                                let room = bytes.len() / 4;
+                                let room = bytes.len() / FRAME;
                                 let frames = match requested {
                                     0 => room,
                                     want => want.min(room),
                                 };
                                 state.shared.fill(&mut state.ring, frames, |f, s| {
-                                    bytes[f * 4..f * 4 + 4].copy_from_slice(&s.to_le_bytes());
+                                    put_frame(bytes, f, s);
                                 });
                                 frames
                             }
@@ -344,8 +381,8 @@ fn open_pipewire(shared: Arc<Shared>) -> Result<Opened> {
                         };
                         let chunk = data.chunk_mut();
                         *chunk.offset_mut() = 0;
-                        *chunk.stride_mut() = 4;
-                        *chunk.size_mut() = (frames * 4) as u32;
+                        *chunk.stride_mut() = FRAME as i32;
+                        *chunk.size_mut() = (frames * FRAME) as u32;
                     })
                     .register()
                     .context("Stream::register")?;
@@ -353,7 +390,13 @@ fn open_pipewire(shared: Arc<Shared>) -> Result<Opened> {
                 let mut info = AudioInfoRaw::new();
                 info.set_format(AudioFormat::F32LE);
                 info.set_rate(RATE);
-                info.set_channels(1);
+                info.set_channels(CHANNELS as u32);
+                // Named channels, not just a count: an unpositioned
+                // stereo stream is linked no better than a mono one.
+                let mut position = [0u32; 64];
+                position[0] = libspa::sys::SPA_AUDIO_CHANNEL_FL;
+                position[1] = libspa::sys::SPA_AUDIO_CHANNEL_FR;
+                info.set_position(position);
                 let obj = Object {
                     type_: libspa::sys::SPA_TYPE_OBJECT_Format,
                     id: libspa::sys::SPA_PARAM_EnumFormat,
@@ -419,6 +462,38 @@ fn open_backend(_shared: Arc<Shared>) -> Result<Opened> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Mono in, the same in both ears out. The regression this is for
+    /// was heard rather than seen: a stream that said mono was linked
+    /// to `playback_FL` and to nothing else.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn every_sample_is_written_to_both_channels() {
+        let shared = Shared::default();
+        let (mut tx, mut rx) = rtrb::RingBuffer::<f32>::new(8);
+        for s in [0.25f32, -0.5, 1.0] {
+            tx.push(s).expect("room");
+        }
+        // Four frames asked for, three in the ring: the fourth is the
+        // silence a starved callback hands over, and it is silent in
+        // both ears too.
+        let mut bytes = vec![0u8; 4 * FRAME];
+        shared.fill(&mut rx, 4, |f, s| put_frame(&mut bytes, f, s));
+
+        let frames: Vec<(f32, f32)> = bytes
+            .chunks_exact(FRAME)
+            .map(|f| {
+                let g = |at: usize| f32::from_le_bytes(f[at..at + 4].try_into().expect("4 bytes"));
+                (g(0), g(4))
+            })
+            .collect();
+        assert_eq!(
+            frames,
+            vec![(0.25, 0.25), (-0.5, -0.5), (1.0, 1.0), (0.0, 0.0)]
+        );
+        assert_eq!(shared.played.load(Ordering::Acquire), 3);
+        assert_eq!(shared.starved.load(Ordering::Acquire), 1);
+    }
 
     #[test]
     #[ignore]
