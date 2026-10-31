@@ -246,6 +246,26 @@ See ROOM_DOCKER.md.
   language. Both of them are in your language and two voices at once is
   neither; what is waiting keeps its place and follows on.
 
+  **It is never more than a few seconds behind, and it never skips
+  anything quietly.** An interpreter that has more than eight seconds
+  of speech still to say stops speaking and only writes: another voice
+  on the end of that queue would be heard later still, and by then
+  nobody wants it. The same when it is turned down, when a translation
+  fails, and when even the translating cannot keep up — the words go on
+  screen either way, as they were said if they could not be put into
+  your language at all. A reader who is given nothing has no way of
+  telling that anything was skipped, which is the one outcome worse
+  than reading a line in a language you didn't ask for. `the
+  interpreter is behind` and `cannot keep up` in the log are what it
+  looks like from outside.
+
+  What makes it fall behind is not usually the translating — a Marian
+  model is fifty milliseconds a line and even the reply model is about
+  two seconds, both faster than the speech they stand in for. It is
+  having nowhere to put the audio: a long AI turn holds every
+  interpretation back until it ends, and a room where everyone talks at
+  once makes more speech than there is time to say it in.
+
   The same bar appears under a line somebody is still being heard
   saying, so the speaker can see when the room has caught up with them.
   It costs a translation and a voice per utterance per language, which

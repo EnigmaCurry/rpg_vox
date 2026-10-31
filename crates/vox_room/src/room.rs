@@ -50,6 +50,13 @@ const EVENT_CAPACITY: usize = 512;
 /// difference between a report ten times a second and fifty.
 const REPORT_STEP: u64 = 200;
 
+/// How far behind the room an interpreter may get before it stops
+/// speaking and only writes. Somebody who hears what was said this long
+/// after it was said is not in the conversation, and the words are on
+/// screen the whole time -- better to be read in the present than heard
+/// in the past.
+const INTERP_BACKLOG: Duration = Duration::from_secs(8);
+
 /// How long the room waits for a translation that every other language
 /// has already outlasted, before it gives up on it and ends the turn.
 /// Long enough that no translator reaches it: it is there so that a
@@ -568,6 +575,11 @@ pub struct InterpJob {
     pub from: String,
     pub into: String,
     pub text: String,
+    /// Whether to say it as well as write it. False when the interpreter
+    /// is already further behind the room than [`INTERP_BACKLOG`]: it
+    /// is still translated, so the line can be read, but another voice
+    /// on the end of that queue would only be heard later still.
+    pub speak: bool,
 }
 
 pub struct TypedJob {
@@ -1496,7 +1508,7 @@ impl Room {
         // Who it is for: every language somebody is here and listening
         // in, other than the one it was said in. Nobody listening in it
         // means nothing to interpret, however many the door offers.
-        let into: Vec<String> = self
+        let into: Vec<(String, bool)> = self
             .interp
             .keys()
             .filter(|l| **l != from)
@@ -1505,7 +1517,22 @@ impl Room {
                     .values()
                     .any(|p| p.online() && self.language_of(p) == l.as_str())
             })
-            .cloned()
+            .map(|l| {
+                // How far behind the room this interpreter already is.
+                // Past the limit it writes without speaking: another
+                // voice on the end of that queue would only be heard
+                // later still, and by then nobody wants it.
+                let queued = self.mixer.interp_backlog(l);
+                let behind = Duration::from_millis(queued as u64 * 1000 / RATE as u64);
+                if behind > INTERP_BACKLOG {
+                    info!(
+                        language = %l,
+                        behind_ms = behind.as_millis() as u64,
+                        "the interpreter is behind: writing this down without saying it"
+                    );
+                }
+                (l.clone(), behind <= INTERP_BACKLOG)
+            })
             .collect();
         if into.is_empty() {
             return;
@@ -1562,7 +1589,7 @@ impl Room {
                 if !i.clips.insert(clip.id.clone()) {
                     continue;
                 }
-                for language in &into {
+                for (language, speak) in &into {
                     *i.pending.entry(language.clone()).or_insert(0) += 1;
                     jobs.push(InterpJob {
                         entry: para.id.clone(),
@@ -1570,12 +1597,13 @@ impl Room {
                         from: from.clone(),
                         into: language.clone(),
                         text: text.to_string(),
+                        speak: *speak,
                     });
                 }
             }
         }
         for job in jobs {
-            let into = job.into.clone();
+            let (into, text) = (job.into.clone(), job.text.clone());
             let sent = match self.interp.get(&into) {
                 Some(tx) => tx.try_send(job).is_ok(),
                 None => false,
@@ -1583,19 +1611,40 @@ impl Room {
             if sent {
                 continue;
             }
-            // The interpreter is further behind than its queue is long.
-            // Dropped rather than waited on: a room is a conversation,
-            // and an interpretation minutes late is worse than none --
-            // the words are on screen either way.
-            warn!(language = %into, "the interpreter is behind: an utterance was dropped");
-            if let Some(n) = st
-                .interp
-                .get_mut(&para.id)
-                .and_then(|i| i.pending.get_mut(&into))
-            {
-                *n = n.saturating_sub(1);
-            }
+            // Even the queue is full, which is an interpreter that
+            // cannot keep up with the translating either. The utterance
+            // goes on screen as it was said rather than being lost: a
+            // reader who is given nothing has no way of telling that
+            // something was skipped, which is the one outcome worse
+            // than reading it in a language they didn't ask for.
+            warn!(language = %into, "the interpreter cannot keep up: left untranslated");
+            Self::interp_wrote(st, &para.id, &into, &text);
         }
+    }
+
+    /// Words on an interpretation's list with no audio to go with them:
+    /// an utterance written down but not said, because the interpreter
+    /// is behind or could not manage it. They appear whole, since
+    /// nobody is hearing them at any pace. Returns whether the line was
+    /// still there to put them on.
+    fn interp_wrote(st: &mut State, entry: &str, into: &str, text: &str) -> bool {
+        let Some(i) = st.interp.get_mut(entry) else {
+            return false;
+        };
+        if let Some(n) = i.pending.get_mut(into) {
+            *n = n.saturating_sub(1);
+        }
+        // Nothing to write: nobody is listening in this language any
+        // more, so there is nobody to write it for either.
+        if text.trim().is_empty() {
+            return false;
+        }
+        i.said.entry(into.to_string()).or_default().push(Said {
+            text: text.trim().to_string(),
+            samples: 0,
+            played: 0,
+        });
+        true
     }
 
     /// An interpreter has put one utterance into `into` and spoken it.
@@ -1609,39 +1658,38 @@ impl Room {
             return;
         };
         let stream = i.stream;
-        if let Some(n) = i.pending.get_mut(into) {
-            *n = n.saturating_sub(1);
-        }
-        let said = i.said.entry(into.to_string()).or_default();
         // Its place in the queue is where it lands, not where it was
         // asked for: an utterance that failed to translate leaves no gap.
-        let index = said.len();
-        said.push(Said {
-            text: text.trim().to_string(),
-            samples: samples.len(),
-            played: 0,
-        });
+        let index = i.said.get(into).map_or(0, |s| s.len());
+        let n = samples.len();
+        if !Self::interp_wrote(&mut st, entry, into, text) {
+            return;
+        }
+        if let Some(said) = st
+            .interp
+            .get_mut(entry)
+            .and_then(|i| i.said.get_mut(into))
+            .and_then(|s| s.last_mut())
+        {
+            said.samples = n;
+        }
         drop(st);
-        // Nothing to play: the interpreter is turned down, and this is
-        // the words alone. On screen at once, since nobody is going to
-        // be hearing them at any particular pace.
+        // Nothing to play: the interpreter is turned down, or further
+        // behind the room than it is any use being. The words are on
+        // screen at once, since nobody is going to be hearing them at
+        // any particular pace.
         if !samples.is_empty() {
             self.mixer.interp_push(into, stream, index, samples);
         }
     }
 
-    /// An interpreter could not manage one utterance. Nothing is spoken
-    /// and nothing is written; the line is on screen in the language it
-    /// was said in, which is what reading it there is for.
-    pub fn interp_failed(&self, entry: &str, into: &str) {
+    /// An interpreter could not manage one utterance: it could not be
+    /// translated, or the voice failed. `said` is what was actually
+    /// said, which goes on screen in its place -- a reader given
+    /// nothing has no way of telling that anything was skipped.
+    pub fn interp_failed(&self, entry: &str, into: &str, said: &str) {
         let mut st = self.lock();
-        if let Some(n) = st
-            .interp
-            .get_mut(entry)
-            .and_then(|i| i.pending.get_mut(into))
-        {
-            *n = n.saturating_sub(1);
-        }
+        Self::interp_wrote(&mut st, entry, into, said);
     }
 
     /// Bring every interpretation up to what the mixer has played: the
@@ -3785,6 +3833,71 @@ mod tests {
     }
 
     #[test]
+    fn an_interpreter_that_is_behind_writes_without_speaking() {
+        let (r, _turns, interp) = room_with(Mode::Named, &["English", "Russian"]);
+        r.set_language("Alex", "Russian").unwrap();
+        r.join("Alex", 1);
+        r.join("Ryan", 2);
+
+        r.on_paragraph("Ryan", &para("p1", "The door is locked.", false));
+        let job = interp["Russian"].try_recv().unwrap();
+        assert!(job.speak, "nothing queued yet, so it is said");
+        // Ten seconds of it queued: whoever is listening in Russian is
+        // already that far behind the room.
+        r.interp_spoke(
+            &job.entry,
+            &job.into,
+            "Дверь заперта.",
+            vec![0.1; 10 * 48_000],
+        );
+
+        r.on_paragraph("Ryan", &para("p2", "And the key is gone.", false));
+        let job = interp["Russian"].try_recv().unwrap();
+        assert!(
+            !job.speak,
+            "another voice on the end of that queue is one nobody wants"
+        );
+        // Written down is still written down, and at once: nobody is
+        // going to be hearing it at any particular pace.
+        r.interp_spoke(&job.entry, &job.into, "И ключ пропал.", Vec::new());
+        r.tick(Instant::now());
+        assert_eq!(
+            agent_entry_of(&r, "p2").translations["Russian"],
+            "И ключ пропал."
+        );
+    }
+
+    #[test]
+    fn an_utterance_the_interpreter_cannot_take_is_read_as_it_was_said() {
+        let (r, _turns, interp) = room_with(Mode::Named, &["English", "Russian"]);
+        r.set_language("Alex", "Russian").unwrap();
+        r.join("Alex", 1);
+        r.join("Ryan", 2);
+        // Nobody is working the queue, so it fills. What it cannot take
+        // is the one thing that must not go quietly: a reader given
+        // nothing has no way of telling that anything was skipped.
+        for n in 0..20 {
+            r.on_paragraph(
+                "Ryan",
+                &para(&format!("p{n}"), &format!("Line {n}."), false),
+            );
+        }
+        assert_eq!(interp["Russian"].len(), 16, "as much as it would hold");
+        r.tick(Instant::now());
+        assert_eq!(
+            agent_entry_of(&r, "p19").translations["Russian"],
+            "Line 19.",
+            "on screen as it was said, rather than missing"
+        );
+        // And nothing is left waiting on an interpretation that is
+        // never coming: the row goes rather than sitting there.
+        let mut events = r.subscribe();
+        r.tick(Instant::now());
+        let of = last_heard(&mut events).unwrap_or_default();
+        assert!(of.is_empty(), "nothing is still to be heard: {of:?}");
+    }
+
+    #[test]
     fn with_the_interpreter_down_the_words_still_arrive() {
         let (r, _turns, interp) = room_with(Mode::Named, &["English", "Russian"]);
         r.set_language("Alex", "Russian").unwrap();
@@ -3832,7 +3945,7 @@ mod tests {
         assert_eq!(of[0]["done"], false, "waiting on the interpreter");
 
         // One it cannot manage is not waited on for ever.
-        r.interp_failed(&job.entry, &job.into);
+        r.interp_failed(&job.entry, &job.into, "");
         r.tick(Instant::now());
         let of = last_heard(&mut events).expect("a last report");
         assert!(of.is_empty(), "nothing is coming: {of:?}");

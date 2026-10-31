@@ -27,3 +27,4 @@ transcript-*.md
 *.jks
 # pi/pi-tts.py's Python (just pi-tts-venv).
 pi/.venv/
+test_sample

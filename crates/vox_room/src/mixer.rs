@@ -447,6 +447,19 @@ impl Mixer {
             });
     }
 
+    /// How much interpreted speech is waiting to be heard in `language`,
+    /// in samples. What is queued is how far behind the room an
+    /// interpreter already is, and the room stops giving it more to say
+    /// rather than let that grow without end.
+    pub fn interp_backlog(&self, language: &str) -> usize {
+        self.lock().interp.get(language).map_or(0, |t| {
+            t.queue
+                .iter()
+                .map(|s| s.samples.len().saturating_sub(s.pos))
+                .sum()
+        })
+    }
+
     /// How far the interpreter has got in each language it is speaking,
     /// so whoever is being interpreted can see when they have been heard.
     pub fn interp_progress(&self) -> BTreeMap<String, TrackProgress> {

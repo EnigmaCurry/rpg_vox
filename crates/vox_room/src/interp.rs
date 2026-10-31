@@ -51,7 +51,7 @@ pub fn spawn(
                 // are listening in. Checked here rather than only at the
                 // door, because a queue takes time to work through.
                 if !room.is_heard_in(&job.into) {
-                    room.interp_failed(&job.entry, &job.into);
+                    room.interp_failed(&job.entry, &job.into, "");
                     continue;
                 }
                 let started = Instant::now();
@@ -63,7 +63,10 @@ pub fn spawn(
                             language = %job.into,
                             "couldn't interpret {:?}: {e:#}", job.text
                         );
-                        room.interp_failed(&job.entry, &job.into);
+                        // On screen as it was said, rather than not at
+                        // all: a reader given nothing has no way of
+                        // telling that anything was skipped.
+                        room.interp_failed(&job.entry, &job.into, &job.text);
                         continue;
                     }
                 };
@@ -72,12 +75,20 @@ pub fn spawn(
                 if context.len() > CONTEXT {
                     context.remove(0);
                 }
-                // Pulled all the way down, the interpreter is off: there
-                // is nothing to pay a voice for. The words still go to
-                // the screen, because reading the room is a different
-                // thing from being talked over.
-                if room.mixer.silent(crate::mixer::INTERP_STRIP) {
-                    info!(who = %job.who, into = %job.into, translated_ms, "interpreted, silently");
+                // Two ways of being written and not said: the fader
+                // pulled all the way down, which is the room turning the
+                // voices off, and an interpreter already further behind
+                // than it is any use being. Neither is a reason to stop
+                // reading the room, so the words go on screen either
+                // way; there is just nothing to pay a voice for.
+                if !job.speak || room.mixer.silent(crate::mixer::INTERP_STRIP) {
+                    info!(
+                        who = %job.who,
+                        into = %job.into,
+                        translated_ms,
+                        behind = !job.speak,
+                        "interpreted, silently"
+                    );
                     room.interp_spoke(&job.entry, &job.into, &say, Vec::new());
                     continue;
                 }
@@ -97,7 +108,9 @@ pub fn spawn(
                     }
                     Err(e) => {
                         warn!(language = %job.into, "the interpreter's voice failed on {say:?}: {e:#}");
-                        room.interp_failed(&job.entry, &job.into);
+                        // The translation is good even though the voice
+                        // failed, so that is what goes on screen.
+                        room.interp_failed(&job.entry, &job.into, &say);
                     }
                 }
             }
