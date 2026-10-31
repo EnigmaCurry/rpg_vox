@@ -26,6 +26,16 @@ section after the version it releases.
   of a language it was never in. See
   [translation](SCRIBE.md#translation-optional).
 
+- **`just install-scribe` installs a scribe that can translate.**
+  `release-scribe` builds with the `translate-local` feature now, so the
+  binary in `~/.local/bin` is the one `just scribe-translate` runs
+  rather than one that answers `--translate local` with "needs a build
+  with the feature". It also copies the Marian models into the per-user
+  models directory, which is where an installed scribe looks: it is not
+  run from the checkout, and unlike the recognizers it cannot fetch
+  those for itself. Release tarballs, Windows and Android are unchanged
+  and still `--translate openai` only.
+
 - **Playback was in the left ear only.** On PipeWire, everything scribe
   plays — `--live`, `--play`, and `--chat` replies read aloud — came out
   of one speaker. The stream is fed mono samples and said so, which gets

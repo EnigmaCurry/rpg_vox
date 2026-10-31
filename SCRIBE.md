@@ -554,11 +554,25 @@ otherwise arrives translated as prose. The LLM translator is told to copy
 such spans through verbatim.
 
 Because the local translator is a C++ library with a CMake build, it is
-behind a feature flag; the default build has `--translate openai` only.
+behind a feature flag. Which builds carry it:
+
+| Build | `--translate local` |
+| --- | --- |
+| `just scribe-translate` | yes, and turned on |
+| `just release-scribe`, `just install-scribe` | yes |
+| `just scribe`, `cargo build -p vox_scribe` | no |
+| `just dist` release tarballs, Windows, Android | no |
 
 ```bash
 cargo build -p vox_scribe --features translate-local --release
 ```
+
+`just install-scribe` also copies the Marian models into the per-user
+models directory, because an installed scribe isn't run from the
+checkout and so doesn't resolve models to `./models`. Unlike the
+recognizers it cannot fetch them for itself: their tokenizer is
+converted by a Python script (`tools/spm2tokenizer.py`), which is what
+`just download-translate-model-ru` runs.
 
 ### When it runs, and what it costs
 

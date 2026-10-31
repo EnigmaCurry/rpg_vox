@@ -472,10 +472,11 @@ scribe *ARGS: download-stt-model download-streaming-stt-model
       cargo run -p vox_scribe --release -- {{ARGS}}
     fi
 
-# Like `just scribe`, with the local translator built in: `--translate
-# local` reads anything heard in another language in your own, with no
-# network (see SCRIBE.md). Fetches the Russian/English Marian models
-# first; the CMake build of CTranslate2 makes the first compile slow.
+# `--translate local` reads anything heard in another language in your
+# own, with no network (see SCRIBE.md). Fetches the Russian/English
+# Marian models first; the CMake build of CTranslate2 makes the first
+# compile slow.
+# Like `just scribe`, with the local translator built in and turned on.
 scribe-translate *ARGS: download-stt-model download-streaming-stt-model download-translate-model-ru
     #!/usr/bin/env bash
     set -euo pipefail
@@ -487,14 +488,21 @@ scribe-translate *ARGS: download-stt-model download-streaming-stt-model download
     fi
 
 # Uses nix-shell when available (Linux), plain cargo otherwise (macOS).
-# Optimized vox_scribe build only → target/release/scribe.
+# Carries `--translate local` (the `translate-local` feature), so the
+# scribe you install is the one `just scribe-translate` runs. That brings
+# a CMake build of CTranslate2 with it, which is most of a cold build's
+# time; `cargo build -p vox_scribe --release` on its own is the quick way
+# to a binary that translates through --llm only. The release tarballs
+# (`just dist`) and the Windows and Android builds don't carry it -- a
+# cmake cross-build is its own piece of work and nothing there has asked.
+# Optimized vox_scribe build only, with local translation → target/release/scribe.
 release-scribe:
     #!/usr/bin/env bash
     set -euo pipefail
     if command -v nix-shell >/dev/null; then
-      nix-shell --run "cargo build -p vox_scribe --release"
+      nix-shell --run "cargo build -p vox_scribe --release --features translate-local"
     else
-      cargo build -p vox_scribe --release
+      cargo build -p vox_scribe --release --features translate-local
     fi
 
 # Pi with the voice extension (see PI.md): talk to it, hear the replies.
@@ -519,8 +527,14 @@ pi-tts-venv:
       [ -n "${PI_TTS_URL:-}" ] || echo "set PI_TTS_URL to your Qwen3-TTS server (see qwen3-tts/)" >&2
     fi
 
-# Build vox_scribe, install it to BIN and download its models.
-install-scribe BIN="~/.local/bin": release-scribe
+# The translation models go to the per-user models directory as well as
+# the checkout's: an installed scribe is not run from here, so it
+# resolves models to that directory instead, and the ones it cannot fetch
+# for itself have to be put there. (It downloads the recognizers on first
+# use; the Marian models can't be, because their tokenizer is converted
+# by a Python script -- see tools/spm2tokenizer.py.)
+# Build vox_scribe, install it to BIN and put its models where it looks.
+install-scribe BIN="~/.local/bin": release-scribe download-translate-model-ru
     #!/usr/bin/env bash
     set -euo pipefail
     bin="{{BIN}}"
@@ -528,6 +542,23 @@ install-scribe BIN="~/.local/bin": release-scribe
     mkdir -p "$bin"
     install -m 755 target/release/scribe "$bin/scribe"
     echo "installed $bin/scribe"
+    # Where the installed scribe looks: models::resolve's user data
+    # directory, or VOX_SCRIBE_MODELS when that is set.
+    if [ -n "${VOX_SCRIBE_MODELS:-}" ]; then
+      models="$VOX_SCRIBE_MODELS"
+    elif [ "$(uname)" = Darwin ]; then
+      models="$HOME/Library/Application Support/vox_scribe/models"
+    else
+      models="${XDG_DATA_HOME:-$HOME/.local/share}/vox_scribe/models"
+    fi
+    for pair in en-ru ru-en; do
+      if [ -f "$models/translate/$pair/model.bin" ]; then
+        continue
+      fi
+      mkdir -p "$models/translate"
+      cp -r "models/translate/$pair" "$models/translate/"
+      echo "installed $models/translate/$pair"
+    done
     if [ "$(uname)" = Darwin ]; then
       contrib=crates/vox_scribe/contrib/macos
       sed "s|@BIN@|$bin|" "$contrib/scribe-once.terminal" > "$bin/scribe-once.terminal"
