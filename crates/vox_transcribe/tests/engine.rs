@@ -359,6 +359,7 @@ fn a_paragraph_heard_in_another_language_is_read_in_the_native_one() {
     // see whose fault a bad reading was.
     assert_eq!(p.text, "Дверь заперта, дверь заперта.");
     let Some(vox_transcribe::Translation::Done {
+        of,
         language,
         text,
         lines,
@@ -367,6 +368,9 @@ fn a_paragraph_heard_in_another_language_is_read_in_the_native_one() {
         panic!("not translated: {:?}", p.translation);
     };
     assert_eq!(language, "Russian");
+    // The reading says which text it was made from, and by the time the
+    // paragraph has hardened that is all of it.
+    assert_eq!(of, &p.text);
     assert_eq!(
         text,
         "[Russian>English after 0] Дверь заперта, дверь заперта."
@@ -391,7 +395,10 @@ fn a_paragraph_already_in_the_native_language_costs_nothing() {
     // It ran, found nothing to do, and said so -- rather than leaving
     // None, which would have it asked again.
     assert!(
-        matches!(p.translation, Some(vox_transcribe::Translation::Native)),
+        matches!(
+            p.translation,
+            Some(vox_transcribe::Translation::Native { .. })
+        ),
         "{:?}",
         p.translation
     );
@@ -411,6 +418,46 @@ fn a_translation_that_failed_does_not_hold_the_paragraph_open() {
         ),
         "{:?}",
         p.translation
+    );
+}
+
+#[test]
+fn a_paragraph_is_read_as_it_forms_and_not_only_once_it_settles() {
+    let (events, t) = run_translated(Arc::new(RussianOffline), false);
+    // A reading that arrived while the paragraph was still two clips of
+    // one sentence each, before pass 3 merged them and before it
+    // hardened: `of` is what the paragraph said at the time, which is
+    // less than what it says now.
+    let early = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Paragraph { paragraph, change } if *change == Change::Translated => {
+                Some(paragraph)
+            }
+            _ => None,
+        })
+        .find_map(|p| match &p.translation {
+            Some(vox_transcribe::Translation::Done { of, text, .. }) if *of != p.text => {
+                Some((of.clone(), text.clone()))
+            }
+            _ => None,
+        });
+    let (of, text) = early.expect("a reading before the paragraph was finished");
+    assert_eq!(of, "Дверь заперта.", "the finished sentence, and only it");
+    assert_eq!(text, "[Russian>English after 0] Дверь заперта.");
+    // The order that matters: read before hardened, every time.
+    let ch = changes(&events);
+    let first_read = ch.iter().position(|c| *c == Change::Translated);
+    let hardened = ch.iter().position(|c| *c == Change::Hardened);
+    assert!(first_read < hardened, "{ch:?}");
+    // And what is left at the end is of the whole paragraph, so the
+    // files are never written from a reading that is a sentence short.
+    let p = &t.paragraphs[0];
+    assert!(
+        p.translation.as_ref().is_some_and(|tr| tr.is_of(&p.text)),
+        "{:?} is not of {:?}",
+        p.translation,
+        p.text
     );
 }
 

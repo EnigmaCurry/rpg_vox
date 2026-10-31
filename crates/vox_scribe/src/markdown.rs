@@ -256,9 +256,10 @@ mod tests {
         };
         // Nothing to read yet, and nothing extra written for it.
         assert_eq!(block(&p), "\n**[00:00:02]** Да, конечно.\n");
-        p.translation = Some(Translation::Native);
+        p.translation = Some(Translation::Native { of: p.text.clone() });
         assert_eq!(block(&p), "\n**[00:00:02]** Да, конечно.\n");
         p.translation = Some(Translation::Done {
+            of: p.text.clone(),
             language: "Russian".into(),
             text: "Yes, of course.".into(),
             lines: Vec::new(),
@@ -270,6 +271,7 @@ mod tests {
         // The quote wraps with its own markers counted, so no line of
         // the file runs past the width.
         p.translation = Some(Translation::Done {
+            of: p.text.clone(),
             language: "Russian".into(),
             text: "word ".repeat(40),
             lines: Vec::new(),

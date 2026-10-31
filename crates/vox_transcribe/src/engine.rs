@@ -12,7 +12,7 @@
 //! locks and no stale-partial races: a partial can only be emitted for
 //! the utterance currently being spoken.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -26,7 +26,7 @@ use crate::correct::{apply_edits, Corrector, Edit};
 use crate::denoise::Denoiser;
 use crate::digits::spoken_digits;
 use crate::filters::{capitalize_sentences, count_words, ends_on_sentence, is_junk};
-use crate::language::{Interpreter, Reading};
+use crate::language::{self, Interpreter, Known, Reading};
 use crate::model::{Clip, Paragraph, Pass4, Stage, Transcript, TranslatedLine, Translation};
 use crate::recognizer::{OfflineRecognizer, SpeakerTagger, StreamingRecognizer, Transcription};
 use crate::ring::AudioRing;
@@ -201,6 +201,9 @@ struct TrJob {
     /// translated sentence in time.
     words: usize,
     context: Vec<String>,
+    /// What this paragraph's sentences already read as, so a paragraph
+    /// read again as it grows pays for the new sentences only.
+    known: Known,
 }
 
 struct TrResult {
@@ -346,7 +349,7 @@ impl Engine {
                     .name("vox-translate".into())
                     .spawn(move || {
                         for job in job_rx {
-                            let reading = i.read(&job.text, job.words, &job.context);
+                            let reading = i.read(&job.text, job.words, &job.context, &job.known);
                             if out_tx.send(TrResult { job, reading }).is_err() {
                                 return;
                             }
@@ -508,6 +511,17 @@ struct Core {
     outstanding_llm: usize,
     tr_tx: Option<Sender<TrJob>>,
     outstanding_tr: usize,
+    /// Per paragraph, what its sentences already read as. Dropped when
+    /// the paragraph hardens: nothing will ask again.
+    tr_known: HashMap<String, Known>,
+    /// Paragraphs with a reading out for translation. One at a time,
+    /// or two answers for one paragraph would race to be the newer.
+    tr_inflight: HashSet<String>,
+    /// Paragraphs whose translator has failed once. They stop being
+    /// read as they grow and get one more try when they settle: a dead
+    /// endpoint should cost one timeout per paragraph, not one per
+    /// utterance.
+    tr_failed: HashSet<String>,
     pass3_pending: HashSet<String>,
     level_max: f32,
     level_next: u64,
@@ -546,6 +560,9 @@ impl Core {
             outstanding_llm: 0,
             tr_tx: None,
             outstanding_tr: 0,
+            tr_known: HashMap::new(),
+            tr_inflight: HashSet::new(),
+            tr_failed: HashSet::new(),
             pass3_pending: HashSet::new(),
             level_max: 0.0,
             level_next: 0,
@@ -1002,7 +1019,9 @@ impl Core {
         if p.clips.is_empty() {
             let id = p.id.clone();
             self.transcript.paragraphs.remove(pi);
-            let _ = self.events.send(Event::ParagraphRemoved { id });
+            self.tr_known.remove(&id);
+            self.tr_failed.remove(&id);
+            let _ = self.events.send(Event::ParagraphRemoved { id: id.clone() });
         } else {
             p.rebuild();
             self.emit(pi, Change::ClipRemoved);
@@ -1048,18 +1067,26 @@ impl Core {
                     Some(_) => {}
                 }
             }
-            // And then the translation, which is made from the text
-            // pass 4 settled on.
+            // And then the translation, of the text pass 4 settled on.
+            // A reading made while the paragraph was still being spoken
+            // is of less than all of it, so this is where the rest of
+            // it is paid for -- by then every sentence but the last is
+            // already read, and that is all this costs.
             if self.tr_tx.is_some() && !p.text.trim().is_empty() {
-                match p.translation {
-                    None => {
-                        self.request_translation(idx);
-                        continue;
-                    }
-                    Some(Translation::Running) => continue,
-                    Some(_) => {}
+                if self.tr_inflight.contains(&p.id) {
+                    continue;
+                }
+                if !p.translation.as_ref().is_some_and(|t| t.is_of(&p.text)) {
+                    let text = p.text.clone();
+                    self.request_translation(idx, text);
+                    continue;
                 }
             }
+            let id = self.transcript.paragraphs[idx].id.clone();
+            // No pass will ask again, so nothing has to be remembered
+            // for it.
+            self.tr_known.remove(&id);
+            self.tr_failed.remove(&id);
             self.transcript.paragraphs[idx].hardened = true;
             self.emit(idx, Change::Hardened);
         }
@@ -1105,10 +1132,14 @@ impl Core {
         todo.len()
     }
 
-    /// Queue the translation of `paragraphs[idx]`. Closed for the same
-    /// reason pass 4 closes it: new speech landing in a paragraph whose
-    /// translation is already out would leave the two out of step.
-    fn request_translation(&mut self, idx: usize) {
+    /// Queue a reading of `text` for `paragraphs[idx]`.
+    ///
+    /// `text` is the whole paragraph when it is settling, and only its
+    /// finished sentences while somebody is still talking -- see
+    /// [`Core::read_as_it_forms`]. Either way the reading records which
+    /// of the two it was made from, so nothing mistakes one for the
+    /// other.
+    fn request_translation(&mut self, idx: usize, text: String) {
         let Some(tx) = &self.tr_tx else { return };
         // The readings of the paragraphs before this one, not their
         // source: a translator using context is being shown what it has
@@ -1118,44 +1149,111 @@ impl Core {
             .filter_map(|p| p.translation.as_ref().and_then(Translation::text))
             .map(str::to_string)
             .collect();
-        let p = &mut self.transcript.paragraphs[idx];
-        p.closed = true;
-        p.translation = Some(Translation::Running);
+        let p = &self.transcript.paragraphs[idx];
+        let known = self.tr_known.get(&p.id).cloned().unwrap_or_default();
         let job = TrJob {
             paragraph_id: p.id.clone(),
-            text: p.text.clone(),
+            text,
             words: p.words.len(),
             context,
+            known,
         };
-        if tx.send(job).is_ok() {
-            self.outstanding_tr += 1;
+        if tx.send(job).is_err() {
+            return;
         }
-        self.emit(idx, Change::Closed);
+        self.outstanding_tr += 1;
+        self.tr_inflight.insert(p.id.clone());
+        // Nothing to show yet is the one state worth announcing; a
+        // paragraph being read again keeps the reading it has.
+        if self.transcript.paragraphs[idx].translation.is_none() {
+            self.transcript.paragraphs[idx].translation = Some(Translation::Running);
+            self.emit(idx, Change::Translated);
+        }
     }
 
-    /// Queue the translation of every paragraph that hasn't had one.
-    /// Returns how many were queued.
+    /// Read the finished sentences of every paragraph still being
+    /// spoken, so the reading keeps up with the words instead of
+    /// arriving all at once when the paragraph settles.
+    ///
+    /// Only the finished sentences: the one being spoken now would be
+    /// translated as half a thought and replaced a moment later. And
+    /// only when there is a sentence that has not been read yet, which
+    /// is what stops a paragraph being retranslated every time pass 2
+    /// lands another clip in the middle of a sentence.
+    fn read_as_it_forms(&mut self) {
+        if self.tr_tx.is_none() {
+            return;
+        }
+        let todo: Vec<(usize, String)> = (0..self.transcript.paragraphs.len())
+            .filter_map(|i| {
+                let p = &self.transcript.paragraphs[i];
+                if p.hardened || self.tr_inflight.contains(&p.id) {
+                    return None;
+                }
+                // A paragraph whose translator has already failed waits
+                // for the settling pass rather than failing again per
+                // utterance.
+                if self.tr_failed.contains(&p.id) {
+                    return None;
+                }
+                let text = language::complete(&p.text);
+                if text.is_empty() || p.translation.as_ref().is_some_and(|t| t.is_of(text)) {
+                    return None;
+                }
+                // Every sentence in it has been read already: this is
+                // the same text with a longer unfinished tail, and
+                // there is nothing to pay for.
+                let known = self.tr_known.get(&p.id);
+                let fresh = crate::filters::sentences(text)
+                    .into_iter()
+                    .any(|s| !known.is_some_and(|k| k.contains_key(s)));
+                fresh.then(|| (i, text.to_string()))
+            })
+            .collect();
+        for (i, text) in todo {
+            self.request_translation(i, text);
+        }
+    }
+
+    /// Queue a reading of every paragraph that hasn't one of its whole
+    /// text yet. Returns how many were queued.
     fn request_translation_all(&mut self) -> usize {
         if self.tr_tx.is_none() {
             return 0;
         }
-        let todo: Vec<usize> = (0..self.transcript.paragraphs.len())
+        let todo: Vec<(usize, String)> = (0..self.transcript.paragraphs.len())
             .filter(|&i| {
                 let p = &self.transcript.paragraphs[i];
-                !p.hardened && p.translation.is_none() && !p.text.trim().is_empty()
+                !p.hardened
+                    && !self.tr_inflight.contains(&p.id)
+                    && !p.text.trim().is_empty()
+                    && !p.translation.as_ref().is_some_and(|t| t.is_of(&p.text))
             })
+            .map(|i| (i, self.transcript.paragraphs[i].text.clone()))
             .collect();
-        for &i in &todo {
-            self.request_translation(i);
+        for (i, text) in &todo {
+            self.request_translation(*i, text.clone());
         }
         todo.len()
     }
 
     fn on_translation(&mut self, r: TrResult) {
         self.outstanding_tr -= 1;
+        self.tr_inflight.remove(&r.job.paragraph_id);
         let Some(idx) = self.find_paragraph(&r.job.paragraph_id) else {
+            self.tr_known.remove(&r.job.paragraph_id);
             return;
         };
+        // What the sentences of this text read as, kept so the next
+        // reading of this paragraph -- a sentence longer, or with one
+        // sentence rewritten by pass 3 -- pays only for what changed.
+        if let Ok(Some(reading)) = &r.reading {
+            let known = self.tr_known.entry(r.job.paragraph_id.clone()).or_default();
+            for l in &reading.lines {
+                known.insert(l.source.clone(), l.text.clone());
+            }
+        }
+        let of = r.job.text;
         let p = &mut self.transcript.paragraphs[idx];
         p.translation = Some(match r.reading {
             Ok(Some(reading)) => {
@@ -1180,8 +1278,14 @@ impl Core {
                         }
                     })
                     .collect();
-                debug!(paragraph = %p.id, language = %reading.language, "translated");
+                debug!(
+                    paragraph = %p.id,
+                    language = %reading.language,
+                    whole = of == p.text,
+                    "translated"
+                );
                 Translation::Done {
+                    of,
                     language: reading.language,
                     text: reading.text,
                     lines,
@@ -1189,14 +1293,20 @@ impl Core {
             }
             // Nothing to do, which is every paragraph of a transcript
             // whose speaker is already understood.
-            Ok(None) => Translation::Native,
+            Ok(None) => Translation::Native { of },
             Err(e) => {
                 let reason = format!("{e:#}");
                 warn!(paragraph = %p.id, %reason, "no translation; the words stand as they were said");
-                Translation::Failed { reason }
+                let id = p.id.clone();
+                self.tr_failed.insert(id);
+                Translation::Failed { of, reason }
             }
         });
         self.emit(idx, Change::Translated);
+        // More was said while that was out, or pass 3 has rewritten a
+        // sentence since: read the rest of it rather than wait for the
+        // paragraph to settle.
+        self.read_as_it_forms();
         self.harden_idle();
     }
 
@@ -1259,6 +1369,9 @@ impl Core {
                 self.on_boundary(paragraph_id, window, r.text);
             }
         }
+        // A finished sentence is worth reading as soon as there is one,
+        // rather than when the paragraph it is in settles.
+        self.read_as_it_forms();
         self.harden_idle();
     }
 

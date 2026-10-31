@@ -983,7 +983,7 @@ fn wrap(
 /// made, so a hardened-looking paragraph is never silently waiting.
 fn reading_lines(p: &vox_transcribe::Paragraph, text_w: usize, out: &mut Vec<Line<'static>>) {
     let style = Style::new().fg(READING);
-    let (label, words, label_style) = match &p.translation {
+    let (label, mut words, label_style) = match &p.translation {
         Some(Translation::Done { language, text, .. }) => (
             // Three letters of the language it was heard in, which is
             // the most that fits beside a timestamp and enough to tell
@@ -1002,7 +1002,7 @@ fn reading_lines(p: &vox_transcribe::Paragraph, text_w: usize, out: &mut Vec<Lin
             )],
             style.add_modifier(Modifier::ITALIC),
         ),
-        Some(Translation::Failed { reason }) => (
+        Some(Translation::Failed { reason, .. }) => (
             "!".to_string(),
             vec![(
                 format!("not translated: {reason}"),
@@ -1012,8 +1012,20 @@ fn reading_lines(p: &vox_transcribe::Paragraph, text_w: usize, out: &mut Vec<Lin
         ),
         // Nothing to say: it was already in the native language, or
         // nothing is translating anything.
-        Some(Translation::Native) | None => return,
+        Some(Translation::Native { .. }) | None => return,
     };
+    // A reading made while this was still being spoken is of the
+    // sentences that were finished then, so it runs behind the line
+    // above it. The ellipsis is that, and it goes when the rest lands.
+    if p.translation
+        .as_ref()
+        .is_some_and(|t| t.text().is_some() && !t.is_of(&p.text))
+    {
+        words.push((
+            "…".to_string(),
+            style.add_modifier(Modifier::ITALIC | Modifier::DIM),
+        ));
+    }
     wrap(
         format!("{label:>w$}", w = GUTTER - 2),
         label_style,

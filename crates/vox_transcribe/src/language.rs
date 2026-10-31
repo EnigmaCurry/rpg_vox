@@ -21,6 +21,7 @@
 //! heard). When there is one, it goes behind [`of`] and everything above
 //! it keeps working.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use anyhow::{bail, Result};
@@ -168,6 +169,17 @@ pub fn pair(into: &str, from: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// What a paragraph's sentences have already been read as, by the
+/// sentence as it was said.
+///
+/// This is what makes a translation worth making again before the
+/// paragraph is finished: a paragraph that has grown by one sentence
+/// costs one sentence to read, not the whole of it over. A sentence a
+/// later pass rewrote is a different key and is translated again, which
+/// is also the whole of the refinement -- there is nothing to invalidate
+/// because the text *is* the key.
+pub type Known = BTreeMap<String, String>;
+
 /// One sentence in the native language, over the stretch of audio the
 /// sentence it came from was spoken in.
 ///
@@ -177,6 +189,9 @@ pub fn pair(into: &str, from: &[String]) -> Result<()> {
 /// giving the translation its source's span is honest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Line {
+    /// The sentence this was made from, as it was said. The key a
+    /// caller keeps it under in [`Known`].
+    pub source: String,
     pub text: String,
     /// Index of the first word of the source sentence in the
     /// paragraph's `words`, and one past its last.
@@ -191,6 +206,28 @@ pub struct Reading {
     pub language: String,
     pub text: String,
     pub lines: Vec<Line>,
+}
+
+/// `text` up to the end of its last *finished* sentence, for
+/// translating a paragraph somebody is still talking into.
+///
+/// What is cut off is the sentence being spoken now. A translator given
+/// half a sentence returns half a thought, confidently, and it would be
+/// replaced a moment later anyway -- so the reading runs a sentence
+/// behind the words on screen, deliberately.
+///
+/// A terminator has to be followed by whitespace to count (see
+/// [`crate::filters::sentence_end`]), which is what makes this work at
+/// all: the last sentence of a paragraph nobody has added to yet has
+/// nothing after it, so it is never mistaken for finished.
+pub fn complete(text: &str) -> &str {
+    let mut end = 0;
+    let mut rest = text;
+    while let Some(n) = crate::filters::sentence_end(rest) {
+        end += n;
+        rest = &rest[n..];
+    }
+    text[..end].trim_end()
 }
 
 /// Puts a paragraph into one language, a sentence at a time.
@@ -259,8 +296,16 @@ impl Interpreter {
     /// `words` is the paragraph's word timings, in the same order as its
     /// text, for placing each sentence in time. `context` is the
     /// preceding paragraphs' readings, for a translator that can use
-    /// them.
-    pub fn read(&self, text: &str, words: usize, context: &[String]) -> Result<Option<Reading>> {
+    /// them. `known` is what this paragraph's sentences have already
+    /// been read as, so making the reading again as the paragraph grows
+    /// costs only the sentences that are new.
+    pub fn read(
+        &self,
+        text: &str,
+        words: usize,
+        context: &[String],
+        known: &Known,
+    ) -> Result<Option<Reading>> {
         let sentences = sentences(text);
         // Which language the paragraph as a whole is in decides the
         // direction, so one short sentence inside it cannot send a line
@@ -276,16 +321,21 @@ impl Interpreter {
             let n = crate::filters::count_words(s);
             let (first, last) = (at.min(words), (at + n).min(words));
             at += n;
-            // A sentence whose own script is the native one is already
-            // read: a URL, a name, an English aside in a Russian
-            // paragraph. Translating it would be a round trip to get
-            // back what we started with, at best.
-            let line = match script(s) == script_of(&self.into) {
-                true => s.to_string(),
-                false => self.by.translate(s, language, &self.into, &said)?,
+            // Already read, on a pass of this paragraph before this
+            // one. The sentence is the key, so this is only a hit while
+            // the sentence is still what it was.
+            let line = match known.get(s) {
+                Some(had) => had.clone(),
+                // A sentence whose own script is the native one is
+                // already read: a URL, a name, an English aside in a
+                // Russian paragraph. Translating it would be a round
+                // trip to get back what we started with, at best.
+                None if script(s) == script_of(&self.into) => s.to_string(),
+                None => self.by.translate(s, language, &self.into, &said)?,
             };
             said.push(line.clone());
             lines.push(Line {
+                source: s.to_string(),
                 text: line,
                 first_word: first,
                 last_word: last,
@@ -339,6 +389,97 @@ mod tests {
 
     fn interpreter() -> Interpreter {
         Interpreter::new("English", &["Russian".to_string()], Arc::new(Marker)).unwrap()
+    }
+
+    /// A translator that counts what it was asked to translate, so a
+    /// test can see what a second pass over a growing paragraph costs.
+    #[derive(Default)]
+    struct Counter {
+        asked: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl Translate for Counter {
+        fn translate(
+            &self,
+            text: &str,
+            _from: &str,
+            _into: &str,
+            _context: &[String],
+        ) -> Result<String> {
+            self.asked.lock().expect("lock").push(text.to_string());
+            Ok(format!("<{text}>"))
+        }
+
+        fn name(&self) -> &'static str {
+            "counter"
+        }
+    }
+
+    #[test]
+    fn only_the_last_finished_sentence_is_offered_while_somebody_is_talking() {
+        // The sentence being spoken now is cut off: it has no space
+        // after its terminator because nothing follows it yet.
+        assert_eq!(complete("Да, конечно. Я пью"), "Да, конечно.");
+        assert_eq!(complete("Да, конечно. Я пью чай."), "Да, конечно.");
+        // One more sentence lands and the one before it is finished.
+        assert_eq!(
+            complete("Да, конечно. Я пью чай. Вот"),
+            "Да, конечно. Я пью чай."
+        );
+        // Nothing finished yet, so nothing to read.
+        assert_eq!(complete("Да, конечно"), "");
+        assert_eq!(complete(""), "");
+    }
+
+    #[test]
+    fn a_paragraph_read_again_pays_only_for_what_is_new() {
+        let by = Arc::new(Counter::default());
+        let i = Interpreter::new("English", &["Russian".to_string()], by.clone()).unwrap();
+        let mut known = Known::new();
+
+        // First pass, while she is still talking: one finished sentence.
+        let said = "Я пью чай на крыше дома. Вот";
+        let r = i
+            .read(complete(said), 6, &[], &known)
+            .unwrap()
+            .expect("a reading");
+        for l in &r.lines {
+            known.insert(l.source.clone(), l.text.clone());
+        }
+        assert_eq!(by.asked.lock().unwrap().len(), 1);
+
+        // The paragraph has grown. The sentence already read is not
+        // translated again; only the new one is.
+        let said = "Я пью чай на крыше дома. Вот так, друзья мои. Ну";
+        let r = i
+            .read(complete(said), 11, &[], &known)
+            .unwrap()
+            .expect("a reading");
+        assert_eq!(
+            by.asked.lock().unwrap().as_slice(),
+            ["Я пью чай на крыше дома.", "Вот так, друзья мои."]
+        );
+        assert_eq!(r.lines.len(), 2);
+        assert_eq!(r.lines[0].text, "<Я пью чай на крыше дома.>");
+        for l in &r.lines {
+            known.insert(l.source.clone(), l.text.clone());
+        }
+
+        // Pass 3 rewrites the first sentence. It is a different
+        // sentence, so it is a different key, so it is read again --
+        // and the untouched one still isn't.
+        let said = "Я пью чай на крыше своего дома. Вот так, друзья мои. Ну";
+        i.read(complete(said), 12, &[], &known)
+            .unwrap()
+            .expect("a reading");
+        assert_eq!(
+            by.asked.lock().unwrap().as_slice(),
+            [
+                "Я пью чай на крыше дома.",
+                "Вот так, друзья мои.",
+                "Я пью чай на крыше своего дома."
+            ]
+        );
     }
 
     #[test]
@@ -407,14 +548,17 @@ mod tests {
     fn a_paragraph_already_in_the_native_language_is_left_alone() {
         let i = interpreter();
         let said = "Hello everyone, dear friends! It is twenty past six.";
-        assert_eq!(i.read(said, 9, &[]).unwrap(), None);
+        assert_eq!(i.read(said, 9, &[], &Known::new()).unwrap(), None);
     }
 
     #[test]
     fn each_sentence_goes_to_the_translator_on_its_own() {
         let i = interpreter();
         let said = "Да, конечно, дорогие друзья. Я пью чай на крыше дома.";
-        let r = i.read(said, 10, &[]).unwrap().expect("a reading");
+        let r = i
+            .read(said, 10, &[], &Known::new())
+            .unwrap()
+            .expect("a reading");
         assert_eq!(r.language, "Russian");
         assert_eq!(
             r.lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(),
@@ -444,7 +588,10 @@ mod tests {
         // English sentence inside it is already readable as it stands.
         let said = "Я пью чай на крыше своего дома. The roof is flat. \
                     Мы живём в этой квартире уже давно.";
-        let r = i.read(said, 18, &[]).unwrap().expect("a reading");
+        let r = i
+            .read(said, 18, &[], &Known::new())
+            .unwrap()
+            .expect("a reading");
         assert_eq!(r.lines[1].text, "The roof is flat.");
         assert!(r.lines[0].text.starts_with("<Russian->English:"));
         assert!(r.lines[2].text.starts_with("<Russian->English:"));
@@ -458,7 +605,7 @@ mod tests {
         // choose, and choosing one anyway is how a line gets translated
         // out of a language it was never in.
         let said = "Я пью чай на крыше. I am drinking tea on the roof.";
-        assert_eq!(i.read(said, 11, &[]).unwrap(), None);
+        assert_eq!(i.read(said, 11, &[], &Known::new()).unwrap(), None);
     }
 
     #[test]
@@ -467,7 +614,7 @@ mod tests {
         // Fewer timings than words, which is what a paragraph whose
         // clips are still partial looks like.
         let r = i
-            .read("Я пью чай на крыше дома. Вот так.", 3, &[])
+            .read("Я пью чай на крыше дома. Вот так.", 3, &[], &Known::new())
             .unwrap()
             .expect("a reading");
         assert_eq!((r.lines[1].first_word, r.lines[1].last_word), (3, 3));

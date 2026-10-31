@@ -2184,7 +2184,7 @@ fn headless(session: Session) -> Result<Outcome> {
             // the two don't read as one paragraph when they scroll past.
             match &p.translation {
                 Some(Translation::Done { text, .. }) => println!("           {}", text.trim()),
-                Some(Translation::Failed { reason }) => {
+                Some(Translation::Failed { reason, .. }) => {
                     println!("           (not translated: {reason})")
                 }
                 _ => {}

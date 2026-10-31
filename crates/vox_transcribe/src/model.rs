@@ -117,11 +117,22 @@ pub enum Pass4 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "lowercase")]
 pub enum Translation {
+    /// Being read for the first time: there is nothing to show yet.
+    /// Only ever the first one -- a paragraph being read again as it
+    /// grows keeps the reading it has until the new one lands, because
+    /// taking it off the screen to put it back is worse than it being a
+    /// sentence out of date.
     Running,
     /// It was heard in `language` and reads as `text`. `lines` is one
     /// entry per sentence, with the span of audio its source was spoken
     /// in, for subtitles.
     Done {
+        /// The paragraph text this was made from. A reading is made
+        /// before the paragraph is finished, so it can be behind
+        /// [`Paragraph::text`]; when this is not equal to it, what is
+        /// on screen is a sentence or two short and another reading is
+        /// coming. A paragraph never hardens in that state.
+        of: String,
         language: String,
         text: String,
         lines: Vec<TranslatedLine>,
@@ -129,12 +140,13 @@ pub enum Translation {
     /// Nothing to put into another language: it is written in the
     /// alphabet you read, or there is too little of it to say
     /// otherwise. Recorded rather than left as `None` so the pass is
-    /// not asked for it twice.
-    Native,
-    /// The translator failed; `text` is all there is.
-    Failed {
-        reason: String,
-    },
+    /// not asked for it twice -- `of` is what it was decided for, and
+    /// more words can change the answer.
+    Native { of: String },
+    /// The translator failed on the text in `of`; what was said is all
+    /// there is. Tried once more when the paragraph settles, since by
+    /// then there is nothing to lose by waiting for it.
+    Failed { of: String, reason: String },
 }
 
 /// One sentence of a translation, over the stretch of audio the sentence
@@ -161,6 +173,23 @@ impl Translation {
             Translation::Done { language, .. } => Some(language),
             _ => None,
         }
+    }
+
+    /// The paragraph text this was decided for, or `None` while the
+    /// first reading is still being made.
+    pub fn of(&self) -> Option<&str> {
+        match self {
+            Translation::Running => None,
+            Translation::Done { of, .. }
+            | Translation::Native { of }
+            | Translation::Failed { of, .. } => Some(of),
+        }
+    }
+
+    /// Whether this is the reading of `text` and not of some earlier,
+    /// shorter version of the paragraph.
+    pub fn is_of(&self, text: &str) -> bool {
+        self.of() == Some(text)
     }
 }
 

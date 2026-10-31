@@ -26,6 +26,22 @@ section after the version it releases.
   of a language it was never in. See
   [translation](SCRIBE.md#translation-optional).
 
+- **The translation keeps up with the speech instead of waiting for the
+  paragraph.** A sentence is read as soon as it is finished, not when
+  the paragraph it is in settles — which, at up to two hundred words a
+  paragraph, could be a minute after the first thing somebody said. It
+  is refined as the paragraph forms, too: pass 3 rewrites words at
+  utterance boundaries and pass 4 rewrites whole paragraphs, and a
+  sentence that changed is read again while every sentence that didn't
+  is reused, because the sentence *is* the cache key. That is what makes
+  it free: a fifteen-minute file now translated in thirteen passes over
+  one paragraph takes the same wall clock, to within a second, and
+  produces byte-identical output. The reading deliberately runs one
+  sentence behind the words on screen — a translator given half a
+  sentence returns half a thought — and shows a trailing `…` while it
+  does. Nothing is written to disk half-translated: a paragraph never
+  hardens on a reading that is short of its text.
+
 - **`--pass1-language`: live text in the language being spoken.** Pass 1
   is the one pass that has to be told which language it is hearing —
   passes 2 and 3 work it out from the audio and the translation works it

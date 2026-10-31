@@ -562,11 +562,40 @@ cargo build -p vox_scribe --features translate-local --release
 
 ### When it runs, and what it costs
 
-The translation is the last pass before a paragraph hardens, after pass 4
-if that is on, because it is made from whatever text pass 4 settled on.
-It runs on its own thread, so a slow translator never holds up the
-decoding of what is being said next. A paragraph whose translation failed
-is written anyway, with the reason, rather than waiting on it.
+**A sentence is read as soon as it is finished**, not when the paragraph
+it is in is. Each time pass 2 decodes an utterance, any sentence that
+has become complete is translated and appears under the line; the
+paragraph can run to two hundred words, so waiting for it would mean
+waiting a minute to read the first thing somebody said.
+
+The reading therefore runs exactly one sentence behind the words on
+screen — the sentence being spoken now is cut off, because a translator
+given half a sentence returns half a thought, confidently, and it would
+be replaced a moment later anyway. A reading that is behind its
+paragraph is shown with a trailing `…` in the TUI, which goes when the
+rest lands.
+
+It is also **refined as the paragraph forms**. Pass 3 rewrites words at
+utterance boundaries and pass 4 rewrites whole paragraphs, so a sentence
+already read can change under it. What makes that cheap is that the
+sentence *is* the cache key: a sentence a later pass rewrote is a
+different key and is read again, and every sentence it didn't touch is
+reused. So reading a paragraph again as it grows costs the sentences
+that are new and nothing else — a fifteen-minute file translated in
+thirteen passes over one paragraph takes the same wall clock, to within
+a second, as translating it once at the end.
+
+The last pass is still at the end, after pass 4, on whatever text pass 4
+settled on: that one pays for the final sentence and nothing more. A
+paragraph never hardens on a reading that is short of its text, so
+nothing is written to disk half-translated.
+
+All of it runs on its own thread, so a slow translator never holds up
+the decoding of what is being said next. A paragraph whose translation
+failed is written anyway, with the reason, rather than waiting on it —
+and a failure stops the per-sentence attempts for that paragraph, so a
+dead endpoint costs one timeout per paragraph rather than one per
+utterance. It gets one more try when the paragraph settles.
 
 With `-r NAME` you also get `NAME.translated.srt`: the reading as
 subtitles, cued from the sentences the translator was given. A separate
