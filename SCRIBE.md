@@ -559,9 +559,13 @@ behind a feature flag. Which builds carry it:
 | Build | `--translate local` |
 | --- | --- |
 | `just scribe-translate` | yes, and turned on |
-| `just release-scribe`, `just install-scribe` | yes |
-| `just scribe`, `cargo build -p vox_scribe` | no |
+| `just scribe`, `just release-scribe`, `just install-scribe` | yes |
+| `cargo build -p vox_scribe` | no |
 | `just dist` release tarballs, Windows, Android | no |
+
+Every `just` recipe that builds scribe for this machine carries it, so
+they share one build; a plain `cargo build` without the feature is a
+second one, and alternating recompiles `vox_transcribe` each way.
 
 ```bash
 cargo build -p vox_scribe --features translate-local --release

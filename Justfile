@@ -462,21 +462,31 @@ download-speaker-models:
 
 # Uses nix-shell when available (Linux), plain cargo otherwise (macOS,
 # where only this crate builds).
+# Built with `translate-local`, so this, `just scribe-translate` and
+# `just release-scribe` are one build between them rather than two --
+# leaving it off here made this the odd one out, and alternating
+# recompiled vox_transcribe and vox_scribe each way. It is the same
+# feature set `vox_room` turns on by default, so a `--workspace` build
+# asks vox_transcribe for nothing different (a different profile, so not
+# the same artifacts, but no extra CTranslate2 build either).
+# `--translate local` then wants only the models:
+# `just download-translate-model-ru`, or `just scribe-translate`, which
+# does both and turns it on.
 # Run the vox_scribe live transcription TUI (fetches models first).
 scribe *ARGS: download-stt-model download-streaming-stt-model
     #!/usr/bin/env bash
     set -euo pipefail
+    args="--release --features translate-local -- {{ARGS}}"
     if command -v nix-shell >/dev/null; then
-      nix-shell --run "cargo run -p vox_scribe --release -- {{ARGS}}"
+      nix-shell --run "cargo run -p vox_scribe $args"
     else
-      cargo run -p vox_scribe --release -- {{ARGS}}
+      cargo run -p vox_scribe $args
     fi
 
 # `--translate local` reads anything heard in another language in your
-# own, with no network (see SCRIBE.md). Fetches the Russian/English
-# Marian models first; the CMake build of CTranslate2 makes the first
-# compile slow.
-# Like `just scribe`, with the local translator built in and turned on.
+# own, with no network (see SCRIBE.md). The build is `just scribe`'s, so
+# this is that recipe plus the Marian models and the flag.
+# Like `just scribe`, with local translation turned on.
 scribe-translate *ARGS: download-stt-model download-streaming-stt-model download-translate-model-ru
     #!/usr/bin/env bash
     set -euo pipefail
@@ -488,13 +498,15 @@ scribe-translate *ARGS: download-stt-model download-streaming-stt-model download
     fi
 
 # Uses nix-shell when available (Linux), plain cargo otherwise (macOS).
-# Carries `--translate local` (the `translate-local` feature), so the
-# scribe you install is the one `just scribe-translate` runs. That brings
-# a CMake build of CTranslate2 with it, which is most of a cold build's
-# time; `cargo build -p vox_scribe --release` on its own is the quick way
-# to a binary that translates through --llm only. The release tarballs
-# (`just dist`) and the Windows and Android builds don't carry it -- a
-# cmake cross-build is its own piece of work and nothing there has asked.
+# Carries `--translate local` (the `translate-local` feature), like every
+# other host build here, so the scribe you install is the one you tested.
+# It brings a CMake build of CTranslate2 with it, which is most of a cold
+# build's time; `cargo build -p vox_scribe --release` without the feature
+# is the quick way to a binary that translates through --llm only, at the
+# cost of rebuilding vox_transcribe whenever you go back. The release
+# tarballs (`just dist`) and the Windows and Android builds don't carry
+# it -- a cmake cross-build is its own piece of work and nothing there
+# has asked.
 # Optimized vox_scribe build only, with local translation → target/release/scribe.
 release-scribe:
     #!/usr/bin/env bash
