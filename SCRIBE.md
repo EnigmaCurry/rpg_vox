@@ -560,8 +560,10 @@ behind a feature flag. Which builds carry it:
 | --- | --- |
 | `just scribe-translate` | yes, and turned on |
 | `just scribe`, `just release-scribe`, `just install-scribe` | yes |
+| `just dist` release archives — Linux, macOS, Windows | yes |
+| `just win64` (cross-built Windows) | yes |
 | `cargo build -p vox_scribe` | no |
-| `just dist` release tarballs, Windows, Android | no |
+| Android, iOS | no |
 
 Every `just` recipe that builds scribe for this machine carries it, so
 they share one build; a plain `cargo build` without the feature is a
@@ -570,6 +572,17 @@ second one, and alternating recompiles `vox_transcribe` each way.
 ```bash
 cargo build -p vox_scribe --features translate-local --release
 ```
+
+What an unpacked release archive still needs is the models. The binary
+has the translator in it, but `--translate local` answers `no
+translation models in …` until `translate/en-ru` and `translate/ru-en`
+are in its models directory. From a checkout, `just
+download-translate-model-ru` writes them under `models/`; copy that
+`translate/` directory to where an installed scribe looks
+(`%LOCALAPPDATA%\vox_scribe\models` on Windows,
+`~/Library/Application Support/vox_scribe/models` on macOS,
+`~/.local/share/vox_scribe/models` on Linux), or point
+`VOX_SCRIBE_MODELS` at it.
 
 `just install-scribe` also copies the Marian models into the per-user
 models directory, because an installed scribe isn't run from the

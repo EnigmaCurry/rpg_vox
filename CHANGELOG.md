@@ -35,8 +35,27 @@ section after the version it releases.
   with the feature". `install-scribe` also copies the Marian models into
   the per-user models directory, which is where an installed scribe
   looks: it is not run from the checkout, and unlike the recognizers it
-  cannot fetch those for itself. Release tarballs, Windows and Android
-  are unchanged and still `--translate openai` only.
+  cannot fetch those for itself.
+
+- **The release archives translate locally too, Windows included.**
+  `just dist` builds scribe with `translate-local` on every target, so
+  the Linux, macOS and Windows archives all answer `--translate local`
+  rather than "needs a build with the feature"; only Android and iOS go
+  without. The models are not in the archive — 160 MB for the pair, and
+  scribe cannot fetch them for itself — so `--translate local` from an
+  unpacked archive still wants `translate/en-ru` and `translate/ru-en`
+  put in its models directory, which [translation](SCRIBE.md#who-translates)
+  spells out. Three things had to agree before Windows would link it:
+  the C runtime (sherpa-onnx's prebuilt archive and CTranslate2 are both
+  built against the static one, while the C++ bridge between them took
+  cc's default, and the linker refuses that pair), the CPU dispatch
+  (CTranslate2 reads `__AVX__` to decide which copy of its kernels it is
+  compiling, so the `-mavx` that libopus needs has to stay out of its
+  C++, or the generic kernels the dispatcher falls back to are never
+  built), and, for a cross-build only, what a library file is called:
+  ct2rs looks for `lib*.a` whenever its build script is *running* on
+  Unix, whatever it is building for, so `just win64` names CMake's
+  `.lib` files twice over and runs the build script again.
 
 - **Playback was in the left ear only.** On PipeWire, everything scribe
   plays — `--live`, `--play`, and `--chat` replies read aloud — came out

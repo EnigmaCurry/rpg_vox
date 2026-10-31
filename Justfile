@@ -25,6 +25,13 @@ release:
 # builds everywhere; rpg_vox needs PipeWire, so it ships on Linux only.
 # Uses nix-shell when available, plain cargo otherwise (macOS, CI).
 # The release workflow runs this on each target.
+#
+# scribe carries `translate-local`, so an unpacked archive reads another
+# language with no network and no service (SCRIBE.md); the CMake build of
+# CTranslate2 that costs is paid here, once per target, rather than by
+# whoever unpacks it. It still needs the Marian models, which it cannot
+# fetch the way it fetches the recognizers -- see `just
+# download-translate-model-ru`.
 dist VERSION=`git describe --tags --always --dirty`:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -34,7 +41,10 @@ dist VERSION=`git describe --tags --always --dirty`:
       bins+=(rpg_vox)
       pkgs+=(-p rpg_vox)
     fi
-    build="cargo build --release --locked ${pkgs[*]}"
+    # `vox_scribe/translate-local` rather than `translate-local`: more
+    # than one package is being built, so the feature has to say which
+    # one it belongs to.
+    build="cargo build --release --locked ${pkgs[*]} --features vox_scribe/translate-local"
     if command -v nix-shell >/dev/null; then
       nix-shell --run "$build"
     else
@@ -608,20 +618,39 @@ install-scribe BIN="~/.local/bin": release-scribe download-translate-model-ru
 #
 # Release builds happen natively on a Windows runner (.github/workflows/
 # release.yml), which needs none of this; `just win64` is for trying a
-# change without pushing one. Pass different packages as ARGS, e.g.
+# change without pushing one. It carries `translate-local`, because the
+# release archives do (`just dist`), and a cross-build that leaves out
+# the one feature with a C++ library in it would not be trying much.
+# Pass different packages as ARGS, e.g.
 #   just win64 "-p vox_scribe"
-win64 ARGS="-p vox_scribe -p vox_agent":
+win64 ARGS="-p vox_scribe -p vox_agent --features vox_scribe/translate-local":
     #!/usr/bin/env bash
     set -euo pipefail
     target=x86_64-pc-windows-msvc
     if ! rustup target list --installed | grep -qx "$target"; then
       rustup target add "$target"
     fi
-    # libopus's CMake tells MSVC that its SSE4.1 and AVX files need those
-    # instruction sets, and says it in a way only MSVC understands;
-    # clang-cl has to be told in its own words. `CL` goes in front of
-    # every clang-cl command line.
-    export CL="/clang:-msse4.1 /clang:-mavx"
+    # Two things clang-cl needs that MSVC does not, both only for C:
+    #
+    # * libopus's CMake tells MSVC that its SSE4.1 and AVX files need
+    #   those instruction sets, and says it in a way only MSVC
+    #   understands; clang-cl has to be told in its own words.
+    # * cpuinfo, down inside ruy inside CTranslate2 (the
+    #   `translate-local` feature), calls `_BitScanReverse` in a `#ifdef
+    #   _MSC_VER` branch without including the <intrin.h> that declares
+    #   it. MSVC lets that pass; clang-cl compiling C makes it an error.
+    #   clang knows the builtin's signature anyway, so demoting the
+    #   error is all it needs -- it still compiles to a `bsr`
+    #   instruction and leaves no undefined symbol behind.
+    #
+    # C only, and that matters: CTranslate2 picks which CPU its kernels
+    # are compiled for from `__AVX__` and friends (src/cpu/kernels.cc),
+    # so -mavx reaching its C++ moves the baseline copy of every kernel
+    # up to AVX and leaves the generic one, the only one the dispatcher
+    # can fall back to, undefined at link time. `TARGET_CFLAGS` rather
+    # than `CFLAGS_x86_64_pc_windows_msvc` because cargo-xwin sets that
+    # name itself and replaces it; cc adds up every spelling it finds.
+    export TARGET_CFLAGS="/clang:-msse4.1 /clang:-mavx -Wno-implicit-function-declaration"
     shell=(
       nix shell
       nixpkgs#cargo-xwin
@@ -646,7 +675,34 @@ win64 ARGS="-p vox_scribe -p vox_agent":
         ln -s "$lower.lib" "$um/$lib.lib"
       fi
     done
-    "${shell[@]}" cargo xwin build --release --locked --target "$target" {{ARGS}}
+    if ! "${shell[@]}" cargo xwin build --release --locked --target "$target" {{ARGS}}; then
+      # With `--features translate-local` that first pass ends in
+      # undefined `ctranslate2::` symbols, and the reason is not the
+      # build: ct2rs decides what a library file is called from the OS
+      # its build script is *running* on (`#[cfg(target_os =
+      # "windows")]`), not the one it is building for, so from here it
+      # looks for lib*.a among the .lib files CMake just produced, finds
+      # none, and names none of them to the linker. Give each one the
+      # spelling it is looking for, make the build script run again, and
+      # the second pass links. A native build (the release workflow)
+      # reads its own OS and never comes through here.
+      aliased=
+      for lib in $(find "target/$target/release/build" -path "*/ct2rs-*" -name "*.lib" 2>/dev/null); do
+        d="$(dirname "$lib")"
+        b="$(basename "$lib" .lib)"
+        if [ ! -e "$d/lib$b.a" ]; then
+          ln -s "$b.lib" "$d/lib$b.a"
+          aliased=1
+        fi
+      done
+      # Nothing to alias: the failure was the build's own, and it has
+      # already been printed.
+      if [ -z "$aliased" ]; then
+        exit 1
+      fi
+      rm -rf "target/$target/release/.fingerprint"/ct2rs-*
+      "${shell[@]}" cargo xwin build --release --locked --target "$target" {{ARGS}}
+    fi
     ls -l "target/$target/release/"*.exe
 
 # Android arm64 (API 26+) scribe bundle in dist/android-arm64/: scribe, the

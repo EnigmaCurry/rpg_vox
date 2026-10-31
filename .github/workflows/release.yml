@@ -2,6 +2,14 @@
 # Release. Each target builds natively; `just dist` does the build and
 # packaging, so a local `just dist` produces the same archives.
 #
+# Each target builds CTranslate2 with CMake, for scribe's `--translate
+# local` (`just dist` turns on `translate-local`). Every runner image
+# already has CMake -- libopus is built the same way on the ones without
+# a system copy -- so there is nothing to install for it; it is the
+# slowest part of a cold build, and the cache below is what keeps it off
+# the second one. Cross-compiling it is another matter, and `just win64`
+# carries the workarounds for that.
+#
 #   git tag v0.1.0 && git push origin v0.1.0
 #
 # Running it by hand (Actions > release > Run workflow) on any branch
@@ -42,8 +50,9 @@ jobs:
       - uses: actions/checkout@v4
 
       # PipeWire headers for pipewire-sys (bindgen needs libclang), and
-      # libopus for rpg_vox's browser monitor. sherpa-onnx downloads its
-      # own static archive at build time.
+      # libopus for rpg_vox's browser monitor. cmake builds CTranslate2
+      # (and libopus). sherpa-onnx downloads its own static archive at
+      # build time.
       - name: Install Linux build deps
         if: runner.os == 'Linux'
         run: |

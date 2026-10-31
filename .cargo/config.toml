@@ -4,6 +4,31 @@
 # CMakeLists predates CMake 3.5, which CMake 4 refuses without this.
 CMAKE_POLICY_VERSION_MINIMUM = "3.5"
 
+# `translate-local`: ct2rs builds CTranslate2 itself with the static C
+# runtime (`static_crt(true)` in its build.rs) and so does sherpa-onnx's
+# prebuilt Windows archive, but the cxx bridge ct2rs compiles alongside
+# them takes cc's default, which is the DLL runtime. The two values are
+# recorded in the objects, and the linker refuses the pair:
+#
+#   lld-link: error: /failifmismatch: mismatch detected for
+#   'RuntimeLibrary': c-api.obj has MT_StaticRelease,
+#   translator.rs.o has MD_DynamicRelease
+#
+# so the bridge is told to agree with the libraries it binds. cc reads
+# this name only when it is building for that target, which is why it
+# can sit here and leave the Linux and macOS builds alone, and it adds
+# the flags it finds to its own, so this does not displace anything.
+# Upstream's advice is `-C target-feature=+crt-static` for the whole
+# program instead; that is the one thing this workspace can't do (see
+# below).
+#
+# The target is spelled with dashes, not underscores, because cc reads
+# both and `just win64` loses the underscored one: cargo-xwin sets that
+# name itself, to the include paths of the SDK it fetched, and replaces
+# rather than appends. The dashed name is nobody else's, and comes last
+# on the command line, so it is also the one that wins.
+"CXXFLAGS_x86_64-pc-windows-msvc" = "/MT"
+
 [target.x86_64-pc-windows-msvc]
 rustflags = [
   # LNK4099: Microsoft ships no PDBs for the CRT import libraries. Only
