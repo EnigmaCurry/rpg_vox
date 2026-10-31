@@ -146,8 +146,16 @@ enum class Script(val label: String) {
  * The languages that can be read in: the ones with a pass-1 model.
  * Nothing else is offered, because the live text has to be in some
  * language and the finished text is already in all of them.
+ *
+ * A getter, and it has to be one: [Language]'s own initializer reads the
+ * models above it, so a top-level `val` here that reads [Language] back
+ * is a circle. Whichever of the two is touched first starts the other,
+ * which then finds `Language.entries` still null and crashes the app on
+ * startup with nothing to go on. Nothing else at the top level of this
+ * file may mention [Language] either.
  */
-val NATIVE_LANGUAGES = Language.entries.filter { it.streaming != null }
+val NATIVE_LANGUAGES: List<Language>
+    get() = Language.entries.filter { it.streaming != null }
 
 /**
  * The opus-mt model that reads `from` in `into`, or null when there is

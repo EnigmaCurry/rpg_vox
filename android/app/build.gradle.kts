@@ -53,6 +53,11 @@ android {
     }
 
     buildFeatures { compose = true }
+
+    // `./gradlew test` runs the plain-JVM tests in src/test: the model
+    // table and the language rules, which need no device and are the
+    // part of this app that can be checked without one.
+    testOptions { unitTests.isReturnDefaultValues = true }
 }
 
 /** CHANGELOG.md from the repository root, shipped as an asset for the About page. */
@@ -79,4 +84,5 @@ dependencies {
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.ui:ui")
     implementation("androidx.activity:activity-compose:1.13.0")
+    testImplementation("junit:junit:4.13.2")
 }
