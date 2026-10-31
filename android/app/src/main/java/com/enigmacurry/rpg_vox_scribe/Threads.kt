@@ -160,7 +160,11 @@ class ThreadStore(file: File) {
         db.rawQuery(
             """SELECT c.id, c.title,
                       strftime('%Y-%m-%d %H:%M', coalesce(max(m.at), c.created_at), 'localtime'),
-                      (SELECT text FROM messages WHERE conversation = c.id ORDER BY id DESC LIMIT 1),
+                      -- The reading of the newest paragraph when it has
+                      -- one, as the transcript itself shows: a preview in
+                      -- a language the reader does not read is no preview.
+                      (SELECT coalesce(nullif(translation, ''), text) FROM messages
+                        WHERE conversation = c.id ORDER BY id DESC LIMIT 1),
                       count(m.id)
                FROM conversations c LEFT JOIN messages m ON m.conversation = c.id
                GROUP BY c.id
