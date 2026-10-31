@@ -25,7 +25,7 @@ the phone. It also adds a voice keyboard for dictating into other apps.
 
 Arm64 phones running Android 8.0 (API 26) or newer. The finished text
 covers 25 European languages; the live text, as you speak, is English or
-Russian, [whichever you pick](#languages).
+Russian, and [follows whichever is being spoken](#languages).
 
 * [Install](#install)
 * [First run: speech models](#first-run-speech-models)
@@ -209,26 +209,29 @@ the middle.
 
 ## Languages
 
-**Settings → Languages** has four things: the language you read in, the
-language the live text is in, the languages to listen out for, and what
-the transcript shows of a paragraph that was read.
+**Settings → Languages** has three things: the language you read in, the
+languages to listen out for, and what the transcript shows of a
+paragraph that was read.
 
-**I read in** is the language every translation is read into.
+**I read in** is the language every translation is read into, and the
+one the words that appear *as you speak* start out in.
 
-**Live text in** is the language pass 1 listens in. Pass 1 is the one
-pass that has to be told: it shows words as they are spoken, so its
-model is chosen before anything has been said, where passes 2 and 3 work
-the language out from the audio in any of 25. It follows **I read in**
-unless you set it otherwise — which is what to do when you are listening
-to someone else: reading in English while a Russian speaker talks, set
-this to Russian and the words appear in Russian as they are spoken, with
-the English reading under them once the paragraph settles.
+Those words come from pass 1, the one pass that has to be told which
+language to listen in: it decodes as the words are said, so its model is
+chosen before any of them have been, where passes 2 and 3 work the
+language out from the audio in any of 25. You are not asked which it
+will be. Pass 1 starts in the language you read in and then follows the
+speaking: an utterance that comes back in another alphabet is enough for
+the next one to be listened to in that language, and for it to go back
+when the speaking does. Nothing changes within an utterance — the
+decode is swapped between them, where it would otherwise lose the words
+already on screen.
 
-Both lists are English and Russian, because those are the two languages
-pass 1 has a model for. Picking one downloads it (27 MB for Russian);
-until it is there the live text stays in English and the settings page
-and the status line both say so, rather than listening in the wrong
-language without a word about it.
+English and Russian are the two languages pass 1 has a model for. The
+model for a language you turn on is downloaded with it (27 MB for
+Russian); until it is there the live text cannot be in that language,
+and the settings page and the recording status line say so rather than
+listening in the wrong one without a word about it.
 
 **Also listen out for** is a language per model, about 81 MB each,
 downloaded here. A paragraph heard in one of them gets a reading in the

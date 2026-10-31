@@ -720,3 +720,123 @@ fn clip_without_a_partial_keeps_its_place() {
         "clips out of order: {starts:?}"
     );
 }
+
+/// Pass 1 in one language, emitting one word per 200 ms fed so the
+/// partials say which recognizer produced them.
+struct Marked {
+    word: &'static str,
+    fed: usize,
+}
+
+impl StreamingRecognizer for Marked {
+    fn reset(&mut self) {
+        self.fed = 0;
+    }
+    fn feed(&mut self, samples: &[f32], _rate: u32) {
+        self.fed += samples.len();
+    }
+    fn partial(&self) -> String {
+        vec![self.word; self.fed / (SR as usize / 5)].join(" ")
+    }
+}
+
+/// Pass 2 hears Russian, then English, one utterance each.
+struct TwoLanguages {
+    decodes: std::sync::atomic::AtomicUsize,
+}
+
+impl OfflineRecognizer for TwoLanguages {
+    fn transcribe(&self, samples: &[f32], rate: u32) -> anyhow::Result<String> {
+        let secs = samples.len() as f32 / rate as f32;
+        if secs < 1.5 {
+            return Ok(String::new());
+        }
+        // Long enough to be a third decode: the boundary re-decode of
+        // the pair, which must not be read as a language of its own.
+        if secs > 4.0 {
+            return Ok("Да, конечно. Yes, of course.".into());
+        }
+        // Pass 2 decodes one utterance at a time, in order, on its own
+        // thread, so counting them says which utterance this is.
+        let nth = self
+            .decodes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(if nth == 0 {
+            "Да, конечно.".into()
+        } else {
+            "Yes, of course.".into()
+        })
+    }
+}
+
+/// Pass 1 follows the language pass 2 heard, so nobody has to say which
+/// language will be spoken: it starts in the one it was given, and after
+/// an utterance that came back in another alphabet the next utterance is
+/// listened to in that language instead.
+#[test]
+fn pass_1_follows_the_language_pass_2_heard() {
+    let mut cfg = EngineConfig::new(SR);
+    cfg.partial_interval = std::time::Duration::ZERO;
+    let engine = Engine::spawn_passes(
+        cfg,
+        Some(Box::new(Marked {
+            word: "ENGLISH",
+            fed: 0,
+        })),
+        Arc::new(TwoLanguages {
+            decodes: std::sync::atomic::AtomicUsize::new(0),
+        }),
+        vox_transcribe::engine::Passes {
+            streaming_also: vec![(
+                "Russian".to_string(),
+                Box::new(Marked {
+                    word: "РУССКИЙ",
+                    fed: 0,
+                }),
+            )],
+            ..Default::default()
+        },
+    );
+    let events = engine.events().clone();
+    for &(ms, amp) in &[
+        (500, 0.0),
+        (2000, 0.2),
+        (1500, 0.0),
+        (2000, 0.2),
+        (2500, 0.0),
+    ] {
+        for chunk in tone(ms, amp).chunks(SR as usize / 50) {
+            engine.push(chunk);
+        }
+    }
+    engine.finish();
+    // Every partial, in order: the first utterance's come from the
+    // recognizer it started with, and the second's from the Russian one.
+    let partials: Vec<String> = events
+        .try_iter()
+        .filter_map(|e| match e {
+            Event::Paragraph { paragraph, .. } => paragraph
+                .clips
+                .iter()
+                .rev()
+                .find(|c| c.stage == Stage::Partial)
+                .map(|c| c.text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        partials.iter().any(|p| p.contains("ENGLISH")),
+        "pass 1 should start in the language it was given: {partials:?}"
+    );
+    assert!(
+        partials.iter().any(|p| p.contains("РУССКИЙ")),
+        "pass 1 should listen in Russian after an utterance that was: {partials:?}"
+    );
+    // And in that order: English first, Russian only after pass 2 said so.
+    let first_ru = partials.iter().position(|p| p.contains("РУССКИЙ"));
+    let first_en = partials.iter().position(|p| p.contains("ENGLISH"));
+    assert!(
+        first_en < first_ru,
+        "the switch should follow the utterance, not precede it: {partials:?}"
+    );
+}

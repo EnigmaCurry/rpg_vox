@@ -464,25 +464,18 @@ private fun LanguagesPage() {
     )
 
     Text(
-        "Live text in",
-        style = MaterialTheme.typography.titleSmall,
-        modifier = Modifier.padding(top = 16.dp),
-    )
-    NATIVE_LANGUAGES.forEach { l ->
-        Choice(l.label, Scribe.pass1 == l) { Scribe.choosePass1(l) }
-    }
-    Text(
-        "Pass 1 shows words as they are spoken, and it is the one pass that " +
-            "has to be told which language to listen in -- the finished text is " +
-            "worked out from the audio, in any of 25. Set this to the language " +
-            "being spoken: the one you read in, or one you are listening out for.",
+        "The words that appear as you speak start in this language and follow " +
+            "the speaking from there: an utterance that turns out to have been " +
+            "in another of the languages below is enough for the next one to be " +
+            "listened to in it.",
         style = MaterialTheme.typography.bodySmall,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = Modifier.padding(top = 4.dp),
     )
     Scribe.pass1Missing?.let { l ->
         Text(
-            "The ${l.label} live-text model isn't here yet, so the live text is " +
-                "in English until it has downloaded.",
+            "The ${l.label} model for the live text isn't here yet, so the words " +
+                "as you speak can't be in ${l.label} until it has downloaded.",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.error,
             modifier = Modifier.padding(top = 4.dp),

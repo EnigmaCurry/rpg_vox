@@ -190,14 +190,6 @@ object Scribe {
     var native by mutableStateOf(Language.ENGLISH)
         private set
     /**
-     * The language pass 1 listens in, which is the live text's own.
-     * Follows [native] unless it is set otherwise: an English reader
-     * listening to a Russian speaker wants the words as they are spoken
-     * to be Russian, and the reading under them to be English.
-     */
-    var pass1 by mutableStateOf(Language.ENGLISH)
-        private set
-    /**
      * The languages listened out for and read in [native]. One per
      * alphabet, because that is what a paragraph's language is read off;
      * only those whose model is downloaded are used.
@@ -300,10 +292,6 @@ object Scribe {
         autoStart = prefs.getBoolean("auto_start", false)
         fontStep = prefs.getInt("font_step", FONT_SCALES.size / 2).coerceIn(0, FONT_SCALES.size - 1)
         native = Language.of(prefs.getString("native_language", null))
-        pass1 = prefs.getString("pass1_language", null)
-            ?.let { Language.of(it) }
-            ?.takeIf { it.streaming != null }
-            ?: native
         others = (prefs.getStringSet("other_languages", null) ?: emptySet())
             .mapNotNull { name -> Language.entries.firstOrNull { it.name == name } }
             // A language whose model was removed, or whose alphabet now
@@ -314,6 +302,12 @@ object Scribe {
             .toSet()
         showing = runCatching { Show.valueOf(prefs.getString("show", "BOTH")!!) }
             .getOrDefault(Show.BOTH)
+        // "Live text in" was a setting for one version. Pass 1 follows
+        // the speaking now, so the key goes rather than sit there
+        // looking like something that still decides anything.
+        if (prefs.contains("pass1_language")) {
+            prefs.edit().remove("pass1_language").apply()
+        }
         phase = if (store.ready()) Phase.Unloaded else Phase.NeedModels(resume = store.started())
         migrate()
         // A pass-1 model the settings ask for and haven't got: fetch it
@@ -385,43 +379,45 @@ object Scribe {
         if (l == native) return
         native = l
         others = emptySet()
-        // The live text follows, which is what someone reading in a new
-        // language almost always means; `choosePass1` is there for when
-        // it isn't.
-        pass1 = l
         app.getSharedPreferences("scribe", Context.MODE_PRIVATE).edit()
             .putString("native_language", l.label)
-            .putString("pass1_language", l.label)
             .putStringSet("other_languages", emptySet())
             .apply()
         languagesChanged()
     }
 
-    /** The language pass 1 listens in; see [pass1]. */
-    fun choosePass1(l: Language) {
-        if (l == pass1 || l.streaming == null) return
-        pass1 = l
-        app.getSharedPreferences("scribe", Context.MODE_PRIVATE).edit()
-            .putString("pass1_language", l.label)
-            .apply()
-        languagesChanged()
-    }
-
     /**
-     * After any language change: fetch what pass 1 now needs, and load
-     * the models again.
+     * After any language change: fetch the pass-1 models the languages
+     * now need, and load everything again.
      *
-     * The pass-1 model is fetched rather than offered. It is 27 MB, and
-     * the setting means nothing without it -- the live text has to be in
-     * some language, and a setting that quietly left it in the old one
-     * is how this went wrong before. The translation models are 81 MB
-     * each and stay behind the Download button.
+     * Those are fetched rather than offered. Each is 27 MB, and a
+     * language chosen here is a language the live text has to be able to
+     * be in -- it is not a choice to put behind a button, which is how
+     * this went wrong before. The translation models are 81 MB each and
+     * stay behind the Download button.
      */
     private fun languagesChanged() {
-        val missing = listOfNotNull(pass1.streaming).filterNot(store::installed)
+        val missing = pass1Models().map { it.second }.filterNot(store::installed)
         if (missing.isNotEmpty() && store.ready()) InstallService.start(app, missing)
         reload()
     }
+
+    /**
+     * Pass 1's models, as `language to model`, the first being the
+     * language it starts in.
+     *
+     * Pass 1 shows words as they are spoken and so has to be told which
+     * language to listen in, and nobody is asked: it starts in the
+     * language you read in and moves to another of these when an
+     * utterance turns out to have been in it, which the engine does by
+     * the alphabet pass 2 heard (`Passes::streaming_also`). English is
+     * always among them -- it is downloaded anyway, and a sentence of it
+     * in a Russian conversation is the common case of this.
+     */
+    fun pass1Models(): List<Pair<Language, Model>> =
+        (listOf(native) + others + Language.ENGLISH)
+            .distinct()
+            .mapNotNull { l -> l.streaming?.let { l to it } }
 
     /**
      * Listen out for [l] as well, or stop. Turning one on replaces
@@ -443,17 +439,17 @@ object Scribe {
 
     /** The models the languages now ask for, in the order they install. */
     fun wanted(): List<Model> =
-        listOfNotNull(pass1.streaming) + others.mapNotNull { translation(it, native) }
+        pass1Models().map { it.second } + others.mapNotNull { translation(it, native) }
 
     /**
-     * The language the live text should be in and has no model for yet,
-     * or null when there is nothing to say. Until it arrives pass 1
-     * listens in English, and saying so is the point of this: a wrong
-     * language in the live text with no explanation is what the silent
-     * fallback here used to produce.
+     * A language pass 1 should be able to listen in and has no model for
+     * yet, or null when there is none. Until it arrives the live text
+     * cannot be in that language, and saying so is the point of this: a
+     * wrong language in the live text with no explanation is what this
+     * used to produce without a word.
      */
     val pass1Missing: Language?
-        get() = pass1.takeIf { it.streaming?.let(store::installed) == false }
+        get() = pass1Models().firstOrNull { !store.installed(it.second) }?.first
 
     /** Models downloaded for a language setting that no longer wants them. */
     fun spare(): List<Model> {
@@ -726,12 +722,15 @@ object Scribe {
                     Native.load(
                         store.dir.path,
                         THREADS,
-                        // English only as a last resort, when the model
-                        // for the language chosen is still downloading:
-                        // some pass-1 model has to load for the app to
-                        // work at all. [pass1Missing] is what says so,
-                        // on the settings page and in the status line.
-                        (pass1.streaming?.takeIf(store::installed) ?: ZIPFORMER_EN).dir,
+                        // `language=directory` per pass-1 model, the
+                        // first being the one it starts in. Only the
+                        // ones that are here: a language still
+                        // downloading cannot be listened in, and
+                        // [pass1Missing] is what says so.
+                        pass1Models()
+                            .filter { store.installed(it.second) }
+                            .ifEmpty { listOf(Language.ENGLISH to ZIPFORMER_EN) }
+                            .joinToString(",") { (l, m) -> "${l.label}=${m.dir}" },
                         native.label,
                         // Only the ones whose model is actually there:
                         // the engine refuses a language it cannot read.

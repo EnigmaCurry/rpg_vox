@@ -174,18 +174,21 @@ section after the version it releases.
   model each, 81 MB, downloaded there), and what the transcript *shows*
   of a paragraph that was read: what was said, the reading, or both.
 
-  **Live text in** is pass 1's own language, and it is a setting of its
-  own because the two are not always the same: pass 1 shows words as
-  they are spoken, so its model is chosen before anything has been said,
-  while passes 2 and 3 work the language out from the audio. Reading in
-  English while a Russian speaker talks, set it to Russian and the words
-  appear in Russian as they are spoken, with the English reading under
-  them when the paragraph settles. It follows **I read in** otherwise.
-  Either way the model it needs is fetched when you pick the language --
-  27 MB, and the setting means nothing without it -- and until it
-  arrives the live text stays in English with the settings page and the
-  status line saying so, rather than listening in the wrong language
-  without a word about it.
+  The words that appear *as you speak* come from pass 1, the one pass
+  that has to be told which language to listen in -- it decodes as the
+  words are said, so its model is chosen before any of them have been,
+  where passes 2 and 3 work the language out from the audio. Nobody is
+  asked which it will be: pass 1 starts in the language you read in and
+  follows the speaking, and an utterance that came back in another
+  alphabet is enough for the next one to be listened to in that
+  language. It is the alphabet pass 2 heard that decides, the same
+  reading the translation itself goes by, and it changes between
+  utterances and never within one -- a decode swapped mid-utterance
+  would lose the words already on screen. The model for a language you
+  turn on is downloaded with it (27 MB for Russian), and until it
+  arrives the settings page and the recording status line say the live
+  text cannot be in that language yet, rather than listening in the
+  wrong one without a word about it.
 
   The languages offered are the ones that can be told apart. A
   paragraph's language is read off its alphabet, since the recognizer

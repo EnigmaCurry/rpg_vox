@@ -690,6 +690,11 @@ fn new_engine(
             corrector: corrector.clone(),
             speakers: tagger,
             interpreter: interpreter.clone(),
+            // Pass 1 listens in one language here: `--pass1-language`
+            // says which. The phone has no flags, so it is given every
+            // model it has and follows the speaking instead; this could
+            // do the same, and would need the other bundles downloaded.
+            streaming_also: Vec::new(),
         },
     )
 }

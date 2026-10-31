@@ -34,7 +34,11 @@ const PARAKEET: &str = "parakeet-tdt-0.6b-v3";
 
 struct Models {
     offline: Arc<dyn OfflineRecognizer>,
+    /// Pass 1's model for the language it starts in.
     zipformer: Zipformer,
+    /// Its other languages, which pass 1 moves between on its own as the
+    /// speaking turns out to be in one of them (`Passes::streaming_also`).
+    zipformer_also: Vec<(String, Zipformer)>,
     /// The languages `--translate local` reads, with the one copy of the
     /// models they are read with. `None` when no other language is
     /// chosen, which is translation off -- and always, without the
@@ -69,11 +73,13 @@ struct Session {
 
 /// Load the recognizers, and the translators for `others` into `native`.
 ///
-/// `streaming` is the pass-1 bundle's directory name, which is per
-/// language (`streaming-zipformer`, `streaming-zipformer-ru`): pass 1 is
-/// the one pass that has to be told which language to listen in, since a
-/// streaming model is chosen before anything has been said. `others`
-/// empty is translation off.
+/// `streaming` is `language=directory` per pass-1 model, comma
+/// separated, the first being the language pass 1 starts in. It gets
+/// more than one because it is the one pass that has to be told which
+/// language to listen in -- a streaming model is chosen before anything
+/// has been said -- so it is given them all and moves between them as
+/// pass 2 says which language is being spoken. `others` empty is
+/// translation off.
 fn load(
     dir: &Path,
     threads: i32,
@@ -89,19 +95,45 @@ fn load(
     let mut pc = ParakeetConfig::from_dir(&dir.join(PARAKEET));
     pc.num_threads = threads;
     let offline = Arc::new(Parakeet::open(&pc).context("loading Parakeet")?);
-    let mut zc = ZipformerConfig::from_dir(&dir.join(streaming));
-    zc.num_threads = threads;
-    let zipformer = Zipformer::open(&zc).with_context(|| format!("loading {streaming}"))?;
-    // Which pass-1 model this is, in logcat: the app picks it from a
-    // setting, and "the live text is in the wrong language" is otherwise
-    // a thing only the person listening can tell you.
+    let mut pass1 = Vec::new();
+    for (language, bundle) in parse_streaming(streaming)? {
+        let mut zc = ZipformerConfig::from_dir(&dir.join(&bundle));
+        zc.num_threads = threads;
+        let z = Zipformer::open(&zc).with_context(|| format!("loading {bundle}"))?;
+        pass1.push((language, z));
+    }
+    // Which pass-1 models these are, in logcat: pass 1 moves between
+    // them on its own, and "the live text is in the wrong language" is
+    // otherwise a thing only the person listening can tell you.
     tracing::info!(pass1 = %streaming, read_in = %native, "models loaded");
+    let (first, zipformer_also) = {
+        let mut it = pass1.into_iter();
+        let first = it.next().expect("parse_streaming returns at least one");
+        (first.1, it.collect::<Vec<_>>())
+    };
+    let zipformer = first;
     let translate = load_translating(dir, native, others)?;
     Ok(Models {
         offline,
         zipformer,
+        zipformer_also,
         translate,
     })
+}
+
+/// `language=directory` per entry, comma separated; the first is the
+/// language pass 1 starts in.
+fn parse_streaming(spec: &str) -> Result<Vec<(String, String)>> {
+    let list: Vec<(String, String)> = spec
+        .split(',')
+        .filter_map(|e| e.split_once('='))
+        .map(|(l, d)| (l.trim().to_string(), d.trim().to_string()))
+        .filter(|(l, d)| !l.is_empty() && !d.is_empty())
+        .collect();
+    if list.is_empty() {
+        anyhow::bail!("no pass-1 model in {spec:?} (want `language=directory`)");
+    }
+    Ok(list)
 }
 
 /// Whether these languages can be told apart at all, which is all of
@@ -343,9 +375,11 @@ pub extern "system" fn Java_com_enigmacurry_rpg_1vox_1scribe_Native_unpackProgre
     UNPACKED.load(Ordering::Relaxed) as jlong
 }
 
-/// `load(modelsDir, threads, streamingDir, nativeLanguage, otherLanguages)`:
-/// a models handle, or throws. `otherLanguages` is comma-separated and
-/// may be empty, which is translation off.
+/// `load(modelsDir, threads, pass1Models, nativeLanguage, otherLanguages)`:
+/// a models handle, or throws. `pass1Models` is `language=directory` per
+/// pass-1 model, the first being the one pass 1 starts in;
+/// `otherLanguages` is comma-separated and may be empty, which is
+/// translation off.
 #[no_mangle]
 pub extern "system" fn Java_com_enigmacurry_rpg_1vox_1scribe_Native_load(
     mut env: JNIEnv,
@@ -475,12 +509,26 @@ pub extern "system" fn Java_com_enigmacurry_rpg_1vox_1scribe_Native_start(
             return 0;
         }
     };
+    // Pass 1's other languages, when there is a pass 1 at all: a file
+    // has no live text to follow the speaking with.
+    let streaming_also = match streaming.is_some() {
+        true => models
+            .zipformer_also
+            .iter()
+            .map(|(language, z)| {
+                let by = Box::new(z.session()) as Box<dyn StreamingRecognizer>;
+                (language.clone(), by)
+            })
+            .collect(),
+        false => Vec::new(),
+    };
     let engine = Engine::spawn_passes(
         EngineConfig::new(rate as u32),
         streaming,
         models.offline.clone(),
         vox_transcribe::engine::Passes {
             interpreter,
+            streaming_also,
             ..Default::default()
         },
     );
@@ -854,13 +902,26 @@ mod tests {
         let dir = std::env::var("VOX_SCRIBE_MODELS").expect("VOX_SCRIBE_MODELS");
         let dir = Path::new(&dir);
         for (streaming, native, other) in [
-            ("streaming-zipformer", "English", "Russian"),
-            ("streaming-zipformer-ru", "Russian", "English"),
+            (
+                "English=streaming-zipformer,Russian=streaming-zipformer-ru",
+                "English",
+                "Russian",
+            ),
+            (
+                "Russian=streaming-zipformer-ru,English=streaming-zipformer",
+                "Russian",
+                "English",
+            ),
         ] {
             let others = vec![other.to_string()];
             let models = load(dir, 2, streaming, native, &others)
                 .unwrap_or_else(|e| panic!("load {native} with {other}: {e:#}"));
             assert!(models.translate.is_some(), "{native}: no translator");
+            assert_eq!(
+                models.zipformer_also.len(),
+                1,
+                "{native}: pass 1 should have the other language to move to"
+            );
             let i = interpreter(&models)
                 .unwrap_or_else(|e| panic!("interpreter for {native}: {e:#}"))
                 .unwrap_or_else(|| panic!("{native}: no interpreter"));
@@ -880,7 +941,7 @@ mod tests {
         let refused = load(
             Path::new("/nonexistent"),
             1,
-            "streaming-zipformer",
+            "English=streaming-zipformer",
             "English",
             &["German".to_string()],
         );

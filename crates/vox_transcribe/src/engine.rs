@@ -18,7 +18,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{bounded, never, select, unbounded, Receiver, Sender};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::boundary::{self, BoundaryConfig, WindowClip};
@@ -26,7 +26,7 @@ use crate::correct::{apply_edits, Corrector, Edit};
 use crate::denoise::Denoiser;
 use crate::digits::spoken_digits;
 use crate::filters::{capitalize_sentences, count_words, ends_on_sentence, is_junk};
-use crate::language::{self, Interpreter, Known, Reading};
+use crate::language::{self, Interpreter, Known, Reading, Script};
 use crate::model::{Clip, Paragraph, Pass4, Stage, Transcript, TranslatedLine, Translation};
 use crate::recognizer::{OfflineRecognizer, SpeakerTagger, StreamingRecognizer, Transcription};
 use crate::ring::AudioRing;
@@ -231,6 +231,30 @@ pub struct Passes {
     /// in the operator's own. Runs after pass 4, on the text pass 4
     /// settled on.
     pub interpreter: Option<Interpreter>,
+    /// Pass 1 in more than one language: a language, spelled as
+    /// [`crate::language`] spells it, and a recognizer listening in it,
+    /// beyond the one [`Engine::spawn`] was given.
+    ///
+    /// Pass 1 is the one pass that has to be told which language to
+    /// listen in -- it decodes as the words are said, so its model is
+    /// chosen before any of them have been. Given these, it stops being
+    /// told: after each utterance it moves to whichever of them is
+    /// written in the alphabet pass 2 just heard, and back to the one it
+    /// started with when none is. Passes 2 and 3 work the language out
+    /// from the audio, so they are what the switch follows, and a
+    /// language is never guessed from the live text it would decide.
+    ///
+    /// A language whose alphabet is the same as another's here is still
+    /// worth having: the first of them wins, which is no worse than the
+    /// one answer the alphabet can give.
+    pub streaming_also: Vec<(String, Box<dyn StreamingRecognizer>)>,
+}
+
+/// One of pass 1's languages, with the alphabet that chooses it.
+struct Pass1Language {
+    language: String,
+    script: Script,
+    by: Box<dyn StreamingRecognizer>,
 }
 
 /// Handle to a running pipeline. Dropping it stops the threads without
@@ -301,7 +325,25 @@ impl Engine {
             corrector,
             speakers,
             interpreter,
+            streaming_also,
         } = passes;
+        // A language nobody knows the alphabet of cannot be switched to,
+        // since the alphabet is the whole of the decision; the rest
+        // still can, so this is dropped rather than refused.
+        let streaming_also: Vec<Pass1Language> = streaming_also
+            .into_iter()
+            .filter_map(|(language, by)| match language::script_of(&language) {
+                Some(script) => Some(Pass1Language {
+                    language,
+                    script,
+                    by,
+                }),
+                None => {
+                    warn!(%language, "pass 1: no alphabet known for it, so it cannot be chosen");
+                    None
+                }
+            })
+            .collect();
         let (cmd_tx, cmd_rx) = bounded::<Cmd>(64);
         let (ev_tx, ev_rx) = unbounded::<Event>();
         let (final_tx, final_rx) = unbounded::<Job>();
@@ -364,7 +406,7 @@ impl Engine {
         let control = std::thread::Builder::new()
             .name("vox-control".into())
             .spawn(move || {
-                let mut core = Core::new(cfg, streaming, ev_tx, final_tx, bound_tx);
+                let mut core = Core::new(cfg, streaming, streaming_also, ev_tx, final_tx, bound_tx);
                 core.llm_tx = llm_tx;
                 core.tr_tx = tr_tx;
                 core.run(cmd_rx, res_rx, llm_rx, tr_rx);
@@ -494,7 +536,18 @@ struct Core {
     cfg: EngineConfig,
     vad: Vad,
     ring: AudioRing,
+    /// Pass 1's recognizer, and the one it goes back to.
     streaming: Option<Box<dyn StreamingRecognizer>>,
+    /// Its other languages; see [`Passes::streaming_also`].
+    streaming_also: Vec<Pass1Language>,
+    /// Which of those pass 1 is listening with. `None` is [`Self::streaming`].
+    streaming_at: Option<usize>,
+    /// Which the next utterance will use, from the alphabet pass 2 last
+    /// heard. Taken up at the start of an utterance and not during one:
+    /// a decode swapped mid-utterance would drop what it had heard so
+    /// far, and the live text would lose words that were already on
+    /// screen.
+    streaming_next: Option<usize>,
     transcript: Transcript,
     current: Option<Current>,
     /// How the last utterance ended, known as soon as the VAD says so
@@ -532,6 +585,7 @@ impl Core {
     fn new(
         cfg: EngineConfig,
         streaming: Option<Box<dyn StreamingRecognizer>>,
+        streaming_also: Vec<Pass1Language>,
         events: Sender<Event>,
         final_tx: Sender<Job>,
         bound_tx: Sender<Job>,
@@ -548,6 +602,9 @@ impl Core {
             vad: Vad::new(cfg.vad.clone(), rate),
             ring: AudioRing::new((rate as u64 * cfg.ring_ms / 1000) as usize),
             streaming,
+            streaming_also,
+            streaming_at: None,
+            streaming_next: None,
             transcript: Transcript::default(),
             current: None,
             last_end: None,
@@ -701,13 +758,21 @@ impl Core {
     fn cut_if_stalled(&mut self) {
         let stall = self.cfg.word_stall_ms;
         let now = self.now_ms();
-        let (Some(s), Some(cur)) = (self.streaming.as_ref(), self.current.as_mut()) else {
+        // The count before the borrow: pass 1's recognizer is reached
+        // through `self`, so reading it and `current` at once would be
+        // two borrows of the same thing.
+        let Some(words) = self
+            .pass1_ref()
+            .map(|s| s.partial().split_whitespace().count())
+        else {
+            return;
+        };
+        let Some(cur) = self.current.as_mut() else {
             return;
         };
         if stall == 0 {
             return;
         }
-        let words = s.partial().split_whitespace().count();
         if words > cur.words {
             cur.words = words;
             cur.last_word_ms = now;
@@ -741,6 +806,50 @@ impl Core {
         }
     }
 
+    /// The recognizer pass 1 is listening with.
+    fn pass1(&mut self) -> Option<&mut (dyn StreamingRecognizer + 'static)> {
+        match self.streaming_at {
+            None => self.streaming.as_deref_mut(),
+            Some(i) => self.streaming_also.get_mut(i).map(|l| l.by.as_mut()),
+        }
+    }
+
+    fn pass1_ref(&self) -> Option<&(dyn StreamingRecognizer + 'static)> {
+        match self.streaming_at {
+            None => self.streaming.as_deref(),
+            Some(i) => self.streaming_also.get(i).map(|l| l.by.as_ref()),
+        }
+    }
+
+    /// Pass 1 follows what pass 2 heard: see [`Passes::streaming_also`].
+    ///
+    /// The alphabet of a finished utterance is read rather than its
+    /// language, because that is what can be read off text at all -- the
+    /// same reasoning as [`crate::language`], and the same limit: a
+    /// sentence with too few letters to say says nothing, and leaves
+    /// pass 1 where it is.
+    fn follow_language(&mut self, text: &str) {
+        if self.streaming_also.is_empty() {
+            return;
+        }
+        let Some(script) = language::script(text) else {
+            return;
+        };
+        let next = self.streaming_also.iter().position(|l| l.script == script);
+        if next == self.streaming_next {
+            return;
+        }
+        match next {
+            Some(i) => info!(
+                language = %self.streaming_also[i].language,
+                ?script,
+                "pass 1 heard another language; listening in it"
+            ),
+            None => info!(?script, "pass 1 back to the language it started in"),
+        }
+        self.streaming_next = next;
+    }
+
     fn on_vad(&mut self, ev: VadEvent) {
         let rate = self.cfg.sample_rate;
         match ev {
@@ -756,7 +865,10 @@ impl Core {
                     words: 0,
                     last_word_ms: self.now_ms(),
                 });
-                if let Some(s) = self.streaming.as_mut() {
+                // Between utterances is the only place pass 1 changes
+                // language: the recognizer is reset here anyway.
+                self.streaming_at = self.streaming_next;
+                if let Some(s) = self.pass1() {
                     s.reset();
                     s.feed(&audio, rate);
                 }
@@ -764,7 +876,7 @@ impl Core {
             }
             VadEvent::Audio(window) => {
                 if self.current.is_some() {
-                    if let Some(s) = self.streaming.as_mut() {
+                    if let Some(s) = self.pass1() {
                         s.feed(&window, rate);
                     }
                     self.maybe_partial();
@@ -776,7 +888,7 @@ impl Core {
                 reason,
             } => {
                 self.last_end = Some(reason);
-                if let Some(s) = self.streaming.as_mut() {
+                if let Some(s) = self.pass1() {
                     s.reset();
                 }
                 let clip_id = self
@@ -804,7 +916,7 @@ impl Core {
                 let _ = self.final_tx.send(job);
             }
             VadEvent::Discard => {
-                if let Some(s) = self.streaming.as_mut() {
+                if let Some(s) = self.pass1() {
                     s.reset();
                 }
                 if let Some(c) = self.current.take() {
@@ -815,10 +927,10 @@ impl Core {
     }
 
     fn maybe_partial(&mut self) {
-        let Some(s) = self.streaming.as_ref() else {
+        // Owned, for the same reason as in `cut_if_stalled`.
+        let Some(text) = self.pass1_ref().map(|s| s.partial()) else {
             return;
         };
-        let text = s.partial();
         let interval = self.cfg.partial_interval;
         let Some(cur) = self.current.as_mut() else {
             return;
@@ -1405,6 +1517,13 @@ impl Core {
             }
         }
         debug!(clip = %clip_id, start_ms, duration_ms, ?reason, %text, "pass 2");
+        // What language the next utterance is listened to in, from what
+        // this one turned out to be. Before the text is tidied: none of
+        // that changes its alphabet, and a decode that failed has
+        // nothing to say about the language either way.
+        if !failed {
+            self.follow_language(&text);
+        }
         if self.cfg.spoken_digits {
             text = spoken_digits(&text);
         }

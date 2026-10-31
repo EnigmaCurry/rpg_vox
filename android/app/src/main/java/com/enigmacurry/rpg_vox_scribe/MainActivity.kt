@@ -492,12 +492,11 @@ private fun Dictate() {
                         (job.detail()?.let { " · $it" } ?: if (job.progress >= 0) " · ${(job.progress * 100).toInt()}%" else "…")
                     Scribe.finishing -> "Finishing…"
                     Scribe.paused -> "Paused $time"
-                    // The language pass 1 is listening in, when it is
-                    // not the one asked for: the live text is in English
-                    // until that model has downloaded, and a recording
-                    // is where that shows.
+                    // A language pass 1 cannot listen in yet, because
+                    // its model is still downloading. A recording is
+                    // where that matters, so it is said here.
                     Scribe.pass1Missing != null ->
-                        "Listening $time · live text in English for now"
+                        "Listening $time · not in ${Scribe.pass1Missing?.label} yet"
                     else -> "Listening $time" + (Scribe.micName?.let { " · $it" } ?: "")
                 },
                 live = Scribe.recording && !Scribe.paused && !Scribe.finishing,
