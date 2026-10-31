@@ -916,6 +916,7 @@ mod tests {
             hardened: false,
             pass3_inflight: false,
             pass4: None,
+            translation: None,
         }
     }
 

@@ -42,7 +42,7 @@ scribe [OPTIONS] [COMMAND]
 | Option              | Description                                                                                                                                                       |
 |---------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `-o, --output NAME` | Write the transcript to `NAME.md` (`.md` is added if missing). Without `-o` or `-r` nothing is saved to disk (but `s` in the TUI can start a file).               |
-| `-r, --record NAME` | Record a session: `NAME.md`, `NAME.srt`, `NAME.ass` and `NAME.opus`. See [output files](SCRIBE.md#output-files). Conflicts with `-o`, `--append`.                          |
+| `-r, --record NAME` | Record a session: `NAME.md`, `NAME.srt`, `NAME.ass` and `NAME.opus`, plus `NAME.translated.srt` with `--translate`. See [output files](SCRIBE.md#output-files). Conflicts with `-o`, `--append`.                          |
 | `-p, --play NAME`   | Play a recording made with `-r`: the audio with the subtitles shown word by word. With no `NAME.opus`, reads `NAME.md` aloud instead (see [reading a transcript aloud](SCRIBE.md#reading-a-transcript-aloud)). Conflicts with every input and output option, `--once` and `--no-tui`. |
 | `--voices LIST`     | With `--play` reading `NAME.md` aloud: Kokoro voices for the speakers in order of appearance, e.g. `am_adam,bf_emma`. Unlisted speakers get af_heart, am_michael, bf_emma, bm_george, af_bella, am_fenrir, bf_isabella, bm_lewis in turn. With `--chat`, the first one is the voice of the replies, named as the `--tts` engine names it (`scribe voices`). |
 | `--tts ENGINE`      | Engine that reads `--chat` replies aloud: `speech-dispatcher` (the desktop's speech daemon, in the voices it already has; `spd` for short) or `kokoro` (an 82M model, about 350 MB, downloaded on first use). Default `auto`: speech-dispatcher when it answers, else Kokoro. speech-dispatcher is unix only; on Windows `auto` is always Kokoro. Reading a transcript aloud (`-p`) is Kokoro's either way. Env `VOX_SCRIBE_TTS`. |
@@ -93,6 +93,16 @@ words counted are still pass 1's.
 | `--llm`              | off     | Enable pass 4. Configured by environment variables; see [pass 4](SCRIBE.md#pass-4-llm-proofreading-optional). |
 | `--llm-timeout SECS` | `30`    | How long to wait for each pass-4 reply before keeping the pass-3 text.                               |
 
+### Translation
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--translate off\|local\|openai` | `off` (env `VOX_SCRIBE_TRANSLATE`) | Also read every paragraph heard in another language in your own. `local` is Marian through CTranslate2 on the CPU, with no network (needs a build with the `translate-local` feature, and the models in `<models-dir>/translate/`); `openai` asks the `--llm` service. What was said is kept either way. See [translation](SCRIBE.md#translation-optional). |
+| `--native-language NAME` | `English` (env `VOX_SCRIBE_NATIVE_LANGUAGE`) | The language you read in, spelled in English. |
+| `--other-language NAME` | `Russian` | A language to listen out for and translate. Repeatable. Each one must be written in a different alphabet from yours and from the others — that is the only thing that tells them apart, so a pair that shares one is refused at startup rather than guessed at. |
+
+`--translate openai` reuses `--llm-timeout` as its per-sentence timeout.
+
 ### Speakers
 
 | Option                  | Default | Description                                                                                                                                                                                                                  |
@@ -118,6 +128,8 @@ words counted are still pass 1's.
 | `VOX_SCRIBE_LLM_URL`                          | LLM endpoint for pass 4 and `agent`, default `http://127.0.0.1:9931/v1`. |
 | `VOX_SCRIBE_LLM_MODEL`                        | LLM model name (required with `--llm`, and by `agent`).  |
 | `VOX_SCRIBE_LLM_KEY`, `OPENAI_API_KEY`        | LLM API key, optional for local servers. `OPENAI_API_KEY` is only sent to OpenAI's URL. |
+| `VOX_SCRIBE_TRANSLATE`                        | Same as `--translate`.                                  |
+| `VOX_SCRIBE_NATIVE_LANGUAGE`                  | Same as `--native-language`.                            |
 | `VOX_SCRIBE_TTS`                              | Same as `--tts`.                                        |
 | `SPEECHD_ADDRESS`                             | Where speech-dispatcher listens, as `unix_socket:PATH`. Default `$XDG_RUNTIME_DIR/speech-dispatcher/speechd.sock`. Unix only. |
 | `VOX_SCRIBE_LOG`                              | Log filter.                                             |

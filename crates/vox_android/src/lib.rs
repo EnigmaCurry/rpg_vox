@@ -102,6 +102,7 @@ fn change_name(c: Change) -> &'static str {
         Change::ClipRemoved => "clip_removed",
         Change::Closed => "closed",
         Change::Corrected => "corrected",
+        Change::Translated => "translated",
         Change::Hardened => "hardened",
     }
 }

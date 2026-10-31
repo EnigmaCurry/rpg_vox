@@ -10,6 +10,10 @@
 //! * **Pass 4** (optional): once a paragraph settles, an LLM proposes
 //!   small edits (number formats, misheard names, bogus sentence breaks).
 //!
+//! * **Translation** (optional): a paragraph heard in another language
+//!   is also read in the operator's own, a sentence at a time. See
+//!   [`language`] for what decides which language it was heard in.
+//!
 //! * **Speakers** (optional): each utterance is labelled live with a
 //!   speaker; [`diarize`] relabels a finished transcript from a full
 //!   offline diarization of the audio.
@@ -26,6 +30,7 @@ pub mod digits;
 pub mod engine;
 pub mod filters;
 pub mod gaps;
+pub mod language;
 pub mod model;
 #[cfg(feature = "llm")]
 pub mod openai;
@@ -45,6 +50,6 @@ pub mod vad;
 pub mod vocab;
 
 pub use engine::{Change, Engine, EngineConfig, Event, ParagraphConfig, ParagraphMode, Pusher};
-pub use model::{Clip, Paragraph, Pass4, Stage, Transcript};
+pub use model::{Clip, Paragraph, Pass4, Stage, Transcript, TranslatedLine, Translation};
 pub use recognizer::{OfflineRecognizer, SpeakerTagger, StreamingRecognizer, Transcription};
 pub use timing::Word;

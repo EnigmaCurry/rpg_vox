@@ -26,7 +26,8 @@ use crate::correct::{apply_edits, Corrector, Edit};
 use crate::denoise::Denoiser;
 use crate::digits::spoken_digits;
 use crate::filters::{capitalize_sentences, count_words, ends_on_sentence, is_junk};
-use crate::model::{Clip, Paragraph, Pass4, Stage, Transcript};
+use crate::language::{Interpreter, Reading};
+use crate::model::{Clip, Paragraph, Pass4, Stage, Transcript, TranslatedLine, Translation};
 use crate::recognizer::{OfflineRecognizer, SpeakerTagger, StreamingRecognizer, Transcription};
 use crate::ring::AudioRing;
 use crate::timing::{align_words, offset, Word};
@@ -127,11 +128,21 @@ pub enum Change {
     Closed,
     /// Pass 4 finished (see [`Paragraph::pass4`] for the outcome).
     Corrected,
+    /// The translation finished (see [`Paragraph::translation`]).
+    Translated,
     /// No further passes will touch it.
     Hardened,
 }
 
 #[derive(Debug, Clone)]
+// One variant carries a whole paragraph and the other carries an id, so
+// they are nothing like the same size. Boxing the paragraph is what the
+// lint wants and is the wrong trade here: a partial update is sent
+// several times a second per source and the paragraph is already a Vec
+// of clips, so this would add an allocation per event to save a memcpy
+// of a few hundred bytes -- and it would put a `Box` in front of every
+// consumer of the one type this crate exists to hand out.
+#[allow(clippy::large_enum_variant)]
 pub enum Event {
     /// Full current state of one paragraph; upsert by id.
     Paragraph {
@@ -183,11 +194,40 @@ struct LlmResult {
     edits: anyhow::Result<Vec<Edit>>,
 }
 
+struct TrJob {
+    paragraph_id: String,
+    text: String,
+    /// How many word timings the paragraph has, for placing each
+    /// translated sentence in time.
+    words: usize,
+    context: Vec<String>,
+}
+
+struct TrResult {
+    job: TrJob,
+    /// `Ok(None)`: it was already in the native language.
+    reading: anyhow::Result<Option<Reading>>,
+}
+
 struct JobResult {
     job: Job,
     text: anyhow::Result<Transcription>,
     /// Pass-2 jobs only, when a speaker tagger is set.
     speaker: Option<String>,
+}
+
+/// The optional work an engine can be given beyond the two recognizers,
+/// each `None` for "don't run it at all".
+#[derive(Default)]
+pub struct Passes {
+    /// Pass 4: an LLM proofreads each paragraph before it hardens.
+    pub corrector: Option<Arc<dyn Corrector>>,
+    /// Live speaker labels, and a new paragraph when the speaker changes.
+    pub speakers: Option<Box<dyn SpeakerTagger>>,
+    /// Translation: a paragraph heard in another language is also read
+    /// in the operator's own. Runs after pass 4, on the text pass 4
+    /// settled on.
+    pub interpreter: Option<Interpreter>,
 }
 
 /// Handle to a running pipeline. Dropping it stops the threads without
@@ -230,6 +270,35 @@ impl Engine {
         corrector: Option<Arc<dyn Corrector>>,
         speakers: Option<Box<dyn SpeakerTagger>>,
     ) -> Self {
+        Self::spawn_passes(
+            cfg,
+            streaming,
+            offline,
+            Passes {
+                corrector,
+                speakers,
+                ..Passes::default()
+            },
+        )
+    }
+
+    /// Start the pipeline with every optional pass named at once.
+    ///
+    /// The three `spawn*` functions above are this one with the rest
+    /// defaulted; they are kept because most callers want one more thing
+    /// than the last, and a struct is where that list stopped fitting in
+    /// an argument list.
+    pub fn spawn_passes(
+        cfg: EngineConfig,
+        streaming: Option<Box<dyn StreamingRecognizer>>,
+        offline: Arc<dyn OfflineRecognizer>,
+        passes: Passes,
+    ) -> Self {
+        let Passes {
+            corrector,
+            speakers,
+            interpreter,
+        } = passes;
         let (cmd_tx, cmd_rx) = bounded::<Cmd>(64);
         let (ev_tx, ev_rx) = unbounded::<Event>();
         let (final_tx, final_rx) = unbounded::<Job>();
@@ -265,12 +334,37 @@ impl Engine {
             None => (None, never()),
         };
 
+        // The translation gets its own thread for the same reason pass 4
+        // does: a Marian model is fifty milliseconds a sentence but a
+        // chat model is two seconds, and neither may hold up the decode
+        // of what is being said next.
+        let (tr_tx, tr_rx) = match interpreter {
+            Some(i) => {
+                let (job_tx, job_rx) = unbounded::<TrJob>();
+                let (out_tx, out_rx) = unbounded::<TrResult>();
+                std::thread::Builder::new()
+                    .name("vox-translate".into())
+                    .spawn(move || {
+                        for job in job_rx {
+                            let reading = i.read(&job.text, job.words, &job.context);
+                            if out_tx.send(TrResult { job, reading }).is_err() {
+                                return;
+                            }
+                        }
+                    })
+                    .expect("spawn translate worker");
+                (Some(job_tx), out_rx)
+            }
+            None => (None, never()),
+        };
+
         let control = std::thread::Builder::new()
             .name("vox-control".into())
             .spawn(move || {
                 let mut core = Core::new(cfg, streaming, ev_tx, final_tx, bound_tx);
                 core.llm_tx = llm_tx;
-                core.run(cmd_rx, res_rx, llm_rx);
+                core.tr_tx = tr_tx;
+                core.run(cmd_rx, res_rx, llm_rx, tr_rx);
             })
             .expect("spawn control thread");
 
@@ -412,6 +506,8 @@ struct Core {
     outstanding_boundary: usize,
     llm_tx: Option<Sender<LlmJob>>,
     outstanding_llm: usize,
+    tr_tx: Option<Sender<TrJob>>,
+    outstanding_tr: usize,
     pass3_pending: HashSet<String>,
     level_max: f32,
     level_next: u64,
@@ -448,6 +544,8 @@ impl Core {
             outstanding_boundary: 0,
             llm_tx: None,
             outstanding_llm: 0,
+            tr_tx: None,
+            outstanding_tr: 0,
             pass3_pending: HashSet::new(),
             level_max: 0.0,
             level_next: 0,
@@ -460,15 +558,23 @@ impl Core {
         cmd_rx: Receiver<Cmd>,
         res_rx: Receiver<JobResult>,
         llm_rx: Receiver<LlmResult>,
+        tr_rx: Receiver<TrResult>,
     ) {
         let mut finishing: Option<Option<Sender<Transcript>>> = None;
         loop {
             if let Some(reply) = &finishing {
-                let idle =
-                    self.outstanding_final + self.outstanding_boundary + self.outstanding_llm == 0;
+                let idle = self.outstanding_final
+                    + self.outstanding_boundary
+                    + self.outstanding_llm
+                    + self.outstanding_tr
+                    == 0;
                 // Once passes 2 and 3 are drained, send every remaining
-                // paragraph through pass 4 before hardening it.
-                if idle && self.request_pass4_all() == 0 {
+                // paragraph through pass 4, and then through the
+                // translator, before hardening it. In that order: the
+                // translation is made from whatever pass 4 settles on,
+                // so asking for both at once would translate a sentence
+                // that is about to change.
+                if idle && self.request_pass4_all() == 0 && self.request_translation_all() == 0 {
                     self.harden_all();
                     if let Some(tx) = reply {
                         let _ = tx.send(self.transcript.clone());
@@ -478,6 +584,7 @@ impl Core {
                 select! {
                     recv(res_rx) -> r => match r { Ok(r) => self.on_result(r), Err(_) => return },
                     recv(llm_rx) -> r => match r { Ok(r) => self.on_llm(r), Err(_) => return },
+                    recv(tr_rx) -> r => match r { Ok(r) => self.on_translation(r), Err(_) => return },
                 }
                 continue;
             }
@@ -497,6 +604,7 @@ impl Core {
                 },
                 recv(res_rx) -> r => if let Ok(r) = r { self.on_result(r) },
                 recv(llm_rx) -> r => if let Ok(r) = r { self.on_llm(r) },
+                recv(tr_rx) -> r => if let Ok(r) = r { self.on_translation(r) },
             }
         }
     }
@@ -929,7 +1037,7 @@ impl Core {
             if idx == last && self.cfg.paragraph.mode == ParagraphMode::Manual && !p.closed {
                 continue;
             }
-            // Pass 4 has the last word before hardening.
+            // Pass 4 has the last word on the text before hardening.
             if self.llm_tx.is_some() && !p.text.trim().is_empty() {
                 match p.pass4 {
                     None => {
@@ -937,6 +1045,18 @@ impl Core {
                         continue;
                     }
                     Some(Pass4::Running) => continue,
+                    Some(_) => {}
+                }
+            }
+            // And then the translation, which is made from the text
+            // pass 4 settled on.
+            if self.tr_tx.is_some() && !p.text.trim().is_empty() {
+                match p.translation {
+                    None => {
+                        self.request_translation(idx);
+                        continue;
+                    }
+                    Some(Translation::Running) => continue,
                     Some(_) => {}
                 }
             }
@@ -983,6 +1103,101 @@ impl Core {
             self.request_pass4(i);
         }
         todo.len()
+    }
+
+    /// Queue the translation of `paragraphs[idx]`. Closed for the same
+    /// reason pass 4 closes it: new speech landing in a paragraph whose
+    /// translation is already out would leave the two out of step.
+    fn request_translation(&mut self, idx: usize) {
+        let Some(tx) = &self.tr_tx else { return };
+        // The readings of the paragraphs before this one, not their
+        // source: a translator using context is being shown what it has
+        // already said, so that a pronoun agrees with it.
+        let context = self.transcript.paragraphs[idx.saturating_sub(2)..idx]
+            .iter()
+            .filter_map(|p| p.translation.as_ref().and_then(Translation::text))
+            .map(str::to_string)
+            .collect();
+        let p = &mut self.transcript.paragraphs[idx];
+        p.closed = true;
+        p.translation = Some(Translation::Running);
+        let job = TrJob {
+            paragraph_id: p.id.clone(),
+            text: p.text.clone(),
+            words: p.words.len(),
+            context,
+        };
+        if tx.send(job).is_ok() {
+            self.outstanding_tr += 1;
+        }
+        self.emit(idx, Change::Closed);
+    }
+
+    /// Queue the translation of every paragraph that hasn't had one.
+    /// Returns how many were queued.
+    fn request_translation_all(&mut self) -> usize {
+        if self.tr_tx.is_none() {
+            return 0;
+        }
+        let todo: Vec<usize> = (0..self.transcript.paragraphs.len())
+            .filter(|&i| {
+                let p = &self.transcript.paragraphs[i];
+                !p.hardened && p.translation.is_none() && !p.text.trim().is_empty()
+            })
+            .collect();
+        for &i in &todo {
+            self.request_translation(i);
+        }
+        todo.len()
+    }
+
+    fn on_translation(&mut self, r: TrResult) {
+        self.outstanding_tr -= 1;
+        let Some(idx) = self.find_paragraph(&r.job.paragraph_id) else {
+            return;
+        };
+        let p = &mut self.transcript.paragraphs[idx];
+        p.translation = Some(match r.reading {
+            Ok(Some(reading)) => {
+                let lines = reading
+                    .lines
+                    .iter()
+                    .map(|l| {
+                        // The sentence's own span of audio, from the
+                        // words it was translated from. A paragraph
+                        // whose timings are short of its words (one
+                        // still ending in a partial) falls back to the
+                        // paragraph's own span, which is late rather
+                        // than wrong.
+                        let at =
+                            |i: usize, or: u64| p.words.get(i).map_or(or, |w: &Word| w.start_ms);
+                        TranslatedLine {
+                            text: l.text.clone(),
+                            start_ms: at(l.first_word, p.start_ms),
+                            end_ms: l.last_word.checked_sub(1).map_or(p.end_ms, |i| {
+                                p.words.get(i).map_or(p.end_ms, |w| w.end_ms)
+                            }),
+                        }
+                    })
+                    .collect();
+                debug!(paragraph = %p.id, language = %reading.language, "translated");
+                Translation::Done {
+                    language: reading.language,
+                    text: reading.text,
+                    lines,
+                }
+            }
+            // Nothing to do, which is every paragraph of a transcript
+            // whose speaker is already understood.
+            Ok(None) => Translation::Native,
+            Err(e) => {
+                let reason = format!("{e:#}");
+                warn!(paragraph = %p.id, %reason, "no translation; the words stand as they were said");
+                Translation::Failed { reason }
+            }
+        });
+        self.emit(idx, Change::Translated);
+        self.harden_idle();
     }
 
     fn on_llm(&mut self, r: LlmResult) {

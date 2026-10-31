@@ -8,7 +8,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context as _, Result};
-use vox_transcribe::{Paragraph, Transcript};
+use vox_transcribe::{Paragraph, Transcript, Translation};
 
 pub struct MarkdownWriter {
     path: PathBuf,
@@ -87,12 +87,18 @@ const WIDTH: usize = 79;
 /// Word-wrap `text` to [`WIDTH`] columns. A word longer than that gets
 /// a line of its own.
 pub fn wrap(text: &str) -> String {
+    wrap_to(text, WIDTH)
+}
+
+/// [`wrap`] to a width of its caller's choosing, for text that is
+/// written inside a prefix.
+fn wrap_to(text: &str, width: usize) -> String {
     use unicode_width::UnicodeWidthStr;
     let mut out = String::new();
     let mut col = 0;
     for word in text.split_whitespace() {
         let w = word.width();
-        if col > 0 && col + 1 + w > WIDTH {
+        if col > 0 && col + 1 + w > width {
             out.push('\n');
             col = 0;
         } else if col > 0 {
@@ -107,13 +113,36 @@ pub fn wrap(text: &str) -> String {
 
 /// A paragraph as written: `**[hh:mm:ss]** text`, or
 /// `**[hh:mm:ss] Speaker A:** text` once diarized, wrapped to [`WIDTH`].
+///
+/// A paragraph that was translated keeps what was said as the paragraph
+/// and gets the reading as a blockquote under it. That way round because
+/// what was said is the record: the timestamps and the subtitles are
+/// about it, and a reading that looks wrong can only be judged against
+/// the line it came from.
 fn block(p: &Paragraph) -> String {
     let ts = timestamp(p.start_ms);
     let line = match &p.speaker {
         Some(s) => format!("**[{ts}] {}:** {}", crate::speakers::name(s), p.text.trim()),
         None => format!("**[{ts}]** {}", p.text.trim()),
     };
-    format!("\n{}\n", wrap(&line))
+    let mut out = format!("\n{}\n", wrap(&line));
+    if let Some(read) = p.translation.as_ref().and_then(Translation::text) {
+        out.push_str(&quote(read));
+    }
+    out
+}
+
+/// `text` as a markdown blockquote, wrapped to [`WIDTH`] with the `> `
+/// counted in it.
+fn quote(text: &str) -> String {
+    let body = wrap_to(text.trim(), WIDTH - 2);
+    let mut out = String::from("\n");
+    for line in body.lines() {
+        out.push_str("> ");
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
 }
 
 /// A whole file for `t`, as [`MarkdownWriter`] would have written it.
@@ -132,6 +161,9 @@ pub enum HistoryBlock {
         timestamp: String,
         text: String,
     },
+    /// A blockquote under a paragraph: its reading in the native
+    /// language, with the `> ` markers taken off.
+    Reading(String),
     /// A `---` session separator.
     Rule,
     /// An italic date line or other text.
@@ -150,6 +182,14 @@ pub fn read_tail(path: &Path, max: usize) -> Vec<HistoryBlock> {
         .map(|b| {
             if b == "---" {
                 return HistoryBlock::Rule;
+            }
+            if b.starts_with("> ") {
+                let text = b
+                    .lines()
+                    .map(|l| l.trim_start_matches("> ").trim())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                return HistoryBlock::Reading(text);
             }
             if let Some((head, text)) = b.strip_prefix("**[").and_then(|r| r.split_once("** ")) {
                 // `ts]` or `ts] Speaker A:`
@@ -195,5 +235,50 @@ mod tests {
         assert_eq!(wrap("short line"), "short line");
         let long = "x".repeat(100);
         assert_eq!(wrap(&format!("a {long} b")), format!("a\n{long}\nb"));
+    }
+
+    #[test]
+    fn a_reading_is_written_under_the_line_it_was_made_from() {
+        use vox_transcribe::Translation;
+        let mut p = Paragraph {
+            id: "p1".into(),
+            start_ms: 2_000,
+            end_ms: 4_000,
+            text: "Да, конечно.".into(),
+            clips: Vec::new(),
+            words: Vec::new(),
+            speaker: None,
+            closed: true,
+            hardened: true,
+            pass3_inflight: false,
+            pass4: None,
+            translation: None,
+        };
+        // Nothing to read yet, and nothing extra written for it.
+        assert_eq!(block(&p), "\n**[00:00:02]** Да, конечно.\n");
+        p.translation = Some(Translation::Native);
+        assert_eq!(block(&p), "\n**[00:00:02]** Да, конечно.\n");
+        p.translation = Some(Translation::Done {
+            language: "Russian".into(),
+            text: "Yes, of course.".into(),
+            lines: Vec::new(),
+        });
+        assert_eq!(
+            block(&p),
+            "\n**[00:00:02]** Да, конечно.\n\n> Yes, of course.\n"
+        );
+        // The quote wraps with its own markers counted, so no line of
+        // the file runs past the width.
+        p.translation = Some(Translation::Done {
+            language: "Russian".into(),
+            text: "word ".repeat(40),
+            lines: Vec::new(),
+        });
+        let out = block(&p);
+        assert!(out.lines().all(|l| l.chars().count() <= WIDTH), "{out}");
+        assert!(
+            out.lines().filter(|l| l.starts_with("> ")).count() > 1,
+            "{out}"
+        );
     }
 }

@@ -120,6 +120,13 @@ fn split_part(p: &Paragraph, n: usize, words: Vec<Word>, speaker: Option<String>
         id,
         start_ms,
         end_ms,
+        // A reading is of the whole paragraph, so it only survives a
+        // part that turned out to be the whole of it. Where the
+        // diarizer really did split one paragraph between two speakers,
+        // neither half has a translation of its own and there is
+        // nothing honest to put there: what was said is still right,
+        // and that is what the files are rewritten from.
+        translation: (text == p.text).then(|| p.translation.clone()).flatten(),
         text,
         clips: vec![clip],
         words,
@@ -764,6 +771,7 @@ mod tests {
             hardened: true,
             pass3_inflight: false,
             pass4: None,
+            translation: None,
         }
     }
 

@@ -99,6 +99,30 @@ pub fn sentence_end(text: &str) -> Option<usize> {
     None
 }
 
+/// `text` split into whole sentences, each keeping its own punctuation
+/// and nothing trimmed away between them.
+///
+/// Built on [`sentence_end`], so it splits exactly where speaking a
+/// reply aloud splits -- and only in languages that put spaces between
+/// words, for the same reason. What is left over after the last
+/// terminator is a sentence too: a paragraph that trails off is still
+/// something somebody said.
+pub fn sentences(text: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(end) = sentence_end(rest) {
+        let (s, after) = rest.split_at(end);
+        if !s.trim().is_empty() {
+            out.push(s.trim());
+        }
+        rest = after;
+    }
+    if !rest.trim().is_empty() {
+        out.push(rest.trim());
+    }
+    out
+}
+
 /// Words a clause needs before it is worth speaking on its own.
 const CLAUSE_WORDS: usize = 4;
 
@@ -320,6 +344,26 @@ mod tests {
         // dotted name is one word: both wait for more text.
         assert_eq!(sentence_end("See d.rymcg.tech now"), None);
         assert_eq!(sentence_end("No end yet."), None);
+    }
+
+    #[test]
+    fn splits_a_paragraph_into_sentences() {
+        assert_eq!(
+            sentences("Hello there. How are you? Fine!"),
+            vec!["Hello there.", "How are you?", "Fine!"]
+        );
+        // What trails off the end is a sentence too.
+        assert_eq!(
+            sentences("It is done. And then we"),
+            vec!["It is done.", "And then we"]
+        );
+        // Cyrillic goes the same way: the rule is the space after the
+        // terminator, not the alphabet before it.
+        assert_eq!(
+            sentences("Да, конечно. Я пью чай."),
+            vec!["Да, конечно.", "Я пью чай."]
+        );
+        assert!(sentences("   ").is_empty());
     }
 
     #[test]

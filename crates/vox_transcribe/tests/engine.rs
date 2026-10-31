@@ -265,6 +265,155 @@ fn pass4_failure_keeps_pass3_text() {
     ));
 }
 
+/// A recognizer that hears Russian, like Parakeet v3 does and without
+/// saying so: what comes back is a string, and what language it is in is
+/// for somebody else to work out.
+struct RussianOffline;
+
+impl OfflineRecognizer for RussianOffline {
+    fn transcribe(&self, samples: &[f32], rate: u32) -> anyhow::Result<String> {
+        let secs = samples.len() as f32 / rate as f32;
+        Ok(if secs < 1.5 {
+            String::new()
+        } else if secs < 3.0 {
+            "Дверь заперта.".into()
+        } else {
+            "Дверь заперта, дверь заперта.".into()
+        })
+    }
+}
+
+/// Translates by marking, and can be told to fail.
+struct FakeTranslate {
+    fail: bool,
+}
+
+impl vox_transcribe::translate::Translate for FakeTranslate {
+    fn translate(
+        &self,
+        text: &str,
+        from: &str,
+        into: &str,
+        context: &[String],
+    ) -> anyhow::Result<String> {
+        if self.fail {
+            anyhow::bail!("endpoint down");
+        }
+        Ok(format!("[{from}>{into} after {}] {text}", context.len()))
+    }
+
+    fn name(&self) -> &'static str {
+        "fake"
+    }
+}
+
+fn run_translated(
+    offline: Arc<dyn OfflineRecognizer>,
+    fail: bool,
+) -> (Vec<Event>, vox_transcribe::Transcript) {
+    let mut cfg = EngineConfig::new(SR);
+    cfg.partial_interval = std::time::Duration::ZERO;
+    let interpreter = vox_transcribe::language::Interpreter::new(
+        "English",
+        &["Russian".to_string()],
+        Arc::new(FakeTranslate { fail }),
+    )
+    .expect("an alphabet apart");
+    let engine = Engine::spawn_passes(
+        cfg,
+        Some(Box::new(FakeStreaming { fed: 0 })),
+        offline,
+        vox_transcribe::engine::Passes {
+            interpreter: Some(interpreter),
+            ..Default::default()
+        },
+    );
+    let events = engine.events().clone();
+    for &(ms, amp) in TWO_CLOSE_UTTERANCES {
+        for chunk in tone(ms, amp).chunks(SR as usize / 50) {
+            engine.push(chunk);
+        }
+    }
+    let t = engine.finish();
+    (events.try_iter().collect(), t)
+}
+
+#[test]
+fn a_paragraph_heard_in_another_language_is_read_in_the_native_one() {
+    let (events, t) = run_translated(Arc::new(RussianOffline), false);
+    let ch = changes(&events);
+    let translated = ch
+        .iter()
+        .position(|c| *c == Change::Translated)
+        .expect("translated");
+    let hardened = ch
+        .iter()
+        .position(|c| *c == Change::Hardened)
+        .expect("hardened");
+    assert!(
+        translated < hardened,
+        "translated before it hardens: {ch:?}"
+    );
+    let p = &t.paragraphs[0];
+    // What was said is untouched: it is the record, and the only way to
+    // see whose fault a bad reading was.
+    assert_eq!(p.text, "Дверь заперта, дверь заперта.");
+    let Some(vox_transcribe::Translation::Done {
+        language,
+        text,
+        lines,
+    }) = &p.translation
+    else {
+        panic!("not translated: {:?}", p.translation);
+    };
+    assert_eq!(language, "Russian");
+    assert_eq!(
+        text,
+        "[Russian>English after 0] Дверь заперта, дверь заперта."
+    );
+    // One line, cued over the words it was translated from rather than
+    // over the whole paragraph.
+    assert_eq!(lines.len(), 1);
+    assert!(lines[0].end_ms > lines[0].start_ms, "{:?}", lines[0]);
+    assert!(
+        lines[0].end_ms <= p.end_ms,
+        "{:?} in {}",
+        lines[0],
+        p.end_ms
+    );
+}
+
+#[test]
+fn a_paragraph_already_in_the_native_language_costs_nothing() {
+    let (_, t) = run_translated(Arc::new(FakeOffline), false);
+    let p = &t.paragraphs[0];
+    assert_eq!(p.text, "Alpha beta, alpha beta.");
+    // It ran, found nothing to do, and said so -- rather than leaving
+    // None, which would have it asked again.
+    assert!(
+        matches!(p.translation, Some(vox_transcribe::Translation::Native)),
+        "{:?}",
+        p.translation
+    );
+    assert!(p.hardened);
+}
+
+#[test]
+fn a_translation_that_failed_does_not_hold_the_paragraph_open() {
+    let (_, t) = run_translated(Arc::new(RussianOffline), true);
+    let p = &t.paragraphs[0];
+    assert!(p.hardened, "a dead translator is not a reason to wait");
+    assert_eq!(p.text, "Дверь заперта, дверь заперта.");
+    assert!(
+        matches!(
+            p.translation,
+            Some(vox_transcribe::Translation::Failed { .. })
+        ),
+        "{:?}",
+        p.translation
+    );
+}
+
 /// Labels utterances from a fixed list, in order.
 struct FakeTagger(Vec<&'static str>);
 

@@ -294,6 +294,8 @@ With `-r NAME`, you also get:
   They work in other players too, e.g. `mpv --sub-file=NAME.ass video.mp4`.
 * `NAME.opus`: the audio exactly as the transcriber heard it, mono Opus
   at 24 kb/s, about 10 MB an hour.
+* `NAME.translated.srt`, with `--translate`: the same subtitles in the
+  language you read in. See [Translation](#translation-optional).
 
 Word times come from the offline recognizer's token timestamps and are
 carried through the boundary and LLM passes. `scribe -p NAME` plays the
@@ -492,6 +494,100 @@ In the TUI, words pass 4 changed are blue, a paragraph's timestamp is
 bold blue while it waits for the LLM, and `o` toggles the text from
 before pass 4. Without `--llm`, pass 3 is the final pass and paragraphs
 are written as soon as they settle.
+
+## Translation (optional)
+
+Pass 2's recognizer (Parakeet TDT 0.6B v3) hears twenty-five languages
+and is told none of them: a Russian speaker is transcribed in Russian
+with nothing to configure. What it will not tell you is *which* language
+it just heard — what comes back is a string. `--translate` is the pass
+that works that out and puts the line into the language you read in:
+
+```bash
+# Marian on the CPU, no network. Russian in, English under it.
+just scribe --translate local -i talk.opus -o talk
+```
+
+What was said is never replaced. The paragraph stays as it was spoken and
+the reading goes under it — a blockquote in the markdown, its own colour
+in the TUI, an indented line on stdout. That way round because when a
+translation looks wrong, the line it came from is the only way to tell
+whether the translator or the recognizer was at fault.
+
+### What decides which language it was in
+
+**The alphabet, and nothing else.** Russian against English is Cyrillic
+against Latin, which is as unambiguous as text gets and needs no model,
+no download and no network. German against English is Latin against
+Latin, which this *cannot* tell apart — so it refuses that pair at
+startup instead of guessing and sending English prose to a German model,
+which comes back as confident nonsense:
+
+```
+$ scribe --translate local --other-language German
+Error: German is written in the same alphabet as English, and telling
+them apart is not something reading the script can do
+```
+
+`--other-language` is repeatable, and every language named has to be in
+a different alphabet from yours and from the others. Russian and
+Ukrainian are both Cyrillic, so you can have either, not both.
+
+The decision is per paragraph, so one short sentence can't send a line
+the wrong way; the translating is per *sentence*, which is the unit the
+models work in. A sentence that is already in your language — an English
+aside, a name, a URL — is left exactly as it was said rather than sent
+round the trip. A paragraph that is genuinely half in each language has
+no majority, so it is left alone: there is no direction to choose.
+
+### Who translates
+
+| `--translate` | What it is | Speed | Notes |
+| --- | --- | --- | --- |
+| `off` (default) | nothing | — | every paragraph stands as it was said |
+| `local` | Marian models through CTranslate2, on the CPU | ~50 ms a sentence | no network at all. Needs a build with the `translate-local` feature and the models in `<models-dir>/translate/ru-en/` (`just download-translate-model-ru`) |
+| `openai` | the `--llm` service | 1–2 s a sentence | same `VOX_SCRIBE_LLM_*` variables as pass 4, and it can be told to leave a command alone |
+
+The local models follow no instructions at all, so anything that is not
+prose has to be in backticks to come back intact — `` `ls -la` ``
+otherwise arrives translated as prose. The LLM translator is told to copy
+such spans through verbatim.
+
+Because the local translator is a C++ library with a CMake build, it is
+behind a feature flag; the default build has `--translate openai` only.
+
+```bash
+cargo build -p vox_scribe --features translate-local --release
+```
+
+### When it runs, and what it costs
+
+The translation is the last pass before a paragraph hardens, after pass 4
+if that is on, because it is made from whatever text pass 4 settled on.
+It runs on its own thread, so a slow translator never holds up the
+decoding of what is being said next. A paragraph whose translation failed
+is written anyway, with the reason, rather than waiting on it.
+
+With `-r NAME` you also get `NAME.translated.srt`: the reading as
+subtitles, cued from the sentences the translator was given. A separate
+file, because a player shows one subtitle track and somebody reading
+this one cannot read the other. There is no translated `.ass` — karaoke
+needs a time per word, and a translation's words were never spoken.
+
+### Debugging a translation
+
+Pass 1 is English-only, so a Russian speaker's live partials are
+nonsense until pass 2 lands. That costs nothing but noise on screen, and
+`--no-streaming` turns it off for a file you are working through:
+
+```bash
+just scribe --translate local --no-streaming \
+  -i "sample.opus" -r out
+diff <(grep -v '^[0-9]*$' out.translated.srt) \
+     <(grep -v '^[0-9]*$' reference.en.srt)
+```
+
+(`--other-language` defaults to Russian, so these examples leave it out.)
 
 ## Vocabulary (optional)
 

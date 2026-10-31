@@ -9,7 +9,8 @@ use std::path::PathBuf;
 
 use anyhow::{anyhow, Context as _, Result};
 use vox_transcribe::subtitle::{self, CueConfig};
-use vox_transcribe::{Paragraph, Transcript};
+use vox_transcribe::timing::align_words;
+use vox_transcribe::{Paragraph, Transcript, Translation};
 
 /// Silence left between an appended session and the one before it.
 const SESSION_GAP_MS: u64 = 2000;
@@ -19,6 +20,13 @@ pub enum Format {
     Srt,
     /// ASS with a `\k` karaoke tag per word.
     Ass,
+    /// SRT of the translation rather than of what was said, cued from
+    /// the sentences the translator was given. The one output where the
+    /// reading stands alone, because that is what a subtitle is for:
+    /// somebody reading it does not also want the line they cannot
+    /// read. No karaoke version -- a translation has its own word count
+    /// and none of the words have times of their own.
+    TranslatedSrt,
 }
 
 pub struct SubtitleWriter {
@@ -77,7 +85,7 @@ impl SubtitleWriter {
 
     /// Append `p`'s cues unless it was already written or is empty.
     pub fn append(&mut self, p: &Paragraph) -> Result<()> {
-        if p.words.is_empty() || !self.written.insert(p.id.clone()) {
+        if !has_cues(p, self.format) || !self.written.insert(p.id.clone()) {
             return Ok(());
         }
         let out = paragraph_cues(p, self.format, self.offset_ms, &mut self.cues, &self.cfg);
@@ -107,13 +115,41 @@ fn paragraph_cues(
     cfg: &CueConfig,
 ) -> String {
     let mut out = String::new();
-    for (i, cue) in subtitle::cues(&p.words, p.end_ms, cfg)
-        .into_iter()
-        .enumerate()
-    {
+    for (i, cue) in cues_of(p, format, cfg).into_iter().enumerate() {
         out.push_str(&format_cue(p, i, cue, format, offset_ms, count));
     }
     out
+}
+
+/// Whether `p` has anything to say in `format`: words for a subtitle of
+/// what was said, a reading for a subtitle of the translation.
+fn has_cues(p: &Paragraph, format: Format) -> bool {
+    match format {
+        Format::TranslatedSrt => matches!(&p.translation, Some(Translation::Done { .. })),
+        _ => !p.words.is_empty(),
+    }
+}
+
+/// `p`'s cues in `format`.
+///
+/// The translation goes through the same cue builder as everything else,
+/// by handing it each translated sentence as words spread evenly over
+/// the stretch of audio its source was spoken in. A sentence is short
+/// enough for that to read right, and it means the line length, the line
+/// count, the clause breaks and the minimum time on screen are the same
+/// rules here as anywhere.
+fn cues_of(p: &Paragraph, format: Format, cfg: &CueConfig) -> Vec<subtitle::Cue> {
+    let words = match format {
+        Format::TranslatedSrt => match &p.translation {
+            Some(Translation::Done { lines, .. }) => lines
+                .iter()
+                .flat_map(|l| align_words(&[], &l.text, (l.start_ms, l.end_ms.max(l.start_ms + 1))))
+                .collect(),
+            _ => return Vec::new(),
+        },
+        _ => p.words.clone(),
+    };
+    subtitle::cues(&words, p.end_ms, cfg)
 }
 
 /// The `i`th cue of `p` in `format`, numbered after `count`.
@@ -129,7 +165,7 @@ fn format_cue(
     cue.end_ms += offset_ms;
     *count += 1;
     match format {
-        Format::Srt => {
+        Format::Srt | Format::TranslatedSrt => {
             if let (0, Some(s)) = (i, &p.speaker) {
                 cue.text = format!("{}: {}", crate::speakers::name(s), cue.text);
             }
@@ -148,15 +184,15 @@ fn format_cue(
 pub fn render(format: Format, t: &Transcript) -> String {
     let cfg = CueConfig::default();
     let mut out = match format {
-        Format::Srt => String::new(),
+        Format::Srt | Format::TranslatedSrt => String::new(),
         Format::Ass => subtitle::ASS_HEADER.to_string(),
     };
     let mut cues: Vec<(&Paragraph, usize, subtitle::Cue)> = t
         .paragraphs
         .iter()
-        .filter(|p| !p.words.is_empty())
+        .filter(|p| has_cues(p, format))
         .flat_map(|p| {
-            subtitle::cues(&p.words, p.end_ms, &cfg)
+            cues_of(p, format, &cfg)
                 .into_iter()
                 .enumerate()
                 .map(move |(i, c)| (p, i, c))
@@ -176,7 +212,7 @@ fn resume_point(existing: &str, format: Format) -> (usize, u64) {
     let mut last_end = None;
     for line in existing.lines() {
         let end = match format {
-            Format::Srt => line.split_once(" --> ").map(|(_, e)| e),
+            Format::Srt | Format::TranslatedSrt => line.split_once(" --> ").map(|(_, e)| e),
             Format::Ass => line
                 .strip_prefix("Dialogue:")
                 .and_then(|l| l.split(',').nth(2)),

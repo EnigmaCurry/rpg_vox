@@ -43,6 +43,8 @@ use clap::{CommandFactory as _, FromArgMatches as _, Parser, Subcommand};
 use tracing::info;
 use vox_audio::{Capture, OpenOptions};
 use vox_transcribe::correct::Corrector;
+use vox_transcribe::engine::Passes;
+use vox_transcribe::language::Interpreter;
 use vox_transcribe::openai::{OpenAiConfig, OpenAiCorrector};
 use vox_transcribe::sherpa::{
     EmbeddingTagger, Parakeet, ParakeetConfig, SenseVoice, SenseVoiceConfig, SpeakerModels,
@@ -51,7 +53,7 @@ use vox_transcribe::sherpa::{
 use vox_transcribe::speaker::ClusterConfig;
 use vox_transcribe::{
     Change, Engine, EngineConfig, Event, ParagraphMode, SpeakerTagger, StreamingRecognizer,
-    Transcript,
+    Transcript, Translation,
 };
 
 use crate::markdown::{timestamp, MarkdownWriter};
@@ -260,6 +262,29 @@ struct Cli {
     /// Seconds to wait for each pass-4 reply before keeping pass-3 text.
     #[arg(long, default_value_t = 30)]
     llm_timeout: u64,
+    /// Read anything heard in another language in your own as well:
+    /// `local` is a Marian model on the CPU with no network (needs a
+    /// build with the `translate-local` feature and the models from
+    /// `just download-translate-model-ru`), `openai` asks the --llm
+    /// service. What was said is kept either way; the reading goes
+    /// under it.
+    #[arg(long, value_enum, default_value = "off", env = "VOX_SCRIBE_TRANSLATE")]
+    translate: TranslateKind,
+    /// With --translate: the language you read in.
+    #[arg(
+        long,
+        value_name = "NAME",
+        default_value = "English",
+        env = "VOX_SCRIBE_NATIVE_LANGUAGE"
+    )]
+    native_language: String,
+    /// With --translate: a language to listen out for and translate,
+    /// spelled in English ("Russian"). Repeatable. Each one has to be
+    /// written in a different alphabet from your own and from the
+    /// others, because that is the only thing that tells them apart --
+    /// see SCRIBE.md.
+    #[arg(long, value_name = "NAME", default_values_t = [String::from("Russian")])]
+    other_language: Vec<String>,
     /// Label who is speaking (Speaker A, B, …). Each utterance is labelled
     /// live as it is transcribed; with --record, or -i with -o, a full
     /// diarization of the whole audio then runs after the session and
@@ -292,6 +317,21 @@ struct Cli {
     /// Log file. Default: <tmp>/vox_scribe.log in TUI mode, stderr otherwise.
     #[arg(long)]
     log: Option<PathBuf>,
+}
+
+/// `--translate`: who puts a paragraph into the native language.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum TranslateKind {
+    /// Don't: every paragraph stands as it was said.
+    #[default]
+    Off,
+    /// Marian models on the CPU, no network. Fast (about 50 ms a
+    /// sentence) and it follows no instructions at all, so anything that
+    /// is not prose has to be in backticks to survive.
+    Local,
+    /// The --llm service. Slower (a second or two a sentence) and it can
+    /// be told to leave a command alone.
+    Openai,
 }
 
 /// `--speakers`: a count, or names (whose number is the count).
@@ -531,6 +571,9 @@ struct Spawner {
     offline: Arc<dyn vox_transcribe::OfflineRecognizer>,
     zipformer: Option<Zipformer>,
     corrector: Option<Arc<dyn Corrector>>,
+    /// --translate: shared, so every source's engine reads the one copy
+    /// of the weights.
+    interpreter: Option<Interpreter>,
     /// --record: the mix every live source goes into.
     mixer: Option<Arc<Mutex<sources::Mixer>>>,
     /// --denoise, with its limit (see [`EngineConfig::denoise`]).
@@ -568,6 +611,7 @@ fn new_engine(
     zipformer: Option<&Zipformer>,
     offline: &Arc<dyn vox_transcribe::OfflineRecognizer>,
     corrector: &Option<Arc<dyn Corrector>>,
+    interpreter: &Option<Interpreter>,
     tagger: Option<Box<dyn SpeakerTagger>>,
 ) -> Engine {
     let mut cfg = EngineConfig::new(rate);
@@ -594,7 +638,16 @@ fn new_engine(
         cfg.paragraph.hard_max_words = words;
     }
     let streaming = zipformer.map(|z| Box::new(z.session()) as Box<dyn StreamingRecognizer>);
-    Engine::spawn_full(cfg, streaming, offline.clone(), corrector.clone(), tagger)
+    Engine::spawn_passes(
+        cfg,
+        streaming,
+        offline.clone(),
+        Passes {
+            corrector: corrector.clone(),
+            speakers: tagger,
+            interpreter: interpreter.clone(),
+        },
+    )
 }
 
 impl Session {
@@ -691,6 +744,7 @@ impl Session {
             sp.zipformer.as_ref(),
             &sp.offline,
             &sp.corrector,
+            &sp.interpreter,
             None,
         );
         let pusher = engine.pusher();
@@ -793,6 +847,11 @@ pub struct RecordPaths {
     pub srt: PathBuf,
     pub ass: PathBuf,
     pub opus: PathBuf,
+    /// `--translate`: the subtitles of the reading, beside the ones of
+    /// what was said. A separate file rather than a second line in the
+    /// same cue, because a player shows one subtitle track and somebody
+    /// reading this one cannot read the other.
+    pub translated_srt: PathBuf,
 }
 
 impl RecordPaths {
@@ -819,11 +878,19 @@ impl RecordPaths {
             srt: with(".srt"),
             ass: with(".ass"),
             opus: with(".opus"),
+            translated_srt: with(".translated.srt"),
         }
     }
 
-    pub fn all(&self) -> [&PathBuf; 4] {
-        [&self.md, &self.srt, &self.ass, &self.opus]
+    /// Everything a recording writes. The translated subtitles are only
+    /// among them when something is being translated, which is why this
+    /// is asked rather than assumed.
+    pub fn all(&self, translating: bool) -> Vec<&PathBuf> {
+        let mut out = vec![&self.md, &self.srt, &self.ass, &self.opus];
+        if translating {
+            out.push(&self.translated_srt);
+        }
+        out
     }
 }
 
@@ -1080,7 +1147,11 @@ fn run() -> Result<()> {
     // Fail before loading models or opening the mic. A recording is
     // never appended to, so only -o mentions --append.
     if let Some(r) = &record {
-        if let Some(p) = r.all().into_iter().find(|p| p.exists()) {
+        if let Some(p) = r
+            .all(cli.translate != TranslateKind::Off)
+            .into_iter()
+            .find(|p| p.exists())
+        {
             anyhow::bail!("{} already exists; pick another name", p.display());
         }
     } else if let Some(output) = output.as_ref().filter(|o| o.exists() && !cli.append) {
@@ -1115,6 +1186,7 @@ fn run() -> Result<()> {
     }
 
     let models_dir = models::resolve(cli.models_dir.as_deref());
+    let interpreter = interpreter(&cli, &models_dir)?;
     // First run: fetch the models rather than failing.
     let streaming = !cli.no_streaming && cli.pass1 != Pass1::Off;
     if !cli.model.present(&models_dir) || (streaming && !models::has_zipformer(&models_dir)) {
@@ -1286,10 +1358,20 @@ fn run() -> Result<()> {
         None => None,
     };
     let subtitles = match &record {
-        Some(r) => vec![
-            SubtitleWriter::create(r.srt.clone(), Format::Srt, false)?,
-            SubtitleWriter::create(r.ass.clone(), Format::Ass, false)?,
-        ],
+        Some(r) => {
+            let mut w = vec![
+                SubtitleWriter::create(r.srt.clone(), Format::Srt, false)?,
+                SubtitleWriter::create(r.ass.clone(), Format::Ass, false)?,
+            ];
+            if interpreter.is_some() {
+                w.push(SubtitleWriter::create(
+                    r.translated_srt.clone(),
+                    Format::TranslatedSrt,
+                    false,
+                )?);
+            }
+            w
+        }
         None => Vec::new(),
     };
     // The `a` menu only changes the default input: sources named on the
@@ -1325,6 +1407,7 @@ fn run() -> Result<()> {
                 zipformer.as_ref(),
                 &offline,
                 &corrector,
+                &interpreter,
                 tagger.take(),
             )
         })
@@ -1421,6 +1504,7 @@ fn run() -> Result<()> {
         offline: offline.clone(),
         zipformer,
         corrector: corrector.clone(),
+        interpreter: interpreter.clone(),
         mixer: mixer.clone(),
         denoise,
         paragraph: ParagraphOpts::from_cli(&cli),
@@ -1431,6 +1515,10 @@ fn run() -> Result<()> {
         md: output.clone(),
         srt: record.as_ref().map(|r| r.srt.clone()),
         ass: record.as_ref().map(|r| r.ass.clone()),
+        translated_srt: record
+            .as_ref()
+            .filter(|_| interpreter.is_some())
+            .map(|r| r.translated_srt.clone()),
         title: title.clone(),
         subtitle: subtitle.clone(),
     };
@@ -1550,7 +1638,11 @@ fn run() -> Result<()> {
         say!("saved {}", path.display());
     }
     if let Some(r) = &record {
-        for p in [&r.srt, &r.ass, &r.opus] {
+        for p in r
+            .all(interpreter.is_some())
+            .into_iter()
+            .filter(|p| **p != r.md)
+        {
             say!("saved {}", p.display());
         }
         say!(
@@ -2025,7 +2117,17 @@ fn headless(session: Session) -> Result<Outcome> {
                 .as_deref()
                 .map(|s| format!(" {}:", speakers::name(s)))
                 .unwrap_or_default();
-            println!("[{}]{who} {}\n", timestamp(p.start_ms), p.text.trim());
+            println!("[{}]{who} {}", timestamp(p.start_ms), p.text.trim());
+            // The reading under the line it was made from, indented so
+            // the two don't read as one paragraph when they scroll past.
+            match &p.translation {
+                Some(Translation::Done { text, .. }) => println!("           {}", text.trim()),
+                Some(Translation::Failed { reason }) => {
+                    println!("           (not translated: {reason})")
+                }
+                _ => {}
+            }
+            println!();
         }
     };
     while !interrupted.load(Ordering::SeqCst)
@@ -2153,6 +2255,87 @@ fn llm_corrector(cli: &Cli) -> Result<Option<Arc<dyn Corrector>>> {
         .check()
         .with_context(|| format!("pass 4 endpoint check failed ({url}, model {model})"))?;
     Ok(Some(Arc::new(corrector)))
+}
+
+/// The local translator, when this build has one. Behind a feature
+/// because it brings a C++ library and a CMake build with it; the flag
+/// says plainly what to do when it isn't there, rather than quietly
+/// asking the network the operator chose to do without.
+#[cfg(feature = "translate-local")]
+fn local_translator(
+    models_dir: &std::path::Path,
+    languages: &[String],
+) -> Result<Arc<dyn vox_transcribe::translate::Translate>> {
+    let t = vox_transcribe::ct2::Ct2Translator::load(models_dir, languages)?;
+    info!(directions = %t.directions().join(", "), "translating: locally, on the CPU");
+    Ok(Arc::new(t))
+}
+
+#[cfg(not(feature = "translate-local"))]
+fn local_translator(
+    _models_dir: &std::path::Path,
+    _languages: &[String],
+) -> Result<Arc<dyn vox_transcribe::translate::Translate>> {
+    anyhow::bail!(
+        "--translate local needs a build with the `translate-local` feature \
+         (cargo build -p vox_scribe --features translate-local)"
+    )
+}
+
+/// Build the translation pass when `--translate` asks for one.
+///
+/// It is checked here, before the models load and the mic opens, because
+/// every way this can be wrong is a way it would otherwise be wrong
+/// quietly: a language whose alphabet gives nothing to decide on, a
+/// direction with no model downloaded, an `--llm` service that isn't
+/// there.
+fn interpreter(cli: &Cli, models_dir: &std::path::Path) -> Result<Option<Interpreter>> {
+    let native = cli.native_language.trim().to_string();
+    let others: Vec<String> = cli
+        .other_language
+        .iter()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    if cli.translate != TranslateKind::Off {
+        // Before the translator is built: a language pair this cannot
+        // decide between is a mistake on the command line whichever
+        // translator was asked for, and a missing model or a missing
+        // feature reported first only hides it.
+        vox_transcribe::language::pair(&native, &others)?;
+    }
+    let by: Arc<dyn vox_transcribe::translate::Translate> = match cli.translate {
+        TranslateKind::Off => return Ok(None),
+        TranslateKind::Local => {
+            // Every direction it may be asked for, which is out of each
+            // other language and into the native one. Loading the way
+            // back too would double the weights for nothing: scribe
+            // never translates into a language nobody is reading in.
+            let mut langs = vec![native.clone()];
+            langs.extend(others.iter().cloned());
+            local_translator(models_dir, &langs)?
+        }
+        TranslateKind::Openai => {
+            let vox_transcribe::openai::Endpoint {
+                url,
+                model,
+                api_key,
+            } = vox_transcribe::openai::Endpoint::from_env();
+            let model = model.context("--translate openai needs VOX_SCRIBE_LLM_MODEL set")?;
+            info!(url = %url, model = %model, "translating: the LLM service");
+            let t = vox_transcribe::openai::OpenAiTranslator::new(OpenAiConfig {
+                base_url: url.clone(),
+                model: model.clone(),
+                api_key,
+                vocabulary: Vec::new(),
+                timeout: Duration::from_secs(cli.llm_timeout),
+            });
+            Arc::new(t)
+        }
+    };
+    let i = Interpreter::new(&native, &others, by)?;
+    eprintln!("translating {i:?}");
+    Ok(Some(i))
 }
 
 fn list_apps() -> Result<()> {

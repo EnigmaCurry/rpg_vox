@@ -243,6 +243,13 @@ pub fn split_at(p: &Paragraph, cuts: &[u64]) -> Vec<Paragraph> {
                     }),
                     other => other.clone(),
                 },
+                // A reading is of the whole paragraph, so only a part
+                // that turned out to be the whole of it keeps one. What
+                // was really split between two speakers has no
+                // translation of either half, and inventing one by
+                // cutting the reading at the same word would be
+                // guessing where the sentence went.
+                translation: (text == p.text).then(|| p.translation.clone()).flatten(),
                 text,
                 words: ws,
                 clips,
@@ -649,6 +656,7 @@ mod tests {
             hardened: false,
             pass3_inflight: false,
             pass4: None,
+            translation: None,
         }
     }
 
@@ -730,6 +738,7 @@ mod tests {
             hardened: false,
             pass3_inflight: false,
             pass4: None,
+            translation: None,
         };
         stamp(&mut p, 1);
         assert_eq!(p.speaker.as_deref(), Some("B"));

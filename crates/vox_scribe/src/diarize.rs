@@ -43,6 +43,8 @@ pub struct Files {
     pub md: Option<PathBuf>,
     pub srt: Option<PathBuf>,
     pub ass: Option<PathBuf>,
+    /// `--translate` with `--record`: the subtitles of the reading.
+    pub translated_srt: Option<PathBuf>,
     pub title: String,
     pub subtitle: String,
 }
@@ -138,6 +140,9 @@ pub fn rewrite(files: &Files, t: &Transcript) -> Result<()> {
     }
     if let Some(p) = &files.ass {
         replace(p, &subtitles::render(Format::Ass, t))?;
+    }
+    if let Some(p) = &files.translated_srt {
+        replace(p, &subtitles::render(Format::TranslatedSrt, t))?;
     }
     Ok(())
 }

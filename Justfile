@@ -472,6 +472,20 @@ scribe *ARGS: download-stt-model download-streaming-stt-model
       cargo run -p vox_scribe --release -- {{ARGS}}
     fi
 
+# Like `just scribe`, with the local translator built in: `--translate
+# local` reads anything heard in another language in your own, with no
+# network (see SCRIBE.md). Fetches the Russian/English Marian models
+# first; the CMake build of CTranslate2 makes the first compile slow.
+scribe-translate *ARGS: download-stt-model download-streaming-stt-model download-translate-model-ru
+    #!/usr/bin/env bash
+    set -euo pipefail
+    args="--features translate-local --release -- --translate local {{ARGS}}"
+    if command -v nix-shell >/dev/null; then
+      nix-shell --run "cargo run -p vox_scribe $args"
+    else
+      cargo run -p vox_scribe $args
+    fi
+
 # Uses nix-shell when available (Linux), plain cargo otherwise (macOS).
 # Optimized vox_scribe build only → target/release/scribe.
 release-scribe:

@@ -19,7 +19,7 @@ use ratatui::widgets::{Block, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 use unicode_width::UnicodeWidthStr;
 use vox_transcribe::correct::changed_words;
-use vox_transcribe::{Change, Event, ParagraphMode, Pass4, Stage, Transcript};
+use vox_transcribe::{Change, Event, ParagraphMode, Pass4, Stage, Transcript, Translation};
 
 use crate::markdown::{timestamp, HistoryBlock};
 use crate::picker::{Action, SourcesMenu};
@@ -30,6 +30,11 @@ const FLASH: Duration = Duration::from_millis(1500);
 /// Bright sky blue (xterm 256-colour 117) for pass-4 text. The basic ANSI
 /// blues are too dark on black in macOS Terminal.
 const LLM_BLUE: Color = Color::Indexed(117);
+
+/// The native-language reading of a paragraph heard in another language.
+/// A colour of its own, because the one thing a reader has to be able to
+/// tell at a glance is which of the two lines is what was actually said.
+const READING: Color = Color::Indexed(180);
 const STATUS_TTL: Duration = Duration::from_secs(3);
 /// How long a source problem (see `Slot::notice`) stays in the footer.
 const NOTICE_TTL: Duration = Duration::from_secs(15);
@@ -972,6 +977,53 @@ fn wrap(
     }
 }
 
+/// The reading under a paragraph heard in another language: one block in
+/// [`READING`], under the line it was made from, with nothing between
+/// them. Also what the translation looks like while it is still being
+/// made, so a hardened-looking paragraph is never silently waiting.
+fn reading_lines(p: &vox_transcribe::Paragraph, text_w: usize, out: &mut Vec<Line<'static>>) {
+    let style = Style::new().fg(READING);
+    let (label, words, label_style) = match &p.translation {
+        Some(Translation::Done { language, text, .. }) => (
+            // Three letters of the language it was heard in, which is
+            // the most that fits beside a timestamp and enough to tell
+            // Russian from Ukrainian.
+            language.chars().take(3).collect::<String>().to_uppercase(),
+            text.split_whitespace()
+                .map(|w| (w.to_string(), style))
+                .collect::<Vec<_>>(),
+            style,
+        ),
+        Some(Translation::Running) => (
+            "…".to_string(),
+            vec![(
+                "translating…".to_string(),
+                style.add_modifier(Modifier::ITALIC),
+            )],
+            style.add_modifier(Modifier::ITALIC),
+        ),
+        Some(Translation::Failed { reason }) => (
+            "!".to_string(),
+            vec![(
+                format!("not translated: {reason}"),
+                Style::new().red().add_modifier(Modifier::ITALIC),
+            )],
+            Style::new().red(),
+        ),
+        // Nothing to say: it was already in the native language, or
+        // nothing is translating anything.
+        Some(Translation::Native) | None => return,
+    };
+    wrap(
+        format!("{label:>w$}", w = GUTTER - 2),
+        label_style,
+        Style::new(),
+        words,
+        text_w,
+        out,
+    );
+}
+
 /// The previous session's tail (when appending), all in grey.
 fn history_lines(history: &[HistoryBlock], width: usize, out: &mut Vec<Line<'static>>) {
     if history.is_empty() {
@@ -987,6 +1039,13 @@ fn history_lines(history: &[HistoryBlock], width: usize, out: &mut Vec<Line<'sta
                     .map(|w| (w.to_string(), grey))
                     .collect();
                 wrap(format!("[{timestamp}]"), grey, grey, words, text_w, out);
+            }
+            HistoryBlock::Reading(text) => {
+                let words = text
+                    .split_whitespace()
+                    .map(|w| (w.to_string(), grey))
+                    .collect();
+                wrap(String::new(), grey, grey, words, text_w, out);
             }
             HistoryBlock::Rule => out.push(Line::styled("─".repeat(width.min(40)), grey)),
             HistoryBlock::Note(note) => out.push(Line::styled(note.clone(), grey.italic())),
@@ -1076,6 +1135,7 @@ fn transcript_lines(
         let start_line = out.len();
         let label = format!("[{}]", timestamp(p.start_ms));
         wrap(label, gutter_style, cont_style, words, text_w, &mut out);
+        reading_lines(p, text_w, &mut out);
         ranges.push((p.id.clone(), start_line, out.len()));
         out.push(Line::default());
     }

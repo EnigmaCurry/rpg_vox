@@ -84,6 +84,11 @@ pub struct Paragraph {
     /// hasn't started.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pass4: Option<Pass4>,
+    /// The reading in the native language, for a paragraph heard in
+    /// another one. `None` when translation is off or hasn't started;
+    /// [`Translation::Native`] when it ran and there was nothing to do.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub translation: Option<Translation>,
 }
 
 /// Pass-4 progress for one paragraph.
@@ -103,6 +108,62 @@ pub enum Pass4 {
     },
 }
 
+/// The native-language reading of one paragraph.
+///
+/// It never replaces [`Paragraph::text`]. What was said is the record --
+/// it is what the word timings, the karaoke subtitles and any later pass
+/// are about, and when a translation looks wrong it is the only way to
+/// see whether the translator or the recognizer was at fault.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "lowercase")]
+pub enum Translation {
+    Running,
+    /// It was heard in `language` and reads as `text`. `lines` is one
+    /// entry per sentence, with the span of audio its source was spoken
+    /// in, for subtitles.
+    Done {
+        language: String,
+        text: String,
+        lines: Vec<TranslatedLine>,
+    },
+    /// Nothing to put into another language: it is written in the
+    /// alphabet you read, or there is too little of it to say
+    /// otherwise. Recorded rather than left as `None` so the pass is
+    /// not asked for it twice.
+    Native,
+    /// The translator failed; `text` is all there is.
+    Failed {
+        reason: String,
+    },
+}
+
+/// One sentence of a translation, over the stretch of audio the sentence
+/// it came from was spoken in.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TranslatedLine {
+    pub text: String,
+    pub start_ms: u64,
+    pub end_ms: u64,
+}
+
+impl Translation {
+    /// The reading, for a paragraph that has one.
+    pub fn text(&self) -> Option<&str> {
+        match self {
+            Translation::Done { text, .. } => Some(text),
+            _ => None,
+        }
+    }
+
+    /// The language it was heard in, for a paragraph that was translated.
+    pub fn language(&self) -> Option<&str> {
+        match self {
+            Translation::Done { language, .. } => Some(language),
+            _ => None,
+        }
+    }
+}
+
 impl Paragraph {
     pub(crate) fn new(id: String, first: Clip) -> Self {
         let mut p = Self {
@@ -117,6 +178,7 @@ impl Paragraph {
             hardened: false,
             pass3_inflight: false,
             pass4: None,
+            translation: None,
         };
         p.rebuild();
         p

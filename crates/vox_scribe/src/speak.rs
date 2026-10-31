@@ -33,28 +33,69 @@ pub struct Para {
 /// The paragraphs of a scribe markdown file: `**[hh:mm:ss]** text` or
 /// `**[hh:mm:ss] Name:** text`. Plain paragraphs are read as they are;
 /// the `#` title, `---` rules and the italic date lines are skipped.
+///
+/// A blockquote under a paragraph is its reading in the operator's
+/// language (`--translate`), and it is what gets read aloud in place of
+/// the paragraph above it. Not a judgement about which matters more: the
+/// voices here are Kokoro's, which has no Russian in it, so reading the
+/// line as it was said would be an English voice sounding out Cyrillic.
 pub fn paragraphs(md: &str) -> Vec<Para> {
-    md.split("\n\n")
+    let mut out: Vec<Para> = Vec::new();
+    for b in md
+        .split("\n\n")
         .map(str::trim)
         .filter(|b| !b.is_empty() && !b.starts_with('#') && *b != "---")
         .filter(|b| !(b.starts_with('*') && !b.starts_with("**") && b.ends_with('*')))
-        .filter_map(|b| {
-            let (speaker, text) = match b.strip_prefix("**[").and_then(|r| r.split_once("** ")) {
-                Some((head, text)) => {
-                    let who = head.split_once(']').map(|(_, w)| w).unwrap_or("");
-                    let who = who.trim().trim_end_matches(':').trim();
-                    ((!who.is_empty()).then(|| who.to_string()), text)
-                }
-                None => (None, b),
-            };
-            let text = text
-                .replace(['*', '`'], "")
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ");
-            (!text.is_empty()).then_some(Para { speaker, text })
-        })
-        .collect()
+    {
+        if let Some(reading) = quoted(b) {
+            // Nothing above it to be the reading of: read it as prose,
+            // which is what a hand-written quote in a transcript is.
+            match out.last_mut() {
+                Some(p) => p.text = reading,
+                None => out.push(Para {
+                    speaker: None,
+                    text: reading,
+                }),
+            }
+            continue;
+        }
+        let (speaker, text) = match b.strip_prefix("**[").and_then(|r| r.split_once("** ")) {
+            Some((head, text)) => {
+                let who = head.split_once(']').map(|(_, w)| w).unwrap_or("");
+                let who = who.trim().trim_end_matches(':').trim();
+                ((!who.is_empty()).then(|| who.to_string()), text)
+            }
+            None => (None, b),
+        };
+        let text = clean(text);
+        if !text.is_empty() {
+            out.push(Para { speaker, text });
+        }
+    }
+    out
+}
+
+/// A blockquote block as one line, or `None` when it isn't one.
+fn quoted(block: &str) -> Option<String> {
+    if !block.starts_with("> ") {
+        return None;
+    }
+    let text = clean(
+        &block
+            .lines()
+            .map(|l| l.trim_start_matches("> ").trim())
+            .collect::<Vec<_>>()
+            .join(" "),
+    );
+    (!text.is_empty()).then_some(text)
+}
+
+/// Markdown emphasis and code markers out, whitespace collapsed.
+fn clean(text: &str) -> String {
+    text.replace(['*', '`'], "")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// `text` cut after each `.`, `?` or `!` (and any closing quote) that is
@@ -306,6 +347,36 @@ mod tests {
                     text: "A plain note.".into()
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn a_reading_is_what_gets_read_aloud() {
+        // What `--translate` writes: the line as it was said, and the
+        // blockquote under it. Kokoro has no Russian voice, so the
+        // blockquote is the one that can actually be spoken.
+        let md = "# talk\n\n**[00:00:02]** Да, конечно.\n\n> Yes, of\n> course.\n\n                  **[00:00:09]** Plain English, no reading.\n";
+        assert_eq!(
+            paragraphs(md),
+            vec![
+                Para {
+                    speaker: None,
+                    text: "Yes, of course.".into()
+                },
+                Para {
+                    speaker: None,
+                    text: "Plain English, no reading.".into()
+                },
+            ]
+        );
+        // A quote with no paragraph above it is somebody quoting
+        // something, and is read as prose.
+        assert_eq!(
+            paragraphs("> Just a quote.\n"),
+            vec![Para {
+                speaker: None,
+                text: "Just a quote.".into()
+            }]
         );
     }
 

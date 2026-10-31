@@ -94,6 +94,7 @@ fn transcript_from_ass(path: &str) -> Transcript {
             hardened: true,
             pass3_inflight: false,
             pass4: None,
+            translation: None,
         };
         p.end_ms = e;
         t.paragraphs.push(p);

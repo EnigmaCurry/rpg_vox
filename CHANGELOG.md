@@ -8,6 +8,24 @@ section after the version it releases.
 
 ### scribe
 
+- **`--translate`: what was said in another language, read in yours.**
+  Pass 2's recognizer hears twenty-five languages without being told
+  which, but it never says which it heard — so the alphabet is read off
+  the text, and a paragraph that comes back in Cyrillic is also put into
+  English, a sentence at a time. What was said is never replaced: the
+  reading goes under it, as a blockquote in the markdown, in its own
+  colour in the TUI, and as `NAME.translated.srt` beside the subtitles of
+  what was said. `--translate local` is Marian on the CPU with no
+  network at all (about 50 ms a sentence, needs a build with the
+  `translate-local` feature); `--translate openai` asks the `--llm`
+  service and can be told to leave a command alone. `--native-language`
+  is what you read in, `--other-language` what to listen out for. The
+  alphabet is the whole of the detection and the limit is stated rather
+  than papered over: a pair that shares one — German against English — is
+  refused at startup, because guessing there means translating a line out
+  of a language it was never in. See
+  [translation](SCRIBE.md#translation-optional).
+
 - **Words no longer come out of order.** A short utterance that the
   live pass never showed (too quick for it) only reached the transcript
   when its re-decode finished, and was added after whatever had been said
