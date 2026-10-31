@@ -9,10 +9,10 @@
  *
  * Nothing here reaches that function: affinity is set only when a
  * replica pool is given a core offset, and ct2rs gives none. It is
- * defined all the same, in vox_android, on top of the
+ * defined all the same, in vox_transcribe::ct2, on top of the
  * sched_setaffinity Bionic has always had -- so if it is ever called it
  * will work rather than abort. This header is force-included into the
- * CTranslate2 build by `just _android-jni`.
+ * CTranslate2 build by the `android` and `_android-jni` recipes.
  *
  * On API 36 and up Bionic declares it too, identically, which C++
  * allows.

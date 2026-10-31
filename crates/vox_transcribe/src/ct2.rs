@@ -186,6 +186,43 @@ impl Translate for Ct2Translator {
     }
 }
 
+/// `pthread_setaffinity_np`, which CTranslate2 refers to from one
+/// function and Android's Bionic declares only from API 36 -- scribe
+/// builds for 26, where the declaration is hidden and that file does not
+/// compile. android/ct2-affinity.h declares it for the build and says
+/// the rest; this is the definition it promises, in terms of the two
+/// calls Bionic has had all along.
+///
+/// It lives here, with the rest of what CTranslate2 needs, because
+/// everything that links it needs the symbol: the app through
+/// vox_android and the command line through vox_scribe.
+///
+/// Nothing calls it. CTranslate2 sets affinity only for a replica pool
+/// given a core offset, and ct2rs gives none; it is a real
+/// implementation rather than a stub so that being unreached is not what
+/// makes it correct.
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub unsafe extern "C" fn pthread_setaffinity_np(
+    thread: libc::pthread_t,
+    set_size: libc::size_t,
+    set: *const libc::cpu_set_t,
+) -> libc::c_int {
+    extern "C" {
+        /// Bionic's, since API 21. The thread id `sched_setaffinity`
+        /// wants is not the `pthread_t` the caller has.
+        fn pthread_gettid_np(thread: libc::pthread_t) -> libc::pid_t;
+    }
+    let tid = pthread_gettid_np(thread);
+    if libc::sched_setaffinity(tid, set_size, set) == 0 {
+        0
+    } else {
+        // The pthread_* functions return the error rather than setting
+        // errno, and CTranslate2 puts this number in what it throws.
+        *libc::__errno()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

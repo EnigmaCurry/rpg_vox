@@ -562,8 +562,9 @@ behind a feature flag. Which builds carry it:
 | `just scribe`, `just release-scribe`, `just install-scribe` | yes |
 | `just dist` release archives — Linux, macOS, Windows | yes |
 | `just win64` (cross-built Windows) | yes |
+| `just android`, `just android-app` (Android arm64) | yes |
 | `cargo build -p vox_scribe` | no |
-| Android, iOS | no |
+| iOS | no |
 
 Every `just` recipe that builds scribe for this machine carries it, so
 they share one build; a plain `cargo build` without the feature is a

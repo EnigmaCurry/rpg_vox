@@ -200,37 +200,6 @@ fn unpack(archive: &Path, dest: &Path, spec: &str) -> Result<()> {
     Ok(())
 }
 
-/// `pthread_setaffinity_np`, which Bionic has only from API 36 and
-/// CTranslate2 refers to from one function. See android/ct2-affinity.h
-/// for the whole of it; this is the definition that header promises, in
-/// terms of the two calls Bionic has had all along.
-///
-/// Nothing calls it: CTranslate2 sets affinity only for a replica pool
-/// given a core offset, and ct2rs gives none. It is a real
-/// implementation rather than a stub so that staying true does not
-/// depend on that.
-#[cfg(all(target_os = "android", feature = "translate-local"))]
-#[no_mangle]
-pub unsafe extern "C" fn pthread_setaffinity_np(
-    thread: libc::pthread_t,
-    set_size: libc::size_t,
-    set: *const libc::cpu_set_t,
-) -> libc::c_int {
-    extern "C" {
-        /// Bionic's, since API 21. The thread id `sched_setaffinity`
-        /// wants is not the `pthread_t` the caller has.
-        fn pthread_gettid_np(thread: libc::pthread_t) -> libc::pid_t;
-    }
-    let tid = pthread_gettid_np(thread);
-    if libc::sched_setaffinity(tid, set_size, set) == 0 {
-        0
-    } else {
-        // The pthread_* functions return the error rather than setting
-        // errno, and CTranslate2 puts this number in what it throws.
-        *libc::__errno()
-    }
-}
-
 fn change_name(c: Change) -> &'static str {
     match c {
         Change::Opened => "opened",

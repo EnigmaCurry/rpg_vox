@@ -687,6 +687,11 @@ win64 ARGS="-p vox_scribe -p vox_agent --features vox_scribe/translate-local":
 # LD_LIBRARY_PATH and points VOX_SCRIBE_MODELS at ./models unless already
 # set. Needs the NDK (ANDROID_NDK_HOME, default: Homebrew's android-ndk),
 # `rustup target add aarch64-linux-android` and `cargo install cargo-ndk`.
+#
+# Carries `--translate local`, like the app (`just android-app`) and every
+# other build here. It needs `curl` on the phone to fetch the model, which
+# an Android shell may not have -- `adb push` a models directory, or point
+# VOX_SCRIBE_MODELS at one, if it hasn't.
 android:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -698,22 +703,37 @@ android:
     # lib dir (the build script checks that path whatever the target is, so
     # a host build then looks for .a files among Android .so files).
     export CARGO_TARGET_DIR="$PWD/target/android"
-    cargo ndk -t arm64-v8a --platform 26 build --release -p vox_scribe
+    # CTranslate2 for the NDK; see `_android-jni`, which says what the
+    # header is for.
+    export TARGET_CXXFLAGS="-include $PWD/android/ct2-affinity.h"
+    cargo ndk -t arm64-v8a --platform 26 build --release \
+      -p vox_scribe --features translate-local
     out=dist/android-arm64
     rm -rf "$out"
     mkdir -p "$out"
     libs="$CARGO_TARGET_DIR/sherpa-onnx-prebuilt/jniLibs/arm64-v8a"
     cp "$CARGO_TARGET_DIR/aarch64-linux-android/release/scribe" "$out/"
     cp "$libs/libsherpa-onnx-c-api.so" "$libs/libonnxruntime.so" "$out/"
+    # The C++ runtime CTranslate2 is built against. sherpa-onnx's
+    # prebuilt libraries have it linked in statically, so before
+    # `translate-local` there was no C++ of ours and nothing to ship;
+    # now the NDK links the shared one by default and it has to come
+    # along. The check at the end of this recipe is what says so.
+    # Stripped: the NDK's copy is nine tenths debug symbols.
+    ndk_bin="$(dirname "$(ls "$ANDROID_NDK_HOME"/toolchains/llvm/prebuilt/*/bin/llvm-readelf | head -1)")"
+    "$ndk_bin/llvm-strip" -o "$out/libc++_shared.so" \
+      "$(ls "$ANDROID_NDK_HOME"/toolchains/llvm/prebuilt/*/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so | head -1)"
     cp SCRIBE.md "$out/"
     printf '%s\n' '#!/system/bin/sh' \
       'dir="$(cd "$(dirname "$0")" && pwd)"' \
       'export LD_LIBRARY_PATH="$dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"' \
       'export VOX_SCRIBE_MODELS="${VOX_SCRIBE_MODELS:-$dir/models}"' \
       'exec "$dir/scribe" "$@"' > "$out/run.sh"
+    # llvm-strip keeps the mode of what it read, which in a Nix store is
+    # read-only; a bundle anyone can unpack over should not be.
     chmod 755 "$out/run.sh" "$out/scribe"
-    readelf="$(ls "$ANDROID_NDK_HOME"/toolchains/llvm/prebuilt/*/bin/llvm-readelf | head -1)"
-    for need in $("$readelf" -d "$out"/scribe "$out"/*.so | sed -n 's/.*NEEDED.*\[\(.*\)\]/\1/p' | sort -u); do
+    chmod 644 "$out"/*.so
+    for need in $("$ndk_bin/llvm-readelf" -d "$out"/scribe "$out"/*.so | sed -n 's/.*NEEDED.*\[\(.*\)\]/\1/p' | sort -u); do
       case "$need" in
         libc.so|libm.so|libdl.so|liblog.so|libandroid.so|libaaudio.so) ;;
         *) [ -f "$out/$need" ] || { echo "missing $need" >&2; exit 1; } ;;
@@ -831,8 +851,24 @@ _android-jni:
     jni=android/app/src/main/jniLibs/arm64-v8a
     libs="$CARGO_TARGET_DIR/sherpa-onnx-prebuilt/jniLibs/arm64-v8a"
     mkdir -p "$jni"
+    # libc++_shared.so for the same reason as in the `android` recipe:
+    # CTranslate2 is ours and the NDK links the shared C++ runtime,
+    # where sherpa-onnx's prebuilt libraries have a static one of their
+    # own. Without it `System.loadLibrary("vox_android")` fails on the
+    # phone with nothing but the name of a file.
     cp "$CARGO_TARGET_DIR/aarch64-linux-android/release/libvox_android.so" \
       "$libs/libsherpa-onnx-c-api.so" "$libs/libonnxruntime.so" "$jni/"
+    ndk_bin="$(dirname "$(ls "$ANDROID_NDK_HOME"/toolchains/llvm/prebuilt/*/bin/llvm-readelf | head -1)")"
+    "$ndk_bin/llvm-strip" -o "$jni/libc++_shared.so" \
+      "$(ls "$ANDROID_NDK_HOME"/toolchains/llvm/prebuilt/*/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so | head -1)"
+    # Every library the app loads has to be in the APK: a missing one is
+    # a crash at startup on the phone and nothing at all at build time.
+    for need in $("$ndk_bin/llvm-readelf" -d "$jni"/*.so | sed -n 's/.*NEEDED.*\[\(.*\)\]/\1/p' | sort -u); do
+      case "$need" in
+        libc.so|libm.so|libdl.so|liblog.so|libandroid.so|libaaudio.so) ;;
+        *) [ -f "$jni/$need" ] || { echo "missing $need in $jni" >&2; exit 1; } ;;
+      esac
+    done
 
 # iOS dictation app (ios/): builds crates/vox_ios for arm64 devices,
 # generates ios/Scribe.xcodeproj (xcodegen), builds and signs it and, with

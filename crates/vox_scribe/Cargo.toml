@@ -16,9 +16,9 @@ default = ["denoise"]
 denoise = ["vox_transcribe/deepfilter"]
 # `--translate local`: Marian translation on the CPU, with no network.
 # Off by default because it brings a C++ library and a CMake build with
-# it; every host build turns it on, including the release archives
-# (`just dist`) and the cross-built Windows one (`just win64`). Android
-# and iOS go without. `--translate openai` needs no feature.
+# it; every build here turns it on -- the release archives (`just dist`),
+# the cross-built Windows one (`just win64`) and both Android ones.
+# Only iOS goes without. `--translate openai` needs no feature.
 translate-local = ["vox_transcribe/ct2"]
 
 [dependencies]

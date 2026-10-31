@@ -61,7 +61,7 @@ section after the version it releases.
 - **The release archives translate locally too, Windows included.**
   `just dist` builds scribe with `translate-local` on every target, so
   the Linux, macOS and Windows archives all answer `--translate local`
-  rather than "needs a build with the feature"; only Android and iOS go
+  rather than "needs a build with the feature"; iOS is the one left
   without. The models are not in the archive — 80 MB a direction — and
   do not need to be: an unpacked archive downloads the one it is asked
   for, as above. Three things had to agree before Windows would link it:
@@ -185,6 +185,21 @@ section after the version it releases.
   editing and cutting stay with it — "The reading" hides it rather than
   replacing it. Readings are saved with the transcript, in two columns
   the desktop's chat database ignores, so a thread reopens with them.
+
+- **The command-line bundle translates too.** `just android`, the
+  `dist/android-arm64/` bundle for a shell on the phone, is built with
+  `translate-local` like everything else, so `--translate local` works
+  there as it does on the desktop. It wants `curl` to fetch the model,
+  which an Android shell may not have; `adb push` a models directory, or
+  point `VOX_SCRIBE_MODELS` at one, if it hasn't.
+
+  Both Android builds now ship `libc++_shared.so`: CTranslate2 is the
+  first C++ of ours in them, and the NDK links the shared C++ runtime
+  where sherpa-onnx's prebuilt libraries carry a static one. Leaving it
+  out is a crash at startup on the phone and nothing at all at build
+  time, so the APK's libraries are now checked against what they say
+  they need, the way the bundle's already were -- which is how this was
+  caught without a device.
 
 - **The app downloaded the wrong Parakeet.** It fetched
   `parakeet-tdt-0.6b-v2` while the library had moved to v3, so a fresh
