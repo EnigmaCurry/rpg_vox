@@ -265,7 +265,14 @@ again whenever one of those passes changes a word -- a sentence pass 3
 rewrites is read again, so what you see is of the words as they finally
 stand. It is simply not what is on the screen.
 
-Two things follow from that:
+A paragraph the engine hasn't ruled on yet — one pass 1 is still typing,
+before pass 2 has decided what language it is — goes by its alphabet,
+the same test the engine will apply. Until there are enough letters to
+say, it shows as `…` rather than risk being the other language, which
+costs about a word of the live text and is the whole point of the
+setting.
+
+Two more things follow:
 
 * A sentence whose reading hasn't arrived yet shows as `…`. The reading
   runs a sentence behind the speaking on purpose — a translator given

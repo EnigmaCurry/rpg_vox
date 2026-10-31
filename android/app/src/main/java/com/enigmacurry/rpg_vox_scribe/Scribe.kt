@@ -95,11 +95,27 @@ data class Para(
     val reading: String? get() = translation?.takeIf { it.isNotBlank() }
 
     /**
-     * Whether what was said is all there is to show: it is in the
-     * language you read already, translation is off, or the translator
-     * gave up on it and nothing else is coming.
+     * Whether what was said is what to show: it is in the language you
+     * read, nothing is being translated at all, or the translator gave
+     * up on it and nothing else is coming.
+     *
+     * [translating] is whether this recording has a translator; [native]
+     * the alphabet the reader reads. Both matter because of the state
+     * the engine has not answered yet: every paragraph starts with no
+     * translation at all -- pass 1 is typing it and pass 2 has not
+     * decided what language it is -- and showing it then is how the
+     * other language got on the screen. So while nothing is settled the
+     * app asks the question the engine will: what alphabet is this
+     * written in. An answer of "not enough letters yet" counts as not
+     * yet readable, which costs a word of latency on the live text and
+     * is the price of never showing a language the reader cannot read.
      */
-    val own: Boolean get() = translated == null || translated == "native" || translated == "failed"
+    fun own(translating: Boolean, native: Script): Boolean = when {
+        !translating -> true
+        translated == "native" || translated == "failed" -> true
+        translated == "done" -> false
+        else -> script(text) == native
+    }
 
     /**
      * The paragraph as rows: a stretch of what was said, with the
@@ -490,6 +506,18 @@ object Scribe {
             .apply()
         languagesChanged()
     }
+
+    /**
+     * Whether anything is being translated: a language to listen out
+     * for, with the model that reads it into yours here. Without one,
+     * every paragraph is shown as it was said -- there is nothing else
+     * to show, whatever language it is in.
+     */
+    val translating: Boolean
+        get() = others.any { l -> translation(l, native)?.let(store::installed) == true }
+
+    /** Whether [p] is shown as what was said, rather than as its reading. */
+    fun saidAsIs(p: Para) = p.own(translating, native.script)
 
     /** The models the languages now ask for, in the order they install. */
     fun wanted(): List<Model> =
@@ -1381,7 +1409,10 @@ object Scribe {
      */
     fun text(): String =
         paragraphs.mapNotNull { p ->
-            val body = if (p.own) p.text else p.readings.joinToString(" ") { it.text }
+            val body = when {
+                saidAsIs(p) -> p.text
+                else -> p.readings.joinToString(" ") { it.text }
+            }
             body.takeIf { it.isNotBlank() }
                 ?.let { if (p.source != null) "${p.source}: $it" else it }
         }.joinToString("\n\n")
@@ -1393,7 +1424,7 @@ object Scribe {
     fun lastLine(): String =
         paragraphs.asReversed().firstNotNullOfOrNull { p ->
             when {
-                !p.own -> p.readings.lastOrNull()?.text
+                !saidAsIs(p) -> p.readings.lastOrNull()?.text
                 else -> p.clips.filter { !it.partial && it.text.isNotBlank() }
                     .takeIf { it.isNotEmpty() }
                     ?.joinToString(" ") { it.text }

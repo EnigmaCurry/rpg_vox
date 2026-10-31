@@ -143,6 +143,43 @@ enum class Script(val label: String) {
 }
 
 /**
+ * The alphabet [text] is written in, or null when there is too little of
+ * it, or too much of a mixture, to say.
+ *
+ * The same rule and the same numbers as `vox_transcribe::language`,
+ * which is what decides for real once pass 2 has the utterance: a
+ * majority of the letters, and enough of them to believe. The app asks
+ * it of a paragraph the engine has not ruled on yet -- while pass 1 is
+ * still typing it -- to know whether it is text the reader can read.
+ */
+fun script(text: String): Script? {
+    var latin = 0
+    var cyrillic = 0
+    var other = 0
+    for (c in text) {
+        if (!c.isLetter()) continue
+        when (c) {
+            in 'a'..'z', in 'A'..'Z' -> latin++
+            in '\u0400'..'\u052f' -> cyrillic++
+            // Latin letters with diacritics, which are Latin: é, ü, ø.
+            in '\u00c0'..'\u024f' -> latin++
+            else -> other++
+        }
+    }
+    val total = latin + cyrillic + other
+    // "OK" is two letters of Latin in a Russian conversation.
+    if (total < 8) return null
+    val (best, n) = listOf(
+        Script.LATIN to latin,
+        Script.CYRILLIC to cyrillic,
+        Script.OTHER to other,
+    ).maxBy { it.second }
+    // Below a majority it is a line with a word of another language in
+    // it, which is not the same as a line in that language.
+    return best.takeIf { n.toFloat() / total >= 0.7f }
+}
+
+/**
  * The languages that can be read in: the ones with a pass-1 model.
  * Nothing else is offered, because the live text has to be in some
  * language and the finished text is already in all of them.

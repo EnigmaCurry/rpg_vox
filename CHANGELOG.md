@@ -204,6 +204,15 @@ section after the version it releases.
   that sentence was spoken, a translation having no word timings of its
   own. Copy, Share and the notification say what the screen says.
 
+  A paragraph the engine has not ruled on yet -- one pass 1 is still
+  typing, where pass 2 has not said what language it is and the
+  translator has not read it -- goes by its alphabet, the same rule and
+  the same numbers the engine uses (`script` in the app, a majority of
+  at least eight letters). Until there are enough letters to say, it
+  shows as an ellipsis rather than risk being the other language: about
+  a word of live text, against which it was the live text that had been
+  putting Russian on an English screen all along.
+
   The words that appear *as you speak* come from pass 1, the one pass
   that has to be told which language to listen in -- it decodes as the
   words are said, so its model is chosen before any of them have been,

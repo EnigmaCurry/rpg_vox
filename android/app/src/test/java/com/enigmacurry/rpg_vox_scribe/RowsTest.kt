@@ -95,11 +95,12 @@ class OwnTest {
         translated = translated,
     )
 
+    /** Reading English, with Russian being listened out for. */
+    private fun shown(p: Para) = p.own(translating = true, native = Script.LATIN)
+
     @Test
     fun a_paragraph_in_your_own_language_is_itself() {
-        // Translation off, or nothing to translate.
-        assertTrue(para("Yes, of course.", null).own)
-        assertTrue(para("Yes, of course.", "native").own)
+        assertTrue(shown(para("Yes, of course, that is right.", "native")))
     }
 
     @Test
@@ -109,26 +110,51 @@ class OwnTest {
             "done",
             listOf(Reading("Да, конечно.", "Yes, of course.")),
         )
-        assertFalse(p.own)
+        assertFalse(shown(p))
         assertEquals(listOf("Yes, of course."), p.readings.map { it.text })
     }
 
     /** Nothing more is coming, so what was said is better than nothing. */
     @Test
     fun a_translation_that_failed_falls_back_to_what_was_said() {
-        assertTrue(para("Да, конечно.", "failed").own)
+        assertTrue(shown(para("Да, конечно.", "failed")))
+    }
+
+    /** With nothing being translated, every paragraph is itself. */
+    @Test
+    fun with_translation_off_everything_is_shown_as_it_was_said() {
+        for (state in listOf(null, "running", "native", "done")) {
+            assertTrue(
+                "state $state",
+                para("Да, конечно.", state).own(translating = false, native = Script.LATIN),
+            )
+        }
     }
 
     /**
-     * Being read for the first time: not the reader's language, and no
-     * reading yet, which the screen shows as an ellipsis rather than as
-     * the other language.
+     * The state the engine has not answered yet, which is every
+     * paragraph while pass 1 is typing it: the alphabet decides, and
+     * this is the case that put Russian on the screen.
      */
     @Test
-    fun a_paragraph_still_being_read_is_not_shown_as_what_was_said() {
-        val p = para("Да, конечно.", "running")
-        assertFalse(p.own)
-        assertTrue(p.readings.isEmpty())
-        assertTrue(p.rows().all { it.reading == null })
+    fun a_paragraph_the_engine_has_not_ruled_on_goes_by_its_alphabet() {
+        // Being typed by pass 1 in Russian: not shown, whatever the
+        // engine has or hasn't said yet.
+        assertFalse(shown(para("Да, конечно, это правда", null)))
+        assertFalse(shown(para("Да, конечно, это правда", "running")))
+        // Being typed in English: shown, as it always was.
+        assertTrue(shown(para("Yes, of course, that is right", null)))
+        assertTrue(shown(para("Yes, of course, that is right", "running")))
+        // Too few letters to say: not yet readable, which costs a word
+        // of live text and never shows the other language.
+        assertFalse(shown(para("Да", null)))
+        assertFalse(shown(para("Yes", null)))
+    }
+
+    /** A word of one language in a line of another does not decide it. */
+    @Test
+    fun a_stray_word_does_not_decide_the_alphabet() {
+        assertTrue(shown(para("Yes of course, да, that is right", null)))
+        assertFalse(shown(para("Да, конечно, это правда, OK", null)))
     }
 }

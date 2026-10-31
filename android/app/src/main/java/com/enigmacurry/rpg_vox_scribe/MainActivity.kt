@@ -924,7 +924,7 @@ fun Para.wordAt(i: Int, shown: Int): Word =
 /**
  * One paragraph, in the language you read and in no other.
  *
- * A paragraph spoken in your own language is itself ([Para.own]): the
+ * A paragraph spoken in your own language is itself ([Scribe.saidAsIs]): the
  * text, with everything it can do -- tap a word to hear it, select to
  * edit or cut -- because that is the text the passes are working on and
  * the one the word timings are of.
@@ -939,11 +939,13 @@ fun Para.wordAt(i: Int, shown: Int): Word =
  * A sentence whose reading has not landed yet is an ellipsis: the
  * reading runs a sentence behind the speaking on purpose (a translator
  * given half a sentence returns half a thought), and the alternative to
- * saying so is a paragraph that appears to have stopped.
+ * saying so is a paragraph that appears to have stopped. So is a
+ * paragraph pass 1 is still typing in the other language, which is all
+ * of one until pass 2 has decided it and the translator has read it.
  */
 @Composable
 private fun Paragraph(p: Para, playing: Playing?, at: Karaoke?, canPlay: Boolean, follow: Boolean) {
-    if (p.own) {
+    if (Scribe.saidAsIs(p)) {
         Said(p, playing, at, canPlay, follow)
         return
     }
@@ -951,8 +953,9 @@ private fun Paragraph(p: Para, playing: Playing?, at: Karaoke?, canPlay: Boolean
         Reading(r.text, p.heardIn, own = true, at = r.startMs.takeIf { canPlay }, p = p)
     }
     // Something was said that has not been read yet: the sentence being
-    // spoken now, or one whose reading is still on its way.
-    if (p.rows().any { it.reading == null }) {
+    // spoken now, one whose reading is still on its way, or the whole
+    // paragraph while pass 1 is still typing it.
+    if (p.readings.isEmpty() || p.rows().any { it.reading == null }) {
         Text(
             "…",
             style = MaterialTheme.typography.bodyLarge.scaled(FONT_SCALES[Scribe.fontStep]),
