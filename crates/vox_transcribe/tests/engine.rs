@@ -840,3 +840,65 @@ fn pass_1_follows_the_language_pass_2_heard() {
         "the switch should follow the utterance, not precede it: {partials:?}"
     );
 }
+
+/// A reading, once made, is on every event after it.
+///
+/// What a screen showing the reading under the paragraph depends on: a
+/// paragraph that came back without one, between two that had it, would
+/// take the reading off the screen and put it back a moment later.
+#[test]
+fn a_reading_once_made_is_on_every_event_after_it() {
+    let (events, _t) = run_translated(Arc::new(RussianOffline), false);
+    let mut with_reading: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen = 0;
+    for e in &events {
+        let Event::Paragraph { paragraph, change } = e else {
+            continue;
+        };
+        let has = paragraph
+            .translation
+            .as_ref()
+            .and_then(vox_transcribe::Translation::text)
+            .is_some();
+        if has {
+            with_reading.insert(paragraph.id.clone());
+            seen += 1;
+        } else {
+            assert!(
+                !with_reading.contains(&paragraph.id),
+                "the reading went away on {change:?}: {:?}",
+                paragraph.translation,
+            );
+        }
+    }
+    assert!(seen > 0, "nothing was read at all");
+}
+
+/// Every line of a reading carries the sentence it was made from, and
+/// that sentence is in the paragraph as the paragraph reads.
+///
+/// What showing a reading beside what was said depends on: the screen
+/// finds each sentence in the paragraph to put its reading under it, and
+/// a `source` that was empty or reworded would leave the reading
+/// homeless (see `Para.rows` in the Android app).
+#[test]
+fn each_line_of_a_reading_says_which_sentence_it_is_of() {
+    let (_events, t) = run_translated(Arc::new(RussianOffline), false);
+    let mut checked = 0;
+    for p in &t.paragraphs {
+        let Some(vox_transcribe::Translation::Done { lines, of, .. }) = &p.translation else {
+            continue;
+        };
+        assert!(!lines.is_empty(), "a reading with no lines: {p:#?}");
+        for l in lines {
+            assert!(!l.source.trim().is_empty(), "a line with no source: {l:?}");
+            assert!(
+                of.contains(l.source.trim()),
+                "{:?} is not in the text it was made from: {of:?}",
+                l.source,
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked > 0, "nothing was read at all");
+}

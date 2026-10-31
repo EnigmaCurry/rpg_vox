@@ -72,6 +72,20 @@ data class Para(
      */
     val translation: String? = null,
     val heardIn: String? = null,
+    /**
+     * The reading a sentence at a time, each with the sentence it was
+     * made from, so it can be shown beside what was said rather than
+     * under all of it.
+     */
+    val readings: List<Reading> = emptyList(),
+    /**
+     * What the engine says of the translation: `done`, `native` (it is
+     * in your language already, so there is nothing to read), `running`,
+     * `failed`, or null when translation is off. [Show] needs the
+     * difference -- "the reading" of a paragraph already in your
+     * language is the paragraph.
+     */
+    val translated: String? = null,
 ) {
     val text: String get() = clips.filter { it.text.isNotBlank() }.joinToString(" ") { it.text }
     /** [text]'s words as shown. */
@@ -79,7 +93,71 @@ data class Para(
 
     /** Whether there is a reading to show, under [Show.TRANSLATION] too. */
     val reading: String? get() = translation?.takeIf { it.isNotBlank() }
+
+    /**
+     * Whether what was said is all there is to show: it is in the
+     * language you read already, translation is off, or the translator
+     * gave up on it and nothing else is coming.
+     */
+    val own: Boolean get() = translated == null || translated == "native" || translated == "failed"
+
+    /**
+     * The paragraph as rows: a stretch of what was said, with the
+     * reading of it when there is one.
+     *
+     * Built by walking [text] and taking each reading's source sentence
+     * out of it in turn, so a sentence still being spoken -- or one
+     * whose reading hasn't landed yet -- is a row of its own with
+     * nothing under it, and the reading of each stays with the sentence
+     * it is of. A reading whose sentence a later pass has rewritten is
+     * dropped rather than shown against the wrong words.
+     */
+    fun rows(): List<Row> {
+        val whole = text
+        if (readings.isEmpty()) return listOf(Row(whole, null, 0, 0))
+        val out = mutableListOf<Row>()
+        var pos = 0
+        var word = 0
+        for (r in readings) {
+            if (r.source.isEmpty()) continue
+            val at = whole.indexOf(r.source, pos)
+            if (at < 0) continue
+            // Anything before this sentence that no reading claimed: a
+            // sentence whose own reading was dropped, or the start of a
+            // paragraph the translator hasn't caught up with.
+            if (at > pos) {
+                val before = whole.substring(pos, at).trim()
+                if (before.isNotEmpty()) {
+                    val beforeAt = whole.indexOf(before, pos)
+                    out += Row(before, null, word, beforeAt)
+                    word += words(before)
+                }
+            }
+            out += Row(r.source, r.text, word, at)
+            word += words(r.source)
+            pos = at + r.source.length
+        }
+        val tail = whole.substring(pos).trim()
+        if (tail.isNotEmpty()) out += Row(tail, null, word, whole.indexOf(tail, pos))
+        return out
+    }
+
+    private fun words(s: String) = s.split(' ').count { it.isNotEmpty() }
 }
+
+/** One sentence of a reading, and the sentence it was made from. */
+data class Reading(val source: String, val text: String)
+
+/**
+ * A stretch of what was said, with the reading of it when it has one.
+ *
+ * [firstWord] and [at] are where the stretch starts in the paragraph --
+ * its first word's index, and its first character's offset in the
+ * paragraph's text. The screen needs both: a word is played by its
+ * index, and a cut is made by the offsets of what was selected, and
+ * both of those are the paragraph's, not the row's.
+ */
+data class Row(val said: String, val reading: String?, val firstWord: Int, val at: Int)
 
 /**
  * What the transcript shows of a translated paragraph. What was said is
@@ -1403,7 +1481,9 @@ object Scribe {
         // `{"state": "done", "language": …, "text": …}` once a reading
         // has landed; "running", "native" and "failed" have none to show,
         // and a paragraph in your own language stays at "native".
-        val tr = o.optJSONObject("translation")?.takeIf { it.optString("state") == "done" }
+        val state = o.optJSONObject("translation")
+        val tr = state?.takeIf { it.optString("state") == "done" }
+        val lines = tr?.optJSONArray("lines")
         val p = Para(
             id = o.getString("id"),
             clips = (0 until clips.length()).map {
@@ -1416,6 +1496,13 @@ object Scribe {
             atMs = src.baseMs + o.optLong("start_ms"),
             translation = tr?.optString("text")?.takeIf { it.isNotEmpty() },
             heardIn = tr?.optString("language")?.takeIf { it.isNotEmpty() },
+            readings = (0 until (lines?.length() ?: 0)).mapNotNull {
+                val l = lines!!.getJSONObject(it)
+                val source = l.optString("source")
+                val text = l.optString("text")
+                if (source.isEmpty() || text.isEmpty()) null else Reading(source, text)
+            },
+            translated = state?.optString("state")?.takeIf { it.isNotEmpty() },
         )
         return withoutCuts(src, p)
     }

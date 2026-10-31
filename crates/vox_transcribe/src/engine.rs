@@ -1382,6 +1382,7 @@ impl Core {
                         let at =
                             |i: usize, or: u64| p.words.get(i).map_or(or, |w: &Word| w.start_ms);
                         TranslatedLine {
+                            source: l.source.clone(),
                             text: l.text.clone(),
                             start_ms: at(l.first_word, p.start_ms),
                             end_ms: l.last_word.checked_sub(1).map_or(p.end_ms, |i| {

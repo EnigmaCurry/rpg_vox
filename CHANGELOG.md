@@ -172,7 +172,16 @@ section after the version it releases.
   the language you *read in* (what every translation is read into), the
   language the *live text* is in, the languages to *listen out for* (a
   model each, 81 MB, downloaded there), and what the transcript *shows*
-  of a paragraph that was read: what was said, the reading, or both.
+  of a paragraph that was read: what was said, the reading, or both --
+  and **Both** interleaves them a sentence at a time, each sentence of
+  what was said with the reading of that sentence under it. A paragraph
+  runs to two hundred words, so a reading of the whole of it sits too
+  far from the sentence it is of to be read along with, and lands long
+  after those words have gone up the screen. Each line of a reading
+  carries the sentence it was made from for this (`TranslatedLine`), so
+  the two stay together through the later passes -- and a reading whose
+  sentence pass 3 or 4 has since reworded is dropped rather than shown
+  against words it is not of.
 
   The words that appear *as you speak* come from pass 1, the one pass
   that has to be told which language to listen in -- it decodes as the

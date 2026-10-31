@@ -149,10 +149,18 @@ pub enum Translation {
     Failed { of: String, reason: String },
 }
 
-/// One sentence of a translation, over the stretch of audio the sentence
-/// it came from was spoken in.
+/// One sentence of a translation, with the sentence it came from and
+/// the stretch of audio that one was spoken in.
+///
+/// `source` is what lets a reading be shown beside what was said rather
+/// than under all of it: a paragraph runs to two hundred words, and a
+/// reading of the whole of it sits too far from the sentence it is of to
+/// be read along with. It is the text the translator was given, so it
+/// can be found in the paragraph as it stood then.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranslatedLine {
+    #[serde(default)]
+    pub source: String,
     pub text: String,
     pub start_ms: u64,
     pub end_ms: u64,

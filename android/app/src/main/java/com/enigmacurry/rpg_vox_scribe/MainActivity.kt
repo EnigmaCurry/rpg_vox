@@ -925,22 +925,35 @@ fun Para.wordAt(i: Int, shown: Int): Word =
  * One paragraph: what was said, its reading in the language you read, or
  * both, as **Show** says ([Scribe.showing]).
  *
- * Only what was said can be played back, tapped into or edited -- it is
+ * **Both** shows it a sentence at a time -- each sentence of what was
+ * said with the reading of that sentence under it ([Para.rows]) -- and
+ * not the whole paragraph with the whole reading beneath. A paragraph
+ * runs to two hundred words: a reading of all of it sits too far from
+ * the sentence it is of to be read along with, and arrives long after
+ * the words it belongs to have gone up the screen.
+ *
+ * Only what was said can be played back, tapped into or edited: it is
  * the text with the word timings, and the one the passes are still
- * working on -- so [Show.TRANSLATION] leaves all of that out rather than
- * pretending the reading has it. A paragraph with no reading (your own
- * language, or one that hasn't landed yet) is shown as it always was,
- * whichever setting is on: there is nothing else to show.
+ * working on. So **The reading** leaves all of that out rather than
+ * pretend the reading has it, and shows nothing at all for a paragraph
+ * whose reading has not landed yet -- it is a sentence behind on
+ * purpose. A paragraph already in the language you read ([Para.own]) is
+ * shown as it always was, whichever setting is on, there being nothing
+ * else to show it as.
  */
 @Composable
 private fun Paragraph(p: Para, playing: Playing?, at: Karaoke?, canPlay: Boolean, follow: Boolean) {
-    val reading = p.reading
-    if (reading != null && Scribe.showing == Show.TRANSLATION) {
-        Reading(reading, p.heardIn, own = true)
-        return
+    val whole = Row(p.text, null, 0, 0)
+    when {
+        p.own -> Said(p, whole, playing, at, canPlay, follow)
+        Scribe.showing == Show.TRANSCRIPT -> Said(p, whole, playing, at, canPlay, follow)
+        Scribe.showing == Show.TRANSLATION ->
+            p.reading?.let { Reading(it, p.heardIn, own = true) }
+        else -> p.rows().forEach { row ->
+            Said(p, row, playing, at, canPlay, follow)
+            row.reading?.let { Reading(it, p.heardIn, own = false) }
+        }
     }
-    Said(p, playing, at, canPlay, follow)
-    if (reading != null && Scribe.showing == Show.BOTH) Reading(reading, p.heardIn, own = false)
 }
 
 /**
@@ -968,10 +981,28 @@ private fun Reading(text: String, heardIn: String?, own: Boolean) {
     }
 }
 
+/**
+ * What was said, for one [Row] of a paragraph -- the whole of it when
+ * nothing is interleaved.
+ *
+ * Everything the row can do is the paragraph's, not the row's: a word is
+ * played by its index among the paragraph's words
+ * ([Row.firstWord] + the word's place here), and a cut is made from the
+ * offsets of what was selected in the paragraph's text ([Row.at] + the
+ * selection's). The row only decides what is drawn.
+ */
 @Composable
-private fun Said(p: Para, playing: Playing?, at: Karaoke?, canPlay: Boolean, follow: Boolean) {
-    val shown = p.shown
-    // Start offset of each shown word in the text.
+private fun Said(
+    p: Para,
+    row: Row,
+    playing: Playing?,
+    at: Karaoke?,
+    canPlay: Boolean,
+    follow: Boolean,
+) {
+    val shown = remember(row.said) { row.said.split(' ').filter { it.isNotEmpty() } }
+    val words = p.shown.size
+    // Start offset of each shown word in the row's text.
     val starts = remember(shown) { shown.runningFold(0) { acc, w -> acc + w.length + 1 }.dropLast(1) }
     val off = playing?.offsets?.get(p.audio)
     val heard = MaterialTheme.colorScheme.primary
@@ -982,10 +1013,10 @@ private fun Said(p: Para, playing: Playing?, at: Karaoke?, canPlay: Boolean, fol
     val text = buildAnnotatedString {
         shown.forEachIndexed { i, w ->
             if (i > 0) append(' ')
-            val t = off?.let { it + p.wordAt(i, shown.size).startMs }
+            val t = off?.let { it + p.wordAt(row.firstWord + i, words).startMs }
             when {
                 at == null || t == null -> append(w)
-                at.para == p.id && at.word == i -> withStyle(current) { append(w) }
+                at.para == p.id && at.word == row.firstWord + i -> withStyle(current) { append(w) }
                 t < at.ms -> withStyle(SpanStyle(color = heard)) { append(w) }
                 else -> append(w)
             }
@@ -993,8 +1024,11 @@ private fun Said(p: Para, playing: Playing?, at: Karaoke?, canPlay: Boolean, fol
     }
     var layout by remember { mutableStateOf<TextLayoutResult?>(null) }
     val requester = remember { BringIntoViewRequester() }
-    // Keep the line being heard in view, with a couple of lines below it.
-    val line = if (at?.para == p.id) layout?.getLineForOffset(starts.getOrElse(at.word) { 0 }) else null
+    // Keep the line being heard in view, with a couple of lines below
+    // it. Only this row's words: another row of the same paragraph has
+    // its own copy of this, and the word being heard is in one of them.
+    val here = at?.takeIf { it.para == p.id && it.word - row.firstWord in shown.indices }
+    val line = here?.let { layout?.getLineForOffset(starts.getOrElse(it.word - row.firstWord) { 0 }) }
     LaunchedEffect(line, follow) {
         val l = layout ?: return@LaunchedEffect
         if (line == null || !follow) return@LaunchedEffect
@@ -1003,9 +1037,9 @@ private fun Said(p: Para, playing: Playing?, at: Karaoke?, canPlay: Boolean, fol
     }
     // A read-only field rather than plain text: it reports what's selected,
     // which Edit and Cut in the selection menu act on.
-    var selection by remember(p.id) { mutableStateOf(TextRange.Zero) }
+    var selection by remember(p.id, row.at) { mutableStateOf(TextRange.Zero) }
     val sel = TextRange(selection.start.coerceIn(0, text.length), selection.end.coerceIn(0, text.length))
-    var editing by remember(p.id) { mutableStateOf(false) }
+    var editing by remember(p.id, row.at) { mutableStateOf(false) }
     if (editing) EditParagraph(p, close = { editing = false })
     BasicTextField(
         value = TextFieldValue(text, sel),
@@ -1029,7 +1063,7 @@ private fun Said(p: Para, playing: Playing?, at: Karaoke?, canPlay: Boolean, fol
                     }
                 }
                 item(key = CutItem, label = "Cut") {
-                    Scribe.cut(p, sel.min, sel.max)
+                    Scribe.cut(p, row.at + sel.min, row.at + sel.max)
                     selection = TextRange.Zero
                     close()
                 }
@@ -1047,7 +1081,7 @@ private fun Said(p: Para, playing: Playing?, at: Karaoke?, canPlay: Boolean, fol
                     val l = layout ?: return@awaitEachGesture
                     val c = l.getOffsetForPosition(up)
                     val i = starts.indexOfLast { it <= c }.coerceAtLeast(0)
-                    Scribe.play(p, p.wordAt(i, shown.size))
+                    Scribe.play(p, p.wordAt(row.firstWord + i, words))
                 }
             },
     )

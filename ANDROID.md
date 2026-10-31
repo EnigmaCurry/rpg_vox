@@ -255,8 +255,13 @@ reading:
 
 * **What was said** — the transcript only, as it was spoken.
 * **The reading** — the translation only; what was said is kept, just
-  not shown.
-* **Both** (the default) — what was said, with the reading under it.
+  not shown. A paragraph whose reading hasn't arrived yet shows nothing
+  until it does, which is a sentence behind the speaking.
+* **Both** (the default) — each sentence of what was said with the
+  reading of *that sentence* under it, and the sentence being spoken now
+  on its own until its reading lands. A paragraph runs to two hundred
+  words, so one reading under all of it would sit too far from the
+  sentence it is of to read along with.
 
 What was said is always what is saved, and it is the only text with word
 timings, so tapping a word to [play it back](#playing-back), editing and
