@@ -187,16 +187,22 @@ section after the version it releases.
   the language you *read in* (what every translation is read into), the
   language the *live text* is in, the languages to *listen out for* (a
   model each, 81 MB, downloaded there), and what the transcript *shows*
-  of a paragraph that was read: what was said, the reading, or both --
-  and **Both** interleaves them a sentence at a time, each sentence of
-  what was said with the reading of that sentence under it. A paragraph
-  runs to two hundred words, so a reading of the whole of it sits too
-  far from the sentence it is of to be read along with, and lands long
-  after those words have gone up the screen. Each line of a reading
-  carries the sentence it was made from for this (`TranslatedLine`), so
-  the two stay together through the later passes -- and a reading whose
-  sentence pass 3 or 4 has since reworded is dropped rather than shown
-  against words it is not of.
+  of a paragraph that was read.
+
+  The transcript is in the language you read and in no other. A
+  paragraph heard in Russian is shown in English, a sentence at a time
+  as each is read, and the Russian is not shown at all -- there is no
+  setting for it, because a transcript you can read is the point of
+  translating one. What was said is still what is kept: it is in the
+  thread, it is what every later pass refines, and it is what each
+  reading is made from again when one of those passes changes a word, so
+  a sentence pass 3 rewrites is read again. Each line of a reading
+  carries the sentence it was made from (`TranslatedLine`) to keep the
+  two together through all of that. A sentence not yet read shows as an
+  ellipsis -- the reading is a sentence behind the speaking on purpose --
+  and tapping one of a translated paragraph's sentences plays from where
+  that sentence was spoken, a translation having no word timings of its
+  own. Copy, Share and the notification say what the screen says.
 
   The words that appear *as you speak* come from pass 1, the one pass
   that has to be told which language to listen in -- it decodes as the

@@ -550,18 +550,13 @@ private fun LanguagesPage() {
     }
 
     Text(
-        "Show",
-        style = MaterialTheme.typography.titleSmall,
-        modifier = Modifier.padding(top = 16.dp),
-    )
-    Show.entries.forEach { s ->
-        Choice(s.label, Scribe.showing == s) { Scribe.chooseShowing(s) }
-    }
-    Text(
-        "For paragraphs that were read in another language. What was said " +
-            "is always what is kept, and what playback and editing are about.",
+        "A paragraph heard in one of these is shown in ${native.label} and " +
+            "not in the language it was spoken in. What was said is still " +
+            "kept — it is what each later pass refines and what every reading " +
+            "is remade from — it is just not what is on the screen.",
         style = MaterialTheme.typography.bodySmall,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = Modifier.padding(top = 12.dp),
     )
     if (Scribe.recording || Scribe.busy()) {
         Text(

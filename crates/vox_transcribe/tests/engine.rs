@@ -983,3 +983,42 @@ fn a_reading_arrives_while_the_recording_runs() {
         "a reading should arrive with the utterance it is of"
     );
 }
+
+/// A sentence a later pass rewrites is read again, so the reading is of
+/// the words as they finally stand.
+///
+/// Pass 3 re-decodes the boundary between two clips and here merges two
+/// sentences into one. A screen showing only the reading has nothing
+/// else to fall back on, so a reading left over from before the merge
+/// would be the only record of a sentence that no longer exists.
+#[test]
+fn a_sentence_a_later_pass_rewrites_is_read_again() {
+    let (events, t) = run_translated(Arc::new(RussianOffline), false);
+    let read: Vec<String> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Paragraph { paragraph, .. } => match &paragraph.translation {
+                Some(vox_transcribe::Translation::Done { of, .. }) => Some(of.clone()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    assert!(
+        read.windows(2).any(|w| w[0] != w[1]),
+        "the same text was read and never read again: {read:?}",
+    );
+    // Pass 3's merge is in there: the comma is what it did.
+    assert!(
+        read.iter().any(|of| of.contains(", ")),
+        "no reading of the merged sentence: {read:?}",
+    );
+    // And the last one standing is of the paragraph as it reads now.
+    let p = &t.paragraphs[0];
+    assert!(
+        p.translation.as_ref().is_some_and(|tr| tr.is_of(&p.text)),
+        "{:?} is not of {:?}",
+        p.translation,
+        p.text,
+    );
+}

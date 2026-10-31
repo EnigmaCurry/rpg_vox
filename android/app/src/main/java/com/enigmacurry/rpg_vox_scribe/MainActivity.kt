@@ -922,47 +922,58 @@ fun Para.wordAt(i: Int, shown: Int): Word =
  */
 @OptIn(ExperimentalFoundationApi::class)
 /**
- * One paragraph: what was said, its reading in the language you read, or
- * both, as **Show** says ([Scribe.showing]).
+ * One paragraph, in the language you read and in no other.
  *
- * **Both** shows it a sentence at a time -- each sentence of what was
- * said with the reading of that sentence under it ([Para.rows]) -- and
- * not the whole paragraph with the whole reading beneath. A paragraph
- * runs to two hundred words: a reading of all of it sits too far from
- * the sentence it is of to be read along with, and arrives long after
- * the words it belongs to have gone up the screen.
+ * A paragraph spoken in your own language is itself ([Para.own]): the
+ * text, with everything it can do -- tap a word to hear it, select to
+ * edit or cut -- because that is the text the passes are working on and
+ * the one the word timings are of.
  *
- * Only what was said can be played back, tapped into or edited: it is
- * the text with the word timings, and the one the passes are still
- * working on. So **The reading** leaves all of that out rather than
- * pretend the reading has it, and shows nothing at all for a paragraph
- * whose reading has not landed yet -- it is a sentence behind on
- * purpose. A paragraph already in the language you read ([Para.own]) is
- * shown as it always was, whichever setting is on, there being nothing
- * else to show it as.
+ * A paragraph heard in another language is its reading, a sentence at a
+ * time, and the other language is not shown at all. What was said is
+ * still what is kept: it is in the thread's database, it is what every
+ * later pass refines, and it is what the reading is remade from each
+ * time one of them changes it. It is simply not what someone who reads
+ * English wants on the screen.
+ *
+ * A sentence whose reading has not landed yet is an ellipsis: the
+ * reading runs a sentence behind the speaking on purpose (a translator
+ * given half a sentence returns half a thought), and the alternative to
+ * saying so is a paragraph that appears to have stopped.
  */
 @Composable
 private fun Paragraph(p: Para, playing: Playing?, at: Karaoke?, canPlay: Boolean, follow: Boolean) {
-    val whole = Row(p.text, null, 0, 0)
-    when {
-        p.own -> Said(p, whole, playing, at, canPlay, follow)
-        Scribe.showing == Show.TRANSCRIPT -> Said(p, whole, playing, at, canPlay, follow)
-        Scribe.showing == Show.TRANSLATION ->
-            p.reading?.let { Reading(it, p.heardIn, own = true) }
-        else -> p.rows().forEach { row ->
-            Said(p, row, playing, at, canPlay, follow)
-            row.reading?.let { Reading(it, p.heardIn, own = false) }
-        }
+    if (p.own) {
+        Said(p, playing, at, canPlay, follow)
+        return
+    }
+    p.readings.forEach { r ->
+        Reading(r.text, p.heardIn, own = true, at = r.startMs.takeIf { canPlay }, p = p)
+    }
+    // Something was said that has not been read yet: the sentence being
+    // spoken now, or one whose reading is still on its way.
+    if (p.rows().any { it.reading == null }) {
+        Text(
+            "…",
+            style = MaterialTheme.typography.bodyLarge.scaled(FONT_SCALES[Scribe.fontStep]),
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
     }
 }
 
 /**
- * The reading, under what was said unless it is all that is shown
- * ([own]), in which case it is the paragraph's own text and styled like
- * one.
+ * One sentence of a reading. [own] means it is the paragraph's own text
+ * here rather than something under it, which is how the transcript shows
+ * a translated paragraph.
+ *
+ * [at] is when the sentence it is of was spoken: given one, tapping the
+ * reading plays from there, which is the same thing tapping a word does
+ * to what was said. The reading has no timings of its own -- a
+ * translation has its own word count and its own order -- so it is the
+ * sentence that is the unit here rather than the word.
  */
 @Composable
-private fun Reading(text: String, heardIn: String?, own: Boolean) {
+private fun Reading(text: String, heardIn: String?, own: Boolean, at: Long? = null, p: Para? = null) {
     val style = MaterialTheme.typography.bodyLarge.scaled(FONT_SCALES[Scribe.fontStep])
     SelectionContainer {
         Text(
@@ -976,33 +987,32 @@ private fun Reading(text: String, heardIn: String?, own: Boolean) {
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(top = if (own) 0.dp else 2.dp)
-                .semantics { heardIn?.let { contentDescription = "$it, read as: $text" } },
+                .semantics { heardIn?.let { contentDescription = "$it, read as: $text" } }
+                .pointerInput(at, p) {
+                    val from = at ?: return@pointerInput
+                    val para = p ?: return@pointerInput
+                    awaitEachGesture {
+                        val playingAtDown = Playback.playing != null && !Playback.paused
+                        awaitTap(PointerEventPass.Main) ?: return@awaitEachGesture
+                        if (playingAtDown || Playback.playing != null && !Playback.paused) {
+                            return@awaitEachGesture
+                        }
+                        Scribe.play(para, Word("", from, from))
+                    }
+                },
         )
     }
 }
 
 /**
- * What was said, for one [Row] of a paragraph -- the whole of it when
- * nothing is interleaved.
- *
- * Everything the row can do is the paragraph's, not the row's: a word is
- * played by its index among the paragraph's words
- * ([Row.firstWord] + the word's place here), and a cut is made from the
- * offsets of what was selected in the paragraph's text ([Row.at] + the
- * selection's). The row only decides what is drawn.
+ * What was said: the paragraph, with everything it can do -- a word
+ * played by tapping it, a selection edited or cut. Only a paragraph in
+ * the language you read is shown this way; see [Paragraph].
  */
 @Composable
-private fun Said(
-    p: Para,
-    row: Row,
-    playing: Playing?,
-    at: Karaoke?,
-    canPlay: Boolean,
-    follow: Boolean,
-) {
-    val shown = remember(row.said) { row.said.split(' ').filter { it.isNotEmpty() } }
-    val words = p.shown.size
-    // Start offset of each shown word in the row's text.
+private fun Said(p: Para, playing: Playing?, at: Karaoke?, canPlay: Boolean, follow: Boolean) {
+    val shown = p.shown
+    // Start offset of each shown word in the text.
     val starts = remember(shown) { shown.runningFold(0) { acc, w -> acc + w.length + 1 }.dropLast(1) }
     val off = playing?.offsets?.get(p.audio)
     val heard = MaterialTheme.colorScheme.primary
@@ -1013,10 +1023,10 @@ private fun Said(
     val text = buildAnnotatedString {
         shown.forEachIndexed { i, w ->
             if (i > 0) append(' ')
-            val t = off?.let { it + p.wordAt(row.firstWord + i, words).startMs }
+            val t = off?.let { it + p.wordAt(i, shown.size).startMs }
             when {
                 at == null || t == null -> append(w)
-                at.para == p.id && at.word == row.firstWord + i -> withStyle(current) { append(w) }
+                at.para == p.id && at.word == i -> withStyle(current) { append(w) }
                 t < at.ms -> withStyle(SpanStyle(color = heard)) { append(w) }
                 else -> append(w)
             }
@@ -1024,11 +1034,8 @@ private fun Said(
     }
     var layout by remember { mutableStateOf<TextLayoutResult?>(null) }
     val requester = remember { BringIntoViewRequester() }
-    // Keep the line being heard in view, with a couple of lines below
-    // it. Only this row's words: another row of the same paragraph has
-    // its own copy of this, and the word being heard is in one of them.
-    val here = at?.takeIf { it.para == p.id && it.word - row.firstWord in shown.indices }
-    val line = here?.let { layout?.getLineForOffset(starts.getOrElse(it.word - row.firstWord) { 0 }) }
+    // Keep the line being heard in view, with a couple of lines below it.
+    val line = if (at?.para == p.id) layout?.getLineForOffset(starts.getOrElse(at.word) { 0 }) else null
     LaunchedEffect(line, follow) {
         val l = layout ?: return@LaunchedEffect
         if (line == null || !follow) return@LaunchedEffect
@@ -1037,9 +1044,9 @@ private fun Said(
     }
     // A read-only field rather than plain text: it reports what's selected,
     // which Edit and Cut in the selection menu act on.
-    var selection by remember(p.id, row.at) { mutableStateOf(TextRange.Zero) }
+    var selection by remember(p.id) { mutableStateOf(TextRange.Zero) }
     val sel = TextRange(selection.start.coerceIn(0, text.length), selection.end.coerceIn(0, text.length))
-    var editing by remember(p.id, row.at) { mutableStateOf(false) }
+    var editing by remember(p.id) { mutableStateOf(false) }
     if (editing) EditParagraph(p, close = { editing = false })
     BasicTextField(
         value = TextFieldValue(text, sel),
@@ -1063,7 +1070,7 @@ private fun Said(
                     }
                 }
                 item(key = CutItem, label = "Cut") {
-                    Scribe.cut(p, row.at + sel.min, row.at + sel.max)
+                    Scribe.cut(p, sel.min, sel.max)
                     selection = TextRange.Zero
                     close()
                 }
@@ -1081,7 +1088,7 @@ private fun Said(
                     val l = layout ?: return@awaitEachGesture
                     val c = l.getOffsetForPosition(up)
                     val i = starts.indexOfLast { it <= c }.coerceAtLeast(0)
-                    Scribe.play(p, p.wordAt(row.firstWord + i, words))
+                    Scribe.play(p, p.wordAt(i, shown.size))
                 }
             },
     )

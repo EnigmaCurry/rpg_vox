@@ -19,9 +19,9 @@ the phone. It also adds a voice keyboard for dictating into other apps.
 * **Voice typing.** A Scribe keyboard that listens as soon as it opens
   and types the finished text into any app.
 * **Reads another language in yours.** A paragraph heard in Russian is
-  also read in English, on the phone, with nothing asked of a network.
-  What was said is kept either way, and you choose whether to see it,
-  the reading, or both.
+  shown in English, on the phone, with nothing asked of a network. The
+  transcript is in the language you read and in no other; what was said
+  is kept all the same, and is what every pass and every reading is of.
 
 Arm64 phones running Android 8.0 (API 26) or newer. The finished text
 covers 25 European languages; the live text, as you speak, is English or
@@ -35,6 +35,7 @@ Russian, and [follows whichever is being spoken](#languages).
 * [Transcribing a file](#transcribing-a-file)
 * [Settings](#settings)
 * [Languages](#languages)
+* [What the transcript shows](#what-the-transcript-shows)
 * [Voice typing keyboard](#voice-typing-keyboard)
 * [Building from source](#building-from-source)
 
@@ -196,7 +197,8 @@ resume to apply them mid-recording.
   when they finish, as is a recording once all its text has been cut. Playback
   also shortens any quiet between words to 1 second.
 
-**Languages**: see [Languages](#languages) below.
+**Languages**: see [Languages](#languages) and [what the transcript
+shows](#what-the-transcript-shows) below.
 
 **Keyboard**: a shortcut to turn on the [voice typing
 keyboard](#voice-typing-keyboard).
@@ -250,25 +252,36 @@ list is only the languages with a model that reads into yours:
 | English | Russian or Ukrainian; Chinese, Japanese or Korean |
 | Russian | English, French or Spanish; Korean |
 
-**Show** is what the transcript does with a paragraph that has a
-reading:
+## What the transcript shows
 
-* **What was said** — the transcript only, as it was spoken.
-* **The reading** — the translation only; what was said is kept, just
-  not shown. A paragraph whose reading hasn't arrived yet shows nothing
-  until it does, which is a sentence behind the speaking.
-* **Both** (the default) — each sentence of what was said with the
-  reading of *that sentence* under it, and the sentence being spoken now
-  on its own until its reading lands. A paragraph runs to two hundred
-  words, so one reading under all of it would sit too far from the
-  sentence it is of to read along with.
+The language you read, and no other. A paragraph spoken in Russian is
+shown in English, a sentence at a time as each sentence is read, and the
+Russian is not shown at all. There is no setting for this: a transcript
+you can read is the point of translating it.
 
-What was said is always what is saved, and it is the only text with word
-timings, so tapping a word to [play it back](#playing-back), editing and
-cutting all work on it: under **The reading** a translated paragraph has
-none of those, and what was said is a setting away. A paragraph in your
-own language looks the same whatever is chosen, there being nothing else
-to show.
+What was said is still what is *kept*. It is in the thread, it is what
+every later pass refines, and it is what each reading is made from
+again whenever one of those passes changes a word -- a sentence pass 3
+rewrites is read again, so what you see is of the words as they finally
+stand. It is simply not what is on the screen.
+
+Two things follow from that:
+
+* A sentence whose reading hasn't arrived yet shows as `…`. The reading
+  runs a sentence behind the speaking on purpose — a translator given
+  half a sentence returns half a thought — and an ellipsis says so
+  rather than leaving the paragraph looking finished.
+* Tapping a word to [play it back](#playing-back) and editing or cutting
+  a selection work on what was said, which a translated paragraph is not
+  showing. Tapping one of its sentences plays from where *that sentence*
+  was spoken instead, which is as fine-grained as a translation can be:
+  it has its own word count and its own word order, so the sentence is
+  the smallest honest unit. Editing and cutting are for the paragraphs
+  in your own language.
+
+A paragraph in your own language is shown as it always was — it is
+already in the language you read — as is one the translator gave up on,
+where what was said is better than nothing.
 
 Changing a language reloads the models, which takes a few seconds and
 waits until the current recording is finished.

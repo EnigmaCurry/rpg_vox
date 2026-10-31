@@ -1,6 +1,8 @@
 package com.enigmacurry.rpg_vox_scribe
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
@@ -19,7 +21,7 @@ class RowsTest {
     @Test
     fun a_paragraph_with_no_reading_is_one_row() {
         val rows = para("Да, конечно.", emptyList()).rows()
-        assertEquals(listOf(Row("Да, конечно.", null, 0, 0)), rows)
+        assertEquals(listOf(Row("Да, конечно.", null)), rows)
     }
 
     @Test
@@ -33,8 +35,8 @@ class RowsTest {
         )
         assertEquals(
             listOf(
-                Row("Да, конечно.", "Yes, of course.", 0, 0),
-                Row("Крыша плоская.", "The roof is flat.", 2, 13),
+                Row("Да, конечно.", "Yes, of course."),
+                Row("Крыша плоская.", "The roof is flat."),
             ),
             p.rows(),
         )
@@ -53,8 +55,8 @@ class RowsTest {
         )
         assertEquals(
             listOf(
-                Row("Да, конечно.", "Yes, of course.", 0, 0),
-                Row("Крыша плоская", null, 2, 13),
+                Row("Да, конечно.", "Yes, of course."),
+                Row("Крыша плоская", null),
             ),
             p.rows(),
         )
@@ -72,25 +74,61 @@ class RowsTest {
         )
         assertEquals(
             listOf(
-                Row("Да, конечно!", null, 0, 0),
-                Row("Крыша плоская.", "The roof is flat.", 2, 13),
+                Row("Да, конечно!", null),
+                Row("Крыша плоская.", "The roof is flat."),
             ),
             p.rows(),
         )
     }
+}
 
-    /** Every row's text is the paragraph's own, at the offset it says. */
+/**
+ * Which paragraphs are shown as themselves and which as their reading.
+ * [Para.own] is the whole of that decision, and the one thing the screen
+ * must never do is show a language the reader doesn't read.
+ */
+class OwnTest {
+    private fun para(text: String, translated: String?, readings: List<Reading> = emptyList()) = Para(
+        id = "p",
+        clips = listOf(ClipUi(text, partial = false)),
+        readings = readings,
+        translated = translated,
+    )
+
     @Test
-    fun the_offsets_point_at_the_rows_own_words() {
+    fun a_paragraph_in_your_own_language_is_itself() {
+        // Translation off, or nothing to translate.
+        assertTrue(para("Yes, of course.", null).own)
+        assertTrue(para("Yes, of course.", "native").own)
+    }
+
+    @Test
+    fun a_translated_paragraph_is_shown_as_its_reading() {
         val p = para(
-            "Один. Два. Три.",
-            listOf(Reading("Один.", "One."), Reading("Три.", "Three.")),
+            "Да, конечно.",
+            "done",
+            listOf(Reading("Да, конечно.", "Yes, of course.")),
         )
-        val text = p.text
-        for (row in p.rows()) {
-            assertEquals(row.said, text.substring(row.at, row.at + row.said.length))
-            val before = text.take(row.at).split(' ').count { it.isNotEmpty() }
-            assertEquals("words before ${row.said}", before, row.firstWord)
-        }
+        assertFalse(p.own)
+        assertEquals(listOf("Yes, of course."), p.readings.map { it.text })
+    }
+
+    /** Nothing more is coming, so what was said is better than nothing. */
+    @Test
+    fun a_translation_that_failed_falls_back_to_what_was_said() {
+        assertTrue(para("Да, конечно.", "failed").own)
+    }
+
+    /**
+     * Being read for the first time: not the reader's language, and no
+     * reading yet, which the screen shows as an ellipsis rather than as
+     * the other language.
+     */
+    @Test
+    fun a_paragraph_still_being_read_is_not_shown_as_what_was_said() {
+        val p = para("Да, конечно.", "running")
+        assertFalse(p.own)
+        assertTrue(p.readings.isEmpty())
+        assertTrue(p.rows().all { it.reading == null })
     }
 }

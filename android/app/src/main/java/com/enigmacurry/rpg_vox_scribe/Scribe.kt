@@ -111,13 +111,17 @@ data class Para(
      * nothing under it, and the reading of each stays with the sentence
      * it is of. A reading whose sentence a later pass has rewritten is
      * dropped rather than shown against the wrong words.
+     *
+     * The screen shows the readings of a translated paragraph and not
+     * the stretches they are of ([own] is what decides), so what this
+     * answers for one of those is the order they go in and whether
+     * anything said is still waiting to be read.
      */
     fun rows(): List<Row> {
         val whole = text
-        if (readings.isEmpty()) return listOf(Row(whole, null, 0, 0))
+        if (readings.isEmpty()) return listOf(Row(whole, null))
         val out = mutableListOf<Row>()
         var pos = 0
-        var word = 0
         for (r in readings) {
             if (r.source.isEmpty()) continue
             val at = whole.indexOf(r.source, pos)
@@ -127,50 +131,33 @@ data class Para(
             // paragraph the translator hasn't caught up with.
             if (at > pos) {
                 val before = whole.substring(pos, at).trim()
-                if (before.isNotEmpty()) {
-                    val beforeAt = whole.indexOf(before, pos)
-                    out += Row(before, null, word, beforeAt)
-                    word += words(before)
-                }
+                if (before.isNotEmpty()) out += Row(before, null)
             }
-            out += Row(r.source, r.text, word, at)
-            word += words(r.source)
+            out += Row(r.source, r.text)
             pos = at + r.source.length
         }
         val tail = whole.substring(pos).trim()
-        if (tail.isNotEmpty()) out += Row(tail, null, word, whole.indexOf(tail, pos))
+        if (tail.isNotEmpty()) out += Row(tail, null)
         return out
     }
-
-    private fun words(s: String) = s.split(' ').count { it.isNotEmpty() }
 }
 
-/** One sentence of a reading, and the sentence it was made from. */
-data class Reading(val source: String, val text: String)
+/**
+ * One sentence of a reading, the sentence it was made from, and when
+ * that one was spoken -- which is what lets a reading be tapped to hear
+ * the words it is of, the same as tapping what was said.
+ */
+data class Reading(val source: String, val text: String, val startMs: Long = 0)
 
 /**
  * A stretch of what was said, with the reading of it when it has one.
  *
- * [firstWord] and [at] are where the stretch starts in the paragraph --
- * its first word's index, and its first character's offset in the
- * paragraph's text. The screen needs both: a word is played by its
- * index, and a cut is made by the offsets of what was selected, and
- * both of those are the paragraph's, not the row's.
+ * The screen shows the readings and not the stretches (see `Paragraph`
+ * in MainActivity), so what this is for is the order they go in and
+ * whether anything said has not been read yet.
  */
-data class Row(val said: String, val reading: String?, val firstWord: Int, val at: Int)
+data class Row(val said: String, val reading: String?)
 
-/**
- * What the transcript shows of a translated paragraph. What was said is
- * always what is kept and what the word timings, playback and editing
- * are about, so [TRANSLATION] hides it rather than replacing it -- and
- * only for the paragraphs that have a reading, since a paragraph in your
- * own language has nothing else to show.
- */
-enum class Show(val label: String, val detail: String) {
-    TRANSCRIPT("What was said", "The transcript only, in the language it was spoken in."),
-    TRANSLATION("The reading", "The translation only, with what was said hidden."),
-    BOTH("Both", "What was said, with the reading under it."),
-}
 
 sealed interface Phase {
     /** Models missing; nothing started yet, or the last attempt failed. */
@@ -274,13 +261,6 @@ object Scribe {
      */
     var others by mutableStateOf<Set<Language>>(emptySet())
         private set
-    /**
-     * What the transcript shows of a paragraph that has a reading.
-     * Named for the setting ("Show"), spelled so as not to collide with
-     * `show(id)`, which opens a thread.
-     */
-    var showing by mutableStateOf(Show.BOTH)
-        private set
     /** The input the mic source is recording from, while it runs. */
     var micName by mutableStateOf<String?>(null)
         private set
@@ -378,13 +358,14 @@ object Scribe {
             .filter { it != native && store.installed(translation(it, native) ?: return@filter false) }
             .distinctBy { it.script }
             .toSet()
-        showing = runCatching { Show.valueOf(prefs.getString("show", "BOTH")!!) }
-            .getOrDefault(Show.BOTH)
-        // "Live text in" was a setting for one version. Pass 1 follows
-        // the speaking now, so the key goes rather than sit there
-        // looking like something that still decides anything.
-        if (prefs.contains("pass1_language")) {
-            prefs.edit().remove("pass1_language").apply()
+        // Two settings that were settings for one version each: which
+        // language pass 1 listens in, which pass 1 now works out for
+        // itself, and what the transcript shows of a translated
+        // paragraph, which is now always the reading. The keys go rather
+        // than sit there looking like something that still decides
+        // anything.
+        for (gone in listOf("pass1_language", "show")) {
+            if (prefs.contains(gone)) prefs.edit().remove(gone).apply()
         }
         phase = if (store.ready()) Phase.Unloaded else Phase.NeedModels(resume = store.started())
         migrate()
@@ -439,11 +420,6 @@ object Scribe {
     fun chooseFontStep(step: Int) {
         fontStep = step.coerceIn(0, FONT_SCALES.size - 1)
         app.getSharedPreferences("scribe", Context.MODE_PRIVATE).edit().putInt("font_step", fontStep).apply()
-    }
-
-    fun chooseShowing(s: Show) {
-        showing = s
-        app.getSharedPreferences("scribe", Context.MODE_PRIVATE).edit().putString("show", s.name).apply()
     }
 
     /**
@@ -1352,6 +1328,17 @@ object Scribe {
                 atMs = m.atMs,
                 translation = m.translation,
                 heardIn = m.heardIn,
+                // A stored paragraph keeps its reading in one piece: the
+                // sentences it was made of are not stored, and a
+                // finished paragraph has no tail to be waiting for, so
+                // one row is all the screen needs of it. Without this a
+                // reopened thread would show the language it was spoken
+                // in, which is the one thing the screen never shows.
+                readings = m.translation
+                    ?.takeIf { it.isNotBlank() }
+                    ?.let { listOf(Reading(m.text, it)) }
+                    ?: emptyList(),
+                translated = if (m.translation.isNullOrBlank()) null else "done",
             )
             paragraphs += p
             written[p.id] = m
@@ -1386,16 +1373,31 @@ object Scribe {
     }
 
     /** The open thread as text, speakers as "Me: …". */
+    /**
+     * The transcript as the screen shows it, for Copy and Share: the
+     * reading of a paragraph that has one, and what was said when it is
+     * in the language you read. Copying the other language would be
+     * copying text the person doing it cannot read.
+     */
     fun text(): String =
-        paragraphs.filter { it.text.isNotBlank() }
-            .joinToString("\n\n") { p -> if (p.source != null) "${p.source}: ${p.text}" else p.text }
+        paragraphs.mapNotNull { p ->
+            val body = if (p.own) p.text else p.readings.joinToString(" ") { it.text }
+            body.takeIf { it.isNotBlank() }
+                ?.let { if (p.source != null) "${p.source}: $it" else it }
+        }.joinToString("\n\n")
 
-    /** The last finished (non-partial) text, for the notification. */
+    /**
+     * The last finished (non-partial) text, for the notification: the
+     * reading of a paragraph that has one, as on the screen.
+     */
     fun lastLine(): String =
         paragraphs.asReversed().firstNotNullOfOrNull { p ->
-            p.clips.filter { !it.partial && it.text.isNotBlank() }
-                .takeIf { it.isNotEmpty() }
-                ?.joinToString(" ") { it.text }
+            when {
+                !p.own -> p.readings.lastOrNull()?.text
+                else -> p.clips.filter { !it.partial && it.text.isNotBlank() }
+                    .takeIf { it.isNotEmpty() }
+                    ?.joinToString(" ") { it.text }
+            }
                 ?.let { if (p.source != null) "${p.source}: $it" else it }
         } ?: ""
 
@@ -1500,7 +1502,10 @@ object Scribe {
                 val l = lines!!.getJSONObject(it)
                 val source = l.optString("source")
                 val text = l.optString("text")
-                if (source.isEmpty() || text.isEmpty()) null else Reading(source, text)
+                when {
+                    source.isEmpty() || text.isEmpty() -> null
+                    else -> Reading(source, text, l.optLong("start_ms"))
+                }
             },
             translated = state?.optString("state")?.takeIf { it.isNotEmpty() },
         )
