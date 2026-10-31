@@ -816,26 +816,7 @@ private fun Transcript(modifier: Modifier) {
                     }
                     val first = firsts[p.id]
                     if (first != null && !Scribe.busy()) PlayFromStart(first, big = false)
-                    if (p.clips.none { it.partial }) {
-                        Paragraph(p, playing, at, canPlay = !Scribe.busy() && p.playable(), follow = !held)
-                    } else {
-                        Text(
-                            buildAnnotatedString {
-                                p.clips.filter { it.text.isNotBlank() }.forEachIndexed { i, c ->
-                                    if (i > 0) append(' ')
-                                    if (c.partial) {
-                                        // Zipformer partials are ALL CAPS.
-                                        withStyle(SpanStyle(color = faint, fontStyle = FontStyle.Italic)) {
-                                            append(c.text.lowercase())
-                                        }
-                                    } else {
-                                        append(c.text)
-                                    }
-                                }
-                            },
-                            style = MaterialTheme.typography.bodyLarge.scaled(FONT_SCALES[Scribe.fontStep]),
-                        )
-                    }
+                    Paragraph(p, playing, at, canPlay = !Scribe.busy() && p.playable(), follow = !held)
                 }
                 if (tail.isNotEmpty()) item(key = "wordless") { tail.forEach { NoWords(it) } }
             }
@@ -946,7 +927,11 @@ fun Para.wordAt(i: Int, shown: Int): Word =
 @Composable
 private fun Paragraph(p: Para, playing: Playing?, at: Karaoke?, canPlay: Boolean, follow: Boolean) {
     if (Scribe.saidAsIs(p)) {
-        Said(p, playing, at, canPlay, follow)
+        // A paragraph pass 1 is still adding to is drawn rather than
+        // edited: the words it is still typing are not the text any pass
+        // has settled, and a field that reported them as selectable
+        // would be offering to cut them.
+        if (p.clips.any { it.partial }) Saying(p) else Said(p, playing, at, canPlay, follow)
         return
     }
     p.readings.forEach { r ->
@@ -1012,6 +997,37 @@ private fun Reading(text: String, heardIn: String?, own: Boolean, at: Long? = nu
  * played by tapping it, a selection edited or cut. Only a paragraph in
  * the language you read is shown this way; see [Paragraph].
  */
+/**
+ * A paragraph with pass 1 still typing into it: what the offline passes
+ * have settled, and the words being spoken now after them, faint.
+ *
+ * Only ever a paragraph in the language you read. One in another
+ * language is its reading, and [Paragraph] is where that is decided --
+ * this used to be chosen in the transcript instead, which is how the
+ * other language stayed on the screen for as long as somebody was
+ * speaking it.
+ */
+@Composable
+private fun Saying(p: Para) {
+    val faint = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.45f)
+    Text(
+        buildAnnotatedString {
+            p.clips.filter { it.text.isNotBlank() }.forEachIndexed { i, c ->
+                if (i > 0) append(' ')
+                if (c.partial) {
+                    // Zipformer partials are ALL CAPS.
+                    withStyle(SpanStyle(color = faint, fontStyle = FontStyle.Italic)) {
+                        append(c.text.lowercase())
+                    }
+                } else {
+                    append(c.text)
+                }
+            }
+        },
+        style = MaterialTheme.typography.bodyLarge.scaled(FONT_SCALES[Scribe.fontStep]),
+    )
+}
+
 @Composable
 private fun Said(p: Para, playing: Playing?, at: Karaoke?, canPlay: Boolean, follow: Boolean) {
     val shown = p.shown
