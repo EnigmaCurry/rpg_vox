@@ -25,7 +25,7 @@ the phone. It also adds a voice keyboard for dictating into other apps.
 
 Arm64 phones running Android 8.0 (API 26) or newer. The finished text
 covers 25 European languages; the live text, as you speak, is English or
-Russian, whichever you [read in](#languages).
+Russian, [whichever you pick](#languages).
 
 * [Install](#install)
 * [First run: speech models](#first-run-speech-models)
@@ -209,14 +209,26 @@ the middle.
 
 ## Languages
 
-**Settings → Languages** has three things: the language you read in, the
-languages to listen out for, and what the transcript shows of a
-paragraph that was read.
+**Settings → Languages** has four things: the language you read in, the
+language the live text is in, the languages to listen out for, and what
+the transcript shows of a paragraph that was read.
 
-**I read in** is English or Russian. Those are the two because pass 1 --
-the live text, as you speak -- is the one pass that needs a model per
-language, and those are the two it has one for. Everything else is read
-*into* this language, and the finished text is in all 25 either way.
+**I read in** is the language every translation is read into.
+
+**Live text in** is the language pass 1 listens in. Pass 1 is the one
+pass that has to be told: it shows words as they are spoken, so its
+model is chosen before anything has been said, where passes 2 and 3 work
+the language out from the audio in any of 25. It follows **I read in**
+unless you set it otherwise — which is what to do when you are listening
+to someone else: reading in English while a Russian speaker talks, set
+this to Russian and the words appear in Russian as they are spoken, with
+the English reading under them once the paragraph settles.
+
+Both lists are English and Russian, because those are the two languages
+pass 1 has a model for. Picking one downloads it (27 MB for Russian);
+until it is there the live text stays in English and the settings page
+and the status line both say so, rather than listening in the wrong
+language without a word about it.
 
 **Also listen out for** is a language per model, about 81 MB each,
 downloaded here. A paragraph heard in one of them gets a reading in the

@@ -169,11 +169,23 @@ section after the version it releases.
   the desktop got is in the app, with CTranslate2 built for the NDK, so
   a paragraph heard in Russian also reads in English with nothing asked
   of a network. **Settings → Languages** has the three choices it takes:
-  the language you *read in* (English or Russian — the two that pass 1,
-  the live text, has a model for, which is also what decides which
-  streaming model is downloaded), the languages to *listen out for* (a
+  the language you *read in* (what every translation is read into), the
+  language the *live text* is in, the languages to *listen out for* (a
   model each, 81 MB, downloaded there), and what the transcript *shows*
   of a paragraph that was read: what was said, the reading, or both.
+
+  **Live text in** is pass 1's own language, and it is a setting of its
+  own because the two are not always the same: pass 1 shows words as
+  they are spoken, so its model is chosen before anything has been said,
+  while passes 2 and 3 work the language out from the audio. Reading in
+  English while a Russian speaker talks, set it to Russian and the words
+  appear in Russian as they are spoken, with the English reading under
+  them when the paragraph settles. It follows **I read in** otherwise.
+  Either way the model it needs is fetched when you pick the language --
+  27 MB, and the setting means nothing without it -- and until it
+  arrives the live text stays in English with the settings page and the
+  status line saying so, rather than listening in the wrong language
+  without a word about it.
 
   The languages offered are the ones that can be told apart. A
   paragraph's language is read off its alphabet, since the recognizer

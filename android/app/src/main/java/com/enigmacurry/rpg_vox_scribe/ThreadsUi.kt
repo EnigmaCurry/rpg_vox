@@ -458,10 +458,36 @@ private fun LanguagesPage() {
         Choice(l.label, native == l) { Scribe.chooseNative(l) }
     }
     Text(
-        "The live text is in this language, and everything else is read into it.",
+        "Everything heard in another language is read into this one.",
         style = MaterialTheme.typography.bodySmall,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
     )
+
+    Text(
+        "Live text in",
+        style = MaterialTheme.typography.titleSmall,
+        modifier = Modifier.padding(top = 16.dp),
+    )
+    NATIVE_LANGUAGES.forEach { l ->
+        Choice(l.label, Scribe.pass1 == l) { Scribe.choosePass1(l) }
+    }
+    Text(
+        "Pass 1 shows words as they are spoken, and it is the one pass that " +
+            "has to be told which language to listen in -- the finished text is " +
+            "worked out from the audio, in any of 25. Set this to the language " +
+            "being spoken: the one you read in, or one you are listening out for.",
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+    Scribe.pass1Missing?.let { l ->
+        Text(
+            "The ${l.label} live-text model isn't here yet, so the live text is " +
+                "in English until it has downloaded.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.error,
+            modifier = Modifier.padding(top = 4.dp),
+        )
+    }
 
     Text(
         "Also listen out for",

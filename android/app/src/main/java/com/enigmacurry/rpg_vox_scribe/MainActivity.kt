@@ -492,6 +492,12 @@ private fun Dictate() {
                         (job.detail()?.let { " · $it" } ?: if (job.progress >= 0) " · ${(job.progress * 100).toInt()}%" else "…")
                     Scribe.finishing -> "Finishing…"
                     Scribe.paused -> "Paused $time"
+                    // The language pass 1 is listening in, when it is
+                    // not the one asked for: the live text is in English
+                    // until that model has downloaded, and a recording
+                    // is where that shows.
+                    Scribe.pass1Missing != null ->
+                        "Listening $time · live text in English for now"
                     else -> "Listening $time" + (Scribe.micName?.let { " · $it" } ?: "")
                 },
                 live = Scribe.recording && !Scribe.paused && !Scribe.finishing,

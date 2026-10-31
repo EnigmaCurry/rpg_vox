@@ -92,6 +92,10 @@ fn load(
     let mut zc = ZipformerConfig::from_dir(&dir.join(streaming));
     zc.num_threads = threads;
     let zipformer = Zipformer::open(&zc).with_context(|| format!("loading {streaming}"))?;
+    // Which pass-1 model this is, in logcat: the app picks it from a
+    // setting, and "the live text is in the wrong language" is otherwise
+    // a thing only the person listening can tell you.
+    tracing::info!(pass1 = %streaming, read_in = %native, "models loaded");
     let translate = load_translating(dir, native, others)?;
     Ok(Models {
         offline,
