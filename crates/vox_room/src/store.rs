@@ -4,7 +4,7 @@
 //! people(name, display, token, used, language)  -- an invite, and whose it is
 //! sessions(id, name)                   -- a browser that traded its link in
 //! entries(conversation, id, who, kind, title, text, cut, typed, translations, at)
-//! settings(key, value)
+//! settings(key, value)                 -- `ROOM:key` for one room's own
 //! games(name, summary, prompt, settings, created, played)  -- names unique, ignoring case
 //! conversations(id, game)                 -- no row: the lobby
 //! cards(conversation, id, who, title, body, at)  -- the cards one person holds
@@ -23,6 +23,13 @@ use crate::room::{Card, Entry, GameSettings, Kind};
 
 pub struct Store {
     db: Connection,
+    /// Which room's settings this handle reads and writes. One server
+    /// holds several rooms in one database, and what they have each
+    /// been left set to -- the conversation they are in, how the AI
+    /// takes its turn, where the faders are -- is one room's business.
+    /// Empty is the whole database: what `vox_room invite` wants, and
+    /// the scope the settings a room doesn't own are kept in.
+    room: String,
 }
 
 const SCHEMA: &str = "
@@ -99,6 +106,13 @@ CREATE TABLE IF NOT EXISTS cards (
 );
 ";
 
+/// The number the next room to want a conversation is given, counted
+/// for the whole database. See [`Store::claim_conversation`].
+const CONVERSATION_COUNTER: &str = "conversations.next";
+/// Set once [`Store::adopt`] has moved a pre-rooms database's settings
+/// into the room they belonged to.
+const ROOMS_FLAG: &str = "schema.rooms";
+
 /// A saved game, without its prompt (which never leaves the server).
 #[derive(Debug, Clone, serde::Serialize, PartialEq)]
 pub struct Game {
@@ -138,7 +152,14 @@ impl Store {
         let db = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
         db.execute_batch(SCHEMA)?;
         migrate(&db)?;
-        Ok(Self { db })
+        // Several rooms are several connections to the one file, and
+        // `vox_room invite` is a whole other process writing to it.
+        // Wait for a writer rather than failing the read.
+        db.busy_timeout(std::time::Duration::from_secs(5))?;
+        Ok(Self {
+            db,
+            room: String::new(),
+        })
     }
 
     #[cfg(test)]
@@ -146,7 +167,30 @@ impl Store {
         let db = Connection::open_in_memory().unwrap();
         db.execute_batch(SCHEMA).unwrap();
         migrate(&db).unwrap();
-        Self { db }
+        Self {
+            db,
+            room: String::new(),
+        }
+    }
+
+    /// The same database as one room sees it: its own settings, and its
+    /// own conversation.
+    pub fn in_room(mut self, room: &str) -> Self {
+        self.room = room.to_string();
+        self
+    }
+
+    /// Where a setting of this room's lives. A room's name is in the
+    /// key rather than a column of its own because the rooms a server
+    /// holds are a matter of how it was started, not of what is in the
+    /// database: a room that is no longer configured leaves its keys
+    /// behind, harmlessly, and finds them again if it comes back.
+    fn key(&self, key: &str) -> String {
+        if self.room.is_empty() {
+            key.to_string()
+        } else {
+            format!("{}:{}", self.room, key)
+        }
     }
 
     /// `name`'s live invite link, made if they haven't got one.
@@ -310,7 +354,19 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// One of this room's settings.
     pub fn setting(&self, key: &str) -> Result<Option<String>> {
+        self.global(&self.key(key))
+    }
+
+    pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        self.set_global(&self.key(key), value)
+    }
+
+    /// A setting of the whole database, whatever room this handle is
+    /// for: the conversation counter every room draws from, and the
+    /// flag that says the keys have been moved into rooms.
+    fn global(&self, key: &str) -> Result<Option<String>> {
         Ok(self
             .db
             .query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| {
@@ -319,7 +375,7 @@ impl Store {
             .optional()?)
     }
 
-    pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+    fn set_global(&self, key: &str, value: &str) -> Result<()> {
         self.db.execute(
             "INSERT INTO settings (key, value) VALUES (?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -328,18 +384,22 @@ impl Store {
         Ok(())
     }
 
-    /// The conversation the room is in; the first one is 1.
+    /// The conversation this room is in. A room that has never had one
+    /// is given a number of its own here, which is the only place a
+    /// room's first conversation comes from.
     pub fn conversation(&self) -> Result<i64> {
-        Ok(self
-            .setting("conversation")?
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(1))
+        if let Some(id) = self.setting("conversation")?.and_then(|v| v.parse().ok()) {
+            return Ok(id);
+        }
+        let id = self.claim_conversation()?;
+        self.set_setting("conversation", &id.to_string())?;
+        Ok(id)
     }
 
-    /// Start a new, empty conversation, in the lobby or playing `game`.
-    /// The old one stays in the database.
+    /// Start a new, empty conversation here, in the lobby or playing
+    /// `game`. The old one stays in the database.
     pub fn new_conversation(&self, game: Option<&str>) -> Result<i64> {
-        let next = self.conversation()? + 1;
+        let next = self.claim_conversation()?;
         self.set_setting("conversation", &next.to_string())?;
         if let Some(g) = game {
             self.db.execute(
@@ -348,6 +408,58 @@ impl Store {
             )?;
         }
         Ok(next)
+    }
+
+    /// The next unused conversation number. Counted for the whole
+    /// database rather than per room: entries and cards are keyed by
+    /// the number alone, so a number handed to two rooms would be one
+    /// log read by both.
+    ///
+    /// Past the counter *and* past everything already written, which is
+    /// what makes the counter safe to be wrong: a database that has
+    /// never had one (every database, before rooms), or one restored
+    /// from a backup, can't hand out a number with somebody's words
+    /// already in it. The rows are read off three primary keys and this
+    /// happens when a person starts a conversation, so the cost of
+    /// asking is nothing.
+    fn claim_conversation(&self) -> Result<i64> {
+        let counter = self
+            .global(CONVERSATION_COUNTER)?
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(0);
+        let used: i64 = self.db.query_row(
+            "SELECT MAX(n) FROM (
+                 SELECT COALESCE(MAX(conversation), 0) AS n FROM entries
+                 UNION ALL SELECT COALESCE(MAX(conversation), 0) FROM cards
+                 UNION ALL SELECT COALESCE(MAX(id), 0) FROM conversations)",
+            [],
+            |r| r.get(0),
+        )?;
+        let next = counter.max(used + 1).max(1);
+        self.set_global(CONVERSATION_COUNTER, &(next + 1).to_string())?;
+        Ok(next)
+    }
+
+    /// Take a database written before there was more than one room into
+    /// `room`: the conversation it was in, how its AI took its turn and
+    /// where its faders were belonged to the whole server, which was
+    /// one room. Done once, and only to a database that has not been
+    /// through it.
+    pub fn adopt(&self, room: &str) -> Result<()> {
+        if self.global(ROOMS_FLAG)?.is_some() {
+            return Ok(());
+        }
+        for key in ["conversation", "mode", "strips"] {
+            if let Some(value) = self.global(key)? {
+                self.set_global(&format!("{room}:{key}"), &value)?;
+                self.db
+                    .execute("DELETE FROM settings WHERE key = ?1", [key])?;
+            }
+        }
+        // The counter is left for `claim_conversation` to work out: it
+        // reads the rows anyway, and so needs nothing set up here.
+        self.set_global(ROOMS_FLAG, "1")?;
+        Ok(())
     }
 
     /// The game `conversation` plays, if any.
@@ -776,7 +888,10 @@ mod tests {
         .unwrap();
         db.execute_batch(SCHEMA).unwrap();
         migrate(&db).unwrap();
-        let s = Store { db };
+        let s = Store {
+            db,
+            room: String::new(),
+        };
 
         let mike = s.person("Mike").unwrap().unwrap();
         assert_eq!(mike.display, "Mikey");
@@ -814,7 +929,9 @@ mod tests {
             ["a", "b"]
         );
         assert_eq!(got[0].text, "revised");
-        assert_eq!(s.new_conversation(None).unwrap(), 2);
+        // Past both the conversations already written to: a number
+        // handed out twice would be one log two rooms are reading.
+        assert_eq!(s.new_conversation(None).unwrap(), 3);
         assert_eq!(s.entries(2, 10).unwrap().len(), 1);
 
         // A typed message keeps its mark and its translations, so coming

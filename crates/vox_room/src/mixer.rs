@@ -1,10 +1,12 @@
 //! The room's mixer: every person's mic and the AI's voice in, one mix per
 //! listener out, each without the listener's own voice (a mix-minus).
 //!
-//! Runs on its own thread on a 20 ms clock. Each tick takes one 960-sample
-//! frame (48 kHz mono) from every mic buffer and from the AI's speech
-//! queue, applies the strip gains, and Opus-encodes a frame for every
-//! connected listener. Nothing here is a realtime audio callback, so plain
+//! One mixer per room, all of them ticked by the one 20 ms clock in
+//! [`crate::rooms`]. Each tick takes one 960-sample frame (48 kHz mono)
+//! from every mic buffer and from the AI's speech queue, applies the
+//! strip gains, and Opus-encodes a frame for every connected listener --
+//! and returns at once if nobody is listening, which is most rooms most
+//! of the time. Nothing here is a realtime audio callback, so plain
 //! mutexes are fine; each lock is held for well under a millisecond.
 //!
 //! The AI's speech is queued as whole sentences, and the mixer counts how
@@ -14,7 +16,6 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -23,8 +24,6 @@ use tracing::{debug, warn};
 pub const RATE: u32 = 48_000;
 /// 20 ms at 48 kHz.
 pub const FRAME: usize = 960;
-const TICK: Duration = Duration::from_millis(20);
-
 /// Mic audio arrives in network-sized bursts. Start playing a mic once
 /// this much is buffered, and again after it runs dry.
 const PRIME_FRAMES: usize = 2;
@@ -264,34 +263,6 @@ impl Mixer {
         })
     }
 
-    /// Start the 20 ms clock on its own thread.
-    pub fn spawn(self: &Arc<Self>) {
-        let me = self.clone();
-        std::thread::Builder::new()
-            .name("vox-room-mixer".into())
-            .spawn(move || me.run())
-            .expect("spawn mixer thread");
-    }
-
-    fn run(&self) {
-        let mut next = Instant::now();
-        loop {
-            self.tick();
-            next += TICK;
-            let now = Instant::now();
-            if next > now {
-                std::thread::sleep(next - now);
-            } else if now - next > TICK * 5 {
-                // Fell far behind (a suspended laptop): don't burst to catch up.
-                warn!(
-                    behind_ms = (now - next).as_millis() as u64,
-                    "mixer clock reset"
-                );
-                next = now;
-            }
-        }
-    }
-
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().expect("mixer mutex poisoned")
     }
@@ -304,6 +275,15 @@ impl Mixer {
             .or_default()
             .buf
             .extend(pcm.iter().copied());
+    }
+
+    /// Let go of whatever of `person`'s voice is still buffered. Called
+    /// when their last tab here has gone: what they were saying as they
+    /// left is not to be played when they come back.
+    pub fn drop_mic(&self, person: &str) {
+        let mut st = self.lock();
+        st.inputs.remove(person);
+        st.peaks.remove(person);
     }
 
     pub fn add_listener(

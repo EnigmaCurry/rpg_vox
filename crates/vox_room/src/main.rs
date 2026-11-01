@@ -6,6 +6,7 @@ mod agent;
 mod interp;
 mod mixer;
 mod room;
+mod rooms;
 mod screen;
 mod store;
 mod stt;
@@ -18,7 +19,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{bail, Context as _, Result};
 use clap::{CommandFactory as _, Parser, Subcommand, ValueEnum};
@@ -57,6 +58,22 @@ struct Cli {
     /// Run without transcription (and so without the AI hearing anyone).
     #[arg(long)]
     no_stt: bool,
+
+    /// A room the whole house shares, by name. Repeat it (or
+    /// comma-separate the variable) for several: one server holds them
+    /// all, and everybody moves between them on the one connection.
+    /// Everyone also has a room of their own, always, which is not
+    /// named here -- it is made the first time they go into it.
+    ///
+    /// The first is where a tab lands. Renaming one starts it fresh:
+    /// a room's conversation and its faders are kept under its name.
+    #[arg(
+        long = "room",
+        env = "VOX_ROOM_ROOMS",
+        value_delimiter = ',',
+        default_value = "Main"
+    )]
+    rooms: Vec<String>,
 
     /// The AI's name. In "named" mode it answers when someone says it.
     #[arg(long, env = "VOX_ROOM_AGENT_NAME", default_value = "Vox")]
@@ -250,6 +267,53 @@ fn canonical_language(name: &str) -> String {
     }
 }
 
+/// How to make a voice, for every room on the server. The settings are
+/// the same wherever it is speaking, so a call only says what language
+/// and which preset.
+struct Speakers {
+    kind: TtsKind,
+    url: Option<String>,
+    key: Option<String>,
+    model: Option<String>,
+    instruct: String,
+    /// The one Kokoro, when that is the voice: it is the whole model,
+    /// so every room reads through this copy. None for the others,
+    /// which are cheap enough to make per room.
+    kokoro: Option<tts::Shared>,
+}
+
+impl Speakers {
+    /// Whether a voice of this kind can be asked for a language other
+    /// than its own, which is what says whether the other languages the
+    /// door offers are ever really spoken.
+    fn multilingual(&self) -> bool {
+        self.kind == TtsKind::Qwen3
+    }
+
+    fn voice(&self, language: &str, preset: &str) -> Result<Box<dyn tts::Voice>> {
+        Ok(match self.kind {
+            TtsKind::Qwen3 => {
+                let Some(url) = self.url.clone() else {
+                    bail!("--tts qwen3 needs --tts-url (or VOX_ROOM_TTS_URL)");
+                };
+                Box::new(tts::Qwen3::new(
+                    &url,
+                    preset,
+                    &self.instruct,
+                    language,
+                    self.key.clone(),
+                    self.model.clone(),
+                ))
+            }
+            TtsKind::Kokoro => match &self.kokoro {
+                Some(shared) => shared.handle(),
+                None => Box::new(tts::Silent),
+            },
+            TtsKind::None => Box::new(tts::Silent),
+        })
+    }
+}
+
 /// The local translator, when this build has one. Behind a feature
 /// because it brings a C++ library and a CMake build with it; the flag
 /// says plainly what to do when it isn't there, rather than quietly
@@ -392,13 +456,23 @@ fn main() -> Result<()> {
         }
         None => {}
     }
-    serve(cli, store)
+    serve(cli, store, db)
 }
 
-fn serve(cli: Cli, store: Store) -> Result<()> {
+fn serve(cli: Cli, store: Store, db: PathBuf) -> Result<()> {
     if store.people()?.is_empty() {
         warn!("nobody is invited yet: run `vox_room invite NAME` for a link");
     }
+    // A database written before there was more than one room: what was
+    // the whole server's -- the conversation, the mode, the faders --
+    // is the first room's. Done before any room opens, so none of them
+    // reads a half-moved setting.
+    let first = cli.rooms.first().map(|r| r.trim()).unwrap_or_default();
+    if first.is_empty() {
+        bail!("--room NAME, at least once");
+    }
+    store.adopt(first)?;
+    drop(store);
     let llm = if cli.echo {
         agent::Llm::Echo
     } else {
@@ -482,57 +556,37 @@ fn serve(cli: Cli, store: Store) -> Result<()> {
             out
         });
 
-    // One voice per language the room is listening in, each on its own
-    // thread, so the languages are spoken at the same time instead of
-    // one after another. A Qwen3 voice is only an HTTP client, so having
-    // several costs nothing; Kokoro would be the whole model again, and
-    // it only speaks English anyway, so it stays alone.
-    let make_voice = |language: &str, preset: &str| -> anyhow::Result<Box<dyn tts::Voice>> {
-        Ok(match kind {
-            TtsKind::Qwen3 => {
-                let Some(url) = tts_url.clone() else {
-                    bail!("--tts qwen3 needs --tts-url (or VOX_ROOM_TTS_URL)");
-                };
-                info!(
-                    %url,
-                    language,
-                    voice = %preset,
-                    model = cli.tts_model.as_deref().unwrap_or("(unnamed)"),
-                    key = cli.tts_key.is_some(),
-                    "voice: Qwen3-TTS"
-                );
-                Box::new(tts::Qwen3::new(
-                    &url,
-                    preset,
-                    &cli.instruct,
-                    language,
-                    cli.tts_key.clone(),
-                    cli.tts_model.clone(),
-                ))
-            }
+    // What the voices can actually say, which is not always what the
+    // door offers: one voice means one language, however many are on
+    // the list. Settled here, once, because it goes into the config
+    // every room is built from.
+    let speakers = Speakers {
+        kind,
+        url: tts_url.clone(),
+        key: cli.tts_key.clone(),
+        model: cli.tts_model.clone(),
+        instruct: cli.instruct.clone(),
+        // Loaded now and shared by every room: see `tts::Shared`.
+        kokoro: match kind {
             TtsKind::Kokoro => {
                 info!(voice = %cli.kokoro_voice, "voice: Kokoro");
-                Box::new(tts::Kokoro::load(&kokoro_dir, &cli.kokoro_voice)?)
+                Some(tts::Shared::new(Box::new(tts::Kokoro::load(
+                    &kokoro_dir,
+                    &cli.kokoro_voice,
+                )?)))
             }
-            TtsKind::None => {
-                warn!("no voice: the AI's replies are shown, silently, at reading pace");
-                Box::new(tts::Silent)
-            }
-        })
+            _ => None,
+        },
     };
-    let mut voices = vec![(language.clone(), make_voice(&language, &cli.voice)?)];
-    let others: Vec<String> = cfg_languages
-        .iter()
-        .filter(|l| **l != language)
-        .cloned()
-        .collect();
-    if !others.is_empty() {
-        if voices[0].1.multilingual() {
-            for language in others {
-                let voice = make_voice(&language, &cli.voice)?;
-                voices.push((language, voice));
-            }
-        } else {
+    let spoken: Vec<String> = if speakers.multilingual() {
+        cfg_languages.clone()
+    } else {
+        let others: Vec<&str> = cfg_languages
+            .iter()
+            .filter(|l| **l != language)
+            .map(String::as_str)
+            .collect();
+        if !others.is_empty() {
             // Said once, loudly: the door would otherwise offer languages
             // that quietly come out in the room's own.
             warn!(
@@ -541,6 +595,24 @@ fn serve(cli: Cli, store: Store) -> Result<()> {
                  written down, and said in {language} (use --tts qwen3 to have \
                  them spoken)",
             );
+        }
+        vec![language.clone()]
+    };
+    match kind {
+        TtsKind::Qwen3 if tts_url.is_none() => {
+            bail!("--tts qwen3 needs --tts-url (or VOX_ROOM_TTS_URL)")
+        }
+        TtsKind::Qwen3 => info!(
+            url = tts_url.as_deref().unwrap_or_default(),
+            voice = %cli.voice,
+            model = cli.tts_model.as_deref().unwrap_or("(unnamed)"),
+            key = cli.tts_key.is_some(),
+            languages = %spoken.join(", "),
+            "voice: Qwen3-TTS"
+        ),
+        TtsKind::Kokoro => {}
+        TtsKind::None => {
+            warn!("no voice: the AI's replies are shown, silently, at reading pace")
         }
     }
 
@@ -557,30 +629,10 @@ fn serve(cli: Cli, store: Store) -> Result<()> {
         Some(stt::Models::load(&models_dir)?.factory())
     };
 
-    let generation = Arc::new(AtomicU64::new(0));
-    let (turn_tx, turn_rx) = crossbeam_channel::unbounded();
-    let cfg = RoomConfig {
-        agent_name: cli.name.clone(),
-        aliases: cli
-            .aliases
-            .iter()
-            .map(|a| a.trim().to_string())
-            .filter(|a| !a.is_empty())
-            .collect(),
-        reply_after: Duration::from_millis(cli.reply_after_ms),
-        confirm: Duration::from_millis(cli.confirm_ms),
-        engaged_for: Duration::from_millis(cli.engaged_for_ms),
-        history: cli.history,
-        language: language.clone(),
-        languages: cfg_languages.clone(),
-        // What the voices above can actually say, which is not always
-        // what the door offers: one voice means one language, however
-        // many are on the list.
-        spoken: voices.iter().map(|(l, _)| l.clone()).collect(),
-    };
     // Who translates, when there is more than one language and a model
-    // to do it with. Built once and shared: the local one is 75 MB of
-    // weights per direction, and every voice thread reads the same copy.
+    // to do it with. Built once and shared by every room: the local one
+    // is 75 MB of weights per direction, and every voice thread on the
+    // server reads the same copy.
     let translate: Option<Arc<dyn vox_transcribe::translate::Translate>> = match cli.translate {
         _ if cfg_languages.len() < 2 => None,
         TranslateKind::Openai => match &llm {
@@ -603,91 +655,121 @@ fn serve(cli: Cli, store: Store) -> Result<()> {
         },
         TranslateKind::Local => Some(local_translator(&models_dir, &cfg_languages)?),
     };
-
-    // The two ends of the typing queue are handed out separately: the
-    // room is built with the one it puts work on, the translators get
-    // the other once there is a room for them to report back to.
-    let typing = agent::typing_queue(translate.as_ref());
-    let (typing_tx, typing_rx) = match typing {
-        Some((tx, rx)) => (Some(tx), Some(rx)),
-        None => (None, None),
-    };
-    // The interpreters: one per language the room is listening in,
-    // including its own -- a Russian speaker's words have to reach the
-    // English listeners as much as the other way about. Same two
-    // conditions as the AI's own languages, for the same reasons: a
-    // translator to put it into words, and a voice that can say them.
-    let mut interp_tx = BTreeMap::new();
-    let mut interp_rx = Vec::new();
-    if cli.interpret && translate.is_some() && voices.len() > 1 {
-        for (language, _) in &voices {
-            let (tx, rx) = interp::queue();
-            interp_tx.insert(language.clone(), tx);
-            interp_rx.push((language.clone(), rx));
-        }
+    if cli.interpret && translate.is_some() && spoken.len() > 1 {
         info!(
-            languages = %voices.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>().join(", "),
+            languages = %spoken.join(", "),
             voice = %cli.interpreter_voice,
             "interpreting: what people say is spoken to whoever doesn't speak it"
         );
     }
-    let room = Room::new(
-        store,
-        cfg,
-        generation.clone(),
-        turn_tx,
-        typing_tx,
-        interp_tx,
-        factory,
-    )?;
-    if let Some(rx) = typing_rx {
-        if let Some(t) = translate.clone() {
-            agent::spawn_typists(room.clone(), t, rx, 2);
-        }
-    }
-    for (language, rx) in interp_rx {
-        let Some(t) = translate.clone() else { break };
-        interp::spawn(
-            room.clone(),
-            &language,
-            make_voice(&language, &cli.interpreter_voice)?,
-            t,
-            rx,
-        );
-    }
-    room.mixer.spawn();
-    agent::Agent {
-        llm,
-        prompt,
-        translate,
-        generation,
-    }
-    .spawn(room.clone(), voices, turn_rx);
 
-    let r = room.clone();
-    std::thread::Builder::new()
-        .name("vox-room-tick".into())
-        .spawn(move || {
-            let mut meters = false;
-            let mut ticks: u32 = 0;
-            loop {
-                r.tick(Instant::now());
-                // Meters at 10 per second.
-                meters = !meters;
-                if meters {
-                    r.emit_levels();
-                }
-                // `vox_room invite` and `uninvite` write to the database
-                // from their own process, so look for their work now and
-                // then rather than only at startup.
-                ticks = ticks.wrapping_add(1);
-                if ticks.is_multiple_of(40) {
-                    r.reconcile_people();
-                }
-                std::thread::sleep(Duration::from_millis(50));
+    // The settings every room shares. What makes one room different
+    // from another -- its name, who it admits, how its AI takes the
+    // turn to begin with -- is filled in by `rooms::Rooms`.
+    let base = RoomConfig {
+        id: String::new(),
+        title: String::new(),
+        only: None,
+        default_mode: room::Mode::Named,
+        agent_name: cli.name.clone(),
+        aliases: cli
+            .aliases
+            .iter()
+            .map(|a| a.trim().to_string())
+            .filter(|a| !a.is_empty())
+            .collect(),
+        reply_after: Duration::from_millis(cli.reply_after_ms),
+        confirm: Duration::from_millis(cli.confirm_ms),
+        engaged_for: Duration::from_millis(cli.engaged_for_ms),
+        history: cli.history,
+        language: language.clone(),
+        languages: cfg_languages.clone(),
+        spoken,
+    };
+
+    // Everything a room is made of, built on demand: the shared rooms
+    // now, somebody's own the first time they walk into it. What it
+    // captures is the expensive part, made once -- the loaded models,
+    // the translator, the endpoint -- and what it builds per room is
+    // the cheap part: a database handle, a mixer, a few threads.
+    let make: rooms::Make = {
+        let db = db.clone();
+        let speakers = Arc::new(speakers);
+        let translate = translate.clone();
+        let voice = cli.voice.clone();
+        let interpreter_voice = cli.interpreter_voice.clone();
+        let interpret = cli.interpret;
+        Box::new(move |cfg: RoomConfig| -> Result<Arc<Room>> {
+            let store = Store::open(&db)?.in_room(&cfg.id);
+            let generation = Arc::new(AtomicU64::new(0));
+            let (turn_tx, turn_rx) = crossbeam_channel::unbounded();
+            // One voice per language the room is listening in, each on
+            // its own thread, so the languages are spoken at the same
+            // time instead of one after another.
+            let mut voices: Vec<(String, Box<dyn tts::Voice>)> = Vec::new();
+            for language in &cfg.spoken {
+                voices.push((language.clone(), speakers.voice(language, &voice)?));
             }
+            // The two ends of the typing queue are handed out
+            // separately: the room is built with the one it puts work
+            // on, the translators get the other once there is a room
+            // for them to report back to.
+            let (typing_tx, typing_rx) = match agent::typing_queue(translate.as_ref()) {
+                Some((tx, rx)) => (Some(tx), Some(rx)),
+                None => (None, None),
+            };
+            // The interpreters: one per language the room is listening
+            // in, including its own -- a Russian speaker's words have
+            // to reach the English listeners as much as the other way
+            // about. Same two conditions as the AI's own languages, for
+            // the same reasons: a translator to put it into words, and
+            // a voice that can say them.
+            let mut interp_tx = BTreeMap::new();
+            let mut interp_rx = Vec::new();
+            if interpret && translate.is_some() && voices.len() > 1 {
+                for (language, _) in &voices {
+                    let (tx, rx) = interp::queue();
+                    interp_tx.insert(language.clone(), tx);
+                    interp_rx.push((language.clone(), rx));
+                }
+            }
+            let room = Room::new(
+                store,
+                cfg,
+                generation.clone(),
+                turn_tx,
+                typing_tx,
+                interp_tx,
+                factory.clone(),
+            )?;
+            if let Some(rx) = typing_rx {
+                if let Some(t) = translate.clone() {
+                    agent::spawn_typists(room.clone(), t, rx, 2);
+                }
+            }
+            for (language, rx) in interp_rx {
+                let Some(t) = translate.clone() else { break };
+                interp::spawn(
+                    room.clone(),
+                    &language,
+                    speakers.voice(&language, &interpreter_voice)?,
+                    t,
+                    rx,
+                );
+            }
+            agent::Agent {
+                llm: llm.clone(),
+                prompt: prompt.clone(),
+                translate: translate.clone(),
+                generation,
+            }
+            .spawn(room.clone(), voices, turn_rx);
+            Ok(room)
         })
-        .context("spawn tick thread")?;
+    };
+
+    let rooms = rooms::Rooms::new(&base, &cli.rooms, make)?;
+    rooms.spawn_clocks()?;
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
@@ -698,7 +780,7 @@ fn serve(cli: Cli, store: Store) -> Result<()> {
             "room open on http://{} (invite people with `vox_room invite NAME`)",
             cli.listen
         );
-        axum::serve(listener, web::router(room, screen::Screen::new()))
+        axum::serve(listener, web::router(rooms, screen::Screen::new()))
             .with_graceful_shutdown(async {
                 let _ = tokio::signal::ctrl_c().await;
             })

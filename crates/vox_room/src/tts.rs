@@ -9,6 +9,7 @@
 
 use std::io::Read as _;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{bail, Context as _, Result};
@@ -22,12 +23,36 @@ pub trait Voice: Send {
     /// `language` overrides the voice's own, for a room that is listening
     /// in more than one. Spelled out in English, as Qwen3 wants it.
     fn speak(&mut self, text: &str, language: Option<&str>) -> Result<Vec<f32>>;
+}
 
-    /// Whether this voice can be asked for a language other than its
-    /// own. Only Qwen3 can, so it is the only voice a room can translate
-    /// with.
-    fn multilingual(&self) -> bool {
-        false
+/// One voice several rooms speak through, in turn.
+///
+/// A Qwen3 voice is only an HTTP client, so a room that wants one makes
+/// its own and they talk at the same time. Kokoro is the whole model --
+/// hundreds of megabytes on the CPU -- and loading it again for every
+/// room somebody opens is not on, so every room shares the one copy.
+/// They queue behind each other, which costs nothing real: the model
+/// is one lot of CPU however many rooms are asking it to read.
+#[derive(Clone)]
+pub struct Shared(Arc<Mutex<Box<dyn Voice>>>);
+
+impl Shared {
+    pub fn new(voice: Box<dyn Voice>) -> Self {
+        Self(Arc::new(Mutex::new(voice)))
+    }
+
+    /// Another way in to the same voice, for another room.
+    pub fn handle(&self) -> Box<dyn Voice> {
+        Box::new(self.clone())
+    }
+}
+
+impl Voice for Shared {
+    fn speak(&mut self, text: &str, language: Option<&str>) -> Result<Vec<f32>> {
+        self.0
+            .lock()
+            .expect("voice mutex poisoned")
+            .speak(text, language)
     }
 }
 
@@ -67,10 +92,6 @@ impl Qwen3 {
 }
 
 impl Voice for Qwen3 {
-    fn multilingual(&self) -> bool {
-        true
-    }
-
     fn speak(&mut self, text: &str, language: Option<&str>) -> Result<Vec<f32>> {
         let mut body = serde_json::json!({
             "input": text,
@@ -267,7 +288,6 @@ mod tests {
             .ok()
             .filter(|m| !m.is_empty());
         let mut qwen3 = Qwen3::new(&url, &voice, "", "English", key, model);
-        assert!(qwen3.multilingual(), "or a room can't be translated");
 
         // Its own language, as every room has always asked for it.
         let english = qwen3

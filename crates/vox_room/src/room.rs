@@ -335,6 +335,17 @@ impl Event {
 
 #[derive(Debug, Clone)]
 pub struct RoomConfig {
+    /// What this room is called in the database and in the commands a
+    /// browser sends: the name it was configured under, or `@NAME` for
+    /// somebody's own room.
+    pub id: String,
+    /// What the room is called on screen.
+    pub title: String,
+    /// The one person this room admits, by the name on their invite --
+    /// the name that never changes, because a room outlives what
+    /// somebody calls themselves at the door. None is a room the whole
+    /// house shares.
+    pub only: Option<String>,
     pub agent_name: String,
     /// Other spellings that count as its name (speech-to-text mishears).
     pub aliases: Vec<String>,
@@ -345,6 +356,12 @@ pub struct RoomConfig {
     pub engaged_for: Duration,
     /// Entries of history the model is shown.
     pub history: usize,
+    /// How the AI takes its turn in a room nobody has set yet. A room
+    /// the house shares waits to be named, so two people can talk
+    /// without it butting in; a room with one person and the AI in it
+    /// has no such problem, and answering every pause is what being
+    /// alone with it is for.
+    pub default_mode: Mode,
     /// The room's own language, spelled out in English ("English",
     /// "Russian"): what the AI is given to say, and what anyone who has
     /// chosen nothing at the door speaks and hears.
@@ -358,6 +375,13 @@ pub struct RoomConfig {
     /// voice is never translated, so waiting to hear the reply in it
     /// would be waiting for something nobody is making.
     pub spoken: Vec<String>,
+}
+
+impl RoomConfig {
+    /// Whether the person whose invite reads `name` may come in.
+    pub fn admits(&self, name: &str) -> bool {
+        self.only.as_deref().is_none_or(|only| only == name)
+    }
 }
 
 /// A turn for the agent: the conversation so far, as chat messages.
@@ -593,8 +617,9 @@ pub struct TypedJob {
 
 /// Makes one person's transcription engine: their name, the language
 /// they speak (spelled out in English, which picks the pass-1 model),
-/// and the room to report to.
-pub type EngineFactory = Box<dyn Fn(&str, &str, Arc<Room>) -> anyhow::Result<Pusher> + Send + Sync>;
+/// and the room to report to. Shared, because every room on the server
+/// transcribes with the one set of loaded models.
+pub type EngineFactory = Arc<dyn Fn(&str, &str, Arc<Room>) -> anyhow::Result<Pusher> + Send + Sync>;
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -619,7 +644,7 @@ impl Room {
         let chosen = store
             .setting("mode")?
             .and_then(|m| Mode::parse(&m))
-            .unwrap_or(Mode::Named);
+            .unwrap_or(cfg.default_mode);
         // The game the room was left playing may require its own mode.
         let game_mode = game
             .as_deref()
@@ -629,9 +654,13 @@ impl Room {
             .setting("strips")?
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
+        // Only the people this room admits: somebody's own room has a
+        // roster of one, so its mixer shows them and the AI and nobody
+        // else, and nothing the AI is told there mentions the house.
         let people = store
             .people()?
             .into_iter()
+            .filter(|p| cfg.admits(&p.name))
             .map(|p| {
                 let person = Person {
                     language: p.language,
@@ -898,6 +927,7 @@ impl Room {
         let invited: BTreeMap<String, String> = match self.store().people() {
             Ok(people) => people
                 .into_iter()
+                .filter(|p| self.cfg.admits(&p.name))
                 .map(|p| (p.display, p.language))
                 .collect(),
             Err(err) => {
@@ -964,6 +994,14 @@ impl Room {
         json!({
             "type": "hello",
             "you": person,
+            // Which room this is. A tab is sent a whole new hello when
+            // it changes room, so this is what tells it that everything
+            // below belongs somewhere else now.
+            "room": {
+                "id": self.cfg.id,
+                "title": self.cfg.title,
+                "private": self.cfg.only.is_some(),
+            },
             "agent": { "name": self.cfg.agent_name, "state": st.agent_state, "strip": AGENT_STRIP },
             // The interpreters, when the room has any: one fader for all
             // of them, and pulling it down is how the room turns the
@@ -999,6 +1037,17 @@ impl Room {
                 warn!("read cards: {err:#}");
                 Vec::new()
             })
+    }
+
+    /// Who is in this room, by the name it calls them. For the
+    /// directory of rooms every tab is shown.
+    pub fn here(&self) -> Vec<String> {
+        let st = self.lock();
+        st.people
+            .iter()
+            .filter(|(_, p)| p.online())
+            .map(|(name, _)| name.clone())
+            .collect()
     }
 
     /// Everyone on the roster, for the agent: the name to address a card
@@ -1321,6 +1370,14 @@ impl Room {
             if let Some(e) = &p.engine {
                 close_utterance(e);
             }
+        }
+        // Nothing of theirs left here. Let go of whatever of their voice
+        // the mixer was still holding, or the tail of it would be
+        // played to the room the moment they come back -- which, now
+        // that somebody can step out into another room and return, is a
+        // thing that happens rather than a thing that doesn't.
+        if p.tabs.is_empty() {
+            self.mixer.drop_mic(person);
         }
         info!(person, tab, tabs = p.tabs.len(), "left");
         self.emit_people(&st);
@@ -3291,6 +3348,10 @@ mod tests {
         store.set_setting("mode", mode.as_str()).unwrap();
         let (tx, rx) = crossbeam_channel::unbounded();
         let cfg = RoomConfig {
+            id: "Main".into(),
+            title: "Main".into(),
+            only: None,
+            default_mode: Mode::Named,
             agent_name: "Vox".into(),
             aliases: vec!["box".into()],
             reply_after: Duration::from_millis(1000),

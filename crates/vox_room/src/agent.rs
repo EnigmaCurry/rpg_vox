@@ -185,6 +185,9 @@ The game:
 {prompt}";
 
 /// An OpenAI-compatible endpoint, and what the AI may do with it.
+/// Cloned per room: every room on the server asks the same service, and
+/// each has an agent of its own to do the asking.
+#[derive(Clone)]
 pub struct Chat {
     pub url: String,
     pub model: String,
@@ -272,6 +275,7 @@ impl Chat {
     }
 }
 
+#[derive(Clone)]
 pub enum Llm {
     /// An OpenAI-compatible endpoint.
     Chat(Chat),
@@ -1478,6 +1482,7 @@ fn clean(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::room::Mode;
 
     #[test]
     fn drops_a_sentence_said_again_after_a_tool_call() {
@@ -1566,6 +1571,10 @@ mod tests {
             translate: None,
         };
         let cfg = RoomConfig {
+            id: "Main".into(),
+            title: "Main".into(),
+            only: None,
+            default_mode: Mode::Named,
             agent_name: "Vox".into(),
             aliases: vec![],
             reply_after: Duration::from_millis(1200),
@@ -1610,7 +1619,11 @@ mod tests {
         let room = Room::new(
             store,
             RoomConfig {
-                agent_name: "Vox".into(),
+                id: "Main".into(),
+            title: "Main".into(),
+            only: None,
+            default_mode: Mode::Named,
+            agent_name: "Vox".into(),
                 aliases: vec![],
                 reply_after: Duration::from_millis(1200),
                 confirm: Duration::from_millis(300),

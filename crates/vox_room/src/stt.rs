@@ -110,10 +110,12 @@ impl Models {
     }
 
     /// A factory the room calls the first time each person's audio
-    /// arrives, with the language they speak.
+    /// arrives, with the language they speak. One of these is handed to
+    /// every room on the server: the models are loaded once, and a
+    /// session off them is what costs anything.
     pub fn factory(self) -> EngineFactory {
         let models = Arc::new(self);
-        Box::new(move |person: &str, language: &str, room: Arc<Room>| {
+        Arc::new(move |person: &str, language: &str, room: Arc<Room>| {
             models.engine(person, language, room)
         })
     }
