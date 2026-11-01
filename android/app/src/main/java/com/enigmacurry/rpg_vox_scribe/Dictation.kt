@@ -32,6 +32,8 @@ class Dictation(
     private var session = 0L
     @Volatile private var capturing = true
     @Volatile private var polling = true
+    /** Set while the main thread still has a batch of events to apply. */
+    @Volatile private var applying = false
     @Volatile private var ended = false
     /** The mic keeps running but its audio is dropped, so resuming is instant. */
     @Volatile var paused = false
@@ -46,8 +48,23 @@ class Dictation(
         session = Native.start(models, RATE, true, null)
         poller = Thread({
             while (polling) {
+                // Wait for the main thread rather than piling batches
+                // up on it; see the same loop in Scribe.
+                if (applying) {
+                    Thread.sleep(10)
+                    continue
+                }
                 val events = Native.poll(session, 100)
-                if (events.length > 2) main.post { apply(events) }
+                if (events.length > 2) {
+                    applying = true
+                    main.post {
+                        try {
+                            apply(events)
+                        } finally {
+                            applying = false
+                        }
+                    }
+                }
             }
         }, "dictation-poll").apply { start() }
         capture = Thread(::record, "dictation-mic").apply { start() }

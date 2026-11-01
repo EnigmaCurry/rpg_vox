@@ -191,6 +191,18 @@ section after the version it releases.
   reusing an untouched new thread rather than piling empty ones up no
   longer rests on a regular expression matching the date.
 
+- **A long recording no longer fills memory with transcripts the screen
+  has not caught up with.** Every paragraph event carries the whole
+  paragraph, which for a paragraph minutes long is megabytes of JSON,
+  and a recording with two sources resends each piece of it on every
+  update. When the main thread fell behind, each `poll` still handed it
+  one more copy, and the engine's queue kept every update in between:
+  after a quarter of an hour the app stopped answering and then died
+  trying to turn a 290 MB backlog into one Java string. A drain now
+  collapses the updates of a paragraph to its latest state, as it always
+  did for the level meter, and a poller waits for the main thread to
+  finish the batch before rather than handing it another.
+
 - **It reads another language in yours, on the phone.** The translation
   the desktop got is in the app, with CTranslate2 built for the NDK, so
   a paragraph heard in Russian also reads in English with nothing asked

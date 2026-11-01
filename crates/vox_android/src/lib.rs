@@ -251,24 +251,54 @@ fn change_name(c: Change) -> &'static str {
 }
 
 /// Everything queued, waiting up to `timeout` for the first event. Level
-/// events are collapsed to the latest one.
+/// events are collapsed to the latest one, and so is every update of one
+/// paragraph: each event carries the whole paragraph, so only its last
+/// state is news to the app. Without that, a backlog the app has not
+/// caught up with grows without bound -- a long paragraph is megabytes
+/// of JSON, and a labelled recording resends every piece of it on each
+/// update -- until one drain is more than a Java string can hold.
 fn drain(events: &Receiver<Event>, timeout: Duration) -> Value {
-    let mut out = Vec::new();
+    // Each paragraph keeps the place its first event had, so the order
+    // of what is left still holds; `None` is one a removal dropped.
+    let mut out: Vec<Option<Value>> = Vec::new();
+    let mut at: HashMap<String, usize> = HashMap::new();
     let mut level = None;
     let first = events.recv_timeout(timeout).ok();
     for ev in first.into_iter().chain(events.try_iter()) {
         match ev {
-            Event::Paragraph { paragraph, change } => out.push(json!({
-                "t": "paragraph",
-                "change": change_name(change),
-                "p": paragraph,
-            })),
-            Event::ParagraphRemoved { id } => out.push(json!({ "t": "removed", "id": id })),
+            Event::Paragraph { paragraph, change } => {
+                let i = *at.entry(paragraph.id.clone()).or_insert_with(|| {
+                    out.push(None);
+                    out.len() - 1
+                });
+                // The app reads `change` only to tell a partial from a
+                // finished paragraph, and a finish collapsed into a
+                // later partial would be a save it never makes: the
+                // stronger of the two names stays.
+                let name = out[i]
+                    .as_ref()
+                    .and_then(|old| old["change"].as_str())
+                    .filter(|was| *was != "partial" && matches!(change, Change::Partial))
+                    .map_or_else(|| change_name(change).to_owned(), str::to_owned);
+                out[i] = Some(json!({
+                    "t": "paragraph",
+                    "change": name,
+                    "p": paragraph,
+                }));
+            }
+            Event::ParagraphRemoved { id } => {
+                // Whatever was still waiting to be sent of it is moot.
+                if let Some(i) = at.remove(&id) {
+                    out[i] = None;
+                }
+                out.push(Some(json!({ "t": "removed", "id": id })));
+            }
             Event::Level { rms, speaking, .. } => {
                 level = Some(json!({ "t": "level", "rms": rms, "speaking": speaking }))
             }
         }
     }
+    let mut out: Vec<Value> = out.into_iter().flatten().collect();
     out.extend(level);
     Value::Array(out)
 }

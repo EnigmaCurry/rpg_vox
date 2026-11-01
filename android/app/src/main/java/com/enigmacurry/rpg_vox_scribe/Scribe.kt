@@ -925,6 +925,8 @@ object Scribe {
         var capture: Capture? = null
         val stopping = mutableListOf<Capture>()
         @Volatile var polling = true
+        /** Set while the main thread still has a batch of this source's events. */
+        @Volatile var applying = false
         var poller: Thread? = null
         var level = 0f
         /** Files: audio through pass 2, for progress and decode throttling. */
@@ -954,8 +956,26 @@ object Scribe {
         sources += src
         src.poller = Thread({
             while (src.polling) {
+                // Nothing is drained while the main thread is still on
+                // the batch before: the events wait in the engine's
+                // queue, where the next drain collapses each paragraph
+                // to its latest state, rather than piling up as strings
+                // the main thread is never going to catch up with.
+                if (src.applying) {
+                    Thread.sleep(10)
+                    continue
+                }
                 val events = Native.poll(src.session, 100)
-                if (events.length > 2) main.post { apply(src, events) }
+                if (events.length > 2) {
+                    src.applying = true
+                    main.post {
+                        try {
+                            apply(src, events)
+                        } finally {
+                            src.applying = false
+                        }
+                    }
+                }
             }
         }, "vox-poll").apply { start() }
         return src
