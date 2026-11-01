@@ -671,13 +671,14 @@ fn serve(cli: Cli, store: Store, db: PathBuf) -> Result<()> {
         title: String::new(),
         only: None,
         default_mode: room::Mode::Named,
-        agent_name: cli.name.clone(),
-        aliases: cli
-            .aliases
-            .iter()
-            .map(|a| a.trim().to_string())
-            .filter(|a| !a.is_empty())
-            .collect(),
+        bots: vec![room::BotConfig::new(
+            &cli.name,
+            cli.aliases
+                .iter()
+                .map(|a| a.trim().to_string())
+                .filter(|a| !a.is_empty())
+                .collect(),
+        )],
         reply_after: Duration::from_millis(cli.reply_after_ms),
         confirm: Duration::from_millis(cli.confirm_ms),
         engaged_for: Duration::from_millis(cli.engaged_for_ms),

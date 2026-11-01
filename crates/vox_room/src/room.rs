@@ -336,6 +336,37 @@ impl Event {
     }
 }
 
+/// One AI in a room: what it is called, what counts as its name when
+/// somebody says it, and where its voice arrives in the mixer.
+///
+/// A room holds a list of these. The list is one long today, and every
+/// place that assumes so says so -- see [`RoomConfig::bot`] -- so that
+/// the second is a matter of giving the turn to somebody rather than a
+/// rewrite of how a turn works.
+#[derive(Debug, Clone)]
+pub struct BotConfig {
+    /// What it is called. In "named" mode it answers when somebody says
+    /// it, and it is the name beside everything it says.
+    pub name: String,
+    /// Other spellings that count as its name, for what speech-to-text
+    /// makes of it.
+    pub aliases: Vec<String>,
+    /// Its fader in the mixer, and the name its level arrives under.
+    /// The first bot keeps `@agent`, so a room's saved faders survive
+    /// knowing there could be another.
+    pub strip: String,
+}
+
+impl BotConfig {
+    pub fn new(name: &str, aliases: Vec<String>) -> Self {
+        Self {
+            name: name.to_string(),
+            aliases,
+            strip: AGENT_STRIP.to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RoomConfig {
     /// What this room is called in the database and in the commands a
@@ -349,9 +380,8 @@ pub struct RoomConfig {
     /// somebody calls themselves at the door. None is a room the whole
     /// house shares.
     pub only: Option<String>,
-    pub agent_name: String,
-    /// Other spellings that count as its name (speech-to-text mishears).
-    pub aliases: Vec<String>,
+    /// The AI (today: AIs) in this room.
+    pub bots: Vec<BotConfig>,
     pub reply_after: Duration,
     pub confirm: Duration,
     /// How long the room may be idle before a back-and-forth lapses and
@@ -384,6 +414,15 @@ impl RoomConfig {
     /// Whether the person whose invite reads `name` may come in.
     pub fn admits(&self, name: &str) -> bool {
         self.only.as_deref().is_none_or(|only| only == name)
+    }
+
+    /// The room's bot, while a room has one.
+    ///
+    /// Every caller is a place where somebody will have to be chosen
+    /// once there are two -- which is the point of its being a call
+    /// rather than a field. A room is never built without one.
+    pub fn bot(&self) -> &BotConfig {
+        self.bots.first().expect("a room has an AI in it")
     }
 }
 
@@ -1009,8 +1048,8 @@ impl Room {
         if wanted.chars().any(char::is_control) {
             return Err("One line, no tabs.".into());
         }
-        if wanted.eq_ignore_ascii_case(&self.cfg.agent_name) {
-            return Err(format!("{} is the AI's name.", self.cfg.agent_name));
+        if wanted.eq_ignore_ascii_case(&self.cfg.bot().name) {
+            return Err(format!("{} is the AI's name.", self.cfg.bot().name));
         }
         match self.store().rename(name, wanted) {
             Ok(true) => {}
@@ -1258,7 +1297,14 @@ impl Room {
                 "title": self.cfg.title,
                 "private": self.cfg.only.is_some(),
             },
-            "agent": { "name": self.cfg.agent_name, "state": st.agent_state, "strip": AGENT_STRIP },
+            // The AIs in this room. One, today; the browsers read a
+            // list so that the second is something to render rather
+            // than something to rewrite.
+            "agents": self.cfg.bots.iter().map(|b| json!({
+                "name": b.name,
+                "strip": b.strip,
+                "state": st.agent_state,
+            })).collect::<Vec<_>>(),
             // The interpreters, when this room has any. `level` is
             // where the one speaking *your* language reports itself:
             // you hear that one and no other, and how loud it is is
@@ -1492,7 +1538,7 @@ impl Room {
         let mut st = self.lock();
         let entry = Entry {
             id: format!("card-{}", uuid::Uuid::new_v4().simple()),
-            who: self.cfg.agent_name.clone(),
+            who: self.cfg.bot().name.clone(),
             kind: Kind::Card,
             title: title.to_string(),
             text: body.to_string(),
@@ -2667,7 +2713,7 @@ impl Room {
     fn add_game_card(&self, st: &mut State, name: &str) {
         let entry = Entry {
             id: format!("game-{}", uuid::Uuid::new_v4().simple()),
-            who: self.cfg.agent_name.clone(),
+            who: self.cfg.bot().name.clone(),
             kind: Kind::Game,
             title: String::new(),
             text: name.to_string(),
@@ -2823,8 +2869,13 @@ impl Room {
             samples: samples.len(),
             played: 0,
         });
-        self.mixer
-            .ai_push(&self.cfg.language, generation, index, samples);
+        self.mixer.ai_push(
+            &self.cfg.bot().strip,
+            &self.cfg.language,
+            generation,
+            index,
+            samples,
+        );
         true
     }
 
@@ -2868,7 +2919,8 @@ impl Room {
                         played: 0,
                     });
                 drop(st);
-                self.mixer.ai_push(language, generation, index, samples);
+                self.mixer
+                    .ai_push(&self.cfg.bot().strip, language, generation, index, samples);
                 true
             }
             Some(_) => false,
@@ -2892,7 +2944,8 @@ impl Room {
                     e.clone()
                 });
                 drop(st);
-                self.mixer.ai_push(language, generation, index, samples);
+                self.mixer
+                    .ai_push(&self.cfg.bot().strip, language, generation, index, samples);
                 if let Some(e) = entry {
                     if e.sent {
                         if let Err(err) = self.store().put_entry(conversation, &e) {
@@ -2927,7 +2980,7 @@ impl Room {
 
     pub fn agent_failed(&self, generation: u64, error: &str) {
         error!(generation, "reply failed: {error}");
-        self.error(&format!("{} couldn't answer: {error}", self.cfg.agent_name));
+        self.error(&format!("{} couldn't answer: {error}", self.cfg.bot().name));
         self.agent_done(generation);
     }
 
@@ -2973,7 +3026,7 @@ impl Room {
         if st.reply.is_none() {
             return;
         }
-        let all = progress.unwrap_or_else(|| self.mixer.ai_progress());
+        let all = progress.unwrap_or_else(|| self.mixer.ai_progress(&self.cfg.bot().strip));
         // Every language this turn is being said in: the room's own, and
         // each other one somebody is listening in. A language nobody has
         // picked is never spoken, so there is nothing of it to wait for
@@ -3225,7 +3278,7 @@ impl Room {
             return;
         }
         self.generation.fetch_add(1, Ordering::SeqCst);
-        let p = self.mixer.ai_clear();
+        let p = self.mixer.ai_clear(&self.cfg.bot().strip);
         st.ducked = false;
         self.follow_reply(st, Some(p));
         let Some(r) = st.reply.take() else {
@@ -3351,7 +3404,7 @@ impl Room {
         }
         let entry = Entry {
             id: format!("agent-{}", uuid::Uuid::new_v4().simple()),
-            who: self.cfg.agent_name.clone(),
+            who: self.cfg.bot().name.clone(),
             kind: Kind::Agent,
             title: String::new(),
             text: String::new(),
@@ -3421,7 +3474,7 @@ impl Room {
             error!("agent thread is gone");
             self.error(&format!(
                 "{} has stopped: restart the room",
-                self.cfg.agent_name
+                self.cfg.bot().name
             ));
         }
     }
@@ -3444,8 +3497,8 @@ impl Room {
     /// Someone said the AI's name (or one of its aliases).
     fn named(&self, text: &str) -> bool {
         let words = words(text);
-        std::iter::once(&self.cfg.agent_name)
-            .chain(self.cfg.aliases.iter())
+        std::iter::once(&self.cfg.bot().name)
+            .chain(self.cfg.bot().aliases.iter())
             .map(|n| words_of(n))
             .filter(|n| !n.is_empty())
             .any(|n| words.windows(n.len()).any(|w| w == n.as_slice()))
@@ -3727,8 +3780,7 @@ mod tests {
             title: "Lobby".into(),
             only: None,
             default_mode: Mode::Named,
-            agent_name: "Vox".into(),
-            aliases: vec!["box".into()],
+            bots: vec![BotConfig::new("Vox", vec!["box".into()])],
             reply_after: Duration::from_millis(1000),
             confirm: Duration::from_millis(300),
             engaged_for: Duration::from_millis(5000),
@@ -3880,8 +3932,7 @@ mod tests {
                 title: "You and Vox".into(),
                 only: Some("Ryan".into()),
                 default_mode: Mode::Always,
-                agent_name: "Vox".into(),
-                aliases: vec![],
+                bots: vec![BotConfig::new("Vox", vec![])],
                 reply_after: Duration::from_millis(1000),
                 confirm: Duration::from_millis(300),
                 engaged_for: Duration::from_millis(5000),

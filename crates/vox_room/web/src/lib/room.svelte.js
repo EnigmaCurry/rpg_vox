@@ -42,6 +42,12 @@ export const room = $state({
   // own room is on anybody else's list. `path` is where the room
   // lives: the server settles the scheme, this only follows it.
   rooms: [],
+  // The AIs in this room: { name, strip, state }. One, today.
+  agents: [{ name: 'AI', state: 'listening', strip: '@agent' }],
+  // The first of them. Every use of this is a place that will have to
+  // say *which* bot once a room can hold two; the prose about "the AI"
+  // is nearly all of them, and it is the shape of the sentence that has
+  // to change there, not a lookup.
   agent: { name: 'AI', state: 'listening', strip: '@agent' },
   // The interpreters this room has, when it has any:
   // { level, languages }. `level` is where the one speaking your
@@ -557,7 +563,8 @@ function apply(ev) {
       room.title = ev.room?.title ?? 'Voice room';
       room.alone = ev.room?.private ?? false;
       room.you = ev.you;
-      room.agent = ev.agent;
+      room.agents = ev.agents ?? [];
+      room.agent = room.agents[0] ?? room.agent;
       room.interpreter = ev.interpreter ?? null;
       room.mode = ev.mode;
       room.engaged = ev.engaged ?? false;
@@ -667,6 +674,8 @@ function apply(ev) {
       room.games = ev.games;
       break;
     case 'agent':
+      // One state for the room's AI, while a room has one of them.
+      for (const bot of room.agents) bot.state = ev.state;
       room.agent.state = ev.state;
       break;
     case 'mode':

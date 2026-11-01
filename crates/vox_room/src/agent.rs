@@ -492,7 +492,7 @@ impl Agent {
             ),
             Some((game, prompt)) => format!("{}{translated}", game_prompt(game, prompt)),
         }
-        .replace("{name}", &cfg.agent_name)
+        .replace("{name}", &cfg.bot().name)
         .replace("{people}", &people);
         let mut out = vec![json!({ "role": "system", "content": system })];
         for (role, text) in &turn.messages {
@@ -1483,6 +1483,7 @@ fn clean(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::room::BotConfig;
     use crate::room::Mode;
 
     #[test]
@@ -1576,8 +1577,7 @@ mod tests {
             title: "Lobby".into(),
             only: None,
             default_mode: Mode::Named,
-            agent_name: "Vox".into(),
-            aliases: vec![],
+            bots: vec![BotConfig::new("Vox", vec![])],
             reply_after: Duration::from_millis(1200),
             confirm: Duration::from_millis(300),
             engaged_for: Duration::from_secs(30),
@@ -1624,8 +1624,7 @@ mod tests {
                 title: "Lobby".into(),
                 only: None,
                 default_mode: Mode::Named,
-                agent_name: "Vox".into(),
-                aliases: vec![],
+                bots: vec![BotConfig::new("Vox", vec![])],
                 reply_after: Duration::from_millis(1200),
                 confirm: Duration::from_millis(300),
                 engaged_for: Duration::from_secs(30),

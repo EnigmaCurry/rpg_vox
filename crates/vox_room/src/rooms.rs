@@ -142,7 +142,7 @@ impl Rooms {
             shared,
             own: Mutex::new(BTreeMap::new()),
             make,
-            agent_name: base.agent_name.clone(),
+            agent_name: base.bot().name.clone(),
             news,
         });
         for room in &rooms.shared {
@@ -391,6 +391,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicU64;
 
+    use crate::room::BotConfig;
     use crate::store::Store;
 
     fn base() -> RoomConfig {
@@ -399,8 +400,7 @@ mod tests {
             title: String::new(),
             only: None,
             default_mode: Mode::Named,
-            agent_name: "Vox".into(),
-            aliases: vec![],
+            bots: vec![BotConfig::new("Vox", vec![])],
             reply_after: Duration::from_millis(1200),
             confirm: Duration::from_millis(300),
             engaged_for: Duration::from_secs(30),

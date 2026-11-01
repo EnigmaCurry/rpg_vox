@@ -102,8 +102,13 @@
             {#each room.people as p (p.name)}
               <Strip key={p.name} label={p.name} mic={p.mic} muted={p.muted} speaking={p.speaking} />
             {/each}
-            <Strip key={room.agent.strip} label={room.agent.name} agent>
+            <!-- The AIs in this room, each with its own fader. One
+                 today; when the AI answers is still the room's rather
+                 than each bot's, so it hangs off the first. -->
+            {#each room.agents as bot, i (bot.strip)}
+            <Strip key={bot.strip} label={bot.name} agent>
               {#snippet children()}
+                {#if i === 0}
                 <!-- When this bot speaks, in this room. -->
                 <!-- A row of three buttons wants more width than this
                      column has, and the names are the whole point: a
@@ -122,8 +127,10 @@
                     {/each}
                   </select>
                 </label>
+                {/if}
               {/snippet}
             </Strip>
+            {/each}
             {#if interpreted}
               <!-- Yours, not the room's: you hear the one speaking your
                    language and nobody else hears yours. All the way down
