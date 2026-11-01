@@ -443,6 +443,20 @@ export async function share() {
   }
 }
 
+/// This tab has gone to another room. Nothing it was being sent came
+/// from here, so let go of every decoder and wait to be told who is
+/// sharing in the room it has arrived in -- the server says, the
+/// moment it has moved us.
+///
+/// A share of our own is deliberately left running: the server takes
+/// it with us, so the picture arrives in the new room without the
+/// browser having to ask for the desktop again.
+export function moved() {
+  for (const s of screen.streams) drop(s.id);
+  screen.streams = [];
+  screen.watching = null;
+}
+
 export function stopSharing() {
   if (!publisher) return;
   publisher.stop();

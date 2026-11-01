@@ -8,6 +8,7 @@
   import Enter from './components/Enter.svelte';
   import Games from './components/Games.svelte';
   import Board from './components/Board.svelte';
+  import Rooms from './components/Rooms.svelte';
 
   // Narrow screens show one area at a time; wide ones show all three.
   let view = $state('chat');
@@ -19,6 +20,17 @@
   // at that tab is put back on the conversation.
   const hasCards = $derived(room.cards.length > 0);
   const area = $derived(view === 'cards' && !hasCards ? 'chat' : view);
+
+  // Somebody on this room's roster who is in another room, and which:
+  // the rooms say who is in them, so "away" need not stand for both
+  // "gone" and "two doors down".
+  const elsewhere = $derived(
+    Object.fromEntries(
+      room.rooms
+        .filter((r) => r.id !== room.where)
+        .flatMap((r) => r.here.map((name) => [name, r.title])),
+    ),
+  );
 
   const views = $derived([
     { id: 'chat', label: 'Conversation' },
@@ -161,8 +173,16 @@
   <div class="app show-{area}" class:watching={screen.watching != null} class:nocards={!hasCards}
     inert={room.audio !== 'on'}>
     <header>
-      <h1>{room.game ?? 'Voice room'}</h1>
-      {#if room.game}<button onclick={lobby}>Back to lobby</button>{/if}
+      <!-- Which room you are in is the heading: the switcher says it and
+           changes it. In a game the game's name takes the h1, as it
+           always has, because that is what the room has become. -->
+      <Rooms />
+      {#if room.game}
+        <h1>{room.game}</h1>
+        <button onclick={lobby}>Back to lobby</button>
+      {:else}
+        <h1 class:hidden={room.rooms.length > 1}>{room.title}</h1>
+      {/if}
       <span class="pill {room.agent.state}" aria-live="polite">
         {#if room.agent.state === 'thinking' || room.agent.state === 'waiting'}
           <span class="dots" aria-hidden="true"><i></i><i></i><i></i></span>
@@ -208,7 +228,8 @@
     <aside>
       <h2>In the room</h2>
       {#each room.people as p (p.name)}
-        <Strip key={p.name} label={p.name} online={p.online} mic={p.mic} muted={p.muted} speaking={p.speaking} />
+        <Strip key={p.name} label={p.name} online={p.online} mic={p.mic} muted={p.muted} speaking={p.speaking}
+          elsewhere={elsewhere[p.name]} />
       {/each}
       <Strip key={room.agent.strip} label={room.agent.name} agent />
       {#if room.interpreter}
@@ -218,8 +239,13 @@
         <Strip key={room.interpreter.strip} label="Interpreter" agent doing={interpreting()} />
       {/if}
       <p class="hint">
-        Levels and mutes here change the room for everyone, and a muted person isn't transcribed.
-        You never hear yourself.
+        {#if room.alone}
+          This room is yours: nobody else can come into it, and nothing said here
+          reaches the rest of the house.
+        {:else}
+          Levels and mutes here change the room for everyone, and a muted person isn't transcribed.
+          You never hear yourself.
+        {/if}
         {#if room.interpreter}
           The louder the interpreter, the further the voices it is speaking over drop under it;
           all the way down turns it off, and the words are still written down for everyone.
@@ -312,6 +338,17 @@
     background: var(--panel);
   }
   h1 { font-size: 17px; margin: 0; }
+  /* With a switcher beside it the heading would say the room's name
+     twice. It stays for anything reading the page rather than looking
+     at it, and shows itself on a server with only the one room. */
+  h1.hidden {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
   h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin: 0 0 4px; }
   .spacer { flex: 1; }
   .pill { font-size: 13px; padding: 3px 10px; border-radius: 999px; background: var(--bubble); color: var(--muted); display: inline-flex; align-items: center; gap: 6px; }

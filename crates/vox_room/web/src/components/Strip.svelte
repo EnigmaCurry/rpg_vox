@@ -4,8 +4,9 @@
   import { screen, showThumb, streamOf, unwatch, watch } from '../lib/screen.svelte.js';
 
   // key: the strip's name in the mixer; label: what to show; doing: what
-  // to say it is up to, for a strip that is nobody's microphone.
-  let { key, label, online = true, mic = false, muted = false, speaking = false, agent = false, doing = undefined } = $props();
+  // to say it is up to, for a strip that is nobody's microphone; elsewhere:
+  // the room they are in instead of this one, when they are in one.
+  let { key, label, online = true, mic = false, muted = false, speaking = false, agent = false, doing = undefined, elsewhere = undefined } = $props();
 
   const strip = $derived(room.strips[key] ?? { gain: 1, mute: false });
   const level = $derived(room.levels[key] ?? 0);
@@ -32,9 +33,12 @@
 
 <div class="strip" class:offline={!online} class:speaking style="--h: {agent ? 270 : hue(label)}">
   <div class="top">
-    <span class="dot" title={online ? 'here' : 'away'}></span>
+    <span class="dot" title={online ? 'here' : elsewhere ? `in ${elsewhere}` : 'away'}></span>
     <span class="label">{label}{#if label === room.you}<em>&nbsp;(you)</em>{/if}</span>
-    <span class="state">{doing ?? (agent ? room.agent.state : speaking ? 'talking' : mic && muted ? 'muted' : mic ? 'mic on' : online ? 'no mic' : 'away')}</span>
+    <!-- "away" is ambiguous on a server with more than one room: it
+         could mean gone, or it could mean they are two doors down. Say
+         which, when the room they are in is one you can see. -->
+    <span class="state">{doing ?? (agent ? room.agent.state : speaking ? 'talking' : mic && muted ? 'muted' : mic ? 'mic on' : online ? 'no mic' : elsewhere ? `in ${elsewhere}` : 'away')}</span>
   </div>
   {#if stream}
     <button class="desktop" class:open onclick={() => (open ? unwatch() : watch(stream.id))}

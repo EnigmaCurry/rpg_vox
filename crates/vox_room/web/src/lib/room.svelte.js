@@ -1,9 +1,14 @@
 // The room as this tab sees it: one WebSocket carrying the room's events
 // (JSON) and this tab's audio (binary), and the state every component
 // reads. The server owns the state; this only applies its events.
+//
+// The server holds more than one room, and `enterRoom` moves this tab
+// between them on the socket it already has: the audio never stops, and
+// what arrives back is a whole new `hello`, because everything below
+// belonged to the room just left.
 
 import { RoomAudio, listDevices, onDeviceChange, permitMic } from './audio.js';
-import { connect as connectScreen, stopSharing } from './screen.svelte.js';
+import { connect as connectScreen, moved as screenMoved, stopSharing } from './screen.svelte.js';
 
 export const room = $state({
   connected: false,
@@ -21,6 +26,17 @@ export const room = $state({
   // link that expired between opening it and pressing the button.
   doorError: null,
   you: null,
+  // Which room this tab is in, from `hello`: its id (what a command
+  // names), what it is called on screen, and whether it is somebody's
+  // own -- a room nobody else can come into.
+  where: '',
+  title: 'Voice room',
+  alone: false,
+  // The rooms you may go to, and who is in each:
+  // { id, title, private, here: [names] }. The house's rooms, then
+  // yours. Worked out per person by the server, so nobody's own room
+  // is on anybody else's list.
+  rooms: [],
   agent: { name: 'AI', state: 'listening', strip: '@agent' },
   // The interpreters, when the room has any: { strip, languages }. One
   // fader for all of them, and pulling it down turns the voices off
@@ -269,6 +285,13 @@ export async function peekGame(name) {
   }
 }
 
+/// Go to another room. The socket stays where it is: the audio keeps
+/// flowing and the server sends back the room it has put you in.
+export function enterRoom(id) {
+  if (!id || id === room.where) return;
+  command({ type: 'enter_room', id });
+}
+
 export async function enterGame(name) {
   if (await ask(`Enter ${name}? Everyone in the room goes into the game, and this chat is cleared.`, `Enter ${name}`)) {
     command({ type: 'enter_game', name });
@@ -315,7 +338,14 @@ function upsert(entry) {
 
 function apply(ev) {
   switch (ev.type) {
-    case 'hello':
+    case 'hello': {
+      // A hello arrives on the way in, after a change of room, and when
+      // this tab fell too far behind to be patched up. Any of the three
+      // means: forget what you had, this is the room.
+      const moved = ev.room && ev.room.id !== room.where;
+      room.where = ev.room?.id ?? '';
+      room.title = ev.room?.title ?? 'Voice room';
+      room.alone = ev.room?.private ?? false;
       room.you = ev.you;
       room.agent = ev.agent;
       room.interpreter = ev.interpreter ?? null;
@@ -341,6 +371,21 @@ function apply(ev) {
       // until they come in.
       room.lang =
         languageOf(ev.people, ev.you) ?? browserLanguage(room.languages);
+      // A seat in a new room knows nothing of this tab's mic: the
+      // server gave it a fresh one, open and unmuted, so say again
+      // what it is really doing. Harmless on the way in, where it is
+      // what the socket said the moment it opened.
+      if (moved) {
+        command({ type: 'mic', on: room.mic });
+        command({ type: 'ptt', on: room.pushToTalk });
+        command({ type: 'mute', on: room.muted });
+      }
+      // Whatever was being shared belonged to the room just left.
+      if (moved) screenMoved();
+      break;
+    }
+    case 'rooms':
+      room.rooms = ev.rooms;
       break;
     case 'people':
       room.people = ev.people;
