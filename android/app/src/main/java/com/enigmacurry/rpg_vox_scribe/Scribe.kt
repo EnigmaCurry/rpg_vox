@@ -184,6 +184,31 @@ data class Para(
 data class Reading(val source: String, val text: String, val startMs: Long = 0)
 
 /**
+ * The engine's `translation.lines`, and the same array as it is stored
+ * beside the paragraph: `[{"source", "text", "start_ms"}, …]`. A line
+ * missing either side is dropped -- a reading with no sentence to show
+ * it against is no reading, and the other way round.
+ */
+fun parseReadings(a: JSONArray?): List<Reading> =
+    (0 until (a?.length() ?: 0)).mapNotNull {
+        val l = a!!.getJSONObject(it)
+        val source = l.optString("source")
+        val text = l.optString("text")
+        when {
+            source.isEmpty() || text.isEmpty() -> null
+            else -> Reading(source, text, l.optLong("start_ms"))
+        }
+    }
+
+fun parseReadings(json: String?): List<Reading> =
+    json?.let { runCatching { parseReadings(JSONArray(it)) }.getOrNull() } ?: emptyList()
+
+fun List<Reading>.toJson(): String =
+    JSONArray(
+        map { JSONObject().put("source", it.source).put("text", it.text).put("start_ms", it.startMs) },
+    ).toString()
+
+/**
  * A stretch of what was said, with the reading of it when it has one
  * and, when it has one, when that stretch was spoken.
  *
@@ -1457,10 +1482,17 @@ object Scribe {
                 // one row is all the screen needs of it. Without this a
                 // reopened thread would show the language it was spoken
                 // in, which is the one thing the screen never shows.
-                readings = m.translation
-                    ?.takeIf { it.isNotBlank() }
-                    ?.let { listOf(Reading(m.text, it)) }
-                    ?: emptyList(),
+                // Each sentence with the one it was made from, as it
+                // was heard: what the screen shows a reading against,
+                // and where a tap on it plays from. A row stored before
+                // there was a column for them keeps the whole reading
+                // against the whole paragraph, which is all it has.
+                readings = parseReadings(m.lines).ifEmpty {
+                    m.translation
+                        ?.takeIf { it.isNotBlank() }
+                        ?.let { listOf(Reading(m.text, it)) }
+                        ?: emptyList()
+                },
                 translated = if (m.translation.isNullOrBlank()) null else "done",
                 // A stored paragraph with no reading is never getting
                 // one: nothing is listening to it any more.
@@ -1627,15 +1659,7 @@ object Scribe {
             atMs = src.baseMs + o.optLong("start_ms"),
             translation = tr?.optString("text")?.takeIf { it.isNotEmpty() },
             heardIn = tr?.optString("language")?.takeIf { it.isNotEmpty() },
-            readings = (0 until (lines?.length() ?: 0)).mapNotNull {
-                val l = lines!!.getJSONObject(it)
-                val source = l.optString("source")
-                val text = l.optString("text")
-                when {
-                    source.isEmpty() || text.isEmpty() -> null
-                    else -> Reading(source, text, l.optLong("start_ms"))
-                }
-            },
+            readings = parseReadings(lines),
             translated = state?.optString("state")?.takeIf { it.isNotEmpty() },
             // Whether this engine has a translator at all, asked now
             // rather than when the paragraph is drawn: the answer
@@ -1684,18 +1708,19 @@ object Scribe {
             if (text.isEmpty()) continue
             present += p.id
             val words = p.words.takeIf { it.isNotEmpty() }?.toJson()
+            val lines = p.readings.takeIf { it.isNotEmpty() }?.toJson()
             val w = written[p.id]
             when {
                 w == null -> written[p.id] = Saved(
-                    threads.say(id, text, p.source, p.audio, words, p.atMs, p.translation, p.heardIn),
-                    text, p.source, p.audio, words, p.atMs, p.translation, p.heardIn,
+                    threads.say(id, text, p.source, p.audio, words, p.atMs, p.translation, p.heardIn, lines),
+                    text, p.source, p.audio, words, p.atMs, p.translation, p.heardIn, lines,
                 )
                 w.text != text || w.words != words || w.atMs != p.atMs ||
-                    w.translation != p.translation -> {
-                    threads.edit(w.rowId, text, words, p.atMs, p.translation, p.heardIn)
+                    w.translation != p.translation || w.lines != lines -> {
+                    threads.edit(w.rowId, text, words, p.atMs, p.translation, p.heardIn, lines)
                     written[p.id] = w.copy(
                         text = text, words = words, atMs = p.atMs,
-                        translation = p.translation, heardIn = p.heardIn,
+                        translation = p.translation, heardIn = p.heardIn, lines = lines,
                     )
                 }
             }

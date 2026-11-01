@@ -180,6 +180,17 @@ section after the version it releases.
 
 ### Scribe for Android
 
+- **A reopened translated paragraph plays from the sentence you tap.**
+  The reading was stored as one piece, so a thread opened again had
+  nothing to say which sentence was which: every tap on it played from
+  the start of the recording. The sentences are kept now, each with the
+  one it was made from and when that one was spoken
+  (`messages.lines`, the shape the engine hands them over in), so a
+  reopened paragraph taps the way a live one does. Paragraphs stored
+  before the column keep the whole reading against the whole
+  paragraph -- the alignment they were saved without cannot be worked
+  out after the fact.
+
 - **What was said shows until its reading lands, in the language it was
   heard in.** A reading arrives a sentence behind the speaking, and the
   sentence being spoken used to be a faint `…` -- a paragraph being

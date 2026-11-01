@@ -36,6 +36,13 @@ data class Saved(
     /** The reading in the language you read, and the one it was heard in. */
     val translation: String? = null,
     val heardIn: String? = null,
+    /**
+     * That reading a sentence at a time, each with the sentence it was
+     * made from and when that one was spoken (JSON, see `toJson` on a
+     * list of `Reading`). Null for a paragraph with no reading, and for
+     * one stored before there was a column for them.
+     */
+    val lines: String? = null,
 )
 
 private val iso = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.ROOT).apply {
@@ -76,10 +83,10 @@ data class AudioRow(
  * `messages.at` is when a paragraph was said rather than stored, so a
  * thread lists in speaking order even when a paragraph was finished after
  * a later one. Additions, ignored by the desktop: `messages.speaker` ("Me",
- * "Phone") for recordings with two sources, `messages.translation` and
- * `messages.heard_in` for a paragraph read in another language, and for
- * kept audio `messages.audio` and `messages.words` (see [Saved]) plus
- * the `audio` table, which groups the files a recording made (one per
+ * "Phone") for recordings with two sources, `messages.translation`,
+ * `messages.heard_in` and `messages.lines` for a paragraph read in
+ * another language, and for kept audio `messages.audio` and
+ * `messages.words` (see [Saved]) plus the `audio` table, which groups the files a recording made (one per
  * source) with each one's start in it, so they play back together.
  */
 class ThreadStore(file: File) {
@@ -113,7 +120,7 @@ class ThreadStore(file: File) {
                 execSQL("ALTER TABLE conversations ADD COLUMN auto_title INTEGER NOT NULL DEFAULT 0")
             }
         }
-        for (column in listOf("speaker", "audio", "words", "translation", "heard_in")) {
+        for (column in listOf("speaker", "audio", "words", "translation", "heard_in", "lines")) {
             rawQuery("SELECT 1 FROM pragma_table_info('messages') WHERE name = ?", arrayOf(column)).use {
                 if (!it.moveToFirst()) execSQL("ALTER TABLE messages ADD COLUMN $column TEXT")
             }
@@ -238,7 +245,7 @@ class ThreadStore(file: File) {
 
     fun messages(thread: Long): List<Saved> =
         db.rawQuery(
-            "SELECT id, text, speaker, audio, words, at, translation, heard_in FROM messages " +
+            "SELECT id, text, speaker, audio, words, at, translation, heard_in, lines FROM messages " +
                 "WHERE conversation = ? AND role = 'user' AND kind = 'say' ORDER BY at, id",
             arrayOf("$thread"),
         ).use { c ->
@@ -248,6 +255,7 @@ class ThreadStore(file: File) {
                         Saved(
                             c.getLong(0), c.getString(1), c.getString(2), c.getString(3),
                             c.getString(4), parseAt(c.getString(5)), c.getString(6), c.getString(7),
+                            c.getString(8),
                         ),
                     )
                 }
@@ -263,6 +271,7 @@ class ThreadStore(file: File) {
         atMs: Long = 0,
         translation: String? = null,
         heardIn: String? = null,
+        lines: String? = null,
     ): Long =
         db.insert("messages", null, ContentValues().apply {
             if (atMs > 0) put("at", isoAt(atMs))
@@ -275,6 +284,7 @@ class ThreadStore(file: File) {
             put("words", words)
             put("translation", translation)
             put("heard_in", heardIn)
+            put("lines", lines)
         })
 
     fun edit(
@@ -284,6 +294,7 @@ class ThreadStore(file: File) {
         atMs: Long = 0,
         translation: String? = null,
         heardIn: String? = null,
+        lines: String? = null,
     ) {
         db.update(
             "messages",
@@ -293,6 +304,7 @@ class ThreadStore(file: File) {
                 if (atMs > 0) put("at", isoAt(atMs))
                 put("translation", translation)
                 put("heard_in", heardIn)
+                put("lines", lines)
             },
             "id = ?",
             arrayOf("$rowId"),
