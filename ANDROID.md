@@ -316,10 +316,11 @@ list is only the languages with a model that reads into yours:
 
 ## What the transcript shows
 
-The language you read, and no other. A paragraph spoken in Russian is
-shown in English, a sentence at a time as each sentence is read, and the
-Russian is not shown at all. There is no setting for this: a transcript
-you can read is the point of translating it.
+The language you read, first and by default. A paragraph spoken in
+Russian is shown in English, a sentence at a time as each sentence is
+read, and the Russian is not shown until you ask for it. A transcript
+you can read is the point of translating it, so the reading is what the
+paragraph is; asking is one tap, and nothing is hidden.
 
 What was said is still what is *kept*. It is in the thread, it is what
 every later pass refines, and it is what each reading is made from
@@ -340,8 +341,34 @@ Text too short or too mixed to place is shown: `OK.` is as likely as
 the first. For those the engine assumes the language pass 1 is listening
 in, so most of them are read rather than left to that guess.
 
-Two more things follow:
+Three more things follow:
 
+* A reading says that it is one. It carries a rule down its left edge,
+  which is the whole of the indicator — a paragraph with that rule is
+  words nobody said, a paragraph without it is what somebody said — and
+  over it, the language it was heard in: **From English**. Tapping that
+  opens the transcript up sentence by sentence: each sentence as it was
+  said, faintly, with its reading on the line under it. Tapping again
+  closes it back to the readings alone.
+
+  One switch for the whole thread, not one per paragraph. Any tag
+  throws it and they all show the same chevron, because reading a
+  translated thread against the original is a way of reading rather
+  than a note taken on one paragraph, and opening each paragraph in
+  turn to do it is the same tap over and over.
+
+  Zipped rather than the reading and then the paragraph, because
+  checking a reading means holding one sentence against one sentence,
+  and down a long paragraph two blocks are too far apart to do it — by
+  the foot of the reading there is nothing left on screen to check it
+  against. A sentence the translator hasn't reached stands alone, with
+  nothing under it yet. Tapping a reading there plays from where its
+  own sentence was spoken, the same as tapping the closed block does.
+
+  A paragraph nothing has been read of yet stays closed however the
+  switch is set, there being nothing to compare it against, and its tag
+  is a label with no chevron. The switch itself is not stored: it is
+  how the transcript is being read just now, and it starts closed.
 * A sentence whose reading hasn't arrived yet shows as it was said,
   faintly, in the language it was heard in, and gives way to its reading
   as that lands. The reading runs a sentence behind the speaking on

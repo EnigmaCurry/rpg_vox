@@ -110,6 +110,16 @@
     <!-- TalkBack, on a paragraph shown as its reading: the language it
          was heard in, then the reading. -->
     <string name="a11y_read_as">%1$s, read as: %2$s</string>
+    <!-- The tag over a paragraph that is a reading rather than what was
+         said: the language it was heard in, or this when the engine has
+         not named one yet. Tapping any of them opens every reading in
+         the transcript against the lines it was made from. -->
+    <string name="reading_from">From %1$s</string>
+    <string name="reading_from_unknown">Translated</string>
+    <!-- TalkBack, on that tag: what tapping it does. One switch for
+         the whole transcript, so the label says so. -->
+    <string name="a11y_show_said">Show what was said, in every paragraph</string>
+    <string name="a11y_hide_said">Hide what was said, in every paragraph</string>
     <!-- The clipboard's name for what Copy put there. -->
     <string name="clip_transcript">Transcript</string>
     <string name="clip_dictation">Dictation</string>

@@ -87,6 +87,12 @@
     <string name="transcript_no_words_in_thread">В этой записи слов не распознано</string>
     <string name="transcript_jump_to_latest">↓ К последнему</string>
     <string name="a11y_read_as">%1$s, перевод: %2$s</string>
+    <!-- Like languages_native_hint, the language is named rather than
+         declined: the name comes from a resource in the nominative. -->
+    <string name="reading_from">Перевод · %1$s</string>
+    <string name="reading_from_unknown">Перевод</string>
+    <string name="a11y_show_said">Показать сказанное во всех абзацах</string>
+    <string name="a11y_hide_said">Скрыть сказанное во всех абзацах</string>
     <string name="clip_transcript">Расшифровка</string>
     <string name="clip_dictation">Диктовка</string>
     <string name="share_transcript">Поделиться расшифровкой</string>

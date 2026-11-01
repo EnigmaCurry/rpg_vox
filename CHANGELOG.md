@@ -7,6 +7,37 @@ releases.
 
 ## Unreleased
 
+### Scribe for Android
+
+- **A reading says that it is a reading, and will show you the line it
+  was made from.** A translated paragraph was the same black text as
+  one somebody actually said, with nothing to tell them apart and no
+  way to see what the translator had been given. It now carries a rule
+  down its left edge -- the whole of the indicator, present on readings
+  and on nothing else -- and over it the language it was heard in,
+  **From English**.
+
+  Tapping that opens the thread sentence by sentence: each sentence as
+  it was said, faintly, with its reading on the line beneath it. Zipped
+  rather than the reading followed by the paragraph, because checking a
+  reading means holding one sentence against one sentence, and down a
+  long paragraph two blocks are too far apart to do it. A sentence the
+  translator hasn't reached stands alone; tapping a reading plays from
+  where its own sentence was spoken, as before.
+
+  One switch for the whole transcript and not one per paragraph: any
+  tag throws it, they all show the same chevron, and one tap puts the
+  thread back to the readings alone. Reading a translated thread
+  against the original is a way of reading, not a note taken on one
+  paragraph. A paragraph nothing has been read of stays closed however
+  the switch is set -- there is nothing to compare it against yet, so
+  its tag is a label with no chevron.
+
+  Distinct from **Show what was said**, which is about the sentence a
+  reading has not reached yet. This is about the ones it has. The
+  switch is not stored: it is how the transcript is being read just
+  now, and it starts closed.
+
 ## v0.2.0 (2026-11-01)
 
 ### scribe

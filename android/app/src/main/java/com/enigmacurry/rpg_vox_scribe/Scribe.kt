@@ -331,6 +331,26 @@ object Scribe {
      */
     var showSaid by mutableStateOf(true)
         private set
+    /**
+     * Whether every reading is opened up against what was said, rather
+     * than standing on its own.
+     *
+     * One switch for the whole transcript and not one per paragraph:
+     * reading a translated thread with the original beside it is a way
+     * of reading, not a note taken on one paragraph, and having to open
+     * each paragraph in turn to do it is the same tap over and over.
+     * Any paragraph's language tag throws it, and throws it for all of
+     * them.
+     *
+     * Not stored: it is how the transcript is being read just now, and
+     * it starts closed, which is what a transcript you can read is for.
+     *
+     * Distinct from [showSaid], which is about the sentence a reading has
+     * not reached yet. This is about the ones it has: a reading that looks
+     * wrong can only be judged against the line it was made from.
+     */
+    var saidShown by mutableStateOf(false)
+        private set
     /** The input the mic source is recording from, while it runs. */
     var micName by mutableStateOf<String?>(null)
         private set
@@ -491,6 +511,11 @@ object Scribe {
     fun chooseShowSaid(on: Boolean) {
         showSaid = on
         app.getSharedPreferences("scribe", Context.MODE_PRIVATE).edit().putBoolean("show_said", on).apply()
+    }
+
+    /** Open every reading against what was said, or close them all. */
+    fun toggleSaid() {
+        saidShown = !saidShown
     }
 
     fun chooseFontStep(step: Int) {
