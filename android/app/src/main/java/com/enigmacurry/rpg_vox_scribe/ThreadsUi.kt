@@ -436,8 +436,9 @@ private fun KeyboardPage() {
 }
 
 /**
- * The language you read in, the ones to listen out for, and what the
- * transcript shows of a paragraph that has a reading.
+ * The language you read in, the secondary ones to listen out for, the
+ * dictionaries they need, and what a paragraph shows while its reading
+ * catches up.
  *
  * Each other language is one model, downloaded here, that reads it in
  * the language you read. Which languages can be offered is not a matter
@@ -446,6 +447,11 @@ private fun KeyboardPage() {
  * own, and two sharing each other's could not be told apart either. So
  * the list is the languages with a model into yours, and turning one on
  * turns off whichever other one shares its alphabet.
+ *
+ * All of which is said here in a line apiece. A settings page that
+ * explains itself in paragraphs is one nobody reads to the end of, and
+ * everything it would have said is in ANDROID.md, where there is room
+ * for it.
  */
 @Composable
 private fun LanguagesPage() {
@@ -457,33 +463,13 @@ private fun LanguagesPage() {
     NATIVE_LANGUAGES.forEach { l ->
         Choice(l.label, native == l) { Scribe.chooseNative(l) }
     }
-    Text(
-        "Everything heard in another language is read into this one.",
-        style = MaterialTheme.typography.bodySmall,
-        color = MaterialTheme.colorScheme.onSurfaceVariant,
-    )
-
-    Text(
-        "The words that appear as you speak start in this language and follow " +
-            "the speaking from there: an utterance that turns out to have been " +
-            "in another of the languages below is enough for the next one to be " +
-            "listened to in it.",
-        style = MaterialTheme.typography.bodySmall,
-        color = MaterialTheme.colorScheme.onSurfaceVariant,
-        modifier = Modifier.padding(top = 4.dp),
-    )
+    Hint("All text will be written and/or translated in ${native.label}.")
     Scribe.pass1Missing?.let { l ->
-        Text(
-            "The ${l.label} model for the live text isn't here yet, so the words " +
-                "as you speak can't be in ${l.label} until it has downloaded.",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.error,
-            modifier = Modifier.padding(top = 4.dp),
-        )
+        Hint("The ${l.label} model for the live text isn't here yet.", error = true)
     }
 
     Text(
-        "Also listen out for",
+        "Choose secondary languages (one per alphabet)",
         style = MaterialTheme.typography.titleSmall,
         modifier = Modifier.padding(top = 16.dp),
     )
@@ -499,10 +485,10 @@ private fun LanguagesPage() {
         Toggle(
             l.label,
             when {
-                clash != null -> "${l.script.label}, like ${clash.label}: only one of them can be told apart."
+                clash != null -> "${l.script.label}, like ${clash.label}."
                 have -> "Downloaded, $mb MB."
                 on -> "$mb MB to download."
-                else -> "$mb MB, downloaded when you turn it on."
+                else -> "$mb MB."
             },
             on,
             { Scribe.chooseOther(l, it) },
@@ -510,33 +496,30 @@ private fun LanguagesPage() {
         )
     }
     if (translatable(native).isEmpty()) {
-        Text(
-            "No other language has a model that reads into ${native.label} yet.",
-            style = MaterialTheme.typography.bodySmall,
-        )
+        Hint("No other language has a model that reads into ${native.label} yet.")
     }
 
     // What the choices above still want fetched, and what they left behind.
     val missing = remember(models, chosen, native) { Scribe.wanted().filterNot(Scribe.store::installed) }
     val spare = remember(models, chosen, native) { Scribe.spare() }
+    // Only when there is one to fetch or one to be rid of: a header
+    // over nothing is the sort of thing this page is being rid of.
+    if (missing.isNotEmpty() || spare.isNotEmpty() || installing !is Install.Idle) {
+        Text(
+            "Manage dictionaries",
+            style = MaterialTheme.typography.titleSmall,
+            modifier = Modifier.padding(top = 16.dp),
+        )
+    }
     when {
-        installing is Install.Running -> Text(
-            describe(installing.step),
-            style = MaterialTheme.typography.bodySmall,
-            modifier = Modifier.padding(top = 8.dp),
-        )
-        installing is Install.Failed -> Text(
-            "Download failed: ${installing.error}\nTrying again resumes where it stopped.",
-            color = MaterialTheme.colorScheme.error,
-            style = MaterialTheme.typography.bodySmall,
-            modifier = Modifier.padding(top = 8.dp),
-        )
-        missing.isNotEmpty() -> Text(
-            "${missing.sumOf { it.approxBytes } / 1_000_000} MB to download. " +
-                "Wi-Fi recommended; it continues if you switch apps.",
-            style = MaterialTheme.typography.bodySmall,
-            modifier = Modifier.padding(top = 8.dp),
-        )
+        installing is Install.Running -> Hint(describe(installing.step))
+        installing is Install.Failed ->
+            Hint("Download failed: ${installing.error}\nTrying again resumes where it stopped.", error = true)
+        missing.isNotEmpty() ->
+            Hint(
+                "${missing.sumOf { it.approxBytes } / 1_000_000} MB to download. " +
+                    "Wi-Fi recommended; it continues in the background.",
+            )
     }
     if (missing.isNotEmpty() && installing !is Install.Running) {
         TextButton(onClick = Scribe::installLanguages) {
@@ -545,27 +528,56 @@ private fun LanguagesPage() {
     }
     spare.forEach { m ->
         TextButton(onClick = { Scribe.removeModel(m) }) {
-            Text("Delete ${m.dir.removePrefix("translate/")} (${m.approxBytes / 1_000_000} MB)")
+            Text("Delete ${modelName(m)}")
         }
     }
 
     Text(
-        "A paragraph heard in one of these is shown in ${native.label} and " +
-            "not in the language it was spoken in. What was said is still " +
-            "kept — it is what each later pass refines and what every reading " +
-            "is remade from — it is just not what is on the screen.",
-        style = MaterialTheme.typography.bodySmall,
-        color = MaterialTheme.colorScheme.onSurfaceVariant,
-        modifier = Modifier.padding(top = 12.dp),
+        "While a reading catches up",
+        style = MaterialTheme.typography.titleSmall,
+        modifier = Modifier.padding(top = 16.dp),
     )
+    Toggle(
+        "Show what was said",
+        "In the language it was heard in. Off: an ellipsis.",
+        Scribe.showSaid,
+        Scribe::chooseShowSaid,
+    )
+
     if (Scribe.recording || Scribe.busy()) {
-        Text(
-            "Language changes apply to the next recording.",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.padding(top = 8.dp),
-        )
+        Hint("Language changes apply to the next recording.")
     }
+}
+
+/**
+ * A model left on disk by a language no longer chosen, said in
+ * languages rather than in the directory it is kept in: "ru-en" is the
+ * app's business and "Russian → English" is the reader's. Its size is
+ * not repeated here -- the list above says what one of these costs,
+ * and a button that wraps onto two lines to say it again is the kind
+ * of thing this page is being rid of.
+ */
+private fun modelName(m: Model): String {
+    val pair = m.dir.removePrefix("translate/").split('-')
+    val from = Language.entries.firstOrNull { it.code == pair.firstOrNull() }
+    val into = Language.entries.firstOrNull { it.code == pair.lastOrNull() }
+    return when {
+        pair.size == 2 && from != null && into != null -> "${from.label} → ${into.label}"
+        else -> Language.entries.firstOrNull { it.streaming?.dir == m.dir }
+            ?.let { "${it.label} live text" }
+            ?: m.dir.substringAfterLast('/')
+    }
+}
+
+/** A line of explanation under a choice, or a warning in red. */
+@Composable
+private fun Hint(text: String, error: Boolean = false) {
+    Text(
+        text,
+        style = MaterialTheme.typography.bodySmall,
+        color = if (error) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = Modifier.padding(top = 4.dp),
+    )
 }
 
 /** Transcript text size: five steps, the default in the middle. */

@@ -78,7 +78,7 @@ private fun Header() {
         color = MaterialTheme.colorScheme.onSurfaceVariant,
     )
     Text(
-        "Live transcription on your phone, with speech models that run on it.",
+        "Live transcription, translation, and dictation on your Android phone using local models.",
         style = MaterialTheme.typography.bodyMedium,
         modifier = Modifier.padding(top = 12.dp),
     )

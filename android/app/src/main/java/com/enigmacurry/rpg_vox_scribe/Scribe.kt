@@ -167,7 +167,7 @@ data class Para(
                 val before = whole.substring(pos, at).trim()
                 if (before.isNotEmpty()) out += Row(before, null)
             }
-            out += Row(r.source, r.text)
+            out += Row(r.source, r.text, r.startMs)
             pos = at + r.source.length
         }
         val tail = whole.substring(pos).trim()
@@ -184,14 +184,15 @@ data class Para(
 data class Reading(val source: String, val text: String, val startMs: Long = 0)
 
 /**
- * A stretch of what was said, with the reading of it when it has one.
+ * A stretch of what was said, with the reading of it when it has one
+ * and, when it has one, when that stretch was spoken.
  *
- * The screen shows the readings and not the stretches (see `Paragraph`
- * in MainActivity), so what this is for is the order they go in and
- * whether anything said has not been read yet.
+ * The screen shows the readings, and what was said only where a reading
+ * has not landed yet (see `Paragraph` in MainActivity), so what this is
+ * for is the order they go in, whether anything said is still waiting,
+ * and where a tap on a reading plays from.
  */
-data class Row(val said: String, val reading: String?)
-
+data class Row(val said: String, val reading: String?, val startMs: Long = 0)
 
 sealed interface Phase {
     /** Models missing; nothing started yet, or the last attempt failed. */
@@ -295,6 +296,16 @@ object Scribe {
      */
     var others by mutableStateOf<Set<Language>>(emptySet())
         private set
+    /**
+     * Show what was said where a reading of it has not landed yet, in
+     * the language it was heard in, rather than an ellipsis holding the
+     * place. The reading runs a sentence behind the speaking on purpose,
+     * and this is what that sentence looks like meanwhile: the words
+     * pass 1 is typing, in their own language, each giving way to its
+     * reading as that arrives.
+     */
+    var showSaid by mutableStateOf(true)
+        private set
     /** The input the mic source is recording from, while it runs. */
     var micName by mutableStateOf<String?>(null)
         private set
@@ -383,6 +394,7 @@ object Scribe {
         keepNonSpeech = prefs.getBoolean("keep_non_speech", false)
         autoStart = prefs.getBoolean("auto_start", false)
         fontStep = prefs.getInt("font_step", FONT_SCALES.size / 2).coerceIn(0, FONT_SCALES.size - 1)
+        showSaid = prefs.getBoolean("show_said", true)
         native = Language.of(prefs.getString("native_language", null))
         others = (prefs.getStringSet("other_languages", null) ?: emptySet())
             .mapNotNull { name -> Language.entries.firstOrNull { it.name == name } }
@@ -449,6 +461,11 @@ object Scribe {
     fun chooseAutoStart(on: Boolean) {
         autoStart = on
         app.getSharedPreferences("scribe", Context.MODE_PRIVATE).edit().putBoolean("auto_start", on).apply()
+    }
+
+    fun chooseShowSaid(on: Boolean) {
+        showSaid = on
+        app.getSharedPreferences("scribe", Context.MODE_PRIVATE).edit().putBoolean("show_said", on).apply()
     }
 
     fun chooseFontStep(step: Int) {

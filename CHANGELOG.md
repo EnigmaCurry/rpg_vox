@@ -180,6 +180,36 @@ section after the version it releases.
 
 ### Scribe for Android
 
+- **What was said shows until its reading lands, in the language it was
+  heard in.** A reading arrives a sentence behind the speaking, and the
+  sentence being spoken used to be a faint `…` -- a paragraph being
+  heard in another language was an ellipsis and nothing else until the
+  translator had read its first sentence. The words themselves stand
+  there now, faintly, in the language they were heard in, each giving
+  way to its reading as that lands, so the screen shows that something
+  is being heard and roughly how much. **Settings -> Languages -> While
+  a reading catches up -> Show what was said** turns it off for the
+  ellipsis again.
+  A reading is still what a translated paragraph is, and still what
+  Copy, Share and the notification say of one: this is what the place a
+  reading has not taken yet looks like.
+
+- **Settings -> Languages says it in lines rather than paragraphs.**
+  The page had grown three paragraphs of explanation around four
+  choices, and the last toggle's description was six lines long with
+  the switch floating somewhere in the middle of it. It fits on one
+  screen now, with a heading that says what each part is for -- **I
+  read in** ("All text will be written and/or translated in English"),
+  **Choose secondary languages (one per alphabet)**, **Manage
+  dictionaries** for what is to be downloaded or deleted, and **While a
+  reading catches up**. The alphabet rule is in the heading rather than
+  repeated under every greyed-out language, a leftover dictionary is
+  named in languages ("English -> Russian") rather than in the
+  directory it is kept in ("en-ru"), and what the page used to spell
+  out is in [ANDROID.md](ANDROID.md#languages), where there is room for
+  it. About says what the app is in one line: live transcription,
+  translation and dictation on the phone, with local models.
+
 - **A new thread is named for when you spoke, not when you made it.**
   Making a thread and then waiting to press record left the title
   stamped with the wait rather than the recording. A new thread is now

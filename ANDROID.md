@@ -215,8 +215,9 @@ the middle.
 ## Languages
 
 **Settings → Languages** has three things: the language you read in, the
-languages to listen out for, and what the transcript shows of a
-paragraph that was read.
+languages to listen out for, and **Show what was said**, which is what a
+paragraph shows while its reading catches up. The page says each of them
+in a line; the rest of what they mean is here.
 
 **I read in** is the language every translation is read into, and the
 one the words that appear *as you speak* start out in.
@@ -238,9 +239,10 @@ Russian); until it is there the live text cannot be in that language,
 and the settings page and the recording status line say so rather than
 listening in the wrong one without a word about it.
 
-**Also listen out for** is a language per model, about 81 MB each,
-downloaded here. A paragraph heard in one of them gets a reading in the
-language you read, a sentence at a time, on the phone.
+**Choose secondary languages (one per alphabet)** is a language per
+model, about 81 MB each, downloaded under **Manage dictionaries** below
+them. A paragraph heard in one of them gets a reading in the language
+you read, a sentence at a time, on the phone.
 
 Which languages are offered is not a matter of taste. A paragraph's
 language is worked out from its alphabet, because the recognizer that
@@ -283,10 +285,13 @@ in, so most of them are read rather than left to that guess.
 
 Two more things follow:
 
-* A sentence whose reading hasn't arrived yet shows as `…`. The reading
-  runs a sentence behind the speaking on purpose — a translator given
-  half a sentence returns half a thought — and an ellipsis says so
-  rather than leaving the paragraph looking finished.
+* A sentence whose reading hasn't arrived yet shows as it was said,
+  faintly, in the language it was heard in, and gives way to its reading
+  as that lands. The reading runs a sentence behind the speaking on
+  purpose — a translator given half a sentence returns half a thought —
+  and the words themselves say so better than a gap would. **Show what
+  was said** (under *While a reading catches up*) turns that off, for a
+  faint `…` in its place.
 * Tapping a word to [play it back](#playing-back) and editing or cutting
   a selection work on what was said, which a translated paragraph is not
   showing. Tapping one of its sentences plays from where *that sentence*

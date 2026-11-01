@@ -911,18 +911,20 @@ fun Para.wordAt(i: Int, shown: Int): Word =
  * the one the word timings are of.
  *
  * A paragraph heard in another language is its reading, a sentence at a
- * time, and the other language is not shown at all. What was said is
- * still what is kept: it is in the thread's database, it is what every
- * later pass refines, and it is what the reading is remade from each
- * time one of them changes it. It is simply not what someone who reads
- * English wants on the screen.
+ * time, once each sentence has one. What was said is what is kept: it is
+ * in the thread's database, it is what every later pass refines, and it
+ * is what the reading is remade from each time one of them changes it.
  *
- * A sentence whose reading has not landed yet is an ellipsis: the
- * reading runs a sentence behind the speaking on purpose (a translator
- * given half a sentence returns half a thought), and the alternative to
- * saying so is a paragraph that appears to have stopped. So is a
- * paragraph pass 1 is still typing in the other language, which is all
- * of one until pass 2 has decided it and the translator has read it.
+ * What a sentence with no reading yet looks like is a setting, **Show
+ * what was said until it is read** (Settings -> Languages): the words as
+ * they were heard, faintly, in the language they were heard in, or a
+ * faint ellipsis in their place. The reading runs a sentence behind the
+ * speaking on purpose (a translator given half a sentence returns half a
+ * thought), so there is always one of those while a paragraph is being
+ * spoken -- and a paragraph pass 1 is still typing is all of one, until
+ * pass 2 has decided it and the translator has read it. Either way the
+ * paragraph is visibly still going rather than appearing to have
+ * stopped; see [Reading].
  */
 @Composable
 private fun Paragraph(p: Para, playing: Playing?, at: Karaoke?, canPlay: Boolean, follow: Boolean) {
@@ -947,31 +949,56 @@ private fun Paragraph(p: Para, playing: Playing?, at: Karaoke?, canPlay: Boolean
  * reading of it that breaks every sentence onto its own line reads like
  * a list of things nobody said that way.
  *
- * It ends in an ellipsis while something said has not been read yet: the
- * sentence being spoken now, one whose reading is still on its way, or
- * the whole paragraph while pass 1 is typing it. Inline, so it is the
- * end of the paragraph rather than a line of its own.
+ * There is always something said with no reading yet -- the reading runs
+ * a sentence behind the speaking on purpose, a translator given half a
+ * sentence returning half a thought -- and that is the sentence being
+ * spoken now, one whose reading is still on its way, or the whole
+ * paragraph while pass 1 is typing it. With **Show what was said until
+ * it is read** on, it is shown as it was said, faintly, in the language
+ * it was heard in, and gives way to its reading as that lands; with it
+ * off, a faint ellipsis holds the place. Either way it is inline, part
+ * of the paragraph rather than a line of its own.
  *
- * Tapping it plays from where the sentence tapped was spoken. A
+ * Tapping a reading plays from where the sentence tapped was spoken. A
  * translation has its own word count and its own word order, so the
  * sentence is as fine-grained as this can honestly be -- which is why
- * each one's place in the text is kept here.
+ * each one's place in the text is kept here. What was said while the
+ * reading catches up is no tap target of its own: a tap in it lands on
+ * the sentence before it, pass 2 not having settled its own words yet.
  */
 @Composable
 private fun Reading(p: Para, canPlay: Boolean) {
     val faint = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.45f)
-    val pending = p.readings.isEmpty() || p.rows().any { it.reading == null }
-    // Where each sentence starts in the block, for a tap to find it.
-    val starts = remember(p.readings) {
-        p.readings.runningFold(0) { at, r -> at + r.text.length + 1 }.dropLast(1)
+    val rows = p.rows()
+    // The block in order: each reading with when its sentence was
+    // spoken, and -- where no reading has landed -- what was said,
+    // which has no time of its own (-1) and is drawn faintly.
+    val parts = rows.mapNotNull { r ->
+        when {
+            r.reading != null -> r.reading to r.startMs
+            Scribe.showSaid && r.said.isNotBlank() -> r.said to -1L
+            else -> null
+        }
+    }
+    // Nothing of it to show: what was said is standing in for no
+    // reading, or there is no reading yet and nothing standing in.
+    val pending = parts.isEmpty() || !Scribe.showSaid && rows.any { it.reading == null }
+    // Where each reading starts in the block, and when it was spoken,
+    // for a tap to find it.
+    var offset = 0
+    val taps = buildList {
+        for ((body, ms) in parts) {
+            if (ms >= 0) add(offset to ms)
+            offset += body.length + 1
+        }
     }
     val text = buildAnnotatedString {
-        p.readings.forEachIndexed { i, r ->
+        parts.forEachIndexed { i, (body, ms) ->
             if (i > 0) append(' ')
-            append(r.text)
+            if (ms >= 0) append(body) else withStyle(SpanStyle(color = faint)) { append(body) }
         }
         if (pending) {
-            if (p.readings.isNotEmpty()) append(' ')
+            if (parts.isNotEmpty()) append(' ')
             withStyle(SpanStyle(color = faint)) { append("…") }
         }
     }
@@ -985,7 +1012,7 @@ private fun Reading(p: Para, canPlay: Boolean) {
             .semantics {
                 p.heardIn?.let { contentDescription = "$it, read as: $text" }
             }
-            .pointerInput(p.id, canPlay, starts) {
+            .pointerInput(p.id, canPlay, taps) {
                 if (!canPlay) return@pointerInput
                 awaitEachGesture {
                     val playingAtDown = Playback.playing != null && !Playback.paused
@@ -995,8 +1022,8 @@ private fun Reading(p: Para, canPlay: Boolean) {
                     }
                     val l = layout ?: return@awaitEachGesture
                     val c = l.getOffsetForPosition(up)
-                    val i = starts.indexOfLast { it <= c }
-                    val from = p.readings.getOrNull(i)?.startMs ?: return@awaitEachGesture
+                    val i = taps.indexOfLast { it.first <= c }
+                    val from = taps.getOrNull(i)?.second ?: return@awaitEachGesture
                     Scribe.play(p, Word("", from, from))
                 }
             },
