@@ -73,8 +73,8 @@
       </p>
     {:else}
       <p class="lead">
-        Everyone here is here by ear. Pick your microphone and press
-        <strong>Join Audio</strong> to come in.
+        This is a voice and video conference room. Select your microphone and
+        press <strong>Join Audio</strong> to enter.
         {#if room.door}
           Your link works once: pressing it is what spends it, and this
           browser is remembered from then on.
@@ -155,12 +155,12 @@
           which everyone here reads, and which the room keeps until somebody
           deletes it. That writing is sent on to the AI, and to the
           translation and voice services this room is set up to use, which
-          are run by whoever runs it. Your audio itself is not stored.
+          are run by whoever runs it.
         </p>
         <label>
           <input type="checkbox" checked={room.consented}
             onchange={(e) => setConsent(e.currentTarget.checked)} />
-          <span>I agree to be heard, transcribed and passed on this way.</span>
+          <span>I agree to be heard, transcribed and recorded.</span>
         </label>
       </div>
 

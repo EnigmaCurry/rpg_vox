@@ -175,8 +175,7 @@ releases.
   and to the translation and voice services the operator has
   configured. **Join Audio** does nothing until you agree. The answer
   is kept in the browser, so it is asked once, and unticking it takes
-  it back. (The audio itself is never stored, and the card says that
-  too.)
+  it back.
 
   **The door's Language box always has a language in it.** It was blank
   for anybody the room already knew: the box's first option carried the

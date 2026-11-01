@@ -238,7 +238,7 @@ See ROOM_DOCKER.md.
   operator has configured — all outside the room. The card says so and
   asks you to agree, and **Join Audio** does nothing until you do. The
   answer is kept in the browser, so it is asked once; unticking it takes
-  it back and shuts the door again. (The audio itself is never stored.) The first time, on an invite link, it says *Hi,
+  it back and shuts the door again. The first time, on an invite link, it says *Hi,
   Mike* and offers **your name in the room**: that is the name everyone
   sees, the one beside everything you say, and the one the AI deals your
   cards to. Change it there and nowhere else — once the link is spent it
