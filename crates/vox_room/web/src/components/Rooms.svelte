@@ -38,7 +38,6 @@
 </script>
 
 <nav class="rooms" aria-label="Rooms">
-  <h2>Rooms</h2>
   <div role="radiogroup" aria-label="Which room you are in">
     {#each list as r (r.id)}
       {@const here = r.id === room.where}
@@ -91,21 +90,13 @@
 <style>
   /* Where it sits in the grid, and the rule down its edge, are App's:
      a scoped class here would outrank App's :global() and strand the
-     sidebar in a column of its own on a narrow screen. */
-  .rooms {
-    padding: 14px 12px;
-    overflow-y: auto;
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-  }
-  h2 {
-    font-size: 13px;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    color: var(--muted);
-    margin: 0 0 6px 4px;
-  }
+     sidebar in a column of its own on a narrow screen.
+     
+     No padding of its own and no heading: the rows run edge to edge
+     from the top, the way a list of channels does. The nav's own label
+     is what says what it is, for anyone who can't see that it is a
+     list of rooms. */
+  .rooms { padding: 0; overflow-y: auto; }
   .room { display: flex; flex-direction: column; }
   .room > button {
     display: flex;
@@ -114,8 +105,8 @@
     width: 100%;
     text-align: left;
     border: 0;
-    border-radius: 8px;
-    padding: 7px 10px;
+    border-radius: 0;
+    padding: 6px 10px;
     background: transparent;
     font-weight: 600;
   }
@@ -133,13 +124,15 @@
   }
   .room > button.on .count { background: var(--accent-ink); color: var(--accent); }
   /* The branch: indented, and hung off a line so the strips read as
-     belonging to the room above them rather than following it. */
+     belonging to the room above them rather than following it. The
+     right-hand padding is the only inset in here, and it is there so a
+     fader doesn't run into the edge of the column. */
   .who {
     display: flex;
     flex-direction: column;
-    gap: 8px;
-    margin: 8px 0 10px 10px;
-    padding-left: 10px;
+    gap: 7px;
+    margin: 5px 0 7px 14px;
+    padding: 0 10px 0 8px;
     border-left: 1px solid var(--line);
   }
   .hint { font-size: 12px; color: var(--muted); margin: 0; }

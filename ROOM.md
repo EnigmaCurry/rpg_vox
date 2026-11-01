@@ -69,14 +69,20 @@ how somebody gets onto a second device, without disturbing the first.
 ## More than one room
 
 One `vox_room` holds several rooms at once. Name the ones the house
-shares with `--room` (repeat it, or comma-separate
-`VOX_ROOM_ROOMS`); without any, there is one called **Main**. On top of
-those, **everybody has a room of their own** — it isn't configured, it
-is made the first time they walk into it, and nobody else can ask for
-it.
+shares with `--room` (repeat it, or comma-separate `VOX_ROOM_ROOMS`);
+without any, there is one called **Lobby**. On top of those,
+**everybody has a room of their own** — it isn't configured, it is made
+the first time they walk into it, and nobody else can ask for it.
 
 They are down the left, one line each, and pressing one takes you
-there. **The audio never stops.** You called in once and you stay called in: what changes
+there. **Your own room is first and stays first**, then the house's in
+the order they were named: the one room that is always there and
+always the same is the one to put where the eye lands, and a room that
+moved about the list as people came and went would be a room you had
+to look for. A tab still *lands* in the first shared room, because
+calling in is calling in to be with people.
+
+**The audio never stops.** You called in once and you stay called in: what changes
 is which room your voice goes into, whose conversation is on your
 screen, and which mixer is feeding your headphones. Moving is a frame
 of audio, not a reconnection.
@@ -94,7 +100,12 @@ reaches the house, and nothing said in the house reaches it. Because
 there is nobody there to take the turn from, it starts out answering
 every pause rather than waiting to be named — which you can change, and
 it will remember. It is called *You and Vox*, after whatever you called
-the AI.
+the AI, and it is the first thing in the list.
+
+(A room called **Lobby** is a room. The *game* sense of "the lobby" —
+being in no game, just the room's own conversation — is the room's
+state, not a place you travel to, and the button that leaves a game
+says **Leave the game** so that the two can't be read for each other.)
 
 The faders for the room you are in hang off it in that same list, so
 the mixer is part of the room rather than a panel beside it. **You are

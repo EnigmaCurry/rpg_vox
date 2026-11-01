@@ -102,14 +102,23 @@ releases.
   mixer the far end is plugged into, whose conversation your screen is
   showing and where your voice is being transcribed.
 
-  The rooms are a list down the left, one line each with a count of who
-  is in it, and the room you are **in** opens underneath itself into
-  everybody there -- the faders and meters and mutes that used to be a
+  The rooms are a list down the left, flush to the edge, one line each
+  with a count of who is in it. **Your own room is first and stays
+  first**, then the house's in the order they were named -- the one
+  room that is always there and always the same is the one to put
+  where the eye lands. The room you are **in** opens underneath itself
+  into everybody there -- the faders and meters and mutes that used to be a
   panel on the right. The mixer is a branch of the room it mixes now,
   which is what it always was: a fader belongs to the room it is being
   heard in, and the room you are not in has none you could usefully
   touch. A list rather than a row of buttons because a server can hold
   a great many rooms, and a row of buttons cannot.
+
+  The default room is called **Lobby**. That word already had a job
+  here -- "the lobby" was the room being in no game -- so the button
+  that leaves a game now says **Leave the game**, which is what it
+  does and what it always did; a button reading "back to the lobby"
+  beside a room called Lobby would be a button that lies.
 
   Each room is a whole room: its own conversation, its own faders, its
   own mode, its own games and cards. Walk out of one and back into it

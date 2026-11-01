@@ -3385,8 +3385,8 @@ mod tests {
         store.set_setting("mode", mode.as_str()).unwrap();
         let (tx, rx) = crossbeam_channel::unbounded();
         let cfg = RoomConfig {
-            id: "Main".into(),
-            title: "Main".into(),
+            id: "Lobby".into(),
+            title: "Lobby".into(),
             only: None,
             default_mode: Mode::Named,
             agent_name: "Vox".into(),

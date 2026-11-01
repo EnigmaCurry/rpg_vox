@@ -71,7 +71,7 @@ struct Cli {
         long = "room",
         env = "VOX_ROOM_ROOMS",
         value_delimiter = ',',
-        default_value = "Main"
+        default_value = "Lobby"
     )]
     rooms: Vec<String>,
 

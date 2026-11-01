@@ -197,22 +197,17 @@ impl Rooms {
         }
     }
 
-    /// The rooms `who` may go to, with who is in each: the house, then
-    /// theirs. Their own room is listed whether or not it has been
-    /// built -- the list is what they press to build it.
+    /// The rooms `who` may go to, with who is in each: theirs first,
+    /// then the house's in the order they were named. Their own room is
+    /// listed whether or not it has been built -- the list is what they
+    /// press to build it.
+    ///
+    /// Theirs is first and stays first, wherever they are and however
+    /// many rooms the house grows: the one room that is always there
+    /// and always the same is the one to put where the eye lands, and a
+    /// room that moved about the list as people came and went would be
+    /// a room you had to look for.
     pub fn directory(&self, who: &Invited) -> Value {
-        let mut rooms: Vec<Value> = self
-            .shared
-            .iter()
-            .map(|r| {
-                json!({
-                    "id": r.config().id,
-                    "title": r.config().title,
-                    "private": false,
-                    "here": r.here(),
-                })
-            })
-            .collect();
         let id = Self::own_id(&who.name);
         let here = self
             .own
@@ -221,11 +216,19 @@ impl Rooms {
             .get(&id)
             .map(|r| r.here())
             .unwrap_or_default();
-        rooms.push(json!({
+        let mut rooms = vec![json!({
             "id": id,
             "title": self.own_title(),
             "private": true,
             "here": here,
+        })];
+        rooms.extend(self.shared.iter().map(|r| {
+            json!({
+                "id": r.config().id,
+                "title": r.config().title,
+                "private": false,
+                "here": r.here(),
+            })
         }));
         json!({ "type": "rooms", "rooms": rooms })
     }
@@ -428,22 +431,26 @@ mod tests {
                 .map(|r| r["id"].as_str().unwrap().to_string())
                 .collect::<Vec<_>>()
         };
-        assert_eq!(ids(&rooms.directory(&ryan)), ["Lounge", "Studio", "@Ryan"]);
-        assert_eq!(ids(&rooms.directory(&alex)), ["Lounge", "Studio", "@Alex"]);
+        // Theirs first, then the house in the order it was named.
+        assert_eq!(ids(&rooms.directory(&ryan)), ["@Ryan", "Lounge", "Studio"]);
+        assert_eq!(ids(&rooms.directory(&alex)), ["@Alex", "Lounge", "Studio"]);
 
         // Listed before it exists -- the list is what you press to make
         // it -- and nobody is in it until somebody is.
-        let own = |d: &Value| d["rooms"].as_array().unwrap().last().unwrap().clone();
+        let own = |d: &Value| d["rooms"][0].clone();
         assert_eq!(own(&rooms.directory(&ryan))["here"], json!([]));
         assert_eq!(own(&rooms.directory(&ryan))["private"], json!(true));
 
-        // Who is where follows the tabs.
+        // Who is where follows the tabs, and the order doesn't move
+        // with them: a room that wandered about the list would be one
+        // you had to look for.
         rooms.find(&ryan, "Lounge").unwrap().join("Ryan", 1);
         rooms.find(&alex, "Studio").unwrap().join("Alex", 2);
         let d = rooms.directory(&ryan);
+        assert_eq!(ids(&d), ["@Ryan", "Lounge", "Studio"]);
         let here = |d: &Value, i: usize| d["rooms"][i]["here"].clone();
-        assert_eq!(here(&d, 0), json!(["Ryan"]));
-        assert_eq!(here(&d, 1), json!(["Alex"]));
+        assert_eq!(here(&d, 1), json!(["Ryan"]));
+        assert_eq!(here(&d, 2), json!(["Alex"]));
         // Even though Alex is on the Studio's roster, Ryan's own room
         // doesn't have her on its.
         assert_eq!(

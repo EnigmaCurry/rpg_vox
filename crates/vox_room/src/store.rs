@@ -950,8 +950,8 @@ mod tests {
                 .unwrap();
         }
 
-        scratch.open("").adopt("Main").unwrap();
-        let main = scratch.open("Main");
+        scratch.open("").adopt("Lobby").unwrap();
+        let main = scratch.open("Lobby");
         assert_eq!(main.conversation().unwrap(), 4, "the room it was left in");
         assert_eq!(main.setting("mode").unwrap().as_deref(), Some("auto"));
         assert_eq!(main.setting("strips").unwrap().as_deref(), Some("{}"));

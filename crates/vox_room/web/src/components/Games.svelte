@@ -103,11 +103,11 @@
     {#if playing}
       <p class="note">You're playing this now. <strong>Restart game</strong> starts it over.</p>
     {:else if room.game}
-      <p class="note">You're in {room.game}. Go back to the lobby to play another game.</p>
+      <p class="note">You're in {room.game}. Leave the game to play another.</p>
     {/if}
     <div class="ask-actions">
       <button class="danger" onclick={remove} disabled={playing}
-        title={playing ? "It's being played: go back to the lobby first." : `Delete ${game.name} for good`}>Delete</button>
+        title={playing ? "It's being played: leave the game first." : `Delete ${game.name} for good`}>Delete</button>
       <button onclick={() => peekGame(game.name)}
         title="Show the game's hidden prompt, to you only">Peek</button>
       <button onclick={() => (shown = null)}>Close</button>

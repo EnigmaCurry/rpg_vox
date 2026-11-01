@@ -74,7 +74,8 @@ export const room = $state({
   // -- there is nothing private about it. Only here while the entry is
   // live; the room says nothing about a turn it has finished.
   heard: {},
-  // The game being played (null: the lobby), and every saved game.
+  // The game being played (null: no game, just the room's own
+  // conversation), and every saved game.
   game: null,
   games: [],
   notice: null,

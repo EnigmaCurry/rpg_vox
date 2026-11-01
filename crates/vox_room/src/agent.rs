@@ -1571,8 +1571,8 @@ mod tests {
             translate: None,
         };
         let cfg = RoomConfig {
-            id: "Main".into(),
-            title: "Main".into(),
+            id: "Lobby".into(),
+            title: "Lobby".into(),
             only: None,
             default_mode: Mode::Named,
             agent_name: "Vox".into(),
@@ -1619,8 +1619,8 @@ mod tests {
         let room = Room::new(
             store,
             RoomConfig {
-                id: "Main".into(),
-                title: "Main".into(),
+                id: "Lobby".into(),
+                title: "Lobby".into(),
                 only: None,
                 default_mode: Mode::Named,
                 agent_name: "Vox".into(),

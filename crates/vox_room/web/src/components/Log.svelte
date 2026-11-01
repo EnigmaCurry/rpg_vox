@@ -101,7 +101,7 @@
           {#if !g}
             <span class="hint">This game was deleted.</span>
           {:else if room.game}
-            <span class="hint">Go back to the lobby to play it.</span>
+            <span class="hint">Leave the game to play it.</span>
           {:else}
             <span class="hint">Ask {room.agent.name} to start it when you're ready.</span>
           {/if}

@@ -60,7 +60,7 @@
   // Why the mode is what it is, when the room and not a click decided it.
   const modeHint = $derived(
     room.locked
-      ? `${room.game} decides when ${room.agent.name} answers, so this can't be changed until you go back to the lobby.`
+      ? `${room.game} decides when ${room.agent.name} answers, so this can't be changed until the room leaves the game.`
       : room.engaged
         ? `You said its name, so ${room.agent.name} has the turn at every pause — judging each one — until the room has been quiet a while. Say "thanks" or "goodbye" and it goes back to waiting for its name.`
         : `When ${room.agent.name} speaks.`,
@@ -73,8 +73,13 @@
     if (await ask(question, room.game ? 'Restart' : 'New conversation')) command({ type: 'new_conversation' });
   }
 
+  // "Leave the game", not "back to the lobby": a room may well be
+  // called Lobby, and a button that reads like it goes there when it
+  // does nothing of the kind is a worse button than a plain one.
   async function lobby() {
-    if (await ask(`Leave ${room.game} and take everyone back to the lobby?`, 'Back to lobby')) command({ type: 'lobby' });
+    if (await ask(`Leave ${room.game} and take everyone in this room back to the conversation?`, 'Leave the game')) {
+      command({ type: 'lobby' });
+    }
   }
 
   let peekDialog = $state();
@@ -156,7 +161,7 @@
       <!-- Which room you are in, or the game it has become. The list of
            rooms is down the left; this is where you are. -->
       <h1>{room.game ?? room.title}</h1>
-      {#if room.game}<button onclick={lobby}>Back to lobby</button>{/if}
+      {#if room.game}<button onclick={lobby}>Leave the game</button>{/if}
       <span class="pill {room.agent.state}" aria-live="polite">
         {#if room.agent.state === 'thinking' || room.agent.state === 'waiting'}
           <span class="dots" aria-hidden="true"><i></i><i></i><i></i></span>
@@ -262,15 +267,17 @@
     display: grid;
     /* Wide: the rooms down the left with the mixer for the one you are
        in under it, then what is yours alone, then the room's
-       conversation, the last two the same size. */
-    grid-template-columns: 300px 1fr 1fr;
+       conversation, the last two the same size. The rooms get only
+       what the widest fader needs, which is not much now that a strip
+       is three tight lines. */
+    grid-template-columns: 260px 1fr 1fr;
     grid-template-rows: auto 1fr auto;
     grid-template-areas: "head head head" "rooms cards log" "foot foot foot";
   }
   /* With nothing in your cards there is no column for them, and the
      conversation has the half they were taking. */
   .app.nocards {
-    grid-template-columns: 300px 1fr;
+    grid-template-columns: 260px 1fr;
     grid-template-areas: "head head" "rooms log" "foot foot";
   }
   :global(.rooms) { grid-area: rooms; border-right: 1px solid var(--line); }
