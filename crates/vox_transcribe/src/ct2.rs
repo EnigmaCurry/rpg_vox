@@ -162,23 +162,52 @@ impl Translate for Ct2Translator {
     /// `context` is ignored: a Marian model translates one sentence with
     /// no notion of what came before it, which is the other thing given
     /// up along with following instructions.
-    fn translate(&self, text: &str, from: &str, into: &str, _context: &[String]) -> Result<String> {
+    fn translate(&self, text: &str, from: &str, into: &str, context: &[String]) -> Result<String> {
+        let mut out = self.translate_all(&[text], from, into, context)?;
+        out.pop().context("the translator returned nothing")
+    }
+
+    /// Every line in one `translate_batch`, which is the whole point of
+    /// having this method: the model is run once over the batch rather
+    /// than once a sentence, and a paragraph that arrives three
+    /// sentences at a time costs one decode instead of three. On a
+    /// phone, with the recognizers already holding the cores, that is
+    /// the difference between a reading that keeps up and a backlog.
+    fn translate_all(
+        &self,
+        texts: &[&str],
+        from: &str,
+        into: &str,
+        _context: &[String],
+    ) -> Result<Vec<String>> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
         let t = self
             .models
             .get(&(from.to_string(), into.to_string()))
             .with_context(|| format!("no local model for {from} to {into}"))?;
         // Backticked and fenced spans never reach the model: it has no
         // way of being told to leave a command alone, so it is kept away
-        // from them instead.
-        let p = protect(text);
+        // from them instead. Each line keeps its own spans, so they go
+        // back into the line they came out of.
+        let kept: Vec<_> = texts.iter().map(|text| protect(text)).collect();
+        let masked: Vec<&str> = kept.iter().map(|p| p.masked.as_str()).collect();
         let out = t
-            .translate_batch(&[&p.masked], &TranslationOptions::default(), None)
+            .translate_batch(&masked, &TranslationOptions::default(), None)
             .with_context(|| format!("translate {from} to {into}"))?;
-        let (said, _score) = out
+        if out.len() != texts.len() {
+            bail!(
+                "the translator returned {} lines for {}",
+                out.len(),
+                texts.len()
+            );
+        }
+        Ok(out
             .into_iter()
-            .next()
-            .context("the translator returned nothing")?;
-        Ok(p.restore(said.trim()).trim().to_string())
+            .zip(&kept)
+            .map(|((said, _score), p)| p.restore(said.trim()).trim().to_string())
+            .collect())
     }
 
     fn name(&self) -> &'static str {

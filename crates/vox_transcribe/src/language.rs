@@ -286,6 +286,16 @@ impl std::fmt::Debug for Interpreter {
     }
 }
 
+/// One placed sentence and its reading, as a [`Line`].
+fn line_of(placed: &(&str, Option<String>, usize, usize), text: String) -> Line {
+    Line {
+        source: placed.0.to_string(),
+        text,
+        first_word: placed.2,
+        last_word: placed.3,
+    }
+}
+
 impl Interpreter {
     /// `into` is the native language, `from` the ones to translate; both
     /// as a language is spelled in English ("Russian").
@@ -363,32 +373,64 @@ impl Interpreter {
             }
             None => return Ok(None),
         };
-        let mut lines = Vec::with_capacity(sentences.len());
-        let mut said: Vec<String> = context.to_vec();
+        // Each sentence with its place in the paragraph, and the
+        // reading it already has: one it was given on an earlier pass
+        // of this paragraph (the sentence is the key, so that is a hit
+        // only while the sentence is still what it was), or itself,
+        // when its own script is the native one -- a URL, a name, an
+        // English aside in a Russian paragraph. Translating one of
+        // those would be a round trip to get back what we started
+        // with, at best.
         let mut at = 0usize;
-        for s in sentences {
-            let n = crate::filters::count_words(s);
-            let (first, last) = (at.min(words), (at + n).min(words));
-            at += n;
-            // Already read, on a pass of this paragraph before this
-            // one. The sentence is the key, so this is only a hit while
-            // the sentence is still what it was.
-            let line = match known.get(s) {
-                Some(had) => had.clone(),
-                // A sentence whose own script is the native one is
-                // already read: a URL, a name, an English aside in a
-                // Russian paragraph. Translating it would be a round
-                // trip to get back what we started with, at best.
-                None if script(s) == script_of(&self.into) => s.to_string(),
-                None => self.by.translate(s, language, &self.into, &said)?,
-            };
-            said.push(line.clone());
-            lines.push(Line {
-                source: s.to_string(),
-                text: line,
-                first_word: first,
-                last_word: last,
-            });
+        let placed: Vec<(&str, Option<String>, usize, usize)> = sentences
+            .iter()
+            .map(|&s| {
+                let n = crate::filters::count_words(s);
+                let (first, last) = (at.min(words), (at + n).min(words));
+                at += n;
+                let had = known
+                    .get(s)
+                    .cloned()
+                    .or_else(|| (script(s) == script_of(&self.into)).then(|| s.to_string()));
+                (s, had, first, last)
+            })
+            .collect();
+
+        // What is left goes to the translator a run at a time rather
+        // than a sentence at a time: a paragraph usually arrives with
+        // several new sentences in a row, and one call for the run is
+        // one decode instead of one each. A run ends where a sentence
+        // that is already read interrupts it, which keeps the context
+        // each line is translated with exactly what it would have been
+        // asked one at a time.
+        let mut lines = Vec::with_capacity(placed.len());
+        let mut said: Vec<String> = context.to_vec();
+        let mut i = 0;
+        while i < placed.len() {
+            if let Some(had) = placed[i].1.clone() {
+                said.push(had.clone());
+                lines.push(line_of(&placed[i], had));
+                i += 1;
+                continue;
+            }
+            let end = placed[i..]
+                .iter()
+                .position(|p| p.1.is_some())
+                .map_or(placed.len(), |n| i + n);
+            let texts: Vec<&str> = placed[i..end].iter().map(|p| p.0).collect();
+            let got = self.by.translate_all(&texts, language, &self.into, &said)?;
+            if got.len() != texts.len() {
+                bail!(
+                    "the translator returned {} lines for {}",
+                    got.len(),
+                    texts.len()
+                );
+            }
+            for (p, line) in placed[i..end].iter().zip(got) {
+                said.push(line.clone());
+                lines.push(line_of(p, line));
+            }
+            i = end;
         }
         if lines.is_empty() {
             return Ok(None);
@@ -734,4 +776,85 @@ mod tests {
         assert_eq!(complete_settled("Yes. (aside)"), "Yes.");
         assert_eq!(complete_settled(""), "");
     }
+
+    /// A translator handed whole batches, the way the local one is, so
+    /// a test can count calls rather than sentences.
+    #[derive(Default)]
+    struct Batches {
+        calls: std::sync::Mutex<Vec<Vec<String>>>,
+    }
+
+    impl Translate for Batches {
+        fn translate(
+            &self,
+            text: &str,
+            from: &str,
+            into: &str,
+            context: &[String],
+        ) -> Result<String> {
+            Ok(self.translate_all(&[text], from, into, context)?.remove(0))
+        }
+
+        fn translate_all(
+            &self,
+            texts: &[&str],
+            _from: &str,
+            _into: &str,
+            _context: &[String],
+        ) -> Result<Vec<String>> {
+            self.calls
+                .lock()
+                .expect("lock")
+                .push(texts.iter().map(|t| t.to_string()).collect());
+            Ok(texts.iter().map(|t| format!("<{t}>")).collect())
+        }
+
+        fn name(&self) -> &'static str {
+            "batches"
+        }
+    }
+
+    /// Pass 2 hands over a whole utterance at once, so a paragraph
+    /// arrives several sentences at a time. They go to the translator
+    /// together: on a phone that is one decode instead of three, which
+    /// is the difference between a reading that keeps up and a backlog.
+    #[test]
+    fn the_new_sentences_of_a_paragraph_go_in_one_call() {
+        let by = Arc::new(Batches::default());
+        let i = Interpreter::new("English", &["Russian".to_string()], by.clone()).unwrap();
+        let said = "Я пью чай. Вот так, друзья мои. Ну ладно. Вот";
+        let r = i
+            .read(complete(said), 10, &[], &Known::new(), None)
+            .unwrap()
+            .expect("a reading");
+        assert_eq!(r.lines.len(), 3);
+        let calls = by.calls.lock().expect("lock").clone();
+        assert_eq!(calls.len(), 1, "one call for the run: {calls:?}");
+        assert_eq!(calls[0].len(), 3);
+        assert_eq!(r.text, "<Я пью чай.> <Вот так, друзья мои.> <Ну ладно.>");
+    }
+
+    /// A sentence already read ends the run rather than being swept
+    /// into it: a translator that reads the lines before this one is
+    /// given them in the order they were said, the same as it would be
+    /// asked one at a time.
+    #[test]
+    fn a_sentence_already_read_ends_the_run() {
+        let by = Arc::new(Batches::default());
+        let i = Interpreter::new("English", &["Russian".to_string()], by.clone()).unwrap();
+        let mut known = Known::new();
+        known.insert("Вот так, друзья мои.".to_string(), "Like so.".to_string());
+        let said = "Я пью чай. Вот так, друзья мои. Ну ладно. Вот";
+        let r = i
+            .read(complete(said), 10, &[], &known, None)
+            .unwrap()
+            .expect("a reading");
+        let calls = by.calls.lock().expect("lock").clone();
+        assert_eq!(
+            calls,
+            vec![vec!["Я пью чай.".to_string()], vec!["Ну ладно.".to_string()]],
+        );
+        assert_eq!(r.text, "<Я пью чай.> Like so. <Ну ладно.>");
+    }
+
 }

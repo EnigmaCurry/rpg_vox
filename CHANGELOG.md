@@ -8,6 +8,21 @@ section after the version it releases.
 
 ### scribe
 
+- **A paragraph's sentences are translated in one call, not one call
+  each.** `--translate local` ran the model once a sentence, so a
+  paragraph that pass 2 hands over three sentences at a time cost three
+  decodes. They go to CTranslate2 as one batch now, which is one decode
+  over the three -- the same work the model does anyway, done once. The
+  reading was keeping up on a desktop and falling behind on a phone,
+  where the recognizers already hold the cores; this is the first thing
+  to try there. `Translate::translate_all` is where a translator says it
+  can take lines together: the default still asks line by line, which is
+  what `--translate openai` wants (nothing to batch when the cost is the
+  round trip, and it reads the lines before each one for agreement), and
+  a run of new sentences is broken wherever one already read sits
+  between them, so the context each line is given is what it would have
+  been asked one at a time.
+
 - **`--translate`: what was said in another language, read in yours.**
   Pass 2's recognizer hears twenty-five languages without being told
   which, but it never says which it heard — so the alphabet is read off

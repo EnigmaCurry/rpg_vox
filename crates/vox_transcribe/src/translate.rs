@@ -27,6 +27,34 @@ pub trait Translate: Send + Sync {
     /// translator that can use them; one that cannot ignores them.
     fn translate(&self, text: &str, from: &str, into: &str, context: &[String]) -> Result<String>;
 
+    /// Several lines at once, in order, each with the ones before it
+    /// for context: one call where there would otherwise be one a line.
+    ///
+    /// The default asks line by line, which is what a translator with a
+    /// round trip per call wants anyway -- there is nothing to batch
+    /// when the cost is the network. A model running on the CPU is the
+    /// other case entirely: it is run once over the batch instead of
+    /// once a sentence, which is most of what a paragraph costs. See
+    /// [`crate::ct2`], which overrides this.
+    ///
+    /// Returns one line per line given, in the same order.
+    fn translate_all(
+        &self,
+        texts: &[&str],
+        from: &str,
+        into: &str,
+        context: &[String],
+    ) -> Result<Vec<String>> {
+        let mut said = context.to_vec();
+        let mut out = Vec::with_capacity(texts.len());
+        for text in texts {
+            let line = self.translate(text, from, into, &said)?;
+            said.push(line.clone());
+            out.push(line);
+        }
+        Ok(out)
+    }
+
     /// Whether a URL, a path or a command has to be put in backticks to
     /// come back intact.
     ///
