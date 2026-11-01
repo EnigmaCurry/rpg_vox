@@ -149,6 +149,12 @@ the list of them: when each was, how much was said, and the first
 thing anybody said in it, newest first with the live one marked
 **now**.
 
+A conversation **nobody said anything in** is not one the room had, and
+isn't on the list: pressing **New conversation** twice leaves nothing
+behind the second time. The one the room is having now is always
+there, empty or not — that is where you are, not an archive of
+anywhere.
+
 Open one and you read it exactly as it was, with the translations and
 the cards that were in it. It is **read-only**, and not by a rule: the
 room has moved on from it, so there is nowhere for anything you said

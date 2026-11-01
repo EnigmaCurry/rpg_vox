@@ -1085,6 +1085,9 @@ mod tests {
             .unwrap();
 
         // A new one closes the old; both are the room's, newest first.
+        // (An empty one is still a row here — the room is what leaves
+        // them out of what it shows, since it is the room that knows
+        // which one it is having.)
         let second = lounge.new_conversation(None).unwrap();
         lounge.put_entry(second, &e("b", "the second")).unwrap();
         let history = lounge.history().unwrap();

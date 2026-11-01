@@ -781,7 +781,15 @@ impl Room {
     // opening the archive dragged everyone else out of the live
     // conversation would be a room nobody dared open it in.
 
-    /// Every conversation this room has had, newest first.
+    /// Every conversation this room has had and anybody said anything
+    /// in, newest first.
+    ///
+    /// A conversation nobody ever spoke into is not a thing that
+    /// happened: pressing "New conversation" twice, or three times,
+    /// leaves one behind each time, and a list of those is a list of
+    /// nothing with the one you wanted buried in it. The one the room
+    /// is having now is always there, empty or not — that is not an
+    /// archive, it is where you are.
     pub fn history(&self) -> Vec<Value> {
         let live = self.lock().conversation;
         self.store()
@@ -791,6 +799,7 @@ impl Room {
                 Vec::new()
             })
             .into_iter()
+            .filter(|c| c.lines > 0 || c.id == live)
             .map(|c| {
                 let mut v = serde_json::to_value(&c).unwrap_or_else(|_| json!({}));
                 // The one being had now: not an archive, and not
@@ -4965,6 +4974,49 @@ mod tests {
         let t = turns.try_recv().expect("the AI opens the game");
         assert_eq!(t.game.unwrap().1, "Run a showdown.");
         assert!(r.start_game(t.generation, "nope").is_err());
+    }
+
+    /// A conversation nobody said anything in is not one the room had.
+    /// The one it is having now is always on the list, empty or not:
+    /// that is where you are, not an archive of anywhere.
+    #[test]
+    fn the_history_skips_the_conversations_nobody_spoke_in() {
+        let (r, _turns) = room(Mode::Named);
+        let ids = |r: &Room| {
+            r.history()
+                .iter()
+                .map(|c| (c["id"].as_i64().unwrap(), c["live"].as_bool().unwrap()))
+                .collect::<Vec<_>>()
+        };
+        let first = r.lock().conversation;
+        assert_eq!(ids(&r), [(first, true)], "empty, but it is where you are");
+
+        r.typed("Ryan", "something").unwrap();
+        r.tick(quiet(&r));
+
+        // Three presses of New conversation, nothing said in any of
+        // them: two dead ones and the one you are in.
+        r.new_conversation();
+        let second = r.lock().conversation;
+        r.new_conversation();
+        r.new_conversation();
+        let now = r.lock().conversation;
+        assert_eq!(
+            ids(&r),
+            [(now, true), (first, false)],
+            "the empty ones are not conversations the room had"
+        );
+        assert_ne!(second, now);
+
+        // Say something in the one you are in and it is both.
+        r.typed("Ryan", "and now this").unwrap();
+        r.tick(quiet(&r));
+        assert_eq!(ids(&r), [(now, true), (first, false)]);
+
+        // Move off it and it keeps its place, as an archive this time.
+        r.new_conversation();
+        let latest = r.lock().conversation;
+        assert_eq!(ids(&r), [(latest, true), (now, false), (first, false)]);
     }
 
     /// A game is the room's conversation put aside, not thrown away:

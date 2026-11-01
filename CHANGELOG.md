@@ -147,6 +147,11 @@ releases.
   translations and all, with no box to type into: the room has moved
   on from it, so read-only is what it is rather than a rule about it.
 
+  A conversation nobody said anything in is not one the room had, and
+  isn't on the list — pressing *New conversation* twice leaves nothing
+  behind the second time. The one the room is having now is always
+  there, empty or not, because that is where you are.
+
   Reading one is **yours alone**. Nobody else's screen moves, which is
   the only way it could work — a room where one person looking
   something up pulled everyone else out of the live conversation would
