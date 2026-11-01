@@ -23,6 +23,9 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // The button, not the card's prose about it.
 const JOIN = 'button:has-text("Join Audio")';
+// Nobody comes in without agreeing to be recorded, so the box is part of
+// pressing the button now.
+const AGREE = '.consent input';
 const SHARE = 'footer button:has-text("Share screen")';
 const STOP = 'footer button:has-text("Stop sharing")';
 
@@ -50,6 +53,7 @@ async function person(name, url) {
   page.on('pageerror', (e) => console.log(`[${name} pageerror] ${e}`));
   await page.goto(url);
   await page.waitForSelector(JOIN);
+  await page.locator(AGREE).check();
   return { name, browser, page };
 }
 

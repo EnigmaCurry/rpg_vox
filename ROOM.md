@@ -823,6 +823,30 @@ pays for a rejected request before every reply.
 ## Testing
 
 `cargo test -p vox_room` covers the mixer, turn taking and barge-in.
+
+`crates/vox_room/e2e/run.sh` is everything that needs a running room and
+nothing of yours. It starts a room of its own on a scratch database,
+mints the invite links each suite wants (a link is spent by **Join
+Audio**, so every run needs fresh ones), runs the suite and stops the
+room again — your own database is never touched:
+
+```bash
+cargo build -p vox_room --release
+cd crates/vox_room/e2e && npm i playwright   # not a dependency of anything built here
+CHROME=$(which chromium) ./run.sh            # or: ./run.sh rooms door
+```
+
+| suite | |
+|---|---|
+| `rooms` | several rooms on one socket: where a tab lands, who may go where, a room of your own admitting one person, and the mix arriving across every move. No browser at all — two sockets are enough |
+| `door` | the door is a page with no room behind it and no socket open; **Join Audio** does nothing until you agree to be recorded, and the Language box is never blank |
+| `permalinks` | `/`, `/lobby` and `/room/<id>`; back and forward move between rooms, a pasted address opens that room, a stale one is put right |
+| `conversations` | the room's history: naming one, reading an old one read-only without moving anybody else's screen, deleting one for everybody, and empty ones never being archived |
+| `game` | a game played inside a room, and leaving it putting the room back where it was for everyone in it |
+| `interpreter` | the interpreter appearing only while it has somebody to interpret for, and its level being each listener's own |
+
+The four below want something of yours — a microphone, a model, a
+voice — so they are run by hand.
 `crates/vox_room/e2e/two-people.js` runs two headless Chromiums against a
 running room, each with a WAV file as its mic, and prints what each one
 hears and the conversation as it unfolds (see the top of the script).

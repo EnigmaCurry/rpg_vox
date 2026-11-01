@@ -1072,6 +1072,14 @@ room-invite NAME:
 room-ui:
     cd crates/vox_room/web && pnpm install && pnpm dev
 
+# The room's end-to-end suites, each against a room of its own on a
+# scratch database: `just room-e2e` for all, `just room-e2e rooms door`
+# for some. Wants playwright beside the scripts and a chromium it can
+# launch (CHROME); see ROOM.md's Testing section.
+room-e2e *SUITES:
+    cargo build -p vox_room --release
+    crates/vox_room/e2e/run.sh {{SUITES}}
+
 # --- vox_room in Docker behind Traefik (see ROOM_DOCKER.md) ---
 
 # A docker/Justfile recipe: config, install, logs -f, room-invite NAME, ...

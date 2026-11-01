@@ -1,4 +1,4 @@
-// Two people in the room, each a headless Chromium whose mic is a WAV file:
+// Two people in one room, each a headless Chromium whose mic is a WAV file:
 //   node two-people.js RYAN_LINK ALEX_LINK [SECONDS] [RYAN_WAV] [ALEX_WAV] [SCREENSHOT]
 // Prints, twice a second, how loud each tab's mix is (each should hear
 // the other and the AI, never themselves), the AI's state, and the
@@ -6,12 +6,18 @@
 // Each browser is new, so each run wants new links: invite links are
 // spent by the Join Audio click, and a second run on the same pair gets
 // the expired page.
+//
+//   CHROME=$(which chromium) node two-people.js RYAN_LINK ALEX_LINK
 const path = require('path');
 const { chromium } = require('playwright');
 const [ryanUrl, alexUrl, secs = '40', ryanWav = 'ryan.wav', alexWav = 'alex.wav', shot = 'room.png'] = process.argv.slice(2);
 
 async function person(name, url, wav) {
   const browser = await chromium.launch({
+    // Playwright's own Chromium doesn't launch everywhere; point CHROME
+    // at one that does, as the other scripts here take it.
+    executablePath: process.env.CHROME || undefined,
+    channel: process.env.CHROME ? undefined : 'chromium',
     args: [
       '--use-fake-ui-for-media-stream',
       '--use-fake-device-for-media-stream',
@@ -24,15 +30,22 @@ async function person(name, url, wav) {
   page.on('console', (m) => { if (m.type() === 'error' || m.type() === 'warning') console.log(`[${name} console] ${m.text()}`); });
   page.on('pageerror', (e) => console.log(`[${name} pageerror] ${e}`));
   await page.goto(url);
-  await page.waitForSelector('text=Join audio');
+  // Nobody comes in without agreeing to be recorded.
+  await page.waitForSelector('.consent input');
+  await page.locator('.consent input').check();
   return { name, browser, page };
 }
 
 (async () => {
   const ryan = await person('Ryan', ryanUrl, ryanWav);
   const alex = await person('Alex', alexUrl, alexWav);
-  await ryan.page.click('text=After every pause');
-  await Promise.all([ryan.page.click('text=Join audio'), alex.page.click('text=Join audio')]);
+  const JOIN = 'button:has-text("Join Audio")';
+  await Promise.all([ryan.page.click(JOIN), alex.page.click(JOIN)]);
+  await ryan.page.waitForTimeout(2000);
+  // When the AI answers is the bot's own setting now, under its strip in
+  // the room list: every pause, so nobody has to say its name for this
+  // to show anything.
+  await ryan.page.selectOption('.room.here select', 'always');
   const t0 = Date.now();
   // Expose what each tab hears (peak since last read) through the meter width.
   const heard = (p) => p.evaluate(() => {
@@ -43,7 +56,12 @@ async function person(name, url, wav) {
   while (Date.now() - t0 < Number(secs) * 1000) {
     await new Promise((r) => setTimeout(r, 500));
     const [hr, ha] = await Promise.all([heard(ryan.page), heard(alex.page)]);
-    const state = await ryan.page.evaluate(() => document.querySelector('.pill')?.textContent);
+    // What the AI is up to is on its own strip now, not a chip in the
+    // top bar.
+    const state = await ryan.page.evaluate(() => {
+      const vox = [...document.querySelectorAll('.room.here .strip')].pop();
+      return vox?.querySelector('.state')?.textContent.trim() ?? '?';
+    });
     const log = await alex.page.evaluate(() => [...document.querySelectorAll('.entry')].map((e) =>
       `${e.querySelector('.name').textContent}${e.querySelector('.text').classList.contains('live') ? '*' : ''}: ${e.querySelector('.text').textContent.trim()}`).join(' | '));
     const t = ((Date.now() - t0) / 1000).toFixed(1);
