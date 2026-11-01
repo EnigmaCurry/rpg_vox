@@ -88,6 +88,22 @@ releases.
   switch is not stored: it is how the transcript is being read just
   now, and it starts closed.
 
+### Voice room
+
+- **"Just for you" is gone when there is nothing in it.** Half the
+  window used to be given over to a column saying what might one day
+  appear in it -- a secret role, a hand, what only you noticed -- and
+  for most of a conversation that is all it ever said. Now the area is
+  only there while you are holding a card: no cards, no column, and the
+  conversation has the half back. The first one dealt opens it; the
+  last one taken back closes it again. On a narrow screen the tab comes
+  and goes with it, and if the last card is taken back while you are
+  looking at that tab you are put back on the conversation rather than
+  left on an empty one.
+
+  Nothing about the cards themselves changed: they are still the AI's
+  to give, rewrite and take back, and still on nobody else's screen.
+
 ## v0.2.0 (2026-11-01)
 
 ### scribe

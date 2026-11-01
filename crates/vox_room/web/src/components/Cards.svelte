@@ -6,21 +6,17 @@
 
 <!-- The cards one person is holding: the server sends these events to
      their tabs and nobody else's, so nothing here is in another browser
-     at all. -->
+     at all. Holding none of them, you are not shown this at all — App
+     leaves it out rather than giving the screen over to an explanation
+     of what might one day appear in it. -->
 <section class="cards" aria-label="Just for you">
   <header>
     <h2>Just for you</h2>
-    {#if room.cards.length}<span class="count">{room.cards.length}</span>{/if}
+    <span class="count">{room.cards.length}</span>
     <span class="only">on no one else's screen</span>
   </header>
 
   <div class="scroll">
-    {#if room.cards.length === 0}
-      <p class="empty">
-        Nothing yet. What {room.agent.name} means for you alone appears here —
-        a secret role, a hand, what only you noticed.
-      </p>
-    {/if}
     <!-- Keyed by when it was dealt as well as which card it is, so one
          the AI has rewritten comes in with the same glow as a new one. -->
     {#each room.cards as c (`${c.id}-${c.at}`)}
@@ -75,7 +71,6 @@
        the width of half an ultrawide. */
     padding: 16px max(16px, calc((100% - 44em) / 2));
   }
-  .empty { color: var(--muted); text-align: center; margin: auto; max-width: 26em; }
   .card {
     border: 1px solid color-mix(in srgb, var(--agent) 45%, var(--line));
     border-radius: 10px;

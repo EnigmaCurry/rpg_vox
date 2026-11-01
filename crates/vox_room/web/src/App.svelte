@@ -12,6 +12,20 @@
   // Narrow screens show one area at a time; wide ones show all three.
   let view = $state('chat');
 
+  // Nothing dealt to you, no area for it: the column (and its tab) are
+  // gone rather than sitting there empty, and the conversation takes the
+  // room back. It comes and goes with the cards, since the AI can take
+  // the last one back at any moment — in which case whoever was looking
+  // at that tab is put back on the conversation.
+  const hasCards = $derived(room.cards.length > 0);
+  const area = $derived(view === 'cards' && !hasCards ? 'chat' : view);
+
+  const views = $derived([
+    { id: 'chat', label: 'Conversation' },
+    ...(hasCards ? [{ id: 'cards', label: 'Just for you' }] : []),
+    { id: 'room', label: 'In the room' },
+  ]);
+
   onMount(async () => {
     if (await whoami()) open();
   });
@@ -144,7 +158,8 @@
 {:else}
   <!-- Until the audio is joined the room is behind the door: visible,
        but not to be clicked, tabbed into, or read out. -->
-  <div class="app show-{view}" class:watching={screen.watching != null} inert={room.audio !== 'on'}>
+  <div class="app show-{area}" class:watching={screen.watching != null} class:nocards={!hasCards}
+    inert={room.audio !== 'on'}>
     <header>
       <h1>{room.game ?? 'Voice room'}</h1>
       {#if room.game}<button onclick={lobby}>Back to lobby</button>{/if}
@@ -176,19 +191,15 @@
     </header>
 
     <nav class="views" aria-label="Which area to show">
-      {#each [
-        { id: 'chat', label: 'Conversation' },
-        { id: 'cards', label: 'Just for you' },
-        { id: 'room', label: 'In the room' },
-      ] as v (v.id)}
-        <button aria-pressed={view === v.id} class:on={view === v.id} onclick={() => (view = v.id)}>
+      {#each views as v (v.id)}
+        <button aria-pressed={area === v.id} class:on={area === v.id} onclick={() => (view = v.id)}>
           {v.label}
-          {#if v.id === 'cards' && room.cards.length}<span class="badge">{room.cards.length}</span>{/if}
+          {#if v.id === 'cards'}<span class="badge">{room.cards.length}</span>{/if}
         </button>
       {/each}
     </nav>
 
-    <Cards />
+    {#if hasCards}<Cards />{/if}
 
     <Log />
 
@@ -281,6 +292,12 @@
     grid-template-rows: auto 1fr auto;
     grid-template-areas: "head head head" "cards log side" "foot foot foot";
   }
+  /* With nothing in your cards there is no column for them, and the
+     conversation has the half they were taking. */
+  .app.nocards {
+    grid-template-columns: 1fr 300px;
+    grid-template-areas: "head head" "log side" "foot foot";
+  }
   :global(.cards) { grid-area: cards; border-right: 1px solid var(--line); }
   /* One area at a time is a narrow-screen idea; here all three show. */
   .views { display: none; }
@@ -336,6 +353,7 @@
   :global(.log) { grid-area: log; }
   :global(.board) { grid-area: board; }
   .app.watching { grid-template-areas: "head head head" "board board side" "foot foot foot"; }
+  .app.nocards.watching { grid-template-areas: "head head" "board side" "foot foot"; }
   .app.watching :global(.log), .app.watching :global(.cards) { display: none; }
   footer button.on { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
   .ask.peek { width: min(46em, calc(100vw - 32px)); max-width: none; }
@@ -413,7 +431,10 @@
 
   /* Narrow: one area at a time, with the switch above it. */
   @media (max-width: 860px) {
-    .app {
+    /* One column whether or not there are cards — the wide `.nocards`
+       template is two classes, so it has to be put back by name here or
+       its two columns survive into one. */
+    .app, .app.nocards {
       grid-template-columns: 1fr;
       grid-template-rows: auto auto 1fr auto;
       grid-template-areas: "head" "views" "main" "foot";
@@ -424,7 +445,7 @@
        the areas it switched between: the board has its own way out.
        (The wide `.app.watching` template is two classes, so it must be
        put back here or its three columns survive into one.) */
-    .app.watching { grid-template-areas: "head" "views" "main" "foot"; }
+    .app.watching, .app.nocards.watching { grid-template-areas: "head" "views" "main" "foot"; }
     .app.watching .views { display: none; }
     .app.watching :global(.log), .app.watching :global(.cards), .app.watching aside { display: none; }
     :global(.cards) { border-right: 0; }

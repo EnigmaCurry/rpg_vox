@@ -94,11 +94,13 @@ See ROOM_DOCKER.md.
   back takes a new one. Choosing a speaker needs `AudioContext.setSinkId`,
   which today means Chrome; elsewhere the room follows the system default
   and the list isn't offered.
-- **The three areas**: what is yours alone on the left, the room's
-  conversation on the right, the mixer beside them. On a narrow screen
-  only one shows at a time, with a switch above it — **Conversation**,
-  **Just for you** (with a count when you are holding cards), **In the
-  room**.
+- **The areas**: what is yours alone on the left, the room's
+  conversation on the right, the mixer beside them. **Just for you** is
+  only there while you are holding something: with no cards it is not an
+  empty column but no column at all, and the conversation has the half it
+  was taking. On a narrow screen one area shows at a time, with a switch
+  above it — **Conversation**, **Just for you** (with a count, and only
+  while you hold a card), **In the room**.
 - **When named / When it fits / Every pause** (top right, shared by
   everyone): who gets the turn when the room goes quiet.
   - **When named** — the AI says nothing until someone says its name, so
@@ -411,6 +413,13 @@ Each person has their own cards, under **Just for you** — its own column
 on a wide monitor, its own tab on a narrow one, and on nobody else's
 screen. The AI deals them: a secret role, a hand, what only your
 character notices, an instruction meant for you alone.
+
+The area comes and goes with the cards. Holding none, you have no
+**Just for you** at all: not a column explaining what might one day turn
+up in it, just the conversation with the room it was taking. The first
+card dealt opens it; the last one taken back closes it again, and if you
+were looking at its tab at the time you are put back on the
+conversation.
 
 They are *cards*, and the prompt tells the AI to call them that out loud
 — "Ryan, check your cards" — because the obvious name for a region of
