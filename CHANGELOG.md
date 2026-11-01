@@ -161,6 +161,14 @@ releases.
   the ones before it can't be told apart by room, so they are left out
   of every room's history rather than guessed into one.
 
+  **The door's Language box always has a language in it.** It was blank
+  for anybody the room already knew: the box's first option carried the
+  empty string the room stores for its own language, and what the room
+  answers with is the name. Every option is its own name now. The
+  default is whatever the system is set to, when the room speaks it,
+  and the room's own otherwise — a guess made once and written down in
+  the browser, so it can never afterwards overrule a choice.
+
   **The interpreter is yours now, and only there when it is working.**
   It used to be one fader in the room's mixer, shown whenever the room
   was *configured* to interpret and shared by everyone in it -- so

@@ -54,7 +54,7 @@
   // What the room already has against your name, so the door only saves
   // a language when it is actually a change.
   const mine = $derived(
-    room.people.find((p) => p.name === room.you)?.language ?? '',
+    room.people.find((p) => p.name === room.you)?.language || room.languages[0] || '',
   );
 </script>
 
@@ -124,9 +124,13 @@
         {#if room.languages.length > 1}
           <label>
             <span>Language</span>
+            <!-- Every option is its own name, the room's own included.
+                 An empty value for the first one meant the box showed
+                 nothing at all to anybody the room already knew about,
+                 since what the room says back is the name. -->
             <select value={room.lang} onchange={(e) => setLanguage(e.currentTarget.value)}>
-              {#each room.languages as l, i (l)}
-                <option value={i === 0 ? '' : l}>{l}</option>
+              {#each room.languages as l (l)}
+                <option value={l}>{l}</option>
               {/each}
             </select>
           </label>

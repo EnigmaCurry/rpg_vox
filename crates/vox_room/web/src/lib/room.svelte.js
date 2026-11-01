@@ -233,7 +233,9 @@ export async function whoami() {
     // come from, and a browser the room has never seen starts at its
     // own language.
     room.languages = d.languages ?? [];
-    room.lang = room.lang || browserLanguage(room.languages);
+    // No socket yet, so nothing has been said about them: this browser's
+    // memory, or the system, settles it.
+    room.lang = myLanguage(room.languages, '');
   } else if (d.state === 'expired') room.expired = true;
   else room.denied = true;
   return false;
@@ -454,20 +456,38 @@ function languageOf(people, you) {
   return people?.find((p) => p.name === you)?.language;
 }
 
-/// This browser's own language, spelled the way the room spells it
-/// ("Russian"), when the room offers it. `Intl` does the naming, so
-/// there is no table of codes to keep in step with the room's list.
-/// Empty for the room's own language, which is what index 0 is.
+/// What language the system is set to, spelled the way the room spells
+/// it ("Russian"), when the room speaks it — and the room's own when it
+/// doesn't. `Intl` does the naming, so there is no table of codes to
+/// keep in step with the room's list.
 function browserLanguage(offered) {
+  const own = offered[0] ?? '';
   try {
     const tag = (navigator.language || '').split('-')[0];
-    if (!tag || offered.length < 2) return '';
+    if (!tag) return own;
     const named = new Intl.DisplayNames(['en'], { type: 'language' }).of(tag);
-    const match = offered.find((l) => l.toLowerCase() === named?.toLowerCase());
-    return match && match !== offered[0] ? match : '';
+    return offered.find((l) => l.toLowerCase() === named?.toLowerCase()) ?? own;
   } catch {
-    return '';
+    return own;
   }
+}
+
+/// The language to show as yours, out of the ones this room offers.
+/// Always one of them, never blank: the door has a box with your
+/// language in it, and an empty box is not an answer to the question it
+/// is asking.
+///
+/// What the room says you are wins; failing that, what this browser
+/// remembers; failing that — the first time only — whatever the system
+/// is set to. Whatever it settles on is written down here, so the
+/// system's language is consulted once and can never afterwards
+/// overrule something you picked.
+function myLanguage(offered, known) {
+  if (!offered.length) return known || '';
+  const offers = (l) => offered.find((o) => o.toLowerCase() === (l || '').toLowerCase());
+  const lang = offers(known) || offers(readChoice('vox_room.lang')) || browserLanguage(offered);
+  writeChoice('vox_room.lang', lang);
+  return lang;
 }
 
 function upsert(entry) {
@@ -513,8 +533,7 @@ function apply(ev) {
       // the room has never seen has chosen one, so start them off at
       // their browser's language -- shown at the door, and not saved
       // until they come in.
-      room.lang =
-        languageOf(ev.people, ev.you) ?? browserLanguage(room.languages);
+      room.lang = myLanguage(room.languages, languageOf(ev.people, ev.you));
       // A seat in a new room knows nothing of this tab's mic: the
       // server gave it a fresh one, open and unmuted, so say again
       // what it is really doing. Harmless on the way in, where it is
@@ -551,7 +570,7 @@ function apply(ev) {
     case 'people':
       room.people = ev.people;
       room.speaks = ev.speaks ?? {};
-      room.lang = languageOf(ev.people, room.you) ?? room.lang;
+      room.lang = myLanguage(room.languages, languageOf(ev.people, room.you));
       break;
     case 'entry':
       upsert(ev.entry);
@@ -667,8 +686,10 @@ export async function setLanguage(language) {
     });
     const d = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(d.error || r.statusText);
-    room.lang = d.language;
-    writeChoice('vox_room.lang', d.language);
+    // The room stores the empty string for its own language; the box
+    // this came out of has a name in it, so put the name back.
+    room.lang = d.language || room.languages[0] || '';
+    writeChoice('vox_room.lang', room.lang);
     return true;
   } catch (e) {
     // Put the select back to what the room still believes.

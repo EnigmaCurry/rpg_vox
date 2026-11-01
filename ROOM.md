@@ -329,6 +329,12 @@ See ROOM_DOCKER.md.
   one shared transcript. It needs `--tts qwen3`; Kokoro only speaks
   English.
 
+  The door's **Language** box always has a language in it, never a
+  blank: whatever the system is set to the first time, if the room
+  speaks it, and the room's own otherwise. That is a guess, and it is
+  made once — it is written down in the browser, so it can never
+  afterwards overrule something you picked.
+
   Your choice follows your invite rather than your browser, so it is
   there on your phone too, and you can change it later from the door.
   A language nobody has picked costs nothing: the AI is only translated
