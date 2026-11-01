@@ -3450,6 +3450,66 @@ mod tests {
         assert_eq!(names(&r), "Alex,Ryan");
     }
 
+    /// Somebody's own room admits them and nobody else, however many
+    /// people the server has invited -- and keeps admitting them after
+    /// they call themselves something new, because `only` is the name
+    /// on the invite and that one never moves.
+    #[test]
+    fn a_room_of_somebodys_own_has_a_roster_of_one() {
+        let store = Store::memory();
+        store.invite("Ryan").unwrap();
+        store.invite("Alex").unwrap();
+        let (tx, _turns) = crossbeam_channel::unbounded();
+        let mine = Room::new(
+            store,
+            RoomConfig {
+                id: "@Ryan".into(),
+                title: "You and Vox".into(),
+                only: Some("Ryan".into()),
+                default_mode: Mode::Always,
+                agent_name: "Vox".into(),
+                aliases: vec![],
+                reply_after: Duration::from_millis(1000),
+                confirm: Duration::from_millis(300),
+                engaged_for: Duration::from_millis(5000),
+                history: 50,
+                language: "English".into(),
+                languages: vec!["English".into()],
+                spoken: vec!["English".into()],
+            },
+            Arc::new(AtomicU64::new(0)),
+            tx,
+            None,
+            BTreeMap::new(),
+            None,
+        )
+        .unwrap();
+        let names = |r: &Room| r.lock().people.keys().cloned().collect::<Vec<_>>();
+        assert_eq!(names(&mine), ["Ryan"], "Alex is invited, not admitted");
+        assert_eq!(
+            mine.lock().mode,
+            Mode::Always,
+            "and nobody to take the turn from"
+        );
+
+        // Somebody else invited while it is open changes nothing here.
+        mine.store().invite("Sam").unwrap();
+        mine.reconcile_people();
+        assert_eq!(names(&mine), ["Ryan"]);
+
+        // A new name at the door, and it is still his room.
+        mine.rename("Ryan", "Ry").unwrap();
+        assert_eq!(names(&mine), ["Ry"]);
+        assert_eq!(mine.config().only.as_deref(), Some("Ryan"));
+
+        // And who is in it is who has a tab in it.
+        assert!(mine.here().is_empty());
+        mine.join("Ry", 1);
+        assert_eq!(mine.here(), ["Ry"]);
+        mine.leave("Ry", 1);
+        assert!(mine.here().is_empty());
+    }
+
     #[test]
     fn a_name_picked_at_the_door_is_the_name_the_room_uses() {
         let (r, _turns) = room(Mode::Named);

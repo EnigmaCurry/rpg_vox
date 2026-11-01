@@ -85,7 +85,10 @@ fn check_name(name: &str) -> Result<String> {
     }
     // `@` opens somebody's own room and `:` separates a room from its
     // settings in the database, so neither is a shared room's to use.
-    if let Some(c) = name.chars().find(|c| *c == '@' || *c == ':' || c.is_control()) {
+    if let Some(c) = name
+        .chars()
+        .find(|c| *c == '@' || *c == ':' || c.is_control())
+    {
         bail!("a room's name can't contain {c:?}, so {name:?} won't do");
     }
     Ok(name.to_string())
@@ -96,15 +99,22 @@ impl Rooms {
     /// room is not: an empty room of one costs nothing while it is only
     /// a button, and most people's will never be opened.
     pub fn new(base: &RoomConfig, names: &[String], make: Make) -> Result<Arc<Self>> {
-        let mut shared = Vec::new();
+        // Every name settled before anything is built, so a server
+        // started with a bad list says so instead of opening half the
+        // house and then failing.
+        let mut wanted: Vec<String> = Vec::new();
         for name in names {
             let name = check_name(name)?;
-            if shared
-                .iter()
-                .any(|r: &Arc<Room>| r.config().id.eq_ignore_ascii_case(&name))
-            {
+            if wanted.iter().any(|w| w.eq_ignore_ascii_case(&name)) {
                 bail!("two rooms called {name:?}");
             }
+            wanted.push(name);
+        }
+        if wanted.is_empty() {
+            bail!("no rooms: --room NAME, at least once");
+        }
+        let mut shared = Vec::new();
+        for name in &wanted {
             let cfg = RoomConfig {
                 id: name.clone(),
                 title: name.clone(),
@@ -115,9 +125,6 @@ impl Rooms {
                 ..base.clone()
             };
             shared.push(make(cfg).with_context(|| format!("open the {name} room"))?);
-        }
-        if shared.is_empty() {
-            bail!("no rooms: --room NAME, at least once");
         }
         info!(
             rooms = %names.join(", "),
@@ -247,7 +254,13 @@ impl Rooms {
     /// Every room that exists right now.
     fn all(&self) -> Vec<Arc<Room>> {
         let mut all = self.shared.clone();
-        all.extend(self.own.lock().expect("rooms mutex poisoned").values().cloned());
+        all.extend(
+            self.own
+                .lock()
+                .expect("rooms mutex poisoned")
+                .values()
+                .cloned(),
+        );
         all
     }
 
@@ -257,11 +270,13 @@ impl Rooms {
         let me = self.clone();
         std::thread::Builder::new()
             .name("vox-room-mixer".into())
-            .spawn(move || clock(FRAME, "mixer", move || {
-                for room in me.all() {
-                    room.mixer.tick();
-                }
-            }))
+            .spawn(move || {
+                clock(FRAME, "mixer", move || {
+                    for room in me.all() {
+                        room.mixer.tick();
+                    }
+                })
+            })
             .context("spawn mixer thread")?;
         let me = self.clone();
         std::thread::Builder::new()
@@ -274,7 +289,7 @@ impl Rooms {
                     for room in me.all() {
                         room.tick(now);
                         // Meters at 10 per second.
-                        if ticks % 2 == 0 {
+                        if ticks.is_multiple_of(2) {
                             room.emit_levels();
                         }
                         // `vox_room invite` and `uninvite` write to the
@@ -310,5 +325,145 @@ fn clock(every: Duration, what: &str, mut step: impl FnMut()) {
             );
             next = now;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicU64;
+
+    use crate::store::Store;
+
+    fn base() -> RoomConfig {
+        RoomConfig {
+            id: String::new(),
+            title: String::new(),
+            only: None,
+            default_mode: Mode::Named,
+            agent_name: "Vox".into(),
+            aliases: vec![],
+            reply_after: Duration::from_millis(1200),
+            confirm: Duration::from_millis(300),
+            engaged_for: Duration::from_secs(30),
+            history: 60,
+            language: "English".into(),
+            languages: vec!["English".into()],
+            spoken: vec!["English".into()],
+        }
+    }
+
+    /// Rooms made out of nothing: a database of their own, no agent, no
+    /// voices. Everything here is about which room you get, not what
+    /// happens inside one.
+    fn rooms(names: &[&str]) -> Arc<Rooms> {
+        let names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+        Rooms::new(
+            &base(),
+            &names,
+            Box::new(|cfg| {
+                let store = Store::memory();
+                store.invite("Ryan").unwrap();
+                store.invite("Alex").unwrap();
+                let (tx, rx) = crossbeam_channel::unbounded();
+                // The receiver would otherwise be dropped, and a turn
+                // sent to a closed channel is an error the room logs.
+                std::mem::forget(rx);
+                Room::new(
+                    store,
+                    cfg,
+                    Arc::new(AtomicU64::new(0)),
+                    tx,
+                    None,
+                    BTreeMap::new(),
+                    None,
+                )
+            }),
+        )
+        .unwrap()
+    }
+
+    fn who(name: &str) -> Invited {
+        Invited {
+            name: name.into(),
+            display: name.into(),
+            link: None,
+            language: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_room_of_your_own_is_yours_and_nobodys_else() {
+        let rooms = rooms(&["Lounge", "Studio"]);
+        let ryan = who("Ryan");
+        let alex = who("Alex");
+
+        assert_eq!(rooms.home().config().id, "Lounge", "the first one named");
+        assert!(rooms.find(&ryan, "Studio").is_some(), "the house's rooms");
+        assert!(rooms.find(&alex, "Studio").is_some());
+
+        // His is made the moment he asks for it, and is the same room
+        // the second time.
+        let mine = rooms.find(&ryan, "@Ryan").expect("his own");
+        assert_eq!(mine.config().title, "You and Vox");
+        assert_eq!(mine.config().only.as_deref(), Some("Ryan"));
+        assert!(Arc::ptr_eq(&mine, &rooms.find(&ryan, "@Ryan").unwrap()));
+
+        // And it is not Alex's to ask for, nor is a room nobody named.
+        assert!(rooms.find(&alex, "@Ryan").is_none());
+        assert!(rooms.find(&ryan, "Cellar").is_none());
+        assert!(rooms.find(&ryan, "@Nobody").is_none());
+    }
+
+    #[test]
+    fn the_directory_shows_the_house_and_your_own_room_only() {
+        let rooms = rooms(&["Lounge", "Studio"]);
+        let ryan = who("Ryan");
+        let alex = who("Alex");
+        let ids = |d: &Value| {
+            d["rooms"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["id"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&rooms.directory(&ryan)), ["Lounge", "Studio", "@Ryan"]);
+        assert_eq!(ids(&rooms.directory(&alex)), ["Lounge", "Studio", "@Alex"]);
+
+        // Listed before it exists -- the list is what you press to make
+        // it -- and nobody is in it until somebody is.
+        let own = |d: &Value| d["rooms"].as_array().unwrap().last().unwrap().clone();
+        assert_eq!(own(&rooms.directory(&ryan))["here"], json!([]));
+        assert_eq!(own(&rooms.directory(&ryan))["private"], json!(true));
+
+        // Who is where follows the tabs.
+        rooms.find(&ryan, "Lounge").unwrap().join("Ryan", 1);
+        rooms.find(&alex, "Studio").unwrap().join("Alex", 2);
+        let d = rooms.directory(&ryan);
+        let here = |d: &Value, i: usize| d["rooms"][i]["here"].clone();
+        assert_eq!(here(&d, 0), json!(["Ryan"]));
+        assert_eq!(here(&d, 1), json!(["Alex"]));
+        // Even though Alex is on the Studio's roster, Ryan's own room
+        // doesn't have her on its.
+        assert_eq!(
+            rooms.find(&ryan, "@Ryan").unwrap().config().only.as_deref(),
+            Some("Ryan")
+        );
+    }
+
+    #[test]
+    fn a_rooms_name_has_to_be_one_a_room_can_have() {
+        assert_eq!(check_name("  Lounge ").unwrap(), "Lounge");
+        assert!(check_name("").is_err());
+        // `@` is how somebody's own room is named, `:` separates a room
+        // from its settings in the database.
+        assert!(check_name("@Ryan").is_err());
+        assert!(check_name("a:b").is_err());
+        assert!(check_name(&"x".repeat(NAME_MAX + 1)).is_err());
+        // And two rooms cannot be the same room.
+        let names = ["Lounge".to_string(), "lounge".to_string()];
+        assert!(Rooms::new(&base(), &names, Box::new(|_| unreachable!())).is_err());
+        assert!(Rooms::new(&base(), &[], Box::new(|_| unreachable!())).is_err());
     }
 }

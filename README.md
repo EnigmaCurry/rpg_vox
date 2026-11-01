@@ -80,9 +80,13 @@ sees one live transcript of who said what. The AI answers out loud and
 can be interrupted just by talking; the log keeps only what it actually
 said. macOS and Linux.
 
+One server holds several rooms, and you move between them without the
+audio stopping — the house's rooms, and one of your own where you can
+talk to the AI with nobody listening.
+
 ```bash
 just room-invite Ryan
-just room
+just room --room Lounge --room Studio
 ```
 
 [Read more →](ROOM.md)

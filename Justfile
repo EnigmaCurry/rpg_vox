@@ -1059,6 +1059,8 @@ install-agent BIN="~/.local/bin":
 # --- vox_room (voice room in the browser, see ROOM.md) ---
 
 # Run the voice room on http://127.0.0.1:7340, e.g. `just room --echo`.
+# `--room NAME` (repeatable) names the rooms the house shares; everybody
+# has one of their own besides. See ROOM.md.
 room *ARGS:
     cargo run -p vox_room --release -- {{ARGS}}
 

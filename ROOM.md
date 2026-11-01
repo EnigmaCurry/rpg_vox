@@ -7,6 +7,11 @@ person's speech is transcribed live into one shared conversation that
 updates on every screen at once, and the AI answers out loud through
 Qwen3-TTS, its words appearing as they are spoken.
 
+One server is several rooms, and everybody moves between them on the
+one connection: the rooms of the house, and a room of your own where
+you can talk to the AI with nobody listening. See
+**[More than one room](#more-than-one-room)**.
+
 It is full duplex: anyone can talk over the AI to interrupt it, with no
 key to press. The conversation keeps only what the AI actually said
 before it was cut off, ending with ` —`, and the AI is told where it was
@@ -21,7 +26,7 @@ just room-invite Ryan          # prints http://127.0.0.1:7340/join/…
 just room-invite Alex
 export VOX_SCRIBE_LLM_MODEL=nemotron-3-nano-4b   # your llama.cpp model
 export VOX_ROOM_TTS_URL=https://qwen3-tts.example.com
-just room
+just room --room Lounge --room Studio
 ```
 
 Open your link, press **Join Audio** at the door, and talk. The speech-to-text models
@@ -61,6 +66,54 @@ themselves in the room, and it stays theirs until they are uninvited.
 `vox_room invite NAME` again, after they have joined, is a second link —
 how somebody gets onto a second device, without disturbing the first.
 
+## More than one room
+
+One `vox_room` holds several rooms at once. Name the ones the house
+shares with `--room` (repeat it, or comma-separate
+`VOX_ROOM_ROOMS`); without any, there is one called **Main**. On top of
+those, **everybody has a room of their own** — it isn't configured, it
+is made the first time they walk into it, and nobody else can ask for
+it.
+
+They are in the top left, and pressing one takes you there. **The audio
+never stops.** You called in once and you stay called in: what changes
+is which room your voice goes into, whose conversation is on your
+screen, and which mixer is feeding your headphones. Moving is a frame
+of audio, not a reconnection.
+
+Each room is a whole room, with everything the one room ever had: its
+own conversation, its own faders, its own mode, its own games being
+played, its own cards. Walk out of one and back into it and it is as
+you left it. What is shared across them all is the invite list, the
+saved games, the name you call yourself and the language you hear —
+the things that are the person's rather than the room's.
+
+A **room of your own** is where the AI is yours alone. Its roster is
+you; its mixer shows you and the AI and nobody else; nothing said in it
+reaches the house, and nothing said in the house reaches it. Because
+there is nobody there to take the turn from, it starts out answering
+every pause rather than waiting to be named — which you can change, and
+it will remember. It is called *You and Vox*, after whatever you called
+the AI.
+
+The mixer says where people are rather than only that they are gone: a
+strip reads **in Studio** when that is where they went, and **away**
+only when they really have. Sharing a desktop follows the same rule as
+talking — it reaches the room you are in and no other, and it goes with
+you when you leave.
+
+Rooms cost a little: each is its own mixer, its own agent and its own
+voices. What they share is everything expensive — the speech-to-text
+models, the translator, the endpoint the AI is asked on — so a handful
+of rooms is a handful of mostly-sleeping threads, and an empty one
+costs nothing at all.
+
+A room's conversation, its mode and its faders are kept in the database
+under its name, so **renaming a room starts it fresh** and the old one's
+conversation sits there waiting to be found again if the name comes
+back. A database from before any of this had one room in it, and that
+room's things become the first `--room`'s on the way up.
+
 ### In Docker
 
 `docker/` has a compose deployment behind Traefik, with the labels
@@ -94,6 +147,11 @@ See ROOM_DOCKER.md.
   back takes a new one. Choosing a speaker needs `AudioContext.setSinkId`,
   which today means Chrome; elsewhere the room follows the system default
   and the list isn't offered.
+- **Which room**: top left, the rooms you can go to and who is in each.
+  See [More than one room](#more-than-one-room). The audio doesn't stop
+  when you move, and the room you arrive in is shown whole — its
+  conversation, its roster, its faders — because none of what you were
+  looking at belonged to it.
 - **The areas**: what is yours alone on the left, the room's
   conversation on the right, the mixer beside them. **Just for you** is
   only there while you are holding something: with no cards it is not an

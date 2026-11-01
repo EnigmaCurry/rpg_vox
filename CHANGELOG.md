@@ -90,6 +90,48 @@ releases.
 
 ### Voice room
 
+- **One server, several rooms, and a room of your own.** A `vox_room`
+  used to be a room. It is now a house: the rooms you name with
+  `--room` (`VOX_ROOM_ROOMS`), which everyone shares, and on top of
+  those one of your own for everybody -- made the first time you walk
+  into it, admitting nobody else, and where the AI is yours alone.
+
+  **Moving doesn't cost you the audio.** You call in once and stay
+  called in. The socket, the mic frames going up and the mix coming
+  back are all exactly where they were; what moves is which room's
+  mixer the far end is plugged into, whose conversation your screen is
+  showing and where your voice is being transcribed. The switch is in
+  the top left, with who is in each room beside its name.
+
+  Each room is a whole room: its own conversation, its own faders, its
+  own mode, its own games and cards. Walk out of one and back into it
+  and it is as you left it. What is the person's rather than the
+  room's -- the invite list, the saved games, your name, the language
+  you hear -- is shared across all of them, so choosing a language at
+  the door still follows you everywhere.
+
+  A room of your own has a roster of one and a mixer with you and the
+  AI on it. Nothing said in it reaches the house, and nothing said in
+  the house reaches it. Because nobody is there to take the turn from,
+  it starts out answering every pause instead of waiting to be named --
+  having to say "Vox" to a room with only the two of you in it is a
+  ceremony with no point to it. Change it and it remembers.
+
+  Three smaller things came with it. The mixer says **in Studio** where
+  it used to say "away", because on a server with more than one room
+  "away" far more often means two doors down than gone. A desktop is
+  shared with the room you are in and no other, and the share goes with
+  you when you leave. And the clocks -- the 20 ms mixer frame and the
+  50 ms turn-taking tick -- are the server's now rather than each
+  room's: a thread per room waking fifty times a second to find nobody
+  in it is a poor way to hold an empty room open.
+
+  Each room keeps its conversation, its mode and its faders in the
+  database under its own name, so renaming a room starts it fresh and
+  the old one's conversation waits there for the name to come back. An
+  existing database has one room in it, and its things become the first
+  `--room`'s the first time the new version starts.
+
 - **"Just for you" is gone when there is nothing in it.** Half the
   window used to be given over to a column saying what might one day
   appear in it -- a secret role, a hand, what only you noticed -- and

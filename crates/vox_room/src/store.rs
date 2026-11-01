@@ -869,6 +869,110 @@ mod tests {
         assert!(!s.set_language("Nobody", "Russian").unwrap());
     }
 
+    /// A database on disk, since two rooms are two connections to one
+    /// file and that is the thing being tested. Dropped with the guard.
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new(what: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "vox_room_test_{}_{what}_{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir.join("room.db"))
+        }
+
+        fn open(&self, room: &str) -> Store {
+            Store::open(&self.0).unwrap().in_room(room)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            if let Some(dir) = self.0.parent() {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
+    }
+
+    /// Same file, two rooms: what is one room's stays one room's, and
+    /// what is everybody's is read by both.
+    #[test]
+    fn each_room_has_its_own_settings_and_its_own_conversation() {
+        let scratch = Scratch::new("rooms");
+        let lounge = scratch.open("Lounge");
+        let studio = scratch.open("Studio");
+        lounge.invite("Mike").unwrap();
+
+        // A conversation each, and never the same one.
+        let a = lounge.conversation().unwrap();
+        let b = studio.conversation().unwrap();
+        assert_ne!(a, b, "two rooms must never share a log");
+        assert_eq!(lounge.conversation().unwrap(), a, "and keep it");
+        assert_eq!(studio.conversation().unwrap(), b);
+        assert_ne!(
+            lounge.new_conversation(None).unwrap(),
+            b,
+            "nor land on one in use"
+        );
+
+        // A setting is the room's.
+        lounge.set_setting("mode", "always").unwrap();
+        assert_eq!(lounge.setting("mode").unwrap().as_deref(), Some("always"));
+        assert_eq!(studio.setting("mode").unwrap(), None, "not the Studio's");
+
+        // The invite list is everybody's.
+        assert_eq!(studio.people().unwrap().len(), 1);
+        assert_eq!(lounge.people().unwrap().len(), 1);
+    }
+
+    /// A database from when the server was one room: what was the whole
+    /// server's belongs to the room that was there, and the rooms made
+    /// afterwards must not be handed its conversation.
+    #[test]
+    fn a_database_from_before_rooms_is_adopted_by_the_first_one() {
+        let scratch = Scratch::new("adopt");
+        {
+            // As it was written: unprefixed keys, and entries under the
+            // conversation number they name.
+            let old = scratch.open("");
+            old.set_global("conversation", "4").unwrap();
+            old.set_global("mode", "auto").unwrap();
+            old.set_global("strips", "{}").unwrap();
+            old.db
+                .execute(
+                    "INSERT INTO entries (conversation, id, who, kind, text, at)
+                     VALUES (4, 'e1', 'Mike', 'human', 'hello', 1)",
+                    [],
+                )
+                .unwrap();
+        }
+
+        scratch.open("").adopt("Main").unwrap();
+        let main = scratch.open("Main");
+        assert_eq!(main.conversation().unwrap(), 4, "the room it was left in");
+        assert_eq!(main.setting("mode").unwrap().as_deref(), Some("auto"));
+        assert_eq!(main.setting("strips").unwrap().as_deref(), Some("{}"));
+        assert_eq!(main.entries(4, 10).unwrap().len(), 1);
+
+        // A room made afterwards gets a number of its own, past
+        // everything already written.
+        let other = scratch.open("Studio");
+        let theirs = other.conversation().unwrap();
+        assert!(theirs > 4, "past everything already written");
+        assert!(other.entries(theirs, 10).unwrap().is_empty());
+
+        // And adopting again does nothing: it has been through it once.
+        scratch.open("").adopt("Studio").unwrap();
+        assert_eq!(
+            scratch.open("Studio").setting("mode").unwrap(),
+            None,
+            "the Studio never had a mode of its own"
+        );
+    }
+
     #[test]
     fn a_database_from_before_languages_opens_and_gains_the_column() {
         // `people` as it was written before the column existed. SCHEMA
