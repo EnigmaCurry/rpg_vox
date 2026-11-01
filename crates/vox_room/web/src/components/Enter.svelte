@@ -160,7 +160,7 @@
         <label>
           <input type="checkbox" checked={room.consented}
             onchange={(e) => setConsent(e.currentTarget.checked)} />
-          <span>I agree to be heard, transcribed and recorded.</span>
+          <span>I agree to be recorded and transcribed.</span>
         </label>
       </div>
 
