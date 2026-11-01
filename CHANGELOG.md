@@ -7,6 +7,8 @@ releases.
 
 ## Unreleased
 
+## v0.2.0 (2026-11-01)
+
 ### scribe
 
 - **A paragraph's sentences are translated in one call, not one call
