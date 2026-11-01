@@ -12,6 +12,7 @@
 //! {"type": "strip", "name": "Alex", "gain": 0.8, "mute": false}
 //! {"type": "interpreter", "gain": 0.8, "mute": false}
 //! {"type": "mode", "mode": "always"}
+//! {"type": "name_conversation", "title": "The heist"}
 //! {"type": "stop"}
 //! {"type": "new_conversation"}
 //! {"type": "enter_game", "name": "Dragon Heist"}
@@ -480,6 +481,10 @@ enum Command {
     Text {
         text: String,
     },
+    /// What to call the conversation the room is having.
+    NameConversation {
+        title: String,
+    },
     Stop,
     NewConversation,
     EnterGame {
@@ -616,6 +621,11 @@ async fn client(app: &App, socket: WebSocket, id: u64, who: &Invited) -> anyhow:
                         // wouldn't take: it is their typing, not news.
                         Ok(Command::Text { text }) => {
                             if let Err(why) = room.typed(&name, &text) {
+                                room.tell(&name, &why);
+                            }
+                        }
+                        Ok(Command::NameConversation { title }) => {
+                            if let Err(why) = room.name_conversation(&title) {
                                 room.tell(&name, &why);
                             }
                         }

@@ -1,5 +1,9 @@
 <script>
-  import { room, loadHistory, readConversation, backToNow, forgetConversation } from '../lib/room.svelte.js';
+  import {
+    room, loadHistory, readConversation, backToNow, forgetConversation,
+    nameConversation, whenItWas,
+  } from '../lib/room.svelte.js';
+  import { TITLE_MAX } from '../lib/names.js';
 
   // The bar over the conversation: which one you are reading, and the
   // way into the ones the room has had before.
@@ -26,17 +30,30 @@
     await readConversation(c.id);
   }
 
-  const when = (at) =>
-    at
-      ? new Date(at).toLocaleString([], {
-          month: 'short',
-          day: 'numeric',
-          hour: '2-digit',
-          minute: '2-digit',
-        })
-      : 'some time ago';
-
   const lines = (n) => `${n} ${n === 1 ? 'line' : 'lines'}`;
+
+  // What to call one: what somebody called it, or when it was.
+  const named = (c) => c.title || whenItWas(c);
+
+  // The box at the head of the live conversation. While you are typing
+  // in it the box is yours; the moment you are not, it is the room's
+  // again — so a name somebody else gives it doesn't change under your
+  // hands mid-word.
+  let typing = $state(null);
+  const mine = $derived(
+    typing ??
+      (room.conversation.title ||
+        whenItWas({ said: room.log.find((e) => e.at)?.at, at: room.conversation.at })),
+  );
+
+  function rename() {
+    if (typing === null) return;
+    const title = typing.trim();
+    typing = null;
+    // Typing the default back in is not naming it that: leave it
+    // unnamed, so it goes on following what is in it.
+    nameConversation(title === mine && !room.conversation.title ? '' : title);
+  }
 </script>
 
 <!-- A click in a dialog is not a click away from the list: confirming a
@@ -53,13 +70,26 @@
 
 <div class="bar">
   {#if reading}
-    <button class="back" onclick={backToNow}>← Back to the conversation</button>
+    <button class="back" onclick={backToNow}>← Back</button>
     <span class="closed">
-      {#if reading.game}<strong>{reading.game}</strong> ·{/if}
-      This one is closed — nothing can be said into it.
+      <strong>{named({ title: reading.title, at: reading.at, said: reading.log?.[0]?.at })}</strong>
+      {#if reading.game} · {reading.game}{/if}
+      · closed, nothing can be said into it
     </span>
   {:else}
-    <span class="now">{room.game ?? 'The conversation'}</span>
+    <!-- What this conversation is called. Unnamed, it is when it was;
+         type over it and it is whatever you say, for everyone, and the
+         room's history keeps it. -->
+    <input class="name" value={mine} maxlength={TITLE_MAX}
+      aria-label="What to call this conversation"
+      title="What to call this conversation. Everyone here sees it."
+      oninput={(e) => (typing = e.currentTarget.value)}
+      onblur={rename}
+      onkeydown={(e) => {
+        if (e.key === 'Enter') { e.preventDefault(); e.currentTarget.blur(); }
+        if (e.key === 'Escape') { typing = null; e.currentTarget.blur(); }
+      }} />
+    {#if room.game}<span class="playing">{room.game}</span>{/if}
   {/if}
 
   <div class="spacer"></div>
@@ -79,7 +109,7 @@
           <div class="row" class:current={reading ? reading.id === c.id : c.live}>
             <button role="menuitem" class="item" onclick={() => pick(c)}>
               <span class="head">
-                <span class="at">{when(c.at)}</span>
+                <span class="at">{named(c)}</span>
                 {#if c.live}<span class="tag">now</span>{/if}
                 {#if c.game}<span class="tag game">{c.game}</span>{/if}
                 <span class="meta">{lines(c.lines)}</span>
@@ -89,7 +119,7 @@
             <!-- The live one is the room, not an archive of it. -->
             {#if !c.live}
               <button class="drop" title="Delete this conversation for good"
-                aria-label="Delete the conversation from {when(c.at)}"
+                aria-label="Delete {named(c)}"
                 onclick={() => forgetConversation(c.id)}>×</button>
             {/if}
           </div>
@@ -115,7 +145,29 @@
     border-bottom: 1px solid var(--line);
   }
   .spacer { flex: 1; }
-  .now { font-size: 12px; color: var(--muted); }
+  /* A box that reads as the heading it is until you are in it. */
+  .name {
+    flex: 0 1 22em;
+    min-width: 6em;
+    font: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--ink);
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    padding: 2px 6px;
+  }
+  .name:hover { border-color: var(--line); }
+  .name:focus { border-color: var(--muted); outline: none; background: var(--panel); }
+  .playing {
+    font-size: 11px;
+    font-weight: 600;
+    padding: 1px 8px;
+    border-radius: 999px;
+    background: var(--agent);
+    color: var(--accent-ink);
+  }
   .closed { font-size: 12px; color: var(--muted); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .back { padding: 2px 10px; font-size: 13px; }
   .picker { position: relative; }

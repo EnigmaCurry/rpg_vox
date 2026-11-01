@@ -77,6 +77,9 @@ pub const NAME_MAX: usize = 24;
 /// nobody but it does go to the model, and once per language to a
 /// translator.
 pub const TYPED_MAX: usize = 2_000;
+/// Longest name anyone may give a conversation. It goes in a box at the
+/// head of the conversation and on a row of the room's history.
+pub const TITLE_MAX: usize = 60;
 /// Longest game name the AI may save.
 const GAME_NAME_MAX: usize = 60;
 /// Longest title on a card the AI deals.
@@ -518,6 +521,13 @@ struct Reply {
 
 struct State {
     conversation: i64,
+    /// What this conversation is called, and when it was started.
+    /// Empty is unnamed, and then the browsers work out what to call it
+    /// from `started` and the first thing said -- a date is a thing you
+    /// spell in the reader's own language and clock, so the room keeps
+    /// the numbers and says nothing about how they read.
+    title: String,
+    started: u64,
     /// The game this conversation plays; None is the lobby.
     game: Option<String>,
     /// The mode that game requires, if it requires one.
@@ -680,6 +690,7 @@ impl Room {
             }
         };
         let log = store.entries(conversation, LOG_LIMIT)?;
+        let (title, started) = store.conversation_name(conversation)?;
         let chosen = store
             .setting("mode")?
             .and_then(|m| Mode::parse(&m))
@@ -714,6 +725,8 @@ impl Room {
             link,
             st: Mutex::new(State {
                 conversation,
+                title,
+                started,
                 game,
                 game_mode,
                 people,
@@ -751,6 +764,37 @@ impl Room {
 
     pub fn link(&self) -> &str {
         &self.link
+    }
+
+    /// Which conversation this room is having, and what it is called.
+    /// `title` empty means nobody has named it; `at` is when it was
+    /// started, which is what an unnamed one is called after when
+    /// nothing has been said in it yet.
+    fn conversation_json(&self, st: &State) -> Value {
+        json!({ "id": st.conversation, "title": st.title, "at": st.started })
+    }
+
+    /// Call this room's conversation something. Everyone in the room
+    /// sees it, and the room's history keeps it. Err says why not.
+    pub fn name_conversation(&self, title: &str) -> Result<(), String> {
+        let title = title.trim();
+        if title.chars().count() > TITLE_MAX {
+            return Err(format!("At most {TITLE_MAX} characters."));
+        }
+        if title.chars().any(char::is_control) {
+            return Err("One line, no tabs.".into());
+        }
+        let mut st = self.lock();
+        let conversation = st.conversation;
+        if let Err(err) = self.store().name_conversation(conversation, title) {
+            warn!(conversation, "name a conversation: {err:#}");
+            return Err("The room couldn't save that.".into());
+        }
+        info!(conversation, title, "named the conversation");
+        st.title = title.to_string();
+        let v = self.conversation_json(&st);
+        self.emit(json!({ "type": "conversation", "conversation": v }));
+        Ok(())
     }
 
     /// How to say that the list of rooms should be looked at again.
@@ -821,8 +865,11 @@ impl Room {
             warn!(conversation = id, "read a conversation: {err:#}");
             Vec::new()
         });
+        let (title, at) = self.store().conversation_name(id).unwrap_or_default();
         Some(json!({
             "id": id,
+            "title": title,
+            "at": at,
             "live": id == self.lock().conversation,
             "game": self.store().conversation_game(id).ok().flatten(),
             "log": log,
@@ -1214,6 +1261,7 @@ impl Room {
             "strips": self.mixer.strips(),
             "log": st.log,
             "game": st.game,
+            "conversation": self.conversation_json(&st),
             "games": self.games(),
             "cards": self.cards_for(&st, person),
         })
@@ -2401,6 +2449,12 @@ impl Room {
         st.reconsider = None;
         self.cut_reply(st);
         st.conversation = conversation;
+        let (title, started) = self
+            .store()
+            .conversation_name(conversation)
+            .unwrap_or_default();
+        st.title = title;
+        st.started = started;
         st.log = log;
         // A game may require its own mode for as long as it is played;
         // leaving it puts the room back the way the people had it.
@@ -2432,6 +2486,7 @@ impl Room {
                     "log": st.log,
                     "cards": cards,
                     "game": st.game,
+                    "conversation": self.conversation_json(st),
                 }),
             );
         }
@@ -4974,6 +5029,55 @@ mod tests {
         let t = turns.try_recv().expect("the AI opens the game");
         assert_eq!(t.game.unwrap().1, "Run a showdown.");
         assert!(r.start_game(t.generation, "nope").is_err());
+    }
+
+    /// A conversation can be called something, and what it is called is
+    /// the room's: everyone sees it, and the history keeps it. Unnamed
+    /// is not blank -- the browsers spell the date, so what the room
+    /// keeps is nothing at all and the numbers it was.
+    #[test]
+    fn a_conversation_can_be_called_something() {
+        let (r, _turns) = room(Mode::Named);
+        let first = r.lock().conversation;
+        let title_of = |r: &Room, id: i64| {
+            r.history()
+                .into_iter()
+                .find(|c| c["id"].as_i64() == Some(id))
+                .map(|c| c["title"].as_str().unwrap_or_default().to_string())
+        };
+        assert_eq!(title_of(&r, first).as_deref(), Some(""), "nobody has yet");
+        assert!(r.lock().started > 0, "and the room knows when it was");
+
+        let mut events = r.subscribe();
+        r.name_conversation("  The heist  ").unwrap();
+        assert_eq!(r.lock().title, "The heist", "trimmed");
+        assert_eq!(title_of(&r, first).as_deref(), Some("The heist"));
+        assert_eq!(
+            events_of(&mut events, "conversation").len(),
+            1,
+            "and the room is told"
+        );
+
+        // A new one is unnamed, and the old one keeps its name.
+        r.typed("Ryan", "something").unwrap();
+        r.tick(quiet(&r));
+        r.new_conversation();
+        let second = r.lock().conversation;
+        assert_eq!(r.lock().title, "");
+        assert_eq!(title_of(&r, first).as_deref(), Some("The heist"));
+
+        // Naming names the one you are in, not the one you were.
+        r.name_conversation("Afterwards").unwrap();
+        assert_eq!(title_of(&r, second).as_deref(), Some("Afterwards"));
+        assert_eq!(title_of(&r, first).as_deref(), Some("The heist"));
+
+        // Emptying it gives it back to the clock.
+        r.name_conversation("").unwrap();
+        assert_eq!(title_of(&r, second).as_deref(), Some(""));
+
+        // And a name has to be one a row can show.
+        assert!(r.name_conversation(&"x".repeat(TITLE_MAX + 1)).is_err());
+        assert!(r.name_conversation("two\nlines").is_err());
     }
 
     /// A conversation nobody said anything in is not one the room had.

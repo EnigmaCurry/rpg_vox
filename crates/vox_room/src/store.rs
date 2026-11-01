@@ -6,7 +6,7 @@
 //! entries(conversation, id, who, kind, title, text, cut, typed, translations, at)
 //! settings(key, value)                 -- `ROOM:key` for one room's own
 //! games(name, summary, prompt, settings, created, played)  -- names unique, ignoring case
-//! conversations(id, room, game, at)       -- a room's history
+//! conversations(id, room, game, title, at) -- a room's history
 //! cards(conversation, id, who, title, body, at)  -- the cards one person holds
 //! ```
 //!
@@ -98,6 +98,10 @@ CREATE TABLE IF NOT EXISTS conversations (
     -- written before conversations knew.
     room TEXT NOT NULL DEFAULT '',
     game TEXT NOT NULL,
+    -- What somebody called it. Empty means nobody has, and then what to
+    -- call it is worked out from when it was -- which only a browser can
+    -- spell, in the reader own language and clock.
+    title TEXT NOT NULL DEFAULT '',
     -- When it was started, in unix milliseconds. Zero on an old row,
     -- and then the first thing said in it stands in for it.
     at   INTEGER NOT NULL DEFAULT 0
@@ -140,11 +144,18 @@ pub struct Game {
 #[derive(Debug, Clone, serde::Serialize, PartialEq)]
 pub struct Conversation {
     pub id: i64,
+    /// What somebody called it. Empty: nobody has, and what to call it
+    /// is for the reader's own clock to say.
+    pub title: String,
     /// The game it was played under, if it was one.
     pub game: Option<String>,
     /// Unix milliseconds. Zero when nothing was ever said in it and
     /// the row is old enough not to have been stamped.
     pub at: u64,
+    /// When the first thing was said in it, in unix milliseconds, or
+    /// zero if nothing ever was. What an unnamed conversation is called
+    /// after.
+    pub said: u64,
     /// How much was said in it.
     pub lines: usize,
     /// The first thing anybody said, for telling one from another.
@@ -459,10 +470,12 @@ impl Store {
     /// Every conversation this room has had, newest first.
     pub fn history(&self) -> Result<Vec<Conversation>> {
         let mut q = self.db.prepare(
-            "SELECT c.id, c.game,
+            "SELECT c.id, c.title, c.game,
                     COALESCE(NULLIF(c.at, 0),
                              (SELECT MIN(at) FROM entries e WHERE e.conversation = c.id),
                              0) AS at,
+                    COALESCE((SELECT MIN(at) FROM entries e
+                               WHERE e.conversation = c.id), 0) AS said,
                     (SELECT COUNT(*) FROM entries e WHERE e.conversation = c.id) AS lines,
                     COALESCE((SELECT e.text FROM entries e
                                WHERE e.conversation = c.id
@@ -476,13 +489,38 @@ impl Store {
         let rows = q.query_map([&self.room], |r| {
             Ok(Conversation {
                 id: r.get(0)?,
-                game: Some(r.get::<_, String>(1)?).filter(|g| !g.is_empty()),
-                at: r.get::<_, i64>(2)? as u64,
-                lines: r.get::<_, i64>(3)? as usize,
-                opening: r.get(4)?,
+                title: r.get(1)?,
+                game: Some(r.get::<_, String>(2)?).filter(|g| !g.is_empty()),
+                at: r.get::<_, i64>(3)? as u64,
+                said: r.get::<_, i64>(4)? as u64,
+                lines: r.get::<_, i64>(5)? as usize,
+                opening: r.get(6)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// What `conversation` is called, and when it was started. Empty is
+    /// unnamed; zero is a row from before conversations were stamped.
+    pub fn conversation_name(&self, conversation: i64) -> Result<(String, u64)> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT title, at FROM conversations WHERE id = ?1",
+                [conversation],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64)),
+            )
+            .optional()?
+            .unwrap_or_default())
+    }
+
+    /// Call it something. Empty puts it back to being unnamed.
+    pub fn name_conversation(&self, conversation: i64, title: &str) -> Result<()> {
+        self.db.execute(
+            "UPDATE conversations SET title = ?2 WHERE id = ?1",
+            params![conversation, title],
+        )?;
+        Ok(())
     }
 
     /// Forget a conversation: everything said in it, every card dealt
@@ -850,6 +888,9 @@ fn migrate(db: &Connection) -> Result<()> {
     // room's *current* one, which the settings name; the ones before it
     // can't be attributed to a room and so are left out of every
     // room's history rather than guessed into one.
+    if !has_column(db, "conversations", "title")? {
+        db.execute_batch("ALTER TABLE conversations ADD COLUMN title TEXT NOT NULL DEFAULT ''")?;
+    }
     if !has_column(db, "conversations", "room")? {
         db.execute_batch(
             "ALTER TABLE conversations ADD COLUMN room TEXT NOT NULL DEFAULT '';

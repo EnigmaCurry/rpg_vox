@@ -145,9 +145,18 @@ invite is coming in to be with people.
 **New conversation** closes the one the room is having and starts a
 blank one. The old one isn't thrown away — it becomes part of that
 room's history, and **History**, at the head of the conversation, is
-the list of them: when each was, how much was said, and the first
-thing anybody said in it, newest first with the live one marked
+the list of them: what each is called, how much was said, and the
+first thing anybody said in it, newest first with the live one marked
 **now**.
+
+**Calling one something.** The name at the head of the conversation is
+a box: type over it and that is what the room calls this conversation,
+for everyone in it and in the history from then on. Left alone it is
+**when it was** — the time of the first thing said in it, or the day it
+was started if nothing has been. Emptying the box gives it back to the
+clock rather than leaving it blank. (A date is a thing each browser
+spells in its own language and timezone, so the room keeps the name and
+the numbers and says nothing about how they read.)
 
 A conversation **nobody said anything in** is not one the room had, and
 isn't on the list: pressing **New conversation** twice leaves nothing
@@ -255,12 +264,13 @@ See ROOM_DOCKER.md.
   back takes a new one. Choosing a speaker needs `AudioContext.setSinkId`,
   which today means Chrome; elsewhere the room follows the system default
   and the list isn't offered.
-- **The top bar** says **Voice Room** and nothing else that moves.
-  Which room you are in is the list on the left, and what the AI is
-  doing is on the AI's own strip in it; neither wanted saying twice,
-  and a heading that changed was a heading you had to read. What is up
-  there is what you press: **Leave the game** while one is on, **Stop
-  Vox** while it is talking, and **New conversation**.
+- **The top bar** is which room you are in, and what you press.
+  The list on the left says the room too, on a screen wide enough to
+  show the list — on a narrow one it is behind a tab, and then this is
+  the only thing that does. What the AI is doing is on the AI's own
+  strip and isn't repeated here. The buttons are **Leave the game**
+  while one is on, **Stop Vox** while it is talking, and **New
+  conversation**.
 - **The rooms**, down the left: every room you can go to, one line
   each, and pressing one takes you there without the audio stopping.
   See [More than one room](#more-than-one-room). The room you are

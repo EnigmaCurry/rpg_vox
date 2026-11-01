@@ -90,6 +90,12 @@ export const room = $state({
   // -- there is nothing private about it. Only here while the entry is
   // live; the room says nothing about a turn it has finished.
   heard: {},
+  // The conversation the room is having: { id, title, at }. `title`
+  // empty means nobody has named it, and then what it is called is
+  // worked out here — a date is a thing you spell in the reader's own
+  // language and clock, so the room keeps the numbers and says nothing
+  // about how they read.
+  conversation: { id: 0, title: '', at: 0 },
   // The game being played (null: no game, just the room's own
   // conversation), and every saved game.
   game: null,
@@ -342,6 +348,28 @@ export function answer(ok) {
 
 const roomPath = () => `/api/rooms/${encodeURIComponent(room.where)}/history`;
 
+/// Call the conversation the room is having something. Everyone in the
+/// room sees it, and the room's history keeps it. Empty puts it back to
+/// being unnamed, which is a date rather than a blank.
+export function nameConversation(title) {
+  if (title.trim() === room.conversation.title) return;
+  command({ type: 'name_conversation', title });
+}
+
+/// What an unnamed conversation is called: when the first thing in it
+/// was said, and failing that the day it was started. The names people
+/// give things are better, which is why this is only the default — but
+/// a list of "Conversation, Conversation, Conversation" is no list at
+/// all, so there is always something here.
+export function whenItWas({ said = 0, at = 0 } = {}) {
+  const ms = said || at;
+  if (!ms) return 'Just now';
+  const d = new Date(ms);
+  return said
+    ? d.toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+    : d.toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' });
+}
+
 /// Every conversation this room has had, newest first.
 export async function loadHistory() {
   try {
@@ -542,6 +570,7 @@ function apply(ev) {
       // date within the frame.
       room.heard = {};
       room.game = ev.game ?? null;
+      room.conversation = ev.conversation ?? { id: 0, title: '', at: 0 };
       room.games = ev.games ?? [];
       room.cards = ev.cards ?? [];
       room.languages = ev.languages ?? [];
@@ -606,6 +635,7 @@ function apply(ev) {
       room.log = ev.log;
       room.heard = {};
       room.game = ev.game ?? null;
+      room.conversation = ev.conversation ?? { id: 0, title: '', at: 0 };
       // Cards belong to the conversation that dealt them.
       room.cards = ev.cards ?? [];
       break;
@@ -621,6 +651,9 @@ function apply(ev) {
     }
     case 'card_removed':
       room.cards = room.cards.filter((c) => c.id !== ev.id);
+      break;
+    case 'conversation':
+      room.conversation = ev.conversation;
       break;
     case 'games':
       room.games = ev.games;

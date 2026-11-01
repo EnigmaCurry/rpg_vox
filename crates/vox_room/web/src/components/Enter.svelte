@@ -297,16 +297,6 @@
   .ptt small { display: block; font-size: 12px; color: var(--muted); line-height: 1.45; }
   .warn { color: var(--danger); font-size: 13px; margin: 12px 0 0; text-align: left; }
   .devices .warn { margin: 2px 0 0; }
-  .who {
-    font-size: 13px;
-    color: var(--muted);
-    margin: 18px 0 0;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 6px;
-    flex-wrap: wrap;
-  }
   .out { margin: 14px 0 0; padding-top: 12px; border-top: 1px solid var(--line); }
   .logout {
     font-size: 13px;

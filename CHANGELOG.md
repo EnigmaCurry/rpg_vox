@@ -147,6 +147,15 @@ releases.
   translations and all, with no box to type into: the room has moved
   on from it, so read-only is what it is rather than a rule about it.
 
+  **A conversation can be called something.** The name at the head of
+  it is a box: type over it and that is what the room calls this
+  conversation, for everyone in it and in the history from then on.
+  Left alone it is when it was — the time of the first thing said, or
+  the day it was started if nothing has been — and emptying the box
+  gives it back to the clock rather than leaving it blank. The room
+  keeps the name and the numbers; how a date reads is each browser's
+  own business, in its own language and timezone.
+
   A conversation nobody said anything in is not one the room had, and
   isn't on the list — pressing *New conversation* twice leaves nothing
   behind the second time. The one the room is having now is always
@@ -203,10 +212,11 @@ releases.
   answering in your language, and there is nobody in there to
   interpret to -- and no longer starts the threads and voices for one.
 
-  **The top bar is one fixed title.** "Vox is listening" has gone: what
-  the AI is doing is on the AI's own strip in the room list, and which
-  room you are in is the list itself. What is left up there is what you
-  press.
+  **The top bar is the room you are in, and what you press.** "Vox is
+  listening" has gone — what the AI is doing is on the AI's own strip
+  in the room list. The heading is the room's name: the list says it
+  too, but only on a screen wide enough to show the list, and on a
+  narrow one it is behind a tab.
 
   **When the AI answers now lives under the AI**, in the room list, as
   that bot's setting in that room -- which is the shape a second bot in

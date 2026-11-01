@@ -124,11 +124,10 @@
 {:else}
   <div class="app show-{area}" class:watching={screen.watching != null} class:nocards={!hasCards}>
     <header>
-      <!-- The one fixed thing on the screen. Which room you are in is
-           in the list on the left, and what the AI is doing is on the
-           AI's own strip there -- neither needs saying twice, and a
-           heading that changed was a heading you had to read. -->
-      <h1>Voice Room</h1>
+      <!-- Which room you are in. The list on the left says it too, on a
+           screen wide enough to show the list -- on a narrow one it is
+           behind a tab, and then this is the only thing that does. -->
+      <h1>{room.title}</h1>
       {#if room.game}
         <span class="playing" title="{room.game} is being played in {room.title}.">{room.game}</span>
         <button onclick={lobby}>Leave the game</button>
