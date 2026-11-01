@@ -480,6 +480,7 @@ private fun Dictate() {
         // Read once: the status line names the language and counts the
         // paragraphs, and both are getters over state another thread moves.
         val missing = Scribe.pass1Missing
+        val telling = Scribe.tellingMissing
         val behind = Scribe.readingBehind
         val copyButton: @Composable () -> Unit = {
             DockButton(DockIcons.Copy, stringResource(R.string.action_copy), enabled = hasText) {
@@ -529,6 +530,13 @@ private fun Dictate() {
                     // where that matters, so it is said here.
                     missing != null ->
                         stringResource(R.string.dock_listening_missing, time, stringResource(missing.nameRes))
+                    // The classifier the chosen languages need and
+                    // haven't got. Said here for the same reason: two
+                    // languages in one alphabet with nothing to tell
+                    // them apart is a set the engine refuses, so
+                    // nothing is being read, and the recording that
+                    // looks fine is where that is noticed.
+                    telling -> stringResource(R.string.dock_listening_no_telling, time)
                     // The reading has fallen behind the speaking, which
                     // it does when Scribe spends the recording off
                     // screen: it says so instead of the readings simply

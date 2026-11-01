@@ -41,8 +41,22 @@
     <string name="language_english">английский</string>
     <string name="language_russian">русский</string>
     <string name="language_ukrainian">украинский</string>
+    <string name="language_bulgarian">болгарский</string>
     <string name="language_french">французский</string>
     <string name="language_spanish">испанский</string>
+    <string name="language_german">немецкий</string>
+    <string name="language_italian">итальянский</string>
+    <string name="language_dutch">нидерландский</string>
+    <string name="language_danish">датский</string>
+    <string name="language_swedish">шведский</string>
+    <string name="language_finnish">финский</string>
+    <string name="language_hungarian">венгерский</string>
+    <string name="language_czech">чешский</string>
+    <string name="language_slovak">словацкий</string>
+    <string name="language_polish">польский</string>
+    <string name="language_latvian">латышский</string>
+    <string name="language_estonian">эстонский</string>
+    <string name="language_maltese">мальтийский</string>
     <string name="language_chinese">китайский</string>
     <string name="language_japanese">японский</string>
     <string name="language_korean">корейский</string>
@@ -68,7 +82,7 @@
 
     <!-- ==== First run, and the models ================================= -->
     <string name="setup_title">Речевые модели</string>
-    <string name="setup_body">Scribe расшифровывает речь на самом телефоне. Для этого нужны две модели из релизов sherpa-onnx на GitHub: Parakeet TDT 0.6B v3, которая пишет готовый текст на любом из 25 языков, и потоковый Zipformer для живого текста. Это разовое скачивание, примерно %1$d МБ, которое останется в личном хранилище приложения. Лучше по Wi-Fi. Чтение другого языка на вашем — ещё по одной модели на язык, в «Настройки → Языки».</string>
+    <string name="setup_body">Scribe расшифровывает речь на самом телефоне. Для этого нужны две модели из релизов sherpa-onnx на GitHub: Parakeet TDT 0.6B v3, которая пишет готовый текст на любом из 25 языков, и потоковый Zipformer для живого текста. Это разовое скачивание, примерно %1$d МБ, которое останется в личном хранилище приложения. Лучше по Wi-Fi. Чтение другого языка на вашем — ещё по одной модели на язык, в «Настройки → Модели».</string>
     <string name="setup_download">Скачать модели</string>
     <string name="setup_resume">Продолжить скачивание</string>
     <string name="download_failed">Не удалось скачать: %1$s\nПовторная попытка продолжит с места остановки.</string>
@@ -106,6 +120,7 @@
     <string name="dock_listening">Слушаю %1$s</string>
     <string name="dock_listening_on">Слушаю %1$s · %2$s</string>
     <string name="dock_listening_missing">Слушаю %1$s · %2$s пока недоступен</string>
+    <string name="dock_listening_no_telling">Слушаю %1$s · пока нечем различать языки</string>
     <plurals name="dock_listening_behind">
         <item quantity="one">Слушаю %1$s · перевод отстаёт на %2$d абзац</item>
         <item quantity="few">Слушаю %1$s · перевод отстаёт на %2$d абзаца</item>
@@ -200,17 +215,33 @@
     <string name="languages_i_read_in">Я читаю на</string>
     <string name="languages_native_hint">Выбранный язык: %1$s. На нём будет весь текст — и расшифровка, и перевод.</string>
     <string name="languages_pass1_missing">%1$s: модели живого текста пока нет.</string>
-    <string name="languages_secondary">Дополнительные языки (по одному на письменность)</string>
-    <string name="languages_clash">%1$s, как и %2$s.</string>
-    <string name="languages_have">Скачано, %1$d МБ.</string>
-    <string name="languages_to_download">Скачать %1$d МБ.</string>
-    <string name="languages_size">%1$d МБ.</string>
+    <string name="languages_secondary">Распознавать также</string>
+    <string name="languages_have">Готово.</string>
+    <string name="languages_needs_model">Нужна модель, %1$d МБ, в «Настройки → Модели».</string>
     <string name="languages_none">Пока нет ни одной модели перевода на этот язык: %1$s.</string>
-    <string name="languages_dictionaries">Управление словарями</string>
-    <string name="languages_fetch_hint">Скачать %1$d МБ. Лучше по Wi-Fi; скачивание продолжится в фоне.</string>
-    <string name="languages_delete_model">Удалить %1$s</string>
+    <plurals name="languages_missing_models">
+        <item quantity="one">Не хватает %1$d модели, %2$d МБ. «Настройки → Модели».</item>
+        <item quantity="few">Не хватает %1$d моделей, всего %2$d МБ. «Настройки → Модели».</item>
+        <item quantity="many">Не хватает %1$d моделей, всего %2$d МБ. «Настройки → Модели».</item>
+        <item quantity="other">Не хватает %1$d моделей, всего %2$d МБ. «Настройки → Модели».</item>
+    </plurals>
     <string name="model_pair">%1$s → %2$s</string>
     <string name="model_live_text">живой текст: %1$s</string>
+    <string name="model_speech">Распознавание речи</string>
+    <string name="model_langid">Различение языков</string>
+
+    <!-- ==== Настройки → Модели ======================================= -->
+    <string name="settings_models">Модели</string>
+    <string name="models_on_disk">На телефоне: %1$s</string>
+    <string name="models_hint">Всё работает на самом телефоне, поэтому всё должно быть на нём. Лучше по Wi-Fi; скачивание продолжится в фоне.</string>
+    <string name="models_get_wanted">Скачать недостающее (%1$d МБ)</string>
+    <string name="models_kind_speech">Готовый текст</string>
+    <string name="models_kind_live">Живой текст, пока вы говорите</string>
+    <string name="models_kind_reading">Чтение другого языка на вашем</string>
+    <string name="models_required">%1$s · нужна для работы</string>
+    <string name="models_in_use">%1$s · используется</string>
+    <string name="models_unused">%1$s · ни один язык её не использует</string>
+    <string name="models_wanted">%1$s · нужна выбранному языку</string>
     <string name="languages_while_catching_up">Пока перевод догоняет</string>
     <string name="languages_show_said">Показывать сказанное</string>
     <string name="languages_show_said_detail">На том языке, на котором это было сказано. Если выключено — многоточие.</string>

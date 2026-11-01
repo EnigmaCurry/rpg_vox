@@ -52,8 +52,22 @@
     <string name="language_english">English</string>
     <string name="language_russian">Russian</string>
     <string name="language_ukrainian">Ukrainian</string>
+    <string name="language_bulgarian">Bulgarian</string>
     <string name="language_french">French</string>
     <string name="language_spanish">Spanish</string>
+    <string name="language_german">German</string>
+    <string name="language_italian">Italian</string>
+    <string name="language_dutch">Dutch</string>
+    <string name="language_danish">Danish</string>
+    <string name="language_swedish">Swedish</string>
+    <string name="language_finnish">Finnish</string>
+    <string name="language_hungarian">Hungarian</string>
+    <string name="language_czech">Czech</string>
+    <string name="language_slovak">Slovak</string>
+    <string name="language_polish">Polish</string>
+    <string name="language_latvian">Latvian</string>
+    <string name="language_estonian">Estonian</string>
+    <string name="language_maltese">Maltese</string>
     <string name="language_chinese">Chinese</string>
     <string name="language_japanese">Japanese</string>
     <string name="language_korean">Korean</string>
@@ -87,7 +101,7 @@
 
     <!-- ==== First run, and the models ================================= -->
     <string name="setup_title">Speech models</string>
-    <string name="setup_body">Scribe transcribes on the phone. It needs two models from the sherpa-onnx releases on GitHub: Parakeet TDT 0.6B v3, which writes the finished text in any of 25 languages, and a streaming Zipformer for the live text. That\'s a one-time download of about %1$d MB, kept in the app\'s private storage. Wi-Fi recommended. Reading another language in your own is a further model each, under Settings → Languages.</string>
+    <string name="setup_body">Scribe transcribes on the phone. It needs two models from the sherpa-onnx releases on GitHub: Parakeet TDT 0.6B v3, which writes the finished text in any of 25 languages, and a streaming Zipformer for the live text. That\'s a one-time download of about %1$d MB, kept in the app\'s private storage. Wi-Fi recommended. Reading another language in your own is a further model each, under Settings → Models.</string>
     <string name="setup_download">Download models</string>
     <string name="setup_resume">Resume download</string>
     <string name="download_failed">Download failed: %1$s\nTrying again resumes where it stopped.</string>
@@ -135,6 +149,7 @@
     <string name="dock_listening_on">Listening %1$s · %2$s</string>
     <!-- A language pass 1 cannot listen in yet, its model still coming. -->
     <string name="dock_listening_missing">Listening %1$s · not in %2$s yet</string>
+    <string name="dock_listening_no_telling">Listening %1$s · nothing to tell the languages apart yet</string>
     <plurals name="dock_listening_behind">
         <item quantity="one">Listening %1$s · reading %2$d paragraph behind</item>
         <item quantity="other">Listening %1$s · reading %2$d paragraphs behind</item>
@@ -227,19 +242,33 @@
     <string name="languages_i_read_in">I read in</string>
     <string name="languages_native_hint">All text will be written and/or translated in %1$s.</string>
     <string name="languages_pass1_missing">The %1$s model for the live text isn\'t here yet.</string>
-    <string name="languages_secondary">Choose secondary languages (one per alphabet)</string>
-    <string name="languages_clash">%1$s, like %2$s.</string>
-    <string name="languages_have">Downloaded, %1$d MB.</string>
-    <string name="languages_to_download">%1$d MB to download.</string>
-    <string name="languages_size">%1$d MB.</string>
+    <string name="languages_secondary">Listen out for</string>
+    <string name="languages_have">Ready.</string>
+    <string name="languages_needs_model">Needs a %1$d MB model, from Settings → Models.</string>
     <string name="languages_none">No other language has a model that reads into %1$s yet.</string>
-    <string name="languages_dictionaries">Manage dictionaries</string>
-    <string name="languages_fetch_hint">%1$d MB to download. Wi-Fi recommended; it continues in the background.</string>
-    <string name="languages_delete_model">Delete %1$s</string>
+    <plurals name="languages_missing_models">
+        <item quantity="one">One model is missing, %2$d MB. Settings → Models.</item>
+        <item quantity="other">%1$d models are missing, %2$d MB in all. Settings → Models.</item>
+    </plurals>
     <!-- A model named in languages rather than in directories: the pair
          it reads, or the language whose live text it writes. -->
     <string name="model_pair">%1$s → %2$s</string>
     <string name="model_live_text">%1$s live text</string>
+    <string name="model_speech">Speech recognition</string>
+    <string name="model_langid">Telling languages apart</string>
+
+    <!-- ==== Settings → Models ======================================== -->
+    <string name="settings_models">Models</string>
+    <string name="models_on_disk">%1$s on this phone</string>
+    <string name="models_hint">Everything runs on the phone, so everything has to be on it. Wi-Fi recommended; downloads continue in the background.</string>
+    <string name="models_get_wanted">Download what\'s missing (%1$d MB)</string>
+    <string name="models_kind_speech">The finished text</string>
+    <string name="models_kind_live">The live text, as you speak</string>
+    <string name="models_kind_reading">Reading another language in yours</string>
+    <string name="models_required">%1$s · needed to run</string>
+    <string name="models_in_use">%1$s · in use</string>
+    <string name="models_unused">%1$s · no language uses it</string>
+    <string name="models_wanted">%1$s · a chosen language needs this</string>
     <string name="languages_while_catching_up">While a reading catches up</string>
     <string name="languages_show_said">Show what was said</string>
     <string name="languages_show_said_detail">In the language it was heard in. Off: an ellipsis.</string>

@@ -9,12 +9,13 @@ import java.net.URL
 import kotlin.concurrent.thread
 
 /**
- * One model, installed as `<models>/<dir>/`. Two kinds, because the two
+ * One model, installed as `<models>/<dir>/`. Three kinds, because the
  * places these come from publish them differently: [Archive] is a
  * sherpa-onnx release `.tar.bz2` with the wanted files renamed out of
  * it, [Loose] is a Hugging Face repo whose files are downloaded one by
- * one. Same sources and layout as vox_scribe's `download-models`, so a
- * desktop models directory would work as-is.
+ * one, and [Single] is one file at a URL. Same sources and layout as
+ * vox_scribe's `download-models`, so a desktop models directory would
+ * work as-is.
  */
 sealed interface Model {
     val dir: String
@@ -52,6 +53,23 @@ class Loose(
 ) : Model {
     fun url(path: String) = "https://huggingface.co/$repo/resolve/main/$path"
     override val installed get() = files.values + if (tokenizer) listOf(TOKENIZER) else emptyList()
+}
+
+/**
+ * One file at one URL, in a directory of its own.
+ *
+ * A directory for a single file so that it is a model like the others:
+ * one thing to install, find and delete whole. A file at the top of the
+ * models directory would make deleting it a special case
+ * ([ModelStore.remove] deletes `dir` and would take everything).
+ */
+class Single(
+    override val dir: String,
+    val url: String,
+    val name: String,
+    override val approxBytes: Long,
+) : Model {
+    override val installed get() = listOf(name)
 }
 
 private const val RELEASES = "https://github.com/k2-fsa/sherpa-onnx/releases/download"
@@ -98,20 +116,54 @@ val ZIPFORMER_RU = Loose(
     approxBytes = 27_000_000,
 )
 
+/**
+ * What tells two languages written in the same alphabet apart:
+ * fastText's `lid.176`, quantized, 917 KB for 176 languages.
+ *
+ * It is what makes French readable by an English reader at all. Pass 2
+ * hears twenty-five languages and never says which it heard, so a
+ * paragraph's language is worked out from the text afterwards; the
+ * alphabet does most of that for nothing, and this does the rest --
+ * English against French, Russian against Ukrainian (see
+ * `vox_transcribe::langid`).
+ *
+ * Small enough that the Models page offers it rather than making a
+ * point of it, and [Scribe.wanted] asks for it whenever a chosen
+ * language needs it.
+ */
+val LANGID = Single(
+    dir = "langid",
+    url = "https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.ftz",
+    name = "lid.176.ftz",
+    approxBytes = 938_013,
+)
+
 /** What the first run downloads: the two models nothing works without. */
 val BUNDLES = listOf(ZIPFORMER_EN, PARAKEET)
 
 /**
  * A language the app can read in or listen out for.
  *
- * [script] is the alphabet it is written in, and it decides everything
- * about which languages can be used together: a paragraph's language is
- * read off its alphabet (`vox_transcribe::language`), so two languages
- * sharing one cannot be told apart and the engine refuses the pair.
- * Greek, Han, Hangul and Kana are one [Script.OTHER] between them for
- * the same reason -- the test is only ever "not the alphabet you read".
+ * [script] is the alphabet it is written in. It used to decide which
+ * languages could be used together -- a paragraph's language was read
+ * off its alphabet alone, so two languages sharing one could not be
+ * told apart and the engine refused the pair. [LANGID] is what lifted
+ * that, and the alphabet now decides something smaller and more useful:
+ * whether the classifier is needed at all. Two languages in different
+ * alphabets are still separated for nothing, by the text itself.
+ *
+ * Greek, Han, Hangul and Kana are still one [Script.OTHER] between
+ * them. That is not a claim that they look alike -- it is that the
+ * engine's `Script` enum has no finer distinction, so anything outside
+ * Latin and Cyrillic is "neither of those" and the classifier settles
+ * the rest, which it does well.
  *
  * [code] is how opus-mt spells it, for the translation model's name.
+ * That is not always the ISO code the classifier is asked in (opus-mt
+ * says `jap` where ISO 639-1 says `ja`), and the two never meet: the
+ * classifier is reached through [label], which the engine maps to a
+ * code of its own in `vox_transcribe::language`.
+ *
  * [streaming] is the pass-1 bundle for reading in this language, null
  * for the languages that have none, which cannot be the one you read in.
  *
@@ -132,8 +184,22 @@ enum class Language(
     ENGLISH("English", R.string.language_english, "en", Script.LATIN, ZIPFORMER_EN),
     RUSSIAN("Russian", R.string.language_russian, "ru", Script.CYRILLIC, ZIPFORMER_RU),
     UKRAINIAN("Ukrainian", R.string.language_ukrainian, "uk", Script.CYRILLIC),
+    BULGARIAN("Bulgarian", R.string.language_bulgarian, "bg", Script.CYRILLIC),
     FRENCH("French", R.string.language_french, "fr", Script.LATIN),
     SPANISH("Spanish", R.string.language_spanish, "es", Script.LATIN),
+    GERMAN("German", R.string.language_german, "de", Script.LATIN),
+    ITALIAN("Italian", R.string.language_italian, "it", Script.LATIN),
+    DUTCH("Dutch", R.string.language_dutch, "nl", Script.LATIN),
+    DANISH("Danish", R.string.language_danish, "da", Script.LATIN),
+    SWEDISH("Swedish", R.string.language_swedish, "sv", Script.LATIN),
+    FINNISH("Finnish", R.string.language_finnish, "fi", Script.LATIN),
+    HUNGARIAN("Hungarian", R.string.language_hungarian, "hu", Script.LATIN),
+    CZECH("Czech", R.string.language_czech, "cs", Script.LATIN),
+    SLOVAK("Slovak", R.string.language_slovak, "sk", Script.LATIN),
+    POLISH("Polish", R.string.language_polish, "pl", Script.LATIN),
+    LATVIAN("Latvian", R.string.language_latvian, "lv", Script.LATIN),
+    ESTONIAN("Estonian", R.string.language_estonian, "et", Script.LATIN),
+    MALTESE("Maltese", R.string.language_maltese, "mt", Script.LATIN),
     CHINESE("Chinese", R.string.language_chinese, "zh", Script.OTHER),
     JAPANESE("Japanese", R.string.language_japanese, "jap", Script.OTHER),
     KOREAN("Korean", R.string.language_korean, "ko", Script.OTHER);
@@ -208,9 +274,8 @@ val NATIVE_LANGUAGES: List<Language>
  * none. Each is one direction of one pair, about 80 MB.
  *
  * The directions are listed rather than generated because the repos
- * exist for some pairs and not others; these are the ones that do, of
- * the languages whose alphabet differs from the native one (the rest
- * could never be told apart anyway).
+ * exist for some pairs and not others, and a pair that is missing is
+ * only found out about halfway through an 80 MB download.
  */
 fun translation(from: Language, into: Language): Loose? {
     val pair = "${from.code}-${into.code}"
@@ -228,15 +293,93 @@ fun translation(from: Language, into: Language): Loose? {
     )
 }
 
-/** Directions with a published model, checked one by one. */
+/**
+ * Directions with a published model, checked one by one against the
+ * repo and its four files.
+ *
+ * Most of these are new, and they are what [LANGID] bought: every pair
+ * written in the Latin alphabet was pointless to list while a
+ * paragraph's language was read off its alphabet, because French could
+ * not have been told from the English it would be read into. The
+ * absences are the uploader's, not a rule -- Greek, Romanian, Croatian,
+ * Slovenian, Lithuanian, Portuguese and `de-ru` have no readable repo.
+ */
 private val TRANSLATIONS = setOf(
-    "ru-en", "uk-en", "zh-en", "jap-en", "ko-en",
-    "en-ru", "fr-ru", "es-ru", "ko-ru",
+    // Into English.
+    "ru-en", "uk-en", "bg-en", "fr-en", "es-en", "de-en", "it-en", "nl-en",
+    "da-en", "sv-en", "fi-en", "hu-en", "cs-en", "sk-en", "pl-en", "lv-en",
+    "et-en", "mt-en", "zh-en", "jap-en", "ko-en",
+    // Into Russian.
+    "en-ru", "uk-ru", "fr-ru", "es-ru", "ko-ru",
 )
 
 /** Every language that can be translated into [into]. */
 fun translatable(into: Language): List<Language> =
     Language.entries.filter { it != into && translation(it, into) != null }
+
+/**
+ * What kind of thing a model is, which is how the Models page groups
+ * them. The order is the order the page lists them in: what nothing
+ * works without, then what each language needs.
+ */
+enum class Kind(@StringRes val titleRes: Int) {
+    SPEECH(R.string.models_kind_speech),
+    LIVE(R.string.models_kind_live),
+    READING(R.string.models_kind_reading),
+}
+
+/**
+ * One row of the Models page: a model, what it is for, and what to call
+ * it in a sentence a reader can act on.
+ *
+ * [required] is whether the app cannot run without it, which is the
+ * only thing that makes a model undeletable. [wantedBy] is the language
+ * whose being chosen asks for it, or null for the ones that are always
+ * wanted -- the page uses it to say why something is there.
+ */
+class Listing(
+    val model: Model,
+    val kind: Kind,
+    val required: Boolean = false,
+    val wantedBy: Language? = null,
+)
+
+/**
+ * Every model the app knows how to install, in the order the Models
+ * page shows them.
+ *
+ * A function and not a `val`, for the reason given on
+ * [NATIVE_LANGUAGES]: anything at the top level of this file that reads
+ * [Language] back while [Language] is still initializing gets `entries`
+ * as null and crashes the app before its first screen.
+ */
+fun catalogue(): List<Listing> {
+    val rows = mutableListOf<Listing>()
+    rows += Listing(PARAKEET, Kind.SPEECH, required = true)
+    // Every pass-1 model, English first: it is required outright, since
+    // it is downloaded on the first run and a sentence of English in
+    // another language's conversation is the common case pass 1 moves
+    // between languages for.
+    rows += Listing(ZIPFORMER_EN, Kind.LIVE, required = true, wantedBy = Language.ENGLISH)
+    for (l in NATIVE_LANGUAGES) {
+        val m = l.streaming ?: continue
+        if (m.dir == ZIPFORMER_EN.dir) continue
+        rows += Listing(m, Kind.LIVE, wantedBy = l)
+    }
+    // The classifier, then one reading model per direction. Listed
+    // under the same heading because they are wanted together: a
+    // reading of French into English needs both, and a page that
+    // separated them would be a page where turning on French leaves
+    // something unexplained in another section.
+    rows += Listing(LANGID, Kind.READING)
+    for (into in NATIVE_LANGUAGES) {
+        for (from in translatable(into)) {
+            val m = translation(from, into) ?: continue
+            rows += Listing(m, Kind.READING, wantedBy = from)
+        }
+    }
+    return rows
+}
 
 sealed interface Step {
     data class Downloading(val bundle: String, val done: Long, val total: Long) : Step
@@ -259,6 +402,18 @@ class ModelStore(root: File) {
 
     /** Bytes on disk for installed models. */
     fun size(): Long = dir.walkTopDown().filter { it.isFile }.sumOf { it.length() }
+
+    /**
+     * Bytes one model takes, as it actually is on disk rather than as
+     * [Model.approxBytes] guessed. Zero when it isn't installed.
+     *
+     * The whole directory and not the listed files: a translation model
+     * keeps a `tokenizer.json` written after the download, and a reader
+     * being told what deleting something gives back should be told the
+     * truth.
+     */
+    fun size(m: Model): Long =
+        File(dir, m.dir).walkTopDown().filter { it.isFile }.sumOf { it.length() }
 
     /** Give back the space one model takes; it can be fetched again. */
     fun remove(m: Model) {
@@ -283,9 +438,26 @@ class ModelStore(root: File) {
                     archive.delete()
                 }
                 is Loose -> loose(m, progress)
+                is Single -> single(m, progress)
             }
         }
         downloads.deleteRecursively()
+    }
+
+    /**
+     * One file, downloaded beside its directory and moved in, like
+     * [loose] and for the same reason: nothing that looks installed is
+     * left behind by a fetch that stopped halfway.
+     */
+    private fun single(m: Single, progress: (Step) -> Unit) {
+        val tmp = File(dir, "${m.dir.replace('/', '-')}.tmp")
+        tmp.deleteRecursively()
+        tmp.mkdirs()
+        download(m.dir, m.url, m.approxBytes, File(tmp, m.name), progress)
+        val final = File(dir, m.dir)
+        final.parentFile?.mkdirs()
+        final.deleteRecursively()
+        if (!tmp.renameTo(final)) throw IOException("rename ${tmp.name}")
     }
 
     /**

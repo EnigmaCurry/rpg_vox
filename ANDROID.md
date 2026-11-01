@@ -26,6 +26,10 @@ the phone. It also adds a voice keyboard for dictating into other apps.
   shown in English, on the phone, with nothing asked of a network. The
   transcript is in the language you read and in no other; what was said
   is kept all the same, and is what every pass and every reading is of.
+  Eighteen languages to read in English, in any alphabet, including
+  languages written like your own.
+* **Models you manage.** One page lists every model with its size and
+  whether it is on the phone, and lets you fetch or delete any of them.
 
 Arm64 phones running Android 8.0 (API 26) or newer. The finished text
 covers 25 European languages; the live text, as you speak, is English or
@@ -40,6 +44,7 @@ Russian, and [follows whichever is being spoken](#languages).
 * [Settings](#settings)
 * [The app's own language](#the-apps-own-language)
 * [Languages](#languages)
+* [Models](#models)
 * [What the transcript shows](#what-the-transcript-shows)
 * [Voice typing keyboard](#voice-typing-keyboard)
 * [Building from source](#building-from-source)
@@ -88,19 +93,16 @@ The models stay loaded while you use Scribe and are unloaded to free
 memory after it has been out of sight for 10 minutes. Tap **Load
 models** to load them again.
 
-Everything else is fetched only if a setting asks for it, from
-**Settings → Languages**:
+Everything else is fetched only if a setting asks for it, and all of
+it can be managed from [**Settings → Models**](#models):
 
 | Model | What for | Download |
 | --- | --- | --- |
 | Streaming Zipformer (English) | the live text, in English | 128 MB |
 | Parakeet TDT 0.6B v3 | the finished text, 25 languages | 487 MB |
 | Vosk streaming Russian | the live text, in Russian | 27 MB |
-| opus-mt, one per language | reading another language in yours | 81 MB each |
-
-The downloads are the same models and the same sources the desktop
-[scribe](SCRIBE.md#models-and-logs) uses, and they land in the same
-layout, so what is written here about either holds for both.
+| fastText lid.176 | telling languages apart | 917 KB |
+| opus-mt, one per direction | reading another language in yours | 81 MB each |
 
 ## Recording
 
@@ -222,6 +224,9 @@ resume to apply them mid-recording.
 **Languages**: see [Languages](#languages) and [what the transcript
 shows](#what-the-transcript-shows) below.
 
+**Models**: every model, with what each is for and a button to fetch or
+delete it. See [Models](#models).
+
 **Keyboard**: a shortcut to turn on the [voice typing
 keyboard](#voice-typing-keyboard).
 
@@ -274,7 +279,8 @@ Adding a third language is a file of strings and a line of XML; see
 **Settings → Languages** has three things: the language you read in, the
 languages to listen out for, and **Show what was said**, which is what a
 paragraph shows while its reading catches up. The page says each of them
-in a line; the rest of what they mean is here.
+in a line; the rest of what they mean is here. Downloading the models
+any of it needs is [its own page](#models).
 
 **I read in** is the language every translation is read into, and the
 one the words that appear *as you speak* start out in.
@@ -294,25 +300,72 @@ English and Russian are the two languages pass 1 has a model for. The
 model for a language you turn on is downloaded with it (27 MB for
 Russian); until it is there the live text cannot be in that language,
 and the settings page and the recording status line say so rather than
-listening in the wrong one without a word about it.
+listening in the wrong one without a word.
 
-**Choose secondary languages (one per alphabet)** is a language per
-model, about 81 MB each, downloaded under **Manage dictionaries** below
-them. A paragraph heard in one of them gets a reading in the language
-you read, a sentence at a time, on the phone.
+**Listen out for** is any number of languages, in any alphabets,
+including your own. A paragraph heard in one of them gets a reading in
+the language you read, a sentence at a time, on the phone. Each is one
+model, about 81 MB, from **Settings → Models**.
 
-Which languages are offered is not a matter of taste. A paragraph's
-language is worked out from its alphabet, because the recognizer that
-hears 25 languages never says which one it heard -- so a language
-written in the alphabet you read could not be told from your own, and
-two written in each other's could not be told apart. Turning one on
-therefore turns off whichever other one shares its alphabet, and the
-list is only the languages with a model that reads into yours:
+Which languages are offered is the uploader's doing and nothing else:
+they are the ones with a published model that reads into yours.
 
 | You read | Listen out for |
 | --- | --- |
-| English | Russian or Ukrainian; Chinese, Japanese or Korean |
-| Russian | English, French or Spanish; Korean |
+| English | Bulgarian, Czech, Danish, Dutch, Estonian, Finnish, French, German, Hungarian, Italian, Latvian, Maltese, Polish, Russian, Slovak, Spanish, Swedish, Ukrainian; Chinese, Japanese, Korean |
+| Russian | English, French, Spanish, Ukrainian; Korean |
+
+That list used to be two or three languages, one per alphabet, and the
+reason is worth keeping: the recognizer that hears 25 languages never
+says which one it heard, so a paragraph's language is worked out from
+its text afterwards. The alphabet does most of that for nothing and is
+never wrong about it — Cyrillic is not Latin — but it cannot tell
+French from the English it would be read into, and a wrong guess sends a
+paragraph to a model that translates it out of a language it is not in,
+which comes back as confident nonsense rather than as an error.
+
+So the rest of the decision is a model too: **Telling languages apart**,
+917 KB, on the Models page. It is asked only what the alphabet could not
+settle, only about the languages you have turned on, and only its
+answers above nine-tenths certainty are used; below that the paragraph
+stands as it was said, which is what the alphabet alone used to do with
+every one of them. Turning on two languages written the same way asks
+for it, and until it is there that pair is refused rather than guessed
+at — the settings page and the recording status line say so.
+
+## Models
+
+**Settings → Models** is every model: what it is for, how big it is,
+whether it is on the phone, and a button to fetch or delete it. The
+heading says how much they take altogether.
+
+They are grouped by what they do rather than by where they came from:
+
+* **The finished text** — Parakeet TDT 0.6B v3, 487 MB. Needed to run,
+  so it has no Delete.
+* **The live text, as you speak** — one per language, English (128 MB)
+  and Russian (27 MB). The English one is needed to run too: it is
+  fetched on the first run either way, and a sentence of English inside
+  another language's conversation is the common case pass 1 changes
+  language for.
+* **Reading another language in yours** — **Telling languages apart**
+  (917 KB), and one opus-mt model per direction (about 81 MB each).
+
+A row says which of these a model is: **in use** by the languages you
+have chosen, **no language uses it** for one left behind by a setting
+you changed, or **a chosen language needs this** in red for one that is
+missing — which is the state where nothing is being read. **Download
+what's missing** at the top fetches all of those at once.
+
+Anything but the two required models can be deleted and fetched again.
+Deleting one a chosen language is using is allowed: that language simply
+stops being read until it is back, which the row and the status line
+say. Models live in the app's private storage and go when the app is
+uninstalled.
+
+The downloads are the same models, from the same sources, in the same
+layout as the desktop [scribe](SCRIBE.md#models-and-logs), so a models
+directory from one would work for the other.
 
 ## What the transcript shows
 

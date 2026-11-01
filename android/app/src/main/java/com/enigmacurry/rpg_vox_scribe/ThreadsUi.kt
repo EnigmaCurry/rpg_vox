@@ -358,6 +358,7 @@ enum class SettingsPage(@StringRes val titleRes: Int) {
     MICROPHONE(R.string.settings_microphone),
     RECORDING(R.string.settings_recording),
     LANGUAGES(R.string.settings_languages),
+    MODELS(R.string.settings_models),
     KEYBOARD(R.string.settings_keyboard),
     DISPLAY(R.string.settings_display),
     ABOUT(R.string.settings_about),
@@ -379,6 +380,7 @@ fun Settings(page: SettingsPage, close: () -> Unit) {
                     SettingsPage.MICROPHONE -> MicrophonePage()
                     SettingsPage.RECORDING -> RecordingPage()
                     SettingsPage.LANGUAGES -> LanguagesPage()
+                    SettingsPage.MODELS -> ModelsPage()
                     SettingsPage.KEYBOARD -> KeyboardPage()
                     SettingsPage.DISPLAY -> DisplayPage()
                     SettingsPage.ABOUT -> {}
@@ -453,17 +455,17 @@ private fun KeyboardPage() {
 }
 
 /**
- * The language you read in, the secondary ones to listen out for, the
- * dictionaries they need, and what a paragraph shows while its reading
- * catches up.
+ * The language you read in, the ones to listen out for, and what a
+ * paragraph shows while its reading catches up. Three choices, and
+ * nothing about downloads: those moved to [ModelsPage], which is the
+ * whole of why this page is now short.
  *
- * Each other language is one model, downloaded here, that reads it in
- * the language you read. Which languages can be offered is not a matter
- * of taste: a paragraph's language is read off its alphabet, so one
- * sharing the alphabet you read in could never be told apart from your
- * own, and two sharing each other's could not be told apart either. So
- * the list is the languages with a model into yours, and turning one on
- * turns off whichever other one shares its alphabet.
+ * Any language with a model that reads into yours can be turned on, in
+ * any alphabet, including your own -- a paragraph's language is worked
+ * out from the text, by its alphabet where that settles it and by the
+ * classifier where it does not (`vox_transcribe::langid`). What that
+ * costs is one model per language, which is the Models page's business
+ * and is said there.
  *
  * All of which is said here in a line apiece. A settings page that
  * explains itself in paragraphs is one nobody reads to the end of, and
@@ -472,7 +474,6 @@ private fun KeyboardPage() {
  */
 @Composable
 private fun LanguagesPage() {
-    val installing = InstallService.state.collectAsState().value
     // Recomposes when a model is installed or deleted.
     val models = Scribe.languageModels
     val native = Scribe.native
@@ -493,67 +494,40 @@ private fun LanguagesPage() {
     val chosen = Scribe.others
     translatable(native).forEach { l ->
         val model = translation(l, native) ?: return@forEach
-        val on = l in chosen
-        // The language already chosen that this one could not be told
-        // apart from, if any: turning it on would replace that one.
-        val clash = if (on) null else chosen.firstOrNull { it.script == l.script }
         val have = remember(models) { Scribe.store.installed(model) }
-        val mb = model.approxBytes / 1_000_000
         Toggle(
             stringResource(l.nameRes),
-            when {
-                clash != null -> stringResource(
-                    R.string.languages_clash,
-                    stringResource(l.script.labelRes),
-                    stringResource(clash.nameRes),
-                )
-                have -> stringResource(R.string.languages_have, mb)
-                on -> stringResource(R.string.languages_to_download, mb)
-                else -> stringResource(R.string.languages_size, mb)
+            // Downloaded or not, and how big, which is as much as this
+            // page says about a model. The Models page is where one is
+            // fetched or deleted, and this says which way to go.
+            if (have) {
+                stringResource(R.string.languages_have)
+            } else {
+                stringResource(R.string.languages_needs_model, model.approxBytes / 1_000_000)
             },
-            on,
+            l in chosen,
             { Scribe.chooseOther(l, it) },
-            enabled = clash == null && !Scribe.busy(),
+            enabled = !Scribe.busy(),
         )
     }
     if (translatable(native).isEmpty()) {
         Hint(stringResource(R.string.languages_none, stringResource(native.nameRes)))
     }
-
-    // What the choices above still want fetched, and what they left behind.
-    val missing = remember(models, chosen, native) { Scribe.wanted().filterNot(Scribe.store::installed) }
-    val spare = remember(models, chosen, native) { Scribe.spare() }
-    // Only when there is one to fetch or one to be rid of: a header
-    // over nothing is the sort of thing this page is being rid of.
-    if (missing.isNotEmpty() || spare.isNotEmpty() || installing !is Install.Idle) {
-        Text(
-            stringResource(R.string.languages_dictionaries),
-            style = MaterialTheme.typography.titleSmall,
-            modifier = Modifier.padding(top = 16.dp),
+    // What the languages chosen still need, said here because it is a
+    // consequence of the choices on this page, and acted on there.
+    val missing = remember(models, chosen, native) {
+        Scribe.wanted().filterNot(Scribe.store::installed)
+    }
+    if (missing.isNotEmpty()) {
+        Hint(
+            pluralStringResource(
+                R.plurals.languages_missing_models,
+                missing.size,
+                missing.size,
+                missing.sumOf { it.approxBytes } / 1_000_000,
+            ),
+            error = true,
         )
-    }
-    val context = androidx.compose.ui.platform.LocalContext.current
-    when {
-        installing is Install.Running -> Hint(describe(context, installing.step))
-        installing is Install.Failed ->
-            Hint(stringResource(R.string.download_failed, installing.error), error = true)
-        missing.isNotEmpty() ->
-            Hint(
-                stringResource(
-                    R.string.languages_fetch_hint,
-                    missing.sumOf { it.approxBytes } / 1_000_000,
-                ),
-            )
-    }
-    if (missing.isNotEmpty() && installing !is Install.Running) {
-        TextButton(onClick = Scribe::installLanguages) {
-            Text(stringResource(if (installing is Install.Failed) R.string.action_retry else R.string.action_download))
-        }
-    }
-    spare.forEach { m ->
-        TextButton(onClick = { Scribe.removeModel(m) }) {
-            Text(stringResource(R.string.languages_delete_model, modelName(context, m)))
-        }
     }
 
     Text(
@@ -574,26 +548,146 @@ private fun LanguagesPage() {
 }
 
 /**
- * A model left on disk by a language no longer chosen, said in
- * languages rather than in the directory it is kept in: "ru-en" is the
- * app's business and "Russian → English" is the reader's. Its size is
- * not repeated here -- the list above says what one of these costs,
- * and a button that wraps onto two lines to say it again is the kind
- * of thing this page is being rid of.
+ * Every model, what it is for, and whether it is on the phone: one page
+ * for all the downloading, which used to be a section of the Languages
+ * page that grew until it was most of it.
+ *
+ * Grouped by what a model does rather than by where it came from, since
+ * "the live text in Russian" is a thing a reader wants and
+ * `streaming-zipformer-ru` is not. Sizes are what is actually on disk
+ * for the installed ones and the approximate download for the rest --
+ * the two differ, and the number that matters is the one the row's
+ * button is about.
+ *
+ * What cannot be deleted is what nothing works without: Parakeet and
+ * the English live text. Everything else can go and be fetched again,
+ * including a model a chosen language is using -- deleting that is a
+ * reasonable thing to want, and the row says the language will stop
+ * being read rather than refusing.
+ */
+@Composable
+private fun ModelsPage() {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val installing = InstallService.state.collectAsState().value
+    val models = Scribe.languageModels
+    val rows = remember(models) { catalogue() }
+    val wanted = remember(models, Scribe.others, Scribe.native) {
+        Scribe.wanted().map { it.dir }.toSet()
+    }
+    val onDisk = remember(models) { Scribe.store.size() }
+
+    Text(
+        stringResource(R.string.models_on_disk, megabytes(onDisk)),
+        style = MaterialTheme.typography.titleSmall,
+    )
+    when {
+        installing is Install.Running -> Hint(describe(context, installing.step))
+        installing is Install.Failed ->
+            Hint(stringResource(R.string.download_failed, installing.error), error = true)
+        else -> Hint(stringResource(R.string.models_hint))
+    }
+
+    val missing = remember(models, wanted) { Scribe.wanted().filterNot(Scribe.store::installed) }
+    if (missing.isNotEmpty() && installing !is Install.Running) {
+        TextButton(onClick = Scribe::installLanguages) {
+            Text(
+                stringResource(
+                    R.string.models_get_wanted,
+                    missing.sumOf { it.approxBytes } / 1_000_000,
+                ),
+            )
+        }
+    }
+
+    Kind.entries.forEach { kind ->
+        val mine = rows.filter { it.kind == kind }
+        if (mine.isEmpty()) return@forEach
+        Text(
+            stringResource(kind.titleRes),
+            style = MaterialTheme.typography.titleSmall,
+            modifier = Modifier.padding(top = 16.dp),
+        )
+        mine.forEach { row -> ModelRow(row, row.model.dir in wanted, installing !is Install.Idle) }
+    }
+}
+
+/**
+ * One model: what it is, its size, and the one thing to do with it.
+ *
+ * One button and not two, because a model is either here or it is not
+ * and the other button would always be the wrong one. Required models
+ * get no button at all rather than a disabled one -- there is nothing
+ * to decide, and a greyed-out Delete invites a tap to find out why.
+ */
+@Composable
+private fun ModelRow(row: Listing, wanted: Boolean, busy: Boolean) {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val have = Scribe.store.installed(row.model)
+    val size = if (have) Scribe.store.size(row.model) else row.model.approxBytes
+    androidx.compose.foundation.layout.Row(
+        verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
+        modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(modelName(context, row.model), style = MaterialTheme.typography.bodyLarge)
+            Text(
+                when {
+                    row.required -> stringResource(R.string.models_required, megabytes(size))
+                    have && wanted -> stringResource(R.string.models_in_use, megabytes(size))
+                    have -> stringResource(R.string.models_unused, megabytes(size))
+                    wanted -> stringResource(R.string.models_wanted, megabytes(size))
+                    else -> megabytes(size)
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = if (wanted && !have) {
+                    MaterialTheme.colorScheme.error
+                } else {
+                    MaterialTheme.colorScheme.onSurfaceVariant
+                },
+            )
+        }
+        when {
+            row.required -> {}
+            have -> TextButton(
+                onClick = { Scribe.removeModel(row.model) },
+                enabled = !busy,
+            ) { Text(stringResource(R.string.action_delete)) }
+            else -> TextButton(
+                onClick = { Scribe.installModel(row.model) },
+                enabled = !busy,
+            ) { Text(stringResource(R.string.action_download)) }
+        }
+    }
+}
+
+/** A size as a reader reads one: "81 MB", or "0.9 MB" under a megabyte. */
+private fun megabytes(bytes: Long): String {
+    val mb = bytes / 1_000_000.0
+    return if (mb < 10) String.format(java.util.Locale.ROOT, "%.1f MB", mb) else "${mb.toInt()} MB"
+}
+
+/**
+ * A model said in languages rather than in the directory it is kept in:
+ * "ru-en" is the app's business and "Russian → English" is the
+ * reader's.
  */
 private fun modelName(context: android.content.Context, m: Model): String {
+    if (m.dir == LANGID.dir) return context.getString(R.string.model_langid)
+    if (m.dir == PARAKEET.dir) return context.getString(R.string.model_speech)
+    Language.entries.firstOrNull { it.streaming?.dir == m.dir }?.let {
+        return context.getString(R.string.model_live_text, context.getString(it.nameRes))
+    }
     val pair = m.dir.removePrefix("translate/").split('-')
     val from = Language.entries.firstOrNull { it.code == pair.firstOrNull() }
     val into = Language.entries.firstOrNull { it.code == pair.lastOrNull() }
-    return when {
-        pair.size == 2 && from != null && into != null -> context.getString(
+    return if (pair.size == 2 && from != null && into != null) {
+        context.getString(
             R.string.model_pair,
             context.getString(from.nameRes),
             context.getString(into.nameRes),
         )
-        else -> Language.entries.firstOrNull { it.streaming?.dir == m.dir }
-            ?.let { context.getString(R.string.model_live_text, context.getString(it.nameRes)) }
-            ?: m.dir.substringAfterLast('/')
+    } else {
+        m.dir.substringAfterLast('/')
     }
 }
 

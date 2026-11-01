@@ -43,6 +43,22 @@ releases.
 
 ### Scribe for Android
 
+- **Models are a page of their own.** Downloading them was a section of
+  the Languages page that had grown until it was most of it, and it
+  could only ever offer what the language settings happened to want.
+  **Settings → Models** is now every model: what each is for, how big
+  it is, whether it is on the phone, and a button to fetch or delete
+  it, with the total on disk at the top. A row says whether a model is
+  in use, unused, or wanted by a chosen language and missing -- which
+  is the state in which nothing is being read, and which previously
+  looked like a recording that simply would not translate.
+
+  The Languages page keeps the three things it is for: the language you
+  read in, the languages to listen out for, and what a paragraph shows
+  while its reading catches up. Nothing on it downloads anything, and
+  the rule that turning on one language turned off whichever other one
+  shared its alphabet is gone with the restriction behind it.
+
 - **A reading says that it is a reading, and will show you the line it
   was made from.** A translated paragraph was the same black text as
   one somebody actually said, with nothing to tell them apart and no
