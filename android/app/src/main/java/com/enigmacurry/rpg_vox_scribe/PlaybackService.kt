@@ -69,7 +69,7 @@ class PlaybackService : Service() {
     override fun onCreate() {
         super.onCreate()
         getSystemService(NotificationManager::class.java).createNotificationChannel(
-            NotificationChannel(CHANNEL, "Playback", NotificationManager.IMPORTANCE_LOW).apply {
+            NotificationChannel(CHANNEL, getString(R.string.channel_playback), NotificationManager.IMPORTANCE_LOW).apply {
                 setShowBadge(false)
             },
         )
@@ -175,7 +175,7 @@ class PlaybackService : Service() {
         session.setMetadata(
             MediaMetadata.Builder()
                 .putString(MediaMetadata.METADATA_KEY_TITLE, Scribe.thread.title)
-                .putString(MediaMetadata.METADATA_KEY_ARTIST, "Scribe")
+                .putString(MediaMetadata.METADATA_KEY_ARTIST, getString(R.string.app_name))
                 .putLong(MediaMetadata.METADATA_KEY_DURATION, Playback.lengthMs)
                 .build(),
         )
@@ -187,21 +187,21 @@ class PlaybackService : Service() {
         return Notification.Builder(this, CHANNEL)
             .setSmallIcon(android.R.drawable.ic_media_play)
             .setContentTitle(Scribe.thread.title)
-            .setContentText(if (playing) "Playing" else "Paused")
+            .setContentText(getString(if (playing) R.string.notif_playing else R.string.status_paused))
             .setContentIntent(openApp())
             .setDeleteIntent(action(ACTION_STOP))
             .setOngoing(playing)
             .setVisibility(Notification.VISIBILITY_PUBLIC)
-            .addAction(button(android.R.drawable.ic_media_rew, "Back 10 seconds", ACTION_BACK))
+            .addAction(button(android.R.drawable.ic_media_rew, R.string.a11y_back_10, ACTION_BACK))
             .addAction(
                 if (playing) {
-                    button(android.R.drawable.ic_media_pause, "Pause", ACTION_TOGGLE)
+                    button(android.R.drawable.ic_media_pause, R.string.action_pause, ACTION_TOGGLE)
                 } else {
-                    button(android.R.drawable.ic_media_play, "Resume", ACTION_TOGGLE)
+                    button(android.R.drawable.ic_media_play, R.string.action_resume, ACTION_TOGGLE)
                 },
             )
-            .addAction(button(android.R.drawable.ic_media_ff, "Ahead 10 seconds", ACTION_AHEAD))
-            .addAction(button(android.R.drawable.ic_menu_close_clear_cancel, "Stop", ACTION_STOP))
+            .addAction(button(android.R.drawable.ic_media_ff, R.string.a11y_ahead_10, ACTION_AHEAD))
+            .addAction(button(android.R.drawable.ic_menu_close_clear_cancel, R.string.action_stop, ACTION_STOP))
             .setStyle(
                 Notification.MediaStyle()
                     .setMediaSession(session.sessionToken)
@@ -210,8 +210,8 @@ class PlaybackService : Service() {
             .build()
     }
 
-    private fun button(icon: Int, label: String, act: String) =
-        Notification.Action.Builder(Icon.createWithResource(this, icon), label, action(act)).build()
+    private fun button(icon: Int, label: Int, act: String) =
+        Notification.Action.Builder(Icon.createWithResource(this, icon), getString(label), action(act)).build()
 
     private fun action(act: String): PendingIntent =
         PendingIntent.getService(

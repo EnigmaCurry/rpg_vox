@@ -202,6 +202,32 @@ section after the version it releases.
 
 ### Scribe for Android
 
+- **The app itself is in English or Russian.** Every word it says --
+  buttons, settings, dialogs, notifications, the voice keyboard, what
+  TalkBack reads out -- was a literal in Kotlin, which is to say the
+  app spoke one language and had no way to be told otherwise. They are
+  resources now, in `values/strings.xml` with `values-ru/` beside it,
+  and the app follows the phone's language list; on Android 13 and
+  newer `locales_config.xml` also gets it a **Language** entry of its
+  own in system Settings, so it can be read in Russian on an English
+  phone. Which language the app is in and which language it
+  *transcribes* are separate, and were worth keeping separate: a
+  Russian reader transcribing English wants one of each. Three things
+  stay in English on purpose -- the changelog, which is CHANGELOG.md as
+  it was written; a model's directory name, which is what the release
+  it came from is called; and the engine's own errors, which a bug
+  report wants quoted. Nothing already recorded is rewritten: a
+  paragraph's speaker is still stored as `Me` or `Phone` and a reading
+  still remembers `heard_in` by the engine's English name, so switching
+  the language changes the words on the screen and not a byte of the
+  thread. Russian numbers properly, too -- "перевод отстаёт на 2
+  абзаца" against "на 5 абзацев", which is four plural forms where
+  English has two. `StringsTest` holds a translation to the same names,
+  the same format arguments and enough plural forms for its language,
+  and fails the build when one drifts; [ANDROID.md](ANDROID.md#translating)
+  says what adding a third language costs, which is a file and a line
+  of XML.
+
 - **The status line says when the reading has fallen behind.** It used
   to degrade in silence: recording from another app, the words kept
   arriving and the readings quietly stopped keeping up, with nothing to

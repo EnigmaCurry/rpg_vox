@@ -1,5 +1,6 @@
 package com.enigmacurry.rpg_vox_scribe
 
+import androidx.annotation.StringRes
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.verticalScroll
@@ -39,6 +40,8 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.res.pluralStringResource
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.font.FontWeight
@@ -78,13 +81,13 @@ fun ThreadDrawer(dialogs: ThreadDialogs, close: () -> Unit) {
         .map { it.second }
     ModalDrawerSheet {
         Text(
-            "Scribe",
+            stringResource(R.string.app_name),
             style = MaterialTheme.typography.titleLarge,
             modifier = Modifier.padding(start = 24.dp, top = 24.dp, bottom = 8.dp),
         )
         if (locked) {
             Text(
-                "Stop recording to switch",
+                stringResource(R.string.drawer_locked),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.error,
                 modifier = Modifier.padding(start = 24.dp, bottom = 8.dp),
@@ -92,7 +95,7 @@ fun ThreadDrawer(dialogs: ThreadDialogs, close: () -> Unit) {
         }
         ThreadRow(
             icon = null,
-            title = "+ New",
+            title = stringResource(R.string.drawer_new),
             subtitle = null,
             selected = false,
             enabled = !locked,
@@ -137,12 +140,12 @@ fun ThreadDrawer(dialogs: ThreadDialogs, close: () -> Unit) {
                         }
                     }
                     DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
-                        DropdownMenuItem(text = { Text("Rename") }, onClick = {
+                        DropdownMenuItem(text = { Text(stringResource(R.string.action_rename)) }, onClick = {
                             menu = false
                             if (e is DictationInfo) dialogs.renamingDictation = e else dialogs.renaming = e as ThreadInfo
                         })
                         DropdownMenuItem(
-                            text = { Text("Delete") },
+                            text = { Text(stringResource(R.string.action_delete)) },
                             enabled = !(e is ThreadInfo && e.id == Scribe.thread.id && locked),
                             onClick = {
                                 menu = false
@@ -210,15 +213,23 @@ fun ThreadDialogHost(dialogs: ThreadDialogs) {
         val done = { dialogs.choosingNew = false }
         AlertDialog(
             onDismissRequest = done,
-            title = { Text("New thread") },
+            title = { Text(stringResource(R.string.new_thread_title)) },
             text = {
                 Column {
-                    NewChoice(PEN, "Dictation", "Write by voice, and keep editing anywhere in the text.") {
+                    NewChoice(
+                        PEN,
+                        stringResource(R.string.new_dictation),
+                        stringResource(R.string.new_dictation_detail),
+                    ) {
                         done()
                         Dictations.create()
                         if (Scribe.autoStart) Scribe.startWhenOpen = "dictation"
                     }
-                    NewChoice(MIC, "Transcription", "Record and transcribe in order: talks, meetings, videos.") {
+                    NewChoice(
+                        MIC,
+                        stringResource(R.string.new_transcription),
+                        stringResource(R.string.new_transcription_detail),
+                    ) {
                         done()
                         Dictations.close()
                         Scribe.newThread()
@@ -227,26 +238,34 @@ fun ThreadDialogHost(dialogs: ThreadDialogs) {
                 }
             },
             confirmButton = {},
-            dismissButton = { TextButton(onClick = done) { Text("Cancel") } },
+            dismissButton = { TextButton(onClick = done) { Text(stringResource(R.string.action_cancel)) } },
         )
     }
     dialogs.renaming?.let { t ->
-        Rename("Rename transcription", t.title, close = { dialogs.renaming = null }) { Scribe.rename(t.id, it) }
+        Rename(
+            stringResource(R.string.rename_transcription),
+            t.title,
+            close = { dialogs.renaming = null },
+        ) { Scribe.rename(t.id, it) }
     }
     dialogs.renamingDictation?.let { d ->
-        Rename("Rename dictation", d.title, close = { dialogs.renamingDictation = null }) { Dictations.rename(d.id, it) }
+        Rename(
+            stringResource(R.string.rename_dictation),
+            d.title,
+            close = { dialogs.renamingDictation = null },
+        ) { Dictations.rename(d.id, it) }
     }
     dialogs.deleting?.let { t ->
         ConfirmDelete(
-            "Delete transcription?",
-            "\"${t.title}\" and its ${t.count} paragraph(s) will be deleted. This can't be undone.",
+            stringResource(R.string.delete_transcription_title),
+            pluralStringResource(R.plurals.delete_transcription_body, t.count, t.title, t.count),
             close = { dialogs.deleting = null },
         ) { Scribe.delete(t.id) }
     }
     dialogs.deletingDictation?.let { d ->
         ConfirmDelete(
-            "Delete dictation?",
-            "\"${d.title}\" and its text will be deleted. This can't be undone.",
+            stringResource(R.string.delete_dictation_title),
+            stringResource(R.string.delete_dictation_body, d.title),
             close = { dialogs.deletingDictation = null },
         ) { Dictations.delete(d.id) }
     }
@@ -312,9 +331,9 @@ private fun Rename(heading: String, current: String, close: () -> Unit, rename: 
                     close()
                 },
                 enabled = text.text.isNotBlank(),
-            ) { Text("Rename") }
+            ) { Text(stringResource(R.string.action_rename)) }
         },
-        dismissButton = { TextButton(onClick = close) { Text("Cancel") } },
+        dismissButton = { TextButton(onClick = close) { Text(stringResource(R.string.action_cancel)) } },
     )
 }
 
@@ -328,20 +347,20 @@ private fun ConfirmDelete(heading: String, detail: String, close: () -> Unit, de
             TextButton(onClick = {
                 delete()
                 close()
-            }) { Text("Delete", color = MaterialTheme.colorScheme.error) }
+            }) { Text(stringResource(R.string.action_delete), color = MaterialTheme.colorScheme.error) }
         },
-        dismissButton = { TextButton(onClick = close) { Text("Cancel") } },
+        dismissButton = { TextButton(onClick = close) { Text(stringResource(R.string.action_cancel)) } },
     )
 }
 
 /** The pages of settings, listed under ⚙. */
-enum class SettingsPage(val title: String) {
-    MICROPHONE("Microphone"),
-    RECORDING("Recording"),
-    LANGUAGES("Languages"),
-    KEYBOARD("Keyboard"),
-    DISPLAY("Display"),
-    ABOUT("About"),
+enum class SettingsPage(@StringRes val titleRes: Int) {
+    MICROPHONE(R.string.settings_microphone),
+    RECORDING(R.string.settings_recording),
+    LANGUAGES(R.string.settings_languages),
+    KEYBOARD(R.string.settings_keyboard),
+    DISPLAY(R.string.settings_display),
+    ABOUT(R.string.settings_about),
 }
 
 /** One settings page as a dialog. */
@@ -353,7 +372,7 @@ fun Settings(page: SettingsPage, close: () -> Unit) {
     }
     AlertDialog(
         onDismissRequest = close,
-        title = { Text(page.title) },
+        title = { Text(stringResource(page.titleRes)) },
         text = {
             Column(Modifier.verticalScroll(androidx.compose.foundation.rememberScrollState())) {
                 when (page) {
@@ -366,29 +385,30 @@ fun Settings(page: SettingsPage, close: () -> Unit) {
                 }
             }
         },
-        confirmButton = { TextButton(onClick = close) { Text("Done") } },
+        confirmButton = { TextButton(onClick = close) { Text(stringResource(R.string.action_done)) } },
     )
 }
 
 /** Which mic, and its gain. Take effect when the mic next starts. */
 @Composable
 private fun MicrophonePage() {
-    Text("Mic", style = MaterialTheme.typography.titleSmall)
+    Text(stringResource(R.string.mic_which), style = MaterialTheme.typography.titleSmall)
     MicRoute.entries.forEach { r ->
-        Choice(r.label, Scribe.route == r) { Scribe.chooseRoute(r) }
+        Choice(stringResource(r.labelRes), Scribe.route == r) { Scribe.chooseRoute(r) }
     }
     Text(
-        "Mic boost",
+        stringResource(R.string.mic_boost),
         style = MaterialTheme.typography.titleSmall,
         modifier = Modifier.padding(top = 12.dp),
     )
     Boost.entries.forEach { b ->
-        val label = if (b == Boost.AUTO) "Auto (raise quiet speech)" else b.label
+        // Auto says what it does here, where there is room for it.
+        val label = stringResource(if (b == Boost.AUTO) R.string.boost_auto_long else b.labelRes)
         Choice(label, Scribe.boost == b) { Scribe.chooseBoost(b) }
     }
     if (Scribe.recording) {
         Text(
-            "Changes apply when the mic next starts (pause and resume).",
+            stringResource(R.string.mic_applies_next_start),
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.padding(top = 8.dp),
@@ -400,21 +420,21 @@ private fun MicrophonePage() {
 @Composable
 private fun RecordingPage() {
     Toggle(
-        "Keep audio (.opus)",
-        "Save the audio with the transcript. Afterwards, tap a word to hear it from there.",
+        stringResource(R.string.keep_audio),
+        stringResource(R.string.keep_audio_detail),
         Scribe.keepAudio,
         Scribe::chooseKeepAudio,
     )
     Toggle(
-        "Keep non-speech audio",
-        "Also keep recordings in which no words were detected.",
+        stringResource(R.string.keep_non_speech),
+        stringResource(R.string.keep_non_speech_detail),
         Scribe.keepNonSpeech,
         Scribe::chooseKeepNonSpeech,
         enabled = Scribe.keepAudio,
     )
     Toggle(
-        "Start recording on New",
-        "A new dictation or transcription starts listening as soon as it opens.",
+        stringResource(R.string.auto_start),
+        stringResource(R.string.auto_start_detail),
         Scribe.autoStart,
         Scribe::chooseAutoStart,
     )
@@ -423,16 +443,13 @@ private fun RecordingPage() {
 @Composable
 private fun KeyboardPage() {
     val context = androidx.compose.ui.platform.LocalContext.current
-    Text(
-        "Turn on \"Scribe voice typing\" to dictate into other apps, then pick it with the keyboard switcher.",
-        style = MaterialTheme.typography.bodyMedium,
-    )
+    Text(stringResource(R.string.keyboard_how), style = MaterialTheme.typography.bodyMedium)
     TextButton(onClick = {
         context.startActivity(
             android.content.Intent(android.provider.Settings.ACTION_INPUT_METHOD_SETTINGS)
                 .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK),
         )
-    }) { Text("Keyboard settings") }
+    }) { Text(stringResource(R.string.keyboard_settings)) }
 }
 
 /**
@@ -459,17 +476,17 @@ private fun LanguagesPage() {
     // Recomposes when a model is installed or deleted.
     val models = Scribe.languageModels
     val native = Scribe.native
-    Text("I read in", style = MaterialTheme.typography.titleSmall)
+    Text(stringResource(R.string.languages_i_read_in), style = MaterialTheme.typography.titleSmall)
     NATIVE_LANGUAGES.forEach { l ->
-        Choice(l.label, native == l) { Scribe.chooseNative(l) }
+        Choice(stringResource(l.nameRes), native == l) { Scribe.chooseNative(l) }
     }
-    Hint("All text will be written and/or translated in ${native.label}.")
+    Hint(stringResource(R.string.languages_native_hint, stringResource(native.nameRes)))
     Scribe.pass1Missing?.let { l ->
-        Hint("The ${l.label} model for the live text isn't here yet.", error = true)
+        Hint(stringResource(R.string.languages_pass1_missing, stringResource(l.nameRes)), error = true)
     }
 
     Text(
-        "Choose secondary languages (one per alphabet)",
+        stringResource(R.string.languages_secondary),
         style = MaterialTheme.typography.titleSmall,
         modifier = Modifier.padding(top = 16.dp),
     )
@@ -483,12 +500,16 @@ private fun LanguagesPage() {
         val have = remember(models) { Scribe.store.installed(model) }
         val mb = model.approxBytes / 1_000_000
         Toggle(
-            l.label,
+            stringResource(l.nameRes),
             when {
-                clash != null -> "${l.script.label}, like ${clash.label}."
-                have -> "Downloaded, $mb MB."
-                on -> "$mb MB to download."
-                else -> "$mb MB."
+                clash != null -> stringResource(
+                    R.string.languages_clash,
+                    stringResource(l.script.labelRes),
+                    stringResource(clash.nameRes),
+                )
+                have -> stringResource(R.string.languages_have, mb)
+                on -> stringResource(R.string.languages_to_download, mb)
+                else -> stringResource(R.string.languages_size, mb)
             },
             on,
             { Scribe.chooseOther(l, it) },
@@ -496,7 +517,7 @@ private fun LanguagesPage() {
         )
     }
     if (translatable(native).isEmpty()) {
-        Hint("No other language has a model that reads into ${native.label} yet.")
+        Hint(stringResource(R.string.languages_none, stringResource(native.nameRes)))
     }
 
     // What the choices above still want fetched, and what they left behind.
@@ -506,46 +527,49 @@ private fun LanguagesPage() {
     // over nothing is the sort of thing this page is being rid of.
     if (missing.isNotEmpty() || spare.isNotEmpty() || installing !is Install.Idle) {
         Text(
-            "Manage dictionaries",
+            stringResource(R.string.languages_dictionaries),
             style = MaterialTheme.typography.titleSmall,
             modifier = Modifier.padding(top = 16.dp),
         )
     }
+    val context = androidx.compose.ui.platform.LocalContext.current
     when {
-        installing is Install.Running -> Hint(describe(installing.step))
+        installing is Install.Running -> Hint(describe(context, installing.step))
         installing is Install.Failed ->
-            Hint("Download failed: ${installing.error}\nTrying again resumes where it stopped.", error = true)
+            Hint(stringResource(R.string.download_failed, installing.error), error = true)
         missing.isNotEmpty() ->
             Hint(
-                "${missing.sumOf { it.approxBytes } / 1_000_000} MB to download. " +
-                    "Wi-Fi recommended; it continues in the background.",
+                stringResource(
+                    R.string.languages_fetch_hint,
+                    missing.sumOf { it.approxBytes } / 1_000_000,
+                ),
             )
     }
     if (missing.isNotEmpty() && installing !is Install.Running) {
         TextButton(onClick = Scribe::installLanguages) {
-            Text(if (installing is Install.Failed) "Retry" else "Download")
+            Text(stringResource(if (installing is Install.Failed) R.string.action_retry else R.string.action_download))
         }
     }
     spare.forEach { m ->
         TextButton(onClick = { Scribe.removeModel(m) }) {
-            Text("Delete ${modelName(m)}")
+            Text(stringResource(R.string.languages_delete_model, modelName(context, m)))
         }
     }
 
     Text(
-        "While a reading catches up",
+        stringResource(R.string.languages_while_catching_up),
         style = MaterialTheme.typography.titleSmall,
         modifier = Modifier.padding(top = 16.dp),
     )
     Toggle(
-        "Show what was said",
-        "In the language it was heard in. Off: an ellipsis.",
+        stringResource(R.string.languages_show_said),
+        stringResource(R.string.languages_show_said_detail),
         Scribe.showSaid,
         Scribe::chooseShowSaid,
     )
 
     if (Scribe.recording || Scribe.busy()) {
-        Hint("Language changes apply to the next recording.")
+        Hint(stringResource(R.string.languages_next_recording))
     }
 }
 
@@ -557,14 +581,18 @@ private fun LanguagesPage() {
  * and a button that wraps onto two lines to say it again is the kind
  * of thing this page is being rid of.
  */
-private fun modelName(m: Model): String {
+private fun modelName(context: android.content.Context, m: Model): String {
     val pair = m.dir.removePrefix("translate/").split('-')
     val from = Language.entries.firstOrNull { it.code == pair.firstOrNull() }
     val into = Language.entries.firstOrNull { it.code == pair.lastOrNull() }
     return when {
-        pair.size == 2 && from != null && into != null -> "${from.label} → ${into.label}"
+        pair.size == 2 && from != null && into != null -> context.getString(
+            R.string.model_pair,
+            context.getString(from.nameRes),
+            context.getString(into.nameRes),
+        )
         else -> Language.entries.firstOrNull { it.streaming?.dir == m.dir }
-            ?.let { "${it.label} live text" }
+            ?.let { context.getString(R.string.model_live_text, context.getString(it.nameRes)) }
             ?: m.dir.substringAfterLast('/')
     }
 }
@@ -583,7 +611,7 @@ private fun Hint(text: String, error: Boolean = false) {
 /** Transcript text size: five steps, the default in the middle. */
 @Composable
 private fun DisplayPage() {
-    Text("Font size", style = MaterialTheme.typography.titleSmall)
+    Text(stringResource(R.string.display_font_size), style = MaterialTheme.typography.titleSmall)
     androidx.compose.material3.Slider(
         value = Scribe.fontStep.toFloat(),
         onValueChange = { Scribe.chooseFontStep(it.roundToInt()) },
@@ -591,7 +619,7 @@ private fun DisplayPage() {
         steps = FONT_SCALES.size - 2,
     )
     Text(
-        "The quick brown fox jumps over the lazy dog.",
+        stringResource(R.string.display_sample),
         style = MaterialTheme.typography.bodyLarge.scaled(FONT_SCALES[Scribe.fontStep]),
     )
 }

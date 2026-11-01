@@ -18,6 +18,10 @@ the phone. It also adds a voice keyboard for dictating into other apps.
   screen off, with Pause/Resume and Stop in the notification.
 * **Voice typing.** A Scribe keyboard that listens as soon as it opens
   and types the finished text into any app.
+* **In English or Russian.** The app's own buttons, settings and
+  notifications follow the phone's language, and can be set to one of
+  their own on Android 13 and newer. Which language is *transcribed* is
+  a separate matter, and its own setting.
 * **Reads another language in yours.** A paragraph heard in Russian is
   shown in English, on the phone, with nothing asked of a network. The
   transcript is in the language you read and in no other; what was said
@@ -34,6 +38,7 @@ Russian, and [follows whichever is being spoken](#languages).
 * [Playing back](#playing-back)
 * [Transcribing a file](#transcribing-a-file)
 * [Settings](#settings)
+* [The app's own language](#the-apps-own-language)
 * [Languages](#languages)
 * [What the transcript shows](#what-the-transcript-shows)
 * [Voice typing keyboard](#voice-typing-keyboard)
@@ -226,6 +231,44 @@ the middle.
 **About**: the app's version, a link to its source, and the
 [changelog](CHANGELOG.md).
 
+## The app's own language
+
+Scribe's buttons, settings, dialogs and notifications are in English or
+Russian, and that is a different question from which language it
+*transcribes* — for which see [Languages](#languages) below. You can
+read the app in Russian and transcribe English in it, or the other way
+round.
+
+It follows the phone: whichever of the two comes first in **Settings →
+System → Languages** is the one Scribe is in, and English is what it
+falls back to for a phone in any other language. On **Android 13 and
+newer** it can also be given a language of its own, without touching
+the rest of the phone, under **Settings → Apps → Scribe → Language**
+(or the same entry from Android's own languages page). Android keeps
+that choice, and Scribe is restarted into it at once.
+
+Three things stay in English whichever language is chosen, each for a
+reason:
+
+* The **changelog** in About. It is [CHANGELOG.md](CHANGELOG.md),
+  shipped with the app as it was written.
+* A **model's name** on the download lines ("parakeet-tdt-0.6b-v3"),
+  which is what the release it comes from is called.
+* An **error** the engine or the network reports, which is what a bug
+  report needs quoted rather than what a reader needs to read.
+
+A thread already recorded is never rewritten: a paragraph's speaker is
+stored as `Me` or `Phone` and a reading remembers the language it was
+heard in by its English name, so the words you see change with the
+setting while the transcript itself does not. The voice keyboard's
+built-in edit keys are a plain QWERTY row in either language, and the
+rules for capitalising dictated text are English ones — both belong to
+the language being *spoken*, which is a thing this setting does not
+touch.
+
+Adding a third language is a file of strings and a line of XML; see
+[Translating](#translating) under Building from source.
+
 ## Languages
 
 **Settings → Languages** has three things: the language you read in, the
@@ -377,3 +420,36 @@ else `android`; you're asked only when that doesn't open it.
 The app is in [android/](android/), Kotlin and Jetpack Compose over a
 JNI bridge, [crates/vox_android](crates/vox_android), to the same
 transcription engine as the desktop scribe.
+
+### Translating
+
+Every word the app says is in
+`android/app/src/main/res/values/strings.xml`, with a comment over each
+group saying where on the screen it appears. A language is that file
+again under `values-<code>/`, where `<code>` is its ISO 639 code (`ru`,
+`de`, `pt-rBR`), plus one line in
+`android/app/src/main/res/xml/locales_config.xml` — without which
+Android never offers the app that language on its own.
+
+Three rules, all of them checked by `StringsTest` in `./gradlew test`,
+which fails the build rather than letting a phone find out:
+
+* **The same names.** A name in `values/` that the translation lacks is
+  a crash on the screen that wanted it. One the translation has and
+  `values/` does not is a line nobody will ever read.
+* **The same arguments.** `%1$s` and `%2$d` must stay in the same places
+  and keep their types; the sentence may put them wherever it reads
+  best. Getting this wrong throws at the moment the sentence is said.
+* **Enough plural forms.** English needs `one` and `other`. Russian
+  needs `one`, `few`, `many` and `other`, because it says "1 абзац", "2
+  абзаца" and "5 абзацев"; a missing form falls back to `other`
+  silently. Add the language to `pluralForms` in `StringsTest` and the
+  test will hold you to them.
+
+Two habits make the rest of it easier. Keep a language's **name** in
+whatever form reads both as a list item and inside a sentence — the
+Russian file uses lower case ("русский") and rephrases the lines that
+would need it declined, putting the name after a colon rather than in
+the middle of a clause. And remember that Russian runs perhaps a third
+longer than English: the dock's status line is one line and ellipsises,
+so it is the place where a long translation is felt first.

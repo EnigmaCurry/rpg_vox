@@ -27,6 +27,8 @@ object Dictations {
     private val main = Handler(Looper.getMainLooper())
     private val store get() = Scribe.threads
     private lateinit var audio: AudioManager
+    /** For the few sentences this says to the user. */
+    private lateinit var app: android.content.Context
 
     /** Every dictation, the most recently changed first. */
     val list = mutableStateListOf<DictationInfo>()
@@ -66,6 +68,7 @@ object Dictations {
     private var then: (() -> Unit)? = null
 
     fun init(context: android.content.Context) {
+        app = context.applicationContext
         audio = context.getSystemService(AudioManager::class.java)
         refresh()
         store.setting("dictation")?.toLongOrNull()?.let(store::dictation)?.let(::show)
@@ -147,7 +150,9 @@ object Dictations {
         dictateMode(resume = false)
         if (open == null || session != null || finishing) return null
         val models = Scribe.claimForDictation()
-        if (models == 0L) return if (Scribe.busy()) "Scribe is recording; stop it first." else "Scribe is busy."
+        if (models == 0L) {
+            return app.getString(if (Scribe.busy()) R.string.busy_recording else R.string.busy)
+        }
         // A new session's clock starts at zero: fold the last one in first.
         doc.settle()
         session = Dictation(

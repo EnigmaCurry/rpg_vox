@@ -24,6 +24,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
@@ -45,7 +46,7 @@ fun About(close: () -> Unit) {
             Column(Modifier.fillMaxSize().systemBarsPadding()) {
                 Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(4.dp)) {
                     IconButton(onClick = close) { Text("←", style = MaterialTheme.typography.titleLarge) }
-                    Text("About", style = MaterialTheme.typography.titleLarge)
+                    Text(stringResource(R.string.settings_about), style = MaterialTheme.typography.titleLarge)
                 }
                 Column(
                     Modifier
@@ -71,14 +72,19 @@ private fun Header() {
     val code = info?.let {
         if (Build.VERSION.SDK_INT >= 28) it.longVersionCode else @Suppress("DEPRECATION") it.versionCode.toLong()
     }
-    Text("Scribe", style = MaterialTheme.typography.headlineMedium)
+    val name = info?.versionName ?: "?"
+    Text(stringResource(R.string.app_name), style = MaterialTheme.typography.headlineMedium)
     Text(
-        "Version ${info?.versionName ?: "?"}" + (code?.let { " ($it)" } ?: ""),
+        if (code != null) {
+            stringResource(R.string.about_version_code, name, code)
+        } else {
+            stringResource(R.string.about_version, name)
+        },
         style = MaterialTheme.typography.bodyMedium,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
     )
     Text(
-        "Live transcription, translation, and dictation on your Android phone using local models.",
+        stringResource(R.string.about_tagline),
         style = MaterialTheme.typography.bodyMedium,
         modifier = Modifier.padding(top = 12.dp),
     )
@@ -87,7 +93,7 @@ private fun Header() {
             context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(SOURCE_URL)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
         },
         contentPadding = PaddingValues(0.dp),
-    ) { Text("github.com/EnigmaCurry/rpg_vox") }
+    ) { Text(stringResource(R.string.source_url)) }
 }
 
 /** CHANGELOG.md (bundled from the repository), from its first release section on. */
@@ -100,7 +106,7 @@ private fun Changelog() {
             .getOrDefault(emptyList())
     }
     if (blocks.isEmpty()) {
-        Text("No changelog in this build.", style = MaterialTheme.typography.bodyMedium)
+        Text(stringResource(R.string.about_no_changelog), style = MaterialTheme.typography.bodyMedium)
         return
     }
     for (b in blocks) {

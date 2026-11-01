@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    The languages the app is translated into, which is how Android knows
+    to offer it a per-app language of its own in Settings (13+). Without
+    the list the entry is not there at all, and the only way to read
+    Scribe in another language would be to put the whole phone in it.
+
+    One line per `values-<language>/strings.xml`; the first is the one
+    the default `values/` is written in.
+-->
+<locale-config xmlns:android="http://schemas.android.com/apk/res/android">
+    <locale android:name="en" />
+    <locale android:name="ru" />
+</locale-config>

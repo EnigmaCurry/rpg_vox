@@ -251,16 +251,16 @@ data class FileJob(
      * "1:23 / 10:05 · about 2:10 left": how far it's got, and the time
      * left at the pace so far (once there's enough to go on).
      */
-    fun detail(): String? {
+    fun detail(context: Context): String? {
         if (totalMs <= 0) return null
         val spent = SystemClock.elapsedRealtime() - startedAt
         val left = if (doneMs >= 5_000 && spent > 0) {
             val ms = (totalMs - doneMs).coerceAtLeast(0) * spent / doneMs
-            " · about ${clock(ms)} left"
+            context.getString(R.string.dock_file_left, clock(ms))
         } else {
             ""
         }
-        return "${clock(doneMs)} / ${clock(totalMs)}$left"
+        return context.getString(R.string.dock_file_progress, clock(doneMs), clock(totalMs)) + left
     }
 }
 
@@ -1070,8 +1070,8 @@ object Scribe {
         recordingMode = m
         sources.clear()
         val rec = if (keepAudio) newRecording() else null
-        if (m.mic) open(Kind.MIC, if (m.phone) "Me" else null, streaming = true, rec)
-        if (m.phone) open(Kind.PHONE, "Phone", streaming = true, rec)
+        if (m.mic) open(Kind.MIC, if (m.phone) SPEAKER_ME else null, streaming = true, rec)
+        if (m.phone) open(Kind.PHONE, SPEAKER_PHONE, streaming = true, rec)
         pendingProjection = consent
         recording = true
         paused = false
@@ -1193,9 +1193,13 @@ object Scribe {
             process = gain::process,
             started = { rec ->
                 // The headset's call link takes a moment; the name follows the switch.
-                rec.addOnRoutingChangedListener({ r -> main.post { micName = (r as AudioRecord).inputName() } }, main)
-                main.post { micName = rec.inputName() }
-                Log.i(TAG, "mic: ${rec.inputName()}, boost ${boost.label}, platform AGC available: ${AutomaticGainControl.isAvailable()}")
+                rec.addOnRoutingChangedListener({ r -> main.post { micName = (r as AudioRecord).inputName(app) } }, main)
+                main.post { micName = rec.inputName(app) }
+                Log.i(
+                    TAG,
+                    "mic: ${rec.routedDevice?.productName ?: "built-in"}, boost ${boost.name}, " +
+                        "platform AGC available: ${AutomaticGainControl.isAvailable()}",
+                )
             },
             ended = {
                 routing.release()
@@ -1312,8 +1316,8 @@ object Scribe {
      * when it can't start now.
      */
     fun transcribe(uri: Uri): String? {
-        if (busy() || pendingFile != null) return "Scribe is busy; stop the current recording first."
-        if (phase is Phase.NeedModels || phase is Phase.Installing) return "Download the speech models first."
+        if (busy() || pendingFile != null) return app.getString(R.string.busy_stop_recording)
+        if (phase is Phase.NeedModels || phase is Phase.Installing) return app.getString(R.string.need_models)
         if (models == 0L) {
             pendingFile = uri
             load()
@@ -1367,7 +1371,11 @@ object Scribe {
                 if (!keepNonSpeech) dropIfWordless(listOf(src))
                 ScribeService.update(app)
                 if (error != null) {
-                    android.widget.Toast.makeText(app, "Could not read $name: ${error.message}", android.widget.Toast.LENGTH_LONG).show()
+                    android.widget.Toast.makeText(
+                        app,
+                        app.getString(R.string.file_unreadable, name, error.message),
+                        android.widget.Toast.LENGTH_LONG,
+                    ).show()
                 }
             }
         }
@@ -1381,7 +1389,7 @@ object Scribe {
             app.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use {
                 if (it.moveToFirst()) it.getString(0) else null
             }
-        }.getOrNull() ?: uri.lastPathSegment ?: "shared audio"
+        }.getOrNull() ?: uri.lastPathSegment ?: app.getString(R.string.shared_audio)
 
     private fun thread(name: String, body: () -> Unit) = Thread(body, name).apply { start() }
 
@@ -1536,7 +1544,7 @@ object Scribe {
         if (!old.exists()) return
         val list = runCatching { JSONArray(old.readText()) }.getOrNull()
         if (list != null && list.length() > 0) {
-            val id = threads.create("Earlier transcript")
+            val id = threads.create(app.getString(R.string.earlier_transcript))
             for (i in 0 until list.length()) {
                 val o = list.getJSONObject(i)
                 threads.say(id, o.getString("text"), if (o.has("source")) o.getString("source") else null)
@@ -1560,7 +1568,7 @@ object Scribe {
                 else -> p.readings.joinToString(" ") { it.text }
             }
             body.takeIf { it.isNotBlank() }
-                ?.let { if (p.source != null) "${p.source}: $it" else it }
+                ?.let { if (p.source != null) "${speakerLabel(app, p.source)}: $it" else it }
         }.joinToString("\n\n")
 
     /**
@@ -1575,7 +1583,7 @@ object Scribe {
                     .takeIf { it.isNotEmpty() }
                     ?.joinToString(" ") { it.text }
             }
-                ?.let { if (p.source != null) "${p.source}: $it" else it }
+                ?.let { if (p.source != null) "${speakerLabel(app, p.source)}: $it" else it }
         } ?: ""
 
     private fun apply(src: Source, json: String) {

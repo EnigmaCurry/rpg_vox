@@ -1,0 +1,252 @@
+<!--
+    Russian. The same names and the same format arguments as
+    values/strings.xml; `StringsTest` fails when one drifts from the
+    other.
+
+    A language is named here the way Russian names one: in lower case,
+    so the same word reads as a list item ("русский") and inside a
+    sentence. Where English puts a language name in the middle of a
+    sentence, the Russian line puts it after a colon instead, since the
+    name would otherwise have to be declined differently in each one.
+-->
+<resources>
+    <string name="keyboard_name">Голосовой ввод Scribe</string>
+    <string name="voice_subtype">Голос</string>
+    <string name="share_target">Расшифровать в Scribe</string>
+
+    <!-- ==== Words used in more than one place ========================= -->
+    <string name="action_cancel">Отмена</string>
+    <string name="action_delete">Удалить</string>
+    <string name="action_rename">Переименовать</string>
+    <string name="action_share">Поделиться</string>
+    <string name="action_copy">Копировать</string>
+    <string name="action_cut">Вырезать</string>
+    <string name="action_edit">Изменить</string>
+    <string name="action_save">Сохранить</string>
+    <string name="action_done">Готово</string>
+    <string name="action_clear">Очистить</string>
+    <string name="action_retry">Повторить</string>
+    <string name="action_download">Скачать</string>
+    <string name="action_pause">Пауза</string>
+    <string name="action_resume">Продолжить</string>
+    <string name="action_stop">Остановить</string>
+    <string name="status_listening">Слушаю…</string>
+    <string name="status_paused">Пауза</string>
+    <string name="status_finishing">Завершение…</string>
+    <string name="toast_copied">Скопировано</string>
+    <string name="toast_need_mic">Нужно разрешение на доступ к микрофону</string>
+    <string name="transcribing_file">Расшифровка %1$s</string>
+
+    <!-- ==== Languages, alphabets, microphones ========================= -->
+    <string name="language_english">английский</string>
+    <string name="language_russian">русский</string>
+    <string name="language_ukrainian">украинский</string>
+    <string name="language_french">французский</string>
+    <string name="language_spanish">испанский</string>
+    <string name="language_chinese">китайский</string>
+    <string name="language_japanese">японский</string>
+    <string name="language_korean">корейский</string>
+
+    <string name="script_latin">Латиница</string>
+    <string name="script_cyrillic">Кириллица</string>
+    <string name="script_other">другая письменность</string>
+
+    <string name="boost_auto">Авто</string>
+    <string name="boost_auto_long">Авто (поднимать тихую речь)</string>
+    <string name="boost_off">Выкл.</string>
+    <string name="boost_6db">+6 дБ</string>
+    <string name="boost_12db">+12 дБ</string>
+    <string name="boost_18db">+18 дБ</string>
+
+    <string name="route_auto">Bluetooth-гарнитура, когда подключена</string>
+    <string name="route_phone">Всегда микрофон телефона</string>
+    <string name="mic_builtin">Микрофон телефона</string>
+    <string name="mic_external">Внешний микрофон</string>
+
+    <string name="speaker_me">Я</string>
+    <string name="speaker_phone">Телефон</string>
+
+    <!-- ==== First run, and the models ================================= -->
+    <string name="setup_title">Речевые модели</string>
+    <string name="setup_body">Scribe расшифровывает речь на самом телефоне. Для этого нужны две модели из релизов sherpa-onnx на GitHub: Parakeet TDT 0.6B v3, которая пишет готовый текст на любом из 25 языков, и потоковый Zipformer для живого текста. Это разовое скачивание, примерно %1$d МБ, которое останется в личном хранилище приложения. Лучше по Wi-Fi. Чтение другого языка на вашем — ещё по одной модели на язык, в «Настройки → Языки».</string>
+    <string name="setup_download">Скачать модели</string>
+    <string name="setup_resume">Продолжить скачивание</string>
+    <string name="download_failed">Не удалось скачать: %1$s\nПовторная попытка продолжит с места остановки.</string>
+    <string name="installing_background">%1$s\n\nЭто продолжится, даже если переключиться на другое приложение.</string>
+    <string name="phase_loading">Загрузка речевых моделей…</string>
+    <string name="phase_failed">Не удалось загрузить модели:\n%1$s</string>
+    <string name="unloaded_body">Речевые модели выгружены, чтобы освободить память.</string>
+    <string name="unloaded_load">Загрузить модели</string>
+    <string name="install_downloading">%1$s: %2$d из %3$d МБ</string>
+    <string name="install_unpacking">Распаковка %1$s… %2$d%%</string>
+    <string name="install_converting">Чтение токенизатора %1$s…</string>
+
+    <!-- ==== The transcript =========================================== -->
+    <string name="transcript_empty">Здесь появятся ваши слова. Живой текст показан бледным, а через мгновение его заменяет готовая расшифровка.</string>
+    <string name="transcript_no_words">Слов не распознано</string>
+    <string name="transcript_no_words_in_thread">В этой записи слов не распознано</string>
+    <string name="transcript_jump_to_latest">↓ К последнему</string>
+    <string name="a11y_read_as">%1$s, перевод: %2$s</string>
+    <string name="clip_transcript">Расшифровка</string>
+    <string name="clip_dictation">Диктовка</string>
+    <string name="share_transcript">Поделиться расшифровкой</string>
+    <string name="share_dictation">Поделиться диктовкой</string>
+
+    <!-- ==== The dock: the status line and its buttons ================ -->
+    <string name="dock_hint_record">Коснитесь ●, чтобы записать</string>
+    <string name="dock_hint_record_and_play">Коснитесь ●, чтобы записать · коснитесь слова, чтобы послушать</string>
+    <string name="dock_hint_dictate">Коснитесь ●, чтобы диктовать</string>
+    <string name="dock_hint_dictate_at_cursor">Коснитесь ●, чтобы диктовать с места курсора</string>
+    <string name="dock_listening">Слушаю %1$s</string>
+    <string name="dock_listening_on">Слушаю %1$s · %2$s</string>
+    <string name="dock_listening_missing">Слушаю %1$s · %2$s пока недоступен</string>
+    <plurals name="dock_listening_behind">
+        <item quantity="one">Слушаю %1$s · перевод отстаёт на %2$d абзац</item>
+        <item quantity="few">Слушаю %1$s · перевод отстаёт на %2$d абзаца</item>
+        <item quantity="many">Слушаю %1$s · перевод отстаёт на %2$d абзацев</item>
+        <item quantity="other">Слушаю %1$s · перевод отстаёт на %2$d абзаца</item>
+    </plurals>
+    <string name="dock_listening_plain">Слушаю</string>
+    <string name="dock_paused_at">Пауза %1$s</string>
+    <string name="dock_playing">%1$s</string>
+    <string name="dock_playing_paused">Пауза · %1$s</string>
+    <string name="dock_file_left"> · осталось около %1$s</string>
+    <string name="dock_file_progress">%1$s / %2$s</string>
+    <string name="action_start_recording">Начать запись</string>
+    <string name="action_stop_recording">Остановить запись</string>
+    <string name="action_stop_transcribing">Остановить расшифровку</string>
+    <string name="action_dictate">Диктовать</string>
+    <string name="action_stop_dictating">Остановить диктовку</string>
+    <string name="action_type">Печатать</string>
+    <string name="action_new_paragraph">Новый абзац</string>
+    <string name="action_delete_last_sentence">Удалить последнее предложение</string>
+    <string name="action_delete_selection">Удалить выделенное</string>
+    <string name="a11y_more">Ещё</string>
+    <string name="a11y_stop_playing">Остановить воспроизведение</string>
+    <string name="a11y_back_10">Назад на 10 секунд</string>
+    <string name="a11y_ahead_10">Вперёд на 10 секунд</string>
+    <string name="a11y_play_from_start">Воспроизвести запись с начала</string>
+    <string name="a11y_recording_options">Действия с записью</string>
+    <string name="a11y_record_from">Источник записи: %1$s</string>
+
+    <string name="source_mic">Микрофон</string>
+    <string name="source_phone">Звук телефона</string>
+    <string name="source_both">Микрофон и звук телефона</string>
+
+    <!-- ==== Threads, dictations and their dialogs ==================== -->
+    <string name="drawer_new">+ Создать</string>
+    <string name="drawer_locked">Остановите запись, чтобы переключиться</string>
+    <string name="new_thread_title">Что создать?</string>
+    <string name="new_dictation">Диктовка</string>
+    <string name="new_dictation_detail">Пишите голосом и правьте текст в любом месте.</string>
+    <string name="new_transcription">Расшифровка</string>
+    <string name="new_transcription_detail">Записывайте и расшифровывайте по порядку: доклады, встречи, видео.</string>
+    <string name="rename_transcription">Переименовать расшифровку</string>
+    <string name="rename_dictation">Переименовать диктовку</string>
+    <string name="delete_transcription_title">Удалить расшифровку?</string>
+    <plurals name="delete_transcription_body">
+        <item quantity="one">«%1$s» и %2$d абзац в ней будут удалены. Это действие нельзя отменить.</item>
+        <item quantity="few">«%1$s» и %2$d абзаца в ней будут удалены. Это действие нельзя отменить.</item>
+        <item quantity="many">«%1$s» и %2$d абзацев в ней будут удалены. Это действие нельзя отменить.</item>
+        <item quantity="other">«%1$s» и %2$d абзаца в ней будут удалены. Это действие нельзя отменить.</item>
+    </plurals>
+    <string name="delete_dictation_title">Удалить диктовку?</string>
+    <string name="delete_dictation_body">«%1$s» и её текст будут удалены. Это действие нельзя отменить.</string>
+    <string name="clear_thread_title">Очистить эту расшифровку?</string>
+    <string name="clear_thread_body">Её текст будет удалён. Сама расшифровка останется. Это действие нельзя отменить.</string>
+    <plurals name="clear_thread_body_audio">
+        <item quantity="one">Удалятся её текст и %1$d запись. Сама расшифровка останется. Это действие нельзя отменить.</item>
+        <item quantity="few">Удалятся её текст и %1$d записи. Сама расшифровка останется. Это действие нельзя отменить.</item>
+        <item quantity="many">Удалятся её текст и %1$d записей. Сама расшифровка останется. Это действие нельзя отменить.</item>
+        <item quantity="other">Удалятся её текст и %1$d записи. Сама расшифровка останется. Это действие нельзя отменить.</item>
+    </plurals>
+    <string name="action_delete_clip">Удалить фрагмент</string>
+    <string name="delete_clip_title">Удалить этот фрагмент?</string>
+    <string name="delete_clip_body">Его звук и расшифрованный из него текст будут удалены. Остальная расшифровка останется. Это действие нельзя отменить.</string>
+    <string name="shared_audio">присланный звук</string>
+    <string name="earlier_transcript">Прежняя расшифровка</string>
+
+    <!-- ==== The dictation screen ===================================== -->
+    <string name="dictation_empty">Диктуйте текст, который можно и дальше править: коснитесь текста, чтобы переставить курсор — новая речь идёт туда, — и выделите слова, чтобы их удалить. ¶ начинает новый абзац, ⌫ удаляет последнее предложение, а кнопка клавиатуры открывает вашу клавиатуру, чтобы править текст руками.</string>
+
+    <!-- ==== Settings ================================================= -->
+    <string name="settings_microphone">Микрофон</string>
+    <string name="settings_recording">Запись</string>
+    <string name="settings_languages">Языки</string>
+    <string name="settings_keyboard">Клавиатура</string>
+    <string name="settings_display">Вид</string>
+    <string name="settings_about">О программе</string>
+
+    <string name="mic_which">Микрофон</string>
+    <string name="mic_boost">Усиление микрофона</string>
+    <string name="mic_applies_next_start">Изменения вступят в силу при следующем запуске микрофона (поставьте на паузу и продолжите).</string>
+
+    <string name="keep_audio">Сохранять звук (.opus)</string>
+    <string name="keep_audio_detail">Сохранять звук вместе с расшифровкой. Потом можно коснуться слова и послушать с него.</string>
+    <string name="keep_non_speech">Сохранять записи без речи</string>
+    <string name="keep_non_speech_detail">Сохранять и те записи, в которых не распознано ни одного слова.</string>
+    <string name="auto_start">Начинать запись сразу</string>
+    <string name="auto_start_detail">Новая диктовка или расшифровка начинает слушать сразу после создания.</string>
+
+    <string name="keyboard_how">Включите «Голосовой ввод Scribe», чтобы диктовать в других приложениях, а потом выберите его в переключателе клавиатур.</string>
+    <string name="keyboard_settings">Настройки клавиатур</string>
+
+    <string name="languages_i_read_in">Я читаю на</string>
+    <string name="languages_native_hint">Выбранный язык: %1$s. На нём будет весь текст — и расшифровка, и перевод.</string>
+    <string name="languages_pass1_missing">%1$s: модели живого текста пока нет.</string>
+    <string name="languages_secondary">Дополнительные языки (по одному на письменность)</string>
+    <string name="languages_clash">%1$s, как и %2$s.</string>
+    <string name="languages_have">Скачано, %1$d МБ.</string>
+    <string name="languages_to_download">Скачать %1$d МБ.</string>
+    <string name="languages_size">%1$d МБ.</string>
+    <string name="languages_none">Пока нет ни одной модели перевода на этот язык: %1$s.</string>
+    <string name="languages_dictionaries">Управление словарями</string>
+    <string name="languages_fetch_hint">Скачать %1$d МБ. Лучше по Wi-Fi; скачивание продолжится в фоне.</string>
+    <string name="languages_delete_model">Удалить %1$s</string>
+    <string name="model_pair">%1$s → %2$s</string>
+    <string name="model_live_text">живой текст: %1$s</string>
+    <string name="languages_while_catching_up">Пока перевод догоняет</string>
+    <string name="languages_show_said">Показывать сказанное</string>
+    <string name="languages_show_said_detail">На том языке, на котором это было сказано. Если выключено — многоточие.</string>
+    <string name="languages_next_recording">Изменения языков применятся к следующей записи.</string>
+
+    <string name="display_font_size">Размер шрифта</string>
+    <string name="display_sample">Съешь же ещё этих мягких французских булок да выпей чаю.</string>
+
+    <string name="about_version">Версия %1$s</string>
+    <string name="about_version_code">Версия %1$s (%2$d)</string>
+    <string name="about_tagline">Живая расшифровка, перевод и диктовка на телефоне Android, на моделях, которые работают на самом устройстве.</string>
+    <string name="about_no_changelog">В этой сборке нет списка изменений.</string>
+
+    <!-- ==== Notifications ============================================ -->
+    <string name="channel_dictation">Диктовка</string>
+    <string name="channel_install">Скачивание моделей</string>
+    <string name="channel_playback">Воспроизведение</string>
+    <string name="notif_install_title">Скачивание речевых моделей</string>
+    <string name="notif_dictating">Диктовка</string>
+    <string name="notif_phone_audio">Расшифровка звука телефона</string>
+    <string name="notif_both">Диктовка + звук телефона</string>
+    <string name="notif_recording">%1$s · %2$s</string>
+    <string name="notif_paused">Пауза · %1$s</string>
+    <string name="notif_finishing">Завершение расшифровки…</string>
+    <string name="notif_ready">Готов к диктовке</string>
+    <string name="notif_ready_detail">Речевые модели загружены · коснитесь, чтобы открыть</string>
+    <string name="notif_unload">Выгрузить модели</string>
+    <string name="notif_playing">Воспроизведение</string>
+
+    <!-- ==== Why a recording cannot start ============================= -->
+    <string name="busy_recording">Scribe записывает: сначала остановите запись.</string>
+    <string name="busy_stop_recording">Scribe занят: сначала остановите текущую запись.</string>
+    <string name="busy">Scribe занят.</string>
+    <string name="need_models">Сначала скачайте речевые модели.</string>
+    <string name="file_unreadable">Не удалось прочитать %1$s: %2$s</string>
+
+    <!-- ==== The voice keyboard ======================================= -->
+    <string name="kb_loading">Загрузка моделей…</string>
+    <string name="kb_allow_mic">Откройте Scribe и разрешите доступ к микрофону.</string>
+    <string name="kb_need_models">Откройте Scribe, чтобы скачать речевые модели.</string>
+    <string name="kb_load_failed">Речевые модели не загрузились; откройте Scribe.</string>
+    <string name="kb_busy">Scribe записывает; остановите запись, чтобы печатать голосом.</string>
+    <string name="kb_space">пробел</string>
+    <string name="kb_ok">ОК</string>
+</resources>

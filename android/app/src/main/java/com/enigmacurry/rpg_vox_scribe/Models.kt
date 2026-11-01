@@ -1,5 +1,6 @@
 package com.enigmacurry.rpg_vox_scribe
 
+import androidx.annotation.StringRes
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
@@ -113,21 +114,29 @@ val BUNDLES = listOf(ZIPFORMER_EN, PARAKEET)
  * [code] is how opus-mt spells it, for the translation model's name.
  * [streaming] is the pass-1 bundle for reading in this language, null
  * for the languages that have none, which cannot be the one you read in.
+ *
+ * Two names, and both are needed. [label] is the engine's word for it
+ * and is English whatever the screen is in: it is what `Native.load` is
+ * told, what a paragraph's `heard_in` comes back as, and what the
+ * chosen language is saved under, so a phone switched to another
+ * language still loads the models it loaded yesterday. [nameRes] is
+ * the name a reader is shown, in whichever language they are reading.
  */
 enum class Language(
     val label: String,
+    @StringRes val nameRes: Int,
     val code: String,
     val script: Script,
     val streaming: Model? = null,
 ) {
-    ENGLISH("English", "en", Script.LATIN, ZIPFORMER_EN),
-    RUSSIAN("Russian", "ru", Script.CYRILLIC, ZIPFORMER_RU),
-    UKRAINIAN("Ukrainian", "uk", Script.CYRILLIC),
-    FRENCH("French", "fr", Script.LATIN),
-    SPANISH("Spanish", "es", Script.LATIN),
-    CHINESE("Chinese", "zh", Script.OTHER),
-    JAPANESE("Japanese", "jap", Script.OTHER),
-    KOREAN("Korean", "ko", Script.OTHER);
+    ENGLISH("English", R.string.language_english, "en", Script.LATIN, ZIPFORMER_EN),
+    RUSSIAN("Russian", R.string.language_russian, "ru", Script.CYRILLIC, ZIPFORMER_RU),
+    UKRAINIAN("Ukrainian", R.string.language_ukrainian, "uk", Script.CYRILLIC),
+    FRENCH("French", R.string.language_french, "fr", Script.LATIN),
+    SPANISH("Spanish", R.string.language_spanish, "es", Script.LATIN),
+    CHINESE("Chinese", R.string.language_chinese, "zh", Script.OTHER),
+    JAPANESE("Japanese", R.string.language_japanese, "jap", Script.OTHER),
+    KOREAN("Korean", R.string.language_korean, "ko", Script.OTHER);
 
     companion object {
         /** By the name vox_transcribe spells it with; English if unknown. */
@@ -136,10 +145,10 @@ enum class Language(
 }
 
 /** The alphabets [Language] is sorted into. */
-enum class Script(val label: String) {
-    LATIN("Latin"),
-    CYRILLIC("Cyrillic"),
-    OTHER("another alphabet"),
+enum class Script(@StringRes val labelRes: Int) {
+    LATIN(R.string.script_latin),
+    CYRILLIC(R.string.script_cyrillic),
+    OTHER(R.string.script_other),
 }
 
 /**

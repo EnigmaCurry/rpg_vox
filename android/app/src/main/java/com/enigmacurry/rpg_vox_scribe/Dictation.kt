@@ -99,7 +99,7 @@ class Dictation(
         val shorts = ShortArray(RATE / 10)
         val buf = FloatArray(shorts.size)
         rec.startRecording()
-        Log.i(TAG, "mic: ${rec.inputName()}")
+        Log.i(TAG, "mic: ${rec.routedDevice?.productName ?: "built-in"}")
         var wasPaused = false
         try {
             while (capturing) {

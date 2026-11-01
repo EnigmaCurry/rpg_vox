@@ -70,7 +70,7 @@ class ScribeService : Service() {
         super.onCreate()
         Scribe.init(this)
         getSystemService(NotificationManager::class.java).createNotificationChannel(
-            NotificationChannel(CHANNEL, "Dictation", NotificationManager.IMPORTANCE_LOW).apply {
+            NotificationChannel(CHANNEL, getString(R.string.channel_dictation), NotificationManager.IMPORTANCE_LOW).apply {
                 setShowBadge(false)
             },
         )
@@ -157,19 +157,22 @@ class ScribeService : Service() {
         )
         val time = clock(Scribe.elapsedMs())
         val line = Scribe.lastLine().let { if (it.length > 120) "…" + it.takeLast(119) else it }
-        val what = when (Scribe.recordingMode) {
-            Mode.MIC -> "Dictating"
-            Mode.PHONE -> "Transcribing phone audio"
-            Mode.BOTH -> "Dictating + phone audio"
-        }
+        val what = getString(
+            when (Scribe.recordingMode) {
+                Mode.MIC -> R.string.notif_dictating
+                Mode.PHONE -> R.string.notif_phone_audio
+                Mode.BOTH -> R.string.notif_both
+            },
+        )
         val job = Scribe.file
         val (title, text) = when {
-            job != null -> "Transcribing ${job.name}" to
-                (job.detail()?.let { "$it · " } ?: if (job.progress >= 0) "${(job.progress * 100).toInt()}% · " else "") + line
-            Scribe.finishing -> "Finishing transcription…" to line
-            Scribe.recording && Scribe.paused -> "Paused · $time" to line
-            Scribe.recording -> "$what · $time" to line.ifEmpty { "Listening…" }
-            else -> "Ready to dictate" to "Speech models loaded · tap to open"
+            job != null -> getString(R.string.transcribing_file, job.name) to
+                (job.detail(this)?.let { "$it · " } ?: if (job.progress >= 0) "${(job.progress * 100).toInt()}% · " else "") + line
+            Scribe.finishing -> getString(R.string.notif_finishing) to line
+            Scribe.recording && Scribe.paused -> getString(R.string.notif_paused, time) to line
+            Scribe.recording -> getString(R.string.notif_recording, what, time) to
+                line.ifEmpty { getString(R.string.status_listening) }
+            else -> getString(R.string.notif_ready) to getString(R.string.notif_ready_detail)
         }
         val b = Notification.Builder(this, CHANNEL)
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
@@ -185,25 +188,25 @@ class ScribeService : Service() {
         }
         if (job != null && job.progress >= 0) b.setProgress(100, (job.progress * 100).toInt(), false)
         when {
-            job != null -> b.addAction(action(ACTION_STOP, "Cancel"))
+            job != null -> b.addAction(action(ACTION_STOP, R.string.action_cancel))
             Scribe.finishing -> {}
             Scribe.recording -> {
-                if (Scribe.paused) b.addAction(action(ACTION_RESUME, "Resume"))
-                else b.addAction(action(ACTION_PAUSE, "Pause"))
-                b.addAction(action(ACTION_STOP, "Stop"))
+                if (Scribe.paused) b.addAction(action(ACTION_RESUME, R.string.action_resume))
+                else b.addAction(action(ACTION_PAUSE, R.string.action_pause))
+                b.addAction(action(ACTION_STOP, R.string.action_stop))
             }
-            else -> b.addAction(action(ACTION_UNLOAD, "Unload models"))
+            else -> b.addAction(action(ACTION_UNLOAD, R.string.notif_unload))
         }
         return b.build() to "$title|$text|${Scribe.paused}|${Scribe.recording}|${job != null}"
     }
 
-    private fun action(name: String, label: String): Notification.Action {
+    private fun action(name: String, label: Int): Notification.Action {
         val pi = PendingIntent.getService(
             this, name.hashCode(),
             Intent(this, ScribeService::class.java).setAction(name),
             PendingIntent.FLAG_IMMUTABLE,
         )
-        return Notification.Action.Builder(null, label, pi).build()
+        return Notification.Action.Builder(null, getString(label), pi).build()
     }
 
     private fun clock(ms: Long): String {

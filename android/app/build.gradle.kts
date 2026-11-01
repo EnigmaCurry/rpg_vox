@@ -55,9 +55,21 @@ android {
     buildFeatures { compose = true }
 
     // `./gradlew test` runs the plain-JVM tests in src/test: the model
-    // table and the language rules, which need no device and are the
-    // part of this app that can be checked without one.
+    // table, the language rules and the translations, which need no
+    // device and are the part of this app that can be checked without
+    // one.
     testOptions { unitTests.isReturnDefaultValues = true }
+}
+
+// StringsTest reads res/values*/strings.xml off the disk rather than
+// through R, since what it checks is whether the files agree with each
+// other. They are not inputs the test task knows about, so a
+// translation edited on its own would leave it UP-TO-DATE and the check
+// unrun -- which is the one edit it exists for.
+tasks.withType<Test>().configureEach {
+    inputs.dir("src/main/res")
+        .withPropertyName("resourcesForStringsTest")
+        .withPathSensitivity(PathSensitivity.RELATIVE)
 }
 
 /** CHANGELOG.md from the repository root, shipped as an asset for the About page. */

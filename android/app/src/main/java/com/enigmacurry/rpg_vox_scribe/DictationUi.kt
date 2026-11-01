@@ -65,6 +65,7 @@ import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.ui.text.TextRange
@@ -84,7 +85,7 @@ fun DictationScreen() {
         if (granted) {
             begin()
         } else {
-            Toast.makeText(context, "Microphone permission is needed", Toast.LENGTH_LONG).show()
+            Toast.makeText(context, context.getString(R.string.toast_need_mic), Toast.LENGTH_LONG).show()
         }
     }
     val toggle: () -> Unit = {
@@ -127,20 +128,44 @@ fun DictationScreen() {
         // Out of the way while the keyboard is up; closing it comes back to them.
         if (!ime) {
             Dock(
-                status = when {
-                    Dictations.finishing -> "Finishing…"
-                    Dictations.listening -> "Listening"
-                    hasText -> "Tap ● to dictate at the cursor"
-                    else -> "Tap ● to dictate"
-                },
+                status = stringResource(
+                    when {
+                        Dictations.finishing -> R.string.status_finishing
+                        Dictations.listening -> R.string.dock_listening_plain
+                        hasText -> R.string.dock_hint_dictate_at_cursor
+                        else -> R.string.dock_hint_dictate
+                    },
+                ),
                 live = Dictations.listening,
                 // A new paragraph at the cursor.
-                l2 = { DockButton(DockIcons.Paragraph, "New paragraph", enabled = hasText, onClick = Dictations::paragraphBreak) },
+                l2 = {
+                    DockButton(
+                        DockIcons.Paragraph,
+                        stringResource(R.string.action_new_paragraph),
+                        enabled = hasText,
+                        onClick = Dictations::paragraphBreak,
+                    )
+                },
                 // The selection, or else the sentence before the cursor.
-                l1 = { DockButton(DockIcons.Backspace, if (Dictations.selection.collapsed) "Delete the last sentence" else "Delete the selection", enabled = hasText, onClick = Dictations::deleteSentence) },
+                l1 = {
+                    DockButton(
+                        DockIcons.Backspace,
+                        stringResource(
+                            if (Dictations.selection.collapsed) {
+                                R.string.action_delete_last_sentence
+                            } else {
+                                R.string.action_delete_selection
+                            },
+                        ),
+                        enabled = hasText,
+                        onClick = Dictations::deleteSentence,
+                    )
+                },
                 center = {
                     BigButton(
-                        label = if (Dictations.listening) "Stop dictating" else "Dictate",
+                        label = stringResource(
+                            if (Dictations.listening) R.string.action_stop_dictating else R.string.action_dictate,
+                        ),
                         enabled = !Dictations.finishing,
                         onClick = toggle,
                         recording = Dictations.listening,
@@ -148,8 +173,14 @@ fun DictationScreen() {
                     )
                 },
                 // Type at the cursor; closing the keyboard comes back here.
-                r1 = { DockButton(DockIcons.Keyboard, "Type", onClick = Dictations::typeMode) },
-                r2 = { DockButton(DockIcons.Copy, "Copy", enabled = hasText) { copyText(context, Dictations.text()) } },
+                r1 = {
+                    DockButton(DockIcons.Keyboard, stringResource(R.string.action_type), onClick = Dictations::typeMode)
+                },
+                r2 = {
+                    DockButton(DockIcons.Copy, stringResource(R.string.action_copy), enabled = hasText) {
+                        copyText(context, Dictations.text())
+                    }
+                },
             )
         }
     }
@@ -199,6 +230,8 @@ private fun Typing(value: TextFieldValue, modifier: Modifier) {
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun Editor(modifier: Modifier) {
+    // The selection menu is built outside a composition; see `Said`.
+    val deleteLabel = stringResource(R.string.action_delete)
     val laid = Dictations.laid
     val selection = Dictations.selection
     // Held while selecting, so new words don't shift the text under it.
@@ -270,7 +303,7 @@ private fun Editor(modifier: Modifier) {
                     val picked = shown.toks.filter { (r, t) -> t.placed && r.first < sel.max && r.last >= sel.min }.map { it.second }
                     if (picked.isEmpty()) return@appendTextContextMenuComponents
                     separator()
-                    item(key = DeleteItem, label = "Delete") {
+                    item(key = DeleteItem, label = deleteLabel) {
                         Dictations.delete(picked)
                         done()
                         close()
@@ -295,10 +328,7 @@ private fun Editor(modifier: Modifier) {
         )
         if (laid.toks.isEmpty() && !Dictations.listening) {
             Text(
-                "Dictate text you can keep editing: tap the text to move the cursor, " +
-                    "where new speech goes, and select words to delete them. " +
-                    "¶ starts a new paragraph, ⌫ deletes the last sentence, and the " +
-                    "keyboard button opens your keyboard to edit the text by hand.",
+                stringResource(R.string.dictation_empty),
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(top = 32.dp),
@@ -309,12 +339,14 @@ private fun Editor(modifier: Modifier) {
 
 private fun copyText(context: android.content.Context, text: String) {
     val cm = context.getSystemService(ClipboardManager::class.java)
-    cm.setPrimaryClip(ClipData.newPlainText("Dictation", text))
+    cm.setPrimaryClip(ClipData.newPlainText(context.getString(R.string.clip_dictation), text))
     // Android 13+ shows its own confirmation.
-    if (Build.VERSION.SDK_INT < 33) Toast.makeText(context, "Copied", Toast.LENGTH_SHORT).show()
+    if (Build.VERSION.SDK_INT < 33) {
+        Toast.makeText(context, context.getString(R.string.toast_copied), Toast.LENGTH_SHORT).show()
+    }
 }
 
 private fun shareText(context: android.content.Context, text: String) {
     val send = Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, text)
-    context.startActivity(Intent.createChooser(send, "Share dictation"))
+    context.startActivity(Intent.createChooser(send, context.getString(R.string.share_dictation)))
 }

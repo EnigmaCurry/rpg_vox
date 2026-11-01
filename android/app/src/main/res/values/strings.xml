@@ -1,5 +1,281 @@
+<!--
+    Every word the app says, in the language it was written in. A
+    translation is the same file under `values-<language>/`, with the
+    same names and the same format arguments; `StringsTest` is what
+    checks that, and ANDROID.md says how to add one.
+
+    Not here, on purpose: the changelog (CHANGELOG.md, shipped as an
+    asset and shown in About as it was written), the model directory
+    names the download lines quote, and the engine's own error
+    messages, which are what a report needs to say rather than what a
+    reader needs to read.
+-->
 <resources>
-    <string name="app_name">Scribe</string>
+    <!-- The app's name and the address of its source: the same in every language. -->
+    <string name="app_name" translatable="false">Scribe</string>
+    <string name="source_url" translatable="false">github.com/EnigmaCurry/rpg_vox</string>
+
     <string name="keyboard_name">Scribe voice typing</string>
     <string name="voice_subtype">Voice</string>
+    <!-- Scribe in another app's share sheet, and in "Open with". -->
+    <string name="share_target">Transcribe with Scribe</string>
+
+    <!-- ==== Words used in more than one place ========================= -->
+    <string name="action_cancel">Cancel</string>
+    <string name="action_delete">Delete</string>
+    <string name="action_rename">Rename</string>
+    <string name="action_share">Share</string>
+    <string name="action_copy">Copy</string>
+    <string name="action_cut">Cut</string>
+    <string name="action_edit">Edit</string>
+    <string name="action_save">Save</string>
+    <string name="action_done">Done</string>
+    <string name="action_clear">Clear</string>
+    <string name="action_retry">Retry</string>
+    <string name="action_download">Download</string>
+    <string name="action_pause">Pause</string>
+    <string name="action_resume">Resume</string>
+    <string name="action_stop">Stop</string>
+    <string name="status_listening">Listening…</string>
+    <string name="status_paused">Paused</string>
+    <string name="status_finishing">Finishing…</string>
+    <string name="toast_copied">Copied</string>
+    <string name="toast_need_mic">Microphone permission is needed</string>
+    <!-- Transcribing a file, in the status line and the notification. -->
+    <string name="transcribing_file">Transcribing %1$s</string>
+
+    <!-- ==== Languages, alphabets, microphones =========================
+         A language's name as the settings list it and as a sentence
+         quotes it, so a language that is capitalised standing alone and
+         not inside a sentence (Russian is one) can be written the way
+         its own readers write it. -->
+    <string name="language_english">English</string>
+    <string name="language_russian">Russian</string>
+    <string name="language_ukrainian">Ukrainian</string>
+    <string name="language_french">French</string>
+    <string name="language_spanish">Spanish</string>
+    <string name="language_chinese">Chinese</string>
+    <string name="language_japanese">Japanese</string>
+    <string name="language_korean">Korean</string>
+
+    <!-- The alphabets a language is sorted into; only ever said as
+         "<alphabet>, like <language>." -->
+    <string name="script_latin">Latin</string>
+    <string name="script_cyrillic">Cyrillic</string>
+    <string name="script_other">another alphabet</string>
+
+    <!-- Mic gain. -->
+    <string name="boost_auto">Auto</string>
+    <string name="boost_auto_long">Auto (raise quiet speech)</string>
+    <string name="boost_off">Off</string>
+    <string name="boost_6db">+6 dB</string>
+    <string name="boost_12db">+12 dB</string>
+    <string name="boost_18db">+18 dB</string>
+
+    <!-- Which mic a recording uses. -->
+    <string name="route_auto">Bluetooth headset when connected</string>
+    <string name="route_phone">Phone mic always</string>
+    <!-- The input a running recording is on, named in the status line. -->
+    <string name="mic_builtin">Phone mic</string>
+    <string name="mic_external">External mic</string>
+
+    <!-- A paragraph's speaker, when a recording has two sources. Stored
+         with the paragraph as "Me" or "Phone" whatever the language, so
+         these are only how the two are shown. -->
+    <string name="speaker_me">Me</string>
+    <string name="speaker_phone">Phone</string>
+
+    <!-- ==== First run, and the models ================================= -->
+    <string name="setup_title">Speech models</string>
+    <string name="setup_body">Scribe transcribes on the phone. It needs two models from the sherpa-onnx releases on GitHub: Parakeet TDT 0.6B v3, which writes the finished text in any of 25 languages, and a streaming Zipformer for the live text. That\'s a one-time download of about %1$d MB, kept in the app\'s private storage. Wi-Fi recommended. Reading another language in your own is a further model each, under Settings → Languages.</string>
+    <string name="setup_download">Download models</string>
+    <string name="setup_resume">Resume download</string>
+    <string name="download_failed">Download failed: %1$s\nTrying again resumes where it stopped.</string>
+    <string name="installing_background">%1$s\n\nThis continues if you switch apps.</string>
+    <string name="phase_loading">Loading speech models…</string>
+    <string name="phase_failed">Could not load the models:\n%1$s</string>
+    <string name="unloaded_body">Speech models are unloaded to free memory.</string>
+    <string name="unloaded_load">Load models</string>
+    <!-- The install, in its notification and on the Languages page. The
+         name is the model's directory, which is the same everywhere. -->
+    <string name="install_downloading">%1$s: %2$d of %3$d MB</string>
+    <string name="install_unpacking">Unpacking %1$s… %2$d%%</string>
+    <string name="install_converting">Reading %1$s\'s tokenizer…</string>
+
+    <!-- ==== The transcript =========================================== -->
+    <string name="transcript_empty">Your words appear here. Live text is shown faint, then replaced by the final transcription a moment later.</string>
+    <string name="transcript_no_words">No words detected</string>
+    <string name="transcript_no_words_in_thread">No words detected in log</string>
+    <string name="transcript_jump_to_latest">↓ Jump to latest</string>
+    <!-- TalkBack, on a paragraph shown as its reading: the language it
+         was heard in, then the reading. -->
+    <string name="a11y_read_as">%1$s, read as: %2$s</string>
+    <!-- The clipboard's name for what Copy put there. -->
+    <string name="clip_transcript">Transcript</string>
+    <string name="clip_dictation">Dictation</string>
+    <string name="share_transcript">Share transcript</string>
+    <string name="share_dictation">Share dictation</string>
+
+    <!-- ==== The dock: the status line and its buttons ================ -->
+    <string name="dock_hint_record">Tap ● to record</string>
+    <string name="dock_hint_record_and_play">Tap ● to record · tap a word to play</string>
+    <string name="dock_hint_dictate">Tap ● to dictate</string>
+    <string name="dock_hint_dictate_at_cursor">Tap ● to dictate at the cursor</string>
+    <string name="dock_listening">Listening %1$s</string>
+    <string name="dock_listening_on">Listening %1$s · %2$s</string>
+    <!-- A language pass 1 cannot listen in yet, its model still coming. -->
+    <string name="dock_listening_missing">Listening %1$s · not in %2$s yet</string>
+    <plurals name="dock_listening_behind">
+        <item quantity="one">Listening %1$s · reading %2$d paragraph behind</item>
+        <item quantity="other">Listening %1$s · reading %2$d paragraphs behind</item>
+    </plurals>
+    <string name="dock_listening_plain">Listening</string>
+    <string name="dock_paused_at">Paused %1$s</string>
+    <!-- Playback: where it is, of how long. -->
+    <string name="dock_playing">%1$s</string>
+    <string name="dock_playing_paused">Paused · %1$s</string>
+    <string name="dock_file_left"> · about %1$s left</string>
+    <string name="dock_file_progress">%1$s / %2$s</string>
+    <string name="action_start_recording">Start recording</string>
+    <string name="action_stop_recording">Stop recording</string>
+    <string name="action_stop_transcribing">Stop transcribing</string>
+    <string name="action_dictate">Dictate</string>
+    <string name="action_stop_dictating">Stop dictating</string>
+    <string name="action_type">Type</string>
+    <string name="action_new_paragraph">New paragraph</string>
+    <string name="action_delete_last_sentence">Delete the last sentence</string>
+    <string name="action_delete_selection">Delete the selection</string>
+    <string name="a11y_more">More</string>
+    <string name="a11y_stop_playing">Stop playing</string>
+    <string name="a11y_back_10">Back 10 seconds</string>
+    <string name="a11y_ahead_10">Ahead 10 seconds</string>
+    <string name="a11y_play_from_start">Play the recording from the start</string>
+    <string name="a11y_recording_options">Recording options</string>
+    <string name="a11y_record_from">Record from: %1$s</string>
+
+    <!-- What a live recording listens to. -->
+    <string name="source_mic">Mic</string>
+    <string name="source_phone">Phone audio</string>
+    <string name="source_both">Mic and phone audio</string>
+
+    <!-- ==== Threads, dictations and their dialogs ==================== -->
+    <string name="drawer_new">+ New</string>
+    <string name="drawer_locked">Stop recording to switch</string>
+    <string name="new_thread_title">New thread</string>
+    <string name="new_dictation">Dictation</string>
+    <string name="new_dictation_detail">Write by voice, and keep editing anywhere in the text.</string>
+    <string name="new_transcription">Transcription</string>
+    <string name="new_transcription_detail">Record and transcribe in order: talks, meetings, videos.</string>
+    <string name="rename_transcription">Rename transcription</string>
+    <string name="rename_dictation">Rename dictation</string>
+    <string name="delete_transcription_title">Delete transcription?</string>
+    <plurals name="delete_transcription_body">
+        <item quantity="one">\"%1$s\" and its %2$d paragraph will be deleted. This can\'t be undone.</item>
+        <item quantity="other">\"%1$s\" and its %2$d paragraphs will be deleted. This can\'t be undone.</item>
+    </plurals>
+    <string name="delete_dictation_title">Delete dictation?</string>
+    <string name="delete_dictation_body">\"%1$s\" and its text will be deleted. This can\'t be undone.</string>
+    <string name="clear_thread_title">Clear this thread?</string>
+    <string name="clear_thread_body">Its text will be deleted. The thread itself stays. This can\'t be undone.</string>
+    <plurals name="clear_thread_body_audio">
+        <item quantity="one">Its text and %1$d recording will be deleted. The thread itself stays. This can\'t be undone.</item>
+        <item quantity="other">Its text and %1$d recordings will be deleted. The thread itself stays. This can\'t be undone.</item>
+    </plurals>
+    <string name="action_delete_clip">Delete clip</string>
+    <string name="delete_clip_title">Delete this clip?</string>
+    <string name="delete_clip_body">Its audio and the text transcribed from it will be deleted. The rest of the thread stays. This can\'t be undone.</string>
+    <!-- A thread the app names itself: a file shared to Scribe with no
+         name of its own, and the one the pre-threads transcript became. -->
+    <string name="shared_audio">shared audio</string>
+    <string name="earlier_transcript">Earlier transcript</string>
+
+    <!-- ==== The dictation screen ===================================== -->
+    <string name="dictation_empty">Dictate text you can keep editing: tap the text to move the cursor, where new speech goes, and select words to delete them. ¶ starts a new paragraph, ⌫ deletes the last sentence, and the keyboard button opens your keyboard to edit the text by hand.</string>
+
+    <!-- ==== Settings ================================================= -->
+    <string name="settings_microphone">Microphone</string>
+    <string name="settings_recording">Recording</string>
+    <string name="settings_languages">Languages</string>
+    <string name="settings_keyboard">Keyboard</string>
+    <string name="settings_display">Display</string>
+    <string name="settings_about">About</string>
+
+    <string name="mic_which">Mic</string>
+    <string name="mic_boost">Mic boost</string>
+    <string name="mic_applies_next_start">Changes apply when the mic next starts (pause and resume).</string>
+
+    <string name="keep_audio">Keep audio (.opus)</string>
+    <string name="keep_audio_detail">Save the audio with the transcript. Afterwards, tap a word to hear it from there.</string>
+    <string name="keep_non_speech">Keep non-speech audio</string>
+    <string name="keep_non_speech_detail">Also keep recordings in which no words were detected.</string>
+    <string name="auto_start">Start recording on New</string>
+    <string name="auto_start_detail">A new dictation or transcription starts listening as soon as it opens.</string>
+
+    <string name="keyboard_how">Turn on \"Scribe voice typing\" to dictate into other apps, then pick it with the keyboard switcher.</string>
+    <string name="keyboard_settings">Keyboard settings</string>
+
+    <string name="languages_i_read_in">I read in</string>
+    <string name="languages_native_hint">All text will be written and/or translated in %1$s.</string>
+    <string name="languages_pass1_missing">The %1$s model for the live text isn\'t here yet.</string>
+    <string name="languages_secondary">Choose secondary languages (one per alphabet)</string>
+    <string name="languages_clash">%1$s, like %2$s.</string>
+    <string name="languages_have">Downloaded, %1$d MB.</string>
+    <string name="languages_to_download">%1$d MB to download.</string>
+    <string name="languages_size">%1$d MB.</string>
+    <string name="languages_none">No other language has a model that reads into %1$s yet.</string>
+    <string name="languages_dictionaries">Manage dictionaries</string>
+    <string name="languages_fetch_hint">%1$d MB to download. Wi-Fi recommended; it continues in the background.</string>
+    <string name="languages_delete_model">Delete %1$s</string>
+    <!-- A model named in languages rather than in directories: the pair
+         it reads, or the language whose live text it writes. -->
+    <string name="model_pair">%1$s → %2$s</string>
+    <string name="model_live_text">%1$s live text</string>
+    <string name="languages_while_catching_up">While a reading catches up</string>
+    <string name="languages_show_said">Show what was said</string>
+    <string name="languages_show_said_detail">In the language it was heard in. Off: an ellipsis.</string>
+    <string name="languages_next_recording">Language changes apply to the next recording.</string>
+
+    <string name="display_font_size">Font size</string>
+    <!-- A line with every letter in it, to size the transcript by. -->
+    <string name="display_sample">The quick brown fox jumps over the lazy dog.</string>
+
+    <string name="about_version">Version %1$s</string>
+    <string name="about_version_code">Version %1$s (%2$d)</string>
+    <string name="about_tagline">Live transcription, translation, and dictation on your Android phone using local models.</string>
+    <string name="about_no_changelog">No changelog in this build.</string>
+
+    <!-- ==== Notifications ============================================ -->
+    <string name="channel_dictation">Dictation</string>
+    <string name="channel_install">Model download</string>
+    <string name="channel_playback">Playback</string>
+    <string name="notif_install_title">Downloading speech models</string>
+    <string name="notif_dictating">Dictating</string>
+    <string name="notif_phone_audio">Transcribing phone audio</string>
+    <string name="notif_both">Dictating + phone audio</string>
+    <string name="notif_recording">%1$s · %2$s</string>
+    <string name="notif_paused">Paused · %1$s</string>
+    <string name="notif_finishing">Finishing transcription…</string>
+    <string name="notif_ready">Ready to dictate</string>
+    <string name="notif_ready_detail">Speech models loaded · tap to open</string>
+    <string name="notif_unload">Unload models</string>
+    <string name="notif_playing">Playing</string>
+
+    <!-- ==== Why a recording cannot start ============================= -->
+    <string name="busy_recording">Scribe is recording; stop it first.</string>
+    <string name="busy_stop_recording">Scribe is busy; stop the current recording first.</string>
+    <string name="busy">Scribe is busy.</string>
+    <string name="need_models">Download the speech models first.</string>
+    <string name="file_unreadable">Could not read %1$s: %2$s</string>
+
+    <!-- ==== The voice keyboard ======================================= -->
+    <string name="kb_loading">Loading models…</string>
+    <string name="kb_allow_mic">Open Scribe once and allow the microphone.</string>
+    <string name="kb_need_models">Open Scribe to download the speech models.</string>
+    <string name="kb_load_failed">The speech models failed to load; open Scribe.</string>
+    <string name="kb_busy">Scribe is recording; stop it to use voice typing.</string>
+    <!-- Keys of the keyboard's own edit row. The letters are a plain
+         QWERTY layout, which is not a matter of language and is not
+         here; these are the keys that are words. -->
+    <string name="kb_space">space</string>
+    <string name="kb_ok">OK</string>
 </resources>

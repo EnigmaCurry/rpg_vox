@@ -50,7 +50,7 @@ class LanguagesTest {
         for (into in NATIVE_LANGUAGES) {
             for (from in translatable(into)) {
                 assertTrue(
-                    "${from.label} is ${from.script.label}, like ${into.label}",
+                    "${from.label} is ${from.script}, like ${into.label}",
                     from.script != into.script,
                 )
             }

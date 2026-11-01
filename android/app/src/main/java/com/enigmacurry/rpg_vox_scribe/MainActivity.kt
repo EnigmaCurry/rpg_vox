@@ -105,6 +105,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.res.pluralStringResource
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.SpanStyle
@@ -209,7 +211,10 @@ private fun App() {
                         if (ready) {
                             Box {
                                 IconButton(onClick = { menu = true }) {
-                                    androidx.compose.material3.Icon(DockIcons.More, contentDescription = "More")
+                                    androidx.compose.material3.Icon(
+                                        DockIcons.More,
+                                        contentDescription = stringResource(R.string.a11y_more),
+                                    )
                                 }
                                 androidx.compose.material3.DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
                                     // The open dictation or transcription, then the settings.
@@ -217,7 +222,7 @@ private fun App() {
                                     val context = LocalContext.current
                                     val text = if (dictation != null) Dictations.text() else Scribe.text()
                                     androidx.compose.material3.DropdownMenuItem(
-                                        text = { Text("Share") },
+                                        text = { Text(stringResource(R.string.action_share)) },
                                         enabled = text.isNotBlank(),
                                         onClick = {
                                             menu = false
@@ -225,14 +230,14 @@ private fun App() {
                                         },
                                     )
                                     androidx.compose.material3.DropdownMenuItem(
-                                        text = { Text("Rename") },
+                                        text = { Text(stringResource(R.string.action_rename)) },
                                         onClick = {
                                             menu = false
                                             if (dictation != null) dialogs.renamingDictation = dictation else dialogs.renaming = Scribe.thread
                                         },
                                     )
                                     androidx.compose.material3.DropdownMenuItem(
-                                        text = { Text("Delete") },
+                                        text = { Text(stringResource(R.string.action_delete)) },
                                         enabled = dictation != null || !Scribe.busy(),
                                         onClick = {
                                             menu = false
@@ -246,7 +251,7 @@ private fun App() {
                                     androidx.compose.material3.HorizontalDivider()
                                     SettingsPage.entries.forEach { page ->
                                         androidx.compose.material3.DropdownMenuItem(
-                                            text = { Text(page.title) },
+                                            text = { Text(stringResource(page.titleRes)) },
                                             onClick = {
                                                 menu = false
                                                 settings = page
@@ -275,7 +280,7 @@ private fun App() {
                                 modifier = Modifier.clickable { dialogs.renaming = Scribe.thread },
                             )
                         } else {
-                            Text("Scribe")
+                            Text(stringResource(R.string.app_name))
                         }
                     },
                 )
@@ -285,9 +290,10 @@ private fun App() {
                 when (val phase = Scribe.phase) {
                     is Phase.NeedModels -> Setup(phase)
                     is Phase.Installing -> Installing(phase)
-                    Phase.Loading -> Centered("Loading speech models…", progress = null)
+                    Phase.Loading -> Centered(stringResource(R.string.phase_loading), progress = null)
                     Phase.Unloaded -> Unloaded()
-                    is Phase.Failed -> Centered("Could not load the models:\n${phase.error}", progress = null)
+                    is Phase.Failed ->
+                        Centered(stringResource(R.string.phase_failed, phase.error), progress = null)
                     Phase.Ready -> if (Dictations.open != null) DictationScreen() else Dictate()
                 }
             }
@@ -337,21 +343,13 @@ private fun Setup(phase: Phase.NeedModels) {
         Modifier.fillMaxSize().padding(24.dp),
         verticalArrangement = Arrangement.Center,
     ) {
-        Text("Speech models", style = MaterialTheme.typography.headlineSmall)
+        Text(stringResource(R.string.setup_title), style = MaterialTheme.typography.headlineSmall)
         Spacer(Modifier.height(12.dp))
-        Text(
-            "Scribe transcribes on the phone. It needs two models from the " +
-                "sherpa-onnx releases on GitHub: Parakeet TDT 0.6B v3, which writes the " +
-                "finished text in any of 25 languages, and a streaming Zipformer for the " +
-                "live text. That's a one-time download of about $mb MB, kept in the app's " +
-                "private storage. Wi-Fi recommended. Reading another language in your own " +
-                "is a further model each, under Settings → Languages.",
-            style = MaterialTheme.typography.bodyMedium,
-        )
+        Text(stringResource(R.string.setup_body, mb), style = MaterialTheme.typography.bodyMedium)
         if (error != null) {
             Spacer(Modifier.height(12.dp))
             Text(
-                "Download failed: $error\nTrying again resumes where it stopped.",
+                stringResource(R.string.download_failed, error),
                 color = MaterialTheme.colorScheme.error,
                 style = MaterialTheme.typography.bodyMedium,
             )
@@ -359,11 +357,13 @@ private fun Setup(phase: Phase.NeedModels) {
         Spacer(Modifier.height(24.dp))
         Button(onClick = go, modifier = Modifier.fillMaxWidth()) {
             Text(
-                when {
-                    error != null -> "Retry"
-                    phase.resume -> "Resume download"
-                    else -> "Download models"
-                },
+                stringResource(
+                    when {
+                        error != null -> R.string.action_retry
+                        phase.resume -> R.string.setup_resume
+                        else -> R.string.setup_download
+                    },
+                ),
             )
         }
     }
@@ -371,8 +371,9 @@ private fun Setup(phase: Phase.NeedModels) {
 
 @Composable
 private fun Installing(phase: Phase.Installing) {
+    val context = LocalContext.current
     Centered(
-        "${describe(phase.step)}\n\nThis continues if you switch apps.",
+        stringResource(R.string.installing_background, describe(context, phase.step)),
         progress = phase.overall,
     )
 }
@@ -384,9 +385,9 @@ private fun Unloaded() {
         verticalArrangement = Arrangement.Center,
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        Text("Speech models are unloaded to free memory.", style = MaterialTheme.typography.bodyLarge)
+        Text(stringResource(R.string.unloaded_body), style = MaterialTheme.typography.bodyLarge)
         Spacer(Modifier.height(16.dp))
-        Button(onClick = Scribe::load) { Text("Load models") }
+        Button(onClick = Scribe::load) { Text(stringResource(R.string.unloaded_load)) }
     }
 }
 
@@ -426,7 +427,7 @@ private fun Dictate() {
         if (got[Manifest.permission.RECORD_AUDIO] != false) {
             begin()
         } else {
-            Toast.makeText(context, "Microphone permission is needed", Toast.LENGTH_LONG).show()
+            Toast.makeText(context, context.getString(R.string.toast_need_mic), Toast.LENGTH_LONG).show()
         }
     }
     val toggle = {
@@ -470,55 +471,77 @@ private fun Dictate() {
         }
         val time = clock(if (Scribe.recording) now else 0)
         val hasText = Scribe.paragraphs.isNotEmpty()
+        // Read once: the status line names the language and counts the
+        // paragraphs, and both are getters over state another thread moves.
+        val missing = Scribe.pass1Missing
+        val behind = Scribe.readingBehind
         val copyButton: @Composable () -> Unit = {
-            DockButton(DockIcons.Copy, "Copy", enabled = hasText) { copy(context, Scribe.text()) }
+            DockButton(DockIcons.Copy, stringResource(R.string.action_copy), enabled = hasText) {
+                copy(context, Scribe.text())
+            }
         }
         when {
             // Playback: its own controls; Stop leaves it.
             playing -> Dock(
-                status = (if (Playback.paused) "Paused · " else "") + playTime(now),
+                status = stringResource(
+                    if (Playback.paused) R.string.dock_playing_paused else R.string.dock_playing,
+                    playTime(now),
+                ),
                 live = false,
-                l2 = { DockButton(DockIcons.Stop, "Stop playing", onClick = Playback::stop) },
-                l1 = { DockButton(DockIcons.Back, "Back 10 seconds") { Playback.skip(-10_000) } },
+                l2 = {
+                    DockButton(DockIcons.Stop, stringResource(R.string.a11y_stop_playing), onClick = Playback::stop)
+                },
+                l1 = {
+                    DockButton(DockIcons.Back, stringResource(R.string.a11y_back_10)) { Playback.skip(-10_000) }
+                },
                 center = {
                     BigButton(
-                        label = if (Playback.paused) "Resume" else "Pause",
+                        label = stringResource(if (Playback.paused) R.string.action_resume else R.string.action_pause),
                         enabled = true,
                         onClick = { if (Playback.paused) Playback.resume() else Playback.pause() },
                         icon = if (Playback.paused) DockIcons.Play else DockIcons.Pause,
                         ring = if (Playback.lengthMs > 0) now.toFloat() / Playback.lengthMs else 0f,
                     )
                 },
-                r1 = { DockButton(DockIcons.Ahead, "Ahead 10 seconds") { Playback.skip(10_000) } },
+                r1 = {
+                    DockButton(DockIcons.Ahead, stringResource(R.string.a11y_ahead_10)) { Playback.skip(10_000) }
+                },
                 r2 = copyButton,
             )
             // Recording, or transcribing a file.
             Scribe.busy() -> Dock(
                 status = when {
-                    job != null -> "Transcribing ${job.name}" +
-                        (job.detail()?.let { " · $it" } ?: if (job.progress >= 0) " · ${(job.progress * 100).toInt()}%" else "…")
-                    Scribe.finishing -> "Finishing…"
-                    Scribe.paused -> "Paused $time"
+                    job != null -> stringResource(R.string.transcribing_file, job.name) +
+                        (
+                            job.detail(context)?.let { " · $it" }
+                                ?: if (job.progress >= 0) " · ${(job.progress * 100).toInt()}%" else "…"
+                            )
+                    Scribe.finishing -> stringResource(R.string.status_finishing)
+                    Scribe.paused -> stringResource(R.string.dock_paused_at, time)
                     // A language pass 1 cannot listen in yet, because
                     // its model is still downloading. A recording is
                     // where that matters, so it is said here.
-                    Scribe.pass1Missing != null ->
-                        "Listening $time · not in ${Scribe.pass1Missing?.label} yet"
+                    missing != null ->
+                        stringResource(R.string.dock_listening_missing, time, stringResource(missing.nameRes))
                     // The reading has fallen behind the speaking, which
                     // it does when Scribe spends the recording off
                     // screen: it says so instead of the readings simply
                     // not arriving. Said here rather than beside the
                     // mic, which matters less than this does.
-                    Scribe.readingBehind >= BEHIND ->
-                        "Listening $time · reading ${Scribe.readingBehind} paragraphs behind"
-                    else -> "Listening $time" + (Scribe.micName?.let { " · $it" } ?: "")
+                    behind >= BEHIND ->
+                        pluralStringResource(R.plurals.dock_listening_behind, behind, time, behind)
+                    else -> Scribe.micName
+                        ?.let { stringResource(R.string.dock_listening_on, time, it) }
+                        ?: stringResource(R.string.dock_listening, time)
                 },
                 live = Scribe.recording && !Scribe.paused && !Scribe.finishing,
                 l2 = null,
                 l1 = null,
                 center = {
                     BigButton(
-                        label = if (job != null) "Stop transcribing" else "Stop recording",
+                        label = stringResource(
+                            if (job != null) R.string.action_stop_transcribing else R.string.action_stop_recording,
+                        ),
                         enabled = !Scribe.finishing,
                         onClick = toggle,
                         recording = true,
@@ -533,7 +556,7 @@ private fun Dictate() {
                     {
                         DockButton(
                             if (Scribe.paused) DockIcons.Play else DockIcons.Pause,
-                            if (Scribe.paused) "Resume" else "Pause",
+                            stringResource(if (Scribe.paused) R.string.action_resume else R.string.action_pause),
                         ) { if (Scribe.paused) Scribe.resume() else Scribe.pause() }
                     }
                 } else {
@@ -542,16 +565,28 @@ private fun Dictate() {
                 r2 = copyButton,
             )
             else -> Dock(
-                status = if (Scribe.paragraphs.any { it.playable() }) "Tap ● to record · tap a word to play" else "Tap ● to record",
+                status = stringResource(
+                    if (Scribe.paragraphs.any { it.playable() }) {
+                        R.string.dock_hint_record_and_play
+                    } else {
+                        R.string.dock_hint_record
+                    },
+                ),
                 live = false,
                 l2 = if (Build.VERSION.SDK_INT >= 29) { { SourceButton() } } else null,
                 l1 = {
                     // Also clears audio that has no text with it.
                     var confirm by remember { mutableStateOf(false) }
-                    DockButton(DockIcons.Clear, "Clear", enabled = hasText || Scribe.threadAudio.isNotEmpty()) { confirm = true }
+                    DockButton(
+                        DockIcons.Clear,
+                        stringResource(R.string.action_clear),
+                        enabled = hasText || Scribe.threadAudio.isNotEmpty(),
+                    ) { confirm = true }
                     if (confirm) ConfirmClear(close = { confirm = false })
                 },
-                center = { BigButton(label = "Start recording", enabled = true, onClick = toggle) },
+                center = {
+                    BigButton(label = stringResource(R.string.action_start_recording), enabled = true, onClick = toggle)
+                },
                 r1 = null,
                 r2 = copyButton,
             )
@@ -563,10 +598,14 @@ private fun Dictate() {
 @Composable
 private fun SourceButton() {
     var menu by remember { mutableStateOf(false) }
-    val modes = listOf(Triple(Mode.MIC, "Mic", DockIcons.Mic), Triple(Mode.PHONE, "Phone audio", DockIcons.Phone), Triple(Mode.BOTH, "Mic and phone audio", DockIcons.Both))
+    val modes = listOf(
+        Triple(Mode.MIC, stringResource(R.string.source_mic), DockIcons.Mic),
+        Triple(Mode.PHONE, stringResource(R.string.source_phone), DockIcons.Phone),
+        Triple(Mode.BOTH, stringResource(R.string.source_both), DockIcons.Both),
+    )
     val current = modes.first { it.first == Scribe.mode }
     Box {
-        DockButton(current.third, "Record from: ${current.second}") { menu = true }
+        DockButton(current.third, stringResource(R.string.a11y_record_from, current.second)) { menu = true }
         androidx.compose.material3.DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
             modes.forEach { (m, label, icon) ->
                 androidx.compose.material3.DropdownMenuItem(
@@ -601,8 +640,8 @@ private fun PlayFromStart(recording: String, big: Boolean) {
             .background(Color(0xFF2E7D32), CircleShape)
             .clip(CircleShape)
             .combinedClickable(
-                onClickLabel = "Play the recording from the start",
-                onLongClickLabel = "Recording options",
+                onClickLabel = stringResource(R.string.a11y_play_from_start),
+                onLongClickLabel = stringResource(R.string.a11y_recording_options),
                 onLongClick = {
                     haptics.performHapticFeedback(HapticFeedbackType.LongPress)
                     menu = true
@@ -612,7 +651,9 @@ private fun PlayFromStart(recording: String, big: Boolean) {
     ) {
         androidx.compose.material3.DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
             androidx.compose.material3.DropdownMenuItem(
-                text = { Text("Delete clip", color = MaterialTheme.colorScheme.error) },
+                text = {
+                    Text(stringResource(R.string.action_delete_clip), color = MaterialTheme.colorScheme.error)
+                },
                 onClick = {
                     menu = false
                     confirm = true
@@ -622,17 +663,17 @@ private fun PlayFromStart(recording: String, big: Boolean) {
         if (confirm) {
             androidx.compose.material3.AlertDialog(
                 onDismissRequest = { confirm = false },
-                title = { Text("Delete this clip?") },
-                text = {
-                    Text("Its audio and the text transcribed from it will be deleted. The rest of the thread stays. This can't be undone.")
-                },
+                title = { Text(stringResource(R.string.delete_clip_title)) },
+                text = { Text(stringResource(R.string.delete_clip_body)) },
                 confirmButton = {
                     TextButton(onClick = {
                         confirm = false
                         Scribe.deleteRecording(recording)
-                    }) { Text("Delete", color = MaterialTheme.colorScheme.error) }
+                    }) { Text(stringResource(R.string.action_delete), color = MaterialTheme.colorScheme.error) }
                 },
-                dismissButton = { TextButton(onClick = { confirm = false }) { Text("Cancel") } },
+                dismissButton = {
+                    TextButton(onClick = { confirm = false }) { Text(stringResource(R.string.action_cancel)) }
+                },
             )
         }
         Canvas(Modifier.size(size * 0.36f)) {
@@ -655,20 +696,23 @@ private fun ConfirmClear(close: () -> Unit) {
     val recordings = Scribe.recordings.size
     androidx.compose.material3.AlertDialog(
         onDismissRequest = close,
-        title = { Text("Clear this thread?") },
+        title = { Text(stringResource(R.string.clear_thread_title)) },
         text = {
             Text(
-                "Its text" + (if (recordings > 0) " and $recordings recording(s)" else "") +
-                    " will be deleted. The thread itself stays. This can't be undone.",
+                if (recordings > 0) {
+                    pluralStringResource(R.plurals.clear_thread_body_audio, recordings, recordings)
+                } else {
+                    stringResource(R.string.clear_thread_body)
+                },
             )
         },
         confirmButton = {
             TextButton(onClick = {
                 Scribe.clear()
                 close()
-            }) { Text("Clear", color = MaterialTheme.colorScheme.error) }
+            }) { Text(stringResource(R.string.action_clear), color = MaterialTheme.colorScheme.error) }
         },
-        dismissButton = { TextButton(onClick = close) { Text("Cancel") } },
+        dismissButton = { TextButton(onClick = close) { Text(stringResource(R.string.action_cancel)) } },
     )
 }
 
@@ -679,7 +723,7 @@ private fun NoWords(recording: String) {
         if (!Scribe.busy()) PlayFromStart(recording, big = false)
         Spacer(Modifier.size(8.dp))
         Text(
-            "No words detected",
+            stringResource(R.string.transcript_no_words),
             style = MaterialTheme.typography.bodyMedium,
             fontStyle = FontStyle.Italic,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -775,15 +819,14 @@ private fun Transcript(modifier: Modifier) {
                     PlayFromStart(rec, big = true)
                     Spacer(Modifier.height(16.dp))
                     Text(
-                        "No words detected in log",
+                        stringResource(R.string.transcript_no_words_in_thread),
                         style = MaterialTheme.typography.bodyLarge,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
             } else {
                 Text(
-                    "Your words appear here. Live text is shown faint, then replaced by the " +
-                        "final transcription a moment later.",
+                    stringResource(R.string.transcript_empty),
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -822,7 +865,7 @@ private fun Transcript(modifier: Modifier) {
                     val prev = Scribe.paragraphs.getOrNull(i - 1)
                     if (p.source != null && prev?.source != p.source) {
                         Text(
-                            p.source,
+                            speakerLabel(LocalContext.current, p.source),
                             style = MaterialTheme.typography.labelLarge.scaled(FONT_SCALES[Scribe.fontStep]),
                             color = MaterialTheme.colorScheme.primary,
                             modifier = Modifier.padding(bottom = 4.dp),
@@ -839,7 +882,7 @@ private fun Transcript(modifier: Modifier) {
             FilledTonalButton(
                 onClick = { follow = true },
                 modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 12.dp),
-            ) { Text("↓ Jump to latest") }
+            ) { Text(stringResource(R.string.transcript_jump_to_latest)) }
         }
     }
 }
@@ -867,7 +910,7 @@ private fun EditParagraph(p: Para, close: () -> Unit) {
     var text by remember { mutableStateOf(p.text) }
     androidx.compose.material3.AlertDialog(
         onDismissRequest = close,
-        title = { Text("Edit") },
+        title = { Text(stringResource(R.string.action_edit)) },
         text = {
             androidx.compose.material3.OutlinedTextField(
                 value = text,
@@ -879,9 +922,9 @@ private fun EditParagraph(p: Para, close: () -> Unit) {
             TextButton(onClick = {
                 Scribe.edit(p, text)
                 close()
-            }) { Text("Save") }
+            }) { Text(stringResource(R.string.action_save)) }
         },
-        dismissButton = { TextButton(onClick = close) { Text("Cancel") } },
+        dismissButton = { TextButton(onClick = close) { Text(stringResource(R.string.action_cancel)) } },
     )
 }
 
@@ -982,7 +1025,11 @@ private fun Paragraph(p: Para, playing: Playing?, at: Karaoke?, canPlay: Boolean
  */
 @Composable
 private fun Reading(p: Para, canPlay: Boolean) {
+    val context = LocalContext.current
     val faint = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.45f)
+    // The engine names the language it heard in English; the screen
+    // names it in whichever language is being read.
+    val heardIn = p.heardIn?.let { languageName(context, it) }
     val rows = p.rows()
     // The block in order: each reading with when its sentence was
     // spoken, and -- where no reading has landed -- what was said,
@@ -1024,7 +1071,7 @@ private fun Reading(p: Para, canPlay: Boolean) {
         modifier = Modifier
             .fillMaxWidth()
             .semantics {
-                p.heardIn?.let { contentDescription = "$it, read as: $text" }
+                heardIn?.let { contentDescription = context.getString(R.string.a11y_read_as, it, text) }
             }
             .pointerInput(p.id, canPlay, taps) {
                 if (!canPlay) return@pointerInput
@@ -1082,6 +1129,10 @@ private fun Saying(p: Para) {
 
 @Composable
 private fun Said(p: Para, playing: Playing?, at: Karaoke?, canPlay: Boolean, follow: Boolean) {
+    // The selection menu is built outside a composition, so its labels
+    // are read here.
+    val editLabel = stringResource(R.string.action_edit)
+    val cutLabel = stringResource(R.string.action_cut)
     val shown = p.shown
     // Start offset of each shown word in the text.
     val starts = remember(shown) { shown.runningFold(0) { acc, w -> acc + w.length + 1 }.dropLast(1) }
@@ -1135,12 +1186,12 @@ private fun Said(p: Para, playing: Playing?, at: Karaoke?, canPlay: Boolean, fol
                 // Edits would be overwritten while the engine still works on the
                 // text; cuts are reapplied to its later versions.
                 if (!Scribe.busy()) {
-                    item(key = EditItem, label = "Edit") {
+                    item(key = EditItem, label = editLabel) {
                         editing = true
                         close()
                     }
                 }
-                item(key = CutItem, label = "Cut") {
+                item(key = CutItem, label = cutLabel) {
                     Scribe.cut(p, sel.min, sel.max)
                     selection = TextRange.Zero
                     close()
@@ -1168,12 +1219,14 @@ private fun Said(p: Para, playing: Playing?, at: Karaoke?, canPlay: Boolean, fol
 
 private fun copy(context: android.content.Context, text: String) {
     val cm = context.getSystemService(ClipboardManager::class.java)
-    cm.setPrimaryClip(ClipData.newPlainText("Transcript", text))
+    cm.setPrimaryClip(ClipData.newPlainText(context.getString(R.string.clip_transcript), text))
     // Android 13+ shows its own confirmation.
-    if (Build.VERSION.SDK_INT < 33) Toast.makeText(context, "Copied", Toast.LENGTH_SHORT).show()
+    if (Build.VERSION.SDK_INT < 33) {
+        Toast.makeText(context, context.getString(R.string.toast_copied), Toast.LENGTH_SHORT).show()
+    }
 }
 
 private fun share(context: android.content.Context, text: String) {
     val send = Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, text)
-    context.startActivity(Intent.createChooser(send, "Share transcript"))
+    context.startActivity(Intent.createChooser(send, context.getString(R.string.share_transcript)))
 }

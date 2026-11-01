@@ -157,7 +157,7 @@ class ScribeKeyboard : InputMethodService() {
             }
         }
         pauseButton = Button(this).apply {
-            text = "Pause"
+            text = getString(R.string.action_pause)
             setOnClickListener { togglePause() }
         }
         breakButton = Button(this).apply {
@@ -165,7 +165,7 @@ class ScribeKeyboard : InputMethodService() {
             setOnClickListener { paragraphBreak() }
         }
         insertButton = Button(this).apply {
-            text = "Done"
+            text = getString(R.string.action_done)
             setTypeface(typeface, Typeface.BOLD)
             setOnClickListener { insert() }
         }
@@ -202,7 +202,7 @@ class ScribeKeyboard : InputMethodService() {
                 addView(buttons, MATCH_PARENT, WRAP_CONTENT)
             }
             loading = TextView(context).apply {
-                text = "Loading models…"
+                text = getString(R.string.kb_loading)
                 setTextColor(fg)
                 textSize = 24f
                 gravity = Gravity.CENTER
@@ -264,11 +264,12 @@ class ScribeKeyboard : InputMethodService() {
             row(*letters("asdfghjkl'")),
             row(key("⇧") { editing?.let { it.shift = !it.shift; drawEdit() } }, *letters("zxcvbnm-"), key("⌫") { backspace() }),
             row(
-                key("Cancel", 2f) { closeEdit(apply = false) },
+                key(getString(R.string.action_cancel), 2f) { closeEdit(apply = false) },
                 key(",") { typeKey(',') },
-                key("space", 4f) { typeKey(' ') },
+                key(getString(R.string.kb_space), 4f) { typeKey(' ') },
                 key(".") { typeKey('.') },
-                key("OK", 2f) { closeEdit(apply = true) }.apply { setTypeface(typeface, Typeface.BOLD) },
+                key(getString(R.string.kb_ok), 2f) { closeEdit(apply = true) }
+                    .apply { setTypeface(typeface, Typeface.BOLD) },
             ),
         )
         return LinearLayout(this).apply {
@@ -308,8 +309,8 @@ class ScribeKeyboard : InputMethodService() {
         if (apply) draft.retype(ed.retype, ed.text.toString())
         session?.let {
             it.paused = ed.wasPaused
-            pauseButton.text = if (it.paused) "Resume" else "Pause"
-            status.text = if (it.paused) "Paused" else "Listening…"
+            pauseButton.text = getString(if (it.paused) R.string.action_resume else R.string.action_pause)
+            status.text = getString(if (it.paused) R.string.status_paused else R.string.status_listening)
         }
         render(paras)
     }
@@ -354,8 +355,8 @@ class ScribeKeyboard : InputMethodService() {
                 insertButton.isEnabled = true
                 pauseButton.isEnabled = true
                 breakButton.isEnabled = true
-                pauseButton.text = if (s.paused) "Resume" else "Pause"
-                status.text = if (s.paused) "Paused" else "Listening…"
+                pauseButton.text = getString(if (s.paused) R.string.action_resume else R.string.action_pause)
+                status.text = getString(if (s.paused) R.string.status_paused else R.string.status_listening)
                 render(paras)
             }
             !waiting -> begin()
@@ -384,24 +385,24 @@ class ScribeKeyboard : InputMethodService() {
         insertButton.isEnabled = false
         pauseButton.isEnabled = false
         breakButton.isEnabled = false
-        pauseButton.text = "Pause"
+        pauseButton.text = getString(R.string.action_pause)
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            status.text = "Open Scribe once and allow the microphone."
+            status.text = getString(R.string.kb_allow_mic)
             return
         }
         when (Scribe.phase) {
             is Phase.NeedModels, is Phase.Installing -> {
-                status.text = "Open Scribe to download the speech models."
+                status.text = getString(R.string.kb_need_models)
                 return
             }
             is Phase.Failed -> {
-                status.text = "The speech models failed to load; open Scribe."
+                status.text = getString(R.string.kb_load_failed)
                 return
             }
             else -> {}
         }
         if (Scribe.busy()) {
-            status.text = "Scribe is recording; stop it to use voice typing."
+            status.text = getString(R.string.kb_busy)
             return
         }
         if (!Scribe.loaded()) {
@@ -427,7 +428,7 @@ class ScribeKeyboard : InputMethodService() {
                 Scribe.phase is Phase.Failed -> {
                     waiting = false
                     showLoading(false)
-                    status.text = "The speech models failed to load; open Scribe."
+                    status.text = getString(R.string.kb_load_failed)
                 }
                 else -> awaitModels()
             }
@@ -437,14 +438,14 @@ class ScribeKeyboard : InputMethodService() {
     private fun start() {
         val models = Scribe.claimForDictation()
         if (models == 0L) {
-            status.text = "Scribe is busy."
+            status.text = getString(R.string.busy)
             return
         }
-        status.text = "Listening…"
+        status.text = getString(R.string.status_listening)
         insertButton.isEnabled = true
         pauseButton.isEnabled = true
         breakButton.isEnabled = true
-        pauseButton.text = "Pause"
+        pauseButton.text = getString(R.string.action_pause)
         session = Dictation(
             models,
             getSystemService(AudioManager::class.java),
@@ -516,8 +517,8 @@ class ScribeKeyboard : InputMethodService() {
     private inner class DeleteAction : ActionMode.Callback {
         override fun onCreateActionMode(mode: ActionMode, menu: Menu): Boolean {
             selecting = true
-            menu.add(Menu.NONE, DELETE, 0, "Delete")
-            menu.add(Menu.NONE, EDIT, 1, "Edit")
+            menu.add(Menu.NONE, DELETE, 0, getString(R.string.action_delete))
+            menu.add(Menu.NONE, EDIT, 1, getString(R.string.action_edit))
             return true
         }
 
@@ -554,8 +555,8 @@ class ScribeKeyboard : InputMethodService() {
     private fun togglePause() {
         val s = session ?: return
         s.paused = !s.paused
-        pauseButton.text = if (s.paused) "Resume" else "Pause"
-        status.text = if (s.paused) "Paused" else "Listening…"
+        pauseButton.text = getString(if (s.paused) R.string.action_resume else R.string.action_pause)
+        status.text = getString(if (s.paused) R.string.status_paused else R.string.status_listening)
     }
 
     private fun insert() {
@@ -564,7 +565,7 @@ class ScribeKeyboard : InputMethodService() {
         insertButton.isEnabled = false
         pauseButton.isEnabled = false
         breakButton.isEnabled = false
-        status.text = "Finishing…"
+        status.text = getString(R.string.status_finishing)
         s.finish { paras ->
             val ic = currentInputConnection
             val multiLine = (currentInputEditorInfo?.inputType ?: 0) and EditorInfo.TYPE_TEXT_FLAG_MULTI_LINE != 0

@@ -1,10 +1,12 @@
 package com.enigmacurry.rpg_vox_scribe
 
+import android.content.Context
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.media.AudioRecord
 import android.os.Build
 import android.util.Log
+import androidx.annotation.StringRes
 import kotlin.math.abs
 import kotlin.math.log10
 import kotlin.math.pow
@@ -12,19 +14,19 @@ import kotlin.math.sqrt
 import kotlin.math.tanh
 
 /** Mic gain: automatic, or a fixed boost in dB (0 = as recorded). */
-enum class Boost(val label: String, val db: Float?) {
-    AUTO("Auto", null),
-    OFF("Off", 0f),
-    DB6("+6 dB", 6f),
-    DB12("+12 dB", 12f),
-    DB18("+18 dB", 18f),
+enum class Boost(@StringRes val labelRes: Int, val db: Float?) {
+    AUTO(R.string.boost_auto, null),
+    OFF(R.string.boost_off, 0f),
+    DB6(R.string.boost_6db, 6f),
+    DB12(R.string.boost_12db, 12f),
+    DB18(R.string.boost_18db, 18f),
 }
 
 /** Which microphone a recording uses. */
-enum class MicRoute(val label: String) {
+enum class MicRoute(@StringRes val labelRes: Int) {
     /** A Bluetooth headset's mic when one is connected, else the phone's. */
-    AUTO("Bluetooth headset when connected"),
-    PHONE("Phone mic always"),
+    AUTO(R.string.route_auto),
+    PHONE(R.string.route_phone),
 }
 
 /**
@@ -121,10 +123,11 @@ class MicRouting(private val am: AudioManager) {
 }
 
 /** A short name for the input a recorder is using. */
-fun AudioRecord.inputName(): String {
-    val d = routedDevice ?: return "Phone mic"
+fun AudioRecord.inputName(context: Context): String {
+    val d = routedDevice ?: return context.getString(R.string.mic_builtin)
     return when (d.type) {
-        AudioDeviceInfo.TYPE_BUILTIN_MIC -> "Phone mic"
-        else -> d.productName?.toString()?.takeIf { it.isNotBlank() } ?: "External mic"
+        AudioDeviceInfo.TYPE_BUILTIN_MIC -> context.getString(R.string.mic_builtin)
+        else -> d.productName?.toString()?.takeIf { it.isNotBlank() }
+            ?: context.getString(R.string.mic_external)
     }
 }

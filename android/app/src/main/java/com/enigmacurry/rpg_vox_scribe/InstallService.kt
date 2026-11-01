@@ -65,7 +65,7 @@ class InstallService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val nm = getSystemService(NotificationManager::class.java)
         nm.createNotificationChannel(
-            NotificationChannel(CHANNEL, "Model download", NotificationManager.IMPORTANCE_LOW),
+            NotificationChannel(CHANNEL, getString(R.string.channel_install), NotificationManager.IMPORTANCE_LOW),
         )
         val notification = notify(_state.value)
         if (Build.VERSION.SDK_INT >= 29) {
@@ -127,19 +127,28 @@ class InstallService : Service() {
         )
         val b = Notification.Builder(this, CHANNEL)
             .setSmallIcon(android.R.drawable.stat_sys_download)
-            .setContentTitle("Downloading speech models")
+            .setContentTitle(getString(R.string.notif_install_title))
             .setContentIntent(open)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
         if (s is Install.Running) {
-            b.setContentText(describe(s.step)).setProgress(1000, (s.overall * 1000).toInt(), false)
+            b.setContentText(describe(this, s.step)).setProgress(1000, (s.overall * 1000).toInt(), false)
         }
         return b.build()
     }
 }
 
-fun describe(step: Step): String = when (step) {
-    is Step.Downloading -> "${step.bundle}: ${step.done / 1_000_000} of ${step.total / 1_000_000} MB"
-    is Step.Unpacking -> "Unpacking ${step.bundle}… ${(step.fraction * 100).toInt()}%"
-    is Step.Converting -> "Reading ${step.bundle}'s tokenizer…"
+/**
+ * Where an install has got to. The model's own directory name is in it
+ * and is not translated: it is what the sherpa-onnx release and the
+ * Hugging Face repo are called, and a reader comparing the two wants
+ * the name they published it under.
+ */
+fun describe(context: Context, step: Step): String = when (step) {
+    is Step.Downloading -> context.getString(
+        R.string.install_downloading, step.bundle, step.done / 1_000_000, step.total / 1_000_000,
+    )
+    is Step.Unpacking ->
+        context.getString(R.string.install_unpacking, step.bundle, (step.fraction * 100).toInt())
+    is Step.Converting -> context.getString(R.string.install_converting, step.bundle)
 }
