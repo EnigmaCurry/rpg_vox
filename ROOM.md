@@ -207,6 +207,12 @@ See ROOM_DOCKER.md.
   back takes a new one. Choosing a speaker needs `AudioContext.setSinkId`,
   which today means Chrome; elsewhere the room follows the system default
   and the list isn't offered.
+- **The top bar** says **Voice Room** and nothing else that moves.
+  Which room you are in is the list on the left, and what the AI is
+  doing is on the AI's own strip in it; neither wanted saying twice,
+  and a heading that changed was a heading you had to read. What is up
+  there is what you press: **Leave the game** while one is on, **Stop
+  Vox** while it is talking, and **New conversation**.
 - **The rooms**, down the left: every room you can go to, one line
   each, and pressing one takes you there without the audio stopping.
   See [More than one room](#more-than-one-room). The room you are
@@ -224,8 +230,12 @@ See ROOM_DOCKER.md.
   narrow screen one area shows at a time, with a switch above it —
   **Conversation**, **Just for you** (with a count, and only while you
   hold a card), **Rooms**.
-- **When named / When it fits / Every pause** (top right, shared by
-  everyone): who gets the turn when the room goes quiet.
+- **Answers: when named / when it fits / every pause**, under the AI's
+  own strip in the room list: who gets the turn when the room goes
+  quiet. It is that bot's setting in that room — the same AI answers
+  differently in the Lobby and in your own room, and a second bot in a
+  room would carry its own. Shared by everyone in the room, like the
+  faders beside it.
   - **When named** — the AI says nothing until someone says its name, so
     two people can talk without it butting in. The default.
   - **When it fits** — at every pause the AI is *given the turn* and
@@ -397,19 +407,28 @@ See ROOM_DOCKER.md.
   is the same arithmetic as the AI's replies and the same two
   requirements: a translator and `--tts qwen3`.
 
-  **The fader is the control.** Every language goes through one
-  **Interpreter** strip in the mixer, beside the AI's, and the duck
-  follows it: at unity the voices being interpreted drop the usual
-  14 dB, and every unit you add to the fader takes another 14 dB off
-  them — a louder interpreter is a quieter floor, which is the only way
-  louder is any use. Pulled all the way down (or muted) it is **off**:
-  nothing is spoken, nothing ducks, and no voice is paid for. What
-  people say is still put into the other languages and written down, so
-  everyone keeps reading the room in their own — turning the voices off
-  is not the same as turning the room monolingual, and the fader is
-  everyone's, so it had better not take the reading away with it. For
-  that, `--interpret false`: no interpreters at all, and a line spoken
-  in a language you don't read is shown as it was said.
+  **The interpreter is yours.** It is the one channel in the mixer that
+  isn't the room's: you hear the voice speaking *your* language and no
+  other, so how loud it is is a thing you do to your own headphones,
+  and turning it down does nothing to anybody else's. It appears in the
+  list under the room **only while it has work** — somebody in the room
+  speaking a language you don't read. Everyone sharing one language,
+  and there is no strip; a room of your own can never have one, since
+  the AI is already answering in your language and there is nobody else
+  in there to interpret.
+
+  The duck follows your fader: at unity the voices being interpreted
+  drop the usual 14 dB *for you*, and every unit you add takes another
+  14 dB off them — a louder interpreter is a quieter floor, which is
+  the only way louder is any use. All the way down (or muted) it is
+  **off for you**: nothing is spoken over you and nothing ducks, and if
+  nobody listening in that language wants it, no voice is paid for at
+  all. What people say is still put into the other languages and
+  written down either way, so everyone keeps reading the room in their
+  own — turning the voice off is not the same as turning the room
+  monolingual. For that, `--interpret false`: no interpreters at all,
+  and a line spoken in a language you don't read is shown as it was
+  said.
 
   What the AI is shown is the room's own language throughout: where an
   interpretation into it exists, that is the line the model gets, so a
@@ -503,7 +522,7 @@ everyone moves into a fresh conversation run by that prompt alone (the
 AI opens the scene). Ask it to change a game and it reads the prompt to
 itself, rewrites it, and replaces the card; ask it to delete one and it
 checks which game you mean before deleting. Inside a game the AI only
-plays it: go back to the lobby to change games.
+plays it: leave the game to change games.
 
 A game also carries settings, not just a prompt. Today that is
 `reply_mode`, how the room is run while the game is played:
@@ -516,17 +535,19 @@ A game also carries settings, not just a prompt. Today that is
 | `named` | the AI speaks only when a player says its name |
 
 The AI picks one as it designs the game and can be told which you want.
-While a game that sets one of the last three is being played the mode
-buttons are locked to it; going back to the lobby restores the mode you
+While a game that sets one of the last three is being played the
+**Answers** control is locked to it; leaving the game restores what you
 chose. A game also records how many players it is for (`players_min` and
 `players_max`, either end open), which the AI works out with you.
 
-**Games** in the top bar is the menu of what is saved, each with its
-player count. Pick one and its card opens: the name, who it is for, how
-many are here now, how it runs the room, whether it has been played, and
-what it is about — with **Play**, **Delete**, and **Peek** at its hidden
-prompt (shown only to you). **Back to lobby** leaves a game; **Restart
-game** starts it over. Saving needs a model with tool calling (llama.cpp
+A saved game is announced in the conversation it was designed in, as a
+card with its name and what it is about, and that card is where it is
+played from: **Play** takes everyone in the room into it, and **Peek**
+shows its hidden prompt to you alone. Asking the AI for it out loud
+does the same thing. (There is no menu of games in the top bar: a game
+belongs to the conversation that made it, and a second index of them
+was a second place to look.) **Leave the game** comes back out of one;
+**Restart game** starts it over. Saving needs a model with tool calling (llama.cpp
 needs `--jinja`); without it the AI can talk about games but not save
 them.
 

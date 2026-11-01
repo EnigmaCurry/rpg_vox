@@ -138,6 +138,31 @@ releases.
   interruption; the room goes on afterwards. (*Restart game* is not
   finishing with one, so what it interrupted is still there.)
 
+  **The interpreter is yours now, and only there when it is working.**
+  It used to be one fader in the room's mixer, shown whenever the room
+  was *configured* to interpret and shared by everyone in it -- so
+  turning the voice down turned it down for people who needed it, and
+  a room where everybody spoke the same language still carried the
+  strip. An interpretation is heard by whoever is listening in that
+  language and by nobody else, so it is theirs: the fader is per
+  listener, the duck follows it per listener, and the strip appears
+  only while somebody in the room is speaking a language you don't
+  read. A room of your own never has one at all -- the AI is already
+  answering in your language, and there is nobody in there to
+  interpret to -- and no longer starts the threads and voices for one.
+
+  **The top bar is one fixed title.** "Vox is listening" has gone: what
+  the AI is doing is on the AI's own strip in the room list, and which
+  room you are in is the list itself. What is left up there is what you
+  press.
+
+  **When the AI answers now lives under the AI**, in the room list, as
+  that bot's setting in that room -- which is the shape a second bot in
+  a room would need. And the Games menu has gone from the top bar: a
+  game is announced in the conversation that designed it, and that card
+  is where **Play** and **Peek** are, which is one place to look
+  instead of two.
+
   The default room is called **Lobby**. That word already had a job
   here -- "the lobby" was the room being in no game -- so the button
   that leaves a game now says **Leave the game**, which is what it

@@ -12,11 +12,30 @@
   // were worth: the names already read as a list, and the branch line
   // beside them already says what they belong to.
   //
-  // key: the strip's name in the mixer; label: what to show; doing:
-  // what to say it is up to, for a strip that is nobody's microphone.
-  let { key, label, mic = false, muted = false, speaking = false, agent = false, doing = undefined } = $props();
+  // key: where this channel's meter arrives under; label: what to show;
+  // doing: what to say it is up to, for a strip that is nobody's
+  // microphone.
+  //
+  // `fader` and `onfader` are for a channel that isn't one of the
+  // room's — the interpreter, which is yours and not shared. Left out,
+  // the fader is the room's and changing it changes it for everyone,
+  // which is what a mixer is for.
+  let {
+    key,
+    label,
+    mic = false,
+    muted = false,
+    speaking = false,
+    agent = false,
+    doing = undefined,
+    fader = undefined,
+    onfader = undefined,
+    children = undefined,
+  } = $props();
 
-  const strip = $derived(room.strips[key] ?? { gain: 1, mute: false });
+  const strip = $derived(fader ?? room.strips[key] ?? { gain: 1, mute: false });
+  const change = (what) =>
+    onfader ? onfader(what) : command({ type: 'strip', name: key, ...what });
   const level = $derived(room.levels[key] ?? 0);
   // Meter in dB, -60..0 mapped to 0..100%.
   const pct = $derived(level > 0 ? Math.max(0, Math.min(100, ((20 * Math.log10(level) + 60) / 60) * 100)) : 0);
@@ -35,10 +54,10 @@
   );
 
   function gain(e) {
-    command({ type: 'strip', name: key, gain: Number(e.currentTarget.value) });
+    change({ gain: Number(e.currentTarget.value) });
   }
   function mute() {
-    command({ type: 'strip', name: key, mute: !strip.mute });
+    change({ mute: !strip.mute });
   }
 
   // The desktop this person is sharing, if they are. Whether it is open
@@ -67,16 +86,21 @@
   <div class="meter"><div class="fill" style="width: {pct}%"></div></div>
   <div class="controls">
     <input type="range" min="0" max="2" step="0.01" value={strip.gain} oninput={gain}
-      ondblclick={() => command({ type: 'strip', name: key, gain: 1 })}
+      ondblclick={() => change({ gain: 1 })}
       title="{label} level — double-click to put it back" aria-label="{label} level" />
     {#if moved}<span class="db">{db}</span>{/if}
     <button class:on={strip.mute} onclick={mute} aria-pressed={strip.mute}
-      title={strip.mute
+      title={onfader
+        ? `${strip.mute ? 'Unmute' : 'Mute'} ${label} for yourself — nobody else's hearing changes`
+        : strip.mute
         ? `Unmute ${label} for everyone`
         : agent
           ? `Mute ${label} for everyone`
           : `Mute ${label} for everyone (and stop transcribing them)`}>{strip.mute ? 'Muted' : 'Mute'}</button>
   </div>
+  <!-- Anything that belongs to this channel rather than to the room:
+       when the AI speaks, under the AI. -->
+  {#if children}<div class="its-own">{@render children()}</div>{/if}
 </div>
 
 <style>
@@ -140,4 +164,5 @@
   .db { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
   .controls button { padding: 1px 8px; font-size: 12px; border-radius: 6px; }
   .controls button.on { background: var(--danger); color: #fff; border-color: var(--danger); }
+  .its-own { margin-top: 6px; }
 </style>

@@ -1,5 +1,5 @@
 <script>
-  import { room, sendText } from '../lib/room.svelte.js';
+  import { room, sendText, enterGame, peekGame } from '../lib/room.svelte.js';
   import { hue } from '../lib/color.js';
   import { TYPED_MAX } from '../lib/names.js';
 
@@ -98,12 +98,23 @@
         <div class="card">
           <div class="title">{e.text}</div>
           {#if g}<p class="summary">{g.summary}</p>{/if}
+          <!-- A game is announced here, so this is where it is played
+               from: the card knows which game it is and whether the
+               room is already in one. Asking out loud does the same. -->
           {#if !g}
             <span class="hint">This game was deleted.</span>
-          {:else if room.game}
-            <span class="hint">Leave the game to play it.</span>
           {:else}
-            <span class="hint">Ask {room.agent.name} to start it when you're ready.</span>
+            <div class="doings">
+              <button onclick={() => enterGame(g.name)} disabled={!!room.game}
+                title={room.game
+                  ? `You're in ${room.game}. Leave the game to play another.`
+                  : `Everyone in this room goes into ${g.name}.`}>Play</button>
+              <button onclick={() => peekGame(g.name)}
+                title="Show the game's hidden prompt, to you only">Peek</button>
+              <span class="hint">
+                {#if room.game}In {room.game}.{:else}Or ask {room.agent.name} for it out loud.{/if}
+              </span>
+            </div>
           {/if}
         </div>
       </div>
@@ -234,6 +245,8 @@
   }
   .card .summary { margin: 0; color: var(--muted); }
   .hint { color: var(--muted); font-size: 13px; }
+  .doings { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+  .doings button { padding: 2px 10px; font-size: 13px; }
   .entry { max-width: min(42em, 92%); }
   .entry.you { align-self: flex-end; }
   .who { font-size: 12px; color: var(--muted); display: flex; gap: 8px; margin: 0 4px 2px; }

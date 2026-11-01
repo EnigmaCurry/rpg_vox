@@ -726,7 +726,10 @@ fn serve(cli: Cli, store: Store, db: PathBuf) -> Result<()> {
             // a voice that can say them.
             let mut interp_tx = BTreeMap::new();
             let mut interp_rx = Vec::new();
-            if interpret && translate.is_some() && voices.len() > 1 {
+            // Never in a room of somebody's own: there is one person
+            // in it and the AI already answers in their language, so
+            // there is nobody for an interpreter to interpret to.
+            if interpret && translate.is_some() && voices.len() > 1 && cfg.only.is_none() {
                 for (language, _) in &voices {
                     let (tx, rx) = interp::queue();
                     interp_tx.insert(language.clone(), tx);

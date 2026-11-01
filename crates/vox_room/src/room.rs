@@ -38,7 +38,7 @@ use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 use vox_transcribe::{Paragraph, ParagraphMode, Pusher, Stage};
 
-use crate::mixer::{Mixer, Strip, TrackProgress, AGENT_STRIP, INTERP_STRIP, RATE};
+use crate::mixer::{Mixer, Strip, TrackProgress, AGENT_STRIP, RATE};
 use crate::store::{Invited, Store};
 
 /// Room events waiting for a slow tab before it starts skipping.
@@ -1104,11 +1104,14 @@ impl Room {
                 "private": self.cfg.only.is_some(),
             },
             "agent": { "name": self.cfg.agent_name, "state": st.agent_state, "strip": AGENT_STRIP },
-            // The interpreters, when the room has any: one fader for all
-            // of them, and pulling it down is how the room turns the
-            // voices off without turning the reading off with them.
+            // The interpreters, when this room has any. `level` is
+            // where the one speaking *your* language reports itself:
+            // you hear that one and no other, and how loud it is is
+            // yours to say, so there is no shared fader here to name.
             "interpreter": (!self.interp.is_empty()).then(|| json!({
-                "strip": INTERP_STRIP,
+                "level": crate::mixer::interp_level(
+                    st.people.get(person).map_or(self.cfg.language.as_str(), |p| self.language_of(p)),
+                ),
                 "languages": self.interp.keys().collect::<Vec<_>>(),
             })),
             "mode": st.mode.as_str(),
@@ -2091,6 +2094,14 @@ impl Room {
         );
         st.engaged = None;
         self.refresh_mode(st);
+    }
+
+    /// How loud one tab wants the interpreter. Theirs alone: no other
+    /// mix changes, and nothing is written down -- it is a thing you do
+    /// to your own headphones, and the browser says it again when it
+    /// comes back or changes room, as it does for its mic.
+    pub fn set_interpreter(&self, tab: u64, gain: Option<f32>, mute: Option<bool>) {
+        self.mixer.set_listener_interp(tab, gain, mute);
     }
 
     pub fn set_strip(&self, name: &str, gain: Option<f32>, mute: Option<bool>) {
@@ -4254,10 +4265,14 @@ mod tests {
         r.join("Alex", 1);
         r.join("Ryan", 2);
         let mut events = r.subscribe();
-        // Pulled all the way down. The interpreter asks before it pays
-        // a voice for anything, and comes back with the words alone.
-        r.set_strip(crate::mixer::INTERP_STRIP, Some(0.0), None);
-        assert!(r.mixer.silent(crate::mixer::INTERP_STRIP));
+        // Alex is the only one listening in Russian, and she has pulled
+        // her own interpreter all the way down. The interpreter asks
+        // before it pays a voice for anything, and comes back with the
+        // words alone.
+        let (tx, _heard) = tokio::sync::mpsc::channel(crate::mixer::LISTENER_QUEUE);
+        r.mixer.add_listener(1, "Alex", "Russian", tx).unwrap();
+        r.set_interpreter(1, Some(0.0), None);
+        assert!(!r.mixer.interp_wanted("Russian"));
 
         r.on_paragraph("Ryan", &para("p1", "The door is locked.", false));
         let job = interp["Russian"]
@@ -4277,6 +4292,46 @@ mod tests {
         );
         let of = last_heard(&mut events).expect("a report");
         assert!(of.is_empty(), "nothing is being heard: {of:?}");
+    }
+
+    /// Turning your interpreter down is a thing you do to your own
+    /// headphones. Somebody else listening in the same language still
+    /// hears it, and the room still pays a voice to say it.
+    #[test]
+    fn an_interpreter_turned_down_is_turned_down_for_one_person() {
+        let (r, _turns, _interp) = room_with(Mode::Named, &["English", "Russian"]);
+        let listener = |id: u64, language: &str| {
+            let (tx, rx) = tokio::sync::mpsc::channel(crate::mixer::LISTENER_QUEUE);
+            r.mixer.add_listener(id, "Someone", language, tx).unwrap();
+            rx
+        };
+        let _a = listener(1, "Russian");
+        let _b = listener(2, "Russian");
+        let _c = listener(3, "English");
+        assert!(r.mixer.interp_wanted("Russian"));
+
+        // One of them turns it off.
+        r.set_interpreter(1, None, Some(true));
+        assert!(
+            r.mixer.interp_wanted("Russian"),
+            "the other one is still listening to it"
+        );
+        // And the other.
+        r.set_interpreter(2, Some(0.0), None);
+        assert!(
+            !r.mixer.interp_wanted("Russian"),
+            "now there is nobody to say it to"
+        );
+        assert!(
+            r.mixer.interp_wanted("English"),
+            "and English is nobody else's business either way"
+        );
+
+        // Nothing of this went near the room's own faders.
+        assert!(
+            !r.mixer.strips().contains_key(crate::mixer::INTERP_STRIP),
+            "the interpreter is not a strip of the room's"
+        );
     }
 
     #[test]

@@ -39,10 +39,21 @@ export const room = $state({
   // lives: the server settles the scheme, this only follows it.
   rooms: [],
   agent: { name: 'AI', state: 'listening', strip: '@agent' },
-  // The interpreters, when the room has any: { strip, languages }. One
-  // fader for all of them, and pulling it down turns the voices off
-  // without turning off the reading.
+  // The interpreters this room has, when it has any:
+  // { level, languages }. `level` is where the one speaking your
+  // language reports itself — you hear that one and no other.
+  // Null in a room that never interprets, which is a room of your own
+  // and any room where everyone shares a language.
   interpreter: null,
+  // How loud the interpreter is for *you*. Not the room's: an
+  // interpretation is heard by whoever is listening in that language
+  // and by nobody else, so turning it down is a thing you do to your
+  // own headphones. Kept in this browser and told to the server on
+  // every connection and every change of room, the way the mic is.
+  myInterpreter: {
+    gain: readNumber('vox_room.interpreter', 1),
+    mute: readPref('vox_room.interpreter_mute'),
+  },
   // How the AI takes its turn. `mode` is what the room is actually doing;
   // `engaged` is true while a back-and-forth (started by saying its name)
   // has it answering every pause, and `locked` while the game being
@@ -129,6 +140,20 @@ function writeChoice(key, id) {
   try { localStorage.setItem(key, id || ''); } catch {}
 }
 
+function readNumber(key, fallback) {
+  try {
+    // Nothing stored is not a number: `Number(null)` is 0, which for a
+    // fader means a browser that has never been here starts with the
+    // thing turned off.
+    const raw = localStorage.getItem(key);
+    if (raw === null || raw.trim() === '') return fallback;
+    const n = Number(raw);
+    return Number.isFinite(n) && n >= 0 ? n : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
 function readPref(key) {
   try { return localStorage.getItem(key) === 'on'; } catch { return false; }
 }
@@ -161,6 +186,7 @@ function connect() {
     if (room.mic) command({ type: 'mic', on: true });
     command({ type: 'ptt', on: room.pushToTalk });
     command({ type: 'mute', on: room.muted });
+    command({ type: 'interpreter', ...room.myInterpreter });
   };
   ws.onmessage = (ev) => {
     if (typeof ev.data === 'string') apply(JSON.parse(ev.data));
@@ -433,6 +459,7 @@ function apply(ev) {
         command({ type: 'mic', on: room.mic });
         command({ type: 'ptt', on: room.pushToTalk });
         command({ type: 'mute', on: room.muted });
+        command({ type: 'interpreter', ...room.myInterpreter });
       }
       // Whatever was being shared belonged to the room just left.
       if (moved) screenMoved();
@@ -671,6 +698,20 @@ export function talk(on) {
       if (room.pushToTalk && !room.talking) setMuted(true);
     }, RELEASE_MS);
   }
+}
+
+/// How loud you want the interpreter. Yours alone: nobody else's mix
+/// changes, and nothing of the room's is written down.
+export function setInterpreter({ gain, mute }) {
+  if (gain !== undefined) {
+    room.myInterpreter.gain = gain;
+    writeChoice('vox_room.interpreter', String(gain));
+  }
+  if (mute !== undefined) {
+    room.myInterpreter.mute = mute;
+    writePref('vox_room.interpreter_mute', mute);
+  }
+  command({ type: 'interpreter', ...room.myInterpreter });
 }
 
 export function setVolume(v) {

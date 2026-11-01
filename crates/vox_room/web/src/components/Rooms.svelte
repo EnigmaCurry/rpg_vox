@@ -1,5 +1,5 @@
 <script>
-  import { room, enterRoom } from '../lib/room.svelte.js';
+  import { room, command, enterRoom, setInterpreter } from '../lib/room.svelte.js';
   import Strip from './Strip.svelte';
 
   // The rooms, down the left, and under the one you are in everybody
@@ -20,13 +20,53 @@
       : [{ id: room.where, title: room.title, private: room.alone, here: [] }],
   );
 
+  // When the AI speaks. It is this bot's setting in this room, so it
+  // lives under this bot in this room — which is also the shape a
+  // second bot would need, each with its own.
+  const modes = $derived([
+    {
+      mode: 'named',
+      label: 'when named',
+      hint: `${room.agent.name} says nothing until someone says its name.`,
+    },
+    {
+      mode: 'auto',
+      label: 'when it fits',
+      hint: `${room.agent.name} is shown every pause and decides for itself whether the moment is its own, so it can sit in a conversation without answering every gap.`,
+    },
+    {
+      mode: 'always',
+      label: 'every pause',
+      hint: `${room.agent.name} answers whenever the room goes quiet, with no judgment about whose turn it is.`,
+    },
+  ]);
+
+  // Why the mode is what it is, when the room and not a click decided it.
+  const modeHint = $derived(
+    room.locked
+      ? `${room.game} decides when ${room.agent.name} answers, so this can't be changed until the room leaves the game.`
+      : room.engaged
+        ? `You said its name, so ${room.agent.name} has the turn at every pause — judging each one — until the room has been quiet a while. Say "thanks" or "goodbye" and it goes back to waiting for its name.`
+        : `When ${room.agent.name} speaks in this room.`,
+  );
+
+  // An interpreter is only here while it has something to do: somebody
+  // in this room speaking a language somebody else here doesn't read.
+  // A room where everyone shares one has nothing to interpret, and a
+  // room of your own can't have anyone to interpret to.
+  const mine = $derived(room.people.find((p) => p.name === room.you)?.language);
+  const interpreted = $derived(
+    !!room.interpreter &&
+      !!mine &&
+      room.people.some((p) => p.name !== room.you && p.language !== mine),
+  );
+
   /// What the interpreter strip says it is doing. All the way down (or
-  /// muted) it is off: nobody is spoken over, and what people say is
-  /// still put into the other languages to be read.
-  function interpreting() {
-    const s = room.strips[room.interpreter?.strip] ?? { gain: 1, mute: false };
-    return s.mute || s.gain <= 0 ? 'off' : 'on';
-  }
+  /// muted) it is off *for you*: you are not spoken over, and what
+  /// people say is still put into your language to be read.
+  const interpreting = $derived(
+    room.myInterpreter.mute || room.myInterpreter.gain <= 0 ? 'off' : 'on',
+  );
 
   // Who is in a room you are not in. The count is on the row; this is
   // the whole of what the row can say, for a tooltip.
@@ -62,13 +102,34 @@
             {#each room.people as p (p.name)}
               <Strip key={p.name} label={p.name} mic={p.mic} muted={p.muted} speaking={p.speaking} />
             {/each}
-            <Strip key={room.agent.strip} label={room.agent.name} agent />
-            {#if room.interpreter}
-              <!-- One fader for every language being interpreted. All the
-                   way down it is off: nobody is spoken over, and what
-                   people say is still put into the other languages to be
-                   read. -->
-              <Strip key={room.interpreter.strip} label="Interpreter" agent doing={interpreting()} />
+            <Strip key={room.agent.strip} label={room.agent.name} agent>
+              {#snippet children()}
+                <!-- When this bot speaks, in this room. -->
+                <!-- A row of three buttons wants more width than this
+                     column has, and the names are the whole point: a
+                     "Named / Fits / Every" that fits is a control you
+                     have to already understand. This reads as what it
+                     is — Vox answers when named. -->
+                <label class="when" title={modeHint}>
+                  <span class="what">
+                    Answers{#if room.engaged}<span class="dot" aria-hidden="true"></span>{/if}
+                  </span>
+                  <select value={room.mode} disabled={room.locked}
+                    aria-label="When {room.agent.name} speaks"
+                    onchange={(e) => command({ type: 'mode', mode: e.currentTarget.value })}>
+                    {#each modes as m (m.mode)}
+                      <option value={m.mode} title={m.hint}>{m.label}</option>
+                    {/each}
+                  </select>
+                </label>
+              {/snippet}
+            </Strip>
+            {#if interpreted}
+              <!-- Yours, not the room's: you hear the one speaking your
+                   language and nobody else hears yours. All the way down
+                   it is off for you, and the words are still written. -->
+              <Strip key={room.interpreter.level} label="Interpreter" agent doing={interpreting}
+                fader={room.myInterpreter} onfader={setInterpreter} />
             {/if}
             <p class="hint">
               {#if room.alone}
@@ -78,10 +139,10 @@
                 Levels and mutes here change this room for everyone in it, and a muted
                 person isn't transcribed. You never hear yourself.
               {/if}
-              {#if room.interpreter}
-                The louder the interpreter, the further the voices it is speaking over drop
-                under it; all the way down turns it off, and the words are still written
-                down for everyone.
+              {#if interpreted}
+                The interpreter is yours alone: the louder you have it, the further the
+                voices it is speaking over drop under it for you, and all the way down
+                turns it off — for you, and with the words still written down.
               {/if}
             </p>
           </div>
@@ -155,4 +216,31 @@
     border-left: 1px solid var(--line);
   }
   .hint { font-size: 12px; color: var(--muted); margin: 0; }
+  /* When the bot above speaks, in this room. */
+  .when { display: flex; align-items: center; gap: 6px; }
+  .what { font-size: 11px; color: var(--muted); flex: none; }
+  .when select {
+    flex: 1;
+    min-width: 0;
+    font: inherit;
+    font-size: 12px;
+    padding: 1px 4px;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    background: var(--panel);
+    color: var(--ink);
+  }
+  .when select:disabled { opacity: 0.6; }
+  /* A back-and-forth the room started, rather than a mode anyone picked. */
+  .what .dot {
+    display: inline-block;
+    width: 5px;
+    height: 5px;
+    margin-left: 4px;
+    border-radius: 50%;
+    background: var(--agent);
+    animation: pulse 2s ease-in-out infinite;
+  }
+  @keyframes pulse { 0%, 100% { opacity: 0.35; } 50% { opacity: 1; } }
+  @media (prefers-reduced-motion: reduce) { .what .dot { animation: none; } }
 </style>

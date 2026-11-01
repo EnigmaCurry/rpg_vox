@@ -5,7 +5,6 @@
   import Log from './components/Log.svelte';
   import Cards from './components/Cards.svelte';
   import Enter from './components/Enter.svelte';
-  import Games from './components/Games.svelte';
   import Board from './components/Board.svelte';
   import Rooms from './components/Rooms.svelte';
 
@@ -29,42 +28,6 @@
   onMount(async () => {
     if (await whoami()) open();
   });
-
-  const agentLabel = $derived(
-    {
-      listening: 'listening',
-      waiting: 'about to answer',
-      thinking: 'thinking',
-      speaking: 'speaking',
-    }[room.agent.state] ?? room.agent.state,
-  );
-
-  const modes = $derived([
-    {
-      mode: 'named',
-      label: 'When named',
-      hint: `${room.agent.name} says nothing until someone says its name.`,
-    },
-    {
-      mode: 'auto',
-      label: 'When it fits',
-      hint: `${room.agent.name} is shown every pause and decides for itself whether the moment is its own, so it can sit in a conversation without answering every gap.`,
-    },
-    {
-      mode: 'always',
-      label: 'Every pause',
-      hint: `${room.agent.name} answers whenever the room goes quiet, with no judgment about whose turn it is.`,
-    },
-  ]);
-
-  // Why the mode is what it is, when the room and not a click decided it.
-  const modeHint = $derived(
-    room.locked
-      ? `${room.game} decides when ${room.agent.name} answers, so this can't be changed until the room leaves the game.`
-      : room.engaged
-        ? `You said its name, so ${room.agent.name} has the turn at every pause — judging each one — until the room has been quiet a while. Say "thanks" or "goodbye" and it goes back to waiting for its name.`
-        : `When ${room.agent.name} speaks.`,
-  );
 
   async function newConversation() {
     const question = room.game
@@ -158,37 +121,19 @@
   <div class="app show-{area}" class:watching={screen.watching != null} class:nocards={!hasCards}
     inert={room.audio !== 'on'}>
     <header>
-      <!-- Where you are, and what is being played there. A game is
-           something a room is doing, not somewhere else you went, so
-           the room keeps the heading and the game sits beside it. -->
-      <h1>{room.title}</h1>
+      <!-- The one fixed thing on the screen. Which room you are in is
+           in the list on the left, and what the AI is doing is on the
+           AI's own strip there -- neither needs saying twice, and a
+           heading that changed was a heading you had to read. -->
+      <h1>Voice Room</h1>
       {#if room.game}
         <span class="playing" title="{room.game} is being played in {room.title}.">{room.game}</span>
         <button onclick={lobby}>Leave the game</button>
       {/if}
-      <span class="pill {room.agent.state}" aria-live="polite">
-        {#if room.agent.state === 'thinking' || room.agent.state === 'waiting'}
-          <span class="dots" aria-hidden="true"><i></i><i></i><i></i></span>
-        {:else if room.agent.state === 'speaking'}
-          <span class="bars" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
-        {/if}
-        {room.agent.name} is {agentLabel}
-      </span>
       {#if room.agent.state === 'thinking' || room.agent.state === 'speaking'}
         <button class="danger" onclick={() => command({ type: 'stop' })}>Stop {room.agent.name}</button>
       {/if}
       <div class="spacer"></div>
-      <div class="seg" class:locked={room.locked} role="radiogroup" title={modeHint}
-        aria-label="When {room.agent.name} speaks">
-        {#each modes as m (m.mode)}
-          <button role="radio" aria-checked={room.mode === m.mode} class:on={room.mode === m.mode}
-            disabled={room.locked} title={m.hint}
-            onclick={() => command({ type: 'mode', mode: m.mode })}>
-            {m.label}{#if room.engaged && room.mode === m.mode}<span class="dot" aria-hidden="true"></span>{/if}
-          </button>
-        {/each}
-      </div>
-      <Games />
       <button onclick={newConversation}>{room.game ? 'Restart game' : 'New conversation'}</button>
       {#if !room.connected}<span class="offline">reconnecting…</span>{/if}
     </header>
@@ -310,41 +255,6 @@
   }
   h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin: 0 0 4px; }
   .spacer { flex: 1; }
-  .pill { font-size: 13px; padding: 3px 10px; border-radius: 999px; background: var(--bubble); color: var(--muted); display: inline-flex; align-items: center; gap: 6px; }
-  .pill.waiting { color: var(--agent); }
-  .pill.thinking { color: var(--agent); box-shadow: 0 0 0 1px var(--agent); animation: glow 1.6s ease-in-out infinite; }
-  .pill.speaking { background: var(--agent); color: var(--accent-ink); }
-  .pill .dots { display: inline-flex; gap: 3px; }
-  .pill .dots i { width: 5px; height: 5px; border-radius: 50%; background: currentColor; animation: hop 1s ease-in-out infinite; }
-  .pill.waiting .dots i { animation-duration: 1.8s; opacity: 0.6; }
-  .pill .dots i:nth-child(2) { animation-delay: 0.15s; }
-  .pill .dots i:nth-child(3) { animation-delay: 0.3s; }
-  .pill .bars { display: inline-flex; align-items: center; gap: 2px; height: 12px; }
-  .pill .bars i { width: 3px; height: 100%; border-radius: 2px; background: currentColor; transform-origin: center; animation: talk 0.9s ease-in-out infinite; }
-  .pill .bars i:nth-child(2) { animation-delay: 0.2s; }
-  .pill .bars i:nth-child(3) { animation-delay: 0.45s; }
-  .pill .bars i:nth-child(4) { animation-delay: 0.1s; }
-  @keyframes hop { 0%, 60%, 100% { transform: translateY(0); } 30% { transform: translateY(-3px); } }
-  @keyframes talk { 0%, 100% { transform: scaleY(0.3); } 50% { transform: scaleY(1); } }
-  @keyframes glow { 0%, 100% { box-shadow: 0 0 0 1px var(--agent); } 50% { box-shadow: 0 0 0 3px color-mix(in srgb, var(--agent) 35%, transparent); } }
-  @media (prefers-reduced-motion: reduce) { .pill *, .pill { animation: none !important; } }
-  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
-  .seg button { border: 0; border-radius: 0; padding: 5px 10px; white-space: nowrap; }
-  .seg button.on { background: var(--accent); color: var(--accent-ink); }
-  .seg.locked { opacity: 0.75; }
-  .seg button:disabled { cursor: default; }
-  /* A back-and-forth the room started, rather than a mode anyone picked. */
-  .seg .dot {
-    display: inline-block;
-    width: 6px;
-    height: 6px;
-    margin-left: 6px;
-    border-radius: 50%;
-    background: currentColor;
-    animation: pulse 2s ease-in-out infinite;
-  }
-  @keyframes pulse { 0%, 100% { opacity: 0.35; } 50% { opacity: 1; } }
-  @media (prefers-reduced-motion: reduce) { .seg .dot { animation: none; } }
   .offline { color: var(--danger); font-size: 13px; }
   :global(.log) { grid-area: log; }
   :global(.board) { grid-area: board; }

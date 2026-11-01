@@ -10,6 +10,7 @@
 //! {"type": "mute", "on": true}
 //! {"type": "ptt", "on": true}
 //! {"type": "strip", "name": "Alex", "gain": 0.8, "mute": false}
+//! {"type": "interpreter", "gain": 0.8, "mute": false}
 //! {"type": "mode", "mode": "always"}
 //! {"type": "stop"}
 //! {"type": "new_conversation"}
@@ -404,6 +405,13 @@ enum Command {
         gain: Option<f32>,
         mute: Option<bool>,
     },
+    /// How loud this tab wants the interpreter. Not a strip: it is
+    /// heard by whoever is listening in one language and by nobody
+    /// else, so it is not the room's to set.
+    Interpreter {
+        gain: Option<f32>,
+        mute: Option<bool>,
+    },
     Mode {
         mode: String,
     },
@@ -539,6 +547,9 @@ async fn client(app: &App, socket: WebSocket, id: u64, who: &Invited) -> anyhow:
                             gain,
                             mute,
                         }) => room.set_strip(&strip, gain, mute),
+                        Ok(Command::Interpreter { gain, mute }) => {
+                            room.set_interpreter(id, gain, mute)
+                        }
                         Ok(Command::Mode { mode }) => room.set_mode(&mode),
                         // Only the sender hears about a message the room
                         // wouldn't take: it is their typing, not news.
