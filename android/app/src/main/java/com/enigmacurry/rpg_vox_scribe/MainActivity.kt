@@ -115,6 +115,13 @@ import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 
+/**
+ * Finished paragraphs waiting to be read before the status line says
+ * the reading is behind. One is ordinary -- a paragraph that just
+ * closed is read a moment later; two is the phone not keeping up.
+ */
+private const val BEHIND = 2
+
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -497,6 +504,13 @@ private fun Dictate() {
                     // where that matters, so it is said here.
                     Scribe.pass1Missing != null ->
                         "Listening $time · not in ${Scribe.pass1Missing?.label} yet"
+                    // The reading has fallen behind the speaking, which
+                    // it does when Scribe spends the recording off
+                    // screen: it says so instead of the readings simply
+                    // not arriving. Said here rather than beside the
+                    // mic, which matters less than this does.
+                    Scribe.readingBehind >= BEHIND ->
+                        "Listening $time · reading ${Scribe.readingBehind} paragraphs behind"
                     else -> "Listening $time" + (Scribe.micName?.let { " · $it" } ?: "")
                 },
                 live = Scribe.recording && !Scribe.paused && !Scribe.finishing,

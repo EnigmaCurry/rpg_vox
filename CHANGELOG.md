@@ -195,6 +195,20 @@ section after the version it releases.
 
 ### Scribe for Android
 
+- **The status line says when the reading has fallen behind.** It used
+  to degrade in silence: recording from another app, the words kept
+  arriving and the readings quietly stopped keeping up, with nothing to
+  say whether the translator was behind, broken or switched off.
+  Android gives the app you are looking at the fast cores and an app in
+  the background the slow ones — measured on a Pixel 6, that is pass 2
+  running a third slower and the reading at about half the speed of the
+  speech — so "Listening 4:21 · reading 3 paragraphs behind" is now part
+  of the status line, counting the finished paragraphs still waiting.
+  The paragraph being spoken is never one of them: a reading runs a
+  sentence behind on purpose. See
+  [ANDROID.md](ANDROID.md#recording) for what to do about it, which is
+  mostly to leave Scribe on screen.
+
 - **A reopened translated paragraph plays from the sentence you tap.**
   The reading was stored as one piece, so a thread opened again had
   nothing to say which sentence was which: every tap on it played from

@@ -580,6 +580,22 @@ object Scribe {
      */
     val translating: Boolean get() = loadedOthers.isNotEmpty()
 
+    /**
+     * Finished paragraphs still waiting to be read, which is what a
+     * reading falling behind the speaking looks like.
+     *
+     * The paragraph being spoken is never one of them: a reading runs a
+     * sentence behind on purpose, and the last paragraph always has
+     * something in it nobody has read yet. Two or more finished ones
+     * waiting is the phone not keeping up -- which happens when Scribe
+     * is not the app on screen, where Android gives it the slow cores
+     * and the translator is the first thing to run short.
+     */
+    val readingBehind: Int
+        get() = paragraphs.dropLast(1).count { p ->
+            !saidAsIs(p) && p.rows().any { it.reading == null }
+        }
+
     /** The other languages the loaded models were given; see [translating]. */
     @Volatile
     private var loadedOthers: List<Language> = emptyList()

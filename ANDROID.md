@@ -123,6 +123,20 @@ While recording:
 empties it. Scribe asks for the notification permission on first
 recording so the Pause/Resume and Stop controls can appear there.
 
+Recording carries on while you are in another app, but not at the same
+speed. Android gives the app on screen the phone's fast cores and an app
+in the background the slow ones, and every pass runs on the CPU here —
+so the words keep coming and the passes behind them fall back. On a
+Pixel 6, transcribing a video playing in another app, pass 2 ran about a
+third slower off screen and the reading of another language ran at
+roughly half the speed of the speech, so it was minutes behind by the
+time the recording stopped. It all catches up — stopping, or coming back
+to Scribe, drains the backlog in seconds — and the status line says
+"reading N paragraphs behind" while it is behind. For a long recording
+in another language, leaving Scribe on screen (the other app in
+picture-in-picture, or split screen) is the difference between a reading
+that keeps up and one that arrives at the end.
+
 ## Threads
 
 Transcripts are kept as threads. **☰** opens the list, most recent
