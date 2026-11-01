@@ -75,8 +75,8 @@ those, **everybody has a room of their own** — it isn't configured, it
 is made the first time they walk into it, and nobody else can ask for
 it.
 
-They are in the top left, and pressing one takes you there. **The audio
-never stops.** You called in once and you stay called in: what changes
+They are down the left, one line each, and pressing one takes you
+there. **The audio never stops.** You called in once and you stay called in: what changes
 is which room your voice goes into, whose conversation is on your
 screen, and which mixer is feeding your headphones. Moving is a frame
 of audio, not a reconnection.
@@ -96,9 +96,11 @@ every pause rather than waiting to be named — which you can change, and
 it will remember. It is called *You and Vox*, after whatever you called
 the AI.
 
-The mixer says where people are rather than only that they are gone: a
-strip reads **in Studio** when that is where they went, and **away**
-only when they really have. Sharing a desktop follows the same rule as
+The faders for the room you are in hang off it in that same list, so
+the mixer is part of the room rather than a panel beside it, and it
+says where people are rather than only that they are gone: a strip
+reads **in Studio** when that is where they went, and **away** only
+when they really have. Sharing a desktop follows the same rule as
 talking — it reaches the room you are in and no other, and it goes with
 you when you leave.
 
@@ -147,18 +149,21 @@ See ROOM_DOCKER.md.
   back takes a new one. Choosing a speaker needs `AudioContext.setSinkId`,
   which today means Chrome; elsewhere the room follows the system default
   and the list isn't offered.
-- **Which room**: top left, the rooms you can go to and who is in each.
-  See [More than one room](#more-than-one-room). The audio doesn't stop
-  when you move, and the room you arrive in is shown whole — its
-  conversation, its roster, its faders — because none of what you were
-  looking at belonged to it.
-- **The areas**: what is yours alone on the left, the room's
-  conversation on the right, the mixer beside them. **Just for you** is
-  only there while you are holding something: with no cards it is not an
-  empty column but no column at all, and the conversation has the half it
-  was taking. On a narrow screen one area shows at a time, with a switch
-  above it — **Conversation**, **Just for you** (with a count, and only
-  while you hold a card), **In the room**.
+- **The rooms**, down the left: every room you can go to, one line
+  each, and pressing one takes you there without the audio stopping.
+  See [More than one room](#more-than-one-room). The room you are
+  **in** opens underneath itself into everybody in it — their faders,
+  their meters, their mutes, and the AI's — so the mixer is a branch of
+  the room it mixes rather than a panel of its own. The rooms you are
+  not in stay one line with a count of who is there, because a list
+  that has to hold a great many rooms has to stay a list you can read.
+- **The areas**: the rooms on the left, then what is yours alone, then
+  the room's conversation. **Just for you** is only there while you are
+  holding something: with no cards it is not an empty column but no
+  column at all, and the conversation has the half it was taking. On a
+  narrow screen one area shows at a time, with a switch above it —
+  **Conversation**, **Just for you** (with a count, and only while you
+  hold a card), **Rooms**.
 - **When named / When it fits / Every pause** (top right, shared by
   everyone): who gets the turn when the room goes quiet.
   - **When named** — the AI says nothing until someone says its name, so

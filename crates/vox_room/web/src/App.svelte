@@ -3,7 +3,6 @@
   import { room, open, command, ask, answer, whoami, leaveAudio, setMuted, setVolume, setPushToTalk, talk } from './lib/room.svelte.js';
   import { screen, share, stopSharing, supported as canShare } from './lib/screen.svelte.js';
   import Log from './components/Log.svelte';
-  import Strip from './components/Strip.svelte';
   import Cards from './components/Cards.svelte';
   import Enter from './components/Enter.svelte';
   import Games from './components/Games.svelte';
@@ -21,21 +20,10 @@
   const hasCards = $derived(room.cards.length > 0);
   const area = $derived(view === 'cards' && !hasCards ? 'chat' : view);
 
-  // Somebody on this room's roster who is in another room, and which:
-  // the rooms say who is in them, so "away" need not stand for both
-  // "gone" and "two doors down".
-  const elsewhere = $derived(
-    Object.fromEntries(
-      room.rooms
-        .filter((r) => r.id !== room.where)
-        .flatMap((r) => r.here.map((name) => [name, r.title])),
-    ),
-  );
-
   const views = $derived([
     { id: 'chat', label: 'Conversation' },
     ...(hasCards ? [{ id: 'cards', label: 'Just for you' }] : []),
-    { id: 'room', label: 'In the room' },
+    { id: 'room', label: 'Rooms' },
   ]);
 
   onMount(async () => {
@@ -105,14 +93,6 @@
 
   // Space toggles your mute (or, with push to talk, talks while held),
   // unless you're typing somewhere.
-  /// What the interpreter strip says it is doing. All the way down (or
-  /// muted) it is off: nobody is spoken over, and what people say is
-  /// still put into the other languages to be read.
-  function interpreting() {
-    const s = room.strips[room.interpreter?.strip] ?? { gain: 1, mute: false };
-    return s.mute || s.gain <= 0 ? 'off' : 'on';
-  }
-
   function spaceKey(e) {
     return e.code === 'Space' && room.audio === 'on' && !e.target.closest('input, textarea, button, dialog');
   }
@@ -173,16 +153,10 @@
   <div class="app show-{area}" class:watching={screen.watching != null} class:nocards={!hasCards}
     inert={room.audio !== 'on'}>
     <header>
-      <!-- Which room you are in is the heading: the switcher says it and
-           changes it. In a game the game's name takes the h1, as it
-           always has, because that is what the room has become. -->
-      <Rooms />
-      {#if room.game}
-        <h1>{room.game}</h1>
-        <button onclick={lobby}>Back to lobby</button>
-      {:else}
-        <h1 class:hidden={room.rooms.length > 1}>{room.title}</h1>
-      {/if}
+      <!-- Which room you are in, or the game it has become. The list of
+           rooms is down the left; this is where you are. -->
+      <h1>{room.game ?? room.title}</h1>
+      {#if room.game}<button onclick={lobby}>Back to lobby</button>{/if}
       <span class="pill {room.agent.state}" aria-live="polite">
         {#if room.agent.state === 'thinking' || room.agent.state === 'waiting'}
           <span class="dots" aria-hidden="true"><i></i><i></i><i></i></span>
@@ -219,39 +193,13 @@
       {/each}
     </nav>
 
+    <Rooms />
+
     {#if hasCards}<Cards />{/if}
 
     <Log />
 
     {#if screen.watching != null}<Board />{/if}
-
-    <aside>
-      <h2>In the room</h2>
-      {#each room.people as p (p.name)}
-        <Strip key={p.name} label={p.name} online={p.online} mic={p.mic} muted={p.muted} speaking={p.speaking}
-          elsewhere={elsewhere[p.name]} />
-      {/each}
-      <Strip key={room.agent.strip} label={room.agent.name} agent />
-      {#if room.interpreter}
-        <!-- One fader for every language being interpreted. All the way
-             down it is off: nobody is spoken over, and what people say
-             is still put into the other languages to be read. -->
-        <Strip key={room.interpreter.strip} label="Interpreter" agent doing={interpreting()} />
-      {/if}
-      <p class="hint">
-        {#if room.alone}
-          This room is yours: nobody else can come into it, and nothing said here
-          reaches the rest of the house.
-        {:else}
-          Levels and mutes here change the room for everyone, and a muted person isn't transcribed.
-          You never hear yourself.
-        {/if}
-        {#if room.interpreter}
-          The louder the interpreter, the further the voices it is speaking over drop under it;
-          all the way down turns it off, and the words are still written down for everyone.
-        {/if}
-      </p>
-    </aside>
 
     <footer>
       {#if room.audio === 'on'}
@@ -312,18 +260,20 @@
   .app {
     height: 100%;
     display: grid;
-    /* Wide: what is yours alone on the left, the room's conversation on
-       the right, the two the same size, and the mixer beside them. */
-    grid-template-columns: 1fr 1fr 300px;
+    /* Wide: the rooms down the left with the mixer for the one you are
+       in under it, then what is yours alone, then the room's
+       conversation, the last two the same size. */
+    grid-template-columns: 300px 1fr 1fr;
     grid-template-rows: auto 1fr auto;
-    grid-template-areas: "head head head" "cards log side" "foot foot foot";
+    grid-template-areas: "head head head" "rooms cards log" "foot foot foot";
   }
   /* With nothing in your cards there is no column for them, and the
      conversation has the half they were taking. */
   .app.nocards {
-    grid-template-columns: 1fr 300px;
-    grid-template-areas: "head head" "log side" "foot foot";
+    grid-template-columns: 300px 1fr;
+    grid-template-areas: "head head" "rooms log" "foot foot";
   }
+  :global(.rooms) { grid-area: rooms; border-right: 1px solid var(--line); }
   :global(.cards) { grid-area: cards; border-right: 1px solid var(--line); }
   /* One area at a time is a narrow-screen idea; here all three show. */
   .views { display: none; }
@@ -338,17 +288,6 @@
     background: var(--panel);
   }
   h1 { font-size: 17px; margin: 0; }
-  /* With a switcher beside it the heading would say the room's name
-     twice. It stays for anything reading the page rather than looking
-     at it, and shows itself on a server with only the one room. */
-  h1.hidden {
-    position: absolute;
-    width: 1px;
-    height: 1px;
-    overflow: hidden;
-    clip-path: inset(50%);
-    white-space: nowrap;
-  }
   h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin: 0 0 4px; }
   .spacer { flex: 1; }
   .pill { font-size: 13px; padding: 3px 10px; border-radius: 999px; background: var(--bubble); color: var(--muted); display: inline-flex; align-items: center; gap: 6px; }
@@ -389,8 +328,8 @@
   .offline { color: var(--danger); font-size: 13px; }
   :global(.log) { grid-area: log; }
   :global(.board) { grid-area: board; }
-  .app.watching { grid-template-areas: "head head head" "board board side" "foot foot foot"; }
-  .app.nocards.watching { grid-template-areas: "head head" "board side" "foot foot"; }
+  .app.watching { grid-template-areas: "head head head" "rooms board board" "foot foot foot"; }
+  .app.nocards.watching { grid-template-areas: "head head" "rooms board" "foot foot"; }
   .app.watching :global(.log), .app.watching :global(.cards) { display: none; }
   footer button.on { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
   .ask.peek { width: min(46em, calc(100vw - 32px)); max-width: none; }
@@ -409,16 +348,6 @@
     font-size: 14px;
     line-height: 1.5;
   }
-  aside {
-    grid-area: side;
-    border-left: 1px solid var(--line);
-    padding: 14px;
-    display: flex;
-    flex-direction: column;
-    gap: 10px;
-    overflow-y: auto;
-  }
-  .hint { font-size: 12px; color: var(--muted); margin: 0; }
   footer {
     grid-area: foot;
     display: flex;
@@ -477,19 +406,18 @@
       grid-template-areas: "head" "views" "main" "foot";
     }
     .views { display: flex; }
-    :global(.log), :global(.cards), aside, :global(.board) { grid-area: main; min-height: 0; }
+    :global(.log), :global(.cards), :global(.rooms), :global(.board) { grid-area: main; min-height: 0; }
     /* Watching takes the whole area, and the switch above it goes with
        the areas it switched between: the board has its own way out.
        (The wide `.app.watching` template is two classes, so it must be
        put back here or its three columns survive into one.) */
     .app.watching, .app.nocards.watching { grid-template-areas: "head" "views" "main" "foot"; }
     .app.watching .views { display: none; }
-    .app.watching :global(.log), .app.watching :global(.cards), .app.watching aside { display: none; }
-    :global(.cards) { border-right: 0; }
-    aside { border-left: 0; }
+    .app.watching :global(.log), .app.watching :global(.cards), .app.watching :global(.rooms) { display: none; }
+    :global(.cards), :global(.rooms) { border-right: 0; }
     .app:not(.show-chat) :global(.log) { display: none; }
     .app:not(.show-cards) :global(.cards) { display: none; }
-    .app:not(.show-room) aside { display: none; }
+    .app:not(.show-room) :global(.rooms) { display: none; }
     header, footer { padding: 8px 16px; }
   }
 </style>

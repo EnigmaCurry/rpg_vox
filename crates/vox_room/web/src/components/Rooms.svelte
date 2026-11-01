@@ -1,14 +1,46 @@
 <script>
   import { room, enterRoom } from '../lib/room.svelte.js';
+  import Strip from './Strip.svelte';
 
-  // Which room you are in, top left. One server holds several, and
-  // pressing one of these moves you without the audio stopping: the
+  // The rooms, down the left, and under the one you are in everybody
+  // who is in it. A list rather than a row of buttons because a server
+  // can hold a great many rooms and they have to stay scannable; a tree
+  // because who is in a room belongs to that room, and the room you are
+  // in is the only one whose people you have any business mixing.
+  //
+  // Pressing a room takes you there without the audio stopping: the
   // socket stays where it is and the server sends back the room it has
   // put you in.
-  //
-  // The count is who is in that room right now, you included. Your own
-  // room never shows one: it is you and the AI, which is what its name
-  // says.
+
+  // Before the first `rooms` event there is no list, but there is a
+  // room — stand one in for it rather than flash an empty sidebar.
+  const list = $derived(
+    room.rooms.length
+      ? room.rooms
+      : [{ id: room.where, title: room.title, private: room.alone, here: [] }],
+  );
+
+  // Somebody on this room's roster who is in another room, and which:
+  // the rooms say who is in them, so "away" need not stand for both
+  // "gone" and "two doors down".
+  const elsewhere = $derived(
+    Object.fromEntries(
+      room.rooms
+        .filter((r) => r.id !== room.where)
+        .flatMap((r) => r.here.map((name) => [name, r.title])),
+    ),
+  );
+
+  /// What the interpreter strip says it is doing. All the way down (or
+  /// muted) it is off: nobody is spoken over, and what people say is
+  /// still put into the other languages to be read.
+  function interpreting() {
+    const s = room.strips[room.interpreter?.strip] ?? { gain: 1, mute: false };
+    return s.mute || s.gain <= 0 ? 'off' : 'on';
+  }
+
+  // Who is in a room you are not in. The count is on the row; this is
+  // the whole of what the row can say, for a tooltip.
   function who(r) {
     if (r.private) return `Just you and ${room.agent.name}. Nobody else can come in.`;
     if (!r.here.length) return 'Nobody here.';
@@ -16,33 +48,91 @@
   }
 </script>
 
-{#if room.rooms.length > 1}
-  <div class="rooms seg" role="radiogroup" aria-label="Which room you are in">
-    {#each room.rooms as r (r.id)}
-      <button role="radio" aria-checked={r.id === room.where} class:on={r.id === room.where}
-        title={who(r)} onclick={() => enterRoom(r.id)}>
-        {r.title}
-        {#if !r.private && r.here.length}<span class="count">{r.here.length}</span>{/if}
-      </button>
+<nav class="rooms" aria-label="Rooms">
+  <h2>Rooms</h2>
+  <div role="radiogroup" aria-label="Which room you are in">
+    {#each list as r (r.id)}
+      {@const here = r.id === room.where}
+      <div class="room" class:here>
+        <button role="radio" aria-checked={here} class:on={here} title={who(r)}
+          onclick={() => enterRoom(r.id)}>
+          <span class="twist" aria-hidden="true">{here ? '▾' : '▸'}</span>
+          <span class="name">{r.title}</span>
+          {#if !r.private && r.here.length}<span class="count">{r.here.length}</span>{/if}
+        </button>
+
+        <!-- Only the room you are in opens: these are faders, and a
+             fader belongs to the room it is being heard in. -->
+        {#if here}
+          <div class="who">
+            {#each room.people as p (p.name)}
+              <Strip key={p.name} label={p.name} online={p.online} mic={p.mic} muted={p.muted}
+                speaking={p.speaking} elsewhere={elsewhere[p.name]} />
+            {/each}
+            <Strip key={room.agent.strip} label={room.agent.name} agent />
+            {#if room.interpreter}
+              <!-- One fader for every language being interpreted. All the
+                   way down it is off: nobody is spoken over, and what
+                   people say is still put into the other languages to be
+                   read. -->
+              <Strip key={room.interpreter.strip} label="Interpreter" agent doing={interpreting()} />
+            {/if}
+            <p class="hint">
+              {#if room.alone}
+                This room is yours: nobody else can come into it, and nothing said here
+                reaches the rest of the house.
+              {:else}
+                Levels and mutes here change this room for everyone in it, and a muted
+                person isn't transcribed. You never hear yourself.
+              {/if}
+              {#if room.interpreter}
+                The louder the interpreter, the further the voices it is speaking over drop
+                under it; all the way down turns it off, and the words are still written
+                down for everyone.
+              {/if}
+            </p>
+          </div>
+        {/if}
+      </div>
     {/each}
   </div>
-{/if}
+</nav>
 
 <style>
-  /* The same segmented control the mode buttons use: the two sit in the
-     same bar and do the same kind of thing. */
-  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
-  .seg button {
-    border: 0;
-    border-radius: 0;
-    padding: 5px 10px;
-    white-space: nowrap;
-    display: inline-flex;
+  /* Where it sits in the grid, and the rule down its edge, are App's:
+     a scoped class here would outrank App's :global() and strand the
+     sidebar in a column of its own on a narrow screen. */
+  .rooms {
+    padding: 14px 12px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  h2 {
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--muted);
+    margin: 0 0 6px 4px;
+  }
+  .room { display: flex; flex-direction: column; }
+  .room > button {
+    display: flex;
     align-items: center;
-    gap: 6px;
+    gap: 8px;
+    width: 100%;
+    text-align: left;
+    border: 0;
+    border-radius: 8px;
+    padding: 7px 10px;
+    background: transparent;
     font-weight: 600;
   }
-  .seg button.on { background: var(--accent); color: var(--accent-ink); }
+  .room > button:hover { background: var(--bubble); }
+  .room > button.on { background: var(--accent); color: var(--accent-ink); }
+  .twist { font-size: 10px; opacity: 0.7; width: 1em; flex: none; }
+  .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .count {
     font-size: 11px;
     font-weight: 500;
@@ -51,10 +141,16 @@
     background: var(--bubble);
     color: var(--muted);
   }
-  .seg button.on .count { background: var(--accent-ink); color: var(--accent); }
-  /* Room names run long; on a narrow screen let the bar scroll rather
-     than push the AI's state and the mode buttons off the end. */
-  @media (max-width: 860px) {
-    .rooms { max-width: 100%; overflow-x: auto; }
+  .room > button.on .count { background: var(--accent-ink); color: var(--accent); }
+  /* The branch: indented, and hung off a line so the strips read as
+     belonging to the room above them rather than following it. */
+  .who {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin: 8px 0 10px 10px;
+    padding-left: 10px;
+    border-left: 1px solid var(--line);
   }
+  .hint { font-size: 12px; color: var(--muted); margin: 0; }
 </style>

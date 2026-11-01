@@ -100,8 +100,16 @@ releases.
   called in. The socket, the mic frames going up and the mix coming
   back are all exactly where they were; what moves is which room's
   mixer the far end is plugged into, whose conversation your screen is
-  showing and where your voice is being transcribed. The switch is in
-  the top left, with who is in each room beside its name.
+  showing and where your voice is being transcribed.
+
+  The rooms are a list down the left, one line each with a count of who
+  is in it, and the room you are **in** opens underneath itself into
+  everybody there -- the faders and meters and mutes that used to be a
+  panel on the right. The mixer is a branch of the room it mixes now,
+  which is what it always was: a fader belongs to the room it is being
+  heard in, and the room you are not in has none you could usefully
+  touch. A list rather than a row of buttons because a server can hold
+  a great many rooms, and a row of buttons cannot.
 
   Each room is a whole room: its own conversation, its own faders, its
   own mode, its own games and cards. Walk out of one and back into it
