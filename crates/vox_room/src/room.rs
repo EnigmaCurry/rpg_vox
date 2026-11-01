@@ -671,6 +671,11 @@ impl Room {
         interp: BTreeMap<String, crossbeam_channel::Sender<InterpJob>>,
         stt: Option<EngineFactory>,
     ) -> anyhow::Result<Arc<Self>> {
+        // Scoped here rather than by whoever built it: a room reading
+        // the whole database's settings instead of its own is a room
+        // sharing another's conversation, and nothing about the handle
+        // it was given would say so.
+        let store = store.in_room(&cfg.id);
         let conversation = store.conversation()?;
         let game = store.conversation_game(conversation)?;
         // Mid-game across a restart: still the game, and still knowing
@@ -774,9 +779,15 @@ impl Room {
         json!({ "id": st.conversation, "title": st.title, "at": st.started })
     }
 
-    /// Call this room's conversation something. Everyone in the room
-    /// sees it, and the room's history keeps it. Err says why not.
-    pub fn name_conversation(&self, title: &str) -> Result<(), String> {
+    /// Call one of this room's conversations something: the one it is
+    /// having, or one out of its history. Everyone in the room sees it,
+    /// and the history keeps it. Err says why not.
+    ///
+    /// An old conversation is read-only in the sense that matters --
+    /// the room has moved on, so nothing can be *said* into it -- and a
+    /// name is not something said. Being able to name one you forgot to
+    /// name is most of what naming is for.
+    pub fn name_conversation(&self, conversation: i64, title: &str) -> Result<(), String> {
         let title = title.trim();
         if title.chars().count() > TITLE_MAX {
             return Err(format!("At most {TITLE_MAX} characters."));
@@ -784,16 +795,26 @@ impl Room {
         if title.chars().any(char::is_control) {
             return Err("One line, no tabs.".into());
         }
-        let mut st = self.lock();
-        let conversation = st.conversation;
+        if !self.holds(conversation) {
+            return Err("That conversation isn't this room's.".into());
+        }
         if let Err(err) = self.store().name_conversation(conversation, title) {
             warn!(conversation, "name a conversation: {err:#}");
             return Err("The room couldn't save that.".into());
         }
-        info!(conversation, title, "named the conversation");
-        st.title = title.to_string();
-        let v = self.conversation_json(&st);
-        self.emit(json!({ "type": "conversation", "conversation": v }));
+        info!(conversation, title, "named a conversation");
+        let mut st = self.lock();
+        if st.conversation == conversation {
+            st.title = title.to_string();
+        }
+        // Named with its number on it, because it may not be the one
+        // anybody else is looking at: a browser applies it to whichever
+        // conversation it has open, if that is this one, and otherwise
+        // only to the list it will read again.
+        self.emit(json!({
+            "type": "conversation",
+            "conversation": { "id": conversation, "title": title, "at": st.started },
+        }));
         Ok(())
     }
 
@@ -1290,8 +1311,17 @@ impl Room {
             .collect()
     }
 
-    /// Everyone on the roster, for the agent: the name to address a card
-    /// to, whether they are here, and what they are already holding.
+    /// Who is in this room, for the agent: the name to address a card
+    /// to, whether they can be heard, and what they are already holding.
+    ///
+    /// Who is in it, and nobody else -- the same answer the browsers
+    /// get, and the same answer `turn.people` gives. The tool is called
+    /// `list_people` and says it lists who is in the room, and a list
+    /// that also had people two doors down on it was a list that made
+    /// the AI deal a card to somebody who wasn't there to be told
+    /// about it. Addressing one to somebody who has just stepped out
+    /// still works -- `send_card` looks them up on the room's own
+    /// roster, and the card waits where they left it.
     pub fn people_here(&self) -> Vec<Value> {
         let st = self.lock();
         let mut holding: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -1307,10 +1337,10 @@ impl Room {
         }
         st.people
             .iter()
+            .filter(|(_, p)| p.online())
             .map(|(name, p)| {
                 json!({
                     "name": name,
-                    "here": p.online(),
                     // Being heard: a mic open and not muted.
                     "listening": p.mic() && !p.muted(),
                     // The titles of what they are holding, which is
@@ -3685,7 +3715,9 @@ mod tests {
         mode: Mode,
         interpreters: &[&str],
     ) -> (Arc<Room>, crossbeam_channel::Receiver<Turn>, Interpreters) {
-        let store = Store::memory();
+        // Scoped as the room will scope it, since what is written here
+        // is written before the room is built.
+        let store = Store::memory().in_room("Lobby");
         store.invite("Ryan").unwrap();
         store.invite("Alex").unwrap();
         store.set_setting("mode", mode.as_str()).unwrap();
@@ -5049,7 +5081,7 @@ mod tests {
         assert!(r.lock().started > 0, "and the room knows when it was");
 
         let mut events = r.subscribe();
-        r.name_conversation("  The heist  ").unwrap();
+        r.name_conversation(first, "  The heist  ").unwrap();
         assert_eq!(r.lock().title, "The heist", "trimmed");
         assert_eq!(title_of(&r, first).as_deref(), Some("The heist"));
         assert_eq!(
@@ -5066,18 +5098,34 @@ mod tests {
         assert_eq!(r.lock().title, "");
         assert_eq!(title_of(&r, first).as_deref(), Some("The heist"));
 
-        // Naming names the one you are in, not the one you were.
-        r.name_conversation("Afterwards").unwrap();
+        // Naming names the one you say, and the one you are in is only
+        // the usual one to mean.
+        r.name_conversation(second, "Afterwards").unwrap();
         assert_eq!(title_of(&r, second).as_deref(), Some("Afterwards"));
         assert_eq!(title_of(&r, first).as_deref(), Some("The heist"));
 
+        // An old one can be named too: it is read-only in the sense
+        // that nothing can be *said* into it, and a name is not
+        // something said.
+        r.name_conversation(first, "The heist, properly").unwrap();
+        assert_eq!(title_of(&r, first).as_deref(), Some("The heist, properly"));
+        assert_eq!(
+            r.lock().title,
+            "Afterwards",
+            "and naming an old one leaves the live one alone"
+        );
+
         // Emptying it gives it back to the clock.
-        r.name_conversation("").unwrap();
+        r.name_conversation(second, "").unwrap();
         assert_eq!(title_of(&r, second).as_deref(), Some(""));
 
-        // And a name has to be one a row can show.
-        assert!(r.name_conversation(&"x".repeat(TITLE_MAX + 1)).is_err());
-        assert!(r.name_conversation("two\nlines").is_err());
+        // A name has to be one a row can show, and a conversation has
+        // to be one of this room's.
+        assert!(r
+            .name_conversation(second, &"x".repeat(TITLE_MAX + 1))
+            .is_err());
+        assert!(r.name_conversation(second, "two\nlines").is_err());
+        assert!(r.name_conversation(9999, "somebody else's").is_err());
     }
 
     /// A conversation nobody said anything in is not one the room had.
@@ -5650,6 +5698,9 @@ mod tests {
     #[test]
     fn cards_belong_to_the_conversation_that_dealt_them() {
         let (r, _turns) = room(Mode::Named);
+        // The AI is shown who is in the room, so they have to be in it.
+        r.join("Ryan", 1);
+        r.join("Alex", 2);
         r.send_card("Ryan", "Your role", "You are the traitor.")
             .unwrap();
         r.send_card("Alex", "Your hand", "Two aces.").unwrap();

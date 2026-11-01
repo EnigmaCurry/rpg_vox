@@ -35,16 +35,27 @@
   // What to call one: what somebody called it, or when it was.
   const named = (c) => c.title || whenItWas(c);
 
-  // The box at the head of the live conversation. While you are typing
-  // in it the box is yours; the moment you are not, it is the room's
-  // again — so a name somebody else gives it doesn't change under your
-  // hands mid-word.
+  // The box at the head of whichever conversation you have open — the
+  // one the room is having, or one out of its history. An old one is
+  // read-only in the sense that matters, which is that nothing can be
+  // *said* into it; a name is not something said, and being able to
+  // name one you forgot to name is most of what naming is for.
+  //
+  // While you are typing in it the box is yours; the moment you are
+  // not, it is the room's again — so a name somebody else gives it
+  // doesn't change under your hands mid-word.
   let typing = $state(null);
-  const mine = $derived(
-    typing ??
-      (room.conversation.title ||
-        whenItWas({ said: room.log.find((e) => e.at)?.at, at: room.conversation.at })),
+  const showing = $derived(
+    reading
+      ? { id: reading.id, title: reading.title ?? '', at: reading.at, said: reading.log?.[0]?.at }
+      : {
+          id: room.conversation.id,
+          title: room.conversation.title,
+          at: room.conversation.at,
+          said: room.log.find((e) => e.at)?.at,
+        },
   );
+  const mine = $derived(typing ?? (showing.title || whenItWas(showing)));
 
   function rename() {
     if (typing === null) return;
@@ -52,7 +63,7 @@
     typing = null;
     // Typing the default back in is not naming it that: leave it
     // unnamed, so it goes on following what is in it.
-    nameConversation(title === mine && !room.conversation.title ? '' : title);
+    nameConversation(showing.id, title === mine && !showing.title ? '' : title);
   }
 </script>
 
@@ -69,27 +80,27 @@
   onkeydown={(e) => { if (e.key === 'Escape') open = false; }} />
 
 <div class="bar">
+  {#if reading}<button class="back" onclick={backToNow}>← Back</button>{/if}
+
+  <!-- What this conversation is called, whichever one you have open.
+       Unnamed, it is when it was; type over it and it is whatever you
+       say, for everyone, and the room's history keeps it. -->
+  <input class="name" value={mine} maxlength={TITLE_MAX}
+    aria-label="What to call this conversation"
+    title="What to call this conversation. Everyone here sees it."
+    oninput={(e) => (typing = e.currentTarget.value)}
+    onblur={rename}
+    onkeydown={(e) => {
+      if (e.key === 'Enter') { e.preventDefault(); e.currentTarget.blur(); }
+      if (e.key === 'Escape') { typing = null; e.currentTarget.blur(); }
+    }} />
+
   {#if reading}
-    <button class="back" onclick={backToNow}>← Back</button>
     <span class="closed">
-      <strong>{named({ title: reading.title, at: reading.at, said: reading.log?.[0]?.at })}</strong>
-      {#if reading.game} · {reading.game}{/if}
-      · closed, nothing can be said into it
+      {#if reading.game}{reading.game} · {/if}closed, nothing can be said into it
     </span>
-  {:else}
-    <!-- What this conversation is called. Unnamed, it is when it was;
-         type over it and it is whatever you say, for everyone, and the
-         room's history keeps it. -->
-    <input class="name" value={mine} maxlength={TITLE_MAX}
-      aria-label="What to call this conversation"
-      title="What to call this conversation. Everyone here sees it."
-      oninput={(e) => (typing = e.currentTarget.value)}
-      onblur={rename}
-      onkeydown={(e) => {
-        if (e.key === 'Enter') { e.preventDefault(); e.currentTarget.blur(); }
-        if (e.key === 'Escape') { typing = null; e.currentTarget.blur(); }
-      }} />
-    {#if room.game}<span class="playing">{room.game}</span>{/if}
+  {:else if room.game}
+    <span class="playing">{room.game}</span>
   {/if}
 
   <div class="spacer"></div>

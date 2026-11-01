@@ -1108,9 +1108,10 @@ fn room_tools() -> Vec<Value> {
     vec![
         tool(
             "list_people",
-            "List everyone in the room: their exact name, whether they have the \
-             room open, whether their microphone is open, and how many cards \
-             they are holding. Use it to get a name right before sending a \
+            "List who is in the room: their exact name, whether their \
+             microphone is open, and what cards they are holding. Only the \
+             people who are actually here; somebody invited but elsewhere is \
+             not in this room. Use it to get a name right before sending a \
              card.",
             json!({}),
             &[],

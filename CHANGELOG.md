@@ -149,12 +149,19 @@ releases.
 
   **A conversation can be called something.** The name at the head of
   it is a box: type over it and that is what the room calls this
-  conversation, for everyone in it and in the history from then on.
+  conversation, for everyone in it and in the history from then on. It
+  names whichever one you have open, an old one included.
   Left alone it is when it was — the time of the first thing said, or
   the day it was started if nothing has been — and emptying the box
   gives it back to the clock rather than leaving it blank. The room
   keeps the name and the numbers; how a date reads is each browser's
   own business, in its own language and timezone.
+
+  What the AI is shown is who is in the room too: `list_people` says it
+  lists who is in the room, and it was listing everybody invited with a
+  flag beside them — which is how it came to deal a card to somebody
+  two doors down. Addressing one to somebody who has just stepped out
+  still works, and the card waits where they left it.
 
   A conversation nobody said anything in is not one the room had, and
   isn't on the list — pressing *New conversation* twice leaves nothing

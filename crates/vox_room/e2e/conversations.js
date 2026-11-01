@@ -94,11 +94,21 @@ const shut = async (page) => {
   await ryan.page.waitForTimeout(900);
   is('reading the old one', (await said(ryan.page)).some((t) => /planning the heist/.test(t)), true);
   is('there is nothing to type into', await canType(ryan.page), false);
-  is('and it says which one, and that it is shut',
+  is('the box says which one you are reading', await name(ryan.page), 'The heist');
+  is('and it says it is shut',
     await ryan.page.evaluate(() =>
-      /^The heist .*closed, nothing can be said into it$/.test(
+      /closed, nothing can be said into it$/.test(
         document.querySelector('.bar .closed')?.textContent.replace(/\s+/g, ' ').trim() ?? '',
       )), true);
+
+  // An old one can be named too: read-only means nothing can be *said*
+  // into it, and a name is not something said.
+  const hers = await name(alex.page);
+  await ryan.page.fill('.bar input.name', 'The heist, properly');
+  await ryan.page.keyboard.press('Enter');
+  await ryan.page.waitForTimeout(900);
+  is('an old one can be named', await name(ryan.page), 'The heist, properly');
+  is('and naming it left the live one alone', await name(alex.page), hers);
   is("Alex's screen never moved",
     (await said(alex.page)).some((t) => /afterwards/.test(t)), true);
   is('and she can still talk', await canType(alex.page), true);

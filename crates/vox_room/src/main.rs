@@ -700,7 +700,8 @@ fn serve(cli: Cli, store: Store, db: PathBuf) -> Result<()> {
         let interpreter_voice = cli.interpreter_voice.clone();
         let interpret = cli.interpret;
         Box::new(move |cfg: RoomConfig| -> Result<Arc<Room>> {
-            let store = Store::open(&db)?.in_room(&cfg.id);
+            // `Room::new` scopes it to the room it is given.
+            let store = Store::open(&db)?;
             let generation = Arc::new(AtomicU64::new(0));
             let (turn_tx, turn_rx) = crossbeam_channel::unbounded();
             // One voice per language the room is listening in, each on

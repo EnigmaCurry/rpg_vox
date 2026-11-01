@@ -348,12 +348,14 @@ export function answer(ok) {
 
 const roomPath = () => `/api/rooms/${encodeURIComponent(room.where)}/history`;
 
-/// Call the conversation the room is having something. Everyone in the
-/// room sees it, and the room's history keeps it. Empty puts it back to
-/// being unnamed, which is a date rather than a blank.
-export function nameConversation(title) {
-  if (title.trim() === room.conversation.title) return;
-  command({ type: 'name_conversation', title });
+/// Call a conversation something: the one the room is having, or one
+/// you have opened out of its history. Everyone in the room sees it,
+/// and the history keeps it. Empty puts it back to being unnamed, which
+/// is a date rather than a blank.
+export function nameConversation(conversation, title) {
+  const was = (room.reading?.id === conversation ? room.reading.title : room.conversation.title) ?? '';
+  if (title.trim() === was) return;
+  command({ type: 'name_conversation', conversation, title });
 }
 
 /// What an unnamed conversation is called: when the first thing in it
@@ -653,7 +655,13 @@ function apply(ev) {
       room.cards = room.cards.filter((c) => c.id !== ev.id);
       break;
     case 'conversation':
-      room.conversation = ev.conversation;
+      // Named with its number on it, because it needn't be the one this
+      // tab has open: somebody else may be naming one out of the
+      // history while you are reading the live one.
+      if (ev.conversation.id === room.conversation.id) room.conversation = ev.conversation;
+      if (room.reading?.id === ev.conversation.id) room.reading.title = ev.conversation.title;
+      // Whatever was named, the list is out of date.
+      room.history = null;
       break;
     case 'games':
       room.games = ev.games;

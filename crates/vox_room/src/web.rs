@@ -12,7 +12,7 @@
 //! {"type": "strip", "name": "Alex", "gain": 0.8, "mute": false}
 //! {"type": "interpreter", "gain": 0.8, "mute": false}
 //! {"type": "mode", "mode": "always"}
-//! {"type": "name_conversation", "title": "The heist"}
+//! {"type": "name_conversation", "conversation": 7, "title": "The heist"}
 //! {"type": "stop"}
 //! {"type": "new_conversation"}
 //! {"type": "enter_game", "name": "Dragon Heist"}
@@ -481,8 +481,10 @@ enum Command {
     Text {
         text: String,
     },
-    /// What to call the conversation the room is having.
+    /// What to call one of this room's conversations: the one it is
+    /// having, or one out of its history.
     NameConversation {
+        conversation: i64,
         title: String,
     },
     Stop,
@@ -624,8 +626,11 @@ async fn client(app: &App, socket: WebSocket, id: u64, who: &Invited) -> anyhow:
                                 room.tell(&name, &why);
                             }
                         }
-                        Ok(Command::NameConversation { title }) => {
-                            if let Err(why) = room.name_conversation(&title) {
+                        Ok(Command::NameConversation {
+                            conversation,
+                            title,
+                        }) => {
+                            if let Err(why) = room.name_conversation(conversation, &title) {
                                 room.tell(&name, &why);
                             }
                         }

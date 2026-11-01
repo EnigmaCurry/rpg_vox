@@ -151,7 +151,10 @@ first thing anybody said in it, newest first with the live one marked
 
 **Calling one something.** The name at the head of the conversation is
 a box: type over it and that is what the room calls this conversation,
-for everyone in it and in the history from then on. Left alone it is
+for everyone in it and in the history from then on. It names whichever
+one you have open, the old ones included — read-only means nothing can
+be *said* into it, and a name is not something said; being able to name
+one you forgot to name is most of what naming is for. Left alone it is
 **when it was** — the time of the first thing said in it, or the day it
 was started if nothing has been. Emptying the box gives it back to the
 clock rather than leaving it blank. (A date is a thing each browser
