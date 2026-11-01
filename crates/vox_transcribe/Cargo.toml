@@ -25,6 +25,22 @@ llm = ["dep:ureq", "dep:serde_json"]
 ct2 = ["dep:ct2rs", "dep:tokenizers"]
 # Experimental DeepFilterNet 3 noise filter (EngineConfig::denoise).
 deepfilter = ["dep:deep_filter", "dep:ndarray"]
+# Telling languages apart *within* one alphabet, off the text a decode
+# came back as -- English against French, Russian against Ukrainian,
+# which `language::script` cannot do and must not pretend to. The
+# `Classify` trait is always compiled; only the backends are optional,
+# so `language::of`'s signature does not move with the feature list.
+#
+# Two backends because which to ship is a measurement and not a
+# preference -- `examples/langid_bench.rs` is what settles it. They are
+# not interchangeable in shape, though: fastText is one 917 KB file
+# covering 176 languages, chosen at runtime, where lingua's languages
+# are *cargo features* and cost ~5 MB of n-gram FSTs each in the
+# binary. An app whose languages are a settings page wants the former
+# almost regardless of the accuracy; lingua is here to say what that
+# choice costs.
+langid-fasttext = ["dep:fasttext-pure-rs"]
+langid-lingua = ["dep:lingua"]
 
 [dependencies]
 anyhow.workspace = true
@@ -46,3 +62,22 @@ ct2rs = { version = "0.10", default-features = false, features = ["ruy", "tokeni
 tokenizers = { version = "0.22", optional = true }
 deep_filter = { git = "https://github.com/Rikorose/DeepFilterNet", tag = "v0.5.6", default-features = false, features = ["tract", "default-model"], optional = true }
 ndarray = { version = "0.15", optional = true }
+# fastText inference with no C++ in it, which is the whole reason for
+# this one rather than the `fasttext` bindings: Facebook's library does
+# not cross-compile to the NDK without a fork, and a second C++ library
+# in this binary is how the SentencePiece/protobuf collision started
+# (see `ct2::TOKENIZER`). Reads the quantized `lid.176.ftz` as shipped.
+fasttext-pure-rs = { version = "0.1", optional = true }
+# The accuracy reference for the bench. Its languages are features:
+# this list is what the bench can compare on, not what anything ships.
+lingua = { version = "1.8", default-features = false, optional = true, features = [
+    "english",
+    "russian",
+    "ukrainian",
+    "french",
+    "spanish",
+    "german",
+    "portuguese",
+    "italian",
+    "bulgarian",
+] }

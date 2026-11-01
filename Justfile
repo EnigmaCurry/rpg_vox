@@ -419,6 +419,35 @@ download-streaming-stt-model-ru:
 # go in the same binary as sherpa-onnx -- their protobufs are different
 # versions of the same symbols. `download-models` also sees to the
 # recognizer, which is a no-op once that is there.
+# fastText's lid.176 into models/, for telling languages apart inside
+# one alphabet (vox_transcribe::langid). The quantized model: 917 KB for
+# 176 languages, against ~5 MB *per language* for the alternative, which
+# is most of why it is the one that can be chosen from a settings page.
+#
+# CC-BY-SA 3.0, which is why it is fetched rather than vendored.
+download-langid-model:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dest="models/langid/lid.176.ftz"
+    if [ -f "$dest" ]; then
+      echo "language classifier already present at $dest"
+      exit 0
+    fi
+    mkdir -p models/langid
+    echo "downloading lid.176.ftz …"
+    curl -fL --progress-bar -o "$dest.part" \
+      https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.ftz
+    mv "$dest.part" "$dest"
+    echo "installed the language classifier → $dest"
+
+# Score the language classifiers and the floor they are used at, over
+# Flores-200 and over real decodes. See examples/langid_bench.rs for
+# what the numbers mean and where to get Flores.
+langid-bench *ARGS: download-langid-model
+    nix-shell --run "cargo run --release -p vox_transcribe \
+      --features langid-fasttext,langid-lingua,sherpa-static \
+      --example langid_bench -- {{ARGS}}"
+
 # Download both Marian translation models (en-ru, ru-en) into models/.
 download-translate-model-ru: release-scribe
     VOX_SCRIBE_MODELS=models ./target/release/scribe \

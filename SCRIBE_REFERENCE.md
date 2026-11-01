@@ -100,7 +100,7 @@ words counted are still pass 1's.
 |--------|---------|-------------|
 | `--translate off\|local\|openai` | `off` (env `VOX_SCRIBE_TRANSLATE`) | Also read every paragraph heard in another language in your own. `local` is Marian through CTranslate2 on the CPU, with no network — the model for the direction it reads is downloaded on first use, ~80 MB (needs a build with the `translate-local` feature); `openai` asks the `--llm` service. What was said is kept either way. See [translation](SCRIBE.md#translation-optional). |
 | `--native-language NAME` | `English` (env `VOX_SCRIBE_NATIVE_LANGUAGE`) | The language you read in, spelled in English. |
-| `--other-language NAME` | `Russian` | A language to listen out for and translate. Repeatable. Each one must be written in a different alphabet from yours and from the others — that is the only thing that tells them apart, so a pair that shares one is refused at startup rather than guessed at. |
+| `--other-language NAME` | `Russian` | A language to listen out for and translate. Repeatable, and they may share an alphabet with each other or with yours (French read into English, Russian and Ukrainian together): the alphabet decides what it can, and a 917 KB classifier fetched on first use decides the rest. Without it — no `langid` feature, or a failed download — a pair sharing an alphabet is refused at startup rather than guessed at. |
 
 `--translate openai` reuses `--llm-timeout` as its per-sentence timeout.
 

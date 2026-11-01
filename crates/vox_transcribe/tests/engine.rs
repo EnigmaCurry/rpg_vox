@@ -317,6 +317,7 @@ fn run_translated(
         "English",
         &["Russian".to_string()],
         Arc::new(FakeTranslate { fail }),
+        None,
     )
     .expect("an alphabet apart");
     let engine = Engine::spawn_passes(
@@ -923,6 +924,7 @@ fn a_reading_arrives_while_the_recording_runs() {
         "English",
         &["Russian".to_string()],
         Arc::new(FakeTranslate { fail: false }),
+        None,
     )
     .expect("an alphabet apart");
     let engine = Engine::spawn_passes(

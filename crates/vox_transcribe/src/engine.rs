@@ -843,10 +843,15 @@ impl Core {
     /// Pass 1 follows what pass 2 heard: see [`Passes::streaming_also`].
     ///
     /// The alphabet of a finished utterance is read rather than its
-    /// language, because that is what can be read off text at all -- the
-    /// same reasoning as [`crate::language`], and the same limit: a
-    /// sentence with too few letters to say says nothing, and leaves
-    /// pass 1 where it is.
+    /// language, and here that is not a limit: pass 1's models are one
+    /// per alphabet (English and Russian are all there are), so the
+    /// alphabet *is* the whole question, and a classifier would have
+    /// nothing left to decide. [`crate::langid`] is for the languages
+    /// passes 2 and 3 hear, which are twenty-five and not two.
+    ///
+    /// The limit it does share with [`crate::language`]: a sentence with
+    /// too few letters to say anything says nothing, and leaves pass 1
+    /// where it is.
     fn follow_language(&mut self, text: &str) {
         if self.streaming_also.is_empty() {
             return;

@@ -7,6 +7,40 @@ releases.
 
 ## Unreleased
 
+### scribe, Scribe for Android
+
+- **A language can now be read in yours even when it is written the
+  same way.** French into English was refused outright, and so was
+  Russian with Ukrainian, because a paragraph's language was worked out
+  from its alphabet and nothing else -- the recognizer that hears 25
+  languages never says which one it heard. The alphabet was never wrong
+  about Cyrillic against Latin, and could say nothing at all about Latin
+  against Latin, so the honest thing was to refuse the pair rather than
+  send a paragraph to a model that would translate it out of a language
+  it was not in and return confident nonsense.
+
+  The alphabet still goes first, still costs nothing and is still never
+  overruled when it answers. What it could not settle now goes to
+  fastText's `lid.176`: 917 KB for 176 languages, pure Rust, asked only
+  about the languages you turned on and only above nine-tenths
+  certainty. Under that the paragraph stands as it was said, which is
+  what used to happen to every one of them.
+
+  Nine-tenths is measured and not a round number. Over Flores-200 and
+  over real decodes from this repo's own recordings it is where the
+  wrong answers stop: Czech against Slovak against Polish is 2.2% wrong
+  with no floor and 0.04% at this one, and the one English paragraph
+  that was called Spanish is called Spanish at every floor up to 0.8
+  and refused at 0.9. `examples/langid_bench.rs` is what took the
+  numbers and `just langid-bench` takes them again.
+
+  For Scribe for Android, reading in English, that turns five offered
+  languages -- never more than two of them on at once, one per alphabet
+  -- into twenty-one, with no limit on how many. For `scribe` it means
+  `--other-language` may share an alphabet with yours or with another of
+  them; without the classifier the old refusal stands, rather than a
+  guess.
+
 ### Scribe for Android
 
 - **A reading says that it is a reading, and will show you the line it

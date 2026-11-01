@@ -9,6 +9,7 @@
 //! <dir>/speaker-diarization/{segmentation,embedding-eres2netv2}.onnx   (--diarize)
 //! <dir>/kokoro/{model.onnx,voices.bin,…}        (--play NAME.md, --tts kokoro)
 //! <dir>/translate/en-ru/{model.bin,config.json,…}         (--translate local)
+//! <dir>/langid/lid.176.ftz                    (telling one alphabet apart)
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -407,6 +408,47 @@ pub fn download_translate(dir: &Path, from: &str, into: &str) -> Result<()> {
     let pieces = vox_transcribe::spm::write_tokenizer(&dest.join("source.spm"), &tokenizer)
         .with_context(|| format!("write {}", tokenizer.display()))?;
     println!("installed {} ({pieces} pieces)", tokenizer.display());
+    Ok(())
+}
+
+/// About what the language classifier costs, for the line before it.
+#[cfg(feature = "langid")]
+pub const LANGID_SIZE: &str = "about 1 MB";
+
+/// Whether the classifier that tells languages apart inside one
+/// alphabet is downloaded.
+#[cfg(feature = "langid")]
+pub fn has_langid(dir: &Path) -> bool {
+    vox_transcribe::langid::FastText::installed(dir)
+}
+
+/// Download fastText's `lid.176.ftz` into `<dir>/langid/`.
+///
+/// One file, straight from Facebook's own bucket rather than a mirror:
+/// 917 KB for 176 languages, which is what makes it the one a phone can
+/// choose languages from at runtime (see `vox_transcribe::langid`).
+#[cfg(feature = "langid")]
+pub fn download_langid(dir: &Path) -> Result<()> {
+    let to = vox_transcribe::langid::FastText::path(dir);
+    if to.is_file() {
+        println!(
+            "the language classifier is already present at {}",
+            to.display()
+        );
+        return Ok(());
+    }
+    let parent = to.parent().expect("a langid directory");
+    std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    let part = to.with_extension("ftz.part");
+    curl(
+        &format!(
+            "https://dl.fbaipublicfiles.com/fasttext/supervised-models/{}",
+            vox_transcribe::langid::MODEL
+        ),
+        &part,
+    )?;
+    std::fs::rename(&part, &to).with_context(|| format!("install {}", to.display()))?;
+    println!("installed {}", to.display());
     Ok(())
 }
 

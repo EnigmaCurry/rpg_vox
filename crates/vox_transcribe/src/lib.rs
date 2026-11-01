@@ -30,6 +30,7 @@ pub mod digits;
 pub mod engine;
 pub mod filters;
 pub mod gaps;
+pub mod langid;
 pub mod language;
 pub mod model;
 #[cfg(feature = "llm")]

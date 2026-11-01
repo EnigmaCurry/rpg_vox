@@ -48,12 +48,18 @@ struct Models {
 }
 
 /// What a session needs to make its own `Interpreter`: the languages,
-/// and the translator they share.
+/// the translator they share, and what tells two of them apart when
+/// they are written in the same alphabet.
 #[cfg(feature = "translate-local")]
 struct Translating {
     native: String,
     others: Vec<String>,
     by: Arc<dyn vox_transcribe::translate::Translate>,
+    /// `None` when the classifier is not downloaded, in which case
+    /// `check_languages` has already refused any set that would have
+    /// needed it -- so this being absent is a set the alphabet can
+    /// separate on its own, not a set being guessed at.
+    telling: Option<Arc<dyn vox_transcribe::langid::Classify>>,
 }
 
 /// Without the feature nothing constructs this; `load` says so rather
@@ -91,7 +97,7 @@ fn load(
     // they are not, and saying which should not cost the seconds the
     // recognizers take. (vox_scribe builds its translation pass first for
     // the same reason.)
-    check_languages(native, others)?;
+    check_languages(dir, native, others)?;
     let mut pc = ParakeetConfig::from_dir(&dir.join(PARAKEET));
     pc.num_threads = threads;
     let offline = Arc::new(Parakeet::open(&pc).context("loading Parakeet")?);
@@ -137,20 +143,25 @@ fn parse_streaming(spec: &str) -> Result<Vec<(String, String)>> {
 }
 
 /// Whether these languages can be told apart at all, which is all of
-/// what `load` can answer without reading a file. A pair sharing an
-/// alphabet is refused rather than guessed at -- see
-/// `vox_transcribe::language` -- and the app only offers one language
-/// per alphabet for that reason.
+/// what `load` can answer before it reads the weights.
+///
+/// Two languages in one alphabet can be, but only with the classifier
+/// downloaded: without it the alphabet is the whole of the decision and
+/// the pair is refused rather than guessed at -- see
+/// `vox_transcribe::language`. So this is asked of the models directory
+/// and not of a build flag, because it is a question about what is on
+/// the phone right now.
 #[cfg(feature = "translate-local")]
-fn check_languages(native: &str, others: &[String]) -> Result<()> {
+fn check_languages(dir: &Path, native: &str, others: &[String]) -> Result<()> {
     if others.is_empty() {
         return Ok(());
     }
-    vox_transcribe::language::pair(native, others)
+    let telling = vox_transcribe::langid::FastText::installed(dir);
+    vox_transcribe::language::pair(native, others, telling)
 }
 
 #[cfg(not(feature = "translate-local"))]
-fn check_languages(_native: &str, others: &[String]) -> Result<()> {
+fn check_languages(_dir: &Path, _native: &str, others: &[String]) -> Result<()> {
     if others.is_empty() {
         return Ok(());
     }
@@ -168,10 +179,30 @@ fn load_translating(dir: &Path, native: &str, others: &[String]) -> Result<Optio
     langs.extend(others.iter().cloned());
     let by = vox_transcribe::ct2::Ct2Translator::load(dir, &langs)?;
     tracing::info!(directions = %by.directions().join(", "), "translating locally");
+    // Loaded if it is there, and not required: a set the alphabet can
+    // separate needs no classifier, and `check_languages` has already
+    // refused any set that does need one when it is missing. 917 KB, so
+    // it is loaded whenever it is present rather than only when some
+    // pair is about to want it -- working out that nothing needs it
+    // would cost more than the loading does.
+    let telling = match vox_transcribe::langid::FastText::load(dir) {
+        Ok(c) => {
+            tracing::info!(by = %vox_transcribe::langid::Classify::name(&c), "telling languages apart");
+            Some(Arc::new(c) as Arc<dyn vox_transcribe::langid::Classify>)
+        }
+        Err(e) => {
+            // Not an error to report upwards: a missing classifier is
+            // an ordinary state of the models directory, and a corrupt
+            // one must not take the recognizers down with it.
+            tracing::info!("no language classifier: {e:#}");
+            None
+        }
+    };
     Ok(Some(Translating {
         native: native.to_string(),
         others: others.to_vec(),
         by: Arc::new(by),
+        telling,
     }))
 }
 
@@ -193,6 +224,7 @@ fn interpreter(models: &Models) -> Result<Option<vox_transcribe::language::Inter
         &t.native,
         &t.others,
         t.by.clone(),
+        t.telling.clone(),
     )?))
 }
 
@@ -219,7 +251,8 @@ impl<R: Read> Read for Counting<R> {
 fn unpack(archive: &Path, dest: &Path, spec: &str) -> Result<()> {
     UNPACKED.store(0, Ordering::Relaxed);
     let wanted: HashMap<&str, &str> = spec.lines().filter_map(|l| l.split_once('\t')).collect();
-    let file = std::fs::File::open(archive).with_context(|| format!("open {}", archive.display()))?;
+    let file =
+        std::fs::File::open(archive).with_context(|| format!("open {}", archive.display()))?;
     let bz = bzip2::read::MultiBzDecoder::new(BufReader::with_capacity(1 << 20, Counting(file)));
     let mut tar = tar::Archive::new(bz);
     for entry in tar.entries().context("read archive")? {
@@ -631,11 +664,19 @@ pub extern "system" fn Java_com_enigmacurry_rpg_1vox_1scribe_Native_finish(
     session: jlong,
 ) -> jstring {
     let session = unsafe { &*(session as *const Session) };
-    let recorder = session.recorder.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let recorder = session
+        .recorder
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
     if let Some(Err(e)) = recorder.map(OpusWriter::finish) {
         tracing::warn!("closing recording: {e:#}");
     }
-    let engine = session.engine.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let engine = session
+        .engine
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
     let transcript = engine.map(Engine::finish).unwrap_or_default();
     let json = serde_json::to_string(&transcript).unwrap_or_else(|_| "{}".into());
     new_string(&mut env, &json)
@@ -766,7 +807,9 @@ pub extern "system" fn Java_com_enigmacurry_rpg_1vox_1scribe_Native_alignWords(
         let text: String = env.get_string(&text)?.into();
         let old: Vec<vox_transcribe::Word> = serde_json::from_str(&words)?;
         let span = (start_ms.max(0) as u64, end_ms.max(0) as u64);
-        Ok(serde_json::to_string(&vox_transcribe::timing::align_words(&old, &text, span))?)
+        Ok(serde_json::to_string(
+            &vox_transcribe::timing::align_words(&old, &text, span),
+        )?)
     })();
     match aligned {
         Ok(json) => new_string(&mut env, &json),
@@ -902,7 +945,9 @@ mod tests {
         }
         // 1 s left, the click 0.5 s in.
         assert!((out.len() as i64 - 48_000).abs() <= 3, "{}", out.len());
-        let peak = (0..out.len()).max_by(|&a, &b| out[a].abs().total_cmp(&out[b].abs())).unwrap();
+        let peak = (0..out.len())
+            .max_by(|&a, &b| out[a].abs().total_cmp(&out[b].abs()))
+            .unwrap();
         assert!((peak as i64 - 24_000).abs() < 200, "click at {peak}");
         assert_eq!(p.read(&mut buf).unwrap(), 0);
         // The click is the only sound: 1.5 s, padded 100 ms each side, to

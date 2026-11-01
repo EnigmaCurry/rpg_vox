@@ -13,7 +13,14 @@ default = []
 # Marian translation on the phone, with no network: the same feature
 # vox_scribe calls `translate-local`. CTranslate2 is built for the NDK by
 # the CMake in `just _android-jni`.
-translate-local = ["vox_transcribe/ct2"]
+#
+# The classifier comes with it rather than on its own switch. It exists
+# to decide which translation direction a paragraph takes, so a build
+# with one and not the other is either a classifier with nothing to
+# decide or -- worse -- a translator that can only be offered the
+# languages an alphabet can separate, which is the restriction this is
+# here to lift. 917 KB of pure Rust, so there is nothing to weigh.
+translate-local = ["vox_transcribe/ct2", "vox_transcribe/langid-fasttext"]
 
 [dependencies]
 vox_transcribe = { path = "../vox_transcribe", features = ["sherpa-static"] }
