@@ -88,15 +88,21 @@ class RowsTest {
  * must never do is show a language the reader doesn't read.
  */
 class OwnTest {
-    private fun para(text: String, translated: String?, readings: List<Reading> = emptyList()) = Para(
+    private fun para(
+        text: String,
+        translated: String?,
+        readings: List<Reading> = emptyList(),
+        translatable: Boolean = true,
+    ) = Para(
         id = "p",
         clips = listOf(ClipUi(text, partial = false)),
         readings = readings,
         translated = translated,
+        translatable = translatable,
     )
 
     /** Reading English, with Russian being listened out for. */
-    private fun shown(p: Para) = p.own(translating = true, native = Script.LATIN)
+    private fun shown(p: Para) = p.own(native = Script.LATIN)
 
     @Test
     fun a_paragraph_in_your_own_language_is_itself() {
@@ -120,13 +126,17 @@ class OwnTest {
         assertTrue(shown(para("Да, конечно.", "failed")))
     }
 
-    /** With nothing being translated, every paragraph is itself. */
+    /**
+     * A paragraph nothing was translating is shown as it was said, in
+     * whatever language, for good. It is never getting a reading, and
+     * hiding it to wait for one loses it.
+     */
     @Test
-    fun with_translation_off_everything_is_shown_as_it_was_said() {
+    fun a_paragraph_nothing_was_translating_is_shown_as_it_was_said() {
         for (state in listOf(null, "running", "native", "done")) {
             assertTrue(
                 "state $state",
-                para("Да, конечно.", state).own(translating = false, native = Script.LATIN),
+                shown(para("Да, конечно, это правда", state, translatable = false)),
             )
         }
     }

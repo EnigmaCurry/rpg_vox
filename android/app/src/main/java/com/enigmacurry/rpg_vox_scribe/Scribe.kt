@@ -81,11 +81,17 @@ data class Para(
     /**
      * What the engine says of the translation: `done`, `native` (it is
      * in your language already, so there is nothing to read), `running`,
-     * `failed`, or null when translation is off. [Show] needs the
-     * difference -- "the reading" of a paragraph already in your
-     * language is the paragraph.
+     * `failed`, or null when it has not looked yet.
      */
     val translated: String? = null,
+    /**
+     * Whether a reading of this paragraph is coming at all -- whether
+     * the engine that heard it had a translator. One recorded with none
+     * is shown as it was said for good, whatever language it is in:
+     * waiting for a reading nobody is making is how text disappears
+     * behind an ellipsis.
+     */
+    val translatable: Boolean = false,
 ) {
     val text: String get() = clips.filter { it.text.isNotBlank() }.joinToString(" ") { it.text }
     /** [text]'s words as shown. */
@@ -99,8 +105,9 @@ data class Para(
      *
      * The rule is: show it unless it is *known* to be in an alphabet the
      * reader does not read. Everything else is a reason to show it --
-     * nothing being translated, a reading that will never come, or text
-     * whose alphabet cannot be read either way.
+     * nothing translating this paragraph ([translatable]), a reading
+     * that will never come, or text whose alphabet cannot be read
+     * either way.
      *
      * The state that matters here is the one the engine has not answered
      * yet, and the one it answers with "nothing to translate". Every
@@ -118,10 +125,10 @@ data class Para(
      * pass 1 is listening in for exactly those, so they are usually read
      * rather than left for this to judge.
      */
-    fun own(translating: Boolean, native: Script): Boolean {
+    fun own(native: Script): Boolean {
         val foreign = script(text)?.let { it != native } == true
         return when {
-            !translating -> true
+            !translatable -> true
             translated == "done" -> false
             translated == "failed" -> true
             else -> !foreign
@@ -519,16 +526,32 @@ object Scribe {
     }
 
     /**
-     * Whether anything is being translated: a language to listen out
-     * for, with the model that reads it into yours here. Without one,
-     * every paragraph is shown as it was said -- there is nothing else
-     * to show, whatever language it is in.
+     * Whether anything is being translated: the languages the loaded
+     * models were actually given, not the ones the settings ask for.
+     *
+     * The difference is what the screen hangs on. A setting changed
+     * while a recording is running cannot be applied until the engine
+     * is loaded again, and until then the screen must show what the
+     * engine can do, not what the settings say it should: believing the
+     * settings means hiding a language nothing is translating, which is
+     * text that never appears at all.
      */
-    val translating: Boolean
-        get() = others.any { l -> translation(l, native)?.let(store::installed) == true }
+    val translating: Boolean get() = loadedOthers.isNotEmpty()
+
+    /** The other languages the loaded models were given; see [translating]. */
+    @Volatile
+    private var loadedOthers: List<Language> = emptyList()
+
+    /**
+     * A language change that had to wait: the models can only be swapped
+     * between recordings, and the one in progress keeps the engine it
+     * started with.
+     */
+    @Volatile
+    private var reloadWanted = false
 
     /** Whether [p] is shown as what was said, rather than as its reading. */
-    fun saidAsIs(p: Para) = p.own(translating, native.script)
+    fun saidAsIs(p: Para) = p.own(native.script)
 
     /** The models the languages now ask for, in the order they install. */
     fun wanted(): List<Model> =
@@ -564,10 +587,21 @@ object Scribe {
      * The download calls back here when it lands.
      */
     private fun reload() {
-        if (busy() || dictating) return
-        if (!store.ready() || !wanted().all(store::installed)) return
+        if (busy() || dictating || !store.ready() || !wanted().all(store::installed)) {
+            // Not now: when the recording ends, or when the model it is
+            // waiting for arrives. Forgetting it here is how a setting
+            // changed mid-recording stayed unapplied for good.
+            reloadWanted = true
+            return
+        }
+        reloadWanted = false
         release()
         if (phase == Phase.Unloaded) load()
+    }
+
+    /** Apply a language change that had to wait for the engine to be free. */
+    private fun reloadIfWanted() {
+        if (reloadWanted) reload()
     }
 
     /** Where kept recordings live. */
@@ -764,7 +798,9 @@ object Scribe {
     fun onVisible(v: Boolean) {
         visible = v
         lastActive = SystemClock.elapsedRealtime()
-        if (v && phase == Phase.Unloaded) load()
+        if (!v) return
+        reloadIfWanted()
+        if (phase == Phase.Unloaded) load()
     }
 
     /**
@@ -810,6 +846,9 @@ object Scribe {
         if (phase == Phase.Loading || models != 0L) return
         phase = Phase.Loading
         scope.launch {
+            // The languages the engine is about to be given, which is
+            // what the screen goes by (see [translating]).
+            val langs = others.filter { l -> translation(l, native)?.let(store::installed) == true }
             val result = withContext(Dispatchers.IO) {
                 runCatching {
                     Native.load(
@@ -827,13 +866,13 @@ object Scribe {
                         native.label,
                         // Only the ones whose model is actually there:
                         // the engine refuses a language it cannot read.
-                        others.filter { store.installed(translation(it, native)!!) }
-                            .joinToString(",") { it.label },
+                        langs.joinToString(",") { it.label },
                     )
                 }
             }
             result.onSuccess {
                 models = it
+                loadedOthers = langs
                 phase = Phase.Ready
                 // Starts the idle clock: loaded by the keyboard, the app may never have been on screen.
                 lastActive = SystemClock.elapsedRealtime()
@@ -855,6 +894,7 @@ object Scribe {
         if (models == 0L || busy() || dictating) return
         Native.freeModels(models)
         models = 0
+        loadedOthers = emptyList()
         phase = Phase.Unloaded
         Log.i(TAG, "models released")
     }
@@ -1172,6 +1212,9 @@ object Scribe {
                 save(now = true)
                 if (!keepNonSpeech) dropIfWordless(srcs)
                 ScribeService.update(app)
+                // A language changed while this was running is applied
+                // now, which is what "the next recording" means.
+                reloadIfWanted()
             }
         }
     }
@@ -1378,6 +1421,9 @@ object Scribe {
                     ?.let { listOf(Reading(m.text, it)) }
                     ?: emptyList(),
                 translated = if (m.translation.isNullOrBlank()) null else "done",
+                // A stored paragraph with no reading is never getting
+                // one: nothing is listening to it any more.
+                translatable = !m.translation.isNullOrBlank(),
             )
             paragraphs += p
             written[p.id] = m
@@ -1550,6 +1596,11 @@ object Scribe {
                 }
             },
             translated = state?.optString("state")?.takeIf { it.isNotEmpty() },
+            // Whether this engine has a translator at all, asked now
+            // rather than when the paragraph is drawn: the answer
+            // changes between recordings, and a paragraph heard without
+            // one never gets a reading however the settings end up.
+            translatable = translating,
         )
         return withoutCuts(src, p)
     }

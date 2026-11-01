@@ -296,8 +296,9 @@ A paragraph in your own language is shown as it always was — it is
 already in the language you read — as is one the translator gave up on,
 where what was said is better than nothing.
 
-Changing a language reloads the models, which takes a few seconds and
-waits until the current recording is finished.
+Changing a language reloads the models, which takes a few seconds. A
+recording in progress keeps the engine it started with, and the change
+is applied the moment that recording ends.
 
 ## Voice typing keyboard
 
