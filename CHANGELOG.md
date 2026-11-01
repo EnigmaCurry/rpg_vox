@@ -138,6 +138,29 @@ releases.
   interruption; the room goes on afterwards. (*Restart game* is not
   finishing with one, so what it interrupted is still there.)
 
+  **A room keeps the conversations it has had.** *New conversation*
+  closed the one you were having and that was the end of it: it stayed
+  in the database, unreachable. It is the room's history now, and
+  **History** at the head of the conversation is the list — when each
+  was, how much was said, and its opening line, newest first with the
+  live one marked. Open one and you read it as it was, cards and
+  translations and all, with no box to type into: the room has moved
+  on from it, so read-only is what it is rather than a rule about it.
+
+  Reading one is **yours alone**. Nobody else's screen moves, which is
+  the only way it could work — a room where one person looking
+  something up pulled everyone else out of the live conversation would
+  be a room nobody dared look anything up in. Deleting one is the
+  exception: it takes that conversation, everything said in it and
+  every card dealt in it away from everybody, for good, and asks
+  first.
+
+  Conversations are written down with the room that had them, from the
+  moment they start, which is what makes any of this possible. A
+  database from before this keeps each room's *current* conversation;
+  the ones before it can't be told apart by room, so they are left out
+  of every room's history rather than guessed into one.
+
   **The interpreter is yours now, and only there when it is working.**
   It used to be one fader in the room's mixer, shown whenever the room
   was *configured* to interpret and shared by everyone in it -- so

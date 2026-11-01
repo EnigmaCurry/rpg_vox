@@ -121,6 +121,12 @@ pub fn router(rooms: Arc<Rooms>, screen: Arc<Screen>) -> Router {
         .route("/api/door/language", post(door_language))
         .route("/api/door/logout", post(door_logout))
         .route("/api/games/:name/prompt", get(game_prompt))
+        .route("/api/rooms/:room/history", get(history))
+        .route("/api/rooms/:room/history/:id", get(read_conversation))
+        .route(
+            "/api/rooms/:room/history/:id/delete",
+            post(forget_conversation),
+        )
         .route("/room.ws", get(ws))
         .route("/screen.ws", get(screen_ws))
         .route("/healthz", get(|| async { "ok" }))
@@ -360,6 +366,61 @@ async fn game_prompt(
                 .into_response()
         }
         None => (StatusCode::NOT_FOUND, "no such game").into_response(),
+    }
+}
+
+/// A room this person may be in, for the history requests. Resolved
+/// the same way `enter_room` resolves one, so a room that isn't theirs
+/// to walk into isn't theirs to read either.
+fn their_room(app: &App, headers: &HeaderMap, id: &str) -> Option<(Invited, Arc<Room>)> {
+    let who = invited(app, headers)?;
+    let room = app.rooms.find(&who, id)?;
+    Some((who, room))
+}
+
+/// Every conversation a room has had, newest first, with the live one
+/// marked. One person asking about their own screen: nothing here is
+/// sent to the room.
+async fn history(State(app): State<App>, Path(id): Path<String>, headers: HeaderMap) -> Response {
+    let Some((_, room)) = their_room(&app, &headers, &id) else {
+        return (StatusCode::NOT_FOUND, "no such room").into_response();
+    };
+    Json(json!({ "conversations": room.history() })).into_response()
+}
+
+/// One past conversation, to read. Read-only by its nature: nothing
+/// can be said into a conversation the room has moved on from.
+async fn read_conversation(
+    State(app): State<App>,
+    Path((id, conversation)): Path<(String, i64)>,
+    headers: HeaderMap,
+) -> Response {
+    let Some((_, room)) = their_room(&app, &headers, &id) else {
+        return (StatusCode::NOT_FOUND, "no such room").into_response();
+    };
+    match room.read_conversation(conversation) {
+        Some(v) => Json(v).into_response(),
+        None => (StatusCode::NOT_FOUND, "no such conversation").into_response(),
+    }
+}
+
+/// Delete one, and everything said and dealt in it. A POST and not a
+/// DELETE so it goes through the same same-site cookie as everything
+/// else here does.
+async fn forget_conversation(
+    State(app): State<App>,
+    Path((id, conversation)): Path<(String, i64)>,
+    headers: HeaderMap,
+) -> Response {
+    let Some((who, room)) = their_room(&app, &headers, &id) else {
+        return (StatusCode::NOT_FOUND, "no such room").into_response();
+    };
+    match room.forget_conversation(conversation) {
+        Ok(()) => {
+            info!(person = %who.name, room = %id, conversation, "deleted a conversation");
+            Json(json!({ "conversations": room.history() })).into_response()
+        }
+        Err(why) => (StatusCode::CONFLICT, Json(json!({ "error": why }))).into_response(),
     }
 }
 

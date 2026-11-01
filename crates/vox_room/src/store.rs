@@ -6,7 +6,7 @@
 //! entries(conversation, id, who, kind, title, text, cut, typed, translations, at)
 //! settings(key, value)                 -- `ROOM:key` for one room's own
 //! games(name, summary, prompt, settings, created, played)  -- names unique, ignoring case
-//! conversations(id, game)                 -- no row: the lobby
+//! conversations(id, room, game, at)       -- a room's history
 //! cards(conversation, id, who, title, body, at)  -- the cards one person holds
 //! ```
 //!
@@ -89,9 +89,18 @@ CREATE TABLE IF NOT EXISTS games (
     -- The game's own settings, as JSON; see room::GameSettings.
     settings TEXT NOT NULL DEFAULT '{}'
 );
+-- A conversation a room has had. One row each, from the moment it is
+-- started: a room's history is the rows with its name on them, and a
+-- conversation with no room on it is one nobody can safely show.
 CREATE TABLE IF NOT EXISTS conversations (
     id   INTEGER PRIMARY KEY,
-    game TEXT NOT NULL
+    -- The room it belongs to. Empty only for a row left by a database
+    -- written before conversations knew.
+    room TEXT NOT NULL DEFAULT '',
+    game TEXT NOT NULL,
+    -- When it was started, in unix milliseconds. Zero on an old row,
+    -- and then the first thing said in it stands in for it.
+    at   INTEGER NOT NULL DEFAULT 0
 );
 -- A card the AI dealt to one person. Only they are ever sent it, and it
 -- belongs to the conversation it was dealt in.
@@ -125,6 +134,21 @@ pub struct Game {
     /// How the game wants the room run. Unlike the prompt, the browsers
     /// see this: it is the room's behaviour, not the game's secrets.
     pub settings: GameSettings,
+}
+
+/// One conversation a room has had, for its history.
+#[derive(Debug, Clone, serde::Serialize, PartialEq)]
+pub struct Conversation {
+    pub id: i64,
+    /// The game it was played under, if it was one.
+    pub game: Option<String>,
+    /// Unix milliseconds. Zero when nothing was ever said in it and
+    /// the row is old enough not to have been stamped.
+    pub at: u64,
+    /// How much was said in it.
+    pub lines: usize,
+    /// The first thing anybody said, for telling one from another.
+    pub opening: String,
 }
 
 /// Somebody invited to the room.
@@ -392,6 +416,7 @@ impl Store {
             return Ok(id);
         }
         let id = self.claim_conversation()?;
+        self.record_conversation(id, None)?;
         self.set_setting("conversation", &id.to_string())?;
         Ok(id)
     }
@@ -400,14 +425,76 @@ impl Store {
     /// `game`. The old one stays in the database.
     pub fn new_conversation(&self, game: Option<&str>) -> Result<i64> {
         let next = self.claim_conversation()?;
+        self.record_conversation(next, game)?;
         self.set_setting("conversation", &next.to_string())?;
-        if let Some(g) = game {
-            self.db.execute(
-                "INSERT OR REPLACE INTO conversations (id, game) VALUES (?1, ?2)",
-                params![next, g],
-            )?;
-        }
         Ok(next)
+    }
+
+    /// Write down that this room is having conversation `id`, from now.
+    /// Every conversation, not only a game's: a room's history is the
+    /// rows with its name on them, and one that was never written down
+    /// is one the room can never show you again.
+    fn record_conversation(&self, id: i64, game: Option<&str>) -> Result<()> {
+        self.db.execute(
+            "INSERT INTO conversations (id, room, game, at) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(id) DO UPDATE SET room = excluded.room, game = excluded.game",
+            params![id, self.room, game.unwrap_or_default(), now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// Which room conversation `id` belongs to, if any room does. What
+    /// says whether somebody may read it: a room you can be in is a
+    /// conversation you can be shown.
+    pub fn conversation_room(&self, id: i64) -> Result<Option<String>> {
+        Ok(self
+            .db
+            .query_row("SELECT room FROM conversations WHERE id = ?1", [id], |r| {
+                r.get::<_, String>(0)
+            })
+            .optional()?
+            .filter(|room| !room.is_empty()))
+    }
+
+    /// Every conversation this room has had, newest first.
+    pub fn history(&self) -> Result<Vec<Conversation>> {
+        let mut q = self.db.prepare(
+            "SELECT c.id, c.game,
+                    COALESCE(NULLIF(c.at, 0),
+                             (SELECT MIN(at) FROM entries e WHERE e.conversation = c.id),
+                             0) AS at,
+                    (SELECT COUNT(*) FROM entries e WHERE e.conversation = c.id) AS lines,
+                    COALESCE((SELECT e.text FROM entries e
+                               WHERE e.conversation = c.id
+                                 AND e.kind IN ('human', 'agent')
+                                 AND trim(e.text) <> ''
+                               ORDER BY e.at, e.id LIMIT 1), '') AS opening
+               FROM conversations c
+              WHERE c.room = ?1
+              ORDER BY at DESC, c.id DESC",
+        )?;
+        let rows = q.query_map([&self.room], |r| {
+            Ok(Conversation {
+                id: r.get(0)?,
+                game: Some(r.get::<_, String>(1)?).filter(|g| !g.is_empty()),
+                at: r.get::<_, i64>(2)? as u64,
+                lines: r.get::<_, i64>(3)? as usize,
+                opening: r.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Forget a conversation: everything said in it, every card dealt
+    /// in it, and the row that says the room ever had it.
+    pub fn forget_conversation(&self, id: i64) -> Result<()> {
+        self.db
+            .execute("DELETE FROM entries WHERE conversation = ?1", [id])?;
+        self.db
+            .execute("DELETE FROM cards WHERE conversation = ?1", [id])?;
+        self.db
+            .execute("DELETE FROM conversations WHERE id = ?1", [id])?;
+        Ok(())
     }
 
     /// The next unused conversation number. Counted for the whole
@@ -463,15 +550,21 @@ impl Store {
     }
 
     /// The game `conversation` plays, if any.
+    ///
+    /// Every conversation has a row now, not only a game's, and a row
+    /// with no game on it has an empty string there. An empty game is
+    /// no game: without this the room comes up believing it is playing
+    /// one called "", and goes looking for it.
     pub fn conversation_game(&self, conversation: i64) -> Result<Option<String>> {
         Ok(self
             .db
             .query_row(
                 "SELECT game FROM conversations WHERE id = ?1",
                 [conversation],
-                |r| r.get(0),
+                |r| r.get::<_, String>(0),
             )
-            .optional()?)
+            .optional()?
+            .filter(|game| !game.is_empty()))
     }
 
     /// Every saved game, newest first.
@@ -674,6 +767,13 @@ impl Store {
     }
 }
 
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 fn invited_row(r: &rusqlite::Row) -> rusqlite::Result<Invited> {
     let name: String = r.get(0)?;
     let display: String = r.get(1)?;
@@ -743,6 +843,28 @@ fn migrate(db: &Connection) -> Result<()> {
         db.execute_batch(
             "ALTER TABLE entries ADD COLUMN typed INTEGER NOT NULL DEFAULT 0;
              ALTER TABLE entries ADD COLUMN translations TEXT NOT NULL DEFAULT '{}';",
+        )?;
+    }
+    // Conversations didn't know which room they belonged to, and only a
+    // game's was written down at all. What can be worked out is each
+    // room's *current* one, which the settings name; the ones before it
+    // can't be attributed to a room and so are left out of every
+    // room's history rather than guessed into one.
+    if !has_column(db, "conversations", "room")? {
+        db.execute_batch(
+            "ALTER TABLE conversations ADD COLUMN room TEXT NOT NULL DEFAULT '';
+             ALTER TABLE conversations ADD COLUMN at INTEGER NOT NULL DEFAULT 0;
+             INSERT OR IGNORE INTO conversations (id, room, game, at)
+                 SELECT CAST(value AS INTEGER),
+                        substr(key, 1, length(key) - length(':conversation')),
+                        '', 0
+                   FROM settings WHERE key LIKE '%:conversation';
+             UPDATE conversations SET room = COALESCE((
+                     SELECT substr(s.key, 1, length(s.key) - length(':conversation'))
+                       FROM settings s
+                      WHERE s.key LIKE '%:conversation'
+                        AND CAST(s.value AS INTEGER) = conversations.id), '')
+               WHERE room = '';",
         )?;
     }
     Ok(())
@@ -926,6 +1048,87 @@ mod tests {
         // The invite list is everybody's.
         assert_eq!(studio.people().unwrap().len(), 1);
         assert_eq!(lounge.people().unwrap().len(), 1);
+    }
+
+    /// A room keeps what it has said. Every conversation is written
+    /// down from the moment it starts, with the room's name on it, so
+    /// the room can show it again -- and one with no game on it is not
+    /// a conversation playing a game called "".
+    #[test]
+    fn a_room_keeps_the_conversations_it_has_had() {
+        let scratch = Scratch::new("history");
+        let lounge = scratch.open("Lounge");
+        let studio = scratch.open("Studio");
+
+        let first = lounge.conversation().unwrap();
+        assert_eq!(
+            lounge.conversation_game(first).unwrap(),
+            None,
+            "an empty game is no game"
+        );
+        let e = |id: &str, text: &str| Entry {
+            id: id.into(),
+            who: "Ryan".into(),
+            kind: Kind::Human,
+            title: String::new(),
+            text: text.into(),
+            live: false,
+            partial: false,
+            cut: false,
+            typed: false,
+            translations: BTreeMap::new(),
+            at: 10,
+            sent: true,
+        };
+        lounge
+            .put_entry(first, &e("a", "the first conversation"))
+            .unwrap();
+
+        // A new one closes the old; both are the room's, newest first.
+        let second = lounge.new_conversation(None).unwrap();
+        lounge.put_entry(second, &e("b", "the second")).unwrap();
+        let history = lounge.history().unwrap();
+        assert_eq!(
+            history.iter().map(|c| c.id).collect::<Vec<_>>(),
+            [second, first]
+        );
+        assert_eq!(history[1].opening, "the first conversation");
+        assert_eq!(history[1].lines, 1);
+        assert!(history[0].at > 0, "stamped when it was started");
+
+        // A game is one of them, and says so.
+        let game = lounge.new_conversation(Some("Quick Draw")).unwrap();
+        assert_eq!(
+            lounge.conversation_game(game).unwrap().as_deref(),
+            Some("Quick Draw")
+        );
+        assert_eq!(
+            lounge.history().unwrap()[0].game.as_deref(),
+            Some("Quick Draw")
+        );
+
+        // Another room's history is its own, and so is the question of
+        // whose a conversation is.
+        studio.conversation().unwrap();
+        assert_eq!(studio.history().unwrap().len(), 1);
+        assert_eq!(
+            lounge.conversation_room(first).unwrap().as_deref(),
+            Some("Lounge")
+        );
+
+        // Forgetting one takes everything said in it with it.
+        lounge.forget_conversation(first).unwrap();
+        assert!(lounge.entries(first, 10).unwrap().is_empty());
+        assert_eq!(lounge.conversation_room(first).unwrap(), None);
+        assert_eq!(
+            lounge
+                .history()
+                .unwrap()
+                .iter()
+                .map(|c| c.id)
+                .collect::<Vec<_>>(),
+            [game, second]
+        );
     }
 
     /// A database from when the server was one room: what was the whole

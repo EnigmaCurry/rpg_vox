@@ -140,6 +140,34 @@ ended up in rather than sitting there broken.
 An invite link lands in the lobby rather than at `/`: coming in on an
 invite is coming in to be with people.
 
+### What a room has said before
+
+**New conversation** closes the one the room is having and starts a
+blank one. The old one isn't thrown away — it becomes part of that
+room's history, and **History**, at the head of the conversation, is
+the list of them: when each was, how much was said, and the first
+thing anybody said in it, newest first with the live one marked
+**now**.
+
+Open one and you read it exactly as it was, with the translations and
+the cards that were in it. It is **read-only**, and not by a rule: the
+room has moved on from it, so there is nowhere for anything you said
+to go, and the box you would have typed into isn't there. **Back to
+the conversation** returns you to the live one.
+
+**Reading is yours alone.** Nobody else's screen moves when you open
+an old conversation, which is the only way it could work: a room where
+one person looking something up pulled everyone else out of the
+conversation they were having would be a room nobody dared look
+anything up in. The one thing in there that *is* the room's is the
+**×** beside each: deleting takes that conversation, everything said
+in it and every card dealt in it away from everybody, for good, and
+asks first. The live one has no **×** — it is the room, not an archive
+of it.
+
+Each room's history is its own, and a conversation can only be read
+from the room that had it.
+
 ### A game is something a room does
 
 A game is played **in a room**, by the people in that room, and while
@@ -230,6 +258,9 @@ See ROOM_DOCKER.md.
   narrow screen one area shows at a time, with a switch above it —
   **Conversation**, **Just for you** (with a count, and only while you
   hold a card), **Rooms**.
+- **History**, at the head of the conversation: the ones this room has
+  had before, to read. See [What a room has said
+  before](#what-a-room-has-said-before).
 - **Answers: when named / when it fits / every pause**, under the AI's
   own strip in the room list: who gets the turn when the room goes
   quiet. It is that bot's setting in that room — the same AI answers

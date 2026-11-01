@@ -90,6 +90,17 @@ export const room = $state({
   // conversation), and every saved game.
   game: null,
   games: [],
+  // The room's past conversations, once you have asked for them:
+  // [{ id, at, game, lines, opening, live }]. Null until you do.
+  // Fetched rather than pushed, because it is your own screen: see
+  // `reading`.
+  history: null,
+  // A conversation of this room's you are reading, or null for the one
+  // the room is having now. Yours alone — an old conversation can't be
+  // spoken into, so opening one changes nothing for anybody else, and a
+  // room where one person opening the archive pulled everyone out of
+  // the live conversation would be a room nobody dared open it in.
+  reading: null,
   notice: null,
   // A question waiting for the user's answer: { text, yes, resolve }.
   asking: null,
@@ -310,6 +321,59 @@ export function answer(ok) {
   a?.resolve(ok);
 }
 
+const roomPath = () => `/api/rooms/${encodeURIComponent(room.where)}/history`;
+
+/// Every conversation this room has had, newest first.
+export async function loadHistory() {
+  try {
+    const r = await fetch(roomPath());
+    if (!r.ok) throw new Error(await r.text());
+    room.history = (await r.json()).conversations;
+  } catch (e) {
+    console.error('[room] history', e);
+    notify(`Can't read this room's history: ${e.message || e}`, true);
+  }
+}
+
+/// Open one of them, to read. The live one is not read: it is the one
+/// already on screen, and going "back" to it is leaving this.
+export async function readConversation(id) {
+  if (room.history?.find((c) => c.id === id)?.live) return backToNow();
+  try {
+    const r = await fetch(`${roomPath()}/${id}`);
+    if (!r.ok) throw new Error(await r.text());
+    room.reading = await r.json();
+  } catch (e) {
+    console.error('[room] read', e);
+    notify(`Can't open that conversation: ${e.message || e}`, true);
+  }
+}
+
+/// Back to the one the room is having now.
+export function backToNow() {
+  room.reading = null;
+}
+
+/// Delete one for good, for everybody. The only thing here that takes
+/// something away from the room rather than from your own screen, so
+/// it asks first.
+export async function forgetConversation(id) {
+  if (!(await ask(
+    'Delete this conversation for good? Everything said in it, and every card dealt in it, goes — for everyone, and it cannot be undone.',
+    'Delete',
+  ))) return;
+  try {
+    const r = await fetch(`${roomPath()}/${id}/delete`, { method: 'POST' });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(d.error || r.statusText);
+    room.history = d.conversations;
+    if (room.reading?.id === id) backToNow();
+  } catch (e) {
+    console.error('[room] delete', e);
+    notify(`Can't delete that conversation: ${e.message || e}`, true);
+  }
+}
+
 /// Fetch a game's hidden prompt, for this person only.
 export async function peekGame(name) {
   try {
@@ -460,6 +524,10 @@ function apply(ev) {
         command({ type: 'ptt', on: room.pushToTalk });
         command({ type: 'mute', on: room.muted });
         command({ type: 'interpreter', ...room.myInterpreter });
+        // Another room's history is not this one's, and you arrive in
+        // the conversation it is having now.
+        room.history = null;
+        room.reading = null;
       }
       // Whatever was being shared belonged to the room just left.
       if (moved) screenMoved();
@@ -496,6 +564,9 @@ function apply(ev) {
       room.heard[ev.id] = ev.of;
       break;
     case 'reset':
+      // The room has moved on, so the list of what it has had is out
+      // of date; it is re-read next time somebody opens it.
+      room.history = null;
       room.log = ev.log;
       room.heard = {};
       room.game = ev.game ?? null;

@@ -772,6 +772,84 @@ impl Room {
         self.lock().game.clone()
     }
 
+    // -- the room's history ------------------------------------------
+    //
+    // Every conversation this room has had, the live one included and
+    // marked. Reading one is a thing one person does on their own
+    // screen: an old conversation can't be spoken into, so looking at
+    // it changes nothing for anybody, and a room where one person
+    // opening the archive dragged everyone else out of the live
+    // conversation would be a room nobody dared open it in.
+
+    /// Every conversation this room has had, newest first.
+    pub fn history(&self) -> Vec<Value> {
+        let live = self.lock().conversation;
+        self.store()
+            .history()
+            .unwrap_or_else(|err| {
+                warn!("read the room's history: {err:#}");
+                Vec::new()
+            })
+            .into_iter()
+            .map(|c| {
+                let mut v = serde_json::to_value(&c).unwrap_or_else(|_| json!({}));
+                // The one being had now: not an archive, and not
+                // something anybody can delete out from under the room.
+                v["live"] = Value::Bool(c.id == live);
+                v
+            })
+            .collect()
+    }
+
+    /// One of this room's past conversations, to read. None when it
+    /// isn't this room's: a room you can be in is a conversation you
+    /// can be shown, and that is the whole of the rule.
+    pub fn read_conversation(&self, id: i64) -> Option<Value> {
+        if !self.holds(id) {
+            return None;
+        }
+        let log = self.store().entries(id, LOG_LIMIT).unwrap_or_else(|err| {
+            warn!(conversation = id, "read a conversation: {err:#}");
+            Vec::new()
+        });
+        Some(json!({
+            "id": id,
+            "live": id == self.lock().conversation,
+            "game": self.store().conversation_game(id).ok().flatten(),
+            "log": log,
+        }))
+    }
+
+    /// Forget one of this room's past conversations, and everything
+    /// said and dealt in it. Err says why not.
+    pub fn forget_conversation(&self, id: i64) -> Result<(), String> {
+        if !self.holds(id) {
+            return Err("That conversation isn't this room's.".into());
+        }
+        if id == self.lock().conversation {
+            return Err("That is the conversation you are in.".into());
+        }
+        match self.store().forget_conversation(id) {
+            Ok(()) => {
+                info!(conversation = id, room = %self.cfg.id, "deleted a conversation");
+                Ok(())
+            }
+            Err(err) => {
+                warn!(conversation = id, "delete a conversation: {err:#}");
+                Err("The room couldn't delete that.".into())
+            }
+        }
+    }
+
+    /// Whether conversation `id` is this room's.
+    fn holds(&self, id: i64) -> bool {
+        self.store()
+            .conversation_room(id)
+            .ok()
+            .flatten()
+            .is_some_and(|room| room == self.cfg.id)
+    }
+
     fn lock(&self) -> MutexGuard<'_, State> {
         self.st.lock().expect("room mutex poisoned")
     }

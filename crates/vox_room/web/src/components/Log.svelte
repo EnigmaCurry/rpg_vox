@@ -1,5 +1,6 @@
 <script>
   import { room, sendText, enterGame, peekGame } from '../lib/room.svelte.js';
+  import History from './History.svelte';
   import { hue } from '../lib/color.js';
   import { TYPED_MAX } from '../lib/names.js';
 
@@ -66,22 +67,35 @@
   }
 
   $effect(() => {
-    // Follow new text while the view is at the bottom.
-    room.log.map((e) => e.text).join();
+    // Follow new text while the view is at the bottom. An archive
+    // doesn't grow, so this is about the live conversation; opening one
+    // scrolls to its foot once, which is where it was left.
+    shown.map((e) => e.text).join();
     // And when a reply grows or loses its row of languages, which is a
     // line of height appearing under the last thing said.
-    room.log.map((e) => tracks(e).length).join();
+    shown.map((e) => tracks(e).length).join();
     room.agent.state;
     if (stick && box) queueMicrotask(() => (box.scrollTop = box.scrollHeight));
   });
 
   const time = (ms) => new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+  // What is on screen: the conversation the room is having, or one out
+  // of its history that you have opened. An old one is read-only by its
+  // nature — the room has moved on from it, so there is nothing to say
+  // into — and that is the whole of what read-only means here.
+  const shown = $derived(room.reading?.log ?? room.log);
+  const archived = $derived(!!room.reading);
 </script>
 
 <div class="log" bind:this={box} {onscroll}>
-  {#if room.log.length === 0}
+  <History />
+
+  {#if shown.length === 0}
     <p class="empty">
-      {#if room.game}
+      {#if archived}
+        Nothing was ever said in this one.
+      {:else if room.game}
         Entering <strong>{room.game}</strong>…
       {:else}
         Nothing said yet. Join the audio and start talking; say <strong>{room.agent.name}</strong>
@@ -90,7 +104,7 @@
       {/if}
     </p>
   {/if}
-  {#each room.log as e (e.id)}
+  {#each shown as e (e.id)}
     {#if e.kind === 'game'}
       {@const g = room.games.find((g) => g.name.toLowerCase() === e.text.toLowerCase())}
       <div class="entry agent game-entry">
@@ -188,7 +202,7 @@
     </div>
     {/if}
   {/each}
-  {#if room.agent.state === 'waiting'}
+  {#if !archived && room.agent.state === 'waiting'}
     <div class="entry agent waiting" aria-live="polite">
       <div class="who"><span class="name">{room.agent.name}</span><span class="time">waiting for a pause</span></div>
       <div class="text"><span class="dots"><i></i><i></i><i></i></span></div>
@@ -196,7 +210,10 @@
   {/if}
 
   <!-- Last child of the scroller and stuck to its foot, so the grid
-       above doesn't have to know the conversation has a composer. -->
+       above doesn't have to know the conversation has a composer. None
+       at all on a conversation the room has finished with: there is
+       nowhere for what you typed to go. -->
+  {#if !archived}
   <form class="composer" onsubmit={send}>
     <input
       type="text"
@@ -208,6 +225,7 @@
     />
     <button type="submit" class="primary" disabled={!draft.trim()}>Send</button>
   </form>
+  {/if}
 </div>
 
 <style>
