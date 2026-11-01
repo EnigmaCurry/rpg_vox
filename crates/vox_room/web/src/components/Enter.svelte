@@ -48,7 +48,7 @@
   });
 
   const here = $derived(
-    room.people.filter((p) => p.online && p.name !== room.you).map((p) => p.name),
+    room.people.filter((p) => p.name !== room.you).map((p) => p.name),
   );
   const starting = $derived(room.audio === 'starting');
   // What the room already has against your name, so the door only saves

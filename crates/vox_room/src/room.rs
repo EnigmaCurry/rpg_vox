@@ -892,14 +892,24 @@ impl Room {
             .any(|p| p.online() && self.language_of(p) == language)
     }
 
+    /// Who is in this room: the people with a tab open on it, and
+    /// nobody else.
+    ///
+    /// Not everyone invited. Somebody invited but elsewhere is not in
+    /// this room in any sense a browser can use -- there is nothing of
+    /// theirs to hear and no fader of theirs worth moving -- and a
+    /// roster that listed them greyed out made "away" stand for two
+    /// different things, now that being in another room is the usual
+    /// one. Where they actually are is on the room they are in, which
+    /// says who is there.
     fn people_json(&self, st: &State) -> Value {
         Value::Array(
             st.people
                 .iter()
+                .filter(|(_, p)| p.online())
                 .map(|(name, p)| {
                     json!({
                         "name": name,
-                        "online": p.online(),
                         "mic": p.mic(),
                         "muted": p.muted(),
                         "speaking": p.speaking,
@@ -908,6 +918,28 @@ impl Room {
                 })
                 .collect(),
         )
+    }
+
+    /// What language everyone the room knows speaks and reads, whether
+    /// or not they are in it.
+    ///
+    /// The roster is who is here; this is a lookup table, and the two
+    /// are not the same question. A browser needs it for the
+    /// conversation: a line said by somebody who has since walked out
+    /// still has to be shown in the language of whoever is reading it,
+    /// and the only way to know whether it needs translating is to know
+    /// what it was said in. Sent only by a room with more than one
+    /// language in it, since that is the only room that translates.
+    fn speaks_json(&self, st: &State) -> Option<Value> {
+        if self.cfg.languages.len() < 2 {
+            return None;
+        }
+        Some(Value::Object(
+            st.people
+                .iter()
+                .map(|(name, p)| (name.clone(), Value::from(self.language_of(p))))
+                .collect(),
+        ))
     }
 
     /// Bring the roster back in line with who is actually invited.
@@ -981,7 +1013,11 @@ impl Room {
     }
 
     fn emit_people(&self, st: &State) {
-        self.emit(json!({ "type": "people", "people": self.people_json(st) }));
+        self.emit(json!({
+            "type": "people",
+            "people": self.people_json(st),
+            "speaks": self.speaks_json(st),
+        }));
     }
 
     fn emit_entry(&self, e: &Entry) {
@@ -1018,6 +1054,7 @@ impl Room {
             "engaged": st.engaged.is_some(),
             "locked": st.game_mode.is_some(),
             "people": self.people_json(&st),
+            "speaks": self.speaks_json(&st),
             "languages": self.cfg.languages,
             "strips": self.mixer.strips(),
             "log": st.log,
@@ -3448,6 +3485,44 @@ mod tests {
         r.leave("Sam", 1);
         r.reconcile_people();
         assert_eq!(names(&r), "Alex,Ryan");
+    }
+
+    /// The roster a browser is sent is who is in the room, not everyone
+    /// invited: "away" would otherwise stand for both "gone" and "in
+    /// the Studio", which are not the same thing and not this room's
+    /// to tell apart. What language each of them speaks is a separate
+    /// question with a separate answer, because a line outlives its
+    /// author's standing in the room.
+    #[test]
+    fn the_roster_a_browser_is_sent_is_who_is_in_the_room() {
+        let (r, _turns) = room(Mode::Named);
+        let names = |r: &Room| {
+            let st = r.lock();
+            r.people_json(&st)
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p["name"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert!(names(&r).is_empty(), "invited is not the same as here");
+
+        r.join("Ryan", 1);
+        assert_eq!(names(&r), ["Ryan"]);
+        r.join("Alex", 2);
+        assert_eq!(names(&r), ["Alex", "Ryan"]);
+
+        // Walked out: off the roster, not greyed out on it.
+        r.leave("Alex", 2);
+        assert_eq!(names(&r), ["Ryan"]);
+
+        // But the room still knows what she speaks, because she is in
+        // the conversation whether or not she is in the room.
+        r.set_language("Alex", "Russian").unwrap();
+        let st = r.lock();
+        let speaks = r.speaks_json(&st).expect("two languages here");
+        assert_eq!(speaks["Alex"], "Russian");
+        assert_eq!(speaks["Ryan"], "English", "the room's own, by default");
     }
 
     /// Somebody's own room admits them and nobody else, however many

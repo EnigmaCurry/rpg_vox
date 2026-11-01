@@ -54,7 +54,16 @@ export const room = $state({
   // you don't read is shown as it was said, because no translation of
   // it is coming.
   interprets: false,
+  // Who is in this room, and nobody else: { name, mic, muted, speaking,
+  // language }. Somebody invited but in another room is not on it --
+  // they are on that room's count in `rooms`.
   people: [],
+  // What language everybody the room knows speaks, here or not, by
+  // name. A lookup table rather than a roster: a line in the
+  // conversation outlives its author's standing in the room, and
+  // whether it needs translating for you depends on what it was said
+  // in. Empty in a room with one language, which translates nothing.
+  speaks: {},
   strips: {},
   levels: {},
   log: [],
@@ -354,6 +363,7 @@ function apply(ev) {
       room.locked = ev.locked ?? false;
       room.interprets = ev.interprets ?? false;
       room.people = ev.people;
+      room.speaks = ev.speaks ?? {};
       room.strips = ev.strips;
       room.log = ev.log;
       // A tab that has just arrived is told the room as it stands, and
@@ -389,6 +399,7 @@ function apply(ev) {
       break;
     case 'people':
       room.people = ev.people;
+      room.speaks = ev.speaks ?? {};
       room.lang = languageOf(ev.people, room.you) ?? room.lang;
       break;
     case 'entry':

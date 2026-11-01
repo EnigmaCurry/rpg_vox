@@ -12,8 +12,10 @@
   // for you, and so whether to wait for one.
   const roomLanguage = $derived(room.languages[0] ?? '');
   const mine = $derived(room.lang || roomLanguage);
-  const languageOf = (who) =>
-    room.people.find((p) => p.name === who)?.language || roomLanguage;
+  // Not from the roster: that is who is in the room now, and a line
+  // outlives its author's standing in it. `speaks` is what everybody
+  // the room knows reads and says, here or not.
+  const languageOf = (who) => room.speaks[who] || roomLanguage;
 
   /// An entry that has a translation for you: which language it was
   /// written in, and what it says in yours (`null` while that is still

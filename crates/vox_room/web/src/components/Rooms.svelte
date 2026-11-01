@@ -3,7 +3,7 @@
   import Strip from './Strip.svelte';
 
   // The rooms, down the left, and under the one you are in everybody
-  // who is in it. A list rather than a row of buttons because a server
+  // who is in it -- who is in it, that is, and not everybody invited. A list rather than a row of buttons because a server
   // can hold a great many rooms and they have to stay scannable; a tree
   // because who is in a room belongs to that room, and the room you are
   // in is the only one whose people you have any business mixing.
@@ -18,17 +18,6 @@
     room.rooms.length
       ? room.rooms
       : [{ id: room.where, title: room.title, private: room.alone, here: [] }],
-  );
-
-  // Somebody on this room's roster who is in another room, and which:
-  // the rooms say who is in them, so "away" need not stand for both
-  // "gone" and "two doors down".
-  const elsewhere = $derived(
-    Object.fromEntries(
-      room.rooms
-        .filter((r) => r.id !== room.where)
-        .flatMap((r) => r.here.map((name) => [name, r.title])),
-    ),
   );
 
   /// What the interpreter strip says it is doing. All the way down (or
@@ -65,9 +54,10 @@
              fader belongs to the room it is being heard in. -->
         {#if here}
           <div class="who">
+            <!-- Who is in it, and nobody else: somebody invited but
+                 elsewhere is on the room they are in, with a count. -->
             {#each room.people as p (p.name)}
-              <Strip key={p.name} label={p.name} online={p.online} mic={p.mic} muted={p.muted}
-                speaking={p.speaking} elsewhere={elsewhere[p.name]} />
+              <Strip key={p.name} label={p.name} mic={p.mic} muted={p.muted} speaking={p.speaking} />
             {/each}
             <Strip key={room.agent.strip} label={room.agent.name} agent />
             {#if room.interpreter}

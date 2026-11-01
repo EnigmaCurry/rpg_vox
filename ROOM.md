@@ -97,12 +97,14 @@ it will remember. It is called *You and Vox*, after whatever you called
 the AI.
 
 The faders for the room you are in hang off it in that same list, so
-the mixer is part of the room rather than a panel beside it, and it
-says where people are rather than only that they are gone: a strip
-reads **in Studio** when that is where they went, and **away** only
-when they really have. Sharing a desktop follows the same rule as
-talking — it reaches the room you are in and no other, and it goes with
-you when you leave.
+the mixer is part of the room rather than a panel beside it. **You are
+in a room or you are not**: the list under it is who is there, and
+somebody invited but elsewhere is simply not on it — they are on the
+count beside the room they went to. There is no greyed-out half-presence
+to read, because there is no such state.
+
+Sharing a desktop follows the same rule as talking — it reaches the
+room you are in and no other, and it goes with you when you leave.
 
 Rooms cost a little: each is its own mixer, its own agent and its own
 voices. What they share is everything expensive — the speech-to-text
@@ -152,11 +154,13 @@ See ROOM_DOCKER.md.
 - **The rooms**, down the left: every room you can go to, one line
   each, and pressing one takes you there without the audio stopping.
   See [More than one room](#more-than-one-room). The room you are
-  **in** opens underneath itself into everybody in it — their faders,
-  their meters, their mutes, and the AI's — so the mixer is a branch of
-  the room it mixes rather than a panel of its own. The rooms you are
-  not in stay one line with a count of who is there, because a list
-  that has to hold a great many rooms has to stay a list you can read.
+  **in** opens underneath itself into everybody who is in it — their
+  faders, their meters, their mutes, and the AI's — so the mixer is a
+  branch of the room it mixes rather than a panel of its own. Who is in
+  it, and nobody else: somebody invited but in another room is on that
+  room's count, not greyed out on this one. The rooms you are not in
+  stay one line, because a list that has to hold a great many rooms has
+  to stay a list you can read.
 - **The areas**: the rooms on the left, then what is yours alone, then
   the room's conversation. **Just for you** is only there while you are
   holding something: with no cards it is not an empty column but no

@@ -3,16 +3,36 @@
   import { hue } from '../lib/color.js';
   import { screen, showThumb, streamOf, unwatch, watch } from '../lib/screen.svelte.js';
 
-  // key: the strip's name in the mixer; label: what to show; doing: what
-  // to say it is up to, for a strip that is nobody's microphone; elsewhere:
-  // the room they are in instead of this one, when they are in one.
-  let { key, label, online = true, mic = false, muted = false, speaking = false, agent = false, doing = undefined, elsewhere = undefined } = $props();
+  // One channel of the room's mixer: who it is, how loud they are
+  // coming in, and the fader and mute everyone shares.
+  //
+  // Three tight lines and no card around them. The strips live in the
+  // room list now, under the room they belong to, and a panel of boxed
+  // cards there costs the rooms below it more height than the boxes
+  // were worth: the names already read as a list, and the branch line
+  // beside them already says what they belong to.
+  //
+  // key: the strip's name in the mixer; label: what to show; doing:
+  // what to say it is up to, for a strip that is nobody's microphone.
+  let { key, label, mic = false, muted = false, speaking = false, agent = false, doing = undefined } = $props();
 
   const strip = $derived(room.strips[key] ?? { gain: 1, mute: false });
   const level = $derived(room.levels[key] ?? 0);
   // Meter in dB, -60..0 mapped to 0..100%.
   const pct = $derived(level > 0 ? Math.max(0, Math.min(100, ((20 * Math.log10(level) + 60) / 60) * 100)) : 0);
   const db = $derived(strip.gain > 0 ? `${(20 * Math.log10(strip.gain)).toFixed(1)} dB` : '-∞');
+  // The reading is only shown once the fader has been moved off unity.
+  // At rest it is a number saying nothing, in a column this narrow; the
+  // moment you drag it, it is the thing you are looking for, and it
+  // appears under your thumb.
+  const moved = $derived(Math.abs(strip.gain - 1) > 0.005);
+  // Nothing of theirs is reaching the room: at the door, mic shut, or
+  // muted. They are here, and you can't hear them.
+  const quiet = $derived(!agent && (!mic || muted || strip.mute));
+
+  const state = $derived(
+    doing ?? (agent ? room.agent.state : speaking ? 'talking' : mic && muted ? 'muted' : mic ? 'mic on' : 'no mic'),
+  );
 
   function gain(e) {
     command({ type: 'strip', name: key, gain: Number(e.currentTarget.value) });
@@ -31,14 +51,11 @@
   $effect(() => (thumb && stream ? showThumb(stream.id, thumb) : undefined));
 </script>
 
-<div class="strip" class:offline={!online} class:speaking style="--h: {agent ? 270 : hue(label)}">
+<div class="strip" class:speaking class:quiet style="--h: {agent ? 270 : hue(label)}">
   <div class="top">
-    <span class="dot" title={online ? 'here' : elsewhere ? `in ${elsewhere}` : 'away'}></span>
+    <span class="dot"></span>
     <span class="label">{label}{#if label === room.you}<em>&nbsp;(you)</em>{/if}</span>
-    <!-- "away" is ambiguous on a server with more than one room: it
-         could mean gone, or it could mean they are two doors down. Say
-         which, when the room they are in is one you can see. -->
-    <span class="state">{doing ?? (agent ? room.agent.state : speaking ? 'talking' : mic && muted ? 'muted' : mic ? 'mic on' : online ? 'no mic' : elsewhere ? `in ${elsewhere}` : 'away')}</span>
+    <span class="state">{state}</span>
   </div>
   {#if stream}
     <button class="desktop" class:open onclick={() => (open ? unwatch() : watch(stream.id))}
@@ -50,8 +67,9 @@
   <div class="meter"><div class="fill" style="width: {pct}%"></div></div>
   <div class="controls">
     <input type="range" min="0" max="2" step="0.01" value={strip.gain} oninput={gain}
-      ondblclick={() => command({ type: 'strip', name: key, gain: 1 })} aria-label="{label} level" />
-    <span class="db">{db}</span>
+      ondblclick={() => command({ type: 'strip', name: key, gain: 1 })}
+      title="{label} level — double-click to put it back" aria-label="{label} level" />
+    {#if moved}<span class="db">{db}</span>{/if}
     <button class:on={strip.mute} onclick={mute} aria-pressed={strip.mute}
       title={strip.mute
         ? `Unmute ${label} for everyone`
@@ -62,22 +80,31 @@
 </div>
 
 <style>
-  .strip { border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; background: var(--panel); }
-  .strip.speaking { border-color: hsl(var(--h) 60% 55%); box-shadow: 0 0 0 2px hsl(var(--h) 60% 55% / 25%); }
-  .strip.offline { opacity: 0.55; }
-  .top { display: flex; align-items: center; gap: 8px; }
-  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
-  .strip:not(.offline) .dot { background: var(--ok); }
+  .strip { padding: 4px 4px 5px; border-radius: 7px; }
+  /* Somebody you can't hear: at the door, mic shut, or muted. They are
+     in the room all the same, so they are dimmed rather than moved or
+     dropped. */
+  .strip.quiet { opacity: 0.6; }
+  /* Talking: the row itself lifts, since there is no border left to
+     colour. Enough to catch the eye in a list, not enough to flicker. */
+  .strip.speaking {
+    opacity: 1;
+    background: color-mix(in srgb, hsl(var(--h) 60% 55%) 16%, transparent);
+  }
+  .top { display: flex; align-items: center; gap: 7px; font-size: 14px; line-height: 1.25; }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); flex: none; }
+  .strip:not(.quiet) .dot { background: var(--ok); }
+  .strip.speaking .dot { background: hsl(var(--h) 60% 45%); }
   .label { font-weight: 600; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .label em { font-weight: 400; color: var(--muted); font-style: normal; }
-  .state { font-size: 12px; color: var(--muted); }
+  .state { font-size: 11px; color: var(--muted); flex: none; }
   /* The desktop they are sharing, under their name. A button, because
      the only thing it does is open the picture on this screen. */
   .desktop {
     display: block;
     position: relative;
     width: 100%;
-    margin-top: 8px;
+    margin-top: 6px;
     padding: 0;
     border: 1px solid var(--line);
     border-radius: 6px;
@@ -106,11 +133,11 @@
   }
   .desktop:hover .what, .desktop:focus-visible .what, .desktop.open .what { opacity: 1; }
   @media (prefers-reduced-motion: reduce) { .desktop .what { transition: none; } }
-  .meter { height: 6px; border-radius: 3px; background: var(--line); margin: 8px 0; overflow: hidden; }
+  .meter { height: 3px; border-radius: 2px; background: var(--line); margin: 4px 0; overflow: hidden; }
   .fill { height: 100%; background: var(--meter); transition: width 80ms linear; }
-  .controls { display: flex; align-items: center; gap: 8px; }
-  .controls input { flex: 1; min-width: 0; }
-  .db { font-size: 12px; color: var(--muted); width: 4.5em; text-align: right; font-variant-numeric: tabular-nums; }
-  .controls button { padding: 2px 10px; font-size: 13px; }
+  .controls { display: flex; align-items: center; gap: 7px; }
+  .controls input { flex: 1; min-width: 0; height: 14px; margin: 0; }
+  .db { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .controls button { padding: 1px 8px; font-size: 12px; border-radius: 6px; }
   .controls button.on { background: var(--danger); color: #fff; border-color: var(--danger); }
 </style>

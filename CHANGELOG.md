@@ -125,14 +125,30 @@ releases.
   having to say "Vox" to a room with only the two of you in it is a
   ceremony with no point to it. Change it and it remembers.
 
-  Three smaller things came with it. The mixer says **in Studio** where
-  it used to say "away", because on a server with more than one room
-  "away" far more often means two doors down than gone. A desktop is
-  shared with the room you are in and no other, and the share goes with
-  you when you leave. And the clocks -- the 20 ms mixer frame and the
-  50 ms turn-taking tick -- are the server's now rather than each
-  room's: a thread per room waking fifty times a second to find nobody
-  in it is a poor way to hold an empty room open.
+  **You are in a room or you are not.** The list under a room is who
+  is there, and that is the whole of it: somebody invited but in
+  another room is on that room's count, not greyed out as "away" on
+  this one. The roster used to be everyone invited with a flag, which
+  made "away" stand for two unrelated things — gone, and standing two
+  doors down — and neither of them is a thing this room has any
+  business claiming about a person. What they speak is still known
+  wherever they are, so a line they said before they walked out is
+  still read in your language.
+
+  The strips lost their boxes and a third of their height along the
+  way, since a column that has to hold the rooms as well cannot spend
+  eighty pixels a person. Everything is still there: the meter, the
+  fader, the mute. The decibel reading is the one thing that comes and
+  goes — it appears while the fader is off unity, which is exactly when
+  you are looking for it, and the fader gets its width back the rest of
+  the time.
+
+  Two other things came with all this. A desktop is shared with the
+  room you are in and no other, and the share goes with you when you
+  leave. And the clocks -- the 20 ms mixer frame and the 50 ms
+  turn-taking tick -- are the server's now rather than each room's: a
+  thread per room waking fifty times a second to find nobody in it is a
+  poor way to hold an empty room open.
 
   Each room keeps its conversation, its mode and its faders in the
   database under its own name, so renaming a room starts it fresh and

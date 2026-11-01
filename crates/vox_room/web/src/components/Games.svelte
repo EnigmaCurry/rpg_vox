@@ -27,7 +27,7 @@
     return 'any number of players';
   }
 
-  const here = $derived(room.people.filter((p) => p.online).length);
+  const here = $derived(room.people.length);
 
   function pick(name) {
     open = false;
