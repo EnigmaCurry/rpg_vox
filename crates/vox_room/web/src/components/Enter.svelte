@@ -2,10 +2,9 @@
   import { onMount } from 'svelte';
   import {
     room, joinAudio, setName, logOut, setPushToTalk, loadDevices, watchDevices,
-    setMicDevice, setSpeakerDevice, setLanguage,
+    setMicDevice, setSpeakerDevice, setLanguage, setConsent,
   } from '../lib/room.svelte.js';
   import { supported, canChooseSpeaker } from '../lib/audio.js';
-  import { hue } from '../lib/color.js';
   import { NAME_MAX } from '../lib/names.js';
 
   // The room is voice only, so this stands in front of it until you have
@@ -47,9 +46,6 @@
     return watchDevices();
   });
 
-  const here = $derived(
-    room.people.filter((p) => p.name !== room.you).map((p) => p.name),
-  );
   const starting = $derived(room.audio === 'starting');
   // What the room already has against your name, so the door only saves
   // a language when it is actually a change.
@@ -58,10 +54,13 @@
   );
 </script>
 
-<div class="enter" role="dialog" aria-modal="true" aria-labelledby="enter-title">
+<main class="enter" aria-labelledby="enter-title">
   <div class="card">
-    <p class="eyebrow">{room.game ? 'Playing' : 'Voice room'}</p>
-    <h1 id="enter-title">{room.game ?? 'Voice room'}</h1>
+    <!-- One name, said once. The eyebrow is there to say what the
+         heading is when the heading is a game's name, and in a room
+         with no game on it there is nothing for it to add. -->
+    {#if room.game}<p class="eyebrow">Playing</p>{/if}
+    <h1 id="enter-title">{room.game ?? 'Voice Room'}</h1>
     {#if room.door}
       <p class="hi">Hi, {room.door.name}!</p>
     {:else if room.you}
@@ -74,8 +73,8 @@
       </p>
     {:else}
       <p class="lead">
-        You are entering a voice conference room. Select your device and click
-        <strong>Join Audio</strong> to enter the room.
+        Everyone here is here by ear. Pick your microphone and press
+        <strong>Join Audio</strong> to come in.
         {#if room.door}
           Your link works once: pressing it is what spends it, and this
           browser is remembered from then on.
@@ -146,7 +145,28 @@
         {/if}
       </div>
 
-      <button class="primary join" bind:this={join} onclick={enter} disabled={starting}>
+      <!-- What coming in actually does to you, before you do it. The
+           tick is kept in this browser, so it is asked once; unticking
+           it takes it back, and shuts the door again. -->
+      <div class="consent" class:agreed={room.consented}>
+        <p>
+          Your microphone goes live to everyone else here. What you say is
+          transcribed on this server and written into the conversation —
+          which everyone here reads, and which the room keeps until somebody
+          deletes it. That writing is sent on to the AI, and to the
+          translation and voice services this room is set up to use, which
+          are run by whoever runs it. Your audio itself is not stored.
+        </p>
+        <label>
+          <input type="checkbox" checked={room.consented}
+            onchange={(e) => setConsent(e.currentTarget.checked)} />
+          <span>I agree to be heard, transcribed and passed on this way.</span>
+        </label>
+      </div>
+
+      <button class="primary join" bind:this={join} onclick={enter}
+        disabled={starting || !room.consented}
+        title={room.consented ? undefined : 'Agree above to come in.'}>
         {starting ? 'Starting…' : 'Join Audio'}
       </button>
       {#if room.audioError}
@@ -167,26 +187,10 @@
       </label>
     {/if}
 
-    <!-- Who is in is the room telling you, live. A link not yet spent has
-         no socket to hear it on, so the card says nothing rather than
-         something that was true once. -->
-    {#if !room.door}
-    <p class="who">
-      {#if !room.connected}
-        Connecting to the room…
-      {:else if here.length === 0}
-        Nobody else is here yet.
-      {:else}
-        <span class="dots" aria-hidden="true">
-          {#each here as name (name)}
-            <span class="pip" style="--h: {hue(name)}" title={name}></span>
-          {/each}
-        </span>
-        {here.join(', ')}
-        {here.length === 1 ? 'is' : 'are'} already in.
-      {/if}
-    </p>
-    {/if}
+    <!-- Nothing of the room is said here, and nothing of it is open:
+         the sockets are the room's, and at the door you are not in it.
+         Who is in, what is being said, which rooms there are -- all of
+         it arrives when you come in, and goes when you leave. -->
 
     <!-- The way out of a browser that is signed in. An invite not yet
          spent has nothing to give back. -->
@@ -199,19 +203,18 @@
       </p>
     {/if}
   </div>
-</div>
+</main>
 
 <style>
+  /* A page, not a sheet over one. Until the audio is joined there is
+     nothing behind this to look at: the room is voice, and a
+     conversation you can read but not hear is not being in it. */
   .enter {
-    position: fixed;
-    inset: 0;
-    z-index: 30;
+    height: 100%;
     display: grid;
     place-items: center;
     padding: 24px;
     overflow-y: auto;
-    background: color-mix(in srgb, var(--bg) 82%, transparent);
-    backdrop-filter: blur(6px);
   }
   .card {
     width: min(26em, 100%);
@@ -233,6 +236,20 @@
   .hi { font-size: 15px; font-weight: 600; margin: 0 0 8px; }
   .lead { color: var(--muted); margin: 0 0 18px; }
   .lead strong { color: var(--ink); font-weight: 600; white-space: nowrap; }
+  /* What coming in does to you. Plain and above the button, because it
+     is the thing the button is asking about. */
+  .consent {
+    text-align: left;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 10px 12px;
+    margin-bottom: 14px;
+    background: var(--bg);
+  }
+  .consent.agreed { border-color: color-mix(in srgb, var(--ok) 45%, var(--line)); }
+  .consent p { font-size: 12px; line-height: 1.5; color: var(--muted); margin: 0 0 8px; }
+  .consent label { display: flex; align-items: flex-start; gap: 8px; font-size: 13px; }
+  .consent input { margin: 2px 0 0; flex: none; }
   .devices { display: flex; flex-direction: column; gap: 10px; margin-bottom: 18px; text-align: left; }
   .devices label { display: flex; flex-direction: column; gap: 4px; }
   .devices span { font-size: 12px; color: var(--muted); }
@@ -299,6 +316,4 @@
     padding: 4px 8px;
   }
   .logout:hover { color: var(--danger); }
-  .dots { display: inline-flex; gap: 3px; }
-  .pip { width: 8px; height: 8px; border-radius: 50%; background: hsl(var(--h) 55% 55%); }
 </style>

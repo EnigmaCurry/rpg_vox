@@ -8,7 +8,11 @@
 // belonged to the room just left.
 
 import { RoomAudio, listDevices, onDeviceChange, permitMic } from './audio.js';
-import { connect as connectScreen, moved as screenMoved, stopSharing } from './screen.svelte.js';
+import {
+  connect as connectScreen,
+  disconnect as disconnectScreen,
+  moved as screenMoved,
+} from './screen.svelte.js';
 
 export const room = $state({
   connected: false,
@@ -135,6 +139,11 @@ export const room = $state({
   devicesError: null,
   muted: false,
   volume: 1,
+  // You have agreed to be heard, written down and passed on. Kept in
+  // this browser, because it is this browser's microphone that is about
+  // to be opened; given once, and taken back by unticking it. Without
+  // it there is no joining — see `joinAudio`.
+  consented: readPref('vox_room.consent'),
   // Push to talk: the mic stays muted except while Space (or the talk
   // button) is held.
   pushToTalk: readPref('vox_room.push_to_talk'),
@@ -183,9 +192,15 @@ let hearTimer = null;
 /// /room.ws, and desktop sharing on /screen.ws. Separate connections, so
 /// a burst of video can't delay a 20 ms frame of somebody talking.
 export function open() {
+  if (wanted) return;
+  wanted = true;
   connect();
   connectScreen();
 }
+
+/// Whether the sockets are supposed to be up. A socket that dropped
+/// comes back; one that was shut on the way out to the door does not.
+let wanted = false;
 
 function connect() {
   const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -205,6 +220,8 @@ function connect() {
   };
   ws.onclose = () => {
     room.connected = false;
+    // Shut on purpose: don't crawl back.
+    if (!wanted) return;
     setTimeout(connect, Math.min(500 * 2 ** retry++, 5000));
   };
 }
@@ -278,7 +295,7 @@ async function enterOnInvite() {
     }
     room.you = d.display;
     room.door = null;
-    open();
+    // The sockets are `joinAudio`'s to open, and it is the only caller.
     return true;
   } catch (e) {
     room.doorError = e.message || String(e);
@@ -699,9 +716,22 @@ export async function setLanguage(language) {
   }
 }
 
-/// Join the audio: hear the room, and open the mic.
+/// Agree, or take it back. Taking it back shuts the only way in.
+export function setConsent(on) {
+  room.consented = on;
+  writePref('vox_room.consent', on);
+  if (on) room.doorError = null;
+}
+
+/// Join the audio: open the sockets, hear the room, and open the mic.
 export async function joinAudio() {
   if (audio) return;
+  // The button is disabled without it; this is the door itself, and the
+  // door is the thing that must not open.
+  if (!room.consented) {
+    room.doorError = 'Agree to be heard and written down before coming in.';
+    return;
+  }
   room.audio = 'starting';
   room.audioError = null;
   // First time in on a link: the button is what spends it.
@@ -709,6 +739,10 @@ export async function joinAudio() {
     room.audio = 'off';
     return;
   }
+  // Only now: at the door you are not in the room, and a tab that is
+  // not in the room has no business on its socket -- not on the roster,
+  // not sent the conversation, not counted as being anywhere.
+  open();
   try {
     audio = new RoomAudio((bytes) => {
       if (ws?.readyState === WebSocket.OPEN) ws.send(bytes);
@@ -741,12 +775,11 @@ function resumeAudio() {
 }
 
 export async function leaveAudio() {
-  // Back at the door is out of the room: a desktop shared from behind it
-  // would be one nobody can hear you talk about.
-  stopSharing();
+  // Back at the door is out of the room, and out is out: the sockets go
+  // with the audio. Nobody at the door is on a roster, is sent a
+  // conversation, or is counted as being anywhere.
   removeEventListener('pointerdown', resumeAudio);
   removeEventListener('keydown', resumeAudio);
-  command({ type: 'mic', on: false });
   room.mic = false;
   room.micName = null;
   clearInterval(hearTimer);
@@ -754,6 +787,26 @@ export async function leaveAudio() {
   await audio?.stop();
   audio = null;
   room.audio = 'off';
+  close();
+}
+
+/// Shut both sockets and stay shut. What the room told us goes with
+/// them: none of it is true of somebody standing at the door.
+function close() {
+  disconnectScreen();
+  wanted = false;
+  const old = ws;
+  ws = null;
+  old?.close();
+  room.connected = false;
+  room.people = [];
+  room.log = [];
+  room.history = null;
+  room.reading = null;
+  room.heard = {};
+  room.cards = [];
+  room.rooms = [];
+  room.levels = {};
 }
 
 export function setMuted(m) {

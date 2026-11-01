@@ -1,6 +1,6 @@
 <script>
   import { onMount } from 'svelte';
-  import { room, open, command, ask, answer, whoami, leaveAudio, setMuted, setVolume, setPushToTalk, talk } from './lib/room.svelte.js';
+  import { room, command, ask, answer, whoami, leaveAudio, setMuted, setVolume, setPushToTalk, talk } from './lib/room.svelte.js';
   import { screen, share, stopSharing, supported as canShare } from './lib/screen.svelte.js';
   import Log from './components/Log.svelte';
   import Cards from './components/Cards.svelte';
@@ -25,9 +25,10 @@
     { id: 'room', label: 'Rooms' },
   ]);
 
-  onMount(async () => {
-    if (await whoami()) open();
-  });
+  // Only who this browser is. The sockets wait for Join Audio: a tab at
+  // the door is not in the room, and nothing of the room's is its
+  // business until it is.
+  onMount(whoami);
 
   async function newConversation() {
     const question = room.game
@@ -115,11 +116,13 @@
     <h1>Voice room</h1>
     <p>You need an invite link to come in. Ask whoever runs the room for one.</p>
   </main>
+{:else if room.audio !== 'on'}
+  <!-- The door is the page, not a sheet over the room. Until the audio
+       is joined there is nothing behind it to see: the room is voice,
+       and a conversation you can read but not hear is not being in it. -->
+  <Enter />
 {:else}
-  <!-- Until the audio is joined the room is behind the door: visible,
-       but not to be clicked, tabbed into, or read out. -->
-  <div class="app show-{area}" class:watching={screen.watching != null} class:nocards={!hasCards}
-    inert={room.audio !== 'on'}>
+  <div class="app show-{area}" class:watching={screen.watching != null} class:nocards={!hasCards}>
     <header>
       <!-- The one fixed thing on the screen. Which room you are in is
            in the list on the left, and what the AI is doing is on the
@@ -205,8 +208,6 @@
       {/if}
     </footer>
   </div>
-
-  {#if room.audio !== 'on'}<Enter />{/if}
 {/if}
 
 <style>

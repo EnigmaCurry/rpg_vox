@@ -220,11 +220,25 @@ See ROOM_DOCKER.md.
 ## In the room
 
 - **The door**: the room is voice only, so a tab that hasn't joined the
-  audio sits behind a **Join Audio** card and can't do anything else —
-  everyone in the room is in it by ear. Pick your microphone and speakers
-  there (both are remembered for next time), and push to talk, before you
-  come in. The card also says who is already in. **Leave audio** puts you
-  back at the door. The first time, on an invite link, it says *Hi,
+  audio is **at the door** and nowhere else — a page of its own, with no
+  room behind it. Nothing of the room is there to see and nothing of it
+  is open: the sockets are the room's, and until you come in you are not
+  on a roster, not sent a conversation, and not counted as being
+  anywhere. Everyone in the room is in it by ear, and a conversation you
+  can read but not hear is not being in it.
+
+  Pick your microphone and speakers there (both are remembered for next
+  time), and push to talk, before you come in. **Leave audio** puts you
+  back at the door and takes the sockets with it.
+
+  **Agreeing to be heard.** Coming in means your microphone goes live to
+  everyone else in the room, what you say is transcribed on the server
+  and written into a conversation the room keeps, and that writing is
+  sent on to the AI and to the translation and voice services the
+  operator has configured — all outside the room. The card says so and
+  asks you to agree, and **Join Audio** does nothing until you do. The
+  answer is kept in the browser, so it is asked once; unticking it takes
+  it back and shuts the door again. (The audio itself is never stored.) The first time, on an invite link, it says *Hi,
   Mike* and offers **your name in the room**: that is the name everyone
   sees, the one beside everything you say, and the one the AI deals your
   cards to. Change it there and nowhere else — once the link is spent it

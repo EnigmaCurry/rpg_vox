@@ -63,7 +63,23 @@ let board = null;
 const decoders = new Map();
 let publisher = null;
 
+/// Shut the desktop socket and stay shut. Called when you go back to
+/// the door: the room is voice, and from out there a desktop is a
+/// picture of somewhere you cannot hear.
+export function disconnect() {
+  wanted = false;
+  stopSharing();
+  moved();
+  const old = ws;
+  ws = null;
+  old?.close();
+  screen.connected = false;
+}
+
+let wanted = false;
+
 export function connect() {
+  wanted = true;
   const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
   ws = new WebSocket(`${scheme}://${location.host}/screen.ws`);
   ws.binaryType = 'arraybuffer';
@@ -80,6 +96,8 @@ export function connect() {
   };
   ws.onclose = () => {
     screen.connected = false;
+    // Shut on purpose: don't crawl back.
+    if (!wanted) return;
     // The decoders are of streams that may be gone, or resized, by the
     // time we are back: the server sends a keyframe to start again with.
     for (const d of decoders.values()) close(d);

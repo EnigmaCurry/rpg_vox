@@ -161,6 +161,23 @@ releases.
   the ones before it can't be told apart by room, so they are left out
   of every room's history rather than guessed into one.
 
+  **The door is a page, and coming in is something you agree to.** The
+  Join Audio card used to be a sheet over a blurred room: the
+  conversation was there to read, and the sockets were open, before
+  anybody had joined anything. It is its own page now, with nothing
+  behind it and nothing open — a tab at the door is not on a roster,
+  not sent a conversation, and not counted as being anywhere, and who
+  is in a room is no longer something the door tells you.
+
+  And the card now says what coming in does: your microphone goes live
+  to everyone else, what you say is transcribed and written into a
+  conversation the room keeps, and that writing is sent on to the AI
+  and to the translation and voice services the operator has
+  configured. **Join Audio** does nothing until you agree. The answer
+  is kept in the browser, so it is asked once, and unticking it takes
+  it back. (The audio itself is never stored, and the card says that
+  too.)
+
   **The door's Language box always has a language in it.** It was blank
   for anybody the room already knew: the box's first option carried the
   empty string the room stores for its own language, and what the room
