@@ -1,8 +1,9 @@
 # Changelog
 
-Changes in each release of rpg_vox, scribe, agent and Scribe for
-Android. New entries go under **Unreleased**; `just publish` names that
-section after the version it releases.
+Changes in each release of scribe, Scribe for Android, Scribe for iOS,
+agent, Pi voice, Voice room and rpg_vox. New entries go under
+**Unreleased**; `just publish` names that section after the version it
+releases.
 
 ## Unreleased
 
@@ -396,6 +397,293 @@ section after the version it releases.
   `parakeet-tdt-0.6b-v2` while the library had moved to v3, so a fresh
   install downloaded 487 MB and then failed to load with the file it was
   looking for missing. One side of that rename had been left behind.
+
+### Voice room
+
+- **First release: a voice chat in the browser for a few people and an
+  AI.** Everyone joins with an invite link and a headset, hears everyone
+  else and the AI, and reads one live transcript of who said what. The
+  server mixes on a 20 ms clock and encodes a separate mix-minus for
+  each tab, so nobody hears themselves — Opus over one WebSocket,
+  WebCodecs in the browser. Each person's mic feeds its own
+  `vox_transcribe` engine, which is what lets a line be labelled with
+  who said it. The AI answers through any OpenAI-compatible model and
+  reads its replies aloud with Qwen3-TTS (Kokoro or silent as
+  fallbacks). Talk over it and it drops in volume at once, then is cut
+  once the speech is confirmed: the log keeps only what the mixer
+  actually played, ending in a dash, and the model is told where it was
+  interrupted. No PipeWire, so it runs on macOS and Linux. See
+  [ROOM.md](ROOM.md).
+
+- **Everyone hears the AI in their own language.** `--language-also
+  Russian` puts a **Language** on the door, and the AI writes its reply
+  once, in the room's own `--language`, while a separate voice per
+  language translates and speaks it. Two people are in the same
+  conversation, each hearing the AI in their own language, over one
+  shared transcript; the people are always heard as they are, in their
+  own voices. The choice follows your invite rather than your browser,
+  so it is there on your phone too, and a language nobody has picked
+  costs nothing, since the AI is only translated while somebody is
+  listening in it. Needs `--tts qwen3` — Kokoro only speaks English.
+
+  Three things are stated rather than papered over. **You hear your own
+  language or nothing**: a translation has to be written before it can
+  be spoken, so it starts about three seconds after the original and
+  those seconds are silence rather than the opening of the reply in a
+  language you didn't ask for (measured on a real room: the first
+  English audio at 3.6 s, the same reply's first Russian at 6.3 s).
+  **If you are listening in a translation you cannot talk the AI down**,
+  because you would be stopping it in the middle of something you
+  haven't heard yet — **Stop** still works, a click saying where to cut
+  without guessing. And **you read what you heard**: replies and typed
+  messages appear in your language with a **Show English** link under
+  them for the words they were written in, one language at a time with
+  the other a click away, and which one you are looking at is yours
+  alone.
+
+  The words arrive at the pace of the voice reading them *to you*. A
+  translation is a different number of syllables from the words it
+  translates, so `Reply` keeps a `Vec<Said>` per language and
+  `Mixer::ai_progress` reports every queue rather than only the
+  canonical one. The turn ends when the *last* language has been heard
+  out, not the first — ending it with the English took the rest of the
+  reply away from whoever was still listening to it — and a reply still
+  being spoken carries a bar per language under it, `ENGLISH heard
+  RUSSIAN 2s`, so each side of the room can see it is being waited for
+  rather than that something has stalled. Each voice says for itself
+  when it is done, since an empty queue cannot tell a voice that has
+  finished from one whose next sentence is still being translated.
+  There is a thirty-second backstop with a warning, for the one case it
+  is there for: a voice thread dying would otherwise hold that turn open
+  for ever, and with it every turn after it.
+
+- **People are interpreted too, not only the AI.** What anyone says out
+  loud is said again, by a separate voice, to everybody in the room who
+  doesn't speak it — the way a booth at a conference does it. The
+  per-listener mix became `(everyone - you) - (1 - env) * foreign + ai +
+  interpreter`, so only the voices actually being interpreted duck; the
+  ones you can already follow stay exactly where they were, nothing
+  being said over those. Pass 2 is the trigger, which is the first point
+  there is a finished sentence rather than a guess that is still
+  changing, and puts the interpreter about half a second behind the end
+  of an utterance (45 ms to translate on the CPU, ~390 ms to
+  synthesize). Pass 3 rewrites clips afterwards and is deliberately
+  never spoken again: by then the words have been heard, and nobody can
+  unhear them. One thread per language, each with its own voice, so what
+  was said is heard in the order it was said;
+  `--interpreter-voice` defaults to `ryan` rather than the AI's `aiden`,
+  because the one thing a listener has to be able to tell by ear is
+  which of the two is talking.
+
+  Every language goes through one `@interpreter` strip, and how far the
+  floor drops under it is that fader: `0.2^gain`, a straight line in
+  decibels at about 14 dB of duck per unit. At unity it is the duck that
+  was always there; at the top the interpreted voices drop 28 dB; at
+  nothing there is no duck at all, which is what makes pulling it down
+  *off* rather than a hole in the room. Down means off down to the cost,
+  since the interpreter asks the mixer before paying a voice for
+  anything — but the queues still drain and the reading is untouched,
+  because taking a person's transcript away because somebody else found
+  the voice intrusive is not a trade one slider should make.
+  `--interpret false` is still there for a room that wants none of it.
+
+  An interpreter with more than eight seconds still to say stops paying
+  for a voice and only writes: another sentence on the end of that queue
+  would be heard later still, and the words have been on screen the
+  whole time, so being read in the present beats being heard in the
+  past. The decision is per utterance and per language, so a queue that
+  drains goes back to speaking by itself. Nothing is dropped quietly any
+  more either — a reader given nothing has no way of telling that
+  anything was skipped — so a failed interpretation shows what there is
+  to show: the translation when only the voice failed, and the line as
+  it was actually said when the translating is what failed. What makes
+  an interpreter fall behind is not the translating but having nowhere
+  to put the audio; `the interpreter is behind` and `the interpreter
+  cannot keep up` are those two limits from outside.
+
+- **`--translate local`: the room's translation on this machine.**
+  Marian opus-mt through CTranslate2, about 110 ms a line against the
+  reply model's 1900 ms, and nothing anyone says leaves the process.
+  Both translators sit behind one `Translate` trait, so the room holds
+  an `Arc<dyn Translate>` and neither the voice threads nor the typists
+  know which one they have. A Marian model cannot be *told* anything,
+  which is the one real cost — no "copy this URL through as it stands" —
+  so the trait carries `needs_backticks` and `translate::protect` lifts
+  backticked spans and fences out of a line before the model sees it,
+  putting them back after.
+
+  The tokenizer is the awkward part: SentencePiece and sherpa-onnx each
+  bundle protobuf-lite, and statically linked that is two copies of the
+  same symbols. The image's way out is to not have SentencePiece at all
+  — `tools/spm2tokenizer.py` converts `source.spm` to a pure-Rust
+  `tokenizer.json` in a build stage that has Python for exactly that
+  long, and refuses to write one that splits any of seven probe lines
+  differently from the `.spm`, so a wrong conversion fails the build
+  rather than the room.
+
+- **The AI judges whether a pause is its turn.** "After every pause"
+  became three modes. **When named** is the default and says nothing
+  until the AI is named, so two people can talk without it butting in.
+  **Every pause** answers whenever the room goes quiet, no judgment
+  involved — the cheapest, and what a game that deals the turns wants.
+  In the new middle one, **when it fits**, the room hands the AI the
+  turn with a `Cue::Decide` and it answers or calls `stay_quiet`, so
+  three people can talk with it in the room without it taking every gap
+  between them. A turn it passes on leaves nothing behind at all: no
+  bubble, no "thinking" flashing every 1.2 s. Passing with
+  `ask_again_in_seconds` has the room show it the conversation again if
+  the quiet actually lasts, once per silence so a quiet room can't loop.
+  The decision is the same model that would answer, with a tool to
+  decline, so a pause it takes costs no second round trip and only
+  passes cost a prompt.
+
+  What it is told is the whole of it, and getting that wrong is silent:
+  the note used to presume the answer, so with one person in the room —
+  nobody else they could be talking to — the AI stayed out of that
+  conversation too, and the mode looked broken rather than wrong. It now
+  carries what the room knows and the model cannot guess: who is here,
+  and whether a back-and-forth is already on. There is a live test
+  against the configured endpoint, off by default because it costs what
+  that endpoint costs.
+
+- **Games the AI designs with the players, and cards it deals.** In the
+  lobby the model gets tools to list games, check a name is free, save
+  one once the players have confirmed it, read and revise one nobody has
+  played yet, and start or delete it by voice. A saved game is a card in
+  the chat; entering starts a fresh conversation run by that prompt
+  alone, with the AI opening the scene. The prompt never leaves the
+  server: **Peek** fetches it from `/api/games/NAME/prompt` for the
+  person who asked and never over the room's broadcast.
+
+  The cards are information the AI chose to give one person, so they are
+  the AI's to keep: there is no discard, and dealing a title someone
+  already holds rewrites that card where it sits — a hand that changes
+  as it is played, rather than five copies of "Your hand". `read_cards`
+  gives them back in full, because a long game outruns the conversation
+  the model can still see and a game master who has forgotten who the
+  traitor is cannot run the game. `post_card` is the opposite: one
+  written into the conversation where everyone reads it and it stays,
+  for what the room should be looking at rather than holding in their
+  heads. A posted card cannot be taken back — it is part of what the
+  room has been told, like anything that was said.
+
+  The AI's every word is read aloud, and the prompt used to teach it to
+  say "check your private area", which does not mean in speech what it
+  means on a screen. It has the words now — "Ryan, check your cards" —
+  and a test keeps the other phrasing out.
+
+- **Sharing a desktop.** **Share screen** puts a thumbnail in the mixer
+  — 320 px wide, 2 frames a second, VP8 — which is what makes the mixer
+  live rather than a list of names; the full size is only *encoded*
+  while somebody has it open, the relay telling the sharer's browser
+  whether anybody is looking. The server never decodes any of it. It
+  forwards frames and keeps one rule — a viewer is sent no delta frames
+  until a keyframe has reached them — which is what makes dropping safe:
+  a viewer who falls behind is put back to the next keyframe instead of
+  being shown a torn picture, and that is also how somebody arriving
+  mid-stream fills in. It is a second WebSocket (`/screen.ws`), and the
+  separate connection is the point, a burst of video in the audio
+  socket's send queue being head-of-line blocking applied to speech.
+  What it has not got is WebRTC's congestion control: the rates are
+  fixed, so a still desktop costs little and a bad network degrades
+  without a feedback loop to degrade *gracefully*. Needs WebCodecs
+  video, so the button is only offered where the browser has it.
+
+- **Typing instead of saying it.** A box at the foot of the
+  conversation, for everything speech-to-text is bound to spoil — a URL,
+  a path, a command, an unusual name. What you send appears beside
+  everything said, marked **typed**, and the mark is the point, because a
+  typed line has no recognition error in it. **Typing never
+  interrupts**: starting to type doesn't dip the AI and sending doesn't
+  cut it off, however much you send, since only a voice does that.
+  Messages are flattened to one line and capped at 2000 characters, and
+  that isn't tidiness — the AI is shown the conversation as `Name: what
+  they said` lines, so a message allowed to keep a line break could put
+  words in somebody else's mouth. Unicode's direction overrides and
+  zero-width characters go the same way, for the same reason, and
+  everything else survives exactly as typed, because the punctuation a
+  careless filter eats is what a URL is made of.
+
+- **An invite link works once, and the door is where it is spent.** The
+  link used to *be* the credential: it was the cookie, reusable by
+  anyone it was ever forwarded to, and `uninvite` left every browser
+  already holding one no worse off than before. It is a one-time token
+  now, traded for a cookie of the browser's own when **Join Audio** is
+  pressed, in one `UPDATE ... WHERE used = 0` so two browsers racing the
+  same link can't both win; `uninvite` takes both. Opening the link
+  spends nothing — it goes to the door, which says *Hi, Mike* and offers
+  the name the room will call them by. That name is what the transcript,
+  the strips and the cards are keyed by, which is why the field is only
+  on an unspent invite: changing it later would orphan everything
+  addressed to them. **Log out**, at the foot of the card, hands this
+  browser's cookie back, and only that session goes, so another device
+  stays in. An existing database migrates in place: the old cookie *was*
+  the invite token, so each becomes a session and every browser already
+  in stays in.
+
+- **A door in front of the room, and three areas instead of a sidebar.**
+  Joining the audio was a button in the footer among the mixer controls,
+  easy to miss and easy to sit behind; it is a card in front of the room
+  now, which stays visible but inert until you have joined, so everyone
+  in the room is in it by ear. The microphone, the speakers and push to
+  talk are chosen there — the decisions that belong before you come in —
+  and the card says who is already in. On a wide screen what is yours
+  alone is on the left and the room's conversation on the right, the
+  same size, with the mixer beside them; a narrow one shows one of the
+  three at a time, with a switch above it that counts the cards you are
+  holding. The games left the sidebar for a menu in the top bar, where
+  picking one opens its card: who it is for, how many are here now, how
+  it runs the room, whether it has been played, and **Play**, **Delete**
+  and **Peek**.
+
+- **Push to talk, and muted meaning not heard.** With push to talk on
+  the mic stays muted except while Space or the talk button is held, and
+  stays open 300 ms after release so the last word gets through; the
+  setting is remembered per browser, and one hold is one entry, the room
+  not handing over until it is let go. A mic muted from the bottom bar
+  or the mixer is no longer transcribed or taken for talking over the
+  AI, so the AI coming back through speakers can't interrupt it, and
+  **No headset** turns on the browser's echo cancellation for people
+  playing the room out loud.
+
+- **`--llm-api` and `--reasoning`: it can think and use tools at once.**
+  OpenAI's reasoning models refuse function tools on
+  `/chat/completions` unless the thinking is off, and the room puts
+  tools on every reply for the cards and the games — so every game was
+  being run, and every pause judged, with reasoning switched off.
+  `/responses` takes both, and one request loop now drives either API:
+  the body, the streamed events, the way a tool call comes back and the
+  way its answer goes in. `--llm-api auto` asks `/responses` first and
+  remembers once per run if the endpoint hasn't got one, which is what a
+  local llama.cpp or vLLM will say. The two things that were both called
+  thinking are now apart: `--reasoning none|low|medium|high` is how hard
+  it thinks, whichever API that means, and `--llm-api` is which API
+  (`--think` stays as the old name for `--reasoning medium`, and
+  `VOX_AGENT_THINK` is read by hand now, so an old `.env` setting it to
+  `0` or `no` doesn't stop the room from starting).
+
+- **In Docker.** `docker/` is a self-contained deployment behind
+  Traefik, with the labels interpolated from `docker/.env` and the
+  speech-to-text models downloaded into a volume on first start. It
+  assumes nothing about where the Docker daemon is — everything is a
+  named volume, so a remote context works the same as a local one.
+  `just config` walks `.env.example` and asks about every key,
+  `just install` builds and starts, and `room-invite` / `room-uninvite`
+  / `room-people` run the room's CLI inside the container against the
+  same SQLite file the running room has open. `docker/.env` is
+  deliberately *not* the repository's own. See
+  [ROOM_DOCKER.md](ROOM_DOCKER.md).
+
+### Pi voice
+
+- **First release: a voice conversation with the Pi coding agent.**
+  `pi/scribe-voice.ts` drives `scribe --jsonl --standby` for what you
+  say and `pi/pi-tts.py` for reading the replies aloud, paced to the
+  voice and shown as they are spoken; talking over a reply cuts it off.
+  `just pi` runs it and `just pi-tts-venv` sets up the voice. The voice
+  is Qwen3-TTS through mlx-audio on a Mac, or, with `PI_TTS_URL`, a
+  vllm-omni server (rpg_vox's qwen3-tts stack), which is what makes it
+  work from Linux. See [PI.md](PI.md).
 
 ## v0.1.10 (2026-10-18)
 
