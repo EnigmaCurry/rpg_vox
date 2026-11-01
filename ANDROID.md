@@ -128,7 +128,10 @@ recording so the Pause/Resume and Stop controls can appear there.
 Transcripts are kept as threads. **☰** opens the list, most recent
 first, with **New thread** at the top. Tap a thread to open it, or
 long-press it to rename or delete it. Tapping the title renames the open
-thread. New threads are named with the date and time.
+thread. A new thread is named with today's date, and gains the time
+when you press record — so its name is when you spoke, not when you
+made it. Renaming it, or saying anything in it, settles the name for
+good.
 
 Recording adds to the open thread. While a recording or a file is being
 transcribed, the other threads can't be opened.

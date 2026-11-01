@@ -981,6 +981,14 @@ object Scribe {
         val m = mode
         if (m.phone && consent == null) return
         Playback.stop()
+        // A thread made minutes ago is named for this press, not for the
+        // wait before it: its date gains the time now. Only while the
+        // title is still the app's and nothing has been heard in it yet
+        // (kept audio counts, even when no words came of it).
+        if (thread.autoTitle && paragraphs.isEmpty() && threadAudio.isEmpty()) {
+            threads.stampTitle(thread.id)
+            refreshThreads()
+        }
         recordingMode = m
         sources.clear()
         val rec = if (keepAudio) newRecording() else null
@@ -1356,7 +1364,7 @@ object Scribe {
         if (busy()) return
         sync()
         // An untouched new thread is reused rather than piling up empty ones.
-        if (paragraphs.isEmpty() && isDateTitle(thread.title)) return
+        if (paragraphs.isEmpty() && thread.autoTitle) return
         dropIfEmpty(thread)
         show(threads.create())
     }
@@ -1381,13 +1389,9 @@ object Scribe {
         }
     }
 
-    private val dateTitle = Regex("""\d{4}-\d\d-\d\d \d\d:\d\d""")
-
-    private fun isDateTitle(t: String) = dateTitle.matches(t)
-
-    /** Forget a thread left with nothing in it and its date title. */
+    /** Forget a thread left with nothing in it and a title nobody chose. */
     private fun dropIfEmpty(t: ThreadInfo) {
-        if (t.id != 0L && paragraphs.isEmpty() && isDateTitle(t.title) && threads.messages(t.id).isEmpty() &&
+        if (t.id != 0L && paragraphs.isEmpty() && t.autoTitle && threads.messages(t.id).isEmpty() &&
             threads.audioRows(t.id).isEmpty()
         ) {
             deleteAudio(threads.delete(t.id))

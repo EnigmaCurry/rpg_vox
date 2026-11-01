@@ -7,8 +7,19 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
-/** A thread in the list: [last] is local "YYYY-MM-DD HH:MM" of its latest text (or creation). */
-data class ThreadInfo(val id: Long, val title: String, val last: String, val preview: String, val count: Int)
+/**
+ * A thread in the list: [last] is local "YYYY-MM-DD HH:MM" of its latest
+ * text (or creation). [autoTitle] is a title the app wrote itself and the
+ * user has not touched, so it is still the app's to change.
+ */
+data class ThreadInfo(
+    val id: Long,
+    val title: String,
+    val last: String,
+    val preview: String,
+    val count: Int,
+    val autoTitle: Boolean = false,
+)
 
 /**
  * One stored paragraph. [audio] is the recording it was heard in and
@@ -94,6 +105,14 @@ class ThreadStore(file: File) {
             )""",
         )
         execSQL("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        // Whether the title is still the one the app wrote (another
+        // addition the desktop ignores). Threads from before this column
+        // count as the user's: their titles are left alone.
+        rawQuery("SELECT 1 FROM pragma_table_info('conversations') WHERE name = 'auto_title'", null).use {
+            if (!it.moveToFirst()) {
+                execSQL("ALTER TABLE conversations ADD COLUMN auto_title INTEGER NOT NULL DEFAULT 0")
+            }
+        }
         for (column in listOf("speaker", "audio", "words", "translation", "heard_in")) {
             rawQuery("SELECT 1 FROM pragma_table_info('messages') WHERE name = ?", arrayOf(column)).use {
                 if (!it.moveToFirst()) execSQL("ALTER TABLE messages ADD COLUMN $column TEXT")
@@ -126,15 +145,40 @@ class ThreadStore(file: File) {
         }
     }
 
-    /** A new thread titled [title], or with the local date and time like the desktop's. */
-    fun create(title: String? = null): Long {
-        val t = title ?: SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.ROOT).format(Date())
-        return db.insert("conversations", null, ContentValues().apply { put("title", t) })
-    }
+    /**
+     * A new thread titled [title], or with today's local date — a title
+     * the app owns until the user renames it, so [stampTitle] can finish
+     * it with the time the recording actually started.
+     */
+    fun create(title: String? = null): Long =
+        db.insert("conversations", null, ContentValues().apply {
+            put("title", title ?: localNow("yyyy-MM-dd"))
+            put("auto_title", if (title == null) 1 else 0)
+        })
 
     fun rename(id: Long, title: String) {
-        db.update("conversations", ContentValues().apply { put("title", title) }, "id = ?", arrayOf("$id"))
+        db.update(
+            "conversations",
+            ContentValues().apply { put("title", title); put("auto_title", 0) },
+            "id = ?",
+            arrayOf("$id"),
+        )
     }
+
+    /**
+     * Give [id] the local date and time now, as the desktop titles a
+     * thread — unless its title is the user's, which is never touched.
+     */
+    fun stampTitle(id: Long) {
+        db.update(
+            "conversations",
+            ContentValues().apply { put("title", localNow("yyyy-MM-dd HH:mm")) },
+            "id = ? AND auto_title = 1",
+            arrayOf("$id"),
+        )
+    }
+
+    private fun localNow(pattern: String) = SimpleDateFormat(pattern, Locale.ROOT).format(Date())
 
     /** Delete thread [id]; its audio files, for the caller to remove. */
     fun delete(id: Long): List<String> {
@@ -165,7 +209,7 @@ class ThreadStore(file: File) {
                       -- a language the reader does not read is no preview.
                       (SELECT coalesce(nullif(translation, ''), text) FROM messages
                         WHERE conversation = c.id ORDER BY id DESC LIMIT 1),
-                      count(m.id)
+                      count(m.id), c.auto_title
                FROM conversations c LEFT JOIN messages m ON m.conversation = c.id
                GROUP BY c.id
                ORDER BY coalesce(max(m.at), c.created_at) DESC, c.id DESC""",
@@ -173,7 +217,12 @@ class ThreadStore(file: File) {
         ).use { c ->
             buildList {
                 while (c.moveToNext()) {
-                    add(ThreadInfo(c.getLong(0), c.getString(1), c.getString(2), c.getString(3) ?: "", c.getInt(4)))
+                    add(
+                        ThreadInfo(
+                            c.getLong(0), c.getString(1), c.getString(2), c.getString(3) ?: "",
+                            c.getInt(4), c.getInt(5) != 0,
+                        ),
+                    )
                 }
             }
         }

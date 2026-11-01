@@ -180,6 +180,17 @@ section after the version it releases.
 
 ### Scribe for Android
 
+- **A new thread is named for when you spoke, not when you made it.**
+  Making a thread and then waiting to press record left the title
+  stamped with the wait rather than the recording. A new thread is now
+  named with today's date alone, and gains the time when recording
+  starts -- so long as the title is still the app's and nothing has been
+  heard in the thread yet. The title says whose it is (`auto_title` on
+  `conversations`, which the desktop ignores) instead of being
+  recognised by its shape: renaming a thread hands it over for good, and
+  reusing an untouched new thread rather than piling empty ones up no
+  longer rests on a regular expression matching the date.
+
 - **It reads another language in yours, on the phone.** The translation
   the desktop got is in the app, with CTranslate2 built for the NDK, so
   a paragraph heard in Russian also reads in English with nothing asked
