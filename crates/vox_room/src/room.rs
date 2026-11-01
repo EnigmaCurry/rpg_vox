@@ -536,6 +536,14 @@ struct State {
     ducked: bool,
     /// The AI state last broadcast.
     agent_state: &'static str,
+    /// The conversation to come back to when the game ends: the one the
+    /// room was having when somebody started it. None when no game is
+    /// being played.
+    ///
+    /// A game is a room's conversation put aside, not thrown away. It
+    /// is kept in the database like everything else, so this survives a
+    /// restart in the middle of a game.
+    resume: Option<i64>,
     /// A game the AI started in reply `.0`: entered once that reply has
     /// been heard (or cut off).
     starting: Option<(u64, String)>,
@@ -564,6 +572,21 @@ struct State {
 }
 
 pub struct Room {
+    /// Told when something the *list of rooms* shows about this one has
+    /// changed -- which is the game being played here, since who is in
+    /// it is already announced by the socket that joined or left.
+    ///
+    /// Installed by [`crate::rooms::Rooms`], which is the only thing
+    /// with a list to refresh. It is called with the room's own state
+    /// locked, so what it does must not reach back in here: the one it
+    /// is given only wakes the sockets, which build their own lists
+    /// afterwards and on their own threads.
+    announce: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>,
+    /// The unguessable half of this room's address, for `/room/<link>`.
+    /// Not the room's name: a name is a thing people retype and change
+    /// their minds about, and a link that changed with it would be a
+    /// link somebody had already sent to somebody else.
+    link: String,
     st: Mutex<State>,
     events: broadcast::Sender<Event>,
     pub mixer: Arc<Mixer>,
@@ -640,6 +663,22 @@ impl Room {
     ) -> anyhow::Result<Arc<Self>> {
         let conversation = store.conversation()?;
         let game = store.conversation_game(conversation)?;
+        // Mid-game across a restart: still the game, and still knowing
+        // what it interrupted.
+        let resume = store
+            .setting("resume")?
+            .and_then(|v| v.parse::<i64>().ok())
+            .filter(|_| game.is_some());
+        // Where this room lives, for anyone who wants to link to it.
+        // Made once and kept, so a link outlives a restart.
+        let link = match store.setting("link")? {
+            Some(l) if !l.trim().is_empty() => l,
+            _ => {
+                let l = uuid::Uuid::new_v4().simple().to_string();
+                store.set_setting("link", &l)?;
+                l
+            }
+        };
         let log = store.entries(conversation, LOG_LIMIT)?;
         let chosen = store
             .setting("mode")?
@@ -671,6 +710,8 @@ impl Room {
             .collect();
         let (events, _) = broadcast::channel(EVENT_CAPACITY);
         Ok(Arc::new(Self {
+            announce: std::sync::OnceLock::new(),
+            link,
             st: Mutex::new(State {
                 conversation,
                 game,
@@ -680,6 +721,7 @@ impl Room {
                 chosen,
                 mode: game_mode.unwrap_or(chosen),
                 reply: None,
+                resume,
                 last_change: Instant::now(),
                 quiet_since: Instant::now(),
                 ducked: false,
@@ -705,6 +747,29 @@ impl Room {
 
     pub fn config(&self) -> &RoomConfig {
         &self.cfg
+    }
+
+    pub fn link(&self) -> &str {
+        &self.link
+    }
+
+    /// How to say that the list of rooms should be looked at again.
+    /// See [`Room::announce`] for what the callback may do.
+    pub fn on_change(&self, announce: Box<dyn Fn() + Send + Sync>) {
+        let _ = self.announce.set(announce);
+    }
+
+    fn changed(&self) {
+        if let Some(announce) = self.announce.get() {
+            announce();
+        }
+    }
+
+    /// The game being played here, for the list of rooms: a room with
+    /// a game on is doing something, and the people not in it may as
+    /// well be told what.
+    pub fn game_name(&self) -> Option<String> {
+        self.lock().game.clone()
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -2046,10 +2111,17 @@ impl Room {
     }
 
     /// Clear the log and start a fresh conversation: the game from the
-    /// top when in one, else a fresh lobby.
+    /// top when in one, else a fresh one in this room.
+    ///
+    /// Restarting a game leaves what it interrupted where it is --
+    /// starting the game over is not the same as finishing with it, and
+    /// the room still has a conversation to come back to.
     pub fn new_conversation(&self) {
         let mut st = self.lock();
         let game = st.game.clone();
+        if game.is_none() {
+            self.set_resume(&mut st, None);
+        }
         self.start_conversation(&mut st, game);
     }
 
@@ -2130,13 +2202,40 @@ impl Room {
             warn!("mark played: {err:#}");
         }
         self.emit_games();
+        // What the room was talking about is put aside, not thrown
+        // away: leaving the game picks it up again, mid-sentence if
+        // that is where it was left.
+        if st.game.is_none() {
+            let was = st.conversation;
+            self.set_resume(st, Some(was));
+        }
         self.start_conversation(st, Some(game));
     }
 
-    /// Everyone out of the game, into a fresh lobby.
+    /// Everyone out of the game and back into the conversation the room
+    /// was having when it started -- for everyone in the room at once,
+    /// because the room is one room.
     pub fn lobby(&self) {
         let mut st = self.lock();
-        self.start_conversation(&mut st, None);
+        match st.resume {
+            Some(c) => {
+                self.set_resume(&mut st, None);
+                self.resume_conversation(&mut st, c);
+            }
+            // No game was interrupted to get here: a room that came up
+            // already in one, or one whose conversation has gone.
+            None => self.start_conversation(&mut st, None),
+        }
+    }
+
+    /// Remember (or forget) the conversation to come back to. Written
+    /// down, so a restart in the middle of a game still knows.
+    fn set_resume(&self, st: &mut State, conversation: Option<i64>) {
+        st.resume = conversation;
+        let value = conversation.map(|c| c.to_string()).unwrap_or_default();
+        if let Err(err) = self.store().set_setting("resume", &value) {
+            warn!("remember what the game interrupted: {err:#}");
+        }
     }
 
     pub fn delete_game(&self, name: &str) {
@@ -2146,9 +2245,7 @@ impl Room {
             .as_deref()
             .is_some_and(|g| g.eq_ignore_ascii_case(name))
         {
-            self.error(&format!(
-                "{name} is being played: go back to the lobby first."
-            ));
+            self.error(&format!("{name} is being played: leave the game first."));
             return;
         }
         match self.store().delete_game(name) {
@@ -2159,18 +2256,54 @@ impl Room {
         self.emit_games();
     }
 
+    /// A brand new conversation here, in the lobby or playing `game`.
     fn start_conversation(&self, st: &mut State, game: Option<String>) {
+        // Bound to a name first, and deliberately: the guard a
+        // `match self.store()...` scrutinee makes is held for the whole
+        // match, arms and all, and the arm below goes back to the store
+        // -- which is the same mutex, and not one that can be taken
+        // twice. Every call out of here wants the store free.
+        let started = self.store().new_conversation(game.as_deref());
+        match started {
+            Ok(c) => self.enter_conversation(st, c, game, Vec::new()),
+            Err(err) => self.error(&format!("Can't start a new conversation: {err:#}")),
+        }
+    }
+
+    /// Back into a conversation this room was having before, with
+    /// everything that was said in it and everything that was dealt.
+    fn resume_conversation(&self, st: &mut State, conversation: i64) {
+        let game = self
+            .store()
+            .conversation_game(conversation)
+            .unwrap_or_else(|err| {
+                warn!("read the conversation to come back to: {err:#}");
+                None
+            });
+        let log = self
+            .store()
+            .entries(conversation, LOG_LIMIT)
+            .unwrap_or_else(|err| {
+                warn!("read the log to come back to: {err:#}");
+                Vec::new()
+            });
+        info!(conversation, entries = log.len(), "back out of the game");
+        self.enter_conversation(st, conversation, game, log);
+    }
+
+    /// Move the room into `conversation`, whatever it was doing before.
+    fn enter_conversation(
+        &self,
+        st: &mut State,
+        conversation: i64,
+        game: Option<String>,
+        log: Vec<Entry>,
+    ) {
         st.starting = None;
         st.reconsider = None;
         self.cut_reply(st);
-        match self.store().new_conversation(game.as_deref()) {
-            Ok(c) => st.conversation = c,
-            Err(err) => {
-                self.error(&format!("Can't start a new conversation: {err:#}"));
-                return;
-            }
-        }
-        st.log.clear();
+        st.conversation = conversation;
+        st.log = log;
         // A game may require its own mode for as long as it is played;
         // leaving it puts the room back the way the people had it.
         st.game_mode = game
@@ -2187,12 +2320,32 @@ impl Room {
         }
         // Anything said before the switch belongs to the old conversation.
         st.last_change = Instant::now();
-        // Cards belong to the conversation they were dealt in, so a fresh
-        // one leaves everyone holding nothing.
-        self.emit(json!({ "type": "reset", "log": [], "cards": [], "game": st.game }));
-        if st.game.is_some() {
+        // Cards belong to the conversation they were dealt in, so each
+        // person is told the switch with their own: nothing in a fresh
+        // conversation, and whatever they were holding in one the room
+        // is coming back to.
+        let names: Vec<String> = st.people.keys().cloned().collect();
+        for name in names {
+            let cards = self.cards_for(st, &name);
+            self.emit_to(
+                &name,
+                json!({
+                    "type": "reset",
+                    "log": st.log,
+                    "cards": cards,
+                    "game": st.game,
+                }),
+            );
+        }
+        // A room that has started or finished a game is doing something
+        // different, and the people not in it are looking at a list that
+        // says what each room is up to.
+        self.changed();
+        if st.game.is_some() && st.log.is_empty() {
             // A game opens with the AI setting the scene, whatever the
-            // room's mode: nobody can have asked for it yet.
+            // room's mode: nobody can have asked for it yet. Only a game
+            // that is actually starting, though -- one being picked up
+            // again has already been opened.
             self.ask(st, Instant::now(), Cue::Speak);
         }
     }
@@ -4679,6 +4832,96 @@ mod tests {
         let t = turns.try_recv().expect("the AI opens the game");
         assert_eq!(t.game.unwrap().1, "Run a showdown.");
         assert!(r.start_game(t.generation, "nope").is_err());
+    }
+
+    /// A game is the room's conversation put aside, not thrown away:
+    /// leaving it picks the conversation back up, for everyone in the
+    /// room at once, with what was said and what was dealt still there.
+    #[test]
+    fn leaving_a_game_puts_the_room_back_where_it_was() {
+        let (r, turns) = room(Mode::Named);
+        let g = r.generation.load(Ordering::SeqCst);
+        r.save_game(
+            g,
+            "Quick Draw",
+            "A showdown.",
+            "Run a showdown.",
+            lobby_game(),
+        )
+        .unwrap();
+
+        // Something said in the room, and a card dealt in it.
+        r.on_paragraph("Ryan", &para("p1", "Before the game.", false));
+        r.tick(quiet(&r));
+        let _ = turns.try_recv();
+        r.send_card("Ryan", "Your hand", "Two aces.").unwrap();
+        let before = r.lock().conversation;
+        // The card the AI posted when it saved the game is in the
+        // conversation too, as anything said in it is.
+        let was = ["Quick Draw", "Before the game."];
+        assert_eq!(said(&r), was);
+        assert_eq!(held(&r, "Ryan"), ["Your hand: Two aces."]);
+
+        // Into the game: a conversation of its own, and nothing held.
+        r.enter_game("Quick Draw");
+        let playing = r.lock().conversation;
+        assert_ne!(playing, before, "a game is its own conversation");
+        assert_eq!(r.lock().game.as_deref(), Some("Quick Draw"));
+        // Nothing of the room's own conversation in it. (What is in it
+        // is the AI's entry for the reply it opens the game with, which
+        // is why this isn't a test for an empty log.)
+        assert!(
+            !said(&r).iter().any(|t| t.contains("Before")),
+            "the game starts clean"
+        );
+        assert!(
+            held(&r, "Ryan").is_empty(),
+            "cards belong to a conversation"
+        );
+        assert!(turns.try_recv().is_ok(), "and the AI opens it");
+
+        // Something said in the game, so there is a second conversation
+        // with something of its own in it.
+        r.on_paragraph("Ryan", &para("p2", "During the game.", false));
+        r.tick(quiet(&r));
+        let _ = turns.try_recv();
+
+        // Out of the game: back exactly where the room was.
+        r.lobby();
+        assert_eq!(r.lock().conversation, before, "the one it interrupted");
+        assert_eq!(r.lock().game, None);
+        assert_eq!(said(&r), was, "and everything that was said in it");
+        assert_eq!(
+            held(&r, "Ryan"),
+            ["Your hand: Two aces."],
+            "and what was dealt"
+        );
+        assert!(
+            turns.try_recv().is_err(),
+            "coming back is not something the AI has to answer"
+        );
+
+        // The game's own conversation is still in the database, and
+        // entering it again starts it over rather than reopening it.
+        r.enter_game("Quick Draw");
+        assert_ne!(r.lock().conversation, playing);
+        assert!(
+            !said(&r).iter().any(|t| t.contains("During")),
+            "not where it left off"
+        );
+
+        // Restarting a game is not finishing with it: what it
+        // interrupted is still there to come back to.
+        r.new_conversation();
+        assert_eq!(r.lock().game.as_deref(), Some("Quick Draw"));
+        r.lobby();
+        assert_eq!(r.lock().conversation, before);
+        assert_eq!(said(&r), was);
+    }
+
+    /// What the room has on screen, in order.
+    fn said(r: &Room) -> Vec<String> {
+        r.lock().log.iter().map(|e| e.text.clone()).collect()
     }
 
     #[test]

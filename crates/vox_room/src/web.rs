@@ -172,7 +172,13 @@ fn person(app: &App, headers: &HeaderMap) -> Option<String> {
 /// can say that it has expired.
 async fn join(Path(t): Path<String>, headers: HeaderMap) -> Response {
     let pending = set_cookie(PENDING, &t, PENDING_MAX_AGE, &headers);
-    ([(header::SET_COOKIE, pending)], Redirect::to("/")).into_response()
+    // To the lobby, not to `/`: `/` is the room of your own, and
+    // coming in on an invite is coming in to be with people.
+    (
+        [(header::SET_COOKIE, pending)],
+        Redirect::to(crate::rooms::LOBBY_PATH),
+    )
+        .into_response()
 }
 
 /// Who this browser is, or whose invite it is holding.

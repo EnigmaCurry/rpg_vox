@@ -158,10 +158,14 @@
   <div class="app show-{area}" class:watching={screen.watching != null} class:nocards={!hasCards}
     inert={room.audio !== 'on'}>
     <header>
-      <!-- Which room you are in, or the game it has become. The list of
-           rooms is down the left; this is where you are. -->
-      <h1>{room.game ?? room.title}</h1>
-      {#if room.game}<button onclick={lobby}>Leave the game</button>{/if}
+      <!-- Where you are, and what is being played there. A game is
+           something a room is doing, not somewhere else you went, so
+           the room keeps the heading and the game sits beside it. -->
+      <h1>{room.title}</h1>
+      {#if room.game}
+        <span class="playing" title="{room.game} is being played in {room.title}.">{room.game}</span>
+        <button onclick={lobby}>Leave the game</button>
+      {/if}
       <span class="pill {room.agent.state}" aria-live="polite">
         {#if room.agent.state === 'thinking' || room.agent.state === 'waiting'}
           <span class="dots" aria-hidden="true"><i></i><i></i><i></i></span>
@@ -295,6 +299,15 @@
     background: var(--panel);
   }
   h1 { font-size: 17px; margin: 0; }
+  /* The game the room is playing, beside the room's own name. */
+  .playing {
+    font-size: 13px;
+    font-weight: 600;
+    padding: 3px 10px;
+    border-radius: 999px;
+    background: var(--agent);
+    color: var(--accent-ink);
+  }
   h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin: 0 0 4px; }
   .spacer { flex: 1; }
   .pill { font-size: 13px; padding: 3px 10px; border-radius: 999px; background: var(--bubble); color: var(--muted); display: inline-flex; align-items: center; gap: 6px; }

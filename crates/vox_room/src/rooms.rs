@@ -49,6 +49,12 @@ const FRAME: Duration = Duration::from_millis(20);
 /// database for nothing.
 const RECONCILE_EVERY: u32 = 40;
 
+/// The address of the room of your own, whoever you are.
+pub const OWN_PATH: &str = "/";
+/// The address of the first room named with `--room`, where a tab that
+/// says nothing about where it wants to be lands.
+pub const LOBBY_PATH: &str = "/lobby";
+
 /// Builds one room, with everything in it: its store, its mixer, its
 /// voices, its interpreters and the agent that answers there.
 pub type Make = Box<dyn Fn(RoomConfig) -> Result<Arc<Room>> + Send + Sync>;
@@ -124,20 +130,25 @@ impl Rooms {
                 default_mode: Mode::Named,
                 ..base.clone()
             };
-            shared.push(make(cfg).with_context(|| format!("open the {name} room"))?);
+            let room = make(cfg).with_context(|| format!("open the {name} room"))?;
+            shared.push(room);
         }
         info!(
             rooms = %names.join(", "),
             "the rooms of the house (and one of their own for everybody)"
         );
         let (news, _) = broadcast::channel(16);
-        Ok(Arc::new(Self {
+        let rooms = Arc::new(Self {
             shared,
             own: Mutex::new(BTreeMap::new()),
             make,
             agent_name: base.agent_name.clone(),
             news,
-        }))
+        });
+        for room in &rooms.shared {
+            rooms.watch(room);
+        }
+        Ok(rooms)
     }
 
     /// The id of the room belonging to the person whose invite reads
@@ -161,7 +172,7 @@ impl Rooms {
     /// shared room, and the one of their own. Somebody's own room is
     /// built here, the first time they ask for it. None is a room that
     /// isn't there, or is somebody else's.
-    pub fn find(&self, who: &Invited, id: &str) -> Option<Arc<Room>> {
+    pub fn find(self: &Arc<Self>, who: &Invited, id: &str) -> Option<Arc<Room>> {
         if let Some(r) = self.shared.iter().find(|r| r.config().id == id) {
             return Some(r.clone());
         }
@@ -187,6 +198,7 @@ impl Rooms {
         match (self.make)(cfg) {
             Ok(room) => {
                 info!(person = %who.name, room = id, "opened a room of their own");
+                self.watch(&room);
                 own.insert(id.to_string(), room.clone());
                 Some(room)
             }
@@ -207,6 +219,20 @@ impl Rooms {
     /// and always the same is the one to put where the eye lands, and a
     /// room that moved about the list as people came and went would be
     /// a room you had to look for.
+    ///
+    /// Each carries the address it lives at, which is what the browser
+    /// puts in the bar and what somebody pastes to somebody else. The
+    /// scheme is settled here rather than in the browser so there is
+    /// one place that knows it:
+    ///
+    /// * `/` -- the room of your own. It is per person, and so is the
+    ///   address: whoever opens it gets theirs.
+    /// * `/lobby` -- the first room named with `--room`, which is where
+    ///   a tab lands.
+    /// * `/room/<link>` -- every other room, by the unguessable id it
+    ///   was given when it was first opened. Not by name: a name is a
+    ///   thing people change their minds about, and a link that changed
+    ///   with it is a link somebody has already sent on.
     pub fn directory(&self, who: &Invited) -> Value {
         let id = Self::own_id(&who.name);
         let here = self
@@ -219,18 +245,47 @@ impl Rooms {
         let mut rooms = vec![json!({
             "id": id,
             "title": self.own_title(),
+            "path": OWN_PATH,
             "private": true,
             "here": here,
+            "game": Value::Null,
         })];
-        rooms.extend(self.shared.iter().map(|r| {
+        rooms.extend(self.shared.iter().enumerate().map(|(n, r)| {
             json!({
                 "id": r.config().id,
                 "title": r.config().title,
+                "path": self.path_of(n, r),
                 "private": false,
                 "here": r.here(),
+                // A room with a game on is doing something, and the
+                // people not in it may as well be told what.
+                "game": r.game_name(),
             })
         }));
         json!({ "type": "rooms", "rooms": rooms })
+    }
+
+    /// Where the `n`th shared room lives. The first is the lobby, and
+    /// gets the short address people can say out loud.
+    fn path_of(&self, n: usize, room: &Arc<Room>) -> String {
+        if n == 0 {
+            LOBBY_PATH.to_string()
+        } else {
+            format!("/room/{}", room.link())
+        }
+    }
+
+    /// Have `room` tell us when the list would show it differently --
+    /// it starting or finishing a game. Only a nudge goes out: the
+    /// list itself is worked out per person, afterwards, on the socket
+    /// that is going to send it.
+    fn watch(self: &Arc<Self>, room: &Arc<Room>) {
+        let me = Arc::downgrade(self);
+        room.on_change(Box::new(move || {
+            if let Some(me) = me.upgrade() {
+                me.announce();
+            }
+        }));
     }
 
     /// Told when who-is-where changes, so every tab can ask for the

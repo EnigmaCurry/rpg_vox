@@ -117,6 +117,51 @@ to read, because there is no such state.
 Sharing a desktop follows the same rule as talking — it reaches the
 room you are in and no other, and it goes with you when you leave.
 
+### Where each room lives
+
+Every room has an address, and the bar follows you from one to another.
+Back and forward move between rooms, because that is what the bar
+changing means, and a link is a link: paste one to somebody and it
+opens that room for them.
+
+| | |
+|---|---|
+| `/` | your own room — per person, so whoever opens it gets theirs |
+| `/lobby` | the first room named with `--room`, where a tab lands |
+| `/room/<id>` | every other room |
+
+The id is not the room's name. A name is a thing people retype and
+change their minds about, and a link that changed with it would be a
+link somebody had already sent on; so each room is given an unguessable
+id the first time it opens and keeps it. An address that names no room
+— a stale link, a typo — quietly becomes the address of the room you
+ended up in rather than sitting there broken.
+
+An invite link lands in the lobby rather than at `/`: coming in on an
+invite is coming in to be with people.
+
+### A game is something a room does
+
+A game is played **in a room**, by the people in that room, and while
+it runs the game is what that room is: its conversation is the game's,
+and the cards dealt in it are the game's. The room keeps its name in
+the heading with the game beside it, and the list of rooms says which
+room has a game on, so a room worth walking into looks like one from
+outside it.
+
+**Leaving the game puts the room back where it was.** What the room was
+talking about is put aside, not thrown away: **Leave the game** picks
+that conversation up again — every word of it, and every card anyone
+was holding — for everyone in the room at once. A game is an
+interruption, and the room goes on afterwards.
+
+The game's own conversation is kept too, like everything else here; it
+is just not what entering the game again gives you, which is the game
+from the top. **Restart game** is not the same as finishing with one:
+the room still has a conversation to come back to afterwards. And a
+room left in the middle of a game is still in it after a restart of the
+server, and still knows what it interrupted.
+
 Rooms cost a little: each is its own mixer, its own agent and its own
 voices. What they share is everything expensive — the speech-to-text
 models, the translator, the endpoint the AI is asked on — so a handful

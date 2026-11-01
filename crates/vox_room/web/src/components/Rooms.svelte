@@ -31,9 +31,10 @@
   // Who is in a room you are not in. The count is on the row; this is
   // the whole of what the row can say, for a tooltip.
   function who(r) {
-    if (r.private) return `Just you and ${room.agent.name}. Nobody else can come in.`;
-    if (!r.here.length) return 'Nobody here.';
-    return `${r.here.join(', ')} ${r.here.length === 1 ? 'is' : 'are'} here.`;
+    const playing = r.game ? ` Playing ${r.game}.` : '';
+    if (r.private) return `Just you and ${room.agent.name}. Nobody else can come in.${playing}`;
+    if (!r.here.length) return `Nobody here.${playing}`;
+    return `${r.here.join(', ')} ${r.here.length === 1 ? 'is' : 'are'} here.${playing}`;
   }
 </script>
 
@@ -46,6 +47,9 @@
           onclick={() => enterRoom(r.id)}>
           <span class="twist" aria-hidden="true">{here ? '▾' : '▸'}</span>
           <span class="name">{r.title}</span>
+          <!-- A game is something a room is doing. Say which, so a room
+               worth walking into looks like one from out here. -->
+          {#if r.game}<span class="game" title="{r.game} is being played there.">{r.game}</span>{/if}
           {#if !r.private && r.here.length}<span class="count">{r.here.length}</span>{/if}
         </button>
 
@@ -113,7 +117,10 @@
   .room > button:hover { background: var(--bubble); }
   .room > button.on { background: var(--accent); color: var(--accent-ink); }
   .twist { font-size: 10px; opacity: 0.7; width: 1em; flex: none; }
-  .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .name { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* Whatever is left over goes between the names and the count. */
+  .room > button .game { margin-right: auto; }
+  .room > button:not(:has(.game)) .name { flex: 1; }
   .count {
     font-size: 11px;
     font-weight: 500;
@@ -123,6 +130,18 @@
     color: var(--muted);
   }
   .room > button.on .count { background: var(--accent-ink); color: var(--accent); }
+  /* Long game names must not push the count off the row, so this is
+     what gives way first. */
+  .game {
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--agent);
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .room > button.on .game { color: var(--accent-ink); opacity: 0.85; }
   /* The branch: indented, and hung off a line so the strips read as
      belonging to the room above them rather than following it. The
      right-hand padding is the only inset in here, and it is there so a

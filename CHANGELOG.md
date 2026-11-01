@@ -114,6 +114,30 @@ releases.
   touch. A list rather than a row of buttons because a server can hold
   a great many rooms, and a row of buttons cannot.
 
+  **Every room has an address**, and the bar follows you from one to
+  another: `/` is the room of your own (per person, so whoever opens it
+  gets theirs), `/lobby` is the first room named with `--room`, and
+  `/room/<id>` is every other one. Back and forward move between
+  rooms, and a link pasted to somebody opens that room for them. The
+  id is not the room's name, because a name is a thing people change
+  their minds about and a link that changed with it is a link somebody
+  has already sent on. An address that names no room quietly becomes
+  the address of the room you ended up in.
+
+  **A game is something a room does.** It is played in a room, by the
+  people in it, and while it runs the game is what that room is --
+  with the room's own name still in the heading and the game beside
+  it, and the list of rooms saying which room has one on.
+
+  And leaving a game now **puts the room back where it was**. What the
+  room was talking about is put aside rather than thrown away, and
+  *Leave the game* picks it up again -- every word of it, and every
+  card anyone was holding -- for everyone in the room at once. It used
+  to start a third empty conversation, so a game cost you the one you
+  were having to get into it and another to get out. A game is an
+  interruption; the room goes on afterwards. (*Restart game* is not
+  finishing with one, so what it interrupted is still there.)
+
   The default room is called **Lobby**. That word already had a job
   here -- "the lobby" was the room being in no game -- so the button
   that leaves a game now says **Leave the game**, which is what it

@@ -33,9 +33,10 @@ export const room = $state({
   title: 'Voice room',
   alone: false,
   // The rooms you may go to, and who is in each:
-  // { id, title, private, here: [names] }. The house's rooms, then
-  // yours. Worked out per person by the server, so nobody's own room
-  // is on anybody else's list.
+  // { id, title, path, private, here: [names], game }. Yours first,
+  // then the house's. Worked out per person by the server, so nobody's
+  // own room is on anybody else's list. `path` is where the room
+  // lives: the server settles the scheme, this only follows it.
   rooms: [],
   agent: { name: 'AI', state: 'listening', strip: '@agent' },
   // The interpreters, when the room has any: { strip, languages }. One
@@ -295,10 +296,52 @@ export async function peekGame(name) {
   }
 }
 
+// Where a tab is, is a thing it can be sent: every room has an address,
+// and the bar follows you from one to another.
+//
+// The server settles the scheme and says each room's address in the
+// directory, so there is one place that knows it and the browser only
+// matches strings. Two directions, and they must not chase each other:
+// `followUrl` reads the bar and moves the tab, `syncUrl` writes the bar
+// once the move has happened. Both are no-ops when the two already
+// agree, which is what keeps them from looping.
+let pushNext = false;
+let urlFollowed = false;
+
+const roomAt = (path) => room.rooms.find((r) => r.path === path);
+const pathOf = (id) => room.rooms.find((r) => r.id === id)?.path;
+
+/// Go where the address bar says, if that isn't where we already are.
+/// True when a move was asked for, and then the bar is left alone until
+/// the room answers.
+function followUrl({ push = false } = {}) {
+  const want = roomAt(location.pathname);
+  if (!want || want.id === room.where) return false;
+  pushNext = push;
+  command({ type: 'enter_room', id: want.id });
+  return true;
+}
+
+/// Put the room we are actually in into the bar. An address that names
+/// no room -- a stale link, a typo -- is quietly replaced by the one we
+/// ended up in rather than left there lying.
+function syncUrl() {
+  const path = pathOf(room.where);
+  if (!path || path === location.pathname) return;
+  history[pushNext ? 'pushState' : 'replaceState']({ room: room.where }, '', path);
+  pushNext = false;
+}
+
+/// Back and forward move between rooms, since that is what the bar
+/// changing means. No new entry for a move the history itself asked for.
+addEventListener('popstate', () => followUrl());
+
 /// Go to another room. The socket stays where it is: the audio keeps
 /// flowing and the server sends back the room it has put you in.
 export function enterRoom(id) {
   if (!id || id === room.where) return;
+  // Pressing a room is somewhere you can come back from.
+  pushNext = true;
   command({ type: 'enter_room', id });
 }
 
@@ -393,10 +436,22 @@ function apply(ev) {
       }
       // Whatever was being shared belonged to the room just left.
       if (moved) screenMoved();
+      // The directory may not have arrived yet, the first time; `rooms`
+      // does this too, and whichever comes second is the one that acts.
+      syncUrl();
       break;
     }
     case 'rooms':
       room.rooms = ev.rooms;
+      // The address the tab was opened at is where it wants to be, and
+      // this is the first moment there is a list to look it up in. Once
+      // only: after that the bar follows the room, not the other way
+      // about.
+      if (!urlFollowed) {
+        urlFollowed = true;
+        if (followUrl()) break;
+      }
+      syncUrl();
       break;
     case 'people':
       room.people = ev.people;
