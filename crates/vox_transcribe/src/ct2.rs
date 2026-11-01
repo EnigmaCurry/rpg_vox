@@ -256,6 +256,99 @@ pub unsafe extern "C" fn pthread_setaffinity_np(
 mod tests {
     use super::*;
 
+    /// A paragraph of real transcript (a recording made on the phone),
+    /// translated three ways: a call a sentence at beam 2, which is
+    /// what this did before batching; one batch at beam 2, which is
+    /// what it does now; and one batch at beam 1, which is greedy
+    /// search and the thing being weighed here.
+    ///
+    /// It prints rather than asserts: what matters is the ratio
+    /// between the three, and whether the greedy readings are worse,
+    /// which is a judgement nobody should make from an assertion. The
+    /// absolute times are this machine's, not a phone's.
+    ///
+    /// ```text
+    /// VOX_SCRIBE_MODELS=… cargo test -p vox_transcribe --features ct2 \
+    ///   -- --ignored --nocapture beam
+    /// ```
+    #[test]
+    #[ignore = "loads the downloaded opus-mt models"]
+    fn beam_two_against_beam_one() {
+        /// Ten sentences as pass 2 settled them, from a video
+        /// transcribed on the phone.
+        const SAID: [&str; 10] = [
+            "Steam OS on the all new minus form T five.",
+            "Controller, and now it's basically a 1440p console.",
+            "Recently on the channel, we took a first look at this device, and out of the box it comes with Windows.",
+            "Now it's got a pretty powerful little APU, and in my opinion, it's one of Minisform's most interesting mini PCs in a very long time.",
+            "So how are they pulling this off in a box this small?",
+            "Well, Minas Forum built a custom mini ITX board for it.",
+            "The mobile APU is soldered right to the board.",
+            "Along with the unified memory.",
+            "But there's one catch here.",
+            "This memory is running slower than some other systems we've seen with this APU.",
+        ];
+
+        let dir = std::env::var("VOX_SCRIBE_MODELS").expect("VOX_SCRIBE_MODELS");
+        let langs = ["English".to_string(), "Russian".to_string()];
+        let t = Ct2Translator::load(Path::new(&dir), &langs).expect("load");
+        let beam = |n: usize| TranslationOptions {
+            beam_size: n,
+            ..Default::default()
+        };
+        let model = t
+            .models
+            .get(&("English".to_string(), "Russian".to_string()))
+            .expect("the en-ru model");
+
+        // Warm: the first call of all pays for whatever is allocated once.
+        let _ = model.translate_batch(&SAID[..1], &beam(2), None);
+
+        let timed = |label: &str, size: usize, one_at_a_time: bool| {
+            let started = std::time::Instant::now();
+            let out: Vec<String> = if one_at_a_time {
+                SAID.iter()
+                    .map(|s| {
+                        model.translate_batch(&[*s], &beam(size), None).expect("translate")[0]
+                            .0
+                            .clone()
+                    })
+                    .collect()
+            } else {
+                model
+                    .translate_batch(&SAID, &beam(size), None)
+                    .expect("translate")
+                    .into_iter()
+                    .map(|(s, _)| s)
+                    .collect()
+            };
+            let took = started.elapsed();
+            println!(
+                "\n{label}: {} ms for {} sentences ({} ms each)",
+                took.as_millis(),
+                SAID.len(),
+                took.as_millis() / SAID.len() as u128,
+            );
+            out
+        };
+
+        let serial = timed("beam 2, a call a sentence", 2, true);
+        let batched = timed("beam 2, one batch", 2, false);
+        let greedy = timed("beam 1, one batch", 1, false);
+
+        assert_eq!(serial, batched, "batching must not change a reading");
+        println!("\nwhere greedy differs:");
+        let mut same = 0;
+        for (i, (b, g)) in batched.iter().zip(&greedy).enumerate() {
+            if b == g {
+                same += 1;
+            } else {
+                println!("  {}\n  beam 2: {b}\n  beam 1: {g}", SAID[i]);
+            }
+        }
+        println!("\n{same} of {} readings identical", SAID.len());
+    }
+
     /// The real models, through the real thing. Not run by default: it
     /// wants the pair downloaded.
     ///

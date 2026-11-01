@@ -21,7 +21,14 @@ section after the version it releases.
   round trip, and it reads the lines before each one for agreement), and
   a run of new sentences is broken wherever one already read sits
   between them, so the context each line is given is what it would have
-  been asked one at a time.
+  been asked one at a time. Ten sentences of a real transcript, through
+  the en-ru model: 1047 ms a call a sentence against 329 ms as one
+  batch, with every reading identical -- which the test asserts, since
+  batching is meant to change the cost and nothing else. Greedy search
+  (`beam_size` 1) would take that to 234 ms and is not taken: it
+  changes eight readings in ten, some for the better and some for the
+  worse, which is a poor trade for a third off something that is
+  already a third of what it was.
 
 - **`--translate`: what was said in another language, read in yours.**
   Pass 2's recognizer hears twenty-five languages without being told
