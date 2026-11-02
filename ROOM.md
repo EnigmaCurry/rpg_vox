@@ -957,7 +957,26 @@ lobby and in a game alike:
   where anything everyone should be looking at belongs — the rules as
   agreed, the standings, the cast of a scene — and it saves the AI
   reading a list aloud. It is shown to the model as its own, in full, so
-  it keeps playing by what the room can see.
+  it keeps playing by what the room can see. Every AI in the room has
+  this one, including the ones that may do nothing else: writing
+  something for the room to look at is saying it.
+
+**A card is written in markdown**, and it is the only thing in the room
+that is — everything else here is written to be heard. Tables, bullet
+and numbered lists, headings, **bold**, `code` blocks, quotes, rules and
+links; no images, nothing that fetches anything, and no raw HTML at all.
+That is what makes it worth having beside a voice: ask for the weather
+and the AI can say "cold tomorrow, wet on Friday" while the figures go
+up in a table, which is a thing speech is bad at and a card is good at.
+The prompt asks for both — the card is not instead of answering, and
+nobody hears a card appear, so it says that it is there.
+
+A card's body is written by a model, so **nothing in it can become
+markup**. It is escaped before a single tag is built from it, every tag
+in the result was put there by `web/src/lib/markdown.js`, and a
+`<script>` in a card is three words on the screen. A `javascript:` link
+is not a link; an `http` one opens in a tab of its own. The `cards`
+suite asserts exactly that, against a card written to try it on.
 
 It has one more tool everywhere, `wait_until_named`, which is how it ends
 a back-and-forth by itself (above).
@@ -1155,6 +1174,7 @@ CHROME=$(which chromium) ./run.sh            # or: ./run.sh rooms bots
 | `permalinks` | `/`, `/lobby` and `/room/<id>`; back and forward move between rooms, a pasted address opens that room, a stale one is put right |
 | `conversations` | the room's history: naming one, reading an old one read-only without moving anybody else's screen, deleting one for everybody, and empty ones never being archived |
 | `game` | a game played inside a room, and leaving it putting the room back where it was for everyone in it |
+| `cards` | what a posted card looks like once it is on the screen: the table, the list and the code block a model wrote in markdown — and the script tag it wrote with them arriving as words rather than as anything at all |
 | `interpreter` | the interpreter appearing only while it has somebody to interpret for, and its level being each listener's own |
 
 The four below want something of yours — a microphone, a model, a

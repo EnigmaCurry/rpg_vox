@@ -1,5 +1,6 @@
 <script>
   import { room } from '../lib/room.svelte.js';
+  import { markdown } from '../lib/markdown.js';
 
   const time = (ms) => new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 </script>
@@ -25,7 +26,11 @@
           <span class="title">{c.title}</span>
           <span class="time">{time(c.at)}</span>
         </div>
-        <p class="body">{c.body}</p>
+        <!-- Written to be read, so it is written in markdown: a hand
+             is a list, a standing order has the important part in bold.
+             `markdown` escapes everything before it builds a single
+             tag, so nothing in here can be markup of its own. -->
+        <div class="body md">{@html markdown(c.body)}</div>
       </article>
     {/each}
   </div>
@@ -85,7 +90,6 @@
   .body {
     margin: 6px 0 0;
     line-height: 1.5;
-    white-space: pre-wrap;
     overflow-wrap: anywhere;
   }
   @keyframes dealt {

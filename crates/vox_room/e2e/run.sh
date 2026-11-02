@@ -122,6 +122,29 @@ one() {
          VALUES ($c,'g1','Vox','game','Quick Draw',1);"
   fi
 
+  # A card is posted by a model, and there is no model here, so the
+  # conversation is given one to show. The body is what a card is for
+  # -- a table of figures, a list, a block of code -- with the two
+  # things a card must never be allowed to become on the end of it.
+  if [[ $suite == cards ]]; then
+    "$bin" $(flags "$suite") >/dev/null 2>&1 &
+    server=$!
+    waitfor; stop
+    local c body
+    c=$(sqlite_get "$data/room.db" "SELECT value FROM settings WHERE key='Lobby:conversation';")
+    body=$'**Boulder, Colorado** -- next three days.\n\n'
+    body+=$'| Day | High | Low |\n|-----|-----:|----:|\n'
+    body+=$'| Thu | 14\u00b0C | 2\u00b0C |\n| Fri | 9\u00b0C | -1\u00b0C |\n\n'
+    body+=$'- Wind picks up *Friday* afternoon\n- Bring a coat after 6pm\n\n'
+    body+=$'```\nwind = 40 km/h\n```\n\n'
+    body+=$'From [the weather office](https://weather.gov/boulder).\n\n'
+    body+=$'<script>alert(1)</script> <img src=x onerror=alert(2)>\n'
+    body+=$'[nope](javascript:alert(3))'
+    sqlite_set "$data/room.db" \
+      "INSERT INTO entries (conversation,id,who,kind,title,text,at)
+         VALUES ($c,'c1','Vox','card','Boulder, next three days','$body',1);"
+  fi
+
   echo "=== $suite"
   # shellcheck disable=SC2046
   "$bin" $(flags "$suite") >"$data/room.log" 2>&1 &
@@ -153,7 +176,7 @@ sqlite_get() { sqlite "$1" "$2"; }
 sqlite_set() { sqlite "$1" "$2" >/dev/null; }
 
 suites=("$@")
-[[ ${#suites[@]} -eq 0 ]] && suites=(rooms bots door permalinks ptt settings roles conversations game interpreter)
+[[ ${#suites[@]} -eq 0 ]] && suites=(rooms bots door permalinks ptt settings roles conversations game cards interpreter)
 
 bad=0
 for suite in "${suites[@]}"; do

@@ -92,10 +92,18 @@ game, when what you dealt has scrolled out of the conversation you can see. \
 Cards last until you take them back or the conversation starts over. \
 post_card is the opposite of all this: it writes a card into the \
 conversation for the whole room, which is where anything everyone should \
-be looking at belongs -- the rules as agreed, the standings, a scene \
-everyone can see. A posted card cannot be taken back. Keep the two \
+be looking at belongs. A posted card cannot be taken back. Keep the two \
 straight: send_card goes to one person's cards, post_card goes to the \
-room, and reading either aloud is what you must not do.";
+room, and reading either aloud is what you must not do.
+
+A card is written in markdown and is the one thing here that is read \
+rather than heard, so use the shape the thing actually has: a table for \
+anything with columns, a list for anything you would otherwise count out \
+loud, bold for the number that matters. That is what it is for -- when \
+somebody asks you something whose answer is a handful of figures, post \
+the figures and say the sentence. Speech is bad at \"nine degrees, \
+fourteen degrees, two degrees\" and a card is good at it, and the person \
+asked for the answer rather than for one of the two.";
 
 /// The last thing the AI is shown when the room is leaving it to decide
 /// whether this pause is its moment. `{here}` and `{engaged}` are filled
@@ -180,6 +188,20 @@ write everything in {language}, however you were spoken to, and write it \
 once -- do not translate yourself, and do not say the same thing twice in \
 two languages. Plain spoken sentences translate best; a pun or a play on \
 words will not survive, so make the point another way when it matters.";
+
+/// Added to the prompt of a bot that may only look: the one thing it
+/// can put on the screen, and when to.
+const POSTING_NOTE: &str = "\
+You can write a card into the conversation for the whole room to read, \
+with post_card: a title and a body in markdown. It is for what the people \
+will want in front of them rather than held in their heads -- a forecast, \
+times, prices, a list of options, anything whose answer is a handful of \
+figures. Use the shape the thing has: a table for anything with columns, \
+a list for anything you would otherwise count out loud. Post it and say \
+it at the same time: the short version in your own voice, the detail on \
+the card, and a word to say the card is there, since nobody hears one \
+appear. It cannot be taken back, so post what will still be true. Reading \
+a card out is what you must not do.";
 
 /// Added to the prompt when there is one other AI in the room;
 /// `{other}` is its name, used throughout rather than a pronoun, since
@@ -457,17 +479,24 @@ pub enum Allowed {
 /// What a bot that is only looking may call. The rest of what the room
 /// offers is the first AI's.
 ///
-/// Three of these are not powers but how a turn works, so every bot
-/// has them: `stay_quiet` is the only way to pass on a pause it was
-/// asked to judge, `wait_until_named` the only way out of a
-/// back-and-forth it was pulled into, and `hand_to` the way it gives
-/// the turn to somebody rather than takes one -- the opposite of a
-/// power, and what makes a conversation of three rather than two
-/// people taking turns with one AI. A bot without the first cannot be
-/// put on "when it fits" at all.
+/// `post_card` is here because writing something for the room to look
+/// at is saying it -- the same thing the bot does with its voice, in
+/// the form a table or a list wants. What stays the first AI's are the
+/// tools that change what somebody is *holding*, or what the room is
+/// doing: `send_card`, `take_back_card`, and the games.
+///
+/// Three more are not powers but how a turn works, so every bot has
+/// them: `stay_quiet` is the only way to pass on a pause it was asked
+/// to judge, `wait_until_named` the only way out of a back-and-forth
+/// it was pulled into, and `hand_to` the way it gives the turn to
+/// somebody rather than takes one -- the opposite of a power, and what
+/// makes a conversation of three rather than two people taking turns
+/// with one AI. A bot without the first cannot be put on "when it
+/// fits" at all.
 pub const LOOKING_TOOLS: &[&str] = &[
     "list_people",
     "look_up",
+    "post_card",
     "stay_quiet",
     "wait_until_named",
     "hand_to",
@@ -642,9 +671,10 @@ impl Agent {
                 "{}\n\n{GAMES_NOTE}\n\n{CARDS_NOTE}\n\n{TURN_NOTE}{search}{others}{translated}",
                 self.prompt
             ),
-            (None, Allowed::Looking) => {
-                format!("{}\n\n{TURN_NOTE}{search}{others}{translated}", self.prompt)
-            }
+            (None, Allowed::Looking) => format!(
+                "{}\n\n{POSTING_NOTE}\n\n{TURN_NOTE}{search}{others}{translated}",
+                self.prompt
+            ),
             (Some((game, prompt)), allowed) => {
                 format!("{}{others}{translated}", game_prompt(game, prompt, allowed))
             }
@@ -744,7 +774,7 @@ fn and_list(names: &[String]) -> String {
 fn game_prompt(game: &str, prompt: &str, allowed: Allowed) -> String {
     let cards = match allowed {
         Allowed::Everything => format!("{CARDS_NOTE}\n\n{TURN_NOTE}"),
-        Allowed::Looking => TURN_NOTE.to_string(),
+        Allowed::Looking => format!("{POSTING_NOTE}\n\n{TURN_NOTE}"),
     };
     GAME_FRAME
         .replace("{cards}", &cards)
@@ -1347,16 +1377,21 @@ fn room_tools() -> Vec<Value> {
         tool(
             "post_card",
             "Write a card into the conversation for the whole room to \
-             read. Use it for what the people will want in front of them \
-             rather than held in their heads, and what you would \
-             otherwise have to read out in a list: the rules you have \
-             just agreed, the standings, a map in words, the cast of a \
-             scene. It stays in the conversation and cannot be taken \
-             back, so post what will still be true. Say a line about it \
-             aloud -- nobody hears a card appear.",
+             read. Use it for anything the people will want in front of \
+             them rather than held in their heads, and for everything \
+             you would otherwise have to read out as a list of numbers: \
+             a forecast, times, prices, options to choose between, the \
+             standings, the rules you have just agreed, a map in words. \
+             **Post it and say it at the same time** -- a card is not \
+             instead of answering. Say the short spoken version in your \
+             own voice (\"it's cold tomorrow and wet on Friday\") and put \
+             the detail on the card, where it can be looked at. Nobody \
+             hears a card appear, so say that it is there. It stays in \
+             the conversation and cannot be taken back, so post what \
+             will still be true.",
             json!({
-                "title": { "type": "string", "description": "A few words heading the card, e.g. \"The rules\" or \"Scores after round 2\"." },
-                "body": { "type": "string", "description": "What the room is to read. Written to be read, not spoken; short lines on their own line are fine." },
+                "title": { "type": "string", "description": "A few words heading the card, e.g. \"Boulder, next three days\" or \"Scores after round 2\"." },
+                "body": { "type": "string", "description": "What the room is to read, in markdown: tables, bullet and numbered lists, **bold**, `code`, quotes, links. A table is the right shape for anything with columns, and a list for anything you would otherwise count out loud. Written to be read, not spoken." },
             }),
             &["title", "body"],
         ),
@@ -1834,6 +1869,7 @@ mod tests {
             looking_names(true, true, true),
             [
                 "list_people",
+                "post_card",
                 "hand_to",
                 "wait_until_named",
                 "stay_quiet",
@@ -1844,7 +1880,6 @@ mod tests {
         let everything = tool_names_deciding(true, true, true);
         for power in [
             "send_card",
-            "post_card",
             "take_back_card",
             "read_cards",
             "save_game",
@@ -1884,8 +1919,14 @@ mod tests {
         // And what is offered is what is allowed: a model that calls
         // something it was never shown is told there is no such tool.
         assert!(Allowed::Looking.may("list_people"));
-        assert!(!Allowed::Looking.may("post_card"));
-        assert!(Allowed::Everything.may("post_card"));
+        // Writing something for the room to look at is saying it, so
+        // the voice that may only look may still post.
+        assert!(Allowed::Looking.may("post_card"));
+        assert!(
+            !Allowed::Looking.may("send_card"),
+            "a card to one person is not"
+        );
+        assert!(Allowed::Everything.may("send_card"));
     }
 
     /// What a bot is told it can do is what it can do. A note about
@@ -1902,11 +1943,17 @@ mod tests {
             system.contains("wait_until_named"),
             "it still gives the turn back"
         );
+        assert!(
+            system.contains("post_card"),
+            "and can still put something on the screen"
+        );
+        assert!(system.contains("in markdown"), "{system}");
 
         // In a game, the same: it plays, it doesn't deal.
         let frame = game_prompt("Dragon Heist", "Run a heist.", Allowed::Looking);
         assert!(!frame.contains("send_card"), "{frame}");
         assert!(frame.contains("wait_until_named"));
+        assert!(frame.contains("post_card"), "it may still post one");
         let dealing = game_prompt("Dragon Heist", "Run a heist.", Allowed::Everything);
         assert!(dealing.contains("send_card"));
     }

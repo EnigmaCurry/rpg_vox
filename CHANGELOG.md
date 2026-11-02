@@ -90,6 +90,36 @@ releases.
 
 ### Voice room
 
+- **A card is written in markdown, so an AI can show you a thing while
+  it tells you.** Ask for the weather and the answer is a handful of
+  figures: speech is bad at "nine degrees, fourteen degrees, two
+  degrees" and a table is good at it. `post_card` already put text in
+  the conversation for the whole room, beside the spoken reply and
+  separate from it, but the body was rendered as plain text -- a table
+  arrived as a row of pipes.
+
+  So a card's body is markdown now: tables, bullet and numbered lists,
+  headings, bold, code blocks, quotes, rules and links. The cards only
+  one person can see are the same -- a hand is a list, a standing order
+  has the important part in bold. It is the only thing in the room
+  written in markdown, because it is the only thing here written to be
+  looked at rather than heard, and the prompt asks for both halves: the
+  short version in the AI's own voice, the detail on the card, and a
+  word to say the card is there, since nobody hears one appear.
+
+  **Nothing in a card can become markup.** The body is written by a
+  model, so it is escaped before a single tag is built from it: every
+  tag in the result was put there by the renderer, a `<script>` in a
+  card is three words on the screen, and a `javascript:` link is not a
+  link. No images, no raw HTML, nothing that fetches anything. The new
+  `cards` suite asserts it against a card written to try it on.
+
+  Every AI in the room can post one, including the ones that may do
+  nothing else: writing something for the room to look at is saying it,
+  the same thing they do with their voices. What stays the first AI's
+  are the tools that change what somebody is *holding* or what the room
+  is doing -- `send_card`, `take_back_card`, and the games.
+
 - **Which rooms an AI is in is the owner's to say.** A second AI was
   in every room the moment the server started with one: the house's
   rooms, and everybody's own. A room of your own is the one place

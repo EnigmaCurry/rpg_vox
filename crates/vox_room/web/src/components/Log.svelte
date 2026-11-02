@@ -2,6 +2,7 @@
   import { room, enterGame, peekGame, theAI, waitingAI } from '../lib/room.svelte.js';
   import History from './History.svelte';
   import { hue } from '../lib/color.js';
+  import { markdown } from '../lib/markdown.js';
 
   let box;
   let stick = true;
@@ -149,7 +150,11 @@
           <div class="who"><span class="name">{e.who}</span><span class="time">{time(e.at)} · for the room</span></div>
           <div class="card posted">
             <div class="title">{e.title}</div>
-            <p class="body">{e.text}</p>
+            <!-- Markdown, because a card is the one thing here written
+                 to be looked at rather than heard: a table of times, a
+                 list of options, the numbers as numbers. Escaped before
+                 anything is built from it -- see lib/markdown.js. -->
+            <div class="body md">{@html markdown(e.text)}</div>
           </div>
         </div>
       {:else}
@@ -262,7 +267,6 @@
   .card.posted { width: 100%; }
   .card.posted .body {
     margin: 0;
-    white-space: pre-wrap;
     overflow-wrap: anywhere;
     line-height: 1.5;
   }
