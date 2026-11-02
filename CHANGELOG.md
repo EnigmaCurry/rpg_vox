@@ -169,10 +169,17 @@ releases.
   was sitting in, and the room is looked up as one of theirs like any
   other, so naming a room that isn't yours seats you in the lobby.
 
-- **The composer sits on the footer.** The box you type into had
-  sixteen pixels of background under it, holding it off the bar below;
-  the header and footer have been brought in too, and the rows they
-  give up are rows of the conversation.
+- **The box you type into is a fixture, not a bubble.** It was a
+  rounded pill at the end of the conversation, stuck to the foot of the
+  scroller and inside the conversation's own margins -- so it read as
+  one more message, which is the one thing it isn't. It is a row of the
+  room now: a bar across the full width of the conversation with a rule
+  along its top, nothing round about it, and the caret where the names
+  above it start. The whole bar lights up when it has the focus,
+  because the whole bar is the field, and **Send** is a word at the end
+  of it rather than a second pill. The header and footer have been
+  brought in at the same time, and the rows they give up are rows of
+  the conversation.
 
 - **No pull-to-refresh.** A swipe down at the top of the room reloaded
   it on iOS Safari, which drops the audio, the socket and your place in

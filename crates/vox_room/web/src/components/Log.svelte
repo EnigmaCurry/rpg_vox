@@ -94,133 +94,139 @@
   const answers = $derived(one ? 'it answers' : 'they answer');
 </script>
 
-<div class="log" bind:this={box} {onscroll}>
-  <History />
+<!-- One column: the conversation scrolling in it, and the box you type
+     into a fixture across its foot. The composer used to be the last
+     thing in the scroller, stuck to the bottom of it -- which kept it
+     inside the conversation's own margins and made it read as one more
+     bubble at the end. It is a row of the room now. -->
+<div class="log">
+  <div class="said" bind:this={box} {onscroll}>
+    <History />
 
-  {#if shown.length === 0}
-    <p class="empty">
-      {#if archived}
-        Nothing was ever said in this one.
-      {:else if room.game}
-        Entering <strong>{room.game}</strong>…
-      {:else}
-        Nothing said yet. Join the audio and start talking; say <strong>{theAI()}</strong>
-        {room.agents.every((a) => a.mode === 'named')
-          ? `to bring ${it} in`
-          : `or just talk, and ${answers} when you pause`}.
-        Ask {it} to design a game with you, then ask {it} to start, change or delete games by voice.
-      {/if}
-    </p>
-  {/if}
-  {#each shown as e (e.id)}
-    {#if e.kind === 'game'}
-      {@const g = room.games.find((g) => g.name.toLowerCase() === e.text.toLowerCase())}
-      <div class="entry agent game-entry">
-        <div class="who"><span class="name">{e.who}</span><span class="time">{time(e.at)} · new game</span></div>
-        <div class="card">
-          <div class="title">{e.text}</div>
-          {#if g}<p class="summary">{g.summary}</p>{/if}
-          <!-- A game is announced here, so this is where it is played
-               from: the card knows which game it is and whether the
-               room is already in one. Asking out loud does the same. -->
-          {#if !g}
-            <span class="hint">This game was deleted.</span>
-          {:else}
-            <div class="doings">
-              <button onclick={() => enterGame(g.name)} disabled={!!room.game}
-                title={room.game
-                  ? `You're in ${room.game}. Leave the game to play another.`
-                  : `Everyone in this room goes into ${g.name}.`}>Play</button>
-              <button onclick={() => peekGame(g.name)}
-                title="Show the game's hidden prompt, to you only">Peek</button>
-              <span class="hint">
-                {#if room.game}In {room.game}.{:else}Or ask {theAI()} for it out loud.{/if}
-              </span>
-            </div>
-          {/if}
-        </div>
-      </div>
-    {:else if e.kind === 'card'}
-      <!-- A card the AI posted for the whole room; it stays in the
-           conversation like anything that was said. -->
-      <div class="entry agent card-entry">
-        <div class="who"><span class="name">{e.who}</span><span class="time">{time(e.at)} · for the room</span></div>
-        <div class="card posted">
-          <div class="title">{e.title}</div>
-          <p class="body">{e.text}</p>
-        </div>
-      </div>
-    {:else}
-    <div class="entry" class:agent={e.kind === 'agent'} class:you={e.who === room.you} style="--h: {hue(e.who)}">
-      <div class="who">
-        <span class="name">{e.who}</span>
-        {#if e.typed}<span class="typed" title="Typed, not spoken">typed</span>{/if}
-        <span class="time">{time(e.at)}</span>
-      </div>
-      {#if pair(e)}
-        {@const p = pair(e)}
-        {@const from = showing(e) === 'from'}
-        <!-- One language at a time, with a link to the other: both are
-             here, so a translation that went wrong can be seen to have
-             gone wrong, without two copies of every line to read past. -->
-        <div
-          class="text"
-          class:partial={from && e.partial}
-          class:live={e.live}
-          lang={from ? p.from : mine}
-        >
-          {#if from}
-            {#if e.text}{e.text}{:else}<span class="dots"><i></i><i></i><i></i></span>{/if}
-          {:else if p.text}
-            {p.text}
-          {:else}
-            <!-- Not translated yet. Deliberately not the original: being
-                 handed a language you didn't ask for is the thing this
-                 is here to avoid. The link below reaches it. -->
-            <span class="pending">{mine}…</span>
-          {/if}
-        </div>
-        {#if e.text || p.text}
-          <button type="button" class="swap" onclick={() => (asWritten[e.id] = !from)}>
-            {from ? `Show ${mine}` : `Show ${p.from}`}
-          </button>
+    {#if shown.length === 0}
+      <p class="empty">
+        {#if archived}
+          Nothing was ever said in this one.
+        {:else if room.game}
+          Entering <strong>{room.game}</strong>…
+        {:else}
+          Nothing said yet. Join the audio and start talking; say <strong>{theAI()}</strong>
+          {room.agents.every((a) => a.mode === 'named')
+            ? `to bring ${it} in`
+            : `or just talk, and ${answers} when you pause`}.
+          Ask {it} to design a game with you, then ask {it} to start, change or delete games by voice.
         {/if}
-      {:else}
-        <div class="text" class:partial={e.partial} class:live={e.live}>
-          {#if e.text}{e.text}{:else if e.kind === 'agent'}<span class="dots"><i></i><i></i><i></i></span>{/if}
-        </div>
-      {/if}
-      {#if tracks(e).length > 0}
-        <!-- The same words take a different time to say in each
-             language, so whichever one you are listening to, this is
-             where the others have got to. It goes when they are all
-             done, which is the thing it is here to show. -->
-        <div class="tracks" title={e.kind === 'agent'
-          ? `How far ${e.who}'s reply has been heard in each language. The turn is over once every language has heard it out.`
-          : `How far ${e.who} has been heard in each language. Anyone listening in one of these is hearing it now, a phrase behind.`}>
-          {#each tracks(e) as t (t.language)}
-            <span class="track" class:done={t.done} class:waiting={!t.total && !t.done}>
-              <span class="lang">{t.language}</span>
-              <span class="bar"><i style="width: {width(t)}%"></i></span>
-              <span class="left">{left(t)}</span>
-            </span>
-          {/each}
-        </div>
-      {/if}
-    </div>
+      </p>
     {/if}
-  {/each}
-  {#if !archived && waitingAI()}
-    <div class="entry agent waiting" aria-live="polite">
-      <div class="who"><span class="name">{waitingAI().name}</span><span class="time">waiting for a pause</span></div>
-      <div class="text"><span class="dots"><i></i><i></i><i></i></span></div>
-    </div>
-  {/if}
+    {#each shown as e (e.id)}
+      {#if e.kind === 'game'}
+        {@const g = room.games.find((g) => g.name.toLowerCase() === e.text.toLowerCase())}
+        <div class="entry agent game-entry">
+          <div class="who"><span class="name">{e.who}</span><span class="time">{time(e.at)} · new game</span></div>
+          <div class="card">
+            <div class="title">{e.text}</div>
+            {#if g}<p class="summary">{g.summary}</p>{/if}
+            <!-- A game is announced here, so this is where it is played
+                 from: the card knows which game it is and whether the
+                 room is already in one. Asking out loud does the same. -->
+            {#if !g}
+              <span class="hint">This game was deleted.</span>
+            {:else}
+              <div class="doings">
+                <button onclick={() => enterGame(g.name)} disabled={!!room.game}
+                  title={room.game
+                    ? `You're in ${room.game}. Leave the game to play another.`
+                    : `Everyone in this room goes into ${g.name}.`}>Play</button>
+                <button onclick={() => peekGame(g.name)}
+                  title="Show the game's hidden prompt, to you only">Peek</button>
+                <span class="hint">
+                  {#if room.game}In {room.game}.{:else}Or ask {theAI()} for it out loud.{/if}
+                </span>
+              </div>
+            {/if}
+          </div>
+        </div>
+      {:else if e.kind === 'card'}
+        <!-- A card the AI posted for the whole room; it stays in the
+             conversation like anything that was said. -->
+        <div class="entry agent card-entry">
+          <div class="who"><span class="name">{e.who}</span><span class="time">{time(e.at)} · for the room</span></div>
+          <div class="card posted">
+            <div class="title">{e.title}</div>
+            <p class="body">{e.text}</p>
+          </div>
+        </div>
+      {:else}
+      <div class="entry" class:agent={e.kind === 'agent'} class:you={e.who === room.you} style="--h: {hue(e.who)}">
+        <div class="who">
+          <span class="name">{e.who}</span>
+          {#if e.typed}<span class="typed" title="Typed, not spoken">typed</span>{/if}
+          <span class="time">{time(e.at)}</span>
+        </div>
+        {#if pair(e)}
+          {@const p = pair(e)}
+          {@const from = showing(e) === 'from'}
+          <!-- One language at a time, with a link to the other: both are
+               here, so a translation that went wrong can be seen to have
+               gone wrong, without two copies of every line to read past. -->
+          <div
+            class="text"
+            class:partial={from && e.partial}
+            class:live={e.live}
+            lang={from ? p.from : mine}
+          >
+            {#if from}
+              {#if e.text}{e.text}{:else}<span class="dots"><i></i><i></i><i></i></span>{/if}
+            {:else if p.text}
+              {p.text}
+            {:else}
+              <!-- Not translated yet. Deliberately not the original: being
+                   handed a language you didn't ask for is the thing this
+                   is here to avoid. The link below reaches it. -->
+              <span class="pending">{mine}…</span>
+            {/if}
+          </div>
+          {#if e.text || p.text}
+            <button type="button" class="swap" onclick={() => (asWritten[e.id] = !from)}>
+              {from ? `Show ${mine}` : `Show ${p.from}`}
+            </button>
+          {/if}
+        {:else}
+          <div class="text" class:partial={e.partial} class:live={e.live}>
+            {#if e.text}{e.text}{:else if e.kind === 'agent'}<span class="dots"><i></i><i></i><i></i></span>{/if}
+          </div>
+        {/if}
+        {#if tracks(e).length > 0}
+          <!-- The same words take a different time to say in each
+               language, so whichever one you are listening to, this is
+               where the others have got to. It goes when they are all
+               done, which is the thing it is here to show. -->
+          <div class="tracks" title={e.kind === 'agent'
+            ? `How far ${e.who}'s reply has been heard in each language. The turn is over once every language has heard it out.`
+            : `How far ${e.who} has been heard in each language. Anyone listening in one of these is hearing it now, a phrase behind.`}>
+            {#each tracks(e) as t (t.language)}
+              <span class="track" class:done={t.done} class:waiting={!t.total && !t.done}>
+                <span class="lang">{t.language}</span>
+                <span class="bar"><i style="width: {width(t)}%"></i></span>
+                <span class="left">{left(t)}</span>
+              </span>
+            {/each}
+          </div>
+        {/if}
+      </div>
+      {/if}
+    {/each}
+    {#if !archived && waitingAI()}
+      <div class="entry agent waiting" aria-live="polite">
+        <div class="who"><span class="name">{waitingAI().name}</span><span class="time">waiting for a pause</span></div>
+        <div class="text"><span class="dots"><i></i><i></i><i></i></span></div>
+      </div>
+    {/if}
+  </div>
 
-  <!-- Last child of the scroller and stuck to its foot, so the grid
-       above doesn't have to know the conversation has a composer. None
-       at all on a conversation the room has finished with: there is
-       nowhere for what you typed to go. -->
+  <!-- None at all on a conversation the room has finished with: there
+       is nowhere for what you typed to go, and the conversation takes
+       the row back. -->
   {#if !archived}
   <form class="composer" onsubmit={send}>
     <input
@@ -231,24 +237,33 @@
       placeholder="Type instead of saying it — a URL, a name, anything that has to arrive exactly"
       aria-label="Type a message to the room"
     />
-    <button type="submit" class="primary" disabled={!draft.trim()}>Send</button>
+    <button type="submit" disabled={!draft.trim()}>Send</button>
   </form>
   {/if}
 </div>
 
 <style>
   .log {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    min-width: 0;
+    /* Keep the conversation in a centered band; on a wide monitor the
+       extra space becomes equal margins instead of a line you have to
+       scan across. One definition, because what you type has to start
+       where what you said starts -- the caret lines up with the names
+       above it, and the bar it sits in runs the full width regardless. */
+    --gutter: max(16px, calc((100% - 64em) / 2));
+  }
+  .said {
+    flex: 1;
+    min-height: 0;
     overflow-y: auto;
     overscroll-behavior: contain;
-    /* Keep the conversation in a centered band; on a wide monitor the extra
-       space becomes equal margins instead of a line you have to scan across.
-       Nothing along the foot: the composer sticks there, and padding under it
-       is a strip of background between the box and the footer. */
-    padding: 16px max(16px, calc((100% - 64em) / 2)) 0;
+    padding: 16px var(--gutter);
     display: flex;
     flex-direction: column;
     gap: 12px;
-    min-height: 0;
   }
   .empty { color: var(--muted); text-align: center; margin: auto; max-width: 28em; }
   .card {
@@ -356,30 +371,47 @@
   .track.waiting .left { font-style: italic; }
   @media (prefers-reduced-motion: reduce) { .bar i { transition: none; } }
 
+  /* A fixture across the foot of the conversation rather than a bubble
+     at the end of it: the bar *is* the field. A rule along the top to
+     part it from what was said, the panel behind it, and nothing round
+     anywhere -- the pill it used to be read as one more message, and
+     the one thing in the room that isn't a message is the place you
+     type. */
   .composer {
-    position: sticky;
-    bottom: 0;
     display: flex;
-    gap: 8px;
-    /* Stuck to the foot of the scroller, so the messages behind it have
-       to be covered rather than showing through. */
+    align-items: center;
+    padding: 0 var(--gutter);
+    border-top: 1px solid var(--line);
     background: var(--bg);
-    /* Sitting on the footer, not floating above it: the only space is
-       the one that keeps the last message off the box. */
-    padding: 10px 0 0;
-    margin-top: auto;
+  }
+  /* The whole bar takes the focus, because the whole bar is the field.
+     Drawn inside, so nothing moves when it lights up. */
+  .composer:focus-within {
+    border-top-color: var(--accent);
+    box-shadow: inset 0 1px 0 var(--accent);
   }
   .composer input {
     flex: 1;
     min-width: 0;
     font: inherit;
     color: var(--ink);
-    background: var(--bg);
-    border: 1px solid var(--line);
-    border-radius: 999px;
-    padding: 9px 14px;
+    background: none;
+    border: 0;
+    padding: 13px 0;
   }
-  .composer input:focus-visible { border-color: var(--muted); outline: none; }
-  .composer button { border-radius: 999px; padding: 9px 16px; }
-  .composer button:disabled { opacity: 0.45; cursor: default; }
+  .composer input:focus { outline: none; }
+  .composer input::placeholder { color: var(--muted); }
+  /* Send is a word at the end of the bar, not a button on top of it.
+     It is the second way to do what Enter already does, so it carries
+     no weight of its own. */
+  .composer button {
+    border: 0;
+    border-radius: 0;
+    background: none;
+    color: var(--accent);
+    font-weight: 600;
+    padding: 13px 0 13px 14px;
+  }
+  .composer button:not(:disabled):hover { color: var(--ink); }
+  .composer button:disabled { opacity: 0.4; cursor: default; }
 </style>
