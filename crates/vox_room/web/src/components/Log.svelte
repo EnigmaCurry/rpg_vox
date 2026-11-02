@@ -1,6 +1,7 @@
 <script>
   import { room, enterGame, peekGame, theAI, waitingAI } from '../lib/room.svelte.js';
   import History from './History.svelte';
+  import Face from './Face.svelte';
   import { hue } from '../lib/color.js';
   import { markdown } from '../lib/markdown.js';
 
@@ -119,6 +120,8 @@
       {#if e.kind === 'game'}
         {@const g = room.games.find((g) => g.name.toLowerCase() === e.text.toLowerCase())}
         <div class="entry agent game-entry">
+          <Face who={e.who} agent />
+          <div class="said-by">
           <div class="who"><span class="name">{e.who}</span><span class="time">{time(e.at)} · new game</span></div>
           <div class="card">
             <div class="title">{e.text}</div>
@@ -142,11 +145,14 @@
               </div>
             {/if}
           </div>
+          </div>
         </div>
       {:else if e.kind === 'card'}
         <!-- A card the AI posted for the whole room; it stays in the
              conversation like anything that was said. -->
         <div class="entry agent card-entry">
+          <Face who={e.who} agent />
+          <div class="said-by">
           <div class="who"><span class="name">{e.who}</span><span class="time">{time(e.at)} · for the room</span></div>
           <div class="card posted">
             <div class="title">{e.title}</div>
@@ -156,9 +162,12 @@
                  anything is built from it -- see lib/markdown.js. -->
             <div class="body md">{@html markdown(e.text)}</div>
           </div>
+          </div>
         </div>
       {:else}
       <div class="entry" class:agent={e.kind === 'agent'} class:you={e.who === room.you} style="--h: {hue(e.who)}">
+        <Face who={e.who} agent={e.kind === 'agent'} />
+        <div class="said-by">
         <div class="who">
           <span class="name">{e.who}</span>
           {#if e.typed}<span class="typed" title="Typed, not spoken">typed</span>{/if}
@@ -214,13 +223,17 @@
             {/each}
           </div>
         {/if}
+        </div>
       </div>
       {/if}
     {/each}
     {#if !archived && waitingAI()}
       <div class="entry agent waiting" aria-live="polite">
-        <div class="who"><span class="name">{waitingAI().name}</span><span class="time">waiting for a pause</span></div>
-        <div class="text"><span class="dots"><i></i><i></i><i></i></span></div>
+        <Face who={waitingAI().name} agent />
+        <div class="said-by">
+          <div class="who"><span class="name">{waitingAI().name}</span><span class="time">waiting for a pause</span></div>
+          <div class="text"><span class="dots"><i></i><i></i><i></i></span></div>
+        </div>
       </div>
     {/if}
   </div>
@@ -273,6 +286,9 @@
      the same weight and the last word otherwise. */
   .entry.card-entry { max-width: 100%; align-self: stretch; }
   .card.posted { width: 100%; }
+  /* A posted card has the whole column, so the column it is in has to
+     fill what the face leaves of the row. */
+  .card-entry .said-by { width: 100%; }
   .card.posted .body {
     margin: 0;
     /* The card is a column of flex items that line up on the left, so
@@ -287,8 +303,18 @@
   .hint { color: var(--muted); font-size: 13px; }
   .doings { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
   .doings button { padding: 2px 10px; font-size: 13px; }
-  .entry { max-width: min(42em, 92%); }
-  .entry.you { align-self: flex-end; }
+  /* An entry is its face and then everything that was said: the
+     square is a column of its own so that the names, the bubbles and
+     the rows under them all start at the same place whether or not
+     somebody has a picture. */
+  .entry { max-width: min(42em, 92%); display: flex; gap: 8px; }
+  /* Your own lines sit on the right, so your face does too -- it stays
+     on the outside edge, which is where every one of them is. */
+  .entry.you { align-self: flex-end; flex-direction: row-reverse; }
+  /* The column beside the face. `min-width: 0` so a long word or a
+     wide table shrinks it rather than pushing the face off. */
+  .said-by { min-width: 0; flex: 1; display: flex; flex-direction: column; align-items: flex-start; }
+  .entry.you .said-by { align-items: flex-end; }
   .who { font-size: 12px; color: var(--muted); display: flex; gap: 8px; margin: 0 4px 2px; }
   .entry.you .who { justify-content: flex-end; }
   .name { font-weight: 600; color: hsl(var(--h) 55% 45%); }

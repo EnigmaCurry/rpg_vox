@@ -4,6 +4,7 @@
 
 mod agent;
 mod interp;
+mod mcp;
 mod mixer;
 mod room;
 mod rooms;
@@ -163,6 +164,23 @@ struct Cli {
     /// llama.cpp has no such thing, and each search costs a request.
     #[arg(long, env = "VOX_ROOM_SEARCH")]
     search: bool,
+    /// An MCP server the AI may use, as NAME=URL[=TOOL,TOOL,...]. NAME
+    /// is the prefix its tools are offered under (`art` gives
+    /// `art_create_inference`), and the tools after it are the only
+    /// ones the room lends -- leave them out to lend the lot, which is
+    /// only sane for a server you know is small. Repeat for more
+    /// servers. The key is --mcp-key.
+    ///
+    /// For Retro Diffusion's pixel art:
+    ///
+    ///   --mcp 'art=https://mcp.retrodiffusion.ai/mcp=create_inference,list_available_styles,estimate_inference_cost,get_balance'
+    #[arg(long = "mcp", env = "VOX_ROOM_MCP", value_delimiter = ';')]
+    mcp: Vec<String>,
+    /// The key for the --mcp servers, as NAME=KEY, or on its own for
+    /// the only one. Sent as a bearer token and filled into whichever
+    /// argument each tool wants it in, so it never reaches the model.
+    #[arg(long = "mcp-key", env = "VOX_ROOM_MCP_KEY", value_delimiter = ';')]
+    mcp_key: Vec<String>,
     /// No model: the AI says back what it heard. For trying the room.
     #[arg(long)]
     echo: bool,
@@ -411,6 +429,74 @@ fn env_names(cmd: &clap::Command, out: &mut Vec<OsString>) {
 /// The old `VOX_AGENT_THINK`, read by hand and leniently: as a clap flag
 /// anything but exactly `true` or `false` stopped the room from starting
 /// at all, which an old `.env` saying `0` should not do.
+/// The `--mcp` servers, with their keys attached.
+///
+/// `NAME=URL` or `NAME=URL=tool,tool`. The key comes from `--mcp-key`,
+/// as `NAME=KEY` or -- when there is exactly one server -- on its own,
+/// which is the shape a one-server house actually wants.
+fn mcp_servers(specs: &[String], keys: &[String]) -> Result<Vec<Arc<mcp::Server>>> {
+    let specs: Vec<&str> = specs.iter().map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+    let keys: Vec<&str> = keys.iter().map(|k| k.trim()).filter(|k| !k.is_empty()).collect();
+    let mut out = Vec::new();
+    for spec in &specs {
+        let mut parts = spec.splitn(3, '=');
+        let name = parts.next().unwrap_or_default().trim().to_string();
+        let url = parts.next().unwrap_or_default().trim().to_string();
+        if name.is_empty() || url.is_empty() {
+            bail!("--mcp wants NAME=URL[=TOOL,TOOL], not {spec:?}");
+        }
+        // The name is a prefix on a tool name, and a tool name is not
+        // allowed to be anything: the endpoints want
+        // `^[a-zA-Z0-9_-]+$`, and a name that breaks that breaks every
+        // tool the server lends rather than just itself.
+        if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+            bail!("--mcp NAME is letters, digits, _ and - (it prefixes tool names), not {name:?}");
+        }
+        if !url.starts_with("https://") && !url.starts_with("http://") {
+            bail!("--mcp {name} wants an http(s) URL; only streamable HTTP is spoken, not stdio");
+        }
+        if out.iter().any(|s: &Arc<mcp::Server>| s.name() == name) {
+            bail!("two --mcp servers called {name:?}: their tools would collide");
+        }
+        let only: Vec<String> = parts
+            .next()
+            .unwrap_or("")
+            .split(',')
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect();
+        if only.is_empty() {
+            warn!(
+                server = %name,
+                "no tool list after the URL, so every tool it has is offered to the AI; \
+                 a big server is a big list in front of every reply"
+            );
+        }
+        // A key given on its own is this one's, when this one is the
+        // only one. Named keys win over it wherever both are given.
+        let key = keys
+            .iter()
+            .find_map(|k| k.strip_prefix(&format!("{name}=")))
+            .or_else(|| keys.iter().copied().find(|k| !k.contains('=')).filter(|_| specs.len() == 1))
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if key.is_empty() {
+            warn!(
+                server = %name,
+                "no --mcp-key for this one; it had better not want authenticating"
+            );
+        }
+        out.push(Arc::new(mcp::Server::new(mcp::Config {
+            name,
+            url,
+            key,
+            only,
+        })));
+    }
+    Ok(out)
+}
+
 fn thinks(flag: bool) -> bool {
     flag || std::env::var("VOX_AGENT_THINK").is_ok_and(|v| {
         matches!(
@@ -790,6 +876,12 @@ fn serve(cli: Cli, store: Store, db: PathBuf) -> Result<()> {
         );
     }
 
+    // The MCP servers the house lends its AIs. Said hello to on their
+    // own threads, so a picture server that is slow or down costs the
+    // AI its picture tools and nothing else; see `mcp::connect_all`.
+    let mcp = mcp_servers(&cli.mcp, &cli.mcp_key)?;
+    mcp::connect_all(&mcp);
+
     // The settings every room shares. What makes one room different
     // from another -- its name, who it admits, how its AI takes the
     // turn to begin with -- is filled in by `rooms::Rooms`.
@@ -875,6 +967,12 @@ fn serve(cli: Cli, store: Store, db: PathBuf) -> Result<()> {
             // The first AI is the one this room was built around and
             // the one that runs it; the rest are voices in it. See
             // `agent::Allowed`.
+            // One per room: a picture made here is handed to somebody
+            // here. See `agent::Art`.
+            let art = Arc::new(agent::Art {
+                servers: mcp.clone(),
+                stash: mcp::Stash::default(),
+            });
             for (n, bot) in wiring.into_iter().enumerate() {
                 let preset = voices.get(&bot.name).unwrap_or(&voice);
                 let mut speaking: Vec<(String, Box<dyn tts::Voice>)> = Vec::new();
@@ -896,6 +994,7 @@ fn serve(cli: Cli, store: Store, db: PathBuf) -> Result<()> {
                     },
                     translate: translate.clone(),
                     generation: bot.generation,
+                    art: art.clone(),
                 }
                 .spawn(room.clone(), speaking, bot.turns);
             }

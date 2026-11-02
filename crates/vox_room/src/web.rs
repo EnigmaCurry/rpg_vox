@@ -109,6 +109,11 @@ const ASSETS: &str = "assets/";
 /// long as the browser likes: a change to it is a new name, never a
 /// different answer at the old one.
 const ASSET_CACHE: &str = "public, max-age=31536000, immutable";
+/// A face, which is asked for once per version and then never again:
+/// the version it was set at is in the URL, so a new one is a new
+/// address. Private, because the house is private -- the bytes are the
+/// same for everybody who may see them, and nobody else may.
+const AVATAR_CACHE: &str = "private, max-age=31536000, immutable";
 /// `index.html` is stored but asked about every time. It is what says
 /// which hashed files the app is made of *now*, and a browser holding
 /// yesterday's index asks this binary for files it no longer has.
@@ -197,9 +202,12 @@ pub fn router(rooms: Arc<Rooms>, screen: Arc<Screen>) -> Router {
             post(forget_conversation),
         )
         // Everything above answers one browser about itself, so none
-        // of it may be cached. The sockets, the health check and the
-        // app's own files below are the same for everybody.
+        // of it may be cached. The sockets, the health check, the
+        // faces and the app's own files below are the same for
+        // everybody -- a face at a given version is the same bytes to
+        // whoever may see it, which is what lets it be cached at all.
         .layer(from_fn(private_answer))
+        .route("/api/avatar/:who", get(avatar).delete(forget_avatar))
         .route("/room.ws", get(ws))
         .route("/screen.ws", get(screen_ws))
         .route("/healthz", get(|| async { "ok" }))
@@ -858,6 +866,85 @@ async fn forget_conversation(
 /// expected -- which the browser refuses to run, so the page came up
 /// blank with a MIME error and nothing to say why. It is a plain 404
 /// now, which is what it is.
+/// The square shown beside everything somebody says.
+///
+/// `who` is the name the room calls them, which is what the
+/// conversation carries and so what a browser has to ask by; the
+/// unchanging key it is really kept under is looked up here. A person
+/// first and then an AI, the same order `Room::set_avatar` resolves in.
+///
+/// The version is in the query rather than read here. It makes the
+/// address change when the picture does, which is the whole of how
+/// this is cached; a request without one still gets the current
+/// picture, it just gets asked again next time.
+async fn avatar(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Path(who): Path<String>,
+) -> Response {
+    // Inside the house only. Not a secret worth much, and not
+    // something to hand to whoever finds the address either.
+    if invited(&app, &headers).is_none() {
+        return (StatusCode::FORBIDDEN, "not invited").into_response();
+    }
+    let found = match app.any().avatar_png(&who) {
+        Ok(found) => found,
+        Err(err) => {
+            warn!("read {who}'s face: {err:#}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "no").into_response();
+        }
+    };
+    // Nobody's face is not an error: the app draws the tint their name
+    // already has, and asks for this only when the roster said there
+    // was one. A 404 is what it gets if that has since been taken away.
+    let Some((png, at)) = found else {
+        return (StatusCode::NOT_FOUND, "no face").into_response();
+    };
+    let tag = format!("\"{at:x}\"");
+    if headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|given| given.split(',').any(|t| t.trim() == tag))
+    {
+        return (StatusCode::NOT_MODIFIED, [(header::ETAG, tag)]).into_response();
+    }
+    (
+        [
+            (header::CONTENT_TYPE, "image/png".to_string()),
+            (header::CACHE_CONTROL, AVATAR_CACHE.to_string()),
+            (header::ETAG, tag),
+            // The bytes are the same for everybody, and who may have
+            // them is not: a shared cache must not answer this for a
+            // browser that never showed a cookie.
+            (header::VARY, "Cookie".to_string()),
+        ],
+        png,
+    )
+        .into_response()
+}
+
+/// Take your own face off, leaving the tint your name already has.
+///
+/// Yours and nobody else's -- not even the owner's to clear, and not
+/// the AI's either. A face is a thing you sat through an interview for;
+/// whoever can take it away can take away the wrong one.
+async fn forget_avatar(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Path(who): Path<String>,
+) -> Response {
+    let Some(me) = invited(&app, &headers) else {
+        return (StatusCode::FORBIDDEN, "not invited").into_response();
+    };
+    if me.display != who {
+        return (StatusCode::FORBIDDEN, "that is not your face").into_response();
+    }
+    match app.any().clear_avatar(&who) {
+        Ok(gone) => Json(json!({ "cleared": gone })).into_response(),
+        Err(err) => (StatusCode::BAD_REQUEST, err).into_response(),
+    }
+}
+
 async fn assets(headers: HeaderMap, uri: Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
     let path = if path.is_empty() { "index.html" } else { path };

@@ -99,6 +99,10 @@ const CARD_TITLE_MAX: usize = 60;
 const CARD_BODY_MAX: usize = 2000;
 /// Cards one person may be holding in a conversation at once.
 const CARDS_MAX: usize = 50;
+/// Biggest face the room will keep. Pixel art at the sizes an avatar
+/// wants is a handful of kilobytes; anything near this is a photograph
+/// that has wandered in, and the database is not the place for it.
+const AVATAR_BYTES_MAX: usize = 512 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -1621,6 +1625,181 @@ impl Room {
         ))
     }
 
+    /// Everybody the room can draw a face for, by the name it calls
+    /// them, and the version theirs is at.
+    ///
+    /// Keyed by display name, like `speaks_json` and for the same
+    /// reason: a line in the conversation carries the name the room
+    /// calls somebody, so that is what a browser has to look a face up
+    /// by. The database keys them by what does not change, and the
+    /// join from one to the other happens here -- which is why
+    /// renaming yourself keeps your face without anything being
+    /// rewritten.
+    ///
+    /// Everybody with one, not just who is here: a line outlives its
+    /// author's standing in the room, and so should their face.
+    fn avatars_json(&self, st: &State) -> Value {
+        let store = self.store();
+        let mut have = match store.avatars() {
+            Ok(have) => have,
+            Err(err) => {
+                warn!("read the faces: {err:#}");
+                return Value::Object(serde_json::Map::new());
+            }
+        };
+        if have.is_empty() {
+            return Value::Object(serde_json::Map::new());
+        }
+        let mut out = serde_json::Map::new();
+        match store.people() {
+            // One query for the invite list and one for the faces,
+            // joined here, rather than a lookup per person: this goes
+            // out whenever the roster changes.
+            Ok(people) => {
+                for p in people {
+                    if let Some(at) = have.remove(&p.name) {
+                        out.insert(p.display, Value::from(at));
+                    }
+                }
+            }
+            Err(err) => warn!("read the invite list for faces: {err:#}"),
+        }
+        // And the AIs, under the key no person can be invited into.
+        // Every bot the room has rather than only the ones in it now,
+        // for the same reason as the people.
+        for b in &st.bots {
+            if let Some(at) = have.get(&crate::store::bot_key(&b.cfg.name)) {
+                out.insert(b.cfg.name.clone(), Value::from(*at));
+            }
+        }
+        Value::Object(out)
+    }
+
+    /// Give somebody the square the room draws beside everything they
+    /// say. The picture is a PNG, and `prompt` is what it was asked
+    /// for; see `store::set_avatar`.
+    ///
+    /// `who` is a name as it is said out loud, matched loosely against
+    /// the roster and then against the AIs -- so a bot can be asked to
+    /// make one for itself as readily as for a person. Ok says whose it
+    /// is now, by the name the room calls them.
+    ///
+    /// Not a thing a turn can be talked over: a face somebody sat
+    /// through an interview for is not undone by the next person
+    /// speaking, which is what `generation` means everywhere it is
+    /// checked. It is taken only to say who is giving it.
+    pub fn set_avatar(
+        &self,
+        generation: u64,
+        who: &str,
+        png: &[u8],
+        prompt: &str,
+    ) -> Result<String, String> {
+        if !crate::mcp::is_png(png) {
+            return Err("that picture isn't a PNG, so the room can't show it".into());
+        }
+        if png.len() > AVATAR_BYTES_MAX {
+            return Err(format!(
+                "that picture is {} KB, and a face is at most {} KB",
+                png.len() / 1024,
+                AVATAR_BYTES_MAX / 1024
+            ));
+        }
+        let st = self.lock();
+        let said = who.trim();
+        // A person first, then an AI. Speech-to-text mangles names, so
+        // both are matched the way `send_card` matches them, and the
+        // error names everybody so the model can pick again.
+        let (key, whose) = if let Some(called) = st
+            .people
+            .keys()
+            .find(|n| n.eq_ignore_ascii_case(said))
+            .cloned()
+        {
+            let found = self
+                .store()
+                .person_called(&called)
+                .map_err(|err| format!("{err:#}"))?;
+            match found {
+                Some(name) => (name, called),
+                // On the roster and not in the invite list: they are
+                // being heard on a session whose account has gone.
+                // Nothing to hang a face on.
+                None => return Err(format!("the room doesn't know {called} well enough yet")),
+            }
+        } else if let Some(bot) = st
+            .bots
+            .iter()
+            .find(|b| b.cfg.name.eq_ignore_ascii_case(said))
+            .map(|b| b.cfg.name.clone())
+        {
+            (crate::store::bot_key(&bot), bot)
+        } else {
+            let mut names: Vec<&str> = st.people.keys().map(String::as_str).collect();
+            names.extend(st.bots.iter().map(|b| b.cfg.name.as_str()));
+            return Err(format!(
+                "there is nobody called {said:?} here; it is {}",
+                if names.is_empty() {
+                    "empty".to_string()
+                } else {
+                    names.join(", ")
+                }
+            ));
+        };
+        let at = self
+            .store()
+            .set_avatar(&key, png, prompt.trim())
+            .map_err(|err| format!("{err:#}"))?;
+        let from = st
+            .bots
+            .iter()
+            .find(|b| b.generation.load(Ordering::SeqCst) == generation)
+            .map(|b| b.cfg.name.clone())
+            .unwrap_or_else(|| self.cfg.bot().name.clone());
+        info!(who = %whose, %from, bytes = png.len(), version = at, "set a face");
+        // Everyone's tabs: a face is beside everything that person has
+        // ever said, so it is not news for them alone.
+        self.emit_people(&st);
+        Ok(whose)
+    }
+
+    /// Somebody's face and the version it is at, by the name the room
+    /// calls them: a person first and then an AI, the same order
+    /// [`Room::set_avatar`] resolves in.
+    ///
+    /// Asked by the browser, once per version -- see `web::avatar`.
+    /// None is nobody's face rather than a failure.
+    pub fn avatar_png(&self, who: &str) -> Result<Option<(Vec<u8>, u64)>, String> {
+        let store = self.store();
+        let key = match store.person_called(who) {
+            Ok(Some(name)) => name,
+            Ok(None) => crate::store::bot_key(who),
+            Err(err) => return Err(format!("{err:#}")),
+        };
+        store.avatar(&key).map_err(|err| format!("{err:#}"))
+    }
+
+    /// Take somebody's face away, leaving the tint their name already
+    /// has. `who` is the name the room calls them, matched exactly:
+    /// this is what the person's own button asks for, not something
+    /// said out loud.
+    pub fn clear_avatar(&self, who: &str) -> Result<bool, String> {
+        let st = self.lock();
+        let key = match self.store().person_called(who) {
+            Ok(Some(name)) => name,
+            Ok(None) => return Err(format!("the room doesn't know {who}")),
+            Err(err) => return Err(format!("{err:#}")),
+        };
+        let gone = self
+            .store()
+            .clear_avatar(&key)
+            .map_err(|err| format!("{err:#}"))?;
+        if gone {
+            self.emit_people(&st);
+        }
+        Ok(gone)
+    }
+
     /// Bring the roster back in line with who is actually invited.
     ///
     /// `vox_room invite` and `uninvite` run in their own process and write
@@ -1696,6 +1875,13 @@ impl Room {
             "type": "people",
             "people": self.people_json(st),
             "speaks": self.speaks_json(st),
+            // Faces ride along with the roster. An avatar belongs to
+            // the person and not to the room, so a room somebody is
+            // not in has to learn about theirs too -- and every room
+            // reads the invite list again when anything of the
+            // person's changes (see `Rooms::catch_up`), which is the
+            // moment this already goes out.
+            "avatars": self.avatars_json(st),
         }));
     }
 
@@ -1740,6 +1926,7 @@ impl Room {
             "interprets": !self.interp.is_empty(),
             "people": self.people_json(&st),
             "speaks": self.speaks_json(&st),
+            "avatars": self.avatars_json(&st),
             "languages": self.cfg.languages,
             "strips": self.mixer.strips(),
             "log": st.log,
@@ -1808,9 +1995,38 @@ impl Room {
                     // The titles of what they are holding, which is
                     // what a card is addressed by.
                     "cards": holding.get(name).cloned().unwrap_or_default(),
+                    // What their face was asked for, when they have
+                    // one. It is how the AI knows not to offer
+                    // somebody an avatar they already sat through, and
+                    // how it can build on the one they have -- "the
+                    // same ranger, older" -- rather than starting over
+                    // from a description it cannot see.
+                    "avatar": self.avatar_asked_for(name),
                 })
             })
             .collect()
+    }
+
+    /// What `who`'s face was asked for, by the name the room calls
+    /// them. None when they have none, or when it was set without a
+    /// description.
+    fn avatar_asked_for(&self, who: &str) -> Option<String> {
+        let store = self.store();
+        let key = match store.person_called(who) {
+            Ok(Some(name)) => name,
+            Ok(None) => crate::store::bot_key(who),
+            Err(err) => {
+                warn!("look up {who} for a face: {err:#}");
+                return None;
+            }
+        };
+        store
+            .avatar_prompt(&key)
+            .unwrap_or_else(|err| {
+                warn!("read what {who}'s face was asked for: {err:#}");
+                None
+            })
+            .filter(|p| !p.trim().is_empty())
     }
 
     /// Deal a card to one person: it joins their own cards and nobody
@@ -4869,6 +5085,84 @@ mod tests {
         // thread that would be reading them.
         let turns = wiring.pop().expect("a room has an AI in it").turns;
         (r, turns, interp_rx)
+    }
+
+    /// A square PNG, as a picture tool would have made it.
+    fn png() -> Vec<u8> {
+        let mut v = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        v.extend_from_slice(b"pixels");
+        v
+    }
+
+    /// A face is asked for by the name it is said by, kept against the
+    /// key that doesn't change, and shown to the whole room.
+    #[test]
+    fn a_face_is_given_by_name_and_shown_to_everybody() {
+        let (r, _turns) = room(Mode::Named);
+        let g = turn(&r);
+
+        // Not a PNG: refused, and nothing written. The browser is told
+        // it is being sent one, so this is where that is made true.
+        let err = r.set_avatar(g, "Ryan", b"GIF89a and the rest", "a wizard").unwrap_err();
+        assert!(err.contains("isn't a PNG"), "{err}");
+        assert!(r.avatar_png("Ryan").unwrap().is_none(), "nothing written");
+
+        // And nothing the size of a photograph.
+        let huge = {
+            let mut v = png();
+            v.resize(AVATAR_BYTES_MAX + 1, 0);
+            v
+        };
+        let err = r.set_avatar(g, "Ryan", &huge, "a wizard").unwrap_err();
+        assert!(err.contains("at most"), "{err}");
+
+        // Said the way speech-to-text would hand it over.
+        assert_eq!(r.set_avatar(g, "ryan", &png(), "a tired wizard").unwrap(), "Ryan");
+        let (got, version) = r.avatar_png("Ryan").unwrap().unwrap();
+        assert_eq!(got, png());
+
+        // Nobody of that name, and the error says who there is -- the
+        // people and the AIs both, since either may be given one.
+        let err = r.set_avatar(g, "Mallory", &png(), "a thief").unwrap_err();
+        assert!(err.contains("Ryan") && err.contains("Vox"), "{err}");
+
+        // The AI's own face, under a key no person can be invited into.
+        assert_eq!(r.set_avatar(g, "Vox", &png(), "a brass head").unwrap(), "Vox");
+
+        // What a browser is sent: the name the room calls them, and the
+        // version to fetch it by.
+        let shown = {
+            let st = r.lock();
+            r.avatars_json(&st)
+        };
+        assert_eq!(shown["Ryan"], Value::from(version));
+        assert!(shown["Vox"].is_u64(), "the AI has one too: {shown}");
+        assert!(shown.get("Alex").is_none(), "and nobody who hasn't");
+
+        // And what the AI is told about it -- what `list_people` puts
+        // under each name -- so it can build on a face somebody
+        // already has instead of starting over from nothing.
+        assert_eq!(
+            r.avatar_asked_for("Ryan").as_deref(),
+            Some("a tired wizard")
+        );
+        assert_eq!(r.avatar_asked_for("Alex"), None, "nobody who hasn't one");
+
+        // Renaming themselves keeps the face and moves which name it
+        // is shown under: the picture is kept against the key, and the
+        // join happens when the roster goes out.
+        assert_eq!(r.rename("Ryan", "Thorne"), Ok("Thorne".to_string()));
+        let shown = {
+            let st = r.lock();
+            r.avatars_json(&st)
+        };
+        assert_eq!(shown["Thorne"], Value::from(version), "{shown}");
+        assert!(shown.get("Ryan").is_none(), "under the old name no longer");
+
+        // Theirs to take off, and then it is the tint of their name.
+        assert_eq!(r.clear_avatar("Thorne"), Ok(true));
+        assert!(r.avatar_png("Thorne").unwrap().is_none());
+        assert_eq!(r.clear_avatar("Thorne"), Ok(false), "and none to take twice");
     }
 
     /// A game that leaves the room's mode alone.

@@ -122,6 +122,30 @@ one() {
          VALUES ($c,'g1','Vox','game','Quick Draw',1);"
   fi
 
+  # Faces are made by a model with a picture server, and there is
+  # neither here, so the room is given some and some lines to put them
+  # beside. Ryan and the AI have one; Alex deliberately has none, so
+  # the placeholder is on the screen next to the real thing.
+  if [[ $suite == avatars ]]; then
+    "$bin" $(flags "$suite") >/dev/null 2>&1 &
+    server=$!
+    waitfor; stop
+    local c
+    c=$(sqlite_get "$data/room.db" "SELECT value FROM settings WHERE key='Lobby:conversation';")
+    # An 8x8 PNG: a yellow square on magenta, so a screenshot shows at
+    # a glance whether the picture or the placeholder won. Kept as a
+    # hex literal because that is what sqlite takes a blob as.
+    local face="x'89504e470d0a1a0a0000000d49484452000000080000000808020000004b6d29dc0000001b4944415478da6338a1b1002b622020f1ff8e061cd14a8204570100f6df6b312bc415490000000049454e44ae426082'"
+    sqlite_set "$data/room.db" \
+      "INSERT INTO avatars (who, png, prompt, at)
+         VALUES ('Ryan', $face, 'a tired wizard', 1700000000000),
+                ('@Vox', $face, 'a brass head', 1700000000001);
+       INSERT INTO entries (conversation,id,who,kind,text,at)
+         VALUES ($c,'a1','Ryan','human','Make me a face, would you.',1),
+                ($c,'a2','Vox','agent','There. How is that?',2),
+                ($c,'a3','Alex','human','I will stay as I am.',3);"
+  fi
+
   # A card is posted by a model, and there is no model here, so the
   # conversation is given one to show. The body is what a card is for
   # -- a table of figures, a list, a block of code -- with the two
@@ -176,7 +200,7 @@ sqlite_get() { sqlite "$1" "$2"; }
 sqlite_set() { sqlite "$1" "$2" >/dev/null; }
 
 suites=("$@")
-[[ ${#suites[@]} -eq 0 ]] && suites=(rooms bots door permalinks ptt settings roles conversations game cards interpreter)
+[[ ${#suites[@]} -eq 0 ]] && suites=(rooms bots door permalinks ptt settings roles conversations game cards avatars interpreter)
 
 bad=0
 for suite in "${suites[@]}"; do

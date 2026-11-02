@@ -115,6 +115,13 @@ export const room = $state({
   // whether it needs translating for you depends on what it was said
   // in. Empty in a room with one language, which translates nothing.
   speaks: {},
+  // Who has a face, by the name the room calls them, to the version
+  // theirs is at. A lookup table for the same reason as `speaks`: a
+  // line outlives its author's standing in the room, and it is still
+  // shown with their face. The version is what `avatarOf` puts in the
+  // address, so a new picture is a new URL and the old one can be
+  // cached forever.
+  avatars: {},
   strips: {},
   levels: {},
   log: [],
@@ -693,6 +700,24 @@ function syncUrl() {
   pushNext = false;
 }
 
+/// Where to fetch somebody's face, or null when they have none and are
+/// to be drawn as the tint their name already has.
+///
+/// The version the room sent is in the query, which is the whole of how
+/// this is cached: a new picture is a new address, and the server marks
+/// the answer immutable. So the browser fetches one face once, however
+/// many lines that person has said.
+export function avatarOf(who) {
+  const at = room.avatars[who];
+  return at ? `/api/avatar/${encodeURIComponent(who)}?v=${at}` : null;
+}
+
+/// Take your own face off. Yours alone -- the server refuses anybody
+/// else's, whoever asks.
+export async function forgetAvatar() {
+  await fetch(`/api/avatar/${encodeURIComponent(room.you)}`, { method: 'DELETE' });
+}
+
 /// Back and forward move between rooms, since that is what the bar
 /// changing means. No new entry for a move the history itself asked for.
 addEventListener('popstate', () => followUrl());
@@ -785,6 +810,7 @@ function apply(ev) {
       room.interprets = ev.interprets ?? false;
       room.people = ev.people;
       room.speaks = ev.speaks ?? {};
+      room.avatars = ev.avatars ?? {};
       room.strips = ev.strips;
       room.log = ev.log;
       // A tab that has just arrived is told the room as it stands, and
@@ -873,6 +899,8 @@ function apply(ev) {
     case 'people':
       room.people = ev.people;
       room.speaks = ev.speaks ?? {};
+      // Faces ride along with the roster; see `Room::emit_people`.
+      room.avatars = ev.avatars ?? {};
       room.lang = myLanguage(room.languages, languageOf(ev.people, room.you));
       break;
     case 'entry':

@@ -1,6 +1,7 @@
 <script>
-  import { room, setName, setVolume } from '../lib/room.svelte.js';
+  import { room, setName, setVolume, avatarOf, forgetAvatar } from '../lib/room.svelte.js';
   import { NAME_MAX } from '../lib/names.js';
+  import Face from './Face.svelte';
 
   // The things you set once, off the floor of the room.
   //
@@ -53,6 +54,28 @@
         onkeydown={(e) => { if (e.key === 'Enter') { e.preventDefault(); e.currentTarget.blur(); } }} />
     </label>
     {#if room.nameError}<p class="warn">{room.nameError}</p>{/if}
+  </section>
+
+  <!-- Yours to be rid of, and nobody else's: the server refuses any
+       name but your own, whoever asks. Making one is a thing you ask
+       the AI for out loud -- there is nothing to press here for that,
+       because it is an interview and not a form. -->
+  <section>
+    <h2>Your face</h2>
+    <div class="face-row">
+      <Face who={room.you} />
+      {#if avatarOf(room.you)}
+        <div>
+          <p class="hint">The square beside everything you say.</p>
+          <button onclick={forgetAvatar}>Take it off</button>
+        </div>
+      {:else}
+        <p class="hint">
+          You have none, so your lines carry your initials. Ask
+          {room.agents[0]?.name ?? 'the AI'} out loud to make you one.
+        </p>
+      {/if}
+    </div>
   </section>
 
   <section>
@@ -136,4 +159,9 @@
   .warn { color: var(--danger); font-size: 13px; margin: 8px 0 0; }
   .much { color: var(--muted); min-width: 3.5ch; text-align: right; }
   kbd { font-size: 11px; opacity: 0.7; border: 1px solid currentColor; border-radius: 4px; padding: 0 4px; }
+  .face-row { display: flex; align-items: flex-start; gap: 12px; }
+  /* The square is drawn to sit beside a name in the conversation, and
+     there is no name above it here. */
+  .face-row :global(.face) { margin-top: 0; }
+  .face-row .hint { margin: 0 0 8px; color: var(--muted); }
 </style>

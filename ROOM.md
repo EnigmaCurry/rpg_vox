@@ -1060,6 +1060,72 @@ test, `whole_reply`, that puts a real reply through the whole path — the
 room's own request, the stream parsed as it arrives, a tool run from it,
 and the model carrying on from the tool's answer.
 
+A third, `says_hello`, says hello to Retro Diffusion's MCP server and
+reads back what it lends. It needs no key — `initialize` and
+`tools/list` want none — so it costs nothing, and it checks the half
+that a made-up server cannot: the SSE framing a real one answers with,
+that the tool list really is filtered to what was asked for, and that
+`rd_api_key` is gone from every schema the model would be shown while
+the room still knows which argument to put it back into:
+
+```bash
+cargo test -p vox_room -- --ignored --nocapture says_hello
+```
+
+### Faces
+
+Everyone in the room has a square beside everything they say, and so
+does each AI. Until one is made it is the tint that name already has
+with their initials in it, which is the same size and shape as the
+picture that may replace it — the column of names lines up either way.
+
+A face is **made by asking for one out loud**. The AI interviews you —
+who you are, what you are wearing, what sort of face — says what it is
+about to make, makes it, and puts it on you; then you tell it what to
+change and it makes another. It cannot see what it made, so you are its
+eyes. Setting another replaces it, so there is no cost to trying again
+beyond what the picture cost.
+
+The picture comes from an **MCP server**, which is any server the house
+was started with:
+
+```bash
+vox_room --room Lobby \
+  --mcp 'art=https://mcp.retrodiffusion.ai/mcp=create_inference,list_available_styles,estimate_inference_cost,get_balance' \
+  --mcp-key "$RD_API_KEY"
+```
+
+`NAME=URL=TOOL,TOOL,...`. The name is the prefix its tools are offered
+under — `art` gives the AI `art_create_inference` — so two servers
+lending a tool of the same name stay apart. **The tool list after the
+URL is the point of the flag.** Retro Diffusion offers 33 tools, of
+which a room that wants faces needs about four; the other 29 are 29
+more ways for a voice answering "make me an avatar" to end up
+generating a rigged 3D model instead. Leave the list out and every tool
+the server has is offered, which is only sane for a server you know is
+small. Repeat `--mcp` (or separate with `;`) for more servers.
+
+Only streamable HTTP is spoken, not stdio: a stdio server would want a
+child process supervised for as long as the house is open.
+
+**The key never reaches the model.** Most of Retro Diffusion's tools
+take an `rd_api_key` argument, and a model shown a field like that
+fills it in — with something it invented, or, worse, correctly, which
+would put the key in a transcript that is written down and shown on
+screen. So the key is stripped out of every schema the AI is shown and
+filled back in when the call is made, from `--mcp-key`.
+
+Making a picture and giving somebody a face are deliberately two steps:
+the server's tool makes it, and the room's own `set_avatar` puts one of
+what it made on a person. What a picture is kept in and how it is
+cached is under [How it works](#how-it-works).
+
+A face belongs to the **person**, not to the room or the conversation:
+it follows them between rooms, outlasts the conversation, and survives
+renaming themselves. **Settings → Your face** takes yours off again,
+and yours is the only one you can take off — not even the owner can
+clear somebody else's.
+
 ## How it works
 
 - One WebSocket per tab carries 20 ms mono Opus frames both ways
@@ -1145,6 +1211,8 @@ pays for a rejected request before every reply.
 | `VOX_ROOM_INTERPRET` | `true` | say what people say to the people who don't speak it, with the voices being interpreted ducked under it. `false` to translate only the AI and what is typed |
 | `VOX_ROOM_INTERPRETER_VOICE` | `ryan` | the interpreters' Qwen3 voice. Not the AI's, on purpose: the one thing to be able to tell by ear is which is which |
 | `VOX_ROOM_KOKORO_VOICE` | `am_michael` | Kokoro voice |
+| `VOX_ROOM_MCP` | | MCP servers the AI may use, `NAME=URL[=TOOL,TOOL,...]`, semicolon-separated. See [Faces](#faces) |
+| `VOX_ROOM_MCP_KEY` | | their keys, `NAME=KEY` or on its own for a single server. Never reaches the model |
 | `VOX_SCRIBE_MODELS` | scribe's models dir | speech-to-text models |
 
 ## Testing
@@ -1175,6 +1243,7 @@ CHROME=$(which chromium) ./run.sh            # or: ./run.sh rooms bots
 | `conversations` | the room's history: naming one, reading an old one read-only without moving anybody else's screen, deleting one for everybody, and empty ones never being archived |
 | `game` | a game played inside a room, and leaving it putting the room back where it was for everyone in it |
 | `cards` | what a posted card looks like once it is on the screen: the table, the list and the code block a model wrote in markdown — and the script tag it wrote with them arriving as words rather than as anything at all |
+| `avatars` | the square beside everything somebody says: a picture where one was made and the same-sized tint-and-initials where none was, each face fetched once however many lines that person said, and taking your own off turning it back into initials in the conversation behind the page |
 | `interpreter` | the interpreter appearing only while it has somebody to interpret for, and its level being each listener's own |
 
 The four below want something of yours — a microphone, a model, a

@@ -14,6 +14,7 @@
 //! been handed to the conversation (and again when a later pass revises
 //! it), and the AI's reply once it has been spoken or cut off.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{bail, Context as _, Result};
@@ -189,6 +190,32 @@ CREATE TABLE IF NOT EXISTS conversations (
     -- When it was started, in unix milliseconds. Zero on an old row,
     -- and then the first thing said in it stands in for it.
     at   INTEGER NOT NULL DEFAULT 0
+);
+-- The square picture shown beside everything somebody says. One row
+-- each, and only for those who have one: a person without a row is
+-- drawn as the tint their name already has, which is the placeholder
+-- and not a missing picture.
+--
+-- Keyed by what does not change. A person's `people.name` rather than
+-- their display name, so renaming themselves doesn't lose their face
+-- the way it would a card (see `rename`, which has to rewrite those);
+-- and `@` and its name for an AI, because a bot's name comes from the
+-- configuration rather than from here, and nothing stops a person
+-- being invited as `Vortex Prime` while a bot is called it.
+CREATE TABLE IF NOT EXISTS avatars (
+    who    TEXT PRIMARY KEY,
+    -- The picture itself, as a PNG. Pixel art is a few kilobytes, so it
+    -- lives here beside everything else the house has to keep rather
+    -- than in a directory of its own that a backup could miss.
+    png    BLOB NOT NULL,
+    -- What it was asked for. Kept so the next one can be asked for in
+    -- the same spirit, and so somebody can read how they were described.
+    prompt TEXT NOT NULL DEFAULT '',
+    -- When it was set, in unix milliseconds. Also its version: it is
+    -- what a browser is told to fetch, and a picture fetched under one
+    -- of these can be cached for good, because setting another one
+    -- changes the number.
+    at     INTEGER NOT NULL
 );
 -- A card the AI dealt to one person. Only they are ever sent it, and it
 -- belongs to the conversation it was dealt in.
@@ -506,6 +533,9 @@ impl Store {
         let gone = tx.execute("DELETE FROM people WHERE name = ?1", [name])? > 0;
         tx.execute("DELETE FROM sessions WHERE name = ?1", [name])?;
         tx.execute("DELETE FROM grants WHERE name = ?1", [name])?;
+        // Their face goes with the account. Somebody invited under the
+        // same name later is a new person, and starts without one.
+        tx.execute("DELETE FROM avatars WHERE who = ?1", [name])?;
         tx.commit()?;
         Ok(gone)
     }
@@ -1225,6 +1255,78 @@ impl Store {
             params![conversation, id],
         )? > 0)
     }
+
+    // -- avatars: the square beside everything somebody says --------------
+
+    /// Give `who` a face, replacing whatever they had. The answer is
+    /// its version, which is what a browser fetches it by.
+    ///
+    /// Not checked against the invite list. A bot is in here under
+    /// [`bot_key`] and is nobody's row in `people`, and the one thing
+    /// that must not happen is the AI's own face being the one kind
+    /// this can't keep.
+    pub fn set_avatar(&self, who: &str, png: &[u8], prompt: &str) -> Result<u64> {
+        let at = now_ms();
+        self.db.execute(
+            "INSERT INTO avatars (who, png, prompt, at) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(who) DO UPDATE SET
+                 png = excluded.png, prompt = excluded.prompt, at = excluded.at",
+            params![who, png, prompt, at],
+        )?;
+        Ok(at as u64)
+    }
+
+    /// `who`'s picture and its version, or None when they have none and
+    /// are to be drawn as their tint.
+    pub fn avatar(&self, who: &str) -> Result<Option<(Vec<u8>, u64)>> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT png, at FROM avatars WHERE who = ?1",
+                [who],
+                |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as u64)),
+            )
+            .optional()?)
+    }
+
+    /// What `who`'s picture was asked for, for making the next one in
+    /// the same spirit. Empty when it was set without a description.
+    pub fn avatar_prompt(&self, who: &str) -> Result<Option<String>> {
+        Ok(self
+            .db
+            .query_row("SELECT prompt FROM avatars WHERE who = ?1", [who], |r| {
+                r.get(0)
+            })
+            .optional()?)
+    }
+
+    /// Everybody who has one, and the version theirs is at. The room
+    /// turns this into what it sends a browser; it is small enough to
+    /// read whole, and the pictures themselves are not in it.
+    pub fn avatars(&self) -> Result<BTreeMap<String, u64>> {
+        let mut q = self.db.prepare("SELECT who, at FROM avatars")?;
+        let rows = q.query_map([], |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as u64)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Take `who`'s picture away; false when they had none.
+    pub fn clear_avatar(&self, who: &str) -> Result<bool> {
+        Ok(self
+            .db
+            .execute("DELETE FROM avatars WHERE who = ?1", [who])?
+            > 0)
+    }
+}
+
+/// What an AI's picture is kept under: `@` and its name.
+///
+/// A person is in `avatars` under their unchanging `people.name`, which
+/// is theirs because they were invited. A bot's name is the
+/// configuration's, so the two namespaces are not the same one and are
+/// not allowed to collide -- nothing stops somebody being invited as
+/// `Vortex Prime` while a bot answers to it.
+pub fn bot_key(bot: &str) -> String {
+    format!("@{bot}")
 }
 
 fn now_ms() -> i64 {
@@ -1390,6 +1492,56 @@ mod tests {
 
     fn plain() -> GameSettings {
         GameSettings::default()
+    }
+
+    /// A face survives being renamed, and goes when the account does.
+    /// Which is the whole reason it is kept against `name` and not
+    /// against what the room calls somebody.
+    #[test]
+    fn a_face_outlives_a_rename_and_dies_with_the_account() {
+        let s = Store::memory();
+        s.invite("Ryan").unwrap();
+
+        assert_eq!(s.avatar("Ryan").unwrap(), None, "nobody starts with one");
+        assert!(!s.clear_avatar("Ryan").unwrap(), "and none to take away");
+
+        let v = s.set_avatar("Ryan", b"\x89PNG...", "a tired wizard").unwrap();
+        let (png, version) = s.avatar("Ryan").unwrap().unwrap();
+        assert_eq!(png, b"\x89PNG...");
+        assert_eq!(version, v, "the version is what it was set at");
+        assert_eq!(
+            s.avatar_prompt("Ryan").unwrap().as_deref(),
+            Some("a tired wizard")
+        );
+
+        // Renaming themselves rewrites their cards and their lines; it
+        // must not touch this.
+        assert!(s.rename("Ryan", "Thorne").unwrap());
+        assert_eq!(s.avatar("Ryan").unwrap().unwrap().1, v, "still theirs");
+
+        // Setting another replaces the one picture rather than stacking
+        // one, and moves the version on so a browser refetches.
+        let again = s.set_avatar("Ryan", b"second", "a rested wizard").unwrap();
+        assert_eq!(s.avatar("Ryan").unwrap().unwrap().0, b"second");
+        assert!(again >= v);
+        assert_eq!(s.avatars().unwrap().len(), 1);
+
+        // An AI keeps its own in the same table, under a key no person
+        // can be invited into.
+        s.set_avatar(&bot_key("Vortex Prime"), b"bot", "a brass head")
+            .unwrap();
+        let all = s.avatars().unwrap();
+        assert_eq!(all.len(), 2);
+        assert!(all.contains_key("@Vortex Prime"));
+        assert!(
+            s.avatar("Vortex Prime").unwrap().is_none(),
+            "a bot is not reachable as a person"
+        );
+
+        // Uninviting takes the person's with it, and leaves the AI's.
+        assert!(s.uninvite("Ryan").unwrap());
+        assert_eq!(s.avatar("Ryan").unwrap(), None);
+        assert!(s.avatar(&bot_key("Vortex Prime")).unwrap().is_some());
     }
 
     /// One owner, and the way to another is through the first.

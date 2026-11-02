@@ -1,0 +1,99 @@
+<script>
+  import { avatarOf } from '../lib/room.svelte.js';
+  import { hue } from '../lib/color.js';
+
+  // `who` is the name the room calls them, which is what a line in the
+  // conversation carries and what a face is looked up by. `agent` is
+  // whether it is one of the AIs, which have their own colour rather
+  // than one worked out from the name.
+  let { who, agent = false } = $props();
+
+  const src = $derived(avatarOf(who));
+
+  // Enough of a name to tell two people apart at this size: the first
+  // letter of the first two words.
+  const initials = $derived(
+    (who || '?')
+      .split(/\s+/)
+      .filter(Boolean)
+      .slice(0, 2)
+      .map((w) => [...w][0])
+      .join('')
+      .toUpperCase(),
+  );
+
+  // A picture the browser couldn't load, by address. The roster said
+  // there was one, so something has gone wrong between then and now --
+  // a face taken away mid-session, most likely. Showing the square
+  // their name already has is the right answer either way, and it is
+  // remembered by address so a *new* picture is tried afresh.
+  let broken = $state({});
+  const show = $derived(src && !broken[src]);
+</script>
+
+<!-- The square beside everything somebody says: their picture, or the
+     tint their name already has with their initials in it. Never
+     nothing -- the column has to line up whether or not a face has
+     been made, so the placeholder is the same size and shape as the
+     picture it is standing in for. -->
+<div
+  class="face"
+  class:agent
+  style="--h: {hue(who)}"
+  title={who}
+  aria-hidden="true"
+>
+  {#if show}
+    <img {src} alt="" onerror={() => (broken = { ...broken, [src]: true })} />
+  {:else}
+    <span class="initials">{initials}</span>
+  {/if}
+</div>
+
+<style>
+  .face {
+    /* Square, and the same square whichever branch above drew it. It
+       does not shrink: the conversation is a column of names that line
+       up, and a face that changed width per person would unalign it. */
+    flex: 0 0 auto;
+    width: 36px;
+    height: 36px;
+    border-radius: 8px;
+    overflow: hidden;
+    display: grid;
+    place-items: center;
+    background: hsl(var(--h) 55% 92%);
+    color: hsl(var(--h) 55% 32%);
+    border: 1px solid hsl(var(--h) 40% 80%);
+    /* It sits beside the name rather than the bubble, which is a line
+       of 12px text above the words. */
+    margin-top: 14px;
+  }
+  .face.agent {
+    background: color-mix(in srgb, var(--agent) 14%, var(--bubble));
+    color: var(--agent);
+    border-color: color-mix(in srgb, var(--agent) 40%, var(--line));
+  }
+  .initials {
+    font-size: 13px;
+    font-weight: 650;
+    letter-spacing: 0.02em;
+    user-select: none;
+  }
+  img {
+    width: 100%;
+    height: 100%;
+    /* Pixel art, so no smoothing: a 128px picture in a 36px square is
+       being scaled down, and bilinear turns pixel art to mush. */
+    image-rendering: pixelated;
+    object-fit: cover;
+    display: block;
+  }
+  @media (prefers-color-scheme: dark) {
+    .face {
+      background: hsl(var(--h) 35% 22%);
+      color: hsl(var(--h) 45% 78%);
+      border-color: hsl(var(--h) 30% 32%);
+    }
+  }
+</style>

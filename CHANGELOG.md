@@ -90,6 +90,52 @@ releases.
 
 ### Voice room
 
+- **Everybody has a face now, and the AI can make you one.** Every line
+  in the conversation carries a square beside it: a picture when one
+  has been made, and otherwise the tint that name already has with the
+  initials in it -- the same size and shape, so the column of names
+  lines up whether or not anybody has sat through an interview.
+
+  Making one is a conversation rather than a form. Ask out loud, and
+  the AI asks who you are, what you are wearing, what sort of face,
+  says what it is about to make, makes it and puts it on you; then you
+  tell it what to change. It cannot see what it made -- it is told how
+  many pictures it has and refers to one by number -- so the room is
+  its eyes, and setting another replaces the first.
+
+  The pictures come from an **MCP server**, which is new and is not
+  only for pictures: `--mcp NAME=URL=TOOL,TOOL` lends the AI any
+  streamable-HTTP MCP server's tools, under a prefix of their own.
+  Retro Diffusion's pixel art is what it was built against:
+
+  ```bash
+  vox_room --room Lobby \
+    --mcp 'art=https://mcp.retrodiffusion.ai/mcp=create_inference,list_available_styles,estimate_inference_cost,get_balance' \
+    --mcp-key "$RD_API_KEY"
+  ```
+
+  **The tool list after the URL is the point of the flag, not a
+  convenience.** That server offers 33 tools; a room that wants faces
+  needs about four, and the other 29 are 29 more ways for a voice
+  answering "make me an avatar" to end up generating a rigged 3D model.
+  Which tools a room lends is a decision about the room, made once in
+  the configuration, rather than one the model re-makes every turn.
+
+  **The key never reaches the model.** Most of those tools take an
+  `rd_api_key` argument, and a model shown a field like that fills it
+  in -- with something it invented, or, worse, correctly, which would
+  put the key into a transcript that is written down and shown on
+  screen. So it is stripped out of every schema the AI is shown and
+  filled back in when the call is made.
+
+  A face belongs to the person and not to the room or the
+  conversation: it is kept against the name on their invite rather
+  than the name the room calls them, so renaming yourself keeps it, it
+  follows you between rooms, and it outlasts the conversation it was
+  made in. **Settings -> Your face** takes yours off, and yours is the
+  only one you can take off -- not even the owner can clear somebody
+  else's.
+
 - **A card is written in markdown, so an AI can show you a thing while
   it tells you.** Ask for the weather and the answer is a handful of
   figures: speech is bad at "nine degrees, fourteen degrees, two

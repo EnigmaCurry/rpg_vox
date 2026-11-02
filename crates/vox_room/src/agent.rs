@@ -20,6 +20,7 @@ use tracing::{debug, info, warn};
 use vox_transcribe::filters::{clause_end, sentence_end};
 use vox_transcribe::translate::Translate;
 
+use crate::mcp;
 #[cfg(test)]
 use crate::room::RoomConfig;
 use crate::room::{Cue, GameSettings, Players, ReplyMode, Role, Room, Turn, TypedJob};
@@ -262,6 +263,40 @@ Say your short goodbye before you call it, since what you have already said \
 is spoken straight away.";
 
 /// Added to the lobby's prompt when `--search` is on.
+/// Added to the prompt when the room has a picture server: the faces.
+///
+/// Deliberately about the room's half and not the picture tool's. What
+/// sizes and styles there are, and how to word a prompt for them, is
+/// in each tool's own schema, written by whoever runs that server and
+/// better than anything that could be restated here -- and it goes
+/// stale the moment they add a style. What this says is the part the
+/// room knows: that it is an interview, that it costs real money, and
+/// that making a picture and giving somebody a face are two steps.
+const AVATAR_NOTE: &str = "\
+Everybody in the room has a square beside everything they say, and you \
+can make somebody theirs. It is two steps: a picture tool makes the \
+picture, and set_avatar puts one of what it made on a person. You cannot \
+see what you made -- you are told how many pictures you have, and you \
+refer to one by its number -- so the people in the room are your eyes: \
+set one, ask how it looks, and make another if they want a change. \
+Setting another replaces it, so trying again costs nothing but a moment.
+
+Interview them first, in the room, out loud. Ask what they want to be -- \
+who the character is, what they are wearing, what they are carrying, what \
+sort of face -- and get enough to work from before you make anything. Then \
+say what you are about to make, in a sentence, so they can stop you. \
+Each picture costs the house real money, so make one at a time, and never \
+make one nobody asked for. list_people tells you what each person's face \
+was asked for, when they have one: use it to build on what somebody \
+already has rather than starting over, and don't offer a face to somebody \
+who is happy with theirs.
+
+A face belongs to the person and not to the game: it follows them from \
+room to room and outlasts the conversation. So ask who they want to be \
+rather than deciding for them, and if somebody would rather not have one, \
+leave them the colour their name already has. You can be given one too, \
+and you may make your own -- ask the room what it thinks you look like.";
+
 const SEARCH_NOTE: &str = "\
 You can look things up on the web with look_up, and you should whenever the \
 answer turns on how the world is now or on specifics you can't be sure of: \
@@ -476,6 +511,35 @@ pub enum Allowed {
     Looking,
 }
 
+/// What this room has for making pictures: the MCP servers it lends
+/// out, and where what they make waits to be given to somebody.
+///
+/// One per room and not one per house. The stash is keyed by bot, and
+/// the first AI is in every room, so a shared one would let a picture
+/// made in the lobby be handed to somebody in the cellar. The servers
+/// themselves are shared -- what they lend is asked once, as the house
+/// opens.
+#[derive(Default)]
+pub struct Art {
+    pub servers: Vec<Arc<mcp::Server>>,
+    pub stash: mcp::Stash,
+}
+
+impl Art {
+    /// Whether anything here can actually make a picture. A room with
+    /// no picture server has no use for `set_avatar`: it would be a
+    /// tool with nothing to put.
+    fn any(&self) -> bool {
+        self.servers.iter().any(|s| !s.offer().is_empty())
+    }
+
+    /// The server whose tool this is, by the prefixed name the model
+    /// called it by.
+    fn whose(&self, tool: &str) -> Option<&Arc<mcp::Server>> {
+        self.servers.iter().find(|s| s.has(tool))
+    }
+}
+
 /// What a bot that is only looking may call. The rest of what the room
 /// offers is the first AI's.
 ///
@@ -529,6 +593,10 @@ pub struct Agent {
     /// has no way to -- and then the other languages are written down
     /// and spoken in the room's own.
     pub translate: Option<Arc<dyn Translate>>,
+    /// The picture servers this room lends, shared with the other bots
+    /// in it. Empty for a house started without any, and then nothing
+    /// below ever offers a picture tool.
+    pub art: Arc<Art>,
 }
 
 impl Agent {
@@ -600,6 +668,8 @@ impl Agent {
                             turn.asked,
                             &self.generation,
                             &tx,
+                            &self.art,
+                            &self.name,
                         ),
                     };
                     tx.send(match result {
@@ -640,6 +710,14 @@ impl Agent {
         } else {
             String::new()
         };
+        // Only when something can actually make a picture. A note
+        // about faces, to a voice with no way to make one, is the same
+        // mistake as a note about cards to one that cannot deal them.
+        let faces = if self.art.any() {
+            format!("\n\n{AVATAR_NOTE}")
+        } else {
+            String::new()
+        };
         let others = match turn.others.as_slice() {
             [] => String::new(),
             [one] => format!("\n\n{}", OTHER_NOTE.replace("{other}", one)),
@@ -668,12 +746,21 @@ impl Agent {
         // instruction to try.
         let system = match (&turn.game, self.allowed) {
             (None, Allowed::Everything) => format!(
-                "{}\n\n{GAMES_NOTE}\n\n{CARDS_NOTE}\n\n{TURN_NOTE}{search}{others}{translated}",
+                "{}\n\n{GAMES_NOTE}\n\n{CARDS_NOTE}\n\n{TURN_NOTE}{search}{faces}{others}{translated}",
                 self.prompt
             ),
+            // A bot that is only looking has no picture tools either;
+            // see `Allowed::Looking` and `LOOKING_TOOLS`.
             (None, Allowed::Looking) => format!(
                 "{}\n\n{POSTING_NOTE}\n\n{TURN_NOTE}{search}{others}{translated}",
                 self.prompt
+            ),
+            // In a game too: a portrait of somebody's character is as
+            // much a thing to make mid-game as before one, which is
+            // what `tools_for` offers there.
+            (Some((game, prompt)), Allowed::Everything) => format!(
+                "{}{faces}{others}{translated}",
+                game_prompt(game, prompt, Allowed::Everything)
             ),
             (Some((game, prompt)), allowed) => {
                 format!("{}{others}{translated}", game_prompt(game, prompt, allowed))
@@ -1096,6 +1183,9 @@ fn stream_reply(
     asked: Instant,
     generation: &AtomicU64,
     tx: &Voices,
+    art: &Art,
+    // Which bot this is: whose pictures are whose, in `art`.
+    bot: &str,
 ) -> Result<()> {
     let model = cfg.model.as_str();
     let mut convo = messages.to_vec();
@@ -1129,7 +1219,8 @@ fn stream_reply(
                 _ => {}
             }
             if tools && round < TOOL_ROUNDS {
-                let offered = tools_for(allowed, lobby, cfg.search, cue.deciding(), hand_on);
+                let offered =
+                    tools_for(allowed, lobby, cfg.search, cue.deciding(), hand_on, art);
                 body["tools"] = match api {
                     Api::Responses => flatten_tools(&offered),
                     _ => offered,
@@ -1263,7 +1354,7 @@ fn stream_reply(
         push_turn(api, &mut convo, &said, &calls);
         let spoke = !spoken.is_empty();
         for (i, c) in calls.iter().enumerate() {
-            let mut result = run_tool(room, cfg, g, c, allowed);
+            let mut result = run_tool(room, cfg, g, c, allowed, art, bot);
             info!(g, tool = c.name, %result, "reply: tool");
             if answered {
                 continue;
@@ -1351,10 +1442,10 @@ fn room_tools() -> Vec<Value> {
         tool(
             "list_people",
             "List who is in the room: their exact name, whether their \
-             microphone is open, and what cards they are holding. Only the \
-             people who are actually here; somebody invited but elsewhere is \
-             not in this room. Use it to get a name right before sending a \
-             card.",
+             microphone is open, what cards they are holding, and what their \
+             avatar was asked for if they have one. Only the people who are \
+             actually here; somebody invited but elsewhere is not in this \
+             room. Use it to get a name right before sending a card.",
             json!({}),
             &[],
         ),
@@ -1499,7 +1590,14 @@ fn look_up_tool() -> Value {
 /// lobby designing games and looking things up when `search` is on --
 /// unless this bot is only [`Allowed::Looking`], and then it is who is
 /// here, the web, and the two tools a turn is taken with.
-fn tools_for(allowed: Allowed, lobby: bool, search: bool, deciding: bool, hand_on: bool) -> Value {
+fn tools_for(
+    allowed: Allowed,
+    lobby: bool,
+    search: bool,
+    deciding: bool,
+    hand_on: bool,
+    art: &Art,
+) -> Value {
     // Not offered when there is nobody to hand to, or nothing left to
     // hand: the model is told as much in `LAST_ROUND`, and a tool it
     // cannot use is a tool it will try.
@@ -1523,6 +1621,16 @@ fn tools_for(allowed: Allowed, lobby: bool, search: bool, deciding: bool, hand_o
     let mut extra: Vec<Value> = room_tools().into_iter().filter(offer).collect();
     if deciding {
         extra.push(quiet_tool());
+    }
+    // Pictures everywhere, and not only in the lobby the way games
+    // are. A portrait of somebody's character is as much a thing to
+    // make in the middle of a game as before one, and a game whose
+    // prompt doesn't want them simply never asks.
+    if art.any() {
+        extra.push(avatar_tool());
+        for server in &art.servers {
+            extra.extend(server.offer());
+        }
     }
     if !lobby {
         return Value::Array(extra);
@@ -1558,6 +1666,36 @@ fn tools_for(allowed: Allowed, lobby: bool, search: bool, deciding: bool, hand_o
             .push(look_up_tool());
     }
     tools
+}
+
+/// Putting a picture that has been made on somebody.
+///
+/// Deliberately two steps and not one. Making the picture is the
+/// picture server's tool, with everything that server knows about
+/// sizes and styles in its own schema; this is the room's half, and
+/// all it decides is whose face it is. A model that has made nothing
+/// is told so when it calls this.
+fn avatar_tool() -> Value {
+    tool(
+        "set_avatar",
+        "Put a picture you have made on somebody: it becomes the square shown beside \
+         everything they say, to everyone. Make the picture first with a picture tool. \
+         Ask them what they want before making one, and ask how they like it after -- \
+         setting another replaces it, so there is no cost to trying again.",
+        json!({
+            "who": {
+                "type": "string",
+                "description": "Whose face it is: somebody in the room, or an AI's own name.",
+            },
+            "picture": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Which of the pictures you last made, counting from 1. \
+                                Leave it out for the first.",
+            },
+        }),
+        &["who"],
+    )
 }
 
 /// Answer one question with a web search, letting the endpoint do the
@@ -1622,7 +1760,16 @@ fn search_text(v: &Value) -> String {
 }
 
 /// Run one tool call; the result is JSON for the model.
-fn run_tool(room: &Room, cfg: &Chat, g: u64, call: &ToolCall, allowed: Allowed) -> String {
+#[allow(clippy::too_many_arguments)]
+fn run_tool(
+    room: &Room,
+    cfg: &Chat,
+    g: u64,
+    call: &ToolCall,
+    allowed: Allowed,
+    art: &Art,
+    bot: &str,
+) -> String {
     // It was never offered this one, which does not stop a model asking
     // for it. The room's answer is the same either way: there is no
     // such tool for you.
@@ -1722,7 +1869,47 @@ fn run_tool(room: &Room, cfg: &Chat, g: u64, call: &ToolCall, allowed: Allowed) 
                 }
             }
         }
-        other => Err(format!("there is no tool called {other:?}")),
+        "set_avatar" => {
+            // Counting from 1, and the first one when it didn't say.
+            let nth = args["picture"].as_u64().unwrap_or(1) as usize;
+            match art.stash.take(bot, nth) {
+                Some(p) => room
+                    .set_avatar(g, &arg("who"), &p.png, &p.prompt)
+                    .map(|who| json!({ "set": who })),
+                None => Err(match art.stash.held(bot) {
+                    0 => "you haven't made a picture yet; make one first, then put it \
+                          on somebody with this"
+                        .to_string(),
+                    held => format!(
+                        "you made {held} picture{}, so `picture` is 1 to {held}",
+                        if held == 1 { "" } else { "s" }
+                    ),
+                }),
+            }
+        }
+        // Somebody else's tool: one of the MCP servers the room lends,
+        // under the prefixed name it was offered as. `Allowed` has
+        // already had its say -- a bot that is only looking never got
+        // offered these and is refused above.
+        other => match art.whose(other) {
+            Some(server) => {
+                info!(g, tool = other, server = server.name(), "reply: over MCP");
+                match server.call(bot, other, &args, &art.stash) {
+                    Ok(said) => Ok(json!({ "result": said })),
+                    Err(err) => {
+                        // Said plainly, so the model tells the room it
+                        // couldn't rather than describing a picture
+                        // that was never made.
+                        warn!(g, tool = other, "MCP call failed: {err:#}");
+                        Err(format!(
+                            "{other} failed ({err}); say you couldn't make it, and don't \
+                             pretend you did"
+                        ))
+                    }
+                }
+            }
+            None => Err(format!("there is no tool called {other:?}")),
+        },
     };
     match result {
         Ok(v) => v.to_string(),
@@ -1825,7 +2012,7 @@ mod tests {
     }
 
     fn tool_names_deciding(lobby: bool, search: bool, deciding: bool) -> Vec<String> {
-        tools_for(Allowed::Everything, lobby, search, deciding, true)
+        tools_for(Allowed::Everything, lobby, search, deciding, true, &Art::default())
             .as_array()
             .unwrap()
             .iter()
@@ -1842,7 +2029,7 @@ mod tests {
     /// What is offered in the lobby, with the web, to a bot judging a
     /// pause -- `hand_on` being the only thing in question.
     fn tools_names(allowed: Allowed, hand_on: bool) -> Vec<String> {
-        tools_for(allowed, true, true, true, hand_on)
+        tools_for(allowed, true, true, true, hand_on, &Art::default())
             .as_array()
             .unwrap()
             .iter()
@@ -1851,7 +2038,7 @@ mod tests {
     }
 
     fn looking_names(lobby: bool, search: bool, deciding: bool) -> Vec<String> {
-        tools_for(Allowed::Looking, lobby, search, deciding, true)
+        tools_for(Allowed::Looking, lobby, search, deciding, true, &Art::default())
             .as_array()
             .unwrap()
             .iter()
@@ -2124,6 +2311,7 @@ mod tests {
             allowed: Allowed::Everything,
             generation: Arc::new(AtomicU64::new(0)),
             translate: None,
+            art: Arc::new(Art::default()),
         };
         let turn = Turn {
             generation: 1,
@@ -2206,6 +2394,8 @@ mod tests {
             Instant::now(),
             &room.generation_of_only_bot(),
             &tx,
+            &Art::default(),
+            "Vox",
         )
         .expect("the reply");
         drop(tx);
@@ -2275,7 +2465,7 @@ mod tests {
             let (agent, mut t) = turn_with(judge(None, false), people, *engaged);
             t.messages = vec![(Role::User, said.to_string())];
             // Ask the way the room asks, on whichever API it speaks.
-            let offered = tools_for(Allowed::Everything, true, false, true, true);
+            let offered = tools_for(Allowed::Everything, true, false, true, true, &Art::default());
             let messages = agent.messages(&t);
             let (path, mut body) = match chat.api() {
                 Api::Responses => (
@@ -2369,7 +2559,7 @@ mod tests {
     #[test]
     fn each_api_is_fed_and_read_in_its_own_shape() {
         // One function tool, wrapped for chat and flat for responses.
-        let offered = tools_for(Allowed::Everything, false, false, false, true);
+        let offered = tools_for(Allowed::Everything, false, false, false, true, &Art::default());
         let flat = flatten_tools(&offered);
         assert_eq!(offered[0]["function"]["name"], "list_people");
         assert_eq!(flat[0]["name"], "list_people");
@@ -2608,7 +2798,7 @@ mod tests {
         // The tools are read as instructions for what to do, so nothing
         // in them is phrased that way at all.
         for (lobby, deciding) in [(true, true), (false, false)] {
-            let tools = tools_for(Allowed::Everything, lobby, true, deciding, true).to_string();
+            let tools = tools_for(Allowed::Everything, lobby, true, deciding, true, &Art::default()).to_string();
             assert!(!tools.contains("private"), "{tools}");
         }
     }
