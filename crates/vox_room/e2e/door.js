@@ -29,6 +29,10 @@ const stored = (page, key) => page.evaluate((k) => localStorage.getItem(k), key)
   // Somebody the room already knows: the one most likely to have a
   // conversation to leak behind the card.
   const k = await atTheDoor(known);
+  // On record before coming in, so the reload below can be asked where
+  // the box got its value.
+  await k.page.selectOption('.enter label:has(span:text-is("Language")) select', 'Russian');
+  await k.page.waitForTimeout(500);
   await comeIn(k.page);
   await k.page.evaluate(() => document.querySelector('footer button:last-child').click());
   await k.page.waitForTimeout(900);
@@ -68,6 +72,20 @@ const stored = (page, key) => page.evaluate((k) => localStorage.getItem(k), key)
     await k.page.evaluate(() => !!document.querySelector('.enter .who')),
     false,
   );
+
+  // A browser the room already knows has no socket out here either, and
+  // the Language box used to be missing entirely for it -- there until
+  // you joined once, gone again on the next reload. The room's own
+  // record is what fills it, so this clears what the browser remembered
+  // and asks again.
+  await k.page.evaluate(() => localStorage.removeItem('vox_room.lang'));
+  await k.page.reload();
+  await k.page.waitForSelector('.enter');
+  await k.page.waitForTimeout(900);
+  is('a browser the room knows is offered the language too', await language(k.page), 'Russian');
+  is('and it came from the room, not from this browser',
+    await stored(k.page, 'vox_room.lang'), 'Russian');
+
   await k.browser.close();
 
   // A fresh invite, and nothing agreed to yet.

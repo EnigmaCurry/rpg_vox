@@ -90,6 +90,17 @@ releases.
 
 ### Voice room
 
+- **Fixed: no Language box at the door until you had joined once.** The
+  door is a page with no socket behind it, so it asks `/api/door` what
+  the room offers -- but the answer carried the list of languages only
+  for somebody arriving on an invite link. A browser the room already
+  knew got a blank space where the box should be, until a socket from
+  joining filled the list in, and the next reload lost it again. The
+  door now tells either of them what the room offers, along with the
+  language that person chose last time: the room has it against their
+  invite, and it beats what this browser would have guessed from the
+  system.
+
 - **Fixed: the space bar stopped talking once you clicked anything.**
   Push to talk ignored Space whenever a button had the focus, and a
   button keeps the focus after you click it -- so opening somebody's

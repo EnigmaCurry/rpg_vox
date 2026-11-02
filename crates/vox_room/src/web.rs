@@ -214,8 +214,22 @@ async fn door(State(app): State<App>, headers: HeaderMap) -> Response {
             return (StatusCode::GONE, Json(json!({ "state": "expired" }))).into_response();
         }
     }
-    match person(&app, &headers) {
-        Some(display) => Json(json!({ "state": "in", "display": display })).into_response(),
+    match invited(&app, &headers) {
+        Some(p) => Json(json!({
+            "state": "in",
+            "display": p.display,
+            // The door is a page with no socket behind it for somebody
+            // the room already knows, exactly as it is for an invite, so
+            // this is the only place either of them can learn what the
+            // room offers. Without it a returning browser was shown no
+            // Language box at all until it had joined once and had the
+            // list from a socket it no longer has.
+            "languages": app.any().config().languages,
+            // And what they chose last time, which the room has and a
+            // fresh tab does not: it beats this browser's own guess.
+            "language": p.language,
+        }))
+        .into_response(),
         None => (
             StatusCode::UNAUTHORIZED,
             Json(json!({ "state": "none", "error": "no invite" })),

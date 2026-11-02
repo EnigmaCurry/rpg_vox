@@ -250,6 +250,12 @@ export async function whoami() {
   }
   if (d.state === 'in') {
     room.you = d.display;
+    // There is no socket at the door for somebody the room knows
+    // either, so the list of languages comes from here as well -- and
+    // the one the room has against their invite, which beats what this
+    // browser would have guessed.
+    room.languages = d.languages ?? [];
+    room.lang = myLanguage(room.languages, d.language ?? '');
     return true;
   }
   // An invite spends nothing until Join Audio: see `enterOnInvite`.
