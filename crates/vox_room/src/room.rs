@@ -1957,6 +1957,11 @@ impl Room {
     /// Everything shown when somebody's face is clicked: who they are,
     /// as much as the house actually knows.
     ///
+    /// Not what their picture was asked for. That is the AI's working
+    /// note -- it reads it through `list_people` to build on a face
+    /// somebody already has -- and reading somebody's own prompt back
+    /// at them is showing the machinery rather than the person.
+    ///
     /// Not sent with the roster. A bio is a paragraph and the roster
     /// goes out whenever anybody's microphone moves, so this is asked
     /// for once, when a modal opens.
@@ -1974,10 +1979,6 @@ impl Room {
             // otherwise: it is the one thing here nobody invited.
             "bot": bot,
             "bio": store.bio(&key).ok().flatten().unwrap_or_default(),
-            // What their face was asked for -- the description they
-            // sat through an interview for, which is as much a part of
-            // who they are here as the picture it made.
-            "face": store.avatar_prompt(&key).ok().flatten().unwrap_or_default(),
             "language": person
                 .as_ref()
                 .map(|p| p.language.clone())
@@ -5557,11 +5558,24 @@ mod tests {
         let ryan = r.profile("ryan").expect("matched the way a name is said");
         assert_eq!(ryan["bio"], "A ranger from the north, quiet about it.");
 
-        // What their face was asked for is part of who they are here.
+        // What the picture was asked for stays out of it. That note
+        // is the AI's, for building on a face somebody already has --
+        // `list_people` is where it reads it -- and reading somebody's
+        // own prompt back at them is showing the machinery.
         let (id, _) = r.begin_picture(g, "a tired wizard").unwrap();
         r.finish_picture(&id, &png());
         r.set_avatar(g, "Ryan", 1).unwrap();
-        assert_eq!(r.profile("Ryan").unwrap()["face"], "a tired wizard");
+        let ryan = r.profile("Ryan").unwrap();
+        assert!(ryan.get("face").is_none(), "not on the card: {ryan}");
+        assert!(
+            !serde_json::to_string(&ryan).unwrap().contains("a tired wizard"),
+            "nor anywhere else in it: {ryan}"
+        );
+        assert_eq!(
+            r.avatar_asked_for("Ryan").as_deref(),
+            Some("a tired wizard"),
+            "but the AI can still read it"
+        );
 
         // An AI is not a person, and the card says so.
         r.set_bio("Vox", "The voice that runs the room.").unwrap();

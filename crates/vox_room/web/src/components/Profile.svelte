@@ -82,12 +82,6 @@
               Ask {asker} out loud.{/if}
           </p>
         {/if}
-        <!-- What the picture was asked for. Shown because it is the
-             description they sat through an interview for, and because
-             it is how anybody knows what to ask to have changed. -->
-        {#if p.face}
-          <p class="asked"><span>drawn as</span> {p.face}</p>
-        {/if}
       {/if}
 
       <button class="primary" onclick={closeProfile}>Done <kbd>Esc</kbd></button>
@@ -161,14 +155,6 @@
   .tag.ai { color: var(--agent); border-color: color-mix(in srgb, var(--agent) 45%, var(--line)); }
   .bio { margin: 2px 0 0; line-height: 1.5; text-align: left; }
   .quiet { margin: 2px 0 0; color: var(--muted); }
-  .asked {
-    margin: 0;
-    font-size: 13px;
-    color: var(--muted);
-    text-align: left;
-    align-self: stretch;
-  }
-  .asked span { text-transform: uppercase; font-size: 10px; letter-spacing: 0.05em; }
   .who-card button { margin-top: 6px; }
   @media (prefers-color-scheme: dark) {
     .face {

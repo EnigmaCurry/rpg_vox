@@ -135,6 +135,9 @@ const [ryanLink] = process.argv.slice(2);
       return {
         who: c.querySelector('h2').textContent.trim(),
         bio: c.querySelector('.bio')?.textContent.trim() ?? null,
+        // What the picture was asked for is not shown here: that is
+        // the AI's note for making the next one, not a thing to read
+        // back at somebody on their own card.
         asked: c.querySelector('.asked')?.textContent.replace(/\s+/g, ' ').trim() ?? null,
         tags: [...c.querySelectorAll('.tag')].map((t) => t.textContent.trim()),
         drawn: c.querySelector('img')?.naturalWidth ?? 0,
@@ -143,7 +146,7 @@ const [ryanLink] = process.argv.slice(2);
     {
       who: 'Ryan',
       bio: 'A ranger from the north, quiet about it.',
-      asked: 'drawn as a wizard at ease',
+      asked: null,
       tags: ['reads English', 'here'],
       drawn: 8,
     },
