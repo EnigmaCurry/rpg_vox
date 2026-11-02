@@ -136,11 +136,14 @@ const byBots = (p) =>
   await wait(500);
   ryan.send({ type: 'enter_room', id: '@Ryan' });
   await wait(700);
-  is('a room of your own has its own AIs', ryan.agents.map((a) => a.name), ['Vox', 'Sage']);
-  is('answering every pause, which is what being alone with them is for',
-    ryan.agents.map((a) => a.mode), ['always', 'always']);
+  // A room of your own has the room's own AI in it and nobody else's:
+  // a second one is in a room because the owner put it there, and
+  // nobody has put this one in anybody's own room.
+  is('a room of your own has the first AI', ryan.agents.map((a) => a.name), ['Vox']);
+  is('answering every pause, which is what being alone with it is for',
+    ryan.agents.map((a) => a.mode), ['always']);
   is('and cut off by a voice, until this room is told otherwise',
-    ryan.agents.map((a) => a.stops), ['interrupted', 'interrupted']);
+    ryan.agents.map((a) => a.stops), ['interrupted']);
   ryan.send({ type: 'enter_room', id: 'Lobby' });
   await wait(700);
   is('and the house remembered what each of them was set to there',

@@ -723,6 +723,16 @@ struct BotState {
     /// What it is actually doing: `chosen`, unless the game being
     /// played requires a mode, or a back-and-forth is on.
     mode: Mode,
+    /// Whether this one is in this room at all.
+    ///
+    /// The first AI is in every room: it is what a room has, the way a
+    /// room has a lobby, and `RoomConfig::bot` is the one every room
+    /// falls back to. Every other one is here because the owner put it
+    /// here -- see [`Room::set_bot_here`] -- and one that isn't is not
+    /// on a fader, not on the roster, and not given a turn by anything.
+    /// It is still wired up, so the owner's tick is a tick and not a
+    /// restart.
+    here: bool,
     /// Whether somebody talking over it cuts it off.
     stops: Stops,
     /// Somebody talked over the reply it was in the middle of and it
@@ -752,6 +762,14 @@ struct BotState {
     /// finished and gone at that point, so this is what a late
     /// translation is still able to find its entry by.
     last_reply: Option<(u64, String)>,
+}
+
+impl BotState {
+    /// Whether a pause could be this one's: it is in the room, and the
+    /// people here haven't told it to say nothing.
+    fn answering(&self) -> bool {
+        self.here && self.mode != Mode::Never
+    }
 }
 
 struct State {
@@ -978,6 +996,11 @@ impl Room {
             .as_deref()
             .and_then(|g| store.game(g).ok().flatten())
             .and_then(|(g, _)| g.settings.reply.forces());
+        // Which AIs the owner has put in this room. Every room of
+        // somebody's own is answered for at once, under `@`: a room of
+        // your own is yours, and which AIs are in it is the house's
+        // answer rather than a thing to arrange per person.
+        let placed = store.bots_in(if cfg.only.is_some() { "@" } else { &cfg.id })?;
         // One of these per bot, each with its own channel to its own
         // agent thread. What the people picked for it is kept under its
         // name -- except the first, whose setting is the plain `mode`
@@ -1022,6 +1045,10 @@ impl Room {
                     Mode::Never => Mode::Never,
                     _ => game_mode.unwrap_or(chosen),
                 },
+                // The first AI is in every room; the rest are where
+                // they were put. It is still wired up either way, so
+                // being given a room is a tick and not a restart.
+                here: n == 0 || placed.contains(&bot.name),
                 stops,
                 talked_over: false,
                 engaged: None,
@@ -1690,23 +1717,12 @@ impl Room {
                 "title": self.title(),
                 "private": self.cfg.only.is_some(),
             },
-            // The AIs in this room. One, today; the browsers read a
-            // list so that the second is something to render rather
-            // than something to rewrite.
-            "agents": st.bots.iter().map(|b| json!({
-                "name": b.cfg.name,
-                "strip": b.cfg.strip,
-                "state": b.state,
-                // When it answers, which is this bot's and not the
-                // room's -- except that a game's rule binds all of them,
-                // which is what `locked` says.
-                "mode": b.mode.as_str(),
-                "engaged": b.engaged.is_some(),
-                // And whether talking over it cuts it off. Its own
-                // too, and not a game's to take: a game says when a
-                // bot answers, never how it is stopped.
-                "stops": b.stops.as_str(),
-            })).collect::<Vec<_>>(),
+            // The AIs in this room -- the ones the owner has put in
+            // it, with what each of them is doing and the two settings
+            // that are each bot's own: when it answers (which a game's
+            // rule may bind, see `locked`) and what stops it (which
+            // nothing but the people ever change).
+            "agents": self.agents_json(&st),
             // The interpreters, when this room has any. `level` is
             // where the one speaking *your* language reports itself:
             // you hear that one and no other, and how loud it is is
@@ -2081,7 +2097,7 @@ impl Room {
         let silenced: BTreeSet<String> = st
             .bots
             .iter()
-            .filter(|b| b.mode == Mode::Never)
+            .filter(|b| !b.answering())
             .map(|b| b.cfg.name.clone())
             .collect();
         let mut due: Vec<Pending> = Vec::new();
@@ -2142,6 +2158,9 @@ impl Room {
     fn queue_handoff(&self, st: &mut State, from: &str, to: &str) -> Result<(), String> {
         if to == from {
             return Err("that is you; say it yourself".into());
+        }
+        if !st.bot(to).here {
+            return Err(format!("{to} is not in this room"));
         }
         if st.bot(to).mode == Mode::Never {
             return Err(format!(
@@ -2780,6 +2799,54 @@ impl Room {
         }
     }
 
+    /// Put one AI in this room, or take it out: the owner's tick in
+    /// **People and rooms**, which is the only thing that decides it.
+    ///
+    /// Nothing is torn down either way -- the bot keeps its thread, its
+    /// fader and everything it has said here, and comes back to all of
+    /// it. Taken out, it stops where it is: it is no longer in the room
+    /// to be finishing a sentence in it.
+    pub fn set_bot_here(&self, bot: &str, here: bool) {
+        let mut st = self.lock();
+        if !st.bots.iter().any(|b| b.cfg.name == bot) {
+            return;
+        }
+        if st.bot(bot).here == here {
+            return;
+        }
+        st.bot(bot).here = here;
+        if !here {
+            st.bot(bot).engaged = None;
+            st.pending.retain(|p| p.bot != bot);
+            self.hush(&mut st, &[bot.to_string()]);
+        }
+        info!(bot, room = %self.cfg.id, here, "the owner said who is in the room");
+        // Every tab is told the room has a different set of voices in
+        // it: a fader appears or goes, and so does its Answers.
+        self.emit(json!({
+            "type": "agents_here",
+            "agents": self.agents_json(&st),
+        }));
+    }
+
+    /// The AIs in this room, as a new tab is told about them.
+    fn agents_json(&self, st: &State) -> Vec<Value> {
+        st.bots
+            .iter()
+            .filter(|b| b.here)
+            .map(|b| {
+                json!({
+                    "name": b.cfg.name,
+                    "strip": b.cfg.strip,
+                    "state": b.state,
+                    "mode": b.mode.as_str(),
+                    "engaged": b.engaged.is_some(),
+                    "stops": b.stops.as_str(),
+                })
+            })
+            .collect()
+    }
+
     /// Someone picked whether talking over this bot cuts it off. Its
     /// own setting, kept under its own name, and it changes nothing in
     /// flight: the next time somebody talks over it, this is what the
@@ -3212,7 +3279,7 @@ impl Room {
             let first = st
                 .bots
                 .iter()
-                .find(|b| b.mode != Mode::Never)
+                .find(|b| b.answering())
                 .map(|b| b.cfg.name.clone());
             if let Some(first) = first {
                 self.ask(st, &first, Instant::now(), Cue::Speak, true);
@@ -3712,8 +3779,9 @@ impl Room {
             let state = match &b.reply {
                 // Not listening for anything: it has been told to say
                 // nothing, and a strip that said "listening" would be
-                // promising a turn that is never coming.
-                None if b.mode == Mode::Never => "off",
+                // promising a turn that is never coming. (A bot that
+                // isn't here has no strip to say it on.)
+                None if !b.answering() => "off",
                 None if waiting && b.mode != Mode::Named => "waiting",
                 None => "listening",
                 Some(r) if r.sentences.iter().any(|s| s.played > 0) => "speaking",
@@ -3748,7 +3816,7 @@ impl Room {
     fn emit_agents(&self, st: &State) {
         self.emit(json!({
             "type": "agents",
-            "agents": st.bots.iter().map(|b| json!({
+            "agents": st.bots.iter().filter(|b| b.here).map(|b| json!({
                 "name": b.cfg.name,
                 "state": b.state,
             })).collect::<Vec<_>>(),
@@ -4231,6 +4299,10 @@ impl Room {
                 self.engage(st, &bot, now);
             }
             let judge = Cue::Decide { lull: None, over };
+            if !st.bot(&bot).here {
+                // Not in this room: there is nobody to give a turn to.
+                continue;
+            }
             match st.bot(&bot).mode {
                 // Silenced: there is no turn to give it.
                 Mode::Never => {}
@@ -4339,7 +4411,7 @@ impl Room {
         let others_answering: Vec<String> = st
             .bots
             .iter()
-            .filter(|b| b.cfg.name != bot && b.mode != Mode::Never)
+            .filter(|b| b.cfg.name != bot && b.answering())
             .map(|b| b.cfg.name.clone())
             .collect();
         let turns = st.bot(bot).turns.clone();
@@ -4404,19 +4476,20 @@ impl Room {
             && (st
                 .bots
                 .iter()
-                .any(|b| b.mode == Mode::Always && !b.talked_over)
+                .any(|b| b.here && b.mode == Mode::Always && !b.talked_over)
                 || pending.any(|e| !self.named(st, &e.text).is_empty()))
     }
 
     /// Which bots somebody said the name of, by name or by one of the
-    /// spellings speech-to-text makes of it. A silenced one is deaf to
-    /// its own name: it is not given the turn, it does not start a
-    /// back-and-forth, and the room doesn't promise an answer from it.
+    /// spellings speech-to-text makes of it. One that isn't answering
+    /// is deaf to its own name -- silenced, or not in this room at all:
+    /// it is not given the turn, it does not start a back-and-forth,
+    /// and the room doesn't promise an answer from it.
     fn named(&self, st: &State, text: &str) -> Vec<String> {
         let words = words(text);
         st.bots
             .iter()
-            .filter(|b| b.mode != Mode::Never)
+            .filter(|b| b.answering())
             .filter(|b| {
                 std::iter::once(&b.cfg.name)
                     .chain(b.cfg.aliases.iter())
@@ -6272,8 +6345,17 @@ mod tests {
     /// each of them is given.
     type Turns = BTreeMap<String, crossbeam_channel::Receiver<Turn>>;
     fn room_of_two() -> (Arc<Room>, Turns) {
+        room_of_two_where(true)
+    }
+
+    /// `placed` is whether the owner has put the second AI in this
+    /// room. The first is in every room and is never asked about.
+    fn room_of_two_where(placed: bool) -> (Arc<Room>, Turns) {
         let store = Store::memory().in_room("Lobby");
         store.invite("Ryan").unwrap();
+        if placed {
+            store.set_bot_room("Sage", "Lobby", true).unwrap();
+        }
         let (r, wiring) = Room::new(
             store,
             RoomConfig {
@@ -6611,6 +6693,52 @@ mod tests {
         assert!(r.lock().pending.is_empty());
         // A turn that is over can't hand anything on either.
         assert!(err(r.hand_to(sage.generation + 99, "Vox")).contains("that turn is over"));
+    }
+
+    /// An AI is in a room because the owner put it there. One that
+    /// hasn't been is not in it at all: not on a fader, not on the
+    /// roster a tab is sent, and deaf to its own name.
+    #[test]
+    fn an_ai_the_owner_has_not_put_here_is_not_in_the_room() {
+        let (r, turns) = room_of_two_where(false);
+        let agents = |r: &Room| {
+            r.hello("Ryan")["agents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|a| a["name"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(agents(&r), ["Vox"], "the room's own, and nobody else");
+
+        // Named, and there is nobody of that name here to answer.
+        r.on_paragraph("Ryan", &para("p1", "Sage, are you there?", false));
+        r.tick(quiet(&r));
+        assert!(turns["Sage"].try_recv().is_err(), "not in the room");
+        assert!(turns["Vox"].try_recv().is_ok(), "and the pause was Vox's");
+
+        // Put in, and it is here at once: on the roster, and given the
+        // turn like anybody else in the room.
+        r.stop_agent();
+        r.set_bot_here("Sage", true);
+        assert_eq!(agents(&r), ["Vox", "Sage"]);
+        r.on_paragraph("Ryan", &para("p2", "Sage?", false));
+        r.tick(quiet(&r));
+        let sage = turns["Sage"].try_recv().expect("in the room now");
+        turns["Vox"].try_recv().expect("and so is the other one");
+
+        // Taken out while it is talking, it stops where it is: it is
+        // no longer in the room to be finishing a sentence in it.
+        assert!(r.agent_speak(sage.generation, "I am here.", vec![0.1; 48_000]));
+        for _ in 0..5 {
+            r.mixer.tick();
+        }
+        r.tick(Instant::now());
+        r.set_bot_here("Sage", false);
+        assert!(r.lock().bot("Sage").reply.is_none(), "stopped");
+        assert_eq!(agents(&r), ["Vox"]);
+        // And what it said is still in the conversation: it was said.
+        assert!(r.lock().log.iter().any(|e| e.who == "Sage"));
     }
 
     /// A conversation can be called something, and what it is called is

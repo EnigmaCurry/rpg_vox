@@ -84,7 +84,7 @@ use axum::{
 use futures_util::{SinkExt as _, StreamExt as _};
 use rust_embed::RustEmbed;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
 use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{debug, info, warn};
 
@@ -182,6 +182,7 @@ pub fn router(rooms: Arc<Rooms>, screen: Arc<Screen>) -> Router {
         .route("/api/people/:name", delete(uninvite_person))
         .route("/api/people/:name/link", post(relink_person))
         .route("/api/people/:name/rooms", post(set_room))
+        .route("/api/bots/:name/rooms", post(set_bot_room))
         // The house's rooms, which are the owner's to make and unmake.
         .route("/api/house/rooms", post(make_room))
         .route(
@@ -393,6 +394,23 @@ async fn people(State(app): State<App>, headers: HeaderMap) -> Response {
             "rooms": grants,
         }));
     }
+    // The AIs are given rooms the same way people are, and the first
+    // one is in all of them the way the owner is: ticked and fixed.
+    let bots: Vec<Value> = app
+        .rooms
+        .bots()
+        .into_iter()
+        .enumerate()
+        .map(|(n, name)| {
+            let rooms = app.rooms.bot_rooms(&name).unwrap_or_default();
+            json!({
+                "name": name,
+                "first": n == 0,
+                "rooms": rooms,
+                "own": rooms.iter().any(|r| r == Rooms::OWN),
+            })
+        })
+        .collect();
     Json(json!({
         "you": me.name,
         // The lobby first, as everywhere else. The page says that one
@@ -401,8 +419,32 @@ async fn people(State(app): State<App>, headers: HeaderMap) -> Response {
             .collect::<Vec<_>>(),
         "lobby": app.rooms.lobby(),
         "people": out,
+        "bots": bots,
+        // What a room of somebody's own is called in all of this: one
+        // column, because it is one answer for every one of them.
+        "own": Rooms::OWN,
     }))
     .into_response()
+}
+
+/// The owner putting one AI in a room, or taking it out.
+async fn set_bot_room(
+    State(app): State<App>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<RoomFor>,
+) -> Response {
+    if owner(&app, &headers).is_none() {
+        return not_for_them();
+    }
+    match app.rooms.set_bot_room(&name, &body.room, body.allowed) {
+        Ok(_) => {
+            info!(bot = %name, room = %body.room, allowed = body.allowed, "the owner said which rooms it is in");
+            app.rooms.announce();
+            Json(json!({ "rooms": app.rooms.bot_rooms(&name).unwrap_or_default() })).into_response()
+        }
+        Err(err) => said(err),
+    }
 }
 
 #[derive(Deserialize)]

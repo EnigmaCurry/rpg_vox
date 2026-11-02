@@ -143,6 +143,22 @@ impl Rooms {
             info!(rooms = %wanted.join(", "), "a new house, with its first rooms");
         }
         let held = people.rooms()?;
+        // Where the AIs beside the first one go. The first is in every
+        // room and is never in the table; the rest start in the rooms
+        // people share and in nobody's own, which is where a house that
+        // predates any of this already had them. Once each has been
+        // placed the house leaves it alone: taking one out of the lobby
+        // is an answer, and a restart must not give it back.
+        let elsewhere: Vec<String> = base.bots.iter().skip(1).map(|b| b.name.clone()).collect();
+        let everywhere: Vec<String> = held.iter().map(|r| r.id.clone()).collect();
+        match people.place_bots(&elsewhere, &everywhere) {
+            Ok(placed) if !placed.is_empty() => info!(
+                bots = %placed.join(", "),
+                "put in the rooms people share, and in nobody's own"
+            ),
+            Ok(_) => {}
+            Err(err) => bail!("work out which rooms the AIs are in: {err:#}"),
+        }
         let mut shared = Vec::new();
         for room in &held {
             let cfg = RoomConfig {
@@ -291,6 +307,61 @@ impl Rooms {
             bail!("the lobby is everybody's; it isn't given out");
         }
         self.people().set_grant(name, room, allowed)
+    }
+
+    /// Put one AI in a room, or take it out. `room` is a room's id, or
+    /// `@` for everybody's own room.
+    ///
+    /// It reaches the room at once, wherever anybody is sitting: a
+    /// fader appears or goes, and a bot taken out of a room it was
+    /// speaking in stops where it is.
+    pub fn set_bot_room(&self, bot: &str, room: &str, allowed: bool) -> Result<bool> {
+        if !self.is_bot(bot) {
+            bail!("there is no AI called {bot:?}");
+        }
+        if self.first_bot() == bot {
+            bail!("{bot} is in every room: it is what a room has");
+        }
+        if room != Self::OWN && self.find_shared(room).is_none() {
+            bail!("there is no room called {room:?}");
+        }
+        let changed = self.people().set_bot_room(bot, room, allowed)?;
+        if room == Self::OWN {
+            for r in self.own.lock().expect("rooms mutex poisoned").values() {
+                r.set_bot_here(bot, allowed);
+            }
+        } else if let Some(r) = self.find_shared(room) {
+            r.set_bot_here(bot, allowed);
+        }
+        Ok(changed)
+    }
+
+    /// The rooms one AI is in, `@` among them for everybody's own.
+    /// The first AI is in all of them and is never asked about.
+    pub fn bot_rooms(&self, bot: &str) -> Result<Vec<String>> {
+        self.people().bot_rooms(bot)
+    }
+
+    /// Everybody's own room, as the table spells it: one answer for all
+    /// of them, because a room of your own is yours.
+    pub const OWN: &'static str = "@";
+
+    /// The AIs this server was started with, the first one first.
+    pub fn bots(&self) -> Vec<String> {
+        self.home()
+            .config()
+            .bots
+            .iter()
+            .map(|b| b.name.clone())
+            .collect()
+    }
+
+    fn first_bot(&self) -> String {
+        self.home().config().bot().name.clone()
+    }
+
+    fn is_bot(&self, name: &str) -> bool {
+        self.bots().iter().any(|b| b == name)
     }
 
     /// The room everybody may go to, by id.
@@ -638,6 +709,52 @@ mod tests {
 
     use crate::room::BotConfig;
     use crate::store::Store;
+
+    /// The same house, with a second AI in it.
+    fn rooms_of_two(names: &[&str]) -> Arc<Rooms> {
+        let names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+        let people = Store::memory();
+        people.invite("Ryan").unwrap();
+        let mut cfg = base();
+        cfg.bots.push(BotConfig::new("Sage", vec![]));
+        Rooms::new(
+            people,
+            &cfg,
+            &names,
+            Box::new(|cfg| {
+                Room::new(Store::memory(), cfg, None, BTreeMap::new(), None).map(|(room, w)| {
+                    std::mem::forget(w);
+                    room
+                })
+            }),
+        )
+        .unwrap()
+    }
+
+    /// The AIs are given rooms the way people are, and the first of
+    /// them is in all of them the way the owner is.
+    #[test]
+    fn the_ais_are_given_rooms_and_the_first_one_has_them_all() {
+        let rooms = rooms_of_two(&["Lobby", "Studio"]);
+        assert_eq!(rooms.bots(), ["Vox", "Sage"]);
+        // Placed in the rooms people share, and in nobody's own.
+        assert_eq!(rooms.bot_rooms("Sage").unwrap(), ["Lobby", "Studio"]);
+        assert!(
+            rooms.bot_rooms("Vox").unwrap().is_empty(),
+            "the first is in every room without being put anywhere"
+        );
+
+        // The first is nobody's to move, and there is no third.
+        assert!(rooms.set_bot_room("Vox", "Studio", false).is_err());
+        assert!(rooms.set_bot_room("Ada", "Studio", true).is_err());
+        assert!(rooms.set_bot_room("Sage", "The Attic", true).is_err());
+
+        // Out of the Studio, and into everybody's own room, which is
+        // one answer rather than one per person.
+        assert!(rooms.set_bot_room("Sage", "Studio", false).unwrap());
+        assert!(rooms.set_bot_room("Sage", Rooms::OWN, true).unwrap());
+        assert_eq!(rooms.bot_rooms("Sage").unwrap(), ["@", "Lobby"]);
+    }
 
     fn base() -> RoomConfig {
         RoomConfig {

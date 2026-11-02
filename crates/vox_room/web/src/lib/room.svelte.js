@@ -534,6 +534,16 @@ export async function deleteRoom(id) {
   return await asked(`/api/house/rooms/${encodeURIComponent(id)}`, { method: 'DELETE' });
 }
 
+/// Put one AI in a room, or take it out. `roomId` is a room's id, or
+/// the `own` the house page was given, which is everybody's own room —
+/// one answer for all of them, because a room of your own is yours.
+export async function setBotRoom(name, roomId, allowed) {
+  return await asked(`/api/bots/${encodeURIComponent(name)}/rooms`, {
+    method: 'POST',
+    body: { room: roomId, allowed },
+  });
+}
+
 /// Give somebody a room, or take it away.
 export async function setPersonRoom(name, roomId, allowed) {
   return await asked(`/api/people/${encodeURIComponent(name)}/rooms`, {
@@ -932,6 +942,11 @@ function apply(ev) {
         const bot = room.agents.find((b) => b.name === said.name);
         if (bot) bot.state = said.state;
       }
+      break;
+    case 'agents_here':
+      // The owner put an AI in this room or took one out: a fader
+      // appears or goes, with its Answers and its Stops.
+      room.agents = ev.agents ?? [];
       break;
     case 'strips':
       room.strips = ev.strips;

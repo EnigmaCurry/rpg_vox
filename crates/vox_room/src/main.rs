@@ -88,6 +88,11 @@ struct Cli {
     /// differs — the first AI runs the room (cards, games, the web),
     /// and every other one can see who is here and look things up, and
     /// no more. See `agent::Allowed`.
+    ///
+    /// This says which AIs the server has, not where they are. The
+    /// first is in every room; the rest are given rooms by the owner,
+    /// on **People and rooms**, the way people are — they start in the
+    /// rooms people share and in nobody's own.
     #[arg(long = "bot", env = "VOX_ROOM_BOTS", value_delimiter = ',')]
     bots: Vec<String>,
 

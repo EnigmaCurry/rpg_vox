@@ -90,6 +90,32 @@ releases.
 
 ### Voice room
 
+- **Which rooms an AI is in is the owner's to say.** A second AI was
+  in every room the moment the server started with one: the house's
+  rooms, and everybody's own. A room of your own is the one place
+  nobody else comes into, so an AI arriving in it uninvited is the
+  room breaking its own rule -- *You and Vox* with a third voice in
+  it.
+
+  So the AIs are given rooms the way people are, with a tick per room
+  on **People and rooms**, and a column for **rooms of their own**:
+  one answer for all of them, because which AIs are in a room of your
+  own is the house's business rather than a thing to arrange person by
+  person. The first AI is in every room and its ticks are fixed -- it
+  is what a room has, the way a room has a lobby, and the owner's row
+  in the table above it is fixed for the same reason.
+
+  A tick reaches the room at once: a fader appears or goes for
+  everybody sitting in it, and an AI taken out of a room it was
+  speaking in stops where it is. Nothing is torn down -- it keeps its
+  thread, its Answers, its Stops and everything it has said there, so
+  being given a room is a tick and not a restart.
+
+  Houses that already have a second AI keep it where it already was:
+  every AI is placed once, into the rooms people share and into
+  nobody's own, and from then on the table is the answer. Taking one
+  out of the lobby stays done.
+
 - **And they can put something to each other.** Seeing each other was
   half of it: a voice could refer to what another had said, but only a
   person could ever cause one to speak, so "say hi to Vortex Prime"

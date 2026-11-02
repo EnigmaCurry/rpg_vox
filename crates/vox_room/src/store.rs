@@ -121,6 +121,18 @@ CREATE TABLE IF NOT EXISTS grants (
     room TEXT NOT NULL,
     PRIMARY KEY (name, room)
 );
+-- Which rooms each AI is in. The first AI a server is started with is in
+-- every room and is not in here: it is what a room has, the way a room
+-- has a lobby. Every other one is somewhere because the owner put it
+-- there. `room` is a room's id, or `@` for everybody's own room, which
+-- is one tick rather than one per person -- a room of your own is yours,
+-- and the AIs in it are the house's answer, not a thing to arrange per
+-- person.
+CREATE TABLE IF NOT EXISTS bot_rooms (
+    bot  TEXT NOT NULL,
+    room TEXT NOT NULL,
+    PRIMARY KEY (bot, room)
+);
 -- A browser that pressed Join Audio: the cookie it was given, and whose
 -- invite it spent. One person may have several (another browser, another
 -- link); uninviting them drops the lot.
@@ -403,6 +415,10 @@ impl Store {
         let gone = tx.execute("DELETE FROM rooms WHERE id = ?1 AND lobby = 0", [id])? > 0;
         if gone {
             tx.execute("DELETE FROM grants WHERE room = ?1", [id])?;
+            // The AIs that were in it are not in it: a room that comes
+            // back under the same name is a new room, and starts the
+            // way a new room starts.
+            tx.execute("DELETE FROM bot_rooms WHERE room = ?1", [id])?;
         }
         tx.commit()?;
         Ok(gone)
@@ -505,6 +521,78 @@ impl Store {
             .query_map([name], |r| r.get(0))?
             .collect::<rusqlite::Result<Vec<String>>>()?;
         Ok(rooms)
+    }
+
+    /// The rooms an AI is in, `@` among them for everybody's own.
+    pub fn bot_rooms(&self, bot: &str) -> Result<Vec<String>> {
+        let mut q = self
+            .db
+            .prepare("SELECT room FROM bot_rooms WHERE bot = ?1 ORDER BY room")?;
+        let rooms = q
+            .query_map([bot], |r| r.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        Ok(rooms)
+    }
+
+    /// The AIs the owner has put in `room`; `@` for a room of
+    /// somebody's own, which they are all answered for at once.
+    pub fn bots_in(&self, room: &str) -> Result<Vec<String>> {
+        let mut q = self
+            .db
+            .prepare("SELECT bot FROM bot_rooms WHERE room = ?1 ORDER BY bot")?;
+        let bots = q
+            .query_map([room], |r| r.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        Ok(bots)
+    }
+
+    /// Put an AI in a room, or take it out. True if anything changed.
+    pub fn set_bot_room(&self, bot: &str, room: &str, allowed: bool) -> Result<bool> {
+        let changed = if allowed {
+            self.db.execute(
+                "INSERT OR IGNORE INTO bot_rooms (bot, room) VALUES (?1, ?2)",
+                params![bot, room],
+            )?
+        } else {
+            self.db.execute(
+                "DELETE FROM bot_rooms WHERE bot = ?1 AND room = ?2",
+                params![bot, room],
+            )?
+        };
+        Ok(changed > 0)
+    }
+
+    /// Where an AI the house has never placed starts: the rooms people
+    /// share, and no room of anybody's own.
+    ///
+    /// For the one-time move to a house where the AIs are given rooms.
+    /// Before it, every AI was in every room, and the shared rooms are
+    /// the half of that nobody would want undone by an upgrade -- a
+    /// room of somebody's own is the half that was the mistake. Each
+    /// AI is placed once and only once: taking it out of the lobby
+    /// afterwards is an answer, and the house must not give it back.
+    pub fn place_bots(&self, bots: &[String], rooms: &[String]) -> Result<Vec<String>> {
+        let placed = self.global("bots:placed")?.unwrap_or_default();
+        let mut known: Vec<String> = placed
+            .split('\n')
+            .filter(|b| !b.is_empty())
+            .map(str::to_string)
+            .collect();
+        let mut new = Vec::new();
+        for bot in bots {
+            if known.iter().any(|k| k == bot) {
+                continue;
+            }
+            for room in rooms {
+                self.set_bot_room(bot, room, true)?;
+            }
+            known.push(bot.clone());
+            new.push(bot.clone());
+        }
+        if !new.is_empty() {
+            self.set_global("bots:placed", &known.join("\n"))?;
+        }
+        Ok(new)
     }
 
     /// Whether `name` has been given `room`.
@@ -1420,6 +1508,37 @@ mod tests {
 
     /// A database made today has never had a room that was not given
     /// out, so there is nothing to hand out in it.
+    /// Where an AI the house has never seen starts, and that the house
+    /// only ever decides it once: taking one out of the lobby is an
+    /// answer, and a restart must not undo it.
+    #[test]
+    fn an_ai_is_placed_once_and_then_left_alone() {
+        let s = Store::memory();
+        let sage = vec!["Sage".to_string()];
+        let rooms = vec!["Lobby".to_string(), "Studio".to_string()];
+        assert_eq!(s.place_bots(&sage, &rooms).unwrap(), ["Sage"]);
+        assert_eq!(s.bot_rooms("Sage").unwrap(), ["Lobby", "Studio"]);
+        assert_eq!(s.bots_in("Lobby").unwrap(), ["Sage"]);
+        // And in nobody's own room, which is the half of "every AI in
+        // every room" that was the mistake.
+        assert!(s.bots_in("@").unwrap().is_empty());
+
+        // Taken out of the lobby; the next start leaves it out.
+        assert!(s.set_bot_room("Sage", "Lobby", false).unwrap());
+        assert!(s.place_bots(&sage, &rooms).unwrap().is_empty(), "placed");
+        assert_eq!(s.bot_rooms("Sage").unwrap(), ["Studio"]);
+
+        // One added to the server later is placed on its own.
+        let two = vec!["Sage".to_string(), "Ada".to_string()];
+        assert_eq!(s.place_bots(&two, &rooms).unwrap(), ["Ada"]);
+        assert_eq!(s.bots_in("Lobby").unwrap(), ["Ada"]);
+
+        // A room taken out of the house takes its AIs with it.
+        s.adopt_rooms(&rooms).unwrap();
+        assert!(s.delete_room("Studio").unwrap());
+        assert_eq!(s.bot_rooms("Sage").unwrap(), Vec::<String>::new());
+    }
+
     #[test]
     fn a_new_house_hands_out_nothing() {
         let s = Store::memory();

@@ -7,6 +7,7 @@
     relinkPerson,
     uninvitePerson,
     setPersonRoom,
+    setBotRoom,
     makeRoom,
     renameRoom,
     deleteRoom,
@@ -20,7 +21,16 @@
   // wants room to be read and copied. Nothing on it is what keeps
   // anybody out either -- every one of these asks the server, and the
   // server asks who is asking.
-  let house = $state({ loading: true, error: null, people: [], allRooms: [], lobby: null, you: '' });
+  let house = $state({
+    loading: true,
+    error: null,
+    people: [],
+    bots: [],
+    allRooms: [],
+    lobby: null,
+    own: '@',
+    you: '',
+  });
   let name = $state('');
   let busy = $state(null);
   // The last link made or asked for, to be copied out of. Shown until
@@ -105,6 +115,9 @@
 
   const toggle = (who, id, allowed) =>
     doing(`room:${who}:${id}`, () => setPersonRoom(who, id, allowed));
+
+  const toggleBot = (who, id, allowed) =>
+    doing(`bot:${who}:${id}`, () => setBotRoom(who, id, allowed));
 
   // -- the rooms themselves --------------------------------------------
 
@@ -226,7 +239,9 @@
 
     <section>
       <h2>Everybody invited</h2>
-      <table>
+      <!-- Named, because the page has two of these and they are not
+           the same question: who may go where, and which AI is where. -->
+      <table class="who">
         <thead>
           <tr>
             <th>Name</th>
@@ -284,6 +299,53 @@
         (<code>vox_room uninvite {house.you}</code>) and then
         <code>vox_room invite-owner NAME</code>. It is a command and not a button on purpose:
         it is the one thing nobody should be able to do by clicking the wrong row.
+      </p>
+    </section>
+
+    <section>
+      <h2>The AI voices</h2>
+      <table class="voices">
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th class="room">Lobby</th>
+            {#each given as r (r.id)}<th class="room">{r.title}</th>{/each}
+            <th class="room">Rooms of their own</th>
+          </tr>
+        </thead>
+        <tbody>
+          {#each house.bots as b (b.name)}
+            <tr>
+              <td>
+                <strong>{b.name}</strong>
+                {#if b.first}<span class="tag">the room's own</span>{/if}
+              </td>
+              {#each [{ id: house.lobby, title: 'the lobby' }, ...given, { id: house.own, title: 'a room of somebody\'s own' }] as r (r.id)}
+                <td class="room">
+                  <input type="checkbox" aria-label="{b.name} is in {r.title}"
+                    checked={b.first || b.rooms.includes(r.id)}
+                    disabled={b.first || busy === `bot:${b.name}:${r.id}`}
+                    onchange={(e) => toggleBot(b.name, r.id, e.currentTarget.checked)} />
+                </td>
+              {/each}
+            </tr>
+          {/each}
+        </tbody>
+      </table>
+      <p class="note">
+        Which rooms each AI is in. The first one is the room's own — it is what a room has,
+        the way a room has a lobby — so its ticks are fixed; the others are somewhere
+        because you put them there. A tick reaches the room at once: a fader appears or
+        goes for everybody sitting in it, and an AI taken out of a room it was speaking in
+        stops where it is. Nothing of what it said is lost, and putting it back brings it
+        back to all of it.
+      </p>
+      <p class="note">
+        <strong>Rooms of their own</strong> is one answer for every one of them, because a
+        room of your own is yours: the AIs in it are the house's, not a thing to arrange
+        person by person. The AIs come from how the server was started
+        (<code>--bot</code>), not from this page: this is where they are, not whether they
+        exist.
       </p>
     </section>
   {/if}

@@ -61,7 +61,7 @@ const asked = async (cookie, path, init = {}) => {
 
   const row = (page, who) =>
     page.evaluate((n) => {
-      const tr = [...document.querySelectorAll('.people tbody tr')].find(
+      const tr = [...document.querySelectorAll('.people table.who tbody tr')].find(
         (r) => r.querySelector('strong')?.textContent.trim() === n,
       );
       if (!tr) return null;
@@ -78,7 +78,7 @@ const asked = async (cookie, path, init = {}) => {
 
   is('everybody invited is on it',
     await boss.page.evaluate(() =>
-      [...document.querySelectorAll('.people tbody tr strong')].map((e) => e.textContent.trim())),
+      [...document.querySelectorAll('.people table.who tbody tr strong')].map((e) => e.textContent.trim())),
     ['Alex', 'Ryan']);
   is('the owner is marked, and the house is ticked and not hers to untick',
     await row(boss.page, 'Ryan'),
@@ -90,8 +90,29 @@ const asked = async (cookie, path, init = {}) => {
     (await row(boss.page, 'Alex')).rooms.map((r) => r.on), [false, false]);
   is('the lobby is nobody’s to give, so it is not a column',
     await boss.page.evaluate(() =>
-      [...document.querySelectorAll('.people thead th.room')].map((e) => e.textContent.trim())),
+      [...document.querySelectorAll('.people table.who thead th.room')].map((e) => e.textContent.trim())),
     ['Studio', 'Cellar']);
+
+  // The AIs are given rooms the same way, with the lobby among them --
+  // a room can be one no AI answers in -- and one column for every
+  // room of somebody's own, because a room of your own is yours.
+  is('the AI columns are every room, and the private ones at once',
+    await boss.page.evaluate(() =>
+      [...document.querySelectorAll('.people table.voices thead th.room')].map((e) => e.textContent.trim())),
+    ['Lobby', 'Studio', 'Cellar', 'Rooms of their own']);
+  is("the room's own AI is in all of them, and not the owner's to untick",
+    await boss.page.evaluate(() =>
+      [...document.querySelectorAll('.people table.voices tbody input[type=checkbox]')].map((c) => [
+        c.getAttribute('aria-label'),
+        c.checked,
+        c.disabled,
+      ])),
+    [
+      ['Vox is in the lobby', true, true],
+      ['Vox is in Studio', true, true],
+      ['Vox is in Cellar', true, true],
+      ["Vox is in a room of somebody's own", true, true],
+    ]);
 
   // Give Alex the Studio: it appears on her list where she sits.
   await boss.page.click('.people input[aria-label="Alex may go to Studio"]');
@@ -204,7 +225,7 @@ const asked = async (cookie, path, init = {}) => {
   // nobody over it is not something to do by clicking a row.
   is('the owner has no Remove of their own',
     await boss.page.evaluate(() => {
-      const tr = [...document.querySelectorAll('.people tbody tr')].find(
+      const tr = [...document.querySelectorAll('.people table.who tbody tr')].find(
         (r) => r.querySelector('strong')?.textContent.trim() === 'Ryan',
       );
       return !!tr.querySelector('button.danger');

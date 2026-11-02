@@ -194,10 +194,26 @@ room you are in and no other, and it goes with you when you leave.
 ### More than one AI in a room
 
 Every room has the AI in it. `--bot NAME[:VOICE[:PROMPT_FILE]]` puts
-another one there — repeat it, or comma-separate `VOX_ROOM_BOTS` — and
-it is in every room, the house's and everybody's own. Each has its own
-voice, its own prompt, and its own name to be called by; the first is
-the one `--name`, `--voice` and `--prompt` describe.
+another one on the server — repeat it, or comma-separate
+`VOX_ROOM_BOTS`. Each has its own voice, its own prompt, and its own
+name to be called by; the first is the one `--name`, `--voice` and
+`--prompt` describe.
+
+**Which rooms each of them is in is the owner's to say**, on the
+[People and rooms](#in-the-room) page, with a tick per room exactly as
+for people. The first AI is in every room and its ticks are fixed: it
+is what a room *has*, the way a room has a lobby, and a room of your
+own is named after it. Every other one is somewhere because the owner
+put it there. They start in the rooms people share and in nobody's own
+— a room of your own is yours, and a second AI arriving in it
+uninvited is the thing this is for — and the house decides that once
+per AI, so taking one out of the lobby stays done across a restart.
+
+A tick reaches the room at once, wherever anybody is sitting: a fader
+appears or goes, and an AI taken out of a room it was speaking in
+stops where it is. Nothing is torn down — it keeps its thread, its
+settings and everything it has said there, and putting it back brings
+it back to all of it.
 
 ```
 vox_room --bot Sage:serena --bot Ada:aiden:/etc/vox_room/ada.md
@@ -820,6 +836,15 @@ See ROOM_DOCKER.md.
   it: see [Who owns the room](#who-owns-the-room). Nobody but the owner
   is shown any of this, and nobody but the owner is answered when they
   ask the server for it either.
+
+  **The AI voices** are a second table under the people, asked the same
+  question: which rooms each of them is in, a tick per room, with the
+  lobby among them (a room can be one no AI answers in) and one column
+  for **rooms of their own**. The first AI is in all of them and its
+  ticks are fixed, the way the owner's are in the table above. Which
+  AIs the server has is `--bot`'s to say and not this page's: this is
+  where they are, not whether they exist. See
+  [More than one AI in a room](#more-than-one-ai-in-a-room).
 
   Taking a room away, or taking it away from one person, happens where
   they are sitting: anybody left in a room that has stopped being
