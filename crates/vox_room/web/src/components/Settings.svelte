@@ -1,5 +1,7 @@
 <script>
-  import { room, setName, setVolume, avatarOf, forgetAvatar } from '../lib/room.svelte.js';
+  import {
+    room, setName, setVolume, avatarOf, forgetAvatar, myFaces, faceAt, wearFace,
+  } from '../lib/room.svelte.js';
   import { NAME_MAX } from '../lib/names.js';
   import Face from './Face.svelte';
 
@@ -20,6 +22,15 @@
   // whenever you are not in the middle of changing it.
   let typed = $state(null);
   const draft = $derived(typed ?? room.you ?? '');
+
+  // The faces you have worn, newest first. Re-read whenever the one
+  // you are wearing changes -- the AI may have given you another
+  // while this page is open, and that one belongs in the row too.
+  let faces = $state([]);
+  $effect(() => {
+    room.avatars[room.you];
+    myFaces().then((f) => (faces = f));
+  });
 
   async function save() {
     // Nothing typed, or typed back to what it already was: there is no
@@ -72,10 +83,34 @@
       {:else}
         <p class="hint">
           You have none, so your lines carry your initials. Ask
-          {room.agents[0]?.name ?? 'the AI'} out loud to make you one.
+          {room.agents[0]?.name ?? 'the AI'} out loud to make you one{#if faces.length},
+          or put one of these back on{/if}.
         </p>
       {/if}
     </div>
+
+    <!-- The ones you have worn before. Choosing again from what has
+         already been made costs nothing and needs no AI, so it is a
+         button rather than something to ask for out loud. -->
+    {#if faces.length > 1 || (faces.length === 1 && !faces[0].worn)}
+      <div class="past">
+        {#each faces as f (f.at)}
+          <button
+            class="past-face"
+            class:worn={f.worn}
+            title={f.prompt || 'A face you have worn'}
+            aria-pressed={f.worn}
+            onclick={() => !f.worn && wearFace(f.at)}
+          >
+            <img src={faceAt(f.at)} alt={f.prompt} />
+          </button>
+        {/each}
+      </div>
+      <p class="hint">
+        The last {faces.length} you have worn, newest first. The one you are
+        wearing is outlined; press another to put it back on.
+      </p>
+    {/if}
   </section>
 
   <section>
@@ -160,8 +195,27 @@
   .much { color: var(--muted); min-width: 3.5ch; text-align: right; }
   kbd { font-size: 11px; opacity: 0.7; border: 1px solid currentColor; border-radius: 4px; padding: 0 4px; }
   .face-row { display: flex; align-items: flex-start; gap: 12px; }
-  /* The square is drawn to sit beside a name in the conversation, and
-     there is no name above it here. */
-  .face-row :global(.face) { margin-top: 0; }
   .face-row .hint { margin: 0 0 8px; color: var(--muted); }
+  .past { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+  .past-face {
+    padding: 0;
+    width: 56px;
+    height: 56px;
+    border-radius: 8px;
+    overflow: hidden;
+    border: 1px solid var(--line);
+    background: var(--bubble);
+    cursor: pointer;
+  }
+  /* The one being worn is not a thing to press, so it does not look
+     like one -- it is the marker for where you are in the row. */
+  .past-face.worn { border: 2px solid var(--agent); cursor: default; }
+  .past-face:not(.worn):hover { border-color: var(--agent); }
+  .past-face img {
+    width: 100%;
+    height: 100%;
+    image-rendering: pixelated;
+    object-fit: cover;
+    display: block;
+  }
 </style>

@@ -1113,6 +1113,24 @@ as never having arrived, on the way back up — the call it was waiting
 on died with the process, and a spinner is a promise that something is
 still happening.
 
+**A picture is nobody's until it is assigned.** The AI can put any
+picture in the chat on anyone here — a person, itself, or another AI
+in the room — so the room can look at one and then decide whose it is,
+and a picture somebody doesn't want is one to offer around rather than
+throw away. (Only the first AI can; the rest can look and talk. See
+[More than one AI in a room](#more-than-one-ai-in-a-room).)
+
+**Settings → Your face** keeps the last ten you have worn and offers
+them back. Choosing one again costs nothing and needs no AI, so it is
+a row of thumbnails and a press rather than something to ask for out
+loud. Taking your face off leaves it in that row — it is not the same
+as never having had one. Yours is the only one you can change this
+way; not even the owner can reach somebody else's.
+
+Faces appear beside every line in the conversation and beside every
+name in the list of who is here, and clicking any of them opens that
+person's card.
+
 The picture comes from an **MCP server**, which is any server the house
 was started with:
 
@@ -1285,7 +1303,7 @@ CHROME=$(which chromium) ./run.sh            # or: ./run.sh rooms bots
 | `conversations` | the room's history: naming one, reading an old one read-only without moving anybody else's screen, deleting one for everybody, and empty ones never being archived |
 | `game` | a game played inside a room, and leaving it putting the room back where it was for everyone in it |
 | `cards` | what a posted card looks like once it is on the screen: the table, the list and the code block a model wrote in markdown — and the script tag it wrote with them arriving as words rather than as anything at all |
-| `avatars` | the square beside everything somebody says, and the pictures it is chosen from: a face where one was made and the same-sized tint-and-initials where none was, a picture card that arrived beside one still spinning, a face clicked open onto who somebody is (and onto an AI that says it is not a person), and taking your own off turning it back into initials in the conversation behind the page |
+| `avatars` | the square beside everything somebody says, and the pictures it is chosen from: a face where one was made and the same-sized tint-and-initials where none was, faces beside the names in the list of who is here, a picture card that arrived beside one that never did, a face clicked open onto who somebody is (and onto an AI that says it is not a person), the last faces worn offered back in Settings and an older one put on again, and taking your own off turning it back into initials in the conversation behind the page |
 | `interpreter` | the interpreter appearing only while it has somebody to interpret for, and its level being each listener's own |
 
 The four below want something of yours — a microphone, a model, a

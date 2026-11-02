@@ -125,6 +125,18 @@ releases.
   way back up -- the call it was waiting on died with the process, and
   a spinner is a promise that something is still happening.
 
+  A picture is nobody's until it is assigned. Any of them can go to
+  anyone here -- a person, the AI itself, or another AI in the room --
+  so one picture can be looked at and then given to whoever it suits,
+  and one nobody wants is offered around rather than thrown away.
+
+  **Settings keeps the last ten faces you have worn** and offers them
+  back. Choosing one again costs nothing and needs no AI, so it is a
+  row of thumbnails and a press rather than something to ask for out
+  loud; taking your face off leaves it in that row, because that is
+  not the same as never having had one. Faces are also beside every
+  name in the list of who is here, not only in the conversation.
+
 - **Everybody has a face now, and the AI can make you one.** Every line
   in the conversation carries a square beside it: a picture when one
   has been made, and otherwise the tint that name already has with the

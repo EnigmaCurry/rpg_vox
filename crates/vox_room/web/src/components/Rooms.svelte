@@ -167,12 +167,13 @@
     <!-- Who is in it, and nobody else: somebody invited but
          elsewhere is on the room they are in, with a count. -->
     {#each room.people as p (p.name)}
-      <Strip key={p.name} label={p.name} mic={p.mic} muted={p.muted} speaking={p.speaking} />
+      <Strip key={p.name} label={p.name} mic={p.mic} muted={p.muted} speaking={p.speaking}
+        somebody />
     {/each}
     <!-- The AIs in this room, each with its own fader and its
          own say in when it speaks. -->
     {#each room.agents as bot (bot.strip)}
-    <Strip key={bot.strip} label={bot.name} doing={bot.state} agent>
+    <Strip key={bot.strip} label={bot.name} doing={bot.state} agent somebody>
       {#snippet children()}
         <!-- When this bot speaks, in this room. -->
         <!-- A row of three buttons wants more width than this

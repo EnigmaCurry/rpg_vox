@@ -307,11 +307,18 @@ new picture. list_people tells you what each person's face was asked for, \
 so you can build on what somebody already has instead of starting over, \
 and so you don't offer a face to somebody who is happy with theirs.
 
+A picture is not made for anybody in particular until you say so. Any \
+picture in the chat can go to anyone here -- a person, yourself, or \
+another AI in the room -- so a picture somebody doesn't want is one to \
+offer around rather than throw away, and the room can look at one and \
+then decide whose it is. The same goes for a bio.
+
 A face belongs to the person and not to the game: it follows them from \
 room to room and outlasts the conversation. So ask who they want to be \
 rather than deciding for them, and if somebody would rather not have one, \
-leave them the colour their name already has. You can be given one too, \
-and you may make your own -- ask the room what it thinks you look like.";
+leave them the colour their name already has. You have a face of your \
+own as well, and may make it -- ask the room what it thinks you look \
+like.";
 
 const SEARCH_NOTE: &str = "\
 You can look things up on the web with look_up, and you should whenever the \
@@ -1698,7 +1705,8 @@ fn bio_tool() -> Value {
         json!({
             "who": {
                 "type": "string",
-                "description": "Whose it is: somebody in the room, or an AI's own name.",
+                "description": "Whose it is. Anybody here: a person in the room, \
+                                yourself, or another AI in it.",
             },
             "bio": {
                 "type": "string",
@@ -1726,7 +1734,10 @@ fn avatar_tool() -> Value {
         json!({
             "who": {
                 "type": "string",
-                "description": "Whose face it is: somebody in the room, or an AI's own name.",
+                "description": "Whose face it is. Anybody here: a person in the room, \
+                                yourself, or another AI in it. A picture is not made for \
+                                anyone in particular, so the same one can go to whoever \
+                                the room decides it suits.",
             },
             "picture": {
                 "type": "integer",
@@ -2455,6 +2466,217 @@ mod tests {
             cue,
         };
         (agent, turn)
+    }
+
+    /// A room to make pictures in.
+    fn picture_room() -> Arc<Room> {
+        let store = crate::store::Store::memory();
+        store.invite("Ryan").unwrap();
+        let (room, _wiring) = Room::new(
+            store,
+            RoomConfig {
+                id: "Lobby".into(),
+                title: "Lobby".into(),
+                only: None,
+                default_mode: Mode::Named,
+                bots: vec![BotConfig::new("Vox", vec![])],
+                reply_after: Duration::from_millis(1200),
+                confirm: Duration::from_millis(300),
+                engaged_for: Duration::from_secs(30),
+                history: 60,
+                ai_turns: 2,
+                language: "English".into(),
+                languages: vec!["English".into()],
+                spoken: vec!["English".into()],
+            },
+            None,
+            std::collections::BTreeMap::new(),
+            None,
+        )
+        .unwrap();
+        room
+    }
+
+    /// An MCP server that answers the handshake and then draws one
+    /// 8x8 PNG, framed as SSE the way a real one does.
+    ///
+    /// Enough of a server to put the room's whole half of the flow
+    /// through its paces without a model, a key or any money: the
+    /// thing that was never covered until a picture came out as the
+    /// bare number 1 on somebody's screen.
+    fn mock_mcp(draws: bool) -> String {
+        use std::io::{BufRead as _, BufReader, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port");
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut len = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                        return;
+                    }
+                    if let Some(n) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        len = n.trim().parse().unwrap_or(0);
+                    }
+                    if line == "\r\n" || line == "\n" {
+                        break;
+                    }
+                }
+                let mut body = vec![0u8; len];
+                std::io::Read::read_exact(&mut reader, &mut body).unwrap_or(());
+                let req: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                let method = req["method"].as_str().unwrap_or("");
+                // A notification wants no answer but the 202.
+                if req["id"].is_null() {
+                    let mut s = stream;
+                    let _ = s.write_all(
+                        b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\
+                          Connection: close\r\n\r\n",
+                    );
+                    continue;
+                }
+                let result = match method {
+                    "initialize" => json!({
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "serverInfo": { "name": "mock", "version": "1" },
+                    }),
+                    "tools/list" => json!({ "tools": [{
+                        "name": "create_inference",
+                        "description": "Draw something.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "prompt": { "type": "string" },
+                                "rd_api_key": { "type": "string" },
+                            },
+                            "required": ["prompt"],
+                        },
+                    }, {
+                        "name": "get_balance",
+                        "description": "Say what is left.",
+                        "inputSchema": { "type": "object", "properties": {} },
+                    }] }),
+                    "tools/call" if req["params"]["name"] == "create_inference" && draws => {
+                        use base64::Engine as _;
+                        let b64 = base64::engine::general_purpose::STANDARD.encode(a_png());
+                        json!({ "content": [
+                            { "type": "text", "text": "drawn" },
+                            { "type": "image", "data": b64, "mimeType": "image/png" },
+                        ] })
+                    }
+                    // A call that draws nothing: the balance, or a
+                    // generation that came back empty.
+                    "tools/call" => json!({
+                        "content": [{ "type": "text", "text": "nothing to draw" }]
+                    }),
+                    _ => json!({}),
+                };
+                let answer = json!({ "jsonrpc": "2.0", "id": req["id"], "result": result });
+                // SSE, because that is what a real one sends.
+                let payload = format!("event: message\ndata: {answer}\n\n");
+                // One request per connection, so every answer says
+                // so: left to keep-alive, the client reuses a socket
+                // this loop has already dropped.
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                     Connection: close\r\nContent-Length: {}\r\n\r\n",
+                    payload.len()
+                );
+                let mut s = stream;
+                let _ = s.write_all(head.as_bytes());
+                let _ = s.write_all(payload.as_bytes());
+            }
+        });
+        url
+    }
+
+    fn a_png() -> Vec<u8> {
+        let mut v = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        v.extend_from_slice(b"the rest of it");
+        v
+    }
+
+    /// The room's whole half of making a picture, against a server
+    /// that behaves like a real one: a card goes up with a spinner,
+    /// the call is made, the picture fills the card, and the model is
+    /// told the number and nothing else.
+    #[test]
+    fn a_picture_goes_up_before_the_call_and_fills_in_after() {
+        let room = picture_room();
+        let g = room.generation_of_only_bot().load(Ordering::SeqCst);
+        let server = Arc::new(mcp::Server::new(mcp::Config {
+            name: "art".into(),
+            url: mock_mcp(true),
+            key: "rdpk-secret".into(),
+            only: vec!["create_inference".into(), "get_balance".into()],
+        }));
+        assert_eq!(server.connect().expect("hello"), 2);
+
+        let args = json!({ "prompt": "a stern Borg commander", "width": 128 });
+        let said = drawing(&room, g, &server, "art_create_inference", &args)
+            .expect("the call went through");
+
+        // The model is told the number and told to wait for a yes.
+        let said = said["result"].as_str().unwrap_or_default().to_string();
+        assert!(said.contains("Picture 1"), "{said}");
+        assert!(said.contains("set_avatar"), "{said}");
+        assert!(!said.contains("PNG"), "and not the picture itself: {said}");
+
+        // The card is in the conversation, finished, and showing what
+        // it was asked for.
+        let entry = room
+            .log_now()
+            .into_iter()
+            .find(|e| e.kind == crate::room::Kind::Picture)
+            .expect("a picture card is in the conversation");
+        assert_eq!(entry.text, "picture 1", "what the model was told to call it");
+        assert_eq!(entry.title, "a stern Borg commander");
+        assert!(!entry.live, "and it is not still spinning");
+        assert_eq!(room.picture_png(&entry.id).unwrap().unwrap(), a_png());
+
+        // Which is a face somebody can now be given.
+        assert_eq!(room.set_avatar(g, "Ryan", 1).unwrap(), "Ryan");
+        assert_eq!(room.avatar_png("Ryan", None).unwrap().unwrap().0, a_png());
+    }
+
+    /// A call that draws nothing leaves no card: a balance is not a
+    /// portrait, and the room must not spin on one.
+    #[test]
+    fn a_call_that_draws_nothing_puts_no_card_up() {
+        let room = picture_room();
+        let g = room.generation_of_only_bot().load(Ordering::SeqCst);
+        let server = Arc::new(mcp::Server::new(mcp::Config {
+            name: "art".into(),
+            url: mock_mcp(false),
+            key: String::new(),
+            only: vec![],
+        }));
+        server.connect().expect("hello");
+
+        // No prompt, so nothing was ever going to be drawn.
+        let said = drawing(&room, g, &server, "art_get_balance", &json!({})).unwrap();
+        assert_eq!(said["result"], "nothing to draw");
+        assert!(
+            !room.log_now().iter().any(|e| e.kind == crate::room::Kind::Picture),
+            "no card for a call that was never going to draw"
+        );
+
+        // A prompt that came back with nothing does leave a card --
+        // the room had already promised one -- and it says so rather
+        // than spinning for ever.
+        let said = drawing(&room, g, &server, "art_create_inference", &json!({ "prompt": "a hat" }))
+            .unwrap();
+        assert_eq!(said["result"], "nothing to draw");
+        let entry = room
+            .log_now()
+            .into_iter()
+            .find(|e| e.kind == crate::room::Kind::Picture)
+            .expect("the card that was promised");
+        assert!(!entry.live, "and it stopped waiting");
+        assert!(room.picture_png(&entry.id).unwrap().is_none());
     }
 
     /// A whole reply, through the real thing: the room's own request,

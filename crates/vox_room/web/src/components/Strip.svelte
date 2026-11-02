@@ -2,6 +2,7 @@
   import { command, room } from '../lib/room.svelte.js';
   import { hue } from '../lib/color.js';
   import { screen, showThumb, streamOf, unwatch, watch } from '../lib/screen.svelte.js';
+  import Face from './Face.svelte';
 
   // One channel of the room's mixer: who it is, how loud they are
   // coming in, and the fader and mute everyone shares.
@@ -31,6 +32,10 @@
     fader = undefined,
     onfader = undefined,
     children = undefined,
+    // Whether this channel is somebody -- a person or an AI -- and so
+    // has a face to show beside the name. The interpreter is a channel
+    // and not anybody, and has none.
+    somebody = false,
   } = $props();
 
   const strip = $derived(fader ?? room.strips[key] ?? { gain: 1, mute: false });
@@ -72,7 +77,13 @@
 
 <div class="strip" class:speaking class:quiet style="--h: {agent ? 270 : hue(label)}">
   <div class="top">
-    <span class="dot"></span>
+    {#if somebody}
+      <!-- The same square as in the conversation, small: this is the
+           list of who is here, and a name is easier to find by face. -->
+      <Face who={label} {agent} size={22} />
+    {:else}
+      <span class="dot"></span>
+    {/if}
     <span class="label">{label}{#if label === room.you}<em>&nbsp;(you)</em>{/if}</span>
     <span class="state">{state}</span>
   </div>

@@ -119,6 +119,18 @@ const AVATAR_CACHE: &str = "private, max-age=31536000, immutable";
 /// yesterday's index asks this binary for files it no longer has.
 const INDEX_CACHE: &str = "no-cache";
 
+/// `?v=` on a face: which one of somebody's to serve.
+#[derive(Deserialize)]
+struct AvatarQuery {
+    v: Option<u64>,
+}
+
+/// Which past face to put back on.
+#[derive(Deserialize)]
+struct WearAvatar {
+    at: u64,
+}
+
 #[derive(RustEmbed)]
 #[folder = "dist-ui/"]
 struct Assets;
@@ -208,7 +220,11 @@ pub fn router(rooms: Arc<Rooms>, screen: Arc<Screen>) -> Router {
         // everybody -- a face at a given version is the same bytes to
         // whoever may see it, which is what lets it be cached at all.
         .layer(from_fn(private_answer))
-        .route("/api/avatar/:who", get(avatar).delete(forget_avatar))
+        .route(
+            "/api/avatar/:who",
+            get(avatar).post(wear_avatar).delete(forget_avatar),
+        )
+        .route("/api/avatar/:who/all", get(faces))
         .route("/api/picture/:id", get(picture))
         .route("/room.ws", get(ws))
         .route("/screen.ws", get(screen_ws))
@@ -875,21 +891,26 @@ async fn forget_conversation(
 /// unchanging key it is really kept under is looked up here. A person
 /// first and then an AI, the same order `Room::set_avatar` resolves in.
 ///
-/// The version is in the query rather than read here. It makes the
-/// address change when the picture does, which is the whole of how
-/// this is cached; a request without one still gets the current
-/// picture, it just gets asked again next time.
+/// The version in the query is both how this is cached and how an old
+/// face is reached: each one has an address of its own that never
+/// changes meaning, so Settings can show ten of them and a browser
+/// holding any of them never has to ask again. Without a version this
+/// is whichever they are wearing, which is asked for afresh each time.
 async fn avatar(
     State(app): State<App>,
     headers: HeaderMap,
     Path(who): Path<String>,
+    Query(q): Query<AvatarQuery>,
 ) -> Response {
     // Inside the house only. Not a secret worth much, and not
     // something to hand to whoever finds the address either.
     if invited(&app, &headers).is_none() {
         return (StatusCode::FORBIDDEN, "not invited").into_response();
     }
-    let found = match app.any().avatar_png(&who) {
+    // `v` asks for one particular face of theirs. Settings shows the
+    // last ten that way, each at its own address; without it this is
+    // the one they are wearing.
+    let found = match app.any().avatar_png(&who, q.v) {
         Ok(found) => found,
         Err(err) => {
             warn!("read {who}'s face: {err:#}");
@@ -970,6 +991,46 @@ async fn profile(State(app): State<App>, headers: HeaderMap, Path(who): Path<Str
     match app.any().profile(&who) {
         Some(profile) => Json(profile).into_response(),
         None => (StatusCode::NOT_FOUND, "nobody here by that name").into_response(),
+    }
+}
+
+/// The faces somebody has worn, newest first, for the row of them in
+/// Settings. Yours only: what somebody else has looked like is not a
+/// list anybody needs.
+async fn faces(State(app): State<App>, headers: HeaderMap, Path(who): Path<String>) -> Response {
+    let Some(me) = invited(&app, &headers) else {
+        return (StatusCode::FORBIDDEN, "not invited").into_response();
+    };
+    if me.display != who {
+        return (StatusCode::FORBIDDEN, "those are not yours").into_response();
+    }
+    match app.any().faces(&who) {
+        Ok(faces) => Json(json!({ "faces": faces })).into_response(),
+        Err(err) => (StatusCode::BAD_REQUEST, err).into_response(),
+    }
+}
+
+/// Put one of your own past faces back on, by its version.
+///
+/// Yours and nobody else's, like taking one off. Choosing again from
+/// what has already been made costs nothing and needs no AI, which is
+/// why it is a button rather than something to ask for out loud.
+async fn wear_avatar(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Path(who): Path<String>,
+    Json(body): Json<WearAvatar>,
+) -> Response {
+    let Some(me) = invited(&app, &headers) else {
+        return (StatusCode::FORBIDDEN, "not invited").into_response();
+    };
+    if me.display != who {
+        return (StatusCode::FORBIDDEN, "that is not your face").into_response();
+    }
+    match app.any().wear_avatar(&who, body.at) {
+        Ok(true) => Json(json!({ "worn": body.at })).into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "you have never worn that one").into_response(),
+        Err(err) => (StatusCode::BAD_REQUEST, err).into_response(),
     }
 }
 

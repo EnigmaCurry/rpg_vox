@@ -233,6 +233,85 @@ CREATE TABLE IF NOT EXISTS bios (
     bio TEXT NOT NULL,
     at  INTEGER NOT NULL
 );
+-- The faces somebody has worn, newest last. One row per picture
+-- that has been theirs, and exactly one of them `worn` -- or none,
+-- when they have taken it off and are drawn as the tint their name
+-- already has.
+--
+-- A history and not a single row, so Settings can offer the last few
+-- back: a face somebody liked a month ago is a thing to return to,
+-- and regenerating it is neither free nor the same picture. Trimmed
+-- to the last `FACES_KEPT` per person.
+--
+-- Keyed by what does not change. A person's `people.name` rather than
+-- their display name, so renaming themselves doesn't lose their face
+-- the way it would a card (see `rename`, which has to rewrite those);
+-- and `@` and its name for an AI, because a bot's name comes from the
+-- configuration rather than from here, and nothing stops a person
+-- being invited as `Vortex Prime` while a bot answers to it.
+CREATE TABLE IF NOT EXISTS faces (
+    who    TEXT NOT NULL,
+    -- When it was first worn, in unix milliseconds. With `who` it is
+    -- the key, and it is the version in the URL -- which is what lets
+    -- a browser cache one for good, and what lets the same address
+    -- serve an old one as readily as the current one.
+    at     INTEGER NOT NULL,
+    -- The picture itself, as a PNG. Pixel art is a few kilobytes, so
+    -- it lives here beside everything else the house has to keep
+    -- rather than in a directory a backup could miss.
+    png    BLOB NOT NULL,
+    -- What it was asked for. Kept so the next one can be asked for in
+    -- the same spirit, and so somebody can read how they were described.
+    prompt TEXT NOT NULL DEFAULT '',
+    -- The one they are wearing. At most one per person, which the code
+    -- keeps rather than the schema: unsetting the old one and setting
+    -- the new is a single transaction.
+    worn   INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (who, at)
+);
+CREATE INDEX IF NOT EXISTS faces_newest ON faces (who, at DESC);
+-- A picture one of the AIs made, posted into the conversation it was
+-- made in. The row is written the moment the generating starts, with
+-- no `png`: the card goes up with a spinner on it and fills in when
+-- this does, so the room can watch it happen and say what to change.
+--
+-- They are numbered within their conversation, and that number is
+-- what the card shows and what `set_avatar` is given: the second one
+-- is a thing people say, and so a thing the AI can act on.
+--
+-- A picture stays in the conversation it was made in, and goes when
+-- that conversation does: it is part of what was said.
+CREATE TABLE IF NOT EXISTS pictures (
+    id           TEXT PRIMARY KEY,
+    conversation INTEGER NOT NULL,
+    -- Its number in this conversation, from 1.
+    n            INTEGER NOT NULL,
+    -- Which AI made it.
+    who          TEXT NOT NULL,
+    -- What it was asked for. Shown on the card and kept with the
+    -- avatar when one is made from it.
+    prompt       TEXT NOT NULL,
+    -- Null while it is still being made. A row that has one is done.
+    png          BLOB,
+    -- Why it will never arrive, when it won't. The card says so
+    -- rather than spinning forever.
+    failed       TEXT NOT NULL DEFAULT '',
+    at           INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS pictures_in_order ON pictures (conversation, n);
+-- The few lines about somebody that go with their face: who their
+-- character is, written by the AI in the same interview the picture
+-- came out of.
+--
+-- Its own table and not a column on `avatars`, because a bio and a
+-- face arrive at different moments and either may exist without the
+-- other -- somebody may want to be described and not drawn. Keyed the
+-- same way, by what does not change.
+CREATE TABLE IF NOT EXISTS bios (
+    who TEXT PRIMARY KEY,
+    bio TEXT NOT NULL,
+    at  INTEGER NOT NULL
+);
 -- The square picture shown beside everything somebody says. One row
 -- each, and only for those who have one: a person without a row is
 -- drawn as the tint their name already has, which is the placeholder
@@ -579,7 +658,7 @@ impl Store {
         // Their face and what was written about them go with the
         // account. Somebody invited under the same name later is a new
         // person, and starts as one.
-        tx.execute("DELETE FROM avatars WHERE who = ?1", [name])?;
+        tx.execute("DELETE FROM faces WHERE who = ?1", [name])?;
         tx.execute("DELETE FROM bios WHERE who = ?1", [name])?;
         tx.commit()?;
         Ok(gone)
@@ -1310,62 +1389,138 @@ impl Store {
 
     // -- avatars: the square beside everything somebody says --------------
 
-    /// Give `who` a face, replacing whatever they had. The answer is
-    /// its version, which is what a browser fetches it by.
+    /// Give `who` a face. The answer is its version, which is what a
+    /// browser fetches it by.
+    ///
+    /// The one they were wearing is not thrown away: it joins the
+    /// history Settings offers back, and only the oldest past
+    /// [`FACES_KEPT`] fall off the end.
     ///
     /// Not checked against the invite list. A bot is in here under
     /// [`bot_key`] and is nobody's row in `people`, and the one thing
     /// that must not happen is the AI's own face being the one kind
     /// this can't keep.
     pub fn set_avatar(&self, who: &str, png: &[u8], prompt: &str) -> Result<u64> {
-        let at = now_ms();
-        self.db.execute(
-            "INSERT INTO avatars (who, png, prompt, at) VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(who) DO UPDATE SET
-                 png = excluded.png, prompt = excluded.prompt, at = excluded.at",
-            params![who, png, prompt, at],
+        let tx = self.db.unchecked_transaction()?;
+        // The clock, unless this person already has a face from this
+        // millisecond -- and they can: the AI may be handing out two
+        // in a row. `at` is the key and the version in the URL, so a
+        // collision would quietly overwrite the face it was meant to
+        // keep. One past their newest is still in order and still
+        // unique, which is all the number has to be.
+        let at: i64 = tx.query_row(
+            "SELECT MAX(?2, COALESCE(MAX(at), 0) + 1) FROM faces WHERE who = ?1",
+            params![who, now_ms()],
+            |r| r.get(0),
         )?;
+        tx.execute("UPDATE faces SET worn = 0 WHERE who = ?1", [who])?;
+        tx.execute(
+            "INSERT INTO faces (who, at, png, prompt, worn) VALUES (?1, ?2, ?3, ?4, 1)
+             ON CONFLICT(who, at) DO UPDATE SET
+                 png = excluded.png, prompt = excluded.prompt, worn = 1",
+            params![who, at, png, prompt],
+        )?;
+        trim_faces(&tx, who)?;
+        tx.commit()?;
         Ok(at as u64)
     }
 
-    /// `who`'s picture and its version, or None when they have none and
-    /// are to be drawn as their tint.
+    /// Wear one they have worn before, by its version. False when
+    /// there is no such face of theirs.
+    pub fn wear_avatar(&self, who: &str, at: u64) -> Result<bool> {
+        let tx = self.db.unchecked_transaction()?;
+        let has: bool = tx.query_row(
+            "SELECT COUNT(*) > 0 FROM faces WHERE who = ?1 AND at = ?2",
+            params![who, at as i64],
+            |r| r.get(0),
+        )?;
+        if !has {
+            return Ok(false);
+        }
+        tx.execute("UPDATE faces SET worn = 0 WHERE who = ?1", [who])?;
+        tx.execute(
+            "UPDATE faces SET worn = 1 WHERE who = ?1 AND at = ?2",
+            params![who, at as i64],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// The face `who` is wearing and its version, or None when they
+    /// are wearing none and are drawn as their tint.
     pub fn avatar(&self, who: &str) -> Result<Option<(Vec<u8>, u64)>> {
         Ok(self
             .db
             .query_row(
-                "SELECT png, at FROM avatars WHERE who = ?1",
+                "SELECT png, at FROM faces WHERE who = ?1 AND worn = 1",
                 [who],
                 |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as u64)),
             )
             .optional()?)
     }
 
-    /// What `who`'s picture was asked for, for making the next one in
-    /// the same spirit. Empty when it was set without a description.
-    pub fn avatar_prompt(&self, who: &str) -> Result<Option<String>> {
+    /// One particular face of theirs, worn or not: what the version in
+    /// the URL asks for, and how Settings shows the ones on offer.
+    pub fn avatar_at(&self, who: &str, at: u64) -> Result<Option<Vec<u8>>> {
         Ok(self
             .db
-            .query_row("SELECT prompt FROM avatars WHERE who = ?1", [who], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT png FROM faces WHERE who = ?1 AND at = ?2",
+                params![who, at as i64],
+                |r| r.get(0),
+            )
             .optional()?)
     }
 
-    /// Everybody who has one, and the version theirs is at. The room
+    /// What the face they are wearing was asked for, for making the
+    /// next one in the same spirit. Empty when it was set without a
+    /// description.
+    pub fn avatar_prompt(&self, who: &str) -> Result<Option<String>> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT prompt FROM faces WHERE who = ?1 AND worn = 1",
+                [who],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// The faces `who` has worn, newest first, without the pictures:
+    /// what Settings lists so somebody can put an old one back on.
+    pub fn faces(&self, who: &str) -> Result<Vec<Face>> {
+        let mut q = self.db.prepare(
+            "SELECT at, prompt, worn FROM faces WHERE who = ?1 ORDER BY at DESC LIMIT ?2",
+        )?;
+        let rows = q.query_map(params![who, FACES_KEPT as i64], |r| {
+            Ok(Face {
+                at: r.get::<_, i64>(0)? as u64,
+                prompt: r.get(1)?,
+                worn: r.get::<_, i64>(2)? != 0,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Everybody wearing one, and the version theirs is at. The room
     /// turns this into what it sends a browser; it is small enough to
     /// read whole, and the pictures themselves are not in it.
     pub fn avatars(&self) -> Result<BTreeMap<String, u64>> {
-        let mut q = self.db.prepare("SELECT who, at FROM avatars")?;
+        let mut q = self
+            .db
+            .prepare("SELECT who, at FROM faces WHERE worn = 1")?;
         let rows = q.query_map([], |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as u64)))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// Take `who`'s picture away; false when they had none.
+    /// Take the one they are wearing off; false when they had none on.
+    ///
+    /// It stays in the history: taking a face off is not the same as
+    /// never having had one, and Settings still offers it back.
     pub fn clear_avatar(&self, who: &str) -> Result<bool> {
         Ok(self
             .db
-            .execute("DELETE FROM avatars WHERE who = ?1", [who])?
+            .execute("UPDATE faces SET worn = 0 WHERE who = ?1 AND worn = 1", [who])?
             > 0)
     }
 
@@ -1530,6 +1685,36 @@ pub struct Made {
     pub at: u64,
 }
 
+/// How many of somebody's past faces are kept and offered back. Ten
+/// is what Settings can show in a row without becoming a gallery, and
+/// a face further back than that is one they have stopped meaning to
+/// return to.
+pub const FACES_KEPT: usize = 10;
+
+/// Drop everything but this person's newest [`FACES_KEPT`]. The one
+/// they are wearing is always among them: it was just set, or it is
+/// one of the newest by definition.
+fn trim_faces(tx: &Connection, who: &str) -> Result<()> {
+    tx.execute(
+        "DELETE FROM faces WHERE who = ?1 AND at NOT IN (
+             SELECT at FROM faces WHERE who = ?1 ORDER BY at DESC LIMIT ?2
+         )",
+        params![who, FACES_KEPT as i64],
+    )?;
+    Ok(())
+}
+
+/// One face somebody has worn, without the picture: what Settings
+/// lists. The picture is fetched by its version, one per thumbnail.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Face {
+    /// Its version, and what the URL asks for.
+    pub at: u64,
+    pub prompt: String,
+    /// The one they are wearing now.
+    pub worn: bool,
+}
+
 /// What an AI's picture is kept under: `@` and its name.
 ///
 /// A person is in `avatars` under their unchanging `people.name`, which
@@ -1662,6 +1847,7 @@ fn migrate(db: &Connection) -> Result<()> {
     // room's *current* one, which the settings name; the ones before it
     // can't be attributed to a room and so are left out of every
     // room's history rather than guessed into one.
+    adopt_avatars(db)?;
     if !has_column(db, "conversations", "title")? {
         db.execute_batch("ALTER TABLE conversations ADD COLUMN title TEXT NOT NULL DEFAULT ''")?;
     }
@@ -1701,6 +1887,37 @@ fn abandoned_pictures(db: &Connection) -> Result<()> {
         tracing::info!(pictures = left, "these were still being drawn when the room stopped");
     }
     Ok(())
+}
+
+/// Faces used to be one row per person, replaced when a new one was
+/// set, in a table called `avatars`. They are a history now -- see
+/// `faces` -- so that Settings can offer the last few back.
+///
+/// Whoever already has one keeps it, wearing it, as the only entry in
+/// their history. The old table goes: its rows are copied, and a
+/// second place where a face might be is a second answer to what
+/// somebody looks like.
+fn adopt_avatars(db: &Connection) -> Result<()> {
+    if !has_table(db, "avatars")? {
+        return Ok(());
+    }
+    db.execute_batch(
+        "INSERT OR IGNORE INTO faces (who, at, png, prompt, worn)
+             SELECT who, at, png, prompt, 1 FROM avatars;
+         DROP TABLE avatars;",
+    )?;
+    Ok(())
+}
+
+fn has_table(db: &Connection, table: &str) -> Result<bool> {
+    Ok(db
+        .query_row(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?
+        .is_some())
 }
 
 fn has_column(db: &Connection, table: &str, column: &str) -> Result<bool> {
@@ -1772,6 +1989,116 @@ mod tests {
         assert!(s.uninvite("Ryan").unwrap());
         assert_eq!(s.avatar("Ryan").unwrap(), None);
         assert!(s.avatar(&bot_key("Vortex Prime")).unwrap().is_some());
+    }
+
+    /// A face is kept after it is replaced, so Settings can offer it
+    /// back -- and only the last ten are.
+    #[test]
+    fn the_faces_somebody_has_worn_are_kept_and_offered_back() {
+        let s = Store::memory();
+        s.invite("Ryan").unwrap();
+
+        let first = s.set_avatar("Ryan", b"\x89PNG one", "a tired wizard").unwrap();
+        let second = s.set_avatar("Ryan", b"\x89PNG two", "a rested wizard").unwrap();
+        assert_ne!(first, second, "each is its own version");
+
+        // The newest is the one being worn, and the one before it is
+        // still there to go back to.
+        assert_eq!(s.avatar("Ryan").unwrap().unwrap().0, b"\x89PNG two");
+        assert_eq!(s.avatars().unwrap()["Ryan"], second);
+        let worn: Vec<_> = s.faces("Ryan").unwrap();
+        assert_eq!(worn.len(), 2);
+        assert_eq!(worn[0].at, second, "newest first");
+        assert!(worn[0].worn);
+        assert_eq!(worn[1].prompt, "a tired wizard");
+        assert!(!worn[1].worn);
+
+        // The old one can be fetched by its version, which is how the
+        // row of them in Settings is drawn.
+        assert_eq!(s.avatar_at("Ryan", first).unwrap().unwrap(), b"\x89PNG one");
+
+        // And put back on, without making anything.
+        assert!(s.wear_avatar("Ryan", first).unwrap());
+        assert_eq!(s.avatar("Ryan").unwrap().unwrap().0, b"\x89PNG one");
+        assert_eq!(
+            s.avatar_prompt("Ryan").unwrap().as_deref(),
+            Some("a tired wizard"),
+            "and what it was asked for comes with it"
+        );
+        assert_eq!(
+            s.faces("Ryan").unwrap().iter().filter(|f| f.worn).count(),
+            1,
+            "exactly one is worn"
+        );
+        assert!(!s.wear_avatar("Ryan", 999).unwrap(), "and only ones of theirs");
+
+        // Taking it off leaves the history: it is not the same as
+        // never having had one.
+        assert!(s.clear_avatar("Ryan").unwrap());
+        assert!(s.avatar("Ryan").unwrap().is_none());
+        assert!(!s.avatars().unwrap().contains_key("Ryan"));
+        assert_eq!(s.faces("Ryan").unwrap().len(), 2, "both still on offer");
+        assert!(!s.clear_avatar("Ryan").unwrap(), "and none on to take off");
+
+        // Only the last ten are kept. The oldest fall off the end.
+        for n in 0..FACES_KEPT + 4 {
+            s.set_avatar("Ryan", format!("PNG {n}").as_bytes(), &format!("face {n}"))
+                .unwrap();
+        }
+        let worn = s.faces("Ryan").unwrap();
+        assert_eq!(worn.len(), FACES_KEPT);
+        assert_eq!(worn[0].prompt, format!("face {}", FACES_KEPT + 3), "newest first");
+        assert!(worn[0].worn, "and it is the one being worn");
+        assert!(
+            s.avatar_at("Ryan", first).unwrap().is_none(),
+            "the first one has fallen off the end"
+        );
+
+        // The whole history goes with the account.
+        assert!(s.uninvite("Ryan").unwrap());
+        assert!(s.faces("Ryan").unwrap().is_empty());
+    }
+
+    /// A house whose faces were one-per-person keeps them, wearing
+    /// them, as the first entry of a history.
+    #[test]
+    fn a_database_from_before_faces_had_a_history_keeps_its_faces() {
+        let db = Connection::open_in_memory().unwrap();
+        // `avatars` as it was: one row each, replaced when a new one
+        // was set.
+        db.execute_batch(
+            "CREATE TABLE avatars (
+                 who    TEXT PRIMARY KEY,
+                 png    BLOB NOT NULL,
+                 prompt TEXT NOT NULL DEFAULT '',
+                 at     INTEGER NOT NULL
+             );
+             INSERT INTO avatars (who, png, prompt, at)
+                 VALUES ('Ryan', x'89504e47', 'a tired wizard', 1700000000000),
+                        ('@Vox', x'89504e48', 'a brass head', 1700000000001);",
+        )
+        .unwrap();
+        db.execute_batch(SCHEMA).unwrap();
+        migrate(&db).unwrap();
+        indexes(&db).unwrap();
+        let s = Store {
+            db,
+            room: String::new(),
+        };
+
+        // Still theirs, still on, and now with a history of one.
+        assert_eq!(s.avatar("Ryan").unwrap().unwrap().1, 1700000000000);
+        assert_eq!(
+            s.avatar_prompt("Ryan").unwrap().as_deref(),
+            Some("a tired wizard")
+        );
+        assert_eq!(s.avatar("@Vox").unwrap().unwrap().0, vec![0x89, 0x50, 0x4e, 0x48]);
+        assert_eq!(s.faces("Ryan").unwrap().len(), 1);
+        assert!(s.faces("Ryan").unwrap()[0].worn);
+
+        // And the old table is gone, so there is one answer to what
+        // somebody looks like.
+        assert!(!has_table(&s.db, "avatars").unwrap());
     }
 
     /// One owner, and the way to another is through the first.

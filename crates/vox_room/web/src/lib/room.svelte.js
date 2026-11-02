@@ -726,9 +726,40 @@ export function avatarOf(who) {
 }
 
 /// Take your own face off. Yours alone -- the server refuses anybody
-/// else's, whoever asks.
+/// else's, whoever asks. It stays in the history below, so putting it
+/// back on is one press.
 export async function forgetAvatar() {
   await fetch(`/api/avatar/${encodeURIComponent(room.you)}`, { method: 'DELETE' });
+}
+
+/// One of your own past faces, at a version: what Settings shows the
+/// row of, and what it puts back on.
+export function faceAt(at) {
+  return `/api/avatar/${encodeURIComponent(room.you)}?v=${at}`;
+}
+
+/// The faces you have worn, newest first. Asked for when Settings
+/// opens rather than kept on the roster: ten of anybody's past faces
+/// is nobody else's business and not something to send on every
+/// change of who is talking.
+export async function myFaces() {
+  try {
+    const r = await fetch(`/api/avatar/${encodeURIComponent(room.you)}/all`);
+    if (!r.ok) return [];
+    return (await r.json()).faces ?? [];
+  } catch {
+    return [];
+  }
+}
+
+/// Put one of them back on. The room tells every tab, so the squares
+/// in the conversation change behind the page.
+export async function wearFace(at) {
+  await fetch(`/api/avatar/${encodeURIComponent(room.you)}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ at }),
+  });
 }
 
 /// Where to fetch a picture made in this conversation.

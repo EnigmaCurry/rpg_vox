@@ -136,10 +136,15 @@ one() {
     # a glance whether the picture or the placeholder won. Kept as a
     # hex literal because that is what sqlite takes a blob as.
     local face="x'89504e470d0a1a0a0000000d49484452000000080000000808020000004b6d29dc0000001b4944415478da6338a1b1002b622020f1ff8e061cd14a8204570100f6df6b312bc415490000000049454e44ae426082'"
+    # Three faces Ryan has worn, the newest on: Settings offers the
+    # older two back without making anything. The SQL must not start
+    # with a `--` comment -- sqlite3 reads that as an option.
     sqlite_set "$data/room.db" \
-      "INSERT INTO avatars (who, png, prompt, at)
-         VALUES ('Ryan', $face, 'a tired wizard', 1700000000000),
-                ('@Vox', $face, 'a brass head', 1700000000001);
+      "INSERT INTO faces (who, at, png, prompt, worn)
+         VALUES ('Ryan', 1700000000000, $face, 'a tired wizard', 0),
+                ('Ryan', 1700000000001, $face, 'a rested wizard', 0),
+                ('Ryan', 1700000000002, $face, 'a wizard at ease', 1),
+                ('@Vox', 1700000000001, $face, 'a brass head', 1);
        INSERT INTO bios (who, bio, at)
          VALUES ('Ryan', 'A ranger from the north, quiet about it.', 1700000000000);
        -- Two pictures in the conversation: one that arrived and one
@@ -152,9 +157,9 @@ one() {
          VALUES ($c,'a1','Ryan','human','','Make me a face, would you.',1),
                 ($c,'a2','Vox','agent','','There. How is that?',2),
                 ($c,'a3','Alex','human','','I will stay as I am.',3),
-                ($c,'picture-one','Vox','picture','a tired wizard','1',4),
+                ($c,'picture-one','Vox','picture','a tired wizard','picture 1',4),
                 ($c,'a4','Ryan','human','','Less tired, maybe.',5),
-                ($c,'picture-two','Vox','picture','the same wizard, rested','2',6);"
+                ($c,'picture-two','Vox','picture','the same wizard, rested','picture 2',6);"
   fi
 
   # A card is posted by a model, and there is no model here, so the

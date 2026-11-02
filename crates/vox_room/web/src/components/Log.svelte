@@ -159,7 +159,7 @@
           <div class="said-by">
             <div class="who">
               <span class="name">{e.who}</span>
-              <span class="time">{time(e.at)} · picture {e.text}</span>
+              <span class="time">{time(e.at)} · {e.text}</span>
             </div>
             <div class="card shot-card">
               <div class="shot" class:waiting={!made?.ready && !made?.failed}>
@@ -388,6 +388,9 @@
   /* The column beside the face. `min-width: 0` so a long word or a
      wide table shrinks it rather than pushing the face off. */
   .said-by { min-width: 0; flex: 1; display: flex; flex-direction: column; align-items: flex-start; }
+  /* Beside the name rather than the bubble: the name is a line of
+     12px text above the words, and the square lines up with it. */
+  .entry > :global(.face) { margin-top: 14px; }
   .entry.you .said-by { align-items: flex-end; }
   .who { font-size: 12px; color: var(--muted); display: flex; gap: 8px; margin: 0 4px 2px; }
   .entry.you .who { justify-content: flex-end; }

@@ -143,7 +143,7 @@ const [ryanLink] = process.argv.slice(2);
     {
       who: 'Ryan',
       bio: 'A ranger from the north, quiet about it.',
-      asked: 'drawn as a tired wizard',
+      asked: 'drawn as a wizard at ease',
       tags: ['reads English', 'here'],
       drawn: 8,
     },
@@ -182,12 +182,77 @@ const [ryanLink] = process.argv.slice(2);
   await ryan.page.keyboard.press('Escape');
   await wait(200);
 
+  // Who is here, with a face each: the list is easier to read by
+  // picture than by name, and the same square does it.
+  is(
+    'the people list carries faces too',
+    await ryan.page.evaluate(() =>
+      [...document.querySelectorAll('.strip')].map((s) => ({
+        who: s.querySelector('.label')?.textContent.replace(/\s*\(you\)$/, '').trim(),
+        drawn: s.querySelector('.face img')?.naturalWidth ?? 0,
+        // Small, because it sits on one line of 14px text.
+        px: Math.round(s.querySelector('.face')?.getBoundingClientRect().width ?? 0),
+      })),
+    ),
+    // Only who is actually in the room -- Alex was invited and never
+    // opened a tab, so she is on nobody's strip.
+    [
+      { who: 'Ryan', drawn: 8, px: 22 },
+      { who: 'Vox', drawn: 8, px: 22 },
+    ],
+  );
+
+  // And a face in that list opens the same card as one in the
+  // conversation: clicking a face is one thing, wherever it is.
+  await ryan.page.click('.strip .face');
+  await ryan.page.waitForSelector('.who-card');
+  is(
+    'and opens the same card from there',
+    await ryan.page.evaluate(() => document.querySelector('.who-card h2').textContent.trim()),
+    'Ryan',
+  );
+  await ryan.page.keyboard.press('Escape');
+  await wait(200);
+
   // Yours to take off, from the one place that offers it. The room
   // tells every tab the moment it goes, so the square in the
   // conversation behind this page turns back into initials without a
   // reload -- which is the half a DELETE on its own wouldn't prove.
   await ryan.page.click('.tools button.cog');
   await ryan.page.waitForSelector('.settings');
+  await wait(400);
+
+  // The ones worn before, newest first, with the current one marked.
+  is(
+    'Settings offers the faces worn before',
+    await ryan.page.evaluate(() =>
+      [...document.querySelectorAll('.past-face')].map((b) => ({
+        asked: b.getAttribute('title'),
+        worn: b.getAttribute('aria-pressed') === 'true',
+      })),
+    ),
+    [
+      { asked: 'a wizard at ease', worn: true },
+      { asked: 'a rested wizard', worn: false },
+      { asked: 'a tired wizard', worn: false },
+    ],
+  );
+
+  // Putting an older one back on costs nothing and needs no AI.
+  await ryan.page.evaluate(() => document.querySelectorAll('.past-face')[2].click());
+  await wait(600);
+  is(
+    'and an older one can be put back on',
+    await ryan.page.evaluate(() =>
+      [...document.querySelectorAll('.past-face')].map(
+        (b) => b.getAttribute('aria-pressed') === 'true',
+      ),
+    ),
+    [false, false, true],
+  );
+
+  await ryan.page.screenshot({ path: '/tmp/vox-room-settings.png' });
+
   is(
     'Settings offers to take your face off',
     await ryan.page.evaluate(() =>

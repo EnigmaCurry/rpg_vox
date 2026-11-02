@@ -8,7 +8,10 @@
   // than one worked out from the name. `opens` is whether clicking it
   // opens who they are -- true wherever a face stands for somebody,
   // and false where one is already being looked at.
-  let { who, agent = false, opens = true } = $props();
+  // `size` is how big the square is drawn. 36 beside a line in the
+  // conversation; smaller in the list of who is here, where it sits
+  // on one line of 14px text.
+  let { who, agent = false, opens = true, size = 36 } = $props();
 
   const src = $derived(avatarOf(who));
 
@@ -43,7 +46,7 @@
   class="face"
   class:agent
   class:opens
-  style="--h: {hue(who)}"
+  style="--h: {hue(who)}; --size: {size}px; --initials: {Math.round(size * 0.36)}px"
   title={opens ? `Who ${who} is` : who}
   type={opens ? 'button' : undefined}
   aria-hidden={opens ? undefined : 'true'}
@@ -62,18 +65,18 @@
        does not shrink: the conversation is a column of names that line
        up, and a face that changed width per person would unalign it. */
     flex: 0 0 auto;
-    width: 36px;
-    height: 36px;
-    border-radius: 8px;
+    width: var(--size);
+    height: var(--size);
+    border-radius: max(4px, calc(var(--size) / 4.5));
     overflow: hidden;
     display: grid;
     place-items: center;
     background: hsl(var(--h) 55% 92%);
     color: hsl(var(--h) 55% 32%);
     border: 1px solid hsl(var(--h) 40% 80%);
-    /* It sits beside the name rather than the bubble, which is a line
-       of 12px text above the words. */
-    margin-top: 14px;
+    /* No margin of its own: where it sits is the business of whatever
+       is placing it. In the conversation it lines up with the name
+       above the bubble; in the list of who is here it is on the line. */
   }
   .face.agent {
     background: color-mix(in srgb, var(--agent) 14%, var(--bubble));
@@ -87,7 +90,7 @@
   .face.opens:focus-visible { outline: 2px solid hsl(var(--h) 55% 50%); outline-offset: 2px; }
   .face.agent.opens:hover { border-color: var(--agent); }
   .initials {
-    font-size: 13px;
+    font-size: var(--initials);
     font-weight: 650;
     letter-spacing: 0.02em;
     user-select: none;

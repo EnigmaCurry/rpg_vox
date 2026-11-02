@@ -1304,6 +1304,14 @@ impl Room {
             .is_some_and(|room| room == self.cfg.id)
     }
 
+    /// The conversation as it stands. For the tests in `agent.rs`,
+    /// which drive a picture through the room from outside this
+    /// module and then look at what it did.
+    #[cfg(test)]
+    pub fn log_now(&self) -> Vec<Entry> {
+        self.lock().log.clone()
+    }
+
     fn lock(&self) -> MutexGuard<'_, State> {
         self.st.lock().expect("room mutex poisoned")
     }
@@ -1758,16 +1766,57 @@ impl Room {
     /// calls them: a person first and then an AI, the same order
     /// [`Room::set_avatar`] resolves in.
     ///
+    /// `at` asks for one particular face of theirs rather than the one
+    /// they are wearing -- which is how Settings shows the ones on
+    /// offer, and why the version has always been in the URL.
+    ///
     /// Asked by the browser, once per version -- see `web::avatar`.
     /// None is nobody's face rather than a failure.
-    pub fn avatar_png(&self, who: &str) -> Result<Option<(Vec<u8>, u64)>, String> {
+    pub fn avatar_png(&self, who: &str, at: Option<u64>) -> Result<Option<(Vec<u8>, u64)>, String> {
         let store = self.store();
         let key = match store.person_called(who) {
             Ok(Some(name)) => name,
             Ok(None) => crate::store::bot_key(who),
             Err(err) => return Err(format!("{err:#}")),
         };
-        store.avatar(&key).map_err(|err| format!("{err:#}"))
+        match at {
+            Some(at) => Ok(store
+                .avatar_at(&key, at)
+                .map_err(|err| format!("{err:#}"))?
+                .map(|png| (png, at))),
+            None => store.avatar(&key).map_err(|err| format!("{err:#}")),
+        }
+    }
+
+    /// The faces `who` has worn, newest first: what Settings lists so
+    /// somebody can put an old one back on. By the name the room calls
+    /// them, like everything else a browser asks by.
+    pub fn faces(&self, who: &str) -> Result<Vec<crate::store::Face>, String> {
+        let store = self.store();
+        let key = match store.person_called(who) {
+            Ok(Some(name)) => name,
+            Ok(None) => crate::store::bot_key(who),
+            Err(err) => return Err(format!("{err:#}")),
+        };
+        store.faces(&key).map_err(|err| format!("{err:#}"))
+    }
+
+    /// Put one of their own past faces back on, by its version.
+    ///
+    /// Theirs to do and nobody else's -- the web layer checks that --
+    /// and it needs no AI: choosing again from what has already been
+    /// made costs nothing and should not have to be asked for out loud.
+    pub fn wear_avatar(&self, who: &str, at: u64) -> Result<bool, String> {
+        let st = self.lock();
+        let (key, _) = self.whose(&st, who)?;
+        let worn = self
+            .store()
+            .wear_avatar(&key, at)
+            .map_err(|err| format!("{err:#}"))?;
+        if worn {
+            self.emit_people(&st);
+        }
+        Ok(worn)
     }
 
     // -- pictures: made where the room can watch -----------------------
@@ -1799,7 +1848,12 @@ impl Room {
             who,
             kind: Kind::Picture,
             // What the model calls it, and what `set_avatar` takes.
-            text: n.to_string(),
+            // Spelled out rather than the bare number: a client that
+            // does not know this kind yet -- an old tab, a browser
+            // holding a bundle from before pictures existed -- falls
+            // back to showing an entry's text, and "picture 1" is a
+            // thing a person can read where "1" is a bug report.
+            text: format!("picture {n}"),
             // What it was asked for, which is the card's caption.
             title: prompt.trim().to_string(),
             // Still being made: the card is a spinner while this is
@@ -5242,7 +5296,7 @@ fn conversation_messages(
             Kind::Picture => {
                 let who = if mine { "You" } else { e.who.as_str() };
                 let note = format!(
-                    "[{who} put picture {} in the chat for everyone to look at: \"{}\". \
+                    "[{who} put {} in the chat for everyone to look at: \"{}\". \
                      Ask how they like it; set_avatar takes that number.]",
                     e.text,
                     one_line(e.title.trim())
@@ -5343,7 +5397,7 @@ mod tests {
             .expect("the card is in the conversation at once");
         assert_eq!(spinner.kind, Kind::Picture);
         assert!(spinner.live, "and it is a spinner until the picture lands");
-        assert_eq!(spinner.text, "1", "the model refers to it by its number");
+        assert_eq!(spinner.text, "picture 1", "what it is called, in words");
         assert_eq!(spinner.title, "a tired wizard");
         assert_eq!(spinner.who, "Vox", "signed by the AI that is making it");
         assert!(r.picture_png(&first).unwrap().is_none(), "nothing to serve yet");
@@ -5369,7 +5423,7 @@ mod tests {
             "and still only onto somebody who is here"
         );
         assert_eq!(r.set_avatar(g, "ryan", 1).unwrap(), "Ryan");
-        assert_eq!(r.avatar_png("Ryan").unwrap().unwrap().0, png());
+        assert_eq!(r.avatar_png("Ryan", None).unwrap().unwrap().0, png());
         // Copied, not pointed at: a face outlives the conversation it
         // was made in.
         assert_eq!(
@@ -5401,7 +5455,7 @@ mod tests {
         let (id, _) = r.begin_picture(g, "a tired wizard").unwrap();
         r.finish_picture(&id, &png());
         r.set_avatar(g, "Ryan", 1).unwrap();
-        let version = r.avatar_png("Ryan").unwrap().unwrap().1;
+        let version = r.avatar_png("Ryan", None).unwrap().unwrap().1;
 
         // The AI has one too, under a key no person can be invited
         // into, and the two do not collide.
@@ -5427,8 +5481,58 @@ mod tests {
         assert!(shown.get("Ryan").is_none(), "not under the old name");
 
         assert_eq!(r.clear_avatar("Thorne"), Ok(true));
-        assert!(r.avatar_png("Thorne").unwrap().is_none());
+        assert!(r.avatar_png("Thorne", None).unwrap().is_none());
         assert_eq!(r.clear_avatar("Thorne"), Ok(false), "and none to take twice");
+    }
+
+    /// One picture, and the room decides afterwards whose it is: the
+    /// first AI can put it on a person, on itself, or on another AI.
+    #[test]
+    fn one_picture_can_go_to_anybody_here() {
+        let store = Store::memory().in_room("Lobby");
+        store.invite("Ryan").unwrap();
+        let cfg = RoomConfig {
+            id: "Lobby".into(),
+            title: "Lobby".into(),
+            only: None,
+            default_mode: Mode::Named,
+            // Two AIs, because the question is whether the first one
+            // can give the second a face.
+            bots: vec![BotConfig::new("Vox", vec![]), BotConfig::new("Sage", vec![])],
+            reply_after: Duration::from_millis(1000),
+            confirm: Duration::from_millis(300),
+            engaged_for: Duration::from_millis(5000),
+            history: 50,
+            ai_turns: 2,
+            language: "English".into(),
+            languages: vec!["English".into()],
+            spoken: vec!["English".into()],
+        };
+        let (r, _wiring) = Room::new(store, cfg, None, BTreeMap::new(), None).unwrap();
+        let g = r.lock().only().generation.load(Ordering::SeqCst);
+
+        // One picture, made once.
+        let (id, _) = r.begin_picture(g, "a brass head").unwrap();
+        r.finish_picture(&id, &png());
+
+        // And it goes wherever the room decides, without being made
+        // again: to a person, to the AI that made it, and to the
+        // other AI in the room.
+        assert_eq!(r.set_avatar(g, "Ryan", 1).unwrap(), "Ryan");
+        assert_eq!(r.set_avatar(g, "Vox", 1).unwrap(), "Vox");
+        assert_eq!(r.set_avatar(g, "Sage", 1).unwrap(), "Sage");
+
+        let shown = {
+            let st = r.lock();
+            r.avatars_json(&st)
+        };
+        for who in ["Ryan", "Vox", "Sage"] {
+            assert!(shown[who].is_u64(), "{who} has it: {shown}");
+            assert_eq!(r.avatar_png(who, None).unwrap().unwrap().0, png());
+        }
+        // Three faces, each kept under its own key -- the AIs under
+        // one no person can be invited into.
+        assert_eq!(r.store().avatars().unwrap().len(), 3);
     }
 
     /// What a face opens: the bio the AI wrote and what the house
