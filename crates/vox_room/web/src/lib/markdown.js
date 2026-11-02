@@ -141,7 +141,13 @@ function blocks(lines) {
       const tb = rows
         .map((r) => `<tr>${r.map((c, n) => `<td${align[n] ?? ''}>${inline(c)}</td>`).join('')}</tr>`)
         .join('');
-      out.push(`<table><thead><tr>${th}</tr></thead><tbody>${tb}</tbody></table>`);
+      // In a box of its own: the box is as wide as the card, the
+      // table is as wide as its columns need, and the difference
+      // between them is a scrollbar rather than a card with a table
+      // hanging out of it.
+      out.push(
+        `<div class="scroll"><table><thead><tr>${th}</tr></thead><tbody>${tb}</tbody></table></div>`,
+      );
       continue;
     }
 

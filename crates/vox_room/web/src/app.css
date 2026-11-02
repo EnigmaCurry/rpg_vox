@@ -120,15 +120,17 @@ dialog.ask p { margin: 0 0 14px; }
   overflow-x: auto;
 }
 .md pre code { background: none; padding: 0; }
-/* The same for a table: it keeps its columns and takes a scrollbar of
-   its own when there are more of them than there is card. */
-.md table {
-  display: block;
-  width: max-content;
-  max-width: 100%;
+/* The same for a table, which keeps its columns rather than squeezing
+   them: the box around it is as wide as the card, the table is as wide
+   as it needs to be, and the difference is a scrollbar. */
+.md .scroll {
   overflow-x: auto;
-  border-collapse: collapse;
   margin: 0 0 8px;
+}
+.md table {
+  width: max-content;
+  max-width: none;
+  border-collapse: collapse;
   font-size: 14px;
 }
 .md th, .md td { border: 1px solid var(--line); padding: 4px 8px; text-align: left; }

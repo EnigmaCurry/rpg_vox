@@ -244,7 +244,11 @@
     min-height: 0;
     overflow-y: auto;
     overscroll-behavior: contain;
-    padding: 5px var(--gutter);
+    /* No padding at the head of it: the bar at the top of the
+       conversation is stuck to the scrollport, and anything above it is
+       a sliver the entries scroll through on their way past. The bar
+       has padding of its own, so nothing is tight against the top. */
+    padding: 0 var(--gutter) 5px;
     display: flex;
     flex-direction: column;
     gap: 12px;
@@ -263,10 +267,19 @@
   .card .title { font-weight: 650; font-size: 16px; }
   /* A posted card is wider than a bubble: it is meant to be read, not
      heard, and often has lines of its own. */
-  .card-entry { max-width: min(46em, 96%); align-self: stretch; }
+  /* A posted card has the whole column: it is a thing to look at, and
+     a table of four columns wants the width a bubble doesn't. Written
+     with both classes so it beats the `.entry` rule below, which has
+     the same weight and the last word otherwise. */
+  .entry.card-entry { max-width: 100%; align-self: stretch; }
   .card.posted { width: 100%; }
   .card.posted .body {
     margin: 0;
+    /* The card is a column of flex items that line up on the left, so
+       this one has to be told to fill it: left to itself it is as wide
+       as what is in it, and a table would size the body rather than
+       the body holding the table. */
+    width: 100%;
     overflow-wrap: anywhere;
     line-height: 1.5;
   }

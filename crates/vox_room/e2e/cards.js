@@ -58,7 +58,12 @@ const [ryanLink] = process.argv.slice(2);
   // onerror image in it; neither became anything.
   is(
     'nothing in a card becomes a tag of its own',
-    c.tags.filter((t) => !['a', 'code', 'del', 'em', 'p', 'pre', 'strong', 'table', 'tbody', 'td', 'th', 'thead', 'tr', 'ul', 'li', 'br'].includes(t)),
+    c.tags.filter(
+      (t) =>
+        // `div` is the box a table scrolls inside, and the only one
+        // the renderer makes.
+        !['a', 'br', 'code', 'del', 'div', 'em', 'li', 'p', 'pre', 'strong', 'table', 'tbody', 'td', 'th', 'thead', 'tr', 'ul'].includes(t),
+    ),
     [],
   );
   is('and nothing carries a handler', c.handlers, false);
