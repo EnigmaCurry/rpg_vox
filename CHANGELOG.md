@@ -90,6 +90,17 @@ releases.
 
 ### Voice room
 
+- **Fixed: the space bar stopped talking once you clicked anything.**
+  Push to talk ignored Space whenever a button had the focus, and a
+  button keeps the focus after you click it -- so opening somebody's
+  shared screen, picking a room, or touching a mute left you holding a
+  key that did nothing, and the way to get the microphone back was to
+  know to click the background first. Space belongs to your microphone
+  everywhere in the room now; it also no longer presses the focused
+  button again while you hold it. Where Space is something else it
+  still is: a text box, a dropdown, and a dialog that is asking you
+  something. A focused button is worked by Enter.
+
 - **More than one AI in a room, and one pause between them.**
   `--bot NAME[:VOICE[:PROMPT_FILE]]` (`VOX_ROOM_BOTS`) puts another AI
   in every room. Each has its own name to be called by, its own voice,

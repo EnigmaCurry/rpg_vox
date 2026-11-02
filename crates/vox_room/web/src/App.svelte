@@ -61,9 +61,21 @@
   });
 
   // Space toggles your mute (or, with push to talk, talks while held),
-  // unless you're typing somewhere.
+  // unless you are typing or choosing something.
+  //
+  // Buttons are deliberately *not* an exception. A button keeps the
+  // focus after you click it, so excluding them meant the space bar
+  // stopped talking the moment you touched one -- a room in the list, a
+  // fader's mute, somebody's screen share -- and the way to get it back
+  // was to know to click the background. Space belongs to your
+  // microphone everywhere in the room; a focused button is still
+  // worked by Enter. `preventDefault` below is what keeps the space bar
+  // from pressing that button again while you talk.
+  //
+  // A dialog is an exception, because there Space is how you answer it.
+  const TYPING = 'input, textarea, select, [contenteditable=""], [contenteditable="true"], dialog';
   function spaceKey(e) {
-    return e.code === 'Space' && room.audio === 'on' && !e.target.closest('input, textarea, button, dialog');
+    return e.code === 'Space' && room.audio === 'on' && !e.target.closest(TYPING);
   }
   function onkeydown(e) {
     if (!spaceKey(e)) return;
@@ -165,8 +177,8 @@
           <button class="big ptt" class:talking={room.talking} disabled={!room.mic}
             onpointerdown={(e) => { e.currentTarget.setPointerCapture(e.pointerId); talk(true); }}
             onpointerup={() => talk(false)} onpointercancel={() => talk(false)}
-            onkeydown={(e) => { if (e.code === 'Space' || e.code === 'Enter') { e.preventDefault(); talk(true); } }}
-            onkeyup={(e) => { if (e.code === 'Space' || e.code === 'Enter') { e.preventDefault(); talk(false); } }}>
+            onkeydown={(e) => { if (e.code === 'Enter') { e.preventDefault(); talk(true); } }}
+            onkeyup={(e) => { if (e.code === 'Enter') { e.preventDefault(); talk(false); } }}>
             {room.talking ? 'Talking…' : 'Hold to talk'} <kbd>Space</kbd>
           </button>
         {:else}

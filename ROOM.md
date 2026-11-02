@@ -604,12 +604,19 @@ See ROOM_DOCKER.md.
   browser's own stop button, and **Leave audio** all end it. No sound is
   taken from what is shared: the room's audio is the mixer's, and a
   shared tab's would come back as another voice to transcribe.
-- **Mixer** (right, the only thing in the sidebar): a level and mute for
-  each person and the AI, shared
-  by the whole room. **Your volume** (bottom) is only yours. Space mutes
+- **Mixer**: a level and mute for each person and each AI, shared
+  by the whole room, hanging off the room you are in in the list on the
+  left. **Your volume** (bottom) is only yours. Space mutes
   your mic, or with **Push to talk** on, your mic is open only while you
   hold Space (or the talk button): everything said in one hold is one
   entry, and the AI waits for you to let go however long you pause.
+
+  **The space bar is the microphone's wherever you left the focus.** On
+  a button you have just clicked -- a room in the list, a mute,
+  somebody's shared screen -- it still talks, and it does not press that
+  button again while you hold it. The exceptions are where Space is
+  something else: a text box, a dropdown, and a dialog that is asking
+  you something. A focused button is still worked by Enter.
 
   Mute, push to talk and the mic belong to the **tab**, not to you, so
   two of your own tabs can't argue over them: you are muted once every
@@ -886,6 +893,7 @@ CHROME=$(which chromium) ./run.sh            # or: ./run.sh rooms bots
 | `rooms` | several rooms on one socket: where a tab lands, who may go where, a room of your own admitting one person, and the mix arriving across every move. No browser at all — two sockets are enough |
 | `bots` | two AIs in one room: a fader and an Answers setting each, each answering to its own name, and one pause going to exactly one of them |
 | `door` | the door is a page with no room behind it and no socket open; **Join Audio** does nothing until you agree to be recorded, and the Language box is never blank |
+| `ptt` | push to talk: the space bar reaching the microphone from wherever the focus was left -- a button you clicked, the history panel, a mute -- and not reaching it in a text box or a dialog |
 | `permalinks` | `/`, `/lobby` and `/room/<id>`; back and forward move between rooms, a pasted address opens that room, a stale one is put right |
 | `conversations` | the room's history: naming one, reading an old one read-only without moving anybody else's screen, deleting one for everybody, and empty ones never being archived |
 | `game` | a game played inside a room, and leaving it putting the room back where it was for everyone in it |
