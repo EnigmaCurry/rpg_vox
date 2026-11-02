@@ -29,7 +29,7 @@
 
 use std::collections::{btree_map, BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -687,6 +687,10 @@ pub struct Room {
     pub mixer: Arc<Mixer>,
     store: Mutex<Store>,
     cfg: RoomConfig,
+    /// What the room is called on screen, now. `cfg.title` is what it
+    /// was called when it was built; the owner can call it something
+    /// else while people are in it, so this is the one to ask.
+    title: RwLock<String>,
     /// Where a turn number comes from. One counter for the room, so a
     /// generation names exactly one turn by exactly one bot however
     /// many of them are thinking at once.
@@ -916,6 +920,7 @@ impl Room {
             events,
             mixer: Mixer::new(strips, &cfg.language),
             store: Mutex::new(store),
+            title: RwLock::new(cfg.title.clone()),
             cfg,
             turns: Arc::new(AtomicU64::new(0)),
             typing,
@@ -1098,6 +1103,19 @@ impl Room {
 
     fn lock(&self) -> MutexGuard<'_, State> {
         self.st.lock().expect("room mutex poisoned")
+    }
+
+    /// What this room is called on screen.
+    pub fn title(&self) -> String {
+        self.title.read().expect("title lock poisoned").clone()
+    }
+
+    /// Call it something else. Everything the room owns is kept against
+    /// its id, so nothing moves but the word.
+    pub fn set_title(&self, title: &str) {
+        *self.title.write().expect("title lock poisoned") = title.to_string();
+        // Everyone in it is looking at the old name.
+        self.emit(json!({ "type": "room", "title": title }));
     }
 
     fn store(&self) -> MutexGuard<'_, Store> {
@@ -1429,7 +1447,7 @@ impl Room {
             // below belongs somewhere else now.
             "room": {
                 "id": self.cfg.id,
-                "title": self.cfg.title,
+                "title": self.title(),
                 "private": self.cfg.only.is_some(),
             },
             // The AIs in this room. One, today; the browsers read a

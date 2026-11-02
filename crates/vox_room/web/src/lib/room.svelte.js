@@ -416,6 +416,24 @@ export async function uninvitePerson(name) {
   return await asked(`/api/people/${encodeURIComponent(name)}`, { method: 'DELETE' });
 }
 
+/// Make a room; returns its id.
+export async function makeRoom(title) {
+  return await asked('/api/house/rooms', { method: 'POST', body: { title } });
+}
+
+/// Call a room something else.
+export async function renameRoom(id, title) {
+  return await asked(`/api/house/rooms/${encodeURIComponent(id)}`, {
+    method: 'POST',
+    body: { title },
+  });
+}
+
+/// Take a room out of the house.
+export async function deleteRoom(id) {
+  return await asked(`/api/house/rooms/${encodeURIComponent(id)}`, { method: 'DELETE' });
+}
+
 /// Give somebody a room, or take it away.
 export async function setPersonRoom(name, roomId, allowed) {
   return await asked(`/api/people/${encodeURIComponent(name)}/rooms`, {
@@ -707,6 +725,10 @@ function apply(ev) {
         if (followUrl()) break;
       }
       syncUrl();
+      break;
+    case 'room':
+      // Renamed under you, by the owner.
+      room.title = ev.title;
       break;
     case 'people':
       room.people = ev.people;

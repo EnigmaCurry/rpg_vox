@@ -85,11 +85,11 @@
     <section>
       <h2>The house</h2>
       <p class="note">
-        You own this room: you invite people, hand out the rooms, and can take any of it
-        back. Nobody else sees this.
+        You own this room: you make the rooms, invite people, say who may go where, and
+        can take any of it back. Nobody else sees this.
       </p>
       <button class="primary manage" onclick={() => { room.settings = false; room.managing = true; }}>
-        People
+        People and rooms
       </button>
     </section>
   {/if}

@@ -17,6 +17,11 @@ const alexToken = alexLink.replace(/.*\/join\//, '');
 /// The rooms a socket is shown, by id.
 const listed = (p) => p.rooms.map((r) => r.id);
 
+/// The id of the room made during this run, whatever it is called by
+/// the time we ask: a room made in the room has an id of its own, and
+/// that is the whole point of it.
+const attic = (p) => (p.rooms.find((r) => !['@Alex', 'Lobby', 'Studio', 'Cellar'].includes(r.id)) ?? {}).id;
+
 /// Ask the people API with somebody's cookie and say what came back.
 const asked = async (cookie, path, init = {}) => {
   const r = await fetch(BASE + path, { ...init, headers: { cookie, ...(init.headers ?? {}) } });
@@ -94,14 +99,15 @@ const asked = async (cookie, path, init = {}) => {
   await wait(600);
   is('and can go into it', alex.where.id, 'Studio');
 
-  // Take it away again: she is shown it no longer. (She stays where she
-  // is until she moves -- the room does not throw anybody out
-  // mid-sentence.)
+  // Take it away again, while she is standing in it: it goes off her
+  // list and she goes with it. A room somebody may not enter is not a
+  // room to leave them sitting in -- it would be off every list, with
+  // no way out of it but the door.
   await boss.page.click('.people input[aria-label="Alex may go to Studio"]');
-  await until(() => !listed(alex).includes('Studio'));
+  await until(() => alex.where.id === 'Lobby');
   is('taken away, it is off her list', listed(alex), ['@Alex', 'Lobby']);
-  alex.send({ type: 'enter_room', id: 'Lobby' });
-  await wait(500);
+  is('and she is out of it', alex.where.id, 'Lobby');
+  is('and told why', alex.notices.at(-1), "That room isn't yours any more. You are back in the lobby.");
   alex.send({ type: 'enter_room', id: 'Studio' });
   await wait(600);
   is('and shut to her again', alex.where.id, 'Lobby');
@@ -140,6 +146,55 @@ const asked = async (cookie, path, init = {}) => {
     })).status, 404);
   await wait(400);
   is('and after all that she still has what she had', listed(alex), ['@Alex', 'Lobby']);
+
+  // -- the house itself, which the owner makes --------------------------
+
+  // A room made in the room. It is the owner's alone until it is given.
+  await boss.page.fill('.people .rooms + .note ~ * input, .people section:nth-of-type(2) .invite input', 'The Attic');
+  await boss.page.click('.people section:nth-of-type(2) .invite button');
+  await boss.page.waitForSelector('.people .rooms li:nth-child(4)');
+  is('the house has a new room',
+    await boss.page.evaluate(() =>
+      [...document.querySelectorAll('.people .rooms li strong')].map((e) => e.textContent.trim())),
+    ['Lobby', 'Studio', 'Cellar', 'The Attic']);
+  await wait(600);
+  is('and nobody else has it yet', listed(alex), ['@Alex', 'Lobby']);
+
+  // Renaming it moves the word and nothing else: Alex is given it,
+  // goes in, and the room she is standing in is renamed under her.
+  await boss.page.click('.people input[aria-label="Alex may go to The Attic"]');
+  await until(() => listed(alex).includes(attic(alex)));
+  const atticId = attic(alex);
+  alex.send({ type: 'enter_room', id: atticId });
+  await wait(700);
+  is('she is in it', alex.where.id, atticId);
+
+  await boss.page.click('.people .rooms li:nth-child(4) button');
+  await boss.page.fill('.people .rooms li:nth-child(4) input', 'The Loft');
+  await boss.page.click('.people .rooms li:nth-child(4) button.primary');
+  await until(() => (alex.rooms.find((r) => r.id === atticId) ?? {}).title === 'The Loft');
+  is('renamed under her, and it is the same room',
+    alex.rooms.find((r) => r.id === atticId).title, 'The Loft');
+  is('she is still in it', alex.where.id, atticId);
+  is('and it is still hers to go to', listed(alex).includes(atticId), true);
+
+  // Taken away while she is standing in it: she walks back to the
+  // lobby by herself.
+  await boss.page.click('.people .rooms li:nth-child(4) button.danger');
+  await boss.page.waitForSelector('dialog.ask[open]');
+  await boss.page.click('dialog.ask button.primary');
+  await until(() => alex.where.id === 'Lobby');
+  is('a room taken away puts her back in the lobby', alex.where.id, 'Lobby');
+  is('and is gone from her list', listed(alex), ['@Alex', 'Lobby']);
+  is('and from the house',
+    await boss.page.evaluate(() =>
+      [...document.querySelectorAll('.people .rooms li strong')].map((e) => e.textContent.trim())),
+    ['Lobby', 'Studio', 'Cellar']);
+
+  // The lobby is not the owner's to take away either.
+  is('the lobby has no way to be taken away',
+    await boss.page.evaluate(() =>
+      !!document.querySelector('.people .rooms li:first-child button.danger')), false);
 
   // The owner cannot remove themselves from the browser: a house with
   // nobody over it is not something to do by clicking a row.

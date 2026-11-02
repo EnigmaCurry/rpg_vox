@@ -58,14 +58,12 @@ struct Cli {
     #[arg(long)]
     no_stt: bool,
 
-    /// A room the whole house shares, by name. Repeat it (or
-    /// comma-separate the variable) for several: one server holds them
-    /// all, and everybody moves between them on the one connection.
-    /// Everyone also has a room of their own, always, which is not
-    /// named here -- it is made the first time they go into it.
-    ///
-    /// The first is where a tab lands. Renaming one starts it fresh:
-    /// a room's conversation and its faders are kept under its name.
+    /// The rooms a *new* house starts with, the first of them the
+    /// lobby. Only read when the database has no rooms yet: after the
+    /// first start the house is the database's, and the owner makes
+    /// and unmakes rooms from the room itself (see ROOM.md). Everyone
+    /// also has a room of their own, always, which is not named here
+    /// -- it is made the first time they go into it.
     #[arg(
         long = "room",
         env = "VOX_ROOM_ROOMS",

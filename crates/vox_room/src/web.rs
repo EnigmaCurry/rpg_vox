@@ -129,6 +129,12 @@ pub fn router(rooms: Arc<Rooms>, screen: Arc<Screen>) -> Router {
         .route("/api/people/:name", delete(uninvite_person))
         .route("/api/people/:name/link", post(relink_person))
         .route("/api/people/:name/rooms", post(set_room))
+        // The house's rooms, which are the owner's to make and unmake.
+        .route("/api/house/rooms", post(make_room))
+        .route(
+            "/api/house/rooms/:id",
+            post(rename_room).delete(delete_room),
+        )
         .route("/api/games/:name/prompt", get(game_prompt))
         .route("/api/rooms/:room/history", get(history))
         .route("/api/rooms/:room/history/:id", get(read_conversation))
@@ -310,7 +316,7 @@ async fn people(State(app): State<App>, headers: HeaderMap) -> Response {
         // is everybody's rather than offering it to be given.
         "allRooms": rooms.iter().map(|(id, title)| json!({ "id": id, "title": title }))
             .collect::<Vec<_>>(),
-        "lobby": rooms.first().map(|(id, _)| id.clone()),
+        "lobby": app.rooms.lobby(),
         "people": out,
     }))
     .into_response()
@@ -420,6 +426,58 @@ async fn set_room(
             app.rooms.announce();
             Json(json!({ "rooms": app.rooms.grants_of(&name).unwrap_or_default() })).into_response()
         }
+        Err(err) => said(err),
+    }
+}
+
+#[derive(Deserialize)]
+struct RoomName {
+    title: String,
+}
+
+/// Make a room.
+async fn make_room(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(body): Json<RoomName>,
+) -> Response {
+    if owner(&app, &headers).is_none() {
+        return not_for_them();
+    }
+    match app.rooms.make_room(&body.title) {
+        Ok(id) => Json(json!({ "id": id })).into_response(),
+        Err(err) => said(err),
+    }
+}
+
+/// Call a room something else.
+async fn rename_room(
+    State(app): State<App>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<RoomName>,
+) -> Response {
+    if owner(&app, &headers).is_none() {
+        return not_for_them();
+    }
+    match app.rooms.rename_room(&id, &body.title) {
+        Ok(title) => Json(json!({ "id": id, "title": title })).into_response(),
+        Err(err) => said(err),
+    }
+}
+
+/// Take a room out of the house.
+async fn delete_room(
+    State(app): State<App>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if owner(&app, &headers).is_none() {
+        return not_for_them();
+    }
+    match app.rooms.delete_room(&id) {
+        Ok(true) => Json(json!({ "gone": id })).into_response(),
+        Ok(false) => said(anyhow::anyhow!("there is no such room")),
         Err(err) => said(err),
     }
 }
@@ -739,6 +797,12 @@ async fn client(app: &App, socket: WebSocket, id: u64, who: &Invited) -> anyhow:
     // it -- one reads the room's events, the other pushes the mic into
     // it -- and only one of them changes it.
     let (here, mut moved) = watch::channel(home.clone());
+    // Shared, because both halves of the socket can move this tab: the
+    // one reading commands when they press a room, and the one watching
+    // the house for when the room they are in stops being theirs.
+    let here = Arc::new(here);
+    let (here_cmd, here_news) = (here.clone(), here.clone());
+    let audio_news = audio_tx.clone();
     let mut news = rooms.subscribe();
     let (mut out, mut inp) = socket.split();
     out.send(Message::Text(home.hello(&name).to_string()))
@@ -773,6 +837,36 @@ async fn client(app: &App, socket: WebSocket, id: u64, who: &Invited) -> anyhow:
                     ping = news.recv() => {
                         if matches!(ping, Err(broadcast::error::RecvError::Closed)) {
                             return Ok(());
+                        }
+                        // The room they are in may have stopped being
+                        // theirs while they sat in it: taken out of the
+                        // house, or taken away from them. Nobody is left
+                        // in one -- it is off every list, so there would
+                        // be no way out of it but the door, and a room
+                        // somebody may not enter is not one to leave them
+                        // sitting in either.
+                        if rooms.find(who, &room.config().id).is_none() {
+                            let back = rooms.home();
+                            part(&room, &name, id);
+                            enter(&back, &name, id, &audio_news)?;
+                            app.screen.place(&name, &back.config().id);
+                            info!(id, person = %name, was = %room.config().id, "their room is no longer theirs");
+                            let _ = here_news.send(back);
+                            rooms.announce();
+                            // Said down this socket rather than through
+                            // the room: the tab is between two rooms at
+                            // this instant -- out of the one it was in
+                            // and not yet listening to the one it is
+                            // going to -- so anything broadcast now is
+                            // said to nobody.
+                            out.send(Message::Text(
+                                json!({
+                                    "type": "notice",
+                                    "text": "That room isn't yours any more. You are back in the lobby.",
+                                })
+                                .to_string(),
+                            ))
+                            .await?;
                         }
                         out.send(Message::Text(rooms.directory(who).to_string())).await?;
                     }
@@ -854,7 +948,7 @@ async fn client(app: &App, socket: WebSocket, id: u64, who: &Invited) -> anyhow:
                             // Their desktop goes with them.
                             app.screen.place(&name, &next.config().id);
                             info!(id, person = %name, room = %want, "changed rooms");
-                            let _ = here.send(next);
+                            let _ = here_cmd.send(next);
                             rooms.announce();
                         }
                         Err(e) => debug!(id, "bad command {text:?}: {e}"),

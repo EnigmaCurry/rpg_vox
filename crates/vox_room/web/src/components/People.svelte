@@ -7,10 +7,13 @@
     relinkPerson,
     uninvitePerson,
     setPersonRoom,
+    makeRoom,
+    renameRoom,
+    deleteRoom,
   } from '../lib/room.svelte.js';
 
-  // The house's people, for the one who owns it: who is invited, who
-  // has been in, and which rooms each of them may go to.
+  // The house, for the one who owns it: the rooms it has, who is
+  // invited, and which of those rooms each of them may go to.
   //
   // A page rather than a panel for the same reason the settings are
   // one: nothing here is watched while it is used, and an invite link
@@ -103,6 +106,40 @@
   const toggle = (who, id, allowed) =>
     doing(`room:${who}:${id}`, () => setPersonRoom(who, id, allowed));
 
+  // -- the rooms themselves --------------------------------------------
+
+  let newRoom = $state('');
+  // Which room is being renamed, and to what. One at a time: the box
+  // you are typing in is the room you are renaming.
+  let naming = $state(null);
+
+  const make = () =>
+    doing('make', async () => {
+      await makeRoom(newRoom);
+      newRoom = '';
+    });
+
+  function startNaming(r) {
+    naming = { id: r.id, title: r.title };
+  }
+
+  const saveName = () =>
+    doing('rename', async () => {
+      const { id, title } = naming;
+      naming = null;
+      await renameRoom(id, title);
+    });
+
+  async function dropRoom(r) {
+    const sure = await ask(
+      `Take ${r.title} out of the house? Anybody in it goes back to the lobby, and nobody ` +
+        `can go to it again. What was said in it is left in the database, out of sight.`,
+      'Take it away',
+    );
+    if (!sure) return;
+    await doing(`drop-room:${r.id}`, () => deleteRoom(r.id));
+  }
+
   /// The rooms that are given out: every shared room but the lobby,
   /// which everybody has.
   const given = $derived(house.allRooms.filter((r) => r.id !== house.lobby));
@@ -112,7 +149,7 @@
 
 <main class="people">
   <header>
-    <h1>People</h1>
+    <h1>People and rooms</h1>
     <div class="spacer"></div>
     <button class="primary" onclick={() => (room.managing = false)}>Done <kbd>Esc</kbd></button>
   </header>
@@ -148,6 +185,43 @@
           </div>
         </div>
       {/if}
+    </section>
+
+    <section>
+      <h2>Rooms</h2>
+      <form class="invite" onsubmit={(e) => { e.preventDefault(); make(); }}>
+        <input placeholder="A name for the room" bind:value={newRoom} maxlength="32" />
+        <button class="primary" disabled={!newRoom.trim() || busy === 'make'}>Make a room</button>
+      </form>
+      <ul class="rooms">
+        {#each house.allRooms as r (r.id)}
+          <li>
+            {#if naming?.id === r.id}
+              <form class="rename" onsubmit={(e) => { e.preventDefault(); saveName(); }}>
+                <input bind:value={naming.title} maxlength="32" aria-label="A new name for {r.title}" />
+                <button class="primary">Save</button>
+                <button type="button" onclick={() => (naming = null)}>Cancel</button>
+              </form>
+            {:else}
+              <span class="what">
+                <strong>{r.title}</strong>
+                {#if r.id === house.lobby}<span class="tag">lobby</span>{/if}
+              </span>
+              <button onclick={() => startNaming(r)}>Rename</button>
+              {#if r.id !== house.lobby}
+                <button class="danger" disabled={busy === `drop-room:${r.id}`}
+                  onclick={() => dropRoom(r)}>Take it away</button>
+              {/if}
+            {/if}
+          </li>
+        {/each}
+      </ul>
+      <p class="note">
+        A new room is yours alone until you give it to somebody below. The lobby is where
+        everybody lands and nobody can be refused, so it stays. Renaming a room changes
+        nothing but the word: what was said in it, and who may go to it, are kept against
+        the room itself and not against what it is called.
+      </p>
     </section>
 
     <section>
@@ -230,7 +304,7 @@
   }
   .note { color: var(--muted); font-size: 13px; line-height: 1.5; margin: 10px 0 0; }
   .warn { color: var(--danger); font-size: 13px; margin: 10px 0 0; }
-  .invite { display: flex; gap: 8px; }
+  .invite, .rename { display: flex; gap: 8px; }
   .invite input { flex: 1; max-width: 20em; }
   .link {
     margin-top: 12px;
@@ -242,6 +316,17 @@
   }
   .link code { display: block; margin: 6px 0; word-break: break-all; user-select: all; }
   .link-do { display: flex; gap: 8px; }
+  .rooms { list-style: none; margin: 12px 0 0; padding: 0; font-size: 13px; }
+  .rooms li {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 0;
+    border-top: 1px solid var(--line);
+  }
+  .rooms .what { flex: 1; }
+  .rename { flex: 1; }
+  .rename input { flex: 1; max-width: 20em; }
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
   th { text-align: left; font-weight: 600; color: var(--muted); padding: 4px 8px; }
   th.room, td.room { text-align: center; width: 1%; white-space: nowrap; }

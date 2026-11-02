@@ -90,6 +90,29 @@ releases.
 
 ### Voice room
 
+- **The owner makes the rooms.** The house used to be the command
+  line's: `--room` at startup, and a restart to add one. The rooms are
+  rows now, made, renamed and taken away from the **People and rooms**
+  page while the server runs and people are talking in them.
+  `VOX_ROOM_ROOMS` still names the first rooms of a house that has
+  none, and is ignored after that -- from the first start the house is
+  the database's.
+
+  A room is known by an **id of its own** rather than by its name, so
+  the owner can call it something else and nothing follows the word:
+  its conversations, its faders, its settings and who may go to it are
+  all kept against the id. (A room that existed before this keeps its
+  old name as its id, so nothing of its past had to be moved.)
+
+  Taking a room away, or taking it away from one person, happens where
+  they are sitting: anybody left in a room that has stopped being
+  theirs is put back in the lobby and told why. A room nobody may enter
+  is not a room to leave somebody in -- it would be off every list,
+  with no way out of it but the door. The lobby is not the owner's to
+  take away: it is where a tab lands and the one room nobody can be
+  refused. What was said in a room that is taken away stays in the
+  database rather than being destroyed by a click.
+
 - **Somebody owns the room, and rooms are given out.** A house used to
   be flat: anybody with a link could walk into any room in it. Now one
   person **owns** it, made at the server with

@@ -103,8 +103,8 @@ invited: there are two kinds of person here and no more.
   not the asker's business.
 - **The owner** has every room in the house without being given any.
 
-A room's grant is kept against the room's name, so renaming a room in
-`--room` starts it fresh — as it already does its conversation.
+A grant is kept against the room's id, so renaming a room keeps
+everything: who may go to it, what was said in it, and its faders.
 
 Upgrading a room that was running before any of this: everybody invited
 keeps every room they could already walk into. Nothing is taken away by
@@ -112,11 +112,22 @@ the new rule; the owner can take it away afterwards.
 
 ## More than one room
 
-One `vox_room` holds several rooms at once. Name the ones the house
-shares with `--room` (repeat it, or comma-separate `VOX_ROOM_ROOMS`);
-without any, there is one called **Lobby**. On top of those,
-**everybody has a room of their own** — it isn't configured, it is made
-the first time they walk into it, and nobody else can ask for it.
+One `vox_room` holds several rooms at once, and **the owner makes
+them** — in the room itself, on the [People and
+rooms](#people-and-rooms) page, while the server runs. A new house
+starts with one room called **Lobby**; `--room` (or
+`VOX_ROOM_ROOMS`) names the first rooms of a house that has none yet
+and is ignored after that, because from the first start the house is
+the database's. On top of those, **everybody has a room of their own**
+— it isn't made by anybody, it appears the first time they walk into
+it, and nobody else can ask for it.
+
+A room is known by an **id of its own** that never changes, not by its
+name: its conversations, its settings and who may go to it are all kept
+against that, so the owner can call it something else without anything
+following the word. Taking a room away takes it out of the house and
+takes everyone's way into it; what was said in it is left in the
+database rather than destroyed by a click.
 
 They are down the left, one line each, and pressing one takes you
 there. **Your own room is first and stays first**, then the house's in
@@ -659,14 +670,21 @@ See ROOM_DOCKER.md.
   coming in, and which microphone the browser gave the room. The room
   goes on running behind it: you are still in the audio, and the space
   bar still mutes or talks from there. **Done** or Escape comes back.
-- **People**, on the settings page and only for the owner: a page of
-  its own with everybody invited on it. Invite somebody and copy their
-  link, give and take away rooms with a tick, make somebody a fresh link
-  when theirs goes astray, or remove them — link, browsers and rooms
-  together. The owner's own row has no Remove on it: see [Who owns the
-  room](#who-owns-the-room). Nobody but the owner is shown any of this,
-  and nobody but the owner is answered when they ask the server for it
-  either.
+- **People and rooms**, on the settings page and only for the owner: a
+  page of its own with the house on it. Make a room, call it something
+  else, or take it away; invite somebody and copy their link, give and
+  take away rooms with a tick, make somebody a fresh link when theirs
+  goes astray, or remove them — link, browsers and rooms together. The
+  lobby cannot be taken away and the owner's own row has no Remove on
+  it: see [Who owns the room](#who-owns-the-room). Nobody but the owner
+  is shown any of this, and nobody but the owner is answered when they
+  ask the server for it either.
+
+  Taking a room away, or taking it away from one person, happens where
+  they are sitting: anybody left in a room that has stopped being
+  theirs is put back in the lobby and told so. A room nobody may enter
+  is not a room to leave somebody in — it would be off every list, with
+  no way out of it but the door.
 - **Mixer**: a level and mute for each person and each AI, shared
   by the whole room, hanging off the room you are in in the list on the
   left. **Your volume**, in the settings, is only yours. Space mutes
@@ -956,7 +974,7 @@ CHROME=$(which chromium) ./run.sh            # or: ./run.sh rooms bots
 | `rooms` | several rooms on one socket: where a tab lands, who may go where, a room of your own admitting one person, and the mix arriving across every move. No browser at all — two sockets are enough |
 | `bots` | two AIs in one room: a fader and an Answers setting each, each answering to its own name, and one pause going to exactly one of them |
 | `door` | the door is a page with no room behind it and no socket open; **Join Audio** does nothing until you agree to be recorded, and the Language box is never blank |
-| `roles` | the owner and the rest: who is shown the people and who is answered when they ask for them, a room given and taken away while somebody sits in the house, and an invite made from the page |
+| `roles` | the house and the people: making a room, renaming one under somebody standing in it, taking one away from under them — and the owner and the rest: who is shown the people and who is answered when they ask for them, a room given and taken away while somebody sits in the house, and an invite made from the page |
 | `settings` | the footer: one width for the talk button whatever it says, sharing and the way out on the other side, and the cog opening a page with everything that used to be strung along it |
 | `ptt` | push to talk: the space bar reaching the microphone from wherever the focus was left -- a button you clicked, the history panel, a mute -- and not reaching it in a text box or a dialog |
 | `permalinks` | `/`, `/lobby` and `/room/<id>`; back and forward move between rooms, a pasted address opens that room, a stale one is put right |

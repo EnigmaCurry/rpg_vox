@@ -32,6 +32,41 @@ pub struct Store {
     room: String,
 }
 
+/// One room of the house, as the database holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoomRow {
+    /// Opaque and unchanging; see the `rooms` table.
+    pub id: String,
+    /// What it is called on screen.
+    pub title: String,
+    /// When it was made, in unix milliseconds.
+    pub at: u64,
+    /// The room everybody may go to, and where a tab lands.
+    pub lobby: bool,
+}
+
+/// How long a room's title may be. It goes on a button in a column that
+/// has to stay a list you can read.
+pub const TITLE_MAX: usize = 32;
+
+/// A title a room can be called by. Only the shape of it: titles need
+/// not be unique, because the id is what anything is kept against and
+/// two rooms called the same thing is the owner's business, not a
+/// mistake the database has to prevent.
+fn check_title(title: &str) -> Result<String> {
+    let title = title.trim();
+    if title.is_empty() {
+        bail!("a room needs a name");
+    }
+    if title.chars().count() > TITLE_MAX {
+        bail!("a room's name is at most {TITLE_MAX} characters");
+    }
+    if title.chars().any(char::is_control) {
+        bail!("one line, no tabs");
+    }
+    Ok(title.to_string())
+}
+
 /// What `people.role` says of the one who invites everybody else. Every
 /// other row's role is empty: there is one kind of person in the room
 /// and one owner over it, and a column of mostly-empty strings is the
@@ -58,6 +93,25 @@ CREATE TABLE IF NOT EXISTS people (
     -- rooms they may go to; see `grants`.
     role TEXT NOT NULL DEFAULT ''
 );
+-- The rooms of the house. One row each, made when somebody makes the
+-- room and kept until somebody takes it away.
+CREATE TABLE IF NOT EXISTS rooms (
+    -- Opaque, and it never changes: a room's settings, its
+    -- conversations and the grants to it are all kept against this, so
+    -- renaming one must not be able to orphan any of them. A room from
+    -- before rooms were rows has its old configured name here, which is
+    -- exactly what all of those were already keyed by.
+    id    TEXT PRIMARY KEY,
+    -- What it is called on screen, which the owner may change.
+    title TEXT NOT NULL,
+    -- When it was made, in unix milliseconds: the order they are shown
+    -- in, after the lobby.
+    at    INTEGER NOT NULL,
+    -- The one room everybody may go to without being given it, and
+    -- where a tab lands. Exactly one, and the database says so.
+    lobby INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS rooms_in_order ON rooms (lobby DESC, at ASC);
 -- A room somebody may go to. Everybody may go to their own room and to
 -- the lobby without a row here; every other room wants one, written by
 -- the owner. The room is named by its id, so renaming a room in the
@@ -283,6 +337,98 @@ impl Store {
             params![name, token],
         )?;
         Ok(token)
+    }
+
+    /// The rooms of the house, the lobby first and the rest in the
+    /// order they were made.
+    pub fn rooms(&self) -> Result<Vec<RoomRow>> {
+        let mut q = self.db.prepare(
+            "SELECT id, title, at, lobby FROM rooms ORDER BY lobby DESC, at ASC, id ASC",
+        )?;
+        let rooms = q
+            .query_map([], |r| {
+                Ok(RoomRow {
+                    id: r.get(0)?,
+                    title: r.get(1)?,
+                    at: r.get::<_, i64>(2)? as u64,
+                    lobby: r.get::<_, i64>(3)? != 0,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<RoomRow>>>()?;
+        Ok(rooms)
+    }
+
+    /// Make a room. Its id is new and opaque: a title is a thing people
+    /// change their minds about, and everything kept against a room --
+    /// its conversations, its settings, who may go to it -- has to
+    /// outlive their changing it.
+    pub fn make_room(&self, title: &str) -> Result<RoomRow> {
+        let title = check_title(title)?;
+        let room = RoomRow {
+            id: uuid::Uuid::new_v4().simple().to_string(),
+            title,
+            at: now_ms() as u64,
+            lobby: false,
+        };
+        self.db.execute(
+            "INSERT INTO rooms (id, title, at, lobby) VALUES (?1, ?2, ?3, 0)",
+            params![room.id, room.title, room.at as i64],
+        )?;
+        Ok(room)
+    }
+
+    /// Call a room something else. Nothing but the name moves: the id
+    /// is what everything else is kept against.
+    pub fn rename_room(&self, id: &str, title: &str) -> Result<String> {
+        let title = check_title(title)?;
+        let wrote = self.db.execute(
+            "UPDATE rooms SET title = ?2 WHERE id = ?1",
+            params![id, title],
+        )?;
+        if wrote == 0 {
+            bail!("there is no such room");
+        }
+        Ok(title)
+    }
+
+    /// Take a room out of the house, with everybody's way into it.
+    ///
+    /// What was said in it is left where it is: a room is a place, and
+    /// deleting the place is not the same as burning what was said in
+    /// it. Nothing shows those conversations afterwards -- there is no
+    /// room to show them in -- and the id is a fresh uuid every time,
+    /// so nothing of this one's is ever picked up by another.
+    pub fn delete_room(&self, id: &str) -> Result<bool> {
+        let tx = self.db.unchecked_transaction()?;
+        let gone = tx.execute("DELETE FROM rooms WHERE id = ?1 AND lobby = 0", [id])? > 0;
+        if gone {
+            tx.execute("DELETE FROM grants WHERE room = ?1", [id])?;
+        }
+        tx.commit()?;
+        Ok(gone)
+    }
+
+    /// The first rooms of a house that has none: the names the server
+    /// was started with, the first of them the lobby. Their ids are
+    /// their names, because everything a room of that age owns --
+    /// `Lobby:conversation` and the rest -- is already keyed by it.
+    ///
+    /// Does nothing once the house has a room, which is from its first
+    /// start onwards: after that the rooms are the database's, and the
+    /// owner makes them.
+    pub fn adopt_rooms(&self, names: &[String]) -> Result<bool> {
+        if !self.rooms()?.is_empty() {
+            return Ok(false);
+        }
+        let tx = self.db.unchecked_transaction()?;
+        for (n, name) in names.iter().enumerate() {
+            tx.execute(
+                "INSERT OR IGNORE INTO rooms (id, title, at, lobby) VALUES (?1, ?2, ?3, ?4)",
+                params![name, name, now_ms() + n as i64, i64::from(n == 0)],
+            )?;
+        }
+        tx.commit()?;
+        Ok(true)
     }
 
     /// A fresh link for somebody already invited, whether or not the
@@ -1008,6 +1154,12 @@ fn json(settings: &GameSettings) -> String {
 /// a column an older database only gains there, and a schema that runs
 /// first cannot mention it.
 fn indexes(db: &Connection) -> Result<()> {
+    // One lobby, for the same reason there is one owner: it is what
+    // everybody may reach and where a tab lands, and two of them is a
+    // question with no answer.
+    db.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS rooms_one_lobby ON rooms (lobby) WHERE lobby = 1;",
+    )?;
     // One owner, and the database says so rather than the code
     // remembering to: a second one cannot be written at all.
     db.execute_batch(
