@@ -102,10 +102,16 @@ const CARDS_MAX: usize = 50;
 /// Longest bio. A few lines under a picture, not a character sheet:
 /// it is read in a modal beside a 128-pixel square.
 const BIO_MAX: usize = 600;
-/// Biggest face the room will keep. Pixel art at the sizes an avatar
-/// wants is a handful of kilobytes; anything near this is a photograph
-/// that has wandered in, and the database is not the place for it.
-const AVATAR_BYTES_MAX: usize = 512 * 1024;
+/// Biggest face the room will keep, and so the biggest picture it
+/// accepts into a conversation: anything in the chat can be worn, and
+/// a picture too big to wear would be a card with a tool that refuses
+/// it. Pixel art at the sizes an avatar wants is a handful of
+/// kilobytes, and a photograph dropped in is scaled down to the size
+/// the room shows it at before it is sent -- see `web::drop_picture`.
+pub const AVATAR_BYTES_MAX: usize = 512 * 1024;
+/// Longest file name kept with a dropped picture. It is the card's
+/// caption, in the place what a picture was asked for goes.
+const UPLOAD_NAME_MAX: usize = 80;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -119,16 +125,29 @@ pub enum Kind {
     /// that was said.
     Card,
     /// A picture one of the AIs made: the entry's text is the
-    /// picture's id and its title is what the picture was asked for.
-    /// The card goes up the moment the generating starts and is a
+    /// picture's number and its title is what the picture was asked
+    /// for. The card goes up the moment the generating starts and is a
     /// spinner until the image lands -- see `Room::begin_picture`.
     Picture,
+    /// A picture somebody dropped into the room from their own
+    /// computer: the entry's text is its number, like a made one's,
+    /// and its title is the name of the file it came in as.
+    ///
+    /// Its own kind and not a [`Kind::Picture`] whose `who` happens to
+    /// be a person. The two are different events -- one is the AI
+    /// having done what it said it would, the other is somebody
+    /// bringing something in -- and they read differently on screen
+    /// and to the model, which must not be left to think it drew
+    /// this. What they share is the numbering, which is the half that
+    /// matters out loud.
+    Upload,
 }
 
 impl Kind {
     pub fn as_str(self) -> &'static str {
         match self {
             Kind::Picture => "picture",
+            Kind::Upload => "upload",
             Kind::Human => "human",
             Kind::Agent => "agent",
             Kind::Game => "game",
@@ -142,6 +161,7 @@ impl Kind {
             "game" => Kind::Game,
             "card" => Kind::Card,
             "picture" => Kind::Picture,
+            "upload" => Kind::Upload,
             _ => Kind::Human,
         }
     }
@@ -1722,8 +1742,9 @@ impl Room {
         let Some((_, prompt, png)) = found else {
             let made = self.store().pictures(st.conversation).unwrap_or_default();
             return Err(match made.len() {
-                0 => "there are no pictures in this conversation yet; make one first, \
-                      and it goes into the chat for everyone to look at"
+                0 => "there are no pictures in this conversation yet; make one, or ask \
+                      whoever wants a face to drop one into the chat -- either way it \
+                      is there for everyone to look at first"
                     .to_string(),
                 most => format!("there is no picture {picture} here; they run 1 to {most}"),
             });
@@ -1912,6 +1933,90 @@ impl Room {
             Ok(None) => warn!(%id, "a picture that finished isn't in the database"),
             Err(err) => warn!("read a picture back: {err:#}"),
         }
+    }
+
+    // -- pictures somebody brought in ----------------------------------
+
+    /// A picture somebody dropped into the room, from their own
+    /// computer: a card in the conversation with the next number on
+    /// it, and from then on a picture like any other -- `set_avatar`
+    /// takes that number, and the conversation keeps it.
+    ///
+    /// `who` is a name as the room says it, resolved the way
+    /// `set_avatar` resolves one -- so it is somebody this room admits
+    /// and not any name a request felt like sending. `name` is the
+    /// file it came in as, which is the card's caption: the place what
+    /// a picture was asked for goes, because where it came from is the
+    /// same question.
+    ///
+    /// Already a PNG and already small when it gets here: the browser
+    /// scales a photograph down to the size the room shows a picture
+    /// at and re-encodes it (see `lib/room.svelte.js`), so what is
+    /// checked here is what a server must always check for itself.
+    ///
+    /// Not something a turn can be talked over, like every other way a
+    /// person puts something into the room: it is theirs, and no
+    /// generation is taken.
+    pub fn upload_picture(&self, who: &str, name: &str, png: &[u8]) -> Result<u32, String> {
+        if !crate::mcp::is_png(png) {
+            return Err("that file isn't a PNG, so the room can't show it".into());
+        }
+        if png.len() > AVATAR_BYTES_MAX {
+            return Err(format!(
+                "that picture is {} KB, and a picture is at most {} KB",
+                png.len() / 1024,
+                AVATAR_BYTES_MAX / 1024
+            ));
+        }
+        let mut st = self.lock();
+        // Who it is from, by the name the conversation carries -- and
+        // whether this room has ever heard of them, which is the one
+        // thing a name arriving in a request has to be checked for.
+        let (_, whose) = self.whose(&st, who)?;
+        let name: String = one_line(name.trim()).chars().take(UPLOAD_NAME_MAX).collect();
+        // One id for the picture and the entry that shows it, exactly
+        // as a made one has: the card is the picture.
+        let id = format!("picture-{}", uuid::Uuid::new_v4().simple());
+        let n = self
+            .store()
+            .put_picture(st.conversation, &id, &whose, &name, png)
+            .map_err(|err| format!("{err:#}"))?;
+        let entry = Entry {
+            id: id.clone(),
+            who: whose.clone(),
+            kind: Kind::Upload,
+            // The number, spelled out, for the same reason a made
+            // picture spells it: a client that has never heard of this
+            // kind shows an entry's text, and "picture 3" is a thing a
+            // person can read where "3" is a bug report.
+            text: format!("picture {n}"),
+            // The file it came in as.
+            title: name.clone(),
+            // Nothing is being waited for: it arrived whole.
+            live: false,
+            partial: false,
+            cut: false,
+            typed: false,
+            translations: BTreeMap::new(),
+            at: now_ms(),
+            sent: true,
+        };
+        if let Err(err) = self.store().put_entry(st.conversation, &entry) {
+            return Err(format!("{err:#}"));
+        }
+        info!(n, %id, who = %whose, file = %name, bytes = png.len(), "a picture was brought in");
+        self.emit_entry(&entry);
+        st.log.push(entry);
+        trim_log(&mut st.log);
+        // What the card draws from, the same event a made one sends
+        // when it lands: the entry says which picture it is and this
+        // says there is something to show.
+        match self.store().made(&id) {
+            Ok(Some(made)) => self.emit(json!({ "type": "picture", "picture": made })),
+            Ok(None) => warn!(%id, "a picture that was brought in isn't in the database"),
+            Err(err) => warn!("read a picture back: {err:#}"),
+        }
+        Ok(n)
     }
 
     /// Every picture in this conversation, without the images: what a
@@ -2250,12 +2355,13 @@ impl Room {
                     // The titles of what they are holding, which is
                     // what a card is addressed by.
                     "cards": holding.get(name).cloned().unwrap_or_default(),
-                    // What their face was asked for, when they have
-                    // one. It is how the AI knows not to offer
-                    // somebody an avatar they already sat through, and
-                    // how it can build on the one they have -- "the
-                    // same ranger, older" -- rather than starting over
-                    // from a description it cannot see.
+                    // Where their face came from, when they have one:
+                    // what it was asked for, or the file it was
+                    // dropped in as. It is how the AI knows not to
+                    // offer somebody an avatar they already sat
+                    // through, and how it can build on the one they
+                    // have -- "the same ranger, older" -- rather than
+                    // starting over from a description it cannot see.
                     "avatar": self.avatar_asked_for(name),
                 })
             })
@@ -5201,7 +5307,9 @@ fn conversation_messages(
         .filter(|e| match e.kind {
             Kind::Human => e.sent && !e.text.trim().is_empty(),
             Kind::Agent => !e.live && !e.text.trim().is_empty(),
-            Kind::Game | Kind::Card => true,
+            // A picture somebody brought in is there the moment the
+            // entry is: there was nothing to wait for.
+            Kind::Game | Kind::Card | Kind::Upload => true,
             // A picture still being made is a spinner in the chat and
             // nothing to tell the model about: it is told when the
             // call it is waiting on comes back.
@@ -5307,6 +5415,29 @@ fn conversation_messages(
                 } else {
                     said_to_me(&mut out, note);
                 }
+            }
+            // One somebody brought in themselves. Said plainly to be
+            // theirs and not the AI's: a model told only that a
+            // picture is in the chat will take credit for it, and
+            // then offer to change a thing it never made. What it may
+            // do with one is the same -- the number is the number.
+            Kind::Upload => {
+                // Whatever the file was called, where it has one: it
+                // is all anybody can say about a picture nobody asked
+                // for in words.
+                let called = match e.title.trim() {
+                    "" => String::new(),
+                    name => format!(", as \"{}\"", one_line(name)),
+                };
+                said_to_me(
+                    &mut out,
+                    format!(
+                        "[{} dropped {} into the chat from their own computer{called}. \
+                         You did not make it and cannot see it, so ask about it rather \
+                         than describing it; set_avatar takes that number.]",
+                        e.who, e.text,
+                    ),
+                );
             }
         }
     }
@@ -5445,6 +5576,88 @@ mod tests {
         // And one that never arrives says so rather than spinning.
         r.fail_picture(&third, "the server was out of balance");
         assert!(!r.lock().log.iter().find(|e| e.id == third).unwrap().live);
+    }
+
+    /// A picture somebody drops into the room from their own computer:
+    /// a card with the next number on it, in the one sequence the AI's
+    /// own pictures are numbered in, and from then on a picture like
+    /// any other -- including one a face can be made from without
+    /// anything having been drawn.
+    #[test]
+    fn a_dropped_picture_is_numbered_with_the_rest_and_can_be_worn() {
+        let (r, _turns) = room(Mode::Named);
+        let g = turn(&r);
+
+        let n = r
+            .upload_picture("ryan", "me-at-the-lake.jpg", &png())
+            .expect("a picture of their own");
+        assert_eq!(n, 1, "numbered from 1, like any other");
+        let card = r
+            .lock()
+            .log
+            .iter()
+            .find(|e| e.text == "picture 1")
+            .cloned()
+            .expect("the card is in the conversation");
+        assert_eq!(card.kind, Kind::Upload, "theirs, and not one that was made");
+        assert_eq!(card.who, "Ryan", "by the name the room calls them");
+        assert_eq!(card.title, "me-at-the-lake.jpg", "the file it came in as");
+        assert!(!card.live, "and never a spinner: it arrived whole");
+        assert_eq!(r.picture_png(&card.id).unwrap().unwrap(), png());
+
+        // One sequence for both kinds, because "the second one" is
+        // said out loud about whatever is on screen.
+        let (made, n) = r.begin_picture(g, "a tired wizard").unwrap();
+        assert_eq!(n, 2);
+        r.finish_picture(&made, &png());
+
+        // And the AI can be asked for theirs as a face, by the number
+        // on its card, without having made anything.
+        assert_eq!(r.set_avatar(g, "Ryan", 1).unwrap(), "Ryan");
+        assert_eq!(r.avatar_png("Ryan", None).unwrap().unwrap().0, png());
+        assert_eq!(
+            r.avatar_asked_for("Ryan").as_deref(),
+            Some("me-at-the-lake.jpg"),
+            "where it came from, in the place what one was asked for goes"
+        );
+
+        // The model is told it is theirs and that it did not make it:
+        // one told only that a picture is in the chat takes credit for
+        // it, and then offers to change a thing it never made.
+        let msgs = conversation_messages(&r.lock().log, 50, "English", "Vox");
+        let said = msgs
+            .iter()
+            .map(|(_, t)| t.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            said.contains("Ryan dropped picture 1 into the chat from their own computer"),
+            "{said}"
+        );
+        assert!(said.contains("You did not make it"), "{said}");
+    }
+
+    /// What the room will not take in: the three checks a page cannot
+    /// be trusted with, since `curl` is a browser too.
+    #[test]
+    fn a_dropped_picture_is_checked_before_it_is_kept() {
+        let (r, _turns) = room(Mode::Named);
+
+        let err = r.upload_picture("Ryan", "notes.txt", b"not a picture").unwrap_err();
+        assert!(err.contains("isn't a PNG"), "{err}");
+
+        let mut huge = png();
+        huge.resize(AVATAR_BYTES_MAX + 1, 0);
+        let err = r.upload_picture("Ryan", "holiday.png", &huge).unwrap_err();
+        assert!(err.contains("at most"), "{err}");
+
+        let err = r.upload_picture("Mallory", "me.png", &png()).unwrap_err();
+        assert!(err.contains("nobody called"), "{err}");
+
+        assert!(
+            r.lock().log.iter().all(|e| e.kind != Kind::Upload),
+            "and none of them left a card behind"
+        );
     }
 
     /// A face survives a rename, goes with the account, and is theirs

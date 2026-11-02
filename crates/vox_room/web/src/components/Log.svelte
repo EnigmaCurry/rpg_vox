@@ -4,6 +4,7 @@
   import Face from './Face.svelte';
   import { hue } from '../lib/color.js';
   import { markdown } from '../lib/markdown.js';
+  import { scaledDown } from '../lib/pixels.js';
 
   let box;
   let stick = true;
@@ -40,6 +41,17 @@
   // whole conversation, and so it survives the entry being replaced as
   // the AI speaks. Yours alone: nobody else's screen changes.
   let asWritten = $state({});
+
+  // How big a picture card's square is, in one place: the CSS draws
+  // it and `lib/pixels.js` is told it, and the two must agree.
+  const SHOT = 192;
+  // Dropped pictures this is scaling *down* rather than up, by id --
+  // which decides how each is drawn, see `lib/pixels.js`. By id and
+  // not one flag, because a conversation holds both kinds at once.
+  let smooth = $state({});
+  const sized = (id, img) => {
+    if (scaledDown(img, SHOT)) smooth = { ...smooth, [id]: true };
+  };
 
   /// Which language to read an entry in. Your own by default -- reading
   /// the reply back in a language you don't speak is the whole point of
@@ -173,6 +185,35 @@
               </div>
               {#if e.title}<p class="asked">{e.title}</p>{/if}
               {#if made?.failed}<p class="hint">{made.failed}</p>{/if}
+            </div>
+          </div>
+        </div>
+      {:else if e.kind === 'upload'}
+        <!-- A picture somebody dropped in from their own computer.
+             The same card as one the AI made, numbered in the same
+             sequence -- that number is what gets said out loud and
+             what set_avatar takes -- and their line, not the AI's: it
+             carries their face and their colour, because bringing
+             something in is a thing a person did. -->
+        {@const made = room.pictures[e.id]}
+        <div class="entry picture-entry" class:you={e.who === room.you} style="--h: {hue(e.who)}">
+          <Face who={e.who} />
+          <div class="said-by">
+            <div class="who">
+              <span class="name">{e.who}</span>
+              <span class="time">{time(e.at)} · {e.text}</span>
+            </div>
+            <div class="card shot-card">
+              <!-- No spinner branch: it arrived whole or it is not
+                   there at all. -->
+              <div class="shot" class:photo={smooth[e.id]}>
+                {#if made?.ready}
+                  <img src={pictureOf(e.id)} alt={e.title} onload={(ev) => sized(e.id, ev.currentTarget)} />
+                {:else}
+                  <span class="broke">gone</span>
+                {/if}
+              </div>
+              {#if e.title}<p class="asked">{e.title}</p>{/if}
             </div>
           </div>
         </div>
@@ -330,7 +371,8 @@
   }
   .card .summary { margin: 0; color: var(--muted); }
   /* A picture is looked at, so it gets room -- but not the whole
-     column: a 128px sprite blown across 42em is a blurry poster. */
+     column: a 128px sprite blown across 42em is a blurry poster.
+     `SHOT` above is this number; they are read together. */
   .shot {
     width: 192px;
     height: 192px;
@@ -351,6 +393,10 @@
     object-fit: contain;
     display: block;
   }
+  /* A picture the card is making smaller -- a photograph, mostly.
+     Smoothing is what that wants; the rule above is about pixel art,
+     which is the other direction. */
+  .shot.photo img { image-rendering: auto; }
   .shot.waiting { background: color-mix(in srgb, var(--agent) 7%, var(--bubble)); }
   .shot .broke { color: var(--muted); font-size: 13px; }
   /* Something is happening and it is going to take a while: a quiet

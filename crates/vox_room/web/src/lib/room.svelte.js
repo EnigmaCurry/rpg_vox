@@ -762,9 +762,112 @@ export async function wearFace(at) {
   });
 }
 
-/// Where to fetch a picture made in this conversation.
+/// Where to fetch a picture of this conversation.
 export function pictureOf(id) {
   return `/api/picture/${encodeURIComponent(id)}`;
+}
+
+// -- a picture dropped into the room -----------------------------------
+//
+// Everything that holds a picture here is a PNG and was before any of
+// this: the card in the conversation, the face beside somebody's name,
+// the square in the modal. So a drop is turned into one here, in the
+// tab that has the file, rather than the room learning a second format
+// for the sake of what a camera happens to write.
+//
+// It is scaled down on the way as well. Nothing shows a picture larger
+// than the card does, and the server keeps no picture bigger than a
+// face may be -- so a photograph straight off a phone is re-encoded to
+// something the room can actually use, instead of being refused for
+// being what phones make.
+
+/// The longest edge of a dropped picture, in order of preference. The
+/// first is a shade over the 192 CSS pixels the card draws it at, so it
+/// is sharp on a 2x screen and nothing more; the rest are what to try
+/// when a photograph is still too big as a PNG at that size, which
+/// lossless compression of a photograph can be.
+const PICTURE_EDGES = [384, 256, 160];
+/// What the room will keep, which is what a face may be: 512 KB. The
+/// server enforces it -- this is here so that a drop that cannot fit
+/// is told so on the spot, rather than after the upload.
+const PICTURE_BYTES_MAX = 512 * 1024;
+/// How many pictures one drop may bring in. A drop is one deliberate
+/// act and these are cards in a shared conversation; a folder let go
+/// of by accident is not a reason to fill the room.
+const PICTURE_DROP_MAX = 8;
+
+/// The images in what was dropped, in the order they were dropped.
+/// Anything else is not a picture and the room has nowhere to put it.
+const imagesIn = (files) => [...files].filter((f) => f.type.startsWith('image/'));
+
+/// One file as a PNG the room will keep, or null when it cannot be
+/// made small enough. Decoded by the browser, so whatever it can
+/// decode can be dropped -- JPEG off a camera, a WebP off the web, a
+/// screenshot off the clipboard.
+async function pngOf(file) {
+  const bitmap = await createImageBitmap(file);
+  try {
+    for (const edge of PICTURE_EDGES) {
+      // Never enlarged: a 64-pixel sprite is dropped in at 64 pixels.
+      const scale = Math.min(1, edge / Math.max(bitmap.width, bitmap.height));
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+      canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+      const ctx = canvas.getContext('2d');
+      ctx.imageSmoothingQuality = 'high';
+      ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+      const png = await new Promise((done) => canvas.toBlob(done, 'image/png'));
+      if (png && png.size <= PICTURE_BYTES_MAX) return png;
+    }
+    return null;
+  } finally {
+    bitmap.close();
+  }
+}
+
+/// Put what was dropped -- or pasted -- into the conversation: each
+/// picture becomes a card with the next number on it, which is then a
+/// picture like any other, so the AI can be asked for it as somebody's
+/// face and the conversation keeps it.
+///
+/// Nothing is drawn here. The server tells every tab about the card,
+/// including this one, the same way it does for a picture the AI made:
+/// a picture arriving is a thing that happened in the room, not a
+/// thing that happened on this screen.
+///
+/// `how` is the word for what was just done, for the one message that
+/// has to name it: being told "only pictures can be dropped" by a
+/// window you pasted into is being answered about somebody else.
+export async function dropPicture(files, how = 'dropped') {
+  const pictures = imagesIn(files);
+  if (!pictures.length) {
+    notify(`Only pictures can be ${how} into the room.`);
+    return;
+  }
+  const taking = pictures.slice(0, PICTURE_DROP_MAX);
+  if (pictures.length > taking.length) {
+    notify(`That is ${pictures.length} pictures; the first ${taking.length} are coming in.`);
+  }
+  // One at a time, so the cards are numbered in the order they were
+  // dropped rather than in the order the uploads happen to finish.
+  for (const file of taking) {
+    try {
+      const png = await pngOf(file);
+      if (!png) throw new Error("it can't be made small enough to keep");
+      const where = `/api/rooms/${encodeURIComponent(room.where)}/picture`;
+      const r = await fetch(`${where}?name=${encodeURIComponent(file.name)}`, {
+        method: 'POST',
+        headers: { 'content-type': 'image/png' },
+        body: png,
+      });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(d.error || r.statusText);
+    } catch (e) {
+      console.error('[room] drop', e);
+      notify(`Can't bring in ${file.name}: ${e.message || e}`, true);
+      return;
+    }
+  }
 }
 
 /// Open somebody's face: who they are, as much as the house knows.
@@ -812,7 +915,11 @@ export async function enterGame(name) {
   }
 }
 
-/// Show a message in the footer for a while.
+/// Show a message in the footer for a while. Exported as `notice` for
+/// the few things said from a component rather than from here: a word
+/// about what just happened belongs in the one place the room puts
+/// them, however it was reached.
+export { notify as notice };
 function notify(text, error = false) {
   room.notice = { text, error };
   clearTimeout(noticeTimer);

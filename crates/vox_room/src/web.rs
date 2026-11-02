@@ -71,9 +71,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use axum::{
+    body::Bytes,
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Path, Query, Request, State,
+        DefaultBodyLimit, Path, Query, Request, State,
     },
     http::{header, HeaderMap, HeaderValue, StatusCode, Uri},
     middleware::{from_fn, Next},
@@ -118,6 +119,21 @@ const AVATAR_CACHE: &str = "private, max-age=31536000, immutable";
 /// which hashed files the app is made of *now*, and a browser holding
 /// yesterday's index asks this binary for files it no longer has.
 const INDEX_CACHE: &str = "no-cache";
+
+/// How much of a dropped picture the server will read at all, which is
+/// a little over what it will keep: the room's own answer -- the size
+/// in kilobytes and what the limit is -- is worth more than a 413 from
+/// the layer, and that needs the bytes to have arrived.
+const PICTURE_BODY_MAX: usize = crate::room::AVATAR_BYTES_MAX + 64 * 1024;
+
+/// `?name=` on a dropped picture: the file it came in as, which is the
+/// caption on its card. Not trusted for anything else -- it is written
+/// by whoever dropped it.
+#[derive(Deserialize)]
+struct PictureName {
+    #[serde(default)]
+    name: String,
+}
 
 /// `?v=` on a face: which one of somebody's to serve.
 #[derive(Deserialize)]
@@ -208,6 +224,15 @@ pub fn router(rooms: Arc<Rooms>, screen: Arc<Screen>) -> Router {
         )
         .route("/api/games/:name/prompt", get(game_prompt))
         .route("/api/profile/:who", get(profile))
+        // A picture dropped into the room. The one endpoint here that
+        // takes bytes rather than JSON, and the only one with a limit
+        // of its own: what it will keep is smaller than what axum
+        // would otherwise refuse, and a browser that sends too much
+        // should be told which of the two it ran into.
+        .route(
+            "/api/rooms/:room/picture",
+            post(drop_picture).route_layer(DefaultBodyLimit::max(PICTURE_BODY_MAX)),
+        )
         .route("/api/rooms/:room/history", get(history))
         .route("/api/rooms/:room/history/:id", get(read_conversation))
         .route(
@@ -849,6 +874,37 @@ async fn read_conversation(
     match room.read_conversation(conversation) {
         Some(v) => Json(v).into_response(),
         None => (StatusCode::NOT_FOUND, "no such conversation").into_response(),
+    }
+}
+
+/// A picture somebody dropped into the room: it becomes a card in the
+/// conversation with the next number on it, which is then a picture
+/// like any other -- the AI can be asked for it as somebody's face,
+/// and the conversation keeps it.
+///
+/// The body is the PNG itself rather than a form or a base64 field:
+/// there is one file and no other fields, and the bytes are what the
+/// room stores. The page has already scaled a photograph down to the
+/// size the room shows a picture at and re-encoded it as PNG, which is
+/// why this takes only the one type -- everything that holds a picture
+/// here, from the card to the face, is a PNG and was before any of
+/// this.
+///
+/// The room checks the bytes and the size itself: a page is not where
+/// a limit lives, and `curl` is a browser too.
+async fn drop_picture(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(q): Query<PictureName>,
+    png: Bytes,
+) -> Response {
+    let Some((who, room)) = their_room(&app, &headers, &id) else {
+        return (StatusCode::NOT_FOUND, "no such room").into_response();
+    };
+    match room.upload_picture(&who.display, &q.name, &png) {
+        Ok(n) => Json(json!({ "picture": n })).into_response(),
+        Err(why) => (StatusCode::CONFLICT, Json(json!({ "error": why }))).into_response(),
     }
 }
 

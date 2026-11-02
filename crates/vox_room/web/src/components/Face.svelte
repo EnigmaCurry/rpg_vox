@@ -1,6 +1,7 @@
 <script>
   import { avatarOf, openProfile } from '../lib/room.svelte.js';
   import { hue } from '../lib/color.js';
+  import { scaledDown } from '../lib/pixels.js';
 
   // `who` is the name the room calls them, which is what a line in the
   // conversation carries and what a face is looked up by. `agent` is
@@ -34,6 +35,12 @@
   // remembered by address so a *new* picture is tried afresh.
   let broken = $state({});
   const show = $derived(src && !broken[src]);
+
+  // Whether this face is being made smaller rather than bigger, which
+  // decides how it is drawn -- see `lib/pixels.js`. Answered again for
+  // every picture that loads here, because a new face can be a
+  // photograph where the one before it was a sprite.
+  let smooth = $state(false);
 </script>
 
 <!-- The square beside everything somebody says: their picture, or the
@@ -53,7 +60,13 @@
   onclick={opens ? () => openProfile(who) : undefined}
 >
   {#if show}
-    <img {src} alt="" onerror={() => (broken = { ...broken, [src]: true })} />
+    <img
+      {src}
+      alt=""
+      class:smooth
+      onload={(e) => (smooth = scaledDown(e.currentTarget, size))}
+      onerror={() => (broken = { ...broken, [src]: true })}
+    />
   {:else}
     <span class="initials">{initials}</span>
   {/if}
@@ -98,12 +111,17 @@
   img {
     width: 100%;
     height: 100%;
-    /* Pixel art, so no smoothing: a 128px picture in a 36px square is
-       being scaled down, and bilinear turns pixel art to mush. */
+    /* Pixel art, blown up to the square it is shown in: nearest
+       neighbour is the whole point of the form, and bilinear would
+       turn it to mush. */
     image-rendering: pixelated;
     object-fit: cover;
     display: block;
   }
+  /* A picture bigger than the square -- a photograph somebody dropped
+     into the room, most likely. It is being made smaller, and nearest
+     neighbour throws away most of a photograph on the way down. */
+  img.smooth { image-rendering: auto; }
   @media (prefers-color-scheme: dark) {
     .face {
       background: hsl(var(--h) 35% 22%);

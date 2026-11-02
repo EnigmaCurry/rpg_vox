@@ -63,6 +63,19 @@ const [ryanLink] = process.argv.slice(2);
   is('Vox has a picture', /^\/api\/avatar\/Vox\?v=\d+$/.test(voxs.src ?? ''), true);
   is('and the browser drew that', voxs.drawn, 8);
 
+  // Pixel art, blown up from 8 pixels into a 36-pixel square, is
+  // drawn pixel by pixel: smoothing it is what the square is not for.
+  // (A face bigger than its square -- a photograph somebody dropped
+  // into the room -- is smoothed instead; see the `drop` suite.)
+  is(
+    'and a face smaller than its square is drawn pixel by pixel',
+    await ryan.page.evaluate(() => {
+      const img = document.querySelector('.said > .entry > .face img');
+      return img ? getComputedStyle(img).imageRendering : null;
+    }),
+    'pixelated',
+  );
+
   // And nobody who has none is left with a hole: the tint of their
   // name, with enough of it to tell two people apart.
   is('Alex has no picture', alexs.src, null);
@@ -141,6 +154,9 @@ const [ryanLink] = process.argv.slice(2);
         asked: c.querySelector('.asked')?.textContent.replace(/\s+/g, ' ').trim() ?? null,
         tags: [...c.querySelectorAll('.tag')].map((t) => t.textContent.trim()),
         drawn: c.querySelector('img')?.naturalWidth ?? 0,
+        // Blown up from 8 pixels to 160 here, so pixel by pixel, for
+        // the same reason as in the conversation.
+        rendering: getComputedStyle(c.querySelector('img')).imageRendering,
       };
     }),
     {
@@ -149,6 +165,7 @@ const [ryanLink] = process.argv.slice(2);
       asked: null,
       tags: ['reads English', 'here'],
       drawn: 8,
+      rendering: 'pixelated',
     },
   );
 

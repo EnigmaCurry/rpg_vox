@@ -263,47 +263,40 @@ Say your short goodbye before you call it, since what you have already said \
 is spoken straight away.";
 
 /// Added to the lobby's prompt when `--search` is on.
-/// Added to the prompt when the room has a picture server: the faces.
+/// The faces: always in the prompt, because a picture can always be in
+/// the chat. Somebody can drop one in from their own computer with no
+/// AI and no picture server involved, so `set_avatar` always has
+/// something it might be asked to put.
 ///
-/// Deliberately about the room's half and not the picture tool's. What
-/// sizes and styles there are, and how to word a prompt for them, is
-/// in each tool's own schema, written by whoever runs that server and
-/// better than anything that could be restated here -- and it goes
-/// stale the moment they add a style. What this says is the part the
-/// room knows: that it is an interview, that it costs real money, and
-/// that making a picture and giving somebody a face are two steps.
+/// Deliberately about the room's half and not any picture tool's. What
+/// goes with a server is in [`DRAWING_NOTE`].
 const AVATAR_NOTE: &str = "\
 Everybody in the room has a square beside everything they say, and you \
-can make somebody theirs. It goes in four steps, and the slow one in the \
-middle is the point of the other three.
+can give somebody theirs: set_avatar puts one of the pictures in the \
+chat on somebody, by the number on its card.
 
-First, interview them, out loud, in the room. Ask what they want to be -- \
-who the character is, what they are wearing, what they are carrying, what \
-sort of face -- and get enough to work from before you make anything. Say \
-what you are about to make, in a sentence, so they can stop you.
+You cannot see any of them. You are told that a picture is there, its \
+number, and what it was asked for or what file it came in as -- never \
+what is in it -- so the people in the room are your eyes. Ask, rather \
+than describing a picture back at them.
 
-Then make it with a picture tool. The picture goes straight into the chat \
-as a card the whole room can see, with a number on it, and a spinner on \
-it until it arrives -- so say you are making it and then let it come; \
-nobody is waiting in silence. Each picture costs the house real money, so \
-make one at a time, and never make one nobody asked for.
-
-Then ask how they like it. You cannot see what you made -- you are told \
-the number and nothing else -- so the people in the room are your eyes. \
-If they want a change, make another: it gets the next number, and the \
-earlier ones stay in the chat, so going back to one is a thing they can \
-ask for and you can do.
-
-Only when they say they are happy with one, call set_avatar with that \
-number. Do not set one because a picture came out well, and do not set \
+Only put one on somebody once they have seen it and said they are happy \
+with it. Do not set one because a picture came out well, and do not set \
 one because it is the only picture there is. A face is theirs, and \
 choosing it is theirs.
+
+Pictures do not have to come from you. Somebody can drop one into the \
+chat from their own computer, and it gets the next number like any \
+other -- so when a picture turns up that you did not make, it is theirs \
+and you have not seen it: ask what they want done with it rather than \
+assuming it is for their face, and if it is, set_avatar takes that \
+number.
 
 set_bio writes the few lines shown beside their face when anybody clicks \
 it: who their character is, in two or three sentences, from what they \
 actually told you rather than from what the picture looks like. Read it \
 back and revise it if they want -- it can be rewritten any time, with no \
-new picture. list_people tells you what each person's face was asked for, \
+new picture. list_people tells you where each person's face came from, \
 so you can build on what somebody already has instead of starting over, \
 and so you don't offer a face to somebody who is happy with theirs.
 
@@ -317,8 +310,35 @@ A face belongs to the person and not to the game: it follows them from \
 room to room and outlasts the conversation. So ask who they want to be \
 rather than deciding for them, and if somebody would rather not have one, \
 leave them the colour their name already has. You have a face of your \
-own as well, and may make it -- ask the room what it thinks you look \
-like.";
+own as well -- ask the room what it thinks you look like.";
+
+/// Added as well when the room has a picture server: making one.
+///
+/// What sizes and styles there are, and how to word a prompt for them,
+/// is in each tool's own schema, written by whoever runs that server
+/// and better than anything that could be restated here -- and it goes
+/// stale the moment they add a style. What this says is the part the
+/// room knows: that it is an interview, that it costs real money, and
+/// that making a picture and giving somebody a face are two steps.
+const DRAWING_NOTE: &str = "\
+You can also make a picture, and that is how most faces here start. It \
+goes in three steps before set_avatar, and the slow one in the middle is \
+the point of the other two.
+
+First, interview them, out loud, in the room. Ask what they want to be -- \
+who the character is, what they are wearing, what they are carrying, what \
+sort of face -- and get enough to work from before you make anything. Say \
+what you are about to make, in a sentence, so they can stop you.
+
+Then make it with a picture tool. The picture goes straight into the chat \
+as a card the whole room can see, with a number on it, and a spinner on \
+it until it arrives -- so say you are making it and then let it come; \
+nobody is waiting in silence. Each picture costs the house real money, so \
+make one at a time, and never make one nobody asked for.
+
+Then ask how they like it. If they want a change, make another: it gets \
+the next number, and the earlier ones stay in the chat, so going back to \
+one is a thing they can ask for and you can do.";
 
 const SEARCH_NOTE: &str = "\
 You can look things up on the web with look_up, and you should whenever the \
@@ -547,9 +567,11 @@ pub struct Art {
 }
 
 impl Art {
-    /// Whether anything here can actually make a picture. A room with
-    /// no picture server has no use for `set_avatar`: it would be a
-    /// tool with nothing to put.
+    /// Whether anything here can actually make a picture. What it
+    /// gates is the drawing -- the servers' own tools and the half of
+    /// the prompt about using them. Not `set_avatar`: a room with no
+    /// picture server still gets pictures, because anybody in it can
+    /// drop one in from their own computer.
     fn any(&self) -> bool {
         self.servers.iter().any(|s| !s.offer().is_empty())
     }
@@ -730,13 +752,15 @@ impl Agent {
         } else {
             String::new()
         };
-        // Only when something can actually make a picture. A note
-        // about faces, to a voice with no way to make one, is the same
-        // mistake as a note about cards to one that cannot deal them.
-        let faces = if self.art.any() {
-            format!("\n\n{AVATAR_NOTE}")
-        } else {
-            String::new()
+        // The faces always, and how to draw one only where something
+        // can draw. A note about making pictures, to a voice with no
+        // way to make one, is the same mistake as a note about cards
+        // to one that cannot deal them -- but giving somebody a face
+        // is not that note: anybody in the room can drop a picture in
+        // from their own computer, and then there is one to give.
+        let faces = match self.art.any() {
+            true => format!("\n\n{AVATAR_NOTE}\n\n{DRAWING_NOTE}"),
+            false => format!("\n\n{AVATAR_NOTE}"),
         };
         let others = match turn.others.as_slice() {
             [] => String::new(),
@@ -1644,9 +1668,14 @@ fn tools_for(
     // are. A portrait of somebody's character is as much a thing to
     // make in the middle of a game as before one, and a game whose
     // prompt doesn't want them simply never asks.
+    //
+    // The two face tools are here whether or not anything can draw: a
+    // picture can be dropped into any room from somebody's own
+    // computer, so a house with no picture server still has faces to
+    // give and bios to write. Only the drawing needs a server.
+    extra.push(avatar_tool());
+    extra.push(bio_tool());
     if art.any() {
-        extra.push(avatar_tool());
-        extra.push(bio_tool());
         for server in &art.servers {
             extra.extend(server.offer());
         }
@@ -1717,20 +1746,23 @@ fn bio_tool() -> Value {
     )
 }
 
-/// Putting a picture that has been made on somebody.
+/// Putting a picture that is already in the chat on somebody.
 ///
 /// Deliberately two steps and not one. Making the picture is the
 /// picture server's tool, with everything that server knows about
 /// sizes and styles in its own schema; this is the room's half, and
-/// all it decides is whose face it is. A model that has made nothing
-/// is told so when it calls this.
+/// all it decides is whose face it is. It is also the half that works
+/// without a server at all, since a picture can be dropped into the
+/// chat by whoever is in the room. A model with no picture to put is
+/// told so when it calls this.
 fn avatar_tool() -> Value {
     tool(
         "set_avatar",
         "Put one of the pictures in the chat on somebody: it becomes the square shown \
          beside everything they say, to everyone. Only do this once they have seen it \
-         and said they are happy with it -- every picture you make is already in the \
-         chat for them to look at, so there is nothing to settle before they have.",
+         and said they are happy with it -- every picture in the chat, whether you made \
+         it or somebody dropped it in, is already there for them to look at, so there \
+         is nothing to settle before they have.",
         json!({
             "who": {
                 "type": "string",
@@ -1743,7 +1775,7 @@ fn avatar_tool() -> Value {
                 "type": "integer",
                 "minimum": 1,
                 "description": "The number on the picture's card in the chat. They are \
-                                numbered from 1 in the order they were made, so an \
+                                numbered from 1 in the order they turned up, so an \
                                 earlier one can still be chosen.",
             },
         }),
@@ -2281,6 +2313,25 @@ mod tests {
         assert!(frame.contains("post_card"), "it may still post one");
         let dealing = game_prompt("Dragon Heist", "Run a heist.", Allowed::Everything);
         assert!(dealing.contains("send_card"));
+    }
+
+    /// A house with no picture server is still told about faces, and
+    /// not about making one. Nothing here can draw -- `Art::default()`
+    /// -- and a picture can still arrive, dropped in by whoever is in
+    /// the room, so `set_avatar` has something it may be asked to put.
+    #[test]
+    fn a_room_that_cannot_draw_is_still_told_about_faces() {
+        let (agent, t) = turn_with(Cue::Speak, &["Ryan"], false);
+        let system = system_of(&agent, &t);
+        assert!(system.contains("set_avatar puts one of the pictures"), "{system}");
+        assert!(
+            system.contains("drop one into the chat from their own computer"),
+            "and where one comes from when nothing here draws: {system}"
+        );
+        assert!(system.contains("set_bio writes the few lines"), "{system}");
+        // And not a word about doing what it cannot do.
+        assert!(!system.contains("Each picture costs the house real money"), "{system}");
+        assert!(!system.contains("make it with a picture tool"), "{system}");
     }
 
     /// The other AIs in the room are in the transcript by name, so the
@@ -3179,7 +3230,14 @@ mod tests {
                 "take_back_card",
                 "read_cards",
                 "hand_to",
-                "wait_until_named"
+                "wait_until_named",
+                // With no picture server anywhere -- `Art::default()`
+                // -- and the faces still here: a picture can be
+                // dropped into any room by whoever is in it, so there
+                // is one to give and lines to write about it. What a
+                // server adds is the drawing.
+                "set_avatar",
+                "set_bio",
             ]
         );
         // In the lobby they are there as well, alongside the games.

@@ -595,6 +595,14 @@ See ROOM_DOCKER.md.
   zero-width characters are still spaces. Everything else survives
   exactly as typed, because the punctuation a careless filter eats is
   what a URL is made of.
+- **Dropping a picture in**: drag one onto the room and let go of it
+  anywhere, or paste one with **Ctrl+V**.
+  It becomes a card in the conversation with your name on it
+  and the next number, which is the number the AI takes for
+  `set_avatar` — so *"make that my face"* is the whole of what you
+  have to say after dropping a photograph in. Only pictures; anything
+  else is declined where you dropped it. See
+  [Dropping a picture in](#dropping-a-picture-in).
 - **More than one language**: start the room with
   `--language-also Russian` and the door offers a **Language** beside
   the devices. Everyone hears the people in the room as they are — their
@@ -1079,8 +1087,10 @@ does each AI. Until one is made it is the tint that name already has
 with their initials in it, which is the same size and shape as the
 picture that may replace it — the column of names lines up either way.
 
-A face is **made by asking for one out loud**, and it takes four steps
-on purpose — the AI does not simply hand you one.
+A face is **made by asking for one out loud**, or **dropped in from
+your own computer** — see [Dropping a picture
+in](#dropping-a-picture-in). Asking for one takes four steps on
+purpose — the AI does not simply hand you one.
 
 It interviews you first: who you are, what you are wearing, what sort
 of face. Then it says what it is about to make and makes it — and the
@@ -1131,8 +1141,46 @@ Faces appear beside every line in the conversation and beside every
 name in the list of who is here, and clicking any of them opens that
 person's card.
 
-The picture comes from an **MCP server**, which is any server the house
-was started with:
+#### Dropping a picture in
+
+**Drag a picture onto the room and let go**, or **paste one with
+Ctrl+V** — a screenshot is on the clipboard as a file, so the two are
+the same act. It goes into the
+conversation as a card with your name on it and the next number — the
+same numbering the AI's own pictures use, because *"the second one"*
+is said out loud about whatever is on screen and nobody counts the two
+apart. From then on it is a picture like any other: ask the AI to make
+it your face and it calls `set_avatar` with that number, and the
+conversation keeps it the way it keeps everything else said in it.
+
+The AI is told that it is there, whose it is, and what the file was
+called. It is **not** shown the picture — it is shown no picture, its
+own included — and it is told plainly that it did not make this one,
+so it asks about it rather than describing a thing it cannot see.
+
+A paste that is text *with* pictures in it — part of a web page, say —
+is left to whatever has the cursor. That one is meant for the box you
+are typing in, and taking the pictures out of it would be answering a
+different question; a screenshot carries no text with it, which is how
+the two are told apart.
+
+Only pictures. Anything else is declined where you dropped it, with a
+word in the footer, and nothing is uploaded. Whatever your browser can
+decode is a picture here — a JPEG off a camera, a PNG, a WebP — and
+the tab re-encodes it before it is sent: scaled down to the size the
+room actually shows a picture at, and written out as a PNG, which is
+what everything here that holds a picture has always been. So a
+photograph straight off a phone comes in as a few tens of kilobytes
+rather than being refused for being what phones make. The server keeps
+nothing over 512 KB, which is also the most a face may be: anything in
+the chat can be worn.
+
+A room with no picture server can do all of this. Nothing here draws,
+so the AI is not told how to draw — but it is still told about faces,
+and `set_avatar` still has something to put.
+
+Pictures made by the AI come from an **MCP server**, which is any
+server the house was started with:
 
 ```bash
 vox_room --room Lobby \
@@ -1304,6 +1352,7 @@ CHROME=$(which chromium) ./run.sh            # or: ./run.sh rooms bots
 | `game` | a game played inside a room, and leaving it putting the room back where it was for everyone in it |
 | `cards` | what a posted card looks like once it is on the screen: the table, the list and the code block a model wrote in markdown — and the script tag it wrote with them arriving as words rather than as anything at all |
 | `avatars` | the square beside everything somebody says, and the pictures it is chosen from: a face where one was made and the same-sized tint-and-initials where none was, faces beside the names in the list of who is here, a picture card that arrived beside one that never did, a face clicked open onto who somebody is (and onto an AI that says it is not a person), the last faces worn offered back in Settings and an older one put on again, and taking your own off turning it back into initials in the conversation behind the page |
+| `drop` | a picture dragged into the room and one pasted into it: what the room says while a file is hanging over it, the card that lands on the dropper's own screen and on somebody else's, the next one getting the next number, a picture bigger than its square being smoothed where a sprite is not, a paste that is text with pictures in it being left to the cursor, and a file that is not a picture being refused in the words of whichever way it arrived |
 | `interpreter` | the interpreter appearing only while it has somebody to interpret for, and its level being each listener's own |
 
 The four below want something of yours — a microphone, a model, a

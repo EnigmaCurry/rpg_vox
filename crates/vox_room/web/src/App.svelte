@@ -1,6 +1,6 @@
 <script>
   import { onMount } from 'svelte';
-  import { room, command, ask, answer, whoami, leaveAudio, setMuted, setPushToTalk, talk, busyAI } from './lib/room.svelte.js';
+  import { room, command, ask, answer, whoami, leaveAudio, setMuted, setPushToTalk, talk, busyAI, dropPicture, notice } from './lib/room.svelte.js';
   import { screen, share, stopSharing, supported as canShare } from './lib/screen.svelte.js';
   import Log from './components/Log.svelte';
   import Cards from './components/Cards.svelte';
@@ -52,6 +52,79 @@
     if (!room.asking && dialog.open) dialog.close();
   });
 
+  // A picture dragged in from outside goes into the conversation. The
+  // target is the window and not the conversation column, or even the
+  // room: the picture lands in the conversation wherever it is let go
+  // of, and a target you have to find is one that makes you aim at a
+  // wall of text while holding a file.
+  //
+  // The window and not the room's own div for a second reason. A file
+  // let go of over a page that has not claimed the drag is *opened*
+  // by the browser, which here means the room is gone and the audio
+  // with it -- so the drag is claimed everywhere this app is on
+  // screen, including the door, and whether there is anywhere to put
+  // it is answered afterwards, in words. (It also keeps a handler for
+  // something nobody can do with a keyboard off an element that is
+  // only a layout: a drop is reachable by pointer alone, and Ctrl+V
+  // below is the way in that isn't.)
+  //
+  // Whether the room is the thing on the screen at all: the door and
+  // the pages of their own have no conversation to put a picture in.
+  const inRoom = $derived(room.audio === 'on' && !room.settings && !room.managing);
+  // And only into the conversation the room is having. One it has
+  // finished with has nowhere to put a picture, which is the same
+  // reason there is nothing to type into it -- see `Say`.
+  const canDrop = $derived(inRoom && !room.reading);
+  // What to say when there isn't. Both ways in say it, and they say
+  // the same thing because the same thing is wrong with both. Only
+  // where it can be read, though: the footer it goes in is the room's.
+  const refuse = () => inRoom && notice(OVER);
+  const OVER = 'That conversation is over; come back to the one the room is having.';
+  // Whether something is over the window right now, counted rather
+  // than flagged: `dragleave` fires as the pointer crosses into a
+  // child, and a flag turns the overlay off halfway across the room.
+  let dragging = $state(0);
+  // A drag of anything else -- a link, selected text, a tab -- is not
+  // ours to take: the browser's own handling of it is better than an
+  // overlay that says it will do something it won't.
+  const hasFiles = (e) => [...(e.dataTransfer?.types ?? [])].includes('Files');
+  function dragenter(e) {
+    if (canDrop && hasFiles(e)) dragging += 1;
+  }
+  function dragover(e) {
+    if (!hasFiles(e)) return;
+    // Needed on every dragover and not only on the drop: without it
+    // the drop never reaches the page at all.
+    e.preventDefault();
+    e.dataTransfer.dropEffect = canDrop ? 'copy' : 'none';
+  }
+  function drop(e) {
+    dragging = 0;
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    if (canDrop) dropPicture(e.dataTransfer.files);
+    else refuse();
+  }
+
+  // Ctrl+V, which is how a screenshot gets anywhere: the clipboard
+  // hands it over as a file, so this is the drop with no drag in
+  // front of it.
+  //
+  // Only a clipboard that is *only* files, though. Copying part of a
+  // web page puts the text and its pictures on the clipboard
+  // together, and that is a paste meant for whatever has the cursor
+  // -- taking the pictures out of it and posting them to the room
+  // would be answering a different question. A screenshot, or a file
+  // copied in a file manager, carries no text with it.
+  function paste(e) {
+    if (!inRoom) return;
+    const files = [...(e.clipboardData?.files ?? [])];
+    if (!files.length || e.clipboardData.types.includes('text/plain')) return;
+    e.preventDefault();
+    if (canDrop) dropPicture(files, 'pasted');
+    else refuse();
+  }
+
   // Space toggles your mute (or, with push to talk, talks while held),
   // unless you are typing or choosing something.
   //
@@ -82,7 +155,21 @@
   }
 </script>
 
-<svelte:window {onkeydown} {onkeyup} onblur={() => talk(false)} />
+<!-- Both ways a picture comes in are on the window. A screenshot is
+     pasted wherever the cursor happens to be, including the box you
+     type into, and it is meant for the room either way; and a drag
+     the page hasn't claimed by the time it is let go of takes the
+     page with it, so it is claimed wherever it lands. -->
+<svelte:window
+  {onkeydown}
+  {onkeyup}
+  onblur={() => talk(false)}
+  onpaste={paste}
+  ondragenter={dragenter}
+  ondragover={dragover}
+  ondragleave={() => (dragging = Math.max(0, dragging - 1))}
+  ondrop={drop}
+/>
 
 <dialog class="ask peek" bind:this={peekDialog} oncancel={(e) => { e.preventDefault(); room.peek = null; }}
   onclick={(e) => { if (e.target === peekDialog) room.peek = null; }}>
@@ -141,6 +228,13 @@
   <Settings />
 {:else}
   <div class="app show-{area}" class:watching={screen.watching != null} class:nocards={!hasCards}>
+    <!-- What is about to happen, while a file is over the room: the
+         one thing a drop can do here, said before it is let go of. -->
+    {#if dragging > 0}
+      <div class="dropping" aria-hidden="true">
+        <span>Drop a picture into the conversation</span>
+      </div>
+    {/if}
     <!-- No title bar. What a room is called is the heading of the room
          list, which is the column it belongs to; what a conversation
          is called, and what is done to it, is the bar over the
@@ -316,6 +410,29 @@
     grid-template-areas: "pick board" "tools board" "rooms board" "foot foot";
   }
   .app.watching :global(.log), .app.watching :global(.cards) { display: none; }
+  /* Over everything while a file is on its way in. Fixed rather than
+     absolute, so it covers the room without being a cell of the grid
+     it is a child of -- and it never takes the pointer, because the
+     drop belongs to the room underneath it. */
+  .dropping {
+    position: fixed;
+    inset: 0;
+    z-index: 5;
+    pointer-events: none;
+    display: grid;
+    place-items: center;
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    outline: 2px dashed var(--accent);
+    outline-offset: -10px;
+  }
+  .dropping span {
+    background: var(--bg);
+    color: var(--accent);
+    border: 1px solid var(--accent);
+    border-radius: 10px;
+    padding: 10px 16px;
+    font-weight: 600;
+  }
   .ask.peek { width: min(46em, calc(100vw - 32px)); max-width: none; }
   .peek-title { font-size: 17px; text-transform: none; letter-spacing: 0; color: inherit; margin: 0 0 4px; }
   .peek-summary { color: var(--muted); margin: 0 0 12px !important; }

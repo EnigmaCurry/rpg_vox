@@ -191,14 +191,18 @@ CREATE TABLE IF NOT EXISTS conversations (
     -- and then the first thing said in it stands in for it.
     at   INTEGER NOT NULL DEFAULT 0
 );
--- A picture one of the AIs made, posted into the conversation it was
--- made in. The row is written the moment the generating starts, with
--- no `png`: the card goes up with a spinner on it and fills in when
--- this does, so the room can watch it happen and say what to change.
+-- A picture in a conversation: one an AI made, or one somebody
+-- dropped into the room from their own computer. A made one's row is
+-- written the moment the generating starts, with no `png`: the card
+-- goes up with a spinner on it and fills in when this does, so the
+-- room can watch it happen and say what to change. A dropped one
+-- arrives whole and is never a spinner.
 --
 -- They are numbered within their conversation, and that number is
 -- what the card shows and what `set_avatar` is given: the second one
--- is a thing people say, and so a thing the AI can act on.
+-- is a thing people say, and so a thing the AI can act on. One
+-- sequence for both kinds, because the second one is said out loud
+-- about whatever is on screen and nobody counts the two apart.
 --
 -- A picture stays in the conversation it was made in, and goes when
 -- that conversation does: it is part of what was said.
@@ -207,10 +211,12 @@ CREATE TABLE IF NOT EXISTS pictures (
     conversation INTEGER NOT NULL,
     -- Its number in this conversation, from 1.
     n            INTEGER NOT NULL,
-    -- Which AI made it.
+    -- Who put it there: the AI that made it, or the person who
+    -- dropped it in.
     who          TEXT NOT NULL,
-    -- What it was asked for. Shown on the card and kept with the
-    -- avatar when one is made from it.
+    -- What it was asked for, or the name of the file it came in as.
+    -- Shown on the card and kept with the face when one is made from
+    -- it, which is how `list_people` can say where a face came from.
     prompt       TEXT NOT NULL,
     -- Null while it is still being made. A row that has one is done.
     png          BLOB,
@@ -270,48 +276,6 @@ CREATE TABLE IF NOT EXISTS faces (
     PRIMARY KEY (who, at)
 );
 CREATE INDEX IF NOT EXISTS faces_newest ON faces (who, at DESC);
--- A picture one of the AIs made, posted into the conversation it was
--- made in. The row is written the moment the generating starts, with
--- no `png`: the card goes up with a spinner on it and fills in when
--- this does, so the room can watch it happen and say what to change.
---
--- They are numbered within their conversation, and that number is
--- what the card shows and what `set_avatar` is given: the second one
--- is a thing people say, and so a thing the AI can act on.
---
--- A picture stays in the conversation it was made in, and goes when
--- that conversation does: it is part of what was said.
-CREATE TABLE IF NOT EXISTS pictures (
-    id           TEXT PRIMARY KEY,
-    conversation INTEGER NOT NULL,
-    -- Its number in this conversation, from 1.
-    n            INTEGER NOT NULL,
-    -- Which AI made it.
-    who          TEXT NOT NULL,
-    -- What it was asked for. Shown on the card and kept with the
-    -- avatar when one is made from it.
-    prompt       TEXT NOT NULL,
-    -- Null while it is still being made. A row that has one is done.
-    png          BLOB,
-    -- Why it will never arrive, when it won't. The card says so
-    -- rather than spinning forever.
-    failed       TEXT NOT NULL DEFAULT '',
-    at           INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS pictures_in_order ON pictures (conversation, n);
--- The few lines about somebody that go with their face: who their
--- character is, written by the AI in the same interview the picture
--- came out of.
---
--- Its own table and not a column on `avatars`, because a bio and a
--- face arrive at different moments and either may exist without the
--- other -- somebody may want to be described and not drawn. Keyed the
--- same way, by what does not change.
-CREATE TABLE IF NOT EXISTS bios (
-    who TEXT PRIMARY KEY,
-    bio TEXT NOT NULL,
-    at  INTEGER NOT NULL
-);
 -- The square picture shown beside everything somebody says. One row
 -- each, and only for those who have one: a person without a row is
 -- drawn as the tint their name already has, which is the placeholder
@@ -1524,7 +1488,18 @@ impl Store {
             > 0)
     }
 
-    // -- pictures: what the AI made, in the conversation it made it in --
+    // -- pictures: made or brought in, in the conversation they are in --
+
+    /// The number the next picture of this conversation gets. Counted
+    /// rather than kept, because the only thing that must hold is that
+    /// two pictures in one conversation are never both "the third one".
+    fn next_picture(&self, conversation: i64) -> Result<u32> {
+        Ok(self.db.query_row(
+            "SELECT COALESCE(MAX(n), 0) + 1 FROM pictures WHERE conversation = ?1",
+            [conversation],
+            |r| r.get(0),
+        )?)
+    }
 
     /// Start a picture: a row with no image yet, which is a card with a
     /// spinner on it. The answer is its number in this conversation,
@@ -1536,18 +1511,33 @@ impl Store {
         who: &str,
         prompt: &str,
     ) -> Result<u32> {
-        // The next number in this conversation. Counted rather than
-        // kept, because the only thing that must hold is that two
-        // pictures in one conversation are never both "the third one".
-        let n: u32 = self.db.query_row(
-            "SELECT COALESCE(MAX(n), 0) + 1 FROM pictures WHERE conversation = ?1",
-            [conversation],
-            |r| r.get(0),
-        )?;
+        let n = self.next_picture(conversation)?;
         self.db.execute(
             "INSERT INTO pictures (id, conversation, n, who, prompt, png, failed, at)
              VALUES (?1, ?2, ?3, ?4, ?5, NULL, '', ?6)",
             params![id, conversation, n, who, prompt, now_ms()],
+        )?;
+        Ok(n)
+    }
+
+    /// A picture that arrived whole: one somebody dropped into the room
+    /// from their own computer. Same table and same numbering as one an
+    /// AI made -- what differs is that there was never a moment when it
+    /// was being waited for, so it is written with its image already in
+    /// it and is never a spinner.
+    pub fn put_picture(
+        &self,
+        conversation: i64,
+        id: &str,
+        who: &str,
+        name: &str,
+        png: &[u8],
+    ) -> Result<u32> {
+        let n = self.next_picture(conversation)?;
+        self.db.execute(
+            "INSERT INTO pictures (id, conversation, n, who, prompt, png, failed, at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, '', ?7)",
+            params![id, conversation, n, who, name, png, now_ms()],
         )?;
         Ok(n)
     }

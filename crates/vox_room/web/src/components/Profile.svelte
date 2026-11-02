@@ -1,6 +1,11 @@
 <script>
   import { room, closeProfile, avatarOf } from '../lib/room.svelte.js';
   import { hue } from '../lib/color.js';
+  import { scaledDown } from '../lib/pixels.js';
+
+  // How big the square on this card is, in one place: the CSS draws
+  // it and `lib/pixels.js` is told it, and the two must agree.
+  const FACE = 160;
 
   // What opens when a face is clicked: the picture at a size worth
   // looking at, and the few things the house actually knows about
@@ -18,6 +23,11 @@
       .join('')
       .toUpperCase(),
   );
+
+  // Whether the picture is being made smaller rather than bigger --
+  // see `lib/pixels.js`. A card opened on somebody else is a new
+  // picture in the same square, so it is asked again each time.
+  let smooth = $state(false);
 
   function onkeydown(e) {
     if (e.key === 'Escape') closeProfile();
@@ -47,7 +57,7 @@
     >
       <div class="face" class:agent={p.bot}>
         {#if src}
-          <img {src} alt="" />
+          <img {src} alt="" class:smooth onload={(e) => (smooth = scaledDown(e.currentTarget, FACE))} />
         {:else}
           <span class="initials">{initials}</span>
         {/if}
@@ -117,6 +127,7 @@
   /* The same square as in the conversation, at a size worth looking
      at: pixel art is drawn to be seen big, and 36px is a label. */
   .face {
+    /* `FACE` above is this number; they are read together. */
     width: 160px;
     height: 160px;
     border-radius: 12px;
@@ -140,6 +151,9 @@
     object-fit: cover;
     display: block;
   }
+  /* Bigger than the square, so it is being made smaller: a
+     photograph, which wants smoothing. See `lib/pixels.js`. */
+  img.smooth { image-rendering: auto; }
   h2 { margin: 0; font-size: 20px; }
   .tags { display: flex; flex-wrap: wrap; gap: 6px; justify-content: center; }
   .tag {

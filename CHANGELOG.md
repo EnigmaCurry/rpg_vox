@@ -90,6 +90,68 @@ releases.
 
 ### Voice room
 
+- **A picture can be dropped into the room, and the AI can be asked
+  for it as your face.** Drag one onto the room and let go of it
+  anywhere, or paste one with Ctrl+V -- a screenshot is on the
+  clipboard as a file, so the two are one act with one path behind
+  them. A paste that is text *with* pictures in it is left to whatever
+  has the cursor: that one is meant for the box you are typing in, and
+  a screenshot carries no text with it, which is how they are told
+  apart. Either way
+  it becomes a card in the conversation with your name on it
+  and the next number -- the same numbering the AI's own pictures use,
+  because "the second one" is said out loud about whatever is on
+  screen and nobody in the room counts the two apart. From then on it
+  is a picture like any other, which is the whole of why it is worth
+  having: `set_avatar` already takes a number, so *"make that my
+  face"* needed nothing new to work.
+
+  The AI is told it is there, whose it is, and what the file was
+  called -- and told plainly that it did not make this one. It is
+  shown no picture here, its own included; a model told only that a
+  picture is in the chat takes credit for it, and then offers to
+  change a thing it never made.
+
+  The tab re-encodes what was dropped before any of it is sent:
+  decoded by the browser, so whatever the browser reads is a picture
+  here, scaled down to the size the room actually shows a picture at,
+  and written out as a PNG, which is what everything here that holds
+  one has always been. So a photograph straight off a phone comes in
+  as a few tens of kilobytes instead of being refused for being what
+  phones make. The server keeps nothing over 512 KB, which is also the
+  most a face may be -- anything in the chat can be worn -- and checks
+  the bytes and the size for itself, because a page is not where a
+  limit lives. Anything that is not a picture is declined where it was
+  dropped, with a word in the footer and nothing uploaded.
+
+  The faces are no longer a thing only a picture server can offer.
+  `set_avatar` and `set_bio` were gated on the house having one, on
+  the reasoning that a tool with nothing to put is a tool to leave
+  out -- which stopped being true the moment a picture could arrive
+  without being drawn. The prompt split along the same line: what the
+  room knows about faces is always there, and the interview, the cost
+  and the iterating are added only where something can actually draw.
+
+  **A picture is drawn the way it is being scaled**, which is a thing
+  the room had not had to decide before. Faces here are pixel art, and
+  everything that showed one asked for nearest-neighbour: blowing a
+  128-pixel sprite up into the square is the whole point of the form.
+  A photograph is the same question with the numbers the other way
+  round -- it arrives bigger than anything that shows it, and nearest
+  neighbour on the way *down* throws most of it away. So the picture
+  is asked rather than the room guessing: wider than the square it is
+  shown in means smoothing, narrower means pixel by pixel, answered
+  when the browser has the image and in one place for the card, the
+  face beside every line, and the card that opens when a face is
+  clicked.
+
+  It is its own kind of entry rather than a made picture with a
+  person's name on it. The two are different events -- one is the AI
+  having done what it said it would, the other is somebody bringing
+  something in -- and they read differently on screen and to the
+  model. What they share is the numbering, which is the half that
+  matters out loud.
+
 - **A picture is made where the room can watch, and a face is only set
   once somebody says yes.** The first version of this went from "make
   me an avatar" to a changed face in one unbroken motion: the AI
