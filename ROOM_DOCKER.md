@@ -181,6 +181,44 @@ means the machine the *daemon* runs on. With a remote context that is the
 remote host, not your workstation, so `VOX_SCRIBE_LLM_URL` and
 `VOX_ROOM_TTS_URL` need names the remote host can resolve.
 
+## Faces, and the MCP server behind them
+
+The AI makes somebody a face by calling out to an MCP server, which is
+configured entirely in `.env` — `env_file` passes the whole file to the
+room, so there is nothing to change in `docker-compose.yaml`:
+
+```ini
+VOX_ROOM_MCP=art=https://mcp.retrodiffusion.ai/mcp=create_inference,list_available_styles,estimate_inference_cost,get_balance
+VOX_ROOM_MCP_KEY=rdpk-…
+```
+
+The tool list after the URL is not optional punctuation: that server
+offers 33 tools and a room that wants faces needs those four. See
+[Faces](ROOM.md#faces).
+
+**A `$` in the key is eaten.** Compose interpolates this file, so
+`rdpk-a$bc` reaches the container as `rdpk-a` — the key fails to
+authenticate and nothing says why. Write it `rdpk-a$$bc`. The `;`, `,`
+and `=` in the server line need no escaping.
+
+**Check it took.** The room says hello to each server on its own thread
+as it starts, and logs what it got:
+
+```console
+$ docker compose logs vox_room | grep -i mcp
+… retrodiffusion-api 2.14.7: lending 4 of its 33 tools …
+```
+
+A server that is down, or a key that is wrong, is a warning on that
+line and nothing else — the rooms open either way, and the AI simply
+has no picture tools until it answers. That is deliberate: a picture
+server is not something a voice room should fail to start over.
+
+The container reaches `mcp.retrodiffusion.ai` over the public internet
+on its own bridge network, so unlike the model and TTS servers there is
+no `host.docker.internal` or DNS pinning to think about — but it does
+need egress, which a locked-down host may not give it.
+
 ## Blank is not unset
 
 `docker compose` passes `FOO=` through as an empty variable, and
