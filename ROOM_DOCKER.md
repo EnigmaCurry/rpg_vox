@@ -13,7 +13,7 @@ cd docker
 just config                   # asks about each setting, writes .env
 just install                  # builds the image and starts the room
 just logs -f                  # the first start downloads the models
-just room-invite Ryan
+just room-invite-owner Ryan   # who invites everybody else, from the room
 ```
 
 | recipe | what it does |
@@ -26,14 +26,20 @@ just room-invite Ryan
 | `status` | what exists, what is running, which volumes are there |
 | `logs` | `just logs -f` to follow |
 | `shell` | a bash shell in the container; `just shell -u root` for root |
-| `room-invite` / `room-uninvite` / `room-people` | the room's CLI inside the container |
+| `room-invite-owner` / `room-invite` / `room-uninvite` / `room-people` | the room's CLI inside the container |
 | `show-config` | the fully interpolated compose file, Traefik labels and all |
 
 `just room-invite NAME` prints the link to send someone, which works
 once: their browser trades it for a cookie when they press **Join
-Audio**, and `just room-uninvite NAME` takes both away. All three CLI
+Audio**, and `just room-uninvite NAME` takes both away. The CLI
 recipes read and write the same SQLite file the running room has open,
 which is fine — they are brief writes.
+
+Start with `just room-invite-owner NAME`. The owner invites everybody
+else and hands out the rooms from inside the room itself, so it is the
+only one of these you have to run at a terminal; there is one, and
+changing it means `just room-uninvite` first. See [Who owns the
+room](ROOM.md#who-owns-the-room).
 
 `docker/.env` is deliberately *not* the repository's own `.env` (that one
 belongs to `just` and rpg_vox, and holds unrelated secrets). The compose

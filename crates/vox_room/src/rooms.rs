@@ -35,7 +35,7 @@ use tokio::sync::broadcast;
 use tracing::{error, info};
 
 use crate::room::{Mode, Room, RoomConfig};
-use crate::store::Invited;
+use crate::store::{Invited, Store};
 
 /// How often the rooms are told the time: turn taking, the meters, and
 /// now and then the invite list. The same 50 ms one room used to run on.
@@ -71,6 +71,12 @@ pub struct Rooms {
     /// Somebody's own room, by its id, made the first time they ask.
     own: Mutex<BTreeMap<String, Arc<Room>>>,
     make: Make,
+    /// The invite list, the roles and the grants, which belong to the
+    /// house rather than to any room in it. Its own handle on the same
+    /// database file: who may go where is asked on the way into a room,
+    /// and asking a room whether somebody may enter it is the wrong way
+    /// round.
+    people: Mutex<Store>,
     /// The AI's name, which is half the title of everyone's own room.
     agent_name: String,
     /// Somebody came in, left, or changed rooms. The directory every
@@ -104,7 +110,12 @@ impl Rooms {
     /// The shared rooms `names` asks for, built now. Everybody's own
     /// room is not: an empty room of one costs nothing while it is only
     /// a button, and most people's will never be opened.
-    pub fn new(base: &RoomConfig, names: &[String], make: Make) -> Result<Arc<Self>> {
+    pub fn new(
+        people: Store,
+        base: &RoomConfig,
+        names: &[String],
+        make: Make,
+    ) -> Result<Arc<Self>> {
         // Every name settled before anything is built, so a server
         // started with a bad list says so instead of opening half the
         // house and then failing.
@@ -137,11 +148,23 @@ impl Rooms {
             rooms = %names.join(", "),
             "the rooms of the house (and one of their own for everybody)"
         );
+        // Everybody invited keeps every room they could already walk
+        // into. Rooms are given out from here on, but giving them out
+        // must not take one away from somebody who had it yesterday.
+        // Everything but the lobby: that one is nobody's to be given,
+        // and a row saying somebody may go where nobody can be refused
+        // is a row that can only ever be wrong.
+        match people.grant_everyone(&wanted[1..]) {
+            Ok(true) => info!("everybody invited was given every room they could already go to"),
+            Ok(false) => {}
+            Err(err) => bail!("hand out the rooms people already had: {err:#}"),
+        }
         let (news, _) = broadcast::channel(16);
         let rooms = Arc::new(Self {
             shared,
             own: Mutex::new(BTreeMap::new()),
             make,
+            people: Mutex::new(people),
             agent_name: base.bot().name.clone(),
             news,
         });
@@ -168,13 +191,101 @@ impl Rooms {
         self.shared[0].clone()
     }
 
-    /// The room called `id`, if `who` may be in it -- which is every
-    /// shared room, and the one of their own. Somebody's own room is
-    /// built here, the first time they ask for it. None is a room that
-    /// isn't there, or is somebody else's.
+    /// Whether `who` may go to the shared room called `id`.
+    ///
+    /// Everybody has the lobby, because a room nobody can be refused is
+    /// what calling in is for, and the owner has the house. Every other
+    /// room is given out one person at a time. A room of your own is
+    /// not asked about here: it is yours because it is yours, and the
+    /// owner has no key to it either -- "just you and Vox" is a promise
+    /// the room makes on its face, and an owner who could walk into it
+    /// would make that a lie.
+    fn may_enter(&self, who: &Invited, id: &str) -> bool {
+        if who.owner || id == self.shared[0].config().id {
+            return true;
+        }
+        match self.people().granted(&who.name, id) {
+            Ok(ok) => ok,
+            Err(err) => {
+                // A database that won't answer is not a key: nobody is
+                // let into a room on the strength of a failed question.
+                error!(person = %who.name, room = id, "whether they may come in: {err:#}");
+                false
+            }
+        }
+    }
+
+    fn people(&self) -> std::sync::MutexGuard<'_, Store> {
+        self.people.lock().expect("people mutex poisoned")
+    }
+
+    // -- the house's people, for the owner --------------------------------
+    //
+    // The invite list belongs to the house and not to any room in it, so
+    // this is where it is asked about and changed. Who is allowed to ask
+    // is [`crate::web`]'s business: these do what they are told.
+
+    /// Everybody invited, in name order.
+    pub fn everyone(&self) -> Result<Vec<Invited>> {
+        self.people().people()
+    }
+
+    /// Invite somebody, or hand back the link they have not used yet.
+    pub fn invite(&self, name: &str) -> Result<String> {
+        self.people().invite(name)
+    }
+
+    /// A fresh link for somebody already invited: the way back in after
+    /// a link goes astray. Their rooms, their name and the browsers
+    /// they are already in stay as they are -- cutting those is what
+    /// removing them is for.
+    pub fn relink(&self, name: &str) -> Result<String> {
+        let people = self.people();
+        if people.person(name)?.is_none() {
+            bail!("{name} isn't invited");
+        }
+        people.relink(name)
+    }
+
+    /// Revoke somebody: their link, their browsers and their rooms.
+    pub fn uninvite(&self, name: &str) -> Result<bool> {
+        self.people().uninvite(name)
+    }
+
+    /// Give somebody a room, or take it away.
+    pub fn set_grant(&self, name: &str, room: &str, allowed: bool) -> Result<bool> {
+        if !self.shared.iter().any(|r| r.config().id == room) {
+            bail!("there is no room called {room:?}");
+        }
+        if room == self.shared[0].config().id {
+            bail!("the lobby is everybody's; it isn't given out");
+        }
+        self.people().set_grant(name, room, allowed)
+    }
+
+    /// The rooms somebody has been given, the lobby and their own aside.
+    pub fn grants_of(&self, name: &str) -> Result<Vec<String>> {
+        self.people().grants(name)
+    }
+
+    /// The shared rooms, by id and title, in the order they were named.
+    /// The first is the lobby, which everybody has.
+    pub fn shared_rooms(&self) -> Vec<(String, String)> {
+        self.shared
+            .iter()
+            .map(|r| (r.config().id.clone(), r.config().title.clone()))
+            .collect()
+    }
+
+    /// The room called `id`, if `who` may be in it: the lobby, a room
+    /// they have been given, or the one of their own. Somebody's own
+    /// room is built here, the first time they ask for it. None is a
+    /// room that isn't there, is somebody else's, or is one they
+    /// haven't been given -- the three are one answer on purpose, so a
+    /// door nobody may open says no more than that it won't.
     pub fn find(self: &Arc<Self>, who: &Invited, id: &str) -> Option<Arc<Room>> {
         if let Some(r) = self.shared.iter().find(|r| r.config().id == id) {
-            return Some(r.clone());
+            return self.may_enter(who, id).then(|| r.clone());
         }
         if id != Self::own_id(&who.name) {
             return None;
@@ -250,19 +361,33 @@ impl Rooms {
             "here": here,
             "game": Value::Null,
         })];
-        rooms.extend(self.shared.iter().enumerate().map(|(n, r)| {
-            json!({
-                "id": r.config().id,
-                "title": r.config().title,
-                "path": self.path_of(n, r),
-                "private": false,
-                "here": r.here(),
-                // A room with a game on is doing something, and the
-                // people not in it may as well be told what.
-                "game": r.game_name(),
-            })
-        }));
-        json!({ "type": "rooms", "rooms": rooms })
+        rooms.extend(
+            self.shared
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| {
+                    // A room they haven't been given is not on the list. A
+                    // greyed-out room is a room to ask about, and the answer
+                    // would always be the same.
+                    self.may_enter(who, &r.config().id)
+                })
+                .map(|(n, r)| {
+                    json!({
+                        "id": r.config().id,
+                        "title": r.config().title,
+                        "path": self.path_of(n, r),
+                        "private": false,
+                        "here": r.here(),
+                        // A room with a game on is doing something, and the
+                        // people not in it may as well be told what.
+                        "game": r.game_name(),
+                    })
+                }),
+        );
+        // Whether they own the house goes with the list, because it is
+        // the same kind of thing: what this person may do, worked out
+        // for them and sent to their tabs alone.
+        json!({ "type": "rooms", "rooms": rooms, "owner": who.owner })
     }
 
     /// Where the `n`th shared room lives. The first is the lobby, and
@@ -414,8 +539,20 @@ mod tests {
     /// voices. Everything here is about which room you get, not what
     /// happens inside one.
     fn rooms(names: &[&str]) -> Arc<Rooms> {
+        rooms_for(names, |_| {})
+    }
+
+    /// Rooms, with a chance to say who is invited and what they have
+    /// been given before anything is built. The people store is its own
+    /// database here, as it is its own handle in the real thing.
+    fn rooms_for(names: &[&str], setup: impl Fn(&Store)) -> Arc<Rooms> {
         let names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+        let people = Store::memory();
+        people.invite("Ryan").unwrap();
+        people.invite("Alex").unwrap();
+        setup(&people);
         Rooms::new(
+            people,
             &base(),
             &names,
             Box::new(|cfg| {
@@ -434,18 +571,35 @@ mod tests {
         .unwrap()
     }
 
+    /// Two rooms, with both people given the second: the ordering and
+    /// the roster are what those tests are about, not who may come in.
+    fn both_given_the_studio() -> Arc<Rooms> {
+        rooms_for(&["Lounge", "Studio"], |p| {
+            p.set_grant("Ryan", "Studio", true).unwrap();
+            p.set_grant("Alex", "Studio", true).unwrap();
+        })
+    }
+
     fn who(name: &str) -> Invited {
         Invited {
             name: name.into(),
             display: name.into(),
             link: None,
             language: String::new(),
+            owner: false,
+        }
+    }
+
+    fn owner(name: &str) -> Invited {
+        Invited {
+            owner: true,
+            ..who(name)
         }
     }
 
     #[test]
     fn a_room_of_your_own_is_yours_and_nobodys_else() {
-        let rooms = rooms(&["Lounge", "Studio"]);
+        let rooms = both_given_the_studio();
         let ryan = who("Ryan");
         let alex = who("Alex");
 
@@ -468,7 +622,7 @@ mod tests {
 
     #[test]
     fn the_directory_shows_the_house_and_your_own_room_only() {
-        let rooms = rooms(&["Lounge", "Studio"]);
+        let rooms = both_given_the_studio();
         let ryan = who("Ryan");
         let alex = who("Alex");
         let ids = |d: &Value| {
@@ -507,6 +661,69 @@ mod tests {
         );
     }
 
+    /// Everybody has the lobby and the room of their own. Every other
+    /// room is one person at a time, and until it is given the room is
+    /// not on their list and not behind its address either -- a room
+    /// you may not go to is a room that isn't there, as far as the
+    /// server will say.
+    #[test]
+    fn a_room_is_given_out_one_person_at_a_time() {
+        let rooms = rooms(&["Lounge", "Studio"]);
+        let ryan = who("Ryan");
+        let ids = |who: &Invited| {
+            rooms.directory(who)["rooms"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["id"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+
+        assert!(
+            rooms.find(&ryan, "Lounge").is_some(),
+            "the lobby is everybody's"
+        );
+        assert!(rooms.find(&ryan, "@Ryan").is_some(), "and so is his own");
+        assert!(rooms.find(&ryan, "Studio").is_none(), "the Studio is not");
+        assert_eq!(ids(&ryan), ["@Ryan", "Lounge"], "nor is it on his list");
+
+        rooms.set_grant("Ryan", "Studio", true).unwrap();
+        assert!(rooms.find(&ryan, "Studio").is_some(), "given");
+        assert_eq!(ids(&ryan), ["@Ryan", "Lounge", "Studio"]);
+        assert_eq!(rooms.grants_of("Ryan").unwrap(), ["Studio"]);
+
+        // Taken away again, and he is out of it.
+        rooms.set_grant("Ryan", "Studio", false).unwrap();
+        assert!(rooms.find(&ryan, "Studio").is_none());
+        assert_eq!(ids(&ryan), ["@Ryan", "Lounge"]);
+
+        // The lobby is nobody's to give or take, and a room that isn't
+        // there can't be given either.
+        assert!(rooms.set_grant("Ryan", "Lounge", false).is_err());
+        assert!(rooms.set_grant("Ryan", "Cellar", true).is_err());
+        // Nor can somebody who was never invited be given a room.
+        assert!(rooms.set_grant("Nobody", "Studio", true).is_err());
+    }
+
+    /// The owner has the house: every shared room, without a grant for
+    /// any of them. Not somebody else's own room, though -- "just you
+    /// and Vox" is a promise the room makes on its face.
+    #[test]
+    fn the_owner_has_the_house_but_not_a_room_of_somebody_elses() {
+        let rooms = rooms(&["Lounge", "Studio"]);
+        let boss = owner("Ryan");
+        assert!(rooms.find(&boss, "Studio").is_some());
+        assert_eq!(rooms.grants_of("Ryan").unwrap(), Vec::<String>::new());
+        let ids: Vec<String> = rooms.directory(&boss)["rooms"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(ids, ["@Ryan", "Lounge", "Studio"]);
+        assert!(rooms.find(&boss, "@Alex").is_none(), "not hers");
+    }
+
     #[test]
     fn a_rooms_name_has_to_be_one_a_room_can_have() {
         assert_eq!(check_name("  Lounge ").unwrap(), "Lounge");
@@ -518,7 +735,13 @@ mod tests {
         assert!(check_name(&"x".repeat(NAME_MAX + 1)).is_err());
         // And two rooms cannot be the same room.
         let names = ["Lounge".to_string(), "lounge".to_string()];
-        assert!(Rooms::new(&base(), &names, Box::new(|_| unreachable!())).is_err());
-        assert!(Rooms::new(&base(), &[], Box::new(|_| unreachable!())).is_err());
+        assert!(Rooms::new(
+            Store::memory(),
+            &base(),
+            &names,
+            Box::new(|_| unreachable!())
+        )
+        .is_err());
+        assert!(Rooms::new(Store::memory(), &base(), &[], Box::new(|_| unreachable!())).is_err());
     }
 }

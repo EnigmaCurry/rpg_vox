@@ -90,6 +90,34 @@ releases.
 
 ### Voice room
 
+- **Somebody owns the room, and rooms are given out.** A house used to
+  be flat: anybody with a link could walk into any room in it. Now one
+  person **owns** it, made at the server with
+  `vox_room invite-owner NAME` -- there is one, and the way to a
+  different one is to uninvite the first. It is a command and not a
+  button because a house whose owner can be changed from a browser is a
+  house with a way in through its own front door.
+
+  The owner invites everybody else and says who may go where, from a
+  **People** page inside the room: a link to copy, a tick per room, a
+  fresh link for one gone astray, and removing somebody -- link,
+  browsers and rooms together. Nobody else is shown it, and nobody else
+  is answered when they ask the server for it: every one of those
+  endpoints asks who is asking and tells anybody else there is no such
+  thing.
+
+  Everybody has **the lobby** and **a room of their own**. Every other
+  room is given out one person at a time, and until it is given it is
+  neither on their list nor behind its address -- a room you may not go
+  to and a room that isn't there get the same answer, because which of
+  the two it is is not the asker's business. The owner has every room in
+  the house; nobody has anybody else's own room, the owner included,
+  because *Just you and Vox* is a promise the room makes on its face.
+
+  Upgrading a room that was already running: everybody invited keeps
+  every room they could already walk into, so the new rule takes nothing
+  from anybody. A database made after it starts empty, as it should.
+
 - **A footer you can reach for, and a settings page for the rest.** The
   foot of the room was a row of everything: the talk button, a push to
   talk box, the name of your microphone, a meter, a volume slider, then

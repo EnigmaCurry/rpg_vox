@@ -66,6 +66,50 @@ themselves in the room, and it stays theirs until they are uninvited.
 `vox_room invite NAME` again, after they have joined, is a second link —
 how somebody gets onto a second device, without disturbing the first.
 
+### Who owns the room
+
+One person **owns** the house, and they are made at the server:
+
+```bash
+vox_room invite-owner Ryan     # their link, and the only way to be one
+```
+
+The owner invites everybody else, hands out the rooms, and takes any of
+it back, from inside the room itself — see [People](#people). There is
+one, and the way to a different one is through the first:
+`vox_room uninvite Ryan`, then `invite-owner` somebody else. It is a
+command and not a button because it is the one thing nobody should be
+able to do by clicking the wrong row, and because a house whose owner
+can be changed from a browser is a house with a way in through its own
+front door. A room with no owner still works; what it hasn't got is
+anybody who can manage it from a browser.
+
+`vox_room people` marks the owner. Everybody else is just somebody
+invited: there are two kinds of person here and no more.
+
+### Who may go where
+
+- **A room of your own** is yours because it is yours. Nobody else can
+  ask for it, the owner included — *Just you and Vox* is a promise the
+  room makes on its face, and an owner with a key to it would make that
+  a lie.
+- **The lobby** — the first room named with `--room` — is everybody's.
+  Calling in has to land somewhere, and a room that could be refused is
+  not that somewhere.
+- **Every other room** is given out one person at a time, by the owner.
+  Until it is given, it is not on their list and not behind its address
+  either: the server says the same thing about a room you may not enter
+  as about a room that isn't there, because which of the two it is is
+  not the asker's business.
+- **The owner** has every room in the house without being given any.
+
+A room's grant is kept against the room's name, so renaming a room in
+`--room` starts it fresh — as it already does its conversation.
+
+Upgrading a room that was running before any of this: everybody invited
+keeps every room they could already walk into. Nothing is taken away by
+the new rule; the owner can take it away afterwards.
+
 ## More than one room
 
 One `vox_room` holds several rooms at once. Name the ones the house
@@ -615,6 +659,14 @@ See ROOM_DOCKER.md.
   coming in, and which microphone the browser gave the room. The room
   goes on running behind it: you are still in the audio, and the space
   bar still mutes or talks from there. **Done** or Escape comes back.
+- **People**, on the settings page and only for the owner: a page of
+  its own with everybody invited on it. Invite somebody and copy their
+  link, give and take away rooms with a tick, make somebody a fresh link
+  when theirs goes astray, or remove them — link, browsers and rooms
+  together. The owner's own row has no Remove on it: see [Who owns the
+  room](#who-owns-the-room). Nobody but the owner is shown any of this,
+  and nobody but the owner is answered when they ask the server for it
+  either.
 - **Mixer**: a level and mute for each person and each AI, shared
   by the whole room, hanging off the room you are in in the list on the
   left. **Your volume**, in the settings, is only yours. Space mutes
@@ -904,6 +956,7 @@ CHROME=$(which chromium) ./run.sh            # or: ./run.sh rooms bots
 | `rooms` | several rooms on one socket: where a tab lands, who may go where, a room of your own admitting one person, and the mix arriving across every move. No browser at all — two sockets are enough |
 | `bots` | two AIs in one room: a fader and an Answers setting each, each answering to its own name, and one pause going to exactly one of them |
 | `door` | the door is a page with no room behind it and no socket open; **Join Audio** does nothing until you agree to be recorded, and the Language box is never blank |
+| `roles` | the owner and the rest: who is shown the people and who is answered when they ask for them, a room given and taken away while somebody sits in the house, and an invite made from the page |
 | `settings` | the footer: one width for the talk button whatever it says, sharing and the way out on the other side, and the cog opening a page with everything that used to be strung along it |
 | `ptt` | push to talk: the space bar reaching the microphone from wherever the focus was left -- a button you clicked, the history panel, a mute -- and not reaching it in a text box or a dialog |
 | `permalinks` | `/`, `/lobby` and `/room/<id>`; back and forward move between rooms, a pasted address opens that room, a stale one is put right |

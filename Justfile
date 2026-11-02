@@ -1068,6 +1068,11 @@ room *ARGS:
 room-invite NAME:
     cargo run -p vox_room --release -- invite "{{NAME}}"
 
+# Make NAME the owner and print their link: they invite everybody else
+# and hand out the rooms from the room itself. There is one owner.
+room-invite-owner NAME:
+    cargo run -p vox_room --release -- invite-owner "{{NAME}}"
+
 # The room's web app with hot reload on :5173, against `just room`.
 room-ui:
     cd crates/vox_room/web && pnpm install && pnpm dev

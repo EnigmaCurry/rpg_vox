@@ -32,6 +32,12 @@ pub struct Store {
     room: String,
 }
 
+/// What `people.role` says of the one who invites everybody else. Every
+/// other row's role is empty: there is one kind of person in the room
+/// and one owner over it, and a column of mostly-empty strings is the
+/// honest shape of that.
+pub const OWNER: &str = "owner";
+
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS people (
     -- The key, and what `vox_room uninvite` names. It never changes.
@@ -47,7 +53,19 @@ CREATE TABLE IF NOT EXISTS people (
     -- as Qwen3-TTS wants it: Russian, not ru. Also set at the door.
     -- Empty: the room's own language. Kept against the name rather than
     -- the display name, so it survives their renaming themselves.
-    language TEXT NOT NULL DEFAULT ''
+    language TEXT NOT NULL DEFAULT '',
+    -- 'owner' or empty. The owner invites everybody else and says which
+    -- rooms they may go to; see `grants`.
+    role TEXT NOT NULL DEFAULT ''
+);
+-- A room somebody may go to. Everybody may go to their own room and to
+-- the lobby without a row here; every other room wants one, written by
+-- the owner. The room is named by its id, so renaming a room in the
+-- configuration starts it fresh -- as it already does its conversation.
+CREATE TABLE IF NOT EXISTS grants (
+    name TEXT NOT NULL,
+    room TEXT NOT NULL,
+    PRIMARY KEY (name, room)
 );
 -- A browser that pressed Join Audio: the cookie it was given, and whose
 -- invite it spent. One person may have several (another browser, another
@@ -177,6 +195,9 @@ pub struct Invited {
     /// ("Russian"). Empty until they choose one at the door, which means
     /// the room's own language.
     pub language: String,
+    /// Whether this is the owner: the one who invites everybody else and
+    /// says which rooms they may go to. There is at most one.
+    pub owner: bool,
 }
 
 impl Store {
@@ -187,6 +208,7 @@ impl Store {
         let db = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
         db.execute_batch(SCHEMA)?;
         migrate(&db)?;
+        indexes(&db)?;
         // Several rooms are several connections to the one file, and
         // `vox_room invite` is a whole other process writing to it.
         // Wait for a writer rather than failing the read.
@@ -202,6 +224,7 @@ impl Store {
         let db = Connection::open_in_memory().unwrap();
         db.execute_batch(SCHEMA).unwrap();
         migrate(&db).unwrap();
+        indexes(&db).unwrap();
         Self {
             db,
             room: String::new(),
@@ -262,14 +285,144 @@ impl Store {
         Ok(token)
     }
 
-    /// Revoke `name`: their link stops working, and so does every cookie
-    /// traded for one.
+    /// A fresh link for somebody already invited, whether or not the
+    /// one they have has been used. The browsers they are already in
+    /// keep working -- cutting those is what uninviting is for -- so
+    /// this is the way back in after a link goes astray, not a way to
+    /// put somebody out.
+    pub fn relink(&self, name: &str) -> Result<String> {
+        let token = uuid::Uuid::new_v4().simple().to_string();
+        let wrote = self.db.execute(
+            "UPDATE people SET token = ?2, used = 0 WHERE name = ?1",
+            params![name, token],
+        )?;
+        if wrote == 0 {
+            bail!("{name} isn't invited");
+        }
+        Ok(token)
+    }
+
+    /// Make `name` the owner and hand back their link. Err while
+    /// somebody else is the owner: there is one, and the way to a new
+    /// one is to uninvite the old.
+    ///
+    /// Run again for the same person it is just [`Store::invite`] --
+    /// the way back in after losing the link or the browser.
+    pub fn invite_owner(&self, name: &str) -> Result<String> {
+        if let Some(owner) = self.owner()? {
+            if owner != name {
+                bail!(
+                    "{owner} is the owner; `vox_room uninvite {owner}` first \
+                     if somebody else is to be"
+                );
+            }
+        }
+        let token = self.invite(name)?;
+        self.db.execute(
+            "UPDATE people SET role = ?2 WHERE name = ?1",
+            params![name, OWNER],
+        )?;
+        Ok(token)
+    }
+
+    /// Who the owner is, while there is one. A room with nobody invited
+    /// as owner is one nobody can manage from the browser -- which is
+    /// what `vox_room invite-owner` is for.
+    pub fn owner(&self) -> Result<Option<String>> {
+        Ok(self
+            .db
+            .query_row("SELECT name FROM people WHERE role = ?1", [OWNER], |r| {
+                r.get(0)
+            })
+            .optional()?)
+    }
+
+    /// Revoke `name`: their link stops working, so does every cookie
+    /// traded for one, and so does every room they were given.
     pub fn uninvite(&self, name: &str) -> Result<bool> {
         let tx = self.db.unchecked_transaction()?;
         let gone = tx.execute("DELETE FROM people WHERE name = ?1", [name])? > 0;
         tx.execute("DELETE FROM sessions WHERE name = ?1", [name])?;
+        tx.execute("DELETE FROM grants WHERE name = ?1", [name])?;
         tx.commit()?;
         Ok(gone)
+    }
+
+    /// The rooms `name` has been given, by room id. Their own room and
+    /// the lobby are not in here: everybody has those, and a row for
+    /// something nobody can be refused is a row that can go wrong.
+    pub fn grants(&self, name: &str) -> Result<Vec<String>> {
+        let mut q = self
+            .db
+            .prepare("SELECT room FROM grants WHERE name = ?1 ORDER BY room")?;
+        let rooms = q
+            .query_map([name], |r| r.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        Ok(rooms)
+    }
+
+    /// Whether `name` has been given `room`.
+    pub fn granted(&self, name: &str, room: &str) -> Result<bool> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT 1 FROM grants WHERE name = ?1 AND room = ?2",
+                params![name, room],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// Give `name` a room, or take it away. Writing a grant for
+    /// somebody who was never invited is refused: a grant is part of an
+    /// account, not a thing standing on its own.
+    pub fn set_grant(&self, name: &str, room: &str, allowed: bool) -> Result<bool> {
+        if !allowed {
+            return Ok(self.db.execute(
+                "DELETE FROM grants WHERE name = ?1 AND room = ?2",
+                params![name, room],
+            )? > 0);
+        }
+        if self.person(name)?.is_none() {
+            bail!("{name} isn't invited");
+        }
+        Ok(self.db.execute(
+            "INSERT OR IGNORE INTO grants (name, room) VALUES (?1, ?2)",
+            params![name, room],
+        )? > 0)
+    }
+
+    /// Give everybody invited every one of `rooms`, for the one-time
+    /// move to a house where rooms are given out: before it, anybody
+    /// invited could walk into any room, and nobody is to lose one they
+    /// already had. The lobby is not among them -- everybody has that
+    /// without a row. Does nothing the second time it is asked.
+    pub fn grant_everyone(&self, rooms: &[String]) -> Result<bool> {
+        // Owed only by a database that was written before rooms were
+        // given out; see `migrate`. Asked on every start, and does
+        // something exactly once.
+        if self.global("schema.grants")?.as_deref() != Some("owed") {
+            return Ok(false);
+        }
+        let tx = self.db.unchecked_transaction()?;
+        {
+            let mut q = tx.prepare("SELECT name FROM people")?;
+            let names = q
+                .query_map([], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<String>>>()?;
+            for name in &names {
+                for room in rooms {
+                    tx.execute(
+                        "INSERT OR IGNORE INTO grants (name, room) VALUES (?1, ?2)",
+                        params![name, room],
+                    )?;
+                }
+            }
+        }
+        tx.commit()?;
+        self.set_global("schema.grants", "done")?;
+        Ok(true)
     }
 
     /// Who this browser's cookie belongs to.
@@ -277,7 +430,7 @@ impl Store {
         Ok(self
             .db
             .query_row(
-                "SELECT p.name, p.display, p.token, p.used, p.language FROM sessions s
+                "SELECT p.name, p.display, p.token, p.used, p.language, p.role FROM sessions s
                  JOIN people p ON p.name = s.name WHERE s.id = ?1",
                 [id],
                 invited_row,
@@ -300,7 +453,7 @@ impl Store {
         Ok(self
             .db
             .query_row(
-                "SELECT name, display, token, used, language FROM people
+                "SELECT name, display, token, used, language, role FROM people
                  WHERE token = ?1 AND used = 0",
                 [token],
                 invited_row,
@@ -323,7 +476,7 @@ impl Store {
             return Ok(None);
         }
         let invited: Invited = tx.query_row(
-            "SELECT name, display, token, used, language FROM people WHERE token = ?1",
+            "SELECT name, display, token, used, language, role FROM people WHERE token = ?1",
             [token],
             invited_row,
         )?;
@@ -374,7 +527,7 @@ impl Store {
         Ok(self
             .db
             .query_row(
-                "SELECT name, display, token, used, language FROM people WHERE name = ?1",
+                "SELECT name, display, token, used, language, role FROM people WHERE name = ?1",
                 [name],
                 invited_row,
             )
@@ -382,9 +535,9 @@ impl Store {
     }
 
     pub fn people(&self) -> Result<Vec<Invited>> {
-        let mut q = self
-            .db
-            .prepare("SELECT name, display, token, used, language FROM people ORDER BY name")?;
+        let mut q = self.db.prepare(
+            "SELECT name, display, token, used, language, role FROM people ORDER BY name",
+        )?;
         let rows = q.query_map([], invited_row)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
@@ -818,6 +971,7 @@ fn invited_row(r: &rusqlite::Row) -> rusqlite::Result<Invited> {
     let token: String = r.get(2)?;
     let used: i64 = r.get(3)?;
     let language: String = r.get(4)?;
+    let role: String = r.get(5)?;
     Ok(Invited {
         // A row from before display names had their own column, or one
         // written by hand: the name is the name.
@@ -827,6 +981,7 @@ fn invited_row(r: &rusqlite::Row) -> rusqlite::Result<Invited> {
             display
         },
         name,
+        owner: role == OWNER,
         link: (used == 0).then_some(token),
         language,
     })
@@ -847,6 +1002,18 @@ fn game_row(r: &rusqlite::Row) -> rusqlite::Result<Game> {
 
 fn json(settings: &GameSettings) -> String {
     serde_json::to_string(settings).unwrap_or_else(|_| "{}".into())
+}
+
+/// Indexes, after [`migrate`] rather than in `SCHEMA`: one of them is on
+/// a column an older database only gains there, and a schema that runs
+/// first cannot mention it.
+fn indexes(db: &Connection) -> Result<()> {
+    // One owner, and the database says so rather than the code
+    // remembering to: a second one cannot be written at all.
+    db.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS people_one_owner ON people (role) WHERE role = 'owner';",
+    )?;
+    Ok(())
 }
 
 /// Columns added after the first release. `CREATE TABLE IF NOT EXISTS`
@@ -875,6 +1042,24 @@ fn migrate(db: &Connection) -> Result<()> {
     }
     if !has_column(db, "people", "language")? {
         db.execute_batch("ALTER TABLE people ADD COLUMN language TEXT NOT NULL DEFAULT ''")?;
+    }
+    // A room used to have one kind of person in it, and anybody invited
+    // could walk into any of its rooms. Everyone is
+    // left roleless, so a house that has not been given an owner has
+    // none -- which is what `vox_room invite-owner` is for. The index
+    // that keeps there being one is made in `indexes`, after this.
+    if !has_column(db, "people", "role")? {
+        db.execute_batch("ALTER TABLE people ADD COLUMN role TEXT NOT NULL DEFAULT ''")?;
+        // Everybody already invited could walk into every room, and
+        // none of them is to lose one. Which rooms there are is the
+        // configuration's to say and not the database's, so the handing
+        // out happens when the house opens; this is the note that it is
+        // owed. A database made today owes nobody anything -- it has
+        // never had a room that was not given out.
+        db.execute(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES ('schema.grants', 'owed')",
+            [],
+        )?;
     }
     // Everything written before typing was possible was said out loud.
     if !has_column(db, "entries", "typed")? {
@@ -930,6 +1115,148 @@ mod tests {
 
     fn plain() -> GameSettings {
         GameSettings::default()
+    }
+
+    /// One owner, and the way to another is through the first.
+    #[test]
+    fn there_is_one_owner_and_you_go_through_them_to_make_another() {
+        let s = Store::memory();
+        assert_eq!(s.owner().unwrap(), None, "a house nobody owns");
+
+        let link = s.invite_owner("Ryan").unwrap();
+        assert_eq!(s.owner().unwrap().as_deref(), Some("Ryan"));
+        assert!(s.person("Ryan").unwrap().unwrap().owner);
+        // It is an ordinary invite besides, and the one it hands back
+        // is the one at the door.
+        assert_eq!(s.live_invite(&link).unwrap().unwrap().name, "Ryan");
+        assert!(s.live_invite(&link).unwrap().unwrap().owner);
+
+        // Somebody else cannot be made one while Ryan is.
+        let err = s.invite_owner("Alex").unwrap_err().to_string();
+        assert!(err.contains("Ryan is the owner"), "{err}");
+        assert!(err.contains("uninvite Ryan"), "it says what to do: {err}");
+        assert_eq!(s.owner().unwrap().as_deref(), Some("Ryan"));
+        assert!(
+            s.person("Alex").unwrap().is_none(),
+            "and nothing was written"
+        );
+
+        // Asking again for the same person is the way back in after a
+        // lost link, and leaves them the owner.
+        s.claim_invite(&link).unwrap().unwrap();
+        let again = s.invite_owner("Ryan").unwrap();
+        assert_ne!(again, link, "the spent one stays spent");
+        assert_eq!(s.owner().unwrap().as_deref(), Some("Ryan"));
+
+        // Uninviting the owner leaves the house without one, and then
+        // anybody may be made it.
+        assert!(s.uninvite("Ryan").unwrap());
+        assert_eq!(s.owner().unwrap(), None);
+        s.invite_owner("Alex").unwrap();
+        assert_eq!(s.owner().unwrap().as_deref(), Some("Alex"));
+    }
+
+    /// A room given to somebody, and what happens to it when they go.
+    #[test]
+    fn a_room_given_to_somebody_goes_when_they_do() {
+        let s = Store::memory();
+        s.invite("Ryan").unwrap();
+        assert_eq!(s.grants("Ryan").unwrap(), Vec::<String>::new());
+        assert!(!s.granted("Ryan", "Studio").unwrap());
+
+        assert!(s.set_grant("Ryan", "Studio", true).unwrap());
+        assert!(
+            !s.set_grant("Ryan", "Studio", true).unwrap(),
+            "already had it"
+        );
+        assert!(s.granted("Ryan", "Studio").unwrap());
+        assert_eq!(s.grants("Ryan").unwrap(), ["Studio"]);
+
+        // Nobody who was never invited gets one: a grant is part of an
+        // account rather than a thing of its own.
+        assert!(s.set_grant("Nobody", "Studio", true).is_err());
+
+        // And uninviting takes the rooms with the link and the cookies.
+        assert!(s.uninvite("Ryan").unwrap());
+        assert_eq!(s.grants("Ryan").unwrap(), Vec::<String>::new());
+        s.invite("Ryan").unwrap();
+        assert!(
+            !s.granted("Ryan", "Studio").unwrap(),
+            "and they don't come back"
+        );
+    }
+
+    /// Upgrading a house that had no rooms to give: everybody invited
+    /// keeps everything they could already walk into. A database made
+    /// today owes nobody anything.
+    #[test]
+    fn nobody_loses_a_room_they_already_had() {
+        // `people` as it was before roles, which is the shape that says
+        // this database is older than the rule.
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE people (
+                 name TEXT PRIMARY KEY,
+                 token TEXT NOT NULL UNIQUE,
+                 used INTEGER NOT NULL DEFAULT 0,
+                 display TEXT NOT NULL DEFAULT '',
+                 language TEXT NOT NULL DEFAULT ''
+             );
+             INSERT INTO people (name, token, used, display)
+                 VALUES ('Ryan', 'a', 1, 'Ryan'), ('Alex', 'b', 1, 'Alex');",
+        )
+        .unwrap();
+        db.execute_batch(SCHEMA).unwrap();
+        migrate(&db).unwrap();
+        indexes(&db).unwrap();
+        let s = Store {
+            db,
+            room: String::new(),
+        };
+
+        let rooms = ["Studio".to_string(), "Cellar".to_string()];
+        assert!(s.grant_everyone(&rooms).unwrap(), "owed");
+        assert_eq!(s.grants("Ryan").unwrap(), ["Cellar", "Studio"]);
+        assert_eq!(s.grants("Alex").unwrap(), ["Cellar", "Studio"]);
+
+        // Once, however many times the house opens -- so a room taken
+        // away stays taken away.
+        assert!(s.set_grant("Alex", "Cellar", false).unwrap());
+        assert!(!s.grant_everyone(&rooms).unwrap());
+        assert_eq!(s.grants("Alex").unwrap(), ["Studio"]);
+
+        // And somebody invited after the move starts with nothing: the
+        // handout was for the people who were already there.
+        s.invite("Sam").unwrap();
+        assert_eq!(s.grants("Sam").unwrap(), Vec::<String>::new());
+    }
+
+    /// A database made today has never had a room that was not given
+    /// out, so there is nothing to hand out in it.
+    #[test]
+    fn a_new_house_hands_out_nothing() {
+        let s = Store::memory();
+        s.invite("Ryan").unwrap();
+        assert!(!s.grant_everyone(&["Studio".to_string()]).unwrap());
+        assert_eq!(s.grants("Ryan").unwrap(), Vec::<String>::new());
+    }
+
+    /// A fresh link for somebody who has one: the way back in after it
+    /// goes astray, and not a way to put anybody out.
+    #[test]
+    fn a_new_link_leaves_the_browsers_they_are_already_in() {
+        let s = Store::memory();
+        let first = s.invite("Ryan").unwrap();
+        let (cookie, _) = s.claim_invite(&first).unwrap().unwrap();
+        let second = s.relink("Ryan").unwrap();
+        assert_ne!(second, first);
+        assert_eq!(s.live_invite(&second).unwrap().unwrap().name, "Ryan");
+        assert_eq!(
+            s.person_for_session(&cookie).unwrap().unwrap().name,
+            "Ryan",
+            "the browser they are in now is not cut off by a new link"
+        );
+        assert!(s.relink("Nobody").is_err());
     }
 
     #[test]
@@ -1239,6 +1566,7 @@ mod tests {
         .unwrap();
         db.execute_batch(SCHEMA).unwrap();
         migrate(&db).unwrap();
+        indexes(&db).unwrap();
         let s = Store {
             db,
             room: String::new(),

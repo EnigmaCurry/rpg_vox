@@ -7,6 +7,7 @@
   import Enter from './components/Enter.svelte';
   import Board from './components/Board.svelte';
   import Settings from './components/Settings.svelte';
+  import People from './components/People.svelte';
   import Rooms from './components/Rooms.svelte';
 
   // Narrow screens show one area at a time; wide ones show all three.
@@ -134,6 +135,10 @@
        is joined there is nothing behind it to see: the room is voice,
        and a conversation you can read but not hear is not being in it. -->
   <Enter />
+{:else if room.managing && room.owner}
+  <!-- The owner's page, and nobody else's: every endpoint behind it
+       asks who is asking, so this only decides what is shown. -->
+  <People />
 {:else if room.settings}
   <!-- A page, not a sheet: what is on it is set once and not watched,
        and the room goes on running behind it -- you are still in the

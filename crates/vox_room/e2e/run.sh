@@ -46,6 +46,8 @@ flags() {
             --model fake --llm-url http://127.0.0.1:1/v1
             --language English --language-also Russian --translate openai" ;;
     rooms)   echo "--room Main --room Studio --echo --no-stt --tts none" ;;
+    # Three rooms: the lobby everybody has, and two that are given out.
+    roles)   echo "--room Lobby --room Studio --room Cellar --echo --no-stt --tts none" ;;
     # A short back-and-forth: being named has one AI answering the next
     # pause as well, and this script is about which of them answers.
     bots)    echo "--room Lobby --bot Sage --echo --no-stt --tts none
@@ -59,6 +61,7 @@ guests() {
   case $1 in
     door) echo "Fresh Known En Ru Fr" ;;
     permalinks|ptt|settings) echo "Ryan" ;;
+    roles) echo "[Ryan] Alex" ;;
     *) echo "Ryan Alex" ;;
   esac
 }
@@ -72,7 +75,31 @@ one() {
   data=$(mktemp -d)
   export VOX_ROOM_DATA=$data VOX_ROOM_LISTEN=127.0.0.1:$port VOX_ROOM_URL=$base
 
-  for who in $(guests "$suite"); do links+=("$("$bin" invite "$who")"); done
+  # A name in [square brackets] is the owner, invited with the command
+  # that makes one: there is one owner and only the command line can
+  # say who it is, which is the thing the roles suite is about.
+  for who in $(guests "$suite"); do
+    if [[ $who == \[*\] ]]; then
+      links+=("$("$bin" invite-owner "${who:1:${#who}-2}" 2>/dev/null)")
+    else
+      links+=("$("$bin" invite "$who")")
+    fi
+  done
+
+  # Rooms are given out by the owner now. Every suite but `roles` is
+  # about something else and wants its people able to walk about the
+  # house, so they are given every room here -- which is what an owner
+  # would have done before any of these scripts ran.
+  if [[ $suite != roles ]]; then
+    local first=1 grant=""
+    for room in $(flags "$suite" | tr ' ' '\n' | grep -A1 -x -- --room | grep -vx -- --room | grep -v '^--$'); do
+      if [[ $first == 1 ]]; then first=0; continue; fi   # the lobby is everybody's
+      for who in $(guests "$suite"); do
+        grant+="INSERT OR IGNORE INTO grants (name, room) VALUES ('$who', '$room');"
+      done
+    done
+    [[ -n $grant ]] && sqlite_set "$data/room.db" "$grant"
+  fi
 
   # Alex reads in the room's second language, so there is somebody for
   # the interpreter to interpret to.
@@ -126,7 +153,7 @@ sqlite_get() { sqlite "$1" "$2"; }
 sqlite_set() { sqlite "$1" "$2" >/dev/null; }
 
 suites=("$@")
-[[ ${#suites[@]} -eq 0 ]] && suites=(rooms bots door permalinks ptt settings conversations game interpreter)
+[[ ${#suites[@]} -eq 0 ]] && suites=(rooms bots door permalinks ptt settings roles conversations game interpreter)
 
 bad=0
 for suite in "${suites[@]}"; do

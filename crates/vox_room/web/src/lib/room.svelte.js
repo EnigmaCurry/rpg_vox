@@ -158,6 +158,12 @@ export const room = $state({
   // browser gave the room to listen with. A view and not a setting, so
   // it is not written down -- a tab opens in the room.
   settings: false,
+  // The people page is open, which is the owner's and nobody else's.
+  managing: false,
+  // Whether this browser owns the house: it invites people and hands
+  // out the rooms. What it shows is all it decides -- the server asks
+  // again for itself on every one of those.
+  owner: false,
   // Push to talk: the mic stays muted except while Space (or the talk
   // button) is held.
   pushToTalk: readPref('vox_room.push_to_talk'),
@@ -260,6 +266,7 @@ export async function whoami() {
     // browser would have guessed.
     room.languages = d.languages ?? [];
     room.lang = myLanguage(room.languages, d.language ?? '');
+    room.owner = d.owner ?? false;
     return true;
   }
   // An invite spends nothing until Join Audio: see `enterOnInvite`.
@@ -377,6 +384,57 @@ export function nameConversation(conversation, title) {
 /// give things are better, which is why this is only the default — but
 /// a list of "Conversation, Conversation, Conversation" is no list at
 /// all, so there is always something here.
+// -- the house's people, which is the owner's business -----------------
+//
+// Nothing here decides anything: the server refuses anybody who isn't
+// the owner, and a page that hid these would still not be the thing
+// keeping them shut.
+
+/// Everybody invited, what they may do and where they may go. Null when
+/// the room won't say -- which is what it says to anybody but the owner.
+export async function loadPeople() {
+  const r = await fetch('/api/people');
+  if (!r.ok) return null;
+  return await r.json();
+}
+
+/// Invite somebody; returns their link, or throws with what the room
+/// said about the name.
+export async function invitePerson(name) {
+  return await asked('/api/people', { method: 'POST', body: { name } });
+}
+
+/// A fresh link for somebody already invited. The browsers they are in
+/// keep working: this is the way back in after a link goes astray, not
+/// a way to put anybody out.
+export async function relinkPerson(name) {
+  return await asked(`/api/people/${encodeURIComponent(name)}/link`, { method: 'POST' });
+}
+
+/// Remove somebody: their link, their browsers and their rooms.
+export async function uninvitePerson(name) {
+  return await asked(`/api/people/${encodeURIComponent(name)}`, { method: 'DELETE' });
+}
+
+/// Give somebody a room, or take it away.
+export async function setPersonRoom(name, roomId, allowed) {
+  return await asked(`/api/people/${encodeURIComponent(name)}/rooms`, {
+    method: 'POST',
+    body: { room: roomId, allowed },
+  });
+}
+
+/// One of the above, with what the room said when it refused.
+async function asked(url, { method, body }) {
+  const r = await fetch(url, {
+    method,
+    ...(body ? { headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) } : {}),
+  });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(d.error || r.statusText);
+  return d;
+}
+
 /// What to call the AIs in a sentence: one name, or every name with
 /// "or" before the last. The prose about "the AI" is written for one of
 /// them, and a room can have two.
@@ -638,6 +696,7 @@ function apply(ev) {
       break;
     }
     case 'rooms':
+      room.owner = ev.owner ?? false;
       room.rooms = ev.rooms;
       // The address the tab was opened at is where it wants to be, and
       // this is the first moment there is a list to look it up in. Once

@@ -81,6 +81,19 @@
     </p>
   </section>
 
+  {#if room.owner}
+    <section>
+      <h2>The house</h2>
+      <p class="note">
+        You own this room: you invite people, hand out the rooms, and can take any of it
+        back. Nobody else sees this.
+      </p>
+      <button class="primary manage" onclick={() => { room.settings = false; room.managing = true; }}>
+        People
+      </button>
+    </section>
+  {/if}
+
   <p class="note back">
     The room is still running: you are still in the audio, and <kbd>Space</kbd>
     still mutes or talks from here.
@@ -112,6 +125,7 @@
   .check small { margin-top: 2px; }
   .note { margin: 10px 0 0; }
   .back { text-align: center; }
+  .manage { margin-top: 10px; }
   .slider { display: flex; align-items: center; gap: 10px; font-size: 13px; margin: 0 0 10px; }
   .slider input[type='range'] { flex: 1; max-width: 18em; }
   .much { color: var(--muted); min-width: 3.5ch; text-align: right; }

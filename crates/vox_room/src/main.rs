@@ -220,6 +220,10 @@ struct Cli {
 enum Cmd {
     /// Print the one-time invite link for NAME, making one if needed.
     Invite { name: String },
+    /// Make NAME the owner and print their link. The owner invites
+    /// everybody else and says which rooms they may go to, from inside
+    /// the room. There is one; `uninvite` the old one first.
+    InviteOwner { name: String },
     /// Revoke NAME: their link and their browsers' cookies.
     Uninvite { name: String },
     /// List everyone invited, with the links not yet used.
@@ -428,13 +432,7 @@ fn main() -> Result<()> {
     let store = Store::open(&db)?;
     match &cli.command {
         Some(Cmd::Invite { name }) => {
-            let name = name.trim();
-            if name.is_empty() || name.starts_with('@') {
-                bail!("give the person a name");
-            }
-            if name.chars().count() > room::NAME_MAX {
-                bail!("names are at most {} characters", room::NAME_MAX);
-            }
+            let name = check_person_name(name)?;
             // A second link for somebody who has already traded one in
             // is a deliberate thing (another browser), so say so.
             if store.person(name)?.is_some_and(|p| p.link.is_none()) {
@@ -443,22 +441,46 @@ fn main() -> Result<()> {
             println!("{}/join/{}", base_url(&cli), store.invite(name)?);
             return Ok(());
         }
+        Some(Cmd::InviteOwner { name }) => {
+            let name = check_person_name(name)?;
+            // invite_owner refuses while somebody else is the owner,
+            // and says who to uninvite.
+            let token = store.invite_owner(name)?;
+            println!("{}/join/{token}", base_url(&cli));
+            eprintln!(
+                "{name} is the owner: they invite everybody else and say which rooms \
+                 people may go to, from the room itself."
+            );
+            return Ok(());
+        }
         Some(Cmd::Uninvite { name }) => {
+            let was_owner = store.owner()?.as_deref() == Some(name.as_str());
             if !store.uninvite(name)? {
                 bail!("{name} wasn't invited");
             }
             println!(
                 "{name}'s link and cookie are gone (an open tab stays connected until it reloads)"
             );
+            if was_owner {
+                eprintln!(
+                    "The room has no owner now: `vox_room invite-owner NAME` to give it one."
+                );
+            }
             return Ok(());
         }
         Some(Cmd::People) => {
+            if store.owner()?.is_none() {
+                eprintln!("Nobody owns this room: `vox_room invite-owner NAME` to give it one.");
+            }
             for p in store.people()? {
-                let who = if p.display == p.name {
+                let mut who = if p.display == p.name {
                     p.name.clone()
                 } else {
                     format!("{} (in the room as {})", p.name, p.display)
                 };
+                if p.owner {
+                    who.push_str(" [owner]");
+                }
                 match p.link {
                     Some(token) => println!("{who}\t{}/join/{token}", base_url(&cli)),
                     None => println!("{who}\tjoined; `vox_room invite {}` for a new link", p.name),
@@ -471,9 +493,32 @@ fn main() -> Result<()> {
     serve(cli, store, db)
 }
 
+/// A name somebody can be invited under: `vox_room uninvite` names it,
+/// and `@` opens a room of one's own.
+fn check_person_name(name: &str) -> Result<&str> {
+    let name = name.trim();
+    if name.is_empty() || name.starts_with('@') {
+        bail!("give the person a name");
+    }
+    if name.chars().count() > room::NAME_MAX {
+        bail!("names are at most {} characters", room::NAME_MAX);
+    }
+    Ok(name)
+}
+
 fn serve(cli: Cli, store: Store, db: PathBuf) -> Result<()> {
     if store.people()?.is_empty() {
         warn!("nobody is invited yet: run `vox_room invite NAME` for a link");
+    }
+    match store.owner()? {
+        Some(owner) => info!(%owner, "the owner invites people and hands out the rooms"),
+        // Everything still works; what is missing is the managing of it
+        // from a browser, and nothing else can be done about that from
+        // one -- which is the point of its being a command.
+        None => warn!(
+            "nobody owns this room: run `vox_room invite-owner NAME` to let somebody \
+             invite people and hand out rooms from the room itself"
+        ),
     }
     // A database written before there was more than one room: what was
     // the whole server's -- the conversation, the mode, the faders --
@@ -827,7 +872,10 @@ fn serve(cli: Cli, store: Store, db: PathBuf) -> Result<()> {
         })
     };
 
-    let rooms = rooms::Rooms::new(&base, &cli.rooms, make)?;
+    // The rooms' own handle on the invite list: who may go where is
+    // asked on the way into a room, and the answer is not any one
+    // room's to give.
+    let rooms = rooms::Rooms::new(Store::open(&db)?, &base, &cli.rooms, make)?;
     rooms.spawn_clocks()?;
 
     let rt = tokio::runtime::Runtime::new()?;

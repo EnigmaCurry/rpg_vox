@@ -60,7 +60,7 @@ use axum::{
     },
     http::{header, HeaderMap, StatusCode, Uri},
     response::{AppendHeaders, IntoResponse, Redirect, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use futures_util::{SinkExt as _, StreamExt as _};
@@ -121,6 +121,14 @@ pub fn router(rooms: Arc<Rooms>, screen: Arc<Screen>) -> Router {
         .route("/api/door/name", post(door_name))
         .route("/api/door/language", post(door_language))
         .route("/api/door/logout", post(door_logout))
+        // The house's people, which is the owner's business and
+        // nobody else's. Every one of these says so for itself: an
+        // endpoint that trusts the page not to have been asked is an
+        // endpoint anybody can ask with curl.
+        .route("/api/people", get(people).post(invite_person))
+        .route("/api/people/:name", delete(uninvite_person))
+        .route("/api/people/:name/link", post(relink_person))
+        .route("/api/people/:name/rooms", post(set_room))
         .route("/api/games/:name/prompt", get(game_prompt))
         .route("/api/rooms/:room/history", get(history))
         .route("/api/rooms/:room/history/:id", get(read_conversation))
@@ -228,6 +236,10 @@ async fn door(State(app): State<App>, headers: HeaderMap) -> Response {
             // And what they chose last time, which the room has and a
             // fresh tab does not: it beats this browser's own guess.
             "language": p.language,
+            // Whether this browser owns the house. The page uses it to
+            // decide what to show; every endpoint that matters asks
+            // again for itself.
+            "owner": p.owner,
         }))
         .into_response(),
         None => (
@@ -235,6 +247,180 @@ async fn door(State(app): State<App>, headers: HeaderMap) -> Response {
             Json(json!({ "state": "none", "error": "no invite" })),
         )
             .into_response(),
+    }
+}
+
+// -- the house's people, for the owner ---------------------------------
+//
+// The owner invites everybody else, hands out the rooms, and can take
+// any of it back. Everything below asks who this browser is first and
+// answers 404 to anybody who isn't them: not 403, because whether a
+// room has a people list is itself none of their business.
+
+/// This browser, if it belongs to the owner.
+fn owner(app: &App, headers: &HeaderMap) -> Option<Invited> {
+    invited(app, headers).filter(|p| p.owner)
+}
+
+/// What anybody but the owner is told about any of this.
+fn not_for_them() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({ "error": "no such thing" })),
+    )
+        .into_response()
+}
+
+fn said(err: anyhow::Error) -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({ "error": format!("{err:#}") })),
+    )
+        .into_response()
+}
+
+/// Everybody invited, what they may do and where they may go.
+async fn people(State(app): State<App>, headers: HeaderMap) -> Response {
+    let Some(me) = owner(&app, &headers) else {
+        return not_for_them();
+    };
+    let everyone = match app.rooms.everyone() {
+        Ok(p) => p,
+        Err(err) => return said(err),
+    };
+    let rooms = app.rooms.shared_rooms();
+    let mut out = Vec::new();
+    for p in everyone {
+        let grants = app.rooms.grants_of(&p.name).unwrap_or_default();
+        out.push(json!({
+            "name": p.name,
+            "display": p.display,
+            "owner": p.owner,
+            "language": p.language,
+            // The link while it is unspent, whole, because the page's
+            // one job with it is to be copied out of. Once it is spent
+            // there is nothing to show: a used link opens nothing.
+            "link": p.link.map(|t| format!("/join/{t}")),
+            "rooms": grants,
+        }));
+    }
+    Json(json!({
+        "you": me.name,
+        // The lobby first, as everywhere else. The page says that one
+        // is everybody's rather than offering it to be given.
+        "allRooms": rooms.iter().map(|(id, title)| json!({ "id": id, "title": title }))
+            .collect::<Vec<_>>(),
+        "lobby": rooms.first().map(|(id, _)| id.clone()),
+        "people": out,
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize)]
+struct NewPerson {
+    name: String,
+}
+
+/// Invite somebody, and hand their link back to be copied.
+async fn invite_person(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(body): Json<NewPerson>,
+) -> Response {
+    if owner(&app, &headers).is_none() {
+        return not_for_them();
+    }
+    let name = body.name.trim();
+    if name.is_empty() || name.starts_with('@') {
+        return said(anyhow::anyhow!("give the person a name"));
+    }
+    if name.chars().count() > crate::room::NAME_MAX {
+        return said(anyhow::anyhow!(
+            "names are at most {} characters",
+            crate::room::NAME_MAX
+        ));
+    }
+    match app.rooms.invite(name) {
+        Ok(token) => {
+            info!(person = %name, "the owner invited somebody");
+            app.rooms.catch_up();
+            Json(json!({ "name": name, "link": format!("/join/{token}") })).into_response()
+        }
+        Err(err) => said(err),
+    }
+}
+
+/// A fresh link for somebody already invited.
+async fn relink_person(
+    State(app): State<App>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if owner(&app, &headers).is_none() {
+        return not_for_them();
+    }
+    match app.rooms.relink(&name) {
+        Ok(token) => {
+            info!(person = %name, "the owner made them a new link");
+            Json(json!({ "name": name, "link": format!("/join/{token}") })).into_response()
+        }
+        Err(err) => said(err),
+    }
+}
+
+/// Remove somebody: their link, their browsers and their rooms.
+async fn uninvite_person(
+    State(app): State<App>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(me) = owner(&app, &headers) else {
+        return not_for_them();
+    };
+    if me.name == name {
+        // Removing yourself from here would leave a house nobody can
+        // manage and no way back into it from a browser. The command
+        // line is where an owner is changed, on purpose.
+        return said(anyhow::anyhow!(
+            "you are the owner; `vox_room uninvite {name}` at the server if you mean to go"
+        ));
+    }
+    match app.rooms.uninvite(&name) {
+        Ok(true) => {
+            info!(person = %name, "the owner removed somebody");
+            app.rooms.catch_up();
+            Json(json!({ "gone": name })).into_response()
+        }
+        Ok(false) => said(anyhow::anyhow!("{name} isn't invited")),
+        Err(err) => said(err),
+    }
+}
+
+#[derive(Deserialize)]
+struct RoomFor {
+    room: String,
+    allowed: bool,
+}
+
+/// Give somebody a room, or take it away.
+async fn set_room(
+    State(app): State<App>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<RoomFor>,
+) -> Response {
+    if owner(&app, &headers).is_none() {
+        return not_for_them();
+    }
+    match app.rooms.set_grant(&name, &body.room, body.allowed) {
+        Ok(_) => {
+            info!(person = %name, room = %body.room, allowed = body.allowed, "the owner said who may go where");
+            // Whoever it was sees the room appear or go from their list
+            // at once, wherever they are sitting.
+            app.rooms.announce();
+            Json(json!({ "rooms": app.rooms.grants_of(&name).unwrap_or_default() })).into_response()
+        }
+        Err(err) => said(err),
     }
 }
 

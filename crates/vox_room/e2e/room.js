@@ -172,7 +172,7 @@ async function socket(token, base = BASE) {
   const cookie = await cookieFor(token, base);
   const ws = new WebSocket(`${base.replace('http', 'ws')}/room.ws`, { headers: { cookie } });
   ws.binaryType = 'arraybuffer';
-  const p = { ws, rooms: [], notices: [], frames: 0, seen: '', people: [], said: [] };
+  const p = { ws, cookie, rooms: [], notices: [], frames: 0, seen: '', people: [], said: [] };
   p.send = (m) => ws.send(JSON.stringify(m));
   ws.onmessage = (ev) => {
     if (typeof ev.data !== 'string') {
