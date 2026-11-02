@@ -45,7 +45,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use vox_transcribe::{Paragraph, ParagraphMode, Pusher, Stage};
 
 use crate::mixer::{Mixer, Strip, TrackProgress, AGENT_STRIP, RATE};
@@ -253,8 +253,10 @@ impl Cue {
 struct Pending {
     /// Who is to be given the turn.
     bot: String,
-    /// Not before this.
-    due: Instant,
+    /// Not before this, when it is waiting on a clock. None is a turn
+    /// with no time of its own: it wants the next moment the room has,
+    /// and the moment is all it is waiting for.
+    due: Option<Instant>,
     /// What kind of turn it is, and what the bot is told about it.
     cue: Cue,
     /// What it is waiting for, which decides what it does when its
@@ -2051,7 +2053,7 @@ impl Room {
             };
             st.pending.push(Pending {
                 bot: bot.clone(),
-                due: Instant::now() + Duration::from_secs(s),
+                due: Some(Instant::now() + Duration::from_secs(s)),
                 cue,
                 why: Why::Silence,
             });
@@ -2089,7 +2091,7 @@ impl Room {
             if silenced.contains(&p.bot) {
                 return false;
             }
-            if now < p.due {
+            if p.due.is_some_and(|at| now < at) {
                 return true;
             }
             if !quiet && p.why == Why::Handed {
@@ -2130,12 +2132,20 @@ impl Room {
         else {
             return Err(format!("there is nobody here called {to:?}"));
         };
-        if bot == from {
+        self.queue_handoff(&mut st, &from, &bot)?;
+        Ok(bot)
+    }
+
+    /// Put `to` in the queue to answer `from`, or say why not. Both
+    /// ways of handing the turn on come through here, so they share one
+    /// set of answers and one allowance.
+    fn queue_handoff(&self, st: &mut State, from: &str, to: &str) -> Result<(), String> {
+        if to == from {
             return Err("that is you; say it yourself".into());
         }
-        if st.bot(&bot).mode == Mode::Never {
+        if st.bot(to).mode == Mode::Never {
             return Err(format!(
-                "{bot} is set to say nothing at all in this room, so there is \
+                "{to} is set to say nothing at all in this room, so there is \
                  no handing it anything: answer yourself, or leave it"
             ));
         }
@@ -2151,14 +2161,16 @@ impl Room {
             return Err("the turn has already been handed on".into());
         }
         st.ai_turns += 1;
-        info!(from = %from, to = %bot, round = st.ai_turns, "handing the turn on");
+        info!(from, to, round = st.ai_turns, "handing the turn on");
         st.pending.push(Pending {
-            bot: bot.clone(),
-            due: Instant::now(),
-            cue: Cue::Handed { from },
+            bot: to.to_string(),
+            due: None,
+            cue: Cue::Handed {
+                from: from.to_string(),
+            },
             why: Why::Handed,
         });
-        Ok(bot)
+        Ok(())
     }
 
     /// A saved game and its prompt, for someone who asks to see it.
@@ -3903,7 +3915,7 @@ impl Room {
             || translations
                 .iter()
                 .any(|(l, t)| e.translations.get(l) != Some(t));
-        e.text = text;
+        e.text = text.clone();
         for (language, said) in translations {
             if said.is_empty() {
                 continue;
@@ -3953,6 +3965,35 @@ impl Room {
                     self.begin_game(st, game);
                 }
             }
+            // It said another voice's name, so that voice is given the
+            // turn -- the same rule as a person saying it, which is the
+            // only rule the room has ever had about who is being talked
+            // to. `hand_to` is the deliberate way to do this; saying
+            // the name is the way it actually happens, since a bot
+            // greeting another one has already said everything the room
+            // needs to know. A name in passing gets the other one a
+            // turn it can hand straight back (`Cue::Handed` may be
+            // declined, and a declined turn leaves nothing behind), so
+            // the cost of reading it that way is one quiet turn.
+            self.hand_on_named(st, bot, &text);
+        }
+    }
+
+    /// Hand the turn to a voice this one named, if it named one.
+    ///
+    /// Quiet about everything it refuses: this is a reading of what a
+    /// bot happened to say, not a thing it asked for, and the model is
+    /// not waiting on an answer.
+    fn hand_on_named(&self, st: &mut State, from: &str, said: &str) {
+        if said.trim().is_empty() {
+            return;
+        }
+        let Some(to) = self.named(st, said).into_iter().find(|name| name != from) else {
+            return;
+        };
+        match self.queue_handoff(st, from, &to) {
+            Ok(()) => info!(from, to = %to, "named another voice: handing the turn on"),
+            Err(why) => debug!(from, to = %to, "not handing the turn on: {why}"),
         }
     }
 
@@ -4014,14 +4055,14 @@ impl Room {
                 Stops::Finished => b.talked_over = true,
             }
         }
-        // A voice in the room takes it back from whatever was waiting
-        // to be given out: a bot about to be handed the turn is about
-        // to answer the thing this person is talking over.
-        st.pending.clear();
         if !cut.is_empty() {
             info!(person = %who, bots = %cut.join(", "), "barge-in");
             self.hush(st, &cut);
         }
+        // A voice in the room takes it back from whatever was waiting
+        // to be given out: a bot about to be handed the turn is about
+        // to answer the thing this person is talking over.
+        st.pending.clear();
         // Anything still speaking stays stepped back while they talk.
         // `cut_reply` lets the duck go, so a room where one bot was cut
         // and another is finishing is also where it is taken back.
@@ -4035,13 +4076,14 @@ impl Room {
     /// A reply nobody wants to hear the end of is every reply, so this
     /// takes no view about which bot was talking.
     fn interrupt(&self, st: &mut State) {
+        let bots: Vec<String> = st.bots.iter().map(|b| b.cfg.name.clone()).collect();
+        self.hush(st, &bots);
         // Stop is the room saying stop: a turn one voice was about to
         // hand to another is part of what it was saying and stops with
         // it, and a silence somebody asked to be shown again is about
-        // a quiet that is over either way.
+        // a quiet that is over either way. After the cut, since a reply
+        // that ended as the room was stopped hands on as it closes.
         st.pending.clear();
-        let bots: Vec<String> = st.bots.iter().map(|b| b.cfg.name.clone()).collect();
-        self.hush(st, &bots);
     }
 
     /// Cut these bots' replies where the mixer has got to, and leave
@@ -6471,6 +6513,62 @@ mod tests {
         let vox = turns["Vox"].try_recv().expect("a pause of their own");
         turns["Sage"].try_recv().expect("both of them");
         assert_eq!(vox.hand_on, 2, "a person in it is what keeps it going");
+    }
+
+    /// Saying the other voice's name is the handing over. "Say hi to
+    /// Vortex Prime" is a thing people ask for, and the hello that came
+    /// back used to reach nobody: a name out of a bot's mouth was the
+    /// one kind of address the room didn't hear.
+    #[test]
+    fn saying_the_other_ones_name_hands_it_the_turn() {
+        let (r, turns) = room_of_two();
+        r.on_paragraph("Ryan", &para("p1", "Sage, say hi to Vox.", false));
+        r.tick(quiet(&r));
+        let sage = turns["Sage"].try_recv().expect("Sage was asked");
+        turns["Vox"]
+            .try_recv()
+            .expect("and Vox was given the pause too");
+        assert!(r.agent_speak(sage.generation, "Hi, Vox!", vec![0.1; 4800]));
+        r.agent_done(sage.generation);
+
+        // Nothing until it has been heard out, and then the turn is
+        // Vox's -- the same cue as a deliberate hand_to, which it may
+        // still hand straight back.
+        r.tick(Instant::now());
+        assert!(
+            turns["Vox"].try_recv().is_err(),
+            "not while Sage is talking"
+        );
+        for _ in 0..20 {
+            r.mixer.tick();
+        }
+        r.tick(Instant::now());
+        let vox = turns["Vox"].try_recv().expect("named, so given the turn");
+        assert_eq!(
+            vox.cue,
+            Cue::Handed {
+                from: "Sage".into()
+            }
+        );
+        assert!(vox.cue.deciding(), "and it can hand it straight back");
+    }
+
+    #[test]
+    fn a_bot_saying_its_own_name_hands_itself_nothing() {
+        let (r, turns) = room_of_two();
+        r.on_paragraph("Ryan", &para("p1", "Who are you?", false));
+        r.tick(quiet(&r));
+        let sage = turns["Sage"].try_recv().unwrap();
+        turns["Vox"].try_recv().unwrap();
+        assert!(r.agent_speak(sage.generation, "I'm Sage.", vec![0.1; 4800]));
+        r.agent_done(sage.generation);
+        for _ in 0..20 {
+            r.mixer.tick();
+        }
+        r.tick(Instant::now());
+        assert!(r.lock().pending.is_empty());
+        assert!(turns["Sage"].try_recv().is_err());
+        assert!(turns["Vox"].try_recv().is_err());
     }
 
     #[test]

@@ -93,12 +93,22 @@ releases.
 - **And they can put something to each other.** Seeing each other was
   half of it: a voice could refer to what another had said, but only a
   person could ever cause one to speak, so "say hi to Vortex Prime"
-  got a hello that Vortex Prime never answered. `hand_to` is the other
-  half -- a bot puts something to another voice and hands it the turn,
-  and the room gives that one the turn as soon as the first has been
-  heard out, exactly as though a person had said its name. That is
-  what makes a conversation of three rather than two people taking
+  got a hello that Vortex Prime never answered.
+
+  **A name is somebody being addressed, whichever mouth it came out
+  of.** A bot that finishes a reply naming another voice in the room
+  hands that voice the turn, which is the rule the room has always had
+  about who is being talked to -- it had only ever been applied to
+  people. `hand_to` does it deliberately as well, for a bot that wants
+  the next turn to be somebody else's without naming them aloud. That
+  is what makes a conversation of three rather than two people taking
   turns with one AI.
+
+  A name in passing hands over too, and that is the design rather than
+  a tolerated miss: the turn it hands over is one the other bot can
+  give straight back, and a turn given back leaves nothing at all. The
+  cost of reading a mention as an address is one quiet turn. The cost
+  of not reading it that way is the hello nobody answered.
 
   What keeps it from being two AIs talking while the people watch is
   `--ai-turns` (default 2): replies they may give each other with

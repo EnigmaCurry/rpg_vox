@@ -131,8 +131,8 @@ have plainly turned to each other. ";
 /// having been asked, and that is the thing that turns two AIs into a
 /// conversation nobody is in.
 const HANDED: &str = "\
-({from} has just handed you the turn: what was put to you is in the lines \
-above, and the room is waiting for your answer. Answer it in your own voice, \
+({from} has put something to you and the room has given you the turn: it is \
+in the lines above, and the room is waiting for your answer. Answer it in your own voice, \
 to the room -- the people are in this conversation, so say it to them as much \
 as to {from}, and don't simply agree to be agreeable. If you have nothing to \
 add, call stay_quiet and let the people have the pause rather than saying \
@@ -192,15 +192,17 @@ const OTHER_NOTE: &str = "\
 {other} is in this room with you: an AI voice like you, not a person. You see \
 what {other} says in the transcript with the name on it, the way you see what \
 a person says, and {other} sees yours the same way. The room gives the turn \
-to one of you at a time, so when {other} has answered something, it is \
-answered: don't say it again, and don't speak for {other}. You can put \
-something to {other} and hand over the turn with hand_to -- ask what {other} \
-makes of it, or ask {other} to take this one -- and the room will give \
-{other} the turn when you have finished speaking. Do that when you actually \
-want the answer, not to be polite, and remember the people are in this \
-conversation too: it is three of you talking, not two of you talking while \
-they listen. The room only allows a couple of replies between you with \
-nobody else saying anything, and the people reset that by joining in.";
+to one of you at a time, and **saying {other}'s name hands the turn over** -- \
+the room gives {other} the turn as soon as you have finished speaking, which \
+is the same thing that happens when a person says a name. So address {other} \
+by name when you want an answer from {other}, and leave the name out when you \
+only mean to mention {other} in passing. hand_to does it deliberately, for \
+when you want {other} to take the next turn without naming {other} in what \
+you say. When {other} has already answered something it is answered: don't \
+say it again, and don't speak for {other}. And the people are in this \
+conversation, not watching it -- the room allows only a couple of replies \
+between the two of you with nobody else saying anything, and the people reset \
+that by joining in.";
 
 /// The same, in a room with more than one other AI in it. `{others}` is
 /// who they are.
@@ -208,15 +210,17 @@ const OTHERS_NOTE: &str = "\
 {others} are in this room with you: AI voices like you, not people. You see \
 what they say in the transcript with their name on it, the way you see what a \
 person says, and they see yours the same way. The room gives the turn to one \
-of you at a time, so when one of them has answered something, it is answered: \
-don't say it again, and don't speak for them. You can put something to one of \
-them and hand over the turn with hand_to -- ask what they make of it, or ask \
-them to take this one -- and the room will give them the turn when you have \
-finished speaking. Do that when you actually want the answer, not to be \
-polite, and remember the people are in this conversation too: you are all \
-talking together, not talking among yourselves while they listen. The room \
-only allows a couple of replies between you with nobody else saying anything, \
-and the people reset that by joining in.";
+of you at a time, and **saying one of their names hands the turn over** -- \
+the room gives that one the turn as soon as you have finished speaking, which \
+is the same thing that happens when a person says a name. So address one of \
+them by name when you want an answer from them, and leave the name out when \
+you only mean to mention them in passing. hand_to does it deliberately, for \
+when you want one of them to take the next turn without naming them in what \
+you say. When one of them has already answered something it is answered: \
+don't say it again, and don't speak for them. And the people are in this \
+conversation, not watching it -- the room allows only a couple of replies \
+between you with nobody else saying anything, and the people reset that by \
+joining in.";
 
 /// Added to the prompt, in the lobby and in a game: how the room decides
 /// the AI's turn, and how it bows out.
@@ -1986,10 +1990,7 @@ mod tests {
                 .to_string()
         };
         let handed = note(&t);
-        assert!(
-            handed.contains("Cora has just handed you the turn"),
-            "{handed}"
-        );
+        assert!(handed.contains("Cora has put something to you"), "{handed}");
         assert!(handed.contains("stay_quiet"), "it may still pass");
 
         // With one of the two left, that is all it is told.

@@ -240,13 +240,23 @@ about dealing cards, to a voice that cannot deal one, is an instruction
 to try.
 
 **They can put something to each other, and the people keep that
-going.** A reply never starts another one by itself: the room hands
-the turn over when a *person* has said something, and when a bot has
-finished it goes quiet and waits. The one exception is deliberate —
-a bot can call `hand_to` to put something to another voice ("what do
-you make of that, Cora?"), and the room gives that one the turn as
-soon as the first has been heard out. That is what makes a
-conversation of three rather than two people taking turns with one AI.
+going.** A reply never starts another one by itself — the room hands
+the turn over when somebody has said something — but **a name is
+somebody saying something, whichever mouth it came out of**. When a
+bot finishes a reply that named another voice in the room, that voice
+is given the turn, exactly as when a person says a name. "Say hi to
+Cora" gets a hello that Cora answers. `hand_to` does the same thing
+deliberately, for when a bot wants the next turn to be somebody
+else's without naming them aloud. That is what makes a conversation
+of three rather than two people taking turns with one AI.
+
+A name in passing ("I'll ask Cora later") hands over too, and that is
+on purpose rather than tolerated: the turn it hands over is one the
+other bot can give straight back, and a turn given back leaves
+nothing at all — no bubble, no "thinking", nothing on anyone's screen.
+The cost of reading a mention as an address is one quiet turn; the
+cost of not reading it that way is the thing you actually asked for
+not happening.
 
 It is bounded by `--ai-turns` (default 2): replies the AIs may give
 each other with nobody human saying anything in between. **The count
