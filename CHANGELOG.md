@@ -90,6 +90,38 @@ releases.
 
 ### Voice room
 
+- **Two AIs in a room can see each other.** Each was shown the other's
+  replies as its own -- every AI entry went to the model as a plain
+  assistant turn with no name on it -- so Vox read what Cora had just
+  said as something Vox said, and would repeat it, answer for it or
+  argue with itself. Each bot is now shown the others the way it is
+  shown a person: a line of the transcript with the name on it, its own
+  words still its own. Cards and saved games are attributed the same
+  way, so "you posted a card" is only ever true of the bot that posted
+  it.
+
+  Each is also told which of the names in the room are AI voices and
+  which are people, and a bot judging a pause is told a pause may be
+  another AI's rather than its own -- "Ryan is the only person here, so
+  there is nobody else they could be talking to" stops being true the
+  moment there is a second AI in the room. A silenced bot is left out
+  of all of this: a pause can't be its, so nothing is left to it.
+
+- **And what each of them may do is not the same.** The first AI is the
+  one the room was built around -- the one `--name`, `--voice` and
+  `--prompt` describe -- and it is the one that runs the room: cards,
+  games, the web. Every other bot is a voice in it, with `list_people`
+  and `look_up` and nothing else. A second AI dealing cards and
+  starting games is two hands on the same room, and nobody asked the
+  second one.
+
+  It keeps `stay_quiet` and `wait_until_named`, which are not powers
+  but how a turn is handed back: without them a bot cannot be put on
+  "when it fits", and cannot get out of a back-and-forth it was pulled
+  into. Its prompt loses the notes about the tools it hasn't got, and
+  a tool it was never offered is refused if the model calls for it
+  anyway.
+
 - **An AI can be told to say nothing at all, and nothing overrides it.**
   **Answers** has a fourth setting, **never**, beside *when named*,
   *when it fits* and *every pause*. A bot set to it stays in the room

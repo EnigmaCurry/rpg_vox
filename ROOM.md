@@ -218,6 +218,32 @@ What each of them is is its own:
   a game's to take.
 - **Its own prompt**, with `{name}` filled in as itself, so each is
   told who it is rather than told it is the first of them.
+- **Its own side of the conversation.** Each AI is shown what the
+  others said the way it is shown what a person said — a line of the
+  transcript with the name on it — and its own words as its own. It is
+  told which of those names are AI voices rather than people, so "Cora
+  said" reads as what it is. A bot that was shown another's reply as
+  its own would answer for it, or argue with itself.
+
+**What each of them may do is not the same.** The first AI is the one
+the room was built around and the one that runs it: the cards, the
+games, standing down, the web. Every other bot is a voice in it, and a
+voice may do two things — `list_people`, to see who is here, and
+`look_up`, to search the web where anybody can (the lobby, with
+`--search`). No cards, no games, nothing that changes the room. It
+keeps `stay_quiet` and `wait_until_named`, because those are not powers
+but how a turn is given back: without them a bot can't be put on "when
+it fits" at all, and can't get out of a back-and-forth it was pulled
+into. A tool it was never offered is refused if the model asks for it
+anyway, and its prompt never mentions the ones it hasn't got — a note
+about dealing cards, to a voice that cannot deal one, is an instruction
+to try.
+
+**They don't talk to each other, by design.** A turn is only ever
+handed over when a *person* has said something, so a reply never starts
+another one: when a bot has finished, the room goes quiet and waits for
+you. They can refer to what the other said; they cannot have a
+conversation between themselves while you listen.
 
 **Who answers a pause.** Every bot that could answer is given the turn
 at once, and **the first to actually say something keeps it** — the
@@ -1032,7 +1058,7 @@ pays for a rejected request before every reply.
 | `VOX_ROOM_DATA` | `~/.local/share/vox_room` (macOS: `~/Library/Application Support/vox_room`) | the database |
 | `VOX_ROOM_AGENT_NAME` | `Vox` | the AI's name |
 | `VOX_ROOM_AGENT_ALIASES` | | other spellings that count as its name, comma-separated (what speech-to-text hears, e.g. `box,fox`) |
-| `VOX_ROOM_BOTS` | | more AIs in every room, `NAME[:VOICE[:PROMPT_FILE]]`, comma-separated. See [More than one AI in a room](#more-than-one-ai-in-a-room) |
+| `VOX_ROOM_BOTS` | | more AIs in every room, `NAME[:VOICE[:PROMPT_FILE]]`, comma-separated. They see each other and answer to their own names; the first AI is the one that runs the room. See [More than one AI in a room](#more-than-one-ai-in-a-room) |
 | `VOX_ROOM_REPLY_AFTER_MS` | `1200` | quiet before what was said is handed over |
 | `VOX_ROOM_CONFIRM_MS` | `300` | continuous speech that cuts the AI off |
 | `VOX_ROOM_ENGAGED_FOR_MS` | `30000` | idle time that ends a back-and-forth and goes back to "when named" |

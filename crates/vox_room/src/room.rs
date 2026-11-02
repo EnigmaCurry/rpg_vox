@@ -511,6 +511,17 @@ pub struct Turn {
     pub game: Option<(String, String)>,
     /// Who is in the room.
     pub people: Vec<String>,
+    /// The other AIs in the room; this bot's own name is not in it.
+    /// They appear in the transcript by name, like people, so the AI is
+    /// told what they are: voices like itself, and not people. A
+    /// silenced one is still one of them -- it is still in the room and
+    /// its old lines still carry its name.
+    pub others: Vec<String>,
+    /// Those of `others` that could take this pause. A silenced one
+    /// could not, so there is nothing to leave to it: a bot told to let
+    /// a question for Cora pass, while Cora is saying nothing at all,
+    /// leaves it unanswered by anybody.
+    pub others_answering: Vec<String>,
     /// The language the AI writes in: the room's own.
     pub language: String,
     /// Who in the room is listening in another language, and which, so
@@ -4063,7 +4074,8 @@ impl Room {
         // turn by exactly one bot however many are thinking at once.
         let generation = self.turns.fetch_add(1, Ordering::SeqCst) + 1;
         st.bot(bot).generation.store(generation, Ordering::SeqCst);
-        let mut messages = conversation_messages(&st.log, self.cfg.history, &self.cfg.language);
+        let mut messages =
+            conversation_messages(&st.log, self.cfg.history, &self.cfg.language, bot);
         let game = match &st.game {
             Some(name) => match self.store().game(name) {
                 Ok(Some((g, prompt))) => Some((g.name, prompt)),
@@ -4136,6 +4148,18 @@ impl Room {
                     .iter()
                     .filter(|(_, p)| p.online())
                     .map(|(n, _)| n.clone())
+                    .collect(),
+                others: st
+                    .bots
+                    .iter()
+                    .filter(|b| b.cfg.name != bot)
+                    .map(|b| b.cfg.name.clone())
+                    .collect(),
+                others_answering: st
+                    .bots
+                    .iter()
+                    .filter(|b| b.cfg.name != bot && b.mode != Mode::Never)
+                    .map(|b| b.cfg.name.clone())
                     .collect(),
                 language: self.cfg.language.clone(),
                 speaks: st
@@ -4410,7 +4434,12 @@ fn heard_prefix(text: &str, frac: f64) -> &str {
 /// `language` is the room's own: what somebody said in another is given
 /// to the model in it where an interpretation exists, so a conversation
 /// the room heard in two languages reads as one.
-fn conversation_messages(log: &[Entry], history: usize, language: &str) -> Vec<(Role, String)> {
+fn conversation_messages(
+    log: &[Entry],
+    history: usize,
+    language: &str,
+    me: &str,
+) -> Vec<(Role, String)> {
     let done: Vec<&Entry> = log
         .iter()
         .filter(|e| match e.kind {
@@ -4421,7 +4450,21 @@ fn conversation_messages(log: &[Entry], history: usize, language: &str) -> Vec<(
         .collect();
     let start = done.len().saturating_sub(history);
     let mut out: Vec<(Role, String)> = Vec::new();
+    // A line somebody else said, which is a line of the transcript
+    // whoever said it: it joins the one above rather than starting a
+    // turn of its own.
+    let said_to_me = |out: &mut Vec<(Role, String)>, line: String| match out.last_mut() {
+        Some((Role::User, text)) => {
+            text.push('\n');
+            text.push_str(&line);
+        }
+        _ => out.push((Role::User, line)),
+    };
     for e in &done[start..] {
+        // Everything another bot did is somebody else's: it is shown
+        // the way a person's line is, with the name on it, because that
+        // is what it was -- a voice in the room that was not this one.
+        let mine = e.who == me;
         match e.kind {
             Kind::Human => {
                 // Whatever is there by now: an interpretation that has
@@ -4433,14 +4476,7 @@ fn conversation_messages(log: &[Entry], history: usize, language: &str) -> Vec<(
                     .map(|t| t.trim())
                     .filter(|t| !t.is_empty())
                     .unwrap_or_else(|| e.text.trim());
-                let line = format!("{}: {}", e.who, one_line(said));
-                match out.last_mut() {
-                    Some((Role::User, text)) => {
-                        text.push('\n');
-                        text.push_str(&line);
-                    }
-                    _ => out.push((Role::User, line)),
-                }
+                said_to_me(&mut out, format!("{}: {}", e.who, one_line(said)));
             }
             Kind::Agent => {
                 let mut text = e.text.trim().to_string();
@@ -4448,31 +4484,51 @@ fn conversation_messages(log: &[Entry], history: usize, language: &str) -> Vec<(
                     text = text.trim_end_matches('—').trim_end().to_string();
                     text.push_str(CUT_NOTE);
                 }
-                out.push((Role::Assistant, text));
+                if mine {
+                    out.push((Role::Assistant, text));
+                } else {
+                    said_to_me(&mut out, format!("{}: {}", e.who, one_line(&text)));
+                }
             }
             Kind::Game => {
-                let note = format!(
-                    "[You saved the game \"{}\"; its card is in the chat.]",
-                    e.text
-                );
-                match out.last_mut() {
-                    Some((Role::Assistant, text)) => {
-                        text.push(' ');
-                        text.push_str(&note);
+                if mine {
+                    let note = format!(
+                        "[You saved the game \"{}\"; its card is in the chat.]",
+                        e.text
+                    );
+                    match out.last_mut() {
+                        Some((Role::Assistant, text)) => {
+                            text.push(' ');
+                            text.push_str(&note);
+                        }
+                        _ => out.push((Role::Assistant, note)),
                     }
-                    _ => out.push((Role::Assistant, note)),
+                } else {
+                    said_to_me(
+                        &mut out,
+                        format!(
+                            "[{} saved the game \"{}\"; its card is in the chat.]",
+                            e.who, e.text
+                        ),
+                    );
                 }
             }
             Kind::Card => {
                 // The card is written down where everyone can see it, so
-                // the model is shown it as its own, and in full: this is
-                // what the room is looking at.
+                // the model is shown it in full: this is what the room is
+                // looking at. Whose it is still matters -- answering for
+                // a card another AI posted is answering for them.
+                let who = if mine { "You" } else { e.who.as_str() };
                 let note = format!(
-                    "[You posted a card to the whole room, headed \"{}\":\n{}]",
+                    "[{who} posted a card to the whole room, headed \"{}\":\n{}]",
                     e.title,
                     e.text.trim()
                 );
-                out.push((Role::Assistant, note));
+                if mine {
+                    out.push((Role::Assistant, note));
+                } else {
+                    said_to_me(&mut out, note);
+                }
             }
         }
     }
@@ -5004,7 +5060,7 @@ mod tests {
         assert!(e.text.ends_with(" —"), "{:?}", e.text);
         assert!(r.lock().only().reply.is_none());
         // The model hears where it was cut off.
-        let msgs = conversation_messages(&r.lock().log, 50, "English");
+        let msgs = conversation_messages(&r.lock().log, 50, "English", "Vox");
         assert!(msgs.last().unwrap().1.ends_with(CUT_NOTE));
     }
 
@@ -5393,7 +5449,7 @@ mod tests {
             let e = st.log.iter_mut().find(|e| e.id == "p1").unwrap();
             e.sent = true;
         }
-        let msgs = conversation_messages(&r.lock().log, 50, "English");
+        let msgs = conversation_messages(&r.lock().log, 50, "English", "Vox");
         assert_eq!(msgs.last().unwrap().1, "Alex: The door is locked.");
     }
 
@@ -5542,7 +5598,7 @@ mod tests {
         assert_eq!(e.translations["Russian"], format!("{ru0} {ru1}"));
         // What the model is shown is still the one language it writes
         // in: a translation of its own words is not news to it.
-        let msgs = conversation_messages(&r.lock().log, 50, "English");
+        let msgs = conversation_messages(&r.lock().log, 50, "English", "Vox");
         let last = &msgs.last().unwrap().1;
         assert_eq!(
             last,
@@ -5931,7 +5987,7 @@ mod tests {
         assert!(r.read_game("Dragon Heist").is_err());
 
         // The model is told about the button in later turns.
-        let msgs = conversation_messages(&r.lock().log, 50, "English");
+        let msgs = conversation_messages(&r.lock().log, 50, "English", "Vox");
         assert!(msgs.last().unwrap().1.contains("\"Dragon Caper\""));
 
         // Entering: a fresh conversation, and the AI opens with the prompt.
@@ -6004,8 +6060,10 @@ mod tests {
     /// something at a pause keeps it — the others are told to stop,
     /// because two of them answering at once is two voices over each
     /// other.
-    #[test]
-    fn two_bots_share_the_room_and_the_first_to_speak_takes_the_pause() {
+    /// Two AIs in one room, both answering every pause, and the turns
+    /// each of them is given.
+    type Turns = BTreeMap<String, crossbeam_channel::Receiver<Turn>>;
+    fn room_of_two() -> (Arc<Room>, Turns) {
         let store = Store::memory().in_room("Lobby");
         store.invite("Ryan").unwrap();
         let (r, wiring) = Room::new(
@@ -6032,10 +6090,16 @@ mod tests {
             None,
         )
         .unwrap();
-        let turns: BTreeMap<String, _> = wiring
+        let turns: Turns = wiring
             .into_iter()
             .map(|w| (w.name.clone(), w.turns))
             .collect();
+        (r, turns)
+    }
+
+    #[test]
+    fn two_bots_share_the_room_and_the_first_to_speak_takes_the_pause() {
+        let (r, turns) = room_of_two();
         let strips: Vec<String> = r.lock().bots.iter().map(|b| b.cfg.strip.clone()).collect();
         assert_eq!(
             strips.iter().collect::<BTreeSet<_>>().len(),
@@ -6106,6 +6170,75 @@ mod tests {
         r.set_mode("Sage", "always");
         let modes: Vec<Mode> = r.lock().bots.iter().map(|b| b.chosen).collect();
         assert_eq!(modes, [Mode::Named, Mode::Always]);
+    }
+
+    /// Each of them is shown the same conversation from its own side:
+    /// its own words as its own, and the other AI's the way a person's
+    /// are, with the name on them. A bot that read the other's reply as
+    /// its own would answer for it, or contradict itself.
+    #[test]
+    fn each_bot_reads_the_other_as_somebody_else() {
+        let (r, turns) = room_of_two();
+        r.on_paragraph("Ryan", &para("p1", "So what do we think?", false));
+        r.tick(quiet(&r));
+        let sage = turns["Sage"].try_recv().expect("Sage was given the turn");
+        turns["Vox"].try_recv().expect("so was Vox");
+        // Sage gets its word in first, so the pause is Sage's.
+        assert!(r.agent_speak(sage.generation, "I think so.", vec![0.1; 4800]));
+        r.agent_done(sage.generation);
+        for _ in 0..20 {
+            r.mixer.tick();
+        }
+        r.tick(Instant::now());
+        assert_eq!(agent_entry(&r).who, "Sage");
+
+        // The next pause goes to both of them again.
+        r.on_paragraph("Ryan", &para("p2", "Anyone else?", false));
+        r.tick(quiet(&r));
+        let vox = turns["Vox"].try_recv().expect("Vox has the next one");
+        let sage = turns["Sage"].try_recv().expect("and so has Sage");
+        let said = |t: &Turn, role: Role, text: &str| {
+            t.messages
+                .iter()
+                .any(|(r, m)| *r == role && m.contains(text))
+        };
+
+        // Vox never said anything, and reads Sage's line as Sage's.
+        assert!(
+            !vox.messages.iter().any(|(r, _)| *r == Role::Assistant),
+            "Vox has said nothing: {:?}",
+            vox.messages
+        );
+        assert!(said(&vox, Role::User, "Sage: I think so."));
+
+        // Sage reads the same line as its own, with no name on it.
+        assert!(said(&sage, Role::Assistant, "I think so."));
+        assert!(
+            !sage.messages.iter().any(|(_, m)| m.contains("Sage: I")),
+            "not a line of the transcript to itself: {:?}",
+            sage.messages
+        );
+
+        // And each is told who the other voice in the room is.
+        assert_eq!(vox.others, ["Sage"]);
+        assert_eq!(sage.others, ["Vox"]);
+
+        // Silenced, it is nobody to leave a pause to -- but it is
+        // still one of the voices in the room, and what it said is
+        // still in the conversation with its name on it. Both were
+        // given that last pause and neither took it, and a turn nobody
+        // ended holds the room: end them first.
+        r.stop_agent();
+        r.set_mode("Sage", "never");
+        r.on_paragraph("Ryan", &para("p3", "Still there?", false));
+        r.tick(quiet(&r));
+        let vox = turns["Vox"].try_recv().expect("Vox answers");
+        assert_eq!(vox.others, ["Sage"], "still a voice, not a person");
+        assert!(
+            vox.others_answering.is_empty(),
+            "but nothing to leave a pause to"
+        );
+        assert!(said(&vox, Role::User, "Sage: I think so."));
     }
 
     /// A conversation can be called something, and what it is called is
@@ -6774,7 +6907,7 @@ mod tests {
 
         // And the AI is shown its own card in full, so it can go on
         // playing by what the room is looking at.
-        let said = conversation_messages(&r.lock().log, 50, "English");
+        let said = conversation_messages(&r.lock().log, 50, "English", "Vox");
         assert_eq!(said.len(), 1);
         assert_eq!(said[0].0, Role::Assistant);
         assert!(said[0].1.contains("The rules"), "{}", said[0].1);

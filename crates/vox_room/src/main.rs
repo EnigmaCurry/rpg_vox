@@ -82,6 +82,12 @@ struct Cli {
     /// turn at once, with the first to actually say something keeping
     /// it and the rest told to stop. Two or three is the sane number:
     /// each one judging each pause is a request each.
+    ///
+    /// They see each other: what one says is in the others' transcript
+    /// with its name on it, as a person's is. What they may *do*
+    /// differs — the first AI runs the room (cards, games, the web),
+    /// and every other one can see who is here and look things up, and
+    /// no more. See `agent::Allowed`.
     #[arg(long = "bot", env = "VOX_ROOM_BOTS", value_delimiter = ',')]
     bots: Vec<String>,
 
@@ -847,7 +853,10 @@ fn serve(cli: Cli, store: Store, db: PathBuf) -> Result<()> {
             // is spoken in -- each on its own thread, so the languages
             // are said at the same time rather than one after another,
             // and so are the bots.
-            for bot in wiring {
+            // The first AI is the one this room was built around and
+            // the one that runs it; the rest are voices in it. See
+            // `agent::Allowed`.
+            for (n, bot) in wiring.into_iter().enumerate() {
                 let preset = voices.get(&bot.name).unwrap_or(&voice);
                 let mut speaking: Vec<(String, Box<dyn tts::Voice>)> = Vec::new();
                 for language in &languages {
@@ -861,6 +870,11 @@ fn serve(cli: Cli, store: Store, db: PathBuf) -> Result<()> {
                     // either way, so the default already says which of
                     // them it is talking as.
                     prompt: prompts.get(&bot.name).unwrap_or(&prompt).clone(),
+                    allowed: if n == 0 {
+                        agent::Allowed::Everything
+                    } else {
+                        agent::Allowed::Looking
+                    },
                     translate: translate.clone(),
                     generation: bot.generation,
                 }

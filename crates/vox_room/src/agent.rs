@@ -151,6 +151,32 @@ once -- do not translate yourself, and do not say the same thing twice in \
 two languages. Plain spoken sentences translate best; a pun or a play on \
 words will not survive, so make the point another way when it matters.";
 
+/// Added to the prompt when there is one other AI in the room;
+/// `{other}` is its name, used throughout rather than a pronoun, since
+/// the room has no idea which one a bot's name is meant to take.
+///
+/// They are in the transcript by name, exactly as a person is, so the
+/// thing the AI needs told is what they are -- otherwise it reads a
+/// voice it has never heard of as one of the people.
+const OTHER_NOTE: &str = "\
+{other} is in this room with you: an AI voice like you, not a person. You see \
+what {other} says in the transcript with the name on it, the way you see what \
+a person says, and {other} sees yours the same way. The room gives the turn \
+to one of you at a time, so when {other} has answered something, it is \
+answered: don't say it again, and don't speak for {other}. Refer to what \
+{other} said as you would to what anybody said. The people are who you are \
+both talking to.";
+
+/// The same, in a room with more than one other AI in it. `{others}` is
+/// who they are.
+const OTHERS_NOTE: &str = "\
+{others} are in this room with you: AI voices like you, not people. You see \
+what they say in the transcript with their name on it, the way you see what a \
+person says, and they see yours the same way. The room gives the turn to one \
+of you at a time, so when one of them has answered something, it is answered: \
+don't say it again, and don't speak for them. Refer to what one of them said \
+as you would to what anybody said. The people are who you are all talking to.";
+
 /// Added to the prompt, in the lobby and in a game: how the room decides
 /// the AI's turn, and how it bows out.
 const TURN_NOTE: &str = "\
@@ -367,6 +393,44 @@ impl Voices {
     }
 }
 
+/// What a bot may do besides talk.
+///
+/// The first AI in a room is the one the room was built around -- the
+/// one `--name`, `--voice` and `--prompt` describe -- and it is the one
+/// that runs the room: the cards, the games, the web. Every other bot
+/// is a voice in it. A voice can see who is here and look something up,
+/// and that is all: a second AI dealing cards and starting games is two
+/// hands on the same room, and nobody asked the second one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Allowed {
+    /// Everything there is: cards, games, standing down, and the web.
+    Everything,
+    /// Looking, and looking things up. See [`LOOKING_TOOLS`].
+    Looking,
+}
+
+/// What a bot that is only looking may call. The rest of what the room
+/// offers is the first AI's.
+///
+/// Two of these are not powers but how a turn works, so every bot has
+/// them: `stay_quiet` is the only way to pass on a pause it was asked
+/// to judge, and `wait_until_named` the only way out of a
+/// back-and-forth it was pulled into. A bot without them cannot be put
+/// on "when it fits" at all.
+pub const LOOKING_TOOLS: &[&str] = &["list_people", "look_up", "stay_quiet", "wait_until_named"];
+
+impl Allowed {
+    /// Whether this bot may call `tool`. The offered list is built from
+    /// the same answer, so this is only ever reached by a model calling
+    /// something it was never shown.
+    fn may(self, tool: &str) -> bool {
+        match self {
+            Allowed::Everything => true,
+            Allowed::Looking => LOOKING_TOOLS.contains(&tool),
+        }
+    }
+}
+
 pub struct Agent {
     pub llm: Llm,
     /// Which of the room's AIs this thread is. It is what `{name}` in
@@ -374,6 +438,9 @@ pub struct Agent {
     /// than told it is the first one.
     pub name: String,
     pub prompt: String,
+    /// What this one may do besides talk: everything, for the AI the
+    /// room was built around, and looking for the rest.
+    pub allowed: Allowed,
     pub generation: Arc<AtomicU64>,
     /// How the room puts a line into another language, or None when it
     /// has no way to -- and then the other languages are written down
@@ -442,6 +509,7 @@ impl Agent {
                             &room,
                             chat,
                             &messages,
+                            self.allowed,
                             turn.game.is_none(),
                             turn.cue,
                             g,
@@ -474,6 +542,10 @@ impl Agent {
             .collect();
         people.sort();
         people.dedup();
+        // The other AIs are in the transcript by name, so they turn up
+        // in the line above. They are not who it is talking *with*:
+        // `OTHERS_NOTE` says what they are instead.
+        people.retain(|p| !turn.others.contains(p));
         let people = if people.is_empty() {
             "the people here".to_string()
         } else {
@@ -483,6 +555,11 @@ impl Agent {
             format!("\n\n{SEARCH_NOTE}")
         } else {
             String::new()
+        };
+        let others = match turn.others.as_slice() {
+            [] => String::new(),
+            [one] => format!("\n\n{}", OTHER_NOTE.replace("{other}", one)),
+            many => format!("\n\n{}", OTHERS_NOTE.replace("{others}", &and_list(many))),
         };
         // Only when somebody is actually listening in another language,
         // so a room where everyone shares one gets the prompt it always had.
@@ -502,12 +579,20 @@ impl Agent {
                     .replace("{language}", &turn.language)
             )
         };
-        let system = match &turn.game {
-            None => format!(
-                "{}\n\n{GAMES_NOTE}\n\n{CARDS_NOTE}\n\n{TURN_NOTE}{search}{translated}",
+        // A bot is told about the tools it has and no others: a note
+        // about dealing cards, to a voice that cannot deal one, is an
+        // instruction to try.
+        let system = match (&turn.game, self.allowed) {
+            (None, Allowed::Everything) => format!(
+                "{}\n\n{GAMES_NOTE}\n\n{CARDS_NOTE}\n\n{TURN_NOTE}{search}{others}{translated}",
                 self.prompt
             ),
-            Some((game, prompt)) => format!("{}{translated}", game_prompt(game, prompt)),
+            (None, Allowed::Looking) => {
+                format!("{}\n\n{TURN_NOTE}{search}{others}{translated}", self.prompt)
+            }
+            (Some((game, prompt)), allowed) => {
+                format!("{}{others}{translated}", game_prompt(game, prompt, allowed))
+            }
         }
         .replace("{name}", &self.name)
         .replace("{people}", &people);
@@ -524,7 +609,7 @@ impl Agent {
         if let Cue::Decide { lull, over } = turn.cue {
             let note = match lull {
                 None => DECIDE
-                    .replace("{here}", &who_is_here(&turn.people))
+                    .replace("{here}", &who_is_here(&turn.people, &turn.others_answering))
                     .replace("{engaged}", if turn.engaged { DECIDE_ENGAGED } else { "" })
                     .replace("{over}", if over { DECIDE_OVER } else { "" }),
                 Some(s) => DECIDE_LULL.replace("{lull}", &s.to_string()),
@@ -538,26 +623,60 @@ impl Agent {
 /// Who the AI is judging the pause among. With one other person there is
 /// nobody else the room could have been talking to; with several, some of
 /// what is said is between them.
-fn who_is_here(people: &[String]) -> String {
-    match people {
+fn who_is_here(people: &[String], others: &[String]) -> String {
+    let among = match people {
         [] => String::new(),
-        [one] => format!(
+        // With another AI in the room there is somebody else it could
+        // have been for, so that sentence is no longer true.
+        [one] if others.is_empty() => format!(
             "{one} is the only person here, so there is nobody else they could \
              be talking to. "
         ),
+        [one] => format!("{one} is the only person here. "),
         many => format!(
-            "{} and {} are here, so some of what is said is between them. ",
+            "{} are here, so some of what is said is between them. ",
+            and_list(many)
+        ),
+    };
+    let also = match others {
+        [] => String::new(),
+        [one] => format!(
+            "{one} is in the room too -- another AI voice like you, not a person -- \
+             so a pause may be {one}'s rather than yours. Let it pass when what was \
+             said was plainly meant for {one}. "
+        ),
+        many => format!(
+            "{} are in the room too -- AI voices like you, not people -- so a pause \
+             may be theirs rather than yours. Let it pass when what was said was \
+             plainly meant for one of them. ",
+            and_list(many)
+        ),
+    };
+    format!("{among}{also}")
+}
+
+/// "Ryan", "Ryan and Alex", "Ryan, Alex and Sam".
+fn and_list(names: &[String]) -> String {
+    match names {
+        [] => String::new(),
+        [one] => one.clone(),
+        many => format!(
+            "{} and {}",
             many[..many.len() - 1].join(", "),
-            many[many.len() - 1],
+            many[many.len() - 1]
         ),
     }
 }
 
 /// The whole system prompt for a game: the frame, the notes the AI has
 /// wherever it is, and the game's own hidden instructions.
-fn game_prompt(game: &str, prompt: &str) -> String {
+fn game_prompt(game: &str, prompt: &str, allowed: Allowed) -> String {
+    let cards = match allowed {
+        Allowed::Everything => format!("{CARDS_NOTE}\n\n{TURN_NOTE}"),
+        Allowed::Looking => TURN_NOTE.to_string(),
+    };
     GAME_FRAME
-        .replace("{cards}", &format!("{CARDS_NOTE}\n\n{TURN_NOTE}"))
+        .replace("{cards}", &cards)
         .replace("{game}", game)
         .replace("{prompt}", prompt)
 }
@@ -866,6 +985,7 @@ fn stream_reply(
     room: &Room,
     cfg: &Chat,
     messages: &[Value],
+    allowed: Allowed,
     lobby: bool,
     cue: Cue,
     g: u64,
@@ -905,7 +1025,7 @@ fn stream_reply(
                 _ => {}
             }
             if tools && round < TOOL_ROUNDS {
-                let offered = tools_for(lobby, cfg.search, cue.deciding());
+                let offered = tools_for(allowed, lobby, cfg.search, cue.deciding());
                 body["tools"] = match api {
                     Api::Responses => flatten_tools(&offered),
                     _ => offered,
@@ -1039,7 +1159,7 @@ fn stream_reply(
         push_turn(api, &mut convo, &said, &calls);
         let spoke = !spoken.is_empty();
         for (i, c) in calls.iter().enumerate() {
-            let mut result = run_tool(room, cfg, g, c);
+            let mut result = run_tool(room, cfg, g, c, allowed);
             info!(g, tool = c.name, %result, "reply: tool");
             if answered {
                 continue;
@@ -1231,9 +1351,42 @@ fn reply_mode_arg() -> Value {
     })
 }
 
+/// Offered in the lobby when `--search` is on, to every bot: looking
+/// something up is reading, and reading is what a voice may do.
+fn look_up_tool() -> Value {
+    tool(
+        "look_up",
+        "Search the web and answer one question from what it finds. Use it \
+         whenever the answer depends on the world as it is now or on \
+         specifics you can't be sure of -- places, opening hours, prices, \
+         events, news, people, anything recent. Prefer it over guessing. \
+         Ask one plain question, with the place or date in it.",
+        json!({ "question": {
+            "type": "string",
+            "description": "The question, in full, as you would ask a person: \"good restaurants in Boulder, Colorado\".",
+        }}),
+        &["question"],
+    )
+}
+
 /// Everything the model may do this turn: the cards anywhere, and in the
-/// lobby designing games and looking things up when `search` is on.
-fn tools_for(lobby: bool, search: bool, deciding: bool) -> Value {
+/// lobby designing games and looking things up when `search` is on --
+/// unless this bot is only [`Allowed::Looking`], and then it is who is
+/// here, the web, and the two tools a turn is taken with.
+fn tools_for(allowed: Allowed, lobby: bool, search: bool, deciding: bool) -> Value {
+    if allowed == Allowed::Looking {
+        let mut out: Vec<Value> = room_tools()
+            .into_iter()
+            .filter(|t| allowed.may(t["function"]["name"].as_str().unwrap_or("")))
+            .collect();
+        if deciding {
+            out.push(quiet_tool());
+        }
+        if lobby && search {
+            out.push(look_up_tool());
+        }
+        return Value::Array(out);
+    }
     let name =
         json!({ "type": "string", "description": "The game's name, as the players will see it." });
     let mut extra = room_tools();
@@ -1268,19 +1421,10 @@ fn tools_for(lobby: bool, search: bool, deciding: bool) -> Value {
         .expect("tools is an array")
         .extend(extra);
     if search {
-        tools.as_array_mut().expect("tools is an array").push(tool(
-            "look_up",
-            "Search the web and answer one question from what it finds. Use it \
-             whenever the answer depends on the world as it is now or on \
-             specifics you can't be sure of -- places, opening hours, prices, \
-             events, news, people, anything recent. Prefer it over guessing. \
-             Ask one plain question, with the place or date in it.",
-            json!({ "question": {
-                "type": "string",
-                "description": "The question, in full, as you would ask a person: \"good restaurants in Boulder, Colorado\".",
-            }}),
-            &["question"],
-        ));
+        tools
+            .as_array_mut()
+            .expect("tools is an array")
+            .push(look_up_tool());
     }
     tools
 }
@@ -1347,7 +1491,17 @@ fn search_text(v: &Value) -> String {
 }
 
 /// Run one tool call; the result is JSON for the model.
-fn run_tool(room: &Room, cfg: &Chat, g: u64, call: &ToolCall) -> String {
+fn run_tool(room: &Room, cfg: &Chat, g: u64, call: &ToolCall, allowed: Allowed) -> String {
+    // It was never offered this one, which does not stop a model asking
+    // for it. The room's answer is the same either way: there is no
+    // such tool for you.
+    if !allowed.may(&call.name) {
+        info!(g, tool = %call.name, "reply: refused a tool this bot hasn't got");
+        return json!({
+            "error": format!("you have no tool called {:?}", call.name),
+        })
+        .to_string();
+    }
     let args: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
     let arg = |k: &str| args[k].as_str().unwrap_or("").to_string();
     // An unknown reply_mode would quietly become the default, so say so.
@@ -1537,12 +1691,155 @@ mod tests {
     }
 
     fn tool_names_deciding(lobby: bool, search: bool, deciding: bool) -> Vec<String> {
-        tools_for(lobby, search, deciding)
+        tools_for(Allowed::Everything, lobby, search, deciding)
             .as_array()
             .unwrap()
             .iter()
             .map(|t| t["function"]["name"].as_str().unwrap().to_string())
             .collect()
+    }
+
+    /// The system prompt a turn goes out with.
+    fn system_of(agent: &Agent, t: &Turn) -> String {
+        let messages = agent.messages(t);
+        messages[0]["content"].as_str().unwrap().to_string()
+    }
+
+    fn looking_names(lobby: bool, search: bool, deciding: bool) -> Vec<String> {
+        tools_for(Allowed::Looking, lobby, search, deciding)
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// A second AI in the room is a voice in it: it can see who is here
+    /// and look something up, and the room's own tools are the first
+    /// one's. The two it keeps besides are not powers but how a turn is
+    /// given back.
+    #[test]
+    fn a_voice_in_the_room_has_only_the_tools_of_one() {
+        assert_eq!(
+            looking_names(true, true, true),
+            ["list_people", "wait_until_named", "stay_quiet", "look_up"]
+        );
+        // Nothing that changes anything: no cards, and no games.
+        let everything = tool_names_deciding(true, true, true);
+        for power in [
+            "send_card",
+            "post_card",
+            "take_back_card",
+            "read_cards",
+            "save_game",
+            "revise_game",
+            "start_game",
+            "delete_game",
+            "list_games",
+            "read_game",
+            "check_game_name",
+        ] {
+            let looking = looking_names(true, true, true);
+            assert!(everything.contains(&power.to_string()), "{power}");
+            assert!(!looking.contains(&power.to_string()), "{power}");
+        }
+
+        // The web only where anybody has it: in the lobby, with
+        // --search on. Judging is the only time stay_quiet is offered,
+        // to either of them.
+        assert_eq!(looking_names(true, false, true).len(), 3, "no search");
+        assert!(!looking_names(false, true, true).contains(&"look_up".to_string()));
+        assert!(!looking_names(true, true, false).contains(&"stay_quiet".to_string()));
+
+        // And what is offered is what is allowed: a model that calls
+        // something it was never shown is told there is no such tool.
+        assert!(Allowed::Looking.may("list_people"));
+        assert!(!Allowed::Looking.may("post_card"));
+        assert!(Allowed::Everything.may("post_card"));
+    }
+
+    /// What a bot is told it can do is what it can do. A note about
+    /// dealing cards, to a voice that cannot deal one, is an
+    /// instruction to try.
+    #[test]
+    fn a_voice_in_the_room_is_not_told_about_cards_or_games() {
+        let (mut agent, t) = turn_with(Cue::Speak, &["Ryan"], false);
+        agent.allowed = Allowed::Looking;
+        let system = system_of(&agent, &t);
+        assert!(!system.contains("send_card"), "{system}");
+        assert!(!system.contains("save_game"));
+        assert!(
+            system.contains("wait_until_named"),
+            "it still gives the turn back"
+        );
+
+        // In a game, the same: it plays, it doesn't deal.
+        let frame = game_prompt("Dragon Heist", "Run a heist.", Allowed::Looking);
+        assert!(!frame.contains("send_card"), "{frame}");
+        assert!(frame.contains("wait_until_named"));
+        let dealing = game_prompt("Dragon Heist", "Run a heist.", Allowed::Everything);
+        assert!(dealing.contains("send_card"));
+    }
+
+    /// The other AIs in the room are in the transcript by name, so the
+    /// AI is told what they are -- or it reads a voice it has never
+    /// heard of as one of the people.
+    #[test]
+    fn a_bot_is_told_which_of_the_names_are_the_other_ais() {
+        let (agent, t) = turn_among(Cue::Speak, &["Ryan"], false, &["Cora"]);
+        let system = system_of(&agent, &t);
+        assert!(system.contains("Cora is in this room with you"), "{system}");
+        assert!(system.contains("an AI voice like you, not a person"));
+        assert!(
+            system.contains("don't speak for Cora"),
+            "by name, never a pronoun"
+        );
+        // And it is talking *with* the people, who do not include Cora.
+        assert!(system.contains("voice chat with Ryan."), "{system}");
+
+        // Two of them, and the note is in the plural.
+        let (agent, t) = turn_among(Cue::Speak, &["Ryan"], false, &["Cora", "Ada"]);
+        let two = system_of(&agent, &t);
+        assert!(
+            two.contains("Cora and Ada are in this room with you"),
+            "{two}"
+        );
+        assert!(two.contains("AI voices like you, not people"));
+
+        // Alone with the people, there is no such note at all.
+        let (agent, t) = turn_with(Cue::Speak, &["Ryan"], false);
+        let alone = system_of(&agent, &t);
+        assert!(!alone.contains("in this room with you"));
+
+        // Judging a pause, it is told a pause may be the other one's.
+        let (agent, mut t) = turn_among(judge(None, false), &["Ryan"], false, &["Cora"]);
+        let note = agent.messages(&t).pop().unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(note.contains("Ryan is the only person here."), "{note}");
+        assert!(note.contains("Cora is in the room too"));
+        assert!(
+            !note.contains("nobody else they could be talking to"),
+            "which is no longer true"
+        );
+
+        // Unless that one has been silenced: then there is nothing to
+        // leave to it, and the pause is this bot's or nobody's. It is
+        // still one of the voices in the room, though -- its name is in
+        // the transcript and must not read as a person's.
+        t.others_answering.clear();
+        let system = system_of(&agent, &t);
+        assert!(system.contains("Cora is in this room with you"), "{system}");
+        let note = agent.messages(&t).pop().unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            note.contains("nobody else they could be talking to"),
+            "{note}"
+        );
+        assert!(!note.contains("Cora is in the room too"));
     }
 
     #[test]
@@ -1595,10 +1892,17 @@ mod tests {
     /// agent, because in a room with two of them the room could only
     /// have said one of their names.
     fn turn_with(cue: Cue, people: &[&str], engaged: bool) -> (Agent, Turn) {
+        let (agent, turn) = turn_among(cue, people, engaged, &[]);
+        (agent, turn)
+    }
+
+    /// The same, in a room with `others` -- the other AIs in it.
+    fn turn_among(cue: Cue, people: &[&str], engaged: bool, others: &[&str]) -> (Agent, Turn) {
         let agent = Agent {
             llm: Llm::Echo,
             name: "Vox".into(),
             prompt: DEFAULT_PROMPT.to_string(),
+            allowed: Allowed::Everything,
             generation: Arc::new(AtomicU64::new(0)),
             translate: None,
         };
@@ -1608,6 +1912,8 @@ mod tests {
             asked: Instant::now(),
             game: None,
             people: people.iter().map(|p| p.to_string()).collect(),
+            others: others.iter().map(|o| o.to_string()).collect(),
+            others_answering: others.iter().map(|o| o.to_string()).collect(),
             language: "English".into(),
             speaks: Vec::new(),
             engaged,
@@ -1671,6 +1977,7 @@ mod tests {
             &room,
             &chat,
             &agent.messages(&t),
+            Allowed::Everything,
             true,
             t.cue,
             7,
@@ -1746,7 +2053,7 @@ mod tests {
             let (agent, mut t) = turn_with(judge(None, false), people, *engaged);
             t.messages = vec![(Role::User, said.to_string())];
             // Ask the way the room asks, on whichever API it speaks.
-            let offered = tools_for(true, false, true);
+            let offered = tools_for(Allowed::Everything, true, false, true);
             let messages = agent.messages(&t);
             let (path, mut body) = match chat.api() {
                 Api::Responses => (
@@ -1840,7 +2147,7 @@ mod tests {
     #[test]
     fn each_api_is_fed_and_read_in_its_own_shape() {
         // One function tool, wrapped for chat and flat for responses.
-        let offered = tools_for(false, false, false);
+        let offered = tools_for(Allowed::Everything, false, false, false);
         let flat = flatten_tools(&offered);
         assert_eq!(offered[0]["function"]["name"], "list_people");
         assert_eq!(flat[0]["name"], "list_people");
@@ -2079,7 +2386,7 @@ mod tests {
         // The tools are read as instructions for what to do, so nothing
         // in them is phrased that way at all.
         for (lobby, deciding) in [(true, true), (false, false)] {
-            let tools = tools_for(lobby, true, deciding).to_string();
+            let tools = tools_for(Allowed::Everything, lobby, true, deciding).to_string();
             assert!(!tools.contains("private"), "{tools}");
         }
     }
@@ -2124,7 +2431,7 @@ mod tests {
 
     #[test]
     fn a_game_is_told_about_the_cards_without_being_told_about_games() {
-        let frame = game_prompt("Dragon Heist", "Run a heist.");
+        let frame = game_prompt("Dragon Heist", "Run a heist.", Allowed::Everything);
         assert!(frame.contains("send_card"));
         assert!(frame.contains("list_people"));
         assert!(frame.contains("wait_until_named"));
