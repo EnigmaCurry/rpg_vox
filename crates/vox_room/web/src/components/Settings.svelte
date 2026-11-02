@@ -1,5 +1,5 @@
 <script>
-  import { room, setName, setPushToTalk, setVolume } from '../lib/room.svelte.js';
+  import { room, setName, setVolume } from '../lib/room.svelte.js';
   import { NAME_MAX } from '../lib/names.js';
 
   // The things you set once, off the floor of the room.
@@ -27,19 +27,6 @@
     if (await setName(draft)) typed = null;
   }
 
-  // Who chose the name on your invite. The owner is reading their own
-  // page when they read this one, and "the owner's to set" said to the
-  // owner is a sentence about somebody who isn't there.
-  const whoever = $derived(room.owner ? 'yours' : "whoever runs the room's");
-
-  // The meter is linear amplitude; the ear is not. Same curve as the
-  // strips in the room list, so the same loudness looks the same in
-  // both places.
-  const level = $derived(
-    room.hearing > 0
-      ? Math.max(0, Math.min(100, ((20 * Math.log10(room.hearing) + 60) / 60) * 100))
-      : 0,
-  );
 </script>
 
 <svelte:window {onkeydown} />
@@ -66,36 +53,10 @@
         onkeydown={(e) => { if (e.key === 'Enter') { e.preventDefault(); e.currentTarget.blur(); } }} />
     </label>
     {#if room.nameError}<p class="warn">{room.nameError}</p>{/if}
-    <p class="note">
-      Everyone in this room and every other one sees this, on the roster and
-      against everything you have said. Your microphone keeps running while it
-      changes.
-      {#if room.invited}
-        You were invited as <strong>{room.invited}</strong>, which is
-        {whoever}'s to set and stays as it is.
-      {/if}
-    </p>
   </section>
 
   <section>
     <h2>Your microphone</h2>
-    <label class="check">
-      <input type="checkbox" checked={room.pushToTalk}
-        onchange={(e) => setPushToTalk(e.currentTarget.checked)} />
-      <span>
-        <strong>Push to talk</strong>
-        <small>
-          Your microphone stays muted except while you hold <kbd>Space</kbd> or the
-          talk button. Everything said in one hold is one thing said, and the AI
-          waits for you to let go however long you pause.
-        </small>
-      </span>
-    </label>
-    <p class="note">
-      Mute, push to talk and the microphone belong to this <strong>tab</strong>, not
-      to you: another tab of your own, or one left at the door, has no say in what
-      the one you are speaking into does.
-    </p>
     {#if room.micName}
       <p class="note">
         The microphone the browser gave the room: <strong>{room.micName}</strong>.
@@ -109,21 +70,11 @@
   <section>
     <h2>What you hear</h2>
     <label class="slider">
-      <span>Your volume</span>
+      <span>App volume</span>
       <input type="range" min="0" max="1.5" step="0.01" value={room.volume}
         oninput={(e) => setVolume(Number(e.currentTarget.value))} />
       <span class="much">{Math.round(room.volume * 100)}%</span>
     </label>
-    <p class="slider">
-      <span>Coming in</span>
-      <span class="hear" title="What you hear: everyone but you"
-        ><span style="width: {level}%"></span></span>
-    </p>
-    <p class="note">
-      Yours alone, both of them: nobody else's hearing changes, and your own voice
-      is never in your own mix. Turning one person down is on their fader, under
-      the room.
-    </p>
   </section>
 
   {#if room.owner}
@@ -165,14 +116,10 @@
     padding: 14px 16px;
     margin-top: 16px;
   }
-  .check { display: flex; align-items: flex-start; gap: 10px; }
-  .check input { margin-top: 3px; }
-  .check small, .note { display: block; color: var(--muted); font-size: 13px; line-height: 1.5; }
-  .check small { margin-top: 2px; }
-  .note { margin: 10px 0 0; }
+  .note { display: block; color: var(--muted); font-size: 13px; line-height: 1.5; margin: 10px 0 0; }
   .back { text-align: center; }
   .manage { margin-top: 10px; }
-  .slider { display: flex; align-items: center; gap: 10px; font-size: 13px; margin: 0 0 10px; }
+  .slider { display: flex; align-items: center; gap: 10px; font-size: 13px; margin: 0; }
   .slider input[type='range'] { flex: 1; max-width: 18em; }
   .name { display: flex; flex-direction: column; gap: 4px; max-width: 22em; }
   .name span { font-size: 12px; color: var(--muted); }
@@ -188,7 +135,5 @@
   .name input:hover { border-color: var(--muted); }
   .warn { color: var(--danger); font-size: 13px; margin: 8px 0 0; }
   .much { color: var(--muted); min-width: 3.5ch; text-align: right; }
-  .hear { width: 120px; height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; }
-  .hear span { display: block; height: 100%; background: var(--meter); transition: width 80ms linear; }
   kbd { font-size: 11px; opacity: 0.7; border: 1px solid currentColor; border-radius: 4px; padding: 0 4px; }
 </style>

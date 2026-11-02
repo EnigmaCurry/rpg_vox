@@ -269,7 +269,6 @@
   }
   select:hover { border-color: var(--muted); }
   .devices.name { margin-bottom: 14px; }
-  .devices.name small { font-size: 12px; color: var(--muted); line-height: 1.45; }
   input[type='text'] {
     font: inherit;
     width: 100%;

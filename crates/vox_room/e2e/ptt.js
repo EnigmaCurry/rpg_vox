@@ -18,7 +18,7 @@ const [ryanLink] = process.argv.slice(2);
 const space = async (page) => {
   await page.keyboard.down('Space');
   await page.waitForTimeout(250);
-  const talking = await page.evaluate(() => !!document.querySelector('footer .ptt.talking'));
+  const talking = await page.evaluate(() => !!document.querySelector('footer .big.ptt.talking'));
   await page.keyboard.up('Space');
   // The mic stays open a moment after you let go, so the next check
   // isn't looking at the tail of this one.
@@ -37,15 +37,11 @@ const focused = (page) =>
 (async () => {
   const { browser, page } = await person(ryanLink);
 
-  // Push to talk is a setting, so it is behind the cog.
-  await page.click('footer button.cog');
-  await page.waitForSelector('.settings');
-  await page.click('.settings .check input[type=checkbox]');
-  await page.waitForTimeout(300);
-  await page.keyboard.press('Escape');
+  // Push to talk is beside the button it changes.
+  await page.click('footer .switch input');
   await page.waitForTimeout(400);
-  is('the talk button is there to hold', await page.evaluate(() => !!document.querySelector('footer .ptt')), true);
-  is('and the mic is not open until it is', await page.evaluate(() => !!document.querySelector('footer .ptt.talking')), false);
+  is('the talk button is there to hold', await page.evaluate(() => !!document.querySelector('footer .big.ptt')), true);
+  is('and the mic is not open until it is', await page.evaluate(() => !!document.querySelector('footer .big.ptt.talking')), false);
 
   // Nothing focused: the case that always worked.
   await page.evaluate(() => document.activeElement?.blur());
@@ -102,7 +98,7 @@ const focused = (page) =>
   await page.keyboard.up('Space');
   await page.waitForTimeout(900);
   is('letting go closes the mic even after the focus moved',
-    await page.evaluate(() => !!document.querySelector('footer .ptt.talking')), false);
+    await page.evaluate(() => !!document.querySelector('footer .big.ptt.talking')), false);
 
   await browser.close();
   report();

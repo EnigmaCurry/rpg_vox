@@ -698,12 +698,14 @@ See ROOM_DOCKER.md.
   your microphone on the left, what you do with the room on the right.
   **Mute** (or **Hold to talk**) is one width whatever it says, so the
   button under your hand is the same button it was a moment ago and
-  nothing beside it moves; then **Share screen**, **Leave audio**, and
-  the cog. Anything the room has to tell you appears along it too.
+  nothing beside it moves, with **Push to talk** beside it — it says
+  what that button does, so it is next to it rather than on a page you
+  have to go to. Then **Share screen**, **Leave audio**, and the cog.
+  Anything the room has to tell you appears along it too.
 - **Settings**, behind the cog on the far right: a page of its own with
-  the things you set once -- **Your name**, **Push to talk**, **Your
-  volume**, what is coming in, and which microphone the browser gave the
-  room. Changing your name changes it everywhere, the conversation
+  the things you set once and don't watch — **Your name**, **App
+  volume**, and which microphone the browser gave the room. Changing
+  your name changes it everywhere, the conversation
   included: the room calls you one thing, not a different thing per
   paragraph. The room
   goes on running behind it: you are still in the audio, and the space
@@ -725,7 +727,7 @@ See ROOM_DOCKER.md.
   no way out of it but the door.
 - **Mixer**: a level and mute for each person and each AI, shared
   by the whole room, hanging off the room you are in in the list on the
-  left. **Your volume**, in the settings, is only yours. Space mutes
+  left. **App volume**, in the settings, is only yours. Space mutes
   your mic, or with **Push to talk** on, your mic is open only while you
   hold Space (or the talk button): everything said in one hold is one
   entry, and the AI waits for you to let go however long you pause.

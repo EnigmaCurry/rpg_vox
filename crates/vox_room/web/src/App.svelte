@@ -1,6 +1,6 @@
 <script>
   import { onMount } from 'svelte';
-  import { room, command, ask, answer, whoami, leaveAudio, setMuted, talk, busyAI } from './lib/room.svelte.js';
+  import { room, command, ask, answer, whoami, leaveAudio, setMuted, setPushToTalk, talk, busyAI } from './lib/room.svelte.js';
   import { screen, share, stopSharing, supported as canShare } from './lib/screen.svelte.js';
   import Log from './components/Log.svelte';
   import Cards from './components/Cards.svelte';
@@ -171,6 +171,13 @@
             {room.muted ? 'Unmute' : 'Mute'} <kbd>Space</kbd>
           </button>
         {/if}
+        <!-- Beside the button it changes, because it changes what that
+             button is. -->
+        <label class="switch" title="Your mic opens only while you hold Space or the talk button.">
+          <input type="checkbox" checked={room.pushToTalk}
+            onchange={(e) => setPushToTalk(e.currentTarget.checked)} />
+          <span>Push to talk</span>
+        </label>
         <!-- Your mic on the left, and what you do with the room on the
              right: everything you set once is behind the cog. A footer
              strung with sliders and readouts put the way out next to a
@@ -197,7 +204,7 @@
         <button class="leave" onclick={leaveAudio} title="Leave the audio and go back to the door.">Leave audio</button>
         <button class="cog" aria-label="Settings" aria-pressed={room.settings}
           onclick={() => (room.settings = !room.settings)}
-          title="Push to talk, your volume, and what the room gave you to speak into.">
+          title="Your name, the app's volume, and what the room gave you to speak into.">
           <svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true" focusable="false">
             <path fill="currentColor" d="M19.14 12.94a7.07 7.07 0 0 0 0-1.88l2.03-1.58a.5.5 0 0 0 .12-.64l-1.92-3.32a.5.5 0 0 0-.6-.22l-2.39.96a7.03 7.03 0 0 0-1.63-.94l-.36-2.54a.5.5 0 0 0-.5-.42h-3.84a.5.5 0 0 0-.49.42l-.36 2.54c-.59.24-1.13.56-1.63.94l-2.39-.96a.5.5 0 0 0-.6.22L2.66 8.84a.5.5 0 0 0 .12.64l2.03 1.58a7.07 7.07 0 0 0 0 1.88L2.78 14.52a.5.5 0 0 0-.12.64l1.92 3.32c.13.22.39.31.6.22l2.39-.96c.5.38 1.04.7 1.63.94l.36 2.54c.04.24.25.42.49.42h3.84c.25 0 .46-.18.5-.42l.36-2.54c.59-.24 1.13-.56 1.63-.94l2.39.96c.22.09.47 0 .6-.22l1.92-3.32a.5.5 0 0 0-.12-.64l-2.03-1.58ZM12 15.5A3.5 3.5 0 1 1 15.5 12 3.5 3.5 0 0 1 12 15.5Z" />
           </svg>
@@ -294,6 +301,8 @@
   .big.muted { background: var(--danger); color: #fff; border-color: var(--danger); }
   .big.ptt { touch-action: none; user-select: none; -webkit-user-select: none; }
   .big.ptt.talking { background: var(--ok); color: var(--accent-ink); border-color: var(--ok); }
+  .switch { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); cursor: pointer; }
+  .switch input { margin: 0; }
   kbd { font-size: 11px; opacity: 0.7; border: 1px solid currentColor; border-radius: 4px; padding: 0 4px; margin-left: 4px; }
   .vol { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); }
   /* Device names run long; keep one from pushing the controls off. */

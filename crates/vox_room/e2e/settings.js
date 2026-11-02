@@ -47,14 +47,15 @@ const feet = (page) =>
   await page.click('footer button.big');
   await wait(400);
 
-  // Nothing else is strung along it any more.
+  // Nothing is strung along it but the one switch that says what the
+  // button beside it does.
   is('no sliders or readouts down there',
     await page.evaluate(() => ({
       sliders: document.querySelectorAll('footer input[type=range]').length,
       boxes: document.querySelectorAll('footer input[type=checkbox]').length,
       meters: document.querySelectorAll('footer .hear').length,
     })),
-    { sliders: 0, boxes: 0, meters: 0 });
+    { sliders: 0, boxes: 1, meters: 0 });
 
   // The cog opens a page, and the room is not behind it.
   await page.click('footer button.cog');
@@ -66,26 +67,33 @@ const feet = (page) =>
       log: !!document.querySelector('.log'),
     })),
     { settings: true, room: false, log: false });
-  is('with what was taken off the footer on it',
+  // What it is for: the things you set once and don't watch. Push to
+  // talk is not one of those -- it says what the button under your
+  // hand does -- so it is beside that button and not here.
+  is('what is set here',
     await page.evaluate(() => ({
-      pushToTalk: !!document.querySelector('.settings input[type=checkbox]'),
+      name: !!document.querySelector('.settings .name input'),
       volume: !!document.querySelector('.settings input[type=range]'),
+      pushToTalk: !!document.querySelector('.settings input[type=checkbox]'),
       meter: !!document.querySelector('.settings .hear'),
     })),
-    { pushToTalk: true, volume: true, meter: true });
+    { name: true, volume: true, pushToTalk: false, meter: false });
 
   // The room kept running: still joined, and the socket never went.
   is('still in the audio', await page.evaluate(() => !document.querySelector('.enter')), true);
-
-  // Push to talk, set here, is what the room does when you go back.
-  await page.click('.settings .check input[type=checkbox]');
-  await wait(400);
   await page.click('.settings button.primary');
   await wait(500);
   is('back in the room', await page.evaluate(() => !!document.querySelector('.log')), true);
-  is('and the footer took the setting',
-    await page.evaluate(() => !!document.querySelector('footer .ptt')), true);
-  is('which is a button of the same width', (await feet(page))[0].width, wide);
+
+  // Push to talk, beside the button it changes: ticking it is what
+  // turns that button into one you hold.
+  await page.click('footer .switch input');
+  await wait(400);
+  is('the button says to hold it', (await feet(page))[0].what, 'Hold to talk Space');
+  is('and is the same width', (await feet(page))[0].width, wide);
+  await page.click('footer .switch input');
+  await wait(400);
+  is('and back again', (await feet(page))[0].what, 'Mute Space');
 
   // Escape closes it too, and the cog says whether it is open.
   await page.click('footer button.cog');

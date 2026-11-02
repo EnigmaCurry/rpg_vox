@@ -90,6 +90,14 @@ releases.
 
 ### Voice room
 
+- **Push to talk is beside the button it changes.** It was on the
+  settings page, a page away from the button whose job it decides. It
+  is a tickbox in the footer next to **Mute** / **Hold to talk** now.
+  The settings page keeps what you set once and don't watch: your name,
+  the app's volume, and which microphone the browser handed over. The
+  **Coming in** meter is gone — it never worked — and **Your volume**,
+  which is this browser's and not the room's, is called **App volume**.
+
 - **The room has no title bar.** It held the room's name and four
   buttons, and every one of them belonged somewhere else. The name is
   the heading of the room column; starting a new conversation and
