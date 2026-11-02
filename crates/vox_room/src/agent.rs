@@ -123,6 +123,36 @@ You are in the middle of a conversation with them: they called you in and \
 have carried on without naming you again, so the turn is yours unless they \
 have plainly turned to each other. ";
 
+/// The last thing the AI is shown when another voice in the room put
+/// something to it and handed it the turn. `{from}` is which voice.
+///
+/// It was addressed, so it answers -- but it is told it may pass,
+/// because the alternative is a voice saying something for the sake of
+/// having been asked, and that is the thing that turns two AIs into a
+/// conversation nobody is in.
+const HANDED: &str = "\
+({from} has just handed you the turn: what was put to you is in the lines \
+above, and the room is waiting for your answer. Answer it in your own voice, \
+to the room -- the people are in this conversation, so say it to them as much \
+as to {from}, and don't simply agree to be agreeable. If you have nothing to \
+add, call stay_quiet and let the people have the pause rather than saying \
+something for the sake of being asked. Never mention this note.)";
+
+/// The last thing the AI is shown when the voices here have used up
+/// what they may say to each other: this answer is the last one before
+/// somebody human speaks.
+///
+/// It is told rather than refused. A bot that discovers the limit by
+/// calling `hand_to` and being told no has already finished speaking,
+/// and whatever it said was written for a conversation that is about
+/// to stop dead -- "I'll let Cora take that" with nobody able to.
+const LAST_ROUND: &str = "\
+(This is the last thing the voices here can say to each other until somebody \
+else joins in: you cannot hand the turn on this time, and nor can anyone you \
+handed it to. So finish the thought and leave it with the people -- put the \
+question to them, ask what they think, or simply stop and let the room be \
+quiet. Don't say that you are out of turns, and never mention this note.)";
+
 /// Added to [`DECIDE`] when what it is being shown arrived while it was
 /// still speaking: it was talked over and left to finish, so the likeliest
 /// thing this pause holds is a cough.
@@ -163,9 +193,14 @@ const OTHER_NOTE: &str = "\
 what {other} says in the transcript with the name on it, the way you see what \
 a person says, and {other} sees yours the same way. The room gives the turn \
 to one of you at a time, so when {other} has answered something, it is \
-answered: don't say it again, and don't speak for {other}. Refer to what \
-{other} said as you would to what anybody said. The people are who you are \
-both talking to.";
+answered: don't say it again, and don't speak for {other}. You can put \
+something to {other} and hand over the turn with hand_to -- ask what {other} \
+makes of it, or ask {other} to take this one -- and the room will give \
+{other} the turn when you have finished speaking. Do that when you actually \
+want the answer, not to be polite, and remember the people are in this \
+conversation too: it is three of you talking, not two of you talking while \
+they listen. The room only allows a couple of replies between you with \
+nobody else saying anything, and the people reset that by joining in.";
 
 /// The same, in a room with more than one other AI in it. `{others}` is
 /// who they are.
@@ -174,8 +209,14 @@ const OTHERS_NOTE: &str = "\
 what they say in the transcript with their name on it, the way you see what a \
 person says, and they see yours the same way. The room gives the turn to one \
 of you at a time, so when one of them has answered something, it is answered: \
-don't say it again, and don't speak for them. Refer to what one of them said \
-as you would to what anybody said. The people are who you are all talking to.";
+don't say it again, and don't speak for them. You can put something to one of \
+them and hand over the turn with hand_to -- ask what they make of it, or ask \
+them to take this one -- and the room will give them the turn when you have \
+finished speaking. Do that when you actually want the answer, not to be \
+polite, and remember the people are in this conversation too: you are all \
+talking together, not talking among yourselves while they listen. The room \
+only allows a couple of replies between you with nobody else saying anything, \
+and the people reset that by joining in.";
 
 /// Added to the prompt, in the lobby and in a game: how the room decides
 /// the AI's turn, and how it bows out.
@@ -412,12 +453,21 @@ pub enum Allowed {
 /// What a bot that is only looking may call. The rest of what the room
 /// offers is the first AI's.
 ///
-/// Two of these are not powers but how a turn works, so every bot has
-/// them: `stay_quiet` is the only way to pass on a pause it was asked
-/// to judge, and `wait_until_named` the only way out of a
-/// back-and-forth it was pulled into. A bot without them cannot be put
-/// on "when it fits" at all.
-pub const LOOKING_TOOLS: &[&str] = &["list_people", "look_up", "stay_quiet", "wait_until_named"];
+/// Three of these are not powers but how a turn works, so every bot
+/// has them: `stay_quiet` is the only way to pass on a pause it was
+/// asked to judge, `wait_until_named` the only way out of a
+/// back-and-forth it was pulled into, and `hand_to` the way it gives
+/// the turn to somebody rather than takes one -- the opposite of a
+/// power, and what makes a conversation of three rather than two
+/// people taking turns with one AI. A bot without the first cannot be
+/// put on "when it fits" at all.
+pub const LOOKING_TOOLS: &[&str] = &[
+    "list_people",
+    "look_up",
+    "stay_quiet",
+    "wait_until_named",
+    "hand_to",
+];
 
 impl Allowed {
     /// Whether this bot may call `tool`. The offered list is built from
@@ -511,7 +561,8 @@ impl Agent {
                             &messages,
                             self.allowed,
                             turn.game.is_none(),
-                            turn.cue,
+                            turn.cue.clone(),
+                            turn.hand_on > 0,
                             g,
                             turn.asked,
                             &self.generation,
@@ -606,15 +657,31 @@ impl Agent {
         }
         // Last, so it is the thing the model has just read, and so the
         // rest of the turn is the same prompt either way.
-        if let Cue::Decide { lull, over } = turn.cue {
-            let note = match lull {
-                None => DECIDE
-                    .replace("{here}", &who_is_here(&turn.people, &turn.others_answering))
-                    .replace("{engaged}", if turn.engaged { DECIDE_ENGAGED } else { "" })
-                    .replace("{over}", if over { DECIDE_OVER } else { "" }),
-                Some(s) => DECIDE_LULL.replace("{lull}", &s.to_string()),
-            };
-            out.push(json!({ "role": "user", "content": note }));
+        match &turn.cue {
+            Cue::Decide { lull, over } => {
+                let note = match lull {
+                    None => DECIDE
+                        .replace("{here}", &who_is_here(&turn.people, &turn.others_answering))
+                        .replace("{engaged}", if turn.engaged { DECIDE_ENGAGED } else { "" })
+                        .replace("{over}", if *over { DECIDE_OVER } else { "" }),
+                    Some(s) => DECIDE_LULL.replace("{lull}", &s.to_string()),
+                };
+                out.push(json!({ "role": "user", "content": note }));
+            }
+            Cue::Handed { from } => {
+                out.push(json!({
+                    "role": "user",
+                    "content": HANDED.replace("{from}", from),
+                }));
+            }
+            Cue::Speak => {}
+        }
+        // Last, after whatever else it has been told about this turn:
+        // the room is about to go quiet unless it brings the people
+        // back in. Only where there is anybody to have been talking
+        // to -- a room with one AI in it never has this to say.
+        if turn.hand_on == 0 && !turn.others.is_empty() {
+            out.push(json!({ "role": "user", "content": LAST_ROUND }));
         }
         out
     }
@@ -988,6 +1055,9 @@ fn stream_reply(
     allowed: Allowed,
     lobby: bool,
     cue: Cue,
+    // Whether the turn may be handed to another voice: see
+    // `Turn::hand_on`.
+    hand_on: bool,
     g: u64,
     asked: Instant,
     generation: &AtomicU64,
@@ -1025,7 +1095,7 @@ fn stream_reply(
                 _ => {}
             }
             if tools && round < TOOL_ROUNDS {
-                let offered = tools_for(allowed, lobby, cfg.search, cue.deciding());
+                let offered = tools_for(allowed, lobby, cfg.search, cue.deciding(), hand_on);
                 body["tools"] = match api {
                     Api::Responses => flatten_tools(&offered),
                     _ => offered,
@@ -1310,6 +1380,23 @@ fn room_tools() -> Vec<Value> {
             &[],
         ),
         tool(
+            "hand_to",
+            "Put the turn to another AI voice in this room: it answers \
+             next, as though somebody had said its name. Use it when you \
+             have actually put something to it and want its answer -- \
+             asked it a question, asked what it makes of something, \
+             asked it to take this one. Not as a courtesy, and never to \
+             pass on something that was asked of you. Say your line \
+             first: what you say is spoken, and then it answers. The \
+             room allows only a couple of these in a row with nobody \
+             else saying anything, so spend them on something you want \
+             an answer to.",
+            json!({
+                "bot": { "type": "string", "description": "Exactly the name of the other voice, as you have seen it in the conversation." },
+            }),
+            &["bot"],
+        ),
+        tool(
             "wait_until_named",
             "Stop answering, and say nothing at all until someone says your \
              name again. Call it when the people are done talking to you -- \
@@ -1373,11 +1460,16 @@ fn look_up_tool() -> Value {
 /// lobby designing games and looking things up when `search` is on --
 /// unless this bot is only [`Allowed::Looking`], and then it is who is
 /// here, the web, and the two tools a turn is taken with.
-fn tools_for(allowed: Allowed, lobby: bool, search: bool, deciding: bool) -> Value {
+fn tools_for(allowed: Allowed, lobby: bool, search: bool, deciding: bool, hand_on: bool) -> Value {
+    // Not offered when there is nobody to hand to, or nothing left to
+    // hand: the model is told as much in `LAST_ROUND`, and a tool it
+    // cannot use is a tool it will try.
+    let offer = |t: &Value| hand_on || t["function"]["name"].as_str().unwrap_or("") != "hand_to";
     if allowed == Allowed::Looking {
         let mut out: Vec<Value> = room_tools()
             .into_iter()
             .filter(|t| allowed.may(t["function"]["name"].as_str().unwrap_or("")))
+            .filter(&offer)
             .collect();
         if deciding {
             out.push(quiet_tool());
@@ -1389,7 +1481,7 @@ fn tools_for(allowed: Allowed, lobby: bool, search: bool, deciding: bool) -> Val
     }
     let name =
         json!({ "type": "string", "description": "The game's name, as the players will see it." });
-    let mut extra = room_tools();
+    let mut extra: Vec<Value> = room_tools().into_iter().filter(offer).collect();
     if deciding {
         extra.push(quiet_tool());
     }
@@ -1557,6 +1649,9 @@ fn run_tool(room: &Room, cfg: &Chat, g: u64, call: &ToolCall, allowed: Allowed) 
         "stay_quiet" => room
             .stay_quiet(g, args["ask_again_in_seconds"].as_u64())
             .map(|()| json!({ "quiet": true })),
+        "hand_to" => room
+            .hand_to(g, &arg("bot"))
+            .map(|to| json!({ "handed_to": to })),
         "wait_until_named" => {
             // What the room is doing afterwards: a game that answers at
             // every pause still does, and the model should know.
@@ -1691,7 +1786,7 @@ mod tests {
     }
 
     fn tool_names_deciding(lobby: bool, search: bool, deciding: bool) -> Vec<String> {
-        tools_for(Allowed::Everything, lobby, search, deciding)
+        tools_for(Allowed::Everything, lobby, search, deciding, true)
             .as_array()
             .unwrap()
             .iter()
@@ -1705,8 +1800,19 @@ mod tests {
         messages[0]["content"].as_str().unwrap().to_string()
     }
 
+    /// What is offered in the lobby, with the web, to a bot judging a
+    /// pause -- `hand_on` being the only thing in question.
+    fn tools_names(allowed: Allowed, hand_on: bool) -> Vec<String> {
+        tools_for(allowed, true, true, true, hand_on)
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap().to_string())
+            .collect()
+    }
+
     fn looking_names(lobby: bool, search: bool, deciding: bool) -> Vec<String> {
-        tools_for(Allowed::Looking, lobby, search, deciding)
+        tools_for(Allowed::Looking, lobby, search, deciding, true)
             .as_array()
             .unwrap()
             .iter()
@@ -1722,7 +1828,13 @@ mod tests {
     fn a_voice_in_the_room_has_only_the_tools_of_one() {
         assert_eq!(
             looking_names(true, true, true),
-            ["list_people", "wait_until_named", "stay_quiet", "look_up"]
+            [
+                "list_people",
+                "hand_to",
+                "wait_until_named",
+                "stay_quiet",
+                "look_up"
+            ]
         );
         // Nothing that changes anything: no cards, and no games.
         let everything = tool_names_deciding(true, true, true);
@@ -1746,10 +1858,24 @@ mod tests {
 
         // The web only where anybody has it: in the lobby, with
         // --search on. Judging is the only time stay_quiet is offered,
-        // to either of them.
-        assert_eq!(looking_names(true, false, true).len(), 3, "no search");
+        // to either of them. And handing the turn on is offered only
+        // while there is a turn left to hand on, so a bot never finds
+        // out by being refused.
+        assert!(!looking_names(true, false, true).contains(&"look_up".to_string()));
         assert!(!looking_names(false, true, true).contains(&"look_up".to_string()));
         assert!(!looking_names(true, true, false).contains(&"stay_quiet".to_string()));
+        for names in [
+            looking_names(true, true, true),
+            tool_names_deciding(true, true, true),
+        ] {
+            assert!(names.contains(&"hand_to".to_string()));
+        }
+        for names in [
+            tools_names(Allowed::Looking, false),
+            tools_names(Allowed::Everything, false),
+        ] {
+            assert!(!names.contains(&"hand_to".to_string()), "{names:?}");
+        }
 
         // And what is offered is what is allowed: a model that calls
         // something it was never shown is told there is no such tool.
@@ -1842,6 +1968,51 @@ mod tests {
         assert!(!note.contains("Cora is in the room too"));
     }
 
+    /// A turn another voice put to it, and the one after which the
+    /// people have to come back in. The second is told, never
+    /// discovered: a bot that finds out by calling `hand_to` and being
+    /// refused has already written a reply for a conversation that is
+    /// about to stop dead.
+    #[test]
+    fn a_handed_turn_says_who_handed_it_and_when_it_is_the_last() {
+        let cue = Cue::Handed {
+            from: "Cora".into(),
+        };
+        let (agent, mut t) = turn_among(cue, &["Ryan"], false, &["Cora"]);
+        let note = |t: &Turn| {
+            agent.messages(t).pop().unwrap()["content"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let handed = note(&t);
+        assert!(
+            handed.contains("Cora has just handed you the turn"),
+            "{handed}"
+        );
+        assert!(handed.contains("stay_quiet"), "it may still pass");
+
+        // With one of the two left, that is all it is told.
+        assert_eq!(t.hand_on, 2);
+        assert!(!handed.contains("last thing the voices here can say"));
+
+        // With none left, the last word is the people's, and it is
+        // asked to leave it with them.
+        t.hand_on = 0;
+        let last = note(&t);
+        assert!(
+            last.contains("last thing the voices here can say"),
+            "{last}"
+        );
+        assert!(last.contains("leave it with the people"));
+
+        // Alone in the room there is no such thing to say at all.
+        let (agent, mut t) = turn_with(Cue::Speak, &["Ryan"], false);
+        t.hand_on = 0;
+        let alone = agent.messages(&t);
+        assert_eq!(alone.len(), 2, "system and the conversation: {alone:?}");
+    }
+
     #[test]
     fn look_up_is_offered_only_when_search_is_on() {
         let without = tool_names(true, false);
@@ -1914,6 +2085,7 @@ mod tests {
             people: people.iter().map(|p| p.to_string()).collect(),
             others: others.iter().map(|o| o.to_string()).collect(),
             others_answering: others.iter().map(|o| o.to_string()).collect(),
+            hand_on: if others.is_empty() { 0 } else { 2 },
             language: "English".into(),
             speaks: Vec::new(),
             engaged,
@@ -1949,6 +2121,7 @@ mod tests {
                 confirm: Duration::from_millis(300),
                 engaged_for: Duration::from_secs(30),
                 history: 60,
+                ai_turns: 2,
                 language: "English".into(),
                 languages: vec!["English".into()],
                 spoken: vec!["English".into()],
@@ -1979,7 +2152,8 @@ mod tests {
             &agent.messages(&t),
             Allowed::Everything,
             true,
-            t.cue,
+            t.cue.clone(),
+            t.hand_on > 0,
             7,
             Instant::now(),
             &room.generation_of_only_bot(),
@@ -2053,7 +2227,7 @@ mod tests {
             let (agent, mut t) = turn_with(judge(None, false), people, *engaged);
             t.messages = vec![(Role::User, said.to_string())];
             // Ask the way the room asks, on whichever API it speaks.
-            let offered = tools_for(Allowed::Everything, true, false, true);
+            let offered = tools_for(Allowed::Everything, true, false, true, true);
             let messages = agent.messages(&t);
             let (path, mut body) = match chat.api() {
                 Api::Responses => (
@@ -2147,7 +2321,7 @@ mod tests {
     #[test]
     fn each_api_is_fed_and_read_in_its_own_shape() {
         // One function tool, wrapped for chat and flat for responses.
-        let offered = tools_for(Allowed::Everything, false, false, false);
+        let offered = tools_for(Allowed::Everything, false, false, false, true);
         let flat = flatten_tools(&offered);
         assert_eq!(offered[0]["function"]["name"], "list_people");
         assert_eq!(flat[0]["name"], "list_people");
@@ -2386,7 +2560,7 @@ mod tests {
         // The tools are read as instructions for what to do, so nothing
         // in them is phrased that way at all.
         for (lobby, deciding) in [(true, true), (false, false)] {
-            let tools = tools_for(Allowed::Everything, lobby, true, deciding).to_string();
+            let tools = tools_for(Allowed::Everything, lobby, true, deciding, true).to_string();
             assert!(!tools.contains("private"), "{tools}");
         }
     }
@@ -2418,6 +2592,7 @@ mod tests {
                 "post_card",
                 "take_back_card",
                 "read_cards",
+                "hand_to",
                 "wait_until_named"
             ]
         );

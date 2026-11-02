@@ -239,11 +239,26 @@ anyway, and its prompt never mentions the ones it hasn't got — a note
 about dealing cards, to a voice that cannot deal one, is an instruction
 to try.
 
-**They don't talk to each other, by design.** A turn is only ever
-handed over when a *person* has said something, so a reply never starts
-another one: when a bot has finished, the room goes quiet and waits for
-you. They can refer to what the other said; they cannot have a
-conversation between themselves while you listen.
+**They can put something to each other, and the people keep that
+going.** A reply never starts another one by itself: the room hands
+the turn over when a *person* has said something, and when a bot has
+finished it goes quiet and waits. The one exception is deliberate —
+a bot can call `hand_to` to put something to another voice ("what do
+you make of that, Cora?"), and the room gives that one the turn as
+soon as the first has been heard out. That is what makes a
+conversation of three rather than two people taking turns with one AI.
+
+It is bounded by `--ai-turns` (default 2): replies the AIs may give
+each other with nobody human saying anything in between. **The count
+goes back to nothing the moment you speak or type**, so as long as you
+are in the conversation they can keep going round; stop, and so do
+they, within a turn or two. `--ai-turns 0` is AIs that only ever
+answer people.
+
+A bot is *told* when it is on the last of them, and isn't offered
+`hand_to` at all then — it is asked to finish the thought and put it
+back to the people. A bot that found out by being refused would
+already have written a reply for a conversation about to stop dead.
 
 **Who answers a pause.** Every bot that could answer is given the turn
 at once, and **the first to actually say something keeps it** — the
@@ -1062,6 +1077,7 @@ pays for a rejected request before every reply.
 | `VOX_ROOM_REPLY_AFTER_MS` | `1200` | quiet before what was said is handed over |
 | `VOX_ROOM_CONFIRM_MS` | `300` | continuous speech that cuts the AI off |
 | `VOX_ROOM_ENGAGED_FOR_MS` | `30000` | idle time that ends a back-and-forth and goes back to "when named" |
+| `VOX_ROOM_AI_TURNS` | `2` | replies the AIs may give each other with nobody human saying anything in between; reset whenever somebody speaks or types. 0 is AIs that only answer people |
 | `VOX_ROOM_HISTORY` | `60` | entries of the conversation sent to the model |
 | `VOX_SCRIBE_LLM_URL`, `VOX_SCRIBE_LLM_MODEL`, `VOX_SCRIBE_LLM_KEY` | as for scribe and `agent` | the model |
 | `VOX_ROOM_REASONING` | `low` | how hard it thinks: `none`, `low`, `medium`, `high` |

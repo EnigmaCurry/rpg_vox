@@ -90,6 +90,40 @@ releases.
 
 ### Voice room
 
+- **And they can put something to each other.** Seeing each other was
+  half of it: a voice could refer to what another had said, but only a
+  person could ever cause one to speak, so "say hi to Vortex Prime"
+  got a hello that Vortex Prime never answered. `hand_to` is the other
+  half -- a bot puts something to another voice and hands it the turn,
+  and the room gives that one the turn as soon as the first has been
+  heard out, exactly as though a person had said its name. That is
+  what makes a conversation of three rather than two people taking
+  turns with one AI.
+
+  What keeps it from being two AIs talking while the people watch is
+  `--ai-turns` (default 2): replies they may give each other with
+  nobody human saying anything in between, and **the count goes back
+  to nothing the moment somebody speaks or types**. So the people in
+  the conversation are the whole of what keeps it going; stop joining
+  in and it stops too, within a turn or two. `--ai-turns 0` is AIs
+  that only ever answer people.
+
+  A bot is told when it is on the last of them, and is not offered
+  `hand_to` at all then: it is asked to finish the thought and put it
+  back to the people. A bot that discovered the limit by calling the
+  tool and being refused would already have written a reply for a
+  conversation about to stop dead -- "I'll let Cora take that" with
+  nobody able to.
+
+  Turns that are waiting to be given out now live in one queue in the
+  room, which is also where a bot's "show me this silence again" ask
+  went. They want the same thing of the room -- a moment that is
+  nobody else's -- and differ only in what happens when the moment
+  doesn't come: a silence that didn't happen is spent, while a voice
+  waiting to be answered waits for the voice ahead of it. Anything
+  waiting is dropped when a person speaks, when the room is stopped,
+  and when a bot is silenced.
+
 - **Two AIs in a room can see each other.** Each was shown the other's
   replies as its own -- every AI entry went to the model as a plain
   assistant turn with no name on it -- so Vox read what Cora had just

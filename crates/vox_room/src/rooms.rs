@@ -650,6 +650,7 @@ mod tests {
             confirm: Duration::from_millis(300),
             engaged_for: Duration::from_secs(30),
             history: 60,
+            ai_turns: 2,
             language: "English".into(),
             languages: vec!["English".into()],
             spoken: vec!["English".into()],

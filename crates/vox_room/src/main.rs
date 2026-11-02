@@ -115,6 +115,19 @@ struct Cli {
     /// Entries of the conversation sent to the model with each turn.
     #[arg(long, env = "VOX_ROOM_HISTORY", default_value_t = 60)]
     history: usize,
+    /// Replies the AIs may give each other with nobody saying anything
+    /// in between.
+    ///
+    /// A voice can put something to another voice and hand it the turn
+    /// (`hand_to`), which is how three of you have a conversation
+    /// rather than two people taking turns with one AI. This is what
+    /// keeps that from becoming two AIs talking to each other while
+    /// the people watch: the count goes back to nothing the moment
+    /// somebody speaks or types, so a conversation people are in can
+    /// go round for as long as they are in it. 0 is AIs that only ever
+    /// answer people.
+    #[arg(long, env = "VOX_ROOM_AI_TURNS", default_value_t = 2)]
+    ai_turns: u32,
 
     /// OpenAI-compatible base URL ending in /v1. The same service as
     /// scribe's --llm and `agent`; the key comes from VOX_SCRIBE_LLM_KEY.
@@ -780,6 +793,7 @@ fn serve(cli: Cli, store: Store, db: PathBuf) -> Result<()> {
         title: String::new(),
         only: None,
         default_mode: room::Mode::Named,
+        ai_turns: cli.ai_turns,
         bots,
         reply_after: Duration::from_millis(cli.reply_after_ms),
         confirm: Duration::from_millis(cli.confirm_ms),

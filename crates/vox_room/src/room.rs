@@ -212,7 +212,7 @@ impl Stops {
 }
 
 /// Why the AI has been given the turn.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Cue {
     /// Say something: it was named, it is opening a game, or the room
     /// answers every pause.
@@ -225,12 +225,56 @@ pub enum Cue {
     /// shown may be a cough or a word to somebody else as easily as a
     /// follow-up for it.
     Decide { lull: Option<u64>, over: bool },
+    /// Another voice in the room put something to it and handed it the
+    /// turn; `from` is which one. It is to answer -- it was addressed,
+    /// which is the same reason a name is -- but it may still pass, and
+    /// then nothing of it reaches the room.
+    Handed { from: String },
 }
 
 impl Cue {
-    pub fn deciding(self) -> bool {
-        matches!(self, Cue::Decide { .. })
+    /// Whether this turn may be passed on, leaving nothing behind: a
+    /// pause it was asked to judge, and a turn another voice put to it
+    /// when it has nothing of its own to add.
+    pub fn deciding(&self) -> bool {
+        matches!(self, Cue::Decide { .. } | Cue::Handed { .. })
     }
+}
+
+/// A turn somebody has asked for that hasn't been given yet.
+///
+/// The room's own turn-taking answers people: `hand_over` gives the
+/// pause after somebody has spoken. This is everything else -- a voice
+/// putting something to another voice, a bot asking to be shown a
+/// longer silence -- and one day whatever asks from outside the room.
+/// They all want the same thing of the room, which is a moment when it
+/// is nobody else's turn, so they all wait in the same queue.
+#[derive(Debug, Clone)]
+struct Pending {
+    /// Who is to be given the turn.
+    bot: String,
+    /// Not before this.
+    due: Instant,
+    /// What kind of turn it is, and what the bot is told about it.
+    cue: Cue,
+    /// What it is waiting for, which decides what it does when its
+    /// moment doesn't come.
+    why: Why,
+}
+
+/// Why a turn is waiting, and what happens if the room isn't ready.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Why {
+    /// One voice handed the turn to another. It waits for the room to
+    /// go quiet, which is when the voice that handed it over has been
+    /// heard out. Somebody speaking takes it back: the conversation has
+    /// moved, and answering the thing before it is worse than silence.
+    Handed,
+    /// A bot that passed on a pause, asking to be shown the room again
+    /// if the quiet lasts. The silence *is* the thing it asked for, so
+    /// if the room isn't quiet when the moment comes, the moment
+    /// didn't happen and the ask is spent.
+    Silence,
 }
 
 /// How the AI takes its turn in a game.
@@ -461,6 +505,11 @@ pub struct RoomConfig {
     pub engaged_for: Duration,
     /// Entries of history the model is shown.
     pub history: usize,
+    /// Replies the AIs may give each other with nobody human saying
+    /// anything in between. The count goes back to nothing the moment
+    /// somebody speaks or types, so a person in the conversation is
+    /// what keeps it going; 0 means they only ever answer people.
+    pub ai_turns: u32,
     /// How the AI takes its turn in a room nobody has set yet. A room
     /// the house shares waits to be named, so two people can talk
     /// without it butting in; a room with one person and the AI in it
@@ -522,6 +571,13 @@ pub struct Turn {
     /// a question for Cora pass, while Cora is saying nothing at all,
     /// leaves it unanswered by anybody.
     pub others_answering: Vec<String>,
+    /// How many more times the turn may be handed from one voice to
+    /// another before somebody human has to say something. 0 is the
+    /// last of them -- the bot is told so, and is not offered `hand_to`
+    /// at all, because a bot that finds out by being refused has
+    /// already finished speaking. It is also 0 when there is nobody to
+    /// hand to.
+    pub hand_on: u32,
     /// The language the AI writes in: the room's own.
     pub language: String,
     /// Who in the room is listening in another language, and which, so
@@ -681,9 +737,6 @@ struct BotState {
     /// Its state as last broadcast: listening, waiting, thinking,
     /// speaking.
     state: &'static str,
-    /// It passed on its turn but asked to be shown the room again if
-    /// the quiet lasted: when to look, and how long that is in seconds.
-    reconsider: Option<(Instant, u64)>,
     reply: Option<Reply>,
     /// A game it started in reply `.0`: entered once that reply has
     /// been heard (or cut off).
@@ -730,6 +783,14 @@ struct State {
     /// is kept in the database like everything else, so this survives a
     /// restart in the middle of a game.
     resume: Option<i64>,
+    /// Turns somebody has asked for that haven't been given yet, in
+    /// the order they were asked for. See [`Pending`].
+    pending: Vec<Pending>,
+    /// Replies the AIs have given each other since the last time a
+    /// person said anything. Capped by `RoomConfig::ai_turns`: two
+    /// voices being polite at each other is a conversation nobody is
+    /// in, and a model call per line of it.
+    ai_turns: u32,
     /// What is being interpreted for the people who don't speak it, by
     /// the line on screen it was said in.
     interp: BTreeMap<String, Interp>,
@@ -963,7 +1024,6 @@ impl Room {
                 talked_over: false,
                 engaged: None,
                 state: "listening",
-                reconsider: None,
                 reply: None,
                 starting: None,
                 last_reply: None,
@@ -1005,6 +1065,8 @@ impl Room {
                 last_change: Instant::now(),
                 quiet_since: Instant::now(),
                 ducked: false,
+                pending: Vec::new(),
+                ai_turns: 0,
                 interp: BTreeMap::new(),
                 next_stream: 0,
             }),
@@ -1969,7 +2031,8 @@ impl Room {
             .reply
             .as_ref()
             .expect("working_on found it by its reply")
-            .cue;
+            .cue
+            .clone();
         if !cue.deciding() {
             return Err("you were asked to answer, not whether to answer".into());
         }
@@ -1981,46 +2044,121 @@ impl Room {
                 .map(|s| s.min(Self::LULL_MAX)),
         };
         self.cut_reply(&mut st, &bot);
-        st.bot(&bot).reconsider = again.map(|s| (Instant::now() + Duration::from_secs(s), s));
+        if let Some(s) = again {
+            let cue = Cue::Decide {
+                lull: Some(s),
+                over: false,
+            };
+            st.pending.push(Pending {
+                bot: bot.clone(),
+                due: Instant::now() + Duration::from_secs(s),
+                cue,
+                why: Why::Silence,
+            });
+        }
         info!(bot = %bot, generation, again, "reply: stayed quiet");
         Ok(())
     }
 
-    /// Give the AI the turn again once a silence it asked about has
-    /// actually lasted.
-    fn reconsider(&self, st: &mut State, now: Instant) {
-        // Only into a room that is still quiet: anybody talking, any bot
-        // answering, or anything waiting to be handed over means the
-        // silence is over and `hand_over` is the one to decide.
+    /// Give out the turns somebody has asked for, once the room has a
+    /// moment that is nobody else's.
+    ///
+    /// Only into a room that is still quiet: anybody talking, any bot
+    /// answering, or anything waiting to be handed over means the
+    /// silence is over and `hand_over` is the one to decide. What that
+    /// means for a turn whose moment has come anyway is [`Why`]'s to
+    /// say -- a silence that didn't happen is spent, while a voice
+    /// waiting to be answered waits for the voice ahead of it.
+    fn pending_turns(&self, st: &mut State, now: Instant) {
+        if st.pending.is_empty() {
+            return;
+        }
         let quiet = st.bots.iter().all(|b| b.reply.is_none())
             && !st.people.values().any(|p| p.speaking || p.holding())
             && !st.log.iter().any(|e| e.kind == Kind::Human && !e.sent);
-        let due: Vec<(String, u64)> = st
+        let silenced: BTreeSet<String> = st
             .bots
-            .iter_mut()
-            .filter_map(|b| {
-                let (at, lull) = b.reconsider?;
-                if b.mode == Mode::Never {
-                    b.reconsider = None;
-                    return None;
-                }
-                if now < at {
-                    return None;
-                }
-                b.reconsider = None;
-                Some((b.cfg.name.clone(), lull))
-            })
+            .iter()
+            .filter(|b| b.mode == Mode::Never)
+            .map(|b| b.cfg.name.clone())
             .collect();
-        if !quiet {
-            return;
+        let mut due: Vec<Pending> = Vec::new();
+        st.pending.retain(|p| {
+            // Silenced since it was asked for: there is nobody to give
+            // it to, and nobody to give it to later either.
+            if silenced.contains(&p.bot) {
+                return false;
+            }
+            if now < p.due {
+                return true;
+            }
+            if !quiet && p.why == Why::Handed {
+                return true;
+            }
+            if quiet {
+                due.push(p.clone());
+            }
+            false
+        });
+        let alone = due.len() == 1;
+        for p in due {
+            self.ask(st, &p.bot, now, p.cue, alone);
         }
-        for (bot, lull) in due {
-            let cue = Cue::Decide {
-                lull: Some(lull),
-                over: false,
-            };
-            self.ask(st, &bot, now, cue, true);
+    }
+
+    /// One voice putting something to another: the bot it names is
+    /// given the turn once this one has been heard out, as though it
+    /// had been named by a person.
+    ///
+    /// The cap is the whole of what keeps this from being two AIs
+    /// talking to each other while the people watch. It goes back to
+    /// nothing whenever somebody says or types anything, so a
+    /// conversation people are in can go round as long as they keep
+    /// being in it.
+    pub fn hand_to(&self, generation: u64, to: &str) -> Result<String, String> {
+        let mut st = self.lock();
+        let Some(b) = st.working_on(generation) else {
+            return Err("that turn is over; the room has moved on".into());
+        };
+        let from = b.cfg.name.clone();
+        let to = to.trim();
+        let Some(bot) = st
+            .bots
+            .iter()
+            .find(|b| b.cfg.name.eq_ignore_ascii_case(to))
+            .map(|b| b.cfg.name.clone())
+        else {
+            return Err(format!("there is nobody here called {to:?}"));
+        };
+        if bot == from {
+            return Err("that is you; say it yourself".into());
         }
+        if st.bot(&bot).mode == Mode::Never {
+            return Err(format!(
+                "{bot} is set to say nothing at all in this room, so there is \
+                 no handing it anything: answer yourself, or leave it"
+            ));
+        }
+        if st.ai_turns >= self.cfg.ai_turns {
+            return Err(format!(
+                "the voices here have already answered each other {} times with \
+                 nobody else saying anything: say what you have to say yourself, \
+                 and leave the next turn to the people",
+                st.ai_turns
+            ));
+        }
+        if st.pending.iter().any(|p| p.why == Why::Handed) {
+            return Err("the turn has already been handed on".into());
+        }
+        st.ai_turns += 1;
+        info!(from = %from, to = %bot, round = st.ai_turns, "handing the turn on");
+        st.pending.push(Pending {
+            bot: bot.clone(),
+            due: Instant::now(),
+            cue: Cue::Handed { from },
+            why: Why::Handed,
+        });
+        Ok(bot)
     }
 
     /// A saved game and its prompt, for someone who asks to see it.
@@ -2609,9 +2747,11 @@ impl Room {
         let b = st.bot(bot);
         b.chosen = mode;
         b.engaged = None;
-        // Nothing it asked to be shown again outlives being silenced.
+        // Nothing anybody asked of it outlives being silenced -- not a
+        // silence it wanted shown again, and not a turn another voice
+        // put to it.
         if mode == Mode::Never {
-            b.reconsider = None;
+            st.pending.retain(|p| p.bot != bot);
         }
         if let Err(err) = self
             .store()
@@ -2990,10 +3130,11 @@ impl Room {
         // Everything any bot was in the middle of belonged to the
         // conversation the room is leaving.
         let bots: Vec<String> = st.bots.iter().map(|b| b.cfg.name.clone()).collect();
+        st.pending.clear();
+        st.ai_turns = 0;
         for bot in &bots {
             let b = st.bot(bot);
             b.starting = None;
-            b.reconsider = None;
             self.cut_reply(st, bot);
         }
         st.conversation = conversation;
@@ -3546,7 +3687,7 @@ impl Room {
         self.follow_interp(&mut st);
         self.barge_in(&mut st, now);
         self.hand_over(&mut st, now);
-        self.reconsider(&mut st, now);
+        self.pending_turns(&mut st, now);
         self.follow_engagement(&mut st, now);
         self.follow_state(&mut st);
     }
@@ -3873,6 +4014,10 @@ impl Room {
                 Stops::Finished => b.talked_over = true,
             }
         }
+        // A voice in the room takes it back from whatever was waiting
+        // to be given out: a bot about to be handed the turn is about
+        // to answer the thing this person is talking over.
+        st.pending.clear();
         if !cut.is_empty() {
             info!(person = %who, bots = %cut.join(", "), "barge-in");
             self.hush(st, &cut);
@@ -3890,6 +4035,11 @@ impl Room {
     /// A reply nobody wants to hear the end of is every reply, so this
     /// takes no view about which bot was talking.
     fn interrupt(&self, st: &mut State) {
+        // Stop is the room saying stop: a turn one voice was about to
+        // hand to another is part of what it was saying and stops with
+        // it, and a silence somebody asked to be shown again is about
+        // a quiet that is over either way.
+        st.pending.clear();
         let bots: Vec<String> = st.bots.iter().map(|b| b.cfg.name.clone()).collect();
         self.hush(st, &bots);
     }
@@ -4019,11 +4169,18 @@ impl Room {
         // that had nothing to say.
         let named = self.named(st, &said);
         let bots: Vec<String> = st.bots.iter().map(|b| b.cfg.name.clone()).collect();
+        // Somebody said something, so whatever was waiting to be given
+        // out has been overtaken: a silence that was asked about didn't
+        // happen, and a turn one voice put to another is about a thing
+        // the room has moved past. And the AIs may answer each other
+        // again -- a person in the conversation is the whole of what
+        // keeps that allowance open.
+        st.pending.clear();
+        st.ai_turns = 0;
         let mut turns: Vec<(String, Cue)> = Vec::new();
         for bot in bots {
             let was_named = named.contains(&bot);
             let b = st.bot(&bot);
-            b.reconsider = None;
             // Whatever was said over its own voice belongs to this
             // hand-over and no later one, whoever the words turn out to
             // have been for.
@@ -4109,12 +4266,13 @@ impl Room {
         if show && !cue.deciding() {
             self.emit_entry(&entry);
         }
+        let deciding = cue.deciding();
         let b = st.bot(bot);
         b.last_reply = Some((generation, entry.id.clone()));
         b.reply = Some(Reply {
             generation,
             entry: entry.id.clone(),
-            cue,
+            cue: cue.clone(),
             sentences: Vec::new(),
             translated: BTreeMap::new(),
             complete: false,
@@ -4132,10 +4290,16 @@ impl Room {
             generation,
             after_words_ms = now.duration_since(st.quiet_since).as_millis() as u64,
             after_transcript_ms = now.duration_since(st.last_change).as_millis() as u64,
-            deciding = cue.deciding(),
+            deciding,
             "reply: asking the agent"
         );
         let engaged = st.bot(bot).engaged.is_some();
+        let others_answering: Vec<String> = st
+            .bots
+            .iter()
+            .filter(|b| b.cfg.name != bot && b.mode != Mode::Never)
+            .map(|b| b.cfg.name.clone())
+            .collect();
         let turns = st.bot(bot).turns.clone();
         if turns
             .send(Turn {
@@ -4155,12 +4319,12 @@ impl Room {
                     .filter(|b| b.cfg.name != bot)
                     .map(|b| b.cfg.name.clone())
                     .collect(),
-                others_answering: st
-                    .bots
-                    .iter()
-                    .filter(|b| b.cfg.name != bot && b.mode != Mode::Never)
-                    .map(|b| b.cfg.name.clone())
-                    .collect(),
+                others_answering: others_answering.clone(),
+                hand_on: if others_answering.is_empty() {
+                    0
+                } else {
+                    self.cfg.ai_turns.saturating_sub(st.ai_turns)
+                },
                 language: self.cfg.language.clone(),
                 speaks: st
                     .people
@@ -4573,6 +4737,7 @@ mod tests {
             confirm: Duration::from_millis(300),
             engaged_for: Duration::from_millis(5000),
             history: 50,
+            ai_turns: 2,
             language: "English".into(),
             languages: vec!["English".into(), "Russian".into()],
             spoken: vec!["English".into(), "Russian".into()],
@@ -4725,6 +4890,7 @@ mod tests {
                 confirm: Duration::from_millis(300),
                 engaged_for: Duration::from_millis(5000),
                 history: 50,
+                ai_turns: 2,
                 language: "English".into(),
                 languages: vec!["English".into()],
                 spoken: vec!["English".into()],
@@ -6081,6 +6247,7 @@ mod tests {
                 confirm: Duration::from_millis(300),
                 engaged_for: Duration::from_millis(5000),
                 history: 50,
+                ai_turns: 2,
                 language: "English".into(),
                 languages: vec!["English".into()],
                 spoken: vec!["English".into()],
@@ -6239,6 +6406,113 @@ mod tests {
             "but nothing to leave a pause to"
         );
         assert!(said(&vox, Role::User, "Sage: I think so."));
+    }
+
+    /// One voice putting something to another: the bot it names is
+    /// given the turn once this one has been heard out, and the people
+    /// keep the allowance open by being in the conversation.
+    #[test]
+    fn a_voice_can_hand_the_turn_to_another_voice() {
+        let (r, turns) = room_of_two();
+        r.on_paragraph("Ryan", &para("p1", "So what do we think?", false));
+        r.tick(quiet(&r));
+        let sage = turns["Sage"].try_recv().expect("Sage has the turn");
+        turns["Vox"].try_recv().expect("and so has Vox");
+
+        // Sage answers and puts it to Vox. Nothing happens yet: Sage
+        // is still being heard, and two of them at once is two voices
+        // over each other.
+        assert!(r.agent_speak(sage.generation, "I think so.", vec![0.1; 4800]));
+        assert_eq!(r.hand_to(sage.generation, "vox").as_deref(), Ok("Vox"));
+        r.agent_done(sage.generation);
+        r.tick(Instant::now());
+        assert!(
+            turns["Vox"].try_recv().is_err(),
+            "not while Sage is talking"
+        );
+
+        // Heard out, and the turn is Vox's -- told who handed it over.
+        for _ in 0..20 {
+            r.mixer.tick();
+        }
+        r.tick(Instant::now());
+        let vox = turns["Vox"].try_recv().expect("handed the turn");
+        assert_eq!(
+            vox.cue,
+            Cue::Handed {
+                from: "Sage".into()
+            }
+        );
+        assert!(
+            vox.messages
+                .iter()
+                .any(|(role, m)| *role == Role::User && m.contains("Sage: I think so.")),
+            "and shown what it is answering: {:?}",
+            vox.messages
+        );
+
+        // One left of the two, and Vox is told as much.
+        assert_eq!(vox.hand_on, 1);
+        assert!(r.hand_to(vox.generation, "Sage").is_ok());
+        r.agent_done(vox.generation);
+        r.tick(Instant::now());
+        let sage = turns["Sage"].try_recv().expect("and back again");
+        assert_eq!(sage.hand_on, 0, "the last of them: no handing it on");
+        assert!(
+            r.hand_to(sage.generation, "Vox")
+                .is_err_and(|e| e.contains("say what you have to say yourself")),
+            "and the room says so if it tries"
+        );
+
+        // Somebody saying something opens it all up again.
+        r.stop_agent();
+        r.on_paragraph("Ryan", &para("p2", "Carry on.", false));
+        r.tick(quiet(&r));
+        let vox = turns["Vox"].try_recv().expect("a pause of their own");
+        turns["Sage"].try_recv().expect("both of them");
+        assert_eq!(vox.hand_on, 2, "a person in it is what keeps it going");
+    }
+
+    #[test]
+    fn a_turn_handed_on_is_dropped_when_somebody_speaks() {
+        let (r, turns) = room_of_two();
+        r.on_paragraph("Ryan", &para("p1", "So what do we think?", false));
+        r.tick(quiet(&r));
+        let sage = turns["Sage"].try_recv().unwrap();
+        turns["Vox"].try_recv().unwrap();
+        assert!(r.agent_speak(sage.generation, "I think so.", vec![0.1; 4800]));
+        assert!(r.hand_to(sage.generation, "Vox").is_ok());
+        r.agent_done(sage.generation);
+        for _ in 0..20 {
+            r.mixer.tick();
+        }
+
+        // Ryan gets in first. What Sage put to Vox is about the room as
+        // it was a moment ago, and the room has moved.
+        r.on_paragraph("Ryan", &para("p2", "Actually, never mind.", false));
+        r.tick(Instant::now());
+        r.tick(quiet(&r));
+        assert!(r.lock().pending.is_empty());
+        let vox = turns["Vox"].try_recv().expect("the people's pause");
+        assert_eq!(vox.cue, Cue::Speak, "answering Ryan, not Sage");
+    }
+
+    #[test]
+    fn there_is_nobody_to_hand_the_turn_to_but_another_voice() {
+        let (r, turns) = room_of_two();
+        r.on_paragraph("Ryan", &para("p1", "So?", false));
+        r.tick(quiet(&r));
+        let sage = turns["Sage"].try_recv().unwrap();
+        turns["Vox"].try_recv().unwrap();
+        let err = |e: Result<String, String>| e.unwrap_err();
+        assert!(err(r.hand_to(sage.generation, "Ryan")).contains("nobody here called"));
+        assert!(err(r.hand_to(sage.generation, "Sage")).contains("that is you"));
+        // And not to one that has been told to say nothing at all.
+        r.set_mode("Vox", "never");
+        assert!(err(r.hand_to(sage.generation, "Vox")).contains("say nothing at all"));
+        assert!(r.lock().pending.is_empty());
+        // A turn that is over can't hand anything on either.
+        assert!(err(r.hand_to(sage.generation + 99, "Vox")).contains("that turn is over"));
     }
 
     /// A conversation can be called something, and what it is called is
@@ -6755,7 +7029,7 @@ mod tests {
         r.stay_quiet(again.generation, Some(3)).unwrap();
         r.tick(at(30_000));
         assert!(turns.try_recv().is_err(), "once per silence");
-        assert!(r.lock().only().reconsider.is_none());
+        assert!(r.lock().pending.is_empty());
     }
 
     #[test]
@@ -6772,7 +7046,7 @@ mod tests {
         // next turn comes from what they said, not from the old wait.
         r.on_paragraph("Alex", &para("p2", "Where were we?", false));
         r.tick(at(2_300));
-        assert!(r.lock().only().reconsider.is_none());
+        assert!(r.lock().pending.is_empty());
         let next = turns.try_recv().expect("the new pause");
         assert_eq!(next.cue, judge(None, false));
         assert!(next.messages[0].1.contains("Where were we?"));
