@@ -122,6 +122,14 @@ export const room = $state({
   // address, so a new picture is a new URL and the old one can be
   // cached forever.
   avatars: {},
+  // The pictures made in this conversation, by id: { n, who, prompt,
+  // ready, failed }. A picture card in the log looks itself up here --
+  // the entry says which picture it is and this says whether there is
+  // anything to show yet.
+  pictures: {},
+  // Whose face is open, or null. One at a time, and nobody else's
+  // screen changes: looking at who somebody is is a thing you do.
+  profile: null,
   strips: {},
   levels: {},
   log: [],
@@ -620,7 +628,12 @@ export async function readConversation(id) {
   try {
     const r = await fetch(`${roomPath()}/${id}`);
     if (!r.ok) throw new Error(await r.text());
-    room.reading = await r.json();
+    const got = await r.json();
+    // An old conversation brings its own pictures. Added rather than
+    // replacing, so coming back out of it leaves the live
+    // conversation's cards still able to draw themselves.
+    for (const p of got.pictures ?? []) room.pictures[p.id] = p;
+    room.reading = got;
   } catch (e) {
     console.error('[room] read', e);
     notify(`Can't open that conversation: ${e.message || e}`, true);
@@ -718,6 +731,37 @@ export async function forgetAvatar() {
   await fetch(`/api/avatar/${encodeURIComponent(room.you)}`, { method: 'DELETE' });
 }
 
+/// Where to fetch a picture made in this conversation.
+export function pictureOf(id) {
+  return `/api/picture/${encodeURIComponent(id)}`;
+}
+
+/// Open somebody's face: who they are, as much as the house knows.
+/// Nobody else's screen changes.
+export async function openProfile(who) {
+  // Shown at once with what is already on screen, so the modal opens
+  // on the click rather than on the round trip; the rest fills in.
+  room.profile = { who, loading: true };
+  await loadProfile(who);
+}
+
+async function loadProfile(who) {
+  try {
+    const r = await fetch(`/api/profile/${encodeURIComponent(who)}`);
+    if (!r.ok) throw new Error(String(r.status));
+    const got = await r.json();
+    // Not if they closed it, or opened somebody else, while this was
+    // in the air.
+    if (room.profile?.who === who) room.profile = { ...got, loading: false };
+  } catch {
+    if (room.profile?.who === who) room.profile = { who, loading: false, failed: true };
+  }
+}
+
+export function closeProfile() {
+  room.profile = null;
+}
+
 /// Back and forward move between rooms, since that is what the bar
 /// changing means. No new entry for a move the history itself asked for.
 addEventListener('popstate', () => followUrl());
@@ -811,6 +855,7 @@ function apply(ev) {
       room.people = ev.people;
       room.speaks = ev.speaks ?? {};
       room.avatars = ev.avatars ?? {};
+      room.pictures = Object.fromEntries((ev.pictures ?? []).map((p) => [p.id, p]));
       room.strips = ev.strips;
       room.log = ev.log;
       // A tab that has just arrived is told the room as it stands, and
@@ -906,6 +951,17 @@ function apply(ev) {
     case 'entry':
       upsert(ev.entry);
       break;
+    case 'picture':
+      // A picture finished, one way or the other. The card is already
+      // in the log; this is what turns its spinner into the picture,
+      // or into why it never came.
+      room.pictures[ev.picture.id] = ev.picture;
+      break;
+    case 'bio':
+      // Somebody was written about. Only matters if their face is the
+      // one open, and then it is read again rather than patched.
+      if (room.profile?.who === ev.who) loadProfile(ev.who);
+      break;
     case 'entry_removed':
       room.log = room.log.filter((e) => e.id !== ev.id);
       delete room.heard[ev.id];
@@ -921,8 +977,11 @@ function apply(ev) {
       room.heard = {};
       room.game = ev.game ?? null;
       room.conversation = ev.conversation ?? { id: 0, title: '', at: 0 };
-      // Cards belong to the conversation that dealt them.
+      // Cards belong to the conversation that dealt them, and so do
+      // pictures: these are the new conversation's, not a patch on
+      // the ones that were on screen.
       room.cards = ev.cards ?? [];
+      room.pictures = Object.fromEntries((ev.pictures ?? []).map((p) => [p.id, p]));
       break;
     case 'card': {
       // Only this person's tabs are sent it; say so, without the contents.

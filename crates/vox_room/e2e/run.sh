@@ -140,10 +140,21 @@ one() {
       "INSERT INTO avatars (who, png, prompt, at)
          VALUES ('Ryan', $face, 'a tired wizard', 1700000000000),
                 ('@Vox', $face, 'a brass head', 1700000000001);
-       INSERT INTO entries (conversation,id,who,kind,text,at)
-         VALUES ($c,'a1','Ryan','human','Make me a face, would you.',1),
-                ($c,'a2','Vox','agent','There. How is that?',2),
-                ($c,'a3','Alex','human','I will stay as I am.',3);"
+       INSERT INTO bios (who, bio, at)
+         VALUES ('Ryan', 'A ranger from the north, quiet about it.', 1700000000000);
+       -- Two pictures in the conversation: one that arrived and one
+       -- still being drawn, so the card and the spinner are on the
+       -- same screen.
+       INSERT INTO pictures (id, conversation, n, who, prompt, png, failed, at)
+         VALUES ('picture-one', $c, 1, 'Vox', 'a tired wizard', $face, '', 4),
+                ('picture-two', $c, 2, 'Vox', 'the same wizard, rested', NULL, '', 6);
+       INSERT INTO entries (conversation,id,who,kind,title,text,at)
+         VALUES ($c,'a1','Ryan','human','','Make me a face, would you.',1),
+                ($c,'a2','Vox','agent','','There. How is that?',2),
+                ($c,'a3','Alex','human','','I will stay as I am.',3),
+                ($c,'picture-one','Vox','picture','a tired wizard','1',4),
+                ($c,'a4','Ryan','human','','Less tired, maybe.',5),
+                ($c,'picture-two','Vox','picture','the same wizard, rested','2',6);"
   fi
 
   # A card is posted by a model, and there is no model here, so the

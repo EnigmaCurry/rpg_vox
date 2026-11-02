@@ -1014,7 +1014,6 @@ fn serve(cli: Cli, store: Store, db: PathBuf) -> Result<()> {
             // here. See `agent::Art`.
             let art = Arc::new(agent::Art {
                 servers: mcp.clone(),
-                stash: mcp::Stash::default(),
             });
             for (n, bot) in wiring.into_iter().enumerate() {
                 let preset = voices.get(&bot.name).unwrap_or(&voice);

@@ -40,9 +40,10 @@
 //! here are text and images. The text goes back to the model as the
 //! tool's answer. The pictures do not: a 128x128 PNG is some 30 KB of
 //! base64, and putting that through a conversation that is read aloud
-//! helps nobody. They are kept in a [`Stash`] instead, and the model
-//! is told in words what it has -- "2 pictures, 128x128" -- which is
-//! all it needs to hand one to `set_avatar`.
+//! helps nobody. They come back in an [`Outcome`] instead, and what
+//! becomes of them is the room's business: they are posted into the
+//! conversation as cards the people can look at and argue about, and
+//! the model is told only their numbers.
 //!
 //! A picture arrives one of three ways, and all three are real:
 //!
@@ -110,40 +111,17 @@ pub struct Picture {
     pub prompt: String,
 }
 
-/// The pictures the last call made, per bot.
+/// What a tool call came back with: what to tell the model, and any
+/// pictures it made.
 ///
-/// Per bot and not per room: two AIs in one room generating at once
-/// must not be able to hand each other's picture to `set_avatar`. One
-/// call's worth each, replaced by the next -- a bot that generates
-/// again has changed its mind, and the one before it was never
-/// anybody's face.
-#[derive(Default)]
-pub struct Stash(Mutex<std::collections::HashMap<String, Vec<Picture>>>);
-
-impl Stash {
-    fn put(&self, bot: &str, pictures: Vec<Picture>) {
-        self.0
-            .lock()
-            .expect("stash")
-            .insert(bot.to_string(), pictures);
-    }
-
-    /// The `nth` picture (1-based) this bot last made, or None when it
-    /// has made none or asked for one that isn't there.
-    pub fn take(&self, bot: &str, nth: usize) -> Option<Picture> {
-        let all = self.0.lock().expect("stash");
-        let mine = all.get(bot)?;
-        mine.get(nth.checked_sub(1)?).cloned()
-    }
-
-    /// How many this bot is holding, for telling it what it has.
-    pub fn held(&self, bot: &str) -> usize {
-        self.0
-            .lock()
-            .expect("stash")
-            .get(bot)
-            .map_or(0, |v| v.len())
-    }
+/// The pictures are handed straight back rather than kept here. Where
+/// they go is the room's business -- into the conversation they were
+/// made in, as cards the people can look at and talk about -- and a
+/// client that held them would be holding the room's state somewhere
+/// the room cannot see it.
+pub struct Outcome {
+    pub said: String,
+    pub pictures: Vec<Picture>,
 }
 
 /// How a server is named and reached. What the configuration says; see
@@ -341,9 +319,9 @@ impl Server {
     }
 
     /// Call one of this server's tools, by the prefixed name the model
-    /// used. The answer is what to tell the model; any pictures it made
-    /// are left in `stash` under `bot`.
-    pub fn call(&self, bot: &str, tool: &str, args: &Value, stash: &Stash) -> Result<String> {
+    /// used. The answer is what the tool said and whatever it drew; see
+    /// [`Outcome`].
+    pub fn call(&self, tool: &str, args: &Value) -> Result<Outcome> {
         let bare = tool
             .strip_prefix(&format!("{}_", self.cfg.name))
             .ok_or_else(|| anyhow!("{tool} is not {}'s", self.cfg.name))?;
@@ -392,39 +370,12 @@ impl Server {
         }
 
         let pictures = self.pictures_of(&result, &what);
-        if pictures.is_empty() {
-            return Ok(if text.is_empty() {
-                format!("{bare} is done")
-            } else {
-                text
-            });
-        }
-        let how_many = pictures.len();
-        let sizes = pictures
-            .iter()
-            .map(|p| format!("{} KB", p.png.len() / 1024))
-            .collect::<Vec<_>>()
-            .join(", ");
-        stash.put(bot, pictures);
-        // Deliberately not the pictures, nor where they are: see the
-        // module docs. What the model needs is that they exist and how
-        // to refer to one.
-        Ok(format!(
-            "{how_many} picture{} ({sizes}), kept as {}. Put one on somebody with \
-             set_avatar, whose `picture` is which of these to use, counting from 1. \
-             Generating again replaces them.{}",
-            if how_many == 1 { "" } else { "s" },
-            if how_many == 1 {
-                "picture 1".to_string()
-            } else {
-                format!("pictures 1 to {how_many}")
-            },
-            if text.is_empty() {
-                String::new()
-            } else {
-                format!(" The tool also said: {text}")
-            }
-        ))
+        let said = if text.is_empty() {
+            format!("{bare} is done")
+        } else {
+            text
+        };
+        Ok(Outcome { said, pictures })
     }
 
     /// Which of this tool's arguments are the key, by what the server
@@ -843,116 +794,6 @@ mod tests {
         assert!(s
             .pictures_of(&json!({ "content": [{ "type": "text", "text": "balance: $1.00" }] }), "")
             .is_empty());
-    }
-
-    /// One call's worth per bot, and one bot cannot reach another's.
-    #[test]
-    fn a_stash_is_the_last_call_and_is_each_bots_own() {
-        let stash = Stash::default();
-        let pic = |p: &str| Picture {
-            png: vec![1],
-            prompt: p.into(),
-        };
-        stash.put("Vortex Prime", vec![pic("first"), pic("second")]);
-        assert_eq!(stash.held("Vortex Prime"), 2);
-        assert_eq!(stash.take("Vortex Prime", 1).unwrap().prompt, "first");
-        assert_eq!(stash.take("Vortex Prime", 2).unwrap().prompt, "second");
-        assert!(stash.take("Vortex Prime", 3).is_none());
-        assert!(stash.take("Vortex Prime", 0).is_none(), "counting from 1");
-        assert!(stash.take("Someone Else", 1).is_none(), "not shared");
-
-        // Generating again replaces them rather than piling up.
-        stash.put("Vortex Prime", vec![pic("latest")]);
-        assert_eq!(stash.held("Vortex Prime"), 1);
-        assert_eq!(stash.take("Vortex Prime", 1).unwrap().prompt, "latest");
-    }
-
-    /// The real thing: say hello to Retro Diffusion's server and read
-    /// what it lends back. No key, because `initialize` and
-    /// `tools/list` want none -- which makes this a free check of the
-    /// whole risky half (the SSE framing, the handshake, the
-    /// filtering, the key never reaching the schema) against a server
-    /// nobody here controls.
-    ///
-    /// ```text
-    /// cargo test -p vox_room -- --ignored --nocapture says_hello
-    /// ```
-    #[test]
-    #[ignore = "talks to Retro Diffusion's MCP server over the network"]
-    fn says_hello_to_a_real_server() {
-        let s = Server::new(Config {
-            name: "art".into(),
-            url: "https://mcp.retrodiffusion.ai/mcp".into(),
-            key: String::new(),
-            only: vec![
-                "create_inference".into(),
-                "list_available_styles".into(),
-                "get_balance".into(),
-            ],
-        });
-        let lent = s.connect().expect("say hello");
-        assert_eq!(lent, 3, "three of its 33, because three is what was asked for");
-
-        let offer = s.offer();
-        let names: Vec<&str> = offer
-            .iter()
-            .map(|t| t["function"]["name"].as_str().unwrap())
-            .collect();
-        assert!(names.contains(&"art_create_inference"), "{names:?}");
-        assert!(!names.iter().any(|n| n.contains("lowpoly")), "{names:?}");
-
-        // The thing that must be true of a real schema and cannot be
-        // checked against a made-up one: its key argument is real, it
-        // is gone from what the model sees, and the room knows where
-        // to put it back.
-        let whole = serde_json::to_string(&offer).unwrap();
-        assert!(!whole.contains("rd_api_key"), "the key is not in the offer");
-        assert_eq!(
-            s.auth_args_of("create_inference"),
-            ["rd_api_key"],
-            "and the room remembers which argument it was"
-        );
-        // Every tool it lends is a shape an endpoint will accept.
-        for t in &offer {
-            assert_eq!(t["type"], "function");
-            assert!(t["function"]["parameters"]["type"] == "object", "{t}");
-            assert!(
-                !t["function"]["description"].as_str().unwrap_or("").is_empty(),
-                "{t}"
-            );
-        }
-    }
-
-    /// The one link the free test above cannot reach: a real
-    /// `tools/call`, with the key put back into the argument it was
-    /// stripped out of. `get_balance` is free and changes nothing, so
-    /// this costs a request and no money.
-    ///
-    /// ```text
-    /// VOX_ROOM_MCP_KEY=rdpk-… cargo test -p vox_room -- --ignored --nocapture the_key_is_put_back
-    /// ```
-    #[test]
-    #[ignore = "needs a Retro Diffusion key in VOX_ROOM_MCP_KEY"]
-    fn the_key_is_put_back_when_the_call_is_made() {
-        let Ok(key) = std::env::var("VOX_ROOM_MCP_KEY") else {
-            panic!("set VOX_ROOM_MCP_KEY to an rdpk-… key");
-        };
-        let s = Server::new(Config {
-            name: "art".into(),
-            url: "https://mcp.retrodiffusion.ai/mcp".into(),
-            key,
-            only: vec!["get_balance".into()],
-        });
-        s.connect().expect("say hello");
-        let stash = Stash::default();
-        let said = s
-            .call("Vox", "art_get_balance", &json!({}), &stash)
-            .expect("ask what the balance is");
-        println!("{said}");
-        assert!(!said.is_empty());
-        // It said something rather than making something: nothing for
-        // `set_avatar` to be handed.
-        assert_eq!(stash.held("Vox"), 0);
     }
 
     #[test]

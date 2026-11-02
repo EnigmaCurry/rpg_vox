@@ -274,22 +274,38 @@ is spoken straight away.";
 /// that making a picture and giving somebody a face are two steps.
 const AVATAR_NOTE: &str = "\
 Everybody in the room has a square beside everything they say, and you \
-can make somebody theirs. It is two steps: a picture tool makes the \
-picture, and set_avatar puts one of what it made on a person. You cannot \
-see what you made -- you are told how many pictures you have, and you \
-refer to one by its number -- so the people in the room are your eyes: \
-set one, ask how it looks, and make another if they want a change. \
-Setting another replaces it, so trying again costs nothing but a moment.
+can make somebody theirs. It goes in four steps, and the slow one in the \
+middle is the point of the other three.
 
-Interview them first, in the room, out loud. Ask what they want to be -- \
+First, interview them, out loud, in the room. Ask what they want to be -- \
 who the character is, what they are wearing, what they are carrying, what \
-sort of face -- and get enough to work from before you make anything. Then \
-say what you are about to make, in a sentence, so they can stop you. \
-Each picture costs the house real money, so make one at a time, and never \
-make one nobody asked for. list_people tells you what each person's face \
-was asked for, when they have one: use it to build on what somebody \
-already has rather than starting over, and don't offer a face to somebody \
-who is happy with theirs.
+sort of face -- and get enough to work from before you make anything. Say \
+what you are about to make, in a sentence, so they can stop you.
+
+Then make it with a picture tool. The picture goes straight into the chat \
+as a card the whole room can see, with a number on it, and a spinner on \
+it until it arrives -- so say you are making it and then let it come; \
+nobody is waiting in silence. Each picture costs the house real money, so \
+make one at a time, and never make one nobody asked for.
+
+Then ask how they like it. You cannot see what you made -- you are told \
+the number and nothing else -- so the people in the room are your eyes. \
+If they want a change, make another: it gets the next number, and the \
+earlier ones stay in the chat, so going back to one is a thing they can \
+ask for and you can do.
+
+Only when they say they are happy with one, call set_avatar with that \
+number. Do not set one because a picture came out well, and do not set \
+one because it is the only picture there is. A face is theirs, and \
+choosing it is theirs.
+
+set_bio writes the few lines shown beside their face when anybody clicks \
+it: who their character is, in two or three sentences, from what they \
+actually told you rather than from what the picture looks like. Read it \
+back and revise it if they want -- it can be rewritten any time, with no \
+new picture. list_people tells you what each person's face was asked for, \
+so you can build on what somebody already has instead of starting over, \
+and so you don't offer a face to somebody who is happy with theirs.
 
 A face belongs to the person and not to the game: it follows them from \
 room to room and outlasts the conversation. So ask who they want to be \
@@ -514,15 +530,13 @@ pub enum Allowed {
 /// What this room has for making pictures: the MCP servers it lends
 /// out, and where what they make waits to be given to somebody.
 ///
-/// One per room and not one per house. The stash is keyed by bot, and
-/// the first AI is in every room, so a shared one would let a picture
-/// made in the lobby be handed to somebody in the cellar. The servers
-/// themselves are shared -- what they lend is asked once, as the house
-/// opens.
+/// The servers are shared across every room: what each lends is asked
+/// once, as the house opens. Nothing else is kept here -- a picture
+/// goes into the conversation it was made in, which is the room's to
+/// hold and not this.
 #[derive(Default)]
 pub struct Art {
     pub servers: Vec<Arc<mcp::Server>>,
-    pub stash: mcp::Stash,
 }
 
 impl Art {
@@ -669,7 +683,6 @@ impl Agent {
                             &self.generation,
                             &tx,
                             &self.art,
-                            &self.name,
                         ),
                     };
                     tx.send(match result {
@@ -1184,8 +1197,6 @@ fn stream_reply(
     generation: &AtomicU64,
     tx: &Voices,
     art: &Art,
-    // Which bot this is: whose pictures are whose, in `art`.
-    bot: &str,
 ) -> Result<()> {
     let model = cfg.model.as_str();
     let mut convo = messages.to_vec();
@@ -1354,7 +1365,7 @@ fn stream_reply(
         push_turn(api, &mut convo, &said, &calls);
         let spoke = !spoken.is_empty();
         for (i, c) in calls.iter().enumerate() {
-            let mut result = run_tool(room, cfg, g, c, allowed, art, bot);
+            let mut result = run_tool(room, cfg, g, c, allowed, art);
             info!(g, tool = c.name, %result, "reply: tool");
             if answered {
                 continue;
@@ -1628,6 +1639,7 @@ fn tools_for(
     // prompt doesn't want them simply never asks.
     if art.any() {
         extra.push(avatar_tool());
+        extra.push(bio_tool());
         for server in &art.servers {
             extra.extend(server.offer());
         }
@@ -1668,6 +1680,35 @@ fn tools_for(
     tools
 }
 
+/// Writing the few lines shown beside somebody's face.
+///
+/// Its own tool rather than an argument to `set_avatar`: a bio is
+/// revised by talking -- "say I'm from the north instead" -- long
+/// after the picture is settled, and a tool that could only write one
+/// alongside a new face would make people sit for another portrait to
+/// fix a sentence.
+fn bio_tool() -> Value {
+    tool(
+        "set_bio",
+        "Write the few lines shown beside somebody's face when anyone clicks it: who \
+         their character is, in two or three sentences, in the words they gave you. \
+         Read it back to them and revise it if they want -- writing again replaces \
+         it, and an empty bio takes it away. Write it from what they actually said, \
+         not from what the picture looks like.",
+        json!({
+            "who": {
+                "type": "string",
+                "description": "Whose it is: somebody in the room, or an AI's own name.",
+            },
+            "bio": {
+                "type": "string",
+                "description": "The few lines, or empty to take theirs away.",
+            },
+        }),
+        &["who", "bio"],
+    )
+}
+
 /// Putting a picture that has been made on somebody.
 ///
 /// Deliberately two steps and not one. Making the picture is the
@@ -1678,10 +1719,10 @@ fn tools_for(
 fn avatar_tool() -> Value {
     tool(
         "set_avatar",
-        "Put a picture you have made on somebody: it becomes the square shown beside \
-         everything they say, to everyone. Make the picture first with a picture tool. \
-         Ask them what they want before making one, and ask how they like it after -- \
-         setting another replaces it, so there is no cost to trying again.",
+        "Put one of the pictures in the chat on somebody: it becomes the square shown \
+         beside everything they say, to everyone. Only do this once they have seen it \
+         and said they are happy with it -- every picture you make is already in the \
+         chat for them to look at, so there is nothing to settle before they have.",
         json!({
             "who": {
                 "type": "string",
@@ -1690,11 +1731,12 @@ fn avatar_tool() -> Value {
             "picture": {
                 "type": "integer",
                 "minimum": 1,
-                "description": "Which of the pictures you last made, counting from 1. \
-                                Leave it out for the first.",
+                "description": "The number on the picture's card in the chat. They are \
+                                numbered from 1 in the order they were made, so an \
+                                earlier one can still be chosen.",
             },
         }),
-        &["who"],
+        &["who", "picture"],
     )
 }
 
@@ -1768,7 +1810,6 @@ fn run_tool(
     call: &ToolCall,
     allowed: Allowed,
     art: &Art,
-    bot: &str,
 ) -> String {
     // It was never offered this one, which does not stop a model asking
     // for it. The room's answer is the same either way: there is no
@@ -1869,24 +1910,17 @@ fn run_tool(
                 }
             }
         }
-        "set_avatar" => {
-            // Counting from 1, and the first one when it didn't say.
-            let nth = args["picture"].as_u64().unwrap_or(1) as usize;
-            match art.stash.take(bot, nth) {
-                Some(p) => room
-                    .set_avatar(g, &arg("who"), &p.png, &p.prompt)
-                    .map(|who| json!({ "set": who })),
-                None => Err(match art.stash.held(bot) {
-                    0 => "you haven't made a picture yet; make one first, then put it \
-                          on somebody with this"
-                        .to_string(),
-                    held => format!(
-                        "you made {held} picture{}, so `picture` is 1 to {held}",
-                        if held == 1 { "" } else { "s" }
-                    ),
-                }),
-            }
-        }
+        "set_avatar" => match args["picture"].as_u64() {
+            Some(n) => room
+                .set_avatar(g, &arg("who"), n as u32)
+                .map(|who| json!({ "set": who, "picture": n })),
+            None => Err("which picture? `picture` is the number on its card in the \
+                         chat, counting from 1"
+                .to_string()),
+        },
+        "set_bio" => room
+            .set_bio(&arg("who"), &arg("bio"))
+            .map(|who| json!({ "wrote": who })),
         // Somebody else's tool: one of the MCP servers the room lends,
         // under the prefixed name it was offered as. `Allowed` has
         // already had its say -- a bot that is only looking never got
@@ -1894,19 +1928,7 @@ fn run_tool(
         other => match art.whose(other) {
             Some(server) => {
                 info!(g, tool = other, server = server.name(), "reply: over MCP");
-                match server.call(bot, other, &args, &art.stash) {
-                    Ok(said) => Ok(json!({ "result": said })),
-                    Err(err) => {
-                        // Said plainly, so the model tells the room it
-                        // couldn't rather than describing a picture
-                        // that was never made.
-                        warn!(g, tool = other, "MCP call failed: {err:#}");
-                        Err(format!(
-                            "{other} failed ({err}); say you couldn't make it, and don't \
-                             pretend you did"
-                        ))
-                    }
-                }
+                drawing(room, g, server, other, &args)
             }
             None => Err(format!("there is no tool called {other:?}")),
         },
@@ -1915,6 +1937,111 @@ fn run_tool(
         Ok(v) => v.to_string(),
         Err(e) => json!({ "error": e }).to_string(),
     }
+}
+
+/// One MCP call, with the room watching.
+///
+/// A call that is going to draw something puts a card into the
+/// conversation *first*, with a spinner on it, and fills it in when
+/// the picture lands. Generating one takes the better part of a
+/// minute, and a room watching nothing happen is a room that asks
+/// again -- so the card is the evidence that the AI is doing what it
+/// just said it would.
+///
+/// Whether a call is going to draw is guessed from its arguments: a
+/// non-empty `prompt` is what every image tool takes and what none of
+/// the tools that merely report -- balances, style lists -- has. The
+/// guess is allowed to be wrong in both directions and costs nothing
+/// either way. Guessed yes and nothing was drawn: the card says the
+/// picture didn't come, which is true. Guessed no and something was
+/// drawn: the pictures are posted when the call returns, without the
+/// spinner anyone would have watched.
+///
+/// This is where the room's half of the flow lives rather than the
+/// model's, because the model cannot post a card and then make a
+/// picture in one tool call -- and asking it to do two in the right
+/// order, every time, before the thing people are waiting on, is a
+/// rule that holds right up until it doesn't.
+fn drawing(room: &Room, g: u64, server: &mcp::Server, tool: &str, args: &Value) -> Result<Value, String> {
+    let prompt = args["prompt"].as_str().unwrap_or("").trim().to_string();
+    // The spinner, when this looks like a call that will draw.
+    let pending = (!prompt.is_empty())
+        .then(|| room.begin_picture(g, &prompt))
+        .transpose()?;
+
+    let outcome = match server.call(tool, args) {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            warn!(g, tool, "MCP call failed: {err:#}");
+            if let Some((id, _)) = &pending {
+                room.fail_picture(id, &format!("{err}"));
+            }
+            // Said plainly, so the model tells the room it couldn't
+            // rather than describing a picture that was never made.
+            return Err(format!(
+                "{tool} failed ({err}); say you couldn't make it, and don't pretend you did"
+            ));
+        }
+    };
+
+    let mut drawn: Vec<u32> = Vec::new();
+    let mut pictures = outcome.pictures.into_iter();
+    // The first one fills the card that is already up; the rest get
+    // cards of their own, since a call asked for several takes is a
+    // call whose takes are each worth looking at.
+    if let Some((id, n)) = &pending {
+        match pictures.next() {
+            Some(first) => {
+                room.finish_picture(id, &first.png);
+                drawn.push(*n);
+            }
+            None => room.fail_picture(id, "the tool came back without a picture"),
+        }
+    }
+    for picture in pictures {
+        let caption = if picture.prompt.trim().is_empty() {
+            prompt.clone()
+        } else {
+            picture.prompt.clone()
+        };
+        match room.begin_picture(g, &caption) {
+            Ok((id, n)) => {
+                room.finish_picture(&id, &picture.png);
+                drawn.push(n);
+            }
+            Err(err) => warn!(g, "couldn't post a picture: {err}"),
+        }
+    }
+
+    if drawn.is_empty() {
+        return Ok(json!({ "result": outcome.said }));
+    }
+    // Deliberately not the pictures themselves: a 128x128 PNG is some
+    // 30 KB of base64, and putting that through a conversation that is
+    // read aloud helps nobody. The numbers are what the room can see
+    // and what `set_avatar` takes.
+    let numbers = drawn
+        .iter()
+        .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let many = drawn.len() > 1;
+    Ok(json!({
+        "result": format!(
+            "Picture{} {numbers} {} now in the chat where everyone can see {}. \
+             Say so, and ask how they like it. Do not call set_avatar until they \
+             have said they are happy with one -- and if they want a change, make \
+             another: it gets the next number, and an earlier one can still be chosen.{}",
+            if many { "s" } else { "" },
+            if many { "are" } else { "is" },
+            if many { "them" } else { "it" },
+            if outcome.said.is_empty() {
+                String::new()
+            } else {
+                format!(" The tool also said: {}", outcome.said)
+            }
+        )
+    }))
 }
 
 /// Hand a sentence to the voice, unless it repeats one this reply has
@@ -2395,7 +2522,6 @@ mod tests {
             &room.generation_of_only_bot(),
             &tx,
             &Art::default(),
-            "Vox",
         )
         .expect("the reply");
         drop(tx);

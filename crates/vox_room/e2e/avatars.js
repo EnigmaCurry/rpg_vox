@@ -47,6 +47,8 @@ const [ryanLink] = process.argv.slice(2);
   );
   is('which is square', faces[0].w, faces[0].h);
 
+  await ryan.page.screenshot({ path: '/tmp/vox-room-avatars.png' });
+
   const ryansOwn = faces.find((f) => f.who === 'Ryan');
   const voxs = faces.find((f) => f.who === 'Vox');
   const alexs = faces.find((f) => f.who === 'Alex');
@@ -79,6 +81,106 @@ const [ryanLink] = process.argv.slice(2);
     fetched.filter((u) => u.startsWith('/api/avatar/Ryan')).length,
     1,
   );
+
+  // A picture the AI made, in the conversation where the room can
+  // look at it and say what to change.
+  const cards = await ryan.page.evaluate(() =>
+    [...document.querySelectorAll('.entry.picture-entry')].map((e) => {
+      const img = e.querySelector('.shot img');
+      return {
+        label: e.querySelector('.time')?.textContent.trim() ?? '',
+        asked: e.querySelector('.asked')?.textContent.trim() ?? '',
+        src: img?.getAttribute('src') ?? null,
+        drawn: img ? img.naturalWidth : 0,
+        spinning: !!e.querySelector('.shot .spinner'),
+        broke: e.querySelector('.shot .broke')?.textContent.trim() ?? null,
+        why: e.querySelector('.hint')?.textContent.trim() ?? null,
+      };
+    }),
+  );
+  is('both pictures are in the conversation', cards.length, 2);
+  // Numbered, because the number is what somebody says out loud and
+  // what set_avatar is given.
+  is('the first is numbered', cards[0].label.endsWith('picture 1'), true);
+  is('and shows what it was asked for', cards[0].asked, 'a tired wizard');
+  is('and the browser drew it', cards[0].drawn, 8);
+  is('with no spinner on it', cards[0].spinning, false);
+
+  // The second was still being drawn when the room was last stopped,
+  // which is the one case a spinner must not survive: the call it was
+  // waiting on died with the process, so the card says so rather than
+  // promising for ever that something is still happening. (The
+  // spinner itself is a live state, checked in the Rust tests where a
+  // picture can be begun without finishing it.)
+  is('the second is numbered too', cards[1].label.endsWith('picture 2'), true);
+  is('and says it never came', cards[1].broke, "didn't come");
+  is('rather than spinning for ever', cards[1].spinning, false);
+  is('with the reason under it', cards[1].why, 'the room restarted while it was being made');
+  is('and no image', cards[1].src, null);
+  is('but it still says what it would have been', cards[1].asked, 'the same wizard, rested');
+
+  // Clicking a face opens who they are.
+  await ryan.page.evaluate(() => {
+    const mine = [...document.querySelectorAll('.said > .entry')].find(
+      (e) => e.querySelector('.name')?.textContent.trim() === 'Ryan',
+    );
+    mine.querySelector(':scope > .face').click();
+  });
+  await ryan.page.waitForSelector('.who-card');
+  await wait(300);
+  is(
+    'a face opens onto who they are',
+    await ryan.page.evaluate(() => {
+      const c = document.querySelector('.who-card');
+      return {
+        who: c.querySelector('h2').textContent.trim(),
+        bio: c.querySelector('.bio')?.textContent.trim() ?? null,
+        asked: c.querySelector('.asked')?.textContent.replace(/\s+/g, ' ').trim() ?? null,
+        tags: [...c.querySelectorAll('.tag')].map((t) => t.textContent.trim()),
+        drawn: c.querySelector('img')?.naturalWidth ?? 0,
+      };
+    }),
+    {
+      who: 'Ryan',
+      bio: 'A ranger from the north, quiet about it.',
+      asked: 'drawn as a tired wizard',
+      tags: ['reads English', 'here'],
+      drawn: 8,
+    },
+  );
+
+  // Escape closes it, and nobody else's screen ever had it.
+  await ryan.page.keyboard.press('Escape');
+  await wait(200);
+  is(
+    'and closes again',
+    await ryan.page.evaluate(() => !!document.querySelector('.who-card')),
+    false,
+  );
+
+  // An AI has one too, and the card says it is not a person.
+  await ryan.page.evaluate(() => {
+    const vox = [...document.querySelectorAll('.said > .entry')].find(
+      (e) => e.querySelector('.name')?.textContent.trim() === 'Vox',
+    );
+    vox.querySelector(':scope > .face').click();
+  });
+  await ryan.page.waitForSelector('.who-card');
+  await wait(300);
+  is(
+    'an AI is not a person, and says so',
+    await ryan.page.evaluate(() => {
+      const c = document.querySelector('.who-card');
+      return {
+        who: c.querySelector('h2').textContent.trim(),
+        tags: [...c.querySelectorAll('.tag')].map((t) => t.textContent.trim()),
+      };
+    }),
+    { who: 'Vox', tags: ['an AI', 'speaks English', 'here'] },
+  );
+  await ryan.page.screenshot({ path: '/tmp/vox-room-profile.png' });
+  await ryan.page.keyboard.press('Escape');
+  await wait(200);
 
   // Yours to take off, from the one place that offers it. The room
   // tells every tab the moment it goes, so the square in the

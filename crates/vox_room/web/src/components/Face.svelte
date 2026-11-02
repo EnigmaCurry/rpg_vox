@@ -1,12 +1,14 @@
 <script>
-  import { avatarOf } from '../lib/room.svelte.js';
+  import { avatarOf, openProfile } from '../lib/room.svelte.js';
   import { hue } from '../lib/color.js';
 
   // `who` is the name the room calls them, which is what a line in the
   // conversation carries and what a face is looked up by. `agent` is
   // whether it is one of the AIs, which have their own colour rather
-  // than one worked out from the name.
-  let { who, agent = false } = $props();
+  // than one worked out from the name. `opens` is whether clicking it
+  // opens who they are -- true wherever a face stands for somebody,
+  // and false where one is already being looked at.
+  let { who, agent = false, opens = true } = $props();
 
   const src = $derived(avatarOf(who));
 
@@ -36,19 +38,23 @@
      nothing -- the column has to line up whether or not a face has
      been made, so the placeholder is the same size and shape as the
      picture it is standing in for. -->
-<div
+<svelte:element
+  this={opens ? 'button' : 'div'}
   class="face"
   class:agent
+  class:opens
   style="--h: {hue(who)}"
-  title={who}
-  aria-hidden="true"
+  title={opens ? `Who ${who} is` : who}
+  type={opens ? 'button' : undefined}
+  aria-hidden={opens ? undefined : 'true'}
+  onclick={opens ? () => openProfile(who) : undefined}
 >
   {#if show}
     <img {src} alt="" onerror={() => (broken = { ...broken, [src]: true })} />
   {:else}
     <span class="initials">{initials}</span>
   {/if}
-</div>
+</svelte:element>
 
 <style>
   .face {
@@ -74,6 +80,12 @@
     color: var(--agent);
     border-color: color-mix(in srgb, var(--agent) 40%, var(--line));
   }
+  /* It is a button where it opens somebody, so it has to be told not
+     to look like one: the square is the whole of the control. */
+  .face.opens { padding: 0; cursor: pointer; }
+  .face.opens:hover { border-color: hsl(var(--h) 45% 55%); }
+  .face.opens:focus-visible { outline: 2px solid hsl(var(--h) 55% 50%); outline-offset: 2px; }
+  .face.agent.opens:hover { border-color: var(--agent); }
   .initials {
     font-size: 13px;
     font-weight: 650;

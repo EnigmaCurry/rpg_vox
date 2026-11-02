@@ -7,6 +7,7 @@
   import Enter from './components/Enter.svelte';
   import Board from './components/Board.svelte';
   import Settings from './components/Settings.svelte';
+  import Profile from './components/Profile.svelte';
   import People from './components/People.svelte';
   import Rooms from './components/Rooms.svelte';
   import Say from './components/Say.svelte';
@@ -105,6 +106,11 @@
     </div>
   {/if}
 </dialog>
+
+<!-- Over whatever is showing. A face is clickable from the
+     conversation and from the people list, and who somebody is is the
+     same card either way. -->
+<Profile />
 
 {#if room.expired}
   <main class="gate">

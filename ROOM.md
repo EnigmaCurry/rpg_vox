@@ -1079,12 +1079,39 @@ does each AI. Until one is made it is the tint that name already has
 with their initials in it, which is the same size and shape as the
 picture that may replace it — the column of names lines up either way.
 
-A face is **made by asking for one out loud**. The AI interviews you —
-who you are, what you are wearing, what sort of face — says what it is
-about to make, makes it, and puts it on you; then you tell it what to
-change and it makes another. It cannot see what it made, so you are its
-eyes. Setting another replaces it, so there is no cost to trying again
-beyond what the picture cost.
+A face is **made by asking for one out loud**, and it takes four steps
+on purpose — the AI does not simply hand you one.
+
+It interviews you first: who you are, what you are wearing, what sort
+of face. Then it says what it is about to make and makes it — and the
+picture goes **into the conversation as a card**, numbered, with a
+spinner on it until it arrives. Generating one takes the better part
+of a minute, so the card is the room's evidence that something is
+happening.
+
+Then you look at it and say what to change. Another picture is another
+card with the next number, and the earlier ones stay where they are,
+so *"go back to the second one"* is a thing you can ask for. The AI
+cannot see any of them — it is told the numbers and nothing else — so
+the room is its eyes.
+
+Only when you say you are happy with one does it call `set_avatar`
+with that number, and the square beside everything you say becomes
+that picture. Clicking any face opens **who that person is**: the
+picture at a size worth looking at, the few lines the AI wrote about
+them, what the picture was asked for, and what the house knows — the
+language they read in, whether the room is theirs, whether they are
+here now. The bio is written by voice too, with `set_bio`, and can be
+revised without making a new picture.
+
+The pictures stay in the conversation they were made in and go when it
+does. A face does not: it is copied when it is set, so deleting the
+conversation you sat for leaves you looking the same.
+
+A picture that was still being drawn when the room stopped is marked
+as never having arrived, on the way back up — the call it was waiting
+on died with the process, and a spinner is a promise that something is
+still happening.
 
 The picture comes from an **MCP server**, which is any server the house
 was started with:
@@ -1258,7 +1285,7 @@ CHROME=$(which chromium) ./run.sh            # or: ./run.sh rooms bots
 | `conversations` | the room's history: naming one, reading an old one read-only without moving anybody else's screen, deleting one for everybody, and empty ones never being archived |
 | `game` | a game played inside a room, and leaving it putting the room back where it was for everyone in it |
 | `cards` | what a posted card looks like once it is on the screen: the table, the list and the code block a model wrote in markdown — and the script tag it wrote with them arriving as words rather than as anything at all |
-| `avatars` | the square beside everything somebody says: a picture where one was made and the same-sized tint-and-initials where none was, each face fetched once however many lines that person said, and taking your own off turning it back into initials in the conversation behind the page |
+| `avatars` | the square beside everything somebody says, and the pictures it is chosen from: a face where one was made and the same-sized tint-and-initials where none was, a picture card that arrived beside one still spinning, a face clicked open onto who somebody is (and onto an AI that says it is not a person), and taking your own off turning it back into initials in the conversation behind the page |
 | `interpreter` | the interpreter appearing only while it has somebody to interpret for, and its level being each listener's own |
 
 The four below want something of yours — a microphone, a model, a

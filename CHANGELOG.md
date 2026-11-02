@@ -90,6 +90,41 @@ releases.
 
 ### Voice room
 
+- **A picture is made where the room can watch, and a face is only set
+  once somebody says yes.** The first version of this went from "make
+  me an avatar" to a changed face in one unbroken motion: the AI
+  generated a picture nobody had seen and put it on you. It worked,
+  which was the problem -- there was no moment in it where anybody
+  could say no.
+
+  So a picture now goes into the conversation as a card of its own,
+  numbered, the moment the AI starts drawing -- with a spinner on it
+  until it lands. Generating one takes the better part of a minute,
+  and the card is what tells the room that something is happening
+  rather than that the AI has gone quiet.
+
+  Then it is looked at and argued about. Another take is another card
+  with the next number, and the earlier ones stay where they are, so
+  going back to the second one is a thing somebody can ask for and the
+  AI can do. `set_avatar` takes that number rather than "the one you
+  just made", and the prompt tells it not to call it at all until
+  somebody has said they are happy.
+
+  Clicking any face -- in the conversation, anybody's -- opens who
+  that person is: the picture at a size worth looking at, a few lines
+  the AI wrote about them in the same interview, what the picture was
+  asked for, and what the house knows (the language they read in,
+  whether the room is theirs, whether they are here). `set_bio` writes
+  those lines and can rewrite them without making a new picture. An
+  AI's own face opens the same card, which says it is not a person.
+
+  The pictures belong to the conversation and go when it does. A face
+  does not: it is copied when it is set, so deleting the conversation
+  you sat for leaves you looking the same. One that was still being
+  drawn when the room stopped is marked as never having arrived on the
+  way back up -- the call it was waiting on died with the process, and
+  a spinner is a promise that something is still happening.
+
 - **Everybody has a face now, and the AI can make you one.** Every line
   in the conversation carries a square beside it: a picture when one
   has been made, and otherwise the tint that name already has with the

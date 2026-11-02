@@ -191,6 +191,48 @@ CREATE TABLE IF NOT EXISTS conversations (
     -- and then the first thing said in it stands in for it.
     at   INTEGER NOT NULL DEFAULT 0
 );
+-- A picture one of the AIs made, posted into the conversation it was
+-- made in. The row is written the moment the generating starts, with
+-- no `png`: the card goes up with a spinner on it and fills in when
+-- this does, so the room can watch it happen and say what to change.
+--
+-- They are numbered within their conversation, and that number is
+-- what the card shows and what `set_avatar` is given: the second one
+-- is a thing people say, and so a thing the AI can act on.
+--
+-- A picture stays in the conversation it was made in, and goes when
+-- that conversation does: it is part of what was said.
+CREATE TABLE IF NOT EXISTS pictures (
+    id           TEXT PRIMARY KEY,
+    conversation INTEGER NOT NULL,
+    -- Its number in this conversation, from 1.
+    n            INTEGER NOT NULL,
+    -- Which AI made it.
+    who          TEXT NOT NULL,
+    -- What it was asked for. Shown on the card and kept with the
+    -- avatar when one is made from it.
+    prompt       TEXT NOT NULL,
+    -- Null while it is still being made. A row that has one is done.
+    png          BLOB,
+    -- Why it will never arrive, when it won't. The card says so
+    -- rather than spinning forever.
+    failed       TEXT NOT NULL DEFAULT '',
+    at           INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS pictures_in_order ON pictures (conversation, n);
+-- The few lines about somebody that go with their face: who their
+-- character is, written by the AI in the same interview the picture
+-- came out of.
+--
+-- Its own table and not a column on `avatars`, because a bio and a
+-- face arrive at different moments and either may exist without the
+-- other -- somebody may want to be described and not drawn. Keyed the
+-- same way, by what does not change.
+CREATE TABLE IF NOT EXISTS bios (
+    who TEXT PRIMARY KEY,
+    bio TEXT NOT NULL,
+    at  INTEGER NOT NULL
+);
 -- The square picture shown beside everything somebody says. One row
 -- each, and only for those who have one: a person without a row is
 -- drawn as the tint their name already has, which is the placeholder
@@ -302,6 +344,7 @@ impl Store {
         db.execute_batch(SCHEMA)?;
         migrate(&db)?;
         indexes(&db)?;
+        abandoned_pictures(&db)?;
         // Several rooms are several connections to the one file, and
         // `vox_room invite` is a whole other process writing to it.
         // Wait for a writer rather than failing the read.
@@ -533,9 +576,11 @@ impl Store {
         let gone = tx.execute("DELETE FROM people WHERE name = ?1", [name])? > 0;
         tx.execute("DELETE FROM sessions WHERE name = ?1", [name])?;
         tx.execute("DELETE FROM grants WHERE name = ?1", [name])?;
-        // Their face goes with the account. Somebody invited under the
-        // same name later is a new person, and starts without one.
+        // Their face and what was written about them go with the
+        // account. Somebody invited under the same name later is a new
+        // person, and starts as one.
         tx.execute("DELETE FROM avatars WHERE who = ?1", [name])?;
+        tx.execute("DELETE FROM bios WHERE who = ?1", [name])?;
         tx.commit()?;
         Ok(gone)
     }
@@ -976,12 +1021,19 @@ impl Store {
     }
 
     /// Forget a conversation: everything said in it, every card dealt
-    /// in it, and the row that says the room ever had it.
+    /// in it, every picture made in it, and the row that says the room
+    /// ever had it.
+    ///
+    /// A face already made from one of those pictures stays: it was
+    /// copied into `avatars` when it was set, and it belongs to the
+    /// person rather than to the conversation they sat for it in.
     pub fn forget_conversation(&self, id: i64) -> Result<()> {
         self.db
             .execute("DELETE FROM entries WHERE conversation = ?1", [id])?;
         self.db
             .execute("DELETE FROM cards WHERE conversation = ?1", [id])?;
+        self.db
+            .execute("DELETE FROM pictures WHERE conversation = ?1", [id])?;
         self.db
             .execute("DELETE FROM conversations WHERE id = ?1", [id])?;
         Ok(())
@@ -1316,6 +1368,166 @@ impl Store {
             .execute("DELETE FROM avatars WHERE who = ?1", [who])?
             > 0)
     }
+
+    // -- pictures: what the AI made, in the conversation it made it in --
+
+    /// Start a picture: a row with no image yet, which is a card with a
+    /// spinner on it. The answer is its number in this conversation,
+    /// which is what the card shows and what `set_avatar` is given.
+    pub fn begin_picture(
+        &self,
+        conversation: i64,
+        id: &str,
+        who: &str,
+        prompt: &str,
+    ) -> Result<u32> {
+        // The next number in this conversation. Counted rather than
+        // kept, because the only thing that must hold is that two
+        // pictures in one conversation are never both "the third one".
+        let n: u32 = self.db.query_row(
+            "SELECT COALESCE(MAX(n), 0) + 1 FROM pictures WHERE conversation = ?1",
+            [conversation],
+            |r| r.get(0),
+        )?;
+        self.db.execute(
+            "INSERT INTO pictures (id, conversation, n, who, prompt, png, failed, at)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, '', ?6)",
+            params![id, conversation, n, who, prompt, now_ms()],
+        )?;
+        Ok(n)
+    }
+
+    /// The picture arrived.
+    pub fn finish_picture(&self, id: &str, png: &[u8]) -> Result<()> {
+        self.db.execute(
+            "UPDATE pictures SET png = ?2, failed = '' WHERE id = ?1",
+            params![id, png],
+        )?;
+        Ok(())
+    }
+
+    /// It never will. The card says so rather than spinning for good.
+    pub fn fail_picture(&self, id: &str, why: &str) -> Result<()> {
+        self.db.execute(
+            "UPDATE pictures SET failed = ?2 WHERE id = ?1",
+            params![id, why],
+        )?;
+        Ok(())
+    }
+
+    /// One picture's image, or None while it is still being made.
+    pub fn picture(&self, id: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .db
+            .query_row("SELECT png FROM pictures WHERE id = ?1", [id], |r| {
+                r.get::<_, Option<Vec<u8>>>(0)
+            })
+            .optional()?
+            .flatten())
+    }
+
+    /// The `n`th picture of a conversation: its id, what it was asked
+    /// for, and the image when it has one.
+    pub fn picture_numbered(&self, conversation: i64, n: u32) -> Result<Option<Numbered>> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT id, prompt, png FROM pictures WHERE conversation = ?1 AND n = ?2",
+                params![conversation, n],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?)
+    }
+
+    /// Every picture in a conversation, oldest first, without the
+    /// images: what a tab needs to draw the cards, which is the number,
+    /// what it was asked for, and whether it is there yet.
+    pub fn pictures(&self, conversation: i64) -> Result<Vec<Made>> {
+        let mut q = self.db.prepare(
+            "SELECT id, n, who, prompt, png IS NOT NULL, failed, at
+               FROM pictures WHERE conversation = ?1 ORDER BY n",
+        )?;
+        let rows = q.query_map([conversation], |r| {
+            Ok(Made {
+                id: r.get(0)?,
+                n: r.get(1)?,
+                who: r.get(2)?,
+                prompt: r.get(3)?,
+                ready: r.get(4)?,
+                failed: r.get(5)?,
+                at: r.get::<_, i64>(6)? as u64,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// One of them, for the event that says it is done.
+    pub fn made(&self, id: &str) -> Result<Option<Made>> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT id, n, who, prompt, png IS NOT NULL, failed, at
+                   FROM pictures WHERE id = ?1",
+                [id],
+                |r| {
+                    Ok(Made {
+                        id: r.get(0)?,
+                        n: r.get(1)?,
+                        who: r.get(2)?,
+                        prompt: r.get(3)?,
+                        ready: r.get(4)?,
+                        failed: r.get(5)?,
+                        at: r.get::<_, i64>(6)? as u64,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    // -- bios: the few lines that go with a face ------------------------
+
+    /// Write what is known about somebody. Empty takes it away.
+    pub fn set_bio(&self, who: &str, bio: &str) -> Result<()> {
+        let bio = bio.trim();
+        if bio.is_empty() {
+            self.db.execute("DELETE FROM bios WHERE who = ?1", [who])?;
+            return Ok(());
+        }
+        self.db.execute(
+            "INSERT INTO bios (who, bio, at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(who) DO UPDATE SET bio = excluded.bio, at = excluded.at",
+            params![who, bio, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    pub fn bio(&self, who: &str) -> Result<Option<String>> {
+        Ok(self
+            .db
+            .query_row("SELECT bio FROM bios WHERE who = ?1", [who], |r| r.get(0))
+            .optional()?)
+    }
+}
+
+/// What [`Store::picture_numbered`] hands back: the picture's id, what
+/// it was asked for, and the image once it has one.
+pub type Numbered = (String, String, Option<Vec<u8>>);
+
+/// A picture in a conversation, without the image itself: what a card
+/// needs to be drawn, and what the AI is told it has.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Made {
+    pub id: String,
+    /// Its number in the conversation, from 1.
+    pub n: u32,
+    pub who: String,
+    pub prompt: String,
+    /// The image is there. Until then the card is a spinner.
+    pub ready: bool,
+    /// Why it never arrived, or empty.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub failed: String,
+    pub at: u64,
 }
 
 /// What an AI's picture is kept under: `@` and its name.
@@ -1469,6 +1681,24 @@ fn migrate(db: &Connection) -> Result<()> {
                         AND CAST(s.value AS INTEGER) = conversations.id), '')
                WHERE room = '';",
         )?;
+    }
+    Ok(())
+}
+
+/// A picture that was being made when the room stopped is never
+/// coming: the call it was waiting on died with the process.
+///
+/// Said once, on the way up, because the alternative is a card that
+/// spins for ever -- and a spinner is a promise that something is
+/// still happening.
+fn abandoned_pictures(db: &Connection) -> Result<()> {
+    let left = db.execute(
+        "UPDATE pictures SET failed = 'the room restarted while it was being made'
+          WHERE png IS NULL AND failed = ''",
+        [],
+    )?;
+    if left > 0 {
+        tracing::info!(pictures = left, "these were still being drawn when the room stopped");
     }
     Ok(())
 }

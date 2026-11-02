@@ -27,7 +27,10 @@ const inList = (page) => roomsListed(page);
   // A game is played from its card in the conversation that announced
   // it; there is no menu of them in the top bar.
   is('the card offers it', await ryan.page.evaluate(() =>
-    [...document.querySelectorAll('.game-entry button')].map((b) => b.textContent.trim())),
+    // The card's own buttons. Scoped to the card because the entry
+    // also carries the AI's face, which is a button of its own now --
+    // it opens who they are, and is not something the card offers.
+    [...document.querySelectorAll('.game-entry .card button')].map((b) => b.textContent.trim())),
     ['Play', 'Peek']);
   await ryan.page.click('.game-entry button:has-text("Play")');
   await ryan.page.waitForTimeout(400);

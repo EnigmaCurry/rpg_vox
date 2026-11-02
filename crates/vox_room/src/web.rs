@@ -195,6 +195,7 @@ pub fn router(rooms: Arc<Rooms>, screen: Arc<Screen>) -> Router {
             post(rename_room).delete(delete_room),
         )
         .route("/api/games/:name/prompt", get(game_prompt))
+        .route("/api/profile/:who", get(profile))
         .route("/api/rooms/:room/history", get(history))
         .route("/api/rooms/:room/history/:id", get(read_conversation))
         .route(
@@ -208,6 +209,7 @@ pub fn router(rooms: Arc<Rooms>, screen: Arc<Screen>) -> Router {
         // whoever may see it, which is what lets it be cached at all.
         .layer(from_fn(private_answer))
         .route("/api/avatar/:who", get(avatar).delete(forget_avatar))
+        .route("/api/picture/:id", get(picture))
         .route("/room.ws", get(ws))
         .route("/screen.ws", get(screen_ws))
         .route("/healthz", get(|| async { "ok" }))
@@ -921,6 +923,54 @@ async fn avatar(
         png,
     )
         .into_response()
+}
+
+/// A picture one of the AIs made, in the conversation it was made in.
+///
+/// Immutable the moment it exists: a picture is never redrawn under
+/// the same id -- another take is another picture with another number
+/// -- so a browser that has one never has to ask again.
+async fn picture(State(app): State<App>, headers: HeaderMap, Path(id): Path<String>) -> Response {
+    if invited(&app, &headers).is_none() {
+        return (StatusCode::FORBIDDEN, "not invited").into_response();
+    }
+    let found = match app.any().picture_png(&id) {
+        Ok(found) => found,
+        Err(err) => {
+            warn!("read a picture: {err:#}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "no").into_response();
+        }
+    };
+    // Still being made, or never arrived. The card is drawing a
+    // spinner either way and is told which by the room, not by this.
+    let Some(png) = found else {
+        return (StatusCode::NOT_FOUND, "not yet").into_response();
+    };
+    (
+        [
+            (header::CONTENT_TYPE, "image/png".to_string()),
+            (header::CACHE_CONTROL, AVATAR_CACHE.to_string()),
+            (header::ETAG, format!("\"{id}\"")),
+            (header::VARY, "Cookie".to_string()),
+        ],
+        png,
+    )
+        .into_response()
+}
+
+/// Who somebody is: what opens when their face is clicked.
+///
+/// Asked for when the modal opens rather than sent with the roster. A
+/// bio is a paragraph and the roster goes out whenever anybody's
+/// microphone moves.
+async fn profile(State(app): State<App>, headers: HeaderMap, Path(who): Path<String>) -> Response {
+    if invited(&app, &headers).is_none() {
+        return (StatusCode::FORBIDDEN, "not invited").into_response();
+    }
+    match app.any().profile(&who) {
+        Some(profile) => Json(profile).into_response(),
+        None => (StatusCode::NOT_FOUND, "nobody here by that name").into_response(),
+    }
 }
 
 /// Take your own face off, leaving the tint your name already has.

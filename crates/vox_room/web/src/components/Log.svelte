@@ -1,5 +1,5 @@
 <script>
-  import { room, enterGame, peekGame, theAI, waitingAI } from '../lib/room.svelte.js';
+  import { room, enterGame, peekGame, theAI, waitingAI, pictureOf } from '../lib/room.svelte.js';
   import History from './History.svelte';
   import Face from './Face.svelte';
   import { hue } from '../lib/color.js';
@@ -145,6 +145,35 @@
               </div>
             {/if}
           </div>
+          </div>
+        </div>
+      {:else if e.kind === 'picture'}
+        <!-- A picture one of the AIs made. The card goes up the moment
+             it starts drawing, so this is a spinner first and the
+             picture after -- the room watches it happen and says what
+             to change. Numbered, because that number is what somebody
+             says out loud and what set_avatar takes. -->
+        {@const made = room.pictures[e.id]}
+        <div class="entry agent picture-entry">
+          <Face who={e.who} agent />
+          <div class="said-by">
+            <div class="who">
+              <span class="name">{e.who}</span>
+              <span class="time">{time(e.at)} · picture {e.text}</span>
+            </div>
+            <div class="card shot-card">
+              <div class="shot" class:waiting={!made?.ready && !made?.failed}>
+                {#if made?.ready}
+                  <img src={pictureOf(e.id)} alt={e.title} />
+                {:else if made?.failed}
+                  <span class="broke" title={made.failed}>didn't come</span>
+                {:else}
+                  <span class="spinner" aria-label="Drawing"></span>
+                {/if}
+              </div>
+              {#if e.title}<p class="asked">{e.title}</p>{/if}
+              {#if made?.failed}<p class="hint">{made.failed}</p>{/if}
+            </div>
           </div>
         </div>
       {:else if e.kind === 'card'}
@@ -300,6 +329,51 @@
     line-height: 1.5;
   }
   .card .summary { margin: 0; color: var(--muted); }
+  /* A picture is looked at, so it gets room -- but not the whole
+     column: a 128px sprite blown across 42em is a blurry poster. */
+  .shot {
+    width: 192px;
+    height: 192px;
+    border-radius: 10px;
+    overflow: hidden;
+    display: grid;
+    place-items: center;
+    background: var(--bubble);
+    border: 1px solid var(--line);
+    align-self: center;
+  }
+  .shot img {
+    width: 100%;
+    height: 100%;
+    /* Pixel art is drawn at the size it means; scaling it up without
+       smoothing is the whole point of the form. */
+    image-rendering: pixelated;
+    object-fit: contain;
+    display: block;
+  }
+  .shot.waiting { background: color-mix(in srgb, var(--agent) 7%, var(--bubble)); }
+  .shot .broke { color: var(--muted); font-size: 13px; }
+  /* Something is happening and it is going to take a while: a quiet
+     ring rather than anything that demands to be watched. */
+  .spinner {
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    border: 3px solid color-mix(in srgb, var(--agent) 25%, transparent);
+    border-top-color: var(--agent);
+    animation: spin 0.9s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) {
+    .spinner { animation-duration: 2.4s; }
+  }
+  /* What it was asked for, under it: the words to change when the
+     next one is asked for. */
+  .asked { margin: 0; color: var(--muted); font-size: 13px; }
+  /* A picture card is as wide as its picture. It is not a posted
+     card -- those hold tables and want the column -- so it must not
+     inherit the rule that gives them it. */
+  .card.shot-card { width: max-content; max-width: 100%; gap: 6px; }
   .hint { color: var(--muted); font-size: 13px; }
   .doings { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
   .doings button { padding: 2px 10px; font-size: 13px; }

@@ -63,7 +63,7 @@
   <section>
     <h2>Your face</h2>
     <div class="face-row">
-      <Face who={room.you} />
+      <Face who={room.you} opens={false} />
       {#if avatarOf(room.you)}
         <div>
           <p class="hint">The square beside everything you say.</p>

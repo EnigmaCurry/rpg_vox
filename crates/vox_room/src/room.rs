@@ -99,6 +99,9 @@ const CARD_TITLE_MAX: usize = 60;
 const CARD_BODY_MAX: usize = 2000;
 /// Cards one person may be holding in a conversation at once.
 const CARDS_MAX: usize = 50;
+/// Longest bio. A few lines under a picture, not a character sheet:
+/// it is read in a modal beside a 128-pixel square.
+const BIO_MAX: usize = 600;
 /// Biggest face the room will keep. Pixel art at the sizes an avatar
 /// wants is a handful of kilobytes; anything near this is a photograph
 /// that has wandered in, and the database is not the place for it.
@@ -115,11 +118,17 @@ pub enum Kind {
     /// text are the card's. It stays in the conversation like anything
     /// that was said.
     Card,
+    /// A picture one of the AIs made: the entry's text is the
+    /// picture's id and its title is what the picture was asked for.
+    /// The card goes up the moment the generating starts and is a
+    /// spinner until the image lands -- see `Room::begin_picture`.
+    Picture,
 }
 
 impl Kind {
     pub fn as_str(self) -> &'static str {
         match self {
+            Kind::Picture => "picture",
             Kind::Human => "human",
             Kind::Agent => "agent",
             Kind::Game => "game",
@@ -132,6 +141,7 @@ impl Kind {
             "agent" => Kind::Agent,
             "game" => Kind::Game,
             "card" => Kind::Card,
+            "picture" => Kind::Picture,
             _ => Kind::Human,
         }
     }
@@ -1254,6 +1264,13 @@ impl Room {
             "live": id == self.lock().conversation,
             "game": self.store().conversation_game(id).ok().flatten(),
             "log": log,
+            // Its own pictures, not the room's current ones: a picture
+            // card in an old conversation has to be able to draw
+            // itself, and nothing else on screen knows about them.
+            "pictures": self.store().pictures(id).unwrap_or_else(|err| {
+                warn!(conversation = id, "read its pictures: {err:#}");
+                Vec::new()
+            }),
         }))
     }
 
@@ -1676,26 +1693,39 @@ impl Room {
     }
 
     /// Give somebody the square the room draws beside everything they
-    /// say. The picture is a PNG, and `prompt` is what it was asked
-    /// for; see `store::set_avatar`.
+    /// say, from a picture already in the conversation.
     ///
-    /// `who` is a name as it is said out loud, matched loosely against
-    /// the roster and then against the AIs -- so a bot can be asked to
-    /// make one for itself as readily as for a person. Ok says whose it
-    /// is now, by the name the room calls them.
+    /// `picture` is the number on its card, which is what the room has
+    /// been looking at and arguing about -- "the second one" rather
+    /// than whatever the last call happened to return. Ok says whose
+    /// face it is now, by the name the room calls them.
     ///
     /// Not a thing a turn can be talked over: a face somebody sat
     /// through an interview for is not undone by the next person
     /// speaking, which is what `generation` means everywhere it is
     /// checked. It is taken only to say who is giving it.
-    pub fn set_avatar(
-        &self,
-        generation: u64,
-        who: &str,
-        png: &[u8],
-        prompt: &str,
-    ) -> Result<String, String> {
-        if !crate::mcp::is_png(png) {
+    pub fn set_avatar(&self, generation: u64, who: &str, picture: u32) -> Result<String, String> {
+        let st = self.lock();
+        let (key, whose) = self.whose(&st, who)?;
+        let found = self
+            .store()
+            .picture_numbered(st.conversation, picture)
+            .map_err(|err| format!("{err:#}"))?;
+        let Some((_, prompt, png)) = found else {
+            let made = self.store().pictures(st.conversation).unwrap_or_default();
+            return Err(match made.len() {
+                0 => "there are no pictures in this conversation yet; make one first, \
+                      and it goes into the chat for everyone to look at"
+                    .to_string(),
+                most => format!("there is no picture {picture} here; they run 1 to {most}"),
+            });
+        };
+        let Some(png) = png else {
+            return Err(format!(
+                "picture {picture} is still being made; wait for it to appear"
+            ));
+        };
+        if !crate::mcp::is_png(&png) {
             return Err("that picture isn't a PNG, so the room can't show it".into());
         }
         if png.len() > AVATAR_BYTES_MAX {
@@ -1705,50 +1735,11 @@ impl Room {
                 AVATAR_BYTES_MAX / 1024
             ));
         }
-        let st = self.lock();
-        let said = who.trim();
-        // A person first, then an AI. Speech-to-text mangles names, so
-        // both are matched the way `send_card` matches them, and the
-        // error names everybody so the model can pick again.
-        let (key, whose) = if let Some(called) = st
-            .people
-            .keys()
-            .find(|n| n.eq_ignore_ascii_case(said))
-            .cloned()
-        {
-            let found = self
-                .store()
-                .person_called(&called)
-                .map_err(|err| format!("{err:#}"))?;
-            match found {
-                Some(name) => (name, called),
-                // On the roster and not in the invite list: they are
-                // being heard on a session whose account has gone.
-                // Nothing to hang a face on.
-                None => return Err(format!("the room doesn't know {called} well enough yet")),
-            }
-        } else if let Some(bot) = st
-            .bots
-            .iter()
-            .find(|b| b.cfg.name.eq_ignore_ascii_case(said))
-            .map(|b| b.cfg.name.clone())
-        {
-            (crate::store::bot_key(&bot), bot)
-        } else {
-            let mut names: Vec<&str> = st.people.keys().map(String::as_str).collect();
-            names.extend(st.bots.iter().map(|b| b.cfg.name.as_str()));
-            return Err(format!(
-                "there is nobody called {said:?} here; it is {}",
-                if names.is_empty() {
-                    "empty".to_string()
-                } else {
-                    names.join(", ")
-                }
-            ));
-        };
+        // Copied rather than pointed at: the conversation it was made
+        // in can be deleted, and a face must outlive that.
         let at = self
             .store()
-            .set_avatar(&key, png, prompt.trim())
+            .set_avatar(&key, &png, &prompt)
             .map_err(|err| format!("{err:#}"))?;
         let from = st
             .bots
@@ -1756,7 +1747,7 @@ impl Room {
             .find(|b| b.generation.load(Ordering::SeqCst) == generation)
             .map(|b| b.cfg.name.clone())
             .unwrap_or_else(|| self.cfg.bot().name.clone());
-        info!(who = %whose, %from, bytes = png.len(), version = at, "set a face");
+        info!(who = %whose, %from, picture, bytes = png.len(), version = at, "set a face");
         // Everyone's tabs: a face is beside everything that person has
         // ever said, so it is not news for them alone.
         self.emit_people(&st);
@@ -1777,6 +1768,211 @@ impl Room {
             Err(err) => return Err(format!("{err:#}")),
         };
         store.avatar(&key).map_err(|err| format!("{err:#}"))
+    }
+
+    // -- pictures: made where the room can watch -----------------------
+
+    /// Start a picture. A card goes into the conversation at once,
+    /// with a spinner on it, and the answer is the id to finish it by
+    /// and the number the card shows.
+    ///
+    /// Posted before the picture exists on purpose. Generating one
+    /// takes the better part of a minute, and a room watching nothing
+    /// happen is a room that asks again -- so the card is the room's
+    /// evidence that the AI is doing what it said it would.
+    pub fn begin_picture(&self, generation: u64, prompt: &str) -> Result<(String, u32), String> {
+        let mut st = self.lock();
+        let who = st
+            .turn_of(generation)
+            .map(|b| b.cfg.name.clone())
+            .unwrap_or_else(|| self.cfg.bot().name.clone());
+        // One id for the picture and the entry that shows it: the card
+        // is the picture, so a second identifier would only be a way
+        // for the two to disagree.
+        let id = format!("picture-{}", uuid::Uuid::new_v4().simple());
+        let n = self
+            .store()
+            .begin_picture(st.conversation, &id, &who, prompt.trim())
+            .map_err(|err| format!("{err:#}"))?;
+        let entry = Entry {
+            id: id.clone(),
+            who,
+            kind: Kind::Picture,
+            // What the model calls it, and what `set_avatar` takes.
+            text: n.to_string(),
+            // What it was asked for, which is the card's caption.
+            title: prompt.trim().to_string(),
+            // Still being made: the card is a spinner while this is
+            // set, exactly as it is for a reply still being spoken.
+            live: true,
+            partial: false,
+            cut: false,
+            typed: false,
+            translations: BTreeMap::new(),
+            at: now_ms(),
+            sent: true,
+        };
+        if let Err(err) = self.store().put_entry(st.conversation, &entry) {
+            return Err(format!("{err:#}"));
+        }
+        info!(n, %id, prompt = %one_line(prompt), "a picture is being made");
+        self.emit_entry(&entry);
+        st.log.push(entry);
+        trim_log(&mut st.log);
+        Ok((id, n))
+    }
+
+    /// The picture arrived: the spinner becomes the picture.
+    pub fn finish_picture(&self, id: &str, png: &[u8]) {
+        if !crate::mcp::is_png(png) {
+            self.fail_picture(id, "what came back was not a PNG");
+            return;
+        }
+        if let Err(err) = self.store().finish_picture(id, png) {
+            warn!("keep a picture: {err:#}");
+            self.fail_picture(id, "the room couldn't keep it");
+            return;
+        }
+        self.settle_picture(id);
+    }
+
+    /// It never will: the card says so rather than spinning for good.
+    pub fn fail_picture(&self, id: &str, why: &str) {
+        if let Err(err) = self.store().fail_picture(id, why) {
+            warn!("mark a picture failed: {err:#}");
+        }
+        self.settle_picture(id);
+    }
+
+    /// Either way the card has stopped waiting: take the spinner off
+    /// and tell every tab what became of it.
+    fn settle_picture(&self, id: &str) {
+        let mut st = self.lock();
+        if let Some(e) = st.log.iter_mut().find(|e| e.id == id) {
+            e.live = false;
+            let entry = e.clone();
+            self.emit_entry(&entry);
+        }
+        match self.store().made(id) {
+            Ok(Some(made)) => self.emit(json!({ "type": "picture", "picture": made })),
+            Ok(None) => warn!(%id, "a picture that finished isn't in the database"),
+            Err(err) => warn!("read a picture back: {err:#}"),
+        }
+    }
+
+    /// Every picture in this conversation, without the images: what a
+    /// tab needs to draw the cards it is being sent.
+    fn pictures_json(&self, st: &State) -> Value {
+        match self.store().pictures(st.conversation) {
+            Ok(made) => serde_json::to_value(made).unwrap_or_else(|_| json!([])),
+            Err(err) => {
+                warn!("read the pictures: {err:#}");
+                json!([])
+            }
+        }
+    }
+
+    /// One picture of this conversation, by the number on its card.
+    /// What `web::picture` serves and `set_avatar` reads.
+    pub fn picture_png(&self, id: &str) -> Result<Option<Vec<u8>>, String> {
+        self.store().picture(id).map_err(|err| format!("{err:#}"))
+    }
+
+    // -- bios: the few lines that go with a face -----------------------
+
+    /// Write the few lines shown with somebody's face. `who` is a name
+    /// as it is said out loud, matched the way `set_avatar` matches
+    /// one. Empty takes the bio away.
+    pub fn set_bio(&self, who: &str, bio: &str) -> Result<String, String> {
+        if bio.chars().count() > BIO_MAX {
+            return Err(format!(
+                "that is {} characters, and a bio is at most {BIO_MAX}",
+                bio.chars().count()
+            ));
+        }
+        let st = self.lock();
+        let (key, whose) = self.whose(&st, who)?;
+        self.store()
+            .set_bio(&key, bio)
+            .map_err(|err| format!("{err:#}"))?;
+        info!(who = %whose, "wrote a bio");
+        self.emit(json!({ "type": "bio", "who": whose }));
+        Ok(whose)
+    }
+
+    /// Everything shown when somebody's face is clicked: who they are,
+    /// as much as the house actually knows.
+    ///
+    /// Not sent with the roster. A bio is a paragraph and the roster
+    /// goes out whenever anybody's microphone moves, so this is asked
+    /// for once, when a modal opens.
+    pub fn profile(&self, who: &str) -> Option<Value> {
+        let st = self.lock();
+        let (key, whose) = self.whose(&st, who).ok()?;
+        let bot = key.starts_with('@');
+        let store = self.store();
+        let person = (!bot)
+            .then(|| store.person(&key).ok().flatten())
+            .flatten();
+        Some(json!({
+            "who": whose,
+            // An AI is not a person, and the card should not pretend
+            // otherwise: it is the one thing here nobody invited.
+            "bot": bot,
+            "bio": store.bio(&key).ok().flatten().unwrap_or_default(),
+            // What their face was asked for -- the description they
+            // sat through an interview for, which is as much a part of
+            // who they are here as the picture it made.
+            "face": store.avatar_prompt(&key).ok().flatten().unwrap_or_default(),
+            "language": person
+                .as_ref()
+                .map(|p| p.language.clone())
+                .filter(|l| !l.is_empty())
+                .unwrap_or_else(|| self.cfg.language.clone()),
+            "owner": person.as_ref().is_some_and(|p| p.owner),
+            // In this room right now, which is not the same as
+            // invited: a line outlives its author's standing in it.
+            "here": st.people.get(&whose).is_some_and(|p| p.online())
+                || st.bots.iter().any(|b| b.cfg.name == whose && b.here),
+        }))
+    }
+
+    /// The key something is kept under and the name the room calls it,
+    /// from a name as it was said. A person first and then an AI; see
+    /// [`Room::set_avatar`], which resolves the same way and is where
+    /// this was lifted from when the bios wanted it too.
+    fn whose(&self, st: &State, said: &str) -> Result<(String, String), String> {
+        let said = said.trim();
+        if let Some(called) = st
+            .people
+            .keys()
+            .find(|n| n.eq_ignore_ascii_case(said))
+            .cloned()
+        {
+            return match self.store().person_called(&called) {
+                Ok(Some(name)) => Ok((name, called)),
+                Ok(None) => Err(format!("the room doesn't know {called} well enough yet")),
+                Err(err) => Err(format!("{err:#}")),
+            };
+        }
+        if let Some(bot) = st
+            .bots
+            .iter()
+            .find(|b| b.cfg.name.eq_ignore_ascii_case(said))
+            .map(|b| b.cfg.name.clone())
+        {
+            return Ok((crate::store::bot_key(&bot), bot));
+        }
+        let mut names: Vec<&str> = st.people.keys().map(String::as_str).collect();
+        names.extend(st.bots.iter().map(|b| b.cfg.name.as_str()));
+        Err(format!(
+            "there is nobody called {said:?} here; it is {}",
+            if names.is_empty() {
+                "empty".to_string()
+            } else {
+                names.join(", ")
+            }
+        ))
     }
 
     /// Take somebody's face away, leaving the tint their name already
@@ -1927,6 +2123,10 @@ impl Room {
             "people": self.people_json(&st),
             "speaks": self.speaks_json(&st),
             "avatars": self.avatars_json(&st),
+            // The pictures made in this conversation, without the
+            // images: a card draws itself from these and fetches the
+            // one picture it is showing.
+            "pictures": self.pictures_json(&st),
             "languages": self.cfg.languages,
             "strips": self.mixer.strips(),
             "log": st.log,
@@ -3475,6 +3675,12 @@ impl Room {
                     "cards": cards,
                     "game": st.game,
                     "conversation": self.conversation_json(st),
+                    // Pictures belong to their conversation too. Left
+                    // out, a picture card in a conversation the room
+                    // has come back to would spin for ever: the card
+                    // is in the log and what it is showing would not
+                    // be anywhere.
+                    "pictures": self.pictures_json(st),
                 }),
             );
         }
@@ -4941,6 +5147,10 @@ fn conversation_messages(
             Kind::Human => e.sent && !e.text.trim().is_empty(),
             Kind::Agent => !e.live && !e.text.trim().is_empty(),
             Kind::Game | Kind::Card => true,
+            // A picture still being made is a spinner in the chat and
+            // nothing to tell the model about: it is told when the
+            // call it is waiting on comes back.
+            Kind::Picture => !e.live,
         })
         .collect();
     let start = done.len().saturating_sub(history);
@@ -5025,6 +5235,24 @@ fn conversation_messages(
                     said_to_me(&mut out, note);
                 }
             }
+            // The one thing in the conversation the model cannot
+            // read. It is told that the picture is there and what
+            // number it is, which is all `set_avatar` needs and all
+            // anybody in the room will say out loud about it.
+            Kind::Picture => {
+                let who = if mine { "You" } else { e.who.as_str() };
+                let note = format!(
+                    "[{who} put picture {} in the chat for everyone to look at: \"{}\". \
+                     Ask how they like it; set_avatar takes that number.]",
+                    e.text,
+                    one_line(e.title.trim())
+                );
+                if mine {
+                    out.push((Role::Assistant, note));
+                } else {
+                    said_to_me(&mut out, note);
+                }
+            }
         }
     }
     out
@@ -5094,75 +5322,157 @@ mod tests {
         v
     }
 
-    /// A face is asked for by the name it is said by, kept against the
-    /// key that doesn't change, and shown to the whole room.
+    /// The whole of it: a card goes up with a spinner, the picture
+    /// fills it, the room argues, and a face is set from the one they
+    /// settled on -- by the number on its card, not by whichever was
+    /// made last.
     #[test]
-    fn a_face_is_given_by_name_and_shown_to_everybody() {
+    fn a_picture_is_watched_being_made_and_then_chosen() {
         let (r, _turns) = room(Mode::Named);
         let g = turn(&r);
 
-        // Not a PNG: refused, and nothing written. The browser is told
-        // it is being sent one, so this is where that is made true.
-        let err = r.set_avatar(g, "Ryan", b"GIF89a and the rest", "a wizard").unwrap_err();
-        assert!(err.contains("isn't a PNG"), "{err}");
-        assert!(r.avatar_png("Ryan").unwrap().is_none(), "nothing written");
+        // The card goes up before there is anything to show.
+        let (first, n) = r.begin_picture(g, "a tired wizard").unwrap();
+        assert_eq!(n, 1, "numbered from 1 within the conversation");
+        let spinner = r
+            .lock()
+            .log
+            .iter()
+            .find(|e| e.id == first)
+            .cloned()
+            .expect("the card is in the conversation at once");
+        assert_eq!(spinner.kind, Kind::Picture);
+        assert!(spinner.live, "and it is a spinner until the picture lands");
+        assert_eq!(spinner.text, "1", "the model refers to it by its number");
+        assert_eq!(spinner.title, "a tired wizard");
+        assert_eq!(spinner.who, "Vox", "signed by the AI that is making it");
+        assert!(r.picture_png(&first).unwrap().is_none(), "nothing to serve yet");
 
-        // And nothing the size of a photograph.
-        let huge = {
-            let mut v = png();
-            v.resize(AVATAR_BYTES_MAX + 1, 0);
-            v
-        };
-        let err = r.set_avatar(g, "Ryan", &huge, "a wizard").unwrap_err();
-        assert!(err.contains("at most"), "{err}");
+        // It lands.
+        r.finish_picture(&first, &png());
+        assert_eq!(r.picture_png(&first).unwrap().unwrap(), png());
+        assert!(
+            !r.lock().log.iter().find(|e| e.id == first).unwrap().live,
+            "the spinner comes off"
+        );
 
-        // Said the way speech-to-text would hand it over.
-        assert_eq!(r.set_avatar(g, "ryan", &png(), "a tired wizard").unwrap(), "Ryan");
-        let (got, version) = r.avatar_png("Ryan").unwrap().unwrap();
-        assert_eq!(got, png());
+        // Nobody liked it, so another. It gets the next number, and
+        // the first is still there to go back to.
+        let (second, n) = r.begin_picture(g, "a rested wizard").unwrap();
+        assert_eq!(n, 2);
+        r.finish_picture(&second, &png());
 
-        // Nobody of that name, and the error says who there is -- the
-        // people and the AIs both, since either may be given one.
-        let err = r.set_avatar(g, "Mallory", &png(), "a thief").unwrap_err();
-        assert!(err.contains("Ryan") && err.contains("Vox"), "{err}");
+        // A face is set by the number on the card -- the first one,
+        // which is the point of them being numbered at all.
+        assert!(
+            r.set_avatar(g, "nobody", 1).is_err(),
+            "and still only onto somebody who is here"
+        );
+        assert_eq!(r.set_avatar(g, "ryan", 1).unwrap(), "Ryan");
+        assert_eq!(r.avatar_png("Ryan").unwrap().unwrap().0, png());
+        // Copied, not pointed at: a face outlives the conversation it
+        // was made in.
+        assert_eq!(
+            r.avatar_asked_for("Ryan").as_deref(),
+            Some("a tired wizard"),
+            "with what that picture was asked for"
+        );
 
-        // The AI's own face, under a key no person can be invited into.
-        assert_eq!(r.set_avatar(g, "Vox", &png(), "a brass head").unwrap(), "Vox");
+        // A number nobody made says what there is instead.
+        let err = r.set_avatar(g, "Ryan", 9).unwrap_err();
+        assert!(err.contains("1 to 2"), "{err}");
 
-        // What a browser is sent: the name the room calls them, and the
-        // version to fetch it by.
+        // One still being made cannot be anybody's face yet.
+        let (third, _) = r.begin_picture(g, "a third").unwrap();
+        let err = r.set_avatar(g, "Ryan", 3).unwrap_err();
+        assert!(err.contains("still being made"), "{err}");
+
+        // And one that never arrives says so rather than spinning.
+        r.fail_picture(&third, "the server was out of balance");
+        assert!(!r.lock().log.iter().find(|e| e.id == third).unwrap().live);
+    }
+
+    /// A face survives a rename, goes with the account, and is theirs
+    /// to take off -- it is kept against the name on the invite.
+    #[test]
+    fn a_face_outlives_a_rename_and_is_theirs_to_remove() {
+        let (r, _turns) = room(Mode::Named);
+        let g = turn(&r);
+        let (id, _) = r.begin_picture(g, "a tired wizard").unwrap();
+        r.finish_picture(&id, &png());
+        r.set_avatar(g, "Ryan", 1).unwrap();
+        let version = r.avatar_png("Ryan").unwrap().unwrap().1;
+
+        // The AI has one too, under a key no person can be invited
+        // into, and the two do not collide.
+        r.set_avatar(g, "Vox", 1).unwrap();
+
         let shown = {
             let st = r.lock();
             r.avatars_json(&st)
         };
         assert_eq!(shown["Ryan"], Value::from(version));
-        assert!(shown["Vox"].is_u64(), "the AI has one too: {shown}");
-        assert!(shown.get("Alex").is_none(), "and nobody who hasn't");
+        assert!(shown["Vox"].is_u64(), "{shown}");
+        assert!(shown.get("Alex").is_none(), "and nobody who hasn't one");
 
-        // And what the AI is told about it -- what `list_people` puts
-        // under each name -- so it can build on a face somebody
-        // already has instead of starting over from nothing.
-        assert_eq!(
-            r.avatar_asked_for("Ryan").as_deref(),
-            Some("a tired wizard")
-        );
-        assert_eq!(r.avatar_asked_for("Alex"), None, "nobody who hasn't one");
-
-        // Renaming themselves keeps the face and moves which name it
-        // is shown under: the picture is kept against the key, and the
-        // join happens when the roster goes out.
+        // Renaming rewrites their cards and their lines; the face is
+        // kept against the key, so it only changes which name it is
+        // shown under.
         assert_eq!(r.rename("Ryan", "Thorne"), Ok("Thorne".to_string()));
         let shown = {
             let st = r.lock();
             r.avatars_json(&st)
         };
         assert_eq!(shown["Thorne"], Value::from(version), "{shown}");
-        assert!(shown.get("Ryan").is_none(), "under the old name no longer");
+        assert!(shown.get("Ryan").is_none(), "not under the old name");
 
-        // Theirs to take off, and then it is the tint of their name.
         assert_eq!(r.clear_avatar("Thorne"), Ok(true));
         assert!(r.avatar_png("Thorne").unwrap().is_none());
         assert_eq!(r.clear_avatar("Thorne"), Ok(false), "and none to take twice");
+    }
+
+    /// What a face opens: the bio the AI wrote and what the house
+    /// knows, for a person and for an AI.
+    #[test]
+    fn a_face_opens_onto_who_they_are() {
+        let (r, _turns) = room(Mode::Named);
+        let g = turn(&r);
+
+        let ryan = r.profile("Ryan").expect("somebody the room knows");
+        assert_eq!(ryan["who"], "Ryan");
+        assert_eq!(ryan["bot"], false);
+        assert_eq!(ryan["bio"], "", "nothing written yet");
+        assert_eq!(ryan["language"], "English", "the room's, having chosen none");
+        assert!(r.profile("Mallory").is_none(), "and nobody it doesn't");
+
+        assert_eq!(
+            r.set_bio("Ryan", "A ranger from the north, quiet about it.")
+                .unwrap(),
+            "Ryan"
+        );
+        let ryan = r.profile("ryan").expect("matched the way a name is said");
+        assert_eq!(ryan["bio"], "A ranger from the north, quiet about it.");
+
+        // What their face was asked for is part of who they are here.
+        let (id, _) = r.begin_picture(g, "a tired wizard").unwrap();
+        r.finish_picture(&id, &png());
+        r.set_avatar(g, "Ryan", 1).unwrap();
+        assert_eq!(r.profile("Ryan").unwrap()["face"], "a tired wizard");
+
+        // An AI is not a person, and the card says so.
+        r.set_bio("Vox", "The voice that runs the room.").unwrap();
+        let vox = r.profile("Vox").unwrap();
+        assert_eq!(vox["bot"], true);
+        assert_eq!(vox["bio"], "The voice that runs the room.");
+        assert_eq!(vox["owner"], false);
+
+        // Writing nothing takes it away again.
+        r.set_bio("Vox", "   ").unwrap();
+        assert_eq!(r.profile("Vox").unwrap()["bio"], "");
+
+        // And a bio has a limit, because it is read in a modal.
+        let err = r.set_bio("Ryan", &"x".repeat(BIO_MAX + 1)).unwrap_err();
+        assert!(err.contains("at most"), "{err}");
     }
 
     /// A game that leaves the room's mode alone.
