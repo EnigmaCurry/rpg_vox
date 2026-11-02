@@ -76,11 +76,11 @@ const focused = (page) =>
   await page.waitForTimeout(400);
 
   // Where Space is not yours: typing it types it.
-  await page.click('.composer input');
-  await page.fill('.composer input', 'a');
+  await page.click('.say textarea');
+  await page.fill('.say textarea', 'a');
   is('the box has it instead', await space(page), false);
-  is('and it went in as a space', await page.inputValue('.composer input'), 'a ');
-  await page.fill('.composer input', '');
+  is('and it went in as a space', await page.inputValue('.say textarea'), 'a ');
+  await page.fill('.say textarea', '');
 
   // A dialog answers with Space, so it keeps it.
   await page.click('.bar button:has-text("New conversation")');
@@ -94,7 +94,7 @@ const focused = (page) =>
   await page.evaluate(() => document.activeElement?.blur());
   await page.keyboard.down('Space');
   await page.waitForTimeout(250);
-  await page.click('.composer input');
+  await page.click('.say textarea');
   await page.keyboard.up('Space');
   await page.waitForTimeout(900);
   is('letting go closes the mic even after the focus moved',

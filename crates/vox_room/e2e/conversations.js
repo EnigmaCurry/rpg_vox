@@ -15,7 +15,7 @@ const { is, report, person, said, type } = require('./room.js');
 const [ryanLink, alexLink] = process.argv.slice(2);
 
 const name = (page) => page.evaluate(() => document.querySelector('.bar input.name')?.value ?? null);
-const canType = (page) => page.evaluate(() => !!document.querySelector('.composer'));
+const canType = (page) => page.evaluate(() => !!document.querySelector('.say'));
 const rows = (page) =>
   page.evaluate(() =>
     [...document.querySelectorAll('.menu .row')].map((r) => ({

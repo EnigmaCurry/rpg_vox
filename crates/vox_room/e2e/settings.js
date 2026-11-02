@@ -1,12 +1,13 @@
 // What is along the foot of the room, and what the cog opens:
 //   node settings.js RYAN_LINK
 //
-// The footer is what you reach for while talking -- your mic on the
-// left, what you do with the room on the right -- and the one button
-// there is the same width whatever it says, so it doesn't change shape
-// under your hand. Everything you set once is on a page of its own
-// behind the cog, with the room still running: still in the audio, and
-// the space bar still yours.
+// The footer is the two ways of saying something and nothing else:
+// the button you talk with -- the same width whatever it says, so it
+// doesn't change shape under your hand -- and the box you type in.
+// What you do with the room is over the people in it, as icons.
+// Everything you set once is on a page of its own behind the cog, with
+// the room still running: still in the audio, and the space bar still
+// yours.
 //
 //   vox_room --room Lobby --room Studio --echo --no-stt --tts none
 
@@ -28,13 +29,18 @@ const feet = (page) =>
   await page.setViewportSize({ width: 1280, height: 860 });
   await wait(400);
 
-  // Mute on the left; the room's own buttons over on the right.
+  // The button you talk with, and the box you type in. Nothing else.
   const row = await feet(page);
-  is('what is down there', row.map((b) => b.what), ['Mute Space', 'Share screen', 'Leave audio', 'Settings']);
+  is('what is down there', row.map((b) => b.what), ['Mute Space', 'Send']);
   const foot = await page.evaluate(() => document.querySelector('footer').getBoundingClientRect().width);
   is('mute is on the left', row[0].left < foot / 3, true);
-  is('and the rest are over on the other side', row[1].left > foot / 2, true);
-  is('with the cog last, after leaving', row[3].left > row[2].left, true);
+  is('and the box you type in takes the rest', row[1].left > foot / 2, true);
+
+  // What you do with the room is over the people in it.
+  is('the room\u2019s own buttons are up there',
+    await page.evaluate(() =>
+      [...document.querySelectorAll('.tools button')].map((b) => b.getAttribute('aria-label'))),
+    ['Share screen', 'Leave audio', 'Settings']);
 
   // The same button whatever it says: Unmute is no wider than Mute.
   const wide = row[0].width;
@@ -57,8 +63,42 @@ const feet = (page) =>
     })),
     { sliders: 0, boxes: 1, meters: 0 });
 
+  // The box grows with what is in it, and stops at half the window.
+  const tall = () =>
+    page.evaluate(() => Math.round(document.querySelector('.say textarea').getBoundingClientRect().height));
+  const one = await tall();
+  await page.click('.say textarea');
+  await page.keyboard.type('one');
+  for (const line of ['two', 'three']) {
+    await page.keyboard.down('Shift');
+    await page.keyboard.press('Enter');
+    await page.keyboard.up('Shift');
+    await page.keyboard.type(line);
+  }
+  await wait(300);
+  const three = await tall();
+  is('shift and enter make a line rather than sending', await page.inputValue('.say textarea'), 'one\ntwo\nthree');
+  is('and the box grew to hold them', three > one, true);
+  for (let i = 0; i < 60; i++) {
+    await page.keyboard.down('Shift');
+    await page.keyboard.press('Enter');
+    await page.keyboard.up('Shift');
+  }
+  await wait(300);
+  is('and stops at half the window',
+    await page.evaluate(() => {
+      const h = document.querySelector('.say textarea').getBoundingClientRect().height;
+      return Math.abs(h - window.innerHeight / 2) < 2;
+    }),
+    true);
+  // Enter on its own sends, and the box goes back to one line.
+  await page.keyboard.press('Enter');
+  await wait(600);
+  is('enter sends it', await page.inputValue('.say textarea'), '');
+  is('and the box is one line again', await tall(), one);
+
   // The cog opens a page, and the room is not behind it.
-  await page.click('footer button.cog');
+  await page.click('.tools button.cog');
   await page.waitForSelector('.settings');
   is('the settings are a page of their own',
     await page.evaluate(() => ({
@@ -96,19 +136,19 @@ const feet = (page) =>
   is('and back again', (await feet(page))[0].what, 'Mute Space');
 
   // Escape closes it too, and the cog says whether it is open.
-  await page.click('footer button.cog');
+  await page.click('.tools button.cog');
   await page.waitForSelector('.settings');
   await page.keyboard.press('Escape');
   await wait(500);
   is('Escape closes it', await page.evaluate(() => !!document.querySelector('.settings')), false);
   is('and the cog is not pressed',
-    await page.evaluate(() => document.querySelector('footer button.cog').getAttribute('aria-pressed')),
+    await page.evaluate(() => document.querySelector('.tools button.cog').getAttribute('aria-pressed')),
     'false');
 
   // And the way out is still the way out: leaving from the room puts
   // you at the door, and coming back lands in the conversation rather
   // than in the settings somebody left open.
-  await page.click('footer button.leave');
+  await page.click('.tools button.leave');
   await page.waitForSelector('.enter');
   await page.locator('.consent input').check();
   await page.click('button:has-text("Join Audio")');

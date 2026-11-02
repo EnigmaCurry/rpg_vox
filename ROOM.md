@@ -462,8 +462,12 @@ See ROOM_DOCKER.md.
   once and stops for good once your speech is confirmed (300 ms of voice
   or the first recognised word), so a cough only dips it. **Stop** does
   the same with a click.
-- **Typing instead of saying it**: there is a box at the foot of the
-  conversation. What you send through it appears beside everything said,
+- **Typing instead of saying it**: there is a box along the foot of
+  the room, beside the button you talk with — saying a thing and typing
+  it are the same act done two ways. **Enter** sends;
+  **Shift+Enter** starts a line, and the box grows to hold what is in
+  it, up to half the window, after which it scrolls. What you send
+  through it appears beside everything said,
   marked **typed** — the mark is the point, because a typed line has no
   recognition error in it. It is for everything speech-to-text is bound
   to spoil: a URL, a path, a command, an unusual name. The AI reads it
@@ -475,13 +479,17 @@ See ROOM_DOCKER.md.
   that. A message joins the conversation at the next pause, with the
   same beat as speech in which to be joined by more.
 
-  Messages are flattened to one line and capped at 2000 characters.
-  That isn't tidiness: the AI is shown the conversation as `Name: what
-  they said` lines, so a message allowed to keep a line break of its own
-  could put words in somebody else's mouth. Unicode's direction
-  overrides and zero-width characters go the same way, for the same
-  reason. Everything else survives exactly as typed, because the
-  punctuation a careless filter eats is what a URL is made of.
+  Messages are capped at 2000 characters, and keep the line breaks you
+  gave them — a list is a list. **What the AI is shown is one line per
+  turn**, which is where that used to be enforced and is the only place
+  it ever mattered: the model reads the conversation as `Name: what
+  they said` lines, so a break inside one of them would read as the
+  start of somebody else's turn. People read the breaks; the model
+  reads the line. Runs of spaces become one, at most one blank line in
+  a row survives, and Unicode's control codes, direction overrides and
+  zero-width characters are still spaces. Everything else survives
+  exactly as typed, because the punctuation a careless filter eats is
+  what a URL is made of.
 - **More than one language**: start the room with
   `--language-also Russian` and the door offers a **Language** beside
   the devices. Everyone hears the people in the room as they are — their
@@ -682,27 +690,31 @@ See ROOM_DOCKER.md.
   model that does work the language out. Nothing is lost, but it looks
   odd while it happens; choose the language you are actually going to
   speak.
-- **Sharing a desktop**: **Share screen**, in the footer, offers the
-  browser's own picker of a window or a screen. Everyone in the room
+- **Sharing a desktop**: **📺️**, over the people in the left column,
+  offers the browser's own picker of a window or a screen. Everyone in the room
   gets a thumbnail of it under that person's name in the mixer, live;
   click one and it opens full size where the conversation was, with the
   mixer (and everyone else's thumbnails) still beside it. **That is
   yours alone** — opening a desktop, or closing it, changes nothing on
   anyone else's screen, and nothing about it is remembered. Several
-  people can share at once; each gets a thumbnail. **Stop sharing**, the
-  browser's own stop button, **Leave audio** and walking into another
-  room all end it. No sound is
+  people can share at once; each gets a thumbnail. Pressing **📺️**
+  again, the browser's own stop button, leaving the audio and walking
+  into another room all end it. No sound is
   taken from what is shared: the room's audio is the mixer's, and a
   shared tab's would come back as another voice to transcribe.
-- **The footer** is what you reach for while talking, and nothing else:
-  your microphone on the left, what you do with the room on the right.
-  **Mute** (or **Hold to talk**) is one width whatever it says, so the
-  button under your hand is the same button it was a moment ago and
-  nothing beside it moves, with **Push to talk** beside it — it says
-  what that button does, so it is next to it rather than on a page you
-  have to go to. Then **Share screen**, **Leave audio**, and the cog.
-  Anything the room has to tell you appears along it too.
-- **Settings**, behind the cog on the far right: a page of its own with
+- **The footer** is the two ways of saying something, side by side,
+  and nothing else. **Mute** (or **Hold to talk**) is one width
+  whatever it says, so the button under your hand is the same button it
+  was a moment ago and nothing beside it moves, with **Push to talk**
+  next to it — it says what that button does. Then the box you type in,
+  taking the rest of the width. Anything the room has to tell you
+  appears along it too.
+- **What you do with the room** is three icons over the people in the
+  left column, where the room they are about is: **📺️** share a
+  desktop, **🚪** leave the audio, and the cog. They are not in the
+  footer because the footer is for the button you aim at without
+  looking, and these are not it.
+- **Settings**, behind the cog: a page of its own with
   the things you set once and don't watch — **Your name**, **App
   volume**, and which microphone the browser gave the room. Changing
   your name changes it everywhere, the conversation

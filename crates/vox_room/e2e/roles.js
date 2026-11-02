@@ -51,7 +51,7 @@ const asked = async (cookie, path, init = {}) => {
   await closeRooms(boss.page);
 
   // Only the owner is offered the page at all.
-  await boss.page.click('footer button.cog');
+  await boss.page.click('.tools button.cog');
   await boss.page.waitForSelector('.settings');
   is('and is offered the people', await boss.page.evaluate(() => !!document.querySelector('.settings button.manage')), true);
   await boss.page.click('.settings button.manage');

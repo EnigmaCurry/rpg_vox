@@ -180,7 +180,7 @@ const said = (page) =>
 /// Type something into the room instead of saying it, and give the AI
 /// its pause to answer in.
 async function type(page, text, settle = 2600) {
-  await page.fill('.composer input', text);
+  await page.fill('.say textarea', text);
   await page.keyboard.press('Enter');
   await page.waitForTimeout(settle);
 }

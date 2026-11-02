@@ -72,8 +72,8 @@ const show = (ts) =>
   await wait(1000);
   // Named, which is the room's own default: the message says the name,
   // so there is no mode to set and no microphone in this at all.
-  await ryan.page.fill('.composer input', 'Vox, say two sentences about the sea.');
-  await ryan.page.click('.composer button');
+  await ryan.page.fill('.say textarea', 'Vox, say two sentences about the sea.');
+  await ryan.page.click('.say button');
 
   const t0 = Date.now();
   let last = '';

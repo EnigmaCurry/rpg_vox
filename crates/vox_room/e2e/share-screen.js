@@ -26,8 +26,8 @@ const JOIN = 'button:has-text("Join Audio")';
 // Nobody comes in without agreeing to be recorded, so the box is part of
 // pressing the button now.
 const AGREE = '.consent input';
-const SHARE = 'footer button:has-text("Share screen")';
-const STOP = 'footer button:has-text("Stop sharing")';
+const SHARE = '.tools button.share';
+const STOP = '.tools button.share.on';
 
 async function person(name, url) {
   const browser = await chromium.launch({

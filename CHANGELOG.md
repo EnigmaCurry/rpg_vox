@@ -90,6 +90,29 @@ releases.
 
 ### Voice room
 
+- **The footer is the two ways of saying something, and nothing else.**
+  **Share screen** and **Leave audio** are now **📺️** and **🚪**,
+  over the people in the left column with the cog beside them — that is
+  the column the room is in, and the footer is for the button you aim
+  at without looking. What takes the room they left is the box you type
+  in, which moves down out of the conversation: saying a thing and
+  typing it are the same act done two ways, so they sit side by side,
+  and the conversation keeps the rows.
+
+- **A typed message can have more than one line.** The box is a
+  textarea now: **Enter** sends, **Shift+Enter** starts a line, and it
+  grows to hold what is in it up to half the window, after which it
+  scrolls. Its prompt is "Type your message here ...".
+
+  Messages used to be flattened to one line, because the model reads
+  the conversation as `Name: what they said` lines and a break inside
+  one of them would read as the start of somebody else's turn. The
+  flattening has moved to the one place that was ever about: the
+  transcript handed to the model. What is stored, shown and read by
+  people keeps the shape it was typed in — runs of spaces still become
+  one, at most one blank line in a row survives, and every other
+  control character is still a space.
+
 - **Push to talk is beside the button it changes.** It was on the
   settings page, a page away from the button whose job it decides. It
   is a tickbox in the footer next to **Mute** / **Hold to talk** now.

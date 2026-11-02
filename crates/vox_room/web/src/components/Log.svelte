@@ -1,12 +1,10 @@
 <script>
-  import { room, sendText, enterGame, peekGame, theAI, waitingAI } from '../lib/room.svelte.js';
+  import { room, enterGame, peekGame, theAI, waitingAI } from '../lib/room.svelte.js';
   import History from './History.svelte';
   import { hue } from '../lib/color.js';
-  import { TYPED_MAX } from '../lib/names.js';
 
   let box;
   let stick = true;
-  let draft = $state('');
 
   // The language you are reading in, and whose language each person is
   // speaking: between them they say whether a message needs translating
@@ -57,11 +55,6 @@
   const left = (t) =>
     t.done ? 'heard' : t.total ? `${Math.max(1, Math.ceil((t.total - t.ms) / 1000))}s` : 'translating…';
 
-  function send(ev) {
-    ev.preventDefault();
-    if (sendText(draft)) draft = '';
-  }
-
   function onscroll() {
     stick = box.scrollHeight - box.scrollTop - box.clientHeight < 60;
   }
@@ -94,11 +87,10 @@
   const answers = $derived(one ? 'it answers' : 'they answer');
 </script>
 
-<!-- One column: the conversation scrolling in it, and the box you type
-     into a fixture across its foot. The composer used to be the last
-     thing in the scroller, stuck to the bottom of it -- which kept it
-     inside the conversation's own margins and made it read as one more
-     bubble at the end. It is a row of the room now. -->
+<!-- Nothing but the conversation. The box you type into is along the
+     foot of the room, beside the button you talk with: saying a thing
+     and typing it are the same act done two ways, and this column is
+     for what came of either. -->
 <div class="log">
   <div class="said" bind:this={box} {onscroll}>
     <History />
@@ -223,23 +215,6 @@
       </div>
     {/if}
   </div>
-
-  <!-- None at all on a conversation the room has finished with: there
-       is nowhere for what you typed to go, and the conversation takes
-       the row back. -->
-  {#if !archived}
-  <form class="composer" onsubmit={send}>
-    <input
-      type="text"
-      bind:value={draft}
-      maxlength={TYPED_MAX}
-      autocomplete="off"
-      placeholder="Type instead of saying it — a URL, a name, anything that has to arrive exactly"
-      aria-label="Type a message to the room"
-    />
-    <button type="submit" disabled={!draft.trim()}>Send</button>
-  </form>
-  {/if}
 </div>
 
 <style>
@@ -260,7 +235,7 @@
     min-height: 0;
     overflow-y: auto;
     overscroll-behavior: contain;
-    padding: 16px var(--gutter);
+    padding: 5px var(--gutter);
     display: flex;
     flex-direction: column;
     gap: 12px;
@@ -371,47 +346,4 @@
   .track.waiting .left { font-style: italic; }
   @media (prefers-reduced-motion: reduce) { .bar i { transition: none; } }
 
-  /* A fixture across the foot of the conversation rather than a bubble
-     at the end of it: the bar *is* the field. A rule along the top to
-     part it from what was said, the panel behind it, and nothing round
-     anywhere -- the pill it used to be read as one more message, and
-     the one thing in the room that isn't a message is the place you
-     type. */
-  .composer {
-    display: flex;
-    align-items: center;
-    padding: 0 var(--gutter);
-    border-top: 1px solid var(--line);
-    background: var(--bg);
-  }
-  /* The whole bar takes the focus, because the whole bar is the field.
-     Drawn inside, so nothing moves when it lights up. */
-  .composer:focus-within {
-    border-top-color: var(--accent);
-    box-shadow: inset 0 1px 0 var(--accent);
-  }
-  .composer input {
-    flex: 1;
-    min-width: 0;
-    font: inherit;
-    color: var(--ink);
-    background: none;
-    border: 0;
-    padding: 13px 0;
-  }
-  .composer input:focus { outline: none; }
-  .composer input::placeholder { color: var(--muted); }
-  /* Send is a word at the end of the bar, not a button on top of it.
-     It is the second way to do what Enter already does, so it carries
-     no weight of its own. */
-  .composer button {
-    border: 0;
-    border-radius: 0;
-    background: none;
-    color: var(--accent);
-    font-weight: 600;
-    padding: 13px 0 13px 14px;
-  }
-  .composer button:not(:disabled):hover { color: var(--ink); }
-  .composer button:disabled { opacity: 0.4; cursor: default; }
 </style>
