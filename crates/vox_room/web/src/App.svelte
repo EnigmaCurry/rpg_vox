@@ -270,6 +270,10 @@
   .tools {
     grid-area: tools;
     display: flex;
+    /* Against the right edge, under the caret that opens the rooms:
+       the far side of this strip is where what-you-do-with-the-room
+       lives, and the room's name has the near side to itself. */
+    justify-content: flex-end;
     gap: 6px;
     padding: 8px 10px;
     border-right: 1px solid var(--line);
@@ -326,10 +330,15 @@
   footer {
     grid-area: foot;
     display: flex;
-    flex-wrap: wrap;
+    /* Lines stack upward, so a box with no room to sit beside the talk
+       button goes above it rather than below: the thing you are typing
+       into is nearest the conversation it is going into, and the button
+       under your thumb stays where it was. */
+    flex-wrap: wrap-reverse;
     /* The box you type into grows; everything beside it stays on the
-       line the two of them share. */
-    align-items: flex-end;
+       line the two of them share. Reversed wrapping turns the cross
+       axis over with it, so the foot of the line is `start` here. */
+    align-items: flex-start;
     gap: 8px;
     padding: 8px 12px;
     border-top: 1px solid var(--line);

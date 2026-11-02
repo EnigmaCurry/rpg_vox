@@ -62,7 +62,9 @@
       aria-label="Type a message to the room"
       {onkeydown}
     ></textarea>
-    <button type="submit" disabled={!draft.trim()}>Send</button>
+    <!-- Only once there is something to send: an empty box has nothing
+         to press this for, and the room is typed into with Enter. -->
+    {#if draft.trim()}<button type="submit">Send</button>{/if}
   </form>
 {/if}
 
@@ -71,7 +73,13 @@
      nothing round, no border of its own, and the whole of it lights up
      when it has the focus. */
   .say {
-    flex: 1;
+    /* A basis wide enough to type in, so that a footer with no room
+       left for it wraps it onto a line of its own. Flexed from zero it
+       is never too big to fit, and a narrow window leaves it a
+       character wide and a half-screen tall. Wide enough that it wraps
+       while there is still a line of room in it, rather than after
+       being squeezed down to a word. */
+    flex: 1 1 20em;
     min-width: 0;
     display: flex;
     align-items: flex-end;
@@ -112,6 +120,5 @@
     font-weight: 600;
     padding: 9px 0;
   }
-  button:not(:disabled):hover { color: var(--ink); }
-  button:disabled { opacity: 0.4; cursor: default; }
+  button:hover { color: var(--ink); }
 </style>

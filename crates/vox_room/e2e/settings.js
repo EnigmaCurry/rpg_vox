@@ -24,17 +24,40 @@ const feet = (page) =>
     })),
   );
 
+/// The two edges of the box you type in: where it starts, which is what
+/// the talk button must not move when it changes what it says, and
+/// where it ends, which is the end of the footer.
+const sayAt = (page) => page.evaluate(() => {
+  const r = document.querySelector('.say').getBoundingClientRect();
+  return { left: Math.round(r.left), right: Math.round(r.right) };
+});
+
 (async () => {
   const { browser, page } = await person(ryanLink);
   await page.setViewportSize({ width: 1280, height: 860 });
   await wait(400);
 
-  // The button you talk with, and the box you type in. Nothing else.
+  // The button you talk with, and the box you type in. Nothing else --
+  // and Send is not down there at all until there is something to send.
   const row = await feet(page);
-  is('what is down there', row.map((b) => b.what), ['Mute Space', 'Send']);
+  const wide = row[0].width;
+  is('what is down there', row.map((b) => b.what), ['Mute Space']);
   const foot = await page.evaluate(() => document.querySelector('footer').getBoundingClientRect().width);
   is('mute is on the left', row[0].left < foot / 3, true);
-  is('and the box you type in takes the rest', row[1].left > foot / 2, true);
+  const box = await sayAt(page);
+  is('and the box you type in takes the rest',
+    box.left > row[0].left + wide && foot - box.right < 20, true);
+
+  // Send turns up with the first thing worth sending, and goes with it.
+  await page.fill('.say textarea', 'something');
+  await wait(200);
+  is('send arrives with something to send', (await feet(page)).map((b) => b.what),
+    ['Mute Space', 'Send']);
+  await page.fill('.say textarea', '   ');
+  await wait(200);
+  is('and spaces are not something', (await feet(page)).map((b) => b.what), ['Mute Space']);
+  await page.fill('.say textarea', '');
+  await wait(200);
 
   // What you do with the room is over the people in it.
   is('the room\u2019s own buttons are up there',
@@ -43,13 +66,13 @@ const feet = (page) =>
     ['Share screen', 'Leave audio', 'Settings']);
 
   // The same button whatever it says: Unmute is no wider than Mute.
-  const wide = row[0].width;
+  const was = box.left;
   await page.click('footer button.big');
   await wait(400);
   const muted = await feet(page);
   is('it says the other thing now', muted[0].what, 'Unmute Space');
   is('and is the same width', muted[0].width, wide);
-  is('so nothing beside it moved', muted[1].left, row[1].left);
+  is('so nothing beside it moved', (await sayAt(page)).left, was);
   await page.click('footer button.big');
   await wait(400);
 

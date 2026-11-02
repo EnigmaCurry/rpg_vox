@@ -109,7 +109,6 @@
     onclick={() => (open = !open)}>
     <span class="name">{room.title}</span>
     {#if room.game}<span class="game">{room.game}</span>{/if}
-    {#if room.alone}<span class="yours" title="Nobody else can come into this one.">yours</span>{/if}
     <span class="caret" aria-hidden="true">▾</span>
   </button>
 
@@ -225,7 +224,7 @@
   }
   .current:hover { background: var(--bubble); }
   .current.on { background: var(--bubble); }
-  .current .caret { margin-left: auto; font-size: 11px; opacity: 0.6; font-weight: 400; }
+  .current .caret { margin-left: auto; font-size: 12pt; opacity: 0.6; font-weight: 400; }
   .current.on .caret { transform: rotate(180deg); }
   .name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
@@ -297,7 +296,6 @@
     color: var(--muted);
     background: none;
   }
-  .current .yours { border: 1px solid var(--line); border-radius: 999px; padding: 0 6px; }
 
   /* Who is in the room you are in, and how loud. Always here, always
      in the same place, however the list above it is being used. */
