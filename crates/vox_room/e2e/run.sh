@@ -58,7 +58,7 @@ flags() {
 guests() {
   case $1 in
     door) echo "Fresh Known En Ru Fr" ;;
-    permalinks|ptt) echo "Ryan" ;;
+    permalinks|ptt|settings) echo "Ryan" ;;
     *) echo "Ryan Alex" ;;
   esac
 }
@@ -126,7 +126,7 @@ sqlite_get() { sqlite "$1" "$2"; }
 sqlite_set() { sqlite "$1" "$2" >/dev/null; }
 
 suites=("$@")
-[[ ${#suites[@]} -eq 0 ]] && suites=(rooms bots door permalinks ptt conversations game interpreter)
+[[ ${#suites[@]} -eq 0 ]] && suites=(rooms bots door permalinks ptt settings conversations game interpreter)
 
 bad=0
 for suite in "${suites[@]}"; do

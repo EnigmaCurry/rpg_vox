@@ -1,11 +1,12 @@
 <script>
   import { onMount } from 'svelte';
-  import { room, command, ask, answer, whoami, leaveAudio, setMuted, setVolume, setPushToTalk, talk, busyAI } from './lib/room.svelte.js';
+  import { room, command, ask, answer, whoami, leaveAudio, setMuted, talk, busyAI } from './lib/room.svelte.js';
   import { screen, share, stopSharing, supported as canShare } from './lib/screen.svelte.js';
   import Log from './components/Log.svelte';
   import Cards from './components/Cards.svelte';
   import Enter from './components/Enter.svelte';
   import Board from './components/Board.svelte';
+  import Settings from './components/Settings.svelte';
   import Rooms from './components/Rooms.svelte';
 
   // Narrow screens show one area at a time; wide ones show all three.
@@ -133,6 +134,11 @@
        is joined there is nothing behind it to see: the room is voice,
        and a conversation you can read but not hear is not being in it. -->
   <Enter />
+{:else if room.settings}
+  <!-- A page, not a sheet: what is on it is set once and not watched,
+       and the room goes on running behind it -- you are still in the
+       audio and the space bar still works. -->
+  <Settings />
 {:else}
   <div class="app show-{area}" class:watching={screen.watching != null} class:nocards={!hasCards}>
     <header>
@@ -186,32 +192,28 @@
             {room.muted ? 'Unmute' : 'Mute'} <kbd>Space</kbd>
           </button>
         {/if}
-        <label class="vol" title="Your mic stays muted except while you hold Space or the talk button.">
-          <input type="checkbox" checked={room.pushToTalk} onchange={(e) => { setPushToTalk(e.currentTarget.checked); e.currentTarget.blur(); }} />
-          Push to talk
-        </label>
-        {#if room.micName}
-          <span class="vol mic-name" title="The microphone the browser gave the room: {room.micName}">
-            Mic: {room.micName}
-          </span>
-        {/if}
-        <span class="vol">You hear</span>
-        <span class="hear" title="What you hear: everyone but you">
-          <span style="width: {room.hearing > 0 ? Math.max(0, Math.min(100, ((20 * Math.log10(room.hearing) + 60) / 60) * 100)) : 0}%"></span>
-        </span>
-        <label class="vol">Your volume
-          <input type="range" min="0" max="1.5" step="0.01" value={room.volume}
-            oninput={(e) => setVolume(Number(e.currentTarget.value))} />
-        </label>
+        <!-- Your mic on the left, and what you do with the room on the
+             right: everything you set once is behind the cog. A footer
+             strung with sliders and readouts put the way out next to a
+             volume control, and none of it was anything you touched
+             twice. -->
+        <div class="spacer"></div>
         {#if canShare()}
-          <button class:on={screen.sharing} onclick={() => (screen.sharing ? stopSharing() : share())}
+          <button class="share" class:on={screen.sharing} onclick={() => (screen.sharing ? stopSharing() : share())}
             title={screen.sharing
               ? 'Stop sharing your desktop with the room.'
               : 'Share a window or screen. Everyone sees a thumbnail of it in the mixer and can open it for themselves.'}>
             {screen.sharing ? 'Stop sharing' : 'Share screen'}
           </button>
         {/if}
-        <button onclick={leaveAudio} title="Leave the audio and go back to the door.">Leave audio</button>
+        <button class="leave" onclick={leaveAudio} title="Leave the audio and go back to the door.">Leave audio</button>
+        <button class="cog" aria-label="Settings" aria-pressed={room.settings}
+          onclick={() => (room.settings = !room.settings)}
+          title="Push to talk, your volume, and what the room gave you to speak into.">
+          <svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true" focusable="false">
+            <path fill="currentColor" d="M19.14 12.94a7.07 7.07 0 0 0 0-1.88l2.03-1.58a.5.5 0 0 0 .12-.64l-1.92-3.32a.5.5 0 0 0-.6-.22l-2.39.96a7.03 7.03 0 0 0-1.63-.94l-.36-2.54a.5.5 0 0 0-.5-.42h-3.84a.5.5 0 0 0-.49.42l-.36 2.54c-.59.24-1.13.56-1.63.94l-2.39-.96a.5.5 0 0 0-.6.22L2.66 8.84a.5.5 0 0 0 .12.64l2.03 1.58a7.07 7.07 0 0 0 0 1.88L2.78 14.52a.5.5 0 0 0-.12.64l1.92 3.32c.13.22.39.31.6.22l2.39-.96c.5.38 1.04.7 1.63.94l.36 2.54c.04.24.25.42.49.42h3.84c.25 0 .46-.18.5-.42l.36-2.54c.59-.24 1.13-.56 1.63-.94l2.39.96c.22.09.47 0 .6-.22l1.92-3.32a.5.5 0 0 0-.12-.64l-2.03-1.58ZM12 15.5A3.5 3.5 0 1 1 15.5 12 3.5 3.5 0 0 1 12 15.5Z" />
+          </svg>
+        </button>
       {/if}
       {#if room.audioError}<span class="warn">Mic: {room.audioError}</span>{/if}
       {#if screen.error}<span class="warn">Screen: {screen.error}</span>{/if}
@@ -302,14 +304,20 @@
     border-top: 1px solid var(--line);
     background: var(--panel);
   }
-  .big { padding: 9px 18px; font-size: 15px; }
+  /* One width for every label it can have -- Mute, Unmute, Hold to
+     talk, Talking... -- so the button under your hand is the same
+     button it was a moment ago and nothing beside it moves. */
+  .big { padding: 9px 18px; font-size: 15px; min-width: 12.5em; text-align: center; }
   .big.muted { background: var(--danger); color: #fff; border-color: var(--danger); }
   .big.ptt { touch-action: none; user-select: none; -webkit-user-select: none; }
   .big.ptt.talking { background: var(--ok); color: var(--accent-ink); border-color: var(--ok); }
   kbd { font-size: 11px; opacity: 0.7; border: 1px solid currentColor; border-radius: 4px; padding: 0 4px; margin-left: 4px; }
   .vol { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); }
   /* Device names run long; keep one from pushing the controls off. */
-  .mic-name { max-width: 22ch; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: inline-block; }
+  /* The cog is an icon and nothing else, so it is square rather than a
+     button with a picture in it. */
+  .cog { display: inline-flex; align-items: center; justify-content: center; padding: 7px; line-height: 0; }
+  .cog[aria-pressed='true'] { border-color: var(--accent); color: var(--accent); }
   .warn { color: var(--danger); font-size: 13px; }
   .dismiss { padding: 0 6px; line-height: 1.4; }
   .hear { width: 80px; height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; }

@@ -34,7 +34,7 @@ const stored = (page, key) => page.evaluate((k) => localStorage.getItem(k), key)
   await k.page.selectOption('.enter label:has(span:text-is("Language")) select', 'Russian');
   await k.page.waitForTimeout(500);
   await comeIn(k.page);
-  await k.page.evaluate(() => document.querySelector('footer button:last-child').click());
+  await k.page.evaluate(() => document.querySelector('footer button.leave').click());
   await k.page.waitForTimeout(900);
 
   is(
@@ -120,7 +120,7 @@ const stored = (page, key) => page.evaluate((k) => localStorage.getItem(k), key)
 
   // Out again: the sockets go with the audio, and so does everything
   // they told us.
-  await f.page.evaluate(() => document.querySelector('footer button:last-child').click());
+  await f.page.evaluate(() => document.querySelector('footer button.leave').click());
   await f.page.waitForTimeout(1200);
   is('back at the door', await f.page.evaluate(() => !!document.querySelector('.enter')), true);
   is(

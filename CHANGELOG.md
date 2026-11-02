@@ -90,6 +90,21 @@ releases.
 
 ### Voice room
 
+- **A footer you can reach for, and a settings page for the rest.** The
+  foot of the room was a row of everything: the talk button, a push to
+  talk box, the name of your microphone, a meter, a volume slider, then
+  sharing and the way out. It is now your microphone on the left and
+  what you do with the room on the right -- **Share screen**, **Leave
+  audio**, and a cog -- and nothing in between. The talk button is one
+  width whatever it says, so **Mute** and **Unmute** are the same shape
+  and nothing beside it moves as you press it.
+
+  The cog opens **Settings**, a page of its own with the things you set
+  once: push to talk, your volume, what is coming in, and which
+  microphone the browser gave the room. The room goes on running behind
+  it -- you are still in the audio, and the space bar still mutes or
+  talks from there. **Done** or Escape comes back.
+
 - **Fixed: no Language box at the door until you had joined once.** The
   door is a page with no socket behind it, so it asks `/api/door` what
   the room offers -- but the answer carried the list of languages only

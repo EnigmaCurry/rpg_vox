@@ -604,9 +604,20 @@ See ROOM_DOCKER.md.
   browser's own stop button, and **Leave audio** all end it. No sound is
   taken from what is shared: the room's audio is the mixer's, and a
   shared tab's would come back as another voice to transcribe.
+- **The footer** is what you reach for while talking, and nothing else:
+  your microphone on the left, what you do with the room on the right.
+  **Mute** (or **Hold to talk**) is one width whatever it says, so the
+  button under your hand is the same button it was a moment ago and
+  nothing beside it moves; then **Share screen**, **Leave audio**, and
+  the cog. Anything the room has to tell you appears along it too.
+- **Settings**, behind the cog on the far right: a page of its own with
+  the things you set once -- **Push to talk**, **Your volume**, what is
+  coming in, and which microphone the browser gave the room. The room
+  goes on running behind it: you are still in the audio, and the space
+  bar still mutes or talks from there. **Done** or Escape comes back.
 - **Mixer**: a level and mute for each person and each AI, shared
   by the whole room, hanging off the room you are in in the list on the
-  left. **Your volume** (bottom) is only yours. Space mutes
+  left. **Your volume**, in the settings, is only yours. Space mutes
   your mic, or with **Push to talk** on, your mic is open only while you
   hold Space (or the talk button): everything said in one hold is one
   entry, and the AI waits for you to let go however long you pause.
@@ -893,6 +904,7 @@ CHROME=$(which chromium) ./run.sh            # or: ./run.sh rooms bots
 | `rooms` | several rooms on one socket: where a tab lands, who may go where, a room of your own admitting one person, and the mix arriving across every move. No browser at all — two sockets are enough |
 | `bots` | two AIs in one room: a fader and an Answers setting each, each answering to its own name, and one pause going to exactly one of them |
 | `door` | the door is a page with no room behind it and no socket open; **Join Audio** does nothing until you agree to be recorded, and the Language box is never blank |
+| `settings` | the footer: one width for the talk button whatever it says, sharing and the way out on the other side, and the cog opening a page with everything that used to be strung along it |
 | `ptt` | push to talk: the space bar reaching the microphone from wherever the focus was left -- a button you clicked, the history panel, a mute -- and not reaching it in a text box or a dialog |
 | `permalinks` | `/`, `/lobby` and `/room/<id>`; back and forward move between rooms, a pasted address opens that room, a stale one is put right |
 | `conversations` | the room's history: naming one, reading an old one read-only without moving anybody else's screen, deleting one for everybody, and empty ones never being archived |

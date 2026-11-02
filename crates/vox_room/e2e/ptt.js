@@ -37,8 +37,12 @@ const focused = (page) =>
 (async () => {
   const { browser, page } = await person(ryanLink);
 
-  // Push to talk, in the room.
-  await page.click('.vol input[type=checkbox]');
+  // Push to talk is a setting, so it is behind the cog.
+  await page.click('footer button.cog');
+  await page.waitForSelector('.settings');
+  await page.click('.settings .check input[type=checkbox]');
+  await page.waitForTimeout(300);
+  await page.keyboard.press('Escape');
   await page.waitForTimeout(400);
   is('the talk button is there to hold', await page.evaluate(() => !!document.querySelector('footer .ptt')), true);
   is('and the mic is not open until it is', await page.evaluate(() => !!document.querySelector('footer .ptt.talking')), false);

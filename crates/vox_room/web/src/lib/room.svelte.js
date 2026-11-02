@@ -154,6 +154,10 @@ export const room = $state({
   // to be opened; given once, and taken back by unticking it. Without
   // it there is no joining — see `joinAudio`.
   consented: readPref('vox_room.consent'),
+  // The settings page is open: push to talk, your volume, and what the
+  // browser gave the room to listen with. A view and not a setting, so
+  // it is not written down -- a tab opens in the room.
+  settings: false,
   // Push to talk: the mic stays muted except while Space (or the talk
   // button) is held.
   pushToTalk: readPref('vox_room.push_to_talk'),
@@ -861,6 +865,10 @@ export async function leaveAudio() {
   removeEventListener('keydown', resumeAudio);
   room.mic = false;
   room.micName = null;
+  // The settings page is a page in the room, so it goes with the room:
+  // coming back in should land you in the conversation, not in the
+  // settings you left open.
+  room.settings = false;
   clearInterval(hearTimer);
   room.hearing = 0;
   await audio?.stop();
