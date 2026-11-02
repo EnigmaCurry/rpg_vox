@@ -15,24 +15,29 @@
 //!
 //! Not what the server offers. Two things are done to it first:
 //!
-//! 1. **Only the tools the room was configured to lend.** Retro
-//!    Diffusion offers 33; a room that wants pictures needs four of
-//!    them, and the other 29 are 29 more ways for a voice answering
-//!    "make me an avatar" to go somewhere else. Which ones is the
-//!    configuration's to say -- see [`Server::only`] -- because that
-//!    is a decision about the room, not one to re-make per turn.
-//! 2. **No key in the schema.** Most of Retro Diffusion's tools take
-//!    an `rd_api_key` argument. A model shown a field like that will
-//!    fill it in, with something it made up -- and a model that
-//!    somehow filled it in correctly would have put the key in the
-//!    transcript, which is written down and shown on screen. So
-//!    [`AUTH_ARGS`] is stripped from every schema on the way out and
-//!    put back on the way in, by [`Server::call`], from the key the
-//!    room was started with.
+//! 1. **Only the tools the room was configured to lend.** A picture
+//!    server offers everything it can do -- uploading, listing what
+//!    was made before, polling a job it was told not to wait for --
+//!    and a room that wants faces needs two of them. The rest are
+//!    that many more ways for a voice answering "make me an avatar"
+//!    to go somewhere else. Which ones is the configuration's to say
+//!    -- see [`Config::only`] -- because that is a decision about the
+//!    room, not one to re-make per turn.
+//! 2. **No key in the schema.** Some servers take the key as an
+//!    argument rather than a header: Retro Diffusion's tools want an
+//!    `rd_api_key`. A model shown a field like that will fill it in,
+//!    with something it made up -- and a model that somehow filled it
+//!    in correctly would have put the key in the transcript, which is
+//!    written down and shown on screen. So [`AUTH_ARGS`] is stripped
+//!    from every schema on the way out and put back on the way in, by
+//!    [`Server::call`], from the key the room was started with. A
+//!    server that only wants the bearer header declares none of them
+//!    and nothing is stripped.
 //!
-//! Names are prefixed with the server's own (`art_create_inference`),
-//! so two servers lending a tool of the same name stay apart, and so
-//! the room's own tools can never be shadowed by somebody else's.
+//! Names are prefixed with the server's own
+//! (`art_generate_pixel_art`), so two servers lending a tool of the
+//! same name stay apart, and so the room's own tools can never be
+//! shadowed by somebody else's.
 //!
 //! ## What comes back
 //!
@@ -47,7 +52,8 @@
 //!
 //! A picture arrives one of three ways, and all three are real:
 //!
-//! - an `image` content block, base64 in the message;
+//! - an `image` content block, base64 in the message -- the
+//!   protocol's own way, and what a ComfyUI server sends;
 //! - `base64_images` in the result's own JSON;
 //! - `output_urls`, and nothing inline at all -- which is what Retro
 //!   Diffusion does over MCP, where `upload_outputs` defaults on and
@@ -101,13 +107,25 @@ const AUTH_ARGS: &[&str] = &[
 const MAX_PICTURES: usize = 8;
 const MAX_BYTES: usize = 4 * 1024 * 1024;
 
+/// The arguments that say, in words, what the call is going to draw.
+/// Whichever one a tool has is the caption on the card and the line
+/// kept with the avatar; see [`asked_for`].
+///
+/// `prompt` is what a tool that draws from nothing calls it. `instruction`
+/// is what one that changes a picture already made calls it -- "give it a
+/// red hat" -- and `label` what one that takes a picture somebody uploaded
+/// calls it. There is no way to ask a server which argument is the words,
+/// so this is a list and not a rule, in the order a tool with two of them
+/// would want them read.
+const PROMPT_ARGS: &[&str] = &["prompt", "instruction", "label"];
+
 /// A picture an MCP tool made, waiting to be given to somebody.
 #[derive(Clone)]
 pub struct Picture {
     pub png: Vec<u8>,
-    /// What it was asked for: the `prompt` argument of the call that
-    /// made it, when the call had one. It is kept with the avatar, so
-    /// the next one can be asked for in the same spirit.
+    /// What it was asked for: whichever of [`PROMPT_ARGS`] the call
+    /// that made it had, when it had one. It is kept with the avatar,
+    /// so the next one can be asked for in the same spirit.
     pub prompt: String,
 }
 
@@ -158,9 +176,11 @@ pub struct Server {
     /// has never heard of.
     auth: Mutex<HashMap<String, Vec<String>>>,
     /// The session a server asked us to keep, echoed on every later
-    /// request. Retro Diffusion hands out none and wants none; the
-    /// protocol allows one, and a server that uses them would
-    /// otherwise see every call as a stranger.
+    /// request. Optional in the protocol and not all of them use it --
+    /// Retro Diffusion hands out none and wants none -- but a ComfyUI
+    /// server hands one out in its answer to `initialize` and expects
+    /// it back, and a client that dropped it would be a stranger on
+    /// every later call.
     session: Mutex<Option<String>>,
     next_id: AtomicU64,
 }
@@ -347,7 +367,7 @@ impl Server {
                 }
             }
         }
-        let what = args["prompt"].as_str().unwrap_or_default().to_string();
+        let what = asked_for(&args);
         let result = self.rpc(
             "tools/call",
             json!({ "name": bare, "arguments": args }),
@@ -588,6 +608,25 @@ impl Server {
     }
 }
 
+/// What a call says it is going to draw, in the words the model used.
+/// The first of [`PROMPT_ARGS`] the call actually has, or nothing for a
+/// call that is not drawing at all -- which is how the room knows
+/// whether to put a card up before it runs.
+///
+/// A tool that changes a picture is asked in two parts, a job and an
+/// instruction, and only one of them is words. "give it a red top hat"
+/// is a thin caption on its own, and it is honestly what was asked for;
+/// what it is a change *to* is the card above it in the same chat.
+pub fn asked_for(args: &Value) -> String {
+    PROMPT_ARGS
+        .iter()
+        .filter_map(|a| args[*a].as_str())
+        .map(str::trim)
+        .find(|words| !words.is_empty())
+        .unwrap_or_default()
+        .to_string()
+}
+
 /// Which of a published schema's arguments are a key rather than a
 /// thing to decide. See [`AUTH_ARGS`].
 fn auth_args_in(schema: &Value) -> Vec<String> {
@@ -606,10 +645,10 @@ fn auth_args_in(schema: &Value) -> Vec<String> {
 /// The JSON out of an SSE body: the `data:` lines, joined.
 ///
 /// A streamable-HTTP server may answer a single request with a stream
-/// of one event, and Retro Diffusion does -- its `content-type` is
-/// `text/event-stream` even for `initialize`. One event is all there
-/// ever is for a request with an id, so this takes the data lines and
-/// leaves the framing.
+/// of one event, and the ones the room has met do -- their
+/// `content-type` is `text/event-stream` even for `initialize`. One
+/// event is all there ever is for a request with an id, so this takes
+/// the data lines and leaves the framing.
 fn events(body: &str) -> String {
     let mut out = String::new();
     for line in body.lines() {
@@ -738,14 +777,14 @@ mod tests {
         assert!(s.lends("get_balance"));
         assert!(
             !s.lends("start_lowpoly_generate"),
-            "33 tools offered, two lent"
+            "everything the server offers, two lent"
         );
         // An empty list is the other way round, for a small server.
         assert!(server(&[]).lends("anything"));
     }
 
     /// A one-event SSE body is a JSON-RPC answer with framing around
-    /// it. This is the shape Retro Diffusion actually replies with.
+    /// it. This is the shape a real server actually replies with.
     #[test]
     fn an_sse_answer_is_read_as_json() {
         let body = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n\n";
@@ -753,6 +792,111 @@ mod tests {
         assert_eq!(v["result"]["ok"], true);
         // And a plain JSON body is left alone by the same path.
         assert_eq!(events("data: {\"a\":1}").trim(), "{\"a\":1}");
+    }
+
+    /// Says hello to a real picture server and reads back what it
+    /// lends. It checks the half a made-up server cannot: the SSE
+    /// framing a real one answers with, the session it hands out and
+    /// expects back on every later request, and that the tool list
+    /// really is filtered down to what the room asked for.
+    ///
+    /// Nothing is generated, so it costs no GPU time. It does need the
+    /// key -- this server answers 401 to `initialize` itself, unlike
+    /// the hosted one the room was first built against:
+    ///
+    /// ```bash
+    /// VOX_ROOM_MCP=art=https://…/mcp=generate_pixel_art,refine_pixel_art \
+    /// VOX_ROOM_MCP_KEY=… \
+    ///   cargo test -p vox_room -- --ignored --nocapture says_hello
+    /// ```
+    #[ignore = "talks to the configured MCP server"]
+    #[test]
+    fn says_hello() {
+        let Ok(spec) = std::env::var("VOX_ROOM_MCP") else {
+            panic!("set VOX_ROOM_MCP to one NAME=URL=TOOL,TOOL server, and VOX_ROOM_MCP_KEY");
+        };
+        // The same three parts `main.rs` reads, and the same way
+        // round, so this test is pointed by the environment the room
+        // itself runs in.
+        let mut parts = spec.splitn(3, '=');
+        let name = parts.next().unwrap_or_default().trim().to_string();
+        let url = parts.next().expect("VOX_ROOM_MCP is NAME=URL=TOOL,TOOL").trim().to_string();
+        let only: Vec<String> = parts
+            .next()
+            .unwrap_or_default()
+            .split(',')
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect();
+        assert!(!only.is_empty(), "name some tools, or this proves nothing about filtering");
+        // `NAME=KEY` when the house runs more than one server, and the
+        // key on its own when it runs one. Both are what the room
+        // takes, so both work here.
+        let key = std::env::var("VOX_ROOM_MCP_KEY").unwrap_or_default();
+        let key = key
+            .strip_prefix(&format!("{name}="))
+            .unwrap_or(&key)
+            .trim()
+            .to_string();
+
+        let s = Server::new(Config {
+            name: name.clone(),
+            url,
+            key: key.clone(),
+            only: only.clone(),
+        });
+        let lent = s.connect().expect("say hello");
+        assert_eq!(lent, only.len(), "it lends exactly what was asked for and no more");
+        assert!(
+            s.session.lock().unwrap().is_some(),
+            "it keeps a session, and a client that dropped it would be a stranger next call"
+        );
+
+        let offered = s.offer();
+        for tool in &only {
+            let prefixed = format!("{name}_{tool}");
+            assert!(s.has(&prefixed), "{prefixed} is lent under the room's own name");
+        }
+        // Nothing of the key reaches the model: not the value, and
+        // not a field inviting one to be invented. The fields are
+        // checked by name rather than by searching the whole offer,
+        // because a description is prose and prose says "token".
+        if !key.is_empty() {
+            let whole = serde_json::to_string(&offered).unwrap();
+            assert!(!whole.contains(&key), "the key is not in what the model is shown");
+        }
+        for tool in &offered {
+            let props = &tool["function"]["parameters"]["properties"];
+            for arg in AUTH_ARGS {
+                assert!(
+                    props[*arg].is_null(),
+                    "{} still offers {arg} for the model to fill in",
+                    tool["function"]["name"]
+                );
+            }
+        }
+        // And the words at least one of them draws from are findable,
+        // or no card ever goes up and no picture is ever captioned;
+        // see `asked_for`. Not every lent tool has to be one that
+        // draws -- a server may lend one that only reports -- but a
+        // picture server where none of them does is misconfigured, or
+        // has renamed the argument underneath us.
+        let mut draws = 0;
+        for tool in &offered {
+            let props = &tool["function"]["parameters"]["properties"];
+            let words: Vec<&str> = PROMPT_ARGS
+                .iter()
+                .copied()
+                .filter(|a| props[*a].is_object())
+                .collect();
+            draws += usize::from(!words.is_empty());
+            let from = match words.is_empty() {
+                true => "nothing -- it only reports".to_string(),
+                false => words.join(", "),
+            };
+            println!("{} draws from {from}", tool["function"]["name"]);
+        }
+        assert!(draws > 0, "none of the lent tools takes any of {PROMPT_ARGS:?}");
     }
 
     #[test]
@@ -794,6 +938,33 @@ mod tests {
         assert!(s
             .pictures_of(&json!({ "content": [{ "type": "text", "text": "balance: $1.00" }] }), "")
             .is_empty());
+    }
+
+    /// What a call is going to draw, whichever word the tool uses for
+    /// it. A tool that changes a picture takes an `instruction` and no
+    /// `prompt`, and a room that only looked for `prompt` would put up
+    /// no card and caption the picture with nothing.
+    #[test]
+    fn the_words_are_found_under_whatever_the_tool_calls_them() {
+        assert_eq!(asked_for(&json!({ "prompt": " a brass head " })), "a brass head");
+        assert_eq!(
+            asked_for(&json!({ "job_id": "41fc", "instruction": "give it a red top hat" })),
+            "give it a red top hat",
+            "a refine is asked in two parts and only one of them is words"
+        );
+        assert_eq!(asked_for(&json!({ "image_id": "x", "label": "my dog" })), "my dog");
+        // A tool with two of them is read in PROMPT_ARGS order.
+        assert_eq!(
+            asked_for(&json!({ "prompt": "a knight", "instruction": "redder" })),
+            "a knight"
+        );
+        // Blank is not words: an empty `prompt` must not hide the
+        // `instruction` underneath it.
+        assert_eq!(asked_for(&json!({ "prompt": "  ", "instruction": "redder" })), "redder");
+        // And a call that is not drawing has none, which is what tells
+        // the room not to put a card up.
+        assert_eq!(asked_for(&json!({ "limit": 10 })), "");
+        assert_eq!(asked_for(&json!({})), "");
     }
 
     #[test]

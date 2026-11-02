@@ -188,20 +188,21 @@ configured entirely in `.env` — `env_file` passes the whole file to the
 room, so there is nothing to change in `docker-compose.yaml`:
 
 ```ini
-VOX_ROOM_MCP=art=https://mcp.retrodiffusion.ai/mcp=create_inference,list_available_styles,estimate_inference_cost,get_balance
-VOX_ROOM_MCP_KEY=rdpk-…
+VOX_ROOM_MCP=art=https://comfyui-mcp.example.com/mcp=generate_pixel_art,refine_pixel_art
+VOX_ROOM_MCP_KEY=…
 ```
 
 The tool list after the URL is not optional punctuation: that server
-offers 33 tools and a room that wants faces needs those four. See
+offers seven tools and a room that wants faces needs those two — one
+to make a sprite, one to change a sprite already made. See
 [Faces](ROOM.md#faces).
 
 Both variables take several servers, separated by semicolons, and the
 name is what pairs a key with its server:
 
 ```ini
-VOX_ROOM_MCP=art=https://mcp.retrodiffusion.ai/mcp=create_inference;docs=https://docs.example.com/mcp=search
-VOX_ROOM_MCP_KEY=art=rdpk-…;docs=sk-…
+VOX_ROOM_MCP=art=https://comfyui-mcp.example.com/mcp=generate_pixel_art;docs=https://docs.example.com/mcp=search
+VOX_ROOM_MCP_KEY=art=…;docs=sk-…
 ```
 
 The bare key in the first example is shorthand for "the only server
@@ -210,8 +211,8 @@ one vendor's key is not a thing to send to another — so the room tells
 you to name them rather than silently picking one.
 
 **A `$` in the key is eaten.** Compose interpolates this file, so
-`rdpk-a$bc` reaches the container as `rdpk-a` — the key fails to
-authenticate and nothing says why. Write it `rdpk-a$$bc`. The `;`, `,`
+`abc$def` reaches the container as `abc` — the key fails to
+authenticate and nothing says why. Write it `abc$$def`. The `;`, `,`
 and `=` in the server line need no escaping.
 
 **Check it took.** The room says hello to each server on its own thread
@@ -219,7 +220,7 @@ as it starts, and logs what it got:
 
 ```console
 $ docker compose logs vox_room | grep -i mcp
-… retrodiffusion-api 2.14.7: lending 4 of its 33 tools …
+… pixel-art 1.30.0: lending 2 of its 7 tools, not create_upload_ticket, import_image, get_job_status, list_jobs, get_job_image …
 ```
 
 A server that is down, or a key that is wrong, is a warning on that
@@ -227,10 +228,17 @@ line and nothing else — the rooms open either way, and the AI simply
 has no picture tools until it answers. That is deliberate: a picture
 server is not something a voice room should fail to start over.
 
-The container reaches `mcp.retrodiffusion.ai` over the public internet
-on its own bridge network, so unlike the model and TTS servers there is
-no `host.docker.internal` or DNS pinning to think about — but it does
-need egress, which a locked-down host may not give it.
+The container reaches the picture server by URL on its own bridge
+network, so unlike the model and TTS servers there is no
+`host.docker.internal` or DNS pinning to think about — the URL is
+resolved and fetched from inside the container, and it has to work
+from there. A hosted server needs egress, which a locked-down host may
+not give it. A server of your own needs a name the container can
+resolve and a route to it: a public hostname behind the same reverse
+proxy is the easy answer, and `localhost` is never one.
+
+Generating holds the connection while it runs, and the room allows two
+minutes for it. A refine on a busy GPU is the one that gets close.
 
 ## Blank is not unset
 

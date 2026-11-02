@@ -1068,16 +1068,25 @@ test, `whole_reply`, that puts a real reply through the whole path — the
 room's own request, the stream parsed as it arrives, a tool run from it,
 and the model carrying on from the tool's answer.
 
-A third, `says_hello`, says hello to Retro Diffusion's MCP server and
-reads back what it lends. It needs no key — `initialize` and
-`tools/list` want none — so it costs nothing, and it checks the half
-that a made-up server cannot: the SSE framing a real one answers with,
-that the tool list really is filtered to what was asked for, and that
-`rd_api_key` is gone from every schema the model would be shown while
-the room still knows which argument to put it back into:
+A third, `says_hello`, says hello to the picture server the
+environment points at and reads back what it lends. It generates
+nothing, so it costs no GPU time, and it checks the half that a made-up
+server cannot: the SSE framing a real one answers with, the session it
+hands out and expects back on every later request, that the tool list
+really is filtered down to what was asked for, that no key is in any
+schema the model would be shown, and that the words each tool draws
+from are findable under one of the names the room looks for — without
+which no card goes up and no picture gets a caption.
+
+It needs the key: unlike the hosted server the room was first built
+against, this one answers 401 to `initialize` itself. It reads the same
+two variables the room does, so an environment that runs the room runs
+the test:
 
 ```bash
-cargo test -p vox_room -- --ignored --nocapture says_hello
+VOX_ROOM_MCP='art=https://comfyui-mcp.example.com/mcp=generate_pixel_art,refine_pixel_art' \
+VOX_ROOM_MCP_KEY=… \
+  cargo test -p vox_room -- --ignored --nocapture says_hello
 ```
 
 ### Faces
@@ -1184,12 +1193,12 @@ server the house was started with:
 
 ```bash
 vox_room --room Lobby \
-  --mcp 'art=https://mcp.retrodiffusion.ai/mcp=create_inference,list_available_styles,estimate_inference_cost,get_balance' \
-  --mcp-key "$RD_API_KEY"
+  --mcp 'art=https://comfyui-mcp.example.com/mcp=generate_pixel_art,refine_pixel_art' \
+  --mcp-key "$ART_KEY"
 ```
 
 `NAME=URL=TOOL,TOOL,...`. The name is the prefix its tools are offered
-under — `art` gives the AI `art_create_inference` — so two servers
+under — `art` gives the AI `art_generate_pixel_art` — so two servers
 lending a tool of the same name stay apart.
 
 **The name is also how a key finds its server.** `--mcp-key` takes
@@ -1197,31 +1206,54 @@ lending a tool of the same name stay apart.
 
 ```bash
 vox_room --room Lobby \
-  --mcp 'art=https://mcp.retrodiffusion.ai/mcp=create_inference;docs=https://docs.example.com/mcp=search' \
-  --mcp-key "art=$RD_API_KEY;docs=$DOCS_KEY"
+  --mcp 'art=https://comfyui-mcp.example.com/mcp=generate_pixel_art;docs=https://docs.example.com/mcp=search' \
+  --mcp-key "art=$ART_KEY;docs=$DOCS_KEY"
 ```
 
 A key written on its own, as in the first example above, is shorthand
 for "the only server there is" — and with more than one server it is
 refused rather than guessed at, because one vendor's key is not a
 thing to hand to another. A server nobody gave a key simply gets none,
-which is right for one that wants no authenticating. **The tool list after the
-URL is the point of the flag.** Retro Diffusion offers 33 tools, of
-which a room that wants faces needs about four; the other 29 are 29
-more ways for a voice answering "make me an avatar" to end up
-generating a rigged 3D model instead. Leave the list out and every tool
-the server has is offered, which is only sane for a server you know is
-small. Repeat `--mcp` (or separate with `;`) for more servers.
+which is right for one that wants no authenticating.
+
+**The tool list after the URL is the point of the flag.** A picture
+server offers everything it can do, and a room that wants faces needs
+two of them: one that makes a sprite from a description, and one that
+changes a sprite already made. The ComfyUI server above offers seven,
+and the five left out are two for uploading a file (the AI has no file
+and no way to POST one), one that re-posts a picture already in the
+chat as a second card, one for polling a job you only need if you told
+it not to wait, and one that lists every job on the server — including
+other rooms'. Each of those is one more way for a voice answering "make
+me an avatar" to end up somewhere else. Leave the list out and every
+tool the server has is offered, which is only sane for a server you
+know is small. Repeat `--mcp` (or separate with `;`) for more servers.
 
 Only streamable HTTP is spoken, not stdio: a stdio server would want a
 child process supervised for as long as the house is open.
 
-**The key never reaches the model.** Most of Retro Diffusion's tools
-take an `rd_api_key` argument, and a model shown a field like that
-fills it in — with something it invented, or, worse, correctly, which
-would put the key in a transcript that is written down and shown on
-screen. So the key is stripped out of every schema the AI is shown and
-filled back in when the call is made, from `--mcp-key`.
+A server may also want a session, handed out in its answer to
+`initialize` and expected back on every later request; the room keeps
+whichever one it is given. The ComfyUI server does this and Retro
+Diffusion does not, and neither needs saying in the configuration.
+
+**The key never reaches the model.** Some servers take the key as an
+argument rather than a header — Retro Diffusion's tools want an
+`rd_api_key` — and a model shown a field like that fills it in: with
+something it invented, or, worse, correctly, which would put the key in
+a transcript that is written down and shown on screen. So the key is
+stripped out of every schema the AI is shown and filled back in when
+the call is made, from `--mcp-key`. A server that wants the bearer
+header and nothing else, as the ComfyUI one does, never has anything
+stripped.
+
+**What a picture costs is the server's business, not the room's.** A
+server on a machine of your own costs GPU time and a hosted one bills
+per image, and the AI is told neither, because the room cannot know
+which it is pointed at. What it is told is the wait — ten seconds or so
+for a sprite, the better part of a minute for a refine, with the room
+listening to nothing throughout — which is why the prompt has it say
+what it is about to make before it makes it, and make one at a time.
 
 Making a picture and giving somebody a face are deliberately two steps:
 the server's tool makes it, and the room's own `set_avatar` puts one of

@@ -166,14 +166,14 @@ struct Cli {
     search: bool,
     /// An MCP server the AI may use, as NAME=URL[=TOOL,TOOL,...]. NAME
     /// is the prefix its tools are offered under (`art` gives
-    /// `art_create_inference`), and the tools after it are the only
+    /// `art_generate_pixel_art`), and the tools after it are the only
     /// ones the room lends -- leave them out to lend the lot, which is
     /// only sane for a server you know is small. Repeat for more
     /// servers. The key is --mcp-key.
     ///
-    /// For Retro Diffusion's pixel art:
+    /// For a ComfyUI pixel-art server:
     ///
-    ///   --mcp 'art=https://mcp.retrodiffusion.ai/mcp=create_inference,list_available_styles,estimate_inference_cost,get_balance'
+    ///   --mcp 'art=https://comfyui-mcp.example.com/mcp=generate_pixel_art,refine_pixel_art'
     #[arg(long = "mcp", env = "VOX_ROOM_MCP", value_delimiter = ';')]
     mcp: Vec<String>,
     /// The key for the --mcp servers, as NAME=KEY, or on its own for

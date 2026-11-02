@@ -214,28 +214,45 @@ releases.
 
   The pictures come from an **MCP server**, which is new and is not
   only for pictures: `--mcp NAME=URL=TOOL,TOOL` lends the AI any
-  streamable-HTTP MCP server's tools, under a prefix of their own.
-  Retro Diffusion's pixel art is what it was built against:
+  streamable-HTTP MCP server's tools, under a prefix of their own. A
+  ComfyUI pixel-art server is what it is run against:
 
   ```bash
   vox_room --room Lobby \
-    --mcp 'art=https://mcp.retrodiffusion.ai/mcp=create_inference,list_available_styles,estimate_inference_cost,get_balance' \
-    --mcp-key "$RD_API_KEY"
+    --mcp 'art=https://comfyui-mcp.example.com/mcp=generate_pixel_art,refine_pixel_art' \
+    --mcp-key "$ART_KEY"
   ```
 
-  **The tool list after the URL is the point of the flag, not a
-  convenience.** That server offers 33 tools; a room that wants faces
-  needs about four, and the other 29 are 29 more ways for a voice
-  answering "make me an avatar" to end up generating a rigged 3D model.
-  Which tools a room lends is a decision about the room, made once in
-  the configuration, rather than one the model re-makes every turn.
+  Two tools, because a change to a face is usually a change and not a
+  fresh start: `refine_pixel_art` edits the picture already made --
+  "give it a red hat" -- and keeps everything else as it was. The new
+  one gets the next number and the earlier ones stay in the chat, so
+  going back to one is still a thing to ask for.
 
-  **The key never reaches the model.** Most of those tools take an
-  `rd_api_key` argument, and a model shown a field like that fills it
-  in -- with something it invented, or, worse, correctly, which would
-  put the key into a transcript that is written down and shown on
-  screen. So it is stripped out of every schema the AI is shown and
-  filled back in when the call is made.
+  **The tool list after the URL is the point of the flag, not a
+  convenience.** That server offers seven tools and a room that wants
+  faces needs those two; the rest are five more ways for a voice
+  answering "make me an avatar" to end up somewhere else -- uploading
+  a file the AI does not have, re-posting a picture already in the
+  chat, listing every job on the server including other rooms'. Which
+  tools a room lends is a decision about the room, made once in the
+  configuration, rather than one the model re-makes every turn.
+
+  **The key never reaches the model.** Some servers take it as an
+  argument rather than a header -- Retro Diffusion's tools want an
+  `rd_api_key` -- and a model shown a field like that fills it in:
+  with something it invented, or, worse, correctly, which would put
+  the key into a transcript that is written down and shown on screen.
+  So it is stripped out of every schema the AI is shown and filled
+  back in when the call is made. A server that wants only the bearer
+  header never has anything stripped.
+
+  Nothing is said to the AI about what a picture costs, because the
+  room cannot know: a server on the house's own machine costs GPU time
+  and a hosted one bills per image. What it is told instead is the
+  wait -- the whole room spends it listening to nothing -- which is
+  why it says what it is about to make before it makes it, and makes
+  one at a time.
 
   A face belongs to the person and not to the room or the
   conversation: it is kept against the name on their invite rather

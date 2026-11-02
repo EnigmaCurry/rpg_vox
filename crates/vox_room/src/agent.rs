@@ -318,8 +318,15 @@ own as well -- ask the room what it thinks you look like.";
 /// is in each tool's own schema, written by whoever runs that server
 /// and better than anything that could be restated here -- and it goes
 /// stale the moment they add a style. What this says is the part the
-/// room knows: that it is an interview, that it costs real money, and
-/// that making a picture and giving somebody a face are two steps.
+/// room knows: that it is an interview, that a picture takes long
+/// enough that the room will notice, and that making a picture and
+/// giving somebody a face are two steps.
+///
+/// It does not say what a picture costs, because the room cannot know:
+/// a hosted server bills per image and a server on the house's own
+/// machine bills nothing. What the brake is made of instead is the
+/// wait, which is true of both -- and a model told to make one at a
+/// time behaves the same way either way.
 const DRAWING_NOTE: &str = "\
 You can also make a picture, and that is how most faces here start. It \
 goes in three steps before set_avatar, and the slow one in the middle is \
@@ -333,12 +340,20 @@ what you are about to make, in a sentence, so they can stop you.
 Then make it with a picture tool. The picture goes straight into the chat \
 as a card the whole room can see, with a number on it, and a spinner on \
 it until it arrives -- so say you are making it and then let it come; \
-nobody is waiting in silence. Each picture costs the house real money, so \
-make one at a time, and never make one nobody asked for.
+nobody is waiting in silence. Each one takes a while and the whole room \
+spends it waiting, so make one at a time, and never make one nobody \
+asked for.
 
-Then ask how they like it. If they want a change, make another: it gets \
-the next number, and the earlier ones stay in the chat, so going back to \
-one is a thing they can ask for and you can do.";
+Then ask how they like it. If they want a change, say what the tools let \
+you do about it. Where there is a tool that changes a picture already \
+made, that is the one to reach for when the change is a change -- a hat, \
+a colour, something taken out -- because it keeps everything else as it \
+was, which is usually what they meant; it wants the number or id of the \
+picture to work from, which the tool told you when it made it. Make a \
+fresh one when they want something genuinely different instead. Either \
+way the new picture gets the next number and the earlier ones stay in \
+the chat, so going back to one is a thing they can ask for and you can \
+do.";
 
 const SEARCH_NOTE: &str = "\
 You can look things up on the web with look_up, and you should whenever the \
@@ -1991,14 +2006,16 @@ fn run_tool(
 /// again -- so the card is the evidence that the AI is doing what it
 /// just said it would.
 ///
-/// Whether a call is going to draw is guessed from its arguments: a
-/// non-empty `prompt` is what every image tool takes and what none of
-/// the tools that merely report -- balances, style lists -- has. The
-/// guess is allowed to be wrong in both directions and costs nothing
-/// either way. Guessed yes and nothing was drawn: the card says the
-/// picture didn't come, which is true. Guessed no and something was
-/// drawn: the pictures are posted when the call returns, without the
-/// spinner anyone would have watched.
+/// Whether a call is going to draw is guessed from its arguments:
+/// whether it was given any words to draw from -- see
+/// [`mcp::asked_for`] -- which every image tool takes under one name
+/// or another and none of the tools that merely report -- balances,
+/// style lists, what was made earlier -- has. The guess is allowed to
+/// be wrong in both directions and costs nothing either way. Guessed
+/// yes and nothing was drawn: the card says the picture didn't come,
+/// which is true. Guessed no and something was drawn: the pictures
+/// are posted when the call returns, without the spinner anyone would
+/// have watched.
 ///
 /// This is where the room's half of the flow lives rather than the
 /// model's, because the model cannot post a card and then make a
@@ -2006,7 +2023,7 @@ fn run_tool(
 /// order, every time, before the thing people are waiting on, is a
 /// rule that holds right up until it doesn't.
 fn drawing(room: &Room, g: u64, server: &mcp::Server, tool: &str, args: &Value) -> Result<Value, String> {
-    let prompt = args["prompt"].as_str().unwrap_or("").trim().to_string();
+    let prompt = mcp::asked_for(args);
     // The spinner, when this looks like a call that will draw.
     let pending = (!prompt.is_empty())
         .then(|| room.begin_picture(g, &prompt))
@@ -2594,8 +2611,16 @@ mod tests {
                         "capabilities": {},
                         "serverInfo": { "name": "mock", "version": "1" },
                     }),
+                    // The two shapes a picture server comes in: one
+                    // that draws from a description, and one that
+                    // changes a picture it already drew -- which is
+                    // asked in two parts, and whose words are under
+                    // `instruction` rather than `prompt`. The key as
+                    // an argument is on the first of them because
+                    // some servers do want it there, and that path
+                    // has to keep working too.
                     "tools/list" => json!({ "tools": [{
-                        "name": "create_inference",
+                        "name": "generate_pixel_art",
                         "description": "Draw something.",
                         "inputSchema": {
                             "type": "object",
@@ -2606,11 +2631,27 @@ mod tests {
                             "required": ["prompt"],
                         },
                     }, {
-                        "name": "get_balance",
-                        "description": "Say what is left.",
+                        "name": "refine_pixel_art",
+                        "description": "Change one already drawn.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "job_id": { "type": "string" },
+                                "instruction": { "type": "string" },
+                            },
+                            "required": ["job_id", "instruction"],
+                        },
+                    }, {
+                        "name": "list_jobs",
+                        "description": "Say what was drawn before.",
                         "inputSchema": { "type": "object", "properties": {} },
                     }] }),
-                    "tools/call" if req["params"]["name"] == "create_inference" && draws => {
+                    "tools/call"
+                        if matches!(
+                            req["params"]["name"].as_str(),
+                            Some("generate_pixel_art" | "refine_pixel_art")
+                        ) && draws =>
+                    {
                         use base64::Engine as _;
                         let b64 = base64::engine::general_purpose::STANDARD.encode(a_png());
                         json!({ "content": [
@@ -2618,8 +2659,9 @@ mod tests {
                             { "type": "image", "data": b64, "mimeType": "image/png" },
                         ] })
                     }
-                    // A call that draws nothing: the balance, or a
-                    // generation that came back empty.
+                    // A call that draws nothing: the list of what
+                    // came before, or a generation that came back
+                    // empty.
                     "tools/call" => json!({
                         "content": [{ "type": "text", "text": "nothing to draw" }]
                     }),
@@ -2661,13 +2703,13 @@ mod tests {
         let server = Arc::new(mcp::Server::new(mcp::Config {
             name: "art".into(),
             url: mock_mcp(true),
-            key: "rdpk-secret".into(),
-            only: vec!["create_inference".into(), "get_balance".into()],
+            key: "secret".into(),
+            only: vec!["generate_pixel_art".into(), "list_jobs".into()],
         }));
         assert_eq!(server.connect().expect("hello"), 2);
 
-        let args = json!({ "prompt": "a stern Borg commander", "width": 128 });
-        let said = drawing(&room, g, &server, "art_create_inference", &args)
+        let args = json!({ "prompt": "a stern Borg commander", "size": 128 });
+        let said = drawing(&room, g, &server, "art_generate_pixel_art", &args)
             .expect("the call went through");
 
         // The model is told the number and told to wait for a yes.
@@ -2693,8 +2735,43 @@ mod tests {
         assert_eq!(room.avatar_png("Ryan", None).unwrap().unwrap().0, a_png());
     }
 
-    /// A call that draws nothing leaves no card: a balance is not a
-    /// portrait, and the room must not spin on one.
+    /// Changing a picture is making one, as far as the room is
+    /// concerned: a card goes up for it too. The tool that does it is
+    /// asked in two parts and only one of them is words, under a name
+    /// the room has to know to look under -- a room that only looked
+    /// for `prompt` would put no card up and caption nothing.
+    #[test]
+    fn a_change_to_a_picture_gets_a_card_of_its_own() {
+        let room = picture_room();
+        let g = room.generation_of_only_bot().load(Ordering::SeqCst);
+        let server = Arc::new(mcp::Server::new(mcp::Config {
+            name: "art".into(),
+            url: mock_mcp(true),
+            key: String::new(),
+            only: vec!["refine_pixel_art".into()],
+        }));
+        assert_eq!(server.connect().expect("hello"), 1);
+
+        let args = json!({ "job_id": "41fc", "instruction": "give it a red top hat" });
+        let said = drawing(&room, g, &server, "art_refine_pixel_art", &args)
+            .expect("the call went through");
+        assert!(said["result"].as_str().unwrap_or_default().contains("Picture 1"));
+
+        let entry = room
+            .log_now()
+            .into_iter()
+            .find(|e| e.kind == crate::room::Kind::Picture)
+            .expect("a picture card is in the conversation");
+        assert_eq!(
+            entry.title, "give it a red top hat",
+            "captioned with what was asked for, which for a change is the change"
+        );
+        assert!(!entry.live, "and it is not still spinning");
+        assert_eq!(room.picture_png(&entry.id).unwrap().unwrap(), a_png());
+    }
+
+    /// A call that draws nothing leaves no card: a list of old work is
+    /// not a portrait, and the room must not spin on one.
     #[test]
     fn a_call_that_draws_nothing_puts_no_card_up() {
         let room = picture_room();
@@ -2707,8 +2784,9 @@ mod tests {
         }));
         server.connect().expect("hello");
 
-        // No prompt, so nothing was ever going to be drawn.
-        let said = drawing(&room, g, &server, "art_get_balance", &json!({})).unwrap();
+        // No words anywhere in the call, so nothing was ever going
+        // to be drawn.
+        let said = drawing(&room, g, &server, "art_list_jobs", &json!({ "limit": 10 })).unwrap();
         assert_eq!(said["result"], "nothing to draw");
         assert!(
             !room.log_now().iter().any(|e| e.kind == crate::room::Kind::Picture),
@@ -2718,8 +2796,9 @@ mod tests {
         // A prompt that came back with nothing does leave a card --
         // the room had already promised one -- and it says so rather
         // than spinning for ever.
-        let said = drawing(&room, g, &server, "art_create_inference", &json!({ "prompt": "a hat" }))
-            .unwrap();
+        let said =
+            drawing(&room, g, &server, "art_generate_pixel_art", &json!({ "prompt": "a hat" }))
+                .unwrap();
         assert_eq!(said["result"], "nothing to draw");
         let entry = room
             .log_now()
