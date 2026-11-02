@@ -86,10 +86,6 @@
       <p class="lead">
         This is a voice and video conference room. Select your microphone and
         press <strong>Join Audio</strong> to enter.
-        {#if room.door}
-          Your link works once: pressing it is what spends it, and this
-          browser is remembered from then on.
-        {/if}
       </p>
 
       {#if room.door}
@@ -99,10 +95,6 @@
             <input type="text" maxlength={NAME_MAX} value={draft}
               oninput={(e) => (typed = e.currentTarget.value)} onblur={save}
               onkeydown={(e) => { if (e.key === 'Enter') { e.preventDefault(); save(); } }} />
-            <small>
-              Everyone in the room sees this, and you can change it later. Your
-              invite stays {room.door.name}'s, whatever you call yourself.
-            </small>
           </label>
           {#if room.nameError}<p class="warn">{room.nameError}</p>{/if}
         </div>
@@ -162,12 +154,11 @@
            it takes it back, and shuts the door again. -->
       <div class="consent" class:agreed={room.consented}>
         <p>
-          Your microphone goes live to everyone else here. What you say is
-          transcribed on this server and written into the conversation —
-          which everyone here reads, and which the room keeps until somebody
-          deletes it. That writing is sent on to the AI, and to the
-          translation and voice services this room is set up to use, which
-          are run by whoever runs it.
+          Your microphone will be recorded and your speech may be
+          transmitted to other participants in this conference. The
+          transcription of what you say will be indefinitely recorded
+          in the conversation log, and it may be further processed by
+          AI chat bots, set up by this server's operator.
         </p>
         <label>
           <input type="checkbox" checked={room.consented}
@@ -191,9 +182,10 @@
         <span>
           Push to talk
           <small>
-            On speakers, turn this on: your mic opens only while you hold Space.
-            With a headset, leave it off — anyone can interrupt {theAI()}
-            just by talking.
+            If push-to-talk is enabled, you will be muted unless you
+            hold down the Spacebar. This allows you to control
+            explicit transmission, and can help with audio feedback
+            issues.
           </small>
         </span>
       </label>
