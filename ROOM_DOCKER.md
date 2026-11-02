@@ -196,6 +196,19 @@ The tool list after the URL is not optional punctuation: that server
 offers 33 tools and a room that wants faces needs those four. See
 [Faces](ROOM.md#faces).
 
+Both variables take several servers, separated by semicolons, and the
+name is what pairs a key with its server:
+
+```ini
+VOX_ROOM_MCP=art=https://mcp.retrodiffusion.ai/mcp=create_inference;docs=https://docs.example.com/mcp=search
+VOX_ROOM_MCP_KEY=art=rdpk-…;docs=sk-…
+```
+
+The bare key in the first example is shorthand for "the only server
+there is". Written with several servers it is refused at startup —
+one vendor's key is not a thing to send to another — so the room tells
+you to name them rather than silently picking one.
+
 **A `$` in the key is eaten.** Compose interpolates this file, so
 `rdpk-a$bc` reaches the container as `rdpk-a` — the key fails to
 authenticate and nothing says why. Write it `rdpk-a$$bc`. The `;`, `,`

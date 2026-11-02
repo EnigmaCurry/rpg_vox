@@ -429,6 +429,48 @@ fn env_names(cmd: &clap::Command, out: &mut Vec<OsString>) {
 /// The old `VOX_AGENT_THINK`, read by hand and leniently: as a clap flag
 /// anything but exactly `true` or `false` stopped the room from starting
 /// at all, which an old `.env` saying `0` should not do.
+/// Which key is `name`'s.
+///
+/// `--mcp-key` is either `NAME=KEY` per server, or -- when the house
+/// has exactly one server -- the key on its own, which is what a
+/// one-server house actually wants to write. A named key always wins.
+///
+/// What counts as "on its own" is not "has no `=`": a base64 key ends
+/// in one. It is "the part before the first `=` is not one of the
+/// servers' names", which is the question actually being asked.
+///
+/// A key on its own with more than one server is an error rather than
+/// a key quietly dropped. Somebody who wrote a key meant it to be
+/// used, and the room cannot guess which server they meant -- and
+/// guessing wrong means handing one vendor's key to another.
+fn key_for(name: &str, keys: &[&str], names: &[String]) -> Result<String> {
+    fn named<'k>(k: &'k str, names: &[String]) -> Option<(&'k str, &'k str)> {
+        k.split_once('=')
+            .filter(|(who, _)| names.iter().any(|n| n == who.trim()))
+    }
+    if let Some(key) = keys
+        .iter()
+        .filter_map(|k| named(k, names))
+        .find(|(who, _)| who.trim() == name)
+        .map(|(_, key)| key)
+    {
+        return Ok(key.trim().to_string());
+    }
+    let Some(bare) = keys.iter().find(|k| named(k, names).is_none()) else {
+        return Ok(String::new());
+    };
+    if names.len() > 1 {
+        bail!(
+            "--mcp-key is a key on its own, but there are {} --mcp servers ({}): \
+             say which with NAME=KEY, separated by semicolons -- one server's key \
+             is not to be sent to another",
+            names.len(),
+            names.join(", ")
+        );
+    }
+    Ok(bare.trim().to_string())
+}
+
 /// The `--mcp` servers, with their keys attached.
 ///
 /// `NAME=URL` or `NAME=URL=tool,tool`. The key comes from `--mcp-key`,
@@ -437,6 +479,15 @@ fn env_names(cmd: &clap::Command, out: &mut Vec<OsString>) {
 fn mcp_servers(specs: &[String], keys: &[String]) -> Result<Vec<Arc<mcp::Server>>> {
     let specs: Vec<&str> = specs.iter().map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
     let keys: Vec<&str> = keys.iter().map(|k| k.trim()).filter(|k| !k.is_empty()).collect();
+    // Every server's name, worked out before any of them is built: a
+    // key is matched to a server by name, and telling `art=rdpk-…`
+    // from a bare key that merely contains an `=` needs to know which
+    // names there are.
+    let names: Vec<String> = specs
+        .iter()
+        .filter_map(|spec| spec.split('=').next())
+        .map(|n| n.trim().to_string())
+        .collect();
     let mut out = Vec::new();
     for spec in &specs {
         let mut parts = spec.splitn(3, '=');
@@ -472,15 +523,7 @@ fn mcp_servers(specs: &[String], keys: &[String]) -> Result<Vec<Arc<mcp::Server>
                  a big server is a big list in front of every reply"
             );
         }
-        // A key given on its own is this one's, when this one is the
-        // only one. Named keys win over it wherever both are given.
-        let key = keys
-            .iter()
-            .find_map(|k| k.strip_prefix(&format!("{name}=")))
-            .or_else(|| keys.iter().copied().find(|k| !k.contains('=')).filter(|_| specs.len() == 1))
-            .unwrap_or("")
-            .trim()
-            .to_string();
+        let key = key_for(&name, &keys, &names)?;
         if key.is_empty() {
             warn!(
                 server = %name,
@@ -1029,6 +1072,95 @@ fn serve(cli: Cli, store: Store, db: PathBuf) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mcp(specs: &[&str], keys: &[&str]) -> Result<Vec<Arc<mcp::Server>>> {
+        let own = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        mcp_servers(&own(specs), &own(keys))
+    }
+
+    /// Why it was refused. Through `map` rather than `unwrap_err`,
+    /// which wants `Debug` on the servers -- and a `Debug` on one of
+    /// those would print the key it holds, which is the whole thing
+    /// `mcp.rs` is careful about.
+    fn mcp_err(specs: &[&str], keys: &[&str]) -> String {
+        mcp(specs, keys)
+            .map(|_| ())
+            .expect_err("this one is not allowed")
+            .to_string()
+    }
+
+    /// Which key is whose. A key on its own is the one-server
+    /// shorthand; past that they are named, because one vendor's key
+    /// is not to be handed to another.
+    #[test]
+    fn a_key_belongs_to_the_server_it_names() {
+        let art = "art=https://example.invalid/mcp=create_inference";
+        let docs = "docs=https://docs.invalid/mcp=search";
+
+        // One server: the key on its own is obviously its.
+        let one = mcp(&[art], &["rdpk-abc"]).unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].key_for_test(), "rdpk-abc");
+
+        // Several: each is named, and each gets its own and no other.
+        let two = mcp(&[art, docs], &["art=rdpk-abc", "docs=sk-xyz"]).unwrap();
+        assert_eq!(two[0].key_for_test(), "rdpk-abc");
+        assert_eq!(two[1].key_for_test(), "sk-xyz");
+
+        // Order doesn't matter, and a named key wins over a bare one.
+        let two = mcp(&[art, docs], &["docs=sk-xyz", "art=rdpk-abc"]).unwrap();
+        assert_eq!(two[0].key_for_test(), "rdpk-abc");
+
+        // A key on its own with more than one server is refused, not
+        // quietly dropped: it was written to be used, and which server
+        // it belongs to is not the room's to guess.
+        let err = mcp_err(&[art, docs], &["rdpk-abc"]);
+        assert!(err.contains("key on its own"), "{err}");
+        assert!(err.contains("NAME=KEY"), "it says what to write: {err}");
+        assert!(err.contains("art, docs"), "and which servers: {err}");
+
+        // A server nobody gave a key is allowed -- not everything
+        // wants authenticating -- and gets an empty one.
+        let two = mcp(&[art, docs], &["art=rdpk-abc"]).unwrap();
+        assert_eq!(two[1].key_for_test(), "");
+        assert_eq!(mcp(&[art], &[]).unwrap()[0].key_for_test(), "");
+
+        // A key that merely contains `=` is still a key on its own:
+        // base64 ends in one, and `art=…` is only named because `art`
+        // is a server here.
+        let one = mcp(&[art], &["c2VjcmV0Lw=="]).unwrap();
+        assert_eq!(one[0].key_for_test(), "c2VjcmV0Lw==");
+    }
+
+    /// What the flag refuses, and why each would be worse discovered
+    /// in the middle of a conversation.
+    #[test]
+    fn a_server_has_to_be_one_the_room_can_lend() {
+        let art = "art=https://example.invalid/mcp=create_inference";
+
+        // The name prefixes a tool name, and the endpoints want
+        // `^[a-zA-Z0-9_-]+$` -- so a bad one breaks every tool the
+        // server lends, not just itself.
+        let err = mcp_err(&["my art=https://example.invalid/mcp"], &[]);
+        assert!(err.contains("prefixes tool names"), "{err}");
+
+        // Only streamable HTTP is spoken.
+        let err = mcp_err(&["art=npx @retrodiffusion/mcp"], &[]);
+        assert!(err.contains("not stdio"), "{err}");
+
+        // Two servers of one name would collide in the offer.
+        let err = mcp_err(&[art, "art=https://other.invalid/mcp"], &[]);
+        assert!(err.contains("two --mcp servers"), "{err}");
+
+        // Nothing at all is a house with no picture tools, not an error.
+        assert!(mcp(&[], &[]).unwrap().is_empty());
+        assert!(mcp(&["", "  "], &[""]).unwrap().is_empty(), "blank is not a server");
+
+        // And the tool list is optional, though leaving it off lends
+        // every tool the server has.
+        let all = mcp(&["art=https://example.invalid/mcp"], &[]).unwrap();
+        assert_eq!(all.len(), 1);
+    }
 
     /// One test, because it mutates the process environment.
     #[test]

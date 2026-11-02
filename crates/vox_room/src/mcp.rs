@@ -205,6 +205,15 @@ impl Server {
         &self.cfg.name
     }
 
+    /// The key this server was built with, for the test in `main.rs`
+    /// that checks which key went to which server. Not otherwise
+    /// reachable: nothing in the room has any business reading it
+    /// back out.
+    #[cfg(test)]
+    pub fn key_for_test(&self) -> &str {
+        &self.cfg.key
+    }
+
     /// Say hello and find out what it has. Called once as the house
     /// opens, on its own thread: a server that is slow to answer must
     /// not hold up a room that works without it.

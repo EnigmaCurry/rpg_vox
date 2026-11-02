@@ -1097,7 +1097,22 @@ vox_room --room Lobby \
 
 `NAME=URL=TOOL,TOOL,...`. The name is the prefix its tools are offered
 under — `art` gives the AI `art_create_inference` — so two servers
-lending a tool of the same name stay apart. **The tool list after the
+lending a tool of the same name stay apart.
+
+**The name is also how a key finds its server.** `--mcp-key` takes
+`NAME=KEY`, semicolon-separated, one per server:
+
+```bash
+vox_room --room Lobby \
+  --mcp 'art=https://mcp.retrodiffusion.ai/mcp=create_inference;docs=https://docs.example.com/mcp=search' \
+  --mcp-key "art=$RD_API_KEY;docs=$DOCS_KEY"
+```
+
+A key written on its own, as in the first example above, is shorthand
+for "the only server there is" — and with more than one server it is
+refused rather than guessed at, because one vendor's key is not a
+thing to hand to another. A server nobody gave a key simply gets none,
+which is right for one that wants no authenticating. **The tool list after the
 URL is the point of the flag.** Retro Diffusion offers 33 tools, of
 which a room that wants faces needs about four; the other 29 are 29
 more ways for a voice answering "make me an avatar" to end up
@@ -1212,7 +1227,7 @@ pays for a rejected request before every reply.
 | `VOX_ROOM_INTERPRETER_VOICE` | `ryan` | the interpreters' Qwen3 voice. Not the AI's, on purpose: the one thing to be able to tell by ear is which is which |
 | `VOX_ROOM_KOKORO_VOICE` | `am_michael` | Kokoro voice |
 | `VOX_ROOM_MCP` | | MCP servers the AI may use, `NAME=URL[=TOOL,TOOL,...]`, semicolon-separated. See [Faces](#faces) |
-| `VOX_ROOM_MCP_KEY` | | their keys, `NAME=KEY` or on its own for a single server. Never reaches the model |
+| `VOX_ROOM_MCP_KEY` | | their keys, `NAME=KEY`, semicolon-separated — or the key on its own when there is exactly one server. Never reaches the model |
 | `VOX_SCRIBE_MODELS` | scribe's models dir | speech-to-text models |
 
 ## Testing
