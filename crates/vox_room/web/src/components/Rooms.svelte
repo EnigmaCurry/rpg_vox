@@ -2,15 +2,32 @@
   import { room, command, enterRoom, setInterpreter, theAI } from '../lib/room.svelte.js';
   import Strip from './Strip.svelte';
 
-  // The rooms, down the left, and under the one you are in everybody
-  // who is in it -- who is in it, that is, and not everybody invited. A list rather than a row of buttons because a server
-  // can hold a great many rooms and they have to stay scannable; a tree
-  // because who is in a room belongs to that room, and the room you are
-  // in is the only one whose people you have any business mixing.
+  // Two things, in one component because they are one idea: which room
+  // you are in, and who is in it.
+  //
+  // The room you are in is the heading of the whole page -- there is no
+  // title bar above this, and this is what was in it. Press it and
+  // every room you may go to drops down over the strips; press one and
+  // it closes, you are there, and the heading says so. A server can
+  // hold a great many rooms, so the list scrolls rather than growing
+  // the column.
+  //
+  // The strips underneath never move. They are the one place to look
+  // for who is here and how loud they are, and a list that pushed them
+  // down the screen every time you went looking for another room would
+  // make you find them again afterwards -- so the list is over them,
+  // not above them.
   //
   // Pressing a room takes you there without the audio stopping: the
   // socket stays where it is and the server sends back the room it has
   // put you in.
+  let open = $state(false);
+  let picker = $state();
+
+  function choose(r) {
+    open = false;
+    enterRoom(r.id);
+  }
 
   // Before the first `rooms` event there is no list, but there is a
   // room — stand one in for it rather than flash an empty sidebar.
@@ -77,97 +94,123 @@
   }
 </script>
 
-<nav class="rooms" aria-label="Rooms">
-  <div role="radiogroup" aria-label="Which room you are in">
-    {#each list as r (r.id)}
-      {@const here = r.id === room.where}
-      <div class="room" class:here>
-        <button role="radio" aria-checked={here} class:on={here} title={who(r)}
-          onclick={() => enterRoom(r.id)}>
-          <span class="twist" aria-hidden="true">{here ? '▾' : '▸'}</span>
+<!-- Closing it is a click anywhere else, as it is for the history
+     menu above the conversation. -->
+<svelte:window onclickcapture={(e) => {
+    if (open && !picker?.contains(e.target)) open = false;
+  }}
+  onkeydown={(e) => { if (e.key === 'Escape') open = false; }} />
+
+<!-- The page's heading, and the way to every other room. There is no
+     title bar over this: the room you are in is named here, once. -->
+<h1 class="pick" bind:this={picker}>
+  <button class="current" class:on={open} aria-haspopup="listbox" aria-expanded={open}
+    title={open ? 'Close the list of rooms' : 'Which room you are in. Press for the others.'}
+    onclick={() => (open = !open)}>
+    <span class="name">{room.title}</span>
+    {#if room.game}<span class="game">{room.game}</span>{/if}
+    {#if room.alone}<span class="yours" title="Nobody else can come into this one.">yours</span>{/if}
+    <span class="caret" aria-hidden="true">▾</span>
+  </button>
+
+  {#if open}
+    <!-- Over the strips and not above them, so that what is under this
+         is where it was when the list opened and where it will be when
+         it shuts. -->
+    <div class="list" role="listbox" aria-label="Which room to go to">
+      {#each list as r (r.id)}
+        {@const here = r.id === room.where}
+        <button role="option" aria-selected={here} class:on={here} title={who(r)}
+          onclick={() => choose(r)}>
           <span class="name">{r.title}</span>
           <!-- A game is something a room is doing. Say which, so a room
                worth walking into looks like one from out here. -->
           {#if r.game}<span class="game" title="{r.game} is being played there.">{r.game}</span>{/if}
-          {#if !r.private && r.here.length}<span class="count">{r.here.length}</span>{/if}
+          {#if r.private}
+            <span class="count yours">yours</span>
+          {:else if r.here.length}
+            <span class="count">{r.here.length}</span>
+          {/if}
         </button>
+      {/each}
+    </div>
+  {/if}
+</h1>
 
-        <!-- Only the room you are in opens: these are faders, and a
-             fader belongs to the room it is being heard in. -->
-        {#if here}
-          <div class="who">
-            <!-- Who is in it, and nobody else: somebody invited but
-                 elsewhere is on the room they are in, with a count. -->
-            {#each room.people as p (p.name)}
-              <Strip key={p.name} label={p.name} mic={p.mic} muted={p.muted} speaking={p.speaking} />
-            {/each}
-            <!-- The AIs in this room, each with its own fader and its
-                 own say in when it speaks. -->
-            {#each room.agents as bot (bot.strip)}
-            <Strip key={bot.strip} label={bot.name} doing={bot.state} agent>
-              {#snippet children()}
-                <!-- When this bot speaks, in this room. -->
-                <!-- A row of three buttons wants more width than this
-                     column has, and the names are the whole point: a
-                     "Named / Fits / Every" that fits is a control you
-                     have to already understand. This reads as what it
-                     is — Vox answers when named. -->
-                <label class="when" title={modeHint(bot)}>
-                  <span class="what">
-                    Answers{#if bot.engaged}<span class="dot" aria-hidden="true"></span>{/if}
-                  </span>
-                  <select value={bot.mode} disabled={room.locked}
-                    aria-label="When {bot.name} speaks"
-                    onchange={(e) =>
-                      command({ type: 'mode', bot: bot.name, mode: e.currentTarget.value })}>
-                    {#each modes(bot) as m (m.mode)}
-                      <option value={m.mode} title={m.hint}>{m.label}</option>
-                    {/each}
-                  </select>
-                </label>
-              {/snippet}
-            </Strip>
-            {/each}
-            {#if interpreted}
-              <!-- Yours, not the room's: you hear the one speaking your
-                   language and nobody else hears yours. All the way down
-                   it is off for you, and the words are still written. -->
-              <Strip key={room.interpreter.level} label="Interpreter" agent doing={interpreting}
-                fader={room.myInterpreter} onfader={setInterpreter} />
-            {/if}
-            <p class="hint">
-              {#if room.alone}
-                This room is yours: nobody else can come into it, and nothing said here
-                reaches the rest of the house.
-              {:else}
-                Levels and mutes here change this room for everyone in it, and a muted
-                person isn't transcribed. You never hear yourself.
-              {/if}
-              {#if interpreted}
-                The interpreter is yours alone: the louder you have it, the further the
-                voices it is speaking over drop under it for you, and all the way down
-                turns it off — for you, and with the words still written down.
-              {/if}
-            </p>
-          </div>
-        {/if}
-      </div>
+<nav class="rooms" aria-label="Who is in {room.title}">
+  <div class="who">
+    <!-- Who is in it, and nobody else: somebody invited but
+         elsewhere is on the room they are in, with a count. -->
+    {#each room.people as p (p.name)}
+      <Strip key={p.name} label={p.name} mic={p.mic} muted={p.muted} speaking={p.speaking} />
     {/each}
+    <!-- The AIs in this room, each with its own fader and its
+         own say in when it speaks. -->
+    {#each room.agents as bot (bot.strip)}
+    <Strip key={bot.strip} label={bot.name} doing={bot.state} agent>
+      {#snippet children()}
+        <!-- When this bot speaks, in this room. -->
+        <!-- A row of three buttons wants more width than this
+             column has, and the names are the whole point: a
+             "Named / Fits / Every" that fits is a control you
+             have to already understand. This reads as what it
+             is — Vox answers when named. -->
+        <label class="when" title={modeHint(bot)}>
+          <span class="what">
+            Answers{#if bot.engaged}<span class="dot" aria-hidden="true"></span>{/if}
+          </span>
+          <select value={bot.mode} disabled={room.locked}
+            aria-label="When {bot.name} speaks"
+            onchange={(e) =>
+              command({ type: 'mode', bot: bot.name, mode: e.currentTarget.value })}>
+            {#each modes(bot) as m (m.mode)}
+              <option value={m.mode} title={m.hint}>{m.label}</option>
+            {/each}
+          </select>
+        </label>
+      {/snippet}
+    </Strip>
+    {/each}
+    {#if interpreted}
+      <!-- Yours, not the room's: you hear the one speaking your
+           language and nobody else hears yours. All the way down
+           it is off for you, and the words are still written. -->
+      <Strip key={room.interpreter.level} label="Interpreter" agent doing={interpreting}
+        fader={room.myInterpreter} onfader={setInterpreter} />
+    {/if}
+    <p class="hint">
+      {#if room.alone}
+        This room is yours: nobody else can come into it, and nothing said here
+        reaches the rest of the house.
+      {:else}
+        Levels and mutes here change this room for everyone in it, and a muted
+        person isn't transcribed. You never hear yourself.
+      {/if}
+      {#if interpreted}
+        The interpreter is yours alone: the louder you have it, the further the
+        voices it is speaking over drop under it for you, and all the way down
+        turns it off — for you, and with the words still written down.
+      {/if}
+    </p>
   </div>
 </nav>
 
 <style>
-  /* Where it sits in the grid, and the rule down its edge, are App's:
-     a scoped class here would outrank App's :global() and strand the
-     sidebar in a column of its own on a narrow screen.
-     
-     No padding of its own and no heading: the rows run edge to edge
-     from the top, the way a list of channels does. The nav's own label
-     is what says what it is, for anyone who can't see that it is a
-     list of rooms. */
-  .rooms { padding: 0; overflow-y: auto; overscroll-behavior: contain; }
-  .room { display: flex; flex-direction: column; }
-  .room > button {
+  /* Where these sit in the grid, and the rule down the column's edge,
+     are App's: a scoped class here would outrank App's :global() and
+     strand them in a column of their own on a narrow screen. */
+
+  /* The heading. It is a heading and a control at once -- the room you
+     are in, named once, and the way to the others -- so it is sized
+     like the title it replaced rather than like a button. */
+  .pick {
+    position: relative;
+    margin: 0;
+    font-size: inherit;
+    font-weight: inherit;
+    border-bottom: 1px solid var(--line);
+  }
+  .current {
     display: flex;
     align-items: center;
     gap: 8px;
@@ -175,17 +218,56 @@
     text-align: left;
     border: 0;
     border-radius: 0;
-    padding: 6px 10px;
     background: transparent;
+    padding: 9px 12px;
+    font-size: 17px;
     font-weight: 600;
   }
-  .room > button:hover { background: var(--bubble); }
-  .room > button.on { background: var(--accent); color: var(--accent-ink); }
-  .twist { font-size: 10px; opacity: 0.7; width: 1em; flex: none; }
-  .name { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .current:hover { background: var(--bubble); }
+  .current.on { background: var(--bubble); }
+  .current .caret { margin-left: auto; font-size: 11px; opacity: 0.6; font-weight: 400; }
+  .current.on .caret { transform: rotate(180deg); }
+  .name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  /* Over the strips, not above them. Absolute so that opening it moves
+     nothing underneath -- the strips are the one place to look for who
+     is here, and a list that pushed them down the screen would make
+     you find them again every time you went looking for a room. */
+  .list {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    right: 0;
+    z-index: 20;
+    /* A house can hold a great many rooms; the list scrolls rather
+       than running off the bottom of the screen. */
+    max-height: min(60vh, 24em);
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 0 0 10px 10px;
+    box-shadow: var(--shadow), 0 10px 30px rgb(0 0 0 / 12%);
+    padding: 4px;
+  }
+  .list button {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    text-align: left;
+    border: 0;
+    border-radius: 7px;
+    background: transparent;
+    padding: 6px 8px;
+    font-weight: 600;
+    font-size: 14px;
+  }
+  .list button:hover { background: var(--bubble); }
+  .list button.on { background: var(--accent); color: var(--accent-ink); }
+  .list button:not(:has(.game)) .name { flex: 1; }
   /* Whatever is left over goes between the names and the count. */
-  .room > button .game { margin-right: auto; }
-  .room > button:not(:has(.game)) .name { flex: 1; }
+  .list .game { margin-right: auto; }
   .count {
     font-size: 11px;
     font-weight: 500;
@@ -194,7 +276,7 @@
     background: var(--bubble);
     color: var(--muted);
   }
-  .room > button.on .count { background: var(--accent-ink); color: var(--accent); }
+  .list button.on .count { background: var(--accent-ink); color: var(--accent); }
   /* Long game names must not push the count off the row, so this is
      what gives way first. */
   .game {
@@ -206,20 +288,26 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  .room > button.on .game { color: var(--accent-ink); opacity: 0.85; }
-  /* The branch: indented, and hung off a line so the strips read as
-     belonging to the room above them rather than following it. The
-     right-hand padding is the only inset in here, and it is there so a
-     fader doesn't run into the edge of the column. */
-  .who {
-    display: flex;
-    flex-direction: column;
-    gap: 7px;
-    margin: 5px 0 7px 14px;
-    padding: 0 10px 0 8px;
-    border-left: 1px solid var(--line);
+  .list button.on .game { color: var(--accent-ink); opacity: 0.85; }
+  /* A room nobody else can come into, said rather than counted: there
+     is never anybody in it but you. */
+  .yours {
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--muted);
+    background: none;
   }
-  .hint { font-size: 12px; color: var(--muted); margin: 0; }
+  .current .yours { border: 1px solid var(--line); border-radius: 999px; padding: 0 6px; }
+
+  /* Who is in the room you are in, and how loud. Always here, always
+     in the same place, however the list above it is being used. */
+  .rooms {
+    padding: 10px 10px 12px;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+  }
+  .who { display: flex; flex-direction: column; gap: 7px; }
+  .hint { font-size: 12px; color: var(--muted); margin: 4px 0 0; }
   /* When the bot above speaks, in this room. */
   .when { display: flex; align-items: center; gap: 6px; }
   .what { font-size: 11px; color: var(--muted); flex: none; }

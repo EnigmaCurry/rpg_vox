@@ -10,7 +10,7 @@
 // Lobby:
 //   vox_room --room Lobby --room Studio --echo --no-stt --tts none
 
-const { BASE, JOIN, AGREE, is, report, person, whereYouAre } = require('./room.js');
+const { BASE, JOIN, AGREE, is, report, person, whereYouAre, goTo } = require('./room.js');
 const [link] = process.argv.slice(2);
 
 (async () => {
@@ -21,14 +21,12 @@ const [link] = process.argv.slice(2);
   is('an invite landed in the lobby', path(), '/lobby');
   is('and that is where it is', await whereYouAre(page), 'Lobby');
 
-  await page.click('.rooms button:has-text("Studio")');
-  await page.waitForTimeout(900);
+  await goTo(page, 'Studio', 900);
   const studio = path();
   is('a room has an address of its own', /^\/room\/[0-9a-f]{32}$/.test(studio), true);
   is('and you are in it', await whereYouAre(page), 'Studio');
 
-  await page.click('.rooms button:has-text("You and Vox")');
-  await page.waitForTimeout(900);
+  await goTo(page, 'You and Vox', 900);
   is('your own room is the root', path(), '/');
   is('and you are in it', await whereYouAre(page), 'You and Vox');
 

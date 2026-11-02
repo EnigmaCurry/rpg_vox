@@ -45,7 +45,7 @@ async function person(name, url, wav) {
   // When the AI answers is the bot's own setting now, under its strip in
   // the room list: every pause, so nobody has to say its name for this
   // to show anything.
-  await ryan.page.selectOption('.room.here select', 'always');
+  await ryan.page.selectOption('.rooms select', 'always');
   const t0 = Date.now();
   // Expose what each tab hears (peak since last read) through the meter width.
   const heard = (p) => p.evaluate(() => {
@@ -59,7 +59,7 @@ async function person(name, url, wav) {
     // What the AI is up to is on its own strip now, not a chip in the
     // top bar.
     const state = await ryan.page.evaluate(() => {
-      const vox = [...document.querySelectorAll('.room.here .strip')].pop();
+      const vox = [...document.querySelectorAll('.rooms .strip')].pop();
       return vox?.querySelector('.state')?.textContent.trim() ?? '?';
     });
     const log = await alex.page.evaluate(() => [...document.querySelectorAll('.entry')].map((e) =>

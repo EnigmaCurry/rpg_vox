@@ -127,7 +127,7 @@ const byBots = (p) =>
   is(
     'and each has its own Answers',
     await alex.page.evaluate(() =>
-      [...document.querySelectorAll('.room.here .strip select')].map((s) => [
+      [...document.querySelectorAll('.rooms .strip select')].map((s) => [
         s.getAttribute('aria-label'),
         s.value,
       ]),
@@ -141,7 +141,7 @@ const byBots = (p) =>
     'and says what each of them is doing, separately from each other and from the people',
     await alex.page.evaluate(() =>
       Object.fromEntries(
-        [...document.querySelectorAll('.room.here .strip')].map((e) => [
+        [...document.querySelectorAll('.rooms .strip')].map((e) => [
           // The label has a hard space in it, as the room renders it.
           e.querySelector('.label').textContent.replace(/\s+/g, ' ').trim(),
           e.querySelector('.state').textContent.replace(/\s+/g, ' ').trim(),
@@ -152,7 +152,7 @@ const byBots = (p) =>
   );
 
   // Setting one from the browser is that one's setting.
-  await alex.page.selectOption('.room.here .strip select[aria-label="When Sage speaks"]', 'always');
+  await alex.page.selectOption('.rooms .strip select[aria-label="When Sage speaks"]', 'always');
   await wait(800);
   is('changed from the browser', ryan.agents.map((a) => a.mode), ['always', 'always']);
 

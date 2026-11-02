@@ -129,13 +129,21 @@ following the word. Taking a room away takes it out of the house and
 takes everyone's way into it; what was said in it is left in the
 database rather than destroyed by a click.
 
-They are down the left, one line each, and pressing one takes you
-there. **Your own room is first and stays first**, then the house's in
-the order they were named: the one room that is always there and
+Which room you are in is the heading of the page, top left, and every
+room you may go to is behind it: press it and they drop down over the
+strips, press one and the list shuts, you are there, and the heading
+says so. **Your own room is first and stays first**, then the house's
+in the order they were named: the one room that is always there and
 always the same is the one to put where the eye lands, and a room that
 moved about the list as people came and went would be a room you had
-to look for. A tab still *lands* in the first shared room, because
-calling in is calling in to be with people.
+to look for. A house can hold a great many rooms, so the list scrolls
+rather than running off the screen. A tab still *lands* in the first
+shared room, because calling in is calling in to be with people.
+
+The list opens **over** who is in the room rather than above them: the
+strips are the one place to look for who is here and how loud they
+are, and a list that pushed them down the screen every time you went
+looking for another room would make you find them again afterwards.
 
 **The audio never stops.** You called in once and you stay called in: what changes
 is which room your voice goes into, whose conversation is on your
@@ -385,20 +393,19 @@ See ROOM_DOCKER.md.
   back takes a new one. Choosing a speaker needs `AudioContext.setSinkId`,
   which today means Chrome; elsewhere the room follows the system default
   and the list isn't offered.
-- **The top bar** is which room you are in, and what you press.
-  The list on the left says the room too, on a screen wide enough to
-  show the list — on a narrow one it is behind a tab, and then this is
-  the only thing that does. What the AI is doing is on the AI's own
-  strip and isn't repeated here. The buttons are **Leave the game**
-  while one is on, **Stop Vox** while it is talking — named after
-  whichever of them is talking, in a room with more than one — and
-  **New conversation**.
-- **The rooms**, down the left: every room you can go to, one line
-  each, and pressing one takes you there without the audio stopping.
-  See [More than one room](#more-than-one-room). The room you are
-  **in** opens underneath itself into everybody who is in it — their
-  faders, their meters, their mutes, and the AI's — so the mixer is a
-  branch of the room it mixes rather than a panel of its own. Who is in
+- **There is no top bar.** What a room is called belongs to the room
+  column, what a conversation is called and what is done to it belong
+  over the conversation, and what you reach for while talking belongs
+  in the footer — so each of those is now where it is about, and the
+  row they used to share is a row of the conversation instead.
+- **The room**, top left: which one you are in, as the heading of the
+  page, and every room you may go to behind it. Pressing one takes you
+  there without the audio stopping. See
+  [More than one room](#more-than-one-room). Underneath it, always in
+  the same place however the list above it is being used, is everybody
+  who is in that room — their faders, their meters, their mutes, and
+  the AI's — so the mixer is part of the room it mixes rather than a
+  panel of its own. Who is in
   it, and nobody else: somebody invited but in another room is on that
   room's count, not greyed out on this one. The rooms you are not in
   stay one line, because a list that has to hold a great many rooms has
@@ -409,12 +416,16 @@ See ROOM_DOCKER.md.
   column at all, and the conversation has the half it was taking. On a
   narrow screen one area shows at a time, with a switch above it —
   **Conversation**, **Just for you** (with a count, and only while you
-  hold a card), **Rooms**.
-- **History**, at the head of the conversation: the ones this room has
-  had before, to read. See [What a room has said
-  before](#what-a-room-has-said-before).
+  hold a card), **People**. The room's heading sits above the tabs
+  rather than inside one, because which room you are in is true of
+  whichever area you are looking at.
+- **The bar over the conversation**: what this one is called, and
+  everything done to it. **History** opens the ones this room has had
+  before, to read; **New conversation** starts the next one; and while
+  a game is on, its name and **Leave the game**. See [What a room has
+  said before](#what-a-room-has-said-before).
 - **Answers: when named / when it fits / every pause**, under the AI's
-  own strip in the room list: who gets the turn when the room goes
+  own strip: who gets the turn when the room goes
   quiet. It is that bot's setting in that room — the same AI answers
   differently in the Lobby and in your own room, and a second bot in
   the room carries its own. Shared by everyone in the room, like the
@@ -770,7 +781,7 @@ A saved game is announced in the conversation it was designed in, as a
 card with its name and what it is about, and that card is where it is
 played from: **Play** takes everyone in the room into it, and **Peek**
 shows its hidden prompt to you alone. Asking the AI for it out loud
-does the same thing. (There is no menu of games in the top bar: a game
+does the same thing. (There is no menu of games anywhere: a game
 belongs to the conversation that made it, and a second index of them
 was a second place to look.) **Leave the game** comes back out of one;
 **Restart game** starts it over. Saving needs a model with tool calling (llama.cpp

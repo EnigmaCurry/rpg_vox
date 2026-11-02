@@ -11,7 +11,7 @@
 //
 //   vox_room --room Lobby --room Studio --echo --no-stt --tts none
 
-const { is, report, person, wait } = require('./room.js');
+const { is, report, person, wait, openRooms, closeRooms } = require('./room.js');
 const [ryanLink] = process.argv.slice(2);
 
 /// Hold the space bar and see whether the mic opened.
@@ -51,12 +51,14 @@ const focused = (page) =>
   await page.evaluate(() => document.activeElement?.blur());
   is('Space talks', await space(page), true);
 
-  // A room in the list, which is where you have just clicked to get
-  // here. Clicking the room you are already in moves nobody.
-  await page.click('.rooms button:has-text("Lobby")');
-  await page.waitForTimeout(500);
+  // The heading that names the room you are in, which is a button and
+  // is where the hand goes to look for another room. (Pressing a room
+  // *in* the list is not this case: the list shuts and takes the
+  // button with it, so nothing is left holding the focus.)
+  await openRooms(page);
   is('a button keeps the focus', (await focused(page)).startsWith('button'), true);
   is('and Space still talks', await space(page), true);
+  await closeRooms(page);
 
   // And it doesn't press that button again while you hold it: the
   // history panel opened by a click stays open through a word.
@@ -71,10 +73,10 @@ const focused = (page) =>
 
   // A fader's mute is a button too, and the one most likely to be under
   // your hand.
-  await page.click('.room.here .strip button[aria-pressed]');
+  await page.click('.rooms .strip button[aria-pressed]');
   await page.waitForTimeout(400);
   is('Space talks from a mute', await space(page), true);
-  await page.click('.room.here .strip button[aria-pressed]');
+  await page.click('.rooms .strip button[aria-pressed]');
   await page.waitForTimeout(400);
 
   // Where Space is not yours: typing it types it.
@@ -85,7 +87,7 @@ const focused = (page) =>
   await page.fill('.composer input', '');
 
   // A dialog answers with Space, so it keeps it.
-  await page.click('header button:has-text("New conversation")');
+  await page.click('.bar button:has-text("New conversation")');
   await page.waitForTimeout(500);
   is('a dialog is asking', await page.evaluate(() => !!document.querySelector('dialog.ask[open]')), true);
   is('and Space is the dialog’s', await space(page), false);

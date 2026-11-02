@@ -99,7 +99,7 @@ const stored = (page, key) => page.evaluate((k) => localStorage.getItem(k), key)
   is('and the way in is shut', await f.page.locator(JOIN).isDisabled(), true);
   is(
     'it says what it is asking about',
-    await f.page.evaluate(() => /transcribed/.test(document.querySelector('.consent p').textContent)),
+    await f.page.evaluate(() => /transcri(bed|ption)/.test(document.querySelector('.consent p').textContent)),
     true,
   );
 

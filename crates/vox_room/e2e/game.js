@@ -8,17 +8,12 @@
 //
 //   vox_room --room Lobby --room Studio --echo --no-stt --tts none
 
-const { is, report, person, said, type, whereYouAre } = require('./room.js');
+const { is, report, person, said, type, whereYouAre, roomsListed } = require('./room.js');
 const [ryanLink, alexLink] = process.argv.slice(2);
 
 const playing = (page) =>
-  page.evaluate(() => document.querySelector('header .playing')?.textContent.trim() ?? null);
-const inList = (page) =>
-  page.evaluate(() =>
-    [...document.querySelectorAll('.rooms .room')].map((r) =>
-      r.querySelector('button').textContent.trim().replace(/\s+/g, ' '),
-    ),
-  );
+  page.evaluate(() => document.querySelector('.bar .playing')?.textContent.trim() ?? null);
+const inList = (page) => roomsListed(page);
 
 (async () => {
   const ryan = await person(ryanLink);
@@ -48,7 +43,7 @@ const inList = (page) =>
     (await inList(alex.page)).some((r) => /Lobby.*Quick Draw/.test(r)), true);
 
   // Out of the game: the room is where it was, for both of them.
-  await ryan.page.click('header button:has-text("Leave the game")');
+  await ryan.page.click('.bar button:has-text("Leave the game")');
   await ryan.page.waitForTimeout(400);
   await ryan.page.click('dialog.ask button.primary');
   await ryan.page.waitForTimeout(2500);

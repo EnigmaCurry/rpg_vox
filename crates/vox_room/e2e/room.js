@@ -124,17 +124,52 @@ async function atTheDoor(url, opts = {}) {
 
 // -- reading the room off a page -------------------------------------
 
-/// The names on the strips under the room you are in.
+/// The names on the strips for the room you are in. They are under the
+/// heading that names it, and they are the only strips on the page.
 const strips = (page) =>
   page.evaluate(() =>
-    [...document.querySelectorAll('.room.here .strip .label')].map((e) =>
+    [...document.querySelectorAll('.rooms .strip .label')].map((e) =>
       e.textContent.trim().replace(/\s+/g, ' '),
     ),
   );
 
-/// Which room the list says you are in.
+/// Which room the heading says you are in.
 const whereYouAre = (page) =>
-  page.evaluate(() => document.querySelector('.rooms [aria-checked=true] .name')?.textContent.trim());
+  page.evaluate(() => document.querySelector('.pick .current .name')?.textContent.trim());
+
+/// Open the heading, which is the only way to see the rooms: the list
+/// is behind it and over the strips.
+async function openRooms(page) {
+  await page.click('.pick .current');
+  await page.waitForSelector('.pick .list');
+}
+
+async function closeRooms(page) {
+  await page.keyboard.press('Escape');
+  await page.waitForTimeout(200);
+}
+
+/// Every room you may go to, as the picker lists them -- the whole of
+/// each row, so a game being played in one is in what comes back.
+async function roomsListed(page) {
+  await openRooms(page);
+  const rows = await page.evaluate(() =>
+    [...document.querySelectorAll('.pick .list button')].map((b) =>
+      b.textContent.trim().replace(/\s+/g, ' '),
+    ),
+  );
+  await closeRooms(page);
+  return rows;
+}
+
+/// Go to another room: open the heading, press the room, and let the
+/// new one arrive. The list shuts itself on the way.
+async function goTo(page, title, settle = 1200) {
+  await page.click('.pick .current');
+  await page.waitForSelector('.pick .list');
+  await page.click(`.pick .list button:has-text("${title}")`);
+  await page.waitForTimeout(settle);
+}
 
 /// Everything on screen that somebody said.
 const said = (page) =>
@@ -244,6 +279,10 @@ module.exports = {
   atTheDoor,
   strips,
   whereYouAre,
+  openRooms,
+  closeRooms,
+  roomsListed,
+  goTo,
   said,
   type,
   cookieFor,

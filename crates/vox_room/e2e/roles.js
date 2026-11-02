@@ -10,7 +10,7 @@
 //   vox_room invite-owner Ryan   # the first link
 //   vox_room invite Alex         # the second
 
-const { BASE, is, report, person, socket, until, wait } = require('./room.js');
+const { BASE, is, report, person, socket, until, wait, openRooms, closeRooms } = require('./room.js');
 const [ownerLink, alexLink] = process.argv.slice(2);
 const alexToken = alexLink.replace(/.*\/join\//, '');
 
@@ -43,10 +43,12 @@ const asked = async (cookie, path, init = {}) => {
   // The owner, in a browser, because the page is the thing being
   // tested. The owner sees every room without being given one.
   const boss = await person(ownerLink);
+  await openRooms(boss.page);
   is('the owner has the house',
     await boss.page.evaluate(() =>
-      [...document.querySelectorAll('.rooms .room > button .name')].map((e) => e.textContent.trim())),
+      [...document.querySelectorAll('.pick .list button .name')].map((e) => e.textContent.trim())),
     ['You and Vox', 'Lobby', 'Studio', 'Cellar']);
+  await closeRooms(boss.page);
 
   // Only the owner is offered the page at all.
   await boss.page.click('footer button.cog');
@@ -120,10 +122,12 @@ const asked = async (cookie, path, init = {}) => {
   is('the link is one of this room’s', link.startsWith(BASE + '/join/'), true);
   const mo = await person(link);
   is('and it lets them in', await mo.page.evaluate(() => !!document.querySelector('.log')), true);
+  await openRooms(mo.page);
   is('with the lobby and a room of their own',
     await mo.page.evaluate(() =>
-      [...document.querySelectorAll('.rooms .room > button .name')].map((e) => e.textContent.trim())),
+      [...document.querySelectorAll('.pick .list button .name')].map((e) => e.textContent.trim())),
     ['You and Vox', 'Lobby']);
+  await closeRooms(mo.page);
   await mo.browser.close();
 
   // None of it is anybody else's: not the page, and not the API behind

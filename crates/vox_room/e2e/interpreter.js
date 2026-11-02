@@ -17,12 +17,12 @@
 //     --model fake --llm-url http://127.0.0.1:1/v1 \
 //     --language English --language-also Russian --translate openai
 
-const { is, report, person, strips } = require('./room.js');
+const { is, report, person, strips, goTo } = require('./room.js');
 const [ryanLink, alexLink] = process.argv.slice(2);
 
 const interpreter = (page) =>
   page.evaluate(() => {
-    const s = [...document.querySelectorAll('.room.here .strip')].find(
+    const s = [...document.querySelectorAll('.rooms .strip')].find(
       (s) => s.querySelector('.label').textContent.trim() === 'Interpreter',
     );
     return s
@@ -45,7 +45,7 @@ const interpreter = (page) =>
 
   // Turning it down is Ryan's business and nobody else's.
   await ryan.page.evaluate(() => {
-    const s = [...document.querySelectorAll('.room.here .strip')].find(
+    const s = [...document.querySelectorAll('.rooms .strip')].find(
       (s) => s.querySelector('.label').textContent.trim() === 'Interpreter',
     );
     const r = s.querySelector('input[type=range]');
@@ -58,14 +58,12 @@ const interpreter = (page) =>
   is("Alex's is where she left it", (await interpreter(alex.page)).fader, 1);
 
   // A room of your own never has one: there is nobody to interpret to.
-  await ryan.page.click('.rooms button:has-text("You and Vox")');
-  await ryan.page.waitForTimeout(1200);
+  await goTo(ryan.page, 'You and Vox');
   is('none in a room of your own', await strips(ryan.page), ['Ryan (you)', 'Vox']);
 
   // And when the other language leaves, it goes.
   await alex.browser.close();
-  await ryan.page.click('.rooms button:has-text("Lobby")');
-  await ryan.page.waitForTimeout(1500);
+  await goTo(ryan.page, 'Lobby', 1500);
   is('nobody left to interpret for', await strips(ryan.page), ['Ryan (you)', 'Vox']);
 
   await ryan.browser.close();

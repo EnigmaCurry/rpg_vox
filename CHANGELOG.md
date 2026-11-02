@@ -90,6 +90,31 @@ releases.
 
 ### Voice room
 
+- **The room has no title bar.** It held the room's name and four
+  buttons, and every one of them belonged somewhere else. The name is
+  the heading of the room column; starting a new conversation and
+  leaving a game are over the conversation, beside the way into the
+  old ones; and **Stop** is in the footer with the rest of what you
+  reach for while talking. The row they shared is a row of the
+  conversation now.
+
+- **The rooms are behind their own name.** They were a list down the
+  left with the room you were in opened out into its strips, so the
+  strips sat at whatever height the list left them and moved whenever
+  anybody made a room. Which room you are in is the heading of the page
+  now; press it and every room you may go to drops down **over** the
+  strips, press one and the list shuts and you are there. A house can
+  hold a great many rooms, so the list scrolls rather than running off
+  the screen — and the strips underneath never move, because they are
+  the one place to look for who is here and how loud they are, and a
+  list that pushed them down the screen would make you find them again
+  afterwards.
+
+  On a narrow screen the heading is above the tabs rather than inside
+  one: which room you are in is true of whichever area you are looking
+  at. The tab that held the rooms holds who is in this one, so it is
+  called **People**.
+
 - **The room hands a browser nothing until Join Audio.** Opening an
   invite link used to write the token straight into a cookie and keep
   it for a day. Looking at a link is not using one: `/join/<token>` is

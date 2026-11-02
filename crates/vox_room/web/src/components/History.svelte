@@ -1,18 +1,20 @@
 <script>
   import {
-    room, loadHistory, readConversation, backToNow, forgetConversation,
+    room, ask, command, loadHistory, readConversation, backToNow, forgetConversation,
     nameConversation, whenItWas,
   } from '../lib/room.svelte.js';
   import { TITLE_MAX } from '../lib/names.js';
 
-  // The bar over the conversation: which one you are reading, and the
-  // way into the ones the room has had before.
+  // The bar over the conversation: which one you are reading, what the
+  // room is playing, and the way into the ones it has had before.
   //
-  // It sits here rather than in the top bar or the room list because
-  // this is the column it governs — and because reading an old
-  // conversation is a thing you do alone. Nothing in here is sent to
-  // the room; the only exception is deleting one, which takes it away
-  // from everybody and asks first.
+  // Everything here is about this conversation, which is why it is
+  // here: there is no title bar over the room any more, and what used
+  // to be in it has gone to whichever column it was actually about.
+  // Starting a new conversation and leaving a game are both of them
+  // this one, so they are the two things in here that the whole room
+  // sees — and both ask first, because both take something away from
+  // everybody.
   let open = $state(false);
   let menu = $state();
 
@@ -56,6 +58,22 @@
         },
   );
   const mine = $derived(typing ?? (showing.title || whenItWas(showing)));
+
+  async function newConversation() {
+    const question = room.game
+      ? `Restart ${room.game} from the beginning, for everyone?`
+      : 'Start a new conversation? The current one is kept in the database but cleared from the screen.';
+    if (await ask(question, room.game ? 'Restart' : 'New conversation')) command({ type: 'new_conversation' });
+  }
+
+  // "Leave the game", not "back to the lobby": a room may well be
+  // called Lobby, and a button that reads like it goes there when it
+  // does nothing of the kind is a worse button than a plain one.
+  async function lobby() {
+    if (await ask(`Leave ${room.game} and take everyone in this room back to the conversation?`, 'Leave the game')) {
+      command({ type: 'lobby' });
+    }
+  }
 
   function rename() {
     if (typing === null) return;
@@ -101,9 +119,18 @@
     </span>
   {:else if room.game}
     <span class="playing">{room.game}</span>
+    <button class="leave" onclick={lobby}>Leave the game</button>
   {/if}
 
   <div class="spacer"></div>
+
+  <!-- Starting the next one, beside the way back into the last ones:
+       they are the same question asked in two directions. -->
+  {#if !reading}
+    <button class="fresh" onclick={newConversation}>
+      {room.game ? 'Restart game' : 'New conversation'}
+    </button>
+  {/if}
 
   <div class="picker" bind:this={menu}>
     <button aria-haspopup="menu" aria-expanded={open} class:on={open} onclick={show}>
@@ -181,8 +208,9 @@
   }
   .closed { font-size: 12px; color: var(--muted); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .back { padding: 2px 10px; font-size: 13px; }
+  .fresh, .leave { padding: 2px 10px; font-size: 13px; white-space: nowrap; }
   .picker { position: relative; }
-  .picker > button { padding: 2px 10px; font-size: 13px; }
+  .picker > button { padding: 2px 10px; font-size: 13px; white-space: nowrap; }
   .picker > button.on { border-color: var(--muted); }
   .caret { font-size: 10px; opacity: 0.7; }
   .menu {

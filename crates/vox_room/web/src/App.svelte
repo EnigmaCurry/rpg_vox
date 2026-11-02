@@ -21,32 +21,20 @@
   const hasCards = $derived(room.cards.length > 0);
   const area = $derived(view === 'cards' && !hasCards ? 'chat' : view);
 
+  // The rooms are not a tab any more -- which room you are in is the
+  // heading over all of these, and every other room is behind it -- so
+  // what is left in that area is who is in this one and how loud they
+  // are, which is what the tab is called.
   const views = $derived([
     { id: 'chat', label: 'Conversation' },
     ...(hasCards ? [{ id: 'cards', label: 'Just for you' }] : []),
-    { id: 'room', label: 'Rooms' },
+    { id: 'room', label: 'People' },
   ]);
 
   // Only who this browser is. The sockets wait for Join Audio: a tab at
   // the door is not in the room, and nothing of the room's is its
   // business until it is.
   onMount(whoami);
-
-  async function newConversation() {
-    const question = room.game
-      ? `Restart ${room.game} from the beginning, for everyone?`
-      : 'Start a new conversation? The current one is kept in the database but cleared from the screen.';
-    if (await ask(question, room.game ? 'Restart' : 'New conversation')) command({ type: 'new_conversation' });
-  }
-
-  // "Leave the game", not "back to the lobby": a room may well be
-  // called Lobby, and a button that reads like it goes there when it
-  // does nothing of the kind is a worse button than a plain one.
-  async function lobby() {
-    if (await ask(`Leave ${room.game} and take everyone in this room back to the conversation?`, 'Leave the game')) {
-      command({ type: 'lobby' });
-    }
-  }
 
   let peekDialog = $state();
   $effect(() => {
@@ -146,25 +134,11 @@
   <Settings />
 {:else}
   <div class="app show-{area}" class:watching={screen.watching != null} class:nocards={!hasCards}>
-    <header>
-      <!-- Which room you are in. The list on the left says it too, on a
-           screen wide enough to show the list -- on a narrow one it is
-           behind a tab, and then this is the only thing that does. -->
-      <h1>{room.title}</h1>
-      {#if room.game}
-        <span class="playing" title="{room.game} is being played in {room.title}.">{room.game}</span>
-        <button onclick={lobby}>Leave the game</button>
-      {/if}
-      {#if busyAI()}
-        <!-- Whichever of them is talking: Stop cuts the reply that is
-             in flight, and in a room with two AIs only one is. -->
-        <button class="danger" onclick={() => command({ type: 'stop' })}>Stop {busyAI().name}</button>
-      {/if}
-      <div class="spacer"></div>
-      <button onclick={newConversation}>{room.game ? 'Restart game' : 'New conversation'}</button>
-      {#if !room.connected}<span class="offline">reconnecting…</span>{/if}
-    </header>
-
+    <!-- No title bar. What a room is called is the heading of the room
+         list, which is the column it belongs to; what a conversation
+         is called, and what is done to it, is the bar over the
+         conversation; and the two live controls that were up here are
+         in the footer with the rest of what you reach for. -->
     <nav class="views" aria-label="Which area to show">
       {#each views as v (v.id)}
         <button aria-pressed={area === v.id} class:on={area === v.id} onclick={() => (view = v.id)}>
@@ -202,7 +176,16 @@
              strung with sliders and readouts put the way out next to a
              volume control, and none of it was anything you touched
              twice. -->
+        {#if busyAI()}
+          <!-- Whichever of them is talking: Stop cuts the reply that is
+               in flight, and in a room with two AIs only one is. It is
+               here because it is the other thing you reach for without
+               looking, and it is only here while there is a reply to
+               cut. -->
+          <button class="danger" onclick={() => command({ type: 'stop' })}>Stop {busyAI().name}</button>
+        {/if}
         <div class="spacer"></div>
+        {#if !room.connected}<span class="offline">reconnecting…</span>{/if}
         {#if canShare()}
           <button class="share" class:on={screen.sharing} onclick={() => (screen.sharing ? stopSharing() : share())}
             title={screen.sharing
@@ -235,55 +218,46 @@
   .app {
     height: 100%;
     display: grid;
-    /* Wide: the rooms down the left with the mixer for the one you are
-       in under it, then what is yours alone, then the room's
-       conversation, the last two the same size. The rooms get only
-       what the widest fader needs, which is not much now that a strip
-       is three tight lines. */
+    /* Wide: which room you are in at the top left -- the heading of the
+       page, there being no bar above it -- with who is in that room
+       under it, then what is yours alone, then the room's
+       conversation, the last two the same size. The left column gets
+       only what the widest fader needs, which is not much now that a
+       strip is three tight lines. */
     grid-template-columns: 260px 1fr 1fr;
     grid-template-rows: auto 1fr auto;
-    grid-template-areas: "head head head" "rooms cards log" "foot foot foot";
+    grid-template-areas:
+      "pick  cards log"
+      "rooms cards log"
+      "foot  foot  foot";
   }
   /* With nothing in your cards there is no column for them, and the
      conversation has the half they were taking. */
   .app.nocards {
     grid-template-columns: 260px 1fr;
-    grid-template-areas: "head head" "rooms log" "foot foot";
+    grid-template-areas: "pick log" "rooms log" "foot foot";
   }
-  :global(.rooms) { grid-area: rooms; border-right: 1px solid var(--line); }
+  /* The heading and the strips are two cells of one column, so the
+     rule down its edge is on both -- and the heading's own rule under
+     it is its, in the component. */
+  :global(.pick), :global(.rooms) { border-right: 1px solid var(--line); }
+  :global(.pick) { grid-area: pick; }
+  :global(.rooms) { grid-area: rooms; min-height: 0; }
   :global(.cards) { grid-area: cards; border-right: 1px solid var(--line); }
   /* One area at a time is a narrow-screen idea; here all three show. */
   .views { display: none; }
-  /* Both bars are frames around the room rather than things to read,
-     so they are kept as thin as their tallest control allows: every row
-     they give up is a row of the conversation. */
-  header {
-    grid-area: head;
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: 8px;
-    padding: 6px 12px;
-    border-bottom: 1px solid var(--line);
-    background: var(--panel);
-  }
-  h1 { font-size: 17px; margin: 0; }
-  /* The game the room is playing, beside the room's own name. */
-  .playing {
-    font-size: 13px;
-    font-weight: 600;
-    padding: 3px 10px;
-    border-radius: 999px;
-    background: var(--agent);
-    color: var(--accent-ink);
-  }
   h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin: 0 0 4px; }
   .spacer { flex: 1; }
   .offline { color: var(--danger); font-size: 13px; }
   :global(.log) { grid-area: log; }
   :global(.board) { grid-area: board; }
-  .app.watching { grid-template-areas: "head head head" "rooms board board" "foot foot foot"; }
-  .app.nocards.watching { grid-template-areas: "head head" "rooms board" "foot foot"; }
+  .app.watching {
+    grid-template-areas:
+      "pick  board board"
+      "rooms board board"
+      "foot  foot  foot";
+  }
+  .app.nocards.watching { grid-template-areas: "pick board" "rooms board" "foot foot"; }
   .app.watching :global(.log), .app.watching :global(.cards) { display: none; }
   footer button.on { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
   .ask.peek { width: min(46em, calc(100vw - 32px)); max-width: none; }
@@ -364,21 +338,25 @@
     .app, .app.nocards {
       grid-template-columns: 1fr;
       grid-template-rows: auto auto 1fr auto;
-      grid-template-areas: "head" "views" "main" "foot";
+      grid-template-areas: "pick" "views" "main" "foot";
     }
     .views { display: flex; }
+    /* The heading stays out of the tabs and over them: which room you
+       are in is true of whichever area you are looking at, and on a
+       narrow screen it is the only thing saying so. */
+    :global(.pick) { border-right: 0; }
     :global(.log), :global(.cards), :global(.rooms), :global(.board) { grid-area: main; min-height: 0; }
     /* Watching takes the whole area, and the switch above it goes with
        the areas it switched between: the board has its own way out.
        (The wide `.app.watching` template is two classes, so it must be
        put back here or its three columns survive into one.) */
-    .app.watching, .app.nocards.watching { grid-template-areas: "head" "views" "main" "foot"; }
+    .app.watching, .app.nocards.watching { grid-template-areas: "pick" "views" "main" "foot"; }
     .app.watching .views { display: none; }
     .app.watching :global(.log), .app.watching :global(.cards), .app.watching :global(.rooms) { display: none; }
     :global(.cards), :global(.rooms) { border-right: 0; }
     .app:not(.show-chat) :global(.log) { display: none; }
     .app:not(.show-cards) :global(.cards) { display: none; }
     .app:not(.show-room) :global(.rooms) { display: none; }
-    header, footer { padding: 5px 10px; }
+    footer { padding: 5px 10px; }
   }
 </style>

@@ -46,7 +46,7 @@ const shut = async (page) => {
 
   // And pressing New conversation on it leaves nothing behind.
   for (let i = 0; i < 2; i++) {
-    await ryan.page.click('header button:has-text("New conversation")');
+    await ryan.page.click('.bar button:has-text("New conversation")');
     await ryan.page.waitForTimeout(300);
     await ryan.page.click('dialog.ask button.primary');
     await ryan.page.waitForTimeout(1400);
@@ -70,7 +70,7 @@ const shut = async (page) => {
   is('and Alex sees the name too', await name(alex.page), 'The heist');
 
   // A new conversation is blank, and Alex is brought into it too.
-  await ryan.page.click('header button:has-text("New conversation")');
+  await ryan.page.click('.bar button:has-text("New conversation")');
   await ryan.page.waitForTimeout(300);
   await ryan.page.click('dialog.ask button.primary');
   await ryan.page.waitForTimeout(1600);
