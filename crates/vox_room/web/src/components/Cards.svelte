@@ -62,6 +62,7 @@
   .only { font-size: 12px; color: var(--muted); margin-left: auto; }
   .scroll {
     overflow-y: auto;
+    overscroll-behavior: contain;
     min-height: 0;
     flex: 1;
     display: flex;

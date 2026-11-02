@@ -291,6 +291,7 @@
     overflow-wrap: anywhere;
     max-height: 60vh;
     overflow-y: auto;
+    overscroll-behavior: contain;
     background: var(--bubble);
     border: 1px solid var(--line);
     border-radius: 8px;

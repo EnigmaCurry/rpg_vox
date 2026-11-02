@@ -193,6 +193,7 @@
     width: min(30em, 80vw);
     max-height: 60vh;
     overflow-y: auto;
+    overscroll-behavior: contain;
     background: var(--panel);
     border: 1px solid var(--line);
     border-radius: 10px;

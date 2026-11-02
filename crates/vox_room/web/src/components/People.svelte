@@ -290,7 +290,14 @@
 </main>
 
 <style>
-  .people { max-width: 60em; margin: 0 auto; padding: 24px 16px 48px; height: 100%; overflow: auto; }
+  .people {
+    max-width: 60em;
+    margin: 0 auto;
+    padding: 24px 16px 48px;
+    height: 100%;
+    overflow: auto;
+    overscroll-behavior: contain;
+  }
   header { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; }
   .spacer { flex: 1; }
   h1 { font-size: 20px; margin: 0; }

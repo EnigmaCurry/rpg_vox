@@ -33,7 +33,17 @@
   }
 }
 * { box-sizing: border-box; }
-html, body { margin: 0; height: 100%; }
+html, body {
+  margin: 0;
+  height: 100%;
+  /* No pull-to-refresh. The room is a page you sit in with your
+     microphone open: a swipe that reloads it drops the audio, the
+     socket and your place in the conversation, and there is nothing
+     here that a reload would fetch. It also stops a swipe that runs
+     off the end of a list from rubber-banding the whole page.
+     Honoured by Safari 16 and later; older ones keep the gesture. */
+  overscroll-behavior: none;
+}
 body {
   background: var(--bg);
   color: var(--ink);

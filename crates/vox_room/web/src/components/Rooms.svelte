@@ -165,7 +165,7 @@
      from the top, the way a list of channels does. The nav's own label
      is what says what it is, for anyone who can't see that it is a
      list of rooms. */
-  .rooms { padding: 0; overflow-y: auto; }
+  .rooms { padding: 0; overflow-y: auto; overscroll-behavior: contain; }
   .room { display: flex; flex-direction: column; }
   .room > button {
     display: flex;

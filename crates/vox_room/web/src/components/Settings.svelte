@@ -107,6 +107,7 @@
     padding: 24px 16px 48px;
     height: 100%;
     overflow: auto;
+    overscroll-behavior: contain;
   }
   header { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; }
   .spacer { flex: 1; }

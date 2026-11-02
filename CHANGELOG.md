@@ -90,6 +90,15 @@ releases.
 
 ### Voice room
 
+- **No pull-to-refresh.** A swipe down at the top of the room reloaded
+  it on iOS Safari, which drops the audio, the socket and your place in
+  the conversation -- for a page where there is nothing a reload would
+  fetch. The document and every list in it keep their overscroll to
+  themselves now, so running off the end of the conversation or the
+  room list is the end of it rather than the start of a reload.
+  `overscroll-behavior` is Safari 16 and later; an older one keeps the
+  gesture.
+
 - **The owner makes the rooms.** The house used to be the command
   line's: `--room` at startup, and a restart to add one. The rooms are
   rows now, made, renamed and taken away from the **People and rooms**
