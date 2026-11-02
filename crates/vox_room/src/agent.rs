@@ -20,7 +20,9 @@ use tracing::{debug, info, warn};
 use vox_transcribe::filters::{clause_end, sentence_end};
 use vox_transcribe::translate::Translate;
 
-use crate::room::{Cue, GameSettings, Players, ReplyMode, Role, Room, RoomConfig, Turn, TypedJob};
+#[cfg(test)]
+use crate::room::RoomConfig;
+use crate::room::{Cue, GameSettings, Players, ReplyMode, Role, Room, Turn, TypedJob};
 use crate::tts::Voice;
 
 /// The default instructions; `{name}` and `{people}` are filled in.
@@ -357,6 +359,10 @@ impl Voices {
 
 pub struct Agent {
     pub llm: Llm,
+    /// Which of the room's AIs this thread is. It is what `{name}` in
+    /// the prompt becomes, so a second bot is told it is itself rather
+    /// than told it is the first one.
+    pub name: String,
     pub prompt: String,
     pub generation: Arc<AtomicU64>,
     /// How the room puts a line into another language, or None when it
@@ -381,6 +387,7 @@ impl Agent {
         turns: Receiver<Turn>,
     ) {
         let canonical = room.config().language.clone();
+        let who = self.name.clone();
         let mut senders = Vec::new();
         for (language, voice) in voices {
             let (tx, rx) = crossbeam_channel::unbounded::<Speak>();
@@ -394,13 +401,13 @@ impl Agent {
             let r = room.clone();
             let canonical = canonical.clone();
             std::thread::Builder::new()
-                .name(format!("vox-room-voice-{language}"))
+                .name(format!("vox-room-voice-{who}-{language}"))
                 .spawn(move || speak(r, &canonical, &language, voice, translate, rx, generation))
                 .expect("spawn voice thread");
         }
         let tx = Voices(senders);
         std::thread::Builder::new()
-            .name("vox-room-agent".into())
+            .name(format!("vox-room-agent-{}", self.name))
             .spawn(move || {
                 let http = ureq::AgentBuilder::new()
                     .timeout_connect(Duration::from_secs(10))
@@ -411,7 +418,7 @@ impl Agent {
                     if self.generation.load(Ordering::SeqCst) != g {
                         continue;
                     }
-                    let messages = self.messages(room.config(), &turn);
+                    let messages = self.messages(&turn);
                     let result = match &self.llm {
                         // Echo has no judgment to offer, so it hands a
                         // turn it was asked to judge straight back.
@@ -442,7 +449,7 @@ impl Agent {
             .expect("spawn agent thread");
     }
 
-    fn messages(&self, cfg: &RoomConfig, turn: &Turn) -> Vec<Value> {
+    fn messages(&self, turn: &Turn) -> Vec<Value> {
         // Who is here, and anyone who spoke in the history.
         let mut people: Vec<String> = turn
             .messages
@@ -492,7 +499,7 @@ impl Agent {
             ),
             Some((game, prompt)) => format!("{}{translated}", game_prompt(game, prompt)),
         }
-        .replace("{name}", &cfg.bot().name)
+        .replace("{name}", &self.name)
         .replace("{people}", &people);
         let mut out = vec![json!({ "role": "system", "content": system })];
         for (role, text) in &turn.messages {
@@ -1388,14 +1395,14 @@ fn run_tool(room: &Room, cfg: &Chat, g: u64, call: &ToolCall) -> String {
         "wait_until_named" => {
             // What the room is doing afterwards: a game that answers at
             // every pause still does, and the model should know.
-            let mode = room.wait_until_named();
+            let mode = room.wait_until_named(g);
             Ok(json!({ "answering": mode }))
         }
         "send_card" => room
-            .send_card(&arg("to"), &arg("title"), &arg("body"))
+            .send_card(g, &arg("to"), &arg("title"), &arg("body"))
             .map(|to| json!({ "sent": true, "to": to })),
         "post_card" => room
-            .post_card(&arg("title"), &arg("body"))
+            .post_card(g, &arg("title"), &arg("body"))
             .map(|title| json!({ "posted": title })),
         "take_back_card" => room
             .take_back_card(&arg("to"), &arg("title"))
@@ -1561,30 +1568,21 @@ mod tests {
         }
     }
 
-    fn turn(cue: Cue) -> (Agent, RoomConfig, Turn) {
+    fn turn(cue: Cue) -> (Agent, Turn) {
         turn_with(cue, &["Ryan", "Alex"], false)
     }
 
-    fn turn_with(cue: Cue, people: &[&str], engaged: bool) -> (Agent, RoomConfig, Turn) {
+    /// An agent and a turn for it. The room's own settings are not in
+    /// it any more: what the AI is told about itself comes from the
+    /// agent, because in a room with two of them the room could only
+    /// have said one of their names.
+    fn turn_with(cue: Cue, people: &[&str], engaged: bool) -> (Agent, Turn) {
         let agent = Agent {
             llm: Llm::Echo,
+            name: "Vox".into(),
             prompt: DEFAULT_PROMPT.to_string(),
             generation: Arc::new(AtomicU64::new(0)),
             translate: None,
-        };
-        let cfg = RoomConfig {
-            id: "Lobby".into(),
-            title: "Lobby".into(),
-            only: None,
-            default_mode: Mode::Named,
-            bots: vec![BotConfig::new("Vox", vec![])],
-            reply_after: Duration::from_millis(1200),
-            confirm: Duration::from_millis(300),
-            engaged_for: Duration::from_secs(30),
-            history: 60,
-            language: "English".into(),
-            languages: vec!["English".into()],
-            spoken: vec!["English".into()],
         };
         let turn = Turn {
             generation: 1,
@@ -1597,7 +1595,7 @@ mod tests {
             engaged,
             cue,
         };
-        (agent, cfg, turn)
+        (agent, turn)
     }
 
     /// A whole reply, through the real thing: the room's own request,
@@ -1615,9 +1613,7 @@ mod tests {
         println!("speaking {:?} to {}", chat.api(), chat.url);
         let store = crate::store::Store::memory();
         store.invite("Ryan").unwrap();
-        let (turns_tx, _turns) = crossbeam_channel::unbounded();
-        let generation = Arc::new(AtomicU64::new(7));
-        let room = Room::new(
+        let (room, _wiring) = Room::new(
             store,
             RoomConfig {
                 id: "Lobby".into(),
@@ -1633,15 +1629,13 @@ mod tests {
                 languages: vec!["English".into()],
                 spoken: vec!["English".into()],
             },
-            generation.clone(),
-            turns_tx,
             None,
             std::collections::BTreeMap::new(),
             None,
         )
         .unwrap();
 
-        let (agent, cfg, mut t) = turn_with(Cue::Speak, &["Ryan"], false);
+        let (agent, mut t) = turn_with(Cue::Speak, &["Ryan"], false);
         t.messages = vec![(
             Role::User,
             "Ryan: Vox, put the rules up for everyone: one card each, aces low. \
@@ -1658,12 +1652,12 @@ mod tests {
             &http,
             &room,
             &chat,
-            &agent.messages(&cfg, &t),
+            &agent.messages(&t),
             true,
             t.cue,
             7,
             Instant::now(),
-            &generation,
+            &room.generation_of_only_bot(),
             &tx,
         )
         .expect("the reply");
@@ -1731,11 +1725,11 @@ mod tests {
         let mut queue: Vec<_> = cases.iter().rev().collect();
         while let Some(case) = queue.pop() {
             let (said, people, engaged, want_turn) = case;
-            let (agent, cfg, mut t) = turn_with(Cue::Decide { lull: None }, people, *engaged);
+            let (agent, mut t) = turn_with(Cue::Decide { lull: None }, people, *engaged);
             t.messages = vec![(Role::User, said.to_string())];
             // Ask the way the room asks, on whichever API it speaks.
             let offered = tools_for(true, false, true);
-            let messages = agent.messages(&cfg, &t);
+            let messages = agent.messages(&t);
             let (path, mut body) = match chat.api() {
                 Api::Responses => (
                     "responses",
@@ -1985,8 +1979,8 @@ mod tests {
     #[test]
     fn a_turn_to_judge_says_who_it_is_being_judged_among() {
         let note = |people: &[&str], engaged| {
-            let (agent, cfg, t) = turn_with(Cue::Decide { lull: None }, people, engaged);
-            agent.messages(&cfg, &t).pop().unwrap()["content"]
+            let (agent, t) = turn_with(Cue::Decide { lull: None }, people, engaged);
+            agent.messages(&t).pop().unwrap()["content"]
                 .as_str()
                 .unwrap()
                 .to_string()
@@ -2014,8 +2008,8 @@ mod tests {
 
     #[test]
     fn a_turn_to_judge_ends_with_what_makes_it_a_judgment() {
-        let (agent, cfg, t) = turn(Cue::Decide { lull: None });
-        let messages = agent.messages(&cfg, &t);
+        let (agent, t) = turn(Cue::Decide { lull: None });
+        let messages = agent.messages(&t);
         let last = messages.last().unwrap();
         assert_eq!(last["role"], "user");
         let note = last["content"].as_str().unwrap();
@@ -2026,8 +2020,8 @@ mod tests {
         assert_eq!(messages[1]["content"], "Ryan: so what did you make of it?");
 
         // The silence it asked for says how long it has lasted.
-        let (agent, cfg, t) = turn(Cue::Decide { lull: Some(8) });
-        let note = agent.messages(&cfg, &t);
+        let (agent, t) = turn(Cue::Decide { lull: Some(8) });
+        let note = agent.messages(&t);
         let note = note.last().unwrap()["content"]
             .as_str()
             .unwrap()
@@ -2036,8 +2030,8 @@ mod tests {
         assert!(!note.contains("{lull}"));
 
         // A turn it was told to take carries no such note at all.
-        let (agent, cfg, t) = turn(Cue::Speak);
-        let messages = agent.messages(&cfg, &t);
+        let (agent, t) = turn(Cue::Speak);
+        let messages = agent.messages(&t);
         assert_eq!(messages.len(), 2, "system and the conversation");
         assert!(!messages[1]["content"]
             .as_str()

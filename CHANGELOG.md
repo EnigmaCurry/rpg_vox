@@ -90,6 +90,34 @@ releases.
 
 ### Voice room
 
+- **More than one AI in a room, and one pause between them.**
+  `--bot NAME[:VOICE[:PROMPT_FILE]]` (`VOX_ROOM_BOTS`) puts another AI
+  in every room. Each has its own name to be called by, its own voice,
+  its own prompt with `{name}` filled in as itself, its own fader under
+  the room, and its own **Answers** setting per room -- so one of them
+  can answer every pause in your own room while waiting to be named in
+  the Lobby.
+
+  **Who answers a pause** is settled by who speaks first. Every bot
+  that could answer is given the turn at once and the first to actually
+  say something keeps it; the rest are told to stop. Asking them one at
+  a time would put a round trip of silence in the room for every bot
+  with nothing to say, and letting them all finish would be two voices
+  over each other. A bot cut off this way leaves nothing behind -- no
+  bubble on anyone's screen, nothing in the conversation, and nothing
+  for the model to read back later as a turn where somebody said
+  nothing. A bot already speaking is never cut off by another starting:
+  it is the first word that claims the pause, and it has already had
+  it.
+
+  Nothing inside the room assumes there is one AI any more. A card is
+  signed by the bot that dealt it, a game's button by the bot that
+  designed it, a failed reply names the bot whose turn it was, and
+  nobody in the room may call themselves after any of them. The screen
+  follows: each strip says what *that* bot is doing, **Stop** names
+  whichever of them is talking, and the prose that used to say "the AI"
+  says all their names.
+
 - **One server, several rooms, and a room of your own.** A `vox_room`
   used to be a room. It is now a house: the rooms you name with
   `--room` (`VOX_ROOM_ROOMS`), which everyone shares, and on top of

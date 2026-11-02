@@ -11,7 +11,7 @@
 //! {"type": "ptt", "on": true}
 //! {"type": "strip", "name": "Alex", "gain": 0.8, "mute": false}
 //! {"type": "interpreter", "gain": 0.8, "mute": false}
-//! {"type": "mode", "mode": "always"}
+//! {"type": "mode", "bot": "Vox", "mode": "always"}
 //! {"type": "name_conversation", "conversation": 7, "title": "The heist"}
 //! {"type": "stop"}
 //! {"type": "new_conversation"}
@@ -474,7 +474,9 @@ enum Command {
         gain: Option<f32>,
         mute: Option<bool>,
     },
+    /// When one bot in this room answers.
     Mode {
+        bot: String,
         mode: String,
     },
     /// Typed into the room rather than said to it.
@@ -618,7 +620,7 @@ async fn client(app: &App, socket: WebSocket, id: u64, who: &Invited) -> anyhow:
                         Ok(Command::Interpreter { gain, mute }) => {
                             room.set_interpreter(id, gain, mute)
                         }
-                        Ok(Command::Mode { mode }) => room.set_mode(&mode),
+                        Ok(Command::Mode { bot, mode }) => room.set_mode(&bot, &mode),
                         // Only the sender hears about a message the room
                         // wouldn't take: it is their typing, not news.
                         Ok(Command::Text { text }) => {

@@ -389,7 +389,6 @@ fn clock(every: Duration, what: &str, mut step: impl FnMut()) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicU64;
 
     use crate::room::BotConfig;
     use crate::store::Store;
@@ -423,19 +422,13 @@ mod tests {
                 let store = Store::memory();
                 store.invite("Ryan").unwrap();
                 store.invite("Alex").unwrap();
-                let (tx, rx) = crossbeam_channel::unbounded();
-                // The receiver would otherwise be dropped, and a turn
-                // sent to a closed channel is an error the room logs.
-                std::mem::forget(rx);
-                Room::new(
-                    store,
-                    cfg,
-                    Arc::new(AtomicU64::new(0)),
-                    tx,
-                    None,
-                    BTreeMap::new(),
-                    None,
-                )
+                Room::new(store, cfg, None, BTreeMap::new(), None).map(|(room, wiring)| {
+                    // The receivers would otherwise be dropped, and a
+                    // turn sent to a closed channel is an error the
+                    // room logs.
+                    std::mem::forget(wiring);
+                    room
+                })
             }),
         )
         .unwrap()

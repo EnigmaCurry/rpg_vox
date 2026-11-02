@@ -14,6 +14,17 @@ const BASE = process.env.VOX_ROOM_URL || 'http://127.0.0.1:7340';
 
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/// Wait until something is so. Room state arrives when the room has
+/// something to say, so a script waits on what it is actually after
+/// rather than on a number of seconds it guessed.
+async function until(ok, { tries = 80, every = 150 } = {}) {
+  for (let i = 0; i < tries; i++) {
+    if (ok()) return true;
+    await wait(every);
+  }
+  return false;
+}
+
 // The button, not the card's prose about it.
 const JOIN = 'button:has-text("Join Audio")';
 // What you agree to before it does anything.
@@ -161,7 +172,7 @@ async function socket(token, base = BASE) {
   const cookie = await cookieFor(token, base);
   const ws = new WebSocket(`${base.replace('http', 'ws')}/room.ws`, { headers: { cookie } });
   ws.binaryType = 'arraybuffer';
-  const p = { ws, rooms: [], notices: [], frames: 0, seen: '', people: [] };
+  const p = { ws, rooms: [], notices: [], frames: 0, seen: '', people: [], said: [] };
   p.send = (m) => ws.send(JSON.stringify(m));
   ws.onmessage = (ev) => {
     if (typeof ev.data !== 'string') {
@@ -172,13 +183,29 @@ async function socket(token, base = BASE) {
     if (m.type === 'hello') {
       p.where = m.room;
       p.people = m.people.map((q) => q.name);
-      p.mode = m.mode;
+      // The AIs in the room, each with its own name, fader and say in
+      // when it speaks. `mode` is the first one's, which is the room's
+      // when there is only one of them in it.
+      p.agents = m.agents;
+      p.mode = m.agents[0]?.mode;
       p.strips = Object.keys(m.strips);
+      // The levels themselves, for the scripts that move a fader and
+      // want to know whose it was.
+      p.faders = m.strips;
       p.log = m.log.map((e) => `${e.who}: ${e.text}`);
       p.conversation = m.conversation;
     } else if (m.type === 'people') {
       p.people = m.people.map((q) => q.name);
       p.speaks = m.speaks;
+    } else if (m.type === 'mode') {
+      const bot = (p.agents ?? []).find((b) => b.name === m.bot);
+      if (bot) bot.mode = m.mode;
+      if (p.agents?.[0]) p.mode = p.agents[0].mode;
+    } else if (m.type === 'agents') {
+      for (const a of m.agents) {
+        const bot = (p.agents ?? []).find((b) => b.name === a.name);
+        if (bot) bot.state = a.state;
+      }
     } else if (m.type === 'rooms') {
       p.rooms = m.rooms;
     } else if (m.type === 'notice') {
@@ -186,6 +213,12 @@ async function socket(token, base = BASE) {
     } else if (m.type === 'entry') {
       p.last = `${m.entry.who}: ${m.entry.text}`;
       p.seen += ` ${m.entry.text}`;
+      p.said.push(m.entry);
+    } else if (m.type === 'entry_removed') {
+      // A turn that was passed on, or taken back before it had any
+      // words in it: it leaves nothing on anybody's screen, so it must
+      // leave nothing here either.
+      p.said = p.said.filter((e) => e.id !== m.id);
     }
   };
   ws.onerror = (e) => console.log('[socket]', e.message);
@@ -198,6 +231,7 @@ module.exports = {
   JOIN,
   AGREE,
   wait,
+  until,
   is,
   report,
   launch,

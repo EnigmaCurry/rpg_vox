@@ -17,7 +17,6 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -74,6 +73,19 @@ struct Cli {
         default_value = "Lobby"
     )]
     rooms: Vec<String>,
+
+    /// Another AI in every room, as `NAME`, `NAME:VOICE` or
+    /// `NAME:VOICE:PROMPT_FILE`. Repeat it for more.
+    ///
+    /// The first AI is the one `--name`, `--voice`, `--alias` and
+    /// `--prompt` describe; these are the ones beside it. Each has its
+    /// own voice, its own fader, and its own say in when it speaks —
+    /// and at a pause every one of them that could answer is given the
+    /// turn at once, with the first to actually say something keeping
+    /// it and the rest told to stop. Two or three is the sane number:
+    /// each one judging each pause is a request each.
+    #[arg(long = "bot", env = "VOX_ROOM_BOTS", value_delimiter = ',')]
+    bots: Vec<String>,
 
     /// The AI's name. In "named" mode it answers when someone says it.
     #[arg(long, env = "VOX_ROOM_AGENT_NAME", default_value = "Vox")]
@@ -663,6 +675,54 @@ fn serve(cli: Cli, store: Store, db: PathBuf) -> Result<()> {
         );
     }
 
+    // The AIs every room gets. The first is the one the old flags
+    // describe; `--bot` adds the others, each with a voice and a
+    // prompt of its own.
+    let mut bots = vec![room::BotConfig::new(
+        &cli.name,
+        cli.aliases
+            .iter()
+            .map(|a| a.trim().to_string())
+            .filter(|a| !a.is_empty())
+            .collect(),
+    )];
+    let mut voices: BTreeMap<String, String> =
+        BTreeMap::from([(cli.name.clone(), cli.voice.clone())]);
+    let mut prompts: BTreeMap<String, String> = BTreeMap::new();
+    for spec in cli.bots.iter().filter(|b| !b.trim().is_empty()) {
+        let mut parts = spec.splitn(3, ':');
+        let name = parts.next().unwrap_or_default().trim().to_string();
+        if name.is_empty() {
+            bail!("--bot wants a name, as NAME or NAME:VOICE or NAME:VOICE:PROMPT_FILE");
+        }
+        if bots.iter().any(|b| b.name.eq_ignore_ascii_case(&name)) {
+            bail!("two AIs called {name:?}: they answer to their names, so they need their own");
+        }
+        let said = parts.next().unwrap_or("").trim();
+        voices.insert(
+            name.clone(),
+            if said.is_empty() {
+                cli.voice.clone()
+            } else {
+                said.to_string()
+            },
+        );
+        if let Some(file) = parts.next().map(str::trim).filter(|f| !f.is_empty()) {
+            let text = std::fs::read_to_string(file)
+                .with_context(|| format!("read {name}'s prompt from {file}"))?;
+            prompts.insert(name.clone(), text);
+        }
+        // A bot nobody configured aliases for answers to its own name.
+        bots.push(room::BotConfig::new(&name, Vec::new()));
+    }
+    if bots.len() > 1 {
+        info!(
+            bots = %bots.iter().map(|b| b.name.as_str()).collect::<Vec<_>>().join(", "),
+            "more than one AI in every room: at a pause they are all given the \
+             turn, and the first to say something keeps it"
+        );
+    }
+
     // The settings every room shares. What makes one room different
     // from another -- its name, who it admits, how its AI takes the
     // turn to begin with -- is filled in by `rooms::Rooms`.
@@ -671,14 +731,7 @@ fn serve(cli: Cli, store: Store, db: PathBuf) -> Result<()> {
         title: String::new(),
         only: None,
         default_mode: room::Mode::Named,
-        bots: vec![room::BotConfig::new(
-            &cli.name,
-            cli.aliases
-                .iter()
-                .map(|a| a.trim().to_string())
-                .filter(|a| !a.is_empty())
-                .collect(),
-        )],
+        bots,
         reply_after: Duration::from_millis(cli.reply_after_ms),
         confirm: Duration::from_millis(cli.confirm_ms),
         engaged_for: Duration::from_millis(cli.engaged_for_ms),
@@ -699,19 +752,12 @@ fn serve(cli: Cli, store: Store, db: PathBuf) -> Result<()> {
         let translate = translate.clone();
         let voice = cli.voice.clone();
         let interpreter_voice = cli.interpreter_voice.clone();
+        let (voices, prompts) = (voices, prompts);
         let interpret = cli.interpret;
         Box::new(move |cfg: RoomConfig| -> Result<Arc<Room>> {
             // `Room::new` scopes it to the room it is given.
             let store = Store::open(&db)?;
-            let generation = Arc::new(AtomicU64::new(0));
-            let (turn_tx, turn_rx) = crossbeam_channel::unbounded();
-            // One voice per language the room is listening in, each on
-            // its own thread, so the languages are spoken at the same
-            // time instead of one after another.
-            let mut voices: Vec<(String, Box<dyn tts::Voice>)> = Vec::new();
-            for language in &cfg.spoken {
-                voices.push((language.clone(), speakers.voice(language, &voice)?));
-            }
+            let languages = cfg.spoken.clone();
             // The two ends of the typing queue are handed out
             // separately: the room is built with the one it puts work
             // on, the translators get the other once there is a room
@@ -731,22 +777,14 @@ fn serve(cli: Cli, store: Store, db: PathBuf) -> Result<()> {
             // Never in a room of somebody's own: there is one person
             // in it and the AI already answers in their language, so
             // there is nobody for an interpreter to interpret to.
-            if interpret && translate.is_some() && voices.len() > 1 && cfg.only.is_none() {
-                for (language, _) in &voices {
+            if interpret && translate.is_some() && languages.len() > 1 && cfg.only.is_none() {
+                for language in &languages {
                     let (tx, rx) = interp::queue();
                     interp_tx.insert(language.clone(), tx);
                     interp_rx.push((language.clone(), rx));
                 }
             }
-            let room = Room::new(
-                store,
-                cfg,
-                generation.clone(),
-                turn_tx,
-                typing_tx,
-                interp_tx,
-                factory.clone(),
-            )?;
+            let (room, wiring) = Room::new(store, cfg, typing_tx, interp_tx, factory.clone())?;
             if let Some(rx) = typing_rx {
                 if let Some(t) = translate.clone() {
                     agent::spawn_typists(room.clone(), t, rx, 2);
@@ -762,13 +800,29 @@ fn serve(cli: Cli, store: Store, db: PathBuf) -> Result<()> {
                     rx,
                 );
             }
-            agent::Agent {
-                llm: llm.clone(),
-                prompt: prompt.clone(),
-                translate: translate.clone(),
-                generation,
+            // One agent thread per bot, and one voice per language it
+            // is spoken in -- each on its own thread, so the languages
+            // are said at the same time rather than one after another,
+            // and so are the bots.
+            for bot in wiring {
+                let preset = voices.get(&bot.name).unwrap_or(&voice);
+                let mut speaking: Vec<(String, Box<dyn tts::Voice>)> = Vec::new();
+                for language in &languages {
+                    speaking.push((language.clone(), speakers.voice(language, preset)?));
+                }
+                agent::Agent {
+                    llm: llm.clone(),
+                    name: bot.name.clone(),
+                    // Its own instructions, or the room's when it was
+                    // given none of its own. `{name}` is filled in
+                    // either way, so the default already says which of
+                    // them it is talking as.
+                    prompt: prompts.get(&bot.name).unwrap_or(&prompt).clone(),
+                    translate: translate.clone(),
+                    generation: bot.generation,
+                }
+                .spawn(room.clone(), speaking, bot.turns);
             }
-            .spawn(room.clone(), voices, turn_rx);
             Ok(room)
         })
     };

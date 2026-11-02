@@ -46,6 +46,10 @@ flags() {
             --model fake --llm-url http://127.0.0.1:1/v1
             --language English --language-also Russian --translate openai" ;;
     rooms)   echo "--room Main --room Studio --echo --no-stt --tts none" ;;
+    # A short back-and-forth: being named has one AI answering the next
+    # pause as well, and this script is about which of them answers.
+    bots)    echo "--room Lobby --bot Sage --echo --no-stt --tts none
+                   --engaged-for-ms 600" ;;
     *)       echo "--room Lobby --room Studio --echo --no-stt --tts none" ;;
   esac
 }
@@ -122,7 +126,7 @@ sqlite_get() { sqlite "$1" "$2"; }
 sqlite_set() { sqlite "$1" "$2" >/dev/null; }
 
 suites=("$@")
-[[ ${#suites[@]} -eq 0 ]] && suites=(rooms door permalinks conversations game interpreter)
+[[ ${#suites[@]} -eq 0 ]] && suites=(rooms bots door permalinks conversations game interpreter)
 
 bad=0
 for suite in "${suites[@]}"; do

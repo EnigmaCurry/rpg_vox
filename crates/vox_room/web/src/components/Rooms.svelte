@@ -1,5 +1,5 @@
 <script>
-  import { room, command, enterRoom, setInterpreter } from '../lib/room.svelte.js';
+  import { room, command, enterRoom, setInterpreter, theAI } from '../lib/room.svelte.js';
   import Strip from './Strip.svelte';
 
   // The rooms, down the left, and under the one you are in everybody
@@ -20,35 +20,34 @@
       : [{ id: room.where, title: room.title, private: room.alone, here: [] }],
   );
 
-  // When the AI speaks. It is this bot's setting in this room, so it
-  // lives under this bot in this room — which is also the shape a
-  // second bot would need, each with its own.
-  const modes = $derived([
+  // When a bot speaks. It is that bot's setting in that room, so it
+  // lives under that bot in that room, and each of them has its own.
+  const modes = (bot) => [
     {
       mode: 'named',
       label: 'when named',
-      hint: `${room.agent.name} says nothing until someone says its name.`,
+      hint: `${bot.name} says nothing until someone says its name.`,
     },
     {
       mode: 'auto',
       label: 'when it fits',
-      hint: `${room.agent.name} is shown every pause and decides for itself whether the moment is its own, so it can sit in a conversation without answering every gap.`,
+      hint: `${bot.name} is shown every pause and decides for itself whether the moment is its own, so it can sit in a conversation without answering every gap.`,
     },
     {
       mode: 'always',
       label: 'every pause',
-      hint: `${room.agent.name} answers whenever the room goes quiet, with no judgment about whose turn it is.`,
+      hint: `${bot.name} answers whenever the room goes quiet, with no judgment about whose turn it is.`,
     },
-  ]);
+  ];
 
-  // Why the mode is what it is, when the room and not a click decided it.
-  const modeHint = $derived(
+  // Why a bot's mode is what it is, when the room and not a click
+  // decided it.
+  const modeHint = (bot) =>
     room.locked
-      ? `${room.game} decides when ${room.agent.name} answers, so this can't be changed until the room leaves the game.`
-      : room.engaged
-        ? `You said its name, so ${room.agent.name} has the turn at every pause — judging each one — until the room has been quiet a while. Say "thanks" or "goodbye" and it goes back to waiting for its name.`
-        : `When ${room.agent.name} speaks in this room.`,
-  );
+      ? `${room.game} decides when ${bot.name} answers, so this can't be changed until the room leaves the game.`
+      : bot.engaged
+        ? `You said its name, so ${bot.name} has the turn at every pause — judging each one — until the room has been quiet a while. Say "thanks" or "goodbye" and it goes back to waiting for its name.`
+        : `When ${bot.name} speaks in this room.`;
 
   // An interpreter is only here while it has something to do: somebody
   // in this room speaking a language somebody else here doesn't read.
@@ -72,7 +71,7 @@
   // the whole of what the row can say, for a tooltip.
   function who(r) {
     const playing = r.game ? ` Playing ${r.game}.` : '';
-    if (r.private) return `Just you and ${room.agent.name}. Nobody else can come in.${playing}`;
+    if (r.private) return `Just you and ${theAI('and')}. Nobody else can come in.${playing}`;
     if (!r.here.length) return `Nobody here.${playing}`;
     return `${r.here.join(', ')} ${r.here.length === 1 ? 'is' : 'are'} here.${playing}`;
   }
@@ -102,32 +101,30 @@
             {#each room.people as p (p.name)}
               <Strip key={p.name} label={p.name} mic={p.mic} muted={p.muted} speaking={p.speaking} />
             {/each}
-            <!-- The AIs in this room, each with its own fader. One
-                 today; when the AI answers is still the room's rather
-                 than each bot's, so it hangs off the first. -->
-            {#each room.agents as bot, i (bot.strip)}
-            <Strip key={bot.strip} label={bot.name} agent>
+            <!-- The AIs in this room, each with its own fader and its
+                 own say in when it speaks. -->
+            {#each room.agents as bot (bot.strip)}
+            <Strip key={bot.strip} label={bot.name} doing={bot.state} agent>
               {#snippet children()}
-                {#if i === 0}
                 <!-- When this bot speaks, in this room. -->
                 <!-- A row of three buttons wants more width than this
                      column has, and the names are the whole point: a
                      "Named / Fits / Every" that fits is a control you
                      have to already understand. This reads as what it
                      is — Vox answers when named. -->
-                <label class="when" title={modeHint}>
+                <label class="when" title={modeHint(bot)}>
                   <span class="what">
-                    Answers{#if room.engaged}<span class="dot" aria-hidden="true"></span>{/if}
+                    Answers{#if bot.engaged}<span class="dot" aria-hidden="true"></span>{/if}
                   </span>
-                  <select value={room.mode} disabled={room.locked}
-                    aria-label="When {room.agent.name} speaks"
-                    onchange={(e) => command({ type: 'mode', mode: e.currentTarget.value })}>
-                    {#each modes as m (m.mode)}
+                  <select value={bot.mode} disabled={room.locked}
+                    aria-label="When {bot.name} speaks"
+                    onchange={(e) =>
+                      command({ type: 'mode', bot: bot.name, mode: e.currentTarget.value })}>
+                    {#each modes(bot) as m (m.mode)}
                       <option value={m.mode} title={m.hint}>{m.label}</option>
                     {/each}
                   </select>
                 </label>
-                {/if}
               {/snippet}
             </Strip>
             {/each}

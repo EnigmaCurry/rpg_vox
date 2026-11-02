@@ -1,6 +1,6 @@
 <script>
   import { onMount } from 'svelte';
-  import { room, command, ask, answer, whoami, leaveAudio, setMuted, setVolume, setPushToTalk, talk } from './lib/room.svelte.js';
+  import { room, command, ask, answer, whoami, leaveAudio, setMuted, setVolume, setPushToTalk, talk, busyAI } from './lib/room.svelte.js';
   import { screen, share, stopSharing, supported as canShare } from './lib/screen.svelte.js';
   import Log from './components/Log.svelte';
   import Cards from './components/Cards.svelte';
@@ -132,8 +132,10 @@
         <span class="playing" title="{room.game} is being played in {room.title}.">{room.game}</span>
         <button onclick={lobby}>Leave the game</button>
       {/if}
-      {#if room.agent.state === 'thinking' || room.agent.state === 'speaking'}
-        <button class="danger" onclick={() => command({ type: 'stop' })}>Stop {room.agent.name}</button>
+      {#if busyAI()}
+        <!-- Whichever of them is talking: Stop cuts the reply that is
+             in flight, and in a room with two AIs only one is. -->
+        <button class="danger" onclick={() => command({ type: 'stop' })}>Stop {busyAI().name}</button>
       {/if}
       <div class="spacer"></div>
       <button onclick={newConversation}>{room.game ? 'Restart game' : 'New conversation'}</button>

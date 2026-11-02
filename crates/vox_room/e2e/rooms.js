@@ -27,7 +27,7 @@ const [ryanToken, alexToken] = process.argv.slice(2).map((l) => l.replace(/.*\/j
   is('Main waits to be named', ryan.mode, 'named');
 
   // Something said in Main, so there is a log to tell the rooms apart by.
-  ryan.send({ type: 'mode', mode: 'always' });
+  ryan.send({ type: 'mode', bot: 'Vox', mode: 'always' });
   ryan.send({ type: 'text', text: 'this is the shared room' });
   await wait(2500);
 

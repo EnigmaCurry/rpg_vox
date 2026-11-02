@@ -2,7 +2,7 @@
   import { onMount } from 'svelte';
   import {
     room, joinAudio, setName, logOut, setPushToTalk, loadDevices, watchDevices,
-    setMicDevice, setSpeakerDevice, setLanguage, setConsent,
+    setMicDevice, setSpeakerDevice, setLanguage, setConsent, theAI,
   } from '../lib/room.svelte.js';
   import { supported, canChooseSpeaker } from '../lib/audio.js';
   import { NAME_MAX } from '../lib/names.js';
@@ -180,7 +180,7 @@
           Push to talk
           <small>
             On speakers, turn this on: your mic opens only while you hold Space.
-            With a headset, leave it off — anyone can interrupt {room.agent.name}
+            With a headset, leave it off — anyone can interrupt {theAI()}
             just by talking.
           </small>
         </span>

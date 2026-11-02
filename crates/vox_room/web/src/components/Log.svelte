@@ -1,5 +1,5 @@
 <script>
-  import { room, sendText, enterGame, peekGame } from '../lib/room.svelte.js';
+  import { room, sendText, enterGame, peekGame, theAI, waitingAI } from '../lib/room.svelte.js';
   import History from './History.svelte';
   import { hue } from '../lib/color.js';
   import { TYPED_MAX } from '../lib/names.js';
@@ -74,7 +74,7 @@
     // And when a reply grows or loses its row of languages, which is a
     // line of height appearing under the last thing said.
     shown.map((e) => tracks(e).length).join();
-    room.agent.state;
+    room.agents.map((a) => a.state).join();
     if (stick && box) queueMicrotask(() => (box.scrollTop = box.scrollHeight));
   });
 
@@ -86,6 +86,12 @@
   // into — and that is the whole of what read-only means here.
   const shown = $derived(room.reading?.log ?? room.log);
   const archived = $derived(!!room.reading);
+
+  // A room can have more than one AI in it, and prose written for one
+  // of them reads wrong the moment it does.
+  const one = $derived(room.agents.length === 1);
+  const it = $derived(one ? 'it' : 'them');
+  const answers = $derived(one ? 'it answers' : 'they answer');
 </script>
 
 <div class="log" bind:this={box} {onscroll}>
@@ -98,9 +104,11 @@
       {:else if room.game}
         Entering <strong>{room.game}</strong>…
       {:else}
-        Nothing said yet. Join the audio and start talking; say <strong>{room.agent.name}</strong>
-        {room.mode === 'named' ? 'to bring it in' : 'or just talk, and it answers when you pause'}.
-        Ask it to design a game with you, then ask it to start, change or delete games by voice.
+        Nothing said yet. Join the audio and start talking; say <strong>{theAI()}</strong>
+        {room.agents.every((a) => a.mode === 'named')
+          ? `to bring ${it} in`
+          : `or just talk, and ${answers} when you pause`}.
+        Ask {it} to design a game with you, then ask {it} to start, change or delete games by voice.
       {/if}
     </p>
   {/if}
@@ -126,7 +134,7 @@
               <button onclick={() => peekGame(g.name)}
                 title="Show the game's hidden prompt, to you only">Peek</button>
               <span class="hint">
-                {#if room.game}In {room.game}.{:else}Or ask {room.agent.name} for it out loud.{/if}
+                {#if room.game}In {room.game}.{:else}Or ask {theAI()} for it out loud.{/if}
               </span>
             </div>
           {/if}
@@ -188,7 +196,7 @@
              where the others have got to. It goes when they are all
              done, which is the thing it is here to show. -->
         <div class="tracks" title={e.kind === 'agent'
-          ? `How far ${room.agent.name}'s reply has been heard in each language. The turn is over once every language has heard it out.`
+          ? `How far ${e.who}'s reply has been heard in each language. The turn is over once every language has heard it out.`
           : `How far ${e.who} has been heard in each language. Anyone listening in one of these is hearing it now, a phrase behind.`}>
           {#each tracks(e) as t (t.language)}
             <span class="track" class:done={t.done} class:waiting={!t.total && !t.done}>
@@ -202,9 +210,9 @@
     </div>
     {/if}
   {/each}
-  {#if !archived && room.agent.state === 'waiting'}
+  {#if !archived && waitingAI()}
     <div class="entry agent waiting" aria-live="polite">
-      <div class="who"><span class="name">{room.agent.name}</span><span class="time">waiting for a pause</span></div>
+      <div class="who"><span class="name">{waitingAI().name}</span><span class="time">waiting for a pause</span></div>
       <div class="text"><span class="dots"><i></i><i></i><i></i></span></div>
     </div>
   {/if}

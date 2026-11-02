@@ -42,13 +42,11 @@ export const room = $state({
   // own room is on anybody else's list. `path` is where the room
   // lives: the server settles the scheme, this only follows it.
   rooms: [],
-  // The AIs in this room: { name, strip, state }. One, today.
-  agents: [{ name: 'AI', state: 'listening', strip: '@agent' }],
-  // The first of them. Every use of this is a place that will have to
-  // say *which* bot once a room can hold two; the prose about "the AI"
-  // is nearly all of them, and it is the shape of the sentence that has
-  // to change there, not a lookup.
-  agent: { name: 'AI', state: 'listening', strip: '@agent' },
+  // The AIs in this room: { name, strip, state, mode, engaged }. When
+  // each answers is its own, not the room's — except that a game's rule
+  // binds all of them, which is what `locked` says.
+  agents: [{ name: 'AI', state: 'listening', strip: '@agent', mode: 'named', engaged: false }],
+
   // The interpreters this room has, when it has any:
   // { level, languages }. `level` is where the one speaking your
   // language reports itself — you hear that one and no other.
@@ -68,8 +66,8 @@ export const room = $state({
   // `engaged` is true while a back-and-forth (started by saying its name)
   // has it answering every pause, and `locked` while the game being
   // played requires the mode and the buttons can't change it.
-  mode: 'named',
-  engaged: false,
+  // A game's rule binds every bot in the room while it is played, and
+  // then nobody's Answers control is theirs to change.
   locked: false,
   // Whether what people say out loud is put into the other languages as
   // well as the AI's replies. False means a line spoken in a language
@@ -369,6 +367,28 @@ export function nameConversation(conversation, title) {
 /// give things are better, which is why this is only the default — but
 /// a list of "Conversation, Conversation, Conversation" is no list at
 /// all, so there is always something here.
+/// What to call the AIs in a sentence: one name, or every name with
+/// "or" before the last. The prose about "the AI" is written for one of
+/// them, and a room can have two.
+export function theAI(join = 'or') {
+  const names = room.agents.map((a) => a.name);
+  if (names.length === 0) return 'the AI';
+  if (names.length === 1) return names[0];
+  return `${names.slice(0, -1).join(', ')} ${join} ${names[names.length - 1]}`;
+}
+
+/// Whichever AI is answering right now, for the things that are about
+/// the reply in flight -- the Stop button, and the row that says one of
+/// them is holding out for a pause.
+export function busyAI() {
+  return room.agents.find((a) => a.state === 'thinking' || a.state === 'speaking');
+}
+
+/// Whichever is waiting for a pause to answer in.
+export function waitingAI() {
+  return room.agents.find((a) => a.state === 'waiting');
+}
+
 export function whenItWas({ said = 0, at = 0 } = {}) {
   const ms = said || at;
   if (!ms) return 'Just now';
@@ -564,10 +584,7 @@ function apply(ev) {
       room.alone = ev.room?.private ?? false;
       room.you = ev.you;
       room.agents = ev.agents ?? [];
-      room.agent = room.agents[0] ?? room.agent;
       room.interpreter = ev.interpreter ?? null;
-      room.mode = ev.mode;
-      room.engaged = ev.engaged ?? false;
       room.locked = ev.locked ?? false;
       room.interprets = ev.interprets ?? false;
       room.people = ev.people;
@@ -655,7 +672,7 @@ function apply(ev) {
       if (i >= 0) room.cards[i] = ev.card;
       else room.cards.push(ev.card);
       const what = ev.replaced ? 'changed your card' : 'sent you a card';
-      notify(`${room.agent.name} ${what}: ${ev.card.title}`);
+      notify(`${ev.from ?? theAI()} ${what}: ${ev.card.title}`);
       break;
     }
     case 'card_removed':
@@ -673,15 +690,21 @@ function apply(ev) {
     case 'games':
       room.games = ev.games;
       break;
-    case 'agent':
-      // One state for the room's AI, while a room has one of them.
-      for (const bot of room.agents) bot.state = ev.state;
-      room.agent.state = ev.state;
-      break;
-    case 'mode':
-      room.mode = ev.mode;
-      room.engaged = ev.engaged ?? false;
+    case 'mode': {
+      // One bot's, named: another bot in the room is not this one.
+      const bot = room.agents.find((b) => b.name === ev.bot);
+      if (bot) {
+        bot.mode = ev.mode;
+        bot.engaged = ev.engaged ?? false;
+      }
       room.locked = ev.locked ?? false;
+      break;
+    }
+    case 'agents':
+      for (const said of ev.agents) {
+        const bot = room.agents.find((b) => b.name === said.name);
+        if (bot) bot.state = said.state;
+      }
       break;
     case 'strips':
       room.strips = ev.strips;

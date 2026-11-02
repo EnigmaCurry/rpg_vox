@@ -117,6 +117,46 @@ to read, because there is no such state.
 Sharing a desktop follows the same rule as talking — it reaches the
 room you are in and no other, and it goes with you when you leave.
 
+### More than one AI in a room
+
+Every room has the AI in it. `--bot NAME[:VOICE[:PROMPT_FILE]]` puts
+another one there — repeat it, or comma-separate `VOX_ROOM_BOTS` — and
+it is in every room, the house's and everybody's own. Each has its own
+voice, its own prompt, and its own name to be called by; the first is
+the one `--name`, `--voice` and `--prompt` describe.
+
+```
+vox_room --bot Sage:serena --bot Ada:aiden:/etc/vox_room/ada.md
+```
+
+What each of them is is its own:
+
+- **Its own name.** Saying "Sage" gives Sage the turn and nobody else.
+  Nobody in the room may call themselves after any of them.
+- **Its own fader.** One strip each, under the room, so turning one
+  down is turning *that one* down.
+- **Its own Answers.** When named, when it fits, every pause — per bot
+  and per room, so Sage can answer every pause in your own room while
+  waiting to be named in the Lobby.
+- **Its own prompt**, with `{name}` filled in as itself, so each is
+  told who it is rather than told it is the first of them.
+
+**Who answers a pause.** Every bot that could answer is given the turn
+at once, and **the first to actually say something keeps it** — the
+rest are told to stop. Asking them one at a time would put a round
+trip of silence in the room for every bot that had nothing to say, and
+letting them all finish would be two voices over each other. A bot
+that is cut off this way leaves nothing behind: no bubble, nothing in
+the conversation, nothing for the model to read later. A bot already
+speaking is never cut off by another starting — it is the first word
+that claims the pause, and it has already had it.
+
+So "when it fits" is the mode that makes a room of several AIs work:
+each judges the pause for itself, and whichever has something to say
+gets there first. Put them all on "every pause" and whichever thread
+wins the race answers, which is a coin toss rather than a
+conversation.
+
 ### Where each room lives
 
 Every room has an address, and the bar follows you from one to another.
@@ -272,8 +312,9 @@ See ROOM_DOCKER.md.
   show the list — on a narrow one it is behind a tab, and then this is
   the only thing that does. What the AI is doing is on the AI's own
   strip and isn't repeated here. The buttons are **Leave the game**
-  while one is on, **Stop Vox** while it is talking, and **New
-  conversation**.
+  while one is on, **Stop Vox** while it is talking — named after
+  whichever of them is talking, in a room with more than one — and
+  **New conversation**.
 - **The rooms**, down the left: every room you can go to, one line
   each, and pressing one takes you there without the audio stopping.
   See [More than one room](#more-than-one-room). The room you are
@@ -297,8 +338,8 @@ See ROOM_DOCKER.md.
 - **Answers: when named / when it fits / every pause**, under the AI's
   own strip in the room list: who gets the turn when the room goes
   quiet. It is that bot's setting in that room — the same AI answers
-  differently in the Lobby and in your own room, and a second bot in a
-  room would carry its own. Shared by everyone in the room, like the
+  differently in the Lobby and in your own room, and a second bot in
+  the room carries its own. Shared by everyone in the room, like the
   faders beside it.
   - **When named** — the AI says nothing until someone says its name, so
     two people can talk without it butting in. The default.
@@ -805,6 +846,7 @@ pays for a rejected request before every reply.
 | `VOX_ROOM_DATA` | `~/.local/share/vox_room` (macOS: `~/Library/Application Support/vox_room`) | the database |
 | `VOX_ROOM_AGENT_NAME` | `Vox` | the AI's name |
 | `VOX_ROOM_AGENT_ALIASES` | | other spellings that count as its name, comma-separated (what speech-to-text hears, e.g. `box,fox`) |
+| `VOX_ROOM_BOTS` | | more AIs in every room, `NAME[:VOICE[:PROMPT_FILE]]`, comma-separated. See [More than one AI in a room](#more-than-one-ai-in-a-room) |
 | `VOX_ROOM_REPLY_AFTER_MS` | `1200` | quiet before what was said is handed over |
 | `VOX_ROOM_CONFIRM_MS` | `300` | continuous speech that cuts the AI off |
 | `VOX_ROOM_ENGAGED_FOR_MS` | `30000` | idle time that ends a back-and-forth and goes back to "when named" |
@@ -836,12 +878,13 @@ room again — your own database is never touched:
 ```bash
 cargo build -p vox_room --release
 cd crates/vox_room/e2e && npm i playwright   # not a dependency of anything built here
-CHROME=$(which chromium) ./run.sh            # or: ./run.sh rooms door
+CHROME=$(which chromium) ./run.sh            # or: ./run.sh rooms bots
 ```
 
 | suite | |
 |---|---|
 | `rooms` | several rooms on one socket: where a tab lands, who may go where, a room of your own admitting one person, and the mix arriving across every move. No browser at all — two sockets are enough |
+| `bots` | two AIs in one room: a fader and an Answers setting each, each answering to its own name, and one pause going to exactly one of them |
 | `door` | the door is a page with no room behind it and no socket open; **Join Audio** does nothing until you agree to be recorded, and the Language box is never blank |
 | `permalinks` | `/`, `/lobby` and `/room/<id>`; back and forward move between rooms, a pasted address opens that room, a stale one is put right |
 | `conversations` | the room's history: naming one, reading an old one read-only without moving anybody else's screen, deleting one for everybody, and empty ones never being archived |

@@ -358,6 +358,18 @@ pub struct BotConfig {
 }
 
 impl BotConfig {
+    /// The turn this bot should be working on.
+    fn generation(&self, st: &State) -> u64 {
+        st.bots
+            .iter()
+            .find(|b| b.cfg.name == self.name)
+            .map(|b| b.generation.load(Ordering::SeqCst))
+            .unwrap_or(0)
+    }
+
+    /// A bot of this name, on the fader the room has always called the
+    /// AI's. [`Room::new`] moves every bot after the first onto one of
+    /// its own, because two bots on one fader are one fader.
     pub fn new(name: &str, aliases: Vec<String>) -> Self {
         Self {
             name: name.to_string(),
@@ -416,11 +428,12 @@ impl RoomConfig {
         self.only.as_deref().is_none_or(|only| only == name)
     }
 
-    /// The room's bot, while a room has one.
+    /// The first AI in the room: what it is called when it is
+    /// standing in for all of them, and the name to fall back on when
+    /// a turn has gone by the time somebody asks whose it was.
     ///
-    /// Every caller is a place where somebody will have to be chosen
-    /// once there are two -- which is the point of its being a call
-    /// rather than a field. A room is never built without one.
+    /// Nothing decides anything by this any more. A room is never
+    /// built without an AI in it.
     pub fn bot(&self) -> &BotConfig {
         self.bots.first().expect("a room has an AI in it")
     }
@@ -558,6 +571,55 @@ struct Reply {
     asked: Instant,
 }
 
+/// What one bot in the room is doing.
+///
+/// Everything here was the room's when a room had one AI in it, and
+/// every one of them turned out to be the bot's: when it answers, the
+/// back-and-forth it is in, the reply it is in the middle of. What
+/// stayed the room's is the mode a game *requires* -- that is the
+/// game's rule for the room, and it binds all of them.
+struct BotState {
+    cfg: BotConfig,
+    /// The turn this bot should be working on; anything older it is
+    /// told to drop. Shared with its own agent thread.
+    ///
+    /// The numbers come from one counter the room shares out, so a
+    /// generation names exactly one turn by exactly one bot however
+    /// many of them are thinking at once.
+    generation: Arc<AtomicU64>,
+    /// Where its turns go.
+    turns: crossbeam_channel::Sender<Turn>,
+    /// What the people picked for it, and what a restart comes back to.
+    chosen: Mode,
+    /// What it is actually doing: `chosen`, unless the game being
+    /// played requires a mode, or a back-and-forth is on.
+    mode: Mode,
+    /// In a back-and-forth: somebody said its name in `Named` mode, so
+    /// it keeps the turn at every pause until the room has been idle
+    /// for `engaged_for`. The instant is the last thing that kept it
+    /// going.
+    engaged: Option<Instant>,
+    /// Its state as last broadcast: listening, waiting, thinking,
+    /// speaking.
+    state: &'static str,
+    /// It passed on its turn but asked to be shown the room again if
+    /// the quiet lasted: when to look, and how long that is in seconds.
+    reconsider: Option<(Instant, u64)>,
+    reply: Option<Reply>,
+    /// A game it started in reply `.0`: entered once that reply has
+    /// been heard (or cut off).
+    starting: Option<(u64, String)>,
+    /// The last turn's generation and the entry it was written into,
+    /// kept after `reply` has been let go.
+    ///
+    /// A translation arrives a couple of seconds behind the words it
+    /// translates, and the room's own language is often done speaking
+    /// by then -- on a short reply, always. The reply itself is
+    /// finished and gone at that point, so this is what a late
+    /// translation is still able to find its entry by.
+    last_reply: Option<(u64, String)>,
+}
+
 struct State {
     conversation: i64,
     /// What this conversation is called, and when it was started.
@@ -573,18 +635,14 @@ struct State {
     game_mode: Option<Mode>,
     people: BTreeMap<String, Person>,
     log: Vec<Entry>,
-    /// What the people picked, and what a restart comes back to.
-    chosen: Mode,
-    /// What the room is actually doing: `chosen`, unless the game being
-    /// played requires a mode, or a back-and-forth is on.
-    mode: Mode,
-    reply: Option<Reply>,
+    /// What each bot in the room is doing, in the order they were
+    /// configured. A list and not a map: the order is the one they are
+    /// shown in, and a room has a handful at most.
+    bots: Vec<BotState>,
     last_change: Instant,
     /// When the last person to speak stopped.
     quiet_since: Instant,
     ducked: bool,
-    /// The AI state last broadcast.
-    agent_state: &'static str,
     /// The conversation to come back to when the game ends: the one the
     /// room was having when somebody started it. None when no game is
     /// being played.
@@ -593,31 +651,19 @@ struct State {
     /// is kept in the database like everything else, so this survives a
     /// restart in the middle of a game.
     resume: Option<i64>,
-    /// A game the AI started in reply `.0`: entered once that reply has
-    /// been heard (or cut off).
-    starting: Option<(u64, String)>,
-    /// In a back-and-forth: `Named` mode was flipped to `Always` because
-    /// someone said the AI's name, and goes back once the room has been
-    /// idle for `engaged_for`. The instant is the last thing that kept it
-    /// going. `None` is the room's own mode, as chosen.
-    engaged: Option<Instant>,
-    /// The AI passed on its turn but asked to be shown the room again if
-    /// the quiet lasted: when to look, and how long that is in seconds.
-    reconsider: Option<(Instant, u64)>,
-    /// The last turn's generation and the entry it was written into,
-    /// kept after [`State::reply`] has been let go.
-    ///
-    /// A translation arrives a couple of seconds behind the words it
-    /// translates, and the room's own language is often done speaking by
-    /// then -- on a short reply, always. The reply itself is finished and
-    /// gone at that point, so this is what a late translation is still
-    /// able to find its entry by.
-    last_reply: Option<(u64, String)>,
     /// What is being interpreted for the people who don't speak it, by
     /// the line on screen it was said in.
     interp: BTreeMap<String, Interp>,
     /// Names the next run of talk handed to an interpreter.
     next_stream: u64,
+}
+
+/// What a bot's agent thread needs from the room it answers in: which
+/// bot it is, the turns to answer, and the one it should be working on.
+pub struct BotWiring {
+    pub name: String,
+    pub generation: Arc<AtomicU64>,
+    pub turns: crossbeam_channel::Receiver<Turn>,
 }
 
 pub struct Room {
@@ -641,9 +687,10 @@ pub struct Room {
     pub mixer: Arc<Mixer>,
     store: Mutex<Store>,
     cfg: RoomConfig,
-    /// The reply the agent should be working on; anything older is dropped.
-    generation: Arc<AtomicU64>,
-    agent: crossbeam_channel::Sender<Turn>,
+    /// Where a turn number comes from. One counter for the room, so a
+    /// generation names exactly one turn by exactly one bot however
+    /// many of them are thinking at once.
+    turns: Arc<AtomicU64>,
     /// Typed messages waiting to be translated. None when there is no
     /// model to translate with, and then a typed message is simply
     /// shown as it was typed.
@@ -700,16 +747,60 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+impl State {
+    /// The bot called `name`.
+    fn bot(&mut self, name: &str) -> &mut BotState {
+        self.bots
+            .iter_mut()
+            .find(|b| b.cfg.name == name)
+            .expect("a bot the room was built with")
+    }
+
+    /// Whichever bot's current turn is `generation`, whether or not it
+    /// has started replying yet. What a tool call is checked against:
+    /// "is this still the turn you were given", which is true from the
+    /// moment it was given and false the moment it is taken away.
+    fn turn_of(&mut self, generation: u64) -> Option<&mut BotState> {
+        self.bots
+            .iter_mut()
+            .find(|b| b.generation.load(Ordering::SeqCst) == generation)
+    }
+
+    /// Whichever bot is working on turn `generation`, if one still is.
+    /// A generation names one turn by one bot, so this is how anything
+    /// coming back from an agent thread finds its way home.
+    fn working_on(&mut self, generation: u64) -> Option<&mut BotState> {
+        self.bots
+            .iter_mut()
+            .find(|b| b.reply.as_ref().is_some_and(|r| r.generation == generation))
+    }
+
+    /// The first bot in the room, for the tests that only have one.
+    ///
+    /// Nothing outside them calls it any more, which is the whole
+    /// point: there is no longer anywhere in the room that assumes
+    /// there is only one AI in it.
+    #[cfg(test)]
+    fn only(&mut self) -> &mut BotState {
+        self.bots.first_mut().expect("a room has an AI in it")
+    }
+}
+
 impl Room {
+    /// Open a room, and hand back the wiring for each of its bots: an
+    /// agent thread per bot reads the turns off these.
+    ///
+    /// The room makes them rather than being given them, because it is
+    /// the room that knows how many bots it has — and because a turn
+    /// number has to be unique across all of them, so there is one
+    /// counter and it lives here.
     pub fn new(
         store: Store,
         cfg: RoomConfig,
-        generation: Arc<AtomicU64>,
-        agent: crossbeam_channel::Sender<Turn>,
         typing: Option<crossbeam_channel::Sender<TypedJob>>,
         interp: BTreeMap<String, crossbeam_channel::Sender<InterpJob>>,
         stt: Option<EngineFactory>,
-    ) -> anyhow::Result<Arc<Self>> {
+    ) -> anyhow::Result<(Arc<Self>, Vec<BotWiring>)> {
         // Scoped here rather than by whoever built it: a room reading
         // the whole database's settings instead of its own is a room
         // sharing another's conversation, and nothing about the handle
@@ -735,15 +826,54 @@ impl Room {
         };
         let log = store.entries(conversation, LOG_LIMIT)?;
         let (title, started) = store.conversation_name(conversation)?;
-        let chosen = store
-            .setting("mode")?
-            .and_then(|m| Mode::parse(&m))
-            .unwrap_or(cfg.default_mode);
-        // The game the room was left playing may require its own mode.
+        // The game the room was left playing may require its own mode,
+        // which binds every bot in it: a game's rule is the room's.
         let game_mode = game
             .as_deref()
             .and_then(|g| store.game(g).ok().flatten())
             .and_then(|(g, _)| g.settings.reply.forces());
+        // One of these per bot, each with its own channel to its own
+        // agent thread. What the people picked for it is kept under its
+        // name -- except the first, whose setting is the plain `mode`
+        // the room had when a room had one AI in it.
+        let mut bots = Vec::new();
+        let mut wiring = Vec::new();
+        for (n, bot) in cfg.bots.iter().enumerate() {
+            let key = format!("mode:{}", bot.name);
+            let chosen = match store.setting(&key)? {
+                Some(m) => Mode::parse(&m),
+                None if n == 0 => store.setting("mode")?.as_deref().and_then(Mode::parse),
+                None => None,
+            }
+            .unwrap_or(cfg.default_mode);
+            let (turns, rx) = crossbeam_channel::unbounded();
+            let generation = Arc::new(AtomicU64::new(0));
+            wiring.push(BotWiring {
+                name: bot.name.clone(),
+                generation: generation.clone(),
+                turns: rx,
+            });
+            // A fader each, or moving one would move them both. The
+            // first keeps the plain `@agent` the room has always used,
+            // so the levels people have already set still find it.
+            let mut cfg = bot.clone();
+            if n > 0 {
+                cfg.strip = format!("{AGENT_STRIP}:{}", bot.name);
+            }
+            bots.push(BotState {
+                cfg,
+                generation,
+                turns,
+                chosen,
+                mode: game_mode.unwrap_or(chosen),
+                engaged: None,
+                state: "listening",
+                reconsider: None,
+                reply: None,
+                starting: None,
+                last_reply: None,
+            });
+        }
         let strips: BTreeMap<String, Strip> = store
             .setting("strips")?
             .and_then(|s| serde_json::from_str(&s).ok())
@@ -764,7 +894,7 @@ impl Room {
             })
             .collect();
         let (events, _) = broadcast::channel(EVENT_CAPACITY);
-        Ok(Arc::new(Self {
+        let room = Arc::new(Self {
             announce: std::sync::OnceLock::new(),
             link,
             st: Mutex::new(State {
@@ -775,18 +905,11 @@ impl Room {
                 game_mode,
                 people,
                 log,
-                chosen,
-                mode: game_mode.unwrap_or(chosen),
-                reply: None,
+                bots,
                 resume,
                 last_change: Instant::now(),
                 quiet_since: Instant::now(),
                 ducked: false,
-                agent_state: "listening",
-                starting: None,
-                engaged: None,
-                reconsider: None,
-                last_reply: None,
                 interp: BTreeMap::new(),
                 next_stream: 0,
             }),
@@ -794,12 +917,12 @@ impl Room {
             mixer: Mixer::new(strips, &cfg.language),
             store: Mutex::new(store),
             cfg,
-            generation,
-            agent,
+            turns: Arc::new(AtomicU64::new(0)),
             typing,
             interp,
             stt,
-        }))
+        });
+        Ok((room, wiring))
     }
 
     pub fn config(&self) -> &RoomConfig {
@@ -808,6 +931,13 @@ impl Room {
 
     pub fn link(&self) -> &str {
         &self.link
+    }
+
+    /// The turn the room's one bot is working on. For the tests, and
+    /// for the agent's own ignored end-to-end one.
+    #[cfg(test)]
+    pub fn generation_of_only_bot(&self) -> Arc<AtomicU64> {
+        self.lock().only().generation.clone()
     }
 
     /// Which conversation this room is having, and what it is called.
@@ -1048,8 +1178,13 @@ impl Room {
         if wanted.chars().any(char::is_control) {
             return Err("One line, no tabs.".into());
         }
-        if wanted.eq_ignore_ascii_case(&self.cfg.bot().name) {
-            return Err(format!("{} is the AI's name.", self.cfg.bot().name));
+        if let Some(bot) = self
+            .cfg
+            .bots
+            .iter()
+            .find(|b| wanted.eq_ignore_ascii_case(&b.name))
+        {
+            return Err(format!("{} is the AI's name.", bot.name));
         }
         match self.store().rename(name, wanted) {
             Ok(true) => {}
@@ -1300,10 +1435,15 @@ impl Room {
             // The AIs in this room. One, today; the browsers read a
             // list so that the second is something to render rather
             // than something to rewrite.
-            "agents": self.cfg.bots.iter().map(|b| json!({
-                "name": b.name,
-                "strip": b.strip,
-                "state": st.agent_state,
+            "agents": st.bots.iter().map(|b| json!({
+                "name": b.cfg.name,
+                "strip": b.cfg.strip,
+                "state": b.state,
+                // When it answers, which is this bot's and not the
+                // room's -- except that a game's rule binds all of them,
+                // which is what `locked` says.
+                "mode": b.mode.as_str(),
+                "engaged": b.engaged.is_some(),
             })).collect::<Vec<_>>(),
             // The interpreters, when this room has any. `level` is
             // where the one speaking *your* language reports itself:
@@ -1315,13 +1455,11 @@ impl Room {
                 ),
                 "languages": self.interp.keys().collect::<Vec<_>>(),
             })),
-            "mode": st.mode.as_str(),
+            "locked": st.game_mode.is_some(),
             // Whether what people say out loud is put into the other
             // languages as well as the AI's replies. A reader waits for
             // a translation only of what one is coming for.
             "interprets": !self.interp.is_empty(),
-            "engaged": st.engaged.is_some(),
-            "locked": st.game_mode.is_some(),
             "people": self.people_json(&st),
             "speaks": self.speaks_json(&st),
             "languages": self.cfg.languages,
@@ -1403,7 +1541,13 @@ impl Room {
     /// Unlike saving a game, this goes through even if the players talked
     /// over the reply that called it: the card is the point, and losing
     /// one silently is worse than one arriving after an interruption.
-    pub fn send_card(&self, to: &str, title: &str, body: &str) -> Result<String, String> {
+    pub fn send_card(
+        &self,
+        generation: u64,
+        to: &str,
+        title: &str,
+        body: &str,
+    ) -> Result<String, String> {
         let (title, body) = (title.trim(), body.trim());
         if title.is_empty() || body.is_empty() {
             return Err("a card needs a title and a body".into());
@@ -1472,9 +1616,19 @@ impl Room {
         }
         info!(to = %to, title = %card.title, replaced, "dealt a card");
         // Only their tabs; the body never reaches another browser.
+        // Who dealt it, for the line that tells them so. On the event
+        // and not on the card: a card is a thing one person holds, and
+        // which of the AIs handed it over is news rather than part of
+        // it.
+        let from = st
+            .bots
+            .iter()
+            .find(|b| b.generation.load(Ordering::SeqCst) == generation)
+            .map(|b| b.cfg.name.clone())
+            .unwrap_or_else(|| self.cfg.bot().name.clone());
         self.emit_to(
             &to,
-            json!({ "type": "card", "card": card, "replaced": replaced }),
+            json!({ "type": "card", "card": card, "from": from, "replaced": replaced }),
         );
         Ok(to)
     }
@@ -1524,7 +1678,7 @@ impl Room {
     /// Unlike a card dealt to one person there is no taking it back: it
     /// is part of
     /// what the room has been told, like anything that was said.
-    pub fn post_card(&self, title: &str, body: &str) -> Result<String, String> {
+    pub fn post_card(&self, generation: u64, title: &str, body: &str) -> Result<String, String> {
         let (title, body) = (title.trim(), body.trim());
         if title.is_empty() || body.is_empty() {
             return Err("a card needs a title and a body".into());
@@ -1536,9 +1690,16 @@ impl Room {
             return Err(format!("a card is at most {CARD_BODY_MAX} characters"));
         }
         let mut st = self.lock();
+        // Whoever is taking this turn: a card is signed by the AI that
+        // dealt it, and in a room with two of them that is not always
+        // the same one.
+        let who = st
+            .turn_of(generation)
+            .map(|b| b.cfg.name.clone())
+            .unwrap_or_else(|| self.cfg.bot().name.clone());
         let entry = Entry {
             id: format!("card-{}", uuid::Uuid::new_v4().simple()),
-            who: self.cfg.bot().name.clone(),
+            who,
             kind: Kind::Card,
             title: title.to_string(),
             text: body.to_string(),
@@ -1602,45 +1763,58 @@ impl Room {
     /// turn into a loop while nobody is saying anything.
     pub fn stay_quiet(&self, generation: u64, ask_again_in: Option<u64>) -> Result<(), String> {
         let mut st = self.lock();
-        let Some(r) = st.reply.as_ref().filter(|r| r.generation == generation) else {
+        let Some(b) = st.working_on(generation) else {
             return Err("that turn is over; the room has moved on".into());
         };
-        if !r.cue.deciding() {
+        let bot = b.cfg.name.clone();
+        let cue = b
+            .reply
+            .as_ref()
+            .expect("working_on found it by its reply")
+            .cue;
+        if !cue.deciding() {
             return Err("you were asked to answer, not whether to answer".into());
         }
-        let again = match r.cue {
+        let again = match cue {
             // A second look that passes is the end of this silence.
             Cue::Decide { lull: Some(_) } => None,
             _ => ask_again_in
                 .filter(|s| *s > 0)
                 .map(|s| s.min(Self::LULL_MAX)),
         };
-        self.cut_reply(&mut st);
-        st.reconsider = again.map(|s| (Instant::now() + Duration::from_secs(s), s));
-        info!(generation, again, "reply: stayed quiet");
+        self.cut_reply(&mut st, &bot);
+        st.bot(&bot).reconsider = again.map(|s| (Instant::now() + Duration::from_secs(s), s));
+        info!(bot = %bot, generation, again, "reply: stayed quiet");
         Ok(())
     }
 
     /// Give the AI the turn again once a silence it asked about has
     /// actually lasted.
     fn reconsider(&self, st: &mut State, now: Instant) {
-        let Some((at, lull)) = st.reconsider else {
-            return;
-        };
-        if now < at {
+        // Only into a room that is still quiet: anybody talking, any bot
+        // answering, or anything waiting to be handed over means the
+        // silence is over and `hand_over` is the one to decide.
+        let quiet = st.bots.iter().all(|b| b.reply.is_none())
+            && !st.people.values().any(|p| p.speaking || p.holding())
+            && !st.log.iter().any(|e| e.kind == Kind::Human && !e.sent);
+        let due: Vec<(String, u64)> = st
+            .bots
+            .iter_mut()
+            .filter_map(|b| {
+                let (at, lull) = b.reconsider?;
+                if now < at {
+                    return None;
+                }
+                b.reconsider = None;
+                Some((b.cfg.name.clone(), lull))
+            })
+            .collect();
+        if !quiet {
             return;
         }
-        st.reconsider = None;
-        // Only into a room that is still quiet: anyone talking, or
-        // anything waiting to be handed over, means the silence is over
-        // and hand_over is the one to decide.
-        if st.reply.is_some()
-            || st.people.values().any(|p| p.speaking || p.holding())
-            || st.log.iter().any(|e| e.kind == Kind::Human && !e.sent)
-        {
-            return;
+        for (bot, lull) in due {
+            self.ask(st, &bot, now, Cue::Decide { lull: Some(lull) }, true);
         }
-        self.ask(st, now, Cue::Decide { lull: Some(lull) });
     }
 
     /// A saved game and its prompt, for someone who asks to see it.
@@ -2218,35 +2392,49 @@ impl Room {
 
     /// Someone picked a mode: that is the room's own, and it ends any
     /// back-and-forth. The game being played may still require another.
-    pub fn set_mode(&self, mode: &str) {
+    pub fn set_mode(&self, bot: &str, mode: &str) {
         let Some(mode) = Mode::parse(mode) else {
             return;
         };
         let mut st = self.lock();
-        st.chosen = mode;
-        st.engaged = None;
-        if let Err(err) = self.store().set_setting("mode", mode.as_str()) {
+        if !st.bots.iter().any(|b| b.cfg.name == bot) {
+            return;
+        }
+        let b = st.bot(bot);
+        b.chosen = mode;
+        b.engaged = None;
+        if let Err(err) = self
+            .store()
+            .set_setting(&format!("mode:{bot}"), mode.as_str())
+        {
             warn!("store mode: {err:#}");
         }
-        self.refresh_mode(&mut st);
+        self.refresh_mode(&mut st, bot);
     }
 
     /// The AI standing down by itself: back to answering only when it is
     /// named. It changes the room's own mode, as if someone picked it,
     /// and answers with what the room is actually doing afterwards --
     /// which is still `always` if the game being played requires it.
-    pub fn wait_until_named(&self) -> &'static str {
+    pub fn wait_until_named(&self, generation: u64) -> &'static str {
         let mut st = self.lock();
-        if st.chosen != Mode::Named || st.engaged.is_some() {
-            info!("the AI stood down: answering only when named again");
+        let Some(b) = st.turn_of(generation) else {
+            return Mode::Named.as_str();
+        };
+        let bot = b.cfg.name.clone();
+        if b.chosen != Mode::Named || b.engaged.is_some() {
+            info!(bot = %bot, "stood down: answering only when named again");
         }
-        st.chosen = Mode::Named;
-        st.engaged = None;
-        if let Err(err) = self.store().set_setting("mode", Mode::Named.as_str()) {
+        b.chosen = Mode::Named;
+        b.engaged = None;
+        if let Err(err) = self
+            .store()
+            .set_setting(&format!("mode:{bot}"), Mode::Named.as_str())
+        {
             warn!("store mode: {err:#}");
         }
-        self.refresh_mode(&mut st);
-        st.mode.as_str()
+        self.refresh_mode(&mut st, &bot);
+        st.bot(&bot).mode.as_str()
     }
 
     /// Work out what the room should be doing and tell every tab.
@@ -2254,57 +2442,83 @@ impl Room {
     /// A back-and-forth wins over the game being played, which wins over
     /// what the people picked. Only the last of those is stored, so a
     /// restart comes back to what was actually chosen.
-    fn refresh_mode(&self, st: &mut State) {
-        st.mode = if st.engaged.is_some() {
+    fn refresh_mode(&self, st: &mut State, bot: &str) {
+        let game_mode = st.game_mode;
+        let b = st.bot(bot);
+        b.mode = if b.engaged.is_some() {
             // It keeps the turn, but it still judges each pause: the
             // people may well have turned to each other.
             Mode::Auto
         } else {
-            st.game_mode.unwrap_or(st.chosen)
+            game_mode.unwrap_or(b.chosen)
         };
+        let (mode, engaged) = (b.mode.as_str(), b.engaged.is_some());
         self.emit(json!({
             "type": "mode",
-            "mode": st.mode.as_str(),
-            "engaged": st.engaged.is_some(),
-            // The game requires this one: the buttons are not the room's
-            // to change while it is being played.
-            "locked": st.game_mode.is_some(),
+            "bot": bot,
+            "mode": mode,
+            "engaged": engaged,
+            // The game requires this one, of every bot in the room: a
+            // game's rule is the room's, and the control is nobody's to
+            // change while it is being played.
+            "locked": game_mode.is_some(),
         }));
+    }
+
+    /// Every bot's mode worked out again, after something that binds
+    /// all of them: entering a game, or leaving one.
+    fn refresh_modes(&self, st: &mut State) {
+        let names: Vec<String> = st.bots.iter().map(|b| b.cfg.name.clone()).collect();
+        for name in names {
+            self.refresh_mode(st, &name);
+        }
     }
 
     /// Someone said the AI's name in `Named` mode: it keeps the turn at
     /// every pause from now on, so they can talk back and forth without
     /// saying it again, until the room has been idle for `engaged_for`.
-    fn engage(&self, st: &mut State, now: Instant) {
+    fn engage(&self, st: &mut State, bot: &str, now: Instant) {
         info!(
+            bot,
             for_ms = self.cfg.engaged_for.as_millis() as u64,
             "named: it keeps the turn at every pause until the room goes quiet"
         );
-        st.engaged = Some(now);
-        self.refresh_mode(st);
+        st.bot(bot).engaged = Some(now);
+        self.refresh_mode(st, bot);
     }
 
     /// Keep a back-and-forth going while anything is happening, and end
     /// it once the room has been idle long enough.
     fn follow_engagement(&self, st: &mut State, now: Instant) {
-        let Some(since) = st.engaged else {
-            return;
-        };
-        // Someone talking, or the AI answering: the countdown only starts
-        // once the room actually falls quiet.
-        if st.reply.is_some() || st.people.values().any(|p| p.speaking || p.holding()) {
-            st.engaged = Some(now);
-            return;
+        // Somebody talking, or any bot answering: the countdown only
+        // starts once the room actually falls quiet, and one bot
+        // answering keeps the room from being quiet for all of them.
+        let busy = st.bots.iter().any(|b| b.reply.is_some())
+            || st.people.values().any(|p| p.speaking || p.holding());
+        let lapsed: Vec<String> = st
+            .bots
+            .iter_mut()
+            .filter_map(|b| {
+                let since = b.engaged?;
+                if busy {
+                    b.engaged = Some(now);
+                    return None;
+                }
+                if now.duration_since(since) < self.cfg.engaged_for {
+                    return None;
+                }
+                info!(
+                    bot = %b.cfg.name,
+                    quiet_ms = now.duration_since(since).as_millis() as u64,
+                    "quiet: back to answering only when named"
+                );
+                b.engaged = None;
+                Some(b.cfg.name.clone())
+            })
+            .collect();
+        for bot in lapsed {
+            self.refresh_mode(st, &bot);
         }
-        if now.duration_since(since) < self.cfg.engaged_for {
-            return;
-        }
-        info!(
-            quiet_ms = now.duration_since(since).as_millis() as u64,
-            "quiet: back to answering only when named"
-        );
-        st.engaged = None;
-        self.refresh_mode(st);
     }
 
     /// How loud one tab wants the interpreter. Theirs alone: no other
@@ -2356,16 +2570,15 @@ impl Room {
             Err(err) => return Err(format!("{err:#}")),
         };
         let mut st = self.lock();
-        if self.generation.load(Ordering::SeqCst) != generation {
+        let Some(b) = st.turn_of(generation) else {
             return Err("the players talked over you; the game was not started".into());
-        }
-        info!(game, "starting game after this reply");
-        if st
-            .reply
-            .as_ref()
-            .is_some_and(|r| r.generation == generation)
-        {
-            st.starting = Some((generation, game.clone()));
+        };
+        let bot = b.cfg.name.clone();
+        info!(bot = %bot, game, "starting game after this reply");
+        if b.reply.as_ref().is_some_and(|r| r.generation == generation) {
+            // It is still speaking: the game opens once what it was
+            // saying has been heard.
+            b.starting = Some((generation, game.clone()));
         } else {
             self.begin_game(&mut st, game.clone());
         }
@@ -2375,9 +2588,9 @@ impl Room {
     /// Reply `generation` started a game, so it has nothing more to say.
     pub fn is_starting(&self, generation: u64) -> bool {
         self.lock()
-            .starting
-            .as_ref()
-            .is_some_and(|(g, _)| *g == generation)
+            .bots
+            .iter()
+            .any(|b| b.starting.as_ref().is_some_and(|(g, _)| *g == generation))
     }
 
     /// The agent deleting a game the players asked it to, during reply
@@ -2389,7 +2602,7 @@ impl Room {
             Err(err) => return Err(format!("{err:#}")),
         };
         let mut st = self.lock();
-        if self.generation.load(Ordering::SeqCst) != generation {
+        if st.turn_of(generation).is_none() {
             return Err("the players talked over you; the game was not deleted".into());
         }
         if let Err(err) = self.store().delete_game(&game) {
@@ -2521,9 +2734,15 @@ impl Room {
         game: Option<String>,
         log: Vec<Entry>,
     ) {
-        st.starting = None;
-        st.reconsider = None;
-        self.cut_reply(st);
+        // Everything any bot was in the middle of belonged to the
+        // conversation the room is leaving.
+        let bots: Vec<String> = st.bots.iter().map(|b| b.cfg.name.clone()).collect();
+        for bot in &bots {
+            let b = st.bot(bot);
+            b.starting = None;
+            b.reconsider = None;
+            self.cut_reply(st, bot);
+        }
         st.conversation = conversation;
         let (title, started) = self
             .store()
@@ -2538,9 +2757,13 @@ impl Room {
             .as_deref()
             .and_then(|g| self.store().game(g).ok().flatten())
             .and_then(|(g, _)| g.settings.reply.forces());
-        st.engaged = None;
+        for b in st.bots.iter_mut() {
+            b.engaged = None;
+        }
         st.game = game;
-        self.refresh_mode(st);
+        // A game's rule binds every bot in the room, so every one of
+        // them is worked out again.
+        self.refresh_modes(st);
         for p in st.people.values() {
             if let Some(e) = &p.engine {
                 e.break_paragraph();
@@ -2574,8 +2797,10 @@ impl Room {
             // A game opens with the AI setting the scene, whatever the
             // room's mode: nobody can have asked for it yet. Only a game
             // that is actually starting, though -- one being picked up
-            // again has already been opened.
-            self.ask(st, Instant::now(), Cue::Speak);
+            // again has already been opened. The first bot opens it;
+            // two of them opening the same game would be two openings.
+            let first = st.bots[0].cfg.name.clone();
+            self.ask(st, &first, Instant::now(), Cue::Speak, true);
         }
     }
 
@@ -2613,9 +2838,9 @@ impl Room {
             return Err("the game needs a prompt".into());
         }
         let mut st = self.lock();
-        if self.generation.load(Ordering::SeqCst) != generation {
+        let Some(who) = st.turn_of(generation).map(|b| b.cfg.name.clone()) else {
             return Err("the players talked over you; the game was not saved".into());
-        }
+        };
         match self
             .store()
             .save_game(name, summary.trim(), prompt.trim(), &settings, now_ms())
@@ -2626,7 +2851,7 @@ impl Room {
         }
         info!(game = name, "saved game");
         self.emit_games();
-        self.add_game_card(&mut st, name);
+        self.add_game_card(&mut st, &who, name);
         Ok(())
     }
 
@@ -2670,9 +2895,9 @@ impl Room {
             return Err("the game needs a prompt".into());
         }
         let mut st = self.lock();
-        if self.generation.load(Ordering::SeqCst) != generation {
+        let Some(who) = st.turn_of(generation).map(|b| b.cfg.name.clone()) else {
             return Err("the players talked over you; the game was not changed".into());
-        }
+        };
         match self.store().update_game(
             &old_name,
             &new_name,
@@ -2687,7 +2912,7 @@ impl Room {
         info!(game = old_name, new = new_name, "revised game");
         self.remove_game_cards(&mut st, &old_name);
         self.emit_games();
-        self.add_game_card(&mut st, &new_name);
+        self.add_game_card(&mut st, &who, &new_name);
         Ok(new_name)
     }
 
@@ -2709,11 +2934,12 @@ impl Room {
         st.log.retain(|e| !old_cards.contains(&e.id));
     }
 
-    /// A game's button, at the end of the conversation.
-    fn add_game_card(&self, st: &mut State, name: &str) {
+    /// A game's button, at the end of the conversation, from the AI
+    /// that designed it.
+    fn add_game_card(&self, st: &mut State, who: &str, name: &str) {
         let entry = Entry {
             id: format!("game-{}", uuid::Uuid::new_v4().simple()),
-            who: self.cfg.bot().name.clone(),
+            who: who.to_string(),
             kind: Kind::Game,
             title: String::new(),
             text: name.to_string(),
@@ -2860,23 +3086,62 @@ impl Room {
     /// Returns false when that reply has been dropped.
     pub fn agent_speak(&self, generation: u64, text: &str, samples: Vec<f32>) -> bool {
         let mut st = self.lock();
-        let Some(r) = st.reply.as_mut().filter(|r| r.generation == generation) else {
+        let Some(b) = st.working_on(generation) else {
             return false;
         };
+        let strip = b.cfg.strip.clone();
+        let bot = b.cfg.name.clone();
+        let r = b.reply.as_mut().expect("working_on found it by its reply");
         let index = r.sentences.len();
+        let first = index == 0;
         r.sentences.push(Said {
             text: text.to_string(),
             samples: samples.len(),
             played: 0,
         });
-        self.mixer.ai_push(
-            &self.cfg.bot().strip,
-            &self.cfg.language,
-            generation,
-            index,
-            samples,
-        );
+        // The first words of a turn settle who the silence belonged to.
+        // Every other bot that was given it and is still making up its
+        // mind is told to stop: two of them answering at once is two
+        // voices over each other, and whoever got there first was the
+        // one with something to say.
+        if first {
+            self.hush_others(&mut st, &bot);
+        }
+        self.mixer
+            .ai_push(&strip, &self.cfg.language, generation, index, samples);
         true
+    }
+
+    /// Drop whatever every bot but `bot` was in the middle of. Only
+    /// what has not been heard: a bot already speaking is not cut off
+    /// by another starting, because it is the first word that claims
+    /// the turn and it has already had it.
+    fn hush_others(&self, st: &mut State, bot: &str) {
+        let mut dropped: Vec<String> = Vec::new();
+        for b in st.bots.iter_mut() {
+            if b.cfg.name == bot {
+                continue;
+            }
+            let Some(r) = &b.reply else { continue };
+            if !r.sentences.is_empty() {
+                continue;
+            }
+            info!(bot = %b.cfg.name, taken = bot, "somebody else took the pause");
+            b.generation.fetch_add(1, Ordering::SeqCst);
+            let entry = r.entry.clone();
+            b.reply = None;
+            b.state = "listening";
+            // Nothing was said, so nothing is left: the empty entry it
+            // was given to fill goes out of the conversation, or the
+            // model is shown a turn where somebody said nothing and
+            // anyone opening the room later reads one.
+            dropped.push(entry);
+        }
+        for entry in dropped {
+            st.log.retain(|e| e.id != entry);
+            self.emit(json!({ "type": "entry_removed", "id": entry }));
+        }
+        self.emit_agents(st);
     }
 
     /// The same sentence of reply `generation`, translated and spoken in
@@ -2899,12 +3164,26 @@ impl Room {
         // Stale: the turn was cut, or another has been given out since.
         // Both bump the counter, and both mean these words are no longer
         // wanted.
-        if self.generation.load(Ordering::SeqCst) != generation {
-            return false;
-        }
         let mut st = self.lock();
         let conversation = st.conversation;
-        match st.reply.as_mut() {
+        // Stale: the turn was cut, or another has been given out since.
+        // Both bump that bot's counter, and both mean these words are
+        // no longer wanted.
+        let Some(bot) = st
+            .bots
+            .iter()
+            .find(|b| {
+                b.reply.as_ref().is_some_and(|r| r.generation == generation)
+                    || b.last_reply.as_ref().is_some_and(|(g, _)| *g == generation)
+            })
+            .map(|b| b.cfg.clone())
+        else {
+            return false;
+        };
+        if bot.generation(&st) != generation {
+            return false;
+        }
+        match st.bot(&bot.name).reply.as_mut() {
             // The usual way: the turn is still being spoken, so this
             // goes on its language's list and the entry picks it up from
             // there as the audio plays, a word at a time, exactly as the
@@ -2920,7 +3199,7 @@ impl Room {
                     });
                 drop(st);
                 self.mixer
-                    .ai_push(&self.cfg.bot().strip, language, generation, index, samples);
+                    .ai_push(&bot.strip, language, generation, index, samples);
                 true
             }
             Some(_) => false,
@@ -2929,7 +3208,7 @@ impl Room {
             // nothing to follow it with any more, so it goes straight on
             // to the entry, which is where it would have ended up.
             None => {
-                let Some((g, id)) = st.last_reply.clone() else {
+                let Some((g, id)) = st.bot(&bot.name).last_reply.clone() else {
                     return false;
                 };
                 if g != generation {
@@ -2945,7 +3224,7 @@ impl Room {
                 });
                 drop(st);
                 self.mixer
-                    .ai_push(&self.cfg.bot().strip, language, generation, index, samples);
+                    .ai_push(&bot.strip, language, generation, index, samples);
                 if let Some(e) = entry {
                     if e.sent {
                         if let Err(err) = self.store().put_entry(conversation, &e) {
@@ -2962,8 +3241,10 @@ impl Room {
     /// The reply `generation` has nothing more to say.
     pub fn agent_done(&self, generation: u64) {
         let mut st = self.lock();
-        if let Some(r) = st.reply.as_mut().filter(|r| r.generation == generation) {
-            r.complete = true;
+        if let Some(b) = st.working_on(generation) {
+            if let Some(r) = b.reply.as_mut() {
+                r.complete = true;
+            }
         }
     }
 
@@ -2973,14 +3254,21 @@ impl Room {
     /// turn open, because a translated sentence is still on its way.
     pub fn agent_done_in(&self, generation: u64, language: &str) {
         let mut st = self.lock();
-        if let Some(r) = st.reply.as_mut().filter(|r| r.generation == generation) {
-            r.spoken.insert(language.to_string());
+        if let Some(b) = st.working_on(generation) {
+            if let Some(r) = b.reply.as_mut() {
+                r.spoken.insert(language.to_string());
+            }
         }
     }
 
     pub fn agent_failed(&self, generation: u64, error: &str) {
         error!(generation, "reply failed: {error}");
-        self.error(&format!("{} couldn't answer: {error}", self.cfg.bot().name));
+        let who = self
+            .lock()
+            .turn_of(generation)
+            .map(|b| b.cfg.name.clone())
+            .unwrap_or_else(|| self.cfg.bot().name.clone());
+        self.error(&format!("{who} couldn't answer: {error}"));
         self.agent_done(generation);
     }
 
@@ -2988,45 +3276,81 @@ impl Room {
 
     pub fn tick(&self, now: Instant) {
         let mut st = self.lock();
-        self.follow_reply(&mut st, None);
+        let bots: Vec<String> = st.bots.iter().map(|b| b.cfg.name.clone()).collect();
+        for bot in &bots {
+            self.follow_reply(&mut st, bot, None);
+        }
         self.follow_interp(&mut st);
         self.barge_in(&mut st, now);
         self.hand_over(&mut st, now);
         self.reconsider(&mut st, now);
         self.follow_engagement(&mut st, now);
-        let state = match &st.reply {
-            None if self.will_answer(&st) => "waiting",
-            None => "listening",
-            Some(r) if r.sentences.iter().any(|s| s.played > 0) => "speaking",
-            // Still only deciding whether to speak: the room shouldn't
-            // flash "thinking" at every pause of a conversation that may
-            // well not be with it.
-            Some(r) if r.cue.deciding() && r.sentences.is_empty() => "listening",
-            Some(_) => "thinking",
-        };
-        if state == "speaking" && st.agent_state != "speaking" {
-            if let Some(r) = &st.reply {
-                info!(
-                    generation = r.generation,
-                    after_words_ms = r.heard.elapsed().as_millis() as u64,
-                    after_asking_ms = r.asked.elapsed().as_millis() as u64,
-                    "reply: first audio"
-                );
+        self.follow_state(&mut st);
+    }
+
+    /// What each bot is up to, and say so when it changes.
+    fn follow_state(&self, st: &mut State) {
+        let waiting = self.will_answer(st);
+        let mut changed = false;
+        for b in st.bots.iter_mut() {
+            let state = match &b.reply {
+                None if waiting && b.mode != Mode::Named => "waiting",
+                None => "listening",
+                Some(r) if r.sentences.iter().any(|s| s.played > 0) => "speaking",
+                // Still only deciding whether to speak: the room
+                // shouldn't flash "thinking" at every pause of a
+                // conversation that may well not be with it.
+                Some(r) if r.cue.deciding() && r.sentences.is_empty() => "listening",
+                Some(_) => "thinking",
+            };
+            if state == "speaking" && b.state != "speaking" {
+                if let Some(r) = &b.reply {
+                    info!(
+                        bot = %b.cfg.name,
+                        generation = r.generation,
+                        after_words_ms = r.heard.elapsed().as_millis() as u64,
+                        after_asking_ms = r.asked.elapsed().as_millis() as u64,
+                        "reply: first audio"
+                    );
+                }
+            }
+            if state != b.state {
+                b.state = state;
+                changed = true;
             }
         }
-        if state != st.agent_state {
-            st.agent_state = state;
-            self.emit(json!({ "type": "agent", "state": state }));
+        if changed {
+            self.emit_agents(st);
         }
+    }
+
+    /// What every bot in the room is doing, to every tab.
+    fn emit_agents(&self, st: &State) {
+        self.emit(json!({
+            "type": "agents",
+            "agents": st.bots.iter().map(|b| json!({
+                "name": b.cfg.name,
+                "state": b.state,
+            })).collect::<Vec<_>>(),
+        }));
     }
 
     /// Bring the AI's entry up to what the mixer has played; finish the
     /// reply once everything has been.
-    fn follow_reply(&self, st: &mut State, progress: Option<BTreeMap<String, TrackProgress>>) {
-        if st.reply.is_none() {
-            return;
-        }
-        let all = progress.unwrap_or_else(|| self.mixer.ai_progress(&self.cfg.bot().strip));
+    fn follow_reply(
+        &self,
+        st: &mut State,
+        bot: &str,
+        progress: Option<BTreeMap<String, TrackProgress>>,
+    ) {
+        let strip = {
+            let b = st.bot(bot);
+            if b.reply.is_none() {
+                return;
+            }
+            b.cfg.strip.clone()
+        };
+        let all = progress.unwrap_or_else(|| self.mixer.ai_progress(&strip));
         // Every language this turn is being said in: the room's own, and
         // each other one somebody is listening in. A language nobody has
         // picked is never spoken, so there is nothing of it to wait for
@@ -3045,7 +3369,7 @@ impl Room {
             })
             .map(|l| (l.clone(), true))
             .collect();
-        let Some(r) = st.reply.as_mut() else {
+        let Some(r) = st.bot(bot).reply.as_mut() else {
             return;
         };
         // Something was queued in a language nobody is listening in any
@@ -3213,8 +3537,10 @@ impl Room {
             }));
         }
         if finished {
-            let generation = st.reply.take().map(|r| r.generation);
-            if let Some((g, game)) = st.starting.take() {
+            let b = st.bot(bot);
+            let generation = b.reply.take().map(|r| r.generation);
+            let started = b.starting.take();
+            if let Some((g, game)) = started {
                 if Some(g) == generation {
                     self.begin_game(st, game);
                 }
@@ -3223,7 +3549,7 @@ impl Room {
     }
 
     fn barge_in(&self, st: &mut State, now: Instant) {
-        if st.reply.is_none() {
+        if st.bots.iter().all(|b| b.reply.is_none()) {
             if st.ducked {
                 st.ducked = false;
                 self.mixer.ai_duck(false);
@@ -3264,24 +3590,35 @@ impl Room {
     }
 
     /// Cut the reply in progress where the mixer has got to.
+    /// Cut whoever is talking. A person talking over the room is
+    /// talking over all of it: every bot in the middle of something
+    /// stops, not only whichever one got in first.
     fn interrupt(&self, st: &mut State) {
-        // A game the AI was starting still starts: the players asked.
-        let starting = st.starting.take();
-        self.cut_reply(st);
+        // A game a bot was starting still starts: the players asked.
+        let mut starting = None;
+        let bots: Vec<String> = st.bots.iter().map(|b| b.cfg.name.clone()).collect();
+        for bot in &bots {
+            starting = st.bot(bot).starting.take().or(starting);
+            self.cut_reply(st, bot);
+        }
         if let Some((_, game)) = starting {
             self.begin_game(st, game);
         }
     }
 
-    fn cut_reply(&self, st: &mut State) {
-        if st.reply.is_none() {
-            return;
-        }
-        self.generation.fetch_add(1, Ordering::SeqCst);
-        let p = self.mixer.ai_clear(&self.cfg.bot().strip);
+    fn cut_reply(&self, st: &mut State, bot: &str) {
+        let strip = {
+            let b = st.bot(bot);
+            if b.reply.is_none() {
+                return;
+            }
+            b.generation.fetch_add(1, Ordering::SeqCst);
+            b.cfg.strip.clone()
+        };
+        let p = self.mixer.ai_clear(&strip);
         st.ducked = false;
-        self.follow_reply(st, Some(p));
-        let Some(r) = st.reply.take() else {
+        self.follow_reply(st, bot, Some(p));
+        let Some(r) = st.bot(bot).reply.take() else {
             // follow_reply saw the whole turn played out in every
             // language and closed it properly. Nothing was cut.
             return;
@@ -3329,7 +3666,8 @@ impl Room {
     /// Hand what people said to the conversation once the room is quiet,
     /// and ask the AI to answer when it should.
     fn hand_over(&self, st: &mut State, now: Instant) {
-        if st.reply.is_some()
+        // Any bot still answering means the turn is not over.
+        if st.bots.iter().any(|b| b.reply.is_some())
             || st.people.values().any(|p| p.speaking || p.holding())
             || now.duration_since(st.last_change) < self.cfg.reply_after
         {
@@ -3369,25 +3707,56 @@ impl Room {
         // the AI is given the turn at every pause, until the room goes
         // quiet. Someone speaking also cancels a silence it was waiting
         // on -- the silence didn't happen.
-        let named = self.named(&said);
-        st.reconsider = None;
-        if st.mode == Mode::Named && named {
-            self.engage(st, now);
+        //
+        // Every bot that could answer is given the turn at once. The
+        // first to actually say something keeps it and the rest are
+        // told to stop (see `hush_others`): asking them one at a time
+        // would put a round trip of silence in the room for every bot
+        // that had nothing to say.
+        let named = self.named(st, &said);
+        let bots: Vec<String> = st.bots.iter().map(|b| b.cfg.name.clone()).collect();
+        let mut turns: Vec<(String, Cue)> = Vec::new();
+        for bot in bots {
+            let was_named = named.contains(&bot);
+            let b = st.bot(&bot);
+            b.reconsider = None;
+            if b.mode == Mode::Named && was_named {
+                self.engage(st, &bot, now);
+            }
+            match st.bot(&bot).mode {
+                // Not its name, so not its turn.
+                Mode::Named => {}
+                // Named, so it answers; otherwise it judges for itself
+                // whether this pause is its moment.
+                Mode::Auto if was_named => turns.push((bot, Cue::Speak)),
+                Mode::Auto => turns.push((bot, Cue::Decide { lull: None })),
+                Mode::Always => turns.push((bot, Cue::Speak)),
+            }
         }
-        match st.mode {
-            // Not its name, so not its turn.
-            Mode::Named => {}
-            // Named, so it answers; otherwise it judges for itself
-            // whether this pause is its moment.
-            Mode::Auto if named => self.ask(st, now, Cue::Speak),
-            Mode::Auto => self.ask(st, now, Cue::Decide { lull: None }),
-            Mode::Always => self.ask(st, now, Cue::Speak),
+        // Worked out before anybody is asked, because it decides
+        // whether a bot goes on screen as it is given the turn: one
+        // bot with the pause to itself does, so the room shows it has
+        // been heard. Two of them cannot -- all but one of those
+        // entries is about to be taken back, and two bots apparently
+        // starting to talk is the thing `hush_others` exists to spare
+        // everyone. They appear when they say something.
+        let alone = turns.len() == 1;
+        for (bot, cue) in turns {
+            self.ask(st, &bot, now, cue, alone);
         }
     }
 
     /// Give the AI the turn: to answer, or to decide whether to.
-    fn ask(&self, st: &mut State, now: Instant, cue: Cue) {
-        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+    ///
+    /// `show` puts its entry on screen as the turn is given, which is
+    /// for the bot that has the pause to itself. Held back otherwise,
+    /// and put up by `follow_reply` the moment there is something in
+    /// it -- the same way a bot that is only deciding is held back.
+    fn ask(&self, st: &mut State, bot: &str, now: Instant, cue: Cue, show: bool) {
+        // One counter for the room, so a generation names exactly one
+        // turn by exactly one bot however many are thinking at once.
+        let generation = self.turns.fetch_add(1, Ordering::SeqCst) + 1;
+        st.bot(bot).generation.store(generation, Ordering::SeqCst);
         let mut messages = conversation_messages(&st.log, self.cfg.history, &self.cfg.language);
         let game = match &st.game {
             Some(name) => match self.store().game(name) {
@@ -3404,7 +3773,7 @@ impl Room {
         }
         let entry = Entry {
             id: format!("agent-{}", uuid::Uuid::new_v4().simple()),
-            who: self.cfg.bot().name.clone(),
+            who: bot.to_string(),
             kind: Kind::Agent,
             title: String::new(),
             text: String::new(),
@@ -3419,11 +3788,12 @@ impl Room {
         // While it is only deciding, its entry is held back: a turn it
         // passes on must leave nothing behind. follow_reply puts it on
         // screen as soon as there is something to show.
-        if !cue.deciding() {
+        if show && !cue.deciding() {
             self.emit_entry(&entry);
         }
-        st.last_reply = Some((generation, entry.id.clone()));
-        st.reply = Some(Reply {
+        let b = st.bot(bot);
+        b.last_reply = Some((generation, entry.id.clone()));
+        b.reply = Some(Reply {
             generation,
             entry: entry.id.clone(),
             cue,
@@ -3433,20 +3803,23 @@ impl Room {
             spoken: BTreeSet::new(),
             reported: Vec::new(),
             dry_since: None,
-            heard: st.quiet_since,
+            heard: now,
             asked: now,
         });
+        st.bot(bot).reply.as_mut().expect("just set").heard = st.quiet_since;
         st.log.push(entry);
         trim_log(&mut st.log);
         info!(
+            bot,
             generation,
             after_words_ms = now.duration_since(st.quiet_since).as_millis() as u64,
             after_transcript_ms = now.duration_since(st.last_change).as_millis() as u64,
             deciding = cue.deciding(),
             "reply: asking the agent"
         );
-        if self
-            .agent
+        let engaged = st.bot(bot).engaged.is_some();
+        let turns = st.bot(bot).turns.clone();
+        if turns
             .send(Turn {
                 generation,
                 messages,
@@ -3466,16 +3839,13 @@ impl Room {
                     .filter(|(_, p)| self.language_of(p) != self.cfg.language)
                     .map(|(n, p)| (n.clone(), self.language_of(p).to_string()))
                     .collect(),
-                engaged: st.engaged.is_some(),
+                engaged,
                 cue,
             })
             .is_err()
         {
-            error!("agent thread is gone");
-            self.error(&format!(
-                "{} has stopped: restart the room",
-                self.cfg.bot().name
-            ));
+            error!(bot, "agent thread is gone");
+            self.error(&format!("{bot} has stopped: restart the room"));
         }
     }
 
@@ -3489,19 +3859,29 @@ impl Room {
             .peekable();
         !st.people.values().any(|p| p.speaking || p.holding())
             && pending.peek().is_some()
-            // In `Auto` it is the AI's call, so the room doesn't promise
-            // an answer it may not give.
-            && (st.mode == Mode::Always || pending.any(|e| self.named(&e.text)))
+            // In `Auto` it is the bot's call, so the room doesn't
+            // promise an answer it may not give. Somebody is going to
+            // answer if any of them answers every pause, or if any of
+            // them was named.
+            && (st.bots.iter().any(|b| b.mode == Mode::Always)
+                || pending.any(|e| !self.named(st, &e.text).is_empty()))
     }
 
-    /// Someone said the AI's name (or one of its aliases).
-    fn named(&self, text: &str) -> bool {
+    /// Which bots somebody said the name of, by name or by one of the
+    /// spellings speech-to-text makes of it.
+    fn named(&self, st: &State, text: &str) -> Vec<String> {
         let words = words(text);
-        std::iter::once(&self.cfg.bot().name)
-            .chain(self.cfg.bot().aliases.iter())
-            .map(|n| words_of(n))
-            .filter(|n| !n.is_empty())
-            .any(|n| words.windows(n.len()).any(|w| w == n.as_slice()))
+        st.bots
+            .iter()
+            .filter(|b| {
+                std::iter::once(&b.cfg.name)
+                    .chain(b.cfg.aliases.iter())
+                    .map(|n| words_of(n))
+                    .filter(|n| !n.is_empty())
+                    .any(|n| words.windows(n.len()).any(|w| w == n.as_slice()))
+            })
+            .map(|b| b.cfg.name.clone())
+            .collect()
     }
 }
 
@@ -3756,6 +4136,11 @@ mod tests {
     use super::*;
     use vox_transcribe::{Clip, Stage};
 
+    /// The turn the room's one bot is working on.
+    fn turn(r: &Room) -> u64 {
+        r.lock().only().generation.load(Ordering::SeqCst)
+    }
+
     fn room(mode: Mode) -> (Arc<Room>, crossbeam_channel::Receiver<Turn>) {
         let (r, turns, _) = room_with(mode, &[]);
         (r, turns)
@@ -3774,7 +4159,6 @@ mod tests {
         store.invite("Ryan").unwrap();
         store.invite("Alex").unwrap();
         store.set_setting("mode", mode.as_str()).unwrap();
-        let (tx, rx) = crossbeam_channel::unbounded();
         let cfg = RoomConfig {
             id: "Lobby".into(),
             title: "Lobby".into(),
@@ -3796,17 +4180,11 @@ mod tests {
             interp_tx.insert(language.to_string(), tx);
             interp_rx.insert(language.to_string(), rx);
         }
-        let r = Room::new(
-            store,
-            cfg,
-            Arc::new(AtomicU64::new(0)),
-            tx,
-            None,
-            interp_tx,
-            None,
-        )
-        .unwrap();
-        (r, rx, interp_rx)
+        let (r, mut wiring) = Room::new(store, cfg, None, interp_tx, None).unwrap();
+        // The turns the room's one bot is given, in place of the agent
+        // thread that would be reading them.
+        let turns = wiring.pop().expect("a room has an AI in it").turns;
+        (r, turns, interp_rx)
     }
 
     /// A game that leaves the room's mode alone.
@@ -3924,8 +4302,7 @@ mod tests {
         let store = Store::memory();
         store.invite("Ryan").unwrap();
         store.invite("Alex").unwrap();
-        let (tx, _turns) = crossbeam_channel::unbounded();
-        let mine = Room::new(
+        let (mine, _wiring) = Room::new(
             store,
             RoomConfig {
                 id: "@Ryan".into(),
@@ -3941,8 +4318,6 @@ mod tests {
                 languages: vec!["English".into()],
                 spoken: vec!["English".into()],
             },
-            Arc::new(AtomicU64::new(0)),
-            tx,
             None,
             BTreeMap::new(),
             None,
@@ -3951,7 +4326,7 @@ mod tests {
         let names = |r: &Room| r.lock().people.keys().cloned().collect::<Vec<_>>();
         assert_eq!(names(&mine), ["Ryan"], "Alex is invited, not admitted");
         assert_eq!(
-            mine.lock().mode,
+            mine.lock().only().mode,
             Mode::Always,
             "and nobody to take the turn from"
         );
@@ -4087,7 +4462,7 @@ mod tests {
             turns.try_recv().is_err(),
             "a pause while holding isn't the end"
         );
-        assert_eq!(r.lock().agent_state, "listening");
+        assert_eq!(r.lock().only().state, "listening");
         r.on_paragraph(
             "Ryan",
             &para("p1", "Let me think about it. Okay, go.", false),
@@ -4133,7 +4508,7 @@ mod tests {
         r.on_paragraph("Ryan", &para("p1", "What do you think, Alex?", false));
         r.tick(quiet(&r));
         assert!(turns.try_recv().is_err(), "not addressed");
-        assert_eq!(r.lock().agent_state, "listening");
+        assert_eq!(r.lock().only().state, "listening");
         r.on_paragraph("Alex", &para("p2", "Let's ask vox.", false));
         r.tick(quiet(&r));
         let t = turns.try_recv().expect("named");
@@ -4163,7 +4538,7 @@ mod tests {
         r.on_paragraph("Ryan", &para("p1", "Hello there.", false));
         r.tick(Instant::now());
         assert!(turns.try_recv().is_err(), "not quiet long enough");
-        assert_eq!(r.lock().agent_state, "waiting", "shown as about to answer");
+        assert_eq!(r.lock().only().state, "waiting", "shown as about to answer");
         r.on_level("Ryan", true);
         r.tick(quiet(&r));
         assert!(turns.try_recv().is_err(), "still talking");
@@ -4216,12 +4591,15 @@ mod tests {
         let since = Instant::now();
         r.tick(since);
         assert!(r.lock().ducked, "ducked as soon as someone talks");
-        assert!(r.lock().reply.is_some(), "not cut before it's confirmed");
+        assert!(
+            r.lock().only().reply.is_some(),
+            "not cut before it's confirmed"
+        );
         r.tick(since + Duration::from_millis(400));
         let e = agent_entry(&r);
         assert!(e.cut && !e.live);
         assert!(e.text.ends_with(" —"), "{:?}", e.text);
-        assert!(r.lock().reply.is_none());
+        assert!(r.lock().only().reply.is_none());
         // The model hears where it was cut off.
         let msgs = conversation_messages(&r.lock().log, 50, "English");
         assert!(msgs.last().unwrap().1.ends_with(CUT_NOTE));
@@ -4243,7 +4621,7 @@ mod tests {
         assert!(!r.lock().ducked, "not ducked by a translated listener");
         r.tick(since + Duration::from_millis(400));
         assert!(
-            r.lock().reply.is_some(),
+            r.lock().only().reply.is_some(),
             "and not cut off by one either, however long they talk"
         );
 
@@ -4253,7 +4631,10 @@ mod tests {
         r.tick(since);
         assert!(r.lock().ducked);
         r.tick(since + Duration::from_millis(400));
-        assert!(r.lock().reply.is_none(), "cut by a listener who is with it");
+        assert!(
+            r.lock().only().reply.is_none(),
+            "cut by a listener who is with it"
+        );
     }
 
     #[test]
@@ -4283,7 +4664,7 @@ mod tests {
         // A click says where to cut without anyone having to guess from
         // voice, so the one escape hatch stays open to them.
         r.stop_agent();
-        assert!(r.lock().reply.is_none());
+        assert!(r.lock().only().reply.is_none());
     }
 
     #[test]
@@ -4684,7 +5065,7 @@ mod tests {
         }
         r.tick(Instant::now());
         assert!(!agent_entry(&r).live, "now it has been heard in both");
-        assert!(r.lock().reply.is_none());
+        assert!(r.lock().only().reply.is_none());
     }
 
     #[test]
@@ -4746,7 +5127,7 @@ mod tests {
         );
         assert!(e.live, "still being said, in Russian");
         assert_eq!(e.translations["Russian"], ru0);
-        assert!(r.lock().reply.is_some());
+        assert!(r.lock().only().reply.is_some());
 
         for _ in 0..150 {
             r.mixer.tick();
@@ -4780,7 +5161,7 @@ mod tests {
         // What is genuinely stale is still dropped: once the turn has
         // been cut or another given out, the counter has moved on and
         // these are words nobody is waiting for.
-        r.generation.fetch_add(1, Ordering::SeqCst);
+        r.lock().only().generation.fetch_add(1, Ordering::SeqCst);
         assert!(!r.agent_speak_translated(g, "Russian", 3, "Конец.", vec![0.1; 4800]));
         assert_eq!(russian(&r), format!("{ru0} {ru1} {ru2}"));
     }
@@ -4863,11 +5244,11 @@ mod tests {
         assert!(!r.lock().ducked, "typing is not talking");
         r.tick(since + Duration::from_millis(400));
         assert!(
-            r.lock().reply.is_some(),
+            r.lock().only().reply.is_some(),
             "and it never cuts the AI off, whatever the confirm window"
         );
         assert_eq!(
-            r.lock().reply.as_ref().unwrap().generation,
+            r.lock().only().reply.as_ref().unwrap().generation,
             g,
             "the same turn is still running"
         );
@@ -4935,7 +5316,7 @@ mod tests {
         r.on_level("Alex", false);
         r.tick(Instant::now());
         assert!(!r.lock().ducked);
-        assert!(r.lock().reply.is_some());
+        assert!(r.lock().only().reply.is_some());
     }
 
     #[test]
@@ -4947,7 +5328,7 @@ mod tests {
         r.on_level("Alex", true);
         r.tick(Instant::now() + Duration::from_millis(400));
         assert!(!r.lock().ducked);
-        assert!(r.lock().reply.is_some());
+        assert!(r.lock().only().reply.is_some());
         // Muted by themselves.
         r.set_strip("Alex", None, Some(false));
         r.join("Ryan", 1);
@@ -4955,11 +5336,14 @@ mod tests {
         r.set_muted("Ryan", 1, true);
         r.on_level("Ryan", true);
         r.tick(Instant::now() + Duration::from_millis(400));
-        assert!(r.lock().reply.is_some());
+        assert!(r.lock().only().reply.is_some());
         r.set_muted("Ryan", 1, false);
         r.on_level("Ryan", true);
         r.tick(Instant::now() + Duration::from_millis(400));
-        assert!(r.lock().reply.is_none(), "unmuted, they interrupt again");
+        assert!(
+            r.lock().only().reply.is_none(),
+            "unmuted, they interrupt again"
+        );
     }
 
     #[test]
@@ -4969,7 +5353,7 @@ mod tests {
         r.on_level("Alex", true);
         r.on_paragraph("Alex", &para("p9", "WAIT", true));
         r.tick(Instant::now());
-        assert!(r.lock().reply.is_none());
+        assert!(r.lock().only().reply.is_none());
     }
 
     #[test]
@@ -5001,7 +5385,7 @@ mod tests {
             e.text,
             "Once upon a time there was a dragon. It was very old."
         );
-        assert!(r.lock().reply.is_none());
+        assert!(r.lock().only().reply.is_none());
     }
 
     fn cards(r: &Room) -> Vec<String> {
@@ -5016,7 +5400,7 @@ mod tests {
     #[test]
     fn a_saved_game_can_be_revised_and_played() {
         let (r, turns) = room(Mode::Always);
-        let g = r.generation.load(Ordering::SeqCst);
+        let g = turn(&r);
         assert_eq!(r.check_game_name("Dragon Heist"), Ok(()));
         r.save_game(g, "Dragon Heist", "A heist.", "Run a heist.", lobby_game())
             .unwrap();
@@ -5065,7 +5449,7 @@ mod tests {
         r.lobby();
         assert_eq!(r.lock().game, None);
         // Played games can still be revised in the lobby.
-        let g = r.generation.load(Ordering::SeqCst);
+        let g = turn(&r);
         r.revise_game(
             g,
             "Dragon Caper",
@@ -5087,7 +5471,7 @@ mod tests {
     #[test]
     fn a_game_started_by_voice_opens_after_the_reply_is_heard() {
         let (r, turns) = room(Mode::Named);
-        let g0 = r.generation.load(Ordering::SeqCst);
+        let g0 = turn(&r);
         r.save_game(
             g0,
             "Quick Draw",
@@ -5112,6 +5496,115 @@ mod tests {
         let t = turns.try_recv().expect("the AI opens the game");
         assert_eq!(t.game.unwrap().1, "Run a showdown.");
         assert!(r.start_game(t.generation, "nope").is_err());
+    }
+
+    /// Two bots in one room: each answers to its own name, each has its
+    /// own say in when it speaks, and the first to actually say
+    /// something at a pause keeps it — the others are told to stop,
+    /// because two of them answering at once is two voices over each
+    /// other.
+    #[test]
+    fn two_bots_share_the_room_and_the_first_to_speak_takes_the_pause() {
+        let store = Store::memory().in_room("Lobby");
+        store.invite("Ryan").unwrap();
+        let (r, wiring) = Room::new(
+            store,
+            RoomConfig {
+                id: "Lobby".into(),
+                title: "Lobby".into(),
+                only: None,
+                default_mode: Mode::Always,
+                bots: vec![
+                    BotConfig::new("Vox", vec!["box".into()]),
+                    BotConfig::new("Sage", vec![]),
+                ],
+                reply_after: Duration::from_millis(1000),
+                confirm: Duration::from_millis(300),
+                engaged_for: Duration::from_millis(5000),
+                history: 50,
+                language: "English".into(),
+                languages: vec!["English".into()],
+                spoken: vec!["English".into()],
+            },
+            None,
+            BTreeMap::new(),
+            None,
+        )
+        .unwrap();
+        let turns: BTreeMap<String, _> = wiring
+            .into_iter()
+            .map(|w| (w.name.clone(), w.turns))
+            .collect();
+        let strips: Vec<String> = r.lock().bots.iter().map(|b| b.cfg.strip.clone()).collect();
+        assert_eq!(
+            strips.iter().collect::<BTreeSet<_>>().len(),
+            2,
+            "a fader each, or one would move both: {strips:?}"
+        );
+
+        // Both answer every pause, so both are given it at once —
+        // asking them one at a time would put a round trip of silence
+        // in the room for every bot with nothing to say.
+        let mut events = r.subscribe();
+        r.on_paragraph("Ryan", &para("p1", "So what do we think?", false));
+        r.tick(quiet(&r));
+        assert!(
+            events_of(&mut events, "entry")
+                .iter()
+                .all(|e| !e.contains("\"kind\":\"agent\"")),
+            "neither of them is on screen yet: all but one of those \
+             entries is about to be taken back"
+        );
+        let vox = turns["Vox"].try_recv().expect("Vox was given the turn");
+        let sage = turns["Sage"].try_recv().expect("Sage was too");
+        assert_ne!(
+            vox.generation, sage.generation,
+            "one counter for the room, so a turn number names one bot's turn"
+        );
+
+        // Sage gets its first word out, so the pause is Sage's. Vox had
+        // not started, so Vox is told to stop.
+        assert!(r.agent_speak(sage.generation, "I think so.", vec![0.1; 4800]));
+        assert!(
+            r.lock().bot("Vox").reply.is_none(),
+            "somebody else took the pause"
+        );
+        assert!(
+            !r.agent_speak(vox.generation, "Well—", vec![0.1; 4800]),
+            "and what it was about to say is dropped"
+        );
+        assert_eq!(agent_entry(&r).who, "Sage", "whose words they are");
+        // And the one that was hushed leaves nothing behind: its entry
+        // is out of the conversation and taken back from every screen
+        // it might have reached.
+        let agents: Vec<String> = r
+            .lock()
+            .log
+            .iter()
+            .filter(|e| e.kind == Kind::Agent)
+            .map(|e| e.who.clone())
+            .collect();
+        assert_eq!(agents, ["Sage"], "one reply in the conversation, not two");
+        assert_eq!(
+            events_of(&mut events, "entry_removed").len(),
+            1,
+            "and the other was taken back"
+        );
+
+        // Each answers to its own name, and in `named` neither answers
+        // anything else.
+        r.set_mode("Vox", "named");
+        r.set_mode("Sage", "named");
+        r.stop_agent();
+        r.on_paragraph("Ryan", &para("p2", "Sage, what about the door?", false));
+        r.tick(quiet(&r));
+        assert!(turns["Sage"].try_recv().is_ok(), "it was named");
+        assert!(turns["Vox"].try_recv().is_err(), "it was not");
+
+        // And one bot's setting is not the other's.
+        r.set_mode("Sage", "always");
+        let modes: Vec<Mode> = r.lock().bots.iter().map(|b| b.chosen).collect();
+        assert_eq!(modes, [Mode::Named, Mode::Always]);
     }
 
     /// A conversation can be called something, and what it is called is
@@ -5228,7 +5721,7 @@ mod tests {
     #[test]
     fn leaving_a_game_puts_the_room_back_where_it_was() {
         let (r, turns) = room(Mode::Named);
-        let g = r.generation.load(Ordering::SeqCst);
+        let g = turn(&r);
         r.save_game(
             g,
             "Quick Draw",
@@ -5242,7 +5735,7 @@ mod tests {
         r.on_paragraph("Ryan", &para("p1", "Before the game.", false));
         r.tick(quiet(&r));
         let _ = turns.try_recv();
-        r.send_card("Ryan", "Your hand", "Two aces.").unwrap();
+        r.send_card(1, "Ryan", "Your hand", "Two aces.").unwrap();
         let before = r.lock().conversation;
         // The card the AI posted when it saved the game is in the
         // conversation too, as anything said in it is.
@@ -5315,7 +5808,7 @@ mod tests {
     #[test]
     fn a_game_deleted_by_voice_leaves_the_chat() {
         let (r, _turns) = room(Mode::Named);
-        let g = r.generation.load(Ordering::SeqCst);
+        let g = turn(&r);
         r.save_game(g, "Zork", "Caves.", "Dark.", lobby_game())
             .unwrap();
         assert_eq!(cards(&r), ["Zork"]);
@@ -5328,8 +5821,8 @@ mod tests {
     #[test]
     fn a_game_isnt_saved_by_a_reply_that_was_talked_over() {
         let (r, _turns) = room(Mode::Always);
-        let g = r.generation.load(Ordering::SeqCst);
-        r.generation.fetch_add(1, Ordering::SeqCst);
+        let g = turn(&r);
+        r.lock().only().generation.fetch_add(1, Ordering::SeqCst);
         assert!(r
             .save_game(g, "Zork", "Caves.", "Dark.", lobby_game())
             .is_err());
@@ -5338,8 +5831,9 @@ mod tests {
 
     /// The room's effective mode, and whether a back-and-forth is on.
     fn mode_now(r: &Room) -> (Mode, bool) {
-        let st = r.lock();
-        (st.mode, st.engaged.is_some())
+        let mut st = r.lock();
+        let b = st.only();
+        (b.mode, b.engaged.is_some())
     }
 
     #[test]
@@ -5364,7 +5858,7 @@ mod tests {
             .collect();
         assert_eq!(
             mode_events,
-            [r#"{"engaged":true,"locked":false,"mode":"auto","type":"mode"}"#],
+            [r#"{"bot":"Vox","engaged":true,"locked":false,"mode":"auto","type":"mode"}"#],
         );
 
         // The next thing said needs no name at all.
@@ -5398,7 +5892,9 @@ mod tests {
         assert!(turns.try_recv().is_ok());
         assert_eq!(mode_now(&r), (Mode::Auto, true));
 
-        assert_eq!(r.wait_until_named(), "named");
+        // Standing down is something a bot does in the middle of the
+        // turn it was given, so it says which turn.
+        assert_eq!(r.wait_until_named(turn(&r)), "named");
         assert_eq!(mode_now(&r), (Mode::Named, false));
         r.stop_agent();
         r.on_paragraph("Ryan", &para("p2", "So where were we, Alex?", false));
@@ -5409,7 +5905,7 @@ mod tests {
     #[test]
     fn a_game_can_require_its_own_mode() {
         let (r, turns) = room(Mode::Named);
-        let g = r.generation.load(Ordering::SeqCst);
+        let g = turn(&r);
         r.save_game(
             g,
             "Dragon Heist",
@@ -5437,7 +5933,7 @@ mod tests {
         r.tick(Instant::now() + r.cfg.engaged_for * 2);
         assert_eq!(mode_now(&r), (Mode::Always, false), "the game still rules");
         // Nor does the AI standing down.
-        assert_eq!(r.wait_until_named(), "always");
+        assert_eq!(r.wait_until_named(turn(&r)), "always");
 
         // Back in the lobby it is the people's mode again.
         r.lobby();
@@ -5464,7 +5960,7 @@ mod tests {
     #[test]
     fn a_games_mode_is_part_of_what_is_saved() {
         let (r, _turns) = room(Mode::Named);
-        let g = r.generation.load(Ordering::SeqCst);
+        let g = turn(&r);
         r.save_game(
             g,
             "Quick Draw",
@@ -5513,11 +6009,11 @@ mod tests {
         r.tick(quiet(&r));
 
         // The room doesn't promise an answer it isn't sure of...
-        assert_eq!(r.lock().agent_state, "listening");
+        assert_eq!(r.lock().only().state, "listening");
         // ...but the AI does get the turn, to judge for itself.
         let t = turns.try_recv().expect("given the turn");
         assert_eq!(t.cue, Cue::Decide { lull: None });
-        assert_eq!(r.lock().agent_state, "listening", "not even thinking");
+        assert_eq!(r.lock().only().state, "listening", "not even thinking");
         assert!(
             events_of(&mut events, "entry")
                 .iter()
@@ -5527,8 +6023,8 @@ mod tests {
 
         // It judges the pause to be the people's, and says so.
         r.stay_quiet(t.generation, None).unwrap();
-        assert!(r.lock().reply.is_none());
-        assert_eq!(r.lock().agent_state, "listening");
+        assert!(r.lock().only().reply.is_none());
+        assert_eq!(r.lock().only().state, "listening");
         // The conversation is exactly what the people said.
         assert_eq!(
             r.lock()
@@ -5566,7 +6062,7 @@ mod tests {
         r.stay_quiet(again.generation, Some(3)).unwrap();
         r.tick(at(30_000));
         assert!(turns.try_recv().is_err(), "once per silence");
-        assert!(r.lock().reconsider.is_none());
+        assert!(r.lock().only().reconsider.is_none());
     }
 
     #[test]
@@ -5583,7 +6079,7 @@ mod tests {
         // next turn comes from what they said, not from the old wait.
         r.on_paragraph("Alex", &para("p2", "Where were we?", false));
         r.tick(at(2_300));
-        assert!(r.lock().reconsider.is_none());
+        assert!(r.lock().only().reconsider.is_none());
         let next = turns.try_recv().expect("the new pause");
         assert_eq!(next.cue, Cue::Decide { lull: None });
         assert!(next.messages[0].1.contains("Where were we?"));
@@ -5600,7 +6096,7 @@ mod tests {
             r.stay_quiet(t.generation, None).is_err(),
             "it was told to answer, not asked whether to"
         );
-        assert!(r.lock().reply.is_some(), "the reply stands");
+        assert!(r.lock().only().reply.is_some(), "the reply stands");
         // And a turn the room has moved past is nobody's to pass on.
         assert!(r.stay_quiet(t.generation + 99, None).is_err());
     }
@@ -5619,7 +6115,7 @@ mod tests {
         let (r, _turns) = room(Mode::Named);
         let mut events = r.subscribe();
         assert_eq!(
-            r.send_card("ryan", " Your role ", " You are the traitor. "),
+            r.send_card(1, "ryan", " Your role ", " You are the traitor. "),
             Ok("Ryan".into()),
             "the name is matched ignoring case"
         );
@@ -5647,15 +6143,15 @@ mod tests {
     #[test]
     fn a_card_needs_somebody_to_send_it_to() {
         let (r, _turns) = room(Mode::Named);
-        let err = r.send_card("Morgan", "Your role", "You are the traitor.");
+        let err = r.send_card(1, "Morgan", "Your role", "You are the traitor.");
         assert!(
             err.as_ref().is_err_and(|e| e.contains("Alex, Ryan")),
             "the error names who is here: {err:?}"
         );
-        assert!(r.send_card("Ryan", "", "nothing titled").is_err());
-        assert!(r.send_card("Ryan", "Empty", "   ").is_err());
+        assert!(r.send_card(1, "Ryan", "", "nothing titled").is_err());
+        assert!(r.send_card(1, "Ryan", "Empty", "   ").is_err());
         assert!(r
-            .send_card("Ryan", &"x".repeat(CARD_TITLE_MAX + 1), "body")
+            .send_card(1, "Ryan", &"x".repeat(CARD_TITLE_MAX + 1), "body")
             .is_err());
         assert!(held(&r, "Ryan").is_empty());
     }
@@ -5664,12 +6160,12 @@ mod tests {
     fn the_ai_decides_what_everyone_is_holding() {
         let (r, _turns) = room(Mode::Named);
         let mut events = r.subscribe();
-        r.send_card("Ryan", "Your hand", "Two aces.").unwrap();
+        r.send_card(1, "Ryan", "Your hand", "Two aces.").unwrap();
         let first = r.cards_for(&r.lock(), "Ryan")[0].id.clone();
 
         // The same title again rewrites that card rather than stacking
         // another beside it, so a hand can change as it is played.
-        r.send_card("Ryan", "your hand", "Two aces and the queen.")
+        r.send_card(1, "Ryan", "your hand", "Two aces and the queen.")
             .unwrap();
         assert_eq!(held(&r, "Ryan"), ["your hand: Two aces and the queen."]);
         assert_eq!(
@@ -5697,10 +6193,10 @@ mod tests {
     fn a_posted_card_is_in_the_conversation_for_good() {
         let (r, _turns) = room(Mode::Named);
         let mut events = r.subscribe();
-        assert!(r.post_card("  ", "nothing titled").is_err());
-        assert!(r.post_card("The rules", "   ").is_err());
+        assert!(r.post_card(1, "  ", "nothing titled").is_err());
+        assert!(r.post_card(1, "The rules", "   ").is_err());
         assert_eq!(
-            r.post_card(" The rules ", " One card each.\nAces are low. "),
+            r.post_card(1, " The rules ", " One card each.\nAces are low. "),
             Ok("The rules".into())
         );
 
@@ -5728,9 +6224,9 @@ mod tests {
     #[test]
     fn the_ai_can_read_back_what_it_has_dealt() {
         let (r, _turns) = room(Mode::Named);
-        r.send_card("Ryan", "Your role", "You are the traitor.")
+        r.send_card(1, "Ryan", "Your role", "You are the traitor.")
             .unwrap();
-        r.send_card("Alex", "Your hand", "Two aces.").unwrap();
+        r.send_card(1, "Alex", "Your hand", "Two aces.").unwrap();
 
         let all = r.read_cards(None);
         assert_eq!(all.len(), 2, "everyone, holding or not");
@@ -5752,9 +6248,9 @@ mod tests {
         // The AI is shown who is in the room, so they have to be in it.
         r.join("Ryan", 1);
         r.join("Alex", 2);
-        r.send_card("Ryan", "Your role", "You are the traitor.")
+        r.send_card(1, "Ryan", "Your role", "You are the traitor.")
             .unwrap();
-        r.send_card("Alex", "Your hand", "Two aces.").unwrap();
+        r.send_card(1, "Alex", "Your hand", "Two aces.").unwrap();
         // What the AI is shown: who is here, and the title of each card
         // it has given them, which is how it addresses one again.
         assert_eq!(
@@ -5771,7 +6267,7 @@ mod tests {
         );
         assert!(r.hello("Ryan")["cards"].as_array().unwrap().is_empty());
         // The old conversation's cards are still in the database, for it.
-        r.send_card("Ryan", "Again", "A new secret.").unwrap();
+        r.send_card(1, "Ryan", "Again", "A new secret.").unwrap();
         assert_eq!(held(&r, "Ryan"), ["Again: A new secret."]);
     }
 }

@@ -50,7 +50,7 @@
   const quiet = $derived(!agent && (!mic || muted || strip.mute));
 
   const state = $derived(
-    doing ?? (agent ? room.agent.state : speaking ? 'talking' : mic && muted ? 'muted' : mic ? 'mic on' : 'no mic'),
+    doing ?? (speaking ? 'talking' : mic && muted ? 'muted' : mic ? 'mic on' : 'no mic'),
   );
 
   function gain(e) {
