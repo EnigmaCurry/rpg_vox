@@ -162,6 +162,12 @@ Things worth knowing:
   and nobody else can — but a link sitting unused in a log is a way in.
   If you log request paths, redact or drop `/join/`.
 
+  The room itself never writes it down: `/join/<token>` is served the
+  app and nothing more, and the page sends the token back in a request
+  *body* for exactly this reason — a body is the one part of the
+  exchange an access log doesn't keep. The URL is the only copy, so
+  your log is the only place it can leak.
+
 There is no `networks:` block and no `traefik.docker.network` label:
 Traefik is assumed to run on the host network, so it reaches the
 container on the compose project's own bridge network at the address the

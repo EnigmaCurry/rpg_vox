@@ -241,8 +241,20 @@ id the first time it opens and keeps it. An address that names no room
 — a stale link, a typo — quietly becomes the address of the room you
 ended up in rather than sitting there broken.
 
-An invite link lands in the lobby rather than at `/`: coming in on an
-invite is coming in to be with people.
+An invite link is served the app and nothing else — no redirect, no
+cookie, nothing written down. **The room hands a browser nothing until
+Join Audio.** The token stays in the address bar, where whoever
+followed the link put it; the page keeps it in memory and sends it with
+each of the three requests the door makes, and pressing **Join Audio**
+is what spends it for the one cookie this browser is ever given. So a
+link you opened and thought better of leaves no trace: close the tab
+and there is nothing to find, and a browser with no cookie and no link
+in the bar is one the room knows nothing about — which is what being
+logged out is.
+
+Once the link is spent, the address bar is written over with the lobby's
+address, which is where you land: coming in on an invite is coming in to
+be with people.
 
 ### What a room has said before
 

@@ -14,6 +14,11 @@ import {
   moved as screenMoved,
 } from './screen.svelte.js';
 
+/// Where an invite link lands. The server serves the app here and does
+/// nothing else with it: the token is the page's to hold and to send
+/// back, not the server's to write down.
+const JOIN = '/join/';
+
 export const room = $state({
   connected: false,
   // No invite link and no cookie: there is nothing to let this browser in.
@@ -217,6 +222,22 @@ function writePref(key, on) {
   try { localStorage.setItem(key, on ? 'on' : 'off'); } catch {}
 }
 
+/// The invite token, when this page was opened on an invite link.
+///
+/// In memory, for as long as this page is open, and nowhere else. The
+/// room is handed nothing and this browser keeps nothing until Join
+/// Audio spends it -- so looking at a link and thinking better of it
+/// leaves no trace, and closing the tab is all it takes to be rid of
+/// one. A browser with no cookie and no link in the bar is a browser
+/// the room knows nothing about, which is what being logged out is.
+///
+/// The address bar is where it lives until then, because that is where
+/// whoever followed the link put it: reloading the door still works,
+/// and `syncUrl` writes the bar over the moment the link is spent.
+let invite = location.pathname.startsWith(JOIN)
+  ? decodeURIComponent(location.pathname.slice(JOIN.length))
+  : null;
+
 let ws = null;
 let audio = null;
 let retry = 0;
@@ -292,12 +313,23 @@ function reconnect() {
   connect();
 }
 
+/// One of the door's requests: whatever it is asking, the link this
+/// page is holding goes with it, because until the link is spent that
+/// is the only thing saying who is at the door.
+function door(path, body = {}) {
+  return fetch(path, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ ...body, token: invite }),
+  });
+}
+
 /// Who this browser is, from its own cookie, or whose invite link it is
 /// holding. True when there is a cookie, and so a room to connect to.
 export async function whoami() {
   let d;
   try {
-    d = await (await fetch('/api/door')).json();
+    d = await (await door('/api/door')).json();
   } catch (e) {
     // The room isn't answering -- restarting, perhaps. Say nothing about
     // invites: this browser may well be perfectly welcome.
@@ -346,11 +378,7 @@ export async function setName(display) {
   const now = room.door ? room.door.display : room.you;
   if (display.trim() === (now ?? '')) return true;
   try {
-    const r = await fetch('/api/door/name', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ display }),
-    });
+    const r = await door('/api/door/name', { display });
     const d = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(d.error || r.statusText);
     // At the door there is no socket to say it on, so what the room
@@ -368,7 +396,7 @@ export async function setName(display) {
 /// not when the link was opened.
 async function enterOnInvite() {
   try {
-    const r = await fetch('/api/door/join', { method: 'POST' });
+    const r = await door('/api/door/join');
     const d = await r.json().catch(() => ({}));
     if (!r.ok) {
       // Somebody else got there first, or it was revoked while the card
@@ -378,6 +406,11 @@ async function enterOnInvite() {
     }
     room.you = d.display;
     room.door = null;
+    // Spent. What the room gave back for it is a cookie, which is this
+    // browser's own and the only thing it has ever been given to keep;
+    // the token is of no further use to anybody, and the address bar's
+    // copy goes when the first `hello` writes the bar over.
+    invite = null;
     // The sockets are `joinAudio`'s to open, and it is the only caller.
     return true;
   } catch (e) {
@@ -946,11 +979,7 @@ export async function setLanguage(language) {
   room.lang = language;
   room.langError = null;
   try {
-    const r = await fetch('/api/door/language', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ language }),
-    });
+    const r = await door('/api/door/language', { language });
     const d = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(d.error || r.statusText);
     // The room stores the empty string for its own language; the box

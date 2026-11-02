@@ -90,24 +90,40 @@ releases.
 
 ### Voice room
 
+- **The room hands a browser nothing until Join Audio.** Opening an
+  invite link used to write the token straight into a cookie and keep
+  it for a day. Looking at a link is not using one: `/join/<token>` is
+  served the app and nothing else now -- no cookie, no redirect, nothing
+  written down -- and the token stays in the address bar, where whoever
+  followed the link put it. The page holds it in memory and sends it
+  with each of the three requests the door makes; **Join Audio** spends
+  it for the one cookie this browser is ever given, and is the only
+  thing that puts anything in a browser at all.
+
+  So a link you opened and thought better of leaves no trace: close the
+  tab and there is nothing to find. And a browser with no cookie and no
+  link in the bar is one the room knows nothing about -- which is what
+  being logged out is, and which it did not used to be: a day-old link
+  cookie went on greeting you by whatever name it named, outranking
+  your own cookie, and **Join Audio** would have spent somebody else's
+  link and made the browser theirs. A link the *page* is holding now
+  only speaks for a browser that has no name of its own; otherwise the
+  door says plainly that it is carrying one, and logging out is what
+  hands the room over to it.
+
+  The token travels in a request body rather than a path or a query,
+  because a body is the one part of the exchange an access log doesn't
+  keep. The URL is the only copy there is.
+
 - **Fixed: the door could greet you with somebody else's name.**
-  `GET /api/door` answers with the identity of the one browser that
-  asked -- who it is, or whose invite link it is holding -- and it said
+  The door answers with the identity of the one browser that asked --
+  who it is, or whose invite link its page is holding -- and it said
   nothing at all about caching. A private window held an earlier test's
   answer in memory and greeted the next browsing session with the wrong
   account's name, on a fresh invite link that had set the right cookie.
-  Every endpoint that answers one browser about itself, `/join/<token>`
-  included, now goes out `no-store` with `Vary: Cookie`, so neither the
-  browser nor anything between it and the room can hand one person's
-  answer to another.
-
-  An unspent invite link also used to outrank this browser's own
-  cookie, for as long as the link cookie lived -- a day. A browser that
-  had merely *looked* at somebody's link was afterwards greeted as
-  them, and **Join Audio** would have spent their link and made the
-  browser theirs. A held link now only speaks for a browser that has no
-  name of its own; otherwise the door says plainly that it is carrying
-  one, and logging out is what hands the room over to it.
+  Every endpoint that answers one browser about itself now goes out
+  `no-store` with `Vary: Cookie`, so neither the browser nor anything
+  between it and the room can hand one person's answer to another.
 
 - **The app's own files are cached the right way round.** The hashed
   files under `assets/` are named after their contents, so they are

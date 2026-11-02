@@ -152,12 +152,16 @@ async function type(page, text, settle = 2600) {
 
 // -- a participant with no browser at all ----------------------------
 
-/// Spend an invite link for a cookie. The order matters: the link is
-/// only remembered until `/api/door/join`, which is what spends it.
+/// Spend an invite link for a cookie. One request: the token goes in
+/// the body, because the room hands a browser nothing until this is
+/// called -- opening `/join/<token>` is served the app and sets no
+/// cookie at all, so there is nothing to carry from it.
 async function cookieFor(token, base = BASE) {
-  let r = await fetch(`${base}/join/${token}`, { redirect: 'manual' });
-  const pending = r.headers.getSetCookie().join('; ');
-  r = await fetch(`${base}/api/door/join`, { method: 'POST', headers: { cookie: pending } });
+  const r = await fetch(`${base}/api/door/join`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ token }),
+  });
   if (!r.ok) throw new Error(`door/join ${r.status}: ${await r.text()}`);
   return r.headers
     .getSetCookie()

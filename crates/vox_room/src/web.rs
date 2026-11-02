@@ -38,25 +38,33 @@
 //! leaves or moves. It is worked out per person, since a room of
 //! somebody's own is nobody else's business.
 //!
-//! The door is three requests. An invite link (`/join/<token>`) only
-//! remembers the token in a short-lived cookie and sends the browser to
-//! the room; `GET /api/door` says whose link it is (or who this browser
-//! already is, which is all the room will answer about itself before the
-//! cookie exists); and `POST /api/door/join` -- Join Audio -- trades the
-//! link for the lasting cookie, which is the only thing the room asks
-//! for afterwards. The link works once. `POST /api/door/name` is the
-//! name they want to be called, which they may set before spending it.
+//! **The door hands this browser nothing until Join Audio.** An invite
+//! link (`/join/<token>`) is served the app and nothing else: no
+//! cookie, no redirect, nothing written down. The token stays in the
+//! address bar, where whoever followed the link put it, and the page
+//! holds it in memory for as long as it is open -- so a browser that
+//! has looked at a link and not used it is a browser the room knows
+//! nothing about, and closing the tab is all it takes to be rid of it.
+//!
+//! The door is three requests, and the page sends the token with each:
+//! `POST /api/door` says whose link it is (or who this browser already
+//! is, which is all the room will answer about itself before there is a
+//! cookie); `POST /api/door/name` is the name they want to be called,
+//! which they may set before spending the link; and `POST
+//! /api/door/join` -- Join Audio -- spends it for the lasting cookie,
+//! which is the only thing the room asks for afterwards, and the first
+//! thing this browser is given to keep. The link works once.
+//!
 //! `POST /api/door/logout` gives the cookie back: this browser is
 //! forgotten, and since the link it came in on is spent, coming back
 //! takes a new one.
 //!
-//! A link this browser is *holding* only speaks for it while it has no
-//! cookie of its own. The cookie outlives the click, so a browser
+//! A link the *page* is holding only speaks for it while the browser
+//! has no cookie of its own. One browser is one person, so a browser
 //! already in the room is told it is carrying somebody else's link
-//! rather than being handed their name -- one browser is one person --
-//! and logging out is what gives the room over to it. None of these
-//! answers may be cached: every one of them is about the one browser
-//! that asked.
+//! rather than being handed their name, and logging out is what gives
+//! the room over to it. None of these answers may be cached: every one
+//! of them is about the one browser that asked.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -68,7 +76,7 @@ use axum::{
     },
     http::{header, HeaderMap, HeaderValue, StatusCode, Uri},
     middleware::{from_fn, Next},
-    response::{AppendHeaders, IntoResponse, Redirect, Response},
+    response::{IntoResponse, Response},
     routing::{delete, get, post},
     Json, Router,
 };
@@ -86,14 +94,11 @@ use crate::screen::{Screen, Size};
 use crate::store::Invited;
 
 /// This browser's own cookie, traded for an invite link at the door.
+/// The only thing the room ever puts in a browser, and Join Audio is
+/// the only thing that puts it there.
 const COOKIE: &str = "vox_room";
-/// The link just clicked, until Join Audio spends it. A dead token is
-/// kept here too, so a browser coming back can be told it is dead.
-const PENDING: &str = "vox_room_invite";
 /// A browser is remembered for a year.
 const SESSION_MAX_AGE: u32 = 31_536_000;
-/// A year is far too long to hold a link that is about to be spent.
-const PENDING_MAX_AGE: u32 = 86_400;
 
 /// Where the app's hashed files live. `index.html` is the only thing
 /// that names them, and the only name under here that never changes is
@@ -130,8 +135,7 @@ impl App {
 
 /// Nothing below this is the same answer twice: every one of these
 /// endpoints says something about the one browser that asked -- who it
-/// is, whose link it is holding, what the owner may see -- and
-/// `/join/<token>` hands out a cookie.
+/// is, whose link its page is holding, what the owner may see.
 ///
 /// A cache is allowed to reuse a response it was told nothing about,
 /// and one of them did: a private window held `GET /api/door`'s answer
@@ -160,8 +164,11 @@ pub fn router(rooms: Arc<Rooms>, screen: Arc<Screen>) -> Router {
         next_id: Arc::new(AtomicU64::new(1)),
     };
     Router::new()
-        .route("/join/:token", get(join))
-        .route("/api/door", get(door))
+        // `/join/<token>` is not here: an invite link is served the app
+        // like any other address the app knows and the server doesn't,
+        // because there is nothing for the server to do with it until
+        // the page sends the token back.
+        .route("/api/door", post(door))
         .route("/api/door/join", post(door_join))
         .route("/api/door/name", post(door_name))
         .route("/api/door/language", post(door_language))
@@ -237,38 +244,34 @@ fn person(app: &App, headers: &HeaderMap) -> Option<String> {
     invited(app, headers).map(|p| p.display)
 }
 
-/// An invite link. Nothing is spent here: the token is only remembered,
-/// so the door can say whose link it is and let them look around before
-/// Join Audio trades it in. Even a dead token is remembered, so the door
-/// can say that it has expired.
-async fn join(Path(t): Path<String>, headers: HeaderMap) -> Response {
-    let pending = set_cookie(PENDING, &t, PENDING_MAX_AGE, &headers);
-    // To the lobby, not to `/`: `/` is the room of your own, and
-    // coming in on an invite is coming in to be with people.
-    (
-        [(header::SET_COOKIE, pending)],
-        Redirect::to(crate::rooms::LOBBY_PATH),
-    )
-        .into_response()
+/// What the page at the door is holding: the token out of the address
+/// bar, when it was opened on an invite link.
+///
+/// In the body rather than the path or the query, because a body is the
+/// one part of the exchange an access log doesn't keep. The address bar
+/// is the only copy of it there is, which is the point.
+#[derive(Deserialize)]
+struct AtTheDoor {
+    #[serde(default)]
+    token: Option<String>,
 }
 
-/// Who this browser is, or whose invite it is holding.
-async fn door(State(app): State<App>, headers: HeaderMap) -> Response {
+/// Who this browser is, or whose invite its page is holding.
+async fn door(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(at): Json<AtTheDoor>,
+) -> Response {
     let mine = invited(&app, &headers);
-    // A link just clicked comes first: they navigated here to come in as
-    // whoever it names, and the card says who that is before anything is
-    // spent.
+    // The link this page was opened on comes first: they followed it to
+    // come in as whoever it names, and the card says who that is before
+    // anything is spent.
     //
-    // First only over a browser with no name of its own, though. The
-    // cookie says "a link this browser is holding", not "the link just
-    // clicked" -- it outlives the click by `PENDING_MAX_AGE` -- so a
-    // browser already in the room was being greeted as whoever's link it
-    // had last picked up, and Join Audio there would have spent that
-    // link and made this browser them. Somebody else's link is said
-    // plainly instead and left unspent: one browser is one person, and
-    // the way to use it is to log out first.
-    if let Some(t) = cookie(&headers, PENDING) {
-        match app.any().invite_at_door(&t) {
+    // First only over a browser with no name of its own, though.
+    // Somebody else's link is said plainly instead and left unspent:
+    // one browser is one person, and the way to use it is to log out.
+    if let Some(t) = &at.token {
+        match app.any().invite_at_door(t) {
             Some(invite) if mine.as_ref().is_none_or(|me| me.name == invite.name) => {
                 return Json(json!({
                     "state": "invited",
@@ -288,6 +291,8 @@ async fn door(State(app): State<App>, headers: HeaderMap) -> Response {
                 // kept a cookie of its own.
                 return (StatusCode::GONE, Json(json!({ "state": "expired" }))).into_response();
             }
+            // A link of their own that they have already spent, opened
+            // again: they are in, and that is what the door says.
             None => {}
         }
     }
@@ -559,10 +564,17 @@ async fn delete_room(
     }
 }
 
-/// Join Audio: trade the invite link for this browser's own cookie. The
-/// link is spent here and nowhere else.
-async fn door_join(State(app): State<App>, headers: HeaderMap) -> Response {
-    let Some(t) = cookie(&headers, PENDING) else {
+/// Join Audio: trade the invite link for this browser's own cookie.
+/// The link is spent here and nowhere else, and this is the one request
+/// in the room that gives a browser anything to keep -- which is the
+/// whole reason the token travels in a body until now rather than in a
+/// cookie the moment the link was opened.
+async fn door_join(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(at): Json<AtTheDoor>,
+) -> Response {
+    let Some(t) = at.token else {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "no invite link" })),
@@ -577,26 +589,25 @@ async fn door_join(State(app): State<App>, headers: HeaderMap) -> Response {
             .into_response();
     };
     info!(person = %invite.name, called = %invite.display, "came in on their invite link");
-    // Two cookies of the same name, so they must be appended: a plain
-    // array of headers would insert, and the second would replace the
-    // first.
     (
-        AppendHeaders([
-            (
-                header::SET_COOKIE,
-                set_cookie(COOKIE, &id, SESSION_MAX_AGE, &headers),
-            ),
-            // Spent: nothing left to remember.
-            (header::SET_COOKIE, set_cookie(PENDING, "", 0, &headers)),
-        ]),
+        [(
+            header::SET_COOKIE,
+            set_cookie(COOKIE, &id, SESSION_MAX_AGE, &headers),
+        )],
         Json(json!({ "state": "in", "display": invite.display })),
     )
         .into_response()
 }
 
-/// Log out: forget this browser, and hand back both cookies cleared.
+/// Log out: forget this browser, and hand the cookie back cleared.
 /// Nobody else's is touched, and the invite stays spent -- coming back
 /// takes a new link.
+///
+/// There is one cookie to give back, and afterwards this browser is a
+/// browser the room has never heard of. A link still open in the
+/// address bar is not the room's to take away, and the door greets them
+/// with it -- which is how somebody in as one person uses another's
+/// link on the same browser.
 async fn door_logout(State(app): State<App>, headers: HeaderMap) -> Response {
     if let Some(id) = cookie(&headers, COOKIE) {
         if let Some(who) = app.any().person_for_session(&id) {
@@ -604,19 +615,8 @@ async fn door_logout(State(app): State<App>, headers: HeaderMap) -> Response {
         }
         app.any().log_out(&id);
     }
-    // A spent link left over from the way in goes with the cookie, or
-    // the door would offer to spend it again. One that is still live is
-    // somebody's way in and this browser is holding it -- which is the
-    // whole reason to log out of a browser that was already in -- so
-    // that one stays, and the door greets them with it.
-    let mut gone = vec![(header::SET_COOKIE, set_cookie(COOKIE, "", 0, &headers))];
-    if cookie(&headers, PENDING)
-        .is_none_or(|t| app.any().invite_at_door(&t).is_none())
-    {
-        gone.push((header::SET_COOKIE, set_cookie(PENDING, "", 0, &headers)));
-    }
     (
-        AppendHeaders(gone),
+        [(header::SET_COOKIE, set_cookie(COOKIE, "", 0, &headers))],
         Json(json!({ "state": "none" })),
     )
         .into_response()
@@ -625,6 +625,10 @@ async fn door_logout(State(app): State<App>, headers: HeaderMap) -> Response {
 #[derive(Deserialize)]
 struct Rename {
     display: String,
+    /// The link this page is holding, for somebody naming themselves
+    /// before they have spent it and so before they have a cookie.
+    #[serde(default)]
+    token: Option<String>,
 }
 
 /// What they want the room to call them: at the door before the link is
@@ -635,18 +639,19 @@ struct Rename {
 /// by, and the owner's to choose -- so this is the only name anybody
 /// here can change about themselves, and the only one anybody reads.
 ///
-/// This browser's own cookie comes first, and an unspent link only
-/// counts when there is no cookie: a browser holding somebody else's
-/// link must not be able to rename them. Both are taken, because the
-/// name is wanted before the link is spent as well as long after.
+/// This browser's own cookie comes first, and the link its page is
+/// holding only counts when there is no cookie: a page holding somebody
+/// else's link must not be able to rename them. Both are taken, because
+/// the name is wanted before the link is spent as well as long after.
 async fn door_name(
     State(app): State<App>,
     headers: HeaderMap,
     Json(body): Json<Rename>,
 ) -> Response {
     let who = invited(&app, &headers).map(|p| p.name).or_else(|| {
-        cookie(&headers, PENDING)
-            .and_then(|t| app.any().invite_at_door(&t))
+        body.token
+            .as_deref()
+            .and_then(|t| app.any().invite_at_door(t))
             .map(|i| i.name)
     });
     let Some(name) = who else {
@@ -683,20 +688,25 @@ async fn door_name(
 #[derive(Deserialize)]
 struct SetLanguage {
     language: String,
+    /// As for the name: chosen at the door, before there is a cookie to
+    /// ask about.
+    #[serde(default)]
+    token: Option<String>,
 }
 
 /// The language they speak and want to hear, chosen at the door. Unlike
 /// the name it is not spent with the link, so it can be changed later by
-/// a browser the room already knows -- which is why both the pending
-/// invite and an established cookie are accepted here.
+/// a browser the room already knows -- which is why both the link a page
+/// is holding and an established cookie are accepted here.
 async fn door_language(
     State(app): State<App>,
     headers: HeaderMap,
     Json(body): Json<SetLanguage>,
 ) -> Response {
     let who = person(&app, &headers).or_else(|| {
-        cookie(&headers, PENDING)
-            .and_then(|t| app.any().invite_at_door(&t))
+        body.token
+            .as_deref()
+            .and_then(|t| app.any().invite_at_door(t))
             .map(|i| i.display)
     });
     let Some(who) = who else {
