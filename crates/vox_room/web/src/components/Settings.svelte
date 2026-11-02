@@ -1,5 +1,6 @@
 <script>
-  import { room, setPushToTalk, setVolume } from '../lib/room.svelte.js';
+  import { room, setName, setPushToTalk, setVolume } from '../lib/room.svelte.js';
+  import { NAME_MAX } from '../lib/names.js';
 
   // The things you set once, off the floor of the room.
   //
@@ -12,6 +13,24 @@
   function onkeydown(e) {
     if (e.key === 'Escape') room.settings = false;
   }
+
+  // The name you are typing, until the room has it; `null` means the
+  // box is showing what the room calls you, which is what it shows
+  // whenever you are not in the middle of changing it.
+  let typed = $state(null);
+  const draft = $derived(typed ?? room.you ?? '');
+
+  async function save() {
+    // Nothing typed, or typed back to what it already was: there is no
+    // rename to ask for, and no error to clear off the page.
+    if (typed === null) return;
+    if (await setName(draft)) typed = null;
+  }
+
+  // Who chose the name on your invite. The owner is reading their own
+  // page when they read this one, and "the owner's to set" said to the
+  // owner is a sentence about somebody who isn't there.
+  const whoever = $derived(room.owner ? 'yours' : "whoever runs the room's");
 
   // The meter is linear amplitude; the ear is not. Same curve as the
   // strips in the room list, so the same loudness looks the same in
@@ -31,6 +50,32 @@
     <div class="spacer"></div>
     <button class="primary" onclick={() => (room.settings = false)}>Done <kbd>Esc</kbd></button>
   </header>
+
+  <!-- The one name here that is yours. Whoever runs the room picked
+       the name on your invite -- it is what you are revoked by and what
+       your own room is yours by, so it never moves -- and this is the
+       one everybody actually reads. Changing it changes it everywhere,
+       the conversation included: the room calls you one thing, not a
+       different thing per paragraph. -->
+  <section>
+    <h2>Your name</h2>
+    <label class="name">
+      <span>What the room calls you</span>
+      <input type="text" maxlength={NAME_MAX} value={draft}
+        oninput={(e) => (typed = e.currentTarget.value)} onblur={save}
+        onkeydown={(e) => { if (e.key === 'Enter') { e.preventDefault(); e.currentTarget.blur(); } }} />
+    </label>
+    {#if room.nameError}<p class="warn">{room.nameError}</p>{/if}
+    <p class="note">
+      Everyone in this room and every other one sees this, on the roster and
+      against everything you have said. Your microphone keeps running while it
+      changes.
+      {#if room.invited}
+        You were invited as <strong>{room.invited}</strong>, which is
+        {whoever}'s to set and stays as it is.
+      {/if}
+    </p>
+  </section>
 
   <section>
     <h2>Your microphone</h2>
@@ -129,6 +174,19 @@
   .manage { margin-top: 10px; }
   .slider { display: flex; align-items: center; gap: 10px; font-size: 13px; margin: 0 0 10px; }
   .slider input[type='range'] { flex: 1; max-width: 18em; }
+  .name { display: flex; flex-direction: column; gap: 4px; max-width: 22em; }
+  .name span { font-size: 12px; color: var(--muted); }
+  .name input {
+    font: inherit;
+    width: 100%;
+    color: var(--ink);
+    background: var(--bg);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 8px 10px;
+  }
+  .name input:hover { border-color: var(--muted); }
+  .warn { color: var(--danger); font-size: 13px; margin: 8px 0 0; }
   .much { color: var(--muted); min-width: 3.5ch; text-align: right; }
   .hear { width: 120px; height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; }
   .hear span { display: block; height: 100%; background: var(--meter); transition: width 80ms linear; }

@@ -217,14 +217,51 @@ impl Screen {
         forget(&mut st, id);
     }
 
+    /// The rooms call `was` `now`. Everything here is keyed by that
+    /// name -- which socket belongs to whom, which room each person is
+    /// in, and whose desktop a stream is -- so it all moves at once,
+    /// rather than their share going on being somebody who is no
+    /// longer on any roster.
+    ///
+    /// A desktop being shared keeps being shared. Taking a new name is
+    /// not leaving the room -- the room socket comes back as the new
+    /// name and asks for the room it was already in, which is no
+    /// change of rooms and so no [`Screen::unshare`] -- and the browser
+    /// is never asked for the desktop again.
+    ///
+    /// Said by the room socket, like [`Screen::place`], because that is
+    /// the one here that knows. A screen socket claiming a rename could
+    /// claim somebody else's name with it.
+    pub fn renamed(&self, was: &str, now: &str) {
+        let mut st = self.lock();
+        if let Some(room) = st.places.remove(was) {
+            st.places.insert(now.to_string(), room);
+        }
+        let mut sharing = false;
+        for c in st.clients.values_mut().filter(|c| c.person == was) {
+            c.person = now.to_string();
+        }
+        for p in st.publishers.values_mut().filter(|p| p.person == was) {
+            p.person = now.to_string();
+            sharing = true;
+        }
+        // Whose a stream is goes out in the list, so the rooms watching
+        // one of theirs are told again. Nobody is sharing, nothing to
+        // say: the names in here are the publishers' alone.
+        if sharing {
+            broadcast_streams(&mut st);
+        }
+    }
+
     /// `person` is in `room` now. Said by their room socket, on the way
     /// in and every time they change rooms, because that socket is the
     /// one thing here that knows -- and because a tab asked where it
     /// was could lie, and share a desktop into a room it isn't in.
     ///
-    /// Their share goes with them: a picture they were publishing
-    /// leaves the room they left and arrives in the one they walked
-    /// into, and both rooms are told.
+    /// Only where they are. A share of theirs does not come along --
+    /// [`Screen::unshare`] ends it on the way out, and this is said
+    /// after it, so the room they are arriving in is told a list with
+    /// nothing of theirs on it.
     pub fn place(&self, person: &str, room: &str) {
         let mut st = self.lock();
         if st.places.get(person).is_some_and(|r| r == room) {
@@ -321,6 +358,45 @@ impl Screen {
         broadcast_streams(&mut st);
         wants(&mut st);
         ask_key(&mut st, id, THUMB);
+    }
+
+    /// Everything `person` is sharing stops, because they are leaving
+    /// the room it was being shared into.
+    ///
+    /// A desktop is shared *to a room*. Carrying it into the next one
+    /// would be showing a room something nobody in it asked to be
+    /// shown, and the person walking in had no moment to decide
+    /// otherwise -- so it ends here, and sharing in the new room is a
+    /// thing they do on purpose when they get there.
+    ///
+    /// Per person and not per socket, because which room somebody is in
+    /// is per person (see `places`): a second tab of theirs pressing
+    /// another room moves them, and their desktop is theirs and not
+    /// that tab's.
+    ///
+    /// The tab doing the sharing is told, so it stops encoding, lets go
+    /// of the desktop the browser gave it, and puts its button back.
+    pub fn unshare(&self, person: &str) {
+        let mut st = self.lock();
+        let theirs: Vec<u64> = st
+            .publishers
+            .iter()
+            .filter(|(_, p)| p.person == person)
+            .map(|(socket, _)| *socket)
+            .collect();
+        if theirs.is_empty() {
+            return;
+        }
+        for socket in theirs {
+            let Some(p) = st.publishers.remove(&socket) else {
+                continue;
+            };
+            info!(socket, person, stream = p.id, "stopped sharing: left the room");
+            stop_watching(&mut st, p.id);
+            send_ctl(&mut st, socket, &json!({ "type": "unshared" }));
+        }
+        broadcast_streams(&mut st);
+        wants(&mut st);
     }
 
     /// A tab stopped sharing (or its share ended by itself -- the
@@ -831,6 +907,51 @@ mod tests {
         // Frames from a socket that has gone reach nobody.
         screen.frame(ALEX, frame(THUMB, true));
         assert!(ryan.got().is_empty());
+    }
+
+    /// A desktop is shared to a room. Walking into the next one does
+    /// not take it along: it stops on the way out, and sharing it where
+    /// they have arrived is something they ask for again.
+    #[test]
+    fn changing_rooms_ends_the_share_rather_than_carrying_it() {
+        let screen = Screen::new();
+        let mut alex = tab(&screen, ALEX, "Alex");
+        let mut ryan = tab(&screen, RYAN, "Ryan");
+        let mut mike = tab(&screen, MIKE, "Mike");
+        screen.place("Alex", "Lobby");
+        screen.place("Ryan", "Lobby");
+        screen.place("Mike", "Study");
+        share(&screen, ALEX);
+        screen.watch(RYAN, Some(1));
+        let shown = |t: &mut Tab| {
+            t.control()
+                .into_iter()
+                .rfind(|v| v["type"] == "streams")
+                .map(|v| v["streams"].as_array().unwrap().len())
+        };
+        assert_eq!(shown(&mut ryan), Some(1), "the room it is shared to sees it");
+        alex.control();
+        mike.control();
+
+        // Alex presses the Study, which is these two calls in the order
+        // the room socket makes them.
+        screen.unshare("Alex");
+        screen.place("Alex", "Study");
+
+        assert!(
+            alex.control().iter().any(|v| v["type"] == "unshared"),
+            "the sharing tab is told to let the desktop go"
+        );
+        assert_eq!(shown(&mut ryan), Some(0), "the room left has nothing of theirs");
+        assert_eq!(
+            shown(&mut mike),
+            Some(0),
+            "and the room walked into is shown nothing nobody asked for"
+        );
+        // Frames from a share that has ended reach nobody, in either room.
+        screen.frame(ALEX, frame(THUMB, true));
+        assert!(ryan.got().is_empty());
+        assert!(mike.got().is_empty());
     }
 
     #[test]

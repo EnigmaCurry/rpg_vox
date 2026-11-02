@@ -529,6 +529,21 @@ impl Rooms {
         let _ = self.news.send(());
     }
 
+    /// Every room calls `was` `now`, and so does every tab in one. A
+    /// name is the person's and not one room's, so the rooms they are
+    /// not sitting in move it too -- including the one of their own,
+    /// which is theirs by the name on the invite and so is still theirs
+    /// afterwards.
+    ///
+    /// The directory goes out again at the end: it lists who is in each
+    /// room, by the name that has just changed.
+    pub fn renamed(&self, was: &str, now: &str) {
+        for room in self.all() {
+            room.renamed(was, now);
+        }
+        self.announce();
+    }
+
     /// Have every room read the invite list again. For when something
     /// that is the person's and not the room's has been written to the
     /// database -- the name they call themselves, the language they

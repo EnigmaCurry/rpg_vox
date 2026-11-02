@@ -90,6 +90,74 @@ releases.
 
 ### Voice room
 
+- **Fixed: the door could greet you with somebody else's name.**
+  `GET /api/door` answers with the identity of the one browser that
+  asked -- who it is, or whose invite link it is holding -- and it said
+  nothing at all about caching. A private window held an earlier test's
+  answer in memory and greeted the next browsing session with the wrong
+  account's name, on a fresh invite link that had set the right cookie.
+  Every endpoint that answers one browser about itself, `/join/<token>`
+  included, now goes out `no-store` with `Vary: Cookie`, so neither the
+  browser nor anything between it and the room can hand one person's
+  answer to another.
+
+  An unspent invite link also used to outrank this browser's own
+  cookie, for as long as the link cookie lived -- a day. A browser that
+  had merely *looked* at somebody's link was afterwards greeted as
+  them, and **Join Audio** would have spent their link and made the
+  browser theirs. A held link now only speaks for a browser that has no
+  name of its own; otherwise the door says plainly that it is carrying
+  one, and logging out is what hands the room over to it.
+
+- **The app's own files are cached the right way round.** The hashed
+  files under `assets/` are named after their contents, so they are
+  kept for a year and never asked about again; `index.html`, the one
+  name that stays put, is revalidated every time against an `ETag`,
+  because it is what says which hashed files the app is made of now.
+  A missing file under `assets/` is a plain 404 as well: it used to be
+  answered with the app itself, so a stale index asking for a bundle
+  this build doesn't have got HTML where a module was expected, and the
+  page came up blank with nothing to say why.
+
+- **Your name in the room is yours to change, and it is the only name
+  you can.** Whoever runs the room picks the name on your invite --
+  it is what you are revoked by and what a room of your own is yours by,
+  and it never moves. What everybody reads was settable at the door and
+  never again; it is now **Settings → Your name**, from inside the
+  room, with your microphone still running.
+
+  Changing it changes it everywhere. The roster, the faders, the
+  meters, your cards and every line you have ever said move with it, in
+  the database as well as on screen: the room calls you one thing, not
+  a different thing per paragraph, and an old conversation is read
+  under the name on the roster now. The name you give up is free for
+  somebody else, and taking it does not pick up what was said under it.
+
+  A room socket is told whose it is when it opens, so each of your tabs
+  comes back on a fresh connection under the new name -- the audio does
+  not stop for it, and a desktop you are sharing keeps being shared.
+
+- **A desktop you are sharing stops when you walk into another room.**
+  It used to come along. A share is made *to a room*, and carrying it
+  into the next one shows a room something nobody in it asked to see,
+  with no moment for the person walking in to decide otherwise. It ends
+  on the way out now -- the browser lets the desktop go, so the capture
+  indicator goes with it -- and sharing where you have arrived is
+  something you ask for again.
+
+  A dropped connection is not walking out. A reconnecting socket used
+  to be seated in the lobby and the tab had to ask to be moved back,
+  which is a change of rooms: a moment of bad wifi silently moved you
+  out of the room you were in, wrote the address bar to match, and now
+  would have ended your share as well. The socket says which room it
+  was sitting in, and the room is looked up as one of theirs like any
+  other, so naming a room that isn't yours seats you in the lobby.
+
+- **The composer sits on the footer.** The box you type into had
+  sixteen pixels of background under it, holding it off the bar below;
+  the header and footer have been brought in too, and the rows they
+  give up are rows of the conversation.
+
 - **No pull-to-refresh.** A swipe down at the top of the room reloaded
   it on iOS Safari, which drops the audio, the socket and your place in
   the conversation -- for a page where there is nothing a reload would

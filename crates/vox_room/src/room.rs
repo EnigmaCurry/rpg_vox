@@ -1180,8 +1180,17 @@ impl Room {
         }
     }
 
-    /// What `name` is called in the room, as asked for at the door. Err
-    /// is the reason it can't be, to show on the card.
+    /// What the room calls `name` now. Theirs to choose, at the door
+    /// and afterwards -- the name on the invite is the owner's and
+    /// never moves, and this is the one everybody reads. Err is the
+    /// reason it can't be, to show next to the box.
+    ///
+    /// This room moves what it is holding under the old name as part of
+    /// it (see [`Room::renamed`]). Every *other* room has a copy too,
+    /// because a name is the person's and not one room's, and bringing
+    /// those into line is [`crate::rooms::Rooms::renamed`]'s -- which
+    /// comes back through here harmlessly, since a name that has
+    /// already moved has nothing left to move.
     pub fn rename(&self, name: &str, wanted: &str) -> Result<String, String> {
         let wanted = wanted.trim();
         if wanted.is_empty() {
@@ -1204,6 +1213,10 @@ impl Room {
         {
             return Err(format!("{} is the AI's name.", bot.name));
         }
+        // Read before the store is written, because it is the only
+        // thing that knows: afterwards there is nothing left to say
+        // what the room used to call them.
+        let was = self.called(name);
         match self.store().rename(name, wanted) {
             Ok(true) => {}
             Ok(false) => return Err("Somebody here is already called that.".into()),
@@ -1212,11 +1225,83 @@ impl Room {
                 return Err("The room couldn't save that.".into());
             }
         }
-        info!(person = %name, called = %wanted, "renamed themselves at the door");
-        // The roster lists everyone invited, so it has their old name on
-        // it until it is brought back in line.
-        self.reconcile_people();
+        info!(person = %name, called = %wanted, "renamed themselves");
+        if let Some(was) = was {
+            self.renamed(&was, wanted);
+        }
         Ok(wanted.to_string())
+    }
+
+    /// What the room calls `name`, which is the only name anything else
+    /// here knows them by. None when nobody is invited under that name.
+    pub fn called(&self, name: &str) -> Option<String> {
+        self.store().person(name).ok().flatten().map(|p| p.display)
+    }
+
+    /// The room called them `was` and calls them `now`. Everything it
+    /// holds under the old name moves: their place on the roster, their
+    /// fader, and every line of theirs in the conversation -- the
+    /// database has already moved the lines it keeps (see
+    /// [`crate::store::Store::rename`]), and this is the copy the room
+    /// is reading from.
+    ///
+    /// Their tabs are taken out of the room on the way through, and
+    /// told to come back. A socket is told whose it is when it opens
+    /// and nothing afterwards changes its mind (see [`crate::web`]), so
+    /// the only way one of them can be the new name's is to be a new
+    /// socket; until it is, they are somebody invited and not here,
+    /// which is exactly what they are.
+    pub fn renamed(&self, was: &str, now: &str) {
+        if was == now {
+            return;
+        }
+        let mut st = self.lock();
+        // Off the roster rather than moved across it. Everything that
+        // was theirs here is a tab, and every one of those is on a
+        // socket that still thinks it is the old name's; the new name
+        // comes back on from the store below, and the tabs come back
+        // with the sockets they are told to open.
+        let here = match st.people.remove(was) {
+            Some(p) => {
+                if let Some(e) = &p.engine {
+                    close_utterance(e);
+                }
+                true
+            }
+            None => false,
+        };
+        let mut lines = 0;
+        for e in st.log.iter_mut().filter(|e| e.who == was) {
+            e.who = now.to_string();
+            lines += 1;
+        }
+        drop(st);
+        if here {
+            // Whatever of their voice the mixer was still holding, or
+            // the tail of it would be played to the room the moment
+            // they are back -- which here is immediately.
+            self.mixer.drop_mic(was);
+        }
+        if self.mixer.rename(was, now) {
+            self.save_strips();
+        }
+        // The roster is everyone this room admits, read from the store,
+        // and the store already has the new name -- so this is what
+        // puts it on, with the language that goes with it. It is also
+        // the one thing that knows whether this room admits them at
+        // all: a room of somebody else's own never did.
+        self.reconcile_people();
+        // Nothing of theirs was ever in this room, so there is nothing
+        // for its tabs to move and nobody of that name to tell.
+        if !here && lines == 0 {
+            return;
+        }
+        info!(was, now, lines, "renamed in the room");
+        // One event, and every tab does what the room just did. The
+        // conversation is not sent again for it: a long one is a lot of
+        // lines to resend to say one word about them, and a tab that
+        // has them can move a name through them itself.
+        self.emit(json!({ "type": "renamed", "was": was, "now": now }));
     }
 
     /// The language `person` speaks and wants to hear, chosen at the
@@ -2549,6 +2634,14 @@ impl Room {
 
     pub fn set_strip(&self, name: &str, gain: Option<f32>, mute: Option<bool>) {
         self.mixer.set_strip(name, gain, mute);
+        self.save_strips();
+    }
+
+    /// Write the faders down and tell the room where they are. They are
+    /// the room's and shared, so there is nothing per-person about
+    /// this: two things move them, somebody dragging one and somebody
+    /// taking a new name.
+    fn save_strips(&self) {
         let strips = self.mixer.strips();
         if let Ok(s) = serde_json::to_string(&strips) {
             if let Err(err) = self.store().set_setting("strips", &s) {
@@ -4409,6 +4502,54 @@ mod tests {
         assert_eq!(r.person_for_session(&cookie), None);
         r.reconcile_people();
         assert!(!r.lock().people.contains_key("Mikey"));
+    }
+
+    /// Renaming yourself from inside the room, rather than at the door.
+    /// The name is the only one anybody reads, so everything the room
+    /// holds by it goes at once -- and the tabs on the old name's
+    /// sockets are put out, because those sockets cannot become the new
+    /// name's and are told to come back as it.
+    #[test]
+    fn a_new_name_moves_everything_the_room_holds_by_the_old_one() {
+        let (r, _turns) = room(Mode::Named);
+        r.store().invite("Mike").unwrap();
+        r.reconcile_people();
+        r.join("Mike", 1);
+        r.typed("Mike", "the door is locked").unwrap();
+        r.set_strip("Mike", Some(0.25), Some(true));
+
+        assert_eq!(r.rename("Mike", "Mikey"), Ok("Mikey".into()));
+
+        assert!(r.lock().people.contains_key("Mikey"));
+        assert!(!r.lock().people.contains_key("Mike"));
+        assert!(
+            r.here().is_empty(),
+            "their tab is between two sockets, so nobody of either name is in"
+        );
+        // Everything they have said reads under the name the room calls
+        // them now. This is the copy the room is reading from; the one
+        // in the database moves in the same breath, which is
+        // `store::tests::a_new_name_is_the_name_on_everything_they_have_said`
+        // -- nothing is written down here, because a line is only put
+        // in the database once the turn it belongs to is over.
+        assert_eq!(
+            r.lock()
+                .log
+                .iter()
+                .map(|e| e.who.clone())
+                .collect::<Vec<_>>(),
+            ["Mikey"]
+        );
+        // The fader is pointed at a person: turned down and renamed is
+        // still turned down.
+        let strips = r.mixer.strips();
+        assert!(!strips.contains_key("Mike"));
+        assert_eq!(strips["Mikey"].gain, 0.25);
+        assert!(strips["Mikey"].mute);
+
+        // And the tab comes back, under the new name, on a new socket.
+        r.join("Mikey", 2);
+        assert_eq!(r.here(), ["Mikey"]);
     }
 
     #[test]

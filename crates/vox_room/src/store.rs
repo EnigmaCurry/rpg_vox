@@ -635,16 +635,51 @@ impl Store {
         Ok(Some((id, invited)))
     }
 
-    /// What `name` is called in the room. False when somebody else
-    /// already answers to it.
+    /// What `name` is called in the room, now and in everything the
+    /// room has kept. False when somebody else already answers to it,
+    /// or when nobody is invited under that name.
+    ///
+    /// A line in the conversation and a card in somebody's hand are
+    /// read *now*, under the name on the roster now, so they move with
+    /// it: what the room calls somebody is one name and not a different
+    /// one per paragraph. They are keyed by the display name rather
+    /// than by `name` -- the AI has a name in there too, and so does
+    /// anybody who has left -- which is why this is a rewrite and not a
+    /// join.
+    ///
+    /// It holds because display names are unique while they are in use:
+    /// at most one person answers to `was` when this runs, so at most
+    /// one person's lines move. A name given up here is given up in the
+    /// conversation too, which is what leaves it free for somebody else.
     pub fn rename(&self, name: &str, display: &str) -> Result<bool> {
         if self.person_called(display)?.is_some_and(|who| who != name) {
             return Ok(false);
         }
-        Ok(self.db.execute(
+        let tx = self.db.unchecked_transaction()?;
+        let was: Option<String> = tx
+            .query_row("SELECT display FROM people WHERE name = ?1", [name], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        let Some(was) = was else {
+            return Ok(false);
+        };
+        tx.execute(
             "UPDATE people SET display = ?2 WHERE name = ?1",
             params![name, display],
-        )? > 0)
+        )?;
+        if was != display {
+            tx.execute(
+                "UPDATE entries SET who = ?2 WHERE who = ?1",
+                params![&was, display],
+            )?;
+            tx.execute(
+                "UPDATE cards SET who = ?2 WHERE who = ?1",
+                params![&was, display],
+            )?;
+        }
+        tx.commit()?;
+        Ok(true)
     }
 
     /// The language `name` speaks and wants to hear. Empty for the
@@ -1473,6 +1508,66 @@ mod tests {
         assert!(s.invite("mikey").is_err());
         assert!(s.uninvite("Mike").unwrap());
         assert!(s.invite("mikey").is_ok());
+    }
+
+    #[test]
+    fn a_new_name_is_the_name_on_everything_they_have_said() {
+        let s = Store::memory();
+        s.invite("Mike").unwrap();
+        s.invite("Alex").unwrap();
+        let said = |who: &str, id: &str| Entry {
+            id: id.into(),
+            who: who.into(),
+            kind: Kind::Human,
+            title: String::new(),
+            text: format!("said {id}"),
+            live: false,
+            partial: false,
+            cut: false,
+            typed: false,
+            translations: BTreeMap::new(),
+            at: 10,
+            sent: true,
+        };
+        s.put_entry(1, &said("Mike", "a")).unwrap();
+        s.put_entry(1, &said("Alex", "b")).unwrap();
+        s.put_entry(1, &said("Vox", "c")).unwrap();
+        s.put_card(
+            1,
+            &Card {
+                id: "k".into(),
+                to: "Mike".into(),
+                title: "Yours".into(),
+                body: "alone".into(),
+                at: 10,
+            },
+        )
+        .unwrap();
+
+        assert!(s.rename("Mike", "Mikey").unwrap());
+        let who = |id: &str| {
+            s.entries(1, 10)
+                .unwrap()
+                .into_iter()
+                .find(|e| e.id == id)
+                .unwrap()
+                .who
+        };
+        assert_eq!(who("a"), "Mikey", "their own lines read under the new name");
+        assert_eq!(who("b"), "Alex", "and nobody else's move");
+        assert_eq!(who("c"), "Vox", "the AI is not a person who renamed");
+        assert_eq!(
+            s.cards(1, "Mikey").unwrap().len(),
+            1,
+            "a card in their hand is still in it"
+        );
+        assert!(s.cards(1, "Mike").unwrap().is_empty());
+
+        // The name they gave up is free, and taking it does not pick up
+        // the lines they said under it: those left with them.
+        assert!(s.rename("Alex", "Mike").unwrap());
+        assert_eq!(who("a"), "Mikey");
+        assert_eq!(who("b"), "Mike");
     }
 
     #[test]

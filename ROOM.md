@@ -149,6 +149,15 @@ you left it. What is shared across them all is the invite list, the
 saved games, the name you call yourself and the language you hear —
 the things that are the person's rather than the room's.
 
+A desktop you are sharing does **not** come with you. It was shared to
+the room you were in, and carrying it into the next one would show a
+room something nobody in it asked to see and give you no moment to
+decide otherwise — so it stops as you leave, and sharing it where you
+have arrived is something you ask for again. A dropped connection is
+not leaving: the socket says which room it was sitting in when it comes
+back, so a moment of bad wifi costs you neither your seat nor your
+share.
+
 A **room of your own** is where the AI is yours alone. Its roster is
 you; its mixer shows you and the AI and nobody else; nothing said in it
 reaches the house, and nothing said in the house reaches it. Because
@@ -354,9 +363,11 @@ See ROOM_DOCKER.md.
   it back and shuts the door again. The first time, on an invite link, it says *Hi,
   Mike* and offers **your name in the room**: that is the name everyone
   sees, the one beside everything you say, and the one the AI deals your
-  cards to. Change it there and nowhere else — once the link is spent it
-  is who you are. (The name on the invite doesn't move with it: that is
-  the key `vox_room uninvite` names.) **Log out**, at the foot of the
+  cards to. It is yours to change here and from **Settings → Your name**
+  afterwards, and it is the only name you can change. (The name on the
+  invite doesn't move with it: whoever runs the room chose that one, it
+  is the key `vox_room uninvite` names, and a room of your own is yours
+  by it.) **Log out**, at the foot of the
   card, hands this browser's cookie back and forgets it — only this one,
   so another device stays in. The link it came in on is spent, so coming
   back takes a new one. Choosing a speaker needs `AudioContext.setSinkId`,
@@ -656,7 +667,8 @@ See ROOM_DOCKER.md.
   yours alone** — opening a desktop, or closing it, changes nothing on
   anyone else's screen, and nothing about it is remembered. Several
   people can share at once; each gets a thumbnail. **Stop sharing**, the
-  browser's own stop button, and **Leave audio** all end it. No sound is
+  browser's own stop button, **Leave audio** and walking into another
+  room all end it. No sound is
   taken from what is shared: the room's audio is the mixer's, and a
   shared tab's would come back as another voice to transcribe.
 - **The footer** is what you reach for while talking, and nothing else:
@@ -666,8 +678,11 @@ See ROOM_DOCKER.md.
   nothing beside it moves; then **Share screen**, **Leave audio**, and
   the cog. Anything the room has to tell you appears along it too.
 - **Settings**, behind the cog on the far right: a page of its own with
-  the things you set once -- **Push to talk**, **Your volume**, what is
-  coming in, and which microphone the browser gave the room. The room
+  the things you set once -- **Your name**, **Push to talk**, **Your
+  volume**, what is coming in, and which microphone the browser gave the
+  room. Changing your name changes it everywhere, the conversation
+  included: the room calls you one thing, not a different thing per
+  paragraph. The room
   goes on running behind it: you are still in the audio, and the space
   bar still mutes or talks from there. **Done** or Escape comes back.
 - **People and rooms**, on the settings page and only for the owner: a

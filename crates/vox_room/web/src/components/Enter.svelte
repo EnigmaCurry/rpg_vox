@@ -66,6 +66,17 @@
     {:else if room.you}
       <p class="hi">Hi, {room.you}!</p>
     {/if}
+    <!-- Somebody else's link, picked up by this browser and never
+         spent. It is said rather than acted on: a browser is one
+         person, and being quietly handed another's name -- on a link
+         clicked who knows when -- is how you end up in the room as
+         them. Logging out below is what gives the room over to it. -->
+    {#if room.holding}
+      <p class="held">
+        This browser is also holding <strong>{room.holding}</strong>'s invite link.
+        You are in as {room.you}; log out below to come in as {room.holding} instead.
+      </p>
+    {/if}
     {#if !supported()}
       <p class="lead">
         This browser can't do the room's audio: it needs WebCodecs, which means a
@@ -89,10 +100,11 @@
               oninput={(e) => (typed = e.currentTarget.value)} onblur={save}
               onkeydown={(e) => { if (e.key === 'Enter') { e.preventDefault(); save(); } }} />
             <small>
-              Everyone in the room sees this. Your invite stays {room.door.name}'s,
-              whatever you call yourself.
+              Everyone in the room sees this, and you can change it later. Your
+              invite stays {room.door.name}'s, whatever you call yourself.
             </small>
           </label>
+          {#if room.nameError}<p class="warn">{room.nameError}</p>{/if}
         </div>
       {/if}
       {#if room.doorError}
@@ -277,6 +289,19 @@
   }
   input[type='text']:hover { border-color: var(--muted); }
   .warn.door { margin: 0 0 14px; }
+  /* A link this browser is carrying for somebody else: worth reading,
+     not a thing that has gone wrong. */
+  .held {
+    text-align: left;
+    font-size: 13px;
+    line-height: 1.45;
+    color: var(--muted);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 8px 12px;
+    margin: 0 0 14px;
+  }
+  .held strong { color: var(--ink); }
   .join {
     width: 100%;
     font-size: 17px;

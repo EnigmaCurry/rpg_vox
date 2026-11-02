@@ -241,8 +241,10 @@
     overflow-y: auto;
     overscroll-behavior: contain;
     /* Keep the conversation in a centered band; on a wide monitor the extra
-       space becomes equal margins instead of a line you have to scan across. */
-    padding: 16px max(16px, calc((100% - 64em) / 2));
+       space becomes equal margins instead of a line you have to scan across.
+       Nothing along the foot: the composer sticks there, and padding under it
+       is a strip of background between the box and the footer. */
+    padding: 16px max(16px, calc((100% - 64em) / 2)) 0;
     display: flex;
     flex-direction: column;
     gap: 12px;
@@ -362,7 +364,9 @@
     /* Stuck to the foot of the scroller, so the messages behind it have
        to be covered rather than showing through. */
     background: var(--bg);
-    padding: 10px 0 2px;
+    /* Sitting on the footer, not floating above it: the only space is
+       the one that keeps the last message off the box. */
+    padding: 10px 0 0;
     margin-top: auto;
   }
   .composer input {

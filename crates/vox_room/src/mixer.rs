@@ -391,6 +391,33 @@ impl Mixer {
         self.lock().strips.clone()
     }
 
+    /// The room calls `was` `now`. The fader is pointed at a person, so
+    /// it goes with them -- turned down and renamed is still turned
+    /// down. True when there was one to move, which is what tells the
+    /// room to write the faders out again.
+    ///
+    /// Their meter and their listeners move with it, for the moment
+    /// before their tabs come back under the new name: a level nobody
+    /// claims shows on the roster, and a listener is how the mixer
+    /// knows whose voice to keep out of whose headphones. Their mic is
+    /// let go of rather than moved -- see [`Mixer::drop_mic`].
+    pub fn rename(&self, was: &str, now: &str) -> bool {
+        let mut st = self.lock();
+        if let Some(peak) = st.peaks.remove(was) {
+            st.peaks.insert(now.to_string(), peak);
+        }
+        for l in st.listeners.iter_mut().filter(|l| l.person == was) {
+            l.person = now.to_string();
+        }
+        match st.strips.remove(was) {
+            Some(strip) => {
+                st.strips.insert(now.to_string(), strip);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Change a strip; returns the new value.
     pub fn set_strip(&self, name: &str, gain: Option<f32>, mute: Option<bool>) -> Strip {
         let mut st = self.lock();

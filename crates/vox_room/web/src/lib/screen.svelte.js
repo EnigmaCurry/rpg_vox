@@ -139,6 +139,14 @@ function apply(ev) {
     case 'publishing':
       if (publisher) publisher.id = ev.id;
       break;
+    case 'unshared':
+      // The room we were sharing into is not the room we are in any
+      // more. The server has already taken the picture off that room's
+      // list; this lets go of the desktop the browser gave us, so the
+      // encoder stops and the tab stops saying it is being captured.
+      // Sharing here is a thing to ask for again, on purpose.
+      stopSharing();
+      break;
     case 'keyframe':
       publisher?.keyframe(ev.kind);
       break;
@@ -466,9 +474,11 @@ export async function share() {
 /// sharing in the room it has arrived in -- the server says, the
 /// moment it has moved us.
 ///
-/// A share of our own is deliberately left running: the server takes
-/// it with us, so the picture arrives in the new room without the
-/// browser having to ask for the desktop again.
+/// A share of our own is not stopped here. The server is what ends it,
+/// because the server is what knows we really did change rooms, and it
+/// says so down this socket (`unshared` above) -- which is also how a
+/// second tab of ours pressing another room stops the desktop this one
+/// is sharing.
 export function moved() {
   for (const s of screen.streams) drop(s.id);
   screen.streams = [];

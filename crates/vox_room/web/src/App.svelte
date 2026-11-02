@@ -254,13 +254,16 @@
   :global(.cards) { grid-area: cards; border-right: 1px solid var(--line); }
   /* One area at a time is a narrow-screen idea; here all three show. */
   .views { display: none; }
+  /* Both bars are frames around the room rather than things to read,
+     so they are kept as thin as their tallest control allows: every row
+     they give up is a row of the conversation. */
   header {
     grid-area: head;
     display: flex;
     flex-wrap: wrap;
     align-items: center;
-    gap: 10px;
-    padding: 10px 16px;
+    gap: 8px;
+    padding: 6px 12px;
     border-bottom: 1px solid var(--line);
     background: var(--panel);
   }
@@ -305,8 +308,8 @@
     display: flex;
     flex-wrap: wrap;
     align-items: center;
-    gap: 12px;
-    padding: 10px 16px;
+    gap: 8px;
+    padding: 6px 12px;
     border-top: 1px solid var(--line);
     background: var(--panel);
   }
@@ -328,7 +331,7 @@
   .dismiss { padding: 0 6px; line-height: 1.4; }
   .hear { width: 80px; height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; }
   .hear span { display: block; height: 100%; background: var(--meter); transition: width 80ms linear; }
-  .views { grid-area: views; gap: 0; padding: 0 16px 10px; }
+  .views { grid-area: views; gap: 0; padding: 0 12px 6px; }
   .views button {
     flex: 1;
     font-size: 13px;
@@ -376,6 +379,6 @@
     .app:not(.show-chat) :global(.log) { display: none; }
     .app:not(.show-cards) :global(.cards) { display: none; }
     .app:not(.show-room) :global(.rooms) { display: none; }
-    header, footer { padding: 8px 16px; }
+    header, footer { padding: 5px 10px; }
   }
 </style>

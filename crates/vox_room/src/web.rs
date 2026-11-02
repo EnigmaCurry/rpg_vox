@@ -49,6 +49,14 @@
 //! `POST /api/door/logout` gives the cookie back: this browser is
 //! forgotten, and since the link it came in on is spent, coming back
 //! takes a new one.
+//!
+//! A link this browser is *holding* only speaks for it while it has no
+//! cookie of its own. The cookie outlives the click, so a browser
+//! already in the room is told it is carrying somebody else's link
+//! rather than being handed their name -- one browser is one person --
+//! and logging out is what gives the room over to it. None of these
+//! answers may be cached: every one of them is about the one browser
+//! that asked.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -56,9 +64,10 @@ use std::sync::Arc;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Path, State,
+        Path, Query, Request, State,
     },
-    http::{header, HeaderMap, StatusCode, Uri},
+    http::{header, HeaderMap, HeaderValue, StatusCode, Uri},
+    middleware::{from_fn, Next},
     response::{AppendHeaders, IntoResponse, Redirect, Response},
     routing::{delete, get, post},
     Json, Router,
@@ -86,6 +95,19 @@ const SESSION_MAX_AGE: u32 = 31_536_000;
 /// A year is far too long to hold a link that is about to be spent.
 const PENDING_MAX_AGE: u32 = 86_400;
 
+/// Where the app's hashed files live. `index.html` is the only thing
+/// that names them, and the only name under here that never changes is
+/// the directory itself.
+const ASSETS: &str = "assets/";
+/// A file named after a hash of its own contents can be kept for as
+/// long as the browser likes: a change to it is a new name, never a
+/// different answer at the old one.
+const ASSET_CACHE: &str = "public, max-age=31536000, immutable";
+/// `index.html` is stored but asked about every time. It is what says
+/// which hashed files the app is made of *now*, and a browser holding
+/// yesterday's index asks this binary for files it no longer has.
+const INDEX_CACHE: &str = "no-cache";
+
 #[derive(RustEmbed)]
 #[folder = "dist-ui/"]
 struct Assets;
@@ -104,6 +126,29 @@ impl App {
     fn any(&self) -> Arc<Room> {
         self.rooms.home()
     }
+}
+
+/// Nothing below this is the same answer twice: every one of these
+/// endpoints says something about the one browser that asked -- who it
+/// is, whose link it is holding, what the owner may see -- and
+/// `/join/<token>` hands out a cookie.
+///
+/// A cache is allowed to reuse a response it was told nothing about,
+/// and one of them did: a private window held `GET /api/door`'s answer
+/// from an earlier test in memory and greeted the next browsing session
+/// with somebody else's name, on a fresh invite link that had set the
+/// right cookie. `Vary` goes with it, so that a cache between us and
+/// the browser -- the proxy out front today, a CDN tomorrow -- can
+/// never hand one person's answer to another either.
+async fn private_answer(req: Request, next: Next) -> Response {
+    let mut res = next.run(req).await;
+    let h = res.headers_mut();
+    h.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store, no-cache, must-revalidate"),
+    );
+    h.insert(header::VARY, HeaderValue::from_static("Cookie"));
+    res
 }
 
 pub fn router(rooms: Arc<Rooms>, screen: Arc<Screen>) -> Router {
@@ -142,6 +187,10 @@ pub fn router(rooms: Arc<Rooms>, screen: Arc<Screen>) -> Router {
             "/api/rooms/:room/history/:id/delete",
             post(forget_conversation),
         )
+        // Everything above answers one browser about itself, so none
+        // of it may be cached. The sockets, the health check and the
+        // app's own files below are the same for everybody.
+        .layer(from_fn(private_answer))
         .route("/room.ws", get(ws))
         .route("/screen.ws", get(screen_ws))
         .route("/healthz", get(|| async { "ok" }))
@@ -205,55 +254,83 @@ async fn join(Path(t): Path<String>, headers: HeaderMap) -> Response {
 
 /// Who this browser is, or whose invite it is holding.
 async fn door(State(app): State<App>, headers: HeaderMap) -> Response {
+    let mine = invited(&app, &headers);
     // A link just clicked comes first: they navigated here to come in as
     // whoever it names, and the card says who that is before anything is
     // spent.
+    //
+    // First only over a browser with no name of its own, though. The
+    // cookie says "a link this browser is holding", not "the link just
+    // clicked" -- it outlives the click by `PENDING_MAX_AGE` -- so a
+    // browser already in the room was being greeted as whoever's link it
+    // had last picked up, and Join Audio there would have spent that
+    // link and made this browser them. Somebody else's link is said
+    // plainly instead and left unspent: one browser is one person, and
+    // the way to use it is to log out first.
     if let Some(t) = cookie(&headers, PENDING) {
-        if let Some(invite) = app.any().invite_at_door(&t) {
-            return Json(json!({
-                "state": "invited",
-                "name": invite.name,
-                "display": invite.display,
-                // The door offers the language as well as the devices,
-                // and this is the only place it can learn the list: the
-                // socket that would otherwise carry it wants a session,
-                // and the invite is not spent until Join Audio.
-                "languages": app.any().config().languages,
-            }))
-            .into_response();
-        }
-        if person(&app, &headers).is_none() {
-            // Used once already, or revoked, and this browser never kept
-            // a cookie of its own.
-            return (StatusCode::GONE, Json(json!({ "state": "expired" }))).into_response();
+        match app.any().invite_at_door(&t) {
+            Some(invite) if mine.as_ref().is_none_or(|me| me.name == invite.name) => {
+                return Json(json!({
+                    "state": "invited",
+                    "name": invite.name,
+                    "display": invite.display,
+                    // The door offers the language as well as the devices,
+                    // and this is the only place it can learn the list: the
+                    // socket that would otherwise carry it wants a session,
+                    // and the invite is not spent until Join Audio.
+                    "languages": app.any().config().languages,
+                }))
+                .into_response();
+            }
+            Some(invite) => return in_already(&app, &mine.unwrap(), Some(&invite.name)),
+            None if mine.is_none() => {
+                // Used once already, or revoked, and this browser never
+                // kept a cookie of its own.
+                return (StatusCode::GONE, Json(json!({ "state": "expired" }))).into_response();
+            }
+            None => {}
         }
     }
-    match invited(&app, &headers) {
-        Some(p) => Json(json!({
-            "state": "in",
-            "display": p.display,
-            // The door is a page with no socket behind it for somebody
-            // the room already knows, exactly as it is for an invite, so
-            // this is the only place either of them can learn what the
-            // room offers. Without it a returning browser was shown no
-            // Language box at all until it had joined once and had the
-            // list from a socket it no longer has.
-            "languages": app.any().config().languages,
-            // And what they chose last time, which the room has and a
-            // fresh tab does not: it beats this browser's own guess.
-            "language": p.language,
-            // Whether this browser owns the house. The page uses it to
-            // decide what to show; every endpoint that matters asks
-            // again for itself.
-            "owner": p.owner,
-        }))
-        .into_response(),
+    match &mine {
+        Some(p) => in_already(&app, p, None),
         None => (
             StatusCode::UNAUTHORIZED,
             Json(json!({ "state": "none", "error": "no invite" })),
         )
             .into_response(),
     }
+}
+
+/// What the door says to a browser the room already knows. `holding` is
+/// the name on somebody else's unspent link that this browser is
+/// carrying, when it is carrying one: the page says so rather than the
+/// room acting on it, because logging out is the only thing that can.
+fn in_already(app: &App, p: &Invited, holding: Option<&str>) -> Response {
+    Json(json!({
+        "state": "in",
+        // Both names: the one on their invite, which whoever runs the
+        // room chose and nobody can change, and the one the room calls
+        // them, which is theirs. The settings page says which is which,
+        // and it can't without being told.
+        "name": p.name,
+        "display": p.display,
+        // The door is a page with no socket behind it for somebody
+        // the room already knows, exactly as it is for an invite, so
+        // this is the only place either of them can learn what the
+        // room offers. Without it a returning browser was shown no
+        // Language box at all until it had joined once and had the
+        // list from a socket it no longer has.
+        "languages": app.any().config().languages,
+        // And what they chose last time, which the room has and a
+        // fresh tab does not: it beats this browser's own guess.
+        "language": p.language,
+        // Whether this browser owns the house. The page uses it to
+        // decide what to show; every endpoint that matters asks
+        // again for itself.
+        "owner": p.owner,
+        "holding": holding,
+    }))
+    .into_response()
 }
 
 // -- the house's people, for the owner ---------------------------------
@@ -527,13 +604,19 @@ async fn door_logout(State(app): State<App>, headers: HeaderMap) -> Response {
         }
         app.any().log_out(&id);
     }
+    // A spent link left over from the way in goes with the cookie, or
+    // the door would offer to spend it again. One that is still live is
+    // somebody's way in and this browser is holding it -- which is the
+    // whole reason to log out of a browser that was already in -- so
+    // that one stays, and the door greets them with it.
+    let mut gone = vec![(header::SET_COOKIE, set_cookie(COOKIE, "", 0, &headers))];
+    if cookie(&headers, PENDING)
+        .is_none_or(|t| app.any().invite_at_door(&t).is_none())
+    {
+        gone.push((header::SET_COOKIE, set_cookie(PENDING, "", 0, &headers)));
+    }
     (
-        AppendHeaders([
-            (header::SET_COOKIE, set_cookie(COOKIE, "", 0, &headers)),
-            // A link left over from the way in goes with it, or the door
-            // would offer to spend it again.
-            (header::SET_COOKIE, set_cookie(PENDING, "", 0, &headers)),
-        ]),
+        AppendHeaders(gone),
         Json(json!({ "state": "none" })),
     )
         .into_response()
@@ -544,26 +627,53 @@ struct Rename {
     display: String,
 }
 
-/// What they want the room to call them, asked at the door before the
-/// link is spent. Their invite's name doesn't move: it is the key the
-/// cookie hangs on, and what `vox_room uninvite` names.
+/// What they want the room to call them: at the door before the link is
+/// spent, and from the settings page afterwards. Theirs either way.
+///
+/// Their invite's name doesn't move. It is the key the cookie hangs on,
+/// what `vox_room uninvite` names, what a room of their own is theirs
+/// by, and the owner's to choose -- so this is the only name anybody
+/// here can change about themselves, and the only one anybody reads.
+///
+/// This browser's own cookie comes first, and an unspent link only
+/// counts when there is no cookie: a browser holding somebody else's
+/// link must not be able to rename them. Both are taken, because the
+/// name is wanted before the link is spent as well as long after.
 async fn door_name(
     State(app): State<App>,
     headers: HeaderMap,
     Json(body): Json<Rename>,
 ) -> Response {
-    let Some(invite) = cookie(&headers, PENDING).and_then(|t| app.any().invite_at_door(&t)) else {
+    let who = invited(&app, &headers).map(|p| p.name).or_else(|| {
+        cookie(&headers, PENDING)
+            .and_then(|t| app.any().invite_at_door(&t))
+            .map(|i| i.name)
+    });
+    let Some(name) = who else {
         return (
             StatusCode::GONE,
             Json(json!({ "error": "This link is expired." })),
         )
             .into_response();
     };
-    // Stored once, then every room's roster is brought back in line
-    // with it: a name is the person's, not one room's.
-    match app.any().rename(&invite.name, &body.display) {
+    let Some(was) = app.any().called(&name) else {
+        return (
+            StatusCode::GONE,
+            Json(json!({ "error": "The room doesn't know you." })),
+        )
+            .into_response();
+    };
+    // Written down once, then every room moves what it is holding under
+    // the old name -- its roster, its faders, its conversation -- and
+    // every tab in one is told to do the same.
+    match app.any().rename(&name, &body.display) {
         Ok(display) => {
-            app.rooms.catch_up();
+            app.rooms.renamed(&was, &display);
+            // The desktop relay keys everything by the same name, and
+            // it is not a room: a share of theirs would otherwise go on
+            // being somebody who is no longer on any roster. Theirs
+            // keeps running -- this is a rename, not an interruption.
+            app.screen.renamed(&was, &display);
             Json(json!({ "display": display })).into_response()
         }
         Err(why) => (StatusCode::CONFLICT, Json(json!({ "error": why }))).into_response(),
@@ -683,26 +793,97 @@ async fn forget_conversation(
     }
 }
 
-async fn assets(uri: Uri) -> Response {
+/// The app's own files, embedded in the binary.
+///
+/// Unknown paths get the app, which has only the one page: its routes
+/// (`/lobby`, `/room/<link>`) are the browser's, and the server has
+/// never heard of them.
+///
+/// A missing file under `assets/` is not one of those. It is a stale
+/// index asking for a hashed file this binary doesn't have, and handing
+/// it the app instead answered 200 `text/html` where a module was
+/// expected -- which the browser refuses to run, so the page came up
+/// blank with a MIME error and nothing to say why. It is a plain 404
+/// now, which is what it is.
+async fn assets(headers: HeaderMap, uri: Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
     let path = if path.is_empty() { "index.html" } else { path };
-    // Unknown paths get the app, which has only the one page.
-    match Assets::get(path).or_else(|| Assets::get("index.html")) {
-        Some(file) => {
-            let mime = file.metadata.mimetype().to_string();
-            ([(header::CONTENT_TYPE, mime)], file.data).into_response()
-        }
-        None => (StatusCode::NOT_FOUND, "not found").into_response(),
+    let hashed = path.starts_with(ASSETS);
+    let file = match Assets::get(path) {
+        Some(f) => f,
+        // Nothing to fall back to, and nothing to fall back on.
+        None if hashed => return (StatusCode::NOT_FOUND, "not found").into_response(),
+        None => match Assets::get("index.html") {
+            Some(f) => f,
+            None => return (StatusCode::NOT_FOUND, "not found").into_response(),
+        },
+    };
+    // Of the file actually being sent, not of the path that was asked
+    // for: an unknown path is answered with the index, and two unknown
+    // paths are the same answer.
+    let tag = etag(file.metadata.sha256_hash());
+    if headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|given| given.split(',').any(|t| t.trim() == tag))
+    {
+        return (StatusCode::NOT_MODIFIED, [(header::ETAG, tag)]).into_response();
     }
+    // `hashed` is what was asked for rather than what is going out, and
+    // here that is the same thing: a request under `assets/` either
+    // found its file or 404'd above.
+    let cache = if hashed { ASSET_CACHE } else { INDEX_CACHE };
+    (
+        [
+            (header::CONTENT_TYPE, file.metadata.mimetype().to_string()),
+            (header::CACHE_CONTROL, cache.to_string()),
+            (header::ETAG, tag),
+        ],
+        file.data,
+    )
+        .into_response()
 }
 
-async fn ws(State(app): State<App>, headers: HeaderMap, upgrade: WebSocketUpgrade) -> Response {
+/// A quoted, strong validator for one embedded file. Eight bytes of its
+/// SHA-256: this says two files are the same file, and nothing hangs on
+/// it but whether the browser is sent bytes it already has.
+fn etag(hash: [u8; 32]) -> String {
+    let mut tag = String::with_capacity(19);
+    tag.push('"');
+    for b in &hash[..8] {
+        tag.push_str(&format!("{b:02x}"));
+    }
+    tag.push('"');
+    tag
+}
+
+/// Where a tab is asking to be seated. A browser whose socket dropped
+/// was somewhere when it did, and only it knows where: the room let go
+/// of the tab when the connection went. Without this the socket came
+/// back in the lobby and the tab had to ask to be moved -- which is a
+/// change of rooms, and ends a desktop it was sharing (see
+/// [`crate::screen::Screen::unshare`]) over a moment of bad wifi.
+///
+/// Asking is not being given: it is looked up with [`Rooms::find`] like
+/// any other room, so a tab naming a room that is not theirs is seated
+/// in the lobby and told nothing about it.
+#[derive(Deserialize)]
+struct Seat {
+    room: Option<String>,
+}
+
+async fn ws(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Query(seat): Query<Seat>,
+    upgrade: WebSocketUpgrade,
+) -> Response {
     let Some(who) = invited(&app, &headers) else {
         return (StatusCode::UNAUTHORIZED, "no invite").into_response();
     };
     upgrade.on_upgrade(move |socket| async move {
         let id = app.next_id.fetch_add(1, Ordering::Relaxed);
-        if let Err(e) = client(&app, socket, id, &who).await {
+        if let Err(e) = client(&app, socket, id, &who, seat.room.as_deref()).await {
             debug!(id, "client ended: {e:#}");
         }
     })
@@ -782,14 +963,24 @@ fn part(room: &Arc<Room>, person: &str, tab: u64) {
     room.leave(person, tab);
 }
 
-async fn client(app: &App, socket: WebSocket, id: u64, who: &Invited) -> anyhow::Result<()> {
+async fn client(
+    app: &App,
+    socket: WebSocket,
+    id: u64,
+    who: &Invited,
+    seat: Option<&str>,
+) -> anyhow::Result<()> {
     let name = who.display.clone();
     let rooms = app.rooms.clone();
     // The mic frames in and the mix out live on this channel for as long
     // as the socket does. Changing room re-plugs the far end of it into
     // another mixer; nothing here is torn down and nothing is dropped.
     let (audio_tx, mut audio_rx) = mpsc::channel::<Vec<u8>>(LISTENER_QUEUE);
-    let home = rooms.home();
+    // Where it asked to sit, if that is a room of theirs; the lobby is
+    // where a tab that has never been anywhere belongs.
+    let home = seat
+        .and_then(|id| rooms.find(who, id))
+        .unwrap_or_else(|| rooms.home());
     enter(&home, &name, id, &audio_tx)?;
     app.screen.place(&name, &home.config().id);
     rooms.announce();
@@ -849,6 +1040,10 @@ async fn client(app: &App, socket: WebSocket, id: u64, who: &Invited) -> anyhow:
                             let back = rooms.home();
                             part(&room, &name, id);
                             enter(&back, &name, id, &audio_news)?;
+                            // Out of the room is out of the room: a
+                            // desktop they were sharing into it stops,
+                            // the same as if they had walked.
+                            app.screen.unshare(&name);
                             app.screen.place(&name, &back.config().id);
                             info!(id, person = %name, was = %room.config().id, "their room is no longer theirs");
                             let _ = here_news.send(back);
@@ -945,7 +1140,11 @@ async fn client(app: &App, socket: WebSocket, id: u64, who: &Invited) -> anyhow:
                             };
                             part(&room, &name, id);
                             enter(&next, &name, id, &audio_tx)?;
-                            // Their desktop goes with them.
+                            // Their desktop does not go with them. It
+                            // was shared to the room they just left,
+                            // and sharing it here is a thing to decide
+                            // on purpose.
+                            app.screen.unshare(&name);
                             app.screen.place(&name, &next.config().id);
                             info!(id, person = %name, room = %want, "changed rooms");
                             let _ = here_cmd.send(next);

@@ -29,7 +29,22 @@ export const room = $state({
   // Why the door wouldn't take something: a name somebody else has, or a
   // link that expired between opening it and pressing the button.
   doorError: null,
+  // The name on an unspent invite link this browser is carrying that
+  // isn't ours -- one picked up and never used. It does not change who
+  // this browser is: it is said at the door so that a name nobody here
+  // recognises is explained rather than quietly adopted, and logging out
+  // is what hands the room over to it.
+  holding: null,
   you: null,
+  // The name on your invite. Whoever runs the room chose it and nobody
+  // can change it: it is what you are revoked by, and what a room of
+  // your own is yours by. `you` is what the room calls you, which is
+  // the only name anybody reads -- and the only one you can change.
+  invited: null,
+  // Why the room wouldn't take a name: one somebody else answers to,
+  // or the AI's. Its own, because the box asking is on the door for
+  // somebody coming in and on the settings page for everybody else.
+  nameError: null,
   // Which room this tab is in, from `hello`: its id (what a command
   // names), what it is called on screen, and whether it is somebody's
   // own -- a room nobody else can come into.
@@ -224,7 +239,17 @@ let wanted = false;
 
 function connect() {
   const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
-  ws = new WebSocket(`${scheme}://${location.host}/room.ws`);
+  // Where to sit. A tab whose socket dropped was in a room when it
+  // did, and the room let go of it along with the connection -- so it
+  // says where it had got to, rather than being put in the lobby and
+  // having to ask to be moved back. Asking to be moved is a change of
+  // rooms, and that ends a desktop it was sharing: a moment of bad
+  // wifi is not somebody walking out.
+  //
+  // The server looks the room up as one of theirs like any other, so
+  // there is nothing here to be trusted or not.
+  const seat = room.where ? `?room=${encodeURIComponent(room.where)}` : '';
+  ws = new WebSocket(`${scheme}://${location.host}/room.ws${seat}`);
   ws.binaryType = 'arraybuffer';
   ws.onopen = () => {
     room.connected = true;
@@ -246,6 +271,27 @@ function connect() {
   };
 }
 
+/// Come back on a fresh socket, now rather than after the backoff a
+/// dropped one waits out. A socket is told whose it is when it opens
+/// and nothing afterwards changes its mind, so taking a new name needs
+/// a new one.
+///
+/// The audio doesn't stop for it: the mic frames go out on whatever
+/// socket is current, the speakers and the microphone are the browser's
+/// and untouched, and the `hello` that comes back says who you are now.
+function reconnect() {
+  if (!wanted) return;
+  const old = ws;
+  ws = null;
+  if (old) {
+    // Ours to replace, so the drop handler must not also crawl back:
+    // two sockets would both be in the room, under the same name.
+    old.onclose = null;
+    old.close();
+  }
+  connect();
+}
+
 /// Who this browser is, from its own cookie, or whose invite link it is
 /// holding. True when there is a cookie, and so a room to connect to.
 export async function whoami() {
@@ -260,6 +306,8 @@ export async function whoami() {
   }
   if (d.state === 'in') {
     room.you = d.display;
+    room.invited = d.name ?? null;
+    room.holding = d.holding ?? null;
     // There is no socket at the door for somebody the room knows
     // either, so the list of languages comes from here as well -- and
     // the one the room has against their invite, which beats what this
@@ -285,12 +333,18 @@ export async function whoami() {
   return false;
 }
 
-/// The name the room should call you, asked at the door while the invite
-/// link is still unspent. False (with `room.doorError` set) when the
-/// room wouldn't have it.
+/// The name the room should call you: at the door while the invite link
+/// is still unspent, and from the settings page once you are in. False
+/// (with `room.nameError` set) when the room wouldn't have it.
+///
+/// In the room this is a rename, and nothing here applies it: the room
+/// says so to everybody at once, this tab included, and the `renamed`
+/// event below is where it lands. The name on your invite is not this
+/// and never moves.
 export async function setName(display) {
-  room.doorError = null;
-  if (!room.door || display.trim() === room.door.display) return true;
+  room.nameError = null;
+  const now = room.door ? room.door.display : room.you;
+  if (display.trim() === (now ?? '')) return true;
   try {
     const r = await fetch('/api/door/name', {
       method: 'POST',
@@ -299,10 +353,12 @@ export async function setName(display) {
     });
     const d = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(d.error || r.statusText);
-    room.door.display = d.display;
+    // At the door there is no socket to say it on, so what the room
+    // took is taken from the answer.
+    if (room.door) room.door.display = d.display;
     return true;
   } catch (e) {
-    room.doorError = e.message || String(e);
+    room.nameError = e.message || String(e);
     return false;
   }
 }
@@ -711,6 +767,36 @@ function apply(ev) {
       // The directory may not have arrived yet, the first time; `rooms`
       // does this too, and whichever comes second is the one that acts.
       syncUrl();
+      break;
+    }
+    case 'renamed': {
+      // What the room calls somebody has changed, and it calls them
+      // that everywhere: the roster, the fader, the meter, and every
+      // line they ever said. The room has already moved the lines it
+      // keeps, and moves them here rather than sending the
+      // conversation again.
+      const { was, now } = ev;
+      const move = (o) => {
+        if (o && was in o) {
+          o[now] = o[was];
+          delete o[was];
+        }
+      };
+      for (const e of room.log) if (e.who === was) e.who = now;
+      // An old conversation open on this screen is read under the name
+      // on the roster now, which is the whole of what a display name
+      // is: there is no record here of what somebody used to be called.
+      if (room.reading) for (const e of room.reading.log) if (e.who === was) e.who = now;
+      for (const p of room.people) if (p.name === was) p.name = now;
+      for (const c of room.cards) if (c.to === was) c.to = now;
+      move(room.strips);
+      move(room.levels);
+      move(room.speaks);
+      if (room.you === was) {
+        room.you = now;
+        // Our own socket is still in the room under the old name.
+        reconnect();
+      }
       break;
     }
     case 'rooms':
