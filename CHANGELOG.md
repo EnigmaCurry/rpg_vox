@@ -90,6 +90,39 @@ releases.
 
 ### Voice room
 
+- **An AI can be told to say nothing at all, and nothing overrides it.**
+  **Answers** has a fourth setting, **never**, beside *when named*,
+  *when it fits* and *every pause*. A bot set to it stays in the room
+  and keeps its fader, its voice and everything it has said; it simply
+  has no turn to be given. Saying its name doesn't give it one, a
+  back-and-forth can't start, and a game that wants every pause
+  answered doesn't get this bot -- a game entered with every AI
+  silenced opens in the quiet it was asked for, and leaving the game
+  finds it still silent. Picking it while one is talking stops it where
+  it is. With two AIs in a room it is how to put one aside for a while
+  without taking it out of the room.
+
+- **And whether talking over an AI cuts it off is now a setting of its
+  own: Stops.** **When interrupted** is what the room has always done
+  and is still the default. **When finished** means it says the whole
+  of its reply: a voice still ducks it, so you can be heard over it,
+  but nothing cuts it off -- so a cough, a false start or a word to
+  somebody else can't cost you the answer you just asked for. **Stop**
+  still stops it; only the voice is disarmed, never the button.
+
+  What you said over it is neither thrown away nor taken for a
+  question. It is transcribed and on screen as always, it waits where
+  it is while the reply plays out, and then the pause it made is handed
+  to the AI to *judge* -- the judgment "when it fits" makes, even for a
+  bot on "every pause", and it is told the words arrived over its own
+  voice. So a throat-clear costs nothing and a follow-up asked while it
+  was still talking gets its answer one turn later. It is the same
+  model call that pause was going to cost, asked a different question.
+
+  Both settings are per bot and per room, like the fader beside them,
+  and **Stops** is one a game never takes: a game says when a bot
+  answers, not how it is stopped.
+
 - **The footer is the two ways of saying something, and nothing else.**
   **Share screen** and **Leave audio** are now **📺️** and **🚪**,
   over the people in the left column with the cog beside them — that is

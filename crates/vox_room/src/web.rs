@@ -12,6 +12,7 @@
 //! {"type": "strip", "name": "Alex", "gain": 0.8, "mute": false}
 //! {"type": "interpreter", "gain": 0.8, "mute": false}
 //! {"type": "mode", "bot": "Vox", "mode": "always"}
+//! {"type": "stops", "bot": "Vox", "stops": "finished"}
 //! {"type": "name_conversation", "conversation": 7, "title": "The heist"}
 //! {"type": "stop"}
 //! {"type": "new_conversation"}
@@ -928,6 +929,11 @@ enum Command {
         bot: String,
         mode: String,
     },
+    /// Whether talking over one bot in this room cuts it off.
+    Stops {
+        bot: String,
+        stops: String,
+    },
     /// Typed into the room rather than said to it.
     Text {
         text: String,
@@ -1120,6 +1126,7 @@ async fn client(
                             room.set_interpreter(id, gain, mute)
                         }
                         Ok(Command::Mode { bot, mode }) => room.set_mode(&bot, &mode),
+                        Ok(Command::Stops { bot, stops }) => room.set_stops(&bot, &stops),
                         // Only the sender hears about a message the room
                         // wouldn't take: it is their typing, not news.
                         Ok(Command::Text { text }) => {

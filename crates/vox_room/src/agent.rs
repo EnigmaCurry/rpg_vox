@@ -104,7 +104,7 @@ room, and reading either aloud is what you must not do.";
 const DECIDE: &str = "\
 (Nobody has said your name, so this turn is yours to judge: the room has \
 gone quiet for a moment, and you may either take it or let it pass. \
-{here}{engaged}\
+{here}{engaged}{over}\
 Take it when the last thing said was meant for you -- a question, a \
 request, a follow-up to what you were saying, something you were asked to \
 watch for -- or when there is nobody else here it could have been meant \
@@ -122,6 +122,16 @@ const DECIDE_ENGAGED: &str = "\
 You are in the middle of a conversation with them: they called you in and \
 have carried on without naming you again, so the turn is yours unless they \
 have plainly turned to each other. ";
+
+/// Added to [`DECIDE`] when what it is being shown arrived while it was
+/// still speaking: it was talked over and left to finish, so the likeliest
+/// thing this pause holds is a cough.
+const DECIDE_OVER: &str = "\
+What was said came in while you were still speaking: they talked over you \
+and you were left to finish, so it may be a cough, a false start or a word \
+to somebody else rather than anything meant for you. Take the turn only if \
+it was plainly for you -- a question, or a follow-up to what you had just \
+said. Otherwise let it pass: you have already answered. ";
 
 /// The same, on the second look at a silence the AI asked to be shown.
 const DECIDE_LULL: &str = "\
@@ -511,11 +521,12 @@ impl Agent {
         }
         // Last, so it is the thing the model has just read, and so the
         // rest of the turn is the same prompt either way.
-        if let Cue::Decide { lull } = turn.cue {
+        if let Cue::Decide { lull, over } = turn.cue {
             let note = match lull {
                 None => DECIDE
                     .replace("{here}", &who_is_here(&turn.people))
-                    .replace("{engaged}", if turn.engaged { DECIDE_ENGAGED } else { "" }),
+                    .replace("{engaged}", if turn.engaged { DECIDE_ENGAGED } else { "" })
+                    .replace("{over}", if over { DECIDE_OVER } else { "" }),
                 Some(s) => DECIDE_LULL.replace("{lull}", &s.to_string()),
             };
             out.push(json!({ "role": "user", "content": note }));
@@ -1572,6 +1583,13 @@ mod tests {
         turn_with(cue, &["Ryan", "Alex"], false)
     }
 
+    /// A pause the AI is to judge for itself: `lull` is a silence it
+    /// asked to be shown again, `over` that the words came in while it
+    /// was still speaking.
+    fn judge(lull: Option<u64>, over: bool) -> Cue {
+        Cue::Decide { lull, over }
+    }
+
     /// An agent and a turn for it. The room's own settings are not in
     /// it any more: what the AI is told about itself comes from the
     /// agent, because in a room with two of them the room could only
@@ -1725,7 +1743,7 @@ mod tests {
         let mut queue: Vec<_> = cases.iter().rev().collect();
         while let Some(case) = queue.pop() {
             let (said, people, engaged, want_turn) = case;
-            let (agent, mut t) = turn_with(Cue::Decide { lull: None }, people, *engaged);
+            let (agent, mut t) = turn_with(judge(None, false), people, *engaged);
             t.messages = vec![(Role::User, said.to_string())];
             // Ask the way the room asks, on whichever API it speaks.
             let offered = tools_for(true, false, true);
@@ -1979,7 +1997,7 @@ mod tests {
     #[test]
     fn a_turn_to_judge_says_who_it_is_being_judged_among() {
         let note = |people: &[&str], engaged| {
-            let (agent, t) = turn_with(Cue::Decide { lull: None }, people, engaged);
+            let (agent, t) = turn_with(judge(None, false), people, engaged);
             agent.messages(&t).pop().unwrap()["content"]
                 .as_str()
                 .unwrap()
@@ -2008,7 +2026,7 @@ mod tests {
 
     #[test]
     fn a_turn_to_judge_ends_with_what_makes_it_a_judgment() {
-        let (agent, t) = turn(Cue::Decide { lull: None });
+        let (agent, t) = turn(judge(None, false));
         let messages = agent.messages(&t);
         let last = messages.last().unwrap();
         assert_eq!(last["role"], "user");
@@ -2019,8 +2037,19 @@ mod tests {
         // the rest of the prompt is the same either way.
         assert_eq!(messages[1]["content"], "Ryan: so what did you make of it?");
 
+        // Talked over and left to finish: it is told so, because the
+        // likeliest thing in that pause is a cough.
+        let (agent, t) = turn(judge(None, true));
+        let over = agent.messages(&t).pop().unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(over.contains("while you were still speaking"), "{over}");
+        assert!(over.contains("Take the turn only if it was plainly for you"));
+        assert!(!over.contains("{over}") && !note.contains("while you were still speaking"));
+
         // The silence it asked for says how long it has lasted.
-        let (agent, t) = turn(Cue::Decide { lull: Some(8) });
+        let (agent, t) = turn(judge(Some(8), false));
         let note = agent.messages(&t);
         let note = note.last().unwrap()["content"]
             .as_str()

@@ -62,10 +62,21 @@ export const room = $state({
   // own room is on anybody else's list. `path` is where the room
   // lives: the server settles the scheme, this only follows it.
   rooms: [],
-  // The AIs in this room: { name, strip, state, mode, engaged }. When
-  // each answers is its own, not the room's — except that a game's rule
-  // binds all of them, which is what `locked` says.
-  agents: [{ name: 'AI', state: 'listening', strip: '@agent', mode: 'named', engaged: false }],
+  // The AIs in this room: { name, strip, state, mode, engaged, stops }.
+  // When each answers is its own, not the room's — except that a game's
+  // rule binds all of them, which is what `locked` says. `stops` is
+  // whether talking over it cuts it off, and that one is nobody's but
+  // the bot's: a game never takes it.
+  agents: [
+    {
+      name: 'AI',
+      state: 'listening',
+      strip: '@agent',
+      mode: 'named',
+      engaged: false,
+      stops: 'interrupted',
+    },
+  ],
 
   // The interpreters this room has, when it has any:
   // { level, languages }. `level` is where the one speaking your
@@ -908,6 +919,12 @@ function apply(ev) {
         bot.engaged = ev.engaged ?? false;
       }
       room.locked = ev.locked ?? false;
+      break;
+    }
+    case 'stops': {
+      // One bot's, like `mode`, and with no `locked` about it.
+      const bot = room.agents.find((b) => b.name === ev.bot);
+      if (bot) bot.stops = ev.stops;
       break;
     }
     case 'agents':

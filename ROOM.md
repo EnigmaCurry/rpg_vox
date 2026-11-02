@@ -15,7 +15,9 @@ you can talk to the AI with nobody listening. See
 It is full duplex: anyone can talk over the AI to interrupt it, with no
 key to press. The conversation keeps only what the AI actually said
 before it was cut off, ending with ` —`, and the AI is told where it was
-interrupted.
+interrupted. Each AI can also be set to **finish** instead, so that a
+cough can't cost you the answer you asked for — see **Stops** under
+**[In the room](#in-the-room)**.
 
 It runs on macOS and Linux (no PipeWire: all the audio is the browsers').
 
@@ -207,9 +209,13 @@ What each of them is is its own:
   Nobody in the room may call themselves after any of them.
 - **Its own fader.** One strip each, under the room, so turning one
   down is turning *that one* down.
-- **Its own Answers.** When named, when it fits, every pause — per bot
-  and per room, so Sage can answer every pause in your own room while
-  waiting to be named in the Lobby.
+- **Its own Answers.** Never, when named, when it fits, every pause —
+  per bot and per room, so Sage can answer every pause in your own room
+  while waiting to be named in the Lobby, and say nothing at all in the
+  Cellar.
+- **Its own Stops.** Whether a voice talking over it cuts it off or it
+  finishes what it was saying. Per bot and per room as well, and never
+  a game's to take.
 - **Its own prompt**, with `{name}` filled in as itself, so each is
   told who it is rather than told it is the first of them.
 
@@ -424,12 +430,22 @@ See ROOM_DOCKER.md.
   before, to read; **New conversation** starts the next one; and while
   a game is on, its name and **Leave the game**. See [What a room has
   said before](#what-a-room-has-said-before).
-- **Answers: when named / when it fits / every pause**, under the AI's
-  own strip: who gets the turn when the room goes
+- **Answers: never / when named / when it fits / every pause**, under
+  the AI's own strip: who gets the turn when the room goes
   quiet. It is that bot's setting in that room — the same AI answers
   differently in the Lobby and in your own room, and a second bot in
   the room carries its own. Shared by everyone in the room, like the
   faders beside it.
+  - **Never** — it says nothing at all. It is still in the room and
+    still on its fader; it just has no turn to be given, and saying its
+    name doesn't give it one. **Nothing overrides this**: not its name,
+    not a back-and-forth, and not a game that wants every pause
+    answered — a bot you silenced is not something a game gets to turn
+    back on, and a game entered with every bot silenced opens in the
+    quiet it was asked for. Pick it while one is talking and it stops
+    there and then. With two AIs in a room it is how you put one of
+    them aside for a while without losing its fader, its voice or what
+    it has already said.
   - **When named** — the AI says nothing until someone says its name, so
     two people can talk without it butting in. The default.
   - **When it fits** — at every pause the AI is *given the turn* and
@@ -462,6 +478,28 @@ See ROOM_DOCKER.md.
   once and stops for good once your speech is confirmed (300 ms of voice
   or the first recognised word), so a cough only dips it. **Stop** does
   the same with a click.
+- **Stops: when interrupted / when finished**, directly under that bot's
+  Answers, because it is the other half of the same question. Its own
+  setting in that room, like Answers, and unlike Answers no game ever
+  takes it: a game says when a bot answers, never how it is stopped.
+  - **When interrupted** — what is written just above. The default, and
+    what a conversation wants: talking over it is how you take the turn
+    back.
+  - **When finished** — it says the whole of its reply. A voice still
+    ducks it, so you can be heard over it, but nothing cuts it off: ask
+    it a question and a cough, a false start or a word to somebody else
+    can't cost you the answer. **Stop** still stops it — only the voice
+    is disarmed, never the button.
+
+    What you said over it is not thrown away and not treated as a
+    question either. It is transcribed and on screen as always, it
+    waits where it is while the reply plays out (the turn isn't over
+    until the AI has finished), and then it is handed over as a pause
+    for the AI to *judge* — the same judgment "when it fits" makes,
+    even when the bot is on "every pause", and it is told the words
+    came in over its own voice. So a throat-clear costs nothing, and a
+    real follow-up asked while it was still talking gets its answer one
+    turn later.
 - **Typing instead of saying it**: there is a box along the foot of
   the room, beside the button you talk with — saying a thing and typing
   it are the same act done two ways. **Enter** sends;
@@ -788,7 +826,9 @@ A game also carries settings, not just a prompt. Today that is
 The AI picks one as it designs the game and can be told which you want.
 While a game that sets one of the last three is being played the
 **Answers** control is locked to it; leaving the game restores what you
-chose. A game also records how many players it is for (`players_min` and
+chose. Two things it cannot reach: a bot set to **never**, which stays
+silent in any game and is still silent when you leave it, and
+**Stops**, which is nobody's but the bot's. A game also records how many players it is for (`players_min` and
 `players_max`, either end open), which the AI works out with you.
 
 A saved game is announced in the conversation it was designed in, as a
@@ -897,6 +937,12 @@ judgment is a semantic one ("is this mine to answer?"), which is what a
 language model is for, and asking the same model that would answer means
 a pause it *does* take costs nothing extra — it just keeps talking,
 with no second round trip.
+
+A bot set to finish judges one pause it would otherwise have answered:
+the one made by whoever talked over it. That is the same model call it
+was going to make, asked a different question, so finishing costs
+nothing extra — and a cough it decides against costs one tool call
+instead of a whole spoken reply.
 
 If that turns out to be too expensive, the seam to replace is narrow: the
 room hands out a turn with a `Cue::Decide`, and anything that can answer
@@ -1024,7 +1070,7 @@ CHROME=$(which chromium) ./run.sh            # or: ./run.sh rooms bots
 | suite | |
 |---|---|
 | `rooms` | several rooms on one socket: where a tab lands, who may go where, a room of your own admitting one person, and the mix arriving across every move. No browser at all — two sockets are enough |
-| `bots` | two AIs in one room: a fader and an Answers setting each, each answering to its own name, and one pause going to exactly one of them |
+| `bots` | two AIs in one room: a fader, an Answers and a Stops setting each, each answering to its own name, one of them silenced while the other carries on, and one pause going to exactly one of them |
 | `door` | the door is a page with no room behind it and no socket open; **Join Audio** does nothing until you agree to be recorded, and the Language box is never blank |
 | `roles` | the house and the people: making a room, renaming one under somebody standing in it, taking one away from under them — and the owner and the rest: who is shown the people and who is answered when they ask for them, a room given and taken away while somebody sits in the house, and an invite made from the page |
 | `settings` | the footer: one width for the talk button whatever it says, sharing and the way out on the other side, and the cog opening a page with everything that used to be strung along it |

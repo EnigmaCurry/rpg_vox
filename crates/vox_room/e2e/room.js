@@ -240,6 +240,9 @@ async function socket(token, base = BASE) {
       const bot = (p.agents ?? []).find((b) => b.name === m.bot);
       if (bot) bot.mode = m.mode;
       if (p.agents?.[0]) p.mode = p.agents[0].mode;
+    } else if (m.type === 'stops') {
+      const bot = (p.agents ?? []).find((b) => b.name === m.bot);
+      if (bot) bot.stops = m.stops;
     } else if (m.type === 'agents') {
       for (const a of m.agents) {
         const bot = (p.agents ?? []).find((b) => b.name === a.name);

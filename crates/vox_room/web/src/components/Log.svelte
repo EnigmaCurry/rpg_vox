@@ -101,6 +101,10 @@
           Nothing was ever said in this one.
         {:else if room.game}
           Entering <strong>{room.game}</strong>…
+        {:else if room.agents.every((a) => a.mode === 'never')}
+          Nothing said yet. {theAI()} {one ? 'is' : 'are'} set to say nothing at all,
+          so the room is yours: join the audio and talk. Change
+          <strong>Answers</strong> beside {it} to bring {it} in.
         {:else}
           Nothing said yet. Join the audio and start talking; say <strong>{theAI()}</strong>
           {room.agents.every((a) => a.mode === 'named')

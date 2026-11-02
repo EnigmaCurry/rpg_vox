@@ -41,6 +41,11 @@
   // lives under that bot in that room, and each of them has its own.
   const modes = (bot) => [
     {
+      mode: 'never',
+      label: 'never',
+      hint: `${bot.name} says nothing at all: not when it is named, and not in a game that wants every pause answered. It stays in the room, on its fader, until this is changed back.`,
+    },
+    {
       mode: 'named',
       label: 'when named',
       hint: `${bot.name} says nothing until someone says its name.`,
@@ -57,10 +62,31 @@
     },
   ];
 
+  // What a voice talking over the bot does to the reply it is in the
+  // middle of. Its own setting as well, and never a game's: a game
+  // says when a bot answers, not how it is stopped.
+  const stop = (bot) => [
+    {
+      stops: 'interrupted',
+      label: 'when interrupted',
+      hint: `Talking over ${bot.name} cuts it off where it had got to, and it is shown where you cut in. 300 ms of voice or a first recognised word, so a cough only dips it.`,
+    },
+    {
+      stops: 'finished',
+      label: 'when finished',
+      hint: `${bot.name} says the whole of its reply: talking over it dips it but never cuts it off, so a cough can't cost you the answer you asked for. What you said over it isn't lost — it is handed over at the pause after, for ${bot.name} to judge whether it was for it. Stop still stops it.`,
+    },
+  ];
+
+  const stopHint = (bot) =>
+    `What somebody talking over ${bot.name} does to the reply it is in the middle of. Yours to set whatever else the room is doing, and Stop always stops it.`;
+
   // Why a bot's mode is what it is, when the room and not a click
   // decided it.
   const modeHint = (bot) =>
-    room.locked
+    bot.mode === 'never'
+      ? `${bot.name} is set to say nothing at all, which is nobody's to override — not a game's, and not its own name's.`
+      : room.locked
       ? `${room.game} decides when ${bot.name} answers, so this can't be changed until the room leaves the game.`
       : bot.engaged
         ? `You said its name, so ${bot.name} has the turn at every pause — judging each one — until the room has been quiet a while. Say "thanks" or "goodbye" and it goes back to waiting for its name.`
@@ -164,6 +190,21 @@
               command({ type: 'mode', bot: bot.name, mode: e.currentTarget.value })}>
             {#each modes(bot) as m (m.mode)}
               <option value={m.mode} title={m.hint}>{m.label}</option>
+            {/each}
+          </select>
+        </label>
+        <!-- And what talking over it does: the other half of the same
+             question, so it sits directly under it. Not locked by a
+             game -- a game says when a bot answers, not how it is
+             stopped. -->
+        <label class="when" title={stopHint(bot)}>
+          <span class="what">Stops</span>
+          <select value={bot.stops}
+            aria-label="When {bot.name} stops speaking"
+            onchange={(e) =>
+              command({ type: 'stops', bot: bot.name, stops: e.currentTarget.value })}>
+            {#each stop(bot) as s (s.stops)}
+              <option value={s.stops} title={s.hint}>{s.label}</option>
             {/each}
           </select>
         </label>
@@ -308,7 +349,9 @@
   .hint { font-size: 12px; color: var(--muted); margin: 4px 0 0; }
   /* When the bot above speaks, in this room. */
   .when { display: flex; align-items: center; gap: 6px; }
-  .what { font-size: 11px; color: var(--muted); flex: none; }
+  /* Wide enough for "Answers" with its dot, so the row under it lines
+     up with it rather than starting a column of its own. */
+  .what { font-size: 11px; color: var(--muted); flex: none; min-width: 52px; }
   .when select {
     flex: 1;
     min-width: 0;
