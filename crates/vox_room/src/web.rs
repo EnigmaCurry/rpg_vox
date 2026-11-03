@@ -1264,6 +1264,15 @@ enum Command {
         bot: String,
         stops: String,
     },
+    /// Take a seat in the playhouse, or put somebody in one: the
+    /// audience, the director's box, or the stage. Only while a puppet
+    /// show is on -- see `room::Seat`. `who` defaults to whoever sent
+    /// it, which is what the bands in the browser use it for.
+    Seat {
+        #[serde(default)]
+        who: Option<String>,
+        seat: String,
+    },
     /// Typed into the room rather than said to it.
     Text {
         text: String,
@@ -1469,6 +1478,16 @@ async fn client(
                             title,
                         }) => {
                             if let Err(why) = room.name_conversation(conversation, &title) {
+                                room.tell(&name, &why);
+                            }
+                        }
+                        Ok(Command::Seat { who, seat }) => {
+                            // Yourself unless you said otherwise. The
+                            // seats are the room's, like the faders:
+                            // anybody may move anybody, and the one
+                            // that cannot be moved says so itself.
+                            let who = who.unwrap_or_else(|| name.clone());
+                            if let Err(why) = room.take_seat(&who, &seat) {
                                 room.tell(&name, &why);
                             }
                         }

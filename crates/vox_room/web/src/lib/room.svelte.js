@@ -610,6 +610,13 @@ export function theAIs() {
   return room.agents.filter((a) => !a.puppet);
 }
 
+/// The puppets in the room, in the order they came on stage: the
+/// characters the first AI speaks through. The stage is drawn from
+/// these, and it is drawn at all only while there are some.
+export function thePuppets() {
+  return room.agents.filter((a) => a.puppet);
+}
+
 /// What to call the AIs in a sentence: one name, or every name with
 /// "or" before the last. The prose about "the AI" is written for one of
 /// them, and a room can have two.

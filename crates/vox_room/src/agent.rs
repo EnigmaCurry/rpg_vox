@@ -497,9 +497,14 @@ for you the moment the curtain goes up: you and every puppet stop \
 answering and finish whatever you are saying, so a cough in the audience \
 cannot cost an actor their line. Say whatever you are going to say about \
 the show *before* you call put_on_show -- announce it, then call it, then \
-be quiet. The play starts once you have finished speaking.
+be quiet. The play starts once you have finished speaking, and your reply \
+is over the moment you make that call: there is nothing you can say after \
+it that anybody would hear before the play, so do not try to round the \
+show off, say how it went, or ask what they thought. None of it has \
+happened yet.
 
-**When it ends** you are given the turn again, and the room is yours \
+**When it ends** -- which is a later turn, minutes after the one you \
+started it in -- you are given the turn again, and the room is yours \
 again: you answer, and you can be talked over. Say the show is over, and \
 then it is the room's to decide what happens to the cast. If they want \
 the puppets gone, send_off_puppets takes them off. If they want to ask \
@@ -1758,6 +1763,23 @@ fn stream_reply(
         }
         if room.is_starting(g) {
             info!(g, "reply: started a game, so it ends here");
+            return Ok(());
+        }
+        // The curtain is up, so this reply is over whatever the model
+        // had left to say. What it has already said is the
+        // announcement, which is spoken; the play begins the moment it
+        // stops speaking, and what it would say *after* a show belongs
+        // to the turn it is given when the curtain comes down.
+        //
+        // Structural, and it has to be: the tool's answer says to stop
+        // talking and the prompt says the same, and the room then
+        // hands every tool result back with "carry on from there" on
+        // it, which is the opposite instruction and the one nearer the
+        // model. Asked to put a play on, it announced the play and
+        // then said "that's it, how did that land?" -- before a word
+        // of the play had been heard.
+        if !failed && calls.iter().any(|c| c.name == "put_on_show") {
+            info!(g, "reply: the curtain is up, so it ends here");
             return Ok(());
         }
         // It judged the pause not to be its own: nothing more to say, and

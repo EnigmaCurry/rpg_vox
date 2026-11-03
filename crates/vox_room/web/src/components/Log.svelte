@@ -2,6 +2,7 @@
   import { room, enterGame, peekGame, theAI, theAIs, waitingAI, pictureOf, sampleOf } from '../lib/room.svelte.js';
   import History from './History.svelte';
   import Face from './Face.svelte';
+  import Stage from './Stage.svelte';
   import { hue } from '../lib/color.js';
   import { markdown } from '../lib/markdown.js';
   import { scaledDown } from '../lib/pixels.js';
@@ -110,6 +111,12 @@
      and typing it are the same act done two ways, and this column is
      for what came of either. -->
 <div class="log">
+  <!-- The puppets, above the conversation and outside its scrollport:
+       a scene is watched, and the cast has to stay in front of you
+       while the transcript of what they are saying scrolls past. There
+       is nothing here at all unless somebody is on stage. -->
+  <Stage />
+
   <div class="said" bind:this={box} {onscroll}>
     <History />
 

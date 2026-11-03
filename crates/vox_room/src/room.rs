@@ -317,6 +317,67 @@ impl Stops {
     }
 }
 
+/// Where somebody is sitting while a puppet show is on.
+///
+/// A show turns the room into a playhouse with three parts, and which
+/// of them you are in decides who can hear you. Outside a show there
+/// are no seats at all: everybody is simply in the room, which is what
+/// a room is the rest of the time.
+///
+/// It is not written down. A seat lasts as long as the show does, like
+/// the stage itself -- what the house keeps is the characters.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Seat {
+    /// Watching. The audience may talk among themselves as freely as
+    /// they like and **the director cannot hear a word of it** -- which
+    /// is the point of the thing: a play with the audience shouting
+    /// suggestions at the director is not a play. A suggestion reaches
+    /// the director the way it does in a real theatre, through
+    /// somebody who has gone round to the box.
+    #[default]
+    Audience,
+    /// Where the AI running the show sits, and anybody who wants a word
+    /// with it: what is said here is the only thing it hears. From here
+    /// a show is changed, extended or ended.
+    Box,
+    /// Up with the puppets. Standing on the stage is joining the play:
+    /// whatever script was running stops where it is, and the puppets
+    /// start answering whoever is up there, line by line, through the
+    /// AI that holds them.
+    Stage,
+}
+
+impl Seat {
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "audience" => Some(Seat::Audience),
+            "box" => Some(Seat::Box),
+            "stage" => Some(Seat::Stage),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Seat::Audience => "audience",
+            Seat::Box => "box",
+            Seat::Stage => "stage",
+        }
+    }
+
+    /// Whether somebody in this seat can hear somebody in `said`.
+    ///
+    /// One rule, and it only ever says no in one direction: the box and
+    /// the stage cannot hear the audience. Everything else hears
+    /// everything -- the audience can follow the play and the
+    /// conversation in the box, because that is what watching a play
+    /// is, and the people in it are not conspiring.
+    fn hears(self, said: Seat) -> bool {
+        !(matches!(self, Seat::Box | Seat::Stage) && said == Seat::Audience)
+    }
+}
+
 /// Why the AI has been given the turn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Cue {
@@ -786,6 +847,11 @@ struct Person {
     /// holds against their unchanging name, kept here because the roster
     /// is keyed by display name and a rename replaces the entry.
     language: String,
+    /// Where they are sitting while a show is on, and meaningless the
+    /// rest of the time -- see [`Seat`]. Everybody comes back to the
+    /// audience when the curtain falls, so this is never stale into a
+    /// room with no show in it.
+    seat: Seat,
 }
 
 impl Person {
@@ -1005,6 +1071,12 @@ struct BotState {
     here: bool,
     /// Whether somebody talking over it cuts it off.
     stops: Stops,
+    /// Where this voice is sitting while a show is on. The AI running
+    /// the show is put in the box for as long as it lasts and cannot
+    /// be moved out of it; every other voice starts in the audience,
+    /// and a puppet is always on the stage, which is what being a
+    /// puppet is.
+    seat: Seat,
     /// Somebody talked over the reply it was in the middle of and it
     /// was not cut off (`stops` is [`Stops::Finished`]), so the words
     /// they said arrived over its own voice. Cleared at the next
@@ -1470,6 +1542,9 @@ impl Room {
                 // being given a room is a tick and not a restart.
                 here: n == 0 || placed.contains(&bot.name),
                 stops,
+                // No show is on in a room that has just opened, so
+                // there are no seats to be in yet.
+                seat: Seat::Audience,
                 talked_over: false,
                 engaged: None,
                 state: "listening",
@@ -2737,13 +2812,12 @@ impl Room {
                 "languages": self.interp.keys().collect::<Vec<_>>(),
             })),
             "locked": st.game_mode.is_some(),
-            // A puppet show playing, so a tab that opened in the
-            // middle of one sees what everyone else is watching.
-            "show": st.show.as_ref().map(|s| json!({
-                "title": s.title,
-                "lines": s.lines,
-                "said": s.said,
-            })),
+            // A puppet show on, so a tab that opened in the middle of
+            // one sees what everyone else is watching -- and where
+            // everybody is sitting, which is what decides who can hear
+            // whom while it lasts.
+            "show": self.show_json(&st),
+            "seats": self.seats_json(&st),
             // Whether what people say out loud is put into the other
             // languages as well as the AI's replies. A reader waits for
             // a translation only of what one is coming for.
@@ -4292,6 +4366,9 @@ impl Room {
             // on everybody anyway (see `begin_show`), so this is what
             // a puppet taking questions afterwards comes back to.
             stops: Stops::Finished,
+            // A puppet is on the stage. That is not a seat anybody put
+            // it in; it is what being a puppet is.
+            seat: Seat::Stage,
             talked_over: false,
             engaged: None,
             state: "listening",
@@ -4300,6 +4377,10 @@ impl Room {
             last_reply: None,
         });
         info!(puppet = %name, room = %self.cfg.id, "a puppet came on stage");
+        // The first one opens the playhouse: the stage, the box and the
+        // audience, and the rule about who can hear whom. See
+        // `Room::showing`.
+        self.follow_showing(&mut st);
         self.emit(json!({
             "type": "agents_here",
             "agents": self.agents_json(&st),
@@ -4336,16 +4417,153 @@ impl Room {
         st.bots.retain(|b| b.cfg.name != name);
         st.pending.retain(|p| p.bot != name);
         info!(puppet = %name, room = %self.cfg.id, "a puppet left the stage");
+        // The last one closes it again, and everybody is simply in the
+        // room once more.
+        let over = on_stage(&st).is_empty();
+        self.follow_showing(&mut st);
         self.emit(json!({
             "type": "agents_here",
             "agents": self.agents_json(&st),
         }));
+        if over {
+            info!(room = %self.cfg.id, "the last puppet left, so the show is over");
+        }
         Ok(name)
     }
 
     /// The puppets in the room, in the order they came on.
     pub fn on_stage(&self) -> Vec<String> {
         on_stage(&self.lock())
+    }
+
+    /// Everybody's seat, and the AI the box belongs to. For a tab
+    /// drawing the three bands; empty when no show is on, which is
+    /// what tells it to draw none of them.
+    fn seats_json(&self, st: &State) -> Value {
+        if on_stage(st).is_empty() {
+            return Value::Null;
+        }
+        let mut people = serde_json::Map::new();
+        for (name, p) in &st.people {
+            people.insert(name.clone(), Value::from(p.seat.as_str()));
+        }
+        let mut bots = serde_json::Map::new();
+        for b in st.bots.iter().filter(|b| b.here) {
+            bots.insert(b.cfg.name.clone(), Value::from(b.seat.as_str()));
+        }
+        json!({
+            "people": people,
+            "bots": bots,
+            // Whose show it is. The box is its box: it is put there
+            // when the curtain goes up and cannot be moved out, so a
+            // tab draws it there rather than reading it off the list.
+            "director": self.cfg.bot().name,
+        })
+    }
+
+    /// Open the playhouse, or close it: called wherever a puppet comes
+    /// on or leaves, and it works out for itself which of the two just
+    /// happened.
+    ///
+    /// On the way in, the AI running the show takes the box and
+    /// everybody else keeps the audience they started in. On the way
+    /// out, every seat goes -- there is nowhere to be sitting in a room
+    /// with no stage in it, and a seat left behind would be a rule
+    /// about who can hear whom still being enforced in a room where
+    /// nobody could see why.
+    fn follow_showing(&self, st: &mut State) {
+        let on = !on_stage(st).is_empty();
+        let director = self.cfg.bot().name.clone();
+        for b in st.bots.iter_mut() {
+            b.seat = match (on, b.puppet(), b.cfg.name == director) {
+                (false, _, _) => Seat::Audience,
+                (true, true, _) => Seat::Stage,
+                (true, false, true) => Seat::Box,
+                (true, false, false) => b.seat,
+            };
+        }
+        if !on {
+            for p in st.people.values_mut() {
+                p.seat = Seat::Audience;
+            }
+        }
+        self.emit(json!({
+            "type": "seats",
+            "seats": self.seats_json(st),
+            "show": self.show_json(st),
+        }));
+    }
+
+    /// Take a seat, or put somebody in one: the one control the three
+    /// bands have.
+    ///
+    /// Anybody may move anybody, which is how the room already treats
+    /// the things everyone shares -- the faders, the mutes, which AI is
+    /// in the room. What it is *for* is moving yourself, and the one
+    /// seat nobody may touch is the director's: the show is its show,
+    /// and an AI shuffled into the audience by somebody who wanted a
+    /// better view would be a show with nobody running it.
+    pub fn take_seat(&self, who: &str, seat: &str) -> Result<String, String> {
+        let Some(seat) = Seat::parse(seat) else {
+            return Err("a seat is \"audience\", \"box\" or \"stage\"".into());
+        };
+        let mut st = self.lock();
+        if on_stage(&st).is_empty() {
+            return Err("there is no show on, so there is nowhere to sit".into());
+        }
+        if who == self.cfg.bot().name {
+            return Err(format!(
+                "{who} is running the show and sits in the box for as long as it lasts"
+            ));
+        }
+        let was = if let Some(p) = st.people.get_mut(who) {
+            std::mem::replace(&mut p.seat, seat)
+        } else if let Some(b) = st.bots.iter_mut().find(|b| b.cfg.name == who && b.here) {
+            if b.puppet() {
+                return Err(format!("{who} is a puppet, and a puppet is on the stage"));
+            }
+            std::mem::replace(&mut b.seat, seat)
+        } else {
+            return Err(format!("there is nobody called {who:?} here"));
+        };
+        if was == seat {
+            return Ok(seat.as_str().to_string());
+        }
+        info!(room = %self.cfg.id, %who, was = was.as_str(), now = seat.as_str(), "took a seat");
+        // Somebody stepping onto the stage is joining the play, and a
+        // script cannot survive that: the puppets have to start
+        // answering them instead of saying what was written before
+        // they were up there. See `Room::stop_show`.
+        let onto_stage = seat == Seat::Stage && was != Seat::Stage;
+        self.emit(json!({
+            "type": "seats",
+            "seats": self.seats_json(&st),
+            "show": self.show_json(&st),
+        }));
+        drop(st);
+        if onto_stage && self.show_title().is_some() {
+            info!(%who, "stepped onto the stage, so the script stops and the rest is adlib");
+            self.stop_show();
+        }
+        Ok(seat.as_str().to_string())
+    }
+
+    /// Who is on the stage besides the puppets: the people and bots who
+    /// have gone up to join the play. Empty is a scripted show.
+    fn up_there(&self, st: &State) -> Vec<String> {
+        let mut out: Vec<String> = st
+            .people
+            .iter()
+            .filter(|(_, p)| p.seat == Seat::Stage)
+            .map(|(n, _)| n.clone())
+            .collect();
+        out.extend(
+            st.bots
+                .iter()
+                .filter(|b| b.here && !b.puppet() && b.seat == Seat::Stage)
+                .map(|b| b.cfg.name.clone()),
+        );
+        out
     }
 
     /// Which cloned voice, if any, a puppet should be lent: the id the
@@ -4557,10 +4775,9 @@ impl Room {
             cast = %and_list(&cast),
             "the curtain is up"
         );
-        self.emit(json!({
-            "type": "show",
-            "show": { "title": title, "lines": lines, "said": 0 },
-        }));
+        let st = self.lock();
+        self.emit(json!({ "type": "show", "show": self.show_json(&st) }));
+        drop(st);
         Ok(stop)
     }
 
@@ -4570,11 +4787,7 @@ impl Room {
         let mut st = self.lock();
         let Some(on) = st.show.as_mut() else { return };
         on.said = n;
-        let (title, lines) = (on.title.clone(), on.lines);
-        self.emit(json!({
-            "type": "show",
-            "show": { "title": title, "lines": lines, "said": n },
-        }));
+        self.emit(json!({ "type": "show", "show": self.show_json(&st) }));
     }
 
     /// Whether the show has been told to stop.
@@ -4585,9 +4798,36 @@ impl Room {
             .is_some_and(|s| s.stop.load(Ordering::SeqCst))
     }
 
-    /// What a show is called, if one is on.
+    /// What a show is called, if a script is playing.
     pub fn show_title(&self) -> Option<String> {
         self.lock().show.as_ref().map(|s| s.title.clone())
+    }
+
+    /// The show, as a tab is told about it: what is playing, how far in
+    /// it is, and whether the puppets are reading or making it up.
+    ///
+    /// Null when there is no show at all, which is the thing that tells
+    /// a browser to draw no stage, no box and no audience -- a room
+    /// with no characters standing in it is just a room. A show with no
+    /// script playing is not null: the puppets are still there, still
+    /// answering, and the playhouse is still open.
+    fn show_json(&self, st: &State) -> Value {
+        if on_stage(st).is_empty() {
+            return Value::Null;
+        }
+        // Somebody has gone up to join the play, so there is nothing
+        // scripted about it any more: the puppets are answering whoever
+        // is up there, a line at a time. See `Room::take_seat`.
+        let up = self.up_there(st);
+        json!({
+            "mode": if up.is_empty() { "scripted" } else { "adlib" },
+            "on_stage": up,
+            "playing": st.show.as_ref().map(|s| json!({
+                "title": s.title,
+                "lines": s.lines,
+                "said": s.said,
+            })),
+        })
     }
 
     /// Stop whatever show is on. What **Stop** does, and what the
@@ -4632,7 +4872,9 @@ impl Room {
             "the curtain is down"
         );
         self.put_settings_back(&on.was);
-        self.emit(json!({ "type": "show", "show": Value::Null }));
+        let st = self.lock();
+        self.emit(json!({ "type": "show", "show": self.show_json(&st) }));
+        drop(st);
         // The last thing it does, and with the settings already back:
         // the turn it is given is one it may answer in, and one
         // somebody may talk over.
@@ -6792,19 +7034,31 @@ impl Room {
             return;
         }
         let conversation = st.conversation;
-        let mut said = String::new();
+        // What was said, and where each of them was sitting when they
+        // said it. The seat matters because a show divides the room
+        // into parts that cannot all hear each other: the audience may
+        // talk as freely as it likes and the box hears none of it. So
+        // the words are kept with their speaker rather than run
+        // together, and each voice is handed the ones it can actually
+        // hear -- see `Seat::hears`.
+        let mut heard: Vec<(String, String, Seat)> = Vec::new();
         let mut who = std::collections::BTreeSet::new();
         for &i in &pending {
             let e = &mut st.log[i];
             e.sent = true;
             e.live = false;
-            said.push_str(&e.text);
-            said.push(' ');
             who.insert(e.who.clone());
-            if let Err(err) = self.store().put_entry(conversation, e) {
+            let entry = e.clone();
+            if let Err(err) = self.store().put_entry(conversation, &entry) {
                 warn!("store entry: {err:#}");
             }
-            self.emit_entry(e);
+            self.emit_entry(&entry);
+            let seat = st
+                .people
+                .get(&entry.who)
+                .map(|p| p.seat)
+                .unwrap_or_default();
+            heard.push((entry.who, entry.text, seat));
         }
         for name in &who {
             if let Some(e) = st.people.get(name).and_then(|p| p.engine.as_ref()) {
@@ -6821,7 +7075,6 @@ impl Room {
         // told to stop (see `hush_others`): asking them one at a time
         // would put a round trip of silence in the room for every bot
         // that had nothing to say.
-        let named = self.named(st, &said);
         let bots: Vec<String> = st.bots.iter().map(|b| b.cfg.name.clone()).collect();
         // Somebody said something, so whatever was waiting to be given
         // out has been overtaken: a silence that was asked about didn't
@@ -6839,7 +7092,25 @@ impl Room {
         st.ai_turns = 0;
         let mut turns: Vec<(String, Cue)> = Vec::new();
         for bot in bots {
-            let was_named = named.contains(&bot);
+            // What this one heard of it. Outside a show that is all of
+            // it; in a show, a voice in the box or on the stage is
+            // deaf to the audience, so a name said out there is not its
+            // name being said and a pause out there is not its pause.
+            let seat = st.bot(&bot).seat;
+            let mine: String = heard
+                .iter()
+                .filter(|(_, _, said_in)| seat.hears(*said_in))
+                .map(|(_, text, _)| text.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let was_named = self.named(st, &mine).contains(&bot);
+            // Nothing it could hear was said at all: the audience was
+            // talking among themselves, which is theirs to do and none
+            // of this one's business.
+            if mine.trim().is_empty() {
+                st.bot(&bot).talked_over = false;
+                continue;
+            }
             let b = st.bot(&bot);
             // Whatever was said over its own voice belongs to this
             // hand-over and no later one, whoever the words turn out to
@@ -6921,8 +7192,30 @@ impl Room {
             false => Vec::new(),
         };
         let mine: Vec<String> = puppets.iter().map(|(n, _)| n.clone()).collect();
-        let mut messages =
-            conversation_messages(&st.log, self.cfg.history, &self.cfg.language, bot, &mine);
+        // Whose lines this one cannot hear: the audience, when it is
+        // sitting in the box or on the stage. The transcript has to
+        // agree with the turn-taking, or the AI reads a question it was
+        // deliberately never given the turn to answer and answers it
+        // anyway -- which is the audience being heard through the back
+        // door.
+        let seat = st.bot(bot).seat;
+        let deaf_to: Vec<String> = match on_stage(st).is_empty() {
+            true => Vec::new(),
+            false => st
+                .people
+                .iter()
+                .filter(|(_, p)| !seat.hears(p.seat))
+                .map(|(n, _)| n.clone())
+                .collect(),
+        };
+        let mut messages = conversation_messages(
+            &st.log,
+            self.cfg.history,
+            &self.cfg.language,
+            bot,
+            &mine,
+            &deaf_to,
+        );
         let game = match &st.game {
             Some(name) => match self.store().game(name) {
                 Ok(Some((g, prompt))) => Some((g.name, prompt)),
@@ -7048,24 +7341,38 @@ impl Room {
     /// Everyone has stopped talking and what they said since the last turn
     /// will get an answer: the room is only waiting out the pause.
     fn will_answer(&self, st: &State) -> bool {
-        let mut pending = st
+        let pending: Vec<&Entry> = st
             .log
             .iter()
             .filter(|e| e.kind == Kind::Human && !e.sent && !e.text.is_empty())
-            .peekable();
-        !st.people.values().any(|p| p.speaking || p.holding())
-            && pending.peek().is_some()
-            // In `Auto` it is the bot's call, so the room doesn't
-            // promise an answer it may not give. Somebody is going to
-            // answer if any of them answers every pause, or if any of
-            // them was named. One that answers every pause but was
-            // talked over is judging this one, so it promises nothing
-            // either.
-            && (st
-                .bots
-                .iter()
-                .any(|b| b.here && b.mode == Mode::Always && !b.talked_over)
-                || pending.any(|e| !self.named(st, &e.text).is_empty()))
+            .collect();
+        if st.people.values().any(|p| p.speaking || p.holding()) || pending.is_empty() {
+            return false;
+        }
+        // Where each of those was said from, so a promise is only made
+        // to somebody a voice can actually hear. The audience talking
+        // among itself is not a pause anybody in the box is going to
+        // answer, and a strip that said "waiting" at it would be
+        // promising a turn that is never coming.
+        let from = |e: &Entry| st.people.get(&e.who).map(|p| p.seat).unwrap_or_default();
+        // In `Auto` it is the bot's call, so the room doesn't
+        // promise an answer it may not give. Somebody is going to
+        // answer if any of them answers every pause, or if any of
+        // them was named. One that answers every pause but was
+        // talked over is judging this one, so it promises nothing
+        // either.
+        st.bots.iter().any(|b| {
+            b.here
+                && b.mode == Mode::Always
+                && !b.talked_over
+                && pending.iter().any(|e| b.seat.hears(from(e)))
+        }) || pending.iter().any(|e| {
+            self.named(st, &e.text).iter().any(|n| {
+                st.bots
+                    .iter()
+                    .any(|b| &b.cfg.name == n && b.seat.hears(from(e)))
+            })
+        })
     }
 
     /// Which bots somebody said the name of, by name or by one of the
@@ -7339,15 +7646,22 @@ fn heard_prefix(text: &str, frac: f64) -> &str {
 /// argue with him. Empty for every bot that holds no puppets, and then
 /// a puppet's line reads like any other voice in the room, which to
 /// them it is.
+///
+/// `deaf_to` are the people whose lines this one cannot hear, which
+/// during a puppet show is the audience as seen from the box or the
+/// stage. Left out of the transcript entirely rather than marked as
+/// unheard: a model shown a question and told to ignore it answers it.
 fn conversation_messages(
     log: &[Entry],
     history: usize,
     language: &str,
     me: &str,
     puppets: &[String],
+    deaf_to: &[String],
 ) -> Vec<(Role, String)> {
     let done: Vec<&Entry> = log
         .iter()
+        .filter(|e| !deaf_to.contains(&e.who))
         .filter(|e| match e.kind {
             Kind::Human => e.sent && !e.text.trim().is_empty(),
             Kind::Agent => !e.live && !e.text.trim().is_empty(),
@@ -7730,7 +8044,7 @@ mod tests {
         // The model is told it is theirs and that it did not make it:
         // one told only that a picture is in the chat takes credit for
         // it, and then offers to change a thing it never made.
-        let msgs = conversation_messages(&r.lock().log, 50, "English", "Vox", &[]);
+        let msgs = conversation_messages(&r.lock().log, 50, "English", "Vox", &[], &[]);
         let said = msgs
             .iter()
             .map(|(_, t)| t.as_str())
@@ -7758,7 +8072,7 @@ mod tests {
         r.finish_picture(&id, &png(), "Job a47b27c5aeb7: 64x64 sprite, 16 colours.");
 
         let read_back = |r: &Room| {
-            conversation_messages(&r.lock().log, 50, "English", "Vox", &[])
+            conversation_messages(&r.lock().log, 50, "English", "Vox", &[], &[])
                 .iter()
                 .map(|(_, t)| t.as_str())
                 .collect::<Vec<_>>()
@@ -8459,7 +8773,7 @@ mod tests {
         assert!(e.text.ends_with(" —"), "{:?}", e.text);
         assert!(r.lock().only().reply.is_none());
         // The model hears where it was cut off.
-        let msgs = conversation_messages(&r.lock().log, 50, "English", "Vox", &[]);
+        let msgs = conversation_messages(&r.lock().log, 50, "English", "Vox", &[], &[]);
         assert!(msgs.last().unwrap().1.ends_with(CUT_NOTE));
     }
 
@@ -8848,7 +9162,7 @@ mod tests {
             let e = st.log.iter_mut().find(|e| e.id == "p1").unwrap();
             e.sent = true;
         }
-        let msgs = conversation_messages(&r.lock().log, 50, "English", "Vox", &[]);
+        let msgs = conversation_messages(&r.lock().log, 50, "English", "Vox", &[], &[]);
         assert_eq!(msgs.last().unwrap().1, "Alex: The door is locked.");
     }
 
@@ -8997,7 +9311,7 @@ mod tests {
         assert_eq!(e.translations["Russian"], format!("{ru0} {ru1}"));
         // What the model is shown is still the one language it writes
         // in: a translation of its own words is not news to it.
-        let msgs = conversation_messages(&r.lock().log, 50, "English", "Vox", &[]);
+        let msgs = conversation_messages(&r.lock().log, 50, "English", "Vox", &[], &[]);
         let last = &msgs.last().unwrap().1;
         assert_eq!(
             last,
@@ -9386,7 +9700,7 @@ mod tests {
         assert!(r.read_game("Dragon Heist").is_err());
 
         // The model is told about the button in later turns.
-        let msgs = conversation_messages(&r.lock().log, 50, "English", "Vox", &[]);
+        let msgs = conversation_messages(&r.lock().log, 50, "English", "Vox", &[], &[]);
         assert!(msgs.last().unwrap().1.contains("\"Dragon Caper\""));
 
         // Entering: a fresh conversation, and the AI opens with the prompt.
@@ -10526,7 +10840,7 @@ mod tests {
 
         // And the AI is shown its own card in full, so it can go on
         // playing by what the room is looking at.
-        let said = conversation_messages(&r.lock().log, 50, "English", "Vox", &[]);
+        let said = conversation_messages(&r.lock().log, 50, "English", "Vox", &[], &[]);
         assert_eq!(said.len(), 1);
         assert_eq!(said[0].0, Role::Assistant);
         assert!(said[0].1.contains("The rules"), "{}", said[0].1);
@@ -10998,7 +11312,7 @@ mod tests {
             sent: true,
         };
         let told = |e: Entry| {
-            conversation_messages(&[e], 50, "English", "Vox", &[])
+            conversation_messages(&[e], 50, "English", "Vox", &[], &[])
                 .into_iter()
                 .map(|(_, t)| t)
                 .collect::<Vec<_>>()
@@ -11113,6 +11427,22 @@ mod tests {
             assert_eq!(r.named(&st, "Grimble, what is through the gate?"), ["Vox"]);
         }
         r.join("Ryan", 1);
+
+        // But a puppet on stage means a show is on, and from the
+        // audience nothing reaches the director at all -- not even its
+        // own puppet's name. That is the point of the audience.
+        r.on_paragraph(
+            "Ryan",
+            &para("p0", "Grimble, what is through the gate?", false),
+        );
+        r.tick(quiet(&r));
+        assert!(
+            turns.recv_timeout(Duration::from_millis(300)).is_err(),
+            "the audience is not heard in the box"
+        );
+
+        // Go round to the box and the same question lands.
+        assert_eq!(r.take_seat("Ryan", "box"), Ok("box".into()));
         r.on_paragraph(
             "Ryan",
             &para("p1", "Grimble, what is through the gate?", false),
@@ -11164,13 +11494,14 @@ mod tests {
             "English",
             "Vox",
             &["Grimble".to_string()],
+            &[],
         );
         assert_eq!(
             mine,
             [(Role::Assistant, "[as Grimble] None shall pass.".to_string())]
         );
         // To anybody else: another voice in the room, which is what it is.
-        let theirs = conversation_messages(&[line], 50, "English", "Sage", &[]);
+        let theirs = conversation_messages(&[line], 50, "English", "Sage", &[], &[]);
         assert_eq!(
             theirs,
             [(Role::User, "Grimble: None shall pass.".to_string())]
@@ -11367,6 +11698,81 @@ mod tests {
             1,
             "the character is kept: being sent off is not being forgotten"
         );
+    }
+
+    /// Who can hear whom, which is the whole of what the three parts of
+    /// a playhouse are for.
+    #[test]
+    fn the_box_and_the_stage_are_deaf_to_the_audience() {
+        // One rule, said four ways, and it only ever refuses in one
+        // direction.
+        for said_in in [Seat::Audience, Seat::Box, Seat::Stage] {
+            assert!(
+                Seat::Audience.hears(said_in),
+                "the audience can follow the play and the box: {said_in:?}"
+            );
+        }
+        for seat in [Seat::Box, Seat::Stage] {
+            assert!(!seat.hears(Seat::Audience), "{seat:?} hears the audience");
+            assert!(seat.hears(Seat::Box));
+            assert!(seat.hears(Seat::Stage));
+        }
+    }
+
+    /// No show, no seats. The three parts of a playhouse exist because
+    /// there are characters standing in it; a room with none is a room,
+    /// and everybody in it can hear everybody.
+    #[test]
+    fn there_are_no_seats_outside_a_show() {
+        let (r, _turns) = room_with_puppets();
+        r.join("Ryan", 1);
+        assert!(r.on_stage().is_empty());
+        assert!(
+            r.take_seat("Ryan", "box")
+                .unwrap_err()
+                .contains("no show on"),
+            "there is nowhere to sit"
+        );
+
+        r.make_puppet(a_puppet("Grimble", "a gatekeeper")).unwrap();
+        r.cast_puppet("Grimble").unwrap();
+        assert!(!r.on_stage().is_empty(), "a puppet on stage is a show");
+        {
+            let st = r.lock();
+            let vox = st.bots.iter().find(|b| b.cfg.name == "Vox").unwrap();
+            assert_eq!(vox.seat, Seat::Box, "the director takes the box");
+            assert_eq!(st.people["Ryan"].seat, Seat::Audience);
+        }
+
+        // The director's seat is not anybody's to move: a show with
+        // nobody running it is not a show.
+        assert!(r
+            .take_seat("Vox", "audience")
+            .unwrap_err()
+            .contains("running the show"));
+        // Nor is a puppet's: being on the stage is what being one is.
+        assert!(r
+            .take_seat("Grimble", "box")
+            .unwrap_err()
+            .contains("is a puppet"));
+
+        r.take_seat("Ryan", "stage").unwrap();
+        assert_eq!(r.lock().people["Ryan"].seat, Seat::Stage);
+
+        // And the last puppet leaving puts everybody back in a room
+        // with no parts to it.
+        r.dismiss_puppet("Grimble").unwrap();
+        assert!(r.on_stage().is_empty());
+        {
+            let st = r.lock();
+            assert_eq!(
+                st.people["Ryan"].seat,
+                Seat::Audience,
+                "no stage to stand on"
+            );
+            let vox = st.bots.iter().find(|b| b.cfg.name == "Vox").unwrap();
+            assert_eq!(vox.seat, Seat::Audience, "and no box to sit in");
+        }
     }
 
     /// A character is given a face while it is being made up, which is
