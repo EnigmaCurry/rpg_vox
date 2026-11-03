@@ -1042,6 +1042,23 @@ impl Store {
         self.set_global(&self.key(key), value)
     }
 
+    /// One of the *house's* settings: the same value whichever room is
+    /// asking, where a room's own would be the same thing said
+    /// differently in each of them.
+    ///
+    /// Which voice an AI speaks in is one. The AI is the same AI in
+    /// every room -- one name, one face, one voice -- so a choice kept
+    /// per room would make it a different character down the hall.
+    /// When the AI *answers* is the opposite and is kept per room; see
+    /// [`Store::setting`].
+    pub fn house_setting(&self, key: &str) -> Result<Option<String>> {
+        self.global(key)
+    }
+
+    pub fn set_house_setting(&self, key: &str, value: &str) -> Result<()> {
+        self.set_global(key, value)
+    }
+
     /// A setting of the whole database, whatever room this handle is
     /// for: the conversation counter every room draws from, and the
     /// flag that says the keys have been moved into rooms.

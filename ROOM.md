@@ -1429,20 +1429,29 @@ afternoon's: it is not written down, and the next restart undoes it. A
 voice deleted from under a bot that is wearing it leaves that bot in
 its own voice rather than silent.
 
-**Settling one is not.** **Settings → Voices** has a picker per AI in
-the room: its own voice, or any the house has cloned. What you choose
-there it wears from that moment, keeps, and comes back up in after a
-restart — so a room whose AI should always sound like somebody is set
-once rather than asked every session. Anybody in the room may set it,
-like **Answers** and the faders: the control is no more than the
-sentence you could say instead.
+**Settling one is not.** **Settings → Voices** has a picker per AI:
+its own voice, or any the house has cloned. What you choose it wears
+from that moment, keeps, and comes back up in after a restart — so an
+AI that should always sound like somebody is set once rather than asked
+every session.
 
-The two do not fight. Ask it out loud for a different voice and it
-obliges, for as long as the house is up; the one you settled on is what
-it opens in next time. A voice that is deleted is unsettled everywhere
-at once — the setting names a voice rather than holding it, and a room
-that kept the name would be asking the clone server for audio that no
-longer exists, every time it opened.
+**That choice is the house's, not the room's.** It is the same AI in
+every room — one name, one face, one voice — so settling it anywhere
+settles it everywhere, there and then: the other rooms put it on
+without waiting for a restart. Which is the opposite of **Answers** and
+**Stops**, which are each room's own, because when an AI speaks depends
+on what the room is for and what it sounds like does not. Anybody in
+the room may set it, like Answers and the faders: the control is no
+more than the sentence you could say instead.
+
+The two ways do not fight. Ask it out loud for a different voice and it
+obliges — in that room, for as long as the house is up — and the one
+you settled on is what every room opens in next time. A voice that is
+deleted is unsettled everywhere at once, and taken off any AI that was
+speaking in it in any room: the setting names a voice rather than
+holding it, and a bot left holding the id of a clone the server no
+longer has is a bot whose next sentence fails instead of coming out in
+its own voice.
 
 A puppet has no picker: its voice is the part it plays, decided when
 the character was made up. See [Puppets](#puppets).

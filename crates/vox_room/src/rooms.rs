@@ -588,6 +588,28 @@ impl Rooms {
                 me.announce();
             }
         }));
+        let me = Arc::downgrade(self);
+        room.on_house(Box::new(move |told| {
+            if let Some(me) = me.upgrade() {
+                me.told(told);
+            }
+        }));
+    }
+
+    /// Something the house holds has changed in one of the rooms, and
+    /// every room has to catch up with it: a face, which is the
+    /// person's and is beside their name on every roster there is, or
+    /// the voice one of the AIs speaks in, which is the house's
+    /// because it is the same AI in every room.
+    ///
+    /// The room it changed in is in the list like any other. It did
+    /// its own writing to the database and nothing else, so that what
+    /// every room does about it is one thing in one place rather than
+    /// one thing here and a different one there.
+    pub fn told(&self, told: crate::room::Told) {
+        for room in self.all() {
+            room.catch_up_with(&told);
+        }
     }
 
     /// Told when who-is-where changes, so every tab can ask for the

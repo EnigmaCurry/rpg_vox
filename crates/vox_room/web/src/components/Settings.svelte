@@ -170,10 +170,11 @@
       <h2>Voices</h2>
       <p class="note">
         Voices the AI has cloned from somebody in the house. Choosing one here
-        settles which voice it speaks in: it keeps it from now on and comes back
-        up in it after a restart. Asking it out loud to speak in another is still
-        the quicker way, and that one only lasts the afternoon — this is what it
-        goes back to.
+        settles which voice it speaks in — in every room, not just this one, and
+        after a restart. It is the same AI down the hall. Asking it out loud to
+        speak in another is still the quicker way, and that one lasts the
+        afternoon and only in the room you asked in; this is what it goes back
+        to.
       </p>
       {#each speakers as bot (bot.name)}
         <label class="voice">

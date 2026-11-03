@@ -99,19 +99,44 @@ releases.
   either: it names a preset on the preset server, which structurally
   cannot speak a clone.
 
-  **Settings -> Voices** now has a picker per AI in the room: its own
-  voice, or any the house has cloned. It wears the choice at once,
-  keeps it, and comes back up in it. Anybody in the room may set it,
-  like Answers and the faders -- the control is no more than the
-  sentence they could say instead -- and a puppet has no picker, since
-  its voice is the part it plays.
+  **Settings -> Voices** now has a picker per AI: its own voice, or any
+  the house has cloned. It wears the choice at once, keeps it, and
+  comes back up in it. Anybody in the room may set it, like Answers and
+  the faders -- the control is no more than the sentence they could say
+  instead -- and a puppet has no picker, since its voice is the part it
+  plays.
+
+  **The choice is the house's and not one room's.** It is the same AI
+  in every room -- one name, one face, one voice -- so a choice kept
+  per room would make it a different character down the hall. Settling
+  it anywhere settles it everywhere, there and then. Which is the
+  opposite of Answers and Stops, and deliberately: when an AI speaks
+  depends on what the room is for, and what it sounds like does not.
 
   The two ways do not fight: asked out loud for another voice it
-  obliges for as long as the house is up, and opens next time in the
-  one that was settled on. Deleting a voice unsettles every room that
-  was set to it, because the setting names a voice rather than holding
-  it and a room that kept the name would ask the clone server for audio
-  that is gone, every time it opened.
+  obliges, in that room and for as long as the house is up, and every
+  room opens next time in the one that was settled on. Deleting a voice
+  unsettles it everywhere and takes it off any AI speaking in it in any
+  room -- the setting names a voice rather than holding its id, and a
+  bot left holding the id of a clone the server no longer has is a bot
+  whose next sentence fails instead of coming out in its own voice.
+
+- **A face changed in Settings reached nobody.** Putting an old face
+  back on, or taking one off, wrote the change to the database and then
+  told *the lobby* about it -- because the request comes in over HTTP
+  rather than down a room's socket, and the handler reached for "a room
+  to ask about things that are the server's". Anybody sitting anywhere
+  else, which includes everybody in a room of their own, saw their own
+  face stay exactly as it was until something unrelated made their
+  roster go out again.
+
+  A face is the person's, not one room's: it is beside their name on
+  every roster in the house, including the rooms they are not sitting
+  in. So all three ways a face changes -- the AI setting one, wearing
+  an old one again, taking one off -- now tell the house rather than
+  the room they happened in, and every room says who is here again. The
+  same goes for the voice an AI was settled on, which travels the same
+  way for the same reason.
 
 - **A picture server stopped working after a quiet hour, and now does
   not.** The session a server hands out at the handshake is ended when

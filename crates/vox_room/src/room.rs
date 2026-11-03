@@ -1341,6 +1341,37 @@ pub struct BotWiring {
     pub borrowed: crate::tts::Borrowed,
 }
 
+/// Where the house keeps which voice one of its AIs speaks in, by the
+/// bot's name. The house's and not the room's: see
+/// [`crate::store::Store::house_setting`].
+fn voice_key(bot: &str) -> String {
+    format!("voice:{bot}")
+}
+
+/// Something the house holds rather than one room, changed in one
+/// room and true in all of them.
+///
+/// There are two, and they are alike in the way that matters: what
+/// changed is not a fact about the room it was changed in, so the room
+/// that changed it is not the only one that has to hear about it. See
+/// [`Room::house`] and `rooms::Rooms::told`.
+#[derive(Clone, Debug)]
+pub enum Told {
+    /// Somebody's face. Every room says who is here again -- a face is
+    /// beside its name on every roster in the house, including the
+    /// rooms that person is not sitting in.
+    Faces,
+    /// Which voice one of the AIs speaks in, by the bot's name. Every
+    /// room puts it on: it is the same AI in each of them, and a voice
+    /// that was only this room's would make it two.
+    Voice { bot: String },
+    /// A cloned voice has been deleted, by the id the clone server
+    /// knew it as. Whoever is wearing it anywhere goes back to
+    /// whatever the house settled on for them, which is usually their
+    /// own voice.
+    VoiceGone { id: String },
+}
+
 pub struct Room {
     /// Told when something the *list of rooms* shows about this one has
     /// changed -- which is the game being played here, since who is in
@@ -1352,6 +1383,23 @@ pub struct Room {
     /// is given only wakes the sockets, which build their own lists
     /// afterwards and on their own threads.
     announce: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>,
+    /// Told when something that is the *house's* has changed here, so
+    /// that the other rooms do something about it: see [`Told`].
+    ///
+    /// A face belongs to the person and a voice to the house, not to
+    /// whichever room they were changed in -- a face is beside its
+    /// name on every roster there is, and an AI is the same AI in
+    /// every room. One room telling its own tabs leaves all the others
+    /// showing yesterday until something else happens to them.
+    ///
+    /// Installed by [`crate::rooms::Rooms`], the only thing that knows
+    /// what the other rooms are. **Unlike [`Room::announce`], this one
+    /// reaches straight back in** -- what it does ends up locking
+    /// every room, this one included -- so it must only ever be called
+    /// with this room's state unlocked. A room with nothing installed
+    /// (a test, a house of one) does its own half and no more, which
+    /// is the same thing when there is nobody else to tell.
+    house: std::sync::OnceLock<Box<dyn Fn(Told) + Send + Sync>>,
     /// The unguessable half of this room's address, for `/room/<link>`.
     /// Not the room's name: a name is a thing people retype and change
     /// their minds about, and a link that changed with it would be a
@@ -1593,8 +1641,8 @@ impl Room {
             // and forgets the choice, rather than asking a clone
             // server for an id it no longer holds.
             let borrowed = crate::tts::Borrowed::default();
-            let key = format!("voice:{}", bot.name);
-            let worn = match store.setting(&key)? {
+            let key = voice_key(&bot.name);
+            let worn = match store.house_setting(&key)? {
                 None => None,
                 Some(name) => match store.voice(&name)? {
                     Some(v) => {
@@ -1603,7 +1651,7 @@ impl Room {
                     }
                     None => {
                         warn!(bot = %bot.name, voice = %name, "the voice it was set to speak in is gone");
-                        store.set_setting(&key, "")?;
+                        store.set_house_setting(&key, "")?;
                         None
                     }
                 },
@@ -1676,6 +1724,7 @@ impl Room {
         let (events, _) = broadcast::channel(EVENT_CAPACITY);
         let room = Arc::new(Self {
             announce: std::sync::OnceLock::new(),
+            house: std::sync::OnceLock::new(),
             link,
             st: Mutex::new(State {
                 conversation,
@@ -1787,6 +1836,63 @@ impl Room {
     fn changed(&self) {
         if let Some(announce) = self.announce.get() {
             announce();
+        }
+    }
+
+    /// How to pass on something that is the house's. See
+    /// [`Room::house`] -- and note that what is installed here is
+    /// called with this room's state *unlocked*, unlike
+    /// [`Room::on_change`].
+    pub fn on_house(&self, told: Box<dyn Fn(Told) + Send + Sync>) {
+        let _ = self.house.set(told);
+    }
+
+    /// Something the whole house holds has changed here. Every room is
+    /// made to catch up with it, or -- in a house that never installed
+    /// the hook -- this one catches up with itself.
+    ///
+    /// Must be called with the state unlocked. Every path that changes
+    /// one of these ends here rather than telling its own tabs,
+    /// because none of them is a change to one room.
+    fn told_house(&self, told: Told) {
+        match self.house.get() {
+            Some(tell) => tell(told),
+            None => self.catch_up_with(&told),
+        }
+    }
+
+    /// This room's half of something the house has changed: saying who
+    /// is here again, or putting on the voice that was settled on.
+    /// What [`crate::rooms::Rooms`] calls on every room it holds.
+    pub fn catch_up_with(&self, told: &Told) {
+        match told {
+            Told::Faces => {
+                let st = self.lock();
+                self.emit_people(&st);
+            }
+            Told::Voice { bot } => self.reload_voice(bot),
+            // Only the bots actually wearing it, because everyone else
+            // is wearing something this does not touch -- a voice
+            // asked for out loud in this room is not undone by a
+            // different voice being deleted in another.
+            Told::VoiceGone { id } => {
+                let wearing: Vec<String> = self
+                    .lock()
+                    .bots
+                    .iter()
+                    .filter(|b| {
+                        b.borrowed
+                            .lock()
+                            .expect("borrowed voice mutex poisoned")
+                            .as_deref()
+                            == Some(id.as_str())
+                    })
+                    .map(|b| b.cfg.name.clone())
+                    .collect();
+                for bot in wearing {
+                    self.reload_voice(&bot);
+                }
+            }
         }
     }
 
@@ -2346,9 +2452,12 @@ impl Room {
             .map(|b| b.cfg.name.clone())
             .unwrap_or_else(|| self.cfg.bot().name.clone());
         info!(who = %whose, %from, picture, bytes = png.len(), version = at, "set a face");
-        // Everyone's tabs: a face is beside everything that person has
-        // ever said, so it is not news for them alone.
-        self.emit_people(&st);
+        // Everyone's tabs, in every room: a face is beside everything
+        // that person has ever said, so it is not news for them alone
+        // -- nor for this room alone. Unlocked first, because telling
+        // the house locks every room in it, this one included.
+        drop(st);
+        self.told_house(Told::Faces);
         Ok(whose)
     }
 
@@ -2443,8 +2552,9 @@ impl Room {
             .store()
             .wear_avatar(&key, at)
             .map_err(|err| format!("{err:#}"))?;
+        drop(st);
         if worn {
-            self.emit_people(&st);
+            self.told_house(Told::Faces);
         }
         Ok(worn)
     }
@@ -2809,8 +2919,9 @@ impl Room {
             .store()
             .clear_avatar(&key)
             .map_err(|err| format!("{err:#}"))?;
+        drop(st);
         if gone {
-            self.emit_people(&st);
+            self.told_house(Told::Faces);
         }
         Ok(gone)
     }
@@ -4364,33 +4475,22 @@ impl Room {
         self.store()
             .forget_voice(id)
             .map_err(|err| format!("{err:#}"))?;
-        let mut st = self.lock();
-        let lost: Vec<String> = st
+        // It is not what anybody comes back up in either. The settings
+        // are the house's, one per bot, and name a voice rather than
+        // holding its id -- so every one of them is read: a bot that
+        // was not wearing it this afternoon may still have been set to
+        // it, in this room or in any other.
+        let names: Vec<String> = self
+            .lock()
             .bots
             .iter()
-            .filter(|b| {
-                b.borrowed
-                    .lock()
-                    .expect("borrowed voice mutex poisoned")
-                    .as_deref()
-                    == Some(id)
-            })
             .map(|b| b.cfg.name.clone())
             .collect();
-        for bot in lost {
-            self.lend_voice(&mut st, &bot, None);
-        }
-        // And it is not what anybody comes back up in either. The
-        // settings are per bot and name a voice rather than an id, so
-        // every one of them is read: a bot that was not wearing it
-        // this afternoon may still have been set to it.
-        let names: Vec<String> = st.bots.iter().map(|b| b.cfg.name.clone()).collect();
-        drop(st);
         for bot in names {
-            let key = format!("voice:{bot}");
+            let key = voice_key(&bot);
             let was = self
                 .store()
-                .setting(&key)
+                .house_setting(&key)
                 .ok()
                 .flatten()
                 .unwrap_or_default();
@@ -4402,9 +4502,15 @@ impl Room {
             // is this one.
             let still = self.store().voice(&was).ok().flatten();
             if still.is_none() {
-                let _ = self.store().set_setting(&key, "");
+                let _ = self.store().set_house_setting(&key, "");
             }
         }
+        // Then every room takes it off whoever is wearing it -- this
+        // one included. A voice can be deleted in one room while
+        // another is speaking in it, and a bot left holding the id of
+        // a clone the server no longer has is a bot whose next
+        // sentence fails rather than coming out in its own voice.
+        self.told_house(Told::VoiceGone { id: id.to_string() });
         self.emit(json!({ "type": "voices", "voices": self.voices_json() }));
         Ok(())
     }
@@ -4460,7 +4566,9 @@ impl Room {
             Some(name) => Some(self.voice_named(name)?),
             None => None,
         };
-        let mut st = self.lock();
+        // Only to check it is a bot that can be given one: putting the
+        // voice on is `reload_voice`'s, in every room at once.
+        let st = self.lock();
         if !st.bots.iter().any(|b| b.cfg.name == bot) {
             return Err(format!("there is no {bot} in this room"));
         }
@@ -4477,13 +4585,53 @@ impl Room {
             None => "its own voice".to_string(),
         };
         let kept = cloned.as_ref().map(|v| v.name.clone()).unwrap_or_default();
-        self.lend_voice(&mut st, bot, cloned);
         drop(st);
-        if let Err(err) = self.store().set_setting(&format!("voice:{bot}"), &kept) {
+        // Written down before anybody is told, because what they are
+        // told is "read it again": every room, this one included, puts
+        // it on by reading the setting back. See `Room::reload_voice`.
+        if let Err(err) = self.store().set_house_setting(&voice_key(bot), &kept) {
             warn!("store the voice: {err:#}");
         }
-        info!(bot, voice = %said, "the room settled which voice it speaks in");
+        info!(bot, voice = %said, "the house settled which voice it speaks in");
+        self.told_house(Told::Voice {
+            bot: bot.to_string(),
+        });
         Ok(said)
+    }
+
+    /// Put on whatever voice the house has settled on for `bot`,
+    /// reading it back out of the database.
+    ///
+    /// Every room does this when any of them settles one, and each
+    /// room does it for its own copy of that bot -- the cell a voice
+    /// reads is per room, because the bot in each room is its own
+    /// speaker with its own turn and its own fader, and only the
+    /// *choice* is the house's.
+    ///
+    /// It overrides a voice this room was asked for out loud, which is
+    /// right: somebody has just settled the question, and that is a
+    /// later answer to it than this afternoon's.
+    pub fn reload_voice(&self, bot: &str) {
+        let name = self
+            .store()
+            .house_setting(&voice_key(bot))
+            .unwrap_or_default()
+            .unwrap_or_default();
+        let settled = match name.trim().is_empty() {
+            true => None,
+            false => match self.store().voice(name.trim()) {
+                Ok(found) => found,
+                Err(err) => {
+                    warn!("read the voice it speaks in: {err:#}");
+                    return;
+                }
+            },
+        };
+        let mut st = self.lock();
+        if !st.bots.iter().any(|b| b.cfg.name == bot) {
+            return;
+        }
+        self.lend_voice(&mut st, bot, settled);
     }
 
     /// Put a voice on a bot, or take one off: the cell its voices
@@ -9373,6 +9521,18 @@ mod tests {
     }
 
     /// The latest playback report the room has broadcast, if any.
+    /// The last roster a room sent, faces and all.
+    fn last_roster(events: &mut broadcast::Receiver<Event>) -> Option<Value> {
+        let mut last = None;
+        while let Ok(e) = events.try_recv() {
+            let v: Value = serde_json::from_str(&e.json).unwrap();
+            if v["type"] == "people" {
+                last = Some(v);
+            }
+        }
+        last
+    }
+
     fn last_heard(events: &mut broadcast::Receiver<Event>) -> Option<Vec<Value>> {
         let mut last = None;
         while let Ok(e) = events.try_recv() {
@@ -11699,9 +11859,14 @@ mod tests {
         assert_eq!(borrowed(&r).as_deref(), Some("ryan"), "worn at once");
         assert_eq!(r.agents_json(&r.lock())[0]["voice"], "Ryan");
         assert_eq!(
-            r.store().setting("voice:Vox").unwrap().as_deref(),
+            r.store().house_setting("voice:Vox").unwrap().as_deref(),
             Some("Ryan"),
             "and written down by the name it is called out loud"
+        );
+        assert_eq!(
+            r.store().setting("voice:Vox").unwrap(),
+            None,
+            "the house's and not this room's: the same AI is in all of them"
         );
 
         // Asked out loud for something else: that is today's, and it
@@ -11710,7 +11875,7 @@ mod tests {
         r.speak_as(g, None).unwrap();
         assert_eq!(borrowed(&r), None);
         assert_eq!(
-            r.store().setting("voice:Vox").unwrap().as_deref(),
+            r.store().house_setting("voice:Vox").unwrap().as_deref(),
             Some("Ryan"),
             "asking is not choosing"
         );
@@ -11729,12 +11894,122 @@ mod tests {
         assert_eq!(again.wear_voice("Vox", None).unwrap(), "its own voice");
         assert_eq!(borrowed(&again), None);
         assert_eq!(
-            again.store().setting("voice:Vox").unwrap().as_deref(),
+            again.store().house_setting("voice:Vox").unwrap().as_deref(),
             Some(""),
             "settled on nothing, which is not the same as never having chosen"
         );
         drop(again);
         assert_eq!(borrowed(&room_again(scratch.open())), None);
+    }
+
+    /// Two rooms over the one database, wired to each other the way
+    /// the house wires them. What is the house's -- a face, a voice --
+    /// changed in either must show up in both.
+    fn two_rooms(scratch: &Scratch) -> (Arc<Room>, Arc<Room>) {
+        let a = room_again(scratch.open());
+        let b = room_again(scratch.open());
+        for (one, other) in [(&a, &b), (&b, &a)] {
+            let these = [Arc::clone(one), Arc::clone(other)];
+            one.on_house(Box::new(move |told| {
+                // Both of them, which is what `Rooms::told` does: the
+                // room it happened in is in the list like any other.
+                for room in &these {
+                    room.catch_up_with(&told);
+                }
+            }));
+        }
+        (a, b)
+    }
+
+    /// Which voice an AI speaks in is the house's and not one room's:
+    /// it is the same AI in each of them, and a choice kept per room
+    /// would make it a different character down the hall. So settling
+    /// it in one room settles it in all of them, there and then.
+    #[test]
+    fn the_voice_an_ai_speaks_in_is_settled_for_the_whole_house() {
+        let scratch = Scratch::new("house_voice");
+        let store = scratch.open();
+        store.invite("Ryan").unwrap();
+        drop(store);
+        let (lobby, mine) = two_rooms(&scratch);
+        lobby
+            .remember_voice("ryan", "Ryan", "Ryan", "The dragon was very old.")
+            .unwrap();
+        let borrowed = |r: &Arc<Room>| r.lock().bots[0].borrowed.lock().unwrap().clone();
+
+        lobby.wear_voice("Vox", Some("Ryan")).unwrap();
+        assert_eq!(borrowed(&lobby).as_deref(), Some("ryan"));
+        assert_eq!(
+            borrowed(&mine).as_deref(),
+            Some("ryan"),
+            "the other room put it on too, without being asked"
+        );
+        assert_eq!(mine.agents_json(&mine.lock())[0]["voice"], "Ryan");
+
+        // And back, from the other end: either room may settle it.
+        mine.wear_voice("Vox", None).unwrap();
+        assert_eq!(borrowed(&lobby), None, "both rooms, whichever one chose");
+        assert_eq!(borrowed(&mine), None);
+
+        // A voice deleted anywhere unsettles it everywhere.
+        mine.wear_voice("Vox", Some("Ryan")).unwrap();
+        assert_eq!(borrowed(&lobby).as_deref(), Some("ryan"));
+        mine.forget_voice("ryan").unwrap();
+        assert_eq!(borrowed(&lobby), None, "not left wearing a deleted voice");
+        assert_eq!(borrowed(&mine), None);
+
+        // And one worn in a single room -- asked for out loud, which
+        // is that room's afternoon and nobody else's -- is taken off
+        // there when it is deleted from another room. A bot left
+        // holding the id of a clone the server no longer has is a bot
+        // whose next sentence fails.
+        mine.remember_voice("sam", "Sam", "Sam", "The dragon was very old.")
+            .unwrap();
+        let g = turn(&mine);
+        mine.speak_as(g, Some("Sam")).unwrap();
+        assert_eq!(borrowed(&mine).as_deref(), Some("sam"));
+        assert_eq!(borrowed(&lobby), None, "asking out loud is one room's");
+        lobby.forget_voice("sam").unwrap();
+        assert_eq!(
+            borrowed(&mine),
+            None,
+            "deleted in the lobby, off in the room that was speaking in it"
+        );
+    }
+
+    /// A face is the person's, so every room says so -- including the
+    /// ones they are not sitting in, where their name is on the roster
+    /// all the same. Settings changes a face from whichever room the
+    /// tab happens to be in, and the room it is in is not the only one
+    /// showing it.
+    #[test]
+    fn a_face_changed_in_one_room_is_the_face_in_every_room() {
+        let scratch = Scratch::new("house_faces");
+        let store = scratch.open();
+        store.invite("Ryan").unwrap();
+        drop(store);
+        let (lobby, mine) = two_rooms(&scratch);
+        let mut watching = mine.subscribe();
+
+        let g = turn(&mine);
+        let (id, n) = mine.begin_picture(g, "a tired wizard").unwrap();
+        mine.finish_picture(&id, &png(), "");
+        assert_eq!(mine.set_avatar(g, "Ryan", n).unwrap(), "Ryan");
+        // What it was set to, which is the version the tabs ask for.
+        let (_, at) = mine.avatar_png("Ryan", None).unwrap().expect("a face");
+
+        // The room it was set in says so, and so does the other one --
+        // which is the half that was missing: a tab in a room of its
+        // own was told nothing at all.
+        let said = last_roster(&mut watching).expect("the room it happened in told its tabs");
+        assert_eq!(said["avatars"]["Ryan"], at);
+
+        let mut elsewhere = lobby.subscribe();
+        assert_eq!(lobby.wear_voice("Vox", None).unwrap(), "its own voice");
+        let _ = last_roster(&mut elsewhere);
+        mine.clear_avatar("Ryan").unwrap();
+        let said = last_roster(&mut elsewhere).expect("taking one off reaches the other room too");
+        assert_eq!(said["avatars"]["Ryan"], Value::Null);
     }
 
     /// A voice that is deleted is not what anything comes back up in.
@@ -11753,7 +12028,7 @@ mod tests {
 
         r.forget_voice("ryan").unwrap();
         assert_eq!(
-            r.store().setting("voice:Vox").unwrap().as_deref(),
+            r.store().house_setting("voice:Vox").unwrap().as_deref(),
             Some(""),
             "the choice went with the voice"
         );
