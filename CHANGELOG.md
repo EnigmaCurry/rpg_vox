@@ -90,6 +90,60 @@ releases.
 
 ### Voice room
 
+- **A room with a puppet in it is a playhouse, and the director cannot
+  hear the audience.** A show used to be a thing the room did to itself
+  for the length of a script: everybody silenced, everybody finishing
+  their sentences, then back to normal. That is right for the three
+  minutes a scene takes and wrong for everything around it. So a show
+  is now *a puppet being in the room* and nothing else --
+  `bring_on_puppets` opens the playhouse, the last `send_off_puppets`
+  closes it -- and a script is something that happens inside a show
+  rather than what a show is.
+
+  An open playhouse has three parts, stacked above the conversation:
+  the **stage** with the characters on it at twice the size they are in
+  the conversation, the one speaking lit, and a log of the lines they
+  are saying; the **director's box** where the AI running it sits; and
+  the **audience**, which is the conversation and everybody watching.
+  **Sit here** on a band moves you, and the one seat nobody may move is
+  the director's.
+
+  **The box and the stage cannot hear the audience.** One rule,
+  refusing in one direction, and the point of the whole thing: a play
+  with the audience shouting suggestions at the director is not a play,
+  and a suggestion reaches the director the way it does in a real
+  theatre -- somebody goes round to the box. It took three places
+  agreeing: `hand_over` now keeps each speaker's words with the seat
+  they were said from and hands each voice only the ones it can hear,
+  `will_answer` won't promise a turn nobody is going to take, and the
+  audience's lines are left out of the AI's transcript altogether
+  rather than marked unheard, because a model shown a question and told
+  to ignore it answers it. **This is a real change in what the room
+  does**: the audience can no longer put a question to the puppets
+  without going round to the box or up onto the stage.
+
+  Going up **onto the stage** is joining the play. Whatever script was
+  running stops where it is -- the puppets have to answer the person
+  who is up there rather than say what was written before they were --
+  and from then on it is an **adlib**, improvised a line at a time. The
+  stage says which of the two it is.
+
+  And **a play is not the room talking.** The lines are read on the
+  stage and never enter the conversation; what the conversation keeps
+  is one note at the curtain, folded up, with the whole script inside
+  it. They were in the conversation to begin with, which made one
+  conversation out of two: half an hour of somebody else's dialogue in
+  the middle of yours, with no way to tell which was which.
+
+  `put_on_show` also **ends the reply it was called in**. Asked for a
+  play, the AI announced it, called the tool, and then said "that's it,
+  how did that land?" -- before a word had been heard, since the play
+  does not begin until it stops speaking. The tool's answer says to
+  stop talking and so does the prompt, and the room then hands every
+  tool result back with "carry on from there" on the end of it, which
+  is the opposite instruction and the one nearer the model. So it is
+  structural now, the way starting a game already was.
+
 - **The AI can put puppets in the room and act out a scene with them.**
   A bot has a brain of its own, and two of them in a room are two
   models talking to each other -- a request each per line, each

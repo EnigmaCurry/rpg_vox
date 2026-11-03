@@ -1468,8 +1468,57 @@ somebody landing on your last word. A line may be the AI's own, so it
 can take a part in its own play. It may never be another bot's: that
 one has a brain of its own and will answer for itself.
 
-**While it plays, the room is set for it.** The AI and every voice in
-the room go to **Answers: never** and **Stops: when finished** the
+### A playhouse in three parts
+
+**A show is on whenever a character is standing in the room** —
+`bring_on_puppets` opens the playhouse and the last `send_off_puppets`
+closes it. A script is something that happens *inside* a show rather
+than what a show is: between two scenes and all through the questions
+afterwards the puppets are still there, and so is everything below.
+
+An open playhouse has three parts, stacked above the conversation, and
+which one you are in decides who can hear you:
+
+| | |
+|---|---|
+| **Stage** | the characters, at twice the size they are in the conversation, with the one speaking lit — and the lines they are saying, in a log of their own. Going up there is joining the play |
+| **Director's box** | where the AI running the show sits. What is said here is the only thing it hears |
+| **Audience** | the conversation, and everybody watching. Talk as freely as you like |
+
+**The box and the stage cannot hear the audience.** That is the whole
+rule and it refuses in one direction only: the audience can follow the
+play and the talk in the box perfectly well. It is the point of the
+thing — a play with the audience shouting suggestions at the director is
+not a play — and a suggestion reaches the director the way it does in a
+real theatre: somebody goes round to the box. **Sit here** on a band
+moves you, and the one seat nobody may move is the director's.
+
+It is not a politeness. The audience's lines are not in the AI's
+transcript at all, because a model shown a question and told to ignore
+it answers it.
+
+Somebody who goes up **onto the stage** is joining the play. Whatever
+script was running **stops where it is** — the remaining lines are
+dropped, since the puppets have to start answering the person who is up
+there rather than saying what was written before they were — and from
+then on it is an **adlib**: no script, the puppets improvising a line at
+a time through the AI that holds them. The stage says which of the two
+it is on the line beneath it.
+
+Seats are not written down. They last as long as the show does, like the
+stage itself: the director takes the box when the curtain goes up,
+everybody else starts in the audience, and the last character leaving
+puts the room back to being a room.
+
+**A play is not the room talking.** The puppets' lines are read on the
+stage and never enter the conversation; what the conversation keeps is
+one note at the curtain, under the AI's name, **folded up with the whole
+script inside it**. A scene is a few hundred words of somebody else's
+dialogue, and left lying open in the middle of yours it would push
+everything the room actually said off the screen.
+
+**While a script plays, the room is set for it.** The AI and every voice
+in the room go to **Answers: never** and **Stops: when finished** the
 moment the curtain goes up, and back to exactly what they were when it
 comes down. Both are *set*, visibly, on the same controls anybody could
 set them with, because a scripted exchange that stopped dead when

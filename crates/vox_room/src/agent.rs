@@ -520,6 +520,44 @@ Never write a line for another AI in this room. Those have brains of their \
 own and will answer for themselves; a puppet is the only voice here that \
 is yours to speak with.";
 
+/// Added while a show is on: the room is a playhouse in three parts
+/// and this is the AI in the box. `{box}`, `{stage}` and `{adlib}` are
+/// filled in with who is where.
+///
+/// The thing it has to be told is not the layout but what it means for
+/// the transcript it is reading. It is not shown a word the audience
+/// says, and a model that does not know that will wonder why a room
+/// full of people has gone quiet, or apologise for ignoring somebody,
+/// or address a question nobody put to it.
+const PLAYHOUSE_NOTE: &str = "\
+**A show is on, so the room is a playhouse in three parts and you are in \
+the director's box.** You cannot hear the audience. Not \"should not \
+answer\" -- cannot: what they say to each other is not in the transcript \
+you are reading, and never will be. That is deliberate and it is what \
+lets a play happen at all. Do not wonder about the silence, do not \
+apologise for not answering them, and never address the audience: they \
+can hear you perfectly well and you cannot hear them, which is what \
+being on the other side of the footlights is.{box}
+
+Somebody who wants a word with you comes round to the box, and then you \
+hear them: that is who you are talking to about the show -- what to put \
+on next, what to change, when to stop. They may be passing on what the \
+audience wanted, since that is the only way a suggestion reaches you.
+
+Somebody who comes up **onto the stage** is joining the play. Whatever \
+script was running has already stopped -- the room stops it the moment \
+they step up -- and from then on the puppets are *improvising with \
+them*: no script, one line at a time, say_as for each. Stay in \
+character and keep the scene going; they came up to be in it, not to be \
+asked what they would like to happen. Answer as whichever character \
+they are talking to, and let the others cut in when a character would. \
+Do not put another script on while anybody is up there -- you would be \
+handing lines to somebody who is making it up.{stage}{adlib}
+
+The show is over when the last character leaves the stage, which is \
+send_off_puppets. Until then it is still on, between scenes and all \
+through the questions afterwards.";
+
 const SEARCH_NOTE: &str = "\
 You can look things up on the web with look_up, and you should whenever the \
 answer turns on how the world is now or on specifics you can't be sure of: \
@@ -1077,6 +1115,42 @@ impl Agent {
                 format!("\n\n{note}{on}")
             }
         };
+        // The playhouse, while one is open. It changes what the
+        // transcript *is* -- a whole section of the room is missing
+        // from it -- so it is said whether or not a script is playing.
+        let playhouse = match turn.playhouse {
+            false => String::new(),
+            true => {
+                let in_box = match turn.in_box.as_slice() {
+                    [] => String::new(),
+                    who => format!(
+                        " In the box with you: {}. Theirs is the only talk you can hear.",
+                        and_list(who)
+                    ),
+                };
+                let stage = match turn.on_stage.as_slice() {
+                    [] => String::new(),
+                    who => format!(
+                        "\n\n{} {} up on the stage with the puppets right now.",
+                        and_list(who),
+                        if who.len() == 1 { "is" } else { "are" }
+                    ),
+                };
+                let adlib = match turn.on_stage.is_empty() {
+                    true => String::new(),
+                    false => " So this is an adlib: there is no script, and every line \
+                              a puppet says is one you say for it, now, with say_as."
+                        .to_string(),
+                };
+                format!(
+                    "\n\n{}",
+                    PLAYHOUSE_NOTE
+                        .replace("{box}", &in_box)
+                        .replace("{stage}", &stage)
+                        .replace("{adlib}", &adlib)
+                )
+            }
+        };
         let others = match turn.others.as_slice() {
             [] => String::new(),
             [one] => format!("\n\n{}", OTHER_NOTE.replace("{other}", one)),
@@ -1105,7 +1179,7 @@ impl Agent {
         // instruction to try.
         let system = match (&turn.game, self.allowed) {
             (None, Allowed::Everything) => format!(
-                "{}\n\n{GAMES_NOTE}\n\n{CARDS_NOTE}\n\n{TURN_NOTE}{search}{faces}{cloning}{puppets}{others}{translated}",
+                "{}\n\n{GAMES_NOTE}\n\n{CARDS_NOTE}\n\n{TURN_NOTE}{search}{faces}{cloning}{puppets}{playhouse}{others}{translated}",
                 self.prompt
             ),
             // A bot that is only looking has no picture tools either;
@@ -1118,7 +1192,7 @@ impl Agent {
             // much a thing to make mid-game as before one, which is
             // what `tools_for` offers there.
             (Some((game, prompt)), Allowed::Everything) => format!(
-                "{}{faces}{cloning}{puppets}{others}{translated}",
+                "{}{faces}{cloning}{puppets}{playhouse}{others}{translated}",
                 game_prompt(game, prompt, Allowed::Everything)
             ),
             (Some((game, prompt)), allowed) => {
@@ -3624,6 +3698,9 @@ mod tests {
             hand_on: if others.is_empty() { 0 } else { 2 },
             puppets: Vec::new(),
             showing: None,
+            playhouse: false,
+            in_box: Vec::new(),
+            on_stage: Vec::new(),
             language: "English".into(),
             speaks: Vec::new(),
             engaged,
@@ -4801,6 +4878,55 @@ mod tests {
             playing.contains("Say nothing and start nothing"),
             "{playing}"
         );
+    }
+
+    /// While a show is on, the AI is told that a whole part of the room
+    /// is missing from the transcript it is reading -- and that is the
+    /// thing it has to be told, far more than the layout. A model that
+    /// does not know it cannot hear the audience will wonder at the
+    /// silence, or apologise for ignoring somebody, or answer a
+    /// question nobody put to it.
+    #[test]
+    fn the_director_is_told_it_cannot_hear_the_audience() {
+        let room = picture_room();
+        let (agent, mut t) = turn_with(Cue::Speak, &["Ryan"], false);
+        let stage = stage_of(&room, &["aiden"]);
+        let said = |t: &Turn| {
+            agent.messages(t, Some(&stage))[0]["content"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+
+        // No show, nothing said: the room is a room.
+        assert!(!said(&t).contains("playhouse"), "no show, no playhouse");
+
+        // A show on, and nobody in the box or up on the stage: it is
+        // reading a transcript with the audience cut out of it, and is
+        // told so in those words.
+        t.playhouse = true;
+        let on = said(&t);
+        assert!(on.contains("cannot hear the audience"), "{on}");
+        assert!(on.contains("never address the audience"), "{on}");
+        assert!(!on.contains("In the box with you"), "nobody has come round");
+        assert!(
+            !on.contains("adlib"),
+            "nobody is up there, so it is still a script"
+        );
+
+        // Somebody comes round to the box: now there is one person it
+        // can hear, and it is named.
+        t.in_box = vec!["Ryan".into()];
+        let box_ = said(&t);
+        assert!(box_.contains("In the box with you: Ryan"), "{box_}");
+
+        // And somebody goes up on the stage, which is the end of any
+        // script and the start of making it up.
+        t.on_stage = vec!["Alex".into()];
+        let adlib = said(&t);
+        assert!(adlib.contains("Alex is up on the stage"), "{adlib}");
+        assert!(adlib.contains("there is no script"), "{adlib}");
+        assert!(adlib.contains("say_as"), "{adlib}");
     }
 
     /// What the tools answer, and what they refuse: the roster, the

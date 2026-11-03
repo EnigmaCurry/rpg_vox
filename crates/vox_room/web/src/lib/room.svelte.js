@@ -84,11 +84,24 @@ export const room = $state({
     },
   ],
 
-  // The puppet show playing, if one is: { title, lines, said }. Null
-  // the rest of the time, which is nearly always. While one is on, the
-  // AI and the puppets in it answer nothing and finish what they say —
-  // the room sets that itself, and **Stop** is the way out of it.
+  // The puppet show, if one is on:
+  // { mode: 'scripted' | 'adlib', on_stage: [names],
+  //   playing: { title, lines, said } | null }.
+  //
+  // Null the rest of the time, which is nearly always, and that is what
+  // says there is no playhouse to draw: no stage, no director's box,
+  // and the conversation is simply the room's. A show is on while there
+  // is a character standing on the stage — `playing` is the *script*,
+  // which is a thing that happens inside a show rather than what one
+  // is, and is null between two scenes and all through the questions
+  // afterwards.
   show: null,
+
+  // Where everybody is sitting while a show is on:
+  // { people: { name: seat }, bots: { name: seat }, director }.
+  // Null outside a show. A seat is 'audience', 'box' or 'stage', and
+  // which one you are in decides who can hear you — see ROOM.md.
+  seats: null,
 
   // The interpreters this room has, when it has any:
   // { level, languages }. `level` is where the one speaking your
@@ -617,6 +630,44 @@ export function thePuppets() {
   return room.agents.filter((a) => a.puppet);
 }
 
+/// Where somebody is sitting, by the name the room calls them.
+/// 'audience' outside a show, which is where everybody is when there
+/// are no seats to be in.
+export function seatOf(who) {
+  if (!room.seats) return 'audience';
+  return room.seats.people?.[who] ?? room.seats.bots?.[who] ?? 'audience';
+}
+
+/// Everybody in one part of the playhouse, people and bots together,
+/// as { who, bot, state }. The bands are drawn from this, so a face
+/// moves from one to another by the room saying so and nothing else.
+export function sitting(seat) {
+  if (!room.seats) return [];
+  const out = [];
+  for (const p of room.people) {
+    if (seatOf(p.name) === seat) out.push({ who: p.name, bot: false, state: null });
+  }
+  for (const a of room.agents) {
+    if (a.puppet) continue;
+    if (seatOf(a.name) === seat) out.push({ who: a.name, bot: true, state: a.state });
+  }
+  return out;
+}
+
+/// Take a seat in one of the three parts, or put somebody else in one.
+/// The one seat nobody may move is the director's; the room says so
+/// rather than this hiding the control.
+export function takeSeat(seat, who = undefined) {
+  command({ type: 'seat', seat, ...(who ? { who } : {}) });
+}
+
+/// The lines said on the stage in this show, oldest first. They are
+/// never in the conversation — a play is not the room talking — so the
+/// stage has a log of its own and this is it.
+export function stageLines() {
+  return room.log.filter((e) => e.kind === 'line');
+}
+
 /// What to call the AIs in a sentence: one name, or every name with
 /// "or" before the last. The prose about "the AI" is written for one of
 /// them, and a room can have two.
@@ -1037,6 +1088,7 @@ function apply(ev) {
       room.interpreter = ev.interpreter ?? null;
       room.locked = ev.locked ?? false;
       room.show = ev.show ?? null;
+      room.seats = ev.seats ?? null;
       room.interprets = ev.interprets ?? false;
       room.people = ev.people;
       room.speaks = ev.speaks ?? {};
@@ -1243,7 +1295,13 @@ function apply(ev) {
       room.agents = ev.agents ?? [];
       break;
     case 'show':
-      // A puppet show went up, got a line further on, or came down.
+      // A show opened, got a line further on, or closed.
+      room.show = ev.show ?? null;
+      break;
+    case 'seats':
+      // Somebody took a seat — which can change the show itself, since
+      // stepping onto the stage ends whatever script was running.
+      room.seats = ev.seats ?? null;
       room.show = ev.show ?? null;
       break;
     case 'strips':

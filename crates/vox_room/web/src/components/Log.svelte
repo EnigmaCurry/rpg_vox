@@ -3,6 +3,7 @@
   import History from './History.svelte';
   import Face from './Face.svelte';
   import Stage from './Stage.svelte';
+  import Seats from './Seats.svelte';
   import { hue } from '../lib/color.js';
   import { markdown } from '../lib/markdown.js';
   import { scaledDown } from '../lib/pixels.js';
@@ -94,7 +95,11 @@
   // of its history that you have opened. An old one is read-only by its
   // nature — the room has moved on from it, so there is nothing to say
   // into — and that is the whole of what read-only means here.
-  const shown = $derived(room.reading?.log ?? room.log);
+  // A line said on the stage is not the room talking, so it is not in
+  // here: it is read on the stage, where it was said, and the
+  // conversation keeps one folded note of the whole play at the
+  // curtain. See `Kind::Line` in room.rs.
+  const shown = $derived((room.reading?.log ?? room.log).filter((e) => e.kind !== 'line'));
   const archived = $derived(!!room.reading);
 
   // A room can have more than one AI in it, and prose written for one
@@ -111,11 +116,22 @@
      and typing it are the same act done two ways, and this column is
      for what came of either. -->
 <div class="log">
-  <!-- The puppets, above the conversation and outside its scrollport:
-       a scene is watched, and the cast has to stay in front of you
-       while the transcript of what they are saying scrolls past. There
-       is nothing here at all unless somebody is on stage. -->
-  <Stage />
+  <!-- A playhouse, while one is open: the stage at the top with the
+       characters on it, the director's box under it, and then the
+       conversation, which is the audience. Stacked above the
+       scrollport, because a scene is watched and the cast has to stay
+       in front of you while the transcript scrolls past.
+
+       None of it exists without a show. A room with no characters
+       standing in it has no parts to it, and everybody in it can hear
+       everybody -- see ROOM.md, Puppets. -->
+  {#if room.show}
+    <Stage />
+    <Seats seat="box" title="Director's box"
+      why="Where {room.seats?.director ?? 'the AI'} runs the show. It hears what is said in here and nothing from the audience." />
+    <Seats seat="audience" title="Audience" size={28}
+      why="Watching. Talk as freely as you like — the box cannot hear a word of it." />
+  {/if}
 
   <div class="said" bind:this={box} {onscroll}>
     <History />
@@ -270,6 +286,23 @@
             </div>
           </div>
         </div>
+      {:else if e.kind === 'programme'}
+        <!-- A show that has been performed, folded up. The lines were
+             read on the stage while it was on; this is what the
+             conversation keeps of it, and it is shut because a scene
+             is a few hundred words of somebody else's dialogue and
+             would otherwise push everything the room said off the
+             screen. -->
+        <div class="entry agent card-entry">
+          <Face who={e.who} agent />
+          <div class="said-by">
+          <div class="who"><span class="name">{e.who}</span><span class="time">{time(e.at)} · the play</span></div>
+          <details class="card posted programme">
+            <summary><span class="title">{e.title}</span><span class="open">the script</span></summary>
+            <div class="body md">{@html markdown(e.text)}</div>
+          </details>
+          </div>
+        </div>
       {:else if e.kind === 'card'}
         <!-- A card the AI posted for the whole room; it stays in the
              conversation like anything that was said. -->
@@ -412,6 +445,25 @@
   /* A posted card has the whole column, so the column it is in has to
      fill what the face leaves of the row. */
   .card-entry .said-by { width: 100%; }
+  /* The programme. A card that is shut: the summary is the one line
+     saying a play happened, and opening it is asking to read it. */
+  .programme > summary {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    cursor: pointer;
+    list-style: none;
+  }
+  .programme > summary::-webkit-details-marker { display: none; }
+  .programme > summary::before {
+    content: '▸';
+    color: var(--muted);
+    font-size: 11px;
+  }
+  .programme[open] > summary::before { content: '▾'; }
+  .programme > summary .title { font-weight: 650; }
+  .programme > summary .open { margin-left: auto; font-size: 11px; color: var(--muted); }
+  .programme[open] > .body { margin-top: 8px; }
   .card.posted .body {
     margin: 0;
     /* The card is a column of flex items that line up on the left, so

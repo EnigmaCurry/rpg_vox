@@ -211,6 +211,34 @@ pub enum Kind {
     /// microphone is being recorded -- and fills in when they have
     /// finished reading. See `Room::take_voice_sample`.
     Sample,
+    /// A line said on the stage by a puppet: the same thing a
+    /// [`Kind::Agent`] entry is in every respect except where it is
+    /// read, which is the stage's own log and not the room's
+    /// conversation.
+    ///
+    /// Its own kind because a play is not the room talking. Everything
+    /// said in a scene is said *by* characters *to* each other, and
+    /// running it into the transcript of what the people in the room
+    /// have been saying to each other makes one conversation out of
+    /// two -- and leaves a half-hour of somebody else's dialogue in
+    /// the middle of yours afterwards. It is an entry all the same,
+    /// because everything that makes a line of speech work is hung off
+    /// one: the words appearing as the audio plays, the dash where it
+    /// was cut, the row of languages under it, the history.
+    ///
+    /// What the conversation keeps instead is one note at the curtain
+    /// with the whole script in it -- a [`Kind::Programme`].
+    Line,
+    /// A show that has been performed, folded up: the entry's title is
+    /// what it was called and its text is the whole script, in
+    /// markdown, under a line saying what became of it.
+    ///
+    /// A card in every respect but one -- it is shut until somebody
+    /// opens it. A scene is a few hundred words of somebody else's
+    /// dialogue, and left lying open in the conversation it would push
+    /// everything the room actually said off the screen. Shut, it is
+    /// one line saying a play happened and offering to show it.
+    Programme,
 }
 
 impl Kind {
@@ -223,6 +251,8 @@ impl Kind {
             Kind::Agent => "agent",
             Kind::Game => "game",
             Kind::Card => "card",
+            Kind::Line => "line",
+            Kind::Programme => "programme",
         }
     }
 
@@ -234,6 +264,8 @@ impl Kind {
             "picture" => Kind::Picture,
             "upload" => Kind::Upload,
             "sample" => Kind::Sample,
+            "line" => Kind::Line,
+            "programme" => Kind::Programme,
             _ => Kind::Human,
         }
     }
@@ -799,6 +831,18 @@ pub struct Turn {
     /// do until the curtain comes down -- and it is told that rather
     /// than left to ask for another one.
     pub showing: Option<String>,
+    /// A show is on at all: there are characters standing in the room,
+    /// so the room is in three parts and most of it cannot hear this
+    /// voice or be heard by it. See [`Seat`].
+    pub playhouse: bool,
+    /// Who is in the box besides the AI running the show -- the only
+    /// people it can hear, and the ones it talks to about the show
+    /// itself.
+    pub in_box: Vec<String>,
+    /// Who has come up onto the stage to join the play. Not empty is
+    /// an adlib: there is no script any more, and the puppets are
+    /// answering these people a line at a time.
+    pub on_stage: Vec<String>,
     /// A back-and-forth is on: the AI has the turn at every pause
     /// because it was named, not because the room is set that way.
     pub engaged: bool,
@@ -1156,6 +1200,11 @@ struct Showing {
     /// card, and for the log.
     lines: usize,
     said: usize,
+    /// When the curtain went up, in unix milliseconds. What the
+    /// programme is gathered from at the end: every line said on the
+    /// stage since this moment is a line of *this* show, and a second
+    /// scene the same evening must not archive the first one again.
+    began: u64,
 }
 
 /// Where the settings a show borrowed are written down while it has
@@ -4416,6 +4465,15 @@ impl Room {
         self.hush(&mut st, std::slice::from_ref(&name));
         st.bots.retain(|b| b.cfg.name != name);
         st.pending.retain(|p| p.bot != name);
+        // The last character leaving takes the play with it: a script
+        // whose cast has walked off is a thread reading lines to an
+        // empty stage.
+        let empty = on_stage(&st).is_empty();
+        if empty {
+            if let Some(on) = &st.show {
+                on.stop.store(true, Ordering::SeqCst);
+            }
+        }
         info!(puppet = %name, room = %self.cfg.id, "a puppet left the stage");
         // The last one closes it again, and everybody is simply in the
         // room once more.
@@ -4647,7 +4705,9 @@ impl Room {
         let entry = Entry {
             id: format!("agent-{}", uuid::Uuid::new_v4().simple()),
             who: who.to_string(),
-            kind: Kind::Agent,
+            // A line in a play, which is read on the stage and not in
+            // the room's conversation. See `Kind::Line`.
+            kind: Kind::Line,
             title: String::new(),
             text: String::new(),
             live: true,
@@ -4749,6 +4809,7 @@ impl Room {
             stop: stop.clone(),
             lines,
             said: 0,
+            began: now_ms(),
         });
         // Written down before anything is changed, so there is never a
         // moment where the room is set for a show and nothing knows
@@ -4879,27 +4940,52 @@ impl Room {
         // the turn it is given is one it may answer in, and one
         // somebody may talk over.
         let mut st = self.lock();
+        let up = self.up_there(&st);
         let played = match (on.said, on.lines) {
             (0, _) => "It never started.".to_string(),
+            (said, lines) if said < lines && !up.is_empty() => format!(
+                "It stopped after {said} of {lines} lines, because {} came up on stage.",
+                and_list(&up)
+            ),
             (said, lines) if said < lines => {
                 format!("It stopped after {said} of {lines} lines.")
             }
             (_, lines) => format!("{lines} lines, played out to the end."),
         };
         let cast = on_stage(&st);
-        let still = match cast.is_empty() {
-            true => "There are no puppets left in the room.".to_string(),
-            false => format!(
+        let still = match (cast.is_empty(), up.is_empty()) {
+            (true, _) => "There are no puppets left in the room.".to_string(),
+            (false, false) => format!(
+                "Still on stage: {}, with {}. They answer out loud now, a line at a time.",
+                and_list(&cast),
+                and_list(&up)
+            ),
+            (false, true) => format!(
                 "Still in the room: {}. They can take questions, or be sent away.",
                 and_list(&cast)
             ),
         };
-        self.note(
-            &mut st,
-            &director,
-            &format!("The show is over: {}", on.title),
-            &format!("{played} {still}"),
-        );
+        // The play itself, archived into the conversation now that it
+        // is over. The lines were never in it -- they were read on the
+        // stage, which is where a play belongs while it is being
+        // performed -- and this is what the room keeps of it
+        // afterwards: one note, folded up, with the whole script
+        // inside. See `Kind::Line`.
+        let script = self.script_so_far(&st, on.began);
+        let body = match script.is_empty() {
+            true => format!("{played} {still}"),
+            false => format!("{played} {still}\n\n{script}"),
+        };
+        // "Over" only if the characters have gone with it. A script
+        // that stopped while they are still standing there is a scene
+        // ending, not a show: the playhouse is still open, and saying
+        // otherwise to a room that can still see three puppets on the
+        // stage would be the room contradicting itself.
+        let heading = match on_stage(&st).is_empty() {
+            true => format!("The show is over: {}", on.title),
+            false => format!("End of the scene: {}", on.title),
+        };
+        self.note(&mut st, &director, &heading, &body);
         self.curtain_turn(&mut st, &director);
     }
 
@@ -4993,6 +5079,23 @@ impl Room {
         self.put_settings_back(&was);
     }
 
+    /// Everything said on the stage during this show, oldest first, as
+    /// the programme would print it.
+    ///
+    /// Read off the log rather than kept alongside it: the lines are
+    /// already there, with the cut marks and the names on them, and a
+    /// second copy accumulating as they were said would be a second
+    /// thing to get out of step.
+    fn script_so_far(&self, st: &State, since: u64) -> String {
+        st.log
+            .iter()
+            .filter(|e| e.kind == Kind::Line && e.at >= since)
+            .filter(|e| !e.text.trim().is_empty())
+            .map(|e| format!("**{}**  {}", e.who, one_line(e.text.trim())))
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
     /// Write a card into the conversation saying what became of the
     /// show: the programme, after the fact.
     ///
@@ -5005,7 +5108,7 @@ impl Room {
         let entry = Entry {
             id: format!("show-{}", uuid::Uuid::new_v4().simple()),
             who: who.to_string(),
-            kind: Kind::Card,
+            kind: Kind::Programme,
             title: title.to_string(),
             text: text.to_string(),
             live: false,
@@ -7315,6 +7418,20 @@ impl Room {
                     .show
                     .as_ref()
                     .and_then(|s| (s.director == bot).then(|| s.title.clone())),
+                playhouse: !on_stage(st).is_empty(),
+                in_box: st
+                    .people
+                    .iter()
+                    .filter(|(_, p)| p.seat == Seat::Box)
+                    .map(|(n, _)| n.clone())
+                    .chain(
+                        st.bots
+                            .iter()
+                            .filter(|b| b.here && b.cfg.name != bot && b.seat == Seat::Box)
+                            .map(|b| b.cfg.name.clone()),
+                    )
+                    .collect(),
+                on_stage: self.up_there(st),
                 hand_on: if others_answering.is_empty() {
                     0
                 } else {
@@ -7664,10 +7781,13 @@ fn conversation_messages(
         .filter(|e| !deaf_to.contains(&e.who))
         .filter(|e| match e.kind {
             Kind::Human => e.sent && !e.text.trim().is_empty(),
-            Kind::Agent => !e.live && !e.text.trim().is_empty(),
+            // A reply, and a line in a play: the same thing to a
+            // model, which is reading what was said out loud whether
+            // it was said in the room or on the stage.
+            Kind::Agent | Kind::Line => !e.live && !e.text.trim().is_empty(),
             // A picture somebody brought in is there the moment the
             // entry is: there was nothing to wait for.
-            Kind::Game | Kind::Card | Kind::Upload => true,
+            Kind::Game | Kind::Card | Kind::Upload | Kind::Programme => true,
             // A picture still being made is a spinner in the chat and
             // nothing to tell the model about: it is told when the
             // call it is waiting on comes back.
@@ -7709,7 +7829,7 @@ fn conversation_messages(
                     .unwrap_or_else(|| e.text.trim());
                 said_to_me(&mut out, format!("{}: {}", e.who, one_line(said)));
             }
-            Kind::Agent => {
+            Kind::Agent | Kind::Line => {
                 let mut text = e.text.trim().to_string();
                 if e.cut {
                     text = text.trim_end_matches('—').trim_end().to_string();
@@ -7730,6 +7850,20 @@ fn conversation_messages(
                         }
                         _ => out.push((Role::Assistant, note)),
                     }
+                } else if e.kind == Kind::Line {
+                    // A line of a play by somebody else's puppet --
+                    // which, to every voice that is not holding it, is
+                    // what every puppet is. It happened in front of
+                    // this one, so it is shown, and marked as a play:
+                    // a line from a scene answered as though it had
+                    // been said to the room is a voice walking onto
+                    // the stage uninvited. Being able to say what it
+                    // made of the play is worth more than being spared
+                    // the lines.
+                    said_to_me(
+                        &mut out,
+                        format!("[in the play] {}: {}", e.who, one_line(&text)),
+                    );
                 } else {
                     said_to_me(&mut out, format!("{}: {}", e.who, one_line(&text)));
                 }
@@ -7755,6 +7889,23 @@ fn conversation_messages(
                             e.who, e.text
                         ),
                     );
+                }
+            }
+            // A show that has been performed, folded up in the
+            // conversation. The model is told what it was and that it
+            // is there, and not the whole script again: it has every
+            // line of it above as its own words, and a second copy
+            // would be the same play twice in one context.
+            Kind::Programme => {
+                let who = if mine { "You" } else { e.who.as_str() };
+                let note = format!(
+                    "[{who} put the script of \"{}\" into the conversation, folded up.]",
+                    e.title
+                );
+                if mine {
+                    out.push((Role::Assistant, note));
+                } else {
+                    said_to_me(&mut out, note);
                 }
             }
             Kind::Card => {
@@ -11564,7 +11715,7 @@ mod tests {
             .log
             .iter()
             .rev()
-            .find(|e| e.kind == Kind::Card)
+            .find(|e| e.kind == Kind::Programme)
             .cloned()
             .expect("the programme, after the fact");
         assert!(card.title.contains("The Gate"), "{}", card.title);
@@ -11685,8 +11836,8 @@ mod tests {
             .iter()
             .find(|e| e.who == "Grimble")
             .cloned()
-            .expect("its line is still in the conversation");
-        assert_eq!(said.kind, Kind::Agent);
+            .expect("its line is still there to be read on the stage");
+        assert_eq!(said.kind, Kind::Line, "a play, not the room talking");
         assert!(said.text.starts_with("None shall pass"), "{}", said.text);
         assert!(said.cut, "and says it was cut off: {}", said.text);
         assert!(
@@ -11698,6 +11849,106 @@ mod tests {
             1,
             "the character is kept: being sent off is not being forgotten"
         );
+    }
+
+    /// What a browser is handed to draw the three bands with. Asserted
+    /// because nothing else can be: the bands are built from these
+    /// exact keys, and a name changed on one side of the socket draws
+    /// an empty stage on the other with nothing anywhere saying why.
+    #[test]
+    fn a_tab_is_told_who_is_sitting_where() {
+        let (r, _turns) = room_with_puppets();
+        r.join("Ryan", 1);
+
+        // No show: null, which is what tells a tab to draw no bands at
+        // all rather than three empty ones.
+        let hello = r.hello("Ryan");
+        assert_eq!(hello["seats"], Value::Null, "no show, no seats");
+        assert_eq!(hello["show"], Value::Null);
+
+        r.make_puppet(a_puppet("Grimble", "a gatekeeper")).unwrap();
+        r.cast_puppet("Grimble").unwrap();
+        let hello = r.hello("Ryan");
+        assert_eq!(hello["seats"]["director"], "Vox", "whose box it is");
+        assert_eq!(hello["seats"]["people"]["Ryan"], "audience");
+        assert_eq!(hello["seats"]["bots"]["Vox"], "box");
+        assert_eq!(
+            hello["seats"]["bots"]["Grimble"], "stage",
+            "a puppet is on the stage because that is what being one is"
+        );
+        // A show with no script playing is still a show.
+        assert_eq!(hello["show"]["mode"], "scripted");
+        assert_eq!(hello["show"]["playing"], Value::Null, "between scenes");
+        assert_eq!(hello["show"]["on_stage"], json!([]));
+
+        // A script, and then somebody going up to join it.
+        r.begin_show("Vox", "The Gate", 4).unwrap();
+        let hello = r.hello("Ryan");
+        assert_eq!(hello["show"]["playing"]["title"], "The Gate");
+        assert_eq!(hello["show"]["playing"]["lines"], 4);
+        assert_eq!(hello["show"]["playing"]["said"], 0);
+
+        r.take_seat("Ryan", "stage").unwrap();
+        let hello = r.hello("Ryan");
+        assert_eq!(hello["show"]["mode"], "adlib", "somebody is up there");
+        assert_eq!(hello["show"]["on_stage"], json!(["Ryan"]));
+        assert_eq!(hello["seats"]["people"]["Ryan"], "stage");
+        // And stepping up stopped the script where it was.
+        assert!(r.show_stopped() || r.show_title().is_none());
+    }
+
+    /// A play is read on the stage while it is being performed, and
+    /// kept in the conversation afterwards as one note with the whole
+    /// script folded into it.
+    ///
+    /// The lines were in the conversation to begin with, which made one
+    /// conversation out of two: half an hour of somebody else's
+    /// dialogue in the middle of yours, and no way to tell which was
+    /// which.
+    #[test]
+    fn a_play_is_archived_into_the_conversation_and_not_said_into_it() {
+        let (r, _turns) = room_with_puppets();
+        r.make_puppet(a_puppet("Grimble", "a gatekeeper")).unwrap();
+        r.cast_puppet("Grimble").unwrap();
+        r.begin_show("Vox", "The Gate", 2).unwrap();
+
+        // Two lines, heard out.
+        for say in ["None shall pass.", "Not one of you."] {
+            let g = r.puppet_line("Grimble").expect("a line");
+            r.agent_speak(g, say, vec![0.0; 2400]);
+            r.agent_done(g);
+            for _ in 0..4 {
+                r.mixer.tick();
+            }
+            r.tick(Instant::now());
+        }
+
+        // On the stage, and nowhere near the conversation.
+        let log = r.log_now();
+        let lines: Vec<&Entry> = log.iter().filter(|e| e.kind == Kind::Line).collect();
+        assert_eq!(lines.len(), 2, "both lines are stage lines");
+        assert!(
+            lines.iter().all(|e| e.who == "Grimble"),
+            "each under the character who said it"
+        );
+        assert!(
+            !log.iter().any(|e| e.kind == Kind::Agent),
+            "and not one of them is the room talking"
+        );
+
+        // The curtain folds the whole thing into one note.
+        r.end_show();
+        let card = r
+            .log_now()
+            .into_iter()
+            .rev()
+            .find(|e| e.kind == Kind::Programme)
+            .expect("the programme");
+        assert_eq!(card.who, "Vox", "posted by whoever ran the show");
+        assert!(card.title.contains("The Gate"), "{}", card.title);
+        assert!(card.text.contains("**Grimble**"), "{}", card.text);
+        assert!(card.text.contains("None shall pass."), "{}", card.text);
+        assert!(card.text.contains("Not one of you."), "{}", card.text);
     }
 
     /// Who can hear whom, which is the whole of what the three parts of
