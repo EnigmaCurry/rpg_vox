@@ -608,8 +608,11 @@ See ROOM_DOCKER.md.
   and the next number, which is the number the AI takes for
   `set_avatar` — so *"make that my face"* is the whole of what you
   have to say after dropping a photograph in. Only pictures; anything
-  else is declined where you dropped it. See
-  [Dropping a picture in](#dropping-a-picture-in).
+  else is declined where you dropped it. Ask for it changed — a hat, a
+  colour — and the AI gives it to the picture server first, which
+  redraws it in one of its looks; yours stays where it is. See
+  [Dropping a picture in](#dropping-a-picture-in) and [Changing a
+  picture you dropped in](#changing-a-picture-you-dropped-in).
 - **More than one language**: start the room with
   `--language-also Russian` and the door offers a **Language** beside
   the devices. Everyone hears the people in the room as they are — their
@@ -1198,6 +1201,45 @@ A room with no picture server can do all of this. Nothing here draws,
 so the AI is not told how to draw — but it is still told about faces,
 and `set_avatar` still has something to put.
 
+#### Changing a picture you dropped in
+
+Asking for a hat on a picture you brought in used to get you an
+apology. A tool that changes a picture only knows the pictures its own
+server drew — it is given the handle that server wrote on the card,
+not the number the room shows — and a photograph off your phone is a
+stranger to it. On screen the two kinds of card look alike, so *"put a
+hat on that one"* worked or didn't depending on where the picture came
+from.
+
+It works now, with a step in front of it that the AI says out loud
+first. **`redraw_picture` hands your picture to the picture server**,
+which redraws it in one of its looks and keeps it from then on. What
+lands is a new card with the next number, with a handle on it, and
+that one can be changed like any the AI made. Yours stays in the
+conversation exactly as you left it.
+
+Two things are worth knowing before you say yes. What comes back is a
+**redrawn copy in the server's look** — it is not your photograph with
+something added, and which look it is drawn in is asked about like any
+other picture, because no later change can alter it. And it takes as
+long as making a picture does, so the AI says what it is doing and the
+card spins while it happens.
+
+None of this is needed to *use* a picture you dropped in. `set_avatar`
+takes it exactly as it came, which is the right answer when you like
+it already.
+
+The two tools the server does this with — one that hands out a
+one-time upload URL, one that takes what was posted — are **not lent
+to the AI**, and naming them in `--mcp` does not lend them either. The
+step between them is a file going up a socket, which no model can do:
+the room posts it, from the picture it already has in its database.
+Where that file may be posted is checked first — the configured
+server's own address, or https, and nowhere else — because the URL
+arrives inside a tool result and what is going up is your photograph.
+A server that publishes neither tool is a room with no
+`redraw_picture` and nothing in the prompt about it.
+
 Pictures made by the AI come from an **MCP server**, which is any
 server the house was started with:
 
@@ -1231,11 +1273,12 @@ server offers everything it can do, and a room that wants faces needs
 three of them: one that makes a picture from a description, one that
 changes a picture already made, and one that says what looks it can
 draw in. The ComfyUI server above offers eight, and the five left out
-are two for uploading a file (the AI has no file
-and no way to POST one), one that re-posts a picture already in the
-chat as a second card, one for polling a job you only need if you told
-it not to wait, and one that lists every job on the server — including
-other rooms'. Each of those is one more way for a voice answering "make
+are two the room takes for itself and calls without lending (the ones
+that bring a picture you dropped in to the server — see [Changing a
+picture you dropped in](#changing-a-picture-you-dropped-in)), one that
+re-posts a picture already in the chat as a second card, one for
+polling a job you only need if you told it not to wait, and one that
+lists every job on the server — including other rooms'. Each of those is one more way for a voice answering "make
 me an avatar" to end up somewhere else. Leave the list out and every
 tool the server has is offered, which is only sane for a server you
 know is small. Repeat `--mcp` (or separate with `;`) for more servers.

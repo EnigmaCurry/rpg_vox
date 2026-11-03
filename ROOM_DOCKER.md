@@ -199,6 +199,15 @@ says what looks it can draw in, since that server draws in more than
 one and which look is the person's to choose. See
 [Faces](ROOM.md#faces).
 
+Two of the five left out are an exception worth knowing about: the
+pair that takes a picture somebody dropped into the room and gives it
+to the server, so it can then be changed like one the AI drew. The
+room calls those itself — the step between them is a file going up a
+socket, which no model can do — and it calls them whether or not they
+are in the list above. Naming them lends nothing and is warned about
+at startup. See [Changing a picture you dropped
+in](ROOM.md#changing-a-picture-you-dropped-in).
+
 Both variables take several servers, separated by semicolons, and the
 name is what pairs a key with its server:
 

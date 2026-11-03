@@ -90,6 +90,37 @@ releases.
 
 ### Voice room
 
+- **A picture you dropped into the room can now be changed, not only
+  worn.** Asking for a hat on one got an apology: a tool that changes a
+  picture knows only the pictures its own server drew, by the handle
+  that server wrote on the card, and a photograph off a phone is a
+  stranger to it. On screen the two kinds of card look alike, so "put a
+  hat on that one" worked or didn't depending on where the picture came
+  from, and the AI could only say so afterwards.
+
+  `redraw_picture` is the step in front: it hands a picture in the chat
+  to the picture server, which redraws it in one of its looks and keeps
+  it from then on. What lands is a new card with the next number and a
+  handle on it, which is then changed like any the AI made; the one
+  they brought in stays in the conversation untouched. What comes back
+  is a redrawn copy in the server's look rather than their photograph
+  with something added, so the AI is told to say that and ask first --
+  and which look it is drawn in is theirs to pick, like every other
+  picture, since no later change can alter it. A picture that is
+  already what somebody wants still needs none of this: `set_avatar`
+  takes it as it came.
+
+  The server does this in two tools and a file going up a socket, and
+  the socket is why neither tool is ever lent to the model: it cannot
+  post a file, and a model holding half of this is a model that will
+  describe the other half as done. The room calls both itself, from
+  the picture already in its database, whether or not they are named
+  in `--mcp` -- naming them lends nothing and is warned about at
+  startup. Where the file may be posted is checked before it goes: the
+  configured server's own address, or https, and nowhere else, because
+  the URL arrives inside a tool result and what is going up is
+  somebody's photograph.
+
 - **A recording can be dropped into the room and a voice cloned from
   it.** Cloning needed somebody to sit at a microphone and read a
   passage, which is the right way to get a voice from a person in the

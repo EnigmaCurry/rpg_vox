@@ -2301,25 +2301,7 @@ impl Room {
     pub fn set_avatar(&self, generation: u64, who: &str, picture: u32) -> Result<String, String> {
         let st = self.lock();
         let (key, whose) = self.whose(&st, who)?;
-        let found = self
-            .store()
-            .picture_numbered(st.conversation, picture)
-            .map_err(|err| format!("{err:#}"))?;
-        let Some((_, prompt, png)) = found else {
-            let made = self.store().pictures(st.conversation).unwrap_or_default();
-            return Err(match made.len() {
-                0 => "there are no pictures in this conversation yet; make one, or ask \
-                      whoever wants a face to drop one into the chat -- either way it \
-                      is there for everyone to look at first"
-                    .to_string(),
-                most => format!("there is no picture {picture} here; they run 1 to {most}"),
-            });
-        };
-        let Some(png) = png else {
-            return Err(format!(
-                "picture {picture} is still being made; wait for it to appear"
-            ));
-        };
+        let (prompt, png) = self.numbered(&st, picture)?;
         if !crate::mcp::is_png(&png) {
             return Err("that picture isn't a PNG, so the room can't show it".into());
         }
@@ -2347,6 +2329,46 @@ impl Room {
         // ever said, so it is not news for them alone.
         self.emit_people(&st);
         Ok(whose)
+    }
+
+    /// One picture of this conversation by the number on its card,
+    /// with what it was asked for or came in as: the bytes and the
+    /// caption, or why there are none.
+    ///
+    /// The number is how everything in the room asks for a picture --
+    /// it is what the people can see and what they argue about -- so
+    /// what is wrong with a number is answered here, once, in words a
+    /// model can repeat out loud. Used by [`Room::set_avatar`] and by
+    /// the tool that hands a picture to a picture server.
+    fn numbered(&self, st: &State, picture: u32) -> Result<(String, Vec<u8>), String> {
+        let found = self
+            .store()
+            .picture_numbered(st.conversation, picture)
+            .map_err(|err| format!("{err:#}"))?;
+        match found {
+            Some((_, prompt, Some(png))) => Ok((prompt, png)),
+            Some((_, _, None)) => Err(format!(
+                "picture {picture} is still being made; wait for it to appear"
+            )),
+            None => {
+                let made = self.store().pictures(st.conversation).unwrap_or_default();
+                Err(match made.len() {
+                    0 => "there are no pictures in this conversation yet; make one, or ask \
+                          whoever wants a face to drop one into the chat -- either way it \
+                          is there for everyone to look at first"
+                        .to_string(),
+                    most => format!("there is no picture {picture} here; they run 1 to {most}"),
+                })
+            }
+        }
+    }
+
+    /// The same, for a caller that is not already holding the room:
+    /// what the picture is and the PNG of it, by the number on its
+    /// card. See [`Room::numbered`].
+    pub fn picture_by_number(&self, picture: u32) -> Result<(String, Vec<u8>), String> {
+        let st = self.lock();
+        self.numbered(&st, picture)
     }
 
     /// Somebody's face and the version it is at, by the name the room

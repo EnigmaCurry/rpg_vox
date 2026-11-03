@@ -378,6 +378,44 @@ Read it off that line and pass it back. If the line for a picture has \
 no handle on it, that picture did not come from a tool that can change \
 it, and the honest answer is to make a new one.";
 
+/// Added after [`DRAWING_NOTE`] where the picture server will take a
+/// picture of the room's own, which is what `redraw_picture` needs.
+///
+/// It is written to finish the paragraph [`DRAWING_NOTE`] ends on. That
+/// one tells the truth about a card with no handle -- it cannot be
+/// changed -- and in a house with this tool the truth has one more
+/// step in it. The two are kept apart rather than merged because a
+/// room whose server cannot take a picture still gets the first, and a
+/// note about a tool that is not there is an instruction to try.
+///
+/// The warning about asking first is not politeness. What comes back
+/// is somebody's own photograph redrawn in a server's look, which is a
+/// thing to be offered and not done to a picture while they watch.
+const REDRAW_NOTE: &str = "\
+That last part has one more step in it here. A picture with no handle on its \
+card is almost always one somebody dropped into the chat from their own \
+computer: it is theirs, the picture server has never seen it, and asking that \
+server to put a hat on it is asking about something that does not exist there. \
+It can be given to the server first.
+
+redraw_picture does that. It hands a picture in the chat to the picture \
+server, which redraws it in one of its looks and keeps it from then on. It \
+takes as long as making a picture does, so say what you are doing and let it \
+come. What lands is a new card with the next number and a handle on it, and \
+that one is what you change from then on -- theirs stays in the chat exactly \
+as they left it.
+
+Ask before you do it, and say what it is: a redrawn copy in the server's look, \
+not their photograph with something added. Which look is theirs to pick, like \
+any other picture. And you have not seen it, so tell redraw_picture what is in \
+it in the words the room gave you -- that is what the server is told, and what \
+a later change is understood against.
+
+A brought-in picture does not have to go through any of this to be used. \
+set_avatar takes it as it is, and that is the right answer when they like it \
+already. redraw_picture is for when they want it changed, and it is worth \
+saying out loud that what comes back will not look quite like what went in.";
+
 /// What the AI is told about cloning a voice, when the house has a
 /// server that can.
 ///
@@ -805,6 +843,19 @@ impl Art {
     fn whose(&self, tool: &str) -> Option<&Arc<mcp::Server>> {
         self.servers.iter().find(|s| s.has(tool))
     }
+
+    /// The server that will take a picture of the room's own, if any
+    /// here will. What gates `redraw_picture`, and what it is handed
+    /// to.
+    ///
+    /// The first that can, where a house runs two. Which is an
+    /// arbitrary rule and still better than an argument for the model
+    /// to fill in: a picture is brought in so that it can be changed
+    /// afterwards, and the server that took it is the only one that
+    /// will be able to change it.
+    fn importer(&self) -> Option<&Arc<mcp::Server>> {
+        self.servers.iter().find(|s| s.can_import())
+    }
 }
 
 /// What a bot that is only looking may call. The rest of what the room
@@ -1068,6 +1119,15 @@ impl Agent {
         let faces = match self.art.any() {
             true => format!("\n\n{AVATAR_NOTE}\n\n{DRAWING_NOTE}"),
             false => format!("\n\n{AVATAR_NOTE}"),
+        };
+        // And the step before changing a picture that came in from
+        // somebody's own computer, only where a server will take one.
+        // Gated with the tool it is about and on the same two things,
+        // so what the prompt describes and what the model is offered
+        // cannot drift apart; see `tools_for`.
+        let faces = match self.art.any() && self.art.importer().is_some() {
+            true => format!("{faces}\n\n{REDRAW_NOTE}"),
+            false => faces,
         };
         // Only where there is a server to clone with and a bot that
         // may: a voice that cannot record anybody told how to is a
@@ -2151,6 +2211,14 @@ fn tools_for(
         for server in &art.servers {
             extra.extend(server.offer());
         }
+        // And, where a server will take a picture of ours, the one
+        // tool that stands in front of the two it takes it with. Only
+        // beside the drawing tools: a picture is brought in so that it
+        // can be changed, and a house that lends nothing to change it
+        // with would be offering a wait for nothing.
+        if let Some(server) = art.importer() {
+            extra.push(redraw_tool(&server.import_styles()));
+        }
     }
     if !lobby {
         return Value::Array(extra);
@@ -2535,6 +2603,69 @@ fn avatar_tool() -> Value {
     )
 }
 
+/// Giving a picture somebody brought in to the picture server, which
+/// is the only way one of those is ever changed.
+///
+/// The asymmetry this is here for: a picture the AI made can be given
+/// a hat, because the server that drew it still has it and gave it a
+/// handle; a picture somebody dropped in from their own computer
+/// cannot, because to that server it does not exist. Both are cards
+/// with numbers on them and nothing on screen says which is which, so
+/// a room without this tool is one where "put a hat on that one" works
+/// or doesn't depending on where the picture came from, and the AI can
+/// only apologise.
+///
+/// One tool and not two, where the server's own way of doing it is
+/// two: the step between them is a file going up a socket, which no
+/// model can do. See [`mcp::Server::bring_in`].
+///
+/// `styles` are the looks the importing tool published, which are
+/// named here for the reason `DRAWING_NOTE` gives -- a look is the one
+/// thing changing a picture afterwards cannot touch, so it is asked
+/// about rather than defaulted to. Empty for a server that has one or
+/// does not say, and then the argument is left out and the server's
+/// own default stands.
+fn redraw_tool(styles: &[String]) -> Value {
+    let mut args = json!({
+        "picture": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "The number on its card in the chat.",
+        },
+        "label": {
+            "type": "string",
+            "description": "What is in the picture, in a few words, as the room has \
+                            described it to you: \"a photo of Ryan by a lake\". You \
+                            have not seen it, so ask rather than guess. The server is \
+                            told this, and it is what a later change is understood \
+                            against -- a wrong one here is a hat on the wrong thing.",
+        },
+    });
+    if !styles.is_empty() {
+        args["style"] = json!({
+            "type": "string",
+            "enum": styles,
+            "description": "Which look to redraw it in. Theirs to pick, so ask before \
+                            you call this: it is the one thing a later change cannot \
+                            give them. Leave it out to take the server's own.",
+        });
+    }
+    tool(
+        "redraw_picture",
+        "Hand a picture somebody brought into the chat to the picture server, which \
+         redraws it in its own look and keeps it from then on. This is how a picture \
+         that came in from somebody's own computer becomes one you can change: the \
+         tools that change a picture only know the ones that server drew, and a \
+         brought-in picture is a stranger to it. The redrawn one goes into the chat \
+         with the next number and a handle on its card, and that is the one to change \
+         from then on; theirs stays where it is, untouched. It takes as long as making \
+         a picture does, so say what you are doing first -- and ask first, because it \
+         is their picture.",
+        args,
+        &["picture", "label"],
+    )
+}
+
 /// Answer one question with a web search, letting the endpoint do the
 /// searching (OpenAI's `/responses` with its hosted `web_search` tool).
 /// Not streamed: the model is waiting on the result, and the room shows
@@ -2767,6 +2898,22 @@ fn run_tool(
                          voice and there are no puppets here at all"
                     .to_string(),
             ),
+        },
+        // The room's own tool, worked with somebody else's server:
+        // the picture is the room's and the redrawing is the
+        // server's, and what is between them is this process posting
+        // a file. Offered only where a server will take one, so a
+        // call with nothing to take it is a model calling what it was
+        // not shown.
+        "redraw_picture" => match art.importer() {
+            Some(server) => {
+                info!(g, server = server.name(), "reply: bringing a picture in");
+                importing(room, g, server, &args)
+            }
+            None => Err("no picture server here will take a picture of ours, so a \
+                         picture somebody brought in cannot be changed; say so, and \
+                         offer to make a new one instead"
+                .to_string()),
         },
         // Somebody else's tool: one of the MCP servers the room lends,
         // under the prefixed name it was offered as. `Allowed` has
@@ -3185,42 +3332,9 @@ fn drawing(
         }
     };
 
-    let mut drawn: Vec<u32> = Vec::new();
-    let mut pictures = outcome.pictures.into_iter();
-    // The first one fills the card that is already up; the rest get
-    // cards of their own, since a call asked for several takes is a
-    // call whose takes are each worth looking at.
-    // What the tool said goes on every card it made, because the
-    // handle for changing a picture is in there and the model will
-    // have forgotten it by the time anybody asks: a tool result lives
-    // in the one reply it arrived in, and the change is always asked
-    // for in a later one. See `Entry::note`.
-    if let Some((id, n)) = &pending {
-        match pictures.next() {
-            Some(first) => {
-                room.finish_picture(id, &first.png, &outcome.said);
-                drawn.push(*n);
-            }
-            None => room.fail_picture(id, "the tool came back without a picture"),
-        }
-    }
-    for picture in pictures {
-        let caption = if picture.prompt.trim().is_empty() {
-            prompt.clone()
-        } else {
-            picture.prompt.clone()
-        };
-        match room.begin_picture(g, &caption) {
-            Ok((id, n)) => {
-                room.finish_picture(&id, &picture.png, &outcome.said);
-                drawn.push(n);
-            }
-            Err(err) => warn!(g, "couldn't post a picture: {err}"),
-        }
-    }
-
+    let (drawn, said) = posted(room, g, pending, outcome, &prompt);
     if drawn.is_empty() {
-        return Ok(json!({ "result": outcome.said }));
+        return Ok(json!({ "result": said }));
     }
     // Deliberately not the pictures themselves: a 128x128 PNG is some
     // 30 KB of base64, and putting that through a conversation that is
@@ -3241,13 +3355,132 @@ fn drawing(
             if many { "s" } else { "" },
             if many { "are" } else { "is" },
             if many { "them" } else { "it" },
-            if outcome.said.is_empty() {
+            if said.is_empty() {
                 String::new()
             } else {
-                format!(" The tool also said: {}", outcome.said)
+                format!(" The tool also said: {said}")
             }
         )
     }))
+}
+
+/// Give a picture somebody brought into the room to a picture server,
+/// so that the tools which change a picture have something to change.
+///
+/// The same three beats as `drawing`, because to everyone in the room
+/// it is the same thing happening: a card goes up with a spinner on
+/// it, the server is waited for, the picture fills the card. What is
+/// different is only where the picture came from -- the room's own
+/// database rather than the model's description -- and that there is
+/// now a second card of the same picture, which is said plainly
+/// because otherwise the model will talk about it as a replacement.
+///
+/// The original is not touched and not removed. It is theirs, they put
+/// it there, and the redrawn one is a copy in somebody else's style.
+fn importing(room: &Room, g: u64, server: &mcp::Server, args: &Value) -> Result<Value, String> {
+    let Some(picture) = args["picture"].as_u64() else {
+        return Err("which picture? `picture` is the number on its card in the \
+                    chat, counting from 1"
+            .to_string());
+    };
+    let picture = picture as u32;
+    // Read before the card goes up: a number that is not a picture is
+    // the model's mistake to be told about, not a spinner for the room
+    // to watch fail.
+    let (was, png) = room.picture_by_number(picture)?;
+    // What the new card says it is. The model's words for it where it
+    // has any -- it got them from the room -- and the file it came in
+    // as otherwise, which is all the room itself ever knew.
+    let label = args["label"].as_str().unwrap_or("").trim();
+    let caption = match label.is_empty() {
+        true => was,
+        false => label.to_string(),
+    };
+    let pending = Some(room.begin_picture(g, &caption)?);
+
+    let outcome = match server.bring_in(&png, &caption, args["style"].as_str()) {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            warn!(g, picture, server = server.name(), "bring in: {err:#}");
+            if let Some((id, _)) = &pending {
+                room.fail_picture(id, &format!("{err}"));
+            }
+            return Err(format!(
+                "picture {picture} couldn't be given to the picture server ({err}); say \
+                 so plainly, and don't go on to call a tool that changes it -- as far as \
+                 that server is concerned it still does not exist"
+            ));
+        }
+    };
+
+    let (drawn, said) = posted(room, g, pending, outcome, &caption);
+    let Some(n) = drawn.first() else {
+        return Err(format!(
+            "the picture server took picture {picture} and sent nothing back ({said}); \
+             say you couldn't"
+        ));
+    };
+    Ok(json!({
+        "result": format!(
+            "Picture {n} is picture {picture} redrawn, in the chat where everyone can \
+             see it, and picture {picture} is still there exactly as they brought it \
+             in. From now on it is {n} you change and not {picture}: the handle is on \
+             its card. Say it is there and ask how it came out before you change \
+             anything.{}",
+            if said.is_empty() {
+                String::new()
+            } else {
+                format!(" The tool also said: {said}")
+            }
+        )
+    }))
+}
+
+/// The pictures a call came back with, put into the conversation: the
+/// numbers the model is told, and what the tool said in words.
+///
+/// The first picture fills the card that is already up; the rest get
+/// cards of their own, since a call asked for several takes is a call
+/// whose takes are each worth looking at.
+///
+/// What the tool said goes on every card it made, because the handle
+/// for changing a picture is in there and the model will have
+/// forgotten it by the time anybody asks: a tool result lives in the
+/// one reply it arrived in, and the change is always asked for in a
+/// later one. See `Entry::note`.
+fn posted(
+    room: &Room,
+    g: u64,
+    pending: Option<(String, u32)>,
+    outcome: mcp::Outcome,
+    prompt: &str,
+) -> (Vec<u32>, String) {
+    let mcp::Outcome { said, pictures } = outcome;
+    let mut drawn: Vec<u32> = Vec::new();
+    let mut pictures = pictures.into_iter();
+    if let Some((id, n)) = &pending {
+        match pictures.next() {
+            Some(first) => {
+                room.finish_picture(id, &first.png, &said);
+                drawn.push(*n);
+            }
+            None => room.fail_picture(id, "the tool came back without a picture"),
+        }
+    }
+    for picture in pictures {
+        let caption = match picture.prompt.trim().is_empty() {
+            true => prompt.to_string(),
+            false => picture.prompt.clone(),
+        };
+        match room.begin_picture(g, &caption) {
+            Ok((id, n)) => {
+                room.finish_picture(&id, &picture.png, &said);
+                drawn.push(n);
+            }
+            Err(err) => warn!(g, "couldn't post a picture: {err}"),
+        }
+    }
+    (drawn, said)
 }
 
 /// Hand a sentence to the voice, unless it repeats one this reply has
@@ -3528,6 +3761,59 @@ mod tests {
             "{system}"
         );
         assert!(!system.contains("make it with a picture tool"), "{system}");
+        assert!(
+            !system.contains("redraw_picture"),
+            "nor about handing a picture to a server that is not there: {system}"
+        );
+    }
+
+    /// And a house whose picture server will take a picture of ours is
+    /// told the step that makes a brought-in one changeable -- the
+    /// paragraph and the tool together, since a note about a tool that
+    /// is not offered is an instruction to try.
+    #[test]
+    fn a_room_whose_server_takes_a_picture_is_told_how_to_hand_one_over() {
+        let server = Arc::new(mcp::Server::new(mcp::Config {
+            name: "art".into(),
+            url: mock_mcp(true),
+            key: String::new(),
+            only: vec!["generate_pixel_art".into()],
+        }));
+        server.connect().expect("hello");
+        let (agent, t) = turn_with(Cue::Speak, &["Ryan"], false);
+        let agent = Agent {
+            art: Arc::new(Art {
+                servers: vec![server],
+            }),
+            ..agent
+        };
+        let system = system_of(&agent, &t);
+        assert!(system.contains("make it with a picture tool"), "{system}");
+        assert!(
+            system.contains("redraw_picture does that"),
+            "the step in front of changing a picture somebody brought in: {system}"
+        );
+        assert!(
+            system.contains("set_avatar takes it as it is"),
+            "and that none of it is needed to simply wear one: {system}"
+        );
+        // The tool itself, offered on the same two conditions.
+        let names: Vec<String> = tools_for(
+            Allowed::Everything,
+            false,
+            false,
+            false,
+            false,
+            &agent.art,
+            false,
+            None,
+        )
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["function"]["name"].as_str().unwrap_or("").to_string())
+        .collect();
+        assert!(names.iter().any(|n| n == "redraw_picture"), "{names:?}");
     }
 
     /// The other AIs in the room are in the transcript by name, so the
@@ -3763,15 +4049,26 @@ mod tests {
     fn mock_mcp(draws: bool) -> String {
         use std::io::{BufRead as _, BufReader, Write as _};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port");
-        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let url = format!("{base}/mcp");
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
                 let mut reader = BufReader::new(stream.try_clone().unwrap());
                 let mut len = 0usize;
+                // Which it is, because this one answers two things:
+                // JSON-RPC on /mcp, and a picture being posted to the
+                // ticket it handed out -- which is not JSON-RPC, has
+                // no key on it, and is the step the room does itself.
+                let mut path = String::new();
+                let mut first = true;
                 loop {
                     let mut line = String::new();
                     if reader.read_line(&mut line).unwrap_or(0) == 0 {
                         return;
+                    }
+                    if first {
+                        first = false;
+                        path = line.split_whitespace().nth(1).unwrap_or("/").to_string();
                     }
                     if let Some(n) = line.to_ascii_lowercase().strip_prefix("content-length:") {
                         len = n.trim().parse().unwrap_or(0);
@@ -3782,6 +4079,25 @@ mod tests {
                 }
                 let mut body = vec![0u8; len];
                 std::io::Read::read_exact(&mut reader, &mut body).unwrap_or(());
+                if path.starts_with("/upload/") {
+                    // What a real upload endpoint answers: the handle,
+                    // as plain JSON. And only for something that is
+                    // actually a picture, so a room that posted the
+                    // wrong thing finds out here.
+                    let payload = match crate::mcp::is_png(&body) {
+                        true => json!({ "image_id": "img99", "bytes": body.len() }).to_string(),
+                        false => json!({ "error": "that is not a picture" }).to_string(),
+                    };
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Connection: close\r\nContent-Length: {}\r\n\r\n",
+                        payload.len()
+                    );
+                    let mut s = stream;
+                    let _ = s.write_all(head.as_bytes());
+                    let _ = s.write_all(payload.as_bytes());
+                    continue;
+                }
                 let req: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
                 let method = req["method"].as_str().unwrap_or("");
                 // A notification wants no answer but the 202.
@@ -3850,7 +4166,66 @@ mod tests {
                         "name": "list_styles",
                         "description": "Say what looks it can draw in.",
                         "inputSchema": { "type": "object", "properties": {} },
+                    }, {
+                        // The two the room works itself. Published
+                        // like any others and lent to nobody; the
+                        // test that nothing offers them is the point
+                        // of having them here.
+                        "name": "create_upload_ticket",
+                        "description": "Hand out a one-time URL to post a picture to.",
+                        "inputSchema": { "type": "object", "properties": {} },
+                    }, {
+                        "name": "import_image",
+                        "description": "Keep a picture that was posted, so it can be changed.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "image_id": { "type": "string" },
+                                "label": { "type": "string" },
+                                "style": {
+                                    "type": "string",
+                                    "enum": ["pixel-art", "cel-shaded"],
+                                },
+                            },
+                            "required": ["image_id"],
+                        },
                     }] }),
+                    // The ticket, answered the way a real one is: the
+                    // URL, and then a paragraph about posting to it
+                    // with the same URL inside a curl line. The room
+                    // reads the first one back out of the prose.
+                    "tools/call" if req["params"]["name"] == "create_upload_ticket" => {
+                        json!({ "content": [{ "type": "text", "text": format!(
+                            "Upload URL (single use, expires in 899s):\n\
+                             {base}/upload/t/tick3t\n\n\
+                             POST the image as multipart form field 'file', or as a \
+                             raw body. No Authorization header is required.\n\n  \
+                             curl -fsS -F file=@YOUR_IMAGE.png \"{base}/upload/t/tick3t\"\n"
+                        ) }] })
+                    }
+                    // And the import, which answers like any call
+                    // that draws: the picture as the server now holds
+                    // it, and a handle in the words to change it by.
+                    // The handle it was posted under is said back, so
+                    // a test can see the file really went up.
+                    "tools/call" if req["params"]["name"] == "import_image" && draws => {
+                        use base64::Engine as _;
+                        let b64 = base64::engine::general_purpose::STANDARD.encode(a_png());
+                        let args = &req["params"]["arguments"];
+                        let said = format!(
+                            "Job mockimp: {} imported{}. Refine it with \
+                             refine_pixel_art('mockimp', '<instruction>').",
+                            args["image_id"].as_str().unwrap_or("nothing"),
+                            match args["style"].as_str() {
+                                Some(style) => format!(" as {style}"),
+                                None => String::new(),
+                            }
+                        );
+                        json!({ "content": [
+                            { "type": "text", "text": said },
+                            { "type": "image", "data": b64, "mimeType": "image/png" },
+                        ] })
+                    }
                     "tools/call"
                         if matches!(
                             req["params"]["name"].as_str(),
@@ -3997,6 +4372,243 @@ mod tests {
             entry.note, "Job mock7f3: drawn.",
             "a refine's own handle is kept too, so it can be refined again"
         );
+    }
+
+    /// The whole of bringing a picture in, which is the only way a
+    /// picture somebody dropped into the room ever gets a handle: the
+    /// ticket, the file going up the socket, the import, and a second
+    /// card with the handle on it. The one they brought in is left
+    /// alone, because it is theirs.
+    #[test]
+    fn a_brought_in_picture_is_given_to_the_server_and_comes_back_changeable() {
+        let room = picture_room();
+        let g = room.generation_of_only_bot().load(Ordering::SeqCst);
+        let server = Arc::new(mcp::Server::new(mcp::Config {
+            name: "art".into(),
+            url: mock_mcp(true),
+            key: "secret".into(),
+            only: vec!["refine_pixel_art".into()],
+        }));
+        assert_eq!(
+            server.connect().expect("hello"),
+            1,
+            "the two it takes a picture with are lent to nobody"
+        );
+        assert!(server.can_import(), "and are the room's to call anyway");
+
+        // Somebody drops one in. It is picture 1, it has no handle on
+        // its card, and nothing the server offers can touch it.
+        assert_eq!(
+            room.upload_picture("Ryan", "me-at-the-lake.jpg", &a_png())
+                .expect("brought in"),
+            1
+        );
+
+        let args = json!({
+            "picture": 1,
+            "label": "a photo of Ryan by a lake",
+            "style": "cel-shaded",
+        });
+        let said = importing(&room, g, &server, &args).expect("the call went through");
+        let said = said["result"].as_str().unwrap_or_default().to_string();
+        assert!(said.contains("Picture 2"), "{said}");
+        assert!(
+            said.contains("picture 1 is still there"),
+            "and the one they brought in has not been replaced: {said}"
+        );
+
+        let cards = room.log_now();
+        let brought = cards
+            .iter()
+            .find(|e| e.kind == crate::room::Kind::Upload)
+            .expect("the picture they brought in is still a card");
+        assert_eq!(brought.title, "me-at-the-lake.jpg");
+        assert_eq!(brought.note, "", "and is still a card with no handle on it");
+
+        let redrawn = cards
+            .iter()
+            .find(|e| e.kind == crate::room::Kind::Picture)
+            .expect("and the redrawn one is a card of its own");
+        assert_eq!(redrawn.text, "picture 2");
+        assert_eq!(
+            redrawn.title, "a photo of Ryan by a lake",
+            "captioned with what the room says is in it, since the model has not seen it"
+        );
+        assert!(!redrawn.live, "and it is not still spinning");
+        assert_eq!(room.picture_png(&redrawn.id).unwrap().unwrap(), a_png());
+        // The point of the whole exercise: a handle on the card, put
+        // there by an import that really did receive the file.
+        let note = &redrawn.note;
+        assert!(
+            note.starts_with("Job mockimp: img99 imported as cel-shaded."),
+            "the handle, the file that went up, and the look asked for: {note}"
+        );
+        assert!(
+            note.contains("refine_pixel_art('mockimp'"),
+            "which is what a later turn reads off the card: {note}"
+        );
+    }
+
+    /// A number that is not a picture is the model's mistake, and it
+    /// is told so in words it can say out loud -- without a card going
+    /// up for a picture that was never going to arrive.
+    #[test]
+    fn a_picture_that_isnt_there_cannot_be_brought_in() {
+        let room = picture_room();
+        let g = room.generation_of_only_bot().load(Ordering::SeqCst);
+        let server = Arc::new(mcp::Server::new(mcp::Config {
+            name: "art".into(),
+            url: mock_mcp(true),
+            key: String::new(),
+            only: vec!["refine_pixel_art".into()],
+        }));
+        server.connect().expect("hello");
+
+        let args = json!({ "picture": 3, "label": "a dog" });
+        let err = importing(&room, g, &server, &args).expect_err("there are no pictures at all");
+        assert!(err.contains("no pictures in this conversation"), "{err}");
+        assert!(
+            !room
+                .log_now()
+                .iter()
+                .any(|e| e.kind == crate::room::Kind::Picture),
+            "and no card went up for it"
+        );
+
+        // And a call with no number at all, which is the other way a
+        // model gets this wrong.
+        let err = importing(&room, g, &server, &json!({ "label": "a dog" }))
+            .expect_err("no picture was named");
+        assert!(err.contains("number on its card"), "{err}");
+    }
+
+    /// A server that took the picture and drew nothing is not a
+    /// picture to talk about. The card says so and the model is told
+    /// to say so, rather than being handed a number it can describe.
+    #[test]
+    fn an_import_that_comes_back_empty_is_not_a_picture() {
+        let room = picture_room();
+        let g = room.generation_of_only_bot().load(Ordering::SeqCst);
+        let server = Arc::new(mcp::Server::new(mcp::Config {
+            name: "art".into(),
+            url: mock_mcp(false),
+            key: String::new(),
+            only: vec!["refine_pixel_art".into()],
+        }));
+        server.connect().expect("hello");
+        room.upload_picture("Ryan", "notes.png", &a_png())
+            .expect("brought in");
+
+        let args = json!({ "picture": 1, "label": "notes" });
+        let err = importing(&room, g, &server, &args).expect_err("nothing came back");
+        assert!(err.contains("say you couldn't"), "{err}");
+        let card = room
+            .log_now()
+            .into_iter()
+            .find(|e| e.kind == crate::room::Kind::Picture)
+            .expect("the card that went up");
+        assert!(!card.live, "has stopped spinning");
+        assert!(room.picture_png(&card.id).unwrap().is_none());
+    }
+
+    /// The two tools that take a picture of ours are the room's own
+    /// hands and are never put in front of the model -- not even when
+    /// the configuration names them, which is the way an operator
+    /// would most plausibly try to help.
+    #[test]
+    fn the_tools_that_take_a_picture_are_never_lent() {
+        let server = Arc::new(mcp::Server::new(mcp::Config {
+            name: "art".into(),
+            url: mock_mcp(true),
+            key: String::new(),
+            only: vec![
+                "generate_pixel_art".into(),
+                "create_upload_ticket".into(),
+                "import_image".into(),
+            ],
+        }));
+        assert_eq!(server.connect().expect("hello"), 1, "one of the three");
+        let offered: Vec<String> = server
+            .offer()
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap_or("").to_string())
+            .collect();
+        assert_eq!(offered, vec!["art_generate_pixel_art"]);
+        assert!(!server.has("art_create_upload_ticket"));
+        assert!(!server.has("art_import_image"));
+        // And calling one by name, which is what a model shown the
+        // configuration would try, gets nowhere.
+        assert!(server.call("art_create_upload_ticket", &json!({})).is_err());
+
+        // The room has them regardless, and knows what looks the
+        // importing one can redraw in -- read off its schema, not
+        // guessed.
+        assert!(server.can_import());
+        assert_eq!(server.import_styles(), ["pixel-art", "cel-shaded"]);
+
+        // Which is what the model is shown instead: one tool, taking
+        // the number on a card, with the server's own looks on it.
+        let art = Art {
+            servers: vec![server],
+        };
+        let tools = tools_for(
+            Allowed::Everything,
+            false,
+            false,
+            false,
+            false,
+            &art,
+            false,
+            None,
+        );
+        let redraw = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["function"]["name"] == "redraw_picture")
+            .expect("the room's own tool is offered");
+        let props = &redraw["function"]["parameters"]["properties"];
+        assert_eq!(props["picture"]["type"], "integer");
+        assert_eq!(
+            props["style"]["enum"],
+            json!(["pixel-art", "cel-shaded"]),
+            "the looks come from the server, so a room never names one it does not have"
+        );
+    }
+
+    /// And a picture server that will not take one is a room with no
+    /// such tool and no paragraph about it: a note about a tool that
+    /// is not there is an instruction to try.
+    #[test]
+    fn a_server_that_cannot_take_a_picture_offers_no_way_to_bring_one_in() {
+        let server = Arc::new(mcp::Server::new(mcp::Config {
+            name: "art".into(),
+            url: mock_mcp(true),
+            key: String::new(),
+            only: vec!["generate_pixel_art".into()],
+        }));
+        server.connect().expect("hello");
+        // The mock publishes them, so this is the room being told not
+        // to: a server whose tools list has neither cannot import,
+        // and `Art::importer` is what every gate here asks.
+        let without = Art::default();
+        assert!(without.importer().is_none());
+        let names: Vec<String> = tools_for(
+            Allowed::Everything,
+            false,
+            false,
+            false,
+            false,
+            &without,
+            false,
+            None,
+        )
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["function"]["name"].as_str().unwrap_or("").to_string())
+        .collect();
+        assert!(!names.iter().any(|n| n == "redraw_picture"), "{names:?}");
     }
 
     /// A look the model picked reaches the server as it picked it, and

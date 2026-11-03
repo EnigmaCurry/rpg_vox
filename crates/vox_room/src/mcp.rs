@@ -61,6 +61,26 @@
 //!   Diffusion does over MCP, where `upload_outputs` defaults on and
 //!   the raw payloads are deliberately left out to keep the result
 //!   small. Those are fetched here.
+//!
+//! ## Pictures going the other way
+//!
+//! A tool that changes a picture only knows the pictures its own
+//! server made. Somebody drops one into the room from their own
+//! computer and it is a picture like any other to everyone looking at
+//! it -- it has a number, it can become a face -- but it is a stranger
+//! to the server, and asking for a hat on it is asking about something
+//! that does not exist there.
+//!
+//! Closing that is [`Server::bring_in`], and the reason it is here and
+//! not in front of the model is that the middle of it is bytes. A
+//! server that takes a picture of yours hands out a one-time URL,
+//! wants the file posted to it, and gives back a handle to pass to the
+//! tool that does the importing. The model cannot post a file
+//! anywhere; the room can, and the picture is already in its database.
+//! So the two mechanical tools -- [`TICKET_TOOL`] and [`IMPORT_TOOL`]
+//! -- are never lent, however the configuration is written. They are
+//! the room's own hands. What the model gets is one room tool that
+//! takes the number on a card; see `agent::importing`.
 
 use std::collections::HashMap;
 use std::io::Read as _;
@@ -102,6 +122,28 @@ const AUTH_ARGS: &[&str] = &[
     "token",
     "secret",
 ];
+
+/// The two tools that take a picture the room already has, by the
+/// names the house's own server publishes them under. The first hands
+/// out a one-time URL to post the file to; the second takes the handle
+/// that comes back and makes the picture an asset of the server's,
+/// which is then a picture its other tools can change.
+///
+/// Never lent to the model, even when the configuration names them:
+/// the step between the two is a file going up a socket, which is the
+/// room's to do and not something a voice can be talked through. See
+/// [`Server::bring_in`] and the module docs.
+///
+/// Names and not a rule, like [`AUTH_ARGS`] and [`PROMPT_ARGS`]: there
+/// is no way to ask a server which of its tools is the one that takes
+/// a picture of yours.
+pub const TICKET_TOOL: &str = "create_upload_ticket";
+pub const IMPORT_TOOL: &str = "import_image";
+
+/// What [`IMPORT_TOOL`] calls the handle the upload came back with.
+/// Filled in by [`Server::bring_in`] from the posting it just did, the
+/// way a key is filled in from the configuration.
+const IMAGE_ARG: &str = "image_id";
 
 /// The most pictures kept from one call, and the most bytes one may be.
 /// A picture bigger than this is not an avatar, and the room says so
@@ -184,7 +226,31 @@ pub struct Server {
     /// it back, and a client that dropped it would be a stranger on
     /// every later call.
     session: Mutex<Option<String>>,
+    /// Whether this server published both of the tools that take a
+    /// picture of the room's own, and what looks the importing one can
+    /// adopt. None for a server that has neither, which is a server
+    /// whose pictures are the only ones it can change.
+    ///
+    /// Kept whether or not the two are lent -- they never are -- so
+    /// the room knows to offer the one tool that stands in front of
+    /// them. See [`Server::bring_in`].
+    imports: Mutex<Option<Imports>>,
     next_id: AtomicU64,
+}
+
+/// What the importing tool published about itself, as far as the room
+/// has any use for it.
+#[derive(Clone, Default)]
+struct Imports {
+    /// The looks it can redraw a picture in, off the `style` argument's
+    /// enum -- the same names the drawing tools take. Empty for a
+    /// server that has one look, or that does not say.
+    ///
+    /// Read from the schema rather than guessed, because which looks a
+    /// server has is the one thing about it that changes without
+    /// warning, and a room that named them would be wrong by the next
+    /// release of a server it does not own.
+    styles: Vec<String>,
 }
 
 impl Server {
@@ -197,6 +263,7 @@ impl Server {
             offer: Mutex::new(Vec::new()),
             auth: Mutex::new(HashMap::new()),
             session: Mutex::new(None),
+            imports: Mutex::new(None),
             next_id: AtomicU64::new(1),
         }
     }
@@ -244,20 +311,46 @@ impl Server {
         let mut offer = Vec::new();
         let mut auth = HashMap::new();
         let mut skipped = Vec::new();
+        // The two the room works itself, and the looks the importing
+        // one can adopt. Both have to be there for either to be any
+        // use: the ticket is how the bytes get up, the import is what
+        // turns them into a picture the server can then change.
+        let mut ticket = false;
+        let mut imports: Option<Imports> = None;
         for t in &tools {
             let Some(name) = t["name"].as_str() else {
                 continue;
             };
-            if !self.lends(name) {
-                skipped.push(name.to_string());
-                continue;
-            }
+            // Which of this tool's arguments are the key, for every
+            // tool it published and not only the lent ones -- two of
+            // them are called by the room rather than by the model,
+            // and they want authenticating like anything else.
             let keys = auth_args_in(&t["inputSchema"]);
             if !keys.is_empty() {
                 auth.insert(name.to_string(), keys);
             }
+            // The room's own hands. Taken whatever the configuration
+            // says and put in front of nobody: see the module docs.
+            match name {
+                TICKET_TOOL => {
+                    ticket = true;
+                    continue;
+                }
+                IMPORT_TOOL => {
+                    imports = Some(Imports {
+                        styles: styles_in(&t["inputSchema"]),
+                    });
+                    continue;
+                }
+                _ => {}
+            }
+            if !self.lends(name) {
+                skipped.push(name.to_string());
+                continue;
+            }
             offer.push(self.as_offered(name, t));
         }
+        let imports = imports.filter(|_| ticket);
         // A name in the configuration that the server has never heard
         // of is a typo, and a typo here is a tool the room thinks it
         // has. Said once, loudly, rather than discovered mid-sentence.
@@ -270,12 +363,28 @@ impl Server {
                 );
             }
         }
+        // Naming either of them in the configuration is harmless and
+        // is not what the operator thinks it is, so it is said once
+        // rather than left to look like it worked.
+        for want in &self.cfg.only {
+            if want == TICKET_TOOL || want == IMPORT_TOOL {
+                warn!(
+                    server = self.cfg.name,
+                    tool = want,
+                    "this one is the room's own and is never lent to the model; \
+                     it is used anyway, by the tool that brings a picture in"
+                );
+            }
+        }
         let lent = offer.len();
+        let brings_in = imports.is_some();
         *self.offer.lock().expect("offer") = offer;
         *self.auth.lock().expect("auth") = auth;
+        *self.imports.lock().expect("imports") = imports;
         info!(
             server = self.cfg.name,
             url = self.cfg.url,
+            brings_in,
             "{server} {version}: lending {lent} of its {} tools{}",
             tools.len(),
             if skipped.len() > 6 {
@@ -288,7 +397,16 @@ impl Server {
     }
 
     /// Whether `tool` is one the room lends out.
+    ///
+    /// Never the two it takes a picture with, whatever the
+    /// configuration says and whatever a model calls them by: lending
+    /// those out is lending out half of a thing that cannot be
+    /// finished without this process posting a file. See the module
+    /// docs and [`Server::bring_in`].
     fn lends(&self, tool: &str) -> bool {
+        if tool == TICKET_TOOL || tool == IMPORT_TOOL {
+            return false;
+        }
         self.cfg.only.is_empty() || self.cfg.only.iter().any(|t| t == tool)
     }
 
@@ -350,7 +468,7 @@ impl Server {
         if !self.lends(bare) {
             bail!("{tool} is not a tool this room lends");
         }
-        let mut args = match args {
+        let args = match args {
             Value::Object(_) => args.clone(),
             // A model that called with nothing, or with a string it
             // meant as JSON: an empty object is what the server wants
@@ -358,6 +476,14 @@ impl Server {
             // which is a better error than one from here.
             _ => json!({}),
         };
+        self.invoke(bare, args)
+    }
+
+    /// One tool call, by the server's own name for it and with the
+    /// arguments already settled. What [`Server::call`] does once the
+    /// model's call has been checked, and what [`Server::bring_in`]
+    /// does twice with calls the model never made.
+    fn invoke(&self, bare: &str, mut args: Value) -> Result<Outcome> {
         // The key goes in now, into whichever argument this tool calls
         // it -- which is known from the schema the server published,
         // not guessed. Then the bearer header carries it as well, for
@@ -398,6 +524,114 @@ impl Server {
             text
         };
         Ok(Outcome { said, pictures })
+    }
+
+    /// Whether this server will take a picture of the room's own.
+    /// What decides whether the room offers the tool that does it.
+    pub fn can_import(&self) -> bool {
+        self.imports.lock().expect("imports").is_some()
+    }
+
+    /// The looks it can redraw a brought-in picture in, off the
+    /// importing tool's own schema. Empty for a server that has one
+    /// look or does not say, and then the room asks for none.
+    pub fn import_styles(&self) -> Vec<String> {
+        self.imports
+            .lock()
+            .expect("imports")
+            .as_ref()
+            .map(|i| i.styles.clone())
+            .unwrap_or_default()
+    }
+
+    /// Give the server a picture the room already has, so its other
+    /// tools can change it. Three steps, and the middle one is why
+    /// this is not a tool the model can be lent:
+    ///
+    /// 1. ask for a ticket, which is a one-time URL and nothing else;
+    /// 2. post the bytes to it, which is this process and a socket;
+    /// 3. import what landed, which is the call that makes it a
+    ///    picture of the server's and answers with the handle.
+    ///
+    /// The answer is an ordinary [`Outcome`], because the third step
+    /// is an ordinary call that draws: the import comes back with the
+    /// picture as the server now holds it and with its handle in the
+    /// words, so the room posts a card exactly as it does for one that
+    /// was generated, and the handle lands on that card for the next
+    /// turn to read off. See `agent::importing`.
+    ///
+    /// `label` is what the picture is, in the words of whoever is in
+    /// the room -- the model has not seen it -- and is both the
+    /// caption and what a later change is understood against. `style`
+    /// is one of [`Server::import_styles`], or None to take the
+    /// server's own default.
+    pub fn bring_in(&self, png: &[u8], label: &str, style: Option<&str>) -> Result<Outcome> {
+        if !self.can_import() {
+            bail!("{} cannot take a picture of yours", self.cfg.name);
+        }
+        if !is_png(png) {
+            bail!("that is not a PNG");
+        }
+        if png.len() > MAX_BYTES {
+            bail!(
+                "that picture is {} KB, which is too big to send",
+                png.len() / 1024
+            );
+        }
+        let ticket = self.invoke(TICKET_TOOL, json!({}))?;
+        let url = ticket_url(&ticket.said)
+            .ok_or_else(|| anyhow!("{TICKET_TOOL} answered without a URL to post to"))?;
+        let image = self
+            .upload(url, png)
+            .with_context(|| format!("send the picture to {}", self.cfg.name))?;
+        let mut args = json!({ IMAGE_ARG: image, "label": label });
+        if let Some(style) = style.filter(|s| !s.trim().is_empty()) {
+            args["style"] = Value::from(style.trim());
+        }
+        self.invoke(IMPORT_TOOL, args)
+    }
+
+    /// Post the bytes to the ticket's URL and read the handle back.
+    ///
+    /// The ticket is the credential -- that is what one-time means --
+    /// so no key goes with this, and the body is the file itself: a
+    /// server that wants multipart accepts a raw body as well, and a
+    /// raw body is one less thing to get subtly wrong.
+    ///
+    /// Where it may be posted is checked first, and narrowly. The URL
+    /// came out of a tool result, which is to say out of something the
+    /// room does not control, and what is being sent is a picture
+    /// somebody in the room brought from their own computer. So it
+    /// goes to the server the room was configured to talk to, or over
+    /// https, and nowhere else: a plain-http URL on another host is a
+    /// tool answer asking the room to hand somebody's picture to a
+    /// stranger.
+    fn upload(&self, url: &str, png: &[u8]) -> Result<String> {
+        if !self.may_post_to(url) {
+            bail!("{url} is not where this room posts a picture");
+        }
+        let resp = self
+            .http
+            .post(url)
+            .timeout(TIMEOUT)
+            .set("content-type", "image/png")
+            .send_bytes(png)
+            .map_err(|e| self.wherefore("the upload", e))?;
+        let text = resp.into_string().context("read what the upload said")?;
+        let v: Value = serde_json::from_str(&text)
+            .with_context(|| format!("the upload answered {}", snippet(&text)))?;
+        v[IMAGE_ARG]
+            .as_str()
+            .or_else(|| v["id"].as_str())
+            .map(str::to_string)
+            .ok_or_else(|| anyhow!("the upload said no {IMAGE_ARG}: {}", snippet(&text)))
+    }
+
+    /// Whether a URL out of a tool result is one to post a picture to:
+    /// the configured server's own origin, whatever its scheme, or any
+    /// https host. See [`Server::upload`].
+    fn may_post_to(&self, url: &str) -> bool {
+        url.starts_with("https://") || origin(url).is_some_and(|o| Some(o) == origin(&self.cfg.url))
     }
 
     /// Which of this tool's arguments are the key, by what the server
@@ -642,6 +876,53 @@ fn auth_args_in(schema: &Value) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// The looks a tool can draw in, off its `style` argument's enum.
+/// Whatever the server says they are, in the order it said them.
+fn styles_in(schema: &Value) -> Vec<String> {
+    schema["properties"]["style"]["enum"]
+        .as_array()
+        .map(|looks| {
+            looks
+                .iter()
+                .filter_map(|s| s.as_str())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The URL in what [`TICKET_TOOL`] said.
+///
+/// Read out of prose, because that is how it arrives: a real server
+/// answers with the URL, then a paragraph about posting to it, then a
+/// curl line and a python snippet with the same URL inside them. The
+/// first one is the bare one, so the first is what this takes --
+/// trimmed of whatever punctuation the sentence around it had, since a
+/// URL in quotes or in brackets is still the URL.
+fn ticket_url(said: &str) -> Option<&str> {
+    said.split_whitespace()
+        // Before the look, not after: the URL in a curl line is
+        // inside quotes, and a word that starts with one does not
+        // start with http.
+        .map(|w| w.trim_matches(|c| matches!(c, '"' | '\'' | '(' | ')' | '<' | '>' | ',' | '.')))
+        .find(|w| w.starts_with("http://") || w.starts_with("https://"))
+        .filter(|w| w.len() > "https://".len())
+}
+
+/// Scheme and host of a URL, and nothing after them -- what makes two
+/// URLs the same server. None for anything that is not one.
+fn origin(url: &str) -> Option<&str> {
+    let (scheme, rest) = url.split_once("://")?;
+    if rest.is_empty() {
+        return None;
+    }
+    let host = rest.split('/').next().unwrap_or(rest);
+    if host.is_empty() {
+        return None;
+    }
+    Some(&url[..scheme.len() + "://".len() + host.len()])
 }
 
 /// The JSON out of an SSE body: the `data:` lines, joined.
@@ -928,6 +1209,80 @@ mod tests {
         );
     }
 
+    /// Brings a real picture into the real server: the ticket, the
+    /// file going up, the import, and a picture coming back with a
+    /// handle in the words. The half a made-up server cannot prove --
+    /// that the URL really is findable in the prose a server writes,
+    /// that it takes a raw body, and that what it answers the upload
+    /// with really is `image_id`.
+    ///
+    /// This one does cost GPU time: the import downscales and
+    /// quantizes what it is given. Pointed by the same environment
+    /// the room runs with, and at the repository's own logo unless
+    /// `PICTURE` says otherwise:
+    ///
+    /// ```bash
+    /// VOX_ROOM_MCP=art=https://…/mcp=generate_pixel_art,refine_pixel_art,list_styles \
+    /// VOX_ROOM_MCP_KEY=… \
+    ///   cargo test -p vox_room -- --ignored --nocapture brings_a_picture_in
+    /// ```
+    #[ignore = "sends a picture to the configured MCP server"]
+    #[test]
+    fn brings_a_picture_in() {
+        let spec = std::env::var("VOX_ROOM_MCP").expect("set VOX_ROOM_MCP, and VOX_ROOM_MCP_KEY");
+        let mut parts = spec.splitn(3, '=');
+        let name = parts.next().unwrap_or_default().trim().to_string();
+        let url = parts.next().expect("NAME=URL=TOOL,TOOL").trim().to_string();
+        let only: Vec<String> = parts
+            .next()
+            .unwrap_or_default()
+            .split(',')
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect();
+        let key = std::env::var("VOX_ROOM_MCP_KEY").unwrap_or_default();
+        let key = key
+            .strip_prefix(&format!("{name}="))
+            .unwrap_or(&key)
+            .trim()
+            .to_string();
+        let s = Server::new(Config {
+            name,
+            url,
+            key,
+            only,
+        });
+        s.connect().expect("say hello");
+        assert!(
+            s.can_import(),
+            "this server does not take a picture of ours, so there is nothing to prove"
+        );
+        println!("it can redraw in: {:?}", s.import_styles());
+
+        let path = std::env::var("PICTURE").unwrap_or_else(|_| {
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../rpg_vox.png").to_string()
+        });
+        let png = std::fs::read(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+        assert!(is_png(&png), "{path} is not a PNG");
+
+        let style = s.import_styles().first().cloned();
+        let outcome = s
+            .bring_in(&png, "the rpg_vox logo", style.as_deref())
+            .expect("bring it in");
+        println!("the server said: {}", outcome.said);
+        assert_eq!(
+            outcome.pictures.len(),
+            1,
+            "the imported picture comes back, as a picture: {}",
+            outcome.said
+        );
+        assert!(is_png(&outcome.pictures[0].png));
+        assert!(
+            !outcome.said.trim().is_empty(),
+            "and says something, because the handle to change it by is in there"
+        );
+    }
+
     #[test]
     fn pictures_come_inline_or_not_at_all() {
         let s = server(&[]);
@@ -1006,6 +1361,94 @@ mod tests {
         // the room not to put a card up.
         assert_eq!(asked_for(&json!({ "limit": 10 })), "");
         assert_eq!(asked_for(&json!({})), "");
+    }
+
+    /// The ticket arrives as prose with the URL said three times --
+    /// once bare, once in a curl line, once in a python snippet. This
+    /// is the house server's own answer, word for word.
+    #[test]
+    fn the_url_to_post_to_is_read_out_of_what_the_ticket_said() {
+        let said = "Upload URL (single use, expires in 899s):\n\
+                    https://comfyui-mcp.example.com/upload/t/o6sYqmpqnWX15G5gyy3sClrEsKnbD\n\n\
+                    POST the image as multipart form field 'file', or as a raw body.\n\
+                    No Authorization header is required.\n\n  \
+                    curl -fsS -F file=@YOUR_IMAGE.png \
+                    \"https://comfyui-mcp.example.com/upload/t/o6sYqmpqnWX15G5gyy3sClrEsKnbD\"\n";
+        assert_eq!(
+            ticket_url(said),
+            Some("https://comfyui-mcp.example.com/upload/t/o6sYqmpqnWX15G5gyy3sClrEsKnbD"),
+            "the first one, which is the bare one"
+        );
+        // Punctuation the sentence had is not part of the URL.
+        assert_eq!(
+            ticket_url("post it to \"http://box.local/upload/t/x\", then import"),
+            Some("http://box.local/upload/t/x")
+        );
+        // And a ticket tool that answered with no URL at all is a
+        // failure to say so about, not something to post into.
+        assert_eq!(ticket_url("your account is out of balance"), None);
+        assert_eq!(ticket_url(""), None);
+    }
+
+    /// Where a picture may be posted. The URL came out of a tool
+    /// result and what is going up is somebody's own photograph, so
+    /// this is the one place the room is suspicious of its own server.
+    #[test]
+    fn a_picture_is_only_posted_to_the_server_or_over_https() {
+        let s = server(&[]);
+        assert!(
+            s.may_post_to("https://anywhere.example.com/upload/t/x"),
+            "https is the protocol's own answer and is taken anywhere"
+        );
+        // The configured server is example.invalid over https; a
+        // house running one on its own machine is http, and that is
+        // only ever its own.
+        let local = Server::new(Config {
+            name: "art".into(),
+            url: "http://127.0.0.1:8188/mcp".into(),
+            key: String::new(),
+            only: Vec::new(),
+        });
+        assert!(local.may_post_to("http://127.0.0.1:8188/upload/t/x"));
+        assert!(
+            !local.may_post_to("http://evil.example.com/collect"),
+            "a tool answer that names another host over http is asking for somebody's \
+             picture, and gets nothing"
+        );
+        assert!(!local.may_post_to("file:///etc/passwd"));
+        assert!(
+            !local.may_post_to("http://127.0.0.1:9999/upload"),
+            "a port is part of who you are"
+        );
+    }
+
+    #[test]
+    fn an_origin_is_the_scheme_and_the_host_and_nothing_else() {
+        assert_eq!(
+            origin("https://a.example.com/mcp"),
+            Some("https://a.example.com")
+        );
+        assert_eq!(
+            origin("http://127.0.0.1:8188"),
+            Some("http://127.0.0.1:8188")
+        );
+        assert_eq!(origin("https://"), None);
+        assert_eq!(origin("not a url"), None);
+    }
+
+    /// The looks the importing tool can adopt, off its own schema.
+    #[test]
+    fn the_looks_a_tool_has_are_read_from_its_schema() {
+        assert_eq!(
+            styles_in(
+                &json!({ "properties": { "style": { "enum": ["pixel-art", "cel-shaded"] } } })
+            ),
+            ["pixel-art", "cel-shaded"]
+        );
+        // A server with one look, or that does not say: the room asks
+        // for none and the server's own default stands.
+        assert!(styles_in(&json!({ "properties": { "style": { "type": "string" } } })).is_empty());
+        assert!(styles_in(&json!({})).is_empty());
     }
 
     #[test]
