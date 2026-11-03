@@ -13,6 +13,7 @@
 //! {"type": "interpreter", "gain": 0.8, "mute": false}
 //! {"type": "mode", "bot": "Vox", "mode": "always"}
 //! {"type": "stops", "bot": "Vox", "stops": "finished"}
+//! {"type": "voice", "bot": "Vox", "voice": "Alan Watts"}
 //! {"type": "name_conversation", "conversation": 7, "title": "The heist"}
 //! {"type": "stop"}
 //! {"type": "new_conversation"}
@@ -1311,6 +1312,14 @@ enum Command {
         bot: String,
         stops: String,
     },
+    /// Which of the house's cloned voices one bot in this room speaks
+    /// in, from now on and after a restart. Null, or left out, is its
+    /// own voice again. See `room::Room::wear_voice`.
+    Voice {
+        bot: String,
+        #[serde(default)]
+        voice: Option<String>,
+    },
     /// Take a seat in the playhouse, or put somebody in one: the
     /// audience, the director's box, or the stage. Only while a puppet
     /// show is on -- see `room::Seat`. `who` defaults to whoever sent
@@ -1513,6 +1522,15 @@ async fn client(
                         }
                         Ok(Command::Mode { bot, mode }) => room.set_mode(&bot, &mode),
                         Ok(Command::Stops { bot, stops }) => room.set_stops(&bot, &stops),
+                        // Only the tab that asked hears why not: a
+                        // voice that has been deleted while somebody
+                        // had the picker open is their problem and
+                        // nobody else's news.
+                        Ok(Command::Voice { bot, voice }) => {
+                            if let Err(why) = room.wear_voice(&bot, voice.as_deref()) {
+                                room.tell(&name, &why);
+                            }
+                        }
                         // Only the sender hears about a message the room
                         // wouldn't take: it is their typing, not news.
                         Ok(Command::Text { text }) => {

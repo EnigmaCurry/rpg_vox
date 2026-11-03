@@ -1,6 +1,7 @@
 <script>
   import {
     room, setName, setVolume, avatarOf, forgetAvatar, myFaces, faceAt, wearFace,
+    command,
   } from '../lib/room.svelte.js';
   import { NAME_MAX } from '../lib/names.js';
   import { scaledDown } from '../lib/pixels.js';
@@ -28,6 +29,11 @@
   // whenever you are not in the middle of changing it.
   let typed = $state(null);
   const draft = $derived(typed ?? room.you ?? '');
+
+  // The AIs in the room whose voice is theirs to settle. Not the
+  // puppets: a puppet's voice is the part it plays, decided when the
+  // character was made up, and there is nothing here to choose.
+  const speakers = $derived(room.agents.filter((b) => !b.puppet));
 
   // The faces you have worn, newest first. Re-read whenever the one
   // you are wearing changes -- the AI may have given you another
@@ -163,16 +169,31 @@
     <section>
       <h2>Voices</h2>
       <p class="note">
-        Voices the AI has cloned from somebody in the house, and can be asked to
-        speak in. Nothing here is a control: ask {room.agents[0]?.name ?? 'the AI'}
-        out loud to wear one, to give it back, or to delete one — and it is
-        yours to ask about if one of them is your voice.
+        Voices the AI has cloned from somebody in the house. Choosing one here
+        settles which voice it speaks in: it keeps it from now on and comes back
+        up in it after a restart. Asking it out loud to speak in another is still
+        the quicker way, and that one only lasts the afternoon — this is what it
+        goes back to.
       </p>
-      <ul class="voices">
-        {#each room.voices as v (v.id)}
-          <li><strong>{v.name}</strong> <span class="note">— {v.who}'s voice</span></li>
-        {/each}
-      </ul>
+      {#each speakers as bot (bot.name)}
+        <label class="voice">
+          <span class="what">{bot.name} speaks in</span>
+          <select value={bot.voice ?? ''}
+            aria-label="The voice {bot.name} speaks in"
+            onchange={(e) =>
+              command({ type: 'voice', bot: bot.name, voice: e.currentTarget.value || null })}>
+            <option value="">Its own voice</option>
+            {#each room.voices as v (v.id)}
+              <option value={v.name}>{v.name} — {v.who}'s voice</option>
+            {/each}
+          </select>
+        </label>
+      {/each}
+      <p class="note">
+        Each one is somebody in the house, read aloud by them. Ask
+        {room.agents[0]?.name ?? 'the AI'} out loud to clone another or to delete
+        one — and it is yours to ask about if one of them is your voice.
+      </p>
     </section>
   {/if}
 
@@ -204,9 +225,9 @@
     overflow: auto;
     overscroll-behavior: contain;
   }
-  .voices { margin: 10px 0 0; padding-left: 18px; font-size: 14px; }
-  .voices li { margin: 2px 0; }
-  .voices .note { font-size: 13px; }
+  .voice { display: flex; align-items: center; gap: 10px; margin: 0 0 10px; }
+  .voice .what { font-size: 14px; }
+  .voice select { flex: 1; min-width: 0; }
   header { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; }
   .spacer { flex: 1; }
   h1 { font-size: 20px; margin: 0; }

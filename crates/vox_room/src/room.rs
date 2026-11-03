@@ -1582,11 +1582,32 @@ impl Room {
             let (turns, rx) = crossbeam_channel::unbounded();
             let generation = Arc::new(AtomicU64::new(0));
             // Which voice it is speaking in, shared between the room
-            // that sets it and the voices that read it. Starts empty:
-            // a bot comes up in its own voice however it went down,
-            // because what it keeps is the voices it has cloned and
-            // not which of them it was wearing on the day.
+            // that sets it and the voices that read it.
+            //
+            // Empty unless somebody chose one in Settings. Being lent
+            // a voice out loud is this afternoon's -- `speak_as` is
+            // not written down, and a bot comes up in whatever was
+            // settled on rather than whatever it happened to be
+            // wearing when the house went down. A voice that has been
+            // deleted since is nobody's: the room comes up in its own
+            // and forgets the choice, rather than asking a clone
+            // server for an id it no longer holds.
             let borrowed = crate::tts::Borrowed::default();
+            let key = format!("voice:{}", bot.name);
+            let worn = match store.setting(&key)? {
+                None => None,
+                Some(name) => match store.voice(&name)? {
+                    Some(v) => {
+                        *borrowed.lock().expect("borrowed voice mutex poisoned") = Some(v.id);
+                        Some(v.name)
+                    }
+                    None => {
+                        warn!(bot = %bot.name, voice = %name, "the voice it was set to speak in is gone");
+                        store.set_setting(&key, "")?;
+                        None
+                    }
+                },
+            };
             wiring.push(BotWiring {
                 name: bot.name.clone(),
                 generation: generation.clone(),
@@ -1607,7 +1628,7 @@ impl Room {
                 // the roster of them is kept, the stage is not.
                 part: None,
                 borrowed,
-                voice: None,
+                voice: worn,
                 generation,
                 turns,
                 chosen,
@@ -4359,6 +4380,31 @@ impl Room {
         for bot in lost {
             self.lend_voice(&mut st, &bot, None);
         }
+        // And it is not what anybody comes back up in either. The
+        // settings are per bot and name a voice rather than an id, so
+        // every one of them is read: a bot that was not wearing it
+        // this afternoon may still have been set to it.
+        let names: Vec<String> = st.bots.iter().map(|b| b.cfg.name.clone()).collect();
+        drop(st);
+        for bot in names {
+            let key = format!("voice:{bot}");
+            let was = self
+                .store()
+                .setting(&key)
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            if was.trim().is_empty() {
+                continue;
+            }
+            // By name, which is what the setting holds -- and the
+            // voice is already gone, so a name that no longer resolves
+            // is this one.
+            let still = self.store().voice(&was).ok().flatten();
+            if still.is_none() {
+                let _ = self.store().set_setting(&key, "");
+            }
+        }
         self.emit(json!({ "type": "voices", "voices": self.voices_json() }));
         Ok(())
     }
@@ -4388,12 +4434,65 @@ impl Room {
         Ok(said)
     }
 
+    /// Settle which voice one of the AIs speaks in, for good: the
+    /// picker in **Settings**, and the only way a cloned voice
+    /// outlives a restart.
+    ///
+    /// Two different things with the same effect, and the difference
+    /// is how long they last. [`Room::speak_as`] is the AI being asked
+    /// out loud, in the middle of a conversation, and is this
+    /// afternoon's; this is somebody choosing from what the house has
+    /// already cloned, which is a decision about the room and is
+    /// written down. Asked out loud afterwards to speak in something
+    /// else, it does -- and comes back up in the one chosen here.
+    ///
+    /// Anybody in the room may, like **Answers** and the faders: the
+    /// control is no more than the sentence they could say instead,
+    /// and a room of somebody's own is theirs anyway.
+    ///
+    /// `voice` is the name a voice is called out loud, or None for the
+    /// bot's own. Ok says what it is wearing now, in the same words
+    /// `speak_as` answers in.
+    pub fn wear_voice(&self, bot: &str, voice: Option<&str>) -> Result<String, String> {
+        // Out of the database before the room is locked: `voice_named`
+        // reads it, and the error it writes names every voice there is.
+        let cloned = match voice.map(str::trim).filter(|v| !v.is_empty()) {
+            Some(name) => Some(self.voice_named(name)?),
+            None => None,
+        };
+        let mut st = self.lock();
+        if !st.bots.iter().any(|b| b.cfg.name == bot) {
+            return Err(format!("there is no {bot} in this room"));
+        }
+        // A puppet's voice is the character's, decided when it was made
+        // up. There is no setting here to change and the picker is not
+        // shown for one.
+        if st.bots.iter().any(|b| b.cfg.name == bot && b.puppet()) {
+            return Err(format!(
+                "{bot} is a puppet, and its voice is the part it plays"
+            ));
+        }
+        let said = match &cloned {
+            Some(v) => format!("{} (cloned from {})", v.name, v.who),
+            None => "its own voice".to_string(),
+        };
+        let kept = cloned.as_ref().map(|v| v.name.clone()).unwrap_or_default();
+        self.lend_voice(&mut st, bot, cloned);
+        drop(st);
+        if let Err(err) = self.store().set_setting(&format!("voice:{bot}"), &kept) {
+            warn!("store the voice: {err:#}");
+        }
+        info!(bot, voice = %said, "the room settled which voice it speaks in");
+        Ok(said)
+    }
+
     /// Put a voice on a bot, or take one off: the cell its voices
     /// read, the name the room shows on its strip, and every tab told.
     ///
-    /// Not written down. What the house keeps is the voice; which of
-    /// them a bot is speaking in today is this afternoon's, so a
-    /// restart is every AI in its own voice again.
+    /// Not written down here. Which of them a bot is speaking in
+    /// *today* is this afternoon's -- see [`Room::speak_as`] -- and
+    /// the one it comes back up in is [`Room::wear_voice`]'s, which
+    /// keeps its own record.
     fn lend_voice(&self, st: &mut State, bot: &str, voice: Option<crate::store::Cloned>) {
         let (id, name) = match voice {
             Some(v) => (Some(v.id), Some(v.name)),
@@ -8276,6 +8375,57 @@ mod tests {
         (r, turns, interp_rx)
     }
 
+    /// A room opened over a database that is already there, which is
+    /// what a restart is: same file, same settings, everything the
+    /// room comes back up holding read out of it again.
+    fn room_again(store: Store) -> Arc<Room> {
+        let cfg = RoomConfig {
+            id: "Lobby".into(),
+            title: "Lobby".into(),
+            only: None,
+            default_mode: Mode::Named,
+            bots: vec![BotConfig::new("Vox", vec!["box".into()])],
+            reply_after: Duration::from_millis(1000),
+            confirm: Duration::from_millis(300),
+            engaged_for: Duration::from_millis(5000),
+            history: 50,
+            ai_turns: 2,
+            language: "English".into(),
+            languages: vec!["English".into()],
+            spoken: vec!["English".into()],
+        };
+        let (r, _wiring) = Room::new(store, cfg, None, BTreeMap::new(), None, None, None).unwrap();
+        r
+    }
+
+    /// A database on disk, so a room can be opened over it twice.
+    /// Dropped with the guard.
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new(what: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "vox_room_room_test_{}_{what}_{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir.join("room.db"))
+        }
+
+        fn open(&self) -> Store {
+            Store::open(&self.0).unwrap().in_room("Lobby")
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            if let Some(dir) = self.0.parent() {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
+    }
+
     /// A square PNG, as a picture tool would have made it.
     fn png() -> Vec<u8> {
         let mut v = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
@@ -11517,6 +11667,100 @@ mod tests {
             r.voice_named("Ryan").is_err(),
             "and there is nothing left to ask for"
         );
+    }
+
+    /// The voice picked in Settings is the one the room comes back up
+    /// in. Being asked out loud is still this afternoon's: it wins
+    /// while the house is running and is forgotten by the restart,
+    /// which comes back to what was settled.
+    #[test]
+    fn a_voice_settled_on_is_what_the_room_comes_back_up_in() {
+        let scratch = Scratch::new("settled_voice");
+        let store = scratch.open();
+        store.invite("Ryan").unwrap();
+        let r = room_again(store);
+        r.remember_voice("ryan", "Ryan", "Ryan", "The dragon was very old.")
+            .unwrap();
+        let borrowed = |r: &Arc<Room>| r.lock().bots[0].borrowed.lock().unwrap().clone();
+
+        // Nothing settled: its own voice, as it always was.
+        assert_eq!(borrowed(&r), None);
+        assert!(
+            r.wear_voice("Vox", Some("nobody")).is_err(),
+            "a voice the house hasn't got is not one to settle on"
+        );
+        assert!(
+            r.wear_voice("Nobody", Some("Ryan")).is_err(),
+            "nor a bot that isn't in this room"
+        );
+
+        let said = r.wear_voice("Vox", Some("ryan")).expect("found by name");
+        assert_eq!(said, "Ryan (cloned from Ryan)");
+        assert_eq!(borrowed(&r).as_deref(), Some("ryan"), "worn at once");
+        assert_eq!(r.agents_json(&r.lock())[0]["voice"], "Ryan");
+        assert_eq!(
+            r.store().setting("voice:Vox").unwrap().as_deref(),
+            Some("Ryan"),
+            "and written down by the name it is called out loud"
+        );
+
+        // Asked out loud for something else: that is today's, and it
+        // does not change what was settled on.
+        let g = turn(&r);
+        r.speak_as(g, None).unwrap();
+        assert_eq!(borrowed(&r), None);
+        assert_eq!(
+            r.store().setting("voice:Vox").unwrap().as_deref(),
+            Some("Ryan"),
+            "asking is not choosing"
+        );
+
+        // The house goes down and comes back up.
+        drop(r);
+        let again = room_again(scratch.open());
+        assert_eq!(
+            borrowed(&again).as_deref(),
+            Some("ryan"),
+            "which is the whole point: it comes up wearing it"
+        );
+        assert_eq!(again.agents_json(&again.lock())[0]["voice"], "Ryan");
+
+        // Its own voice again, chosen, and that is what is kept.
+        assert_eq!(again.wear_voice("Vox", None).unwrap(), "its own voice");
+        assert_eq!(borrowed(&again), None);
+        assert_eq!(
+            again.store().setting("voice:Vox").unwrap().as_deref(),
+            Some(""),
+            "settled on nothing, which is not the same as never having chosen"
+        );
+        drop(again);
+        assert_eq!(borrowed(&room_again(scratch.open())), None);
+    }
+
+    /// A voice that is deleted is not what anything comes back up in.
+    /// The setting names a voice rather than holding it, so a room
+    /// that kept the name would ask the clone server for a voice it
+    /// does not have, every time it opened.
+    #[test]
+    fn deleting_a_voice_unsettles_the_room_that_was_set_to_it() {
+        let scratch = Scratch::new("deleted_voice");
+        let store = scratch.open();
+        store.invite("Ryan").unwrap();
+        let r = room_again(store);
+        r.remember_voice("ryan", "Ryan", "Ryan", "The dragon was very old.")
+            .unwrap();
+        r.wear_voice("Vox", Some("Ryan")).unwrap();
+
+        r.forget_voice("ryan").unwrap();
+        assert_eq!(
+            r.store().setting("voice:Vox").unwrap().as_deref(),
+            Some(""),
+            "the choice went with the voice"
+        );
+        drop(r);
+        let again = room_again(scratch.open());
+        assert_eq!(again.lock().bots[0].borrowed.lock().unwrap().clone(), None);
+        assert_eq!(again.agents_json(&again.lock())[0]["voice"], Value::Null);
     }
 
     /// The room counts a reply that has gone quiet against the turn,

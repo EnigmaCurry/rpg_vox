@@ -1422,13 +1422,30 @@ nothing is left named after audio that has gone. The clip itself stays
 in the conversation it was read in, with a play button on its card, and
 goes when that conversation does.
 
-**Wearing one is temporary.** `speak_as` changes which voice the AI
-speaks in from its next sentence on, and its strip says *Speaking as
-Ryan* for as long as it lasts. Its own voice is what it comes back to:
-asked for it, or at the next restart. The voice itself survives the
-restart; which of them it was wearing that afternoon does not. A voice
-deleted from under a bot that is wearing it leaves that bot in its own
-voice rather than silent.
+**Asking for one out loud is temporary.** `speak_as` changes which
+voice the AI speaks in from its next sentence on, and its strip says
+*Speaking as Ryan* for as long as it lasts. That one is the
+afternoon's: it is not written down, and the next restart undoes it. A
+voice deleted from under a bot that is wearing it leaves that bot in
+its own voice rather than silent.
+
+**Settling one is not.** **Settings → Voices** has a picker per AI in
+the room: its own voice, or any the house has cloned. What you choose
+there it wears from that moment, keeps, and comes back up in after a
+restart — so a room whose AI should always sound like somebody is set
+once rather than asked every session. Anybody in the room may set it,
+like **Answers** and the faders: the control is no more than the
+sentence you could say instead.
+
+The two do not fight. Ask it out loud for a different voice and it
+obliges, for as long as the house is up; the one you settled on is what
+it opens in next time. A voice that is deleted is unsettled everywhere
+at once — the setting names a voice rather than holding it, and a room
+that kept the name would be asking the clone server for audio that no
+longer exists, every time it opened.
+
+A puppet has no picker: its voice is the part it plays, decided when
+the character was made up. See [Puppets](#puppets).
 
 Each AI wears its own, and only the first one can record anybody or
 keep a voice — the others can look and talk, like everything else

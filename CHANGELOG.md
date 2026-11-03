@@ -90,6 +90,29 @@ releases.
 
 ### Voice room
 
+- **A cloned voice can be the voice an AI speaks in, and stay that
+  way.** Asking out loud was the only way to put one on, and `speak_as`
+  is deliberately the afternoon's -- it is not written down, so every
+  restart brought every AI back up in the preset voice the house was
+  started with, and a room whose AI should always sound like somebody
+  had to be asked again every session. The configured voice was no help
+  either: it names a preset on the preset server, which structurally
+  cannot speak a clone.
+
+  **Settings -> Voices** now has a picker per AI in the room: its own
+  voice, or any the house has cloned. It wears the choice at once,
+  keeps it, and comes back up in it. Anybody in the room may set it,
+  like Answers and the faders -- the control is no more than the
+  sentence they could say instead -- and a puppet has no picker, since
+  its voice is the part it plays.
+
+  The two ways do not fight: asked out loud for another voice it
+  obliges for as long as the house is up, and opens next time in the
+  one that was settled on. Deleting a voice unsettles every room that
+  was set to it, because the setting names a voice rather than holding
+  it and a room that kept the name would ask the clone server for audio
+  that is gone, every time it opened.
+
 - **A picture server stopped working after a quiet hour, and now does
   not.** The session a server hands out at the handshake is ended when
   nothing has used it for a while -- the house's own server times an

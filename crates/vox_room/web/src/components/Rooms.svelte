@@ -236,13 +236,14 @@
             {/each}
           </select>
         </label>
-        <!-- A cloned voice it has been lent. Not a control: which
-             voice an AI speaks in is asked of it out loud, by
-             whoever's voice it is. It is here because a bot that has
-             stopped sounding like itself must say so somewhere, and
-             this is where everything else about it is said. -->
+        <!-- A cloned voice it is speaking in: one it was asked for
+             out loud, or the one settled on in Settings. Not a
+             control here -- the picker is in Settings, with the list
+             of voices it would be choosing from. It is said here
+             because a bot that has stopped sounding like itself must
+             say so where everything else about it is said. -->
         {#if bot.voice}
-          <p class="wearing" title="A voice {bot.name} was asked to speak in. Ask it for its own voice back.">
+          <p class="wearing" title="The voice {bot.name} is speaking in. Ask it for its own voice back, or settle which one it uses in Settings.">
             Speaking as {bot.voice}
           </p>
         {/if}
