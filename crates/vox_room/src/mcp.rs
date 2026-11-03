@@ -752,7 +752,10 @@ mod tests {
             }),
         );
         let schema = &offered["function"]["parameters"];
-        assert!(schema["properties"]["prompt"].is_object(), "the real ones stay");
+        assert!(
+            schema["properties"]["prompt"].is_object(),
+            "the real ones stay"
+        );
         assert!(
             schema["properties"]["rd_api_key"].is_null(),
             "and the key is gone"
@@ -763,7 +766,10 @@ mod tests {
             "and is not required either"
         );
         let whole = serde_json::to_string(&offered).unwrap();
-        assert!(!whole.contains("rdpk-secret"), "nor the key itself: {whole}");
+        assert!(
+            !whole.contains("rdpk-secret"),
+            "nor the key itself: {whole}"
+        );
         assert_eq!(
             offered["function"]["name"], "art_create_inference",
             "and it is named for the server it came from"
@@ -789,7 +795,8 @@ mod tests {
     /// it. This is the shape a real server actually replies with.
     #[test]
     fn an_sse_answer_is_read_as_json() {
-        let body = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n\n";
+        let body =
+            "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n\n";
         let v: Value = serde_json::from_str(&events(body)).unwrap();
         assert_eq!(v["result"]["ok"], true);
         // And a plain JSON body is left alone by the same path.
@@ -822,7 +829,11 @@ mod tests {
         // itself runs in.
         let mut parts = spec.splitn(3, '=');
         let name = parts.next().unwrap_or_default().trim().to_string();
-        let url = parts.next().expect("VOX_ROOM_MCP is NAME=URL=TOOL,TOOL").trim().to_string();
+        let url = parts
+            .next()
+            .expect("VOX_ROOM_MCP is NAME=URL=TOOL,TOOL")
+            .trim()
+            .to_string();
         let only: Vec<String> = parts
             .next()
             .unwrap_or_default()
@@ -830,7 +841,10 @@ mod tests {
             .map(|t| t.trim().to_string())
             .filter(|t| !t.is_empty())
             .collect();
-        assert!(!only.is_empty(), "name some tools, or this proves nothing about filtering");
+        assert!(
+            !only.is_empty(),
+            "name some tools, or this proves nothing about filtering"
+        );
         // `NAME=KEY` when the house runs more than one server, and the
         // key on its own when it runs one. Both are what the room
         // takes, so both work here.
@@ -848,7 +862,11 @@ mod tests {
             only: only.clone(),
         });
         let lent = s.connect().expect("say hello");
-        assert_eq!(lent, only.len(), "it lends exactly what was asked for and no more");
+        assert_eq!(
+            lent,
+            only.len(),
+            "it lends exactly what was asked for and no more"
+        );
         assert!(
             s.session.lock().unwrap().is_some(),
             "it keeps a session, and a client that dropped it would be a stranger next call"
@@ -857,7 +875,10 @@ mod tests {
         let offered = s.offer();
         for tool in &only {
             let prefixed = format!("{name}_{tool}");
-            assert!(s.has(&prefixed), "{prefixed} is lent under the room's own name");
+            assert!(
+                s.has(&prefixed),
+                "{prefixed} is lent under the room's own name"
+            );
         }
         // Nothing of the key reaches the model: not the value, and
         // not a field inviting one to be invented. The fields are
@@ -865,7 +886,10 @@ mod tests {
         // because a description is prose and prose says "token".
         if !key.is_empty() {
             let whole = serde_json::to_string(&offered).unwrap();
-            assert!(!whole.contains(&key), "the key is not in what the model is shown");
+            assert!(
+                !whole.contains(&key),
+                "the key is not in what the model is shown"
+            );
         }
         for tool in &offered {
             let props = &tool["function"]["parameters"]["properties"];
@@ -898,7 +922,10 @@ mod tests {
             };
             println!("{} draws from {from}", tool["function"]["name"]);
         }
-        assert!(draws > 0, "none of the lent tools takes any of {PROMPT_ARGS:?}");
+        assert!(
+            draws > 0,
+            "none of the lent tools takes any of {PROMPT_ARGS:?}"
+        );
     }
 
     #[test]
@@ -938,7 +965,10 @@ mod tests {
 
         // Nothing at all: a tool that only said something.
         assert!(s
-            .pictures_of(&json!({ "content": [{ "type": "text", "text": "balance: $1.00" }] }), "")
+            .pictures_of(
+                &json!({ "content": [{ "type": "text", "text": "balance: $1.00" }] }),
+                ""
+            )
             .is_empty());
     }
 
@@ -948,13 +978,19 @@ mod tests {
     /// no card and caption the picture with nothing.
     #[test]
     fn the_words_are_found_under_whatever_the_tool_calls_them() {
-        assert_eq!(asked_for(&json!({ "prompt": " a brass head " })), "a brass head");
+        assert_eq!(
+            asked_for(&json!({ "prompt": " a brass head " })),
+            "a brass head"
+        );
         assert_eq!(
             asked_for(&json!({ "job_id": "41fc", "instruction": "give it a red top hat" })),
             "give it a red top hat",
             "a refine is asked in two parts and only one of them is words"
         );
-        assert_eq!(asked_for(&json!({ "image_id": "x", "label": "my dog" })), "my dog");
+        assert_eq!(
+            asked_for(&json!({ "image_id": "x", "label": "my dog" })),
+            "my dog"
+        );
         // A tool with two of them is read in PROMPT_ARGS order.
         assert_eq!(
             asked_for(&json!({ "prompt": "a knight", "instruction": "redder" })),
@@ -962,7 +998,10 @@ mod tests {
         );
         // Blank is not words: an empty `prompt` must not hide the
         // `instruction` underneath it.
-        assert_eq!(asked_for(&json!({ "prompt": "  ", "instruction": "redder" })), "redder");
+        assert_eq!(
+            asked_for(&json!({ "prompt": "  ", "instruction": "redder" })),
+            "redder"
+        );
         // And a call that is not drawing has none, which is what tells
         // the room not to put a card up.
         assert_eq!(asked_for(&json!({ "limit": 10 })), "");

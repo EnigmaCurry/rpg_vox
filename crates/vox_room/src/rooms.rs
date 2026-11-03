@@ -722,10 +722,12 @@ mod tests {
             &cfg,
             &names,
             Box::new(|cfg| {
-                Room::new(Store::memory(), cfg, None, BTreeMap::new(), None).map(|(room, w)| {
-                    std::mem::forget(w);
-                    room
-                })
+                Room::new(Store::memory(), cfg, None, BTreeMap::new(), None, None).map(
+                    |(room, w)| {
+                        std::mem::forget(w);
+                        room
+                    },
+                )
             }),
         )
         .unwrap()
@@ -798,7 +800,7 @@ mod tests {
                 let store = Store::memory();
                 store.invite("Ryan").unwrap();
                 store.invite("Alex").unwrap();
-                Room::new(store, cfg, None, BTreeMap::new(), None).map(|(room, wiring)| {
+                Room::new(store, cfg, None, BTreeMap::new(), None, None).map(|(room, wiring)| {
                     // The receivers would otherwise be dropped, and a
                     // turn sent to a closed channel is an error the
                     // room logs.
@@ -827,10 +829,12 @@ mod tests {
     /// Rooms made out of nothing, for the house tests.
     fn make_rooms() -> Make {
         Box::new(|cfg| {
-            Room::new(Store::memory(), cfg, None, BTreeMap::new(), None).map(|(room, wiring)| {
-                std::mem::forget(wiring);
-                room
-            })
+            Room::new(Store::memory(), cfg, None, BTreeMap::new(), None, None).map(
+                |(room, wiring)| {
+                    std::mem::forget(wiring);
+                    room
+                },
+            )
         })
     }
 

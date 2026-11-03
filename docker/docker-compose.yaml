@@ -61,14 +61,16 @@ services:
     ## and the Host header still work -- only the lookup is overridden.
     ## Unset, each is an inert .invalid line. See ROOM_DOCKER.md.
     ##
-    ## There are two because a room commonly needs two: the TTS server and
-    ## the picture server are separate names and are often both behind the
-    ## same Traefik. A compose list cannot be grown from one variable, so
-    ## the slots are counted out; a third wants another line here.
+    ## There are three because a room commonly needs three: the TTS
+    ## server, the voice-cloning server and the picture server are
+    ## separate names and are often all behind the same Traefik. A
+    ## compose list cannot be grown from one variable, so the slots are
+    ## counted out; a fourth wants another line here.
     extra_hosts:
       - "host.docker.internal:host-gateway"
       - "${VOX_ROOM_PIN_HOST:-unpinned.invalid}:${VOX_ROOM_PIN_IP:-127.0.0.1}"
       - "${VOX_ROOM_PIN_HOST_2:-unpinned2.invalid}:${VOX_ROOM_PIN_IP_2:-127.0.0.1}"
+      - "${VOX_ROOM_PIN_HOST_3:-unpinned3.invalid}:${VOX_ROOM_PIN_IP_3:-127.0.0.1}"
 
     ## vox_room's graceful shutdown waits on ctrl_c, i.e. SIGINT, and as
     ## PID 1 it ignores the SIGTERM docker would otherwise send -- so

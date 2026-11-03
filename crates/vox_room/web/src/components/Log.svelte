@@ -1,5 +1,5 @@
 <script>
-  import { room, enterGame, peekGame, theAI, waitingAI, pictureOf } from '../lib/room.svelte.js';
+  import { room, enterGame, peekGame, theAI, theAIs, waitingAI, pictureOf, sampleOf } from '../lib/room.svelte.js';
   import History from './History.svelte';
   import Face from './Face.svelte';
   import { hue } from '../lib/color.js';
@@ -97,8 +97,10 @@
   const archived = $derived(!!room.reading);
 
   // A room can have more than one AI in it, and prose written for one
-  // of them reads wrong the moment it does.
-  const one = $derived(room.agents.length === 1);
+  // of them reads wrong the moment it does. Puppets are not among them:
+  // nothing here is a thing to ask one of those to do.
+  const ais = $derived(theAIs());
+  const one = $derived(ais.length === 1);
   const it = $derived(one ? 'it' : 'them');
   const answers = $derived(one ? 'it answers' : 'they answer');
 </script>
@@ -117,13 +119,13 @@
           Nothing was ever said in this one.
         {:else if room.game}
           Entering <strong>{room.game}</strong>…
-        {:else if room.agents.every((a) => a.mode === 'never')}
+        {:else if ais.every((a) => a.mode === 'never')}
           Nothing said yet. {theAI()} {one ? 'is' : 'are'} set to say nothing at all,
           so the room is yours: join the audio and talk. Change
           <strong>Answers</strong> beside {it} to bring {it} in.
         {:else}
           Nothing said yet. Join the audio and start talking; say <strong>{theAI()}</strong>
-          {room.agents.every((a) => a.mode === 'named')
+          {ais.every((a) => a.mode === 'named')
             ? `to bring ${it} in`
             : `or just talk, and ${answers} when you pause`}.
           Ask {it} to design a game with you, then ask {it} to start, change or delete games by voice.
@@ -216,6 +218,48 @@
                 {/if}
               </div>
               {#if e.title}<p class="asked">{e.title}</p>{/if}
+            </div>
+          </div>
+        </div>
+      {:else if e.kind === 'sample'}
+        <!-- A few seconds of somebody reading aloud, recorded so a
+             voice can be cloned from it. The card goes up the moment
+             the room starts listening and says so while it is: it is
+             the light on a microphone being recorded, and it is here
+             in the conversation where nobody can miss it rather than
+             on one person's screen.
+
+             Theirs, not the AI's: it carries their face and their
+             colour, because it is their voice. The clip can be played
+             by anyone in the room, which is no more than they could
+             already hear. -->
+        {@const clip = room.samples[e.id]}
+        <div class="entry sample-entry" class:you={e.who === room.you} style="--h: {hue(e.who)}">
+          <Face who={e.who} />
+          <div class="said-by">
+            <div class="who">
+              <span class="name">{e.who}</span>
+              <span class="time">
+                {time(e.at)} · {e.text}{clip?.ready ? ` · ${Math.round(clip.secs)}s` : ''}
+              </span>
+            </div>
+            <div class="card clip-card">
+              {#if clip?.ready}
+                <audio controls preload="none" src={sampleOf(e.id)}></audio>
+                {#if clip.said}<p class="asked">“{clip.said}”</p>{/if}
+              {:else if clip?.failed}
+                <p class="hint">{clip.failed}</p>
+              {:else}
+                <p class="listening">
+                  <span class="rec" aria-hidden="true"></span>
+                  {#if e.who === room.you}
+                    Recording — read your card aloud.
+                  {:else}
+                    Recording {e.who}.
+                  {/if}
+                </p>
+                {#if clip?.passage}<p class="asked">{clip.passage}</p>{/if}
+              {/if}
             </div>
           </div>
         </div>
@@ -423,6 +467,28 @@
      inherit the rule that gives them it. */
   .card.shot-card { width: max-content; max-width: 100%; gap: 6px; }
   .hint { color: var(--muted); font-size: 13px; }
+  /* A clip is as wide as the player it holds, like a picture card is
+     as wide as its picture. */
+  .card.clip-card { width: max-content; max-width: 100%; gap: 6px; }
+  .clip-card audio { width: min(20rem, 100%); height: 32px; }
+  .clip-card .asked { max-width: 20rem; }
+  .listening { margin: 0; font-size: 13px; display: flex; align-items: center; gap: 6px; }
+  /* The one red thing in the room, and it means exactly one thing:
+     somebody's microphone is being recorded right now. */
+  .rec {
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background: #d8463c;
+    animation: recording 1.6s ease-in-out infinite;
+  }
+  @keyframes recording {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.25; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .rec { animation: none; }
+  }
   .doings { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
   .doings button { padding: 2px 10px; font-size: 13px; }
   /* An entry is its face and then everything that was said: the

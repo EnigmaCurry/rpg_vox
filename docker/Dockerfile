@@ -46,11 +46,14 @@ RUN pnpm run build
 FROM ${PYTHON_IMAGE} AS tokenizers
 RUN pip install --no-cache-dir sentencepiece tokenizers
 WORKDIR /t
-COPY tools/spm2tokenizer.py ./
+# The download before the script, because it does not depend on it:
+# copied first, editing the converter would fetch both .spm files again
+# to convert the same bytes a different way.
 RUN python3 -c "import urllib.request as u, pathlib; \
 [ (pathlib.Path(p).mkdir(exist_ok=True), \
    u.urlretrieve(f'https://huggingface.co/manancode/opus-mt-{p}-ctranslate2-android/resolve/main/source.spm', \
                  f'{p}/source.spm')) for p in ('en-ru', 'ru-en') ]"
+COPY tools/spm2tokenizer.py ./
 # Refuses to write a tokenizer that splits text differently from the
 # .spm, so a bad conversion fails the build rather than the room.
 RUN python3 spm2tokenizer.py en-ru ru-en

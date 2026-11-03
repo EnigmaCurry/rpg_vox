@@ -159,6 +159,23 @@
     </label>
   </section>
 
+  {#if room.voices.length}
+    <section>
+      <h2>Voices</h2>
+      <p class="note">
+        Voices the AI has cloned from somebody in the house, and can be asked to
+        speak in. Nothing here is a control: ask {room.agents[0]?.name ?? 'the AI'}
+        out loud to wear one, to give it back, or to delete one — and it is
+        yours to ask about if one of them is your voice.
+      </p>
+      <ul class="voices">
+        {#each room.voices as v (v.id)}
+          <li><strong>{v.name}</strong> <span class="note">— {v.who}'s voice</span></li>
+        {/each}
+      </ul>
+    </section>
+  {/if}
+
   {#if room.owner}
     <section>
       <h2>The house</h2>
@@ -187,6 +204,9 @@
     overflow: auto;
     overscroll-behavior: contain;
   }
+  .voices { margin: 10px 0 0; padding-left: 18px; font-size: 14px; }
+  .voices li { margin: 2px 0; }
+  .voices .note { font-size: 13px; }
   header { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; }
   .spacer { flex: 1; }
   h1 { font-size: 20px; margin: 0; }

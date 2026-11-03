@@ -241,6 +241,13 @@ What each of them is is its own:
   said" reads as what it is. A bot that was shown another's reply as
   its own would answer for it, or argue with itself.
 
+The first AI can also put **[puppets](#puppets)** in the room:
+characters with a name, a face and a voice and no brain at all, which it
+speaks through. A puppet is how a room gets a scripted scene with
+timing in it — an interjection landing on the half-second, one voice
+cutting another off — which two AIs taking turns with a model each
+cannot do.
+
 **What each of them may do is not the same.** The first AI is the one
 the room was built around and the one that runs it: the cards, the
 games, standing down, the web. Every other bot is a voice in it, and a
@@ -1303,6 +1310,195 @@ renaming themselves. **Settings → Your face** takes yours off again,
 and yours is the only one you can take off — not even the owner can
 clear somebody else's.
 
+### Voices
+
+With a **voice-cloning server** configured (`VOX_ROOM_TTS_CLONE_URL` —
+the `clone` service of `qwen3-tts/docker-compose.yml`, which holds the
+one Qwen3-TTS model that can take a reference clip), the AI can record
+a few seconds of somebody in the room reading aloud, keep a voice
+cloned from it under a name, and be asked to speak in it. Without one
+it has none of those tools and nothing in its prompt mentions them.
+
+Ask for it out loud. The AI says what it is about to do, then puts a
+**card with a passage on your screen** and the room starts listening —
+and a card goes into the conversation, in your name, with a red dot on
+it saying it is recording. **No microphone here is recorded without a
+light on it**, and the light is in the conversation where the whole
+room can see it rather than on the screen of the one person being
+recorded.
+
+Then read the passage. The clip starts on your first word — the room
+keeps the moment before it, so nothing is clipped — and ends when you
+stop. On push to talk it ends when you let go of the key, which is the
+cleanest end there is: you stopped reading and said so. Two words and a
+pause is not a reading: *"go on then"* is forgotten and the room keeps
+listening, and so is letting go of the key after two words. Nothing at all for two minutes and it gives up, and the card
+says so. The clip is capped at thirty seconds, and a voice is cloned
+from a good deal less.
+
+Being muted is not a refusal when push to talk is on — that is what
+push to talk *is*, muted between every word — so the AI can arm the
+recording and you hold the key when you are ready. Muted with push to
+talk off is refused, and so is a strip turned off on the room's own
+mixer, which is not yours to unmute.
+
+**What you are reading is a clip and not a turn**: the AI is not handed
+it as something said to it, even in a room where it answers every
+pause. It gets the turn when the clip lands, with the card in the
+conversation in front of it — how long it is, and what you said. Then
+it asks what to call the voice, and `save_voice` keeps it under that
+name.
+
+The clip's **transcript goes with it**: the server clones better from a
+few seconds of speech when it is told what the speech says, and the
+room has that already from the transcription. Where nothing was
+written down, the passage stands in for it.
+
+A kept voice is **the house's**, under the name you gave it: any room
+can ask the AI to speak in it, `list_voices` says what there is, and
+`forget_voice` deletes one for good — the server's copy first, so
+nothing is left named after audio that has gone. The clip itself stays
+in the conversation it was read in, with a play button on its card, and
+goes when that conversation does.
+
+**Wearing one is temporary.** `speak_as` changes which voice the AI
+speaks in from its next sentence on, and its strip says *Speaking as
+Ryan* for as long as it lasts. Its own voice is what it comes back to:
+asked for it, or at the next restart. The voice itself survives the
+restart; which of them it was wearing that afternoon does not. A voice
+deleted from under a bot that is wearing it leaves that bot in its own
+voice rather than silent.
+
+Each AI wears its own, and only the first one can record anybody or
+keep a voice — the others can look and talk, like everything else
+under [More than one AI in a room](#more-than-one-ai-in-a-room). A
+voice it has been lent is spoken in every language the room is
+listening in: the bot changes voice, not one of its languages.
+
+The clips are 16-bit mono WAV at 24 kHz — Qwen3-TTS's own rate — kept
+as blobs in the database beside the pictures, and fetched by whoever
+presses play. Anyone invited can play one, which is no more than they
+could already hear: it is what somebody said out loud in a room with
+everybody else in it, and the transcript of it is on every screen
+there.
+
+
+### Puppets
+
+A bot has a brain of its own. Two of them in a room are two models
+talking to each other, a request each per line, each deciding for
+itself what to say next — which is the point of them, and which is also
+why they cannot act out a scene. Neither one knows what the other is
+about to say, so there is no timing to it: every line waits for a model
+to finish thinking, and an interjection lands wherever the round trip
+put it.
+
+A **puppet** is the other half of that. It has a name, a face, a voice
+and a fader of its own — to anybody in the room it *is* another voice
+in the room — and nothing behind it at all. What a puppet says is the
+first AI's, written in advance and said through it. **Nothing ever
+gives a puppet the turn**, because there is nothing there to take one:
+its Answers is `never` and is not a setting anybody chose. Saying a
+puppet's name gives the turn to the AI that holds it, which is how a
+puppet left standing after a show takes a question.
+
+That is what makes a **puppet show** possible. The AI writes the whole
+scene first, every line of it; the room turns it all into speech
+*before* it plays — a line or two ahead, so the audio for line four is
+made while line three is being heard — and then the lines land exactly
+where the script put them. A beat of silence. An answer coming in on
+the last word. Two voices over each other for half a second. **The
+timing is the whole reason to do it**; a play made up a line at a time
+is not worth the puppets.
+
+**Every line is spoken in full**, to its last syllable. An interruption
+is not something the room does to a line; it is something the script
+*writes*: the interrupted line stops where the character got to and
+ends with a dash — *"But I only wanted—"* — and the line after it comes
+in over the tail. The room used to do it the other way, synthesizing a
+whole line and then cutting the audio off with the same machinery a
+person talking over a bot uses, and that was wrong twice over. The cut
+landed where the wall clock said rather than where the writing meant,
+and most of a line the speech server had been paid for was thrown away.
+A playwright knows that the sentence breaks after *"wanted"*; nothing
+else does.
+
+It needs a speech server (`--tts qwen3`). Without one there are no
+puppets at all and nothing in the AI's prompt mentions them: a puppet
+with no voice is a name on a fader.
+
+**Making one.** Ask out loud. `make_puppet` keeps a character under a
+name, with a line about who it is and a line of **delivery notes** —
+written as instructions to an actor, *"gruff and slow, an old soldier
+who has told this story before"*. That line is what makes a puppet
+sound like itself rather than like the AI, and it is the usual answer in
+a house with no cloned voices: the delivery goes to Qwen3-TTS as its
+`instructions`, over whichever of the server's voices the character was
+built on (`VOX_ROOM_TTS_VOICES` says what there is). Where somebody has
+read for a [cloned voice](#voices), a puppet can have that instead.
+
+A puppet wears a face the way everybody in the room does: make a
+picture, show it to the room, `set_avatar` it onto the puppet by name,
+`set_bio` writes who it is. **The name, the voice, the face and the bio
+are the house's from then on** — `list_puppets` is the roster, and a
+character made one evening can be cast again months later without being
+made again. `forget_puppet` deletes one for good, and takes every face
+it ever wore with it: a name that is free again must not hand the next
+character somebody's old portrait.
+
+The stage is not the roster. `bring_on_puppets` puts a cast in the
+room, where everyone watches them arrive and can see who is about to
+speak; `send_off_puppets` takes them out again, and what they said stays
+in the conversation with their names on it, because that is what
+happened. Six at once is the limit, which is a limit on what an
+audience can follow rather than on anything the server minds. **The
+stage does not survive a restart** — the roster does. A puppet is
+something the room is doing, like a game; the characters are something
+the house keeps, like the voices.
+
+**Setting a show up** is a conversation, and the AI is told to have it
+in order: who is in it, from the roster or made now; what it is about;
+and only then the script. `put_on_show` takes a title and every line in
+one call — `who`, `say`, and the timing. `pause` is the seconds of
+silence before a line, measured from the moment the one before it was
+heard out. `over` is the other kind: the line comes in that many
+seconds before the previous one ends, so both are heard at once for
+that long, which is what an interjection sounds like. Half a second is
+somebody landing on your last word. A line may be the AI's own, so it
+can take a part in its own play. It may never be another bot's: that
+one has a brain of its own and will answer for itself.
+
+**While it plays, the room is set for it.** The AI and every voice in
+the room go to **Answers: never** and **Stops: when finished** the
+moment the curtain goes up, and back to exactly what they were when it
+comes down. Both are *set*, visibly, on the same controls anybody could
+set them with, because a scripted exchange that stopped dead when
+somebody in the audience cleared their throat is not a play, and a
+director that broke off mid-scene to answer a question is not one
+either. A show is a thing the room is doing and it binds every bot in
+it, the way a game's reply mode does.
+
+A line in the room list says what is playing and how far in it is.
+**Stop** brings the curtain down — that button is never a game's or a
+show's to take, and a play set to finish whatever anybody says is
+exactly the thing somebody needs a way out of. The settings are written
+down as well as set, so a server that stops in the middle of the second
+act does not come back up with its AI silenced for good.
+
+**When it ends** the AI is given the turn to say so, with a card in the
+conversation saying what played and who is still standing there, and the
+room is its own again: it answers, and it can be interrupted. If the
+room would rather ask the puppets things than send them away, they stay,
+and `say_as` says one line as one of them, now — rendered first and
+queued second, so two puppets answering in turn have no hole between
+them. Anything said while the show was on is still in the conversation
+waiting to be read, which is how the AI knows what the audience made of
+it.
+
+The puppets speak every language the room is listening in, like the AIs
+do: each line is translated and synthesized ahead of time in each of
+them, and the timing follows the room's own language.
+
 ## How it works
 
 - One WebSocket per tab carries 20 ms mono Opus frames both ways
@@ -1382,7 +1578,9 @@ pays for a rejected request before every reply.
 | `VOX_ROOM_PROMPT`, `VOX_ROOM_PROMPT_FILE` | a short one for spoken group chat | system prompt; `{name}` and `{people}` are filled in |
 | `VOX_ROOM_TTS` | see above | `qwen3`, `kokoro` or `none` |
 | `VOX_ROOM_TTS_URL` | `PI_TTS_URL` | Qwen3-TTS server (`/v1/audio/speech`) |
+| `VOX_ROOM_TTS_CLONE_URL`, `VOX_ROOM_TTS_CLONE_KEY` | | a voice-cloning server (the `clone` service of `qwen3-tts/`), and its key if it isn't `VOX_ROOM_TTS_KEY`'s. With one the AI can record somebody reading aloud and speak in a voice cloned from it; without one it has no such tools. Needs `--tts qwen3`. See [Voices](#voices) |
 | `VOX_ROOM_VOICE`, `VOX_ROOM_INSTRUCT`, `VOX_ROOM_LANGUAGE` | `aiden`, none, `English` | Qwen3 voice, delivery and language |
+| `VOX_ROOM_TTS_VOICES` | asked of the server | the voices a [puppet](#puppets) may be built on, comma-separated. Normally not set: the room asks `/v1/audio/voices` as it opens and keeps the server's own voices, leaving out the clones uploaded to it. Set it for a server that won't say — and spell the names the way its `/v1/audio/speech` takes them (`uncle_fu`, not "Uncle Fu") |
 | `VOX_ROOM_LANGUAGES` | | other languages the door offers, comma-separated and spelled out in English (`Russian`). The AI answers in each one somebody is listening in; needs `--tts qwen3` |
 | `VOX_ROOM_TRANSLATE` | `openai` | who translates: `openai` asks the reply model, `local` asks Marian models on the CPU (see below) |
 | `VOX_ROOM_INTERPRET` | `true` | say what people say to the people who don't speak it, with the voices being interpreted ducked under it. `false` to translate only the AI and what is typed |
@@ -1394,7 +1592,20 @@ pays for a rejected request before every reply.
 
 ## Testing
 
-`cargo test -p vox_room` covers the mixer, turn taking and barge-in.
+`cargo test -p vox_room` covers the mixer, turn taking, barge-in,
+recording somebody reading aloud, and the puppets — including a whole
+show played out against a real room and a real mixer on a real clock,
+which is the only way to test that a pause is a pause and that an
+overlap lands where the script said. Two more talk to real servers and
+are not run by default:
+
+```bash
+VOX_ROOM_TTS_URL=… cargo test -p vox_room -- --ignored speaks_two
+VOX_ROOM_TTS_CLONE_URL=… cargo test -p vox_room -- --ignored clones
+```
+
+The second keeps a voice under a name, lists it, speaks a sentence in it
+and deletes it again.
 
 `crates/vox_room/e2e/run.sh` is everything that needs a running room and
 nothing of yours. It starts a room of its own on a scratch database,

@@ -68,12 +68,31 @@ const focused = (page) =>
   await page.waitForTimeout(400);
 
   // A fader's mute is a button too, and the one most likely to be under
-  // your hand.
+  // your hand. Clicked twice, so the strip is live again while the
+  // focus is still sitting on it: what this is about is where the key
+  // goes, not what the fader does.
+  await page.click('.rooms .strip button[aria-pressed]');
+  await page.waitForTimeout(400);
   await page.click('.rooms .strip button[aria-pressed]');
   await page.waitForTimeout(400);
   is('Space talks from a mute', await space(page), true);
+
+  // What the fader does is the other thing, and the first strip is
+  // your own: muted there, the room is not listening to you at all --
+  // nothing you say is transcribed or heard. So the talk button has to
+  // be dead and say why, rather than going green over audio that is
+  // being thrown away. A button that lights up is the room claiming to
+  // be listening, and it has to be true.
   await page.click('.rooms .strip button[aria-pressed]');
   await page.waitForTimeout(400);
+  is('the talk button is dead while the room has you muted',
+    await page.evaluate(() => !!document.querySelector('footer .big.ptt[disabled]')), true);
+  is('and says which mute it is',
+    await page.evaluate(() => document.querySelector('footer .big.ptt')?.textContent.includes('mixer')), true);
+  is('and Space does not talk', await space(page), false);
+  await page.click('.rooms .strip button[aria-pressed]');
+  await page.waitForTimeout(400);
+  is('unmuted, the key is yours again', await space(page), true);
 
   // Where Space is not yours: typing it types it.
   await page.click('.say textarea');

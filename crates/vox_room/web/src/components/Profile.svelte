@@ -1,5 +1,5 @@
 <script>
-  import { room, closeProfile, avatarOf } from '../lib/room.svelte.js';
+  import { room, closeProfile, avatarOf, theAIs } from '../lib/room.svelte.js';
   import { hue } from '../lib/color.js';
   import { scaledDown } from '../lib/pixels.js';
 
@@ -65,7 +65,12 @@
 
       <h2>{p.who}</h2>
       <div class="tags">
-        {#if p.bot}
+        {#if p.puppet}
+          <!-- Not an AI: a character one of them speaks through, with
+               nothing of its own behind it. The one thing somebody
+               clicking its face wants to know. -->
+          <span class="tag ai" title="A character {theAIs()[0]?.name ?? 'the AI'} speaks through. There is nothing behind it: what it says was written for it.">a puppet</span>
+        {:else if p.bot}
           <span class="tag ai">an AI</span>
         {:else if p.owner}
           <span class="tag">whose room this is</span>
@@ -86,7 +91,7 @@
         {#if p.bio}
           <p class="bio">{p.bio}</p>
         {:else}
-          {@const asker = room.agents.find((a) => a.name !== p.who)?.name}
+          {@const asker = theAIs().find((a) => a.name !== p.who)?.name}
           <p class="quiet">
             Nothing written about {p.bot ? 'it' : 'them'} yet.{#if asker}
               Ask {asker} out loud.{/if}

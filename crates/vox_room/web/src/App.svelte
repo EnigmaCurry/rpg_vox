@@ -1,6 +1,6 @@
 <script>
   import { onMount } from 'svelte';
-  import { room, command, ask, answer, whoami, leaveAudio, setMuted, setPushToTalk, talk, busyAI, dropPicture, notice } from './lib/room.svelte.js';
+  import { room, command, ask, answer, whoami, leaveAudio, setMuted, setPushToTalk, talk, busyAI, dropPicture, notice, mutedByRoom } from './lib/room.svelte.js';
   import { screen, share, stopSharing, supported as canShare } from './lib/screen.svelte.js';
   import Log from './components/Log.svelte';
   import Cards from './components/Cards.svelte';
@@ -21,6 +21,12 @@
   // the last one back at any moment — in which case whoever was looking
   // at that tab is put back on the conversation.
   const hasCards = $derived(room.cards.length > 0);
+  // The room's mixer has your own strip turned off, so nothing you say
+  // here is heard however open your mic is. Said by the mic button and
+  // nowhere else: a dead button named for the mute that stopped it is
+  // the whole message, and a line of prose beside it only repeats what
+  // the button already is.
+  const stripMuted = $derived(mutedByRoom());
   const area = $derived(view === 'cards' && !hasCards ? 'chat' : view);
 
   // The rooms are not a tab any more -- which room you are in is the
@@ -145,6 +151,12 @@
   function onkeydown(e) {
     if (!spaceKey(e)) return;
     e.preventDefault();
+    // Muted on the room's mixer, the space bar still belongs to your
+    // microphone -- it just has nothing left to do with it. Claimed and
+    // ignored rather than handed back to the page, so nothing jumps
+    // under you, and your own mute is left where it was: changing it
+    // would move a switch that cannot make you heard.
+    if (stripMuted) return;
     if (room.pushToTalk) talk(true);
     else if (!e.repeat) setMuted(!room.muted);
   }
@@ -288,16 +300,16 @@
       {#if room.audio === 'on'}
         <div class="mic">
         {#if room.pushToTalk}
-          <button class="big ptt" class:talking={room.talking} disabled={!room.mic}
+          <button class="big ptt" class:talking={room.talking} disabled={!room.mic || stripMuted}
             onpointerdown={(e) => { e.currentTarget.setPointerCapture(e.pointerId); talk(true); }}
             onpointerup={() => talk(false)} onpointercancel={() => talk(false)}
             onkeydown={(e) => { if (e.code === 'Enter') { e.preventDefault(); talk(true); } }}
             onkeyup={(e) => { if (e.code === 'Enter') { e.preventDefault(); talk(false); } }}>
-            {room.talking ? 'Talking…' : 'Hold to talk'} <kbd>Space</kbd>
+            {stripMuted ? 'Muted on the mixer' : room.talking ? 'Talking…' : 'Hold to talk'} <kbd>Space</kbd>
           </button>
         {:else}
-          <button class="big" class:muted={room.muted} onclick={() => setMuted(!room.muted)} disabled={!room.mic}>
-            {room.muted ? 'Unmute' : 'Mute'} <kbd>Space</kbd>
+          <button class="big" class:muted={room.muted || stripMuted} onclick={() => setMuted(!room.muted)} disabled={!room.mic || stripMuted}>
+            {stripMuted ? 'Muted on the mixer' : room.muted ? 'Unmute' : 'Mute'} <kbd>Space</kbd>
           </button>
         {/if}
         <!-- Beside the button it changes, because it changes what that

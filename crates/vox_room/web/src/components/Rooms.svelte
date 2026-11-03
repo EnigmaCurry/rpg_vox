@@ -163,6 +163,18 @@
 </h1>
 
 <nav class="rooms" aria-label="Who is in {room.title}">
+  <!-- A puppet show playing. Said here, over the strips, because the
+       faders below are where the puppets are and because this is the
+       one time the room has set everybody's Answers and Stops itself:
+       the line says why they read the way they do. Stop brings it
+       down. -->
+  {#if room.show}
+    <p class="show" title="The AI and the puppets in it answer nothing and finish what they say until the curtain comes down. Stop ends it.">
+      <span class="curtain" aria-hidden="true">●</span>
+      <span class="title">{room.show.title}</span>
+      <span class="at">line {Math.min(room.show.said + 1, room.show.lines)} of {room.show.lines}</span>
+    </p>
+  {/if}
   <div class="who">
     <!-- Who is in it, and nobody else: somebody invited but
          elsewhere is on the room they are in, with a count. -->
@@ -171,10 +183,25 @@
         somebody />
     {/each}
     <!-- The AIs in this room, each with its own fader and its
-         own say in when it speaks. -->
+         own say in when it speaks -- and the puppets, which have a
+         fader and a face like everybody else and nothing to set:
+         there is nothing behind one to answer with. -->
     {#each room.agents as bot (bot.strip)}
     <Strip key={bot.strip} label={bot.name} doing={bot.state} agent somebody>
       {#snippet children()}
+        {#if bot.puppet}
+        <!-- A character the AI speaks through. It is in the room on
+             the same terms as anybody -- its own name, face and fader
+             -- so the one thing to say about it is which it is. -->
+        <p class="wearing" title="A puppet: a character {room.agents[0]?.name ?? 'the AI'} speaks through. It has no say of its own, so there is nothing here to set.">
+          A puppet
+        </p>
+        {#if bot.voice}
+          <p class="wearing" title="The voice this puppet speaks in.">
+            Speaking as {bot.voice}
+          </p>
+        {/if}
+        {:else}
         <!-- When this bot speaks, in this room. -->
         <!-- A row of three buttons wants more width than this
              column has, and the names are the whole point: a
@@ -209,6 +236,17 @@
             {/each}
           </select>
         </label>
+        <!-- A cloned voice it has been lent. Not a control: which
+             voice an AI speaks in is asked of it out loud, by
+             whoever's voice it is. It is here because a bot that has
+             stopped sounding like itself must say so somewhere, and
+             this is where everything else about it is said. -->
+        {#if bot.voice}
+          <p class="wearing" title="A voice {bot.name} was asked to speak in. Ask it for its own voice back.">
+            Speaking as {bot.voice}
+          </p>
+        {/if}
+        {/if}
       {/snippet}
     </Strip>
     {/each}
@@ -348,7 +386,39 @@
   }
   .who { display: flex; flex-direction: column; gap: 7px; }
   .hint { font-size: 12px; color: var(--muted); margin: 4px 0 0; }
+  /* The show. One line, and the only thing in this column with a
+     border round it: it is the one state here that nobody in the room
+     chose and that changes what every control below it is doing. */
+  .show {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    margin: 0 0 6px;
+    padding: 3px 7px;
+    border: 1px solid var(--accent);
+    border-radius: 7px;
+    font-size: 12px;
+    line-height: 1.5;
+  }
+  .show .curtain { color: var(--danger); font-size: 9px; }
+  .show .title {
+    font-weight: 600;
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .show .at { color: var(--muted); font-variant-numeric: tabular-nums; flex: none; }
   /* When the bot above speaks, in this room. */
+  /* Said plainly, not shouted: it is a fact about the bot, like
+     what it is doing. */
+  .wearing {
+    margin: 2px 0 0;
+    font-size: 11px;
+    color: var(--muted);
+    overflow-wrap: anywhere;
+  }
   .when { display: flex; align-items: center; gap: 6px; }
   /* Wide enough for "Answers" with its dot, so the row under it lines
      up with it rather than starting a column of its own. */

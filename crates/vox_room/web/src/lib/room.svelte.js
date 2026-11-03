@@ -62,11 +62,16 @@ export const room = $state({
   // own room is on anybody else's list. `path` is where the room
   // lives: the server settles the scheme, this only follows it.
   rooms: [],
-  // The AIs in this room: { name, strip, state, mode, engaged, stops }.
-  // When each answers is its own, not the room's — except that a game's
-  // rule binds all of them, which is what `locked` says. `stops` is
-  // whether talking over it cuts it off, and that one is nobody's but
-  // the bot's: a game never takes it.
+  // The voices in this room: { name, strip, state, mode, engaged,
+  // stops, puppet }. When each answers is its own, not the room's —
+  // except that a game's rule binds all of them, which is what
+  // `locked` says. `stops` is whether talking over it cuts it off, and
+  // that one is nobody's but the bot's: a game never takes it.
+  //
+  // `puppet` is a character the first AI speaks through rather than an
+  // AI of its own. It has a name, a face and a fader like everybody
+  // else and no Answers to set: there is nothing behind it to answer
+  // with. See ROOM.md, Puppets.
   agents: [
     {
       name: 'AI',
@@ -75,8 +80,15 @@ export const room = $state({
       mode: 'named',
       engaged: false,
       stops: 'interrupted',
+      puppet: false,
     },
   ],
+
+  // The puppet show playing, if one is: { title, lines, said }. Null
+  // the rest of the time, which is nearly always. While one is on, the
+  // AI and the puppets in it answer nothing and finish what they say —
+  // the room sets that itself, and **Stop** is the way out of it.
+  show: null,
 
   // The interpreters this room has, when it has any:
   // { level, languages }. `level` is where the one speaking your
@@ -127,6 +139,18 @@ export const room = $state({
   // the entry says which picture it is and this says whether there is
   // anything to show yet.
   pictures: {},
+  // The voice samples read in this conversation, by id: { n, who,
+  // passage, said, ready, secs, failed }. Read by the card in the log
+  // the same way a picture's is: the entry says which clip it is and
+  // this says whether the room is still listening, what was recorded,
+  // and how long it is.
+  samples: {},
+  // The voices the house has cloned from any of them: { id, name, who,
+  // said, created }. Not a control -- which voice an AI speaks in is
+  // asked of it out loud -- but the room shows what there is, because
+  // a voice of yours kept on a server is a thing you should be able
+  // to see the list of.
+  voices: [],
   // Whose face is open, or null. One at a time, and nobody else's
   // screen changes: looking at who somebody is is a thing you do.
   profile: null,
@@ -578,11 +602,19 @@ async function asked(url, { method, body }) {
   return d;
 }
 
+/// The AIs in this room, and not the puppets. Everything that says
+/// "the AI" or asks one of them to do something means these: a puppet
+/// is a voice in the room with nothing behind it, so a sentence
+/// telling you to ask one is a sentence telling you to ask nobody.
+export function theAIs() {
+  return room.agents.filter((a) => !a.puppet);
+}
+
 /// What to call the AIs in a sentence: one name, or every name with
 /// "or" before the last. The prose about "the AI" is written for one of
 /// them, and a room can have two.
 export function theAI(join = 'or') {
-  const names = room.agents.map((a) => a.name);
+  const names = theAIs().map((a) => a.name);
   if (names.length === 0) return 'the AI';
   if (names.length === 1) return names[0];
   return `${names.slice(0, -1).join(', ')} ${join} ${names[names.length - 1]}`;
@@ -633,6 +665,8 @@ export async function readConversation(id) {
     // replacing, so coming back out of it leaves the live
     // conversation's cards still able to draw themselves.
     for (const p of got.pictures ?? []) room.pictures[p.id] = p;
+    // And its own voice samples, for the same reason.
+    for (const c of got.samples ?? []) room.samples[c.id] = c;
     room.reading = got;
   } catch (e) {
     console.error('[room] read', e);
@@ -765,6 +799,11 @@ export async function wearFace(at) {
 /// Where to fetch a picture of this conversation.
 export function pictureOf(id) {
   return `/api/picture/${encodeURIComponent(id)}`;
+}
+
+/// Where to fetch a voice sample read in this conversation.
+export function sampleOf(id) {
+  return `/api/sample/${encodeURIComponent(id)}`;
 }
 
 // -- a picture dropped into the room -----------------------------------
@@ -990,11 +1029,14 @@ function apply(ev) {
       room.agents = ev.agents ?? [];
       room.interpreter = ev.interpreter ?? null;
       room.locked = ev.locked ?? false;
+      room.show = ev.show ?? null;
       room.interprets = ev.interprets ?? false;
       room.people = ev.people;
       room.speaks = ev.speaks ?? {};
       room.avatars = ev.avatars ?? {};
       room.pictures = Object.fromEntries((ev.pictures ?? []).map((p) => [p.id, p]));
+      room.samples = Object.fromEntries((ev.samples ?? []).map((s) => [s.id, s]));
+      room.voices = ev.voices ?? [];
       room.strips = ev.strips;
       room.log = ev.log;
       // A tab that has just arrived is told the room as it stands, and
@@ -1096,6 +1138,24 @@ function apply(ev) {
       // or into why it never came.
       room.pictures[ev.picture.id] = ev.picture;
       break;
+    case 'sample':
+      // The room has stopped listening, one way or the other: the card
+      // becomes the clip, with what was said and a button to hear it,
+      // or says why there is nothing.
+      room.samples[ev.sample.id] = ev.sample;
+      break;
+    case 'voices':
+      // One was kept or deleted. The whole list, because it is short
+      // and the house's rather than this conversation's.
+      room.voices = ev.voices ?? [];
+      break;
+    case 'voice': {
+      // One of the AIs is speaking in a cloned voice, or in its own
+      // again. It says so on its strip for as long as it lasts.
+      const bot = room.agents.find((b) => b.name === ev.bot);
+      if (bot) bot.voice = ev.voice ?? null;
+      break;
+    }
     case 'bio':
       // Somebody was written about. Only matters if their face is the
       // one open, and then it is read again rather than patched.
@@ -1170,9 +1230,14 @@ function apply(ev) {
       }
       break;
     case 'agents_here':
-      // The owner put an AI in this room or took one out: a fader
-      // appears or goes, with its Answers and its Stops.
+      // The owner put an AI in this room or took one out, or a puppet
+      // came on or left the stage: a fader appears or goes, with its
+      // Answers and its Stops.
       room.agents = ev.agents ?? [];
+      break;
+    case 'show':
+      // A puppet show went up, got a line further on, or came down.
+      room.show = ev.show ?? null;
       break;
     case 'strips':
       room.strips = ev.strips;
@@ -1372,8 +1437,20 @@ export function setPushToTalk(on) {
 const RELEASE_MS = 300;
 let releaseTimer = null;
 
+/// The room's mixer has your own strip turned off, so nothing you say
+/// here reaches the room or is written down -- whatever your own mute
+/// button says. A fader everybody shares, and this room's alone, so it
+/// is not yours to clear from the mic and it does not follow you into
+/// the next room.
+export function mutedByRoom() {
+  return room.strips?.[room.you]?.mute === true;
+}
+
 export function talk(on) {
-  if (!room.pushToTalk || !room.mic) return;
+  // Muted on the mixer, holding the key does nothing and must look
+  // like nothing: a talk button that lights up while the room is
+  // throwing the audio away is the room lying about being listened to.
+  if (!room.pushToTalk || !room.mic || mutedByRoom()) return;
   clearTimeout(releaseTimer);
   if (on) {
     room.talking = true;

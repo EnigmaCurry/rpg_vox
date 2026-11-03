@@ -391,7 +391,12 @@ impl Screen {
             let Some(p) = st.publishers.remove(&socket) else {
                 continue;
             };
-            info!(socket, person, stream = p.id, "stopped sharing: left the room");
+            info!(
+                socket,
+                person,
+                stream = p.id,
+                "stopped sharing: left the room"
+            );
             stop_watching(&mut st, p.id);
             send_ctl(&mut st, socket, &json!({ "type": "unshared" }));
         }
@@ -929,7 +934,11 @@ mod tests {
                 .rfind(|v| v["type"] == "streams")
                 .map(|v| v["streams"].as_array().unwrap().len())
         };
-        assert_eq!(shown(&mut ryan), Some(1), "the room it is shared to sees it");
+        assert_eq!(
+            shown(&mut ryan),
+            Some(1),
+            "the room it is shared to sees it"
+        );
         alex.control();
         mike.control();
 
@@ -942,7 +951,11 @@ mod tests {
             alex.control().iter().any(|v| v["type"] == "unshared"),
             "the sharing tab is told to let the desktop go"
         );
-        assert_eq!(shown(&mut ryan), Some(0), "the room left has nothing of theirs");
+        assert_eq!(
+            shown(&mut ryan),
+            Some(0),
+            "the room left has nothing of theirs"
+        );
         assert_eq!(
             shown(&mut mike),
             Some(0),

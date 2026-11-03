@@ -250,13 +250,17 @@ carries on without it …
 ```
 
 The fix is the same pin the TTS server uses, which is why there are
-two slots:
+three slots — a room commonly needs the voice it speaks with, the voice
+it clones with and the server it draws with, all behind the one
+Traefik:
 
 ```ini
 VOX_ROOM_PIN_HOST=qwen3-tts.example.com
 VOX_ROOM_PIN_IP=host-gateway
 VOX_ROOM_PIN_HOST_2=comfyui-mcp.example.com
 VOX_ROOM_PIN_IP_2=host-gateway
+VOX_ROOM_PIN_HOST_3=qwen3-tts-clone.example.com
+VOX_ROOM_PIN_IP_3=host-gateway
 ```
 
 `host-gateway` is the Docker host itself, which is the right answer

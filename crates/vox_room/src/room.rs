@@ -72,6 +72,13 @@ const INTERP_BACKLOG: Duration = Duration::from_secs(8);
 /// Long enough that no translator reaches it: it is there so that a
 /// voice thread dying cannot wedge the room, nothing else.
 const TRANSLATION_TAIL: Duration = Duration::from_secs(30);
+
+/// How long a tool of the AI's may run before the room stops taking it
+/// as a sign of life. A model server can be slow and an upload can be
+/// large, so this is generous; it is here because a tool that never
+/// returns would otherwise hold the turn, and every turn behind it,
+/// for as long as the room was open.
+const WORKING_TAIL: Duration = Duration::from_secs(180);
 /// Entries a new tab is sent, and kept in memory.
 const LOG_LIMIT: usize = 500;
 /// Shown to the model after a reply someone talked over.
@@ -128,6 +135,47 @@ pub const AVATAR_BYTES_MAX: usize = 1024 * 1024;
 /// caption, in the place what a picture was asked for goes.
 const UPLOAD_NAME_MAX: usize = 80;
 
+/// What the card holding a passage to read aloud is headed. One title,
+/// because the room takes that card back itself when the reading is
+/// done and has to be able to find it again.
+const SAMPLE_CARD: &str = "Read this aloud";
+/// Longest passage the AI may put up to be read. Long enough for the
+/// twenty or thirty seconds of speech a voice is cloned from, and short
+/// enough that nobody is handed an essay.
+const SAMPLE_PASSAGE_MAX: usize = 600;
+/// How long the room waits for somebody to start reading before it
+/// gives up on the clip. Two minutes is long enough to find your
+/// glasses and short enough that a microphone is not left armed for
+/// the afternoon.
+const SAMPLE_WAIT: Duration = Duration::from_secs(120);
+/// The quiet that ends a reading. Shorter than `reply_after`, so the
+/// clip is in the conversation before the room decides whose turn it
+/// is -- see `hand_over`.
+const SAMPLE_GAP: Duration = Duration::from_millis(900);
+/// Kept from before their first word, so the clip starts on the word
+/// and not on however long they took to find it. Not nothing: a clip
+/// cut hard at the first sample of speech is a clip missing the start
+/// of it.
+const SAMPLE_PREROLL: Duration = Duration::from_millis(300);
+/// The shortest clip worth cloning from. Three seconds is what Qwen3's
+/// Base model asks for; anything less and what comes back is a voice
+/// that is nobody's.
+const SAMPLE_MIN: f32 = 3.0;
+/// The longest clip kept. A voice is cloned from a few seconds and a
+/// longer clip is no better -- this is the bound on what one armed
+/// microphone can put in the database, not a target.
+const SAMPLE_MAX: f32 = 30.0;
+/// The rate a clip goes to the clone server at: Qwen3-TTS's own, so
+/// nothing resamples it at the other end.
+const SAMPLE_HZ: u32 = 24_000;
+/// How long a reading may go without a frame of audio before the room
+/// stops waiting for the rest of it. Somebody whose connection went
+/// while they were reading sends nothing more, and a room that waited
+/// for them would be a room whose turn-taking had stopped -- see
+/// `hand_over`. Longer than any pause between frames and shorter than
+/// anybody would sit through.
+const SAMPLE_STALL: Duration = Duration::from_secs(3);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
@@ -156,6 +204,13 @@ pub enum Kind {
     /// this. What they share is the numbering, which is the half that
     /// matters out loud.
     Upload,
+    /// A few seconds of somebody reading aloud, recorded so a voice
+    /// can be cloned from it: the entry's text is the clip's number
+    /// and its title is what they said. The card goes up the moment
+    /// the room starts listening -- it is the light that says a
+    /// microphone is being recorded -- and fills in when they have
+    /// finished reading. See `Room::take_voice_sample`.
+    Sample,
 }
 
 impl Kind {
@@ -163,6 +218,7 @@ impl Kind {
         match self {
             Kind::Picture => "picture",
             Kind::Upload => "upload",
+            Kind::Sample => "sample",
             Kind::Human => "human",
             Kind::Agent => "agent",
             Kind::Game => "game",
@@ -177,6 +233,7 @@ impl Kind {
             "card" => Kind::Card,
             "picture" => Kind::Picture,
             "upload" => Kind::Upload,
+            "sample" => Kind::Sample,
             _ => Kind::Human,
         }
     }
@@ -326,6 +383,21 @@ enum Why {
     /// if the room isn't quiet when the moment comes, the moment
     /// didn't happen and the ask is spent.
     Silence,
+    /// A clip of somebody reading aloud has landed, and the bot that
+    /// asked for it is to be told. Only ever queued for a bot that
+    /// would not be given the turn anyway: nobody says an AI's name
+    /// while reading a passage at a microphone, so a bot that answers
+    /// only when it is named would otherwise never hear that the
+    /// recording it asked for is in. Waits for quiet like a handed
+    /// turn, and is taken back by somebody speaking for the same
+    /// reason.
+    Reading,
+    /// A puppet show has ended, and the AI that wrote it is to come
+    /// out and say so. Queued for the same reason as `Reading`:
+    /// nobody says an AI's name while watching a play, so a bot that
+    /// speaks only when it is named would never get the turn where the
+    /// puppets start taking questions.
+    Curtain,
 }
 
 /// How the AI takes its turn in a game.
@@ -652,6 +724,20 @@ pub struct Turn {
     /// not be written in their language itself. Empty in a room where
     /// everyone shares the one language.
     pub speaks: Vec<(String, String)>,
+    /// The puppets on stage, with the line about who each one is: the
+    /// characters this AI speaks through. Only ever filled in for the
+    /// one that speaks through them, and its own lines as them are
+    /// shown back to it as its own -- see `conversation_messages`.
+    ///
+    /// Empty for every other bot in the room, and then a puppet is
+    /// just another voice in `others`: that is what it is, to anybody
+    /// who isn't holding it.
+    pub puppets: Vec<(String, String)>,
+    /// A puppet show is playing, and this is the AI running it. It is
+    /// scripted and pre-rendered, so there is nothing for the model to
+    /// do until the curtain comes down -- and it is told that rather
+    /// than left to ask for another one.
+    pub showing: Option<String>,
     /// A back-and-forth is on: the AI has the turn at every pause
     /// because it was named, not because the room is set that way.
     pub engaged: bool,
@@ -692,11 +778,103 @@ struct Person {
     /// Last time a streaming guess with words in it came in.
     last_words: Option<Instant>,
     engine: Option<Pusher>,
+    /// A clip of their voice the room has been asked to record, while
+    /// it is listening for one. See [`Recording`].
+    sample: Option<Recording>,
     /// The language they speak and want to hear, spelled out in English
     /// ("Russian"); empty for the room's own. A copy of what the store
     /// holds against their unchanging name, kept here because the roster
     /// is keyed by display name and a rename replaces the entry.
     language: String,
+}
+
+impl Person {
+    /// They are reading a passage into their microphone for a voice
+    /// sample, right now. What they are saying is a clip and not a
+    /// turn, which is why `hand_over` waits for it.
+    fn reading(&self) -> bool {
+        self.sample.as_ref().is_some_and(|r| r.reading)
+    }
+}
+
+/// A clip of somebody's voice the room is listening for: one of the
+/// AIs has put a passage up for them to read, and the next thing they
+/// say is the recording.
+///
+/// The room does the recording rather than the browser, and it records
+/// what it is already being sent: the same mic frames it transcribes.
+/// A browser asked to record its own microphone would be a second
+/// capture, a second permission and a second thing to go wrong, for
+/// audio the server already has in front of it.
+struct Recording {
+    /// The `samples` row and the card in the conversation, both under
+    /// this id: the card is the clip, so a second identifier would
+    /// only be a way for the two to disagree.
+    id: String,
+    /// Which AI asked, so the room knows who to tell when the reading
+    /// is done.
+    asked_by: String,
+    /// What they were given to read. The clip's transcript is what
+    /// they actually said; this is the fallback for a clip the
+    /// transcription never caught up with.
+    passage: String,
+    /// Their audio at the room's rate, oldest first. Before they start
+    /// this is only ever the last [`SAMPLE_PREROLL`] of it.
+    pcm: Vec<f32>,
+    /// They have started reading.
+    reading: bool,
+    /// When the room started listening, so it can stop waiting.
+    armed: Instant,
+    /// When the last frame of their audio arrived. A tab that went
+    /// away stops sending, and a reading nobody is sending any more is
+    /// over whatever it was in the middle of.
+    heard: Instant,
+    /// Since when they have been quiet, which is what ends a reading.
+    quiet: Option<Instant>,
+    /// The last thing this person had said in the room when the mic was
+    /// armed, if anything. The clip's transcript is whatever they said
+    /// *after* that; without the mark, a reading the transcription
+    /// never caught would be sent to the clone server labelled with
+    /// whatever they happened to say before it.
+    was: Option<String>,
+}
+
+/// A tool of the AI's, running. See [`Room::working`].
+pub struct Working<'a> {
+    room: &'a Room,
+    generation: u64,
+}
+
+impl Drop for Working<'_> {
+    fn drop(&mut self) {
+        self.room.mark_working(self.generation, None);
+    }
+}
+
+/// What the room decided about a recording while somebody's audio went
+/// past, for doing once the state is unlocked: keeping a clip means
+/// writing to the database and telling every tab about it.
+enum Sampled {
+    /// Nothing to do this time round, which is almost every time.
+    Nothing,
+    /// They read it.
+    Read {
+        id: String,
+        /// At the room's rate; resampled on the way to the server.
+        pcm: Vec<f32>,
+        /// What the room heard them say.
+        said: String,
+        who: String,
+        asked_by: String,
+    },
+    /// They never did, and the card says so rather than listening for
+    /// good.
+    Never {
+        id: String,
+        why: String,
+        who: String,
+        asked_by: String,
+    },
 }
 
 /// Somebody's run of talk being interpreted for the people in the room
@@ -760,6 +938,12 @@ struct Reply {
     /// When every language ran out of audio with one of them still owing
     /// a translation. The backstop below, nothing more.
     dry_since: Option<Instant>,
+    /// Since when a tool of this reply's has been running, if one is.
+    /// The backstop cannot tell a voice thread that died from an agent
+    /// that is still working, and the two want opposite things: it has
+    /// to end the turn for the first and must not for the second. So
+    /// the agent says which it is.
+    working: Option<Instant>,
     /// The last words it answers, and when it was asked: for timings.
     heard: Instant,
     asked: Instant,
@@ -774,6 +958,27 @@ struct Reply {
 /// game's rule for the room, and it binds all of them.
 struct BotState {
     cfg: BotConfig,
+    /// The character this one is, when it is a puppet rather than an
+    /// AI with a brain of its own: a name, a voice and a line about
+    /// who it is. None for the AIs.
+    ///
+    /// A puppet is in the room on exactly the same terms as a bot --
+    /// a name, a fader, a face, a line in the conversation with its
+    /// name on it -- and differs in one thing: nothing ever gives it
+    /// the turn, because there is nothing behind it to answer with.
+    /// What it says is the first AI's, said through it. See
+    /// [`crate::puppet`].
+    part: Option<crate::store::Puppet>,
+    /// A cloned voice it has been asked to speak in instead of its
+    /// own, as the clone server knows it. Shared with each of its
+    /// voices -- one per language, each on its own thread -- so that
+    /// being lent a voice is the bot's and not any one thread's. See
+    /// [`crate::tts::Borrowed`].
+    borrowed: crate::tts::Borrowed,
+    /// The same voice by the name it is called out loud, for the
+    /// people in the room: a bot that has stopped sounding like itself
+    /// says so on its strip. None is its own voice.
+    voice: Option<String>,
     /// The turn this bot should be working on; anything older it is
     /// told to drop. Shared with its own agent thread.
     ///
@@ -830,10 +1035,113 @@ struct BotState {
 }
 
 impl BotState {
-    /// Whether a pause could be this one's: it is in the room, and the
-    /// people here haven't told it to say nothing.
+    /// Whether a pause could be this one's: it is in the room, the
+    /// people here haven't told it to say nothing, and there is
+    /// something behind it to answer with.
+    ///
+    /// A puppet is never answering, whatever its Answers says. It has
+    /// no brain: a turn given to it would be a turn nobody takes, and
+    /// the room would sit waiting for a reply that cannot come. Its
+    /// name still reaches the AI that speaks through it -- see
+    /// [`Room::named`] -- which is how a puppet left on stage after
+    /// the show takes a question.
     fn answering(&self) -> bool {
-        self.here && self.mode != Mode::Never
+        self.here && self.mode != Mode::Never && self.part.is_none()
+    }
+
+    /// Whether this one is a puppet.
+    fn puppet(&self) -> bool {
+        self.part.is_some()
+    }
+}
+
+/// A puppet show that is on: who is running it, who is in it, and what
+/// the room was set to before the curtain went up.
+///
+/// While one is on, the director and every puppet in it answer nothing
+/// and finish what they are saying -- the two settings a play needs,
+/// because a scripted exchange that stopped dead the moment somebody
+/// in the audience cleared their throat is not a play, and a director
+/// that broke off mid-scene to answer a question is not one either.
+/// Both are *set*, visibly, on the same controls anybody could set
+/// them with, and put back when the curtain comes down.
+struct Showing {
+    /// The AI whose script this is. It gets the turn when the show is
+    /// over, so it can take questions or send the puppets away.
+    director: String,
+    /// What the show is called, for the card in the conversation.
+    title: String,
+    /// What each voice in it was answering, and whether it could be
+    /// talked over, before any of this. Kept in the database too, so
+    /// a server that went down in the middle of act two does not come
+    /// back up with its AI silenced for good -- see
+    /// [`Room::restore_after_show`].
+    was: BTreeMap<String, (Mode, Stops)>,
+    /// Tripped to bring the curtain down early: the player thread
+    /// reads it between lines, and `Stop` trips it.
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    /// How many lines there are, and how many have been said. For the
+    /// card, and for the log.
+    lines: usize,
+    said: usize,
+}
+
+/// Where the settings a show borrowed are written down while it has
+/// them. The room would otherwise come back up from a crash mid-show
+/// with its AI set to answer nothing, and nothing anywhere to say why.
+const SHOW_WAS: &str = "show.was";
+
+/// Longest a puppet's name may be. Short, because it is said out loud
+/// to address it and it goes on a fader beside everybody else's.
+const PUPPET_NAME_MAX: usize = 40;
+
+/// Most puppets on stage at once. Not a resource limit -- each is a
+/// fader and a few kilobytes -- but a limit on what an audience can
+/// follow: six voices in a play is already a crowd.
+const CAST_MAX: usize = 6;
+
+/// The puppets in the room, in the order they came on stage.
+fn on_stage(st: &State) -> Vec<String> {
+    st.bots
+        .iter()
+        .filter(|b| b.puppet())
+        .map(|b| b.cfg.name.clone())
+        .collect()
+}
+
+/// What the model is told when it asks for a puppet in a house with no
+/// speech server. It is never offered the tools, so this is only ever
+/// a model calling something it was not shown.
+fn no_puppets() -> String {
+    "this house has no speech server, so a puppet would have no voice and there \
+     are no puppets here at all"
+        .to_string()
+}
+
+/// A puppet nobody has made, with the roster so the model can see what
+/// there is rather than guess again.
+fn unknown_puppet(name: &str, roster: &[crate::store::Puppet]) -> String {
+    let have: Vec<String> = roster.iter().map(|p| p.name.clone()).collect();
+    match have.is_empty() {
+        true => format!(
+            "there is no puppet called {:?}, and the house has none at all yet: \
+             make_puppet makes one",
+            name.trim()
+        ),
+        false => format!(
+            "there is no puppet called {:?}; the house has {}",
+            name.trim(),
+            and_list(&have)
+        ),
+    }
+}
+
+/// "A", "A and B", "A, B and C" -- names in a sentence the model reads.
+pub fn and_list(names: &[String]) -> String {
+    match names {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
     }
 }
 
@@ -881,6 +1189,9 @@ struct State {
     interp: BTreeMap<String, Interp>,
     /// Names the next run of talk handed to an interpreter.
     next_stream: u64,
+    /// The puppet show being played, if one is. None is a room not in
+    /// the middle of a play, which is nearly always.
+    show: Option<Showing>,
 }
 
 /// What a bot's agent thread needs from the room it answers in: which
@@ -889,6 +1200,10 @@ pub struct BotWiring {
     pub name: String,
     pub generation: Arc<AtomicU64>,
     pub turns: crossbeam_channel::Receiver<Turn>,
+    /// The cell its voices read to find out whether it is being lent
+    /// somebody else's. Made here, because the room is what sets it
+    /// and whoever builds the voices only has to pass it on.
+    pub borrowed: crate::tts::Borrowed,
 }
 
 pub struct Room {
@@ -931,6 +1246,11 @@ pub struct Room {
     /// what is said has to be heard in the order it was said.
     interp: BTreeMap<String, crossbeam_channel::Sender<InterpJob>>,
     stt: Option<EngineFactory>,
+    /// How this room makes a voice for somebody who wasn't there when
+    /// it opened. None in a house with no speech server, and then
+    /// there are no puppets: a puppet with no voice is a name on a
+    /// fader.
+    tts: Option<VoiceFactory>,
 }
 
 /// A typed message waiting to be put into one other language: which
@@ -968,6 +1288,27 @@ pub struct TypedJob {
 /// and the room to report to. Shared, because every room on the server
 /// transcribes with the one set of loaded models.
 pub type EngineFactory = Arc<dyn Fn(&str, &str, Arc<Room>) -> anyhow::Result<Pusher> + Send + Sync>;
+
+/// Makes a voice: the language to speak in, the preset to speak with,
+/// the delivery notes to speak it under, and the cell that says
+/// whether a cloned voice has been lent over the top. Shared, because
+/// every room on the server speaks through the one speech server.
+///
+/// The bots' voices are built once, as the house opens. This is here
+/// for the ones that are not: a puppet is made up in the middle of a
+/// conversation and has to be given a voice there and then, which is
+/// the one thing the room could not do for itself.
+pub type VoiceFactory = Arc<
+    dyn Fn(&str, &str, &str, crate::tts::Borrowed) -> anyhow::Result<Box<dyn crate::tts::Voice>>
+        + Send
+        + Sync,
+>;
+
+/// One voice in the room, in each language it is spoken in: the room's
+/// own first, then the others anybody is listening in. A bot gets one
+/// of these as the house opens; a puppet is handed one when it is made
+/// up. See [`Room::stage_voices`].
+pub type Speaking = Vec<(String, Box<dyn crate::tts::Voice>)>;
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -1029,6 +1370,7 @@ impl Room {
         typing: Option<crossbeam_channel::Sender<TypedJob>>,
         interp: BTreeMap<String, crossbeam_channel::Sender<InterpJob>>,
         stt: Option<EngineFactory>,
+        tts: Option<VoiceFactory>,
     ) -> anyhow::Result<(Arc<Self>, Vec<BotWiring>)> {
         // Scoped here rather than by whoever built it: a room reading
         // the whole database's settings instead of its own is a room
@@ -1087,10 +1429,17 @@ impl Room {
                 .unwrap_or_default();
             let (turns, rx) = crossbeam_channel::unbounded();
             let generation = Arc::new(AtomicU64::new(0));
+            // Which voice it is speaking in, shared between the room
+            // that sets it and the voices that read it. Starts empty:
+            // a bot comes up in its own voice however it went down,
+            // because what it keeps is the voices it has cloned and
+            // not which of them it was wearing on the day.
+            let borrowed = crate::tts::Borrowed::default();
             wiring.push(BotWiring {
                 name: bot.name.clone(),
                 generation: generation.clone(),
                 turns: rx,
+                borrowed: borrowed.clone(),
             });
             // A fader each, or moving one would move them both. The
             // first keeps the plain `@agent` the room has always used,
@@ -1101,6 +1450,12 @@ impl Room {
             }
             bots.push(BotState {
                 cfg,
+                // An AI, not a puppet. Puppets are cast in the middle
+                // of a conversation and are gone by the next restart:
+                // the roster of them is kept, the stage is not.
+                part: None,
+                borrowed,
+                voice: None,
                 generation,
                 turns,
                 chosen,
@@ -1163,6 +1518,7 @@ impl Room {
                 ai_turns: 0,
                 interp: BTreeMap::new(),
                 next_stream: 0,
+                show: None,
             }),
             events,
             mixer: Mixer::new(strips, &cfg.language),
@@ -1173,7 +1529,14 @@ impl Room {
             typing,
             interp,
             stt,
+            tts,
         });
+        // A show that was on when the server stopped. The puppets are
+        // gone with it -- they were only ever on the stage -- but the
+        // settings it borrowed are written down, and putting those
+        // back is the difference between a room that works and an AI
+        // that answers nothing and never says why.
+        room.restore_after_show();
         Ok((room, wiring))
     }
 
@@ -1320,6 +1683,11 @@ impl Room {
             // itself, and nothing else on screen knows about them.
             "pictures": self.store().pictures(id).unwrap_or_else(|err| {
                 warn!(conversation = id, "read its pictures: {err:#}");
+                Vec::new()
+            }),
+            // And its own voice samples, for the same reason.
+            "samples": self.store().samples(id).unwrap_or_else(|err| {
+                warn!(conversation = id, "read its voice samples: {err:#}");
                 Vec::new()
             }),
         }))
@@ -1474,6 +1842,18 @@ impl Room {
             .find(|b| wanted.eq_ignore_ascii_case(&b.name))
         {
             return Err(format!("{} is the AI's name.", bot.name));
+        }
+        // And a puppet on stage, which the configuration knows nothing
+        // about: it was made up this evening, and it is a voice in
+        // this room with a name beside everything it says.
+        if let Some(puppet) = self
+            .lock()
+            .bots
+            .iter()
+            .find(|b| b.puppet() && wanted.eq_ignore_ascii_case(&b.cfg.name))
+            .map(|b| b.cfg.name.clone())
+        {
+            return Err(format!("{puppet} is a puppet in this room."));
         }
         // Read before the store is written, because it is the only
         // thing that knows: afterwards there is nothing left to say
@@ -2038,7 +2418,10 @@ impl Room {
         // whether this room has ever heard of them, which is the one
         // thing a name arriving in a request has to be checked for.
         let (_, whose) = self.whose(&st, who)?;
-        let name: String = one_line(name.trim()).chars().take(UPLOAD_NAME_MAX).collect();
+        let name: String = one_line(name.trim())
+            .chars()
+            .take(UPLOAD_NAME_MAX)
+            .collect();
         // One id for the picture and the entry that shows it, exactly
         // as a made one has: the card is the picture.
         let id = format!("picture-{}", uuid::Uuid::new_v4().simple());
@@ -2141,14 +2524,16 @@ impl Room {
         let (key, whose) = self.whose(&st, who).ok()?;
         let bot = key.starts_with('@');
         let store = self.store();
-        let person = (!bot)
-            .then(|| store.person(&key).ok().flatten())
-            .flatten();
+        let person = (!bot).then(|| store.person(&key).ok().flatten()).flatten();
         Some(json!({
             "who": whose,
             // An AI is not a person, and the card should not pretend
             // otherwise: it is the one thing here nobody invited.
             "bot": bot,
+            // And a puppet is not an AI. It is a character one of them
+            // speaks through, which is the one thing about it anybody
+            // clicking its face wants to know.
+            "puppet": st.bots.iter().any(|b| b.cfg.name == whose && b.puppet()),
             "bio": store.bio(&key).ok().flatten().unwrap_or_default(),
             "language": person
                 .as_ref()
@@ -2188,6 +2573,16 @@ impl Room {
             .map(|b| b.cfg.name.clone())
         {
             return Ok((crate::store::bot_key(&bot), bot));
+        }
+        // A puppet the house has but nobody has brought on yet. Its
+        // face and its few lines are kept under its name like
+        // everybody else's and are the house's, not the stage's -- so
+        // a character can be given a face while it is being made up,
+        // which is the order anybody would do it in. Refusing until it
+        // was standing in the room made giving it a face depend on
+        // casting it first, and nothing about a portrait needs that.
+        if let Ok(Some(part)) = self.store().puppet(said) {
+            return Ok((crate::store::bot_key(&part.name), part.name));
         }
         let mut names: Vec<&str> = st.people.keys().map(String::as_str).collect();
         names.extend(st.bots.iter().map(|b| b.cfg.name.as_str()));
@@ -2342,6 +2737,13 @@ impl Room {
                 "languages": self.interp.keys().collect::<Vec<_>>(),
             })),
             "locked": st.game_mode.is_some(),
+            // A puppet show playing, so a tab that opened in the
+            // middle of one sees what everyone else is watching.
+            "show": st.show.as_ref().map(|s| json!({
+                "title": s.title,
+                "lines": s.lines,
+                "said": s.said,
+            })),
             // Whether what people say out loud is put into the other
             // languages as well as the AI's replies. A reader waits for
             // a translation only of what one is coming for.
@@ -2353,6 +2755,13 @@ impl Room {
             // images: a card draws itself from these and fetches the
             // one picture it is showing.
             "pictures": self.pictures_json(&st),
+            // The voice samples read in this conversation, without the
+            // audio, and the voices the house has cloned from any of
+            // them. Same bargain as the pictures: enough to draw the
+            // card, and the clip itself is fetched by whoever presses
+            // play.
+            "samples": self.samples_json(&st),
+            "voices": self.voices_json(),
             "languages": self.cfg.languages,
             "strips": self.mixer.strips(),
             "log": st.log,
@@ -2754,7 +3163,7 @@ impl Room {
             if p.due.is_some_and(|at| now < at) {
                 return true;
             }
-            if !quiet && p.why == Why::Handed {
+            if !quiet && p.why != Why::Silence {
                 return true;
             }
             if quiet {
@@ -2805,6 +3214,16 @@ impl Room {
         }
         if !st.bot(to).here {
             return Err(format!("{to} is not in this room"));
+        }
+        // A puppet is not somebody to hand a turn to: it is you,
+        // speaking. The model is told which of the two this is,
+        // because the answers are opposite -- one says leave it alone,
+        // the other says say it yourself as that character.
+        if st.bot(to).puppet() {
+            return Err(format!(
+                "{to} is a puppet: there is nothing behind it to take a turn. Say \
+                 its line yourself with say_as"
+            ));
         }
         if st.bot(to).mode == Mode::Never {
             return Err(format!(
@@ -2929,6 +3348,7 @@ impl Room {
         }
         let ptt = t.ptt;
         t.muted = muted;
+        let mut read = Sampled::Nothing;
         if p.muted() {
             p.speaking = false;
             // Let go of push to talk: what they said is done.
@@ -2937,8 +3357,57 @@ impl Room {
                     e.break_paragraph();
                 }
             }
+            // And if what they said was a passage, it is done too. No
+            // audio arrives from a muted mic, so the gap that ends a
+            // reading never passes and `sampling` is never asked: the
+            // mute itself is the end of the utterance, and the cleanest
+            // one there is -- they stopped reading and said so.
+            let was;
+            (read, was) = Self::stop_reading(p, person);
+            // Prefer what the room wrote down, the same way a reading
+            // that ended in a pause does -- but only what it wrote down
+            // since. A mute can land ahead of the last words of the
+            // passage, and the thing not to do then is label the clip
+            // with whatever they said before they started.
+            if let Sampled::Read { said, .. } = &mut read {
+                if let Some(words) = Self::last_words(&st, person, was.as_deref()) {
+                    *said = words;
+                }
+            }
         }
         self.emit_people(&st);
+        drop(st);
+        self.sampled(read);
+    }
+
+    /// End `p`'s reading because their microphone just closed, whether
+    /// they muted it or left. A clip if there is enough of one; else
+    /// the room goes back to waiting for them to read, because a mute
+    /// in the middle of "go on then" is not a failed reading.
+    fn stop_reading(p: &mut Person, person: &str) -> (Sampled, Option<String>) {
+        let Some(r) = &mut p.sample else {
+            return (Sampled::Nothing, None);
+        };
+        if !r.reading {
+            return (Sampled::Nothing, None);
+        }
+        let secs = r.pcm.len() as f32 / crate::mixer::RATE as f32;
+        if secs < SAMPLE_MIN {
+            r.reading = false;
+            r.quiet = None;
+            r.pcm.clear();
+            return (Sampled::Nothing, None);
+        }
+        let r = p.sample.take().expect("there a moment ago");
+        let read = Sampled::Read {
+            id: r.id,
+            pcm: r.pcm,
+            // The passage until the caller has a transcript to put here.
+            said: r.passage,
+            who: person.to_string(),
+            asked_by: r.asked_by,
+        };
+        (read, r.was)
     }
 
     /// `person` turned push to talk on or off in one of their tabs.
@@ -3002,6 +3471,1342 @@ impl Room {
                 e.push(pcm);
             }
         }
+        // A voice sample being read, if one is: the same frames, kept
+        // rather than only listened to. Muted audio is not recorded --
+        // it is not transcribed either, and a clip of the silence a
+        // mute leaves would be a clip of nobody.
+        let sampled = match muted {
+            true => Sampled::Nothing,
+            false => self.sampling(person, pcm),
+        };
+        self.sampled(sampled);
+    }
+
+    // -- voice samples: somebody reading, so a voice can be cloned ------
+
+    /// Keep this frame of `person`'s audio, if the room is listening
+    /// for a clip of them, and say what that leaves to be done.
+    ///
+    /// Called for every frame of everybody's audio, so the quick
+    /// answer -- nobody is being recorded -- is the first thing it
+    /// works out.
+    fn sampling(&self, person: &str, pcm: &[f32]) -> Sampled {
+        let mut st = self.lock();
+        if st.people.get(person).is_none_or(|p| p.sample.is_none()) {
+            return Sampled::Nothing;
+        }
+        let speaking = st.people.get(person).is_some_and(|p| p.speaking);
+        let now = Instant::now();
+        let rate = crate::mixer::RATE as f32;
+        let secs = |n: usize| n as f32 / rate;
+        let preroll = (SAMPLE_PREROLL.as_secs_f32() * rate) as usize;
+        // The clip, if this frame is the one that ends the reading.
+        // Worked out with the recording borrowed and nothing else, so
+        // that what it decides can be acted on with the room
+        // unlocked. Giving up on a reading is not decided here at all
+        // -- see `give_up_on_samples`.
+        let over = {
+            let p = st.people.get_mut(person).expect("there a moment ago");
+            let r = p.sample.as_mut().expect("there a moment ago");
+            r.pcm.extend_from_slice(pcm);
+            r.heard = now;
+            let trim = |pcm: &mut Vec<f32>| {
+                if pcm.len() > preroll {
+                    pcm.drain(..pcm.len() - preroll);
+                }
+            };
+            if !r.reading {
+                if speaking {
+                    // Their first word. What is in the buffer is the
+                    // moment before it, which is what should be there.
+                    r.reading = true;
+                    r.quiet = None;
+                    None
+                } else {
+                    // Still waiting: keep the last moment, no more.
+                    trim(&mut r.pcm);
+                    None
+                }
+            } else {
+                if speaking {
+                    r.quiet = None;
+                } else if r.quiet.is_none() {
+                    r.quiet = Some(now);
+                }
+                let long_enough = secs(r.pcm.len()) >= SAMPLE_MIN;
+                let full = secs(r.pcm.len()) >= SAMPLE_MAX;
+                let stopped = r
+                    .quiet
+                    .is_some_and(|at| now.duration_since(at) >= SAMPLE_GAP);
+                if stopped && !long_enough {
+                    // Two words and a pause is not a reading -- it is
+                    // "go on then" on the way to one. The room forgets
+                    // it and goes back to waiting, rather than keeping
+                    // a clip too short to clone anything from.
+                    r.reading = false;
+                    r.quiet = None;
+                    trim(&mut r.pcm);
+                    None
+                } else if full || stopped {
+                    let mut pcm = std::mem::take(&mut r.pcm);
+                    // The quiet that ended it is not part of what they
+                    // read, bar the moment it takes a sentence to stop.
+                    if stopped {
+                        let tail = (0.2 * rate) as usize;
+                        let cut = (SAMPLE_GAP.as_secs_f32() * rate) as usize;
+                        let end = pcm.len().saturating_sub(cut.saturating_sub(tail));
+                        pcm.truncate(end.max(1));
+                    }
+                    Some((r.id.clone(), pcm))
+                } else {
+                    None
+                }
+            }
+        };
+        let Some((id, pcm)) = over else {
+            return Sampled::Nothing;
+        };
+        let (asked_by, passage, was) = st
+            .people
+            .get_mut(person)
+            .and_then(|p| p.sample.take())
+            .map(|r| (r.asked_by, r.passage, r.was))
+            .unwrap_or_default();
+        Sampled::Read {
+            id,
+            pcm,
+            // What they have just read, as the transcription has it. It
+            // goes to the clone server as the clip's transcript, which
+            // is what makes a cloned voice sound like the person rather
+            // than like a guess at them.
+            said: Self::last_words(&st, person, was.as_deref()).unwrap_or(passage),
+            who: person.to_string(),
+            asked_by,
+        }
+    }
+
+    /// What `person` has said since entry `was`, as the room wrote it
+    /// down: the transcript of a reading, when there is one. `None`
+    /// when the transcription caught nothing of it -- a room with no
+    /// transcription at all, or a mute that landed before the words
+    /// did -- and the caller falls back to the passage.
+    fn last_words(st: &State, person: &str, was: Option<&str>) -> Option<String> {
+        let last = st
+            .log
+            .iter()
+            .rev()
+            .find(|e| e.kind == Kind::Human && e.who == person)?;
+        if Some(last.id.as_str()) == was {
+            return None;
+        }
+        Some(last.text.trim().to_string()).filter(|t| !t.is_empty())
+    }
+
+    /// Recordings the room has waited long enough for, taken off the
+    /// people they were armed on. Acted on by the caller, unlocked.
+    ///
+    /// Two different waits, because they are two different things
+    /// happening. Nobody has read anything: the microphone has been
+    /// armed for [`SAMPLE_WAIT`] and whatever they were doing, it
+    /// wasn't this. Somebody was reading and their audio stopped
+    /// arriving: their tab went, and what was read before it went is
+    /// a clip if there is enough of it -- and either way the room
+    /// cannot go on holding the turn for a reading that has no reader.
+    fn give_up_on_samples(&self, st: &mut State, now: Instant) -> Vec<Sampled> {
+        let mut over = Vec::new();
+        for (who, p) in st.people.iter_mut() {
+            let Some(r) = &p.sample else { continue };
+            let stalled = r.reading && now.saturating_duration_since(r.heard) >= SAMPLE_STALL;
+            let unread = !r.reading && now.saturating_duration_since(r.armed) >= SAMPLE_WAIT;
+            if !stalled && !unread {
+                continue;
+            }
+            let r = p.sample.take().expect("there a moment ago");
+            let secs = r.pcm.len() as f32 / crate::mixer::RATE as f32;
+            over.push(match stalled && secs >= SAMPLE_MIN {
+                true => Sampled::Read {
+                    id: r.id,
+                    pcm: r.pcm,
+                    said: r.passage,
+                    who: who.clone(),
+                    asked_by: r.asked_by,
+                },
+                false => Sampled::Never {
+                    id: r.id,
+                    why: match stalled {
+                        true => "their microphone stopped in the middle of it".into(),
+                        false => "they didn't read it".into(),
+                    },
+                    who: who.clone(),
+                    asked_by: r.asked_by,
+                },
+            });
+        }
+        over
+    }
+
+    /// Act on what [`Self::sampling`] decided, with the room unlocked.
+    fn sampled(&self, sampled: Sampled) {
+        match sampled {
+            Sampled::Nothing => {}
+            Sampled::Read {
+                id,
+                pcm,
+                said,
+                who,
+                asked_by,
+            } => self.finish_sample(&id, &pcm, &said, &who, &asked_by),
+            Sampled::Never {
+                id,
+                why,
+                who,
+                asked_by,
+            } => {
+                info!(who = %who, %why, "a voice sample nobody read");
+                self.fail_sample(&id, &why, &who, &asked_by);
+            }
+        }
+    }
+
+    /// Ask `who` to read `passage` aloud, and listen for it: the card
+    /// goes onto their screen, a card goes into the conversation
+    /// saying the room is recording them, and the next thing they say
+    /// is the clip. The answer is its number, which is what
+    /// `save_voice` takes.
+    ///
+    /// The room posts both cards itself rather than leaving either to
+    /// the model, for the reason `begin_picture` does: the passage has
+    /// to be on the screen they are reading it off, and the card
+    /// saying a microphone is being recorded has to be up *before* it
+    /// is, not whenever a model remembers to mention it. Nobody's
+    /// voice is recorded in this room without a light on.
+    pub fn take_voice_sample(
+        &self,
+        generation: u64,
+        who: &str,
+        passage: &str,
+    ) -> Result<(u32, String), String> {
+        let passage = passage.trim();
+        if passage.is_empty() {
+            return Err("say what they are to read; a clip needs words in it".into());
+        }
+        if passage.chars().count() > SAMPLE_PASSAGE_MAX {
+            return Err(format!(
+                "a passage is at most {SAMPLE_PASSAGE_MAX} characters; \
+                 a voice is cloned from a few seconds of speech"
+            ));
+        }
+        // Who, and which of the AIs is asking. Both are settled before
+        // anything is written down, so a refusal leaves the room as it
+        // was.
+        let (who, asked_by) = {
+            let mut st = self.lock();
+            let Some(who) = st
+                .people
+                .keys()
+                .find(|n| n.eq_ignore_ascii_case(who.trim()))
+                .cloned()
+            else {
+                let here: Vec<&str> = st.people.keys().map(String::as_str).collect();
+                return Err(format!(
+                    "there is nobody called {who:?} in the room; it is {}",
+                    if here.is_empty() {
+                        "empty".to_string()
+                    } else {
+                        here.join(", ")
+                    }
+                ));
+            };
+            let p = st.people.get(&who).expect("just found");
+            if !p.mic() {
+                return Err(format!(
+                    "{who} hasn't joined the audio, so there is no microphone to record"
+                ));
+            }
+            if self.mixer.is_muted(&who) {
+                return Err(format!(
+                    "{who}'s strip is muted on the mixer, so the room hears nothing \
+                     from them; that is a fader in the room's own settings, not \
+                     theirs to unmute"
+                ));
+            }
+            // Push to talk is muted between every word -- that is what it
+            // is -- so somebody who is about to read is muted right up
+            // until they hold the key down. Refusing here would refuse
+            // every reading a push-to-talk room ever offered.
+            if p.muted() && !p.ptt() {
+                return Err(format!(
+                    "{who}'s microphone is muted; ask them to unmute it and try again"
+                ));
+            }
+            if p.sample.is_some() {
+                return Err(format!("the room is already listening for {who} to read"));
+            }
+            let asked_by = st
+                .turn_of(generation)
+                .map(|b| b.cfg.name.clone())
+                .ok_or("that turn is over; the room has moved on")?;
+            (who, asked_by)
+        };
+        // Their card first: a room listening for a passage nobody has
+        // been given is a room recording somebody for no reason.
+        self.send_card(generation, &who, SAMPLE_CARD, passage)?;
+        let id = format!("sample-{}", uuid::Uuid::new_v4().simple());
+        let mut st = self.lock();
+        let conversation = st.conversation;
+        let n = self
+            .store()
+            .begin_sample(conversation, &id, &who, &asked_by, passage)
+            .map_err(|err| format!("{err:#}"))?;
+        let entry = Entry {
+            id: id.clone(),
+            who: who.clone(),
+            kind: Kind::Sample,
+            // Spelled out rather than the bare number, as a picture's
+            // is: a client that has never heard of this kind falls
+            // back to showing an entry's text, and "voice sample 1" is
+            // a thing a person can read.
+            text: format!("voice sample {n}"),
+            // What they were given to read, until the room knows what
+            // they actually said.
+            title: passage.to_string(),
+            // The room is listening: the card says so, and it is the
+            // only light there is on a microphone being recorded.
+            live: true,
+            partial: false,
+            cut: false,
+            typed: false,
+            translations: BTreeMap::new(),
+            note: String::new(),
+            at: now_ms(),
+            sent: true,
+        };
+        if let Err(err) = self.store().put_entry(conversation, &entry) {
+            return Err(format!("{err:#}"));
+        }
+        // What they had already said, so that whatever the room writes
+        // down from here can be told apart from it.
+        let was = st
+            .log
+            .iter()
+            .rev()
+            .find(|e| e.kind == Kind::Human && e.who == who)
+            .map(|e| e.id.clone());
+        if let Some(p) = st.people.get_mut(&who) {
+            p.sample = Some(Recording {
+                id: id.clone(),
+                asked_by: asked_by.clone(),
+                passage: passage.to_string(),
+                pcm: Vec::new(),
+                reading: false,
+                armed: Instant::now(),
+                heard: Instant::now(),
+                quiet: None,
+                was,
+            });
+        }
+        info!(n, %who, asked_by = %asked_by, "listening for a voice sample");
+        self.emit_entry(&entry);
+        st.log.push(entry);
+        trim_log(&mut st.log);
+        Ok((n, who))
+    }
+
+    /// They read it: the card becomes the clip, and the AI that asked
+    /// is told.
+    fn finish_sample(&self, id: &str, pcm: &[f32], said: &str, who: &str, asked_by: &str) {
+        let secs = pcm.len() as f32 / crate::mixer::RATE as f32;
+        // Written at the rate the clone server wants rather than the
+        // room's, because the only thing this clip is ever for is
+        // being uploaded, and 24 kHz is what it is listened to at.
+        let clip = crate::tts::resample(pcm, crate::mixer::RATE, SAMPLE_HZ)
+            .and_then(|s| crate::voices::wav(&s, SAMPLE_HZ));
+        let wav = match clip {
+            Ok(wav) => wav,
+            Err(err) => {
+                warn!(%id, "couldn't keep a voice sample: {err:#}");
+                self.fail_sample(id, "the room couldn't keep the recording", who, asked_by);
+                return;
+            }
+        };
+        if let Err(err) = self.store().finish_sample(id, &wav, secs, said) {
+            warn!(%id, "couldn't keep a voice sample: {err:#}");
+            self.fail_sample(id, "the room couldn't keep the recording", who, asked_by);
+            return;
+        }
+        info!(
+            %id,
+            %who,
+            secs = format!("{secs:.1}"),
+            said = %one_line(said),
+            "recorded a voice sample"
+        );
+        self.settle_sample(id, said, secs, who, asked_by);
+    }
+
+    /// They never did, or the room couldn't keep what they said. The
+    /// card says which rather than listening for good.
+    fn fail_sample(&self, id: &str, why: &str, who: &str, asked_by: &str) {
+        if let Err(err) = self.store().fail_sample(id, why) {
+            warn!(%id, "mark a voice sample failed: {err:#}");
+        }
+        self.settle_sample(id, why, 0.0, who, asked_by);
+    }
+
+    /// Either way the room has stopped listening: the passage comes
+    /// off their screen, the card says what became of it, and the AI
+    /// that asked for it is given the turn to say so.
+    fn settle_sample(&self, id: &str, said: &str, secs: f32, who: &str, asked_by: &str) {
+        // The passage has served its purpose. Taken back by the room
+        // and not by the model, because the model is not told the
+        // reading is over until the next turn, and a card telling
+        // somebody to read something they have already read is a card
+        // they will read again.
+        let _ = self.take_back_card(who, SAMPLE_CARD);
+        let mut st = self.lock();
+        let conversation = st.conversation;
+        if let Some(e) = st.log.iter_mut().find(|e| e.id == id) {
+            e.live = false;
+            // What they said, where what they were asked to say was:
+            // the clip's own caption, and the one thing about it the
+            // model can read.
+            if !said.trim().is_empty() {
+                e.title = one_line(said.trim());
+            }
+            // How long it is, for the model alone -- see `Entry::note`.
+            // It is on the card for everyone else.
+            if secs > 0.0 {
+                e.note = format!("{secs:.0} seconds");
+            }
+            let entry = e.clone();
+            if let Err(err) = self.store().put_entry(conversation, &entry) {
+                warn!("store a voice sample's card: {err:#}");
+            }
+            self.emit_entry(&entry);
+        }
+        match self.store().read_aloud(id) {
+            Ok(Some(read)) => self.emit(json!({ "type": "sample", "sample": read })),
+            Ok(None) => warn!(%id, "a voice sample that finished isn't in the database"),
+            Err(err) => warn!("read a voice sample back: {err:#}"),
+        }
+        self.tell_about_sample(&mut st, asked_by);
+    }
+
+    /// Give the bot that asked for a clip the turn to say what became
+    /// of it -- but only if the room's own turn-taking will not.
+    ///
+    /// Reading a passage aloud is speaking, so in a room where the AI
+    /// answers pauses, or a back-and-forth it is already in, the end
+    /// of the reading is a pause like any other and `hand_over` gives
+    /// it the turn with the card already in the conversation -- which
+    /// is why `hand_over` waits for a reading to finish. A bot that
+    /// speaks only when it is named would never hear about it: nobody
+    /// says an AI's name while reading a passage at a microphone.
+    fn tell_about_sample(&self, st: &mut State, bot: &str) {
+        if !st.bots.iter().any(|b| b.cfg.name == bot) {
+            return;
+        }
+        let b = st.bot(bot);
+        if !b.here || b.mode == Mode::Never {
+            return;
+        }
+        if b.engaged.is_some() || matches!(b.mode, Mode::Auto | Mode::Always) {
+            return;
+        }
+        let bot = bot.to_string();
+        st.pending.retain(|p| p.why != Why::Reading);
+        st.pending.push(Pending {
+            bot,
+            due: None,
+            cue: Cue::Speak,
+            why: Why::Reading,
+        });
+    }
+
+    /// The clips read in this conversation, without the audio: what a
+    /// card needs to draw itself.
+    fn samples_json(&self, st: &State) -> Value {
+        match self.store().samples(st.conversation) {
+            Ok(read) => serde_json::to_value(read).unwrap_or_else(|_| json!([])),
+            Err(err) => {
+                warn!("read the voice samples: {err:#}");
+                json!([])
+            }
+        }
+    }
+
+    /// One clip's audio, for the play button on its card.
+    pub fn sample_wav(&self, id: &str) -> Result<Option<Vec<u8>>, String> {
+        self.store()
+            .sample_wav(id)
+            .map_err(|err| format!("{err:#}"))
+    }
+
+    /// The clip numbered `n` in this conversation, with its audio:
+    /// what `save_voice` sends to the clone server.
+    pub fn voice_clip(&self, n: u32) -> Result<crate::store::Clip, String> {
+        let conversation = self.lock().conversation;
+        let clip = self
+            .store()
+            .sample_numbered(conversation, n)
+            .map_err(|err| format!("{err:#}"))?;
+        let Some(clip) = clip else {
+            return Err(format!(
+                "there is no voice sample {n} in this conversation; \
+                 take_voice_sample makes one"
+            ));
+        };
+        if !clip.failed.is_empty() {
+            return Err(format!(
+                "voice sample {n} came to nothing ({}); take another",
+                clip.failed
+            ));
+        }
+        if clip.wav.is_none() {
+            return Err(format!(
+                "voice sample {n} is still being read; wait for the room to say it is in"
+            ));
+        }
+        Ok(clip)
+    }
+
+    // -- voices: kept under their names, and lent to the AIs -------------
+
+    /// Write down a voice that is now on the clone server, so the
+    /// house knows whose it is and what it is called.
+    pub fn remember_voice(
+        &self,
+        id: &str,
+        name: &str,
+        who: &str,
+        said: &str,
+    ) -> Result<(), String> {
+        self.store()
+            .put_voice(id, name, who, said)
+            .map_err(|err| format!("{err:#}"))?;
+        self.emit(json!({ "type": "voices", "voices": self.voices_json() }));
+        Ok(())
+    }
+
+    /// The voices the house has cloned, oldest first.
+    pub fn voices(&self) -> Vec<crate::store::Cloned> {
+        self.store().voices().unwrap_or_else(|err| {
+            warn!("read the voices: {err:#}");
+            Vec::new()
+        })
+    }
+
+    fn voices_json(&self) -> Value {
+        serde_json::to_value(self.voices()).unwrap_or_else(|_| json!([]))
+    }
+
+    /// One of them by the name it is asked for out loud.
+    pub fn voice_named(&self, name: &str) -> Result<crate::store::Cloned, String> {
+        let name = name.trim();
+        // Read out of the database before the match rather than in it:
+        // a `MutexGuard` in the scrutinee is held for the whole of it,
+        // and the arm that says what voices there *are* reads the
+        // database again.
+        let found = self.store().voice(name);
+        match found {
+            Ok(Some(v)) => Ok(v),
+            Ok(None) => {
+                let have = self.voices();
+                // Said as "cloned voice" and not "voice", because the
+                // other kind of voice has names too and they are not
+                // these. A model that has just read the speech
+                // server's presets off `list_puppets` will reach for
+                // one of those here, and the answer "there is no voice
+                // called that" is a true sentence that explains
+                // nothing: the voice exists, it is simply not a thing
+                // this tool takes.
+                Err(format!(
+                    "there is no voice *cloned* from anybody called {name:?}. {}                      The speech server's own preset voices are not cloned voices                      and cannot be worn this way -- they are what a puppet's                      `preset` builds on.",
+                    if have.is_empty() {
+                        "Nobody here has recorded one yet.".to_string()
+                    } else {
+                        format!(
+                            "The cloned voices are {}.",
+                            have.iter()
+                                .map(|v| format!("{:?}", v.name))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    }
+                ))
+            }
+            Err(err) => Err(format!("{err:#}")),
+        }
+    }
+
+    /// Forget a voice: the row goes, and any AI in this room that was
+    /// speaking in it goes back to its own. Taking it off the server
+    /// is the caller's half -- see `agent::run_tool`.
+    pub fn forget_voice(&self, id: &str) -> Result<(), String> {
+        self.store()
+            .forget_voice(id)
+            .map_err(|err| format!("{err:#}"))?;
+        let mut st = self.lock();
+        let lost: Vec<String> = st
+            .bots
+            .iter()
+            .filter(|b| {
+                b.borrowed
+                    .lock()
+                    .expect("borrowed voice mutex poisoned")
+                    .as_deref()
+                    == Some(id)
+            })
+            .map(|b| b.cfg.name.clone())
+            .collect();
+        for bot in lost {
+            self.lend_voice(&mut st, &bot, None);
+        }
+        self.emit(json!({ "type": "voices", "voices": self.voices_json() }));
+        Ok(())
+    }
+
+    /// Speak in a voice the house has cloned, or in its own again.
+    /// `voice` is the name it is called out loud; None is its own.
+    ///
+    /// The bot is whichever one's turn this is: a voice is a thing one
+    /// of them is wearing, and the one that asked is the one that
+    /// wears it.
+    pub fn speak_as(&self, generation: u64, voice: Option<&str>) -> Result<String, String> {
+        let cloned = match voice {
+            Some(name) => Some(self.voice_named(name)?),
+            None => None,
+        };
+        let mut st = self.lock();
+        let bot = st
+            .turn_of(generation)
+            .map(|b| b.cfg.name.clone())
+            .ok_or("that turn is over; the room has moved on")?;
+        let said = match &cloned {
+            Some(v) => format!("{} (cloned from {})", v.name, v.who),
+            None => "its own voice".to_string(),
+        };
+        self.lend_voice(&mut st, &bot, cloned);
+        info!(bot = %bot, voice = %said, "speaking in another voice");
+        Ok(said)
+    }
+
+    /// Put a voice on a bot, or take one off: the cell its voices
+    /// read, the name the room shows on its strip, and every tab told.
+    ///
+    /// Not written down. What the house keeps is the voice; which of
+    /// them a bot is speaking in today is this afternoon's, so a
+    /// restart is every AI in its own voice again.
+    fn lend_voice(&self, st: &mut State, bot: &str, voice: Option<crate::store::Cloned>) {
+        let (id, name) = match voice {
+            Some(v) => (Some(v.id), Some(v.name)),
+            None => (None, None),
+        };
+        let b = st.bot(bot);
+        *b.borrowed.lock().expect("borrowed voice mutex poisoned") = id;
+        b.voice = name.clone();
+        self.emit(json!({ "type": "voice", "bot": bot, "voice": name }));
+    }
+
+    // -- puppets: characters the first AI speaks through ----------------
+
+    /// The puppets the house has kept, oldest first. Not who is on
+    /// stage -- the roster to cast from.
+    pub fn puppet_roster(&self) -> Vec<crate::store::Puppet> {
+        self.store().puppets().unwrap_or_else(|err| {
+            warn!("read the puppets: {err:#}");
+            Vec::new()
+        })
+    }
+
+    /// Whether this room can have puppets at all: a puppet is given a
+    /// voice the moment it is made up, and a house with no speech
+    /// server has none to give.
+    pub fn can_puppet(&self) -> bool {
+        self.tts.is_some()
+    }
+
+    /// Keep a puppet under its name, or write over the one that is
+    /// already there. Ok says what it is called.
+    ///
+    /// Writing over one is deliberate: a character is revised by
+    /// talking about it -- "give him a rougher voice" -- and a tool
+    /// that could only ever make a new one would leave the room with
+    /// two Grimbles.
+    pub fn make_puppet(&self, mut part: crate::store::Puppet) -> Result<String, String> {
+        if self.tts.is_none() {
+            return Err(no_puppets());
+        }
+        let name = part.name.trim().to_string();
+        if name.is_empty() {
+            return Err("a puppet needs a name: it goes beside everything it says".into());
+        }
+        if name.chars().count() > PUPPET_NAME_MAX {
+            return Err(format!(
+                "a puppet's name is at most {PUPPET_NAME_MAX} characters; it is said out loud"
+            ));
+        }
+        if name.starts_with('@') || name.chars().any(char::is_control) {
+            return Err("a name is one line and doesn't start with @".into());
+        }
+        if let Some(bot) = self
+            .cfg
+            .bots
+            .iter()
+            .find(|b| name.eq_ignore_ascii_case(&b.name))
+        {
+            return Err(format!(
+                "{} is one of the AIs in this house, so a puppet cannot be called \
+                 that: the room would not know which of them was being spoken to",
+                bot.name
+            ));
+        }
+        // A cloned voice has to exist before it is written down, or
+        // the puppet comes on stage and says nothing.
+        let clone = part.clone.trim().to_string();
+        if !clone.is_empty() {
+            match self.store().voice(&clone) {
+                Ok(Some(v)) => part.clone = v.name,
+                Ok(None) => {
+                    return Err(format!(
+                        "there is no cloned voice called {clone:?}; list_voices says \
+                         what there is"
+                    ))
+                }
+                Err(err) => return Err(format!("{err:#}")),
+            }
+        }
+        part.name = name.clone();
+        self.store()
+            .put_puppet(&part)
+            .map_err(|err| format!("{err:#}"))?;
+        info!(
+            puppet = %name,
+            voice = %if part.clone.is_empty() { part.preset.clone() } else { part.clone.clone() },
+            "kept a puppet"
+        );
+        // A puppet already on stage takes the revision the next time
+        // it is spoken for: the roster is what a show is cast from,
+        // and a character changed while it is standing there should
+        // sound changed at the next show or the next question. Not
+        // mid-play -- a show holds the voices it opened with, and a
+        // character that changed voice between two lines of one scene
+        // would be two characters.
+        let mut st = self.lock();
+        if st.bots.iter().any(|b| b.cfg.name == name && b.puppet()) {
+            let voice = self.borrow_for(&part);
+            let b = st.bot(&name);
+            b.part = Some(part);
+            *b.borrowed.lock().expect("borrowed voice mutex poisoned") = voice;
+        }
+        Ok(name)
+    }
+
+    /// Forget a puppet for good: the roster, its face and its bio.
+    /// It is taken off the stage first if it is on it.
+    pub fn forget_puppet(&self, name: &str) -> Result<String, String> {
+        let Some(part) = self
+            .store()
+            .puppet(name)
+            .map_err(|err| format!("{err:#}"))?
+        else {
+            return Err(unknown_puppet(name, &self.puppet_roster()));
+        };
+        let _ = self.dismiss_puppet(&part.name);
+        match self.store().forget_puppet(&part.name) {
+            Ok(_) => {
+                info!(puppet = %part.name, "forgot a puppet");
+                Ok(part.name)
+            }
+            Err(err) => Err(format!("{err:#}")),
+        }
+    }
+
+    /// Bring a puppet on stage: it joins the room as its own voice,
+    /// with its own name, its own fader and its own face.
+    ///
+    /// Everything about being in the room is the same as for an AI --
+    /// that is the point, and it is why a puppet is one of `State::bots`
+    /// rather than a list of its own. What differs is that nothing ever
+    /// gives it the turn: see [`BotState::answering`].
+    pub fn cast_puppet(&self, name: &str) -> Result<String, String> {
+        if self.tts.is_none() {
+            return Err(no_puppets());
+        }
+        let Some(part) = self
+            .store()
+            .puppet(name)
+            .map_err(|err| format!("{err:#}"))?
+        else {
+            return Err(unknown_puppet(name, &self.puppet_roster()));
+        };
+        let name = part.name.clone();
+        let mut st = self.lock();
+        if st
+            .bots
+            .iter()
+            .any(|b| b.cfg.name.eq_ignore_ascii_case(&name))
+        {
+            return Err(format!("{name} is already in the room"));
+        }
+        if let Some(person) = st
+            .people
+            .keys()
+            .find(|n| n.eq_ignore_ascii_case(&name))
+            .cloned()
+        {
+            return Err(format!(
+                "there is somebody here called {person}, so a puppet cannot be \
+                 called that in this room: ask them to rename it, or rename the puppet"
+            ));
+        }
+        if st.bots.iter().filter(|b| b.puppet()).count() >= CAST_MAX {
+            return Err(format!(
+                "there are already {CAST_MAX} puppets in the room, which is as many \
+                 as anybody can follow; send one away first"
+            ));
+        }
+        // A fader of its own, like every bot after the first, and for
+        // the same reason: two voices on one fader are one fader.
+        let mut cfg = BotConfig::new(&name, Vec::new());
+        cfg.strip = format!("{AGENT_STRIP}:{name}");
+        let borrowed: crate::tts::Borrowed = Arc::new(Mutex::new(self.borrow_for(&part)));
+        // It has no agent thread, so nothing is ever read off this.
+        // The sender is here because a bot in the room has one; `ask`
+        // refuses a puppet before it could ever be used.
+        let (turns, _never) = crossbeam_channel::unbounded();
+        st.bots.push(BotState {
+            cfg,
+            part: Some(part),
+            borrowed,
+            voice: None,
+            generation: Arc::new(AtomicU64::new(0)),
+            turns,
+            // Never, and it is not a setting anybody chose: a puppet
+            // answers nothing because there is nothing behind it.
+            chosen: Mode::Never,
+            mode: Mode::Never,
+            here: true,
+            // It finishes its line. A play in which a cough costs an
+            // actor their speech is not a play -- and a show sets this
+            // on everybody anyway (see `begin_show`), so this is what
+            // a puppet taking questions afterwards comes back to.
+            stops: Stops::Finished,
+            talked_over: false,
+            engaged: None,
+            state: "listening",
+            reply: None,
+            starting: None,
+            last_reply: None,
+        });
+        info!(puppet = %name, room = %self.cfg.id, "a puppet came on stage");
+        self.emit(json!({
+            "type": "agents_here",
+            "agents": self.agents_json(&st),
+        }));
+        // Its face, which it may have worn in a show months ago.
+        self.emit_people(&st);
+        Ok(name)
+    }
+
+    /// Take a puppet off the stage. It stops where it is: it is no
+    /// longer in the room to be finishing a sentence in it. What it
+    /// said stays in the conversation, with its name on it, because
+    /// that is what happened.
+    pub fn dismiss_puppet(&self, name: &str) -> Result<String, String> {
+        let mut st = self.lock();
+        let Some(name) = st
+            .bots
+            .iter()
+            .find(|b| b.puppet() && b.cfg.name.eq_ignore_ascii_case(name.trim()))
+            .map(|b| b.cfg.name.clone())
+        else {
+            let on = on_stage(&st);
+            return Err(if on.is_empty() {
+                "there are no puppets in the room".to_string()
+            } else {
+                format!(
+                    "there is no puppet called {:?} in the room; it is {}",
+                    name.trim(),
+                    and_list(&on)
+                )
+            });
+        };
+        self.hush(&mut st, std::slice::from_ref(&name));
+        st.bots.retain(|b| b.cfg.name != name);
+        st.pending.retain(|p| p.bot != name);
+        info!(puppet = %name, room = %self.cfg.id, "a puppet left the stage");
+        self.emit(json!({
+            "type": "agents_here",
+            "agents": self.agents_json(&st),
+        }));
+        Ok(name)
+    }
+
+    /// The puppets in the room, in the order they came on.
+    pub fn on_stage(&self) -> Vec<String> {
+        on_stage(&self.lock())
+    }
+
+    /// Which cloned voice, if any, a puppet should be lent: the id the
+    /// clone server knows it by, which is what its voices read.
+    fn borrow_for(&self, part: &crate::store::Puppet) -> Option<String> {
+        if part.clone.trim().is_empty() {
+            return None;
+        }
+        match self.store().voice(part.clone.trim()) {
+            Ok(Some(v)) => Some(v.id),
+            // Deleted from under it. Its preset is what is left, which
+            // is the same answer `speak_as` gives: a character that
+            // sounds like itself again beats one that has gone silent.
+            Ok(None) => {
+                warn!(
+                    puppet = %part.name,
+                    voice = %part.clone,
+                    "the cloned voice is gone, so this puppet speaks in its preset"
+                );
+                None
+            }
+            Err(err) => {
+                warn!("look a cloned voice up: {err:#}");
+                None
+            }
+        }
+    }
+
+    /// Build one voice in the room a second set of mouths for: one per
+    /// language it is spoken in, the room's own first.
+    ///
+    /// For [`crate::puppet`], which is the only thing that asks. A
+    /// puppet gets the preset and the delivery notes its character was
+    /// made with; the AI running the show -- which may take a part in
+    /// its own play -- gets the room's own voice, and both read the
+    /// same cell that says whether a cloned voice has been lent over
+    /// the top, so a puppet wearing somebody's voice keeps wearing it.
+    pub fn stage_voices(&self, name: &str) -> Result<Speaking, String> {
+        let Some(tts) = self.tts.clone() else {
+            return Err(no_puppets());
+        };
+        let (part, borrowed) = {
+            let st = self.lock();
+            let Some(b) = st.bots.iter().find(|b| b.cfg.name == name) else {
+                return Err(format!("{name} is not in the room"));
+            };
+            (b.part.clone(), b.borrowed.clone())
+        };
+        // A puppet with no preset of its own, and every AI, speak in
+        // the voice the house was started with -- which is what the
+        // factory falls back to when it is handed nothing.
+        let (preset, delivery) = match &part {
+            Some(p) => (p.preset.trim(), p.delivery.trim()),
+            None => ("", ""),
+        };
+        let mut out = Vec::new();
+        for language in &self.cfg.spoken {
+            let voice = tts(language, preset, delivery, borrowed.clone())
+                .map_err(|err| format!("{name} has no voice here: {err:#}"))?;
+            out.push((language.clone(), voice));
+        }
+        Ok(out)
+    }
+
+    /// Open a line for a puppet: a turn number, and an entry in the
+    /// conversation with its name on it. The audio goes in with
+    /// [`Room::agent_speak`] exactly as a bot's does, which is what
+    /// makes a puppet's line follow the voice word by word on everyone's
+    /// screen, cut where it was cut, and end up in the history.
+    ///
+    /// None when the puppet has left the stage, which is a line nobody
+    /// should say.
+    pub fn puppet_line(&self, who: &str) -> Option<u64> {
+        let mut st = self.lock();
+        if !st.bots.iter().any(|b| b.cfg.name == who && b.puppet()) {
+            return None;
+        }
+        let now = Instant::now();
+        let generation = self.turns.fetch_add(1, Ordering::SeqCst) + 1;
+        st.bot(who).generation.store(generation, Ordering::SeqCst);
+        let entry = Entry {
+            id: format!("agent-{}", uuid::Uuid::new_v4().simple()),
+            who: who.to_string(),
+            kind: Kind::Agent,
+            title: String::new(),
+            text: String::new(),
+            live: true,
+            partial: false,
+            cut: false,
+            typed: false,
+            translations: BTreeMap::new(),
+            note: String::new(),
+            at: now_ms(),
+            sent: true,
+        };
+        self.emit_entry(&entry);
+        let b = st.bot(who);
+        b.last_reply = Some((generation, entry.id.clone()));
+        b.reply = Some(Reply {
+            generation,
+            entry: entry.id.clone(),
+            cue: Cue::Speak,
+            sentences: Vec::new(),
+            translated: BTreeMap::new(),
+            complete: false,
+            spoken: BTreeSet::new(),
+            reported: Vec::new(),
+            dry_since: None,
+            working: None,
+            heard: now,
+            asked: now,
+        });
+        st.log.push(entry);
+        trim_log(&mut st.log);
+        Some(generation)
+    }
+
+    /// Whether this voice is still saying something: a line queued, or
+    /// one still playing. What the puppeteer waits on between lines,
+    /// and what it waits on before the curtain goes up -- a play that
+    /// began over the top of the AI announcing it would be two voices
+    /// at once.
+    pub fn voice_busy(&self, bot: &str) -> bool {
+        self.lock()
+            .bots
+            .iter()
+            .any(|b| b.cfg.name == bot && b.reply.is_some())
+    }
+
+    /// Cut a voice off where it has got to, as talking over it would.
+    /// How one puppet interrupts another: the line on screen ends with
+    /// a dash, exactly as an interrupted AI's does, because that is
+    /// what happened to it.
+    pub fn cut_short(&self, bot: &str) {
+        let mut st = self.lock();
+        if st.bots.iter().any(|b| b.cfg.name == bot) {
+            self.hush(&mut st, &[bot.to_string()]);
+        }
+    }
+
+    /// Put the curtain up: the show is on, and the director and every
+    /// puppet in it answer nothing and finish what they say until it
+    /// comes down. Ok hands back the flag that stops it early.
+    ///
+    /// The settings are *set*, on the same controls anybody could set
+    /// them with, and written down so a restart in the middle of the
+    /// second act does not leave an AI silenced for good.
+    pub fn begin_show(
+        &self,
+        director: &str,
+        title: &str,
+        lines: usize,
+    ) -> Result<Arc<std::sync::atomic::AtomicBool>, String> {
+        let mut st = self.lock();
+        if let Some(on) = &st.show {
+            return Err(format!(
+                "a show is already on ({:?}, {} of {} lines said); stop it or wait \
+                 for the curtain",
+                on.title, on.said, on.lines
+            ));
+        }
+        if !st.bots.iter().any(|b| b.cfg.name == director) {
+            return Err(format!("{director} is not in this room"));
+        }
+        // Every voice in the room, not only the cast. A puppet not in
+        // this script is still on stage and still must not be cut off
+        // mid-breath by somebody coughing in the audience -- and
+        // another AI that answered a pause between two lines would be
+        // speaking over the play. A show is a thing the room is doing,
+        // the way a game is, and a game's reply mode binds every bot
+        // in the room for the same reason.
+        let cast: Vec<String> = st.bots.iter().map(|b| b.cfg.name.clone()).collect();
+        let mut was = BTreeMap::new();
+        for who in &cast {
+            let b = st.bot(who);
+            was.insert(who.clone(), (b.chosen, b.stops));
+        }
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        st.show = Some(Showing {
+            director: director.to_string(),
+            title: title.to_string(),
+            was: was.clone(),
+            stop: stop.clone(),
+            lines,
+            said: 0,
+        });
+        // Written down before anything is changed, so there is never a
+        // moment where the room is set for a show and nothing knows
+        // how to put it back.
+        if let Err(err) = serde_json::to_string(
+            &was.iter()
+                .map(|(k, (m, s))| (k.clone(), (m.as_str().to_string(), s.as_str().to_string())))
+                .collect::<BTreeMap<_, _>>(),
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .and_then(|j| self.store().set_setting(SHOW_WAS, &j))
+        {
+            warn!("write down what the show borrowed: {err:#}");
+        }
+        for who in &cast {
+            self.bind(&mut st, who, Mode::Never, Stops::Finished);
+        }
+        drop(st);
+        info!(
+            room = %self.cfg.id,
+            %director,
+            %title,
+            lines,
+            cast = %and_list(&cast),
+            "the curtain is up"
+        );
+        self.emit(json!({
+            "type": "show",
+            "show": { "title": title, "lines": lines, "said": 0 },
+        }));
+        Ok(stop)
+    }
+
+    /// One more line has been said, for the card and for anyone
+    /// watching the bar.
+    pub fn show_said(&self, n: usize) {
+        let mut st = self.lock();
+        let Some(on) = st.show.as_mut() else { return };
+        on.said = n;
+        let (title, lines) = (on.title.clone(), on.lines);
+        self.emit(json!({
+            "type": "show",
+            "show": { "title": title, "lines": lines, "said": n },
+        }));
+    }
+
+    /// Whether the show has been told to stop.
+    pub fn show_stopped(&self) -> bool {
+        self.lock()
+            .show
+            .as_ref()
+            .is_some_and(|s| s.stop.load(Ordering::SeqCst))
+    }
+
+    /// What a show is called, if one is on.
+    pub fn show_title(&self) -> Option<String> {
+        self.lock().show.as_ref().map(|s| s.title.clone())
+    }
+
+    /// Stop whatever show is on. What **Stop** does, and what the
+    /// `stop_show` tool does: the player thread reads the flag between
+    /// lines and brings the curtain down itself, which is what puts
+    /// the settings back.
+    pub fn stop_show(&self) -> bool {
+        let st = self.lock();
+        match &st.show {
+            Some(on) => {
+                on.stop.store(true, Ordering::SeqCst);
+                // Every voice in it, the director included: it may
+                // have taken a part in its own play, and the thing
+                // somebody pressed Stop to end is the play.
+                let cast: Vec<String> = st.bots.iter().map(|b| b.cfg.name.clone()).collect();
+                drop(st);
+                // Nothing queued is wanted: the audience asked for it
+                // to end, not to end after the speech it was in.
+                for who in cast {
+                    self.cut_short(&who);
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Bring the curtain down: the settings go back to what they were,
+    /// and the AI that wrote the script is given the turn to say so --
+    /// which is how a show ends with the puppets taking questions
+    /// rather than with silence.
+    pub fn end_show(&self) {
+        let mut st = self.lock();
+        let Some(on) = st.show.take() else { return };
+        let director = on.director.clone();
+        drop(st);
+        info!(
+            room = %self.cfg.id,
+            title = %on.title,
+            said = on.said,
+            of = on.lines,
+            "the curtain is down"
+        );
+        self.put_settings_back(&on.was);
+        self.emit(json!({ "type": "show", "show": Value::Null }));
+        // The last thing it does, and with the settings already back:
+        // the turn it is given is one it may answer in, and one
+        // somebody may talk over.
+        let mut st = self.lock();
+        let played = match (on.said, on.lines) {
+            (0, _) => "It never started.".to_string(),
+            (said, lines) if said < lines => {
+                format!("It stopped after {said} of {lines} lines.")
+            }
+            (_, lines) => format!("{lines} lines, played out to the end."),
+        };
+        let cast = on_stage(&st);
+        let still = match cast.is_empty() {
+            true => "There are no puppets left in the room.".to_string(),
+            false => format!(
+                "Still in the room: {}. They can take questions, or be sent away.",
+                and_list(&cast)
+            ),
+        };
+        self.note(
+            &mut st,
+            &director,
+            &format!("The show is over: {}", on.title),
+            &format!("{played} {still}"),
+        );
+        self.curtain_turn(&mut st, &director);
+    }
+
+    /// Put back what a show borrowed. Shared by the curtain and by a
+    /// room opening after a server that stopped in the middle of one.
+    fn put_settings_back(&self, was: &BTreeMap<String, (Mode, Stops)>) {
+        if let Err(err) = self.store().set_setting(SHOW_WAS, "") {
+            warn!("clear what the show borrowed: {err:#}");
+        }
+        let mut st = self.lock();
+        for (who, (mode, stops)) in was {
+            if st.bots.iter().any(|b| &b.cfg.name == who) {
+                self.bind(&mut st, who, *mode, *stops);
+            }
+        }
+    }
+
+    /// Set one voice's Answers and Stops, as the controls do and
+    /// written down the same way -- but without cutting off whatever
+    /// it is in the middle of saying.
+    ///
+    /// That is the whole reason this is not [`Room::set_mode`]:
+    /// silencing a bot from the controls stops it mid-sentence,
+    /// because a control that waited for the sentence to end would not
+    /// be the control anybody pressed. The curtain going up is the
+    /// opposite case -- it happens *inside* the reply where the AI is
+    /// announcing the show, and a show that began by cutting off its
+    /// own announcement would lose the sentence that explains it.
+    fn bind(&self, st: &mut State, bot: &str, mode: Mode, stops: Stops) {
+        let b = st.bot(bot);
+        b.chosen = mode;
+        b.stops = stops;
+        if mode == Mode::Never {
+            b.engaged = None;
+        }
+        if mode == Mode::Never {
+            st.pending.retain(|p| p.bot != bot);
+        }
+        let store = self.store();
+        for (key, value) in [
+            (format!("mode:{bot}"), mode.as_str()),
+            (format!("stops:{bot}"), stops.as_str()),
+        ] {
+            if let Err(err) = store.set_setting(&key, value) {
+                warn!("store {key}: {err:#}");
+            }
+        }
+        drop(store);
+        self.refresh_mode(st, bot);
+        self.emit(json!({ "type": "stops", "bot": bot, "stops": stops.as_str() }));
+    }
+
+    /// A server that went down in the middle of a show. The puppets
+    /// are gone -- they were only ever on the stage -- and what is
+    /// left is an AI set to answer nothing because a play wanted it
+    /// that way. Put back as the room opens, before anybody is in it.
+    fn restore_after_show(&self) {
+        let saved = match self.store().setting(SHOW_WAS) {
+            Ok(Some(s)) if !s.trim().is_empty() => s,
+            Ok(_) => return,
+            Err(err) => {
+                warn!("read what a show borrowed: {err:#}");
+                return;
+            }
+        };
+        let read: BTreeMap<String, (String, String)> = match serde_json::from_str(&saved) {
+            Ok(r) => r,
+            Err(err) => {
+                warn!("what a show borrowed is unreadable, so it stays as it is: {err}");
+                let _ = self.store().set_setting(SHOW_WAS, "");
+                return;
+            }
+        };
+        let was: BTreeMap<String, (Mode, Stops)> = read
+            .into_iter()
+            // Only the AIs: a puppet's row is for a puppet that is no
+            // longer anywhere, and `set_mode` on a name the room
+            // hasn't got does nothing anyway.
+            .filter(|(who, _)| self.cfg.bots.iter().any(|b| &b.name == who))
+            .filter_map(|(who, (m, s))| Some((who, (Mode::parse(&m)?, Stops::parse(&s)?))))
+            .collect();
+        if was.is_empty() {
+            let _ = self.store().set_setting(SHOW_WAS, "");
+            return;
+        }
+        info!(
+            room = %self.cfg.id,
+            put_back = %and_list(&was.keys().cloned().collect::<Vec<_>>()),
+            "a show was on when the server stopped: its settings go back"
+        );
+        self.put_settings_back(&was);
+    }
+
+    /// Write a card into the conversation saying what became of the
+    /// show: the programme, after the fact.
+    ///
+    /// A card rather than something said, because nobody said it --
+    /// and because a card is the room's way of putting something in
+    /// front of everybody that the model also reads next turn, which
+    /// is exactly what this is. It cannot be taken back, which is
+    /// right: the show happened.
+    fn note(&self, st: &mut State, who: &str, title: &str, text: &str) {
+        let entry = Entry {
+            id: format!("show-{}", uuid::Uuid::new_v4().simple()),
+            who: who.to_string(),
+            kind: Kind::Card,
+            title: title.to_string(),
+            text: text.to_string(),
+            live: false,
+            partial: false,
+            cut: false,
+            typed: false,
+            translations: BTreeMap::new(),
+            note: String::new(),
+            at: now_ms(),
+            sent: true,
+        };
+        if let Err(err) = self.store().put_entry(st.conversation, &entry) {
+            warn!("store the show's note: {err:#}");
+        }
+        self.emit_entry(&entry);
+        st.log.push(entry);
+        trim_log(&mut st.log);
+    }
+
+    /// Give the director the turn now the show is over, unless the
+    /// room's own turn-taking is going to. Same shape as
+    /// [`Room::tell_about_sample`] and for the same reason: nobody
+    /// says an AI's name while watching a play, so a bot that speaks
+    /// only when named would never get to come out and bow.
+    fn curtain_turn(&self, st: &mut State, director: &str) {
+        if !st.bots.iter().any(|b| b.cfg.name == director) {
+            return;
+        }
+        let b = st.bot(director);
+        if !b.here || b.mode == Mode::Never {
+            return;
+        }
+        if b.engaged.is_some() || matches!(b.mode, Mode::Auto | Mode::Always) {
+            return;
+        }
+        let director = director.to_string();
+        st.pending.retain(|p| p.why != Why::Curtain);
+        st.pending.push(Pending {
+            bot: director,
+            due: None,
+            cue: Cue::Speak,
+            why: Why::Curtain,
+        });
     }
 
     /// A paragraph of `person`'s transcription changed.
@@ -3420,6 +5225,12 @@ impl Room {
         if !st.bots.iter().any(|b| b.cfg.name == bot) {
             return;
         }
+        // A puppet answers nothing because there is nothing behind it,
+        // not because anybody chose that. There is no setting here to
+        // change, and the control is not shown for one.
+        if st.bots.iter().any(|b| b.cfg.name == bot && b.puppet()) {
+            return;
+        }
         let b = st.bot(bot);
         b.chosen = mode;
         b.engaged = None;
@@ -3487,6 +5298,14 @@ impl Room {
                     "mode": b.mode.as_str(),
                     "engaged": b.engaged.is_some(),
                     "stops": b.stops.as_str(),
+                    // A cloned voice it has been lent, by the name it
+                    // is called: a bot that has stopped sounding like
+                    // itself says so where everyone can see it.
+                    "voice": b.voice,
+                    // A puppet, not an AI: it has a fader like
+                    // everybody else and no Answers to set, because
+                    // there is nothing behind it to answer with.
+                    "puppet": b.puppet(),
                 })
             })
             .collect()
@@ -3640,6 +5459,20 @@ impl Room {
 
     pub fn set_strip(&self, name: &str, gain: Option<f32>, mute: Option<bool>) {
         self.mixer.set_strip(name, gain, mute);
+        // Worth a line of its own, because a muted strip is the room
+        // not listening to that person at all -- not a word of theirs
+        // is transcribed while it is on -- and it is kept, per room, so
+        // it outlives whatever made somebody set it. Looking for why
+        // one person can be heard in one room and not the next, this is
+        // the line you want, and it is not findable any other way.
+        if let Some(mute) = mute {
+            info!(
+                room = %self.config().id,
+                strip = name,
+                mute,
+                "a strip was muted or unmuted on the mixer"
+            );
+        }
         self.save_strips();
     }
 
@@ -3659,6 +5492,12 @@ impl Room {
 
     /// Someone pressed Stop: cut the AI off as if talked over.
     pub fn stop_agent(&self) {
+        // A puppet show first, and then everything that is in flight.
+        // **Stop** is the one control that is never a game's or a
+        // show's to take: a play set to finish whatever anybody says
+        // is exactly the thing somebody needs a way out of, and the
+        // button is it.
+        self.stop_show();
         let mut st = self.lock();
         self.interrupt(&mut st);
     }
@@ -3700,6 +5539,30 @@ impl Room {
             self.begin_game(&mut st, game.clone());
         }
         Ok(game)
+    }
+
+    /// A tool of reply `generation`'s is running. Hold the returned
+    /// guard for as long as it is: the room stops counting the silence
+    /// against the turn while it is held, and starts again when it is
+    /// dropped. Dropped on the way out of a panic too, which is the
+    /// reason it is a guard and not two calls -- a tool that blew up
+    /// leaving the room counting nothing would wedge every turn after
+    /// it.
+    pub fn working(&self, generation: u64) -> Working<'_> {
+        self.mark_working(generation, Some(Instant::now()));
+        Working {
+            room: self,
+            generation,
+        }
+    }
+
+    fn mark_working(&self, generation: u64, at: Option<Instant>) {
+        let mut st = self.lock();
+        if let Some(b) = st.working_on(generation) {
+            if let Some(r) = b.reply.as_mut() {
+                r.working = at;
+            }
+        }
     }
 
     /// Reply `generation` started a game, so it has nothing more to say.
@@ -4422,6 +6285,14 @@ impl Room {
         self.pending_turns(&mut st, now);
         self.follow_engagement(&mut st, now);
         self.follow_state(&mut st);
+        // A microphone armed for a reading that isn't coming. Last,
+        // and with the room unlocked, because stopping one writes to
+        // the database and tells every tab.
+        let over = self.give_up_on_samples(&mut st, now);
+        drop(st);
+        for sampled in over {
+            self.sampled(sampled);
+        }
     }
 
     /// What each bot is up to, and say so when it changes.
@@ -4430,6 +6301,11 @@ impl Room {
         let mut changed = false;
         for b in st.bots.iter_mut() {
             let state = match &b.reply {
+                // A puppet is never answering and is never off: it is
+                // a character standing there, and it says something
+                // when the one holding it does. "off" on its strip
+                // would read as a voice somebody had silenced.
+                None if b.puppet() => "listening",
                 // Not listening for anything: it has been told to say
                 // nothing, and a strip that said "listening" would be
                 // promising a turn that is never coming. (A bot that
@@ -4592,7 +6468,13 @@ impl Room {
         // since the room gives out one at a time. So there is a limit --
         // a backstop, not part of the reckoning above, and far longer
         // than any translation takes.
-        r.dry_since = match (finished, dry, r.dry_since) {
+        // A tool of its own is the one thing that keeps a reply quiet
+        // for as long as a dead voice would. Nothing is owed while one
+        // is running: the turn is waiting on the agent, which is awake
+        // and has said so. Capped all the same, because a tool that
+        // hangs is a dead thread by another name.
+        let working = r.working.is_some_and(|t| t.elapsed() < WORKING_TAIL);
+        r.dry_since = match (finished, dry && !working, r.dry_since) {
             (false, true, Some(t)) => Some(t),
             (false, true, None) => Some(Instant::now()),
             _ => None,
@@ -4890,6 +6772,15 @@ impl Room {
         {
             return;
         }
+        // Somebody is reading a passage into their microphone for a
+        // voice sample. What they are saying is a clip and not a turn:
+        // the room waits for the reading to end, and by then there is
+        // a card in the conversation saying what was recorded -- which
+        // is the thing the AI should be answering about, rather than
+        // the passage it wrote itself.
+        if st.people.values().any(|p| p.reading()) {
+            return;
+        }
         let pending: Vec<usize> = st
             .log
             .iter()
@@ -4938,7 +6829,13 @@ impl Room {
         // the room has moved past. And the AIs may answer each other
         // again -- a person in the conversation is the whole of what
         // keeps that allowance open.
-        st.pending.clear();
+        //
+        // Except a bot waiting to be told what was recorded while
+        // somebody was reading: that turn is *about* the thing that
+        // has just been said, so the saying of it cannot overtake it.
+        // It is also the hand-over the reading itself arrives in --
+        // see `tell_about_sample`.
+        st.pending.retain(|p| p.why == Why::Reading);
         st.ai_turns = 0;
         let mut turns: Vec<(String, Cue)> = Vec::new();
         for bot in bots {
@@ -4994,12 +6891,38 @@ impl Room {
     /// and put up by `follow_reply` the moment there is something in
     /// it -- the same way a bot that is only deciding is held back.
     fn ask(&self, st: &mut State, bot: &str, now: Instant, cue: Cue, show: bool) {
+        // A puppet has no brain to answer with, so a turn given to one
+        // is a turn nobody takes and a room left waiting for it.
+        // Nothing here should ever reach this -- `answering` is false
+        // for every puppet, which is what every path into this goes
+        // by -- and it is cheaper to say so than to find out from a
+        // room that has gone quiet.
+        if st.bots.iter().any(|b| b.cfg.name == bot && b.puppet()) {
+            warn!(
+                bot,
+                "a puppet was given the turn; there is nothing behind it"
+            );
+            return;
+        }
         // One counter for the room, so a generation names exactly one
         // turn by exactly one bot however many are thinking at once.
         let generation = self.turns.fetch_add(1, Ordering::SeqCst) + 1;
         st.bot(bot).generation.store(generation, Ordering::SeqCst);
+        // The puppets this one speaks through, which is all of them
+        // for the AI that runs the room and none at all for the rest:
+        // see `Turn::puppets`.
+        let puppets: Vec<(String, String)> = match bot == self.cfg.bot().name {
+            true => st
+                .bots
+                .iter()
+                .filter_map(|b| b.part.as_ref())
+                .map(|p| (p.name.clone(), p.about.clone()))
+                .collect(),
+            false => Vec::new(),
+        };
+        let mine: Vec<String> = puppets.iter().map(|(n, _)| n.clone()).collect();
         let mut messages =
-            conversation_messages(&st.log, self.cfg.history, &self.cfg.language, bot);
+            conversation_messages(&st.log, self.cfg.history, &self.cfg.language, bot, &mine);
         let game = match &st.game {
             Some(name) => match self.store().game(name) {
                 Ok(Some((g, prompt))) => Some((g.name, prompt)),
@@ -5047,6 +6970,7 @@ impl Room {
             spoken: BTreeSet::new(),
             reported: Vec::new(),
             dry_since: None,
+            working: None,
             heard: now,
             asked: now,
         });
@@ -5081,13 +7005,23 @@ impl Room {
                     .filter(|(_, p)| p.online())
                     .map(|(n, _)| n.clone())
                     .collect(),
+                // Every other voice in the room -- except the puppets
+                // this one is holding, which are not somebody else in
+                // the room to it. They are somebody else to every
+                // other bot, and those get them in this list.
                 others: st
                     .bots
                     .iter()
                     .filter(|b| b.cfg.name != bot)
+                    .filter(|b| !mine.contains(&b.cfg.name))
                     .map(|b| b.cfg.name.clone())
                     .collect(),
                 others_answering: others_answering.clone(),
+                puppets,
+                showing: st
+                    .show
+                    .as_ref()
+                    .and_then(|s| (s.director == bot).then(|| s.title.clone())),
                 hand_on: if others_answering.is_empty() {
                     0
                 } else {
@@ -5141,18 +7075,38 @@ impl Room {
     /// and the room doesn't promise an answer from it.
     fn named(&self, st: &State, text: &str) -> Vec<String> {
         let words = words(text);
-        st.bots
+        let said = |b: &BotState| {
+            std::iter::once(&b.cfg.name)
+                .chain(b.cfg.aliases.iter())
+                .map(|n| words_of(n))
+                .filter(|n| !n.is_empty())
+                .any(|n| words.windows(n.len()).any(|w| w == n.as_slice()))
+        };
+        let mut out: Vec<String> = st
+            .bots
             .iter()
             .filter(|b| b.answering())
-            .filter(|b| {
-                std::iter::once(&b.cfg.name)
-                    .chain(b.cfg.aliases.iter())
-                    .map(|n| words_of(n))
-                    .filter(|n| !n.is_empty())
-                    .any(|n| words.windows(n.len()).any(|w| w == n.as_slice()))
-            })
+            .filter(|b| said(b))
             .map(|b| b.cfg.name.clone())
-            .collect()
+            .collect();
+        // A puppet's name is the AI that speaks through it being
+        // spoken to. Nothing can give a puppet the turn -- there is
+        // nothing behind it -- but "Grimble, what did you mean?" is a
+        // question with an answer, and the one who has it is the one
+        // who wrote Grimble's lines. That is the whole of how a
+        // puppet left on stage after the show takes a question.
+        if st.bots.iter().any(|b| b.puppet() && said(b)) {
+            let director = self.cfg.bot().name.clone();
+            if !out.contains(&director)
+                && st
+                    .bots
+                    .iter()
+                    .any(|b| b.cfg.name == director && b.answering())
+            {
+                out.push(director);
+            }
+        }
+        out
     }
 }
 
@@ -5242,7 +7196,15 @@ fn sanitize_typed(text: &str) -> Result<String, String> {
     // forge somebody else's turn.
     let flat: String = text
         .chars()
-        .map(|c| if c == '\n' { c } else if is_unsafe_typed(c) { ' ' } else { c })
+        .map(|c| {
+            if c == '\n' {
+                c
+            } else if is_unsafe_typed(c) {
+                ' '
+            } else {
+                c
+            }
+        })
         .collect();
     // Runs of spaces become one, runs of blank lines become one blank
     // line, and nothing is left hanging off either end.
@@ -5367,11 +7329,22 @@ fn heard_prefix(text: &str, frac: f64) -> &str {
 /// `language` is the room's own: what somebody said in another is given
 /// to the model in it where an interpretation exists, so a conversation
 /// the room heard in two languages reads as one.
+/// The conversation as one bot is shown it: its own words as its own,
+/// everybody else's with the name on them.
+///
+/// `puppets` are the characters *this* bot speaks through. Their lines
+/// are its own words too, and are shown as its own with the character
+/// named -- because they are what it wrote, and a model shown "Grimble
+/// said" for a line it put in Grimble's mouth will answer Grimble, or
+/// argue with him. Empty for every bot that holds no puppets, and then
+/// a puppet's line reads like any other voice in the room, which to
+/// them it is.
 fn conversation_messages(
     log: &[Entry],
     history: usize,
     language: &str,
     me: &str,
+    puppets: &[String],
 ) -> Vec<(Role, String)> {
     let done: Vec<&Entry> = log
         .iter()
@@ -5385,6 +7358,11 @@ fn conversation_messages(
             // nothing to tell the model about: it is told when the
             // call it is waiting on comes back.
             Kind::Picture => !e.live,
+            // Nor is a recording the room is still listening for: the
+            // AI that asked for it is told when it lands, and a model
+            // shown one in progress would say so and then say it
+            // again.
+            Kind::Sample => !e.live,
         })
         .collect();
     let start = done.len().saturating_sub(history);
@@ -5425,6 +7403,19 @@ fn conversation_messages(
                 }
                 if mine {
                     out.push((Role::Assistant, text));
+                } else if puppets.iter().any(|p| p == &e.who) {
+                    // Its own words through one of its puppets. Said
+                    // as its own turn, with the character named, so
+                    // the model reads a line it wrote rather than a
+                    // line somebody said to it.
+                    let note = format!("[as {}] {}", e.who, one_line(&text));
+                    match out.last_mut() {
+                        Some((Role::Assistant, said)) => {
+                            said.push('\n');
+                            said.push_str(&note);
+                        }
+                        _ => out.push((Role::Assistant, note)),
+                    }
                 } else {
                     said_to_me(&mut out, format!("{}: {}", e.who, one_line(&text)));
                 }
@@ -5496,6 +7487,37 @@ fn conversation_messages(
                 } else {
                     said_to_me(&mut out, note);
                 }
+            }
+            // A few seconds of somebody's own voice, which the model
+            // cannot hear any more than it can see a picture. What it
+            // is told is whose it is, what number it is, how long it
+            // is and what they said -- which is everything
+            // `save_voice` needs and everything anybody in the room
+            // will say out loud about it. A clip that came to nothing
+            // says so, so the AI can ask them to try again rather
+            // than offering a voice it hasn't got.
+            Kind::Sample => {
+                // A clip that came to nothing has no length to it,
+                // which is how the room tells the two apart here: the
+                // AI must be able to say "I didn't get that, try
+                // again" rather than offering a voice it hasn't got.
+                let note = match e.note.trim() {
+                    "" => format!(
+                        "[{} was asked to read something aloud and the room recorded \
+                         nothing: {}. Say so, and offer to try again.]",
+                        e.who,
+                        one_line(e.title.trim())
+                    ),
+                    secs => format!(
+                        "[{} read something aloud and the room recorded it as {} ({secs}): \
+                         \"{}\". save_voice takes that number and a name to keep the voice \
+                         under.]",
+                        e.who,
+                        e.text,
+                        one_line(e.title.trim())
+                    ),
+                };
+                said_to_me(&mut out, note);
             }
             // One somebody brought in themselves. Said plainly to be
             // theirs and not the AI's: a model told only that a
@@ -5575,7 +7597,7 @@ mod tests {
             interp_tx.insert(language.to_string(), tx);
             interp_rx.insert(language.to_string(), rx);
         }
-        let (r, mut wiring) = Room::new(store, cfg, None, interp_tx, None).unwrap();
+        let (r, mut wiring) = Room::new(store, cfg, None, interp_tx, None, None).unwrap();
         // The turns the room's one bot is given, in place of the agent
         // thread that would be reading them.
         let turns = wiring.pop().expect("a room has an AI in it").turns;
@@ -5613,7 +7635,10 @@ mod tests {
         assert_eq!(spinner.text, "picture 1", "what it is called, in words");
         assert_eq!(spinner.title, "a tired wizard");
         assert_eq!(spinner.who, "Vox", "signed by the AI that is making it");
-        assert!(r.picture_png(&first).unwrap().is_none(), "nothing to serve yet");
+        assert!(
+            r.picture_png(&first).unwrap().is_none(),
+            "nothing to serve yet"
+        );
 
         // It lands.
         r.finish_picture(&first, &png(), "");
@@ -5705,7 +7730,7 @@ mod tests {
         // The model is told it is theirs and that it did not make it:
         // one told only that a picture is in the chat takes credit for
         // it, and then offers to change a thing it never made.
-        let msgs = conversation_messages(&r.lock().log, 50, "English", "Vox");
+        let msgs = conversation_messages(&r.lock().log, 50, "English", "Vox", &[]);
         let said = msgs
             .iter()
             .map(|(_, t)| t.as_str())
@@ -5733,7 +7758,7 @@ mod tests {
         r.finish_picture(&id, &png(), "Job a47b27c5aeb7: 64x64 sprite, 16 colours.");
 
         let read_back = |r: &Room| {
-            conversation_messages(&r.lock().log, 50, "English", "Vox")
+            conversation_messages(&r.lock().log, 50, "English", "Vox", &[])
                 .iter()
                 .map(|(_, t)| t.as_str())
                 .collect::<Vec<_>>()
@@ -5761,7 +7786,10 @@ mod tests {
         // It is for the model and not for the people: the browser is
         // sent a card, not a job id.
         let shown = serde_json::to_string(&kept).unwrap();
-        assert!(!shown.contains("a47b27c5aeb7"), "not sent to the browser: {shown}");
+        assert!(
+            !shown.contains("a47b27c5aeb7"),
+            "not sent to the browser: {shown}"
+        );
 
         // A tool that said nothing leaves the line as it always was.
         let (quiet, _) = r.begin_picture(g, "a tired wizard").unwrap();
@@ -5769,8 +7797,10 @@ mod tests {
         let said = read_back(&r);
         assert!(said.contains("picture 2"), "{said}");
         assert!(
-            !said.contains("picture 2 in the chat for everyone to look at: \"a tired wizard\". \
-                            Ask how they like it; set_avatar takes that number. The tool said"),
+            !said.contains(
+                "picture 2 in the chat for everyone to look at: \"a tired wizard\". \
+                            Ask how they like it; set_avatar takes that number. The tool said"
+            ),
             "no empty quotation where a tool said nothing: {said}"
         );
     }
@@ -5781,7 +7811,9 @@ mod tests {
     fn a_dropped_picture_is_checked_before_it_is_kept() {
         let (r, _turns) = room(Mode::Named);
 
-        let err = r.upload_picture("Ryan", "notes.txt", b"not a picture").unwrap_err();
+        let err = r
+            .upload_picture("Ryan", "notes.txt", b"not a picture")
+            .unwrap_err();
         assert!(err.contains("isn't a PNG"), "{err}");
 
         let mut huge = png();
@@ -5834,7 +7866,11 @@ mod tests {
 
         assert_eq!(r.clear_avatar("Thorne"), Ok(true));
         assert!(r.avatar_png("Thorne", None).unwrap().is_none());
-        assert_eq!(r.clear_avatar("Thorne"), Ok(false), "and none to take twice");
+        assert_eq!(
+            r.clear_avatar("Thorne"),
+            Ok(false),
+            "and none to take twice"
+        );
     }
 
     /// One picture, and the room decides afterwards whose it is: the
@@ -5850,7 +7886,10 @@ mod tests {
             default_mode: Mode::Named,
             // Two AIs, because the question is whether the first one
             // can give the second a face.
-            bots: vec![BotConfig::new("Vox", vec![]), BotConfig::new("Sage", vec![])],
+            bots: vec![
+                BotConfig::new("Vox", vec![]),
+                BotConfig::new("Sage", vec![]),
+            ],
             reply_after: Duration::from_millis(1000),
             confirm: Duration::from_millis(300),
             engaged_for: Duration::from_millis(5000),
@@ -5860,7 +7899,7 @@ mod tests {
             languages: vec!["English".into()],
             spoken: vec!["English".into()],
         };
-        let (r, _wiring) = Room::new(store, cfg, None, BTreeMap::new(), None).unwrap();
+        let (r, _wiring) = Room::new(store, cfg, None, BTreeMap::new(), None, None).unwrap();
         let g = r.lock().only().generation.load(Ordering::SeqCst);
 
         // One picture, made once.
@@ -5898,7 +7937,10 @@ mod tests {
         assert_eq!(ryan["who"], "Ryan");
         assert_eq!(ryan["bot"], false);
         assert_eq!(ryan["bio"], "", "nothing written yet");
-        assert_eq!(ryan["language"], "English", "the room's, having chosen none");
+        assert_eq!(
+            ryan["language"], "English",
+            "the room's, having chosen none"
+        );
         assert!(r.profile("Mallory").is_none(), "and nobody it doesn't");
 
         assert_eq!(
@@ -5919,7 +7961,9 @@ mod tests {
         let ryan = r.profile("Ryan").unwrap();
         assert!(ryan.get("face").is_none(), "not on the card: {ryan}");
         assert!(
-            !serde_json::to_string(&ryan).unwrap().contains("a tired wizard"),
+            !serde_json::to_string(&ryan)
+                .unwrap()
+                .contains("a tired wizard"),
             "nor anywhere else in it: {ryan}"
         );
         assert_eq!(
@@ -6085,6 +8129,7 @@ mod tests {
             },
             None,
             BTreeMap::new(),
+            None,
             None,
         )
         .unwrap();
@@ -6414,7 +8459,7 @@ mod tests {
         assert!(e.text.ends_with(" —"), "{:?}", e.text);
         assert!(r.lock().only().reply.is_none());
         // The model hears where it was cut off.
-        let msgs = conversation_messages(&r.lock().log, 50, "English", "Vox");
+        let msgs = conversation_messages(&r.lock().log, 50, "English", "Vox", &[]);
         assert!(msgs.last().unwrap().1.ends_with(CUT_NOTE));
     }
 
@@ -6803,7 +8848,7 @@ mod tests {
             let e = st.log.iter_mut().find(|e| e.id == "p1").unwrap();
             e.sent = true;
         }
-        let msgs = conversation_messages(&r.lock().log, 50, "English", "Vox");
+        let msgs = conversation_messages(&r.lock().log, 50, "English", "Vox", &[]);
         assert_eq!(msgs.last().unwrap().1, "Alex: The door is locked.");
     }
 
@@ -6952,7 +8997,7 @@ mod tests {
         assert_eq!(e.translations["Russian"], format!("{ru0} {ru1}"));
         // What the model is shown is still the one language it writes
         // in: a translation of its own words is not news to it.
-        let msgs = conversation_messages(&r.lock().log, 50, "English", "Vox");
+        let msgs = conversation_messages(&r.lock().log, 50, "English", "Vox", &[]);
         let last = &msgs.last().unwrap().1;
         assert_eq!(
             last,
@@ -7341,7 +9386,7 @@ mod tests {
         assert!(r.read_game("Dragon Heist").is_err());
 
         // The model is told about the button in later turns.
-        let msgs = conversation_messages(&r.lock().log, 50, "English", "Vox");
+        let msgs = conversation_messages(&r.lock().log, 50, "English", "Vox", &[]);
         assert!(msgs.last().unwrap().1.contains("\"Dragon Caper\""));
 
         // Entering: a fresh conversation, and the AI opens with the prompt.
@@ -7451,6 +9496,7 @@ mod tests {
             },
             None,
             BTreeMap::new(),
+            None,
             None,
         )
         .unwrap();
@@ -8480,7 +10526,7 @@ mod tests {
 
         // And the AI is shown its own card in full, so it can go on
         // playing by what the room is looking at.
-        let said = conversation_messages(&r.lock().log, 50, "English", "Vox");
+        let said = conversation_messages(&r.lock().log, 50, "English", "Vox", &[]);
         assert_eq!(said.len(), 1);
         assert_eq!(said[0].0, Role::Assistant);
         assert!(said[0].1.contains("The rules"), "{}", said[0].1);
@@ -8535,5 +10581,860 @@ mod tests {
         // The old conversation's cards are still in the database, for it.
         r.send_card(1, "Ryan", "Again", "A new secret.").unwrap();
         assert_eq!(held(&r, "Ryan"), ["Again: A new secret."]);
+    }
+    /// Audible frames, for the room to keep: `secs` of a tone, which
+    /// is not speech but is what a microphone sends in the shape the
+    /// room takes it.
+    fn speech(secs: f32) -> Vec<f32> {
+        let rate = crate::mixer::RATE as f32;
+        let n = (secs * rate) as usize;
+        (0..n)
+            .map(|i| (i as f32 * 220.0 * std::f32::consts::TAU / rate).sin() * 0.4)
+            .collect()
+    }
+
+    /// They have stopped talking, long enough for the room to say the
+    /// reading is over: a frame with nobody speaking starts the quiet,
+    /// and another one after it is what notices how long it has
+    /// lasted. Two frames, because that is how it happens in a room --
+    /// they arrive every 20 ms for as long as the tab is open.
+    fn quiet_for(r: &Arc<Room>, who: &str) {
+        r.on_level(who, false);
+        r.mic_audio(who, &speech(0.02));
+        std::thread::sleep(SAMPLE_GAP + Duration::from_millis(50));
+        r.mic_audio(who, &speech(0.02));
+    }
+
+    /// Somebody in the room with a microphone open, which is what a
+    /// recording needs and what the picture tests never had to have.
+    fn with_a_mic(r: &Arc<Room>, who: &str) {
+        r.join(who, 1);
+        r.set_mic(who, 1, true);
+        r.set_muted(who, 1, false);
+    }
+
+    /// A clip read aloud, the whole way: the card goes up saying the
+    /// room is listening before anybody speaks, nothing is kept until
+    /// they start, what lands is a WAV at the rate the clone server
+    /// wants with what they said against it, and the AI that asked is
+    /// given the turn to say so.
+    #[test]
+    fn a_voice_sample_is_read_and_kept() {
+        let (r, turns) = room(Mode::Named);
+        with_a_mic(&r, "Ryan");
+        let g = turn(&r);
+        let (n, who) = r
+            .take_voice_sample(g, "ryan", "The dragon was very old.")
+            .expect("the room starts listening");
+        assert_eq!((n, who.as_str()), (1, "Ryan"), "numbered, and whose it is");
+
+        // The light: a card in the conversation, in their name, before
+        // a word of it has been read.
+        let card = r
+            .lock()
+            .log
+            .iter()
+            .find(|e| e.kind == Kind::Sample)
+            .cloned()
+            .expect("the card is in the conversation at once");
+        assert!(card.live, "and it says the room is listening");
+        assert_eq!(card.text, "voice sample 1");
+        assert_eq!(card.who, "Ryan", "it is their voice, not the AI's");
+        assert_eq!(card.title, "The dragon was very old.");
+        // And the passage itself, on their screen alone.
+        assert!(
+            r.cards_for(&r.lock(), "Ryan")
+                .iter()
+                .any(|c| c.title == SAMPLE_CARD && c.body == "The dragon was very old."),
+            "the passage is on the screen they are reading it off"
+        );
+
+        // A second ask for the same person is refused rather than
+        // quietly replacing the first.
+        assert!(r.take_voice_sample(g, "Ryan", "Again").is_err());
+
+        // Nothing is kept while they are finding their glasses: the
+        // buffer holds the moment before their first word and no more.
+        r.mic_audio("Ryan", &speech(1.0));
+        assert!(r.sample_wav(&card.id).unwrap().is_none(), "nothing yet");
+        let preroll = (SAMPLE_PREROLL.as_secs_f32() * crate::mixer::RATE as f32) as usize;
+        assert!(
+            r.lock().people["Ryan"].sample.as_ref().unwrap().pcm.len() <= preroll,
+            "a second of waiting is not a second of the clip"
+        );
+
+        // They read it, and the room writes down what it heard.
+        r.on_level("Ryan", true);
+        r.on_paragraph("Ryan", &para("p1", "The dragon was very old.", false));
+        r.mic_audio("Ryan", &speech(4.0));
+        assert!(r.lock().people["Ryan"].reading(), "mid-reading");
+        assert!(
+            r.sample_wav(&card.id).unwrap().is_none(),
+            "and not kept until they stop"
+        );
+
+        // They stop. The clip lands once the quiet has lasted.
+        quiet_for(&r, "Ryan");
+
+        let wav = r
+            .sample_wav(&card.id)
+            .unwrap()
+            .expect("the clip is kept once they have finished");
+        let (samples, rate) = crate::voices::read_wav(&wav).unwrap();
+        assert_eq!(rate, SAMPLE_HZ, "at the rate the clone server listens at");
+        let secs = samples.len() as f32 / rate as f32;
+        assert!(
+            (3.5..6.0).contains(&secs),
+            "about as long as they read for, not as long as the room was armed: {secs:.1}s"
+        );
+        let clip = r.voice_clip(1).expect("and it can be read back by number");
+        assert_eq!(clip.who, "Ryan");
+        assert_eq!(
+            clip.said, "The dragon was very old.",
+            "what they said, which is what the server clones in context"
+        );
+        assert!(!r.lock().people["Ryan"].reading(), "and nothing is armed now");
+
+        // The card has stopped waiting, and the passage has come off
+        // their screen: they have read it.
+        let done = r
+            .lock()
+            .log
+            .iter()
+            .find(|e| e.id == card.id)
+            .cloned()
+            .unwrap();
+        assert!(!done.live);
+        assert_eq!(done.note, "4 seconds", "how long it is, for the model");
+        assert!(
+            !r.cards_for(&r.lock(), "Ryan")
+                .iter()
+                .any(|c| c.title == SAMPLE_CARD),
+            "nobody is asked to read a passage they have already read"
+        );
+
+        // And the AI that asked is given the turn, because nobody says
+        // its name while reading a passage at a microphone.
+        r.tick(quiet(&r));
+        let given = turns.try_recv().expect("the bot that asked is told");
+        assert!(
+            given
+                .messages
+                .iter()
+                .any(|(_, t)| t.contains("voice sample 1") && t.contains("save_voice")),
+            "with the clip in the conversation it is reading: {:?}",
+            given.messages
+        );
+    }
+
+    /// Two words and a pause is not a reading. The room forgets them
+    /// and goes on listening, rather than keeping a clip too short to
+    /// clone anything from.
+    #[test]
+    fn a_word_on_the_way_to_reading_is_not_the_clip() {
+        let (r, _turns) = room(Mode::Named);
+        with_a_mic(&r, "Ryan");
+        let g = turn(&r);
+        let (_, _) = r.take_voice_sample(g, "Ryan", "Read this.").unwrap();
+
+        // "Go on then."
+        r.on_level("Ryan", true);
+        r.mic_audio("Ryan", &speech(0.8));
+        quiet_for(&r, "Ryan");
+        {
+            let st = r.lock();
+            let p = &st.people["Ryan"];
+            assert!(p.sample.is_some(), "the room is still listening");
+            assert!(!p.reading(), "and back to waiting for the reading itself");
+        }
+
+        // Now the reading, which is kept.
+        r.on_level("Ryan", true);
+        r.mic_audio("Ryan", &speech(4.0));
+        quiet_for(&r, "Ryan");
+        let clip = r.voice_clip(1).expect("the second time round");
+        assert!(clip.secs >= SAMPLE_MIN);
+        assert_eq!(
+            clip.said, "Read this.",
+            "nothing was transcribed, so the passage stands in for it"
+        );
+    }
+
+    /// A reading is a clip and not a turn: the room does not hand the
+    /// AI what somebody is in the middle of reading to a microphone.
+    #[test]
+    fn nobody_is_answered_in_the_middle_of_reading() {
+        let (r, turns) = room(Mode::Always);
+        with_a_mic(&r, "Ryan");
+        let g = turn(&r);
+        r.take_voice_sample(g, "Ryan", "The dragon was very old.")
+            .unwrap();
+        r.on_level("Ryan", true);
+        r.on_paragraph("Ryan", &para("p1", "The dragon was very old.", false));
+        r.mic_audio("Ryan", &speech(4.0));
+        r.on_level("Ryan", false);
+        r.mic_audio("Ryan", &speech(0.02));
+        r.tick(quiet(&r));
+        assert!(
+            turns.try_recv().is_err(),
+            "a room that answers every pause still waits for the reading to end"
+        );
+
+        // Once it has ended, it is a pause like any other -- and the
+        // clip is in the conversation by then.
+        std::thread::sleep(SAMPLE_GAP + Duration::from_millis(50));
+        r.mic_audio("Ryan", &speech(0.02));
+        r.tick(quiet(&r));
+        let given = turns.try_recv().expect("now it answers");
+        assert!(
+            given
+                .messages
+                .iter()
+                .any(|(_, t)| t.contains("voice sample 1")),
+            "with the clip in front of it: {:?}",
+            given.messages
+        );
+    }
+
+    /// Wearing a cloned voice: the cell every one of the bot's voices
+    /// reads, the name the room shows for it, and its own voice again
+    /// when the voice is forgotten.
+    #[test]
+    fn an_ai_is_lent_a_voice_and_gives_it_back() {
+        let (r, _turns) = room(Mode::Named);
+        let g = turn(&r);
+        // As `save_voice` would have left it, once the server had it.
+        r.remember_voice("ryan", "Ryan", "Ryan", "The dragon was very old.")
+            .unwrap();
+
+        assert!(
+            r.speak_as(g, Some("nobody")).is_err(),
+            "a voice the house hasn't got is not one to try"
+        );
+        let said = r.speak_as(g, Some("ryan")).expect("found however it is said");
+        assert_eq!(said, "Ryan (cloned from Ryan)");
+        let borrowed = |r: &Room| {
+            r.lock().bots[0]
+                .borrowed
+                .lock()
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(
+            borrowed(&r).as_deref(),
+            Some("ryan"),
+            "which is what its voices read"
+        );
+        let agents = r.agents_json(&r.lock());
+        assert_eq!(agents[0]["voice"], "Ryan", "and what its strip says");
+
+        // Its own again, asked for.
+        r.speak_as(g, None).unwrap();
+        assert_eq!(borrowed(&r), None);
+        assert_eq!(r.agents_json(&r.lock())[0]["voice"], Value::Null);
+
+        // And a voice deleted from under it leaves it in its own,
+        // rather than wearing a name nothing can speak.
+        r.speak_as(g, Some("Ryan")).unwrap();
+        r.forget_voice("ryan").unwrap();
+        assert_eq!(borrowed(&r), None);
+        assert!(r.voices().is_empty());
+        assert!(
+            r.voice_named("Ryan").is_err(),
+            "and there is nothing left to ask for"
+        );
+    }
+
+    /// The room counts a reply that has gone quiet against the turn,
+    /// because the only thing that normally goes quiet that long is a
+    /// voice thread that died. A tool of the AI's is the exception:
+    /// while one is running the turn is waiting on the agent, which is
+    /// awake and has said so, and ending the turn underneath it means
+    /// whatever the model says about the result is never heard.
+    #[test]
+    fn a_slow_tool_is_not_a_voice_that_died() {
+        let (r, turns) = room(Mode::Named);
+        with_a_mic(&r, "Ryan");
+        r.on_level("Ryan", true);
+        r.on_paragraph("Ryan", &para("p1", "Vox, save that voice.", false));
+        r.on_level("Ryan", false);
+        r.tick(quiet(&r));
+        let g = turns.try_recv().expect("the turn went out").generation;
+
+        let working = |r: &Arc<Room>| {
+            r.lock()
+                .bots
+                .iter()
+                .find_map(|b| b.reply.as_ref().map(|p| p.working))
+                .flatten()
+        };
+        assert!(working(&r).is_none(), "nothing of its own running yet");
+        {
+            let _tool = r.working(g);
+            assert!(working(&r).is_some(), "the room is told, and waits");
+            // And the clock the room would have given up on is not
+            // running while it waits.
+            r.tick(Instant::now());
+            assert!(
+                r.lock()
+                    .bots
+                    .iter()
+                    .all(|b| b.reply.as_ref().is_none_or(|p| p.dry_since.is_none())),
+                "a reply with a tool in it is not a reply gone dry"
+            );
+        }
+        assert!(working(&r).is_none(), "and told when it is over");
+
+        // A tool that blew up leaves nothing behind either -- which is
+        // the whole reason the room is told by a guard and not by two
+        // calls with the tool in between them.
+        let hold = Arc::clone(&r);
+        let blew_up = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _tool = hold.working(g);
+            panic!("the tool blew up");
+        }));
+        assert!(blew_up.is_err(), "it did blow up");
+        assert!(
+            working(&r).is_none(),
+            "and the room is not still waiting on it"
+        );
+    }
+
+    /// Push to talk, which is how most of these rooms are run: the mic
+    /// is muted between every word, so somebody about to read is muted
+    /// when they are asked to -- and letting go of the key is the end
+    /// of the reading, because there is no pause to wait for in audio
+    /// that has stopped arriving.
+    #[test]
+    fn a_passage_is_read_on_push_to_talk() {
+        let (r, _turns) = room(Mode::Named);
+        r.join("Ryan", 1);
+        r.set_mic("Ryan", 1, true);
+        r.set_ptt("Ryan", 1, true);
+        // At rest, between words. Refusing here would refuse every
+        // reading a push-to-talk room could ever offer.
+        r.set_muted("Ryan", 1, true);
+        let g = turn(&r);
+        let (n, _) = r
+            .take_voice_sample(g, "Ryan", "The dragon was very old.")
+            .expect("muted at rest is not a muted microphone");
+
+        // They hold the key down and read it.
+        r.set_muted("Ryan", 1, false);
+        r.on_level("Ryan", true);
+        r.on_paragraph("Ryan", &para("p1", "The dragon was very old.", false));
+        r.mic_audio("Ryan", &speech(4.0));
+        assert!(r.lock().people["Ryan"].reading(), "mid-reading");
+        assert!(r.voice_clip(n).is_err(), "and nothing kept until they stop");
+
+        // And let go, which is the end of it. Nothing waits on the
+        // stall: there is a clip the moment the key comes up.
+        r.set_muted("Ryan", 1, true);
+        let clip = r.voice_clip(n).expect("the clip lands when the key does");
+        assert!(clip.secs >= SAMPLE_MIN, "{:.1}s", clip.secs);
+        assert_eq!(clip.said, "The dragon was very old.");
+        assert!(
+            !r.lock().people["Ryan"].reading(),
+            "and the room is not still listening for it"
+        );
+
+        // A mic that is muted and staying that way is still refused.
+        r.set_ptt("Ryan", 1, false);
+        let g = turn(&r);
+        assert!(
+            r.take_voice_sample(g, "Ryan", "Again, please.")
+                .unwrap_err()
+                .contains("muted"),
+            "with push to talk off, muted means muted"
+        );
+    }
+
+    /// A reading the transcription never caught is labelled with the
+    /// passage -- not with whatever they happened to say before it.
+    /// What goes to the clone server as the clip's transcript has to be
+    /// the words that are actually in the audio.
+    #[test]
+    fn a_clip_is_never_labelled_with_what_came_before_it() {
+        let (r, _turns) = room(Mode::Named);
+        with_a_mic(&r, "Ryan");
+        // Something said in the room first, and written down.
+        r.on_level("Ryan", true);
+        r.on_paragraph("Ryan", &para("p1", "Yes, let's do it.", false));
+        r.on_level("Ryan", false);
+
+        let g = turn(&r);
+        let (n, _) = r
+            .take_voice_sample(g, "Ryan", "The dragon was very old.")
+            .unwrap();
+        // They read it, and the room catches nothing of it.
+        r.on_level("Ryan", true);
+        r.mic_audio("Ryan", &speech(4.0));
+        quiet_for(&r, "Ryan");
+
+        let clip = r.voice_clip(n).expect("the clip is still kept");
+        assert_eq!(
+            clip.said, "The dragon was very old.",
+            "the passage, because that is what is in the audio"
+        );
+    }
+
+    /// What the model is told about a clip, which is the one thing in
+    /// the conversation it can neither see nor hear.
+    #[test]
+    fn the_model_is_told_what_was_recorded() {
+        let read = |title: &str, note: &str| Entry {
+            id: "sample-1".into(),
+            who: "Ryan".into(),
+            kind: Kind::Sample,
+            title: title.into(),
+            text: "voice sample 2".into(),
+            live: false,
+            partial: false,
+            cut: false,
+            typed: false,
+            translations: BTreeMap::new(),
+            note: note.into(),
+            at: 0,
+            sent: true,
+        };
+        let told = |e: Entry| {
+            conversation_messages(&[e], 50, "English", "Vox", &[])
+                .into_iter()
+                .map(|(_, t)| t)
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let kept = told(read("The dragon was very old.", "9 seconds"));
+        assert!(kept.contains("Ryan read something aloud"), "{kept}");
+        assert!(kept.contains("voice sample 2 (9 seconds)"), "{kept}");
+        assert!(kept.contains("The dragon was very old."), "{kept}");
+        assert!(kept.contains("save_voice"), "{kept}");
+
+        // A clip that came to nothing has no length to it, and the AI
+        // must not be left offering a voice it hasn't got.
+        let never = told(read("they didn't read it", ""));
+        assert!(never.contains("recorded nothing"), "{never}");
+        assert!(never.contains("they didn't read it"), "{never}");
+        assert!(!never.contains("save_voice"), "{never}");
+
+        // And one still being read is not mentioned at all: the AI is
+        // told when it lands.
+        let mut listening = read("The dragon was very old.", "");
+        listening.live = true;
+        assert_eq!(told(listening), "", "nothing is said about it yet");
+    }
+
+    // -- puppets ---------------------------------------------------------
+
+    /// A room that can give a puppet a voice: the factory the house
+    /// would have handed it, speaking silence for as long as reading
+    /// the line would take.
+    fn room_with_puppets() -> (Arc<Room>, crossbeam_channel::Receiver<Turn>) {
+        let store = Store::memory().in_room("Lobby");
+        store.invite("Ryan").unwrap();
+        let cfg = RoomConfig {
+            id: "Lobby".into(),
+            title: "Lobby".into(),
+            only: None,
+            default_mode: Mode::Named,
+            bots: vec![BotConfig::new("Vox", vec![])],
+            reply_after: Duration::from_millis(1000),
+            confirm: Duration::from_millis(300),
+            engaged_for: Duration::from_millis(5000),
+            history: 50,
+            ai_turns: 2,
+            language: "English".into(),
+            languages: vec!["English".into()],
+            spoken: vec!["English".into()],
+        };
+        let tts: VoiceFactory = Arc::new(|_, _, _, _| Ok(Box::new(crate::tts::Silent)));
+        let (r, mut wiring) =
+            Room::new(store, cfg, None, BTreeMap::new(), None, Some(tts)).unwrap();
+        let turns = wiring.pop().expect("a room has an AI in it").turns;
+        (r, turns)
+    }
+
+    fn a_puppet(name: &str, about: &str) -> crate::store::Puppet {
+        crate::store::Puppet {
+            name: name.into(),
+            about: about.into(),
+            delivery: "gruff and slow".into(),
+            ..Default::default()
+        }
+    }
+
+    /// A puppet is in the room on everybody else's terms -- its own
+    /// name, its own fader, its own face -- and on one of its own:
+    /// nothing ever gives it the turn, because there is nothing behind
+    /// it. Saying its name reaches the AI that holds it instead.
+    #[test]
+    fn a_puppet_is_a_voice_in_the_room_that_is_never_given_the_turn() {
+        let (r, turns) = room_with_puppets();
+        r.make_puppet(a_puppet("Grimble", "an old gatekeeper"))
+            .unwrap();
+        assert_eq!(
+            r.puppet_roster()
+                .iter()
+                .map(|p| p.name.clone())
+                .collect::<Vec<_>>(),
+            ["Grimble"],
+            "the house keeps it, so it can be cast again"
+        );
+        assert!(r.on_stage().is_empty(), "the roster is not the stage");
+
+        r.cast_puppet("Grimble").unwrap();
+        assert_eq!(r.on_stage(), ["Grimble"]);
+        let on: Vec<Value> = {
+            let st = r.lock();
+            r.agents_json(&st)
+        };
+        let grimble = on
+            .iter()
+            .find(|a| a["name"] == "Grimble")
+            .expect("it is on the roster of voices, like a bot");
+        assert_eq!(grimble["puppet"], json!(true), "and says which it is");
+        assert_eq!(
+            grimble["strip"],
+            json!("@agent:Grimble"),
+            "a fader of its own"
+        );
+        assert_eq!(
+            grimble["mode"],
+            json!("never"),
+            "it answers nothing, and that is not a setting anybody chose"
+        );
+
+        // Its name is the AI's turn, not the puppet's: a question put
+        // to Grimble has an answer, and the one who has it is whoever
+        // wrote Grimble's lines.
+        {
+            let st = r.lock();
+            assert_eq!(r.named(&st, "Grimble, what is through the gate?"), ["Vox"]);
+        }
+        r.join("Ryan", 1);
+        r.on_paragraph(
+            "Ryan",
+            &para("p1", "Grimble, what is through the gate?", false),
+        );
+        r.tick(quiet(&r));
+        let given = turns.recv_timeout(Duration::from_secs(2)).expect("a turn");
+        assert_eq!(
+            given.puppets,
+            [("Grimble".to_string(), "an old gatekeeper".to_string())]
+        );
+        assert!(
+            !given.others.contains(&"Grimble".to_string()),
+            "a puppet it is holding is not somebody else in the room to it"
+        );
+
+        // Nothing is waiting for a reply from the puppet itself.
+        assert!(
+            !r.lock()
+                .bots
+                .iter()
+                .any(|b| b.puppet() && b.reply.is_some()),
+            "a turn is never given to a puppet"
+        );
+    }
+
+    /// What a puppet says is the AI's own words. It must read back as
+    /// its own, or the model answers the character it wrote.
+    #[test]
+    fn a_puppets_line_reads_back_to_its_holder_as_its_own() {
+        let line = Entry {
+            id: "a".into(),
+            who: "Grimble".into(),
+            kind: Kind::Agent,
+            title: String::new(),
+            text: "None shall pass.".into(),
+            live: false,
+            partial: false,
+            cut: false,
+            typed: false,
+            translations: BTreeMap::new(),
+            note: String::new(),
+            at: 0,
+            sent: true,
+        };
+        // To the one holding it: its own turn, with the character named.
+        let mine = conversation_messages(
+            std::slice::from_ref(&line),
+            50,
+            "English",
+            "Vox",
+            &["Grimble".to_string()],
+        );
+        assert_eq!(
+            mine,
+            [(Role::Assistant, "[as Grimble] None shall pass.".to_string())]
+        );
+        // To anybody else: another voice in the room, which is what it is.
+        let theirs = conversation_messages(&[line], 50, "English", "Sage", &[]);
+        assert_eq!(
+            theirs,
+            [(Role::User, "Grimble: None shall pass.".to_string())]
+        );
+    }
+
+    /// The curtain sets Answers and Stops on every voice in the room
+    /// and puts them back afterwards -- and it must not cut off the
+    /// reply the AI is announcing the show in.
+    #[test]
+    fn a_show_borrows_the_rooms_settings_and_gives_them_back() {
+        let (r, _turns) = room_with_puppets();
+        r.make_puppet(a_puppet("Grimble", "a gatekeeper")).unwrap();
+        r.cast_puppet("Grimble").unwrap();
+        r.set_mode("Vox", "always");
+        r.set_stops("Vox", "interrupted");
+
+        // Mid-announcement: a turn of the AI's own, part said.
+        {
+            let mut st = r.lock();
+            let now = Instant::now();
+            r.ask(&mut st, "Vox", now, Cue::Speak, true);
+        }
+        let g = r.lock().only().generation.load(Ordering::SeqCst);
+        assert!(g > 0);
+        r.agent_speak(g, "Right, here we go.", vec![0.0; 100]);
+
+        r.begin_show("Vox", "The Gate", 4).unwrap();
+        assert!(
+            r.lock().only().reply.is_some(),
+            "the curtain does not cut off the sentence that announces it"
+        );
+        {
+            let st = r.lock();
+            let vox = st.bots.iter().find(|b| b.cfg.name == "Vox").unwrap();
+            assert_eq!(
+                vox.mode,
+                Mode::Never,
+                "it answers nothing while the show is on"
+            );
+            assert_eq!(vox.stops, Stops::Finished, "and cannot be talked over");
+        }
+        assert_eq!(r.show_title().as_deref(), Some("The Gate"));
+        assert!(
+            r.begin_show("Vox", "Another", 2).is_err(),
+            "one show at a time"
+        );
+
+        // And the curtain puts back exactly what it borrowed.
+        r.end_show();
+        assert!(r.show_title().is_none());
+        {
+            let st = r.lock();
+            let vox = st.bots.iter().find(|b| b.cfg.name == "Vox").unwrap();
+            assert_eq!(vox.chosen, Mode::Always);
+            assert_eq!(vox.stops, Stops::Interrupted);
+        }
+        let card = r
+            .lock()
+            .log
+            .iter()
+            .rev()
+            .find(|e| e.kind == Kind::Card)
+            .cloned()
+            .expect("the programme, after the fact");
+        assert!(card.title.contains("The Gate"), "{}", card.title);
+        assert!(
+            card.text.contains("Still in the room: Grimble"),
+            "{}",
+            card.text
+        );
+    }
+
+    /// A server that stopped mid-show would otherwise come back up with
+    /// its AI set to answer nothing and nothing anywhere to say why.
+    #[test]
+    fn a_show_that_was_on_when_the_server_stopped_gives_the_settings_back() {
+        let store = Store::memory().in_room("Lobby");
+        store.set_setting("mode", "always").unwrap();
+        store
+            .set_setting(
+                SHOW_WAS,
+                r#"{"Vox":["always","interrupted"],"Grimble":["never","finished"]}"#,
+            )
+            .unwrap();
+        // As the show left it: silenced, and finishing what it says.
+        store.set_setting("mode:Vox", "never").unwrap();
+        store.set_setting("stops:Vox", "finished").unwrap();
+        let cfg = RoomConfig {
+            id: "Lobby".into(),
+            title: "Lobby".into(),
+            only: None,
+            default_mode: Mode::Named,
+            bots: vec![BotConfig::new("Vox", vec![])],
+            reply_after: Duration::from_millis(1000),
+            confirm: Duration::from_millis(300),
+            engaged_for: Duration::from_millis(5000),
+            history: 50,
+            ai_turns: 2,
+            language: "English".into(),
+            languages: vec!["English".into()],
+            spoken: vec!["English".into()],
+        };
+        let (r, _wiring) = Room::new(store, cfg, None, BTreeMap::new(), None, None).unwrap();
+        let st = r.lock();
+        let vox = st.bots.iter().find(|b| b.cfg.name == "Vox").unwrap();
+        assert_eq!(vox.chosen, Mode::Always, "put back as the people had it");
+        assert_eq!(vox.stops, Stops::Interrupted);
+        drop(st);
+        assert_eq!(
+            r.store().setting(SHOW_WAS).unwrap().unwrap_or_default(),
+            "",
+            "and not put back a second time at the next restart"
+        );
+    }
+
+    /// A name has to be one name: a puppet called after an AI, or
+    /// after somebody sitting in the room, is a room that cannot tell
+    /// who was spoken to.
+    #[test]
+    fn a_puppet_cannot_take_a_name_somebody_here_answers_to() {
+        let (r, _turns) = room_with_puppets();
+        assert!(
+            r.make_puppet(a_puppet("Vox", "an impostor"))
+                .unwrap_err()
+                .contains("one of the AIs"),
+            "a bot's name is not free"
+        );
+        r.join("Ryan", 1);
+        r.make_puppet(a_puppet("Ryan", "a look-alike")).unwrap();
+        assert!(
+            r.cast_puppet("Ryan")
+                .unwrap_err()
+                .contains("somebody here called Ryan"),
+            "and nor is the name of somebody in the room"
+        );
+        // The other way round, too.
+        r.make_puppet(a_puppet("Grimble", "a gatekeeper")).unwrap();
+        r.cast_puppet("Grimble").unwrap();
+        assert!(
+            r.rename("Ryan", "Grimble")
+                .unwrap_err()
+                .contains("is a puppet"),
+            "a person cannot rename themselves after one"
+        );
+    }
+
+    /// Sending one away stops it where it is, and what it said stays
+    /// in the conversation with its name on it: that is what happened.
+    #[test]
+    fn a_puppet_sent_away_leaves_what_it_said_behind() {
+        let (r, _turns) = room_with_puppets();
+        r.make_puppet(a_puppet("Grimble", "a gatekeeper")).unwrap();
+        r.cast_puppet("Grimble").unwrap();
+
+        // A line of its own, heard the way a bot's reply is heard: the
+        // entry follows the audio the mixer has actually played.
+        let g = r.puppet_line("Grimble").expect("a line of its own");
+        assert!(
+            r.agent_speak(
+                g,
+                "None shall pass, not one of you, not today.",
+                vec![0.0; 4800]
+            ),
+            "its audio goes in on its own strip"
+        );
+        r.agent_done(g);
+        assert!(r.voice_busy("Grimble"), "it is saying it");
+        // Part of it heard, and then it is taken off the stage.
+        for _ in 0..3 {
+            r.mixer.tick();
+        }
+        r.tick(Instant::now());
+
+        r.dismiss_puppet("Grimble").unwrap();
+        assert!(r.on_stage().is_empty());
+        assert!(!r.voice_busy("Grimble"), "and it stopped where it was");
+        let said = r
+            .lock()
+            .log
+            .iter()
+            .find(|e| e.who == "Grimble")
+            .cloned()
+            .expect("its line is still in the conversation");
+        assert_eq!(said.kind, Kind::Agent);
+        assert!(said.text.starts_with("None shall pass"), "{}", said.text);
+        assert!(said.cut, "and says it was cut off: {}", said.text);
+        assert!(
+            r.dismiss_puppet("Grimble").is_err(),
+            "and it is not in the room to be sent away twice"
+        );
+        assert_eq!(
+            r.puppet_roster().len(),
+            1,
+            "the character is kept: being sent off is not being forgotten"
+        );
+    }
+
+    /// A character is given a face while it is being made up, which is
+    /// the order anybody would do it in: the picture is in the chat and
+    /// the puppet exists, and whether it is standing in the room yet
+    /// has nothing to do with it.
+    ///
+    /// It used to be refused until the puppet had been brought on, so
+    /// `set_avatar` on a character made a moment earlier answered
+    /// "there is nobody called that here" -- which is a room arguing
+    /// about the order of two steps that do not depend on each other.
+    #[test]
+    fn a_puppet_can_be_given_a_face_before_it_comes_on_stage() {
+        let (r, _turns) = room_with_puppets();
+        r.make_puppet(a_puppet("Maximilian", "a dignified old bear"))
+            .unwrap();
+        assert!(r.on_stage().is_empty(), "nobody has brought it on");
+
+        let g = turn(&r);
+        let (id, n) = r.begin_picture(g, "a dignified old bear").unwrap();
+        r.finish_picture(&id, &png(), "");
+        assert_eq!(r.set_avatar(g, "maximilian", n), Ok("Maximilian".into()));
+        assert!(
+            r.avatar_png("Maximilian", None).unwrap().is_some(),
+            "and the face is its own from then on"
+        );
+        r.set_bio("Maximilian", "Keeps the gate, and has views about it")
+            .unwrap();
+
+        // And it is wearing them when it finally comes on.
+        r.cast_puppet("Maximilian").unwrap();
+        let shown = r.profile("Maximilian").expect("a card of its own");
+        assert_eq!(
+            shown["puppet"],
+            json!(true),
+            "and the card says which it is"
+        );
+        assert_eq!(shown["bot"], json!(true));
+        assert!(
+            shown["bio"].as_str().unwrap().starts_with("Keeps the gate"),
+            "{shown}"
+        );
+
+        // Somebody who is nobody at all is still nobody.
+        assert!(r.set_avatar(g, "Grumble", n).is_err());
+    }
+
+    /// Forgetting one takes its face with it. A name that is free
+    /// again must not hand the next character somebody's old portrait.
+    #[test]
+    fn forgetting_a_puppet_takes_its_face_too() {
+        let (r, _turns) = room_with_puppets();
+        r.make_puppet(a_puppet("Grimble", "a gatekeeper")).unwrap();
+        r.cast_puppet("Grimble").unwrap();
+        r.store()
+            .set_avatar(&crate::store::bot_key("Grimble"), &png(), "an old man")
+            .unwrap();
+        assert!(r.avatar_png("Grimble", None).unwrap().is_some());
+
+        r.forget_puppet("Grimble").unwrap();
+        assert!(
+            r.on_stage().is_empty(),
+            "taken off the stage on the way out"
+        );
+        assert!(r.puppet_roster().is_empty());
+        assert!(
+            r.avatar_png("Grimble", None).unwrap().is_none(),
+            "and its face went with it"
+        );
     }
 }

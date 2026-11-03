@@ -324,6 +324,98 @@ CREATE TABLE IF NOT EXISTS cards (
     at    INTEGER NOT NULL,
     PRIMARY KEY (conversation, id)
 );
+-- A few seconds of somebody reading aloud, recorded so a voice can be
+-- cloned from it. Numbered within its conversation exactly as a
+-- picture is, and for the same reason: the number is what the card
+-- shows, what anybody says out loud about it, and what `save_voice`
+-- takes.
+--
+-- The row is written when the recording is armed, with no `wav`: the
+-- card goes up at once saying the room is listening, which is the
+-- light that says a microphone is being recorded. It fills in when
+-- they have finished reading, or is failed when they never started.
+--
+-- It stays with the conversation it was read in and goes when that
+-- does, like anything else that happened in the room. A voice already
+-- cloned from it stays: the clip it was made from lives on the clone
+-- server from the moment it is uploaded, and `voices` keeps the rest.
+CREATE TABLE IF NOT EXISTS samples (
+    id           TEXT PRIMARY KEY,
+    conversation INTEGER NOT NULL,
+    -- Its number in this conversation, from 1.
+    n            INTEGER NOT NULL,
+    -- Whose voice it is. A person as the conversation names them.
+    who          TEXT NOT NULL,
+    -- The AI that asked for it, so the room knows which of them to
+    -- give the turn to when the reading is done.
+    asked_by     TEXT NOT NULL DEFAULT '',
+    -- What they were given to read.
+    passage      TEXT NOT NULL DEFAULT '',
+    -- What they actually said, as the room heard it. This is what goes
+    -- to the clone server as `ref_text`, because it is the transcript
+    -- of the audio and not of the intention.
+    said         TEXT NOT NULL DEFAULT '',
+    -- Null while the room is still listening. A row that has one is a
+    -- clip: 16-bit mono WAV at the rate the clone server wants.
+    wav          BLOB,
+    -- How long the clip is, in seconds.
+    secs         REAL NOT NULL DEFAULT 0,
+    -- Why there will never be one: they never read it, or they were
+    -- muted, or the room stopped. The card says so rather than
+    -- listening forever.
+    failed       TEXT NOT NULL DEFAULT '',
+    at           INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS samples_in_order ON samples (conversation, n);
+-- A voice cloned from one of those clips and kept under a name.
+--
+-- The house's, not the room's: a voice is somebody's voice wherever it
+-- was read, and the AI in any room can be asked to speak in it. The
+-- audio is not here -- it is the clone server's, under `id` -- so what
+-- this table is for is everything the server does not know: whose
+-- voice it is, what it is called out loud, and when.
+CREATE TABLE IF NOT EXISTS voices (
+    -- What the clone server knows it as: the name, spelled down to
+    -- what can be a filename and a path. See `voices::id_for`.
+    id      TEXT PRIMARY KEY,
+    -- What it is called out loud, which is what anybody asks for.
+    name    TEXT NOT NULL COLLATE NOCASE UNIQUE,
+    -- Whose voice it is, as the room named them when they read.
+    who     TEXT NOT NULL DEFAULT '',
+    -- What they read, kept so somebody can see what it was made from.
+    said    TEXT NOT NULL DEFAULT '',
+    created INTEGER NOT NULL
+);
+-- A puppet: a character the first AI speaks through, kept so the same
+-- one can be brought on again next week.
+--
+-- The house's, like the voices and for the same reason: a character
+-- somebody made up one evening is one the AI in any room can put on
+-- stage. What is *not* here is the face and the few lines beside it --
+-- those are in `faces` and `bios` under `@` and the name,
+-- exactly as a bot's are, because a puppet wears a face the same way
+-- everybody else in the room does and there is no second way to do it.
+CREATE TABLE IF NOT EXISTS puppets (
+    -- What it is called, which is the name beside everything it says
+    -- and the name anybody in the room addresses it by. NOCASE, since
+    -- it is said out loud.
+    name     TEXT PRIMARY KEY COLLATE NOCASE,
+    -- Its voice, one of two ways. A preset the speech server already
+    -- has, with a line of delivery notes on top of it -- which is how
+    -- a character nobody has ever recorded gets a voice of its own --
+    -- or `clone`, the name of a voice cloned from somebody who read
+    -- for it. A clone wins where there is one.
+    preset   TEXT NOT NULL DEFAULT '',
+    delivery TEXT NOT NULL DEFAULT '',
+    clone    TEXT NOT NULL DEFAULT '',
+    -- Who the character is, in a line or two: what the AI wrote down
+    -- when it made the puppet, so a show next month can be cast from
+    -- the roster without reading the old script. Not the bio -- that
+    -- is the room's and everyone can see it -- though the AI usually
+    -- writes the same thing into both.
+    about    TEXT NOT NULL DEFAULT '',
+    created  INTEGER NOT NULL
+);
 ";
 
 /// The number the next room to want a conversation is given, counted
@@ -399,6 +491,7 @@ impl Store {
         migrate(&db)?;
         indexes(&db)?;
         abandoned_pictures(&db)?;
+        abandoned_samples(&db)?;
         // Several rooms are several connections to the one file, and
         // `vox_room invite` is a whole other process writing to it.
         // Wait for a writer rather than failing the read.
@@ -1075,12 +1168,15 @@ impl Store {
     }
 
     /// Forget a conversation: everything said in it, every card dealt
-    /// in it, every picture made in it, and the row that says the room
-    /// ever had it.
+    /// in it, every picture made in it, every clip of somebody reading
+    /// aloud in it, and the row that says the room ever had it.
     ///
     /// A face already made from one of those pictures stays: it was
     /// copied into `avatars` when it was set, and it belongs to the
-    /// person rather than to the conversation they sat for it in.
+    /// person rather than to the conversation they sat for it in. A
+    /// voice already cloned from one of those clips stays for the same
+    /// reason, and because the clip it was made from is the clone
+    /// server's by then rather than this database's.
     pub fn forget_conversation(&self, id: i64) -> Result<()> {
         self.db
             .execute("DELETE FROM entries WHERE conversation = ?1", [id])?;
@@ -1088,6 +1184,8 @@ impl Store {
             .execute("DELETE FROM cards WHERE conversation = ?1", [id])?;
         self.db
             .execute("DELETE FROM pictures WHERE conversation = ?1", [id])?;
+        self.db
+            .execute("DELETE FROM samples WHERE conversation = ?1", [id])?;
         self.db
             .execute("DELETE FROM conversations WHERE id = ?1", [id])?;
         Ok(())
@@ -1495,10 +1593,10 @@ impl Store {
     /// It stays in the history: taking a face off is not the same as
     /// never having had one, and Settings still offers it back.
     pub fn clear_avatar(&self, who: &str) -> Result<bool> {
-        Ok(self
-            .db
-            .execute("UPDATE faces SET worn = 0 WHERE who = ?1 AND worn = 1", [who])?
-            > 0)
+        Ok(self.db.execute(
+            "UPDATE faces SET worn = 0 WHERE who = ?1 AND worn = 1",
+            [who],
+        )? > 0)
     }
 
     // -- pictures: made or brought in, in the conversation they are in --
@@ -1642,6 +1740,276 @@ impl Store {
             .optional()?)
     }
 
+    // -- samples: somebody reading aloud, and the voices kept from them --
+
+    /// The number the next clip of this conversation gets. Counted, not
+    /// kept, exactly as a picture's is.
+    fn next_sample(&self, conversation: i64) -> Result<u32> {
+        Ok(self.db.query_row(
+            "SELECT COALESCE(MAX(n), 0) + 1 FROM samples WHERE conversation = ?1",
+            [conversation],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Arm a recording: a row with no clip in it yet, which is a card
+    /// saying the room is listening to `who`. The answer is its number
+    /// in this conversation, which is what `save_voice` is given.
+    pub fn begin_sample(
+        &self,
+        conversation: i64,
+        id: &str,
+        who: &str,
+        asked_by: &str,
+        passage: &str,
+    ) -> Result<u32> {
+        let n = self.next_sample(conversation)?;
+        self.db.execute(
+            "INSERT INTO samples
+                 (id, conversation, n, who, asked_by, passage, said, wav, secs, failed, at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, '', NULL, 0, '', ?7)",
+            params![id, conversation, n, who, asked_by, passage, now_ms()],
+        )?;
+        Ok(n)
+    }
+
+    /// They read it: the clip, how long it is, and what they said.
+    pub fn finish_sample(&self, id: &str, wav: &[u8], secs: f32, said: &str) -> Result<()> {
+        self.db.execute(
+            "UPDATE samples SET wav = ?2, secs = ?3, said = ?4, failed = '' WHERE id = ?1",
+            params![id, wav, secs as f64, said],
+        )?;
+        Ok(())
+    }
+
+    /// They didn't, and the card says so rather than listening for good.
+    pub fn fail_sample(&self, id: &str, why: &str) -> Result<()> {
+        self.db.execute(
+            "UPDATE samples SET failed = ?2 WHERE id = ?1",
+            params![id, why],
+        )?;
+        Ok(())
+    }
+
+    /// One clip's audio, or None while the room is still listening.
+    pub fn sample_wav(&self, id: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .db
+            .query_row("SELECT wav FROM samples WHERE id = ?1", [id], |r| {
+                r.get::<_, Option<Vec<u8>>>(0)
+            })
+            .optional()?
+            .flatten())
+    }
+
+    /// The `n`th clip of a conversation, with its audio when it has
+    /// any: what `save_voice` reads.
+    pub fn sample_numbered(&self, conversation: i64, n: u32) -> Result<Option<Clip>> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT id, who, said, passage, wav, secs, failed
+                   FROM samples WHERE conversation = ?1 AND n = ?2",
+                params![conversation, n],
+                |r| {
+                    Ok(Clip {
+                        id: r.get(0)?,
+                        n,
+                        who: r.get(1)?,
+                        said: r.get(2)?,
+                        passage: r.get(3)?,
+                        wav: r.get(4)?,
+                        secs: r.get::<_, f64>(5)? as f32,
+                        failed: r.get(6)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Every clip in a conversation, oldest first and without the
+    /// audio: what a tab needs to draw the cards.
+    pub fn samples(&self, conversation: i64) -> Result<Vec<Reading>> {
+        let mut q = self.db.prepare(
+            "SELECT id, n, who, passage, said, wav IS NOT NULL, secs, failed, at
+               FROM samples WHERE conversation = ?1 ORDER BY n",
+        )?;
+        let rows = q.query_map([conversation], |r| {
+            Ok(Reading {
+                id: r.get(0)?,
+                n: r.get(1)?,
+                who: r.get(2)?,
+                passage: r.get(3)?,
+                said: r.get(4)?,
+                ready: r.get(5)?,
+                secs: r.get::<_, f64>(6)? as f32,
+                failed: r.get(7)?,
+                at: r.get::<_, i64>(8)? as u64,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// One of them, for the event that says the room has stopped
+    /// listening.
+    pub fn read_aloud(&self, id: &str) -> Result<Option<Reading>> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT id, n, who, passage, said, wav IS NOT NULL, secs, failed, at
+                   FROM samples WHERE id = ?1",
+                [id],
+                |r| {
+                    Ok(Reading {
+                        id: r.get(0)?,
+                        n: r.get(1)?,
+                        who: r.get(2)?,
+                        passage: r.get(3)?,
+                        said: r.get(4)?,
+                        ready: r.get(5)?,
+                        secs: r.get::<_, f64>(6)? as f32,
+                        failed: r.get(7)?,
+                        at: r.get::<_, i64>(8)? as u64,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    // -- voices: the house's, under the names they were given -----------
+
+    /// Keep a voice that is now on the clone server. The name is
+    /// taken as given; `id` is what the server knows it as.
+    ///
+    /// Not scoped to the room, on purpose: a voice is somebody's voice
+    /// wherever they read for it, and being asked to speak in it is a
+    /// thing any room may ask.
+    pub fn put_voice(&self, id: &str, name: &str, who: &str, said: &str) -> Result<()> {
+        self.db.execute(
+            "INSERT INTO voices (id, name, who, said, created)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(id) DO UPDATE SET
+                 name = excluded.name, who = excluded.who,
+                 said = excluded.said, created = excluded.created",
+            params![id, name.trim(), who, said, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// The voices the house has, oldest first.
+    pub fn voices(&self) -> Result<Vec<Cloned>> {
+        let mut q = self
+            .db
+            .prepare("SELECT id, name, who, said, created FROM voices ORDER BY created")?;
+        let rows = q.query_map([], |r| {
+            Ok(Cloned {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                who: r.get(2)?,
+                said: r.get(3)?,
+                created: r.get::<_, i64>(4)? as u64,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// One of them, by the name it is asked for out loud. Found
+    /// whatever case it was said in, because it is said out loud.
+    pub fn voice(&self, name: &str) -> Result<Option<Cloned>> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT id, name, who, said, created FROM voices WHERE name = ?1",
+                [name.trim()],
+                |r| {
+                    Ok(Cloned {
+                        id: r.get(0)?,
+                        name: r.get(1)?,
+                        who: r.get(2)?,
+                        said: r.get(3)?,
+                        created: r.get::<_, i64>(4)? as u64,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Forget a voice. The answer says whether there was one.
+    pub fn forget_voice(&self, id: &str) -> Result<bool> {
+        Ok(self
+            .db
+            .execute("DELETE FROM voices WHERE id = ?1", [id])?
+            > 0)
+    }
+
+    // -- puppets: the characters the first AI speaks through ------------
+
+    /// Keep a puppet under its name, or write over the one that is
+    /// already there. The house's, not the room's: see `voices` above.
+    pub fn put_puppet(&self, p: &Puppet) -> Result<()> {
+        self.db.execute(
+            "INSERT INTO puppets (name, preset, delivery, clone, about, created)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(name) DO UPDATE SET
+                 preset = excluded.preset, delivery = excluded.delivery,
+                 clone = excluded.clone, about = excluded.about",
+            params![
+                p.name.trim(),
+                p.preset.trim(),
+                p.delivery.trim(),
+                p.clone.trim(),
+                p.about.trim(),
+                now_ms()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The puppets the house has, oldest first.
+    pub fn puppets(&self) -> Result<Vec<Puppet>> {
+        let mut q = self.db.prepare(
+            "SELECT name, preset, delivery, clone, about, created
+               FROM puppets ORDER BY created",
+        )?;
+        let rows = q.query_map([], puppet_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// One of them, by the name it is asked for out loud -- so
+    /// whatever case it was said in.
+    pub fn puppet(&self, name: &str) -> Result<Option<Puppet>> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT name, preset, delivery, clone, about, created
+                   FROM puppets WHERE name = ?1",
+                [name.trim()],
+                puppet_row,
+            )
+            .optional()?)
+    }
+
+    /// Forget a puppet for good. The answer says whether there was
+    /// one. Its faces and its bio go with it: they are keyed by the
+    /// name, and a name that is free again must not hand the next
+    /// character somebody's old portrait.
+    ///
+    /// Every face it ever wore, not only the one it had on. A puppet
+    /// is a thing the AI made up and the room can unmake; leaving a
+    /// history behind would leave Settings able to offer one of them
+    /// back to whoever took the name next.
+    pub fn forget_puppet(&self, name: &str) -> Result<bool> {
+        let tx = self.db.unchecked_transaction()?;
+        let gone = tx.execute("DELETE FROM puppets WHERE name = ?1", [name.trim()])? > 0;
+        if gone {
+            let key = bot_key(name.trim());
+            tx.execute("DELETE FROM faces WHERE who = ?1", [&key])?;
+            tx.execute("DELETE FROM bios WHERE who = ?1", [&key])?;
+        }
+        tx.commit()?;
+        Ok(gone)
+    }
+
     // -- bios: the few lines that go with a face ------------------------
 
     /// Write what is known about somebody. Empty takes it away.
@@ -1670,6 +2038,91 @@ impl Store {
 /// What [`Store::picture_numbered`] hands back: the picture's id, what
 /// it was asked for, and the image once it has one.
 pub type Numbered = (String, String, Option<Vec<u8>>);
+
+/// A clip of somebody reading aloud, with its audio: what `save_voice`
+/// sends to the clone server.
+#[derive(Debug, Clone)]
+pub struct Clip {
+    pub id: String,
+    pub n: u32,
+    pub who: String,
+    /// What the room heard them say, which is the clip's transcript.
+    pub said: String,
+    /// What they were given to read.
+    pub passage: String,
+    /// None while the room is still listening.
+    pub wav: Option<Vec<u8>>,
+    pub secs: f32,
+    /// Why there will never be one, or empty.
+    pub failed: String,
+}
+
+/// A clip in a conversation, without the audio: what a card needs to
+/// be drawn, and what the AI is told it has.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Reading {
+    pub id: String,
+    /// Its number in the conversation, from 1.
+    pub n: u32,
+    pub who: String,
+    /// What they were given to read.
+    pub passage: String,
+    /// What they said, once the room has heard it.
+    pub said: String,
+    /// The clip is there. Until then the card says the room is
+    /// listening.
+    pub ready: bool,
+    pub secs: f32,
+    /// Why it never came, or empty.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub failed: String,
+    pub at: u64,
+}
+
+/// A voice the house has cloned from somebody, as it is kept here:
+/// everything about it that is not the audio.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Cloned {
+    /// What the clone server knows it as.
+    pub id: String,
+    /// What it is called out loud.
+    pub name: String,
+    /// Whose voice it is.
+    pub who: String,
+    /// What they read to make it.
+    pub said: String,
+    pub created: u64,
+}
+
+/// A character the first AI speaks through: a name, a voice, and a
+/// line about who it is. The face and the bio are not here -- a
+/// puppet wears those the way everybody in the room does, under `@`
+/// and its name.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct Puppet {
+    pub name: String,
+    /// A voice the speech server already has, and the delivery notes
+    /// that make it this character's rather than the preset's.
+    pub preset: String,
+    pub delivery: String,
+    /// A cloned voice by the name it is kept under, which wins over
+    /// the preset where there is one.
+    pub clone: String,
+    /// Who the character is, for casting it again later.
+    pub about: String,
+    pub created: u64,
+}
+
+fn puppet_row(r: &rusqlite::Row) -> rusqlite::Result<Puppet> {
+    Ok(Puppet {
+        name: r.get(0)?,
+        preset: r.get(1)?,
+        delivery: r.get(2)?,
+        clone: r.get(3)?,
+        about: r.get(4)?,
+        created: r.get::<_, i64>(5)? as u64,
+    })
+}
 
 /// A picture in a conversation, without the image itself: what a card
 /// needs to be drawn, and what the AI is told it has.
@@ -1890,7 +2343,26 @@ fn abandoned_pictures(db: &Connection) -> Result<()> {
         [],
     )?;
     if left > 0 {
-        tracing::info!(pictures = left, "these were still being drawn when the room stopped");
+        tracing::info!(
+            pictures = left,
+            "these were still being drawn when the room stopped"
+        );
+    }
+    Ok(())
+}
+
+/// A recording that was still being listened for when the room
+/// stopped. Nobody is listening now, and the audio never arrived, so
+/// the card is told the truth rather than waiting for a reading that
+/// ended with the process that armed it.
+fn abandoned_samples(db: &Connection) -> Result<()> {
+    let left = db.execute(
+        "UPDATE samples SET failed = 'the room restarted while it was listening'
+          WHERE wav IS NULL AND failed = ''",
+        [],
+    )?;
+    if left > 0 {
+        tracing::info!(samples = left, "the room was listening for these when it stopped");
     }
     Ok(())
 }
@@ -1958,7 +2430,9 @@ mod tests {
         assert_eq!(s.avatar("Ryan").unwrap(), None, "nobody starts with one");
         assert!(!s.clear_avatar("Ryan").unwrap(), "and none to take away");
 
-        let v = s.set_avatar("Ryan", b"\x89PNG...", "a tired wizard").unwrap();
+        let v = s
+            .set_avatar("Ryan", b"\x89PNG...", "a tired wizard")
+            .unwrap();
         let (png, version) = s.avatar("Ryan").unwrap().unwrap();
         assert_eq!(png, b"\x89PNG...");
         assert_eq!(version, v, "the version is what it was set at");
@@ -2004,8 +2478,12 @@ mod tests {
         let s = Store::memory();
         s.invite("Ryan").unwrap();
 
-        let first = s.set_avatar("Ryan", b"\x89PNG one", "a tired wizard").unwrap();
-        let second = s.set_avatar("Ryan", b"\x89PNG two", "a rested wizard").unwrap();
+        let first = s
+            .set_avatar("Ryan", b"\x89PNG one", "a tired wizard")
+            .unwrap();
+        let second = s
+            .set_avatar("Ryan", b"\x89PNG two", "a rested wizard")
+            .unwrap();
         assert_ne!(first, second, "each is its own version");
 
         // The newest is the one being worn, and the one before it is
@@ -2036,7 +2514,10 @@ mod tests {
             1,
             "exactly one is worn"
         );
-        assert!(!s.wear_avatar("Ryan", 999).unwrap(), "and only ones of theirs");
+        assert!(
+            !s.wear_avatar("Ryan", 999).unwrap(),
+            "and only ones of theirs"
+        );
 
         // Taking it off leaves the history: it is not the same as
         // never having had one.
@@ -2053,7 +2534,11 @@ mod tests {
         }
         let worn = s.faces("Ryan").unwrap();
         assert_eq!(worn.len(), FACES_KEPT);
-        assert_eq!(worn[0].prompt, format!("face {}", FACES_KEPT + 3), "newest first");
+        assert_eq!(
+            worn[0].prompt,
+            format!("face {}", FACES_KEPT + 3),
+            "newest first"
+        );
         assert!(worn[0].worn, "and it is the one being worn");
         assert!(
             s.avatar_at("Ryan", first).unwrap().is_none(),
@@ -2098,7 +2583,10 @@ mod tests {
             s.avatar_prompt("Ryan").unwrap().as_deref(),
             Some("a tired wizard")
         );
-        assert_eq!(s.avatar("@Vox").unwrap().unwrap().0, vec![0x89, 0x50, 0x4e, 0x48]);
+        assert_eq!(
+            s.avatar("@Vox").unwrap().unwrap().0,
+            vec![0x89, 0x50, 0x4e, 0x48]
+        );
         assert_eq!(s.faces("Ryan").unwrap().len(), 1);
         assert!(s.faces("Ryan").unwrap()[0].worn);
 
@@ -2701,7 +3189,10 @@ mod tests {
         let old = s.entries(1, 50).unwrap();
         assert_eq!(old.len(), 1, "what was said is still there");
         assert_eq!(old[0].title, "a tired wizard");
-        assert_eq!(old[0].note, "", "and it never had a handle, so it has none now");
+        assert_eq!(
+            old[0].note, "",
+            "and it never had a handle, so it has none now"
+        );
 
         // And a new one written against the migrated table keeps its
         // note, including when the row is updated in place -- which is
@@ -2713,7 +3204,10 @@ mod tests {
         s.put_entry(1, &e).unwrap();
         let back = s.entries(1, 50).unwrap();
         let new = back.iter().find(|x| x.id == "picture-new").unwrap();
-        assert_eq!(new.note, "Job a47b27c5aeb7", "the second write is the one that lands");
+        assert_eq!(
+            new.note, "Job a47b27c5aeb7",
+            "the second write is the one that lands"
+        );
     }
 
     #[test]

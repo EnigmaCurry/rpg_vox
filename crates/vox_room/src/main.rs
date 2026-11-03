@@ -6,12 +6,14 @@ mod agent;
 mod interp;
 mod mcp;
 mod mixer;
+mod puppet;
 mod room;
 mod rooms;
 mod screen;
 mod store;
 mod stt;
 mod tts;
+mod voices;
 mod web;
 
 use std::collections::BTreeMap;
@@ -208,12 +210,42 @@ struct Cli {
     /// name one, which is right for a server with a single model.
     #[arg(long, env = "VOX_ROOM_TTS_MODEL")]
     tts_model: Option<String>,
+    /// A voice-cloning server: the same vllm-omni speech API, holding
+    /// Qwen3-TTS's Base model instead of the preset speakers (the
+    /// `clone` service of `qwen3-tts/docker-compose.yml`). With one
+    /// configured, the AI can record a few seconds of somebody in the
+    /// room reading aloud, keep a voice cloned from it under a name,
+    /// and be asked to speak in it. Without one it has none of those
+    /// tools at all. A different host from `--tts-url` on purpose: the
+    /// preset server cannot speak in an uploaded voice, and asking it
+    /// to would quietly get a preset.
+    #[arg(long, env = "VOX_ROOM_TTS_CLONE_URL")]
+    tts_clone_url: Option<String>,
+    /// Bearer token for the clone server. Defaults to `--tts-key`,
+    /// which is right when the two servers are one deployment behind
+    /// one gate.
+    #[arg(long, env = "VOX_ROOM_TTS_CLONE_KEY")]
+    tts_clone_key: Option<String>,
     /// Qwen3 voice.
     #[arg(long, env = "VOX_ROOM_VOICE", default_value = "aiden")]
     voice: String,
     /// How the Qwen3 voice should speak, e.g. "calm and warm".
     #[arg(long, env = "VOX_ROOM_INSTRUCT", default_value = "")]
     instruct: String,
+    /// The voices the speech server has, comma-separated. Only needed
+    /// for a server that won't say: the room asks `/v1/audio/voices`
+    /// as it opens, and what comes back is what a [puppet](ROOM.md)
+    /// may be built on.
+    ///
+    /// Given here, this is used instead of asking. It wants the names
+    /// the server's own `/v1/audio/speech` takes, which are not the
+    /// names a picker shows: `uncle_fu`, not "Uncle Fu".
+    #[arg(
+        long = "tts-voices",
+        env = "VOX_ROOM_TTS_VOICES",
+        value_delimiter = ','
+    )]
+    tts_voices: Vec<String>,
     #[arg(long, env = "VOX_ROOM_LANGUAGE", default_value = "English")]
     language: String,
     /// Other languages the door offers, comma-separated and spelled out
@@ -336,6 +368,9 @@ struct Speakers {
     key: Option<String>,
     model: Option<String>,
     instruct: String,
+    /// Where a voice cloned from somebody in the room is spoken from,
+    /// when the house has such a server. See [`crate::voices`].
+    clone_url: Option<String>,
     /// The one Kokoro, when that is the voice: it is the whole model,
     /// so every room reads through this copy. None for the others,
     /// which are cheap enough to make per room.
@@ -350,20 +385,44 @@ impl Speakers {
         self.kind == TtsKind::Qwen3
     }
 
-    fn voice(&self, language: &str, preset: &str) -> Result<Box<dyn tts::Voice>> {
+    /// `borrowed` is the cell this voice reads to find out whether the
+    /// bot it belongs to has been lent a cloned voice. Every one of a
+    /// bot's voices is given the same cell; anything that is nobody's
+    /// bot -- an interpreter -- is given one of its own, which nothing
+    /// ever sets.
+    ///
+    /// `delivery` is how this one voice is to be spoken, instead of
+    /// the house's `--instruct`. Empty for everything the house set up
+    /// itself; a puppet is the thing that uses it, because a made-up
+    /// character's voice is a preset plus the way it talks -- which is
+    /// how a room with no clone server has more than one voice in it.
+    fn voice(
+        &self,
+        language: &str,
+        preset: &str,
+        delivery: &str,
+        borrowed: tts::Borrowed,
+    ) -> Result<Box<dyn tts::Voice>> {
+        let instruct = match delivery.trim() {
+            "" => self.instruct.as_str(),
+            said => said,
+        };
         Ok(match self.kind {
             TtsKind::Qwen3 => {
                 let Some(url) = self.url.clone() else {
                     bail!("--tts qwen3 needs --tts-url (or VOX_ROOM_TTS_URL)");
                 };
-                Box::new(tts::Qwen3::new(
-                    &url,
-                    preset,
-                    &self.instruct,
-                    language,
-                    self.key.clone(),
-                    self.model.clone(),
-                ))
+                Box::new(
+                    tts::Qwen3::new(
+                        &url,
+                        preset,
+                        instruct,
+                        language,
+                        self.key.clone(),
+                        self.model.clone(),
+                    )
+                    .cloning(self.clone_url.clone(), borrowed),
+                )
             }
             TtsKind::Kokoro => match &self.kokoro {
                 Some(shared) => shared.handle(),
@@ -748,6 +807,30 @@ fn serve(cli: Cli, store: Store, db: PathBuf) -> Result<()> {
     } else {
         TtsKind::None
     });
+    // The voice-cloning server, where there is one. Only ever with
+    // Qwen3: cloning somebody's voice and then speaking in it are the
+    // same server's two halves, and a house that could record a clip
+    // it has no way to speak with would offer the AI three tools that
+    // end in nothing.
+    let clone_url = cli.tts_clone_url.clone().filter(|url| {
+        if kind == TtsKind::Qwen3 {
+            return true;
+        }
+        warn!(
+            url = %url,
+            "a voice-cloning server needs --tts qwen3 to speak the voices it keeps, \
+             so the AI is not offered them"
+        );
+        false
+    });
+    let clone_key = cli
+        .tts_clone_key
+        .clone()
+        .or_else(|| cli.tts_key.clone())
+        .filter(|k| !k.is_empty());
+    let clones = clone_url
+        .as_deref()
+        .map(|url| Arc::new(voices::Clones::new(url, clone_key.clone())));
     // The room's own language first, then the others the door offers,
     // each at most once however it was spelled -- and settled to the one
     // spelling everything downstream matches on, so `english` in the
@@ -778,6 +861,7 @@ fn serve(cli: Cli, store: Store, db: PathBuf) -> Result<()> {
         key: cli.tts_key.clone(),
         model: cli.tts_model.clone(),
         instruct: cli.instruct.clone(),
+        clone_url: clone_url.clone(),
         // Loaded now and shared by every room: see `tts::Shared`.
         kokoro: match kind {
             TtsKind::Kokoro => {
@@ -827,6 +911,49 @@ fn serve(cli: Cli, store: Store, db: PathBuf) -> Result<()> {
             warn!("no voice: the AI's replies are shown, silently, at reading pace")
         }
     }
+    if let Some(url) = &clone_url {
+        info!(
+            url = %url,
+            key = clone_key.is_some(),
+            "voices: the AI can record somebody reading aloud and clone it"
+        );
+    }
+
+    // What the speech server holds, for building a puppet's voice on
+    // one of them. Asked rather than assumed: the names its
+    // `/v1/audio/speech` takes are not the names a picker shows --
+    // `uncle_fu`, not "Uncle Fu" -- and a name it does not know is an
+    // HTTP 400 in the middle of a line somebody was waiting to hear.
+    // `--tts-voices` overrides it for a server that will not say.
+    let given: Vec<String> = cli
+        .tts_voices
+        .iter()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .collect();
+    let presets: Vec<String> = match (&given[..], &speakers.url) {
+        ([], Some(url)) if speakers.kind == TtsKind::Qwen3 => {
+            match tts::presets(url, speakers.key.as_deref()) {
+                Ok(have) => {
+                    info!(voices = %have.join(", "), "the speech server's own voices");
+                    have
+                }
+                // Not fatal. What it costs is the AI being told what
+                // it may build a puppet on, and it is told nothing
+                // rather than told wrong -- a preset it invents is
+                // refused by the server with its own list in the
+                // refusal, which is the next best thing.
+                Err(err) => {
+                    warn!(
+                        "the speech server wouldn't say which voices it has, so the \
+                         AI isn't told: {err:#}"
+                    );
+                    Vec::new()
+                }
+            }
+        }
+        _ => given,
+    };
 
     let factory = if cli.no_stt {
         // Said out loud, because from inside the room it looks like a
@@ -957,7 +1084,9 @@ fn serve(cli: Cli, store: Store, db: PathBuf) -> Result<()> {
         let db = db.clone();
         let speakers = Arc::new(speakers);
         let translate = translate.clone();
+        let clones = clones.clone();
         let voice = cli.voice.clone();
+        let presets = presets.clone();
         let interpreter_voice = cli.interpreter_voice.clone();
         let (voices, prompts) = (voices, prompts);
         let interpret = cli.interpret;
@@ -991,7 +1120,35 @@ fn serve(cli: Cli, store: Store, db: PathBuf) -> Result<()> {
                     interp_rx.push((language.clone(), rx));
                 }
             }
-            let (room, wiring) = Room::new(store, cfg, typing_tx, interp_tx, factory.clone())?;
+            // How this room makes a voice for somebody who wasn't
+            // there when it opened, which is what a puppet is. None
+            // where there is nothing to speak with, and then there
+            // are no puppets and nothing in the AI's prompt mentions
+            // them -- a puppet with no voice is a name on a fader.
+            let speaking: Option<room::VoiceFactory> = match speakers.kind {
+                TtsKind::None => None,
+                _ => {
+                    let speakers = speakers.clone();
+                    let own = voice.clone();
+                    Some(Arc::new(
+                        move |language: &str,
+                              preset: &str,
+                              delivery: &str,
+                              borrowed: tts::Borrowed| {
+                            // A puppet nobody gave a voice to gets the
+                            // room's own: a character that sounds like
+                            // the AI beats one that says nothing.
+                            let preset = match preset.trim() {
+                                "" => own.as_str(),
+                                said => said,
+                            };
+                            speakers.voice(language, preset, delivery, borrowed)
+                        },
+                    ))
+                }
+            };
+            let (room, wiring) =
+                Room::new(store, cfg, typing_tx, interp_tx, factory.clone(), speaking)?;
             if let Some(rx) = typing_rx {
                 if let Some(t) = translate.clone() {
                     agent::spawn_typists(room.clone(), t, rx, 2);
@@ -1002,7 +1159,7 @@ fn serve(cli: Cli, store: Store, db: PathBuf) -> Result<()> {
                 interp::spawn(
                     room.clone(),
                     &language,
-                    speakers.voice(&language, &interpreter_voice)?,
+                    speakers.voice(&language, &interpreter_voice, "", Default::default())?,
                     t,
                     rx,
                 );
@@ -1023,11 +1180,28 @@ fn serve(cli: Cli, store: Store, db: PathBuf) -> Result<()> {
                 let preset = voices.get(&bot.name).unwrap_or(&voice);
                 let mut speaking: Vec<(String, Box<dyn tts::Voice>)> = Vec::new();
                 for language in &languages {
-                    speaking.push((language.clone(), speakers.voice(language, preset)?));
+                    // Every language this bot speaks in reads the one
+                    // cell: a voice it has been lent is the bot's, and
+                    // a bot that changed voice in English alone would
+                    // be two different people in one room.
+                    speaking.push((
+                        language.clone(),
+                        speakers.voice(language, preset, "", bot.borrowed.clone())?,
+                    ));
                 }
                 agent::Agent {
                     llm: llm.clone(),
                     name: bot.name.clone(),
+                    // The voice-cloning server, where the house has
+                    // one: the tools that record somebody and keep a
+                    // voice from them are its, and a bot in a house
+                    // without one is never offered them.
+                    clones: clones.clone(),
+                    // What the speech server holds, for building a
+                    // puppet's voice on one of them. Only the first
+                    // AI is ever offered a puppet, so only it is ever
+                    // shown this.
+                    presets: presets.clone(),
                     // Its own instructions, or the room's when it was
                     // given none of its own. `{name}` is filled in
                     // either way, so the default already says which of

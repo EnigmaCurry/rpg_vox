@@ -251,6 +251,7 @@ pub fn router(rooms: Arc<Rooms>, screen: Arc<Screen>) -> Router {
         )
         .route("/api/avatar/:who/all", get(faces))
         .route("/api/picture/:id", get(picture))
+        .route("/api/sample/:id", get(sample))
         .route("/room.ws", get(ws))
         .route("/screen.ws", get(screen_ws))
         .route("/healthz", get(|| async { "ok" }))
@@ -310,11 +311,7 @@ struct AtTheDoor {
 }
 
 /// Who this browser is, or whose invite its page is holding.
-async fn door(
-    State(app): State<App>,
-    headers: HeaderMap,
-    Json(at): Json<AtTheDoor>,
-) -> Response {
+async fn door(State(app): State<App>, headers: HeaderMap, Json(at): Json<AtTheDoor>) -> Response {
     let mine = invited(&app, &headers);
     // The link this page was opened on comes first: they followed it to
     // come in as whoever it names, and the card says who that is before
@@ -1031,6 +1028,43 @@ async fn picture(State(app): State<App>, headers: HeaderMap, Path(id): Path<Stri
             (header::VARY, "Cookie".to_string()),
         ],
         png,
+    )
+        .into_response()
+}
+
+/// A clip of somebody reading aloud, for the play button on its card.
+///
+/// Immutable like a picture, and for the same reason: a clip is never
+/// recorded again under the same id -- another go is another clip with
+/// another number -- so a browser that has one never asks twice.
+///
+/// Anyone invited may play it. It is what somebody said out loud in a
+/// room where everybody could hear them, and the transcript of it is
+/// already on every screen in that room.
+async fn sample(State(app): State<App>, headers: HeaderMap, Path(id): Path<String>) -> Response {
+    if invited(&app, &headers).is_none() {
+        return (StatusCode::FORBIDDEN, "not invited").into_response();
+    }
+    let found = match app.any().sample_wav(&id) {
+        Ok(found) => found,
+        Err(err) => {
+            warn!("read a voice sample: {err:#}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "no").into_response();
+        }
+    };
+    // Still being read, or never read at all. The card says which,
+    // from what the room told it rather than from this.
+    let Some(wav) = found else {
+        return (StatusCode::NOT_FOUND, "not yet").into_response();
+    };
+    (
+        [
+            (header::CONTENT_TYPE, "audio/wav".to_string()),
+            (header::CACHE_CONTROL, AVATAR_CACHE.to_string()),
+            (header::ETAG, format!("\"{id}\"")),
+            (header::VARY, "Cookie".to_string()),
+        ],
+        wav,
     )
         .into_response()
 }
