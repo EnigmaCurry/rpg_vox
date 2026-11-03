@@ -9,6 +9,9 @@ import micUrl from './mic.worklet.js?url';
 
 const RATE = 48000;
 const FRAME_US = 20000;
+/// How long the room's sound takes to go and to come back, in seconds.
+/// See `RoomAudio.hushRoom`.
+const HUSH_S = 0.015;
 
 export function supported() {
   return typeof window.AudioDecoder === 'function'
@@ -66,6 +69,14 @@ export class RoomAudio {
     this.decoder = null;
     this.player = null;
     this.volume = null;
+    // The room's sound, cut while push to talk is held. Its own node
+    // rather than the volume one: what you set in Settings is yours to
+    // come back to, and a hush that moved the slider would lose it.
+    this.hush = null;
+    // Whether it is cut right now, for `takeHeard`: a meter showing
+    // what is coming down the socket while the speakers are silent is
+    // the room telling you that you can hear something you cannot.
+    this.silent = false;
     this.encoder = null;
     this.stream = null;
     this.muted = false;
@@ -77,9 +88,36 @@ export class RoomAudio {
   }
 
   takeHeard() {
-    const h = this.heard;
+    const h = this.silent ? 0 : this.heard;
     this.heard = 0;
     return h;
+  }
+
+  /// Cut the room's sound dead, or let it back in.
+  ///
+  /// Held for as long as push to talk is held. The whole point of that
+  /// mode is somebody on speakers with a microphone pointed at them:
+  /// whatever the room is saying goes into their mic, is transcribed as
+  /// theirs, and is read back to the room as something they said. The
+  /// mic cannot be made deaf to one sound in the room it is in, so the
+  /// room stops making it.
+  ///
+  /// Ramped rather than switched. Zero at a stroke is a click, and a
+  /// click is a sound the mic hears too; `HUSH_S` is too short to be a
+  /// fade and long enough not to be an edge.
+  ///
+  /// The frames keep arriving and the player keeps playing them, so
+  /// what is missed is missed rather than queued -- a room that caught
+  /// up afterwards would be a room talking over itself, a second
+  /// behind, every time somebody let go of the key.
+  hushRoom(on) {
+    this.silent = on;
+    const gain = this.hush?.gain;
+    if (!gain || !this.ctx) return;
+    const now = this.ctx.currentTime;
+    gain.cancelScheduledValues(now);
+    gain.setValueAtTime(gain.value, now);
+    gain.linearRampToValueAtTime(on ? 0 : 1, now + HUSH_S);
   }
 
   /// Start hearing the room. Call from a click: browsers only start audio
@@ -97,7 +135,8 @@ export class RoomAudio {
     });
     this.player.port.onmessage = (ev) => this.onStats?.(ev.data);
     this.volume = new GainNode(this.ctx, { gain: volume });
-    this.player.connect(this.volume).connect(this.ctx.destination);
+    this.hush = new GainNode(this.ctx, { gain: this.silent ? 0 : 1 });
+    this.player.connect(this.hush).connect(this.volume).connect(this.ctx.destination);
     // A context the browser suspends or interrupts (a modal dialog, an
     // audio device change) is started again at once, or on the next click.
     this.ctx.onstatechange = () => {

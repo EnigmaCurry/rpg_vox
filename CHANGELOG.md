@@ -90,6 +90,28 @@ releases.
 
 ### Voice room
 
+- **Push to talk now shuts the room up while you hold the key.** The
+  mode is for somebody on speakers with a microphone pointed at them,
+  and it only did half the job: the mic opened, and the room went on
+  talking into it. Whatever it said was picked up, written down as
+  something that person said, and read back to the room -- which is
+  also how a sentence of the AI's own came back to it as a thing it had
+  been told. `audio.js` has claimed this worked all along, in the
+  comment explaining why echo cancellation is off ("on speakers, push
+  to talk keeps the room's sound out").
+
+  The room's sound is now taken to nothing as the key goes down and
+  brought back once the mic has actually closed -- a moment after you
+  let go, since the tail that catches your last word is still a moment
+  with a microphone in front of the speakers. A fade of a few
+  milliseconds rather than a switch, because a hard cut is a click and
+  a click is a sound the mic hears too. Its own gain, so the volume you
+  set in Settings is still there when it comes back.
+
+  What the room said while you held is missed rather than queued: a
+  room that caught up afterwards would be talking over itself, a second
+  behind, every time somebody let go.
+
 - **A cloned voice can be the voice an AI speaks in, and stay that
   way.** Asking out loud was the only way to put one on, and `speak_as`
   is deliberately the afternoon's -- it is not written down, so every

@@ -876,6 +876,24 @@ See ROOM_DOCKER.md.
   hold Space (or the talk button): everything said in one hold is one
   entry, and the AI waits for you to let go however long you pause.
 
+  **The room goes quiet while you hold it.** Push to talk is the mode
+  for somebody on speakers with a microphone pointed at them: whatever
+  the room is saying goes into that mic, is written down as theirs, and
+  is read back as something they said. A microphone cannot be made deaf
+  to one sound in the room it is in, so the room stops making it — the
+  sound is taken to nothing as the key goes down and brought back when
+  the mic has actually closed, which is a moment after you let go,
+  because that moment is still a microphone in front of the speakers.
+  It is a fade of a few milliseconds and not a switch, since a hard cut
+  is a click and a click is a sound the mic hears too.
+
+  What is said while you hold is missed rather than queued: a room that
+  caught up afterwards would be a room talking over itself, a second
+  behind, every time somebody let go. On headphones that is a cost
+  rather than a saving — hold the key to interrupt and you won't hear
+  the AI stop — which is the trade push to talk is, and the open mic is
+  the other side of it.
+
   **The space bar is the microphone's wherever you left the focus.** On
   a button you have just clicked -- a room in the list, a mute,
   somebody's shared screen -- it still talks, and it does not press that
@@ -1762,7 +1780,7 @@ CHROME=$(which chromium) ./run.sh            # or: ./run.sh rooms bots
 | `door` | the door is a page with no room behind it and no socket open; **Join Audio** does nothing until you agree to be recorded, and the Language box is never blank |
 | `roles` | the house and the people: making a room, renaming one under somebody standing in it, taking one away from under them — and the owner and the rest: who is shown the people and who is answered when they ask for them, a room given and taken away while somebody sits in the house, and an invite made from the page |
 | `settings` | the footer: one width for the talk button whatever it says, sharing and the way out on the other side, and the cog opening a page with everything that used to be strung along it |
-| `ptt` | push to talk: the space bar reaching the microphone from wherever the focus was left -- a button you clicked, the history panel, a mute -- and not reaching it in a text box or a dialog |
+| `ptt` | push to talk: the space bar reaching the microphone from wherever the focus was left -- a button you clicked, the history panel, a mute -- and not reaching it in a text box or a dialog, and the room's own sound going to nothing while the key is down and coming back only once the mic has closed |
 | `permalinks` | `/`, `/lobby` and `/room/<id>`; back and forward move between rooms, a pasted address opens that room, a stale one is put right |
 | `conversations` | the room's history: naming one, reading an old one read-only without moving anybody else's screen, deleting one for everybody, and empty ones never being archived |
 | `game` | a game played inside a room, and leaving it putting the room back where it was for everyone in it |

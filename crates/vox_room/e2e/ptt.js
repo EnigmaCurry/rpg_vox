@@ -94,6 +94,53 @@ const focused = (page) =>
   await page.waitForTimeout(400);
   is('unmuted, the key is yours again', await space(page), true);
 
+  // The room goes quiet while the key is down, which is the whole
+  // point of the mode: somebody on speakers with a microphone pointed
+  // at them. The mic cannot be made deaf to one sound in the room it
+  // is in, so the room stops making it -- and starts again only once
+  // the mic has actually closed, since the tail after letting go is
+  // still a moment with a microphone in front of the speakers.
+  await page.evaluate(() => document.activeElement?.blur());
+  // What the button says is one thing and what the speakers do is
+  // another, so the gain itself is watched: every ramp any audio
+  // parameter is asked for, recorded off the prototype, which is the
+  // one place this can be seen from outside the app.
+  await page.evaluate(() => {
+    window.__ramps = [];
+    const ramp = AudioParam.prototype.linearRampToValueAtTime;
+    AudioParam.prototype.linearRampToValueAtTime = function (value, when) {
+      window.__ramps.push(value);
+      return ramp.call(this, value, when);
+    };
+  });
+  await page.keyboard.down('Space');
+  await page.waitForTimeout(250);
+  is('the room is quiet while the key is down',
+    await page.evaluate(() => !!document.querySelector('footer .big.ptt.hushed')), true);
+  is('and the sound really was taken to nothing',
+    await page.evaluate(() => window.__ramps.at(-1)), 0);
+  await page.keyboard.up('Space');
+  await page.waitForTimeout(100);
+  is('and still quiet through the moment the mic is left open for',
+    await page.evaluate(() => !!document.querySelector('footer .big.ptt.hushed')), true);
+  await page.waitForTimeout(800);
+  is('and comes back once the mic has closed',
+    await page.evaluate(() => !!document.querySelector('footer .big.ptt.hushed')), false);
+  is('with the sound brought back up where it was',
+    await page.evaluate(() => window.__ramps.at(-1)), 1);
+
+  // And turning the mode off mid-hold is not a room left silent: the
+  // switch is beside the button, which is where a hand goes.
+  await page.keyboard.down('Space');
+  await page.waitForTimeout(250);
+  await page.click('footer .switch input');
+  await page.keyboard.up('Space');
+  await page.waitForTimeout(400);
+  is('letting go of push to talk while holding it gives the room back',
+    await page.evaluate(() => !!document.querySelector('footer .big.hushed')), false);
+  await page.click('footer .switch input');
+  await page.waitForTimeout(400);
+
   // Where Space is not yours: typing it types it.
   await page.click('.say textarea');
   await page.fill('.say textarea', 'a');

@@ -300,7 +300,15 @@
       {#if room.audio === 'on'}
         <div class="mic">
         {#if room.pushToTalk}
-          <button class="big ptt" class:talking={room.talking} disabled={!room.mic || stripMuted}
+          <!-- `hushed` is the room's own sound being off while you
+               hold, which is what push to talk is for: see
+               `RoomAudio.hushRoom`. It does not change the button's
+               size -- the one under your hand must stay where it is --
+               so what it says is in the title, and the switch beside
+               it says the same thing before you ever turn it on. -->
+          <button class="big ptt" class:talking={room.talking} class:hushed={room.hushed}
+            disabled={!room.mic || stripMuted}
+            title="While you hold this, the room's own sound is off, so your microphone hears only you."
             onpointerdown={(e) => { e.currentTarget.setPointerCapture(e.pointerId); talk(true); }}
             onpointerup={() => talk(false)} onpointercancel={() => talk(false)}
             onkeydown={(e) => { if (e.code === 'Enter') { e.preventDefault(); talk(true); } }}
@@ -314,7 +322,7 @@
         {/if}
         <!-- Beside the button it changes, because it changes what that
              button is. -->
-        <label class="switch" title="Your mic opens only while you hold Space or the talk button.">
+        <label class="switch" title="Your mic opens only while you hold Space or the talk button — and the room goes quiet while you hold it, so your microphone hears you and not the speakers.">
           <input type="checkbox" checked={room.pushToTalk}
             onchange={(e) => setPushToTalk(e.currentTarget.checked)} />
           <span>Push to talk</span>

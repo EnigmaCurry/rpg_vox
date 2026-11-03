@@ -251,6 +251,11 @@ export const room = $state({
   // button) is held.
   pushToTalk: readPref('vox_room.push_to_talk'),
   talking: false,
+  // Whether the room's own sound is cut just now, which it is for as
+  // long as push to talk is held: the mic is open and the speakers are
+  // in front of it. Said on the button, because silence that is not
+  // explained is a fault.
+  hushed: false,
   // Peak level of what this tab hears, for its meter.
   hearing: 0,
 });
@@ -1571,6 +1576,7 @@ export async function leaveAudio() {
   room.settings = false;
   clearInterval(hearTimer);
   room.hearing = 0;
+  room.hushed = false;
   await audio?.stop();
   audio = null;
   room.audio = 'off';
@@ -1609,6 +1615,10 @@ export function setPushToTalk(on) {
   writePref('vox_room.push_to_talk', on);
   clearTimeout(releaseTimer);
   room.talking = false;
+  // Let go of mid-hold -- the switch is beside the button, and turning
+  // the mode off while holding it is a thing a hand does. Nothing is
+  // listening any more, so nothing is worth being quiet for.
+  hushRoom(false);
   command({ type: 'ptt', on });
   setMuted(on);
 }
@@ -1635,13 +1645,36 @@ export function talk(on) {
   clearTimeout(releaseTimer);
   if (on) {
     room.talking = true;
+    // The room goes quiet before the mic opens, and not the other way
+    // round. Push to talk is the mode for somebody on speakers: what
+    // the room is saying is in front of their microphone, and a mic
+    // cannot be made deaf to one sound in the room it is in. See
+    // `RoomAudio.hushRoom`.
+    hushRoom(true);
     if (room.muted) setMuted(false);
   } else if (room.talking) {
     room.talking = false;
     releaseTimer = setTimeout(() => {
-      if (room.pushToTalk && !room.talking) setMuted(true);
+      if (room.pushToTalk && !room.talking) {
+        setMuted(true);
+        // Not on the release: the mic is deliberately left open a
+        // moment for the last word, and that moment is still a moment
+        // with a microphone in front of the speakers.
+        hushRoom(false);
+      }
     }, RELEASE_MS);
   }
+}
+
+/// Cut the room's sound, or let it back in, and say so on the button
+/// being held: a room that goes silent for no stated reason is a room
+/// somebody reports as broken.
+function hushRoom(on) {
+  // The sound first and the sign afterwards, so that a button saying
+  // the room is quiet is a room that is quiet: anything that threw on
+  // the way down leaves the button telling the truth about it.
+  audio?.hushRoom(on);
+  room.hushed = on;
 }
 
 /// How loud you want the interpreter. Yours alone: nobody else's mix
