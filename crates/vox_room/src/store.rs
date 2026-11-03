@@ -157,6 +157,15 @@ CREATE TABLE IF NOT EXISTS entries (
     -- listening in: a JSON object keyed by language. Kept so a reload
     -- shows what everyone was shown at the time.
     translations TEXT NOT NULL DEFAULT '{}',
+    -- What the tool that made this entry said about it, for the model
+    -- to read again later. A picture tool answers with a handle for
+    -- the thing it just made -- the id you pass back to change it --
+    -- and that answer lives only in the one reply it arrived in: the
+    -- conversation the model is given next turn is what was said out
+    -- loud, and a tool result is not that. So it is kept here, beside
+    -- the entry it is about, and put back in front of the model when
+    -- the history is built. Empty for everything a tool did not make.
+    note TEXT NOT NULL DEFAULT '',
     at   INTEGER NOT NULL,
     PRIMARY KEY (conversation, id)
 );
@@ -1236,11 +1245,11 @@ impl Store {
     pub fn put_entry(&self, conversation: i64, e: &Entry) -> Result<()> {
         self.db.execute(
             "INSERT INTO entries
-                 (conversation, id, who, kind, title, text, cut, typed, translations, at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 (conversation, id, who, kind, title, text, cut, typed, translations, note, at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
              ON CONFLICT(conversation, id) DO UPDATE SET
                text = excluded.text, cut = excluded.cut,
-               translations = excluded.translations",
+               translations = excluded.translations, note = excluded.note",
             params![
                 conversation,
                 e.id,
@@ -1251,6 +1260,7 @@ impl Store {
                 e.cut as i64,
                 e.typed as i64,
                 serde_json::to_string(&e.translations).unwrap_or_else(|_| "{}".into()),
+                e.note,
                 e.at as i64
             ],
         )?;
@@ -1260,7 +1270,7 @@ impl Store {
     /// The last `limit` entries of `conversation`, oldest first.
     pub fn entries(&self, conversation: i64, limit: usize) -> Result<Vec<Entry>> {
         let mut q = self.db.prepare(
-            "SELECT id, who, kind, title, text, cut, typed, translations, at FROM entries
+            "SELECT id, who, kind, title, text, cut, typed, translations, note, at FROM entries
              WHERE conversation = ?1 ORDER BY at DESC, rowid DESC LIMIT ?2",
         )?;
         let rows = q.query_map(params![conversation, limit as i64], |r| {
@@ -1277,7 +1287,8 @@ impl Store {
                 cut: r.get::<_, i64>(5)? != 0,
                 typed: r.get::<_, i64>(6)? != 0,
                 translations: serde_json::from_str(&translations).unwrap_or_default(),
-                at: r.get::<_, i64>(8)? as u64,
+                note: r.get(8)?,
+                at: r.get::<_, i64>(9)? as u64,
                 sent: true,
             })
         })?;
@@ -1841,6 +1852,9 @@ fn migrate(db: &Connection) -> Result<()> {
     if !has_column(db, "conversations", "title")? {
         db.execute_batch("ALTER TABLE conversations ADD COLUMN title TEXT NOT NULL DEFAULT ''")?;
     }
+    if !has_column(db, "entries", "note")? {
+        db.execute_batch("ALTER TABLE entries ADD COLUMN note TEXT NOT NULL DEFAULT ''")?;
+    }
     if !has_column(db, "conversations", "room")? {
         db.execute_batch(
             "ALTER TABLE conversations ADD COLUMN room TEXT NOT NULL DEFAULT '';
@@ -2344,6 +2358,7 @@ mod tests {
             cut: false,
             typed: false,
             translations: BTreeMap::new(),
+            note: String::new(),
             at: 10,
             sent: true,
         };
@@ -2510,6 +2525,7 @@ mod tests {
             cut: false,
             typed: false,
             translations: BTreeMap::new(),
+            note: String::new(),
             at: 10,
             sent: true,
         };
@@ -2644,6 +2660,60 @@ mod tests {
         assert_eq!(s.person("Mike").unwrap().unwrap().language, "Russian");
     }
 
+    /// A house that was already talking when `note` was added keeps
+    /// everything it had said, and the new column is empty on it --
+    /// nobody's old pictures gain a handle they never had.
+    #[test]
+    fn a_database_from_before_a_tool_could_say_anything_opens_and_gains_the_column() {
+        // `entries` as it was written before the column existed.
+        // SCHEMA is CREATE TABLE IF NOT EXISTS, so it leaves this one
+        // alone and only `migrate` can rescue it.
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE entries (
+                 conversation INTEGER NOT NULL,
+                 id   TEXT NOT NULL,
+                 who  TEXT NOT NULL,
+                 kind TEXT NOT NULL,
+                 title TEXT NOT NULL DEFAULT '',
+                 text TEXT NOT NULL,
+                 cut  INTEGER NOT NULL DEFAULT 0,
+                 typed INTEGER NOT NULL DEFAULT 0,
+                 translations TEXT NOT NULL DEFAULT '{}',
+                 at   INTEGER NOT NULL,
+                 PRIMARY KEY (conversation, id)
+             );
+             INSERT INTO entries (conversation, id, who, kind, title, text, at)
+                 VALUES (1, 'picture-old', 'Vox', 'picture', 'a tired wizard',
+                         'picture 1', 10);",
+        )
+        .unwrap();
+        db.execute_batch(SCHEMA).unwrap();
+        migrate(&db).unwrap();
+        indexes(&db).unwrap();
+        let s = Store {
+            db,
+            room: String::new(),
+        };
+
+        let old = s.entries(1, 50).unwrap();
+        assert_eq!(old.len(), 1, "what was said is still there");
+        assert_eq!(old[0].title, "a tired wizard");
+        assert_eq!(old[0].note, "", "and it never had a handle, so it has none now");
+
+        // And a new one written against the migrated table keeps its
+        // note, including when the row is updated in place -- which is
+        // what finishing a picture does to the card that was already up.
+        let mut e = old[0].clone();
+        e.id = "picture-new".into();
+        s.put_entry(1, &e).unwrap();
+        e.note = "Job a47b27c5aeb7".into();
+        s.put_entry(1, &e).unwrap();
+        let back = s.entries(1, 50).unwrap();
+        let new = back.iter().find(|x| x.id == "picture-new").unwrap();
+        assert_eq!(new.note, "Job a47b27c5aeb7", "the second write is the one that lands");
+    }
+
     #[test]
     fn entries_round_trip_in_order() {
         let s = Store::memory();
@@ -2658,6 +2728,7 @@ mod tests {
             cut: false,
             typed: false,
             translations: BTreeMap::new(),
+            note: String::new(),
             at,
             sent: true,
         };

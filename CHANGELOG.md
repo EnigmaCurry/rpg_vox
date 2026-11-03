@@ -229,6 +229,21 @@ releases.
   one gets the next number and the earlier ones stay in the chat, so
   going back to one is still a thing to ask for.
 
+  **A card remembers what the tool said when it made it.** Changing a
+  picture means telling the tool which one, by a handle only the tool
+  knows -- and the tool says it once, in the reply to the call that
+  drew the thing. That reply does not survive the turn: the
+  conversation a model is given is what was said out loud, and a tool
+  result is not that. Nobody asks for the hat to be red in the same
+  breath as "here it is", so by the time it was asked the handle was
+  always gone, and the AI would say it did not have one. The tool's
+  own words are kept against the card now and read back every turn
+  after, verbatim -- the room does not know which server it is talking
+  to, and what the tool said is what the tool will understand when it
+  comes back. They are kept for the model and not for the people: a
+  job id is not something anybody is going to read out, and the
+  browser is never sent it.
+
   **The tool list after the URL is the point of the flag, not a
   convenience.** That server offers seven tools and a room that wants
   faces needs those two; the rest are five more ways for a voice

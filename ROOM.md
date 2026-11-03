@@ -1255,6 +1255,20 @@ for a sprite, the better part of a minute for a refine, with the room
 listening to nothing throughout — which is why the prompt has it say
 what it is about to make before it makes it, and make one at a time.
 
+**A card remembers what the tool said when it made it.** A tool that
+changes a picture has to be told which one, by a handle that is the
+tool's own and not the number on the card — and it says that handle
+once, answering the call that drew the picture. A tool result does not
+survive the turn it arrived in: what a model is given next time is the
+conversation, and the conversation is what was said out loud. Since
+nobody asks for a change in the same breath as "here it is", the
+handle would always be gone by the time it was wanted. So the tool's
+words are kept beside the card and put back in front of the model
+every turn after, word for word — the room cannot know which server it
+is talking to, and what the tool said is what the tool will understand
+coming back. Capped at 300 characters, and never sent to the browser:
+it is machinery, and nobody is going to read a job id out loud.
+
 Making a picture and giving somebody a face are deliberately two steps:
 the server's tool makes it, and the room's own `set_avatar` puts one of
 what it made on a person. What a picture is kept in and how it is

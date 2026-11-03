@@ -348,12 +348,19 @@ Then ask how they like it. If they want a change, say what the tools let \
 you do about it. Where there is a tool that changes a picture already \
 made, that is the one to reach for when the change is a change -- a hat, \
 a colour, something taken out -- because it keeps everything else as it \
-was, which is usually what they meant; it wants the number or id of the \
-picture to work from, which the tool told you when it made it. Make a \
-fresh one when they want something genuinely different instead. Either \
-way the new picture gets the next number and the earlier ones stay in \
-the chat, so going back to one is a thing they can ask for and you can \
-do.";
+was, which is usually what they meant. Make a fresh one when they want \
+something genuinely different instead. Either way the new picture gets \
+the next number and the earlier ones stay in the chat, so going back to \
+one is a thing they can ask for and you can do.
+
+A tool that changes a picture needs to be told which one, and not by \
+its number in the chat: that number is the room's and means nothing to \
+the tool. It wants the handle the tool itself gave that picture, which \
+is written down beside the card -- every picture in the conversation \
+above says what the tool said when it made it, and the id is in there. \
+Read it off that line and pass it back. If the line for a picture has \
+no handle on it, that picture did not come from a tool that can change \
+it, and the honest answer is to make a new one.";
 
 const SEARCH_NOTE: &str = "\
 You can look things up on the web with look_up, and you should whenever the \
@@ -2049,10 +2056,15 @@ fn drawing(room: &Room, g: u64, server: &mcp::Server, tool: &str, args: &Value) 
     // The first one fills the card that is already up; the rest get
     // cards of their own, since a call asked for several takes is a
     // call whose takes are each worth looking at.
+    // What the tool said goes on every card it made, because the
+    // handle for changing a picture is in there and the model will
+    // have forgotten it by the time anybody asks: a tool result lives
+    // in the one reply it arrived in, and the change is always asked
+    // for in a later one. See `Entry::note`.
     if let Some((id, n)) = &pending {
         match pictures.next() {
             Some(first) => {
-                room.finish_picture(id, &first.png);
+                room.finish_picture(id, &first.png, &outcome.said);
                 drawn.push(*n);
             }
             None => room.fail_picture(id, "the tool came back without a picture"),
@@ -2066,7 +2078,7 @@ fn drawing(room: &Room, g: u64, server: &mcp::Server, tool: &str, args: &Value) 
         };
         match room.begin_picture(g, &caption) {
             Ok((id, n)) => {
-                room.finish_picture(&id, &picture.png);
+                room.finish_picture(&id, &picture.png, &outcome.said);
                 drawn.push(n);
             }
             Err(err) => warn!(g, "couldn't post a picture: {err}"),
@@ -2654,8 +2666,11 @@ mod tests {
                     {
                         use base64::Engine as _;
                         let b64 = base64::engine::general_purpose::STANDARD.encode(a_png());
+                        // A handle in the words, the way a real
+                        // picture server answers: the id you pass
+                        // back to change this one.
                         json!({ "content": [
-                            { "type": "text", "text": "drawn" },
+                            { "type": "text", "text": "Job mock7f3: drawn." },
                             { "type": "image", "data": b64, "mimeType": "image/png" },
                         ] })
                     }
@@ -2729,6 +2744,11 @@ mod tests {
         assert_eq!(entry.title, "a stern Borg commander");
         assert!(!entry.live, "and it is not still spinning");
         assert_eq!(room.picture_png(&entry.id).unwrap().unwrap(), a_png());
+        // And what the tool said is kept on the card, because the
+        // handle for changing this picture is in it and the request
+        // to change it always comes in a later turn, by which time
+        // the tool's reply is gone. See `room::Entry::note`.
+        assert_eq!(entry.note, "Job mock7f3: drawn.");
 
         // Which is a face somebody can now be given.
         assert_eq!(room.set_avatar(g, "Ryan", 1).unwrap(), "Ryan");
@@ -2768,6 +2788,10 @@ mod tests {
         );
         assert!(!entry.live, "and it is not still spinning");
         assert_eq!(room.picture_png(&entry.id).unwrap().unwrap(), a_png());
+        assert_eq!(
+            entry.note, "Job mock7f3: drawn.",
+            "a refine's own handle is kept too, so it can be refined again"
+        );
     }
 
     /// A call that draws nothing leaves no card: a list of old work is

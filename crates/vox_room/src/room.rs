@@ -102,6 +102,12 @@ const CARDS_MAX: usize = 50;
 /// Longest bio. A few lines under a picture, not a character sheet:
 /// it is read in a modal beside a 128-pixel square.
 const BIO_MAX: usize = 600;
+
+/// The most of a tool's own words kept against an entry for the model
+/// to read next turn; see [`Entry::note`]. Enough for a handle and a
+/// sentence saying what it is, and not enough for a tool that answers
+/// in paragraphs to crowd out the conversation.
+const MAX_NOTE: usize = 300;
 /// Biggest face the room will keep, and so the biggest picture it
 /// accepts into a conversation: anything in the chat can be worn, and
 /// a picture too big to wear would be a card with a tool that refuses
@@ -439,6 +445,22 @@ pub struct Entry {
     /// it, so a translation that went wrong can be seen to have.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub translations: BTreeMap<String, String>,
+    /// What the tool that made this said about it, kept for the model
+    /// to read again next turn. Empty for everything a tool did not
+    /// make, which is nearly everything.
+    ///
+    /// A picture tool answers with a handle for what it just made --
+    /// the id you pass back to change it rather than start over -- and
+    /// that answer lives only inside the one reply it arrived in. The
+    /// conversation a model is given next turn is what was said out
+    /// loud, and a tool result is not that: by the time anybody has
+    /// looked at the picture and asked for the hat to be red, the
+    /// handle is gone. So it is kept beside the entry it is about.
+    ///
+    /// Not sent to the browser. It is the machinery behind a card, and
+    /// nobody in the room is going to read a job id out.
+    #[serde(skip)]
+    pub note: String,
     /// Unix milliseconds when it started.
     pub at: u64,
     /// Handed to the conversation (people's entries only).
@@ -1884,6 +1906,7 @@ impl Room {
             cut: false,
             typed: false,
             translations: BTreeMap::new(),
+            note: String::new(),
             at: now_ms(),
             sent: true,
         };
@@ -1898,7 +1921,10 @@ impl Room {
     }
 
     /// The picture arrived: the spinner becomes the picture.
-    pub fn finish_picture(&self, id: &str, png: &[u8]) {
+    /// `note` is what the tool said when it handed this over, kept for
+    /// the model rather than for the room; see [`Entry::note`]. Empty
+    /// where the tool said nothing.
+    pub fn finish_picture(&self, id: &str, png: &[u8], note: &str) {
         if !crate::mcp::is_png(png) {
             self.fail_picture(id, "what came back was not a PNG");
             return;
@@ -1908,7 +1934,37 @@ impl Room {
             self.fail_picture(id, "the room couldn't keep it");
             return;
         }
+        self.remember_note(id, note);
         self.settle_picture(id);
+    }
+
+    /// Keep what the tool said against the entry it is about, in the
+    /// log and in the database both -- the log is what this turn reads
+    /// and the database is what every turn after a restart reads.
+    ///
+    /// Capped, because this goes into the conversation the model is
+    /// given and a tool is under no obligation to be brief. One line
+    /// is what a handle and a sentence about it fit in.
+    fn remember_note(&self, id: &str, note: &str) {
+        let note = one_line(note.trim());
+        if note.is_empty() {
+            return;
+        }
+        let note: String = match note.chars().count() > MAX_NOTE {
+            false => note,
+            true => note.chars().take(MAX_NOTE).collect(),
+        };
+        let mut st = self.lock();
+        let Some(e) = st.log.iter_mut().find(|e| e.id == id) else {
+            return;
+        };
+        e.note = note;
+        let entry = e.clone();
+        let conversation = st.conversation;
+        drop(st);
+        if let Err(err) = self.store().put_entry(conversation, &entry) {
+            warn!("keep what a tool said: {err:#}");
+        }
     }
 
     /// It never will: the card says so rather than spinning for good.
@@ -1998,6 +2054,7 @@ impl Room {
             cut: false,
             typed: false,
             translations: BTreeMap::new(),
+            note: String::new(),
             at: now_ms(),
             sent: true,
         };
@@ -2563,6 +2620,7 @@ impl Room {
             cut: false,
             typed: false,
             translations: BTreeMap::new(),
+            note: String::new(),
             at: now_ms(),
             sent: true,
         };
@@ -2966,6 +3024,7 @@ impl Room {
                     cut: false,
                     typed: false,
                     translations: BTreeMap::new(),
+                    note: String::new(),
                     at: now_ms(),
                     sent: false,
                 });
@@ -4014,6 +4073,7 @@ impl Room {
             cut: false,
             typed: false,
             translations: BTreeMap::new(),
+            note: String::new(),
             at: now_ms(),
             sent: true,
         };
@@ -4061,6 +4121,7 @@ impl Room {
                 cut: false,
                 typed: true,
                 translations: BTreeMap::new(),
+                note: String::new(),
                 at: now_ms(),
                 sent: false,
             };
@@ -4954,6 +5015,7 @@ impl Room {
             cut: false,
             typed: false,
             translations: BTreeMap::new(),
+            note: String::new(),
             at: now_ms(),
             sent: true,
         };
@@ -5404,9 +5466,19 @@ fn conversation_messages(
             // anybody in the room will say out loud about it.
             Kind::Picture => {
                 let who = if mine { "You" } else { e.who.as_str() };
+                // What the tool said when it handed this over, which
+                // is where a handle for changing it lives. Kept
+                // verbatim rather than picked apart: the room does
+                // not know which server it is talking to, and the
+                // tool's own words are what the tool will understand
+                // when they come back to it.
+                let said = match e.note.trim() {
+                    "" => String::new(),
+                    said => format!(" The tool said: \"{said}\"."),
+                };
                 let note = format!(
                     "[{who} put {} in the chat for everyone to look at: \"{}\". \
-                     Ask how they like it; set_avatar takes that number.]",
+                     Ask how they like it; set_avatar takes that number.{said}]",
                     e.text,
                     one_line(e.title.trim())
                 );
@@ -5535,7 +5607,7 @@ mod tests {
         assert!(r.picture_png(&first).unwrap().is_none(), "nothing to serve yet");
 
         // It lands.
-        r.finish_picture(&first, &png());
+        r.finish_picture(&first, &png(), "");
         assert_eq!(r.picture_png(&first).unwrap().unwrap(), png());
         assert!(
             !r.lock().log.iter().find(|e| e.id == first).unwrap().live,
@@ -5546,7 +5618,7 @@ mod tests {
         // the first is still there to go back to.
         let (second, n) = r.begin_picture(g, "a rested wizard").unwrap();
         assert_eq!(n, 2);
-        r.finish_picture(&second, &png());
+        r.finish_picture(&second, &png(), "");
 
         // A face is set by the number on the card -- the first one,
         // which is the point of them being numbered at all.
@@ -5609,7 +5681,7 @@ mod tests {
         // said out loud about whatever is on screen.
         let (made, n) = r.begin_picture(g, "a tired wizard").unwrap();
         assert_eq!(n, 2);
-        r.finish_picture(&made, &png());
+        r.finish_picture(&made, &png(), "");
 
         // And the AI can be asked for theirs as a face, by the number
         // on its card, without having made anything.
@@ -5635,6 +5707,63 @@ mod tests {
             "{said}"
         );
         assert!(said.contains("You did not make it"), "{said}");
+    }
+
+    /// A tool that can change a picture needs to be told which one, by
+    /// a handle only the tool knows -- and the tool says it once, in
+    /// the reply to the call that drew it. That reply is gone by the
+    /// next turn: the conversation the model is given is what was said
+    /// out loud, and a tool result is not that. So what the tool said
+    /// is kept against the card and read back to the model every turn
+    /// after, which is the whole of why `Entry::note` exists.
+    #[test]
+    fn what_the_tool_said_is_still_there_next_turn() {
+        let (r, _turns) = room(Mode::Named);
+        let g = turn(&r);
+        let (id, _) = r.begin_picture(g, "a brass automaton head").unwrap();
+        r.finish_picture(&id, &png(), "Job a47b27c5aeb7: 64x64 sprite, 16 colours.");
+
+        let read_back = |r: &Room| {
+            conversation_messages(&r.lock().log, 50, "English", "Vox")
+                .iter()
+                .map(|(_, t)| t.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let said = read_back(&r);
+        assert!(said.contains("picture 1"), "{said}");
+        assert!(
+            said.contains("a47b27c5aeb7"),
+            "the handle is in front of the model, or it cannot change the picture: {said}"
+        );
+
+        // And it is in the database, not only in the log this process
+        // happens to be holding -- the room restarts and the people
+        // carry on with the same pictures.
+        let kept = r
+            .store()
+            .entries(r.lock().conversation, 50)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.id == id)
+            .expect("the card is in the database");
+        assert_eq!(kept.note, "Job a47b27c5aeb7: 64x64 sprite, 16 colours.");
+
+        // It is for the model and not for the people: the browser is
+        // sent a card, not a job id.
+        let shown = serde_json::to_string(&kept).unwrap();
+        assert!(!shown.contains("a47b27c5aeb7"), "not sent to the browser: {shown}");
+
+        // A tool that said nothing leaves the line as it always was.
+        let (quiet, _) = r.begin_picture(g, "a tired wizard").unwrap();
+        r.finish_picture(&quiet, &png(), "   ");
+        let said = read_back(&r);
+        assert!(said.contains("picture 2"), "{said}");
+        assert!(
+            !said.contains("picture 2 in the chat for everyone to look at: \"a tired wizard\". \
+                            Ask how they like it; set_avatar takes that number. The tool said"),
+            "no empty quotation where a tool said nothing: {said}"
+        );
     }
 
     /// What the room will not take in: the three checks a page cannot
@@ -5667,7 +5796,7 @@ mod tests {
         let (r, _turns) = room(Mode::Named);
         let g = turn(&r);
         let (id, _) = r.begin_picture(g, "a tired wizard").unwrap();
-        r.finish_picture(&id, &png());
+        r.finish_picture(&id, &png(), "");
         r.set_avatar(g, "Ryan", 1).unwrap();
         let version = r.avatar_png("Ryan", None).unwrap().unwrap().1;
 
@@ -5727,7 +5856,7 @@ mod tests {
 
         // One picture, made once.
         let (id, _) = r.begin_picture(g, "a brass head").unwrap();
-        r.finish_picture(&id, &png());
+        r.finish_picture(&id, &png(), "");
 
         // And it goes wherever the room decides, without being made
         // again: to a person, to the AI that made it, and to the
@@ -5776,7 +5905,7 @@ mod tests {
         // `list_people` is where it reads it -- and reading somebody's
         // own prompt back at them is showing the machinery.
         let (id, _) = r.begin_picture(g, "a tired wizard").unwrap();
-        r.finish_picture(&id, &png());
+        r.finish_picture(&id, &png(), "");
         r.set_avatar(g, "Ryan", 1).unwrap();
         let ryan = r.profile("Ryan").unwrap();
         assert!(ryan.get("face").is_none(), "not on the card: {ryan}");
