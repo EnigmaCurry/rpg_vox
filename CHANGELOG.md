@@ -90,6 +90,22 @@ releases.
 
 ### Voice room
 
+- **A picture server stopped working after a quiet hour, and now does
+  not.** The session a server hands out at the handshake is ended when
+  nothing has used it for a while -- the house's own server times an
+  idle one out and says so in its log -- and a room goes hours between
+  pictures, because nobody asks for one between conversations. The room
+  kept the id it was given as it opened and sent it for the life of the
+  process, so the first picture asked for after a quiet spell was
+  answered `404 Session not found`, and so was every one after it until
+  the house was restarted. The AI said it couldn't, correctly and
+  uselessly.
+
+  404 is the protocol's way of saying "not that session, start
+  another", so that is what happens now: the handshake is done again
+  and the call is made once more, once. A second 404 is a 404 about
+  something else and is reported as one.
+
 - **A picture you dropped into the room can now be changed, not only
   worn.** Asking for a hat on one got an apology: a tool that changes a
   picture knows only the pictures its own server drew, by the handle

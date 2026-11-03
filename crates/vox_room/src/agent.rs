@@ -4047,11 +4047,24 @@ mod tests {
     /// thing that was never covered until a picture came out as the
     /// bare number 1 on somebody's screen.
     fn mock_mcp(draws: bool) -> String {
+        mock_mcp_which(draws, false)
+    }
+
+    /// The same, `ends_sessions` making it behave like a server that
+    /// has been left alone too long: the session it handed out at
+    /// startup is terminated, and every call carrying it is answered
+    /// 404 until the client says hello again. Which is what the
+    /// house's own picture server does between conversations.
+    fn mock_mcp_which(draws: bool, ends_sessions: bool) -> String {
         use std::io::{BufRead as _, BufReader, Write as _};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port");
         let base = format!("http://{}", listener.local_addr().unwrap());
         let url = format!("{base}/mcp");
         std::thread::spawn(move || {
+            // How many times it has been said hello to, which is what
+            // names the session: everything carrying an older one is
+            // talking to a session that has been ended.
+            let mut hellos = 0u32;
             for stream in listener.incoming().flatten() {
                 let mut reader = BufReader::new(stream.try_clone().unwrap());
                 let mut len = 0usize;
@@ -4060,6 +4073,7 @@ mod tests {
                 // ticket it handed out -- which is not JSON-RPC, has
                 // no key on it, and is the step the room does itself.
                 let mut path = String::new();
+                let mut session = String::new();
                 let mut first = true;
                 loop {
                     let mut line = String::new();
@@ -4070,8 +4084,12 @@ mod tests {
                         first = false;
                         path = line.split_whitespace().nth(1).unwrap_or("/").to_string();
                     }
-                    if let Some(n) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    let lower = line.to_ascii_lowercase();
+                    if let Some(n) = lower.strip_prefix("content-length:") {
                         len = n.trim().parse().unwrap_or(0);
+                    }
+                    if let Some(sid) = lower.strip_prefix("mcp-session-id:") {
+                        session = sid.trim().to_string();
                     }
                     if line == "\r\n" || line == "\n" {
                         break;
@@ -4100,6 +4118,26 @@ mod tests {
                 }
                 let req: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
                 let method = req["method"].as_str().unwrap_or("");
+                // A session that was ended while nobody was using it.
+                // Anything still carrying it is told so the way the
+                // protocol says to -- 404, and start another.
+                if ends_sessions && !session.is_empty() && session != format!("s{hellos}") {
+                    let payload = json!({
+                        "jsonrpc": "2.0",
+                        "id": req["id"],
+                        "error": { "code": -32001, "message": "Session not found" },
+                    })
+                    .to_string();
+                    let head = format!(
+                        "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\n\
+                         Connection: close\r\nContent-Length: {}\r\n\r\n",
+                        payload.len()
+                    );
+                    let mut s = stream;
+                    let _ = s.write_all(head.as_bytes());
+                    let _ = s.write_all(payload.as_bytes());
+                    continue;
+                }
                 // A notification wants no answer but the 202.
                 if req["id"].is_null() {
                     let mut s = stream;
@@ -4110,11 +4148,14 @@ mod tests {
                     continue;
                 }
                 let result = match method {
-                    "initialize" => json!({
-                        "protocolVersion": "2025-06-18",
-                        "capabilities": {},
-                        "serverInfo": { "name": "mock", "version": "1" },
-                    }),
+                    "initialize" => {
+                        hellos += 1;
+                        json!({
+                            "protocolVersion": "2025-06-18",
+                            "capabilities": {},
+                            "serverInfo": { "name": "mock", "version": "1" },
+                        })
+                    }
                     // The two shapes a picture server comes in: one
                     // that draws from a description, and one that
                     // changes a picture it already drew -- which is
@@ -4264,6 +4305,7 @@ mod tests {
                 // this loop has already dropped.
                 let head = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                     mcp-session-id: s{hellos}\r\n\
                      Connection: close\r\nContent-Length: {}\r\n\r\n",
                     payload.len()
                 );
@@ -4509,6 +4551,54 @@ mod tests {
             .expect("the card that went up");
         assert!(!card.live, "has stopped spinning");
         assert!(room.picture_png(&card.id).unwrap().is_none());
+    }
+
+    /// A session the server ended while the room was quiet is not a
+    /// picture server that has stopped working. The house's own server
+    /// times an idle session out -- a room goes hours between pictures
+    /// -- and answers 404 to everything carrying it afterwards, which
+    /// is the protocol saying "start another". So the room says hello
+    /// again and makes the call it was making.
+    ///
+    /// Before this, the first picture asked for after a quiet hour
+    /// failed, and so did every one after it until the house was
+    /// restarted.
+    #[test]
+    fn a_session_the_server_ended_is_started_again_rather_than_reported() {
+        let room = picture_room();
+        let g = room.generation_of_only_bot().load(Ordering::SeqCst);
+        let server = Arc::new(mcp::Server::new(mcp::Config {
+            name: "art".into(),
+            url: mock_mcp_which(true, true),
+            key: String::new(),
+            only: vec!["generate_pixel_art".into(), "list_styles".into()],
+        }));
+        assert_eq!(server.connect().expect("hello"), 2);
+
+        // The room is left alone and the server ends the session it
+        // was given. The next call carries a session that is gone.
+        server.end_session_for_test();
+
+        let args = json!({ "prompt": "a brass head" });
+        let said = drawing(&room, g, &server, "art_generate_pixel_art", &args)
+            .expect("said hello again and drew it");
+        assert!(
+            said["result"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Picture 1"),
+            "{said}"
+        );
+        let entry = room
+            .log_now()
+            .into_iter()
+            .find(|e| e.kind == crate::room::Kind::Picture)
+            .expect("the picture is in the conversation");
+        assert_eq!(room.picture_png(&entry.id).unwrap().unwrap(), a_png());
+
+        // And the one after it goes straight through on the new
+        // session, rather than handshaking every time.
+        drawing(&room, g, &server, "art_generate_pixel_art", &args).expect("and again");
     }
 
     /// The two tools that take a picture of ours are the room's own

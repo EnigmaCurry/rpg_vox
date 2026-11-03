@@ -281,6 +281,14 @@ impl Server {
         &self.cfg.key
     }
 
+    /// Leave this room holding a session the server has ended, which
+    /// is where a quiet hour leaves it for real. For the test in
+    /// `agent.rs`: nothing else has any business writing one.
+    #[cfg(test)]
+    pub fn end_session_for_test(&self) {
+        *self.session.lock().expect("session") = Some("ended".into());
+    }
+
     /// Say hello and find out what it has. Called once as the house
     /// opens, on its own thread: a server that is slow to answer must
     /// not hold up a room that works without it.
@@ -290,21 +298,10 @@ impl Server {
     /// [`Server::offer`].
     pub fn connect(&self) -> Result<usize> {
         let hello = self
-            .rpc(
-                "initialize",
-                json!({
-                    "protocolVersion": PROTOCOL,
-                    "capabilities": {},
-                    "clientInfo": { "name": "vox_room", "version": env!("CARGO_PKG_VERSION") },
-                }),
-                HELLO_TIMEOUT,
-            )
+            .hello(HELLO_TIMEOUT)
             .with_context(|| format!("say hello to {}", self.cfg.url))?;
         let server = hello["serverInfo"]["name"].as_str().unwrap_or("?");
         let version = hello["serverInfo"]["version"].as_str().unwrap_or("?");
-        // The handshake is not over until the server has been told the
-        // client is ready. A notification: no id, and no answer.
-        self.notify("notifications/initialized", json!({}))?;
 
         let listed = self.rpc("tools/list", json!({}), HELLO_TIMEOUT)?;
         let tools = listed["tools"].as_array().cloned().unwrap_or_default();
@@ -751,14 +748,72 @@ impl Server {
         Ok(png)
     }
 
-    /// One JSON-RPC call: post it, read the answer, hand back `result`.
+    /// One JSON-RPC call, saying hello again first if the session this
+    /// room has been using is gone.
+    ///
+    /// It will be gone. A server that keeps sessions ends them when
+    /// nothing has used one for a while, and a room is idle for hours
+    /// at a time -- nobody asks for a picture between conversations.
+    /// From then on every call is answered 404, which is the
+    /// protocol's way of saying "not that session, start another", and
+    /// a client that took it for an ordinary failure would have a
+    /// picture server that worked until the first quiet hour and never
+    /// again until the house was restarted.
+    ///
+    /// So the handshake is done again and the call is made once more.
+    /// Once: a second 404 is a 404 about something else.
     fn rpc(&self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
+        match self.rpc_once(method, params.clone(), timeout) {
+            Err(err) if err.downcast_ref::<Stale>().is_some() => {
+                info!(
+                    server = self.cfg.name,
+                    method, "the session was ended; saying hello again"
+                );
+                self.hello(timeout)?;
+                self.rpc_once(method, params, timeout)
+            }
+            other => other,
+        }
+    }
+
+    /// The handshake, and the session that comes out of it.
+    ///
+    /// Done as the house opens and again whenever the server has
+    /// forgotten us. The old session is dropped first, because what is
+    /// being asked for is a new one and a server told to start one
+    /// while being shown the dead one is being told two things.
+    fn hello(&self, timeout: Duration) -> Result<Value> {
+        *self.session.lock().expect("session") = None;
+        let hello = self.rpc_once(
+            "initialize",
+            json!({
+                "protocolVersion": PROTOCOL,
+                "capabilities": {},
+                "clientInfo": { "name": "vox_room", "version": env!("CARGO_PKG_VERSION") },
+            }),
+            timeout,
+        )?;
+        // The handshake is not over until the server has been told the
+        // client is ready. A notification: no id, and no answer.
+        self.notify("notifications/initialized", json!({}))?;
+        Ok(hello)
+    }
+
+    /// One JSON-RPC call: post it, read the answer, hand back `result`.
+    fn rpc_once(&self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let body = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-        let resp = self
-            .post(timeout)
-            .send_json(&body)
-            .map_err(|e| self.wherefore(method, e))?;
+        let resp = match self.post(timeout).send_json(&body) {
+            Ok(resp) => resp,
+            // The session is gone, and only [`Server::rpc`] has
+            // anything to do about it. Nothing is read from the body
+            // beyond what makes the log line honest.
+            Err(ureq::Error::Status(404, r)) if self.in_session() => {
+                let why = r.into_string().unwrap_or_default();
+                return Err(anyhow!(Stale(snippet(&why))));
+            }
+            Err(e) => return Err(self.wherefore(method, e)),
+        };
         // A server that keeps sessions says so once, in the answer to
         // `initialize`, and expects it back from then on.
         if let Some(sid) = resp.header("mcp-session-id") {
@@ -812,6 +867,13 @@ impl Server {
             req = req.set("mcp-session-id", sid);
         }
         req
+    }
+
+    /// Whether this room is holding a session at all. What tells a 404
+    /// about a session apart from a 404 about a URL: a client that has
+    /// been given no session cannot have had one ended.
+    fn in_session(&self) -> bool {
+        self.session.lock().expect("session").is_some()
     }
 
     /// What went wrong, with the body in it. ureq's own message for a
@@ -877,6 +939,27 @@ fn auth_args_in(schema: &Value) -> Vec<String> {
         })
         .unwrap_or_default()
 }
+
+/// The session this room was using has been ended by the server.
+///
+/// Its own type and not a message, because it is the one failure the
+/// client does something about rather than reports: see
+/// [`Server::rpc`]. It never reaches a model -- by the time anything
+/// is reported, the handshake has been done again and the call made
+/// once more.
+#[derive(Debug)]
+struct Stale(String);
+
+impl std::fmt::Display for Stale {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0.trim().is_empty() {
+            true => write!(f, "the session was ended by the server"),
+            false => write!(f, "the session was ended by the server: {}", self.0),
+        }
+    }
+}
+
+impl std::error::Error for Stale {}
 
 /// The looks a tool can draw in, off its `style` argument's enum.
 /// Whatever the server says they are, in the order it said them.
