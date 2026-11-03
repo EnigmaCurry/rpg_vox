@@ -228,14 +228,51 @@ line and nothing else — the rooms open either way, and the AI simply
 has no picture tools until it answers. That is deliberate: a picture
 server is not something a voice room should fail to start over.
 
-The container reaches the picture server by URL on its own bridge
-network, so unlike the model and TTS servers there is no
-`host.docker.internal` or DNS pinning to think about — the URL is
-resolved and fetched from inside the container, and it has to work
-from there. A hosted server needs egress, which a locked-down host may
-not give it. A server of your own needs a name the container can
-resolve and a route to it: a public hostname behind the same reverse
-proxy is the easy answer, and `localhost` is never one.
+The URL is resolved and fetched from inside the container, so it has
+to work from there and not from your workstation. A hosted server
+needs egress, which a locked-down host may not give it. A server of
+your own needs a name the container can resolve *and* a route to the
+address it resolves to, and `localhost` is never one.
+
+**Split-horizon DNS is the trap, and it looks like nothing.** If you
+run the picture server behind the same Traefik as this room, your
+workstation is probably on the private network and resolves the name
+to a private address, while the Docker host is on the public resolver
+and gets the public one — which may not be routable from there at all.
+Everything looks configured; the log says only:
+
+```console
+… no tools from this one: say hello to https://…/mcp: initialize: …
+Connection Failed: Connect error: connection timed out; the room
+carries on without it …
+```
+
+The fix is the same pin the TTS server uses, which is why there are
+two slots:
+
+```ini
+VOX_ROOM_PIN_HOST=qwen3-tts.example.com
+VOX_ROOM_PIN_IP=host-gateway
+VOX_ROOM_PIN_HOST_2=comfyui-mcp.example.com
+VOX_ROOM_PIN_IP_2=host-gateway
+```
+
+`host-gateway` is the Docker host itself, which is the right answer
+whenever the service is behind the same Traefik. Only the lookup is
+overridden — the URL keeps the name, so TLS and the `Host` header are
+unaffected, which is what makes this safe to do to a name Traefik
+routes on.
+
+Checking it from inside the container is worth knowing how to do, and
+there is one way to get it wrong: `/bin/sh` is dash, and `/dev/tcp` is
+a bash feature, so under `sh` every probe fails and the answer looks
+like "no egress at all".
+
+```console
+$ docker compose exec -T vox_room bash -c \
+    'timeout 5 bash -c "echo > /dev/tcp/comfyui-mcp.example.com/443" \
+     && echo reachable'
+```
 
 Generating holds the connection while it runs, and the room allows two
 minutes for it. A refine on a busy GPU is the one that gets close.

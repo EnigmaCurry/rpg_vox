@@ -55,14 +55,20 @@ services:
     ## point VOX_SCRIBE_LLM_URL and VOX_ROOM_TTS_URL at names the remote
     ## host can actually resolve.
     ##
-    ## The second entry pins one name to one address, for split-horizon
+    ## The entries after it pin one name to one address, for split-horizon
     ## DNS: a container on the public resolver gets the public IP of a
     ## service it can only reach privately. The URL keeps the name, so TLS
     ## and the Host header still work -- only the lookup is overridden.
-    ## Unset, it is an inert .invalid line. See ROOM_DOCKER.md.
+    ## Unset, each is an inert .invalid line. See ROOM_DOCKER.md.
+    ##
+    ## There are two because a room commonly needs two: the TTS server and
+    ## the picture server are separate names and are often both behind the
+    ## same Traefik. A compose list cannot be grown from one variable, so
+    ## the slots are counted out; a third wants another line here.
     extra_hosts:
       - "host.docker.internal:host-gateway"
       - "${VOX_ROOM_PIN_HOST:-unpinned.invalid}:${VOX_ROOM_PIN_IP:-127.0.0.1}"
+      - "${VOX_ROOM_PIN_HOST_2:-unpinned2.invalid}:${VOX_ROOM_PIN_IP_2:-127.0.0.1}"
 
     ## vox_room's graceful shutdown waits on ctrl_c, i.e. SIGINT, and as
     ## PID 1 it ignores the SIGTERM docker would otherwise send -- so
