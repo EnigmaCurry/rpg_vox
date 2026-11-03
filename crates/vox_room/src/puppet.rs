@@ -875,7 +875,7 @@ mod tests {
         let tts: crate::room::VoiceFactory =
             Arc::new(|_, _, _, _| Ok(Box::new(crate::tts::Silent)));
         let (room, _wiring) =
-            Room::new(store, cfg, None, BTreeMap::new(), None, Some(tts)).unwrap();
+            Room::new(store, cfg, None, BTreeMap::new(), None, Some(tts), None).unwrap();
         for name in ["Grimble", "Pell"] {
             room.make_puppet(crate::store::Puppet {
                 name: name.into(),

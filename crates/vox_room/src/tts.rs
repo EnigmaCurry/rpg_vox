@@ -286,7 +286,7 @@ impl Qwen3 {
         resp.into_reader()
             .read_to_end(&mut wav)
             .context("read TTS audio")?;
-        let (samples, rate) = decode_wav(&wav)?;
+        let (samples, rate) = decode_wav(&wav).context("TTS sent no WAV")?;
         to_room_rate(&samples, rate)
     }
 }
@@ -329,9 +329,16 @@ impl Voice for Silent {
     }
 }
 
-/// A WAV file as mono f32 and its sample rate.
-fn decode_wav(bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
-    let mut r = hound::WavReader::new(std::io::Cursor::new(bytes)).context("TTS sent no WAV")?;
+/// A WAV file as mono f32 and its sample rate. Several channels are
+/// mixed down: what everything here wants is one.
+///
+/// Public because a WAV reaches this house two ways -- back from the
+/// speech server, and in from somebody's computer as a clip to clone a
+/// voice from -- and they want the same twenty lines. Each adds its
+/// own context: a WAV that will not read means something different
+/// depending on who sent it.
+pub fn decode_wav(bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
+    let mut r = hound::WavReader::new(std::io::Cursor::new(bytes)).context("that is not a WAV")?;
     let spec = r.spec();
     let channels = spec.channels.max(1) as usize;
     let interleaved: Vec<f32> = match spec.sample_format {

@@ -229,6 +229,19 @@ pub enum Kind {
     /// What the conversation keeps instead is one note at the curtain
     /// with the whole script in it -- a [`Kind::Programme`].
     Line,
+    /// A clip of somebody's voice brought in from a computer, rather
+    /// than read into a microphone here: the entry's text is its
+    /// number, like a recorded one's, and its title is the name of the
+    /// file it came in as.
+    ///
+    /// Its own kind and not a [`Kind::Sample`] whose recording nobody
+    /// watched, for the reason [`Kind::Upload`] is not a
+    /// [`Kind::Picture`]: they are different events, and a model told
+    /// only that there is a clip in the chat will thank somebody for
+    /// reading a file they already had. A sample is something that
+    /// happened in the room, with a light on it; a clip is something
+    /// that was brought to it.
+    Clip,
     /// A show that has been performed, folded up: the entry's title is
     /// what it was called and its text is the whole script, in
     /// markdown, under a line saying what became of it.
@@ -252,6 +265,7 @@ impl Kind {
             Kind::Game => "game",
             Kind::Card => "card",
             Kind::Line => "line",
+            Kind::Clip => "clip",
             Kind::Programme => "programme",
         }
     }
@@ -265,6 +279,7 @@ impl Kind {
             "upload" => Kind::Upload,
             "sample" => Kind::Sample,
             "line" => Kind::Line,
+            "clip" => Kind::Clip,
             "programme" => Kind::Programme,
             _ => Kind::Human,
         }
@@ -1288,7 +1303,6 @@ struct State {
     last_change: Instant,
     /// When the last person to speak stopped.
     quiet_since: Instant,
-    ducked: bool,
     /// The conversation to come back to when the game ends: the one the
     /// room was having when somebody started it. None when no game is
     /// being played.
@@ -1367,6 +1381,11 @@ pub struct Room {
     /// what is said has to be heard in the order it was said.
     interp: BTreeMap<String, crossbeam_channel::Sender<InterpJob>>,
     stt: Option<EngineFactory>,
+    /// How this room reads a clip that arrived whole, rather than one
+    /// somebody is speaking into a microphone. None without the
+    /// models, and then a clip brought in has no transcript and the
+    /// clone server is given none.
+    words: Option<Transcriber>,
     /// How this room makes a voice for somebody who wasn't there when
     /// it opened. None in a house with no speech server, and then
     /// there are no puppets: a puppet with no voice is a name on a
@@ -1409,6 +1428,17 @@ pub struct TypedJob {
 /// and the room to report to. Shared, because every room on the server
 /// transcribes with the one set of loaded models.
 pub type EngineFactory = Arc<dyn Fn(&str, &str, Arc<Room>) -> anyhow::Result<Pusher> + Send + Sync>;
+
+/// Transcribes one clip of audio in one go: the samples and their
+/// rate in, the words out. Shared, because every room on the server
+/// reads through the one loaded model.
+///
+/// For audio that is not somebody talking in the room, which is one
+/// thing: a recording brought in from a computer. What people say
+/// here goes through an engine of its own per person -- streaming
+/// text, then the re-decode -- and nothing about that fits a file
+/// that arrived whole.
+pub type Transcriber = Arc<dyn Fn(&[f32], u32) -> anyhow::Result<String> + Send + Sync>;
 
 /// Makes a voice: the language to speak in, the preset to speak with,
 /// the delivery notes to speak it under, and the cell that says
@@ -1492,6 +1522,7 @@ impl Room {
         interp: BTreeMap<String, crossbeam_channel::Sender<InterpJob>>,
         stt: Option<EngineFactory>,
         tts: Option<VoiceFactory>,
+        words: Option<Transcriber>,
     ) -> anyhow::Result<(Arc<Self>, Vec<BotWiring>)> {
         // Scoped here rather than by whoever built it: a room reading
         // the whole database's settings instead of its own is a room
@@ -1637,7 +1668,6 @@ impl Room {
                 resume,
                 last_change: Instant::now(),
                 quiet_since: Instant::now(),
-                ducked: false,
                 pending: Vec::new(),
                 ai_turns: 0,
                 interp: BTreeMap::new(),
@@ -1653,6 +1683,7 @@ impl Room {
             typing,
             interp,
             stt,
+            words,
             tts,
         });
         // A show that was on when the server stopped. The puppets are
@@ -4044,6 +4075,127 @@ impl Room {
             cue: Cue::Speak,
             why: Why::Reading,
         });
+    }
+
+    /// A recording somebody dropped into the room from their own
+    /// computer, to clone a voice from: a card in the conversation
+    /// with the next number on it, and from then on a clip like any
+    /// other -- `save_voice` takes that number.
+    ///
+    /// The counterpart of [`Room::upload_picture`], and the same shape:
+    /// `who` is a name as the room says it, resolved the way
+    /// `set_avatar` resolves one, so it is somebody this room admits
+    /// and not any name a request felt like sending.
+    ///
+    /// It is not dressed up as a recording: its own entry kind and a
+    /// card that says it was brought in, so neither the room nor the
+    /// AI talks about a file somebody already had as though it had
+    /// just been read here. See [`Kind::Clip`].
+    ///
+    /// A WAV when it gets here, of any rate and any number of
+    /// channels: the page decodes whatever the file was -- mp3, m4a,
+    /// ogg, a voice memo -- because a browser already has a decoder
+    /// for everything it can play and the room would need a new
+    /// library for each. What the room does is what a server must
+    /// always do for itself: check it, make it mono at the rate the
+    /// clone server wants, and bound it.
+    pub fn upload_clip(&self, who: &str, name: &str, wav: &[u8]) -> Result<u32, String> {
+        let (samples, rate) = crate::tts::decode_wav(wav)
+            .map_err(|err| format!("the room can't read that clip: {err:#}"))?;
+        let secs = samples.len() as f32 / rate as f32;
+        if secs < SAMPLE_MIN {
+            return Err(format!(
+                "that clip is {secs:.1} seconds and a voice is cloned from at least                  {SAMPLE_MIN:.0}"
+            ));
+        }
+        if secs > SAMPLE_MAX {
+            return Err(format!(
+                "that clip is {secs:.0} seconds and the room keeps at most                  {SAMPLE_MAX:.0}; a voice is cloned from a few of them"
+            ));
+        }
+        // What the clone server wants, so nothing resamples it at the
+        // other end -- the same rate a recorded clip is kept at.
+        let clip = crate::tts::resample(&samples, rate, SAMPLE_HZ)
+            .and_then(|s| crate::voices::wav(&s, SAMPLE_HZ))
+            .map_err(|err| format!("the room couldn't keep that clip: {err:#}"))?;
+        // What it says, so the clone server can be told: it clones
+        // markedly better from a few seconds of speech when it knows
+        // what the speech says. Nothing turns on it -- a clip with no
+        // transcript is still a clip -- so a model that is not loaded,
+        // or a decode that comes back empty, costs the quality and not
+        // the clip.
+        let said = match &self.words {
+            None => String::new(),
+            Some(words) => match words(&samples, rate) {
+                Ok(said) => said.trim().to_string(),
+                Err(err) => {
+                    warn!("couldn't read a clip that was brought in: {err:#}");
+                    String::new()
+                }
+            },
+        };
+        let mut st = self.lock();
+        let (_, whose) = self.whose(&st, who)?;
+        let name: String = one_line(name.trim())
+            .chars()
+            .take(UPLOAD_NAME_MAX)
+            .collect();
+        // One id for the clip and the card that plays it, exactly as a
+        // recorded one has: the card is the clip.
+        let id = format!("sample-{}", uuid::Uuid::new_v4().simple());
+        let n = self
+            .store()
+            .put_clip(st.conversation, &id, &whose, &clip, secs, &said)
+            .map_err(|err| format!("{err:#}"))?;
+        let entry = Entry {
+            id: id.clone(),
+            who: whose.clone(),
+            kind: Kind::Clip,
+            // The number, spelled out, for the same reason a recorded
+            // one spells it: a client that has never heard of this
+            // kind shows an entry's text, and "voice clip 3" is a
+            // thing a person can read where "3" is a bug report.
+            text: format!("voice clip {n}"),
+            // The file it came in as, which is the card's caption.
+            title: name.clone(),
+            // For the model alone -- see `Entry::note`. How long it is
+            // and what it says, which is what it needs to decide
+            // whether this is worth keeping a voice from.
+            note: match said.is_empty() {
+                true => format!("{secs:.0} seconds, and the room could not make out what it says"),
+                false => format!("{secs:.0} seconds. It says: \"{}\".", one_line(&said)),
+            },
+            live: false,
+            partial: false,
+            cut: false,
+            typed: false,
+            translations: BTreeMap::new(),
+            at: now_ms(),
+            sent: true,
+        };
+        if let Err(err) = self.store().put_entry(st.conversation, &entry) {
+            return Err(format!("{err:#}"));
+        }
+        info!(
+            n,
+            %id,
+            who = %whose,
+            file = %name,
+            secs = format!("{secs:.1}"),
+            said = %one_line(&said),
+            "a voice clip was brought in"
+        );
+        self.emit_entry(&entry);
+        st.log.push(entry);
+        trim_log(&mut st.log);
+        // What the card plays from, the same event a recorded clip
+        // sends when it lands.
+        match self.store().read_aloud(&id) {
+            Ok(Some(read)) => self.emit(json!({ "type": "sample", "sample": read })),
+            Ok(None) => warn!(%id, "a clip that was brought in isn't in the database"),
+            Err(err) => warn!("read a clip back: {err:#}"),
+        }
+        Ok(n)
     }
 
     /// The clips read in this conversation, without the audio: what a
@@ -6946,11 +7098,17 @@ impl Room {
     }
 
     fn barge_in(&self, st: &mut State, now: Instant) {
+        // Whether a voice is stepped back is the mixer's to know and
+        // nobody's to cache. The room used to keep a copy and only
+        // write to the mixer when its copy changed, which is wrong the
+        // moment the two can disagree -- and they could: cutting one
+        // bot off clears the copy while un-ducking only *that* bot's
+        // tracks, so anything else still playing stayed quiet with
+        // nothing left that would ever lift it. A show where somebody
+        // gave the director a note played the rest of itself at
+        // half volume.
         if st.bots.iter().all(|b| b.reply.is_none()) {
-            if st.ducked {
-                st.ducked = false;
-                self.mixer.ai_duck(false);
-            }
+            self.mixer.ai_duck(false);
             return;
         }
         // Only the people hearing the AI in the room's own language may
@@ -6966,10 +7124,7 @@ impl Room {
             .filter(|(_, p)| p.speaking && self.language_of(p) == self.cfg.language)
             .collect();
         if talkers.is_empty() {
-            if st.ducked {
-                st.ducked = false;
-                self.mixer.ai_duck(false);
-            }
+            self.mixer.ai_duck(false);
             return;
         }
         let confirmed = talkers.iter().find(|(_, p)| {
@@ -6980,10 +7135,7 @@ impl Room {
         let Some((who, _)) = confirmed else {
             // Nothing confirmed yet: whatever is playing steps back,
             // and carries on at full level if it was a cough.
-            if !st.ducked {
-                st.ducked = true;
-                self.mixer.ai_duck(true);
-            }
+            self.mixer.ai_duck(true);
             return;
         };
         let who = who.to_string();
@@ -7012,10 +7164,10 @@ impl Room {
         // to answer the thing this person is talking over.
         st.pending.clear();
         // Anything still speaking stays stepped back while they talk.
-        // `cut_reply` lets the duck go, so a room where one bot was cut
-        // and another is finishing is also where it is taken back.
-        if st.bots.iter().any(|b| b.reply.is_some()) && !st.ducked {
-            st.ducked = true;
+        // Said every time rather than only when it changes: cutting one
+        // bot off un-ducks that one, and a room where another is
+        // finishing is exactly where the duck has to be put back.
+        if st.bots.iter().any(|b| b.reply.is_some()) {
             self.mixer.ai_duck(true);
         }
     }
@@ -7060,7 +7212,6 @@ impl Room {
             b.cfg.strip.clone()
         };
         let p = self.mixer.ai_clear(&strip);
-        st.ducked = false;
         self.follow_reply(st, bot, Some(p));
         let Some(r) = st.bot(bot).reply.take() else {
             // follow_reply saw the whole turn played out in every
@@ -7797,6 +7948,9 @@ fn conversation_messages(
             // shown one in progress would say so and then say it
             // again.
             Kind::Sample => !e.live,
+            // A clip somebody brought in arrived whole: there was
+            // never anything to wait for.
+            Kind::Clip => true,
         })
         .collect();
     let start = done.len().saturating_sub(history);
@@ -7984,6 +8138,37 @@ fn conversation_messages(
                 };
                 said_to_me(&mut out, note);
             }
+            // A clip of a voice somebody brought in. Said plainly to
+            // be a file and not a reading: the model must not tell the
+            // room that somebody read this aloud here, because nobody
+            // did, and whose voice is on it is a thing only the person
+            // who dropped it knows.
+            Kind::Clip => {
+                // `text` is the number, spelled out, as a recorded
+                // clip's is; `title` the file it came in as, like a
+                // picture somebody brought in; `note` how long it is
+                // and what it says, which is the model's to read and
+                // nobody's to see.
+                let called = match e.title.trim() {
+                    "" => String::new(),
+                    name => format!(", as \"{}\"", one_line(name)),
+                };
+                let about = match e.note.trim() {
+                    "" => String::new(),
+                    note => format!(" {note}"),
+                };
+                said_to_me(
+                    &mut out,
+                    format!(
+                        "[{} brought a recording of a voice into the chat from their own \
+                         computer{called}. It is {}.{about} save_voice takes that number \
+                         and a name to keep the voice under. Nobody read it here -- it is \
+                         a file they already had -- so don't talk about it as a reading \
+                         that just happened.]",
+                        e.who, e.text,
+                    ),
+                );
+            }
             // One somebody brought in themselves. Said plainly to be
             // theirs and not the AI's: a model told only that a
             // picture is in the chat will take credit for it, and
@@ -8062,7 +8247,7 @@ mod tests {
             interp_tx.insert(language.to_string(), tx);
             interp_rx.insert(language.to_string(), rx);
         }
-        let (r, mut wiring) = Room::new(store, cfg, None, interp_tx, None, None).unwrap();
+        let (r, mut wiring) = Room::new(store, cfg, None, interp_tx, None, None, None).unwrap();
         // The turns the room's one bot is given, in place of the agent
         // thread that would be reading them.
         let turns = wiring.pop().expect("a room has an AI in it").turns;
@@ -8364,7 +8549,7 @@ mod tests {
             languages: vec!["English".into()],
             spoken: vec!["English".into()],
         };
-        let (r, _wiring) = Room::new(store, cfg, None, BTreeMap::new(), None, None).unwrap();
+        let (r, _wiring) = Room::new(store, cfg, None, BTreeMap::new(), None, None, None).unwrap();
         let g = r.lock().only().generation.load(Ordering::SeqCst);
 
         // One picture, made once.
@@ -8594,6 +8779,7 @@ mod tests {
             },
             None,
             BTreeMap::new(),
+            None,
             None,
             None,
         )
@@ -8913,7 +9099,7 @@ mod tests {
         r.on_level("Alex", true);
         let since = Instant::now();
         r.tick(since);
-        assert!(r.lock().ducked, "ducked as soon as someone talks");
+        assert!(r.mixer.ai_ducked(), "ducked as soon as someone talks");
         assert!(
             r.lock().only().reply.is_some(),
             "not cut before it's confirmed"
@@ -8941,7 +9127,7 @@ mod tests {
         r.on_level("Alex", true);
         let since = Instant::now();
         r.tick(since);
-        assert!(!r.lock().ducked, "not ducked by a translated listener");
+        assert!(!r.mixer.ai_ducked(), "not ducked by a translated listener");
         r.tick(since + Duration::from_millis(400));
         assert!(
             r.lock().only().reply.is_some(),
@@ -8952,7 +9138,7 @@ mod tests {
         r.on_level("Ryan", true);
         let since = Instant::now();
         r.tick(since);
-        assert!(r.lock().ducked);
+        assert!(r.mixer.ai_ducked());
         r.tick(since + Duration::from_millis(400));
         assert!(
             r.lock().only().reply.is_none(),
@@ -9579,7 +9765,7 @@ mod tests {
         }
         let since = Instant::now();
         r.tick(since);
-        assert!(!r.lock().ducked, "typing is not talking");
+        assert!(!r.mixer.ai_ducked(), "typing is not talking");
         r.tick(since + Duration::from_millis(400));
         assert!(
             r.lock().only().reply.is_some(),
@@ -9650,10 +9836,10 @@ mod tests {
         speaking(&r, &turns);
         r.on_level("Alex", true);
         r.tick(Instant::now());
-        assert!(r.lock().ducked);
+        assert!(r.mixer.ai_ducked());
         r.on_level("Alex", false);
         r.tick(Instant::now());
-        assert!(!r.lock().ducked);
+        assert!(!r.mixer.ai_ducked());
         assert!(r.lock().only().reply.is_some());
     }
 
@@ -9678,7 +9864,7 @@ mod tests {
         let since = Instant::now();
         r.tick(since + Duration::from_millis(400));
         assert!(r.lock().only().reply.is_some(), "not cut");
-        assert!(r.lock().ducked, "stepped back while they talk");
+        assert!(r.mixer.ai_ducked(), "stepped back while they talk");
         assert!(r.lock().only().talked_over, "and it knows it was");
 
         // It plays out, and the whole of it is in the conversation.
@@ -9693,7 +9879,7 @@ mod tests {
             e.text,
             "Once upon a time there was a dragon. It was very old."
         );
-        assert!(!r.lock().ducked, "and the duck goes with the reply");
+        assert!(!r.mixer.ai_ducked(), "and the duck goes with the reply");
     }
 
     /// What was said over it is not thrown away and not treated as a
@@ -9748,7 +9934,7 @@ mod tests {
         r.set_strip("Alex", None, Some(true));
         r.on_level("Alex", true);
         r.tick(Instant::now() + Duration::from_millis(400));
-        assert!(!r.lock().ducked);
+        assert!(!r.mixer.ai_ducked());
         assert!(r.lock().only().reply.is_some());
         // Muted by themselves.
         r.set_strip("Alex", None, Some(false));
@@ -9961,6 +10147,7 @@ mod tests {
             },
             None,
             BTreeMap::new(),
+            None,
             None,
             None,
         )
@@ -11515,7 +11702,7 @@ mod tests {
         };
         let tts: VoiceFactory = Arc::new(|_, _, _, _| Ok(Box::new(crate::tts::Silent)));
         let (r, mut wiring) =
-            Room::new(store, cfg, None, BTreeMap::new(), None, Some(tts)).unwrap();
+            Room::new(store, cfg, None, BTreeMap::new(), None, Some(tts), None).unwrap();
         let turns = wiring.pop().expect("a room has an AI in it").turns;
         (r, turns)
     }
@@ -11756,7 +11943,7 @@ mod tests {
             languages: vec!["English".into()],
             spoken: vec!["English".into()],
         };
-        let (r, _wiring) = Room::new(store, cfg, None, BTreeMap::new(), None, None).unwrap();
+        let (r, _wiring) = Room::new(store, cfg, None, BTreeMap::new(), None, None, None).unwrap();
         let st = r.lock();
         let vox = st.bots.iter().find(|b| b.cfg.name == "Vox").unwrap();
         assert_eq!(vox.chosen, Mode::Always, "put back as the people had it");
@@ -11949,6 +12136,125 @@ mod tests {
         assert!(card.text.contains("**Grimble**"), "{}", card.text);
         assert!(card.text.contains("None shall pass."), "{}", card.text);
         assert!(card.text.contains("Not one of you."), "{}", card.text);
+    }
+
+    /// Nobody is talking, so nothing is stepped back. One tick, and
+    /// whatever left a voice ducked does not matter.
+    ///
+    /// This is what a puppet show hit: a note given to the director
+    /// ducked the room, something cleared the room's *copy* of "is
+    /// anything ducked" while the puppet's own tracks stayed ducked,
+    /// and from then on the room believed nothing was stepped back and
+    /// so never lifted it. The rest of the play was performed at half
+    /// volume with nobody talking.
+    ///
+    /// Written as the invariant rather than as the path that broke it,
+    /// because the path is not the point: whether a voice is quiet is
+    /// the mixer's to know, and any disagreement between it and a copy
+    /// elsewhere ends the same way. The room keeps no copy now, and
+    /// this is what that buys.
+    #[test]
+    fn a_voice_comes_back_up_when_nobody_is_talking() {
+        let (r, _turns) = room(Mode::Named);
+        r.join("Ryan", 1);
+        {
+            let mut st = r.lock();
+            let now = Instant::now();
+            r.ask(&mut st, "Vox", now, Cue::Speak, true);
+        }
+        let g = turn(&r);
+        assert!(r.agent_speak(g, "Something at length.", vec![0.0; 48_000]));
+
+        // However it got there -- a cut that un-ducked somebody else, a
+        // talker the room stopped hearing about -- a voice is stepped
+        // back and no mouth in the room is open.
+        r.mixer.ai_duck(true);
+        assert!(r.mixer.ai_ducked());
+        assert!(
+            !r.lock().people.values().any(|p| p.speaking),
+            "nobody is talking"
+        );
+
+        r.tick(Instant::now());
+        assert!(
+            !r.mixer.ai_ducked(),
+            "nobody is talking, so the voice is back at full level"
+        );
+
+        // And it stays down while somebody really is talking, which is
+        // the half of this that has to keep working.
+        r.on_level("Ryan", true);
+        r.tick(Instant::now());
+        assert!(r.mixer.ai_ducked(), "stepped back while they talk");
+        r.on_level("Ryan", false);
+        r.tick(Instant::now());
+        assert!(!r.mixer.ai_ducked(), "and back up when they stop");
+    }
+
+    /// A recording brought in from somebody's computer: numbered,
+    /// playable and clonable exactly like one read into a microphone
+    /// here -- and never dressed up as one.
+    #[test]
+    fn a_clip_can_be_brought_in_and_is_not_called_a_reading() {
+        let (r, _turns) = room_with_puppets();
+        r.join("Ryan", 1);
+
+        // A second of silence is not a clip: a voice is cloned from a
+        // few seconds of speech and the room says so rather than
+        // keeping something nothing can be made of.
+        let short = crate::voices::wav(&vec![0.0; 24_000], 24_000).unwrap();
+        assert!(r
+            .upload_clip("Ryan", "blip.wav", &short)
+            .unwrap_err()
+            .contains("at least"));
+        // Nor is a file that is not audio at all.
+        assert!(r
+            .upload_clip("Ryan", "notes.txt", b"this is not a wav")
+            .unwrap_err()
+            .contains("can't read that clip"));
+        // Nor is one from somebody this room has never heard of.
+        let fine = crate::voices::wav(&vec![0.1; 24_000 * 8], 24_000).unwrap();
+        assert!(r.upload_clip("Nobody", "x.wav", &fine).is_err());
+
+        assert_eq!(r.upload_clip("Ryan", "memo.m4a", &fine), Ok(1));
+        let entry = r
+            .log_now()
+            .into_iter()
+            .find(|e| e.kind == Kind::Clip)
+            .expect("a card in the conversation");
+        assert_eq!(
+            entry.who, "Ryan",
+            "whoever brought it, not whoever is on it"
+        );
+        assert_eq!(entry.text, "voice clip 1", "numbered as a read one is");
+        assert_eq!(entry.title, "memo.m4a", "the file it came in as");
+        assert!(!entry.live, "it arrived whole: nothing to wait for");
+
+        // The model is told it is a file and not a reading. A model
+        // told only that there is a clip in the chat thanks somebody
+        // for reading a recording they already had.
+        let told = conversation_messages(&r.log_now(), 50, "English", "Vox", &[], &[])
+            .into_iter()
+            .map(|(_, t)| t)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(told.contains("brought a recording"), "{told}");
+        assert!(told.contains("from their own computer"), "{told}");
+        assert!(told.contains("Nobody read it here"), "{told}");
+        assert!(told.contains("voice clip 1"), "{told}");
+
+        // And what `save_voice` reads: the clip, at the rate the clone
+        // server wants, marked as having been brought in -- which is
+        // what goes into the consent the server keeps.
+        let clip = r.voice_clip(1).expect("the clip save_voice takes");
+        assert!(clip.brought, "the house knows only who dropped it");
+        assert!(clip.passage.is_empty(), "nobody was given anything to read");
+        let (samples, rate) = crate::tts::decode_wav(clip.wav.as_deref().unwrap()).unwrap();
+        assert_eq!(rate, SAMPLE_HZ, "kept at the rate the clone server wants");
+        assert!(
+            (samples.len() as f32 / rate as f32 - 8.0).abs() < 0.2,
+            "eight seconds of it, as it came in"
+        );
     }
 
     /// Who can hear whom, which is the whole of what the three parts of

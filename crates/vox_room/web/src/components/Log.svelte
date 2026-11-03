@@ -244,6 +244,37 @@
             </div>
           </div>
         </div>
+      {:else if e.kind === 'clip'}
+        <!-- A recording somebody brought in from their own computer to
+             clone a voice from. Plays and is numbered exactly like one
+             read into a microphone here, because from here on it is
+             the same thing: save_voice takes that number.
+
+             What it does not do is look like a recording. A card that
+             did would be claiming something happened in this room that
+             did not, and the clip was a file somebody already had. So
+             it says it was brought in, with the name it came in as. -->
+        {@const clip = room.samples[e.id]}
+        <div class="entry sample-entry" class:you={e.who === room.you} style="--h: {hue(e.who)}">
+          <Face who={e.who} />
+          <div class="said-by">
+            <div class="who">
+              <span class="name">{e.who}</span>
+              <span class="time">
+                {time(e.at)} · brought in · {e.text}{clip?.ready ? ` · ${Math.round(clip.secs)}s` : ''}
+              </span>
+            </div>
+            <div class="card clip-card">
+              <p class="hint brought">{e.title || 'a recording'}</p>
+              {#if clip?.ready}
+                <audio controls preload="none" src={sampleOf(e.id)}></audio>
+                {#if clip.said}<p class="asked">“{clip.said}”</p>{/if}
+              {:else}
+                <p class="hint">The room couldn't keep this one.</p>
+              {/if}
+            </div>
+          </div>
+        </div>
       {:else if e.kind === 'sample'}
         <!-- A few seconds of somebody reading aloud, recorded so a
              voice can be cloned from it. The card goes up the moment
@@ -445,6 +476,14 @@
   /* A posted card has the whole column, so the column it is in has to
      fill what the face leaves of the row. */
   .card-entry .said-by { width: 100%; }
+  /* The file a clip came in as. Said above the player, because the
+     one thing to know about this card is that nobody read it here. */
+  .clip-card .brought {
+    margin: 0 0 6px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
   /* The programme. A card that is shut: the summary is the one line
      saying a play happened, and opening it is asking to read it. */
   .programme > summary {

@@ -212,21 +212,32 @@ const waitForCards = (page, n) =>
   await wait(600);
   is('a paste that is also text is left alone', (await cardsOn(ryan.page)).length, 2);
 
-  // Anything that is not a picture is refused where it was dropped,
-  // and nothing goes into the conversation.
+  // Anything that is neither a picture nor a recording is refused
+  // where it was dropped, and nothing goes into the conversation. Both
+  // can be brought in now -- a recording becomes a clip to clone a
+  // voice from -- so the refusal names both rather than offering the
+  // one and leaving you to guess about the other.
   const footer = () =>
     ryan.page.evaluate(
       () => document.querySelector('footer .hint')?.textContent.trim() ?? null,
     );
   await dropOn(ryan.page, { name: 'notes.txt', type: 'text/plain' });
   await wait(400);
-  is('something that is not a picture is refused', await footer(), 'Only pictures can be dropped into the room.');
+  is(
+    'something that is neither is refused',
+    await footer(),
+    'Only pictures and recordings can be dropped into the room.',
+  );
   is('and leaves no card behind', (await cardsOn(ryan.page)).length, 2);
 
   // And said in the words of what was actually done.
   await pasteOn(ryan.page, { name: 'notes.txt', type: 'text/plain' });
   await wait(400);
-  is('pasting one says so the same way', await footer(), 'Only pictures can be pasted into the room.');
+  is(
+    'pasting one says so the same way',
+    await footer(),
+    'Only pictures and recordings can be pasted into the room.',
+  );
 
   // A conversation the room has finished with has nowhere to put a
   // picture -- and a drop the page doesn't take is one the browser

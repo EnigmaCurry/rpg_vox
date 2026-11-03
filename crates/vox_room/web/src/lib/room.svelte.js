@@ -895,8 +895,119 @@ const PICTURE_BYTES_MAX = 1024 * 1024;
 const PICTURE_DROP_MAX = 8;
 
 /// The images in what was dropped, in the order they were dropped.
-/// Anything else is not a picture and the room has nowhere to put it.
 const imagesIn = (files) => [...files].filter((f) => f.type.startsWith('image/'));
+
+/// The recordings in what was dropped. A voice memo off a phone may
+/// arrive with no type at all, so the extension is read as well — the
+/// browser is about to try to decode it either way, and a file it
+/// cannot decode is refused by the decoder with a better message than
+/// a guess from the name would give.
+const CLIP_SUFFIX = /\.(wav|mp3|m4a|aac|ogg|oga|opus|flac|webm|weba|aiff?|caf|amr|3gp)$/i;
+const clipsIn = (files) =>
+  [...files].filter((f) => f.type.startsWith('audio/') || CLIP_SUFFIX.test(f.name || ''));
+
+/// The rate a clip is sent at: Qwen3-TTS's own, which is what the
+/// clone server wants and what `SAMPLE_HZ` in `room.rs` keeps a
+/// recorded one at. Resampled here by the browser's own audio engine,
+/// which does it well and for nothing.
+const CLIP_HZ = 24000;
+/// The longest clip worth sending, a shade over the thirty seconds the
+/// room keeps (`SAMPLE_MAX`). Trimmed rather than refused: somebody
+/// dropping a two-minute recording meant the voice in it, and the
+/// first half-minute of it is a voice.
+const CLIP_SECS_MAX = 30;
+
+/// One audio file as a WAV the room will take: mono, 24 kHz, 16-bit.
+///
+/// The browser decodes it, which is the whole reason this is done
+/// here: it already has a decoder for everything it can play — mp3,
+/// m4a, ogg, a voice memo — and the room would need a library for each
+/// and would still be guessing at the rest. An `OfflineAudioContext`
+/// does the downmix and the resample on the way through, properly,
+/// because that is what it is for.
+async function wavOf(file) {
+  const bytes = await file.arrayBuffer();
+  // A plain context first, only to decode: `decodeAudioData` keeps the
+  // file's own rate and channel count, and the offline one below is
+  // what changes them.
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  const decoded = await new Ctx().decodeAudioData(bytes);
+  const secs = Math.min(decoded.duration, CLIP_SECS_MAX);
+  if (!(secs > 0)) throw new Error('there is no sound in it');
+  const frames = Math.floor(secs * CLIP_HZ);
+  const off = new OfflineAudioContext(1, frames, CLIP_HZ);
+  const src = off.createBufferSource();
+  src.buffer = decoded;
+  src.connect(off.destination);
+  src.start(0, 0, secs);
+  const mono = (await off.startRendering()).getChannelData(0);
+
+  // 16-bit mono WAV, which is what the clone server is given and what
+  // the room keeps. Written by hand because it is 20 lines and the
+  // alternative is a library to emit a header.
+  const head = 44;
+  const out = new DataView(new ArrayBuffer(head + mono.length * 2));
+  const ascii = (at, s) => [...s].forEach((c, i) => out.setUint8(at + i, c.charCodeAt(0)));
+  ascii(0, 'RIFF');
+  out.setUint32(4, head - 8 + mono.length * 2, true);
+  ascii(8, 'WAVEfmt ');
+  out.setUint32(16, 16, true); // the size of this fmt chunk
+  out.setUint16(20, 1, true); // PCM, uncompressed
+  out.setUint16(22, 1, true); // one channel
+  out.setUint32(24, CLIP_HZ, true);
+  out.setUint32(28, CLIP_HZ * 2, true); // bytes a second
+  out.setUint16(32, 2, true); // bytes a frame
+  out.setUint16(34, 16, true); // bits a sample
+  ascii(36, 'data');
+  out.setUint32(40, mono.length * 2, true);
+  for (let i = 0; i < mono.length; i++) {
+    // Clamped before it is scaled: a sample over 1.0 would wrap to
+    // the opposite extreme and be heard as a click.
+    const v = Math.max(-1, Math.min(1, mono[i]));
+    out.setInt16(head + i * 2, Math.round(v * 32767), true);
+  }
+  return { wav: new Blob([out.buffer], { type: 'audio/wav' }), secs };
+}
+
+/// Put a recording somebody dropped into the conversation, to clone a
+/// voice from: a card with the next number on it, playable, and from
+/// then on a clip like any other — `save_voice` takes that number.
+///
+/// Nothing is drawn here, as with a picture: the server tells every tab
+/// about the card, including this one. A clip arriving is a thing that
+/// happened in the room.
+///
+/// One at a time and only the first, because a clip is a deliberate
+/// thing to bring in and the room keeps thirty seconds of it: a folder
+/// of recordings let go of by accident must not become eight cards and
+/// eight model decodes.
+export async function dropClip(files, how = 'dropped') {
+  const clips = clipsIn(files);
+  if (!clips.length) return false;
+  const file = clips[0];
+  if (clips.length > 1) {
+    notify(`That is ${clips.length} recordings; the first is coming in.`);
+  }
+  notify(`Reading ${file.name}…`);
+  try {
+    const { wav, secs } = await wavOf(file);
+    const where = `/api/rooms/${encodeURIComponent(room.where)}/clip`;
+    const r = await fetch(`${where}?name=${encodeURIComponent(file.name)}`, {
+      method: 'POST',
+      headers: { 'content-type': 'audio/wav' },
+      body: wav,
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(d.error || r.statusText);
+    if (secs >= CLIP_SECS_MAX) {
+      notify(`${file.name} is longer than ${CLIP_SECS_MAX} seconds, so the first ${CLIP_SECS_MAX} came in.`);
+    }
+  } catch (e) {
+    console.error('[room] clip', e);
+    notify(`Can't bring in ${file.name}: ${e.message || e}`, true);
+  }
+  return true;
+}
 
 /// One file as a PNG the room will keep, or null when it cannot be
 /// made small enough. Decoded by the browser, so whatever it can
@@ -937,9 +1048,14 @@ async function pngOf(file) {
 /// has to name it: being told "only pictures can be dropped" by a
 /// window you pasted into is being answered about somebody else.
 export async function dropPicture(files, how = 'dropped') {
+  // A recording is the other thing worth bringing in, and it goes
+  // somewhere else entirely: into the conversation as a clip to clone
+  // a voice from. Checked first, so a dropped voice memo is not
+  // answered with "only pictures can be dropped".
+  if (await dropClip(files, how)) return;
   const pictures = imagesIn(files);
   if (!pictures.length) {
-    notify(`Only pictures can be ${how} into the room.`);
+    notify(`Only pictures and recordings can be ${how} into the room.`);
     return;
   }
   const taking = pictures.slice(0, PICTURE_DROP_MAX);

@@ -1354,6 +1354,24 @@ few seconds of speech when it is told what the speech says, and the
 room has that already from the transcription. Where nothing was
 written down, the passage stands in for it.
 
+**A clip can also be brought in.** Drop a recording onto the room — or
+paste one — and it goes into the conversation with the next number on
+it, playable, and `save_voice` takes that number exactly as it takes a
+read one. The browser decodes whatever the file was (mp3, m4a, ogg, a
+voice memo off a phone), because it already has a decoder for everything
+it can play; the room makes it mono at 24 kHz, bounds it to thirty
+seconds, and reads it with the same model that does the room's own last
+pass — so the clone server is told what the clip says rather than
+cloning blind.
+
+**It is not dressed up as a recording.** A brought-in clip is its own
+kind of card, saying so and naming the file it came in as, and the AI is
+told plainly that nobody read this one here — otherwise it thanks
+somebody for reading a file they already had, and the room claims
+something happened in it that did not. The clone server's own consent
+field records which of the two kinds a clip was, since it asks for one
+and that is what the house actually knows.
+
 A kept voice is **the house's**, under the name you gave it: any room
 can ask the AI to speak in it, `list_voices` says what there is, and
 `forget_voice` deletes one for good — the server's copy first, so

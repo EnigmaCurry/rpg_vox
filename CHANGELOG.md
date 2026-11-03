@@ -90,6 +90,35 @@ releases.
 
 ### Voice room
 
+- **A recording can be dropped into the room and a voice cloned from
+  it.** Cloning needed somebody to sit at a microphone and read a
+  passage, which is the right way to get a voice from a person in the
+  room and no way at all to use fifteen seconds you already have. A
+  dropped file now gets the next number in the conversation, plays
+  there, and `save_voice` takes that number exactly as it takes a read
+  one.
+
+  The browser decodes it, which is the whole reason it works for mp3,
+  m4a, ogg and a voice memo off a phone: it already has a decoder for
+  everything it can play, and the room would need a library for each
+  and would still be guessing at the rest. What arrives is a WAV, and
+  what the room does with it is what a server must always do for
+  itself -- check it, make it mono at the rate the clone server wants,
+  bound it to the thirty seconds a recorded clip is bounded to. Then it
+  **reads the clip with the same model the room's own last pass uses**,
+  which is already loaded, so the clone server is told what the clip
+  says instead of cloning blind -- it clones markedly better that way,
+  and a dropped file has no transcript of its own.
+
+  **It is not dressed up as a recording**, for the reason a picture
+  somebody brought in is not a picture the AI made: they are different
+  events. It is its own kind of entry, the card says it was brought in
+  and names the file, and the AI is told plainly that nobody read this
+  one here -- a model told only that there is a clip in the chat thanks
+  somebody for reading a recording they already had. The clone server's
+  own consent field records which of the two kinds a clip was, since it
+  asks for one and that is what the house actually knows.
+
 - **A room with a puppet in it is a playhouse, and the director cannot
   hear the audience.** A show used to be a thing the room did to itself
   for the length of a script: everybody silenced, everybody finishing

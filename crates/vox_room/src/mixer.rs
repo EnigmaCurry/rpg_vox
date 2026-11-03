@@ -468,10 +468,29 @@ impl Mixer {
 
     /// Lower the AI while someone may be talking over it, or bring it
     /// back. Every language at once: it is one turn being interrupted.
+    ///
+    /// Idempotent, and meant to be called with what the room wants
+    /// rather than only when the answer changes. It is the only thing
+    /// that knows whether a voice is stepped back, so the room asking
+    /// for the same answer twice costs a lock and a walk over a handful
+    /// of tracks -- and the room keeping its own copy of the answer
+    /// cost a show that played quietly to the end. See `Room::barge_in`.
     pub fn ai_duck(&self, ducked: bool) {
         for ai in self.lock().ai.values_mut() {
             ai.ducked = ducked;
         }
+    }
+
+    /// Whether anything the AI is saying is stepped back right now.
+    ///
+    /// For the tests, and only them -- which is the whole point. The
+    /// room used to keep its own copy of this and gate its writes on
+    /// it; the copy could disagree with the truth, and did. Nothing
+    /// outside a test has any business asking: the room says what it
+    /// wants and the mixer is what knows.
+    #[cfg(test)]
+    pub fn ai_ducked(&self) -> bool {
+        self.lock().ai.values().any(|ai| ai.ducked)
     }
 
     /// How far `bot`'s turn has got in each language it is being said

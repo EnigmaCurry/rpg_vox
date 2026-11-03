@@ -407,6 +407,12 @@ say before that is said over the thing being recorded. A clip that came \
 to nothing -- they never read it, or it was too short to use -- is not a \
 voice: say so, and offer them another go.
 
+**A clip can also arrive without anybody reading.** Somebody may drop a \
+recording into the room from their own computer, and it gets the next \
+number like a read one: save_voice takes that number and nothing else is \
+different. Don't thank them for reading it or talk about it as something \
+that just happened in the room -- it is a file they already had.
+
 Then ask what to call it, and save_voice keeps it under that name, with \
 the number on the clip's card in the chat. It is the house's voice from \
 then on: list_voices says what there is, speak_as is how you wear one \
@@ -3024,10 +3030,17 @@ fn save_voice(
         "" => clip.passage.trim(),
         said => said,
     };
-    // Whose voice it is and which room they read it in. The server
-    // asks for a consent record and this is the whole of what the
-    // house knows: they were asked out loud, and they read it.
-    let consent = format!("vox_room:{}:{}", room.config().id, clip.who);
+    // The server asks for a consent record, and this is the whole of
+    // what the house knows about why the audio is allowed to be here.
+    // For a reading that is a good deal: they were asked out loud, in
+    // a room where everybody could see the light on, and they read it.
+    // For a clip somebody brought in it is almost nothing -- who
+    // dropped the file -- and the record says so rather than quietly
+    // reading like the other kind.
+    let consent = match clip.brought {
+        false => format!("vox_room:{}:{}", room.config().id, clip.who),
+        true => format!("vox_room:{}:{}:brought-in", room.config().id, clip.who),
+    };
     // Replacing one of their own -- a second go at a voice that didn't
     // sound like them -- takes the first off the server, so what is
     // kept under the name is what was just read.
@@ -3734,6 +3747,7 @@ mod tests {
             std::collections::BTreeMap::new(),
             None,
             None,
+            None,
         )
         .unwrap();
         room
@@ -4169,6 +4183,7 @@ mod tests {
             },
             None,
             std::collections::BTreeMap::new(),
+            None,
             None,
             None,
         )
@@ -4958,6 +4973,7 @@ mod tests {
             std::collections::BTreeMap::new(),
             None,
             Some(tts),
+            None,
         )
         .unwrap();
         // Spelled as the server spells them, which is the only

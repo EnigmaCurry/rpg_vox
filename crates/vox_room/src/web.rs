@@ -125,6 +125,13 @@ const INDEX_CACHE: &str = "no-cache";
 /// in kilobytes and what the limit is -- is worth more than a 413 from
 /// the layer, and that needs the bytes to have arrived.
 const PICTURE_BODY_MAX: usize = crate::room::AVATAR_BYTES_MAX + 64 * 1024;
+/// The most a clip brought in may weigh. The room keeps at most thirty
+/// seconds of it and the page sends a WAV, which is uncompressed: thirty
+/// seconds of 48 kHz stereo 32-bit is 23 MB, and a browser that has
+/// decoded a long file hands over what it decoded. The room tells it
+/// plainly that the clip is too long, which it cannot do for a body the
+/// server refused to read.
+const CLIP_BODY_MAX: usize = 32 * 1024 * 1024;
 
 /// `?name=` on a dropped picture: the file it came in as, which is the
 /// caption on its card. Not trusted for anything else -- it is written
@@ -232,6 +239,10 @@ pub fn router(rooms: Arc<Rooms>, screen: Arc<Screen>) -> Router {
         .route(
             "/api/rooms/:room/picture",
             post(drop_picture).route_layer(DefaultBodyLimit::max(PICTURE_BODY_MAX)),
+        )
+        .route(
+            "/api/rooms/:room/clip",
+            post(drop_clip).route_layer(DefaultBodyLimit::max(CLIP_BODY_MAX)),
         )
         .route("/api/rooms/:room/history", get(history))
         .route("/api/rooms/:room/history/:id", get(read_conversation))
@@ -902,6 +913,42 @@ async fn drop_picture(
     match room.upload_picture(&who.display, &q.name, &png) {
         Ok(n) => Json(json!({ "picture": n })).into_response(),
         Err(why) => (StatusCode::CONFLICT, Json(json!({ "error": why }))).into_response(),
+    }
+}
+
+/// A recording somebody dropped into the room, to clone a voice from.
+///
+/// The body is a WAV, because the page has already decoded whatever
+/// the file actually was -- mp3, m4a, ogg, a voice memo off a phone --
+/// using the decoder the browser has for everything it can play. The
+/// room would need a library for each of them to do the same, and
+/// would still be guessing at the ones it had not been built for.
+///
+/// Decoding, transcribing and resampling are all work, and enough of
+/// it that it must not happen on an async worker: a fifteen-second
+/// clip is a second or two of model time. So it goes to a blocking
+/// thread, and the answer waits for it -- a drag-and-drop is one
+/// deliberate act, and a card that appeared complete two seconds later
+/// is better than one that appeared at once and filled in.
+async fn drop_clip(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(q): Query<PictureName>,
+    wav: Bytes,
+) -> Response {
+    let Some((who, room)) = their_room(&app, &headers, &id) else {
+        return (StatusCode::NOT_FOUND, "no such room").into_response();
+    };
+    let kept =
+        tokio::task::spawn_blocking(move || room.upload_clip(&who.display, &q.name, &wav)).await;
+    match kept {
+        Ok(Ok(n)) => Json(json!({ "clip": n })).into_response(),
+        Ok(Err(why)) => (StatusCode::CONFLICT, Json(json!({ "error": why }))).into_response(),
+        Err(err) => {
+            warn!("a clip that was brought in: {err}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "no").into_response()
+        }
     }
 }
 

@@ -955,7 +955,7 @@ fn serve(cli: Cli, store: Store, db: PathBuf) -> Result<()> {
         _ => given,
     };
 
-    let factory = if cli.no_stt {
+    let (factory, reader) = if cli.no_stt {
         // Said out loud, because from inside the room it looks like a
         // fault rather than a choice: everyone hears everyone, the
         // meters move, and not a word is written down.
@@ -963,9 +963,13 @@ fn serve(cli: Cli, store: Store, db: PathBuf) -> Result<()> {
             "--no-stt: nothing anyone says is transcribed, so there is no \
              conversation and the AI cannot hear the room"
         );
-        None
+        (None, None)
     } else {
-        Some(stt::Models::load(&models_dir)?.factory())
+        let models = stt::Models::load(&models_dir)?;
+        // The one-shot reader first: `factory` consumes the models,
+        // and both want the same loaded copy of the last-pass model.
+        let reader = models.transcriber();
+        (Some(models.factory()), Some(reader))
     };
 
     // Who translates, when there is more than one language and a model
@@ -1087,6 +1091,7 @@ fn serve(cli: Cli, store: Store, db: PathBuf) -> Result<()> {
         let clones = clones.clone();
         let voice = cli.voice.clone();
         let presets = presets.clone();
+        let reader = reader.clone();
         let interpreter_voice = cli.interpreter_voice.clone();
         let (voices, prompts) = (voices, prompts);
         let interpret = cli.interpret;
@@ -1148,7 +1153,15 @@ fn serve(cli: Cli, store: Store, db: PathBuf) -> Result<()> {
                 }
             };
             let (room, wiring) =
-                Room::new(store, cfg, typing_tx, interp_tx, factory.clone(), speaking)?;
+                Room::new(
+                    store,
+                    cfg,
+                    typing_tx,
+                    interp_tx,
+                    factory.clone(),
+                    speaking,
+                    reader.clone(),
+                )?;
             if let Some(rx) = typing_rx {
                 if let Some(t) = translate.clone() {
                     agent::spawn_typists(room.clone(), t, rx, 2);

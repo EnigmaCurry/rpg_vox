@@ -1773,6 +1773,32 @@ impl Store {
         Ok(n)
     }
 
+    /// Keep a clip that arrived whole: one somebody brought in from
+    /// their own computer rather than read into a microphone here.
+    ///
+    /// One insert and not `begin_sample` then `finish_sample`, because
+    /// there was never a moment where the room was listening for it.
+    /// `asked_by` is empty for the same reason -- no AI asked for it --
+    /// and so is `passage`: nobody was given anything to read.
+    pub fn put_clip(
+        &self,
+        conversation: i64,
+        id: &str,
+        who: &str,
+        wav: &[u8],
+        secs: f32,
+        said: &str,
+    ) -> Result<u32> {
+        let n = self.next_sample(conversation)?;
+        self.db.execute(
+            "INSERT INTO samples
+                 (id, conversation, n, who, asked_by, passage, said, wav, secs, failed, at)
+             VALUES (?1, ?2, ?3, ?4, '', '', ?5, ?6, ?7, '', ?8)",
+            params![id, conversation, n, who, said, wav, secs as f64, now_ms()],
+        )?;
+        Ok(n)
+    }
+
     /// They read it: the clip, how long it is, and what they said.
     pub fn finish_sample(&self, id: &str, wav: &[u8], secs: f32, said: &str) -> Result<()> {
         self.db.execute(
@@ -1808,7 +1834,7 @@ impl Store {
         Ok(self
             .db
             .query_row(
-                "SELECT id, who, said, passage, wav, secs, failed
+                "SELECT id, who, said, passage, wav, secs, failed, asked_by = ''
                    FROM samples WHERE conversation = ?1 AND n = ?2",
                 params![conversation, n],
                 |r| {
@@ -1821,6 +1847,7 @@ impl Store {
                         wav: r.get(4)?,
                         secs: r.get::<_, f64>(5)? as f32,
                         failed: r.get(6)?,
+                        brought: r.get(7)?,
                     })
                 },
             )
@@ -2055,6 +2082,16 @@ pub struct Clip {
     pub secs: f32,
     /// Why there will never be one, or empty.
     pub failed: String,
+    /// Brought in from somebody's computer rather than read into a
+    /// microphone here: no AI asked for it, so nobody is written in
+    /// `asked_by`.
+    ///
+    /// What turns on it is the consent record the clone server keeps.
+    /// For a reading, the house knows whose voice it is and that they
+    /// were asked out loud and read it. For a file, it knows who
+    /// brought it and nothing else, and the record has to say which of
+    /// the two this was.
+    pub brought: bool,
 }
 
 /// A clip in a conversation, without the audio: what a card needs to
