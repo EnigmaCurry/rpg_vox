@@ -787,10 +787,11 @@ export function pictureOf(id) {
 /// when a photograph is still too big as a PNG at that size, which
 /// lossless compression of a photograph can be.
 const PICTURE_EDGES = [384, 256, 160];
-/// What the room will keep, which is what a face may be: 512 KB. The
-/// server enforces it -- this is here so that a drop that cannot fit
-/// is told so on the spot, rather than after the upload.
-const PICTURE_BYTES_MAX = 512 * 1024;
+/// What the room will keep, which is what a face may be: 1 MB, the
+/// `AVATAR_BYTES_MAX` of `room.rs`. The server enforces it -- this is
+/// here so that a drop that cannot fit is told so on the spot, rather
+/// than after the upload.
+const PICTURE_BYTES_MAX = 1024 * 1024;
 /// How many pictures one drop may bring in. A drop is one deliberate
 /// act and these are cards in a shared conversation; a folder let go
 /// of by accident is not a reason to fill the room.

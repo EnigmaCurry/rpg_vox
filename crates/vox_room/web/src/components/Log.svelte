@@ -45,9 +45,11 @@
   // How big a picture card's square is, in one place: the CSS draws
   // it and `lib/pixels.js` is told it, and the two must agree.
   const SHOT = 192;
-  // Dropped pictures this is scaling *down* rather than up, by id --
-  // which decides how each is drawn, see `lib/pixels.js`. By id and
-  // not one flag, because a conversation holds both kinds at once.
+  // Pictures this is scaling *down* rather than up, by id -- which
+  // decides how each is drawn, see `lib/pixels.js`. By id and not one
+  // flag, because a conversation holds both kinds at once: a sprite,
+  // a full-resolution picture beside it, and a photograph somebody
+  // dropped in under them.
   let smooth = $state({});
   const sized = (id, img) => {
     if (scaledDown(img, SHOT)) smooth = { ...smooth, [id]: true };
@@ -387,15 +389,15 @@
   .shot img {
     width: 100%;
     height: 100%;
-    /* Pixel art is drawn at the size it means; scaling it up without
+    /* A sprite is drawn at the size it means; scaling it up without
        smoothing is the whole point of the form. */
     image-rendering: pixelated;
     object-fit: contain;
     display: block;
   }
-  /* A picture the card is making smaller -- a photograph, mostly.
-     Smoothing is what that wants; the rule above is about pixel art,
-     which is the other direction. */
+  /* A picture the card is making smaller -- one drawn at full
+     resolution, or a photograph. Smoothing is what that wants; the
+     rule above is about a sprite, which is the other direction. */
   .shot.photo img { image-rendering: auto; }
   .shot.waiting { background: color-mix(in srgb, var(--agent) 7%, var(--bubble)); }
   .shot .broke { color: var(--muted); font-size: 13px; }

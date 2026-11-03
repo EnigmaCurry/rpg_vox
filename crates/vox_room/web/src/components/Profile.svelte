@@ -125,7 +125,7 @@
     box-shadow: 0 10px 40px rgb(0 0 0 / 25%);
   }
   /* The same square as in the conversation, at a size worth looking
-     at: pixel art is drawn to be seen big, and 36px is a label. */
+     at: a face is drawn to be seen big, and 36px is a label. */
   .face {
     /* `FACE` above is this number; they are read together. */
     width: 160px;
@@ -151,8 +151,9 @@
     object-fit: cover;
     display: block;
   }
-  /* Bigger than the square, so it is being made smaller: a
-     photograph, which wants smoothing. See `lib/pixels.js`. */
+  /* Bigger than the square, so it is being made smaller: a picture
+     drawn at full resolution, or a photograph. Either wants
+     smoothing. See `lib/pixels.js`. */
   img.smooth { image-rendering: auto; }
   h2 { margin: 0; font-size: 20px; }
   .tags { display: flex; flex-wrap: wrap; gap: 6px; justify-content: center; }

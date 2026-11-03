@@ -171,9 +171,13 @@ struct Cli {
     /// only sane for a server you know is small. Repeat for more
     /// servers. The key is --mcp-key.
     ///
-    /// For a ComfyUI pixel-art server:
+    /// For a ComfyUI art server:
     ///
     ///   --mcp 'art=https://comfyui-mcp.example.com/mcp=generate_pixel_art,refine_pixel_art'
+    ///
+    /// That server draws in more than one look, so a third tool goes
+    /// with those two: `list_styles`, which is how the AI finds out
+    /// what there is to choose between.
     #[arg(long = "mcp", env = "VOX_ROOM_MCP", value_delimiter = ';')]
     mcp: Vec<String>,
     /// The key for the --mcp servers, as NAME=KEY, or on its own for

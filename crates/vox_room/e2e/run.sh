@@ -136,12 +136,20 @@ one() {
     # a glance whether the picture or the placeholder won. Kept as a
     # hex literal because that is what sqlite takes a blob as.
     local face="x'89504e470d0a1a0a0000000d49484452000000080000000808020000004b6d29dc0000001b4944415478da6338a1b1002b622020f1ff8e061cd14a8204570100f6df6b312bc415490000000049454e44ae426082'"
-    # Three faces Ryan has worn, the newest on: Settings offers the
-    # older two back without making anything. The SQL must not start
+    # A 64x64 PNG: a black diagonal on cyan, bigger than the 56-pixel
+    # square Settings shows a face you have worn in. Everything a
+    # picture server makes is bigger than that square -- a cel-shaded
+    # portrait at 768, or a sprite handed back magnified so it reads
+    # in a chat -- so that row holds both kinds at once and has to ask
+    # each picture which way it is being scaled; see `lib/pixels.js`.
+    local big="x'89504e470d0a1a0a0000000d4948445200000040000000400802000000250be689000000ee4944415478daeddad10d83300c0540f61faadf1dab0314151292f81ec56281930238f6dbb6ef7abd939efd8a0704197e553c20c2705c3ae00c4207441b1a0e930e083534bfd43a20ced0f971d50141864b3f391d106118d06ce800dc30ace9d301ac6170f3ad0340c3944b900ea00c132fa33a00314c1f0ae88072c3a2e18c0e28342c1d92e9801243c1b052072c36940d8d75c03243f1f05e072c30104b141d30d5002db374c02403b754d401c30de87257070c34d04b761d30c4101076d001170d31a1131dd06d080bffe8800e4364084b07341982c3703ae0a4e109253ec9d0bf88e7de21237d87a0fa9ee1030fa55e61c0ab7f510000000049454e44ae426082'"
+    # Four faces Ryan has worn, the newest on: Settings offers the
+    # older three back without making anything. The SQL must not start
     # with a `--` comment -- sqlite3 reads that as an option.
     sqlite_set "$data/room.db" \
       "INSERT INTO faces (who, at, png, prompt, worn)
-         VALUES ('Ryan', 1700000000000, $face, 'a tired wizard', 0),
+         VALUES ('Ryan', 1699999999999, $big, 'a wizard at full size', 0),
+                ('Ryan', 1700000000000, $face, 'a tired wizard', 0),
                 ('Ryan', 1700000000001, $face, 'a rested wizard', 0),
                 ('Ryan', 1700000000002, $face, 'a wizard at ease', 1),
                 ('@Vox', 1700000000001, $face, 'a brass head', 1);

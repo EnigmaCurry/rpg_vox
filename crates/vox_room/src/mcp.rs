@@ -18,11 +18,13 @@
 //! 1. **Only the tools the room was configured to lend.** A picture
 //!    server offers everything it can do -- uploading, listing what
 //!    was made before, polling a job it was told not to wait for --
-//!    and a room that wants faces needs two of them. The rest are
-//!    that many more ways for a voice answering "make me an avatar"
-//!    to go somewhere else. Which ones is the configuration's to say
-//!    -- see [`Config::only`] -- because that is a decision about the
-//!    room, not one to re-make per turn.
+//!    and a room that wants faces needs three of them: one that
+//!    draws, one that changes what was drawn, and one that says what
+//!    looks it can draw in. The rest are that many more ways for a
+//!    voice answering "make me an avatar" to go somewhere else. Which
+//!    ones is the configuration's to say -- see [`Config::only`] --
+//!    because that is a decision about the room, not one to re-make
+//!    per turn.
 //! 2. **No key in the schema.** Some servers take the key as an
 //!    argument rather than a header: Retro Diffusion's tools want an
 //!    `rd_api_key`. A model shown a field like that will fill it in,
@@ -805,7 +807,7 @@ mod tests {
     /// the hosted one the room was first built against:
     ///
     /// ```bash
-    /// VOX_ROOM_MCP=art=https://…/mcp=generate_pixel_art,refine_pixel_art \
+    /// VOX_ROOM_MCP=art=https://…/mcp=generate_pixel_art,refine_pixel_art,list_styles \
     /// VOX_ROOM_MCP_KEY=… \
     ///   cargo test -p vox_room -- --ignored --nocapture says_hello
     /// ```

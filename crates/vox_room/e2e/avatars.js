@@ -255,7 +255,25 @@ const [ryanLink] = process.argv.slice(2);
       { asked: 'a wizard at ease', worn: true },
       { asked: 'a rested wizard', worn: false },
       { asked: 'a tired wizard', worn: false },
+      { asked: 'a wizard at full size', worn: false },
     ],
+  );
+
+  // And each of them is drawn the way its own picture wants. A
+  // picture server draws in more than one look -- the sprites here
+  // are 8 pixels and the last one is 64, in a 56-pixel square -- so
+  // the row holds both kinds at once: the small ones blown up pixel
+  // by pixel, the big one shrunk with smoothing. Magnifying that one
+  // would throw away most of it and leave noise where a face was.
+  await wait(300);
+  is(
+    'and each is drawn the way its own picture wants',
+    await ryan.page.evaluate(() =>
+      [...document.querySelectorAll('.past-face img')].map(
+        (img) => `${img.naturalWidth}:${getComputedStyle(img).imageRendering}`,
+      ),
+    ),
+    ['8:pixelated', '8:pixelated', '8:pixelated', '64:auto'],
   );
 
   // Putting an older one back on costs nothing and needs no AI.
@@ -268,7 +286,7 @@ const [ryanLink] = process.argv.slice(2);
         (b) => b.getAttribute('aria-pressed') === 'true',
       ),
     ),
-    [false, false, true],
+    [false, false, true, false],
   );
 
   await ryan.page.screenshot({ path: '/tmp/vox-room-settings.png' });

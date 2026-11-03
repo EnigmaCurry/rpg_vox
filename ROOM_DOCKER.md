@@ -188,13 +188,15 @@ configured entirely in `.env` — `env_file` passes the whole file to the
 room, so there is nothing to change in `docker-compose.yaml`:
 
 ```ini
-VOX_ROOM_MCP=art=https://comfyui-mcp.example.com/mcp=generate_pixel_art,refine_pixel_art
+VOX_ROOM_MCP=art=https://comfyui-mcp.example.com/mcp=generate_pixel_art,refine_pixel_art,list_styles
 VOX_ROOM_MCP_KEY=…
 ```
 
 The tool list after the URL is not optional punctuation: that server
-offers seven tools and a room that wants faces needs those two — one
-to make a sprite, one to change a sprite already made. See
+offers eight tools and a room that wants faces needs those three — one
+to make a picture, one to change a picture already made, and one that
+says what looks it can draw in, since that server draws in more than
+one and which look is the person's to choose. See
 [Faces](ROOM.md#faces).
 
 Both variables take several servers, separated by semicolons, and the
@@ -220,7 +222,7 @@ as it starts, and logs what it got:
 
 ```console
 $ docker compose logs vox_room | grep -i mcp
-… pixel-art 1.30.0: lending 2 of its 7 tools, not create_upload_ticket, import_image, get_job_status, list_jobs, get_job_image …
+… pixel-art 1.30.0: lending 3 of its 8 tools, not create_upload_ticket, import_image, get_job_status, list_jobs, get_job_image …
 ```
 
 A server that is down, or a key that is wrong, is a warning on that

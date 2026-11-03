@@ -317,10 +317,17 @@ own as well -- ask the room what it thinks you look like.";
 /// What sizes and styles there are, and how to word a prompt for them,
 /// is in each tool's own schema, written by whoever runs that server
 /// and better than anything that could be restated here -- and it goes
-/// stale the moment they add a style. What this says is the part the
-/// room knows: that it is an interview, that a picture takes long
-/// enough that the room will notice, and that making a picture and
-/// giving somebody a face are two steps.
+/// stale the moment they add a style. The house's own server has two
+/// now, a sprite and a full-resolution one, and will have more; not
+/// one of them is named here, and a room that named them would be
+/// wrong by the next release of a server it does not own.
+///
+/// What this says is the part the room knows: that it is an interview,
+/// that a picture takes long enough that the room will notice, that
+/// making a picture and giving somebody a face are two steps -- and
+/// that which look it is drawn in is one of the things asked about
+/// rather than defaulted to, because it is the one thing about a
+/// picture that changing the picture afterwards cannot touch.
 ///
 /// It does not say what a picture costs, because the room cannot know:
 /// a hosted server bills per image and a server on the house's own
@@ -336,6 +343,15 @@ First, interview them, out loud, in the room. Ask what they want to be -- \
 who the character is, what they are wearing, what they are carrying, what \
 sort of face -- and get enough to work from before you make anything. Say \
 what you are about to make, in a sentence, so they can stop you.
+
+Where the tools can draw in more than one look, which look is theirs to \
+pick and not yours to default to. Find out what there is rather than \
+assuming, say what each one is in a word or two -- somebody who has not \
+seen one has no idea what the names mean -- and ask before you make \
+anything. It belongs in the interview and not after it: a look is the one \
+thing a later change cannot give them, since a tool that changes a picture \
+keeps the look it was drawn in, so changing their mind about it costs a \
+whole new picture and another wait.
 
 Then make it with a picture tool. The picture goes straight into the chat \
 as a card the whole room can see, with a number on it, and a spinner on \
@@ -2631,6 +2647,15 @@ mod tests {
                     // an argument is on the first of them because
                     // some servers do want it there, and that path
                     // has to keep working too.
+                    //
+                    // The one that draws has a `style`, the way the
+                    // house's own server does: the looks it can draw
+                    // in, as an enum the model picks out of. The room
+                    // decides nothing about it and hands it straight
+                    // on; see the test that a style is passed through
+                    // untouched. The one that changes a picture has
+                    // none, because a change keeps the look it was
+                    // drawn in.
                     "tools/list" => json!({ "tools": [{
                         "name": "generate_pixel_art",
                         "description": "Draw something.",
@@ -2638,6 +2663,10 @@ mod tests {
                             "type": "object",
                             "properties": {
                                 "prompt": { "type": "string" },
+                                "style": {
+                                    "type": "string",
+                                    "enum": ["pixel-art", "cel-shaded"],
+                                },
                                 "rd_api_key": { "type": "string" },
                             },
                             "required": ["prompt"],
@@ -2657,6 +2686,10 @@ mod tests {
                         "name": "list_jobs",
                         "description": "Say what was drawn before.",
                         "inputSchema": { "type": "object", "properties": {} },
+                    }, {
+                        "name": "list_styles",
+                        "description": "Say what looks it can draw in.",
+                        "inputSchema": { "type": "object", "properties": {} },
                     }] }),
                     "tools/call"
                         if matches!(
@@ -2668,9 +2701,15 @@ mod tests {
                         let b64 = base64::engine::general_purpose::STANDARD.encode(a_png());
                         // A handle in the words, the way a real
                         // picture server answers: the id you pass
-                        // back to change this one.
+                        // back to change this one. And the style it
+                        // drew in when the call named one, which is
+                        // also what a real one says.
+                        let said = match req["params"]["arguments"]["style"].as_str() {
+                            Some(style) => format!("Job mock7f3: drawn, {style}."),
+                            None => "Job mock7f3: drawn.".to_string(),
+                        };
                         json!({ "content": [
-                            { "type": "text", "text": "Job mock7f3: drawn." },
+                            { "type": "text", "text": said },
                             { "type": "image", "data": b64, "mimeType": "image/png" },
                         ] })
                     }
@@ -2794,6 +2833,68 @@ mod tests {
         );
     }
 
+    /// A look the model picked reaches the server as it picked it, and
+    /// both looks are in front of it to pick from.
+    ///
+    /// The room decides nothing about how a picture is drawn -- what
+    /// looks there are is the server's to publish and the person in
+    /// the room's to choose between, and the room's whole part is to
+    /// not get in the way of either. So this checks the two halves of
+    /// not getting in the way: that the enum the server published is
+    /// still in the schema the model is shown, next to the key that
+    /// was taken out of it, and that the style named in the call is
+    /// what the server was asked for.
+    #[test]
+    fn a_style_is_passed_through_untouched() {
+        let room = picture_room();
+        let g = room.generation_of_only_bot().load(Ordering::SeqCst);
+        let server = Arc::new(mcp::Server::new(mcp::Config {
+            name: "art".into(),
+            url: mock_mcp(true),
+            key: "secret".into(),
+            only: vec!["generate_pixel_art".into(), "list_styles".into()],
+        }));
+        assert_eq!(server.connect().expect("hello"), 2);
+
+        // What the model is shown: the looks it may ask for, and no
+        // key to invent.
+        let offered = server.offer();
+        let draws = offered
+            .iter()
+            .find(|t| t["function"]["name"] == "art_generate_pixel_art")
+            .expect("the tool that draws is lent");
+        let props = &draws["function"]["parameters"]["properties"];
+        assert_eq!(
+            props["style"]["enum"].as_array().unwrap(),
+            &[json!("pixel-art"), json!("cel-shaded")],
+            "both looks are in front of it: {props}"
+        );
+        assert!(props["rd_api_key"].is_null(), "and the key still is not: {props}");
+
+        let args = json!({ "prompt": "a dwarf blacksmith", "style": "cel-shaded" });
+        let said = drawing(&room, g, &server, "art_generate_pixel_art", &args)
+            .expect("the call went through");
+        assert!(said["result"].as_str().unwrap_or_default().contains("Picture 1"));
+
+        let entry = room
+            .log_now()
+            .into_iter()
+            .find(|e| e.kind == crate::room::Kind::Picture)
+            .expect("a picture card is in the conversation");
+        assert_eq!(
+            entry.title, "a dwarf blacksmith",
+            "captioned with the words and not with the look"
+        );
+        assert_eq!(
+            entry.note, "Job mock7f3: drawn, cel-shaded.",
+            "the server drew in the look that was asked for"
+        );
+        assert!(!entry.live);
+        // And it is a face, the same as a sprite is: nothing about
+        // wearing one knows which look it was drawn in.
+        assert_eq!(room.set_avatar(g, "Ryan", 1).unwrap(), "Ryan");
+    }
+
     /// A call that draws nothing leaves no card: a list of old work is
     /// not a portrait, and the room must not spin on one.
     #[test]
@@ -2809,13 +2910,20 @@ mod tests {
         server.connect().expect("hello");
 
         // No words anywhere in the call, so nothing was ever going
-        // to be drawn.
-        let said = drawing(&room, g, &server, "art_list_jobs", &json!({ "limit": 10 })).unwrap();
-        assert_eq!(said["result"], "nothing to draw");
-        assert!(
-            !room.log_now().iter().any(|e| e.kind == crate::room::Kind::Picture),
-            "no card for a call that was never going to draw"
-        );
+        // to be drawn. Asking what looks there are is the same: it is
+        // a question, asked in the middle of an interview, and a
+        // spinner for it would promise a picture nobody is making.
+        for (tool, args) in [
+            ("art_list_jobs", json!({ "limit": 10 })),
+            ("art_list_styles", json!({})),
+        ] {
+            let said = drawing(&room, g, &server, tool, &args).unwrap();
+            assert_eq!(said["result"], "nothing to draw", "{tool}");
+            assert!(
+                !room.log_now().iter().any(|e| e.kind == crate::room::Kind::Picture),
+                "no card for {tool}, which was never going to draw"
+            );
+        }
 
         // A prompt that came back with nothing does leave a card --
         // the room had already promised one -- and it says so rather

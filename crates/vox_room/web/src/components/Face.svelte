@@ -39,7 +39,8 @@
   // Whether this face is being made smaller rather than bigger, which
   // decides how it is drawn -- see `lib/pixels.js`. Answered again for
   // every picture that loads here, because a new face can be a
-  // photograph where the one before it was a sprite.
+  // full-resolution one, or a photograph, where the one before it was
+  // a sprite.
   let smooth = $state(false);
 </script>
 
@@ -111,16 +112,17 @@
   img {
     width: 100%;
     height: 100%;
-    /* Pixel art, blown up to the square it is shown in: nearest
+    /* A sprite, blown up to the square it is shown in: nearest
        neighbour is the whole point of the form, and bilinear would
        turn it to mush. */
     image-rendering: pixelated;
     object-fit: cover;
     display: block;
   }
-  /* A picture bigger than the square -- a photograph somebody dropped
-     into the room, most likely. It is being made smaller, and nearest
-     neighbour throws away most of a photograph on the way down. */
+  /* A picture bigger than the square -- one drawn at full resolution
+     rather than as a sprite, or a photograph somebody dropped into the
+     room. It is being made smaller, and nearest neighbour throws away
+     most of a picture on the way down. */
   img.smooth { image-rendering: auto; }
   @media (prefers-color-scheme: dark) {
     .face {

@@ -271,8 +271,9 @@ CREATE TABLE IF NOT EXISTS faces (
     -- a browser cache one for good, and what lets the same address
     -- serve an old one as readily as the current one.
     at     INTEGER NOT NULL,
-    -- The picture itself, as a PNG. Pixel art is a few kilobytes, so
-    -- it lives here beside everything else the house has to keep
+    -- The picture itself, as a PNG. A sprite is a few kilobytes and a
+    -- full-resolution one a few hundred, which is small enough either
+    -- way to live here beside everything else the house has to keep
     -- rather than in a directory a backup could miss.
     png    BLOB NOT NULL,
     -- What it was asked for. Kept so the next one can be asked for in
@@ -298,9 +299,10 @@ CREATE INDEX IF NOT EXISTS faces_newest ON faces (who, at DESC);
 -- being invited as `Vortex Prime` while a bot is called it.
 CREATE TABLE IF NOT EXISTS avatars (
     who    TEXT PRIMARY KEY,
-    -- The picture itself, as a PNG. Pixel art is a few kilobytes, so it
-    -- lives here beside everything else the house has to keep rather
-    -- than in a directory of its own that a backup could miss.
+    -- The picture itself, as a PNG. A sprite is a few kilobytes and a
+    -- full-resolution one a few hundred, so it lives here beside
+    -- everything else the house has to keep rather than in a directory
+    -- of its own that a backup could miss.
     png    BLOB NOT NULL,
     -- What it was asked for. Kept so the next one can be asked for in
     -- the same spirit, and so somebody can read how they were described.

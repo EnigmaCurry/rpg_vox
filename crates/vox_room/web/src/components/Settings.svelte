@@ -3,7 +3,13 @@
     room, setName, setVolume, avatarOf, forgetAvatar, myFaces, faceAt, wearFace,
   } from '../lib/room.svelte.js';
   import { NAME_MAX } from '../lib/names.js';
+  import { scaledDown } from '../lib/pixels.js';
   import Face from './Face.svelte';
+
+  // How big a square in the row of faces you have worn is, in one
+  // place: the CSS draws it and `lib/pixels.js` is told it, and the
+  // two must agree.
+  const PAST = 56;
 
   // The things you set once, off the floor of the room.
   //
@@ -31,6 +37,19 @@
     room.avatars[room.you];
     myFaces().then((f) => (faces = f));
   });
+
+  // Which of those squares is scaling its picture *down* rather than
+  // up, which decides how each is drawn -- see `lib/pixels.js`. By
+  // version and not one flag, because the ten faces in this row are
+  // not all the same size: a 64-pixel sprite somebody dropped in is
+  // being blown up in a 56-pixel square, and anything a picture
+  // server made -- a cel-shaded portrait at 768, or a sprite handed
+  // back magnified so it reads in a chat -- is being shrunk by ten
+  // times or more, which nearest neighbour turns to noise.
+  let smooth = $state({});
+  const sized = (at, img) => {
+    if (scaledDown(img, PAST)) smooth = { ...smooth, [at]: true };
+  };
 
   async function save() {
     // Nothing typed, or typed back to what it already was: there is no
@@ -102,7 +121,12 @@
             aria-pressed={f.worn}
             onclick={() => !f.worn && wearFace(f.at)}
           >
-            <img src={faceAt(f.at)} alt={f.prompt} />
+            <img
+              src={faceAt(f.at)}
+              alt={f.prompt}
+              class:smooth={smooth[f.at]}
+              onload={(e) => sized(f.at, e.currentTarget)}
+            />
           </button>
         {/each}
       </div>
@@ -199,6 +223,7 @@
   .past { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
   .past-face {
     padding: 0;
+    /* `PAST` above is this number; they are read together. */
     width: 56px;
     height: 56px;
     border-radius: 8px;
@@ -214,8 +239,15 @@
   .past-face img {
     width: 100%;
     height: 100%;
+    /* A sprite blown up into the square: nearest neighbour, which is
+       the whole point of the form. */
     image-rendering: pixelated;
     object-fit: cover;
     display: block;
   }
+  /* And one bigger than the square, which this is shrinking: a
+     full-resolution picture, or a photograph somebody dropped in.
+     Nearest neighbour throws away thirteen pixels in fourteen on the
+     way down, which is noise and not a face. */
+  .past-face img.smooth { image-rendering: auto; }
 </style>

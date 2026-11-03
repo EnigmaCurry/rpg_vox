@@ -111,10 +111,19 @@ const MAX_NOTE: usize = 300;
 /// Biggest face the room will keep, and so the biggest picture it
 /// accepts into a conversation: anything in the chat can be worn, and
 /// a picture too big to wear would be a card with a tool that refuses
-/// it. Pixel art at the sizes an avatar wants is a handful of
-/// kilobytes, and a photograph dropped in is scaled down to the size
-/// the room shows it at before it is sent -- see `web::drop_picture`.
-pub const AVATAR_BYTES_MAX: usize = 512 * 1024;
+/// it. A photograph dropped in is scaled down to the size the room
+/// shows it at before it is sent -- see `web::drop_picture`.
+///
+/// A megabyte because a picture server has more than one kind of
+/// picture in it. A sprite is a handful of kilobytes, which is what
+/// this number was first set against; a full-resolution style is a
+/// few hundred -- the busiest thing the house's own server will draw,
+/// 1024 square and quantized to 24 colours, measures about 420 KB --
+/// and a face the room refuses after somebody has looked at it and
+/// said yes is the one failure here that cannot be explained to them.
+/// It costs little: every face is fetched once and cached by its
+/// version, which never changes meaning -- see `web::avatar`.
+pub const AVATAR_BYTES_MAX: usize = 1024 * 1024;
 /// Longest file name kept with a dropped picture. It is the card's
 /// caption, in the place what a picture was asked for goes.
 const UPLOAD_NAME_MAX: usize = 80;

@@ -1084,7 +1084,7 @@ two variables the room does, so an environment that runs the room runs
 the test:
 
 ```bash
-VOX_ROOM_MCP='art=https://comfyui-mcp.example.com/mcp=generate_pixel_art,refine_pixel_art' \
+VOX_ROOM_MCP='art=https://comfyui-mcp.example.com/mcp=generate_pixel_art,refine_pixel_art,list_styles' \
 VOX_ROOM_MCP_KEY=… \
   cargo test -p vox_room -- --ignored --nocapture says_hello
 ```
@@ -1102,7 +1102,10 @@ in](#dropping-a-picture-in). Asking for one takes four steps on
 purpose — the AI does not simply hand you one.
 
 It interviews you first: who you are, what you are wearing, what sort
-of face. Then it says what it is about to make and makes it — and the
+of face — and, where the server draws in more than one look, which
+look, because that is the one thing about a picture that no later
+change can give you. Then it says what it is about to make and makes
+it — and the
 picture goes **into the conversation as a card**, numbered, with a
 spinner on it until it arrives. Generating one takes the better part
 of a minute, so the card is the room's evidence that something is
@@ -1181,7 +1184,7 @@ room actually shows a picture at, and written out as a PNG, which is
 what everything here that holds a picture has always been. So a
 photograph straight off a phone comes in as a few tens of kilobytes
 rather than being refused for being what phones make. The server keeps
-nothing over 512 KB, which is also the most a face may be: anything in
+nothing over 1 MB, which is also the most a face may be: anything in
 the chat can be worn.
 
 A room with no picture server can do all of this. Nothing here draws,
@@ -1193,7 +1196,7 @@ server the house was started with:
 
 ```bash
 vox_room --room Lobby \
-  --mcp 'art=https://comfyui-mcp.example.com/mcp=generate_pixel_art,refine_pixel_art' \
+  --mcp 'art=https://comfyui-mcp.example.com/mcp=generate_pixel_art,refine_pixel_art,list_styles' \
   --mcp-key "$ART_KEY"
 ```
 
@@ -1218,9 +1221,10 @@ which is right for one that wants no authenticating.
 
 **The tool list after the URL is the point of the flag.** A picture
 server offers everything it can do, and a room that wants faces needs
-two of them: one that makes a sprite from a description, and one that
-changes a sprite already made. The ComfyUI server above offers seven,
-and the five left out are two for uploading a file (the AI has no file
+three of them: one that makes a picture from a description, one that
+changes a picture already made, and one that says what looks it can
+draw in. The ComfyUI server above offers eight, and the five left out
+are two for uploading a file (the AI has no file
 and no way to POST one), one that re-posts a picture already in the
 chat as a second card, one for polling a job you only need if you told
 it not to wait, and one that lists every job on the server — including
@@ -1228,6 +1232,25 @@ other rooms'. Each of those is one more way for a voice answering "make
 me an avatar" to end up somewhere else. Leave the list out and every
 tool the server has is offered, which is only sane for a server you
 know is small. Repeat `--mcp` (or separate with `;`) for more servers.
+
+**What looks there are is the server's to say.** That ComfyUI server
+draws in two as it stands — a 64-pixel sprite, one colour to a pixel,
+and a 768-pixel cel-shaded portrait with ink lineart — and which one
+is an argument of the tool that draws, with the names in its own
+schema. The room names neither, anywhere: not in the prompt, not in
+the code, not in the browser. A room that listed them would be wrong
+the next time whoever runs that server adds one, and the AI would be
+confidently offering a look that no longer exists. What the room says
+instead is that the choice is yours and is made before anything is
+drawn, and `list_styles` is how the AI finds out what it is offering
+you. That tool draws nothing, costs no GPU time, and gets no card —
+asking what there is is a question in the middle of an interview, and
+a spinner for it would promise a picture nobody is making.
+
+Changing your mind about the look costs a whole new picture. A tool
+that changes one keeps the look it was drawn in — that is what makes
+it a change rather than a fresh start — so the look is settled in the
+interview and not afterwards.
 
 Only streamable HTTP is spoken, not stdio: a stdio server would want a
 child process supervised for as long as the house is open.

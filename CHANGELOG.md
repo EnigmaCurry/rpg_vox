@@ -90,6 +90,58 @@ releases.
 
 ### Voice room
 
+- **A face can be drawn in more than one look now, and which one is
+  yours to choose.** The picture server the room is pointed at grew a
+  second style -- a 768-pixel cel-shaded portrait with ink lineart,
+  beside the 64-pixel sprite it had always drawn -- and a room that
+  had quietly been a pixel-art room found three things in its way.
+
+  The look is now part of the interview. The AI is told that where the
+  tools can draw in more than one, which look is the person's to pick
+  and not its to default to: find out what there is, say what each one
+  is in a word or two, and ask before anything is made. It belongs in
+  the interview rather than after it because it is the one thing about
+  a picture that a later change cannot give you -- a tool that changes
+  one keeps the look it was drawn in, which is what makes it a change
+  rather than a fresh start -- so changing your mind costs a whole new
+  picture and another wait.
+
+  **Not one style is named anywhere in the room.** Not in the prompt,
+  not in the code, not in the browser. What looks there are is the
+  server's to publish, and a room that listed them would be wrong the
+  next time whoever runs that server adds one, with the AI
+  confidently offering a look that is no longer there. So the room
+  lends `list_styles` as a third tool -- it generates nothing, costs
+  no GPU time, and is how the AI finds out what it is offering you --
+  and says only the part it knows, which is that the choice is yours
+  and is made up front. A call that only asks what there is gets no
+  card: asking a question in the middle of an interview is not a
+  picture being made, and a spinner for it would promise one nobody
+  is making.
+
+  **The most a face may be is 1 MB, up from 512 KB.** The old number
+  was set against a sprite, which is a handful of kilobytes, and the
+  headroom it looked like it had was gone against a full-resolution
+  style: the busiest thing that server will draw, 1024 square and
+  quantized to 24 colours, measures about 420 KB. A face the room
+  refuses *after* somebody has looked at it and said yes is the one
+  failure here that cannot be explained to them. It costs little --
+  every face is fetched once and cached under a version that never
+  changes meaning.
+
+  **And the row of faces you have worn is drawn the right way round.**
+  Every other square in the room already asked the picture which way
+  it was being scaled -- blown up past its own pixels wants nearest
+  neighbour, shrunk wants smoothing -- but Settings magnified
+  regardless. A 768-pixel portrait in a 56-pixel thumbnail throws away
+  thirteen pixels in fourteen that way, and what is left is noise
+  rather than a face. It asks now, per picture, because that row holds
+  both kinds at once: a sprite dropped in at its own 64 pixels is
+  blown up, and anything a picture server made is shrunk. That bug was
+  there before this style was, for a photograph dropped in and for a
+  sprite the server handed back magnified; a row of ten thumbnails is
+  just where it finally showed.
+
 - **A picture can be dropped into the room, and the AI can be asked
   for it as your face.** Drag one onto the room and let go of it
   anywhere, or paste one with Ctrl+V -- a screenshot is on the
@@ -118,7 +170,7 @@ releases.
   and written out as a PNG, which is what everything here that holds
   one has always been. So a photograph straight off a phone comes in
   as a few tens of kilobytes instead of being refused for being what
-  phones make. The server keeps nothing over 512 KB, which is also the
+  phones make. The server keeps nothing over 1 MB, which is also the
   most a face may be -- anything in the chat can be worn -- and checks
   the bytes and the size for itself, because a page is not where a
   limit lives. Anything that is not a picture is declined where it was
