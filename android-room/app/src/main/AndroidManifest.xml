@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- Not optional, and not obvious: Chromium's Android audio manager
+         selects a communication device before it will open a capture
+         stream, and without this every getUserMedia in the WebView fails
+         with NotReadableError ("Could not start audio source") and
+         `Unable to select communication device!` in the log. It is a
+         normal permission, so declaring it is the whole of granting it. -->
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Asked for only if the box on the first screen is ticked. Whether
+         it is needed at all is half of what this app is for. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <application
+        android:allowBackup="false"
+        android:label="Voice Room (spike)"
+        android:usesCleartextTraffic="false"
+        android:theme="@android:style/Theme.Material.NoActionBar">
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:windowSoftInputMode="adjustResize"
+            >
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+        <!-- The whole point: a microphone-typed foreground service is what
+             stops Android reclaiming the process while the screen is off.
+             Scribe's recording survives on exactly this (ScribeService). -->
+        <service
+            android:name=".RoomService"
+            android:exported="false"
+            android:foregroundServiceType="microphone" />
+    </application>
+</manifest>
