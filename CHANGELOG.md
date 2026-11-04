@@ -90,6 +90,39 @@ releases.
 
 ### Voice room
 
+- **Which key talks is yours to pick.** It was Space, because that is
+  what the person who wrote it likes, and Space is wrong for somebody:
+  it is how a screen reader works a page, and it is taken if you are
+  playing something in another window. **Settings → The talk key**
+  binds another.
+
+  You press the key rather than naming it. A box you type a key's name
+  into is a box you can be wrong in -- *Spacebar*, *ctrl space*, a key
+  whose name you don't know -- and what comes out of it is a microphone
+  that doesn't open. Pressing it also means the keys the browser never
+  hands over need no list: press one and nothing arrives, and the
+  button goes on waiting, which is the truth about that key.
+
+  Three kinds do arrive and are still refused, each with its reason
+  said at the moment you press it: ones the browser keeps (`Ctrl+W`
+  would close the tab and take the audio with it), ones the room has
+  already spent (Escape is how you get the keyboard back out of a text
+  box; Enter and Tab are how a keyboard works the page at all), and a
+  modifier on its own, which is held down whenever you use it with
+  anything else.
+
+  Combinations are allowed, and the reason they can be is that release
+  is matched on the key alone. Hold `Ctrl+Space`, let go of Ctrl first,
+  and the keyup for Space arrives with `ctrlKey` already false -- a
+  release that insisted on the modifiers would never match it, and the
+  microphone would stay open with nothing on the screen saying so. In a
+  room where everybody hears everybody that is the worst thing this app
+  can do, so going down matches the key and the modifiers, and coming
+  up matches the key.
+
+  Kept in this browser like the theme, and for the same reason: a
+  binding is a fact about a keyboard, not about a person.
+
 - **Escape gives the keyboard back.** The space bar is the
   microphone's from wherever you left the focus, with two exceptions:
   the box you type into and the `Stops` menu on a fader, where Space is

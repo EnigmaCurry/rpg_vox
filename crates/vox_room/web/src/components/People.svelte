@@ -12,7 +12,7 @@
     renameRoom,
     deleteRoom,
   } from '../lib/room.svelte.js';
-  import { fieldAt } from '../lib/keys.js';
+  import { fieldAt } from '../lib/keys.svelte.js';
 
   // The house, for the one who owns it: the rooms it has, who is
   // invited, and which of those rooms each of them may go to.

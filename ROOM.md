@@ -918,7 +918,30 @@ See ROOM_DOCKER.md.
   cut. The setting is a page away from the key and still lands on the
   hold you are in: the room goes on running behind that page.
 
-  **The space bar is the microphone's wherever you left the focus.** On
+  **Which key talks is yours to pick.** Space out of the box;
+  **Settings → The talk key** binds another. You press the key rather
+  than naming it, so there is nothing to spell wrong, and a key the
+  browser never hands the room simply doesn't arrive — the button goes
+  on waiting, which is the truth about that key. Three kinds do arrive
+  and are still refused, with the reason said at the moment you press
+  them: ones the browser keeps (`Ctrl+W` would close the tab and take
+  the audio with it), ones the room has already spent (Escape is how
+  you get the keyboard back; Enter and Tab are how a keyboard works the
+  page at all), and a modifier on its own, which is held down whenever
+  you use it with anything else.
+
+  Combinations are allowed. Holding `Ctrl+Space` and letting go of Ctrl
+  first still closes your microphone: the room matches the key *and*
+  the modifiers going down, and the key alone coming up. A release that
+  insisted on the modifiers would leave the mic open with nothing on
+  the screen saying so, which in a room where everybody hears everybody
+  is the worst thing this app could do. Losing the window closes it
+  too, as it always did.
+
+  Like the theme, the binding is this browser's and never reaches the
+  server: it is a fact about a keyboard, not about a person.
+
+  **The talk key is the microphone's wherever you left the focus.** On
   a button you have just clicked -- a room in the list, a mute,
   somebody's shared screen -- it still talks, and it does not press that
   button again while you hold it. The exceptions are where Space is
@@ -1952,7 +1975,7 @@ CHROME=$(which chromium) ./run.sh            # or: ./run.sh rooms bots
 | `door` | the door is a page with no room behind it and no socket open; **Join Audio** does nothing until you agree to be recorded, and the Language box is never blank |
 | `roles` | the house and the people: making a room, renaming one under somebody standing in it, taking one away from under them — and the owner and the rest: who is shown the people and who is answered when they ask for them, a room given and taken away while somebody sits in the house, and an invite made from the page |
 | `settings` | the footer: one width for the talk button whatever it says, the two half-height switches stacked beside it, sharing and the way out on the other side, and the cog opening a page with what each switch means when it is off |
-| `ptt` | push to talk: the space bar reaching the microphone from wherever the focus was left -- a button you clicked, the history panel, a mute -- and not reaching it in a text box, a dropdown or a dialog; Escape giving it back from each of those without disturbing what is in them; and what holding it does to the room's own sound, which is nothing until you ask for it, and then going to nothing while the key is down, coming back only once the mic has closed, and changing under a hold that is already being held |
+| `ptt` | push to talk: the talk key reaching the microphone from wherever the focus was left -- a button you clicked, the history panel, a mute -- and not reaching it in a text box, a dropdown or a dialog; Escape giving it back from each of those without disturbing what is in them; binding another key, the three kinds of key that are refused and why, and a bound combination still closing the mic when the modifier is let go of first; and what holding it does to the room's own sound, which is nothing until you ask for it, and then going to nothing while the key is down, coming back only once the mic has closed, and changing under a hold that is already being held |
 | `permalinks` | `/`, `/lobby` and `/room/<id>`; back and forward move between rooms, a pasted address opens that room, a stale one is put right |
 | `conversations` | the room's history: naming one, reading an old one read-only without moving anybody else's screen, deleting one for everybody, and empty ones never being archived |
 | `game` | a game played inside a room, and leaving it putting the room back where it was for everyone in it |

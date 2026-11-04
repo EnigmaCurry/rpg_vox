@@ -2,7 +2,7 @@
   import { onMount } from 'svelte';
   import { room, command, ask, answer, whoami, leaveAudio, setMuted, setPushToTalk, setBots, talk, busyAI, dropPicture, notice, mutedByRoom, theAI, theAIs } from './lib/room.svelte.js';
   import { screen, share, stopSharing, supported as canShare } from './lib/screen.svelte.js';
-  import { TYPING, fieldAt } from './lib/keys.js';
+  import { TYPING, fieldAt, talk as talkKey, keyName, pressed, released } from './lib/keys.svelte.js';
   import Log from './components/Log.svelte';
   import Cards from './components/Cards.svelte';
   import Enter from './components/Enter.svelte';
@@ -132,24 +132,25 @@
     else refuse();
   }
 
-  // Space toggles your mute (or, with push to talk, talks while held),
-  // unless you are typing or choosing something.
+  // What the talk key is called, for the button and for the prose about
+  // it. Space out of the box; whatever Settings bound after that.
+  const key = $derived(keyName(talkKey.bind));
+
+  // The talk key toggles your mute (or, with push to talk, talks while
+  // held), unless you are typing or choosing something.
   //
   // Buttons are deliberately *not* an exception. A button keeps the
   // focus after you click it, so excluding them meant the space bar
   // stopped talking the moment you touched one -- a room in the list, a
   // fader's mute, somebody's screen share -- and the way to get it back
-  // was to know to click the background. Space belongs to your
+  // was to know to click the background. The talk key belongs to your
   // microphone everywhere in the room; a focused button is still
-  // worked by Enter. `preventDefault` below is what keeps the space bar
-  // from pressing that button again while you talk.
+  // worked by Enter. `preventDefault` below is what keeps the key from
+  // pressing that button again while you talk.
   //
-  // A dialog is an exception, because there Space is how you answer it.
-  // What counts as typing is `lib/keys.js`, because Escape below has to
-  // agree with it.
-  function spaceKey(e) {
-    return e.code === 'Space' && room.audio === 'on' && !e.target.closest(TYPING);
-  }
+  // A dialog is an exception, because there the key may be how you
+  // answer it. What counts as typing is `lib/keys.svelte.js`, because
+  // Escape below has to agree with it.
   // Escape gives the keyboard back.
   //
   // The two things in the room that take Space off your microphone are
@@ -183,7 +184,7 @@
 
   function onkeydown(e) {
     if (e.key === 'Escape') return escape(e);
-    if (!spaceKey(e)) return;
+    if (!pressed(e, talkKey.bind) || room.audio !== 'on' || e.target.closest(TYPING)) return;
     e.preventDefault();
     // Muted on the room's mixer, the space bar still belongs to your
     // microphone -- it just has nothing left to do with it. Claimed and
@@ -195,7 +196,10 @@
     else if (!e.repeat) setMuted(!room.muted);
   }
   function onkeyup(e) {
-    if (e.code !== 'Space' || !room.pushToTalk) return;
+    // The key alone, modifiers ignored: see `released`. A microphone
+    // left open because somebody let go of Ctrl first would be the
+    // worst bug this room could have.
+    if (!released(e, talkKey.bind) || !room.pushToTalk) return;
     e.preventDefault();
     talk(false);
   }
@@ -350,11 +354,11 @@
             onpointerup={() => talk(false)} onpointercancel={() => talk(false)}
             onkeydown={(e) => { if (e.code === 'Enter') { e.preventDefault(); talk(true); } }}
             onkeyup={(e) => { if (e.code === 'Enter') { e.preventDefault(); talk(false); } }}>
-            {stripMuted ? 'Muted on the mixer' : room.talking ? 'Talking…' : 'Hold to talk'} <kbd>Space</kbd>
+            {stripMuted ? 'Muted on the mixer' : room.talking ? 'Talking…' : 'Hold to talk'} <kbd>{key}</kbd>
           </button>
         {:else}
           <button class="big" class:muted={room.muted || stripMuted} onclick={() => setMuted(!room.muted)} disabled={!room.mic || stripMuted}>
-            {stripMuted ? 'Muted on the mixer' : room.muted ? 'Unmute' : 'Mute'} <kbd>Space</kbd>
+            {stripMuted ? 'Muted on the mixer' : room.muted ? 'Unmute' : 'Mute'} <kbd>{key}</kbd>
           </button>
         {/if}
         <!-- The two switches that say what the room does with your
@@ -370,9 +374,9 @@
             onclick={() => setPushToTalk(!room.pushToTalk)}
             title={room.pushToTalk
               ? (room.pttHush
-                ? 'Push to talk is on: your mic opens only while you hold Space or the talk button, and the room goes quiet while you hold it. Off, your mic is simply open.'
-                : 'Push to talk is on: your mic opens only while you hold Space or the talk button, and you go on hearing the room while you talk. Off, your mic is simply open.')
-              : 'Your mic is open and everybody hears everybody. Turn this on and it opens only while you hold Space or the talk button — Settings says what holding it does to the room’s own sound.'}>
+                ? `Push to talk is on: your mic opens only while you hold ${key} or the talk button, and the room goes quiet while you hold it. Off, your mic is simply open.`
+                : `Push to talk is on: your mic opens only while you hold ${key} or the talk button, and you go on hearing the room while you talk. Off, your mic is simply open.`)
+              : `Your mic is open and everybody hears everybody. Turn this on and it opens only while you hold ${key} or the talk button — Settings says what holding it does to the room’s own sound.`}>
             PTT
           </button>
           <!-- Whether the AIs may answer you, which is yours and
@@ -565,7 +569,10 @@
   }
   /* One width for every label it can have -- Mute, Unmute, Hold to
      talk, Talking... -- so the button under your hand is the same
-     button it was a moment ago and nothing beside it moves. */
+     button it was a moment ago and nothing beside it moves. The key's
+     own name is in there too and a long one widens it, which is
+     allowed: that changes when you bind another key and never while
+     you are talking. */
   /* The one button you aim at without looking, so it is the one shaped
      like something to press: a deeper bevel than the switches beside
      it, and far deeper than the box you type in, which stays flat. A

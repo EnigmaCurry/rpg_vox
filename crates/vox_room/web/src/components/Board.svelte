@@ -2,7 +2,7 @@
   // One shared desktop, full size, on this screen alone. Opening or
   // closing it changes nothing for anyone else in the room.
   import { screen, showBoard, unwatch } from '../lib/screen.svelte.js';
-  import { fieldAt } from '../lib/keys.js';
+  import { fieldAt } from '../lib/keys.svelte.js';
 
   const stream = $derived(screen.streams.find((s) => s.id === screen.watching));
 

@@ -247,6 +247,70 @@ const focused = (page) =>
   await page.keyboard.press('Escape');
   await page.waitForTimeout(400);
 
+  // Which key talks is a choice, and the one thing that must survive
+  // it is letting go. Bound to Ctrl+Space and released modifier-first,
+  // the keyup for Space arrives with `ctrlKey` already false -- a
+  // release that insisted on the modifiers would never match it, and
+  // the microphone would stay open with nothing on the screen saying
+  // so. So the room listens for the key alone coming up.
+  await page.evaluate(() => document.activeElement?.blur());
+  await page.click('.tools button.cog');
+  await page.waitForSelector('.settings');
+  await page.click('.settings .press');
+  is('the room is waiting for a key',
+    await page.evaluate(() => document.querySelector('.settings .press').textContent.trim()),
+    'Press a key…');
+
+  // The three kinds of no. A key the room is simply never given needs
+  // no list -- it never arrives -- so these are the ones that do.
+  await page.keyboard.press('Control+KeyW');
+  await page.waitForTimeout(200);
+  is('a key the browser keeps is refused',
+    await page.evaluate(() => document.querySelector('.settings .warn')?.textContent.includes('closes the tab')), true);
+  await page.keyboard.press('Tab');
+  await page.waitForTimeout(200);
+  is('and so is one the room has already spent',
+    await page.evaluate(() => document.querySelector('.settings .warn')?.textContent.includes('Tab')), true);
+  is('and it is still waiting, a no being about that key and not the end of it',
+    await page.evaluate(() => document.querySelector('.settings .press').textContent.trim()),
+    'Press a key…');
+
+  await page.keyboard.down('Control');
+  await page.keyboard.press('Space');
+  await page.keyboard.up('Control');
+  await page.waitForTimeout(300);
+  is('a combination binds', await page.evaluate(() => document.querySelector('.settings .press kbd')?.textContent), 'Ctrl+Space');
+  await page.click('.settings button.primary');
+  await page.waitForSelector('footer .big.ptt');
+  is('and the talk button says which key it is now',
+    await page.evaluate(() => document.querySelector('footer .big.ptt kbd')?.textContent), 'Ctrl+Space');
+
+  await page.evaluate(() => document.activeElement?.blur());
+  is('the bare key no longer talks', await space(page), false);
+
+  await page.keyboard.down('Control');
+  await page.keyboard.down('Space');
+  await page.waitForTimeout(250);
+  is('the bound one does',
+    await page.evaluate(() => !!document.querySelector('footer .big.ptt.talking')), true);
+  // The modifier first, which is how a hand actually lets go.
+  await page.keyboard.up('Control');
+  await page.keyboard.up('Space');
+  await page.waitForTimeout(900);
+  is('and letting the modifier go first still closes the mic',
+    await page.evaluate(() => !!document.querySelector('footer .big.ptt.talking')), false);
+
+  // Back to where the rest of this suite left it.
+  await page.click('.tools button.cog');
+  await page.waitForSelector('.settings');
+  await page.click('.settings .bind button:has-text("Back to Space")');
+  await page.waitForTimeout(200);
+  is('and it can be put back', await page.evaluate(() => document.querySelector('.settings .press kbd')?.textContent), 'Space');
+  await page.click('.settings button.primary');
+  await page.waitForSelector('footer .big.ptt');
+  await page.evaluate(() => document.activeElement?.blur());
+  is('with the space bar talking again', await space(page), true);
+
   // Letting go of the key is heard wherever the focus went in between.
   await page.evaluate(() => document.activeElement?.blur());
   await page.keyboard.down('Space');

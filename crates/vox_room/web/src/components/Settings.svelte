@@ -4,7 +4,9 @@
     command, setPttHush, setBotsOff, theAI, theAIs,
   } from '../lib/room.svelte.js';
   import { theme, setTheme, THEMES } from '../lib/theme.svelte.js';
-  import { fieldAt } from '../lib/keys.js';
+  import {
+    fieldAt, talk, bindTalk, keyName, refuse, bindOf, isDefault, DEFAULT,
+  } from '../lib/keys.svelte.js';
   import { NAME_MAX } from '../lib/names.js';
   import { scaledDown } from '../lib/pixels.js';
   import Face from './Face.svelte';
@@ -65,6 +67,51 @@
   const sized = (at, img) => {
     if (scaledDown(img, PAST)) smooth = { ...smooth, [at]: true };
   };
+
+  // Binding the talk key: press the key rather than name it.
+  //
+  // A box you type a key's name into is a box you can be wrong in --
+  // "Spacebar", "ctrl space", a key whose name you don't know -- and
+  // what comes out of it is a microphone that doesn't open. So this
+  // listens for the next press and takes what it was.
+  //
+  // It also means the keys the room is never given need no list: press
+  // one and nothing arrives, and this goes on waiting for a key, which
+  // is the truth about that key. What is listed in `refuse` is only the
+  // ones that do arrive and still can't be it.
+  let arming = $state(false);
+  let refused = $state(null);
+
+  $effect(() => {
+    if (!arming) return;
+    // Capture, and nothing else gets a look: while this is listening,
+    // a press is being *chosen*, not used. Escape included -- it would
+    // otherwise be the key that lets go of the button you armed this
+    // with, which is not what pressing it here means.
+    const grab = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      // Changed your mind. Escape is also the one key you cannot bind,
+      // so it is free to mean this.
+      if (e.code === 'Escape') {
+        arming = false;
+        refused = null;
+        return;
+      }
+      const no = refuse(e);
+      if (no) {
+        // Still listening: a no is an answer about that key, not the
+        // end of the question.
+        refused = no;
+        return;
+      }
+      bindTalk(bindOf(e));
+      arming = false;
+      refused = null;
+    };
+    window.addEventListener('keydown', grab, true);
+    return () => window.removeEventListener('keydown', grab, true);
+  });
 
   async function save() {
     // Nothing typed, or typed back to what it already was: there is no
@@ -162,6 +209,40 @@
     {:else}
       <p class="note">The browser hasn't named the microphone it gave the room.</p>
     {/if}
+  </section>
+
+  <!-- Which key talks. Above the section about what holding it does,
+       because that one is about this key. Yours and this browser's: it
+       is a fact about a keyboard rather than about a person, and the
+       same person at a desk and on a laptop may want two answers. -->
+  <section>
+    <h2>The talk key</h2>
+    <p class="note first">
+      The key your microphone is on, wherever you have left the focus — it
+      mutes and unmutes you, and with push to talk on it is the key you hold.
+      It is off duty while you are typing: in the message box, or a menu, the
+      key is theirs, and <kbd>Esc</kbd> gives it back.
+    </p>
+    <div class="bind">
+      <button class="press" class:arming onclick={() => { arming = !arming; refused = null; }}
+        aria-live="polite"
+        title={arming
+          ? 'Press the key you want. Escape to leave it as it is.'
+          : 'Press this, then press the key you want to talk with.'}>
+        {#if arming}Press a key…{:else}<kbd>{keyName(talk.bind)}</kbd>{/if}
+      </button>
+      {#if arming}
+        <span class="hint">…or <kbd>Esc</kbd> to leave it as it is.</span>
+      {:else if !isDefault(talk.bind)}
+        <button onclick={() => bindTalk(DEFAULT)}>Back to Space</button>
+      {/if}
+    </div>
+    {#if refused}<p class="warn">{refused}</p>{/if}
+    <p class="note">
+      A combination is fine — hold the modifiers and press the key. Letting go
+      of the modifier first still closes your microphone: the room listens for
+      the key coming up and not for what was held with it.
+    </p>
   </section>
 
   <!-- What push to talk *means*, which is not the same question as
@@ -326,8 +407,8 @@
   {/if}
 
   <p class="note back">
-    The room is still running: you are still in the audio, and <kbd>Space</kbd>
-    still mutes or talks from here.
+    The room is still running: you are still in the audio, and
+    <kbd>{keyName(talk.bind)}</kbd> still mutes or talks from here.
   </p>
 </main>
 
@@ -364,6 +445,12 @@
   .duplex input { margin-top: 3px; }
   .duplex small { display: block; font-size: 12px; color: var(--muted); line-height: 1.45; margin-top: 2px; }
   .back { text-align: center; }
+  .bind { display: flex; align-items: center; gap: 10px; }
+  /* Wide enough for the longest binding anybody is likely to set, so
+     the row does not jump as you try keys. */
+  .press { min-width: 11em; }
+  .press.arming { border-color: var(--accent); color: var(--accent); }
+  .bind .hint { font-size: 13px; color: var(--muted); }
   .manage { margin-top: 10px; }
   .slider { display: flex; align-items: center; gap: 10px; font-size: 13px; margin: 0; }
   .slider input[type='range'] { flex: 1; max-width: 18em; }
