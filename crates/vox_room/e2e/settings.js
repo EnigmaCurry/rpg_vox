@@ -18,7 +18,11 @@ const [ryanLink] = process.argv.slice(2);
 const feet = (page) =>
   page.evaluate(() =>
     [...document.querySelectorAll('footer button')].map((b) => ({
-      what: (b.getAttribute('aria-label') ?? b.textContent).replace(/\s+/g, ' ').trim(),
+      // `innerText` and not `textContent`: the talk button is drawn
+      // holding every label it could have, so that it is always as wide
+      // as the widest, and the ones it is not saying are invisible.
+      // `textContent` would hand back all of them at once.
+      what: (b.getAttribute('aria-label') ?? b.innerText).replace(/\s+/g, ' ').trim(),
       width: Math.round(b.getBoundingClientRect().width),
       left: Math.round(b.getBoundingClientRect().left),
     })),

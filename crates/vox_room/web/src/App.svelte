@@ -136,6 +136,38 @@
   // it. Space out of the box; whatever Settings bound after that.
   const key = $derived(keyName(talkKey.bind));
 
+  // Everything the talk button can ever say, and which of them it is
+  // saying now.
+  //
+  // The button must not change width. It is the one control in the room
+  // you put a hand on without looking, and a button that is 210 pixels
+  // while it says *Hold to talk* and 190 the moment it says *Talking…*
+  // moves out from under you mid-sentence, taking the switches beside
+  // it along.
+  //
+  // It used to be a `min-width` in ems, which is a guess that the
+  // longest label fits inside it -- and the guess held exactly as long
+  // as the labels were these English ones with the word *Space* after
+  // them. Binding a longer key walked straight past it. So the button
+  // is drawn holding every label it could have, all in one place, with
+  // the ones it isn't saying made invisible: the browser works out
+  // which is widest, and that is the width -- in any language, with
+  // any key bound.
+  //
+  // One list for both the hold-to-talk button and the mute one, so
+  // throwing the PTT switch doesn't move it either. `Muted on the
+  // mixer` is the longest and so sets the width although it is the
+  // rarest: a state you cannot talk in is still not a reason for the
+  // button to jump.
+  const SAYS = ['Mute', 'Unmute', 'Hold to talk', 'Talking…', 'Muted on the mixer'];
+  const saying = $derived(
+    stripMuted
+      ? 'Muted on the mixer'
+      : room.pushToTalk
+        ? room.talking ? 'Talking…' : 'Hold to talk'
+        : room.muted ? 'Unmute' : 'Mute',
+  );
+
   // The talk key toggles your mute (or, with push to talk, talks while
   // held), unless you are typing or choosing something.
   //
@@ -334,6 +366,20 @@
 
     {#if screen.watching != null}<Board />{/if}
 
+    <!-- What the talk button says, and how wide it is. The one it is
+         saying is on top of the rest, which are there to be measured
+         and not to be read -- `visibility: hidden` keeps them out of
+         the picture and out of anything reading the page aloud. -->
+    {#snippet says()}
+      <span class="says">
+        <span>{saying}</span>
+        {#each SAYS as could (could)}
+          <span class="ghost" aria-hidden="true">{could}</span>
+        {/each}
+      </span>
+      <kbd>{key}</kbd>
+    {/snippet}
+
     <footer class="panel">
       {#if room.audio === 'on'}
         <div class="mic">
@@ -354,11 +400,11 @@
             onpointerup={() => talk(false)} onpointercancel={() => talk(false)}
             onkeydown={(e) => { if (e.code === 'Enter') { e.preventDefault(); talk(true); } }}
             onkeyup={(e) => { if (e.code === 'Enter') { e.preventDefault(); talk(false); } }}>
-            {stripMuted ? 'Muted on the mixer' : room.talking ? 'Talking…' : 'Hold to talk'} <kbd>{key}</kbd>
+            {@render says()}
           </button>
         {:else}
           <button class="big" class:muted={room.muted || stripMuted} onclick={() => setMuted(!room.muted)} disabled={!room.mic || stripMuted}>
-            {stripMuted ? 'Muted on the mixer' : room.muted ? 'Unmute' : 'Mute'} <kbd>{key}</kbd>
+            {@render says()}
           </button>
         {/if}
         <!-- The two switches that say what the room does with your
@@ -567,12 +613,13 @@
        draws the frame out of this. */
     --surface: var(--foot-surface);
   }
-  /* One width for every label it can have -- Mute, Unmute, Hold to
-     talk, Talking... -- so the button under your hand is the same
-     button it was a moment ago and nothing beside it moves. The key's
-     own name is in there too and a long one widens it, which is
-     allowed: that changes when you bind another key and never while
-     you are talking. */
+  /* One width for every label it can have, so the button under your
+     hand is the same button it was a moment ago and nothing beside it
+     moves. The width comes from `.says` below, which holds all of them
+     at once; this `min-width` is only a floor, for a language whose
+     labels are all short. The key's name is outside that stack because
+     it is the same in every state -- it changes when you bind another
+     key, and never while you are talking. */
   /* The one button you aim at without looking, so it is the one shaped
      like something to press: a deeper bevel than the switches beside
      it, and far deeper than the box you type in, which stays flat. A
@@ -582,6 +629,11 @@
     padding: 9px 18px;
     font-size: 15px;
     min-width: 12.5em;
+    /* A row, so the stack of labels and the key's name sit side by
+       side and the stack can be a grid of its own. */
+    display: inline-flex;
+    align-items: baseline;
+    justify-content: center;
     text-align: center;
     background: var(--cut-control-edges), var(--key-image) var(--btn-bg);
     box-shadow: var(--key-shadow);
@@ -604,6 +656,15 @@
   /* The button and the switch that says what it does, as one thing:
      the box beside them grows upward, and these stay on its last line
      rather than being pulled apart by it. */
+  /* Every label the button can have, in one cell: the cell is as wide
+     as the widest of them, and the one being said is the only one you
+     can see. */
+  .says { display: grid; justify-items: center; }
+  .says > * { grid-area: 1 / 1; }
+  /* Measured, not read. `visibility: hidden` takes them out of the
+     accessibility tree as well as off the screen, which `opacity: 0`
+     would not. */
+  .says .ghost { visibility: hidden; }
   .mic { display: flex; align-items: center; gap: 8px; }
   /* Two rows the height of the one button beside them: the gap between
      them is the gap `.mic` already uses, so the three edges line up. */

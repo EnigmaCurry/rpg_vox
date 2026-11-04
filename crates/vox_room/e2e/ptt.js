@@ -88,7 +88,7 @@ const focused = (page) =>
   is('the talk button is dead while the room has you muted',
     await page.evaluate(() => !!document.querySelector('footer .big.ptt[disabled]')), true);
   is('and says which mute it is',
-    await page.evaluate(() => document.querySelector('footer .big.ptt')?.textContent.includes('mixer')), true);
+    await page.evaluate(() => document.querySelector('footer .big.ptt')?.innerText.includes('mixer')), true);
   is('and Space does not talk', await space(page), false);
   await page.click('.rooms .strip button[aria-pressed]');
   await page.waitForTimeout(400);
@@ -310,6 +310,38 @@ const focused = (page) =>
   await page.waitForSelector('footer .big.ptt');
   await page.evaluate(() => document.activeElement?.blur());
   is('with the space bar talking again', await space(page), true);
+
+  // The button does not change width, whatever it says and whatever
+  // key is bound. It is the one control here you put a hand on without
+  // looking, so a button that is one size while it says `Hold to talk`
+  // and another the moment it says `Talking...` moves out from under
+  // you mid-sentence -- and takes the switches beside it along.
+  const wide = () => page.evaluate(() => Math.round(
+    document.querySelector('footer .big').getBoundingClientRect().width));
+  const sizes = {};
+  await page.evaluate(() => document.activeElement?.blur());
+  sizes[await page.evaluate(() => document.querySelector('footer .big').innerText.trim())] = await wide();
+  await page.keyboard.down('Space');
+  await page.waitForTimeout(250);
+  sizes.talking = await wide();
+  await page.keyboard.up('Space');
+  await page.waitForTimeout(800);
+  await page.click('footer .ptt-switch');
+  await page.waitForTimeout(400);
+  sizes.mute = await wide();
+  await page.click('footer .big');
+  await page.waitForTimeout(300);
+  sizes.unmute = await wide();
+  await page.click('footer .big');
+  await page.waitForTimeout(300);
+  await page.click('.rooms .strip button[aria-pressed]');
+  await page.waitForTimeout(400);
+  sizes.mixer = await wide();
+  await page.click('.rooms .strip button[aria-pressed]');
+  await page.waitForTimeout(400);
+  await page.click('footer .ptt-switch');
+  await page.waitForTimeout(400);
+  is('one width for everything it can say', new Set(Object.values(sizes)).size, 1);
 
   // Letting go of the key is heard wherever the focus went in between.
   await page.evaluate(() => document.activeElement?.blur());
