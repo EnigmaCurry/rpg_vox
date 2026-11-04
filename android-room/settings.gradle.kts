@@ -12,5 +12,5 @@ dependencyResolutionManagement {
         mavenCentral()
     }
 }
-rootProject.name = "VoxRoomSpike"
+rootProject.name = "VoxRoom"
 include(":app")

@@ -13,29 +13,27 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-    <!-- Asked for only if the box on the first screen is ticked. Whether
-         it is needed at all is half of what this app is for. -->
-    <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <application
         android:allowBackup="false"
-        android:label="Voice Room (spike)"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
         android:usesCleartextTraffic="false"
         android:theme="@android:style/Theme.Material.NoActionBar">
         <activity
             android:name=".MainActivity"
             android:exported="true"
             android:launchMode="singleTask"
-            android:windowSoftInputMode="adjustResize"
-            >
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|uiMode|density"
+            android:windowSoftInputMode="adjustResize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
-        <!-- The whole point: a microphone-typed foreground service is what
-             stops Android reclaiming the process while the screen is off.
-             Scribe's recording survives on exactly this (ScribeService). -->
+        <!-- What keeps the call alive while the screen is off: Android
+             keeps the process scheduled, and the WebView inside it goes
+             on holding the room. See README.md. -->
         <service
             android:name=".RoomService"
             android:exported="false"
