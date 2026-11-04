@@ -633,8 +633,18 @@
      two rules change nothing. */
   .entry.you .name { color: var(--self); }
   .agent .name { color: var(--agent); }
+  /* A bubble is cut at the top corner away from the face beside it --
+     top right for somebody else, top left for your own, which hang on
+     the other side -- so a column of them leans away from whoever is
+     talking. One corner and not the panels' two: four machined corners
+     round every paragraph is a page the eye cannot rest on.
+
+     Your own cut comes out in your own colour, so the bar down the
+     side turns the corner instead of being sliced off at it. */
   .text {
-    background: var(--bubble);
+    --cut-ink: var(--cut-ink-said);
+    background: var(--cut-said-edges) var(--bubble);
+    clip-path: var(--cut-said);
     border: var(--bubble-border);
     border-left: var(--bubble-edge-w) solid var(--person-edge);
     padding: 8px 12px;
@@ -643,12 +653,19 @@
     white-space: pre-wrap;
     overflow-wrap: anywhere;
   }
-  .entry.you .text { border-left-color: var(--self); }
+  .entry.you .text {
+    --cut-ink: var(--cut-ink-mine);
+    background: var(--cut-mine-edges) var(--bubble);
+    clip-path: var(--cut-mine);
+    border-left-color: var(--self);
+  }
   .agent .text { border-left-color: var(--agent); }
   .text.partial { color: var(--muted); }
-  .text.live { box-shadow: var(--bubble-shadow), 0 0 0 1px color-mix(in srgb, var(--person-edge) 40%, transparent); }
-  .entry.you .text.live { box-shadow: var(--bubble-shadow), 0 0 0 1px color-mix(in srgb, var(--self) 40%, transparent); }
-  .agent .text.live { box-shadow: var(--bubble-shadow), 0 0 0 1px color-mix(in srgb, var(--agent) 40%, transparent); }
+  /* Still arriving. Inset, because the bubble is clipped at a corner
+     and a clip takes anything drawn outside the box with it. */
+  .text.live { box-shadow: var(--bubble-shadow), inset 0 0 0 1px color-mix(in srgb, var(--person-edge) 45%, transparent); }
+  .entry.you .text.live { box-shadow: var(--bubble-shadow), inset 0 0 0 1px color-mix(in srgb, var(--self) 45%, transparent); }
+  .agent .text.live { box-shadow: var(--bubble-shadow), inset 0 0 0 1px color-mix(in srgb, var(--agent) 45%, transparent); }
   /* Thinking: an empty reply bubble with bouncing dots and a breathing edge. */
   .agent .text.live:empty, .agent .text.live:has(> .dots) { animation: breathe 1.6s ease-in-out infinite; }
   .dots { display: inline-flex; gap: 5px; padding: 6px 2px; }
@@ -660,8 +677,8 @@
   .waiting .dots i { animation-duration: 1.8s; background: var(--muted); }
   @keyframes bounce { 0%, 60%, 100% { transform: translateY(0); opacity: 0.4; } 30% { transform: translateY(-5px); opacity: 1; } }
   @keyframes breathe {
-    0%, 100% { box-shadow: var(--bubble-shadow), 0 0 0 1px color-mix(in srgb, var(--agent) 40%, transparent); }
-    50% { box-shadow: var(--bubble-shadow), 0 0 0 4px color-mix(in srgb, var(--agent) 20%, transparent); }
+    0%, 100% { box-shadow: var(--bubble-shadow), inset 0 0 0 1px color-mix(in srgb, var(--agent) 45%, transparent); }
+    50% { box-shadow: var(--bubble-shadow), inset 0 0 0 4px color-mix(in srgb, var(--agent) 22%, transparent); }
   }
   @media (prefers-reduced-motion: reduce) { .dots i, .text { animation: none !important; } }
 

@@ -532,10 +532,34 @@
   /* One width for every label it can have -- Mute, Unmute, Hold to
      talk, Talking... -- so the button under your hand is the same
      button it was a moment ago and nothing beside it moves. */
-  .big { padding: 9px 18px; font-size: 15px; min-width: 12.5em; text-align: center; }
-  .big.muted { background: var(--danger); color: var(--on-solid); border-color: var(--danger); }
+  /* The one button you aim at without looking, so it is the one shaped
+     like something to press: a deeper bevel than the switches beside
+     it, and far deeper than the box you type in, which stays flat. A
+     flat theme leaves `--key-*` at the ordinary button's values and
+     this is the same button it always was, only wider. */
+  .big {
+    padding: 9px 18px;
+    font-size: 15px;
+    min-width: 12.5em;
+    text-align: center;
+    background: var(--cut-control-edges), var(--key-image) var(--btn-bg);
+    box-shadow: var(--key-shadow);
+  }
+  .big:hover { background: var(--cut-control-edges), var(--key-image) var(--btn-hover-bg); }
+  /* Down: the face sinks and the light moves to the bottom edge. */
+  .big:active:not(:disabled), .big.talking { box-shadow: var(--key-down-shadow); }
+  .big.muted {
+    background: var(--danger);
+    color: var(--on-solid);
+    border-color: var(--danger);
+    box-shadow: var(--key-down-shadow);
+  }
   .big.ptt { touch-action: none; user-select: none; -webkit-user-select: none; }
-  .big.ptt.talking { background: var(--ok); color: var(--on-solid); border-color: var(--ok); }
+  .big.ptt.talking {
+    background: var(--ok);
+    color: var(--on-solid);
+    border-color: var(--ok);
+  }
   /* The button and the switch that says what it does, as one thing:
      the box beside them grows upward, and these stay on its last line
      rather than being pulled apart by it. */

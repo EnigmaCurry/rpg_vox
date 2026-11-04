@@ -245,6 +245,7 @@
     <label class="slider">
       <span>App volume</span>
       <input type="range" min="0" max="1.5" step="0.01" value={room.volume}
+        style="--at: {Math.round((room.volume / 1.5) * 100)}%"
         oninput={(e) => setVolume(Number(e.currentTarget.value))} />
       <span class="much">{Math.round(room.volume * 100)}%</span>
     </label>

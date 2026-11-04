@@ -7,6 +7,11 @@
    gradients in its own component -- is the same six declarations copied
    nine times, and a new theme having to find all nine.
 
+   This is also where the corner grammar is pointed at things. A theme
+   declares four cuts and the four colours their faces come out in; the
+   rules below say which of them each kind of thing wears, so there is
+   one place to read "a card is cut like a control" off.
+
    These are global rather than scoped because they are the room's
    furniture rather than any one component's: `.panel` is on a grid cell
    in App, on a heading in Rooms, on a card at the door, and it has to
@@ -20,16 +25,17 @@
 /* A panel: a part of the room with a frame round it.
 
    `clip-path` cuts the corners; the two diagonal faces of the cut are
-   lined by `--frame-corners`, which are background layers rather than a
-   border because a border follows the rectangle the clip just took a
+   lined by `--cut-panel-edges`, which are background layers rather than
+   a border because a border follows the rectangle the clip just took a
    bite out of. The straight edges are inset shadows, which do not
    scroll -- several of these panels are scrollports, and an edge that
    slid away up the screen would be worse than no edge. */
 .panel {
   position: relative;
-  background: var(--frame-corners), var(--surface-image) var(--surface);
+  --cut-ink: var(--cut-ink-panel);
+  background: var(--cut-panel-edges), var(--surface-image) var(--surface);
   border-radius: var(--frame-radius);
-  clip-path: var(--frame-clip);
+  clip-path: var(--cut-panel);
   box-shadow: var(--frame-edge);
   /* The cut corner is a hole in the panel, and a child painting its own
      background into the corner would fill it back in. */
@@ -38,13 +44,16 @@
 }
 
 /* A card: a panel inside a panel. A fader, a card you were dealt, the
-   note at the foot of the column. The same four tokens at a smaller
-   size, so the two read as the same object at two scales. */
+   note at the foot of the column. The control cut, and a bevel of its
+   own that is deliberately fainter than the frame's: a card sits
+   inside a panel, and two rings of equal weight round the same thing
+   read as a mistake rather than as two objects. */
 .card-chrome {
   position: relative;
-  background: var(--card-corners), var(--card-image) var(--card-bg);
+  --cut-ink: var(--cut-ink-control);
+  background: var(--cut-control-edges), var(--card-image) var(--card-bg);
   border-radius: var(--card-radius);
-  clip-path: var(--card-clip);
+  clip-path: var(--cut-control);
   box-shadow: var(--card-edge);
 }
 

@@ -41,24 +41,35 @@ body {
   font: var(--font);
 }
 #app { height: 100%; }
+/* A button wears the control cut -- see `themes/chrome.css` for where
+   the grammar is pointed at each kind of thing. */
 button {
   font: inherit;
+  --cut-ink: var(--cut-ink-control);
   border: 1px solid var(--btn-border);
-  background: var(--btn-image) var(--btn-bg);
+  background: var(--cut-control-edges), var(--btn-image) var(--btn-bg);
   color: var(--btn-ink);
   border-radius: var(--btn-radius);
+  clip-path: var(--cut-control);
   box-shadow: var(--btn-shadow);
   padding: 6px 12px;
   cursor: pointer;
 }
 button:hover {
   border-color: var(--btn-hover-border);
-  background: var(--btn-image) var(--btn-hover-bg);
+  background: var(--cut-control-edges), var(--btn-image) var(--btn-hover-bg);
   color: var(--btn-hover-ink);
 }
+/* A cut corner is a clip, and a clip takes an outline drawn outside the
+   box away with it -- so where corners are cut, the ring is pulled
+   inside. Said once, here, for everything the browser can focus: the
+   room has clipped panels, clipped cards and clipped buttons, and a
+   focus ring you cannot see is the one piece of chrome that is not a
+   matter of taste. */
+:focus-visible { outline-offset: var(--focus-inset); }
 /* The one the room wants you to press. Same shape as the rest, lit. */
 button.primary {
-  background: var(--btn-on-image) var(--btn-on-bg);
+  background: var(--cut-control-edges), var(--btn-on-image) var(--btn-on-bg);
   color: var(--btn-on-ink);
   border-color: var(--btn-on-border);
   box-shadow: var(--btn-on-shadow);
@@ -66,8 +77,60 @@ button.primary {
 button.primary:hover { color: var(--btn-on-ink); }
 button.danger { color: var(--danger); }
 button:disabled { opacity: 0.5; cursor: default; }
-input[type="range"], input[type="checkbox"], input[type="radio"] {
-  accent-color: var(--accent);
+input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
+
+/* The faders, and the one volume slider that is not one.
+   =====================================================
+
+   Themed like everything else rather than left to the browser. How far
+   along the thing has got is `--at`, set on the input by whoever knows
+   the number: a range the page has styled gives no way to paint the
+   part behind the thumb, and a fader you can only read off the thumb
+   is a fader you have to look twice at.
+
+   The flat theme's values are the native control's -- a hairline
+   groove, a round bead in the accent colour -- so this is the same
+   fader it always was, with a theme able to get at it. */
+input[type="range"] {
+  appearance: none;
+  -webkit-appearance: none;
+  height: var(--range-h);
+  background:
+    linear-gradient(var(--range-fill), var(--range-fill))
+      left center / var(--at, 0%) var(--range-groove) no-repeat,
+    linear-gradient(var(--range-track), var(--range-track))
+      left center / 100% var(--range-groove) no-repeat;
+  border-radius: calc(var(--range-groove) / 2);
+  cursor: pointer;
+}
+/* The slug. Each browser names it differently and throws out a whole
+   rule it cannot parse, so the two say the same thing twice. The
+   margin is what centres it: with the page styling the track, the
+   thumb hangs from the top of it. */
+input[type="range"]::-webkit-slider-runnable-track {
+  height: var(--range-h);
+  background: none;
+}
+input[type="range"]::-webkit-slider-thumb {
+  appearance: none;
+  -webkit-appearance: none;
+  width: var(--range-thumb-size);
+  height: var(--range-thumb-size);
+  margin-top: calc((var(--range-h) - var(--range-thumb-size)) / 2);
+  border-radius: 50%;
+  background: var(--range-thumb-image) var(--range-thumb);
+  border: 1px solid var(--range-thumb-border);
+  box-shadow: var(--range-thumb-shadow);
+}
+input[type="range"]::-moz-range-track { height: var(--range-h); background: none; }
+input[type="range"]::-moz-range-progress { background: none; }
+input[type="range"]::-moz-range-thumb {
+  width: var(--range-thumb-size);
+  height: var(--range-thumb-size);
+  border-radius: 50%;
+  background: var(--range-thumb-image) var(--range-thumb);
+  border: 1px solid var(--range-thumb-border);
+  box-shadow: var(--range-thumb-shadow);
 }
 
 /* The room's dialogs: the question, a game's card, a game's prompt. They

@@ -96,7 +96,11 @@
   {/if}
   <div class="meter"><div class="fill" style="width: {pct}%"></div></div>
   <div class="controls">
+    <!-- `--at` is what paints the groove behind the slug: a range the
+         page has styled has no way of its own to say how far along it
+         is. Two is the top of this fader. -->
     <input type="range" min="0" max="2" step="0.01" value={strip.gain} oninput={gain}
+      style="--at: {Math.round((strip.gain / 2) * 100)}%"
       ondblclick={() => change({ gain: 1 })}
       title="{label} level — double-click to put it back" aria-label="{label} level" />
     {#if moved}<span class="db">{db}</span>{/if}
