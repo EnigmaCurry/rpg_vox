@@ -8,6 +8,7 @@
 // belonged to the room just left.
 
 import { RoomAudio, listDevices, onDeviceChange, permitMic } from './audio.js';
+import { Link } from './link.js';
 import {
   connect as connectScreen,
   disconnect as disconnectScreen,
@@ -324,28 +325,36 @@ let invite = location.pathname.startsWith(JOIN)
   ? decodeURIComponent(location.pathname.slice(JOIN.length))
   : null;
 
-let ws = null;
+let link = null;
 let audio = null;
-let retry = 0;
 let noticeTimer = null;
 let hearTimer = null;
 
 /// Open both of the room's sockets: its events and this tab's audio on
 /// /room.ws, and desktop sharing on /screen.ws. Separate connections, so
 /// a burst of video can't delay a 20 ms frame of somebody talking.
+///
+/// The first of them is the worker's, not this thread's -- see link.js.
+/// Reconnecting is its too, for the same reason the frames are: the
+/// thread that draws the room is the one a phone with its screen off
+/// stops giving time to, and a socket waiting to come back wants a
+/// clock that is still running.
 export function open() {
   if (wanted) return;
   wanted = true;
-  connect();
-  connectScreen();
-}
-
-/// Whether the sockets are supposed to be up. A socket that dropped
-/// comes back; one that was shut on the way out to the door does not.
-let wanted = false;
-
-function connect() {
-  const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
+  // One worker for the page: coming back into the room is a new socket
+  // on the thread that is already there.
+  link ??= new Link({
+    onEvent: apply,
+    onUp: () => {
+      room.connected = true;
+      if (room.mic) command({ type: 'mic', on: true });
+      command({ type: 'ptt', on: room.pushToTalk });
+      command({ type: 'mute', on: room.muted });
+      command({ type: 'interpreter', ...room.myInterpreter });
+    },
+    onDown: () => (room.connected = false),
+  });
   // Where to sit. A tab whose socket dropped was in a room when it
   // did, and the room let go of it along with the connection -- so it
   // says where it had got to, rather than being put in the lobby and
@@ -355,28 +364,13 @@ function connect() {
   //
   // The server looks the room up as one of theirs like any other, so
   // there is nothing here to be trusted or not.
-  const seat = room.where ? `?room=${encodeURIComponent(room.where)}` : '';
-  ws = new WebSocket(`${scheme}://${location.host}/room.ws${seat}`);
-  ws.binaryType = 'arraybuffer';
-  ws.onopen = () => {
-    room.connected = true;
-    retry = 0;
-    if (room.mic) command({ type: 'mic', on: true });
-    command({ type: 'ptt', on: room.pushToTalk });
-    command({ type: 'mute', on: room.muted });
-    command({ type: 'interpreter', ...room.myInterpreter });
-  };
-  ws.onmessage = (ev) => {
-    if (typeof ev.data === 'string') apply(JSON.parse(ev.data));
-    else audio?.frame(ev.data);
-  };
-  ws.onclose = () => {
-    room.connected = false;
-    // Shut on purpose: don't crawl back.
-    if (!wanted) return;
-    setTimeout(connect, Math.min(500 * 2 ** retry++, 5000));
-  };
+  link.connect(room.where);
+  connectScreen();
 }
+
+/// Whether the sockets are supposed to be up. A socket that dropped
+/// comes back; one that was shut on the way out to the door does not.
+let wanted = false;
 
 /// Come back on a fresh socket, now rather than after the backoff a
 /// dropped one waits out. A socket is told whose it is when it opens
@@ -388,15 +382,7 @@ function connect() {
 /// and untouched, and the `hello` that comes back says who you are now.
 function reconnect() {
   if (!wanted) return;
-  const old = ws;
-  ws = null;
-  if (old) {
-    // Ours to replace, so the drop handler must not also crawl back:
-    // two sockets would both be in the room, under the same name.
-    old.onclose = null;
-    old.close();
-  }
-  connect();
+  link?.reconnect();
 }
 
 /// One of the door's requests: whatever it is asking, the link this
@@ -524,7 +510,7 @@ export async function logOut() {
 }
 
 export function command(msg) {
-  if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
+  if (link?.up) link.send(msg);
 }
 
 /// Ask the user to confirm, in the page. (The browser's own confirm()
@@ -1241,6 +1227,9 @@ function apply(ev) {
       // means: forget what you had, this is the room.
       const moved = ev.room && ev.room.id !== room.where;
       room.where = ev.room?.id ?? '';
+      // The worker reconnects on its own, so it is the one that has to
+      // know which room to ask for.
+      link?.setSeat(room.where);
       room.title = ev.room?.title ?? 'Voice room';
       room.alone = ev.room?.private ?? false;
       room.you = ev.you;
@@ -1575,9 +1564,7 @@ export async function joinAudio() {
   // not sent the conversation, not counted as being anywhere.
   open();
   try {
-    audio = new RoomAudio((bytes) => {
-      if (ws?.readyState === WebSocket.OPEN) ws.send(bytes);
-    });
+    audio = new RoomAudio(link);
     await audio.start(room.volume, room.speakerId);
     // Any click or key brings back audio the browser stopped.
     addEventListener('pointerdown', resumeAudio);
@@ -1631,9 +1618,7 @@ export async function leaveAudio() {
 function close() {
   disconnectScreen();
   wanted = false;
-  const old = ws;
-  ws = null;
-  old?.close();
+  link?.shut();
   room.connected = false;
   room.people = [];
   room.log = [];

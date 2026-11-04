@@ -239,7 +239,7 @@ sqlite_get() { sqlite "$1" "$2"; }
 sqlite_set() { sqlite "$1" "$2" >/dev/null; }
 
 suites=("$@")
-[[ ${#suites[@]} -eq 0 ]] && suites=(rooms bots door permalinks ptt settings roles conversations game cards avatars drop interpreter)
+[[ ${#suites[@]} -eq 0 ]] && suites=(rooms bots door permalinks ptt settings roles conversations game cards avatars drop interpreter rename)
 
 bad=0
 for suite in "${suites[@]}"; do
