@@ -84,13 +84,13 @@
     display: flex;
     align-items: flex-end;
     gap: 10px;
-    border: 1px solid var(--line);
+    border: 1px solid var(--field-border);
     /* The same corner as the buttons it shares the footer with. */
-    border-radius: 8px;
-    background: var(--bg);
+    border-radius: var(--field-radius);
+    background: var(--field-bg);
     padding: 0 10px;
   }
-  .say:focus-within { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+  .say:focus-within { border-color: var(--accent); box-shadow: var(--field-focus); }
   textarea {
     flex: 1;
     min-width: 0;
@@ -116,9 +116,10 @@
     border: 0;
     border-radius: 0;
     background: none;
+    box-shadow: none;
     color: var(--accent);
     font-weight: 600;
     padding: 9px 0;
   }
-  button:hover { color: var(--ink); }
+  button:hover { color: var(--ink); background: none; }
 </style>

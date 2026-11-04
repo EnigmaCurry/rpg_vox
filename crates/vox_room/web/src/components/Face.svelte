@@ -85,9 +85,9 @@
     overflow: hidden;
     display: grid;
     place-items: center;
-    background: hsl(var(--h) 55% 92%);
-    color: hsl(var(--h) 55% 32%);
-    border: 1px solid hsl(var(--h) 40% 80%);
+    background: var(--face-bg);
+    color: var(--face-ink);
+    border: 1px solid var(--face-line);
     /* No margin of its own: where it sits is the business of whatever
        is placing it. In the conversation it lines up with the name
        above the bubble; in the list of who is here it is on the line. */
@@ -99,9 +99,9 @@
   }
   /* It is a button where it opens somebody, so it has to be told not
      to look like one: the square is the whole of the control. */
-  .face.opens { padding: 0; cursor: pointer; }
-  .face.opens:hover { border-color: hsl(var(--h) 45% 55%); }
-  .face.opens:focus-visible { outline: 2px solid hsl(var(--h) 55% 50%); outline-offset: 2px; }
+  .face.opens { padding: 0; cursor: pointer; box-shadow: none; }
+  .face.opens:hover { border-color: var(--person-edge); background: var(--face-bg); }
+  .face.opens:focus-visible { outline: 2px solid var(--person); outline-offset: 2px; }
   .face.agent.opens:hover { border-color: var(--agent); }
   .initials {
     font-size: var(--initials);
@@ -124,11 +124,4 @@
      room. It is being made smaller, and nearest neighbour throws away
      most of a picture on the way down. */
   img.smooth { image-rendering: auto; }
-  @media (prefers-color-scheme: dark) {
-    .face {
-      background: hsl(var(--h) 35% 22%);
-      color: hsl(var(--h) 45% 78%);
-      border-color: hsl(var(--h) 30% 32%);
-    }
-  }
 </style>

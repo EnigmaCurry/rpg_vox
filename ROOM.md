@@ -1748,6 +1748,42 @@ The puppets speak every language the room is listening in, like the AIs
 do: each line is translated and synthesized ahead of time in each of
 them, and the timing follows the room's own language.
 
+### The look
+
+The room comes up in **Obsidian Comms**: dark glass panels with their
+top-left and bottom-right corners cut, laid on a near-black field and
+lit along their edges in periwinkle. The AI speaks in violet and you
+speak in amber, so a glance down the conversation says whose line is
+whose without reading a name; everybody else keeps the hue their own
+name hashes to, lifted to read on that ground. Nothing in it is a
+picture — the brushed look is a gradient, the cut corners are a clip
+path and the hatching is a repeating one — so it costs no requests and
+is sharp at any size.
+
+**Plain** is the other one: paper by day and graphite by night,
+following whatever the machine is set to, flat, with the columns told
+apart by a hairline and the page running to the glass. It is the look
+the room had before it had a choice, kept whole.
+
+**Settings → The look** picks. It is this browser's own and nothing
+about it goes to the server: two people in the same room can be sitting
+in two different ones and neither can tell, which is also why it is not
+in your profile — it is a fact about a screen, not about a person, and
+the same person at a desk and on a phone may well want different
+answers.
+
+**Writing another.** A theme is a block of custom properties keyed on
+`data-theme`, in `web/src/themes/`. `tokens.css` is the vocabulary —
+about seventy of them, every one declared with a value, so a theme that
+leaves one out gets that rather than a blank. A theme sets tokens and
+nothing else: the shapes are drawn once in `chrome.css` out of the same
+tokens, so four values change the frame on every panel in the room
+rather than nine components each having their own. Components read
+tokens and nothing else; one hardcoded colour is one place the next
+theme is wrong. Add the file, `@import` it from `app.css`, and put its
+name in `THEMES` in `lib/theme.svelte.js` — that list is what Settings
+offers. `legacy.css` is forty lines and is the one worth copying.
+
 ## How it works
 
 - One WebSocket per tab carries 20 ms mono Opus frames both ways

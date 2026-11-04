@@ -75,7 +75,7 @@
   $effect(() => (thumb && stream ? showThumb(stream.id, thumb) : undefined));
 </script>
 
-<div class="strip" class:speaking class:quiet style="--h: {agent ? 270 : hue(label)}">
+<div class="strip card-chrome" class:speaking class:quiet style="--h: {agent ? 270 : hue(label)}">
   <div class="top">
     {#if somebody}
       <!-- The same square as in the conversation, small: this is the
@@ -115,7 +115,11 @@
 </div>
 
 <style>
-  .strip { padding: 4px 4px 5px; border-radius: 7px; }
+  /* A fader is a card: in a framed theme a small panel of its own,
+     in a flat one four pixels of padding and nothing else. Which is
+     why there is no background or border named here -- `card-chrome`
+     has them, out of the theme. */
+  .strip { padding: var(--card-pad, 4px 4px 5px); }
   /* Somebody you can't hear: at the door, mic shut, or muted. They are
      in the room all the same, so they are dimmed rather than moved or
      dropped. */
@@ -124,12 +128,15 @@
      colour. Enough to catch the eye in a list, not enough to flicker. */
   .strip.speaking {
     opacity: 1;
-    background: color-mix(in srgb, hsl(var(--h) 60% 55%) 16%, transparent);
+    /* The colour only: the card's own fill, bevel and cut corners are
+       the theme's and must survive somebody opening their mouth. */
+    background-color: color-mix(in srgb, var(--person-edge) 16%, transparent);
+    box-shadow: var(--card-edge), inset 0 0 0 1px color-mix(in srgb, var(--person-edge) 45%, transparent);
   }
   .top { display: flex; align-items: center; gap: 7px; font-size: 14px; line-height: 1.25; }
   .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); flex: none; }
   .strip:not(.quiet) .dot { background: var(--ok); }
-  .strip.speaking .dot { background: hsl(var(--h) 60% 45%); }
+  .strip.speaking .dot { background: var(--person-edge); }
   .label { font-weight: 600; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .label em { font-weight: 400; color: var(--muted); font-style: normal; }
   .state { font-size: 11px; color: var(--muted); flex: none; }
@@ -148,7 +155,7 @@
     line-height: 0;
     cursor: pointer;
   }
-  .desktop:hover, .desktop:focus-visible { border-color: hsl(var(--h) 60% 55%); }
+  .desktop:hover, .desktop:focus-visible { border-color: var(--person-edge); }
   .desktop.open { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
   /* As wide as the strip, but never tall enough to push the level and
      the mute off a narrow screen, where the strip is the whole width. */
@@ -162,7 +169,7 @@
     padding: 0 6px;
     border-radius: 4px;
     background: rgb(0 0 0 / 60%);
-    color: #fff;
+    color: #ffffff;
     opacity: 0;
     transition: opacity 120ms;
   }
@@ -174,6 +181,6 @@
   .controls input { flex: 1; min-width: 0; height: 14px; margin: 0; }
   .db { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
   .controls button { padding: 1px 8px; font-size: 12px; border-radius: 6px; }
-  .controls button.on { background: var(--danger); color: #fff; border-color: var(--danger); }
+  .controls button.on { background: var(--danger); color: var(--on-solid); border-color: var(--danger); }
   .its-own { margin-top: 6px; }
 </style>

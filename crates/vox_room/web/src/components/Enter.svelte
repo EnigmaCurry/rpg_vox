@@ -55,7 +55,7 @@
 </script>
 
 <main class="enter" aria-labelledby="enter-title">
-  <div class="card">
+  <div class="card panel">
     <!-- One name, said once. The eyebrow is there to say what the
          heading is when the heading is a game's name, and in a room
          with no game on it there is nothing for it to add. -->
@@ -223,13 +223,18 @@
     overflow-y: auto;
     overscroll-behavior: contain;
   }
+  /* A panel like the room's, with its own fill: the door is not a
+     column of the console, but it is the first thing anybody sees and
+     it is made of the same stuff. The three properties `.panel` would
+     have set are composed here rather than replaced, since this card
+     has a border and a corner of its own on top of the theme's. */
   .card {
     width: min(26em, 100%);
     text-align: center;
-    background: var(--panel);
+    background: var(--frame-corners), var(--panel);
     border: 1px solid var(--line);
     border-radius: 16px;
-    box-shadow: var(--shadow), 0 12px 40px rgb(0 0 0 / 12%);
+    box-shadow: var(--frame-edge), var(--shadow);
     padding: 28px 28px 22px;
   }
   .eyebrow {
@@ -251,7 +256,7 @@
     border-radius: 10px;
     padding: 10px 12px;
     margin-bottom: 14px;
-    background: var(--bg);
+    background: var(--field-bg);
   }
   .consent.agreed { border-color: color-mix(in srgb, var(--ok) 45%, var(--line)); }
   .consent p { font-size: 12px; line-height: 1.5; color: var(--muted); margin: 0 0 8px; }
@@ -264,9 +269,9 @@
     font: inherit;
     width: 100%;
     color: var(--ink);
-    background: var(--bg);
-    border: 1px solid var(--line);
-    border-radius: 8px;
+    background: var(--field-bg);
+    border: 1px solid var(--field-border);
+    border-radius: var(--field-radius);
     padding: 8px 10px;
   }
   select:hover { border-color: var(--muted); }
@@ -275,9 +280,9 @@
     font: inherit;
     width: 100%;
     color: var(--ink);
-    background: var(--bg);
-    border: 1px solid var(--line);
-    border-radius: 8px;
+    background: var(--field-bg);
+    border: 1px solid var(--field-border);
+    border-radius: var(--field-radius);
     padding: 8px 10px;
   }
   input[type='text']:hover { border-color: var(--muted); }
@@ -321,6 +326,7 @@
     font-size: 13px;
     color: var(--muted);
     background: none;
+    box-shadow: none;
     border: 0;
     padding: 4px 8px;
   }

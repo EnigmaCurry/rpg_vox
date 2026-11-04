@@ -97,10 +97,10 @@
     gap: 8px;
     margin: 0 0 6px;
     font-size: 11px;
-    font-weight: 700;
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-    color: var(--muted);
+    font-weight: var(--head-weight);
+    letter-spacing: var(--head-letter);
+    text-transform: var(--head-transform);
+    color: var(--head-ink);
   }
   h3 button {
     margin-left: auto;

@@ -4,6 +4,28 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Voice room</title>
+    <script>
+      // The theme, before anything is drawn.
+      //
+      // Which look the room wears is this browser's own (see
+      // lib/theme.svelte.js), which means it is in localStorage, which
+      // means the app cannot apply it until it has loaded -- and a dark
+      // room that arrives one frame after a white one is a flash in the
+      // eye every time the page opens. So it is read here instead, in
+      // the head, before the body exists.
+      //
+      // The key and the default are lib/theme.svelte.js's; if either
+      // changes, it changes in both. A name that is no longer a theme
+      // leaves the room unstyled for an instant and is put right by
+      // `wearTheme()` as the app starts, which is why there is no list
+      // of the valid ones here to go stale.
+      try {
+        document.documentElement.dataset.theme =
+          localStorage.getItem('vox_room.theme') || 'obsidian';
+      } catch (e) {
+        document.documentElement.dataset.theme = 'obsidian';
+      }
+    </script>
   </head>
   <body>
     <div id="app"></div>

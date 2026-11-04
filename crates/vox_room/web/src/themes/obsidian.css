@@ -1,0 +1,203 @@
+/* Obsidian Comms -- the room as a comms console.
+   ==============================================
+
+   Dark glass panels with their corners cut, laid on a near-black field
+   and lit along their edges in periwinkle. The AI speaks in violet and
+   you speak in amber, so a glance down the conversation tells you whose
+   line is whose without reading a name. Everybody else keeps the hue
+   their name hashes to, which on this ground is lifted and desaturated
+   so that two people are still two colours and neither is a shout.
+
+   The cut corner is the motif and it is always the same two: top left
+   and bottom right. Nothing in here is a picture -- the brushed look is
+   a gradient, the hatching is a repeating one -- so the theme costs no
+   requests and scales to any window.
+
+   This is the default. A browser that has never chosen gets it. */
+[data-theme='obsidian'] {
+  color-scheme: dark;
+
+  /* The lit line along a panel's edges. Theme-private: `--frame-edge`
+     and `--frame-corners` below are what the room actually reads, and
+     this is only so the two of them agree. */
+  --edge: #6871b4;
+
+  /* ---- The field the panels lie on ------------------------------- */
+  --deep: #07080d;
+  --deep-image:
+    radial-gradient(130% 80% at 50% -10%, #1b2135 0%, #0b0e16 55%, #06070c 100%);
+  --app-pad: 10px;
+  --app-gap: 10px;
+
+  /* ---- Surfaces --------------------------------------------------- */
+  --bg: #0e1119;
+  --panel: #1b1f2c;
+  --dialog-bg: #1b1f2c;
+  /* Flat, deliberately. The depth here is in the bevel and in the
+     field showing between the panels; a gradient down the face of one
+     would have to be matched by the bar stuck to the top of the
+     conversation, which scrolls over it. The gradients are on the
+     cards, which are small and have nothing stuck to them. */
+  --surface: #13161f;
+  --surface-image: none;
+  --well: var(--surface);
+  --foot-surface: #13161f;
+
+  /* ---- Ink and rules ----------------------------------------------- */
+  --ink: #e7eaf3;
+  --muted: #8a90a7;
+  --line: #2a3043;
+  /* The columns are held apart by the gap between their frames; a rule
+     down the edge of one would be a second border beside the first. */
+  --column-rule: none;
+  /* A menu is the one thing here that is not a panel and still has to
+     read as lifted off one: a dark ring under it, because on this
+     ground a soft shadow alone is invisible. */
+  --shadow: 0 0 0 1px rgb(0 0 0 / 60%), 0 18px 40px rgb(0 0 0 / 65%);
+
+  /* ---- Meanings ------------------------------------------------------ */
+  --accent: #6d7cf5;
+  --accent-ink: #f4f6ff;
+  --agent: #a98bff;
+  --self: #e9b96a;
+  --self-ink: #2a1d06;
+  --danger: #ff6a5c;
+  --ok: #56d68c;
+  --meter: #56d68c;
+  --on-solid: #0b0d14;
+
+  --glow-accent: rgb(109 124 245 / 55%);
+  --glow-agent: rgb(169 139 255 / 50%);
+  --glow-self: rgb(233 185 106 / 45%);
+
+  /* ---- The frame -------------------------------------------------------
+     The shape, then the two diagonals, then the bevel. See the note in
+     `tokens.css` for why the diagonals are background layers: a clip
+     path cuts the corner off the rectangle an inset shadow is still
+     tracing, so the cut face has to be painted rather than bordered. */
+  --chamfer: 16px;
+  --frame-radius: 3px;
+  --frame-clip: polygon(
+    var(--chamfer) 0,
+    100% 0,
+    100% calc(100% - var(--chamfer)),
+    calc(100% - var(--chamfer)) 100%,
+    0 100%,
+    0 var(--chamfer)
+  );
+  --frame-corners:
+    linear-gradient(135deg,
+      transparent calc(50% - 0.8px), var(--edge) calc(50% - 0.8px),
+      var(--edge) calc(50% + 0.8px), transparent calc(50% + 0.8px))
+      top left / var(--chamfer) var(--chamfer) no-repeat,
+    linear-gradient(135deg,
+      transparent calc(50% - 0.8px), var(--edge) calc(50% - 0.8px),
+      var(--edge) calc(50% + 0.8px), transparent calc(50% + 0.8px))
+      bottom right / var(--chamfer) var(--chamfer) no-repeat;
+  --frame-edge:
+    inset 0 0 0 1px #4a5490,
+    inset 0 1px 0 rgb(198 206 255 / 26%),
+    inset 0 0 28px -10px rgb(123 110 255 / 45%);
+  --rail: inset 0 -2px 0 rgb(124 124 255 / 55%);
+
+  /* ---- A card inside a panel ---------------------------------------- */
+  --card-bg: #181d2b;
+  /* A highlight along the top edge rather than a wash down the whole
+     face: a settings section is ten times the height of a fader, and a
+     gradient that fits one reads as weather over the other. */
+  --card-image: linear-gradient(180deg, rgb(132 146 226 / 12%) 0, rgb(132 146 226 / 0%) 54px);
+  --card-radius: 2px;
+  --card-chamfer: 10px;
+  --card-clip: polygon(
+    var(--card-chamfer) 0,
+    100% 0,
+    100% calc(100% - var(--card-chamfer)),
+    calc(100% - var(--card-chamfer)) 100%,
+    0 100%,
+    0 var(--card-chamfer)
+  );
+  --card-corners:
+    linear-gradient(135deg,
+      transparent calc(50% - 0.7px), #3f4873 calc(50% - 0.7px),
+      #3f4873 calc(50% + 0.7px), transparent calc(50% + 0.7px))
+      top left / var(--card-chamfer) var(--card-chamfer) no-repeat,
+    linear-gradient(135deg,
+      transparent calc(50% - 0.7px), #3f4873 calc(50% - 0.7px),
+      #3f4873 calc(50% + 0.7px), transparent calc(50% + 0.7px))
+      bottom right / var(--card-chamfer) var(--card-chamfer) no-repeat;
+  --card-edge:
+    inset 0 0 0 1px #343c63,
+    inset 0 1px 0 rgb(180 190 255 / 14%);
+  --card-pad: 9px 10px;
+
+  /* ---- Buttons ---------------------------------------------------------
+     Keys on a console: a shallow dome, a dark sill under it, and a lit
+     face when they are down. */
+  --btn-bg: #1e2433;
+  --btn-image: linear-gradient(180deg, #2b3248 0%, #1c2130 100%);
+  --btn-border: #3a4262;
+  --btn-ink: #dfe3f2;
+  --btn-radius: 7px;
+  --btn-shadow: inset 0 1px 0 rgb(255 255 255 / 6%), 0 2px 5px rgb(0 0 0 / 45%);
+  --btn-hover-bg: #262d41;
+  --btn-hover-border: #5b67a0;
+  --btn-hover-ink: #ffffff;
+  --btn-on-bg: #4558d8;
+  --btn-on-image: linear-gradient(180deg, #5f71f2 0%, #3a4cc6 100%);
+  --btn-on-border: #8491ff;
+  --btn-on-ink: #ffffff;
+  --btn-on-shadow:
+    inset 0 1px 0 rgb(255 255 255 / 28%),
+    0 0 12px -2px var(--glow-accent);
+
+  /* ---- Fields ------------------------------------------------------------ */
+  --field-bg: #0d1017;
+  --field-border: #333b57;
+  --field-radius: 8px;
+  --field-focus: 0 0 0 1px var(--accent), 0 0 16px -4px var(--glow-accent);
+
+  /* ---- Bubbles ------------------------------------------------------------ */
+  --bubble: #242a3a;
+  --bubble-radius: 10px;
+  --bubble-border: 1px solid #333a52;
+  --bubble-shadow: inset 0 1px 0 rgb(255 255 255 / 4%), 0 10px 20px -14px #000;
+  --bubble-edge-w: 3px;
+
+  /* ---- Headings ----------------------------------------------------------- */
+  --head-ink: #7f88b5;
+  --head-weight: 700;
+  --head-letter: 0.08em;
+
+  /* ---- Decoration ----------------------------------------------------------
+     The hatching in a panel's spare corner. It says nothing; it is the
+     console admitting it has corners. */
+  --hatch: repeating-linear-gradient(
+    135deg,
+    rgb(150 160 220 / 20%) 0 2px,
+    transparent 2px 8px
+  );
+  --hatch-w: 46px;
+  --hatch-h: 16px;
+
+  /* ---- People -------------------------------------------------------------
+     Lifted and held back: on this ground a name at 45% is unreadable and
+     one at full saturation is a flare. */
+  --person-s: 62%;
+  --person-l: 70%;
+  --person-edge-s: 58%;
+  --person-edge-l: 60%;
+  --face-bg: hsl(var(--h, 230) 30% 24%);
+  --face-ink: hsl(var(--h, 230) 58% 80%);
+  --face-line: hsl(var(--h, 230) 34% 44%);
+}
+
+/* A narrow screen has one column on it and no width to spare, so the
+   field around the panels closes up. The frames stay: they are how the
+   footer is told from the conversation when the two are stacked. */
+@media (max-width: 860px) {
+  [data-theme='obsidian'] {
+    --app-pad: 6px;
+    --app-gap: 6px;
+    --chamfer: 12px;
+  }
+}

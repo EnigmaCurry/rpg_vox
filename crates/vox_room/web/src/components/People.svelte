@@ -367,7 +367,7 @@
   section {
     border: 1px solid var(--line);
     border-radius: 10px;
-    background: var(--panel);
+    background: var(--card-image) var(--panel);
     padding: 14px 16px;
     margin-top: 16px;
   }

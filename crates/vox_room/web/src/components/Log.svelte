@@ -128,7 +128,7 @@
      foot of the room, beside the button you talk with: saying a thing
      and typing it are the same act done two ways, and this column is
      for what came of either. -->
-<div class="log">
+<div class="log panel">
   <!-- A playhouse, while one is open: the stage at the top with the
        characters on it, the director's box under it, and then the
        conversation, which is the audience. Stacked above the
@@ -597,7 +597,7 @@
     width: 9px;
     height: 9px;
     border-radius: 50%;
-    background: #d8463c;
+    background: var(--danger);
     animation: recording 1.6s ease-in-out infinite;
   }
   @keyframes recording {
@@ -626,20 +626,29 @@
   .entry.you .said-by { align-items: flex-end; }
   .who { font-size: 12px; color: var(--muted); display: flex; gap: 8px; margin: 0 4px 2px; }
   .entry.you .who { justify-content: flex-end; }
-  .name { font-weight: 600; color: hsl(var(--h) 55% 45%); }
+  .name { font-weight: 600; color: var(--person); }
+  /* Your own name and your own bubble, in whatever the theme keeps for
+     you. A theme that keeps nothing leaves `--self` at the hue your
+     name hashes to, which is what every other name here is, and these
+     two rules change nothing. */
+  .entry.you .name { color: var(--self); }
   .agent .name { color: var(--agent); }
   .text {
     background: var(--bubble);
-    border-left: 3px solid hsl(var(--h) 55% 55%);
+    border: var(--bubble-border);
+    border-left: var(--bubble-edge-w) solid var(--person-edge);
     padding: 8px 12px;
-    border-radius: 10px;
+    border-radius: var(--bubble-radius);
+    box-shadow: var(--bubble-shadow);
     white-space: pre-wrap;
     overflow-wrap: anywhere;
   }
+  .entry.you .text { border-left-color: var(--self); }
   .agent .text { border-left-color: var(--agent); }
   .text.partial { color: var(--muted); }
-  .text.live { box-shadow: 0 0 0 1px hsl(var(--h) 55% 55% / 40%); }
-  .agent .text.live { box-shadow: 0 0 0 1px color-mix(in srgb, var(--agent) 40%, transparent); }
+  .text.live { box-shadow: var(--bubble-shadow), 0 0 0 1px color-mix(in srgb, var(--person-edge) 40%, transparent); }
+  .entry.you .text.live { box-shadow: var(--bubble-shadow), 0 0 0 1px color-mix(in srgb, var(--self) 40%, transparent); }
+  .agent .text.live { box-shadow: var(--bubble-shadow), 0 0 0 1px color-mix(in srgb, var(--agent) 40%, transparent); }
   /* Thinking: an empty reply bubble with bouncing dots and a breathing edge. */
   .agent .text.live:empty, .agent .text.live:has(> .dots) { animation: breathe 1.6s ease-in-out infinite; }
   .dots { display: inline-flex; gap: 5px; padding: 6px 2px; }
@@ -651,8 +660,8 @@
   .waiting .dots i { animation-duration: 1.8s; background: var(--muted); }
   @keyframes bounce { 0%, 60%, 100% { transform: translateY(0); opacity: 0.4; } 30% { transform: translateY(-5px); opacity: 1; } }
   @keyframes breathe {
-    0%, 100% { box-shadow: 0 0 0 1px color-mix(in srgb, var(--agent) 40%, transparent); }
-    50% { box-shadow: 0 0 0 4px color-mix(in srgb, var(--agent) 20%, transparent); }
+    0%, 100% { box-shadow: var(--bubble-shadow), 0 0 0 1px color-mix(in srgb, var(--agent) 40%, transparent); }
+    50% { box-shadow: var(--bubble-shadow), 0 0 0 4px color-mix(in srgb, var(--agent) 20%, transparent); }
   }
   @media (prefers-reduced-motion: reduce) { .dots i, .text { animation: none !important; } }
 
@@ -677,11 +686,12 @@
     font: inherit;
     font-size: 12px;
     color: var(--muted);
+    box-shadow: none;
     text-decoration: underline dotted;
     text-underline-offset: 2px;
     cursor: pointer;
   }
-  .swap:hover { color: var(--ink); }
+  .swap:hover { color: var(--ink); box-shadow: none; }
   /* Block, so it sits under the bubble rather than beside it, and
      pushed over for your own messages, which hang on the right. */
   .swap { display: block; }

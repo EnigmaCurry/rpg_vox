@@ -3,6 +3,7 @@
     room, setName, setVolume, avatarOf, forgetAvatar, myFaces, faceAt, wearFace,
     command, setPttHush, setBotsOff, theAI, theAIs,
   } from '../lib/room.svelte.js';
+  import { theme, setTheme, THEMES } from '../lib/theme.svelte.js';
   import { NAME_MAX } from '../lib/names.js';
   import { scaledDown } from '../lib/pixels.js';
   import Face from './Face.svelte';
@@ -249,6 +250,30 @@
     </label>
   </section>
 
+  <!-- What the room looks like, which is this browser's business and
+       nobody else's: it is not sent anywhere, and two people in the
+       same room can be sitting in two different ones without either
+       being able to tell. Kept per browser for the same reason -- the
+       same person at a desk and on a phone may well want different
+       answers. See `lib/theme.svelte.js`. -->
+  <section>
+    <h2>The look</h2>
+    <p class="note first">
+      Yours alone, and only on this browser. Nobody else in the room sees it
+      change.
+    </p>
+    {#each THEMES as t (t.id)}
+      <label class="duplex">
+        <input type="radio" name="theme" checked={theme.id === t.id}
+          onchange={() => setTheme(t.id)} />
+        <span>
+          {t.name}
+          <small>{t.blurb}</small>
+        </span>
+      </label>
+    {/each}
+  </section>
+
   {#if room.voices.length}
     <section>
       <h2>Voices</h2>
@@ -320,7 +345,7 @@
   section {
     border: 1px solid var(--line);
     border-radius: 10px;
-    background: var(--panel);
+    background: var(--card-image) var(--panel);
     padding: 14px 16px;
     margin-top: 16px;
   }
@@ -343,9 +368,9 @@
     font: inherit;
     width: 100%;
     color: var(--ink);
-    background: var(--bg);
-    border: 1px solid var(--line);
-    border-radius: 8px;
+    background: var(--field-bg);
+    border: 1px solid var(--field-border);
+    border-radius: var(--field-radius);
     padding: 8px 10px;
   }
   .name input:hover { border-color: var(--muted); }
@@ -364,6 +389,7 @@
     overflow: hidden;
     border: 1px solid var(--line);
     background: var(--bubble);
+    box-shadow: none;
     cursor: pointer;
   }
   /* The one being worn is not a thing to press, so it does not look

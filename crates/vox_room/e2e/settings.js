@@ -208,6 +208,41 @@ const sayAt = (page) => page.evaluate(() => {
   await wait(400);
   is('and back again', (await feet(page))[0].what, 'Mute Space');
 
+  // The look, which is this browser's and nobody else's. It is on the
+  // settings page, it is remembered, and it is on the page before the
+  // app is -- `index.html` sets it in the head so the room does not
+  // flash the other theme on its way to this one.
+  await page.click('.tools button.cog');
+  await page.waitForSelector('.settings');
+  const look = () =>
+    page.evaluate(() => ({
+      on: document.documentElement.dataset.theme,
+      kept: localStorage.getItem('vox_room.theme'),
+      picked: [...document.querySelectorAll('input[name="theme"]')].findIndex((r) => r.checked),
+    }));
+  is('a browser that has never chosen is in Obsidian Comms',
+    await look(), { on: 'obsidian', kept: 'obsidian', picked: 0 });
+  await page.locator('input[name="theme"]').nth(1).check();
+  await wait(300);
+  is('and can be put in the plain one', await look(), { on: 'legacy', kept: 'legacy', picked: 1 });
+  // A reload puts this tab back at the door -- the audio went with it
+  // -- and the theme is on the page before the door is.
+  await page.reload();
+  await page.waitForSelector('.enter');
+  is('which is what it comes back in',
+    await page.evaluate(() => document.documentElement.dataset.theme), 'legacy');
+  await page.locator('.consent input').check();
+  await page.click('button:has-text("Join Audio")');
+  await page.waitForTimeout(2600);
+  // Back where it was, so nothing after this is reading the other one.
+  await page.click('.tools button.cog');
+  await page.waitForSelector('.settings');
+  await page.locator('input[name="theme"]').nth(0).check();
+  await wait(300);
+  is('and back again', (await look()).on, 'obsidian');
+  await page.keyboard.press('Escape');
+  await wait(400);
+
   // Escape closes it too, and the cog says whether it is open.
   await page.click('.tools button.cog');
   await page.waitForSelector('.settings');

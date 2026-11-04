@@ -123,7 +123,7 @@
 <!-- The page's heading, and the way to every other room. There is no
      title bar over this: the room you are in is named here, once. -->
 <h1 class="pick" bind:this={picker}>
-  <button class="current" class:on={open} aria-haspopup="listbox" aria-expanded={open}
+  <button class="current panel" class:on={open} aria-haspopup="listbox" aria-expanded={open}
     title={open ? 'Close the list of rooms' : 'Which room you are in. Press for the others.'}
     onclick={() => (open = !open)}>
     <span class="name">{room.title}</span>
@@ -155,7 +155,7 @@
   {/if}
 </h1>
 
-<nav class="rooms" aria-label="Who is in {room.title}">
+<nav class="rooms panel" aria-label="Who is in {room.title}">
   <!-- A puppet show playing. Said here, over the strips, because the
        faders below are where the puppets are and because this is the
        one time the room has set what every voice answers and what
@@ -243,7 +243,7 @@
       <Strip key={room.interpreter.level} label="Interpreter" agent doing={interpreting}
         fader={room.myInterpreter} onfader={setInterpreter} />
     {/if}
-    <p class="hint">
+    <p class="hint card-chrome">
       {#if room.alone}
         This room is yours: nobody else can come into it, and nothing said here
         reaches the rest of the house.
@@ -257,6 +257,10 @@
         turns it off — for you, and with the words still written down.
       {/if}
     </p>
+    <!-- The console admitting it has a corner. It says nothing, it is
+         not read out, and a theme that does not decorate gives it no
+         size, so it is not in the column either. -->
+    <span class="hatch mark" aria-hidden="true"></span>
   </div>
 </nav>
 
@@ -268,13 +272,23 @@
   /* The heading. It is a heading and a control at once -- the room you
      are in, named once, and the way to the others -- so it is sized
      like the title it replaced rather than like a button. */
+  /* The heading is the box the list hangs out of, so the frame goes on
+     the button inside it and not here: a panel's corners are cut with
+     `clip-path`, and a clip takes its descendants with it -- the list
+     of rooms below would be clipped out of existence. */
   .pick {
     position: relative;
     margin: 0;
     font-size: inherit;
     font-weight: inherit;
-    border-bottom: 1px solid var(--line);
+    border-bottom: var(--column-rule);
   }
+  /* The room you are in, named once, and the way to the others. It
+     carries the frame, for the reason above: in a framed theme it is
+     the pill at the top of the column, and in a flat one `.panel`
+     resolves to nothing and this is the plain heading it always was.
+     The lit line under it is composed with the frame's own bevel here
+     rather than left to `.panel`, which knows nothing about rails. */
   .current {
     display: flex;
     align-items: center;
@@ -282,14 +296,15 @@
     width: 100%;
     text-align: left;
     border: 0;
-    border-radius: 0;
-    background: transparent;
     padding: 9px 12px;
     font-size: 17px;
     font-weight: 600;
+    box-shadow: var(--rail), var(--frame-edge);
   }
-  .current:hover { background: var(--bubble); }
-  .current.on { background: var(--bubble); }
+  /* The colour only: the frame's cut corners are laid into the same
+     property, and a whole `background` here would paint over them. */
+  .current:hover { background-color: var(--bubble); }
+  .current.on { background-color: var(--bubble); }
   .current .caret { margin-left: auto; font-size: 12pt; opacity: 0.6; font-weight: 400; }
   .current.on .caret { transform: rotate(180deg); }
   .name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -312,7 +327,7 @@
     background: var(--panel);
     border: 1px solid var(--line);
     border-radius: 0 0 10px 10px;
-    box-shadow: var(--shadow), 0 10px 30px rgb(0 0 0 / 12%);
+    box-shadow: var(--shadow);
     padding: 4px;
   }
   .list button {
@@ -324,12 +339,13 @@
     border: 0;
     border-radius: 7px;
     background: transparent;
+    box-shadow: none;
     padding: 6px 8px;
     font-weight: 600;
     font-size: 14px;
   }
   .list button:hover { background: var(--bubble); }
-  .list button.on { background: var(--accent); color: var(--accent-ink); }
+  .list button.on { background: var(--btn-on-bg); color: var(--btn-on-ink); }
   .list button:not(:has(.game)) .name { flex: 1; }
   /* Whatever is left over goes between the names and the count. */
   .list .game { margin-right: auto; }
@@ -341,7 +357,7 @@
     background: var(--bubble);
     color: var(--muted);
   }
-  .list button.on .count { background: var(--accent-ink); color: var(--accent); }
+  .list button.on .count { background: var(--btn-on-ink); color: var(--btn-on-bg); }
   /* Long game names must not push the count off the row, so this is
      what gives way first. */
   .game {
@@ -353,7 +369,7 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  .list button.on .game { color: var(--accent-ink); opacity: 0.85; }
+  .list button.on .game { color: var(--btn-on-ink); opacity: 0.85; }
   /* A room nobody else can come into, said rather than counted: there
      is never anybody in it but you. */
   .yours {
@@ -371,7 +387,23 @@
     overscroll-behavior: contain;
   }
   .who { display: flex; flex-direction: column; gap: 7px; }
-  .hint { font-size: 12px; color: var(--muted); margin: 4px 0 0; }
+  /* The note at the foot of the column: what this room is, said once.
+     A card in a framed theme, plain text in a flat one -- which is
+     what `--card-*` being nothing comes to. */
+  .hint {
+    font-size: 12px;
+    color: var(--muted);
+    margin: 4px 0 0;
+    padding: var(--card-pad, 0);
+  }
+  /* Where the hatching goes: the bottom of the column, out of the way
+     of everything that means something. */
+  .mark {
+    display: block;
+    width: var(--hatch-w);
+    height: var(--hatch-h);
+    margin-top: 10px;
+  }
   /* The show. One line, and the only thing in this column with a
      border round it: it is the one state here that nobody in the room
      chose and that changes what every control below it is doing. */
@@ -415,9 +447,9 @@
     font: inherit;
     font-size: 12px;
     padding: 1px 4px;
-    border: 1px solid var(--line);
+    border: 1px solid var(--field-border);
     border-radius: 6px;
-    background: var(--panel);
+    background: var(--field-bg);
     color: var(--ink);
   }
   .when select:disabled { opacity: 0.6; }

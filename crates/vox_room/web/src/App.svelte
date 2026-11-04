@@ -296,7 +296,7 @@
 
     {#if screen.watching != null}<Board />{/if}
 
-    <footer>
+    <footer class="panel">
       {#if room.audio === 'on'}
         <div class="mic">
         {#if room.pushToTalk}
@@ -401,6 +401,11 @@
       "tools cards log"
       "rooms cards log"
       "foot  foot  foot";
+    /* What a framed theme uses to hold the panels off the edges of the
+       window and off each other; zero in a flat one, where the columns
+       meet along the hairlines below and the room runs to the glass. */
+    padding: var(--app-pad);
+    gap: var(--app-gap);
   }
   /* With nothing in your cards there is no column for them, and the
      conversation has the half they were taking. */
@@ -411,7 +416,7 @@
   /* The heading and the strips are two cells of one column, so the
      rule down its edge is on both -- and the heading's own rule under
      it is its, in the component. */
-  :global(.pick), :global(.rooms) { border-right: 1px solid var(--line); }
+  :global(.pick), :global(.rooms) { border-right: var(--column-rule); }
   :global(.pick) { grid-area: pick; }
   :global(.rooms) { grid-area: rooms; min-height: 0; }
   /* What you do with the room, over the people in it. */
@@ -424,8 +429,8 @@
     justify-content: flex-end;
     gap: 6px;
     padding: 8px 10px;
-    border-right: 1px solid var(--line);
-    border-bottom: 1px solid var(--line);
+    border-right: var(--column-rule);
+    border-bottom: var(--column-rule);
   }
   .tools button {
     display: inline-flex;
@@ -436,10 +441,15 @@
     font-size: 15px;
     line-height: 1;
   }
-  .tools button.on { background: var(--accent); border-color: var(--accent); }
+  .tools button.on {
+    background: var(--btn-on-image) var(--btn-on-bg);
+    color: var(--btn-on-ink);
+    border-color: var(--btn-on-border);
+    box-shadow: var(--btn-on-shadow);
+  }
   .tools .cog[aria-pressed='true'] { border-color: var(--accent); color: var(--accent); }
   .tools .leave:hover { border-color: var(--danger); }
-  :global(.cards) { grid-area: cards; border-right: 1px solid var(--line); }
+  :global(.cards) { grid-area: cards; border-right: var(--column-rule); }
   /* One area at a time is a narrow-screen idea; here all three show. */
   .views { display: none; }
   h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin: 0 0 4px; }
@@ -512,16 +522,20 @@
     align-items: flex-start;
     gap: 8px;
     padding: 8px 12px;
-    border-top: 1px solid var(--line);
-    background: var(--panel);
+    border-top: var(--column-rule);
+    /* A panel that is also the thing you reach for, so it names its own
+       fill: in a flat theme it is raised off the page, in a framed one
+       it is another panel of the console. The `.panel` class on it
+       draws the frame out of this. */
+    --surface: var(--foot-surface);
   }
   /* One width for every label it can have -- Mute, Unmute, Hold to
      talk, Talking... -- so the button under your hand is the same
      button it was a moment ago and nothing beside it moves. */
   .big { padding: 9px 18px; font-size: 15px; min-width: 12.5em; text-align: center; }
-  .big.muted { background: var(--danger); color: #fff; border-color: var(--danger); }
+  .big.muted { background: var(--danger); color: var(--on-solid); border-color: var(--danger); }
   .big.ptt { touch-action: none; user-select: none; -webkit-user-select: none; }
-  .big.ptt.talking { background: var(--ok); color: var(--accent-ink); border-color: var(--ok); }
+  .big.ptt.talking { background: var(--ok); color: var(--on-solid); border-color: var(--ok); }
   /* The button and the switch that says what it does, as one thing:
      the box beside them grows upward, and these stay on its last line
      rather than being pulled apart by it. */
@@ -540,7 +554,12 @@
   }
   /* On is on, and reads as on without being read: these are the two
      switches nobody looks at twice. */
-  .switch.on { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+  .switch.on {
+    background: var(--btn-on-image) var(--btn-on-bg);
+    color: var(--btn-on-ink);
+    border-color: var(--btn-on-border);
+    box-shadow: var(--btn-on-shadow);
+  }
   kbd { font-size: 11px; opacity: 0.7; border: 1px solid currentColor; border-radius: 4px; padding: 0 4px; margin-left: 4px; }
   .vol { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); }
   /* Device names run long; keep one from pushing the controls off. */
@@ -563,15 +582,19 @@
   }
   .views button:first-child { border-radius: 8px 0 0 8px; }
   .views button:last-child { border-radius: 0 8px 8px 0; border-right-width: 1px; }
-  .views button.on { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+  .views button.on {
+    background: var(--btn-on-image) var(--btn-on-bg);
+    color: var(--btn-on-ink);
+    border-color: var(--btn-on-border);
+  }
   .views .badge {
     font-size: 11px;
     border-radius: 999px;
     padding: 0 6px;
     background: var(--agent);
-    color: var(--accent-ink);
+    color: var(--on-solid);
   }
-  .views button.on .badge { background: var(--accent-ink); color: var(--accent); }
+  .views button.on .badge { background: var(--btn-on-ink); color: var(--btn-on-bg); }
 
   /* Narrow: one area at a time, with the switch above it. */
   @media (max-width: 860px) {

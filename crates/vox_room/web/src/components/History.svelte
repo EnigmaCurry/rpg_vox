@@ -124,6 +124,11 @@
 
   <div class="spacer"></div>
 
+  <!-- The console admitting it has a corner. Decoration, hidden from
+       anything that reads the page out, and given no size at all by a
+       theme that does not decorate. -->
+  <span class="hatch mark" aria-hidden="true"></span>
+
   <!-- Starting the next one, beside the way back into the last ones:
        they are the same question asked in two directions. -->
   {#if !reading}
@@ -177,12 +182,13 @@
     gap: 10px;
     /* Stuck to the head of the scroller, so what passes behind it is
        covered rather than showing through. */
-    background: var(--bg);
+    background: var(--well);
     padding: 2px 0 8px;
     margin-bottom: 2px;
     border-bottom: 1px solid var(--line);
   }
   .spacer { flex: 1; }
+  .mark { flex: none; width: var(--hatch-w); height: var(--hatch-h); }
   /* A box that reads as the heading it is until you are in it. */
   .name {
     flex: 0 1 22em;
@@ -193,18 +199,18 @@
     color: var(--ink);
     background: transparent;
     border: 1px solid transparent;
-    border-radius: 6px;
+    border-radius: var(--field-radius);
     padding: 2px 6px;
   }
   .name:hover { border-color: var(--line); }
-  .name:focus { border-color: var(--muted); outline: none; background: var(--panel); }
+  .name:focus { border-color: var(--accent); outline: none; background: var(--field-bg); }
   .playing {
     font-size: 11px;
     font-weight: 600;
     padding: 1px 8px;
     border-radius: 999px;
     background: var(--agent);
-    color: var(--accent-ink);
+    color: var(--on-solid);
   }
   .closed { font-size: 12px; color: var(--muted); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .back { padding: 2px 10px; font-size: 13px; }
@@ -225,7 +231,7 @@
     background: var(--panel);
     border: 1px solid var(--line);
     border-radius: 10px;
-    box-shadow: var(--shadow), 0 10px 30px rgb(0 0 0 / 12%);
+    box-shadow: var(--shadow);
     padding: 4px;
   }
   .none { font-size: 13px; color: var(--muted); margin: 0; padding: 8px 10px; }
@@ -244,6 +250,7 @@
     border-radius: 7px;
     padding: 7px 10px;
     background: transparent;
+    box-shadow: none;
   }
   .head { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
   .at { font-weight: 600; font-size: 13px; }
@@ -269,11 +276,12 @@
     align-self: center;
     border: 0;
     background: transparent;
+    box-shadow: none;
     color: var(--muted);
     font-size: 16px;
     line-height: 1;
     padding: 4px 9px;
     border-radius: 6px;
   }
-  .drop:hover { background: var(--danger); color: #fff; }
+  .drop:hover { background: var(--danger); color: var(--on-solid); }
 </style>

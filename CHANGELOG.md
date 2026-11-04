@@ -90,6 +90,36 @@ releases.
 
 ### Voice room
 
+- **The room has a look, and it is now a thing you can choose.** Every
+  colour, every border and every corner in the app came out of thirteen
+  custom properties and a `prefers-color-scheme` block, which was one
+  look in two shades and no way to have another. The vocabulary is now
+  about seventy tokens -- surfaces, frames, bevels, glows, fields,
+  bubbles, headings, what a person's hue is made of -- declared once in
+  `web/src/themes/tokens.css`, answered by a theme, and read by every
+  component. Nothing in a component names a colour.
+
+  **Obsidian Comms** is the new default and the reason for the rest:
+  dark glass panels with their top-left and bottom-right corners cut,
+  laid on a near-black field and lit along their edges. The AI speaks in
+  violet and you speak in amber, so a glance down the conversation says
+  whose line is whose without reading a name; everybody else keeps the
+  hue their own name hashes to. The cut corners are `clip-path` and the
+  two diagonal faces are hard-stopped gradients -- there is no image in
+  the theme, so it costs no requests and is sharp at any size.
+
+  **Plain** is the old look, kept whole: paper by day and graphite by
+  night, following whatever the machine is set to, flat, with the
+  columns told apart by a hairline. Everything structural in it is the
+  default, so it is forty lines of colour.
+
+  **Settings → The look** chooses. It is this browser's own and goes
+  nowhere near the server: two people in the same room can be sitting in
+  two different ones and neither can tell, and the same person at a desk
+  and on a phone may well want different answers. `index.html` reads the
+  choice before the first paint, so the room does not flash white on its
+  way to being black.
+
 - **Whether an AI may answer you is now your own switch, and the bots'
   Answers control is gone.** When an AI spoke was one setting per bot
   -- *never / when named / when it fits / every pause* -- shared by the

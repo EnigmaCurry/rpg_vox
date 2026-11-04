@@ -115,7 +115,7 @@
     z-index: 50;
   }
   .who-card {
-    background: var(--bg, var(--bubble));
+    background: var(--dialog-bg);
     border: 1px solid var(--line);
     border-radius: 14px;
     padding: 20px;
@@ -139,9 +139,9 @@
     overflow: hidden;
     display: grid;
     place-items: center;
-    background: hsl(var(--h) 55% 92%);
-    color: hsl(var(--h) 55% 32%);
-    border: 1px solid hsl(var(--h) 40% 80%);
+    background: var(--face-bg);
+    color: var(--face-ink);
+    border: 1px solid var(--face-line);
   }
   .face.agent {
     background: color-mix(in srgb, var(--agent) 14%, var(--bubble));
@@ -171,17 +171,9 @@
     border-radius: 999px;
     color: var(--muted);
   }
-  .tag.here { color: hsl(140 45% 38%); border-color: hsl(140 35% 60%); }
+  .tag.here { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, var(--line)); }
   .tag.ai { color: var(--agent); border-color: color-mix(in srgb, var(--agent) 45%, var(--line)); }
   .bio { margin: 2px 0 0; line-height: 1.5; text-align: left; }
   .quiet { margin: 2px 0 0; color: var(--muted); }
   .who-card button { margin-top: 6px; }
-  @media (prefers-color-scheme: dark) {
-    .face {
-      background: hsl(var(--h) 35% 22%);
-      color: hsl(var(--h) 45% 78%);
-      border-color: hsl(var(--h) 30% 32%);
-    }
-    .tag.here { color: hsl(140 40% 62%); border-color: hsl(140 25% 38%); }
-  }
 </style>

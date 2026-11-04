@@ -10,7 +10,7 @@
      at all. Holding none of them, you are not shown this at all — App
      leaves it out rather than giving the screen over to an explanation
      of what might one day appear in it. -->
-<section class="cards" aria-label="Just for you">
+<section class="cards panel" aria-label="Just for you">
   <header>
     <h2>Just for you</h2>
     <span class="count">{room.cards.length}</span>
@@ -41,7 +41,12 @@
     display: flex;
     flex-direction: column;
     min-height: 0;
-    background: color-mix(in srgb, var(--agent) 4%, transparent);
+    /* The wash that says this column is the AI's doing. The colour
+       only: `.panel` lays the frame's cut corners and fill into the
+       same property, and a whole `background` here would paint over
+       them. In a flat theme `--surface` is nothing, so this is the
+       same four per cent of agent over the page it always was. */
+    background-color: color-mix(in srgb, var(--agent) 4%, var(--surface));
   }
   header {
     display: flex;
@@ -52,14 +57,15 @@
   }
   h2 {
     font-size: 13px;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
+    text-transform: var(--head-transform);
+    letter-spacing: var(--head-letter);
+    font-weight: var(--head-weight);
     color: var(--agent);
     margin: 0;
   }
   .count {
     font-size: 11px;
-    color: var(--accent-ink);
+    color: var(--on-solid);
     background: var(--agent);
     border-radius: 999px;
     padding: 0 6px;
@@ -80,7 +86,7 @@
   .card {
     border: 1px solid color-mix(in srgb, var(--agent) 45%, var(--line));
     border-radius: 10px;
-    background: var(--panel);
+    background: var(--card-image) var(--panel);
     padding: 10px 14px;
     animation: dealt 1.2s ease-out;
   }

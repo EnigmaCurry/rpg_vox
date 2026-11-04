@@ -1,0 +1,205 @@
+/* What a theme may set, and what everything else may read.
+   =======================================================
+
+   The room has one look at a time and more than one look to choose
+   from, so nothing in a component names a colour. A component asks for
+   a thing by what it is -- the panel, the well, the AI's colour, your
+   own -- and the theme in `data-theme` on <html> says what that is.
+
+   Three rules keep that honest:
+
+   - Every token is declared here, with a value. A theme that leaves
+     one out gets this one rather than a blank, so adding a token to
+     the vocabulary never breaks a theme that was written before it.
+   - A theme sets tokens and nothing else. The shapes -- what a panel
+     is, where its bevel goes -- are drawn once in `chrome.css` out of
+     these, so a theme changes the look of every panel in the room by
+     changing four values rather than by finding them all.
+   - Components read tokens and nothing else. One hardcoded `#fff` is
+     one place the next theme is wrong.
+
+   The defaults below are the plain look: a flat page, hairline rules,
+   square-cornered panels with no fill of their own. `legacy.css` is
+   little more than colours on top of this; `obsidian.css` is the one
+   that uses the rest.
+
+   A handful of these are written in terms of `--h`, the hue a person's
+   name hashes to (`lib/color.js`), which is set on the element being
+   drawn and not here. A custom property is substituted where it is
+   *used*, so `--person` below resolves against whichever person's row
+   it is read in. That is what lets a theme say how a person's colour
+   is built -- how saturated, how light -- in one place, for everybody. */
+:root {
+  /* ---- The page, behind everything ------------------------------ */
+  /* `--deep` is what the panels are laid on. In a flat theme it is the
+     same as `--bg`; in a framed one it is darker than anything else. */
+  --deep: var(--bg);
+  --deep-image: none;
+  /* How far the panels are held off the edges of the window, and off
+     each other. Zero makes the room edge to edge, which is the plain
+     look: the panels meet along the hairlines below. */
+  --app-pad: 0px;
+  --app-gap: 0px;
+
+  /* ---- Surfaces -------------------------------------------------- */
+  /* `--bg` is the page and the inside of a field; `--panel` is a thing
+     raised off it -- a menu, a dialog, a card. Both predate the themes
+     and mean what they always did. */
+  --bg: #f6f5f2;
+  --panel: #ffffff;
+  /* A dialog is raised over everything, so it names its own fill rather
+     than taking the page's. */
+  --dialog-bg: var(--bg);
+  /* `--surface` is what a panel of the room is filled with: the column
+     of faders, the conversation, the footer. Transparent in a flat
+     theme, where the page itself is the fill. */
+  --surface: transparent;
+  --surface-image: none;
+  /* A well is a surface sunk into a panel: the conversation's
+     scrollport, and the bar stuck to the top of it. The two share a
+     token because the bar has to cover what scrolls under it. */
+  --well: transparent;
+  /* The footer is a panel that is also raised, so it names its own. */
+  --foot-surface: var(--panel);
+
+  /* ---- Ink and rules --------------------------------------------- */
+  --ink: #1d1d1f;
+  --muted: #6b6b70;
+  --line: #e3e1dc;
+  /* The rule down the side of a column. A framed theme has the frame
+     instead and sets this to none. */
+  --column-rule: 1px solid var(--line);
+  --shadow: 0 1px 2px rgb(0 0 0 / 6%), 0 2px 8px rgb(0 0 0 / 4%);
+
+  /* ---- Meanings --------------------------------------------------- */
+  --accent: #3d5afe;      /* the room's own colour: on, chosen, focused */
+  --accent-ink: #ffffff;  /* what reads on top of it */
+  --agent: #7c4dff;       /* an AI, wherever one appears */
+  /* You. A theme that tells your own lines apart by colour sets this;
+     the plain one leaves them in your own hue like everybody else's. */
+  --self: var(--person);
+  --self-ink: var(--accent-ink);
+  --danger: #d93025;
+  --ok: #188038;
+  --meter: #34a853;
+  /* Where something has to read on a solid --danger or --ok. */
+  --on-solid: #ffffff;
+
+  /* ---- Glow -------------------------------------------------------
+     What a lit edge is made of. `none` in a theme that does not light
+     anything, which is most of them. */
+  /* Written as a colour rather than `none`, because these are dropped
+     into shadow lists a component builds: `0 0 10px transparent` is a
+     shadow that isn't there, and `0 0 10px none` is a broken rule. The
+     same goes for every shadow token below. */
+  --glow-accent: transparent;
+  --glow-agent: transparent;
+  --glow-self: transparent;
+
+  /* ---- The frame around a panel -----------------------------------
+     Four tokens draw every panel in the room (`chrome.css`):
+
+       --frame-clip     the panel's shape, as a clip-path
+       --frame-corners  background layers that line the cut corners
+       --frame-edge     inset shadows: the bevel along the straight edges
+       --frame-radius   for a theme whose corners are round, not cut
+
+     The cut corner is `--chamfer` square, taken out of the top left and
+     the bottom right. `clip-path` cuts the shape but an inset shadow
+     still follows the rectangle, so the two diagonals are drawn as
+     background layers instead -- a hard-stopped gradient whose middle
+     band lies exactly along the cut. */
+  --chamfer: 0px;
+  --frame-radius: 0px;
+  --frame-clip: none;
+  --frame-corners: none;
+  --frame-edge: 0 0 transparent;
+  --frame-shadow: 0 0 transparent;
+  /* The lit line under a panel's heading. */
+  --rail: 0 0 transparent;
+
+  /* ---- A card: a panel inside a panel ------------------------------
+     A fader, a dealt card, the note at the foot of the column. Same
+     four tokens, smaller. */
+  --card-bg: transparent;
+  --card-image: none;
+  --card-radius: 7px;
+  --card-chamfer: 0px;
+  --card-clip: none;
+  --card-corners: none;
+  --card-edge: 0 0 transparent;
+  /* How much air a card puts round what is in it. The one token here
+     that is deliberately *not* declared: a card in a flat theme is not
+     a box at all, and what it should be instead differs per card -- a
+     fader keeps its four pixels, the note at the foot of the column
+     keeps none. So each reads it with its own flat-theme answer as the
+     fallback, `var(--card-pad, 4px 4px 5px)`, and a theme that boxes
+     its cards declares it once and takes over every one of them. */
+
+  /* ---- Buttons ------------------------------------------------------ */
+  --btn-bg: var(--panel);
+  --btn-image: none;
+  --btn-border: var(--line);
+  --btn-ink: var(--ink);
+  --btn-radius: 8px;
+  --btn-shadow: 0 0 transparent;
+  --btn-hover-bg: var(--btn-bg);
+  --btn-hover-border: var(--muted);
+  --btn-hover-ink: var(--btn-ink);
+  /* A button that is on: a tab you are looking at, a switch you threw. */
+  --btn-on-bg: var(--accent);
+  --btn-on-image: none;
+  --btn-on-border: var(--accent);
+  --btn-on-ink: var(--accent-ink);
+  --btn-on-shadow: 0 0 transparent;
+
+  /* ---- Fields -------------------------------------------------------- */
+  --field-bg: var(--bg);
+  --field-border: var(--line);
+  --field-radius: 8px;
+  --field-focus: 0 0 0 1px var(--accent);
+
+  /* ---- Bubbles -------------------------------------------------------
+     What somebody said. The edge down the side is the speaker's colour
+     and is set where it is drawn; these are the rest of it. */
+  --bubble: #f0efeb;
+  --bubble-radius: 10px;
+  --bubble-border: 0px solid transparent;
+  --bubble-shadow: 0 0 transparent;
+  --bubble-edge-w: 3px;
+
+  /* ---- Headings -------------------------------------------------------
+     The small uppercase labels over a part of the room. */
+  --head-ink: var(--muted);
+  --head-weight: 700;
+  --head-letter: 0.06em;
+  --head-transform: uppercase;
+  --font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+
+  /* ---- Decoration ------------------------------------------------------
+     Marks that mean nothing: the hatching in the corners of a console.
+     `none` is a theme that doesn't decorate, and the elements carrying
+     it are `aria-hidden` either way. */
+  --hatch: none;
+  /* How much room the hatching is given. Zero is a theme that does not
+     decorate: the element carrying it is still in the markup, and still
+     takes no space in the row it sits in. */
+  --hatch-w: 0px;
+  --hatch-h: 0px;
+
+  /* ---- A person's colour ------------------------------------------------
+     Built from `--h`, which is set on the row, the bubble or the face
+     being drawn. A theme says how light and how saturated; which hue is
+     the name's business. See the note at the top about why this works. */
+  --person-s: 55%;
+  --person-l: 45%;
+  --person-edge-s: 55%;
+  --person-edge-l: 55%;
+  --person: hsl(var(--h, 230) var(--person-s) var(--person-l));
+  --person-edge: hsl(var(--h, 230) var(--person-edge-s) var(--person-edge-l));
+  /* The square with somebody's initials in it, when they have no
+     picture: a wash of their hue, their hue darker for the letters. */
+  --face-bg: hsl(var(--h, 230) 55% 92%);
+  --face-ink: hsl(var(--h, 230) 55% 32%);
+  --face-line: hsl(var(--h, 230) 40% 80%);
+}

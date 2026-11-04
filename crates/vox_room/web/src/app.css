@@ -1,37 +1,24 @@
-:root {
-  --bg: #f6f5f2;
-  --panel: #ffffff;
-  --ink: #1d1d1f;
-  --muted: #6b6b70;
-  --line: #e3e1dc;
-  --accent: #3d5afe;
-  --accent-ink: #ffffff;
-  --agent: #7c4dff;
-  --danger: #d93025;
-  --ok: #188038;
-  --meter: #34a853;
-  --bubble: #f0efeb;
-  --shadow: 0 1px 2px rgb(0 0 0 / 6%), 0 2px 8px rgb(0 0 0 / 4%);
-  color-scheme: light;
-}
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #141416;
-    --panel: #1c1c1f;
-    --ink: #ececee;
-    --muted: #9a9aa1;
-    --line: #2c2c31;
-    --accent: #7b8cff;
-    --accent-ink: #0d0d10;
-    --agent: #b39dff;
-    --danger: #ff6b5e;
-    --ok: #5bd17a;
-    --meter: #5bd17a;
-    --bubble: #242428;
-    --shadow: none;
-    color-scheme: dark;
-  }
-}
+/* The room's global styles.
+   =========================
+
+   Three things live here and nothing else: the look the room is wearing
+   (imported below), the handful of element defaults every component
+   inherits, and the two blocks of markup that are built outside any
+   component -- the dialogs, which are raised from several places, and
+   the HTML a card's body is turned into.
+
+   Nothing here names a colour. `themes/tokens.css` says what the
+   vocabulary is; `themes/obsidian.css` and `themes/legacy.css` answer
+   it; and `themes/chrome.css` draws the one shape -- a panel -- that
+   would otherwise be copied into nine components. */
+
+/* The vocabulary first, so a theme overrides it rather than the other
+   way round, then the themes, then the furniture built out of both. */
+@import './themes/tokens.css';
+@import './themes/obsidian.css';
+@import './themes/legacy.css';
+@import './themes/chrome.css';
+
 * { box-sizing: border-box; }
 html, body {
   margin: 0;
@@ -45,25 +32,43 @@ html, body {
   overscroll-behavior: none;
 }
 body {
-  background: var(--bg);
+  /* The field the panels lie on. In a flat theme this is the page
+     itself and there are no panels; in a framed one it is darker than
+     anything laid on it, and what shows between the frames. */
+  background: var(--deep-image) var(--deep);
+  background-attachment: fixed;
   color: var(--ink);
-  font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  font: var(--font);
 }
 #app { height: 100%; }
 button {
   font: inherit;
-  border: 1px solid var(--line);
-  background: var(--panel);
-  color: var(--ink);
-  border-radius: 8px;
+  border: 1px solid var(--btn-border);
+  background: var(--btn-image) var(--btn-bg);
+  color: var(--btn-ink);
+  border-radius: var(--btn-radius);
+  box-shadow: var(--btn-shadow);
   padding: 6px 12px;
   cursor: pointer;
 }
-button:hover { border-color: var(--muted); }
-button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+button:hover {
+  border-color: var(--btn-hover-border);
+  background: var(--btn-image) var(--btn-hover-bg);
+  color: var(--btn-hover-ink);
+}
+/* The one the room wants you to press. Same shape as the rest, lit. */
+button.primary {
+  background: var(--btn-on-image) var(--btn-on-bg);
+  color: var(--btn-on-ink);
+  border-color: var(--btn-on-border);
+  box-shadow: var(--btn-on-shadow);
+}
+button.primary:hover { color: var(--btn-on-ink); }
 button.danger { color: var(--danger); }
 button:disabled { opacity: 0.5; cursor: default; }
-input[type="range"] { accent-color: var(--accent); }
+input[type="range"], input[type="checkbox"], input[type="radio"] {
+  accent-color: var(--accent);
+}
 
 /* The room's dialogs: the question, a game's card, a game's prompt. They
    are raised from more than one component, so the look is global. */
@@ -72,8 +77,8 @@ dialog.ask {
   border-radius: 12px;
   padding: 18px 20px;
   max-width: min(28em, calc(100vw - 32px));
-  background: var(--bg, var(--bubble));
-  color: inherit;
+  background: var(--dialog-bg);
+  color: var(--ink);
   box-shadow: 0 12px 40px rgb(0 0 0 / 18%);
 }
 dialog.ask::backdrop { background: rgb(0 0 0 / 35%); }
