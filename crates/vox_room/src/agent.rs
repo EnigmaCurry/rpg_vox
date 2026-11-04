@@ -1019,9 +1019,14 @@ impl Agent {
             let generation = self.generation.clone();
             let r = room.clone();
             let canonical = canonical.clone();
+            // One per thread: each of them asks the room whether this
+            // voice is being heard or only read.
+            let mine = who.clone();
             std::thread::Builder::new()
                 .name(format!("vox-room-voice-{who}-{language}"))
-                .spawn(move || speak(r, &canonical, &language, voice, translate, rx, generation))
+                .spawn(move || {
+                    speak(r, &mine, &canonical, &language, voice, translate, rx, generation)
+                })
                 .expect("spawn voice thread");
         }
         let tx = Voices(senders);
@@ -1389,6 +1394,7 @@ fn game_prompt(game: &str, prompt: &str, allowed: Allowed) -> String {
 #[allow(clippy::too_many_arguments)]
 fn speak(
     room: Arc<Room>,
+    bot: &str,
     canonical: &str,
     language: &str,
     mut voice: Box<dyn Voice>,
@@ -1424,6 +1430,28 @@ fn speak(
                 // play to an empty queue. Checked per sentence, so
                 // somebody arriving mid-reply is heard out from there.
                 if !own && !room.is_heard_in(language) {
+                    continue;
+                }
+                // And nobody wants it out loud at all: this voice is
+                // muted on the room's mixer, which means the room is
+                // reading it rather than listening to it. Same saving
+                // as above and a bigger one -- no translating and no
+                // synthesis in any language.
+                //
+                // The room's own language still hands the sentence over
+                // with no audio on it, because that is what writes it
+                // into the conversation and what claims the turn from
+                // the other bots. A sentence with nothing to play is
+                // heard the moment it arrives, so the reply is read at
+                // the speed it is thought rather than the speed it
+                // would have been spoken. See `Room::aloud`.
+                if !room.aloud(bot) {
+                    if own {
+                        if !room.agent_speak(g, &text, Vec::new()) {
+                            debug!(g, "reply dropped while it was being written");
+                        }
+                        index += 1;
+                    }
                     continue;
                 }
                 let started = Instant::now();

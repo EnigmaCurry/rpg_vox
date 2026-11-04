@@ -36,6 +36,10 @@
     // has a face to show beside the name. The interpreter is a channel
     // and not anybody, and has none.
     somebody = false,
+    // Switched off in this room, for a voice that can be. `undefined`
+    // is a channel with no such switch -- a person, a puppet, the
+    // interpreter -- and then there is no button for one.
+    off = undefined,
     // Whether this person is taking answers from the AIs: their own
     // BOTS switch, which is on the roster everybody is sent. Only a
     // person has one -- an AI is the other side of that question, and
@@ -56,8 +60,11 @@
   // appears under your thumb.
   const moved = $derived(Math.abs(strip.gain - 1) > 0.005);
   // Nothing of theirs is reaching the room: at the door, mic shut, or
-  // muted. They are here, and you can't hear them.
-  const quiet = $derived(!agent && (!mic || muted || strip.mute));
+  // muted. They are here, and you can't hear them. A voice switched
+  // off is the same thing for the same reason -- it is in the list and
+  // it is not in the room's conversation -- and dimming is what says
+  // so without being read.
+  const quiet = $derived(off === true || (!agent && (!mic || muted || strip.mute)));
 
   const state = $derived(
     doing ?? (speaking ? 'talking' : mic && muted ? 'muted' : mic ? 'mic on' : 'no mic'),
@@ -67,17 +74,17 @@
   // when they are: everybody starts with the switch on, and a mark
   // against every name in the room would be a mark that means nothing.
   // So the icon is the exception and its absence is the rule.
-  const off = $derived(bots && bots !== 'any' ? bots : null);
+  const botsOff = $derived(bots && bots !== 'any' ? bots : null);
   const yours = $derived(label === room.you);
   const one = $derived(theAIs().length === 1);
   const why = $derived(
-    !off
+    !botsOff
       ? ''
       : yours
-        ? off === 'never'
+        ? botsOff === 'never'
           ? `You have BOTS off all the way: nothing you say reaches ${theAI()}, its own name included. Nobody else in the room is affected.`
           : `You have BOTS off: ${theAI()} ${one ? 'stays' : 'stay'} out of what you say until you say its name. Nobody else in the room is affected.`
-        : off === 'never'
+        : botsOff === 'never'
           ? `${label} has BOTS off all the way: nothing they say reaches ${theAI()}, its own name included. Everybody else is answered as usual.`
           : `${label} has BOTS off: ${theAI()} ${one ? 'stays' : 'stay'} out of what they say until they say its name. Everybody else is answered as usual.`,
   );
@@ -92,6 +99,15 @@
   // The desktop this person is sharing, if they are. Whether it is open
   // full size is this tab's own business: clicking here opens it for
   // nobody but you.
+  // A voice the room made has no level worth setting: it is as loud
+  // as the room asked it to be, and nobody has ever wanted it louder
+  // or quieter than the rest of the room. So the fader is not shown
+  // for one -- what is left is the two switches that do mean
+  // something, side by side. The interpreter is the exception and
+  // keeps its own, because turning that one down is how you turn it
+  // off for yourself: see `Rooms`.
+  const fades = $derived(!agent || onfader !== undefined);
+
   const stream = $derived(agent ? undefined : streamOf(label));
   const open = $derived(stream && screen.watching === stream.id);
 
@@ -113,8 +129,8 @@
          because at this size the thing to see is whether the AIs are
          in what somebody says at all; which of the two it is is the
          nuance, and it is in the title and in how solid the mark is. -->
-    {#if off}
-      <span class="bots" class:all={off === 'never'} role="img" title={why} aria-label={why}>
+    {#if botsOff}
+      <span class="bots" class:all={botsOff === 'never'} role="img" title={why} aria-label={why}>
         <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" focusable="false">
           <path d="M3 2.5h10A1.5 1.5 0 0 1 14.5 4v4.5A1.5 1.5 0 0 1 13 10H7.5L4.75 12.25V10H3A1.5 1.5 0 0 1 1.5 8.5V4A1.5 1.5 0 0 1 3 2.5Z"
             fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" />
@@ -135,15 +151,32 @@
   {/if}
   <div class="meter"><div class="fill" style="width: {pct}%"></div></div>
   <div class="controls">
-    <!-- `--at` is what paints the groove behind the slug: a range the
-         page has styled has no way of its own to say how far along it
-         is. Two is the top of this fader. -->
-    <input type="range" min="0" max="2" step="0.01" value={strip.gain} oninput={gain}
-      style="--at: {Math.round((strip.gain / 2) * 100)}%"
-      ondblclick={() => change({ gain: 1 })}
-      title="{label} level — double-click to put it back" aria-label="{label} level" />
-    {#if moved}<span class="db">{db}</span>{/if}
-    <button class:on={strip.mute} onclick={mute} aria-pressed={strip.mute}
+    {#if fades}
+      <!-- `--at` is what paints the groove behind the slug: a range the
+           page has styled has no way of its own to say how far along it
+           is. Two is the top of this fader. -->
+      <input type="range" min="0" max="2" step="0.01" value={strip.gain} oninput={gain}
+        style="--at: {Math.round((strip.gain / 2) * 100)}%"
+        ondblclick={() => change({ gain: 1 })}
+        title="{label} level — double-click to put it back" aria-label="{label} level" />
+      {#if moved}<span class="db">{db}</span>{/if}
+    {:else}
+      <span class="spacer"></span>
+    {/if}
+    <!-- Off is off: nothing is asked of it, so nothing is thought and
+         nothing is said. It keeps its place here and everything set on
+         it, which is what makes this a switch rather than a way of
+         getting rid of a voice. -->
+    {#if off !== undefined}
+      <button class="power" class:on={!off} aria-pressed={!off}
+        onclick={() => command({ type: 'bot_off', bot: label, off: !off })}
+        title={off
+          ? `${label} is switched off in this room: it is asked nothing and says nothing. Press to bring it back.`
+          : `Switch ${label} off in this room. It keeps its place and everything set on it, and is asked nothing until it is switched back on — nobody else's room changes.`}>
+        {off ? 'Off' : 'On'}
+      </button>
+    {/if}
+    <button class="mute" class:on={strip.mute} onclick={mute} aria-pressed={strip.mute}
       title={onfader
         ? `${strip.mute ? 'Unmute' : 'Mute'} ${label} for yourself — nobody else's hearing changes`
         : strip.mute
@@ -233,8 +266,24 @@
   .fill { height: 100%; background: var(--meter); transition: width 80ms linear; }
   .controls { display: flex; align-items: center; gap: 7px; }
   .controls input { flex: 1; min-width: 0; height: 14px; margin: 0; }
+  /* What the fader was taking, for a voice that has none: the
+     switches stay over on the right where they are on every other
+     strip, rather than sliding under the name. */
+  .controls .spacer { flex: 1; }
+  /* On is the quiet state here, unlike every other switch in the room:
+     a voice being in the room is the ordinary thing, and a button lit
+     up to say so against every bot in the list would be the list
+     shouting. Off is the one worth seeing -- and it is outlined rather
+     than filled, because filled red next to it is the mute, and the
+     two are different things. The strip dims as well, which is the
+     part you see without reading. */
+  .controls button.power.on { color: var(--muted); }
+  .controls button.power:not(.on) { color: var(--danger); border-color: var(--danger); }
   .db { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
   .controls button { padding: 1px 8px; font-size: 12px; border-radius: 6px; }
-  .controls button.on { background: var(--danger); color: var(--on-solid); border-color: var(--danger); }
+  /* Named, not just `.on`: there is a second switch on this row now,
+     and a rule that said "any switch in here that is on is red" put
+     the mute's colour on it. */
+  .controls button.mute.on { background: var(--danger); color: var(--on-solid); border-color: var(--danger); }
   .its-own { margin-top: 6px; }
 </style>

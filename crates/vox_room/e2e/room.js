@@ -249,10 +249,26 @@ async function socket(token, base = BASE) {
       const bot = (p.agents ?? []).find((b) => b.name === m.bot);
       if (bot) bot.stops = m.stops;
     } else if (m.type === 'agents') {
+      // Names and states only: the light one, sent many times a turn.
       for (const a of m.agents) {
         const bot = (p.agents ?? []).find((b) => b.name === a.name);
         if (bot) bot.state = a.state;
       }
+    } else if (m.type === 'voice') {
+      // Which voice one of them is speaking in. A browser follows this
+      // to keep the name on the strip right, and so must a socket:
+      // without it the voice on `agents` is whatever it was when the
+      // room was last described in full.
+      const bot = (p.agents ?? []).find((b) => b.name === m.bot);
+      if (bot) bot.voice = m.voice ?? null;
+    } else if (m.type === 'agents_here') {
+      // And the heavy one: which voices are in the room and everything
+      // set on each. A browser has always followed this; a socket used
+      // not to, so anything *set* on a bot while a script was watching
+      // -- which voice it speaks in, whether it is switched off -- was
+      // a change the script never saw.
+      p.agents = m.agents;
+      p.mode = m.agents[0]?.mode;
     } else if (m.type === 'rooms') {
       p.rooms = m.rooms;
     } else if (m.type === 'notice') {

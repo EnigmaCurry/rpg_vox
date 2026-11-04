@@ -90,6 +90,39 @@ releases.
 
 ### Voice room
 
+- **An AI's strip gains the controls that were missing, and loses the
+  one nobody wanted.** It had a fader and a **Stops**; it now has an
+  **On/Off** switch, a **Mute** that means something different for a
+  voice the room made, a **Voice** picker, and no fader at all --
+  nobody has ever wanted one of these louder or quieter than the rest
+  of the room.
+
+  **Off is off.** No turn is given to it by anything, so nothing is
+  asked of a model, nothing is thought and nothing is said. It keeps
+  its place in the list and everything set on it, the strip dims and
+  says `off`, and it is the room's, like **Stops**: the room down the
+  hall has its own answer and this one is still off tomorrow. Not the
+  same as the `Mode::Never` a game or a show sets -- that one is the
+  room's own doing and is put back by whatever set it, and this is a
+  switch a person threw.
+
+  **Mute now means the room is reading that voice rather than hearing
+  it.** It used to synthesize every word and throw the audio away.
+  Nothing is synthesized at all now, in any language -- and because the
+  words are no longer paced to audio that does not exist, the whole
+  reply lands at once, as fast as it is thought. Nor can anybody talk
+  over it: there is nothing in the air to talk over, so **Stops** has
+  nothing to do and a sentence is never cut off half-written. **Stop**
+  still stops it.
+
+  **Voice** picks which of the house's cloned voices it speaks in *in
+  this room*. Which voice an AI speaks in is still the house's -- one
+  name, one face, one voice -- and a room may now disagree: *as the
+  house has it* is where every room starts and what most of them stay,
+  and a room with an answer of its own keeps it when the house is
+  settled afterwards. Handing the question back is not the same as
+  choosing the AI's own voice here, which is an answer like any other.
+
 - **Who the AIs are staying out of is now visible in the room.**
   Whether an AI may answer you became each person's own switch, and it
   has been on the roster everybody is sent ever since -- an AI that

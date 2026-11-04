@@ -13,7 +13,9 @@
 //! {"type": "interpreter", "gain": 0.8, "mute": false}
 //! {"type": "bots", "how": "any"}
 //! {"type": "stops", "bot": "Vox", "stops": "finished"}
+//! {"type": "bot_off", "bot": "Sage", "off": true}
 //! {"type": "voice", "bot": "Vox", "voice": "Alan Watts"}
+//! {"type": "room_voice", "bot": "Vox", "voice": "Alan Watts", "here": true}
 //! {"type": "name_conversation", "conversation": 7, "title": "The heist"}
 //! {"type": "stop"}
 //! {"type": "new_conversation"}
@@ -1314,6 +1316,26 @@ enum Command {
         bot: String,
         stops: String,
     },
+    /// Switch one bot off in this room, or back on. Off is off: no
+    /// turn is given to it, so nothing is asked of a model. It keeps
+    /// its place in the list and everything set on it. See
+    /// `room::Room::set_bot_off`.
+    BotOff {
+        bot: String,
+        off: bool,
+    },
+    /// Which voice one bot speaks in *in this room*, overriding what
+    /// the house settled on. `here: false` gives the room no opinion
+    /// again and it follows the house; `voice: null` with `here: true`
+    /// is this room wanting the AI's own voice whatever the house
+    /// says. See `room::Room::wear_voice_here`.
+    RoomVoice {
+        bot: String,
+        #[serde(default)]
+        voice: Option<String>,
+        #[serde(default)]
+        here: bool,
+    },
     /// Which of the house's cloned voices one bot in this room speaks
     /// in, from now on and after a restart. Null, or left out, is its
     /// own voice again. See `room::Room::wear_voice`.
@@ -1531,6 +1553,16 @@ async fn client(
                             }
                         }
                         Ok(Command::Stops { bot, stops }) => room.set_stops(&bot, &stops),
+                        Ok(Command::BotOff { bot, off }) => room.set_bot_off(&bot, off),
+                        // Like `Voice`, only the tab that asked hears
+                        // why not: a voice deleted while somebody had
+                        // the picker open is their problem.
+                        Ok(Command::RoomVoice { bot, voice, here }) => {
+                            let want = here.then(|| voice.unwrap_or_default());
+                            if let Err(why) = room.wear_voice_here(&bot, want.as_deref()) {
+                                room.tell(&name, &why);
+                            }
+                        }
                         // Only the tab that asked hears why not: a
                         // voice that has been deleted while somebody
                         // had the picker open is their problem and

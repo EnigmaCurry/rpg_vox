@@ -1072,6 +1072,20 @@ impl Store {
         self.set_global(&self.key(key), value)
     }
 
+    /// Take one of this room's settings away, so that whatever would
+    /// be read in its absence is read again.
+    ///
+    /// Not the same as setting it to nothing: an empty value is a room
+    /// having said something, and some settings mean something by it.
+    /// Which voice an AI speaks in is one -- empty is *its own voice*,
+    /// and the row being gone is this room having no opinion and
+    /// taking the house's. See [`crate::room::Room::settled_voice`].
+    pub fn clear_setting(&self, key: &str) -> Result<()> {
+        self.db
+            .execute("DELETE FROM settings WHERE key = ?1", params![self.key(key)])?;
+        Ok(())
+    }
+
     /// One of the *house's* settings: the same value whichever room is
     /// asking, where a room's own would be the same thing said
     /// differently in each of them.

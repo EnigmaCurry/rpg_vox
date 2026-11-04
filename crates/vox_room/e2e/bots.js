@@ -169,6 +169,121 @@ const marks = (page) =>
   await wait(600);
   is('and back on', switches(ryan), { Alex: 'any', Ryan: 'any' });
 
+  // Switched off in this room: not silenced, not taken out of the
+  // house -- asked nothing, so nothing is thought and nothing is
+  // said. It keeps its place in the list and everything set on it.
+  const before = byBots(ryan).length;
+  ryan.send({ type: 'bot_off', bot: 'Sage', off: true });
+  await wait(600);
+  is('one of them is switched off here',
+    ryan.agents.map((a) => [a.name, a.off]), [['Vox', false], ['Sage', true]]);
+  is('and its strip says so rather than promising a turn',
+    ryan.agents.find((a) => a.name === 'Sage').state, 'off');
+  ryan.send({ type: 'text', text: 'Sage, are you there?' });
+  await settled(ryan);
+  is('and being named does not wake it', byBots(ryan).slice(before).map((e) => e.who), []);
+  is('while the one beside it answers as before', ryan.agents.find((a) => a.name === 'Vox').off, false);
+
+  // It is the room's, like Stops and unlike the BOTS switch: the room
+  // down the hall has its own answer, and this one is still off when
+  // you come back to it.
+  ryan.send({ type: 'enter_room', id: '@Ryan' });
+  await wait(700);
+  ryan.send({ type: 'enter_room', id: 'Lobby' });
+  await wait(700);
+  is('and it is still off when you come back',
+    ryan.agents.find((a) => a.name === 'Sage').off, true);
+
+  const back = byBots(ryan).length;
+  ryan.send({ type: 'bot_off', bot: 'Sage', off: false });
+  await wait(600);
+  ryan.send({ type: 'text', text: 'Sage, and now?' });
+  await settled(ryan);
+  is('switched back on, it answers again',
+    byBots(ryan).slice(back).map((e) => e.who), ['Sage']);
+
+  // Muted on the mixer is the room *reading* a voice rather than
+  // hearing it: nothing is synthesized, so the reply is not paced to
+  // any audio and the whole of it lands as fast as it is thought.
+  //
+  // `--tts none` is silence of the length the words would have taken,
+  // which is what makes the difference measurable. The line below is
+  // long on purpose: echoed back it is some six hundred characters,
+  // which is forty seconds of silence to play and no time at all to
+  // read. So "finished inside five seconds" tells the two apart with
+  // a margin nothing here is going to close.
+  const mouthful = `Vox, ${'tell me about the long slow business of waiting. '.repeat(12)}`;
+  const whole = (n) => {
+    const said = byBots(ryan).slice(n)[0];
+    return !!said && said.text.trim().endsWith('That is all I heard.');
+  };
+
+  await settled(ryan);
+  const quiet = byBots(ryan).length;
+  ryan.send({ type: 'strip', name: '@agent', mute: true });
+  await wait(400);
+  ryan.send({ type: 'text', text: mouthful });
+  await until(() => whole(quiet), { tries: 50, every: 100 });
+  is('a muted voice is read rather than heard, and all of it at once', whole(quiet), true);
+  is('and it is never shown as speaking, because it is not',
+    ryan.agents.find((a) => a.name === 'Vox').state !== 'speaking', true);
+  await settled(ryan);
+
+  // And unmuted, the same words are paced to the voice saying them:
+  // the reply arrives a phrase at a time, so after the five seconds
+  // that were long enough above there is still most of it to come.
+  const aloud = byBots(ryan).length;
+  ryan.send({ type: 'strip', name: '@agent', mute: false });
+  await wait(400);
+  ryan.send({ type: 'text', text: mouthful });
+  await wait(5000);
+  is('heard rather than read, it arrives at the speed it is spoken', whole(aloud), false);
+  ryan.send({ type: 'stop' });
+  await settled(ryan);
+
+  /// Which voice one bot is wearing, and whose idea it was.
+  const wearing = (p, bot = 'Vox') => {
+    const b = (p.agents ?? []).find((a) => a.name === bot);
+    return { voice: b?.voice ?? null, here: !!b?.voice_here };
+  };
+
+  // Which voice an AI speaks in is the house's, and a room may
+  // disagree. The house settles one in Settings and every room
+  // follows it; a room that has been given its own keeps it, which is
+  // for a room that wants a different reader without changing the AI
+  // down the hall.
+  is('to begin with it is nobody in particular', wearing(ryan), { voice: null, here: false });
+  ryan.send({ type: 'room_voice', bot: 'Vox', here: true, voice: 'Alan Watts' });
+  await wait(600);
+  is('this room gave it one', wearing(ryan), { voice: 'Alan Watts', here: true });
+
+  // A room nobody has had an opinion about is untouched by that: this
+  // is one room disagreeing, not the house being settled.
+  ryan.send({ type: 'enter_room', id: '@Ryan' });
+  await wait(700);
+  is('and the room down the hall is where it was', wearing(ryan), { voice: null, here: false });
+
+  // The house settling one reaches every room that has no answer of
+  // its own -- and is overruled by the one that has.
+  ryan.send({ type: 'voice', bot: 'Vox', voice: 'Deanna' });
+  await wait(700);
+  is('the house settled a voice, and this room took it', wearing(ryan), { voice: 'Deanna', here: false });
+  ryan.send({ type: 'enter_room', id: 'Lobby' });
+  await wait(700);
+  is('and the room with its own answer kept it', wearing(ryan), { voice: 'Alan Watts', here: true });
+
+  // Handing the question back: the room stops having an opinion and
+  // hears the house again. Not the same as choosing the AI's own
+  // voice here, which is an opinion like any other.
+  ryan.send({ type: 'room_voice', bot: 'Vox', here: true, voice: null });
+  await wait(600);
+  is('its own voice here is still an answer', wearing(ryan), { voice: null, here: true });
+  ryan.send({ type: 'room_voice', bot: 'Vox', here: false });
+  await wait(600);
+  is('and handing the question back takes the house s again', wearing(ryan), { voice: 'Deanna', here: false });
+  ryan.send({ type: 'voice', bot: 'Vox', voice: null });
+  await wait(600);
+
   // Whether a voice talking over one cuts it off is that bot's own,
   // and the one thing about an AI that is still set per AI.
   is('both cut off by a voice to begin with',
@@ -196,9 +311,11 @@ const marks = (page) =>
   is('and the house remembered what stops each of them there',
     ryan.agents.map((a) => a.stops), ['finished', 'interrupted']);
 
-  // And on screen: a fader each, under the room, each saying what that
-  // AI is doing -- and one Stops to set, which is all there is to set
-  // about an AI now.
+  // And on screen: a strip each under the room, each saying what that
+  // AI is doing -- with no fader on it, because nobody has ever wanted
+  // one of these louder or quieter than the rest of the room, and two
+  // things to set: when talking over it cuts it off, and which voice
+  // it speaks in here.
   is('the people, then a strip for each AI', await strips(alex.page), [
     'Alex (you)',
     'Ryan',
@@ -206,7 +323,7 @@ const marks = (page) =>
     'Sage',
   ]);
   is(
-    'and each has its own Stops, and nothing else to set',
+    'and each has its own Stops and its own voice, and nothing else to set',
     await alex.page.evaluate(() =>
       [...document.querySelectorAll('.rooms .strip select')].map((s) => [
         s.getAttribute('aria-label'),
@@ -215,8 +332,21 @@ const marks = (page) =>
     ),
     [
       ['When Vox stops speaking', 'finished'],
+      ['The voice Vox speaks in here', 'house'],
       ['When Sage stops speaking', 'interrupted'],
+      ['The voice Sage speaks in here', 'house'],
     ],
+  );
+  // A voice the room made is as loud as the room asked it to be.
+  is(
+    'and no fader on an AI, where every person has one',
+    await alex.page.evaluate(() =>
+      [...document.querySelectorAll('.rooms .strip')].map((s) => [
+        s.querySelector('.label').textContent.replace(/\s+/g, ' ').trim(),
+        !!s.querySelector('input[type=range]'),
+      ]),
+    ),
+    [['Alex (you)', true], ['Ryan', true], ['Vox', false], ['Sage', false]],
   );
   is(
     'and says what each of them is doing, separately from each other and from the people',

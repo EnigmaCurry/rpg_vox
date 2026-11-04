@@ -1019,6 +1019,26 @@ being off, since at that size the thing to see is whether the AIs are
 in what somebody says at all; which of the two it is is in the tooltip,
 and in how solid the mark is.
 
+**An AI's own strip has four things on it**, and no fader: a voice the
+room made is as loud as the room asked it to be, and nobody has ever
+wanted one louder or quieter than the rest of the room.
+
+- **On / Off** switches that voice off *in this room*. Off is off: it
+  is given no turn by anything, so nothing is asked of a model, nothing
+  is thought and nothing is said. It keeps its place in the list and
+  everything set on it, and the strip dims and says `off` — this is the
+  room not having that voice in it for the moment, not a bot being
+  taken out of the house. The room's, like **Stops**: the room down the
+  hall has its own answer, and this one is still off tomorrow.
+- **Mute** is the room *reading* that voice rather than hearing it.
+  Nothing is synthesized at all — in any language — and because the
+  words are no longer paced to audio that doesn't exist, the whole
+  reply lands at once, as fast as it is thought. Nor can anybody talk
+  over it: there is nothing in the air to talk over, so **Stops** has
+  nothing to do and a sentence is never cut off half-written. **Stop**
+  still stops it; that one is the room saying so.
+- **Stops** and **Voice**, above.
+
 ### Games
 
 In the lobby (the room's ordinary conversation) the AI can design a game
@@ -1565,14 +1585,24 @@ from that moment, keeps, and comes back up in after a restart — so an
 AI that should always sound like somebody is set once rather than asked
 every session.
 
-**That choice is the house's, not the room's.** It is the same AI in
-every room — one name, one face, one voice — so settling it anywhere
-settles it everywhere, there and then: the other rooms put it on
-without waiting for a restart. Which is the opposite of **Stops** and
-of how a bot takes a pause, which are each room's own, because when an
-AI speaks depends on what the room is for and what it sounds like does
-not. Anybody in the room may set it, like the faders: the control is no
-more than the sentence you could say instead.
+**That choice is the house's**, and a room may disagree with it. It is
+the same AI in every room — one name, one face, one voice — so settling
+it in Settings settles it everywhere, there and then: the other rooms
+put it on without waiting for a restart. Anybody in the room may set
+it, like the faders: the control is no more than the sentence you could
+say instead.
+
+A room that wants a different reader without changing the AI down the
+hall sets one on the AI's strip, under **Voice**: *as the house has
+it*, which is where every room starts and what most of them stay, or
+its own voice, or any the house has cloned. A room with an answer of
+its own keeps it, and the house being settled afterwards goes past it.
+*As the house has it* hands the question back — which is not the same
+as choosing the AI's own voice here, that being an answer like any
+other.
+
+The room's is read first and the house's is the fallback, so the thing
+nobody has to set is the thing most rooms want.
 
 The two ways do not fight. Ask it out loud for a different voice and it
 obliges — in that room, for as long as the house is up — and the one

@@ -1207,6 +1207,15 @@ struct BotState {
     /// people in the room: a bot that has stopped sounding like itself
     /// says so on its strip. None is its own voice.
     voice: Option<String>,
+    /// Whether *this room* has its own idea about which voice it
+    /// speaks in, rather than following the house.
+    ///
+    /// Not which voice -- that is `voice`, resolved. This is only
+    /// whether the question was answered here, which the picker needs
+    /// in order to show the difference between *the house's, which
+    /// happens to be Alan Watts* and *Alan Watts, whatever the house
+    /// says*. See [`Room::settled_voice`].
+    here_voice: bool,
     /// The turn this bot should be working on; anything older it is
     /// told to drop. Shared with its own agent thread.
     ///
@@ -1233,6 +1242,20 @@ struct BotState {
     here: bool,
     /// Whether somebody talking over it cuts it off.
     stops: Stops,
+    /// Switched off in this room: it is listed, it keeps its place and
+    /// its settings, and it is given no turn by anything. Nobody is
+    /// asked, nothing is thought, nothing is said.
+    ///
+    /// The room's, like `stops` and unlike [`Bots`]: it is not about
+    /// how one person wants to be spoken to, it is this room not
+    /// having that voice in it for the moment. Written down per room,
+    /// so a room that was quiet last night is quiet this morning.
+    ///
+    /// Not the same as [`Mode::Never`], which is the room's own doing
+    /// -- a game's rule, a show's curtain -- and is put back by
+    /// whatever set it. This is a switch a person threw, and only a
+    /// person puts it back.
+    off: bool,
     /// Where this voice is sitting while a show is on. The AI running
     /// the show is put in the box for as long as it lasts and cannot
     /// be moved out of it; every other voice starts in the audience,
@@ -1282,7 +1305,7 @@ impl BotState {
     /// [`Room::named`] -- which is how a puppet left on stage after
     /// the show takes a question.
     fn answering(&self) -> bool {
-        self.here && self.mode != Mode::Never && self.part.is_none()
+        self.here && !self.off && self.mode != Mode::Never && self.part.is_none()
     }
 
     /// Whether this one is a puppet.
@@ -1471,9 +1494,15 @@ pub struct BotWiring {
     pub borrowed: crate::tts::Borrowed,
 }
 
-/// Where the house keeps which voice one of its AIs speaks in, by the
-/// bot's name. The house's and not the room's: see
-/// [`crate::store::Store::house_setting`].
+/// Where which voice one of the AIs speaks in is kept, by the bot's
+/// name. The same key in two scopes, which is the whole of how a room
+/// overrides the house: [`crate::store::Store::house_setting`] is what
+/// the house settled on, and [`crate::store::Store::setting`] -- which
+/// is already per room -- is this room having its own idea about it.
+///
+/// The room's is read first and the house's is the fallback, so a room
+/// nobody has had an opinion about follows the house, which is the
+/// thing most rooms want and the thing nobody has to set.
 fn voice_key(bot: &str) -> String {
     format!("voice:{bot}")
 }
@@ -1760,6 +1789,13 @@ impl Room {
                 .as_deref()
                 .and_then(Stops::parse)
                 .unwrap_or_default();
+            // Switched off in this room, and still off this morning:
+            // somebody turned this voice off here, and a restart is
+            // not them changing their mind.
+            let off = store
+                .setting(&format!("off:{}", bot.name))?
+                .as_deref()
+                .is_some_and(|v| v == "off");
             let (turns, rx) = crossbeam_channel::unbounded();
             let generation = Arc::new(AtomicU64::new(0));
             // Which voice it is speaking in, shared between the room
@@ -1825,6 +1861,8 @@ impl Room {
                 // being given a room is a tick and not a restart.
                 here: n == 0 || placed.contains(&bot.name),
                 stops,
+                off,
+                here_voice: store.setting(&key)?.is_some(),
                 // No show is on in a room that has just opened, so
                 // there are no seats to be in yet.
                 seat: Seat::Audience,
@@ -4809,11 +4847,7 @@ impl Room {
     /// right: somebody has just settled the question, and that is a
     /// later answer to it than this afternoon's.
     pub fn reload_voice(&self, bot: &str) {
-        let name = self
-            .store()
-            .house_setting(&voice_key(bot))
-            .unwrap_or_default()
-            .unwrap_or_default();
+        let name = self.settled_voice(bot);
         let settled = match name.trim().is_empty() {
             true => None,
             false => match self.store().voice(name.trim()) {
@@ -4829,6 +4863,92 @@ impl Room {
             return;
         }
         self.lend_voice(&mut st, bot, settled);
+    }
+
+    /// Which voice this room has `bot` speaking in: its own idea about
+    /// it, or the house's if it has none.
+    ///
+    /// Empty is its own voice. The two scopes are told apart by the row
+    /// existing at all, not by what is in it -- a room that has been
+    /// given a voice of its own and then put back to the AI's own
+    /// voice is still a room with an opinion, and must not fall back
+    /// to the house's.
+    fn settled_voice(&self, bot: &str) -> String {
+        let key = voice_key(bot);
+        // Bound, not matched on. `store()` hands out a guard, and the
+        // scrutinee of a `match` is alive for the whole of it -- so
+        // reading the database again from an arm is the room waiting
+        // on a lock it is already holding. See `Room::store`.
+        let here = self.store().setting(&key).unwrap_or_default();
+        match here {
+            Some(here) => here,
+            None => self
+                .store()
+                .house_setting(&key)
+                .unwrap_or_default()
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Which voice one bot speaks in *here*, set from its strip.
+    ///
+    /// `None` gives the room no opinion again and it follows the house.
+    /// `Some("")` is this room wanting the AI's own voice whatever the
+    /// house says. Anything else is a cloned voice by name.
+    ///
+    /// Only this room is told, which is the difference between this and
+    /// [`Room::wear_voice`]: that one is the house settling the
+    /// question everywhere, and this one is a room disagreeing.
+    pub fn wear_voice_here(&self, bot: &str, voice: Option<&str>) -> Result<String, String> {
+        // Out of the database before the room is locked, like
+        // `wear_voice`: the error names every voice there is.
+        let cloned = match voice.map(str::trim).filter(|v| !v.is_empty()) {
+            Some(name) => Some(self.voice_named(name)?),
+            None => None,
+        };
+        {
+            let st = self.lock();
+            if !st.bots.iter().any(|b| b.cfg.name == bot) {
+                return Err(format!("there is no {bot} in this room"));
+            }
+            if st.bots.iter().any(|b| b.cfg.name == bot && b.puppet()) {
+                return Err(format!(
+                    "{bot} is a puppet, and its voice is the part it plays"
+                ));
+            }
+        }
+        let key = voice_key(bot);
+        let said = match (voice, &cloned) {
+            (None, _) => "whatever the house has settled on".to_string(),
+            (Some(_), Some(v)) => format!("{} (cloned from {})", v.name, v.who),
+            (Some(_), None) => "its own voice".to_string(),
+        };
+        let stored = match voice {
+            // No opinion: the row goes, and the house is heard again.
+            None => None,
+            Some(_) => Some(cloned.as_ref().map(|v| v.name.clone()).unwrap_or_default()),
+        };
+        let wrote = match &stored {
+            Some(v) => self.store().set_setting(&key, v),
+            None => self.store().clear_setting(&key),
+        };
+        if let Err(err) = wrote {
+            warn!("store the room's voice: {err:#}");
+        }
+        info!(bot, room = %self.cfg.id, voice = %said, "this room settled which voice it speaks in");
+        {
+            let mut st = self.lock();
+            st.bot(bot).here_voice = stored.is_some();
+        }
+        // `reload_voice` tells every tab which voice it is wearing;
+        // this says whose idea that was, which is the other half of
+        // what the picker on its strip has to draw.
+        self.reload_voice(bot);
+        {
+            let st = self.lock();
+            self.emit_agents_here(&st);
+        }
+        Ok(said)
     }
 
     /// Put a voice on a bot, or take one off: the cell its voices
@@ -5033,6 +5153,13 @@ impl Room {
             // on everybody anyway (see `begin_show`), so this is what
             // a puppet taking questions afterwards comes back to.
             stops: Stops::Finished,
+            // A puppet's voice is the part it plays, so there is no
+            // question here for a room to have an opinion about.
+            here_voice: false,
+            // Nobody switches a puppet off. There is nothing behind
+            // one to switch off, and the way to be rid of it is to
+            // take it off the stage.
+            off: false,
             // A puppet is on the stage. That is not a seat anybody put
             // it in; it is what being a puppet is.
             seat: Seat::Stage,
@@ -5048,10 +5175,7 @@ impl Room {
         // audience, and the rule about who can hear whom. See
         // `Room::showing`.
         self.follow_showing(&mut st);
-        self.emit(json!({
-            "type": "agents_here",
-            "agents": self.agents_json(&st),
-        }));
+        self.emit_agents_here(&st);
         // Its face, which it may have worn in a show months ago.
         self.emit_people(&st);
         Ok(name)
@@ -5097,10 +5221,7 @@ impl Room {
         // room once more.
         let over = on_stage(&st).is_empty();
         self.follow_showing(&mut st);
-        self.emit(json!({
-            "type": "agents_here",
-            "agents": self.agents_json(&st),
-        }));
+        self.emit_agents_here(&st);
         if over {
             info!(room = %self.cfg.id, "the last puppet left, so the show is over");
         }
@@ -6213,10 +6334,7 @@ impl Room {
         info!(bot, room = %self.cfg.id, here, "the owner said who is in the room");
         // Every tab is told the room has a different set of voices in
         // it: a fader appears or goes, and so does its Stops.
-        self.emit(json!({
-            "type": "agents_here",
-            "agents": self.agents_json(&st),
-        }));
+        self.emit_agents_here(&st);
     }
 
     /// The AIs in this room, as a new tab is told about them.
@@ -6232,10 +6350,21 @@ impl Room {
                     "mode": b.mode.as_str(),
                     "engaged": b.engaged.is_some(),
                     "stops": b.stops.as_str(),
+                    // Switched off in this room: listed, and given no
+                    // turn by anything. Everybody's to see and
+                    // anybody's to put back -- it is the room not
+                    // having this voice in it just now, which is not
+                    // a thing to hide from the people in the room.
+                    "off": b.off,
                     // A cloned voice it has been lent, by the name it
                     // is called: a bot that has stopped sounding like
                     // itself says so where everyone can see it.
                     "voice": b.voice,
+                    // Whether that is this room's own doing or the
+                    // house's, which is the difference between *the
+                    // house's, which happens to be Alan Watts* and
+                    // *Alan Watts, whatever the house says*.
+                    "voice_here": b.here_voice,
                     // A puppet, not an AI: it has a fader like
                     // everybody else and nothing to set, because
                     // there is nothing behind it to answer with.
@@ -6269,6 +6398,71 @@ impl Room {
             "bot": bot,
             "stops": stops.as_str(),
         }));
+    }
+
+    /// Somebody switched this voice off in this room, or back on.
+    ///
+    /// Off is off: no turn is given to it, so nothing is asked of a
+    /// model and nothing is said. It keeps its place in the list, its
+    /// fader, its `stops` and its voice -- this is a room not having
+    /// that voice in it for the moment, not a bot being taken out of
+    /// the house.
+    ///
+    /// Anything it was in the middle of goes with the switch. Leaving
+    /// a half-finished reply on screen from a voice that has just been
+    /// switched off would be the room still talking after being told
+    /// to stop.
+    pub fn set_bot_off(&self, bot: &str, off: bool) {
+        let mut st = self.lock();
+        if !st.bots.iter().any(|b| b.cfg.name == bot) {
+            return;
+        }
+        if st.bot(bot).off == off {
+            return;
+        }
+        st.bot(bot).off = off;
+        if off {
+            self.drop_reply(&mut st, bot);
+        }
+        if let Err(err) = self
+            .store()
+            .set_setting(&format!("off:{bot}"), if off { "off" } else { "" })
+        {
+            warn!("store off:{bot}: {err:#}");
+        }
+        info!(
+            bot,
+            off,
+            room = %self.config().id,
+            "a voice was switched off in this room, or back on"
+        );
+        self.refresh_mode(&mut st, bot);
+        self.emit_agents_here(&st);
+    }
+
+    /// Let go of whatever `bot` is in the middle of, and take back the
+    /// entry it was filling if it had not said anything into it yet.
+    ///
+    /// The same thing `hush_others` does to the bots that lost the
+    /// pause, for the one case that is not about losing a pause: being
+    /// switched off.
+    fn drop_reply(&self, st: &mut State, bot: &str) {
+        let Some(r) = st.bot(bot).reply.as_ref() else {
+            return;
+        };
+        let empty = r.sentences.is_empty();
+        let entry = r.entry.clone();
+        let b = st.bot(bot);
+        b.generation.fetch_add(1, Ordering::SeqCst);
+        b.reply = None;
+        b.state = "listening";
+        // Nothing was said into it, so nothing is left: the empty entry
+        // goes out of the conversation rather than standing there as a
+        // turn where somebody said nothing.
+        if empty {
+            st.log.retain(|e| e.id != entry);
+            self.emit(json!({ "type": "entry_removed", "id": entry }));
+        }
     }
 
     /// The AI standing down by itself: back to answering only when it is
@@ -7021,6 +7215,25 @@ impl Room {
 
     // -- the agent's side ---------------------------------------------------
 
+    /// Whether this room is playing `bot`'s voice out loud at all, or
+    /// only reading it.
+    ///
+    /// Muting a bot on the mixer used to mean the room synthesized
+    /// every word of it and then threw the audio away. It now means
+    /// what it looks like it means: the voice is not made at all, and
+    /// the room reads the reply instead. See `agent::speak`, which is
+    /// where the saving is, and `Room::barge_in`, where it decides
+    /// that a voice nobody is hearing cannot be talked over.
+    pub fn aloud(&self, bot: &str) -> bool {
+        let st = self.lock();
+        let Some(b) = st.bots.iter().find(|b| b.cfg.name == bot) else {
+            return true;
+        };
+        let strip = b.cfg.strip.clone();
+        drop(st);
+        !self.mixer.is_muted(&strip)
+    }
+
     /// One sentence of the reply `generation`, synthesized (48 kHz mono).
     /// Returns false when that reply has been dropped.
     pub fn agent_speak(&self, generation: u64, text: &str, samples: Vec<f32>) -> bool {
@@ -7046,8 +7259,15 @@ impl Room {
         if first {
             self.hush_others(&mut st, &bot);
         }
-        self.mixer
-            .ai_push(&strip, &self.cfg.language, generation, index, samples);
+        // A sentence with no audio is one the room is reading rather
+        // than hearing -- see `Room::aloud`. It is still a sentence of
+        // the reply and still claims the turn above; there is simply
+        // nothing to queue, and `heard` counts it as heard the moment
+        // it arrives, which is what puts it on the screen at once.
+        if !samples.is_empty() {
+            self.mixer
+                .ai_push(&strip, &self.cfg.language, generation, index, samples);
+        }
         true
     }
 
@@ -7281,7 +7501,23 @@ impl Room {
         }
     }
 
-    /// What every bot in the room is doing, to every tab.
+    /// Everything about every bot in the room, to every tab: which of
+    /// them are here, what each is doing, and everything set on them.
+    ///
+    /// The heavy one. [`Room::emit_agents`] below is the light one --
+    /// names and states -- and it goes out many times a turn, so it
+    /// carries nothing that could have changed in between. Anything
+    /// that is *set* on a bot has to go out through this one, and a
+    /// change sent through the other is a change no tab will draw.
+    fn emit_agents_here(&self, st: &State) {
+        self.emit(json!({
+            "type": "agents_here",
+            "agents": self.agents_json(st),
+        }));
+    }
+
+    /// What every bot in the room is doing, to every tab. Names and
+    /// states only -- see [`Room::emit_agents_here`] for the rest.
     fn emit_agents(&self, st: &State) {
         self.emit(json!({
             "type": "agents",
@@ -7593,6 +7829,16 @@ impl Room {
             if b.reply.is_none() {
                 continue;
             }
+            // A voice the room is reading rather than hearing cannot be
+            // talked over: there is nothing in the air to talk over,
+            // and cutting it would leave half a sentence on the screen
+            // because somebody in the room started a sentence of their
+            // own. Reading it is not listening to it, so nothing it is
+            // writing is interrupted by anybody speaking. **Stop** is
+            // still **Stop** -- that one is the room saying so.
+            if self.mixer.is_muted(&b.cfg.strip) {
+                continue;
+            }
             match b.stops {
                 Stops::Interrupted => cut.push(b.cfg.name.clone()),
                 Stops::Finished => b.talked_over = true,
@@ -7845,8 +8091,11 @@ impl Room {
                 self.engage(st, &bot, now);
             }
             let judge = Cue::Decide { lull: None, over };
-            if !st.bot(&bot).here {
-                // Not in this room: there is nobody to give a turn to.
+            if !st.bot(&bot).here || st.bot(&bot).off {
+                // Not in this room, or switched off in it: there is
+                // nobody to give a turn to. Off is before the model
+                // rather than after it -- nothing is asked, so nothing
+                // is paid for and nothing is thought.
                 continue;
             }
             match st.bot(&bot).mode {

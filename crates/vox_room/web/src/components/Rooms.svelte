@@ -37,6 +37,27 @@
       : [{ id: room.where, title: room.title, private: room.alone, here: [] }],
   );
 
+  /// Which way the voice picker on a bot's strip is set.
+  ///
+  /// `house` is this room having no opinion, which is what every room
+  /// starts as and what most of them stay. Anything else is this room
+  /// having answered the question for itself -- `own` for the AI's own
+  /// voice whatever the house says, or a cloned voice by name.
+  const voiceNow = (bot) => (!bot.voice_here ? 'house' : (bot.voice ?? 'own'));
+
+  const voiceHint = (bot) =>
+    !bot.voice_here
+      ? `${bot.name} speaks in whatever the house has settled on${bot.voice ? ` — ${bot.voice} just now` : ''}. Pick one here and this room keeps its own answer, and the rooms down the hall are left alone.`
+      : `This room has ${bot.name} speaking in ${bot.voice ?? 'its own voice'}, whatever the house has settled on. Put it back to the house's to follow Settings again.`;
+
+  function setVoiceHere(bot, pick) {
+    command(
+      pick === 'house'
+        ? { type: 'room_voice', bot: bot.name, here: false }
+        : { type: 'room_voice', bot: bot.name, here: true, voice: pick === 'own' ? null : pick },
+    );
+  }
+
   // What a voice talking over the bot does to the reply it is in the
   // middle of. Its own setting as well, and never a game's: a game
   // says when a bot answers, not how it is stopped.
@@ -181,7 +202,8 @@
          fader and a face like everybody else and nothing to set:
          there is nothing behind one to answer with. -->
     {#each room.agents as bot (bot.strip)}
-    <Strip key={bot.strip} label={bot.name} doing={bot.state} agent somebody>
+    <Strip key={bot.strip} label={bot.name} doing={bot.state} agent somebody
+      off={bot.puppet ? undefined : bot.off}>
       {#snippet children()}
         {#if bot.puppet}
         <!-- A character the AI speaks through. It is in the room on
@@ -221,13 +243,27 @@
             {/each}
           </select>
         </label>
-        <!-- A cloned voice it is speaking in: one it was asked for
-             out loud, or the one settled on in Settings. Not a
-             control here -- the picker is in Settings, with the list
-             of voices it would be choosing from. It is said here
-             because a bot that has stopped sounding like itself must
-             say so where everything else about it is said. -->
-        {#if bot.voice}
+        <!-- Which voice it speaks in *here*. The house settles one in
+             Settings and every room follows it; this is the room
+             disagreeing, for a room that wants a different reader
+             without changing the AI down the hall. Only offered where
+             there is something to choose between: with no cloned
+             voices in the house, the picker would be two ways of
+             saying the same thing. -->
+        {#if room.voices.length}
+          <label class="when" title={voiceHint(bot)}>
+            <span class="what">Voice</span>
+            <select value={voiceNow(bot)}
+              aria-label="The voice {bot.name} speaks in here"
+              onchange={(e) => setVoiceHere(bot, e.currentTarget.value)}>
+              <option value="house">As the house has it</option>
+              <option value="own">Its own voice</option>
+              {#each room.voices as v (v.id)}
+                <option value={v.name}>{v.name} — {v.who}'s voice</option>
+              {/each}
+            </select>
+          </label>
+        {:else if bot.voice}
           <p class="wearing" title="The voice {bot.name} is speaking in. Ask it for its own voice back, or settle which one it uses in Settings.">
             Speaking as {bot.voice}
           </p>

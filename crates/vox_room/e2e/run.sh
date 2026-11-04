@@ -122,6 +122,21 @@ one() {
          VALUES ($c,'g1','Vox','game','Quick Draw',1);"
   fi
 
+  # Voices are cloned from somebody reading into their microphone, and
+  # there is nobody here doing that -- so the house is given two. What
+  # the bots suite is about is the *choosing*: which voice one of them
+  # speaks in here, which the house has settled on, and which of those
+  # two wins. Nothing has to have been recorded for that.
+  if [[ $suite == bots ]]; then
+    "$bin" $(flags "$suite") >/dev/null 2>&1 &
+    server=$!
+    waitfor; stop
+    sqlite_set "$data/room.db" \
+      "INSERT INTO voices (id,name,who,said,created)
+         VALUES ('alan-watts','Alan Watts','Ryan','a passage',1),
+                ('deanna','Deanna','Alex','a passage',2);"
+  fi
+
   # Faces are made by a model with a picture server, and there is
   # neither here, so the room is given some and some lines to put them
   # beside. Ryan and the AI have one; Alex deliberately has none, so
