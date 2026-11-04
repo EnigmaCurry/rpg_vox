@@ -71,32 +71,23 @@
   --glow-self: rgb(233 185 106 / 45%);
 
   /* ---- The corner grammar ---------------------------------------------
-     Four cuts and no more (see `tokens.css`). Each is a shape and the
+     Two cuts and no more (see `tokens.css`). Each is a shape and the
      line along the faces it opened; the line is a gradient because a
      border traces the rectangle the clip just bit a corner out of.
 
-     `--cut-face` and `--cut-face-alt` are the two diagonals a cut can
-     lie on -- "/" and "\" -- written once and placed in the corners
-     below. 135deg and 45deg put a gradient's own middle exactly along
-     them, which is what makes the band land on the cut and not beside
-     it. The colour is substituted where the token is *used*, so a
-     bubble's cut comes out in the bubble's line and a panel's in the
-     frame's, from the same two gradients. */
+     `--cut-face` is the diagonal both of them lie on, written once and
+     placed in the corners below. 135deg puts a gradient's own middle
+     exactly along it, which is what makes the band land on the cut and
+     not beside it. The colour is substituted where the token is
+     *used*, so a card's cut comes out in the card's line and a panel's
+     in the frame's, from the one gradient. */
   --cut-face: linear-gradient(135deg,
     transparent calc(50% - 0.8px), var(--cut-ink) calc(50% - 0.8px),
     var(--cut-ink) calc(50% + 0.8px), transparent calc(50% + 0.8px));
-  --cut-face-alt: linear-gradient(45deg,
-    transparent calc(50% - 0.8px), var(--cut-ink) calc(50% - 0.8px),
-    var(--cut-ink) calc(50% + 0.8px), transparent calc(50% + 0.8px));
 
-  /* The frame is lit, a card and a button are not, a bubble is drawn in
-     its own line, and your own bubble's cut comes out in your amber --
-     the bar down its side turns the corner rather than being sliced
-     off at it. */
+  /* The frame is lit; a card inside one is not. */
   --cut-ink-panel: var(--edge);
-  --cut-ink-control: #3b4370;
-  --cut-ink-said: #3b4361;
-  --cut-ink-mine: var(--self);
+  --cut-ink-card: #3b4370;
 
   /* A major panel: 16px off the top left and the bottom right. */
   --cut-panel: polygon(16px 0, 100% 0, 100% calc(100% - 16px),
@@ -105,22 +96,19 @@
     var(--cut-face) top left / 16px 16px no-repeat,
     var(--cut-face) bottom right / 16px 16px no-repeat;
 
-  /* A control -- a button, a card, a field: the same cut at 7px, which
-     on something two lines tall reads as a bevel rather than a notch. */
-  --cut-control: polygon(7px 0, 100% 0, 100% calc(100% - 7px),
-    calc(100% - 7px) 100%, 0 100%, 0 7px);
-  --cut-control-edges:
-    var(--cut-face) top left / 7px 7px no-repeat,
-    var(--cut-face) bottom right / 7px 7px no-repeat;
+  /* A card inside a panel -- a fader, the note under them: the same cut
+     at 9px, which on something a few lines tall reads as a bevel
+     rather than a notch.
 
-  /* A bubble, cut at the top corner away from the face beside it: top
-     right for somebody else, top left for you. One corner and not two
-     -- a bubble is a thing to read, and four machined corners around
-     every paragraph is a page you cannot rest your eye on. */
-  --cut-said: polygon(0 0, calc(100% - 10px) 0, 100% 10px, 100% 100%, 0 100%);
-  --cut-said-edges: var(--cut-face-alt) top right / 10px 10px no-repeat;
-  --cut-mine: polygon(10px 0, 100% 0, 100% 100%, 0 100%, 0 10px);
-  --cut-mine-edges: var(--cut-face) top left / 10px 10px no-repeat;
+     Nothing smaller is cut. A button and a bubble are the things
+     *inside* a panel, they are small and there are a great many of
+     them, and machining every one of them made the room something to
+     look at rather than to talk in. They are round. */
+  --cut-card: polygon(9px 0, 100% 0, 100% calc(100% - 9px),
+    calc(100% - 9px) 100%, 0 100%, 0 9px);
+  --cut-card-edges:
+    var(--cut-face) top left / 9px 9px no-repeat,
+    var(--cut-face) bottom right / 9px 9px no-repeat;
 
   /* ---- The frame ------------------------------------------------------- */
   --frame-radius: 3px;
@@ -153,7 +141,7 @@
   --btn-image: linear-gradient(180deg, #2b3248 0%, #1c2130 100%);
   --btn-border: #3a4262;
   --btn-ink: #dfe3f2;
-  --btn-radius: 7px;
+  --btn-radius: 8px;
   --btn-shadow: inset 0 1px 0 rgb(255 255 255 / 6%), 0 2px 5px rgb(0 0 0 / 45%);
   --btn-hover-bg: #262d41;
   --btn-hover-border: #5b67a0;

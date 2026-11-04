@@ -1808,33 +1808,36 @@ in your profile — it is a fact about a screen, not about a person, and
 the same person at a desk and on a phone may well want different
 answers.
 
-**The corner grammar.** A theme declares four cuts and no more, and
+**The corner grammar.** A theme declares two cuts and no more, and
 everything in the room that has a cut corner wears one of them:
 
 | cut | where | Obsidian |
 | --- | --- | --- |
-| `--cut-panel` | a column, the conversation, the footer, the door | 16px off the top left and bottom right |
-| `--cut-control` | a button, a card, a field | the same, at 7px |
-| `--cut-said` | a bubble somebody else's words are in | 10px off the top right |
-| `--cut-mine` | the mirror of it, for your own | 10px off the top left |
+| `--cut-panel` | a column, the conversation, the footer, the heading that names the room, the door | 16px off the top left and bottom right |
+| `--cut-card` | a panel inside a panel — a fader, the note under them | the same, at 9px |
 
 Each is a pair: `--cut-X` is the shape as a `clip-path`, and
 `--cut-X-edges` is the line along the faces the cut opened. That line
 has to be a background layer rather than a border, because `clip-path`
 takes a bite out of the very rectangle a border is tracing — the cut
-face is the one edge nothing else will draw. Obsidian writes the two
-possible diagonals once, as `--cut-face` and `--cut-face-alt`, and
-places them in the corners; the colour is `--cut-ink`, substituted
-where the token is *used*, so the same two gradients come out in the
-frame's colour on a panel and in your amber on your own bubble — the
-bar down its side turns the corner instead of being sliced off at it.
+face is the one edge nothing else will draw. Obsidian writes the
+diagonal once, as `--cut-face`, and places it in the corners; the
+colour is `--cut-ink`, substituted where the token is *used*, so the
+one gradient comes out in the frame's colour on a panel and the card's
+on a card.
 
-A bubble gets one cut and not the panels' two: four machined corners
-round every paragraph is a page the eye cannot rest on. And a cut is a
-clip, which takes anything drawn *outside* the box with it — a focus
-ring, a spread shadow. `--focus-inset` is why the ring is pulled inside
-a control that is cut, and it is why "still arriving" on a bubble is an
-inset shadow rather than an outer one.
+**Two, and not on everything.** A cut corner says *this is a piece of
+the console*, and the pieces are the panels. Buttons and message
+bubbles are the things inside one — they are small and there are a
+great many of them, and machining those as well turned every paragraph
+and every control into another bit of equipment to look at. They are
+round, from `--btn-radius` and `--bubble-radius`, and the geometry is
+left to the frames.
+
+A cut is a clip, and a clip takes anything drawn *outside* the box with
+it — a focus ring, a spread shadow, and its children's too.
+`--focus-inset` is why the ring is pulled inside a cut thing, the
+heading that names the room being a button that is one.
 
 **Writing another.** A theme is a block of custom properties keyed on
 `data-theme`, in `web/src/themes/`. `tokens.css` is the vocabulary —

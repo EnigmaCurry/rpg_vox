@@ -8,9 +8,11 @@
    nine times, and a new theme having to find all nine.
 
    This is also where the corner grammar is pointed at things. A theme
-   declares four cuts and the four colours their faces come out in; the
+   declares two cuts and the two colours their faces come out in; the
    rules below say which of them each kind of thing wears, so there is
-   one place to read "a card is cut like a control" off.
+   one place to read what is cut and what is not off. What is not: a
+   button and a bubble, which are the things inside a panel rather than
+   pieces of the console, and are round.
 
    These are global rather than scoped because they are the room's
    furniture rather than any one component's: `.panel` is on a grid cell
@@ -44,16 +46,16 @@
 }
 
 /* A card: a panel inside a panel. A fader, a card you were dealt, the
-   note at the foot of the column. The control cut, and a bevel of its
-   own that is deliberately fainter than the frame's: a card sits
+   note at the foot of the column. The card cut, and a bevel of its own
+   that is deliberately fainter than the frame's: a card sits
    inside a panel, and two rings of equal weight round the same thing
    read as a mistake rather than as two objects. */
 .card-chrome {
   position: relative;
-  --cut-ink: var(--cut-ink-control);
-  background: var(--cut-control-edges), var(--card-image) var(--card-bg);
+  --cut-ink: var(--cut-ink-card);
+  background: var(--cut-card-edges), var(--card-image) var(--card-bg);
   border-radius: var(--card-radius);
-  clip-path: var(--cut-control);
+  clip-path: var(--cut-card);
   box-shadow: var(--card-edge);
 }
 

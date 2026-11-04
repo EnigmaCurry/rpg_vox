@@ -41,35 +41,35 @@ body {
   font: var(--font);
 }
 #app { height: 100%; }
-/* A button wears the control cut -- see `themes/chrome.css` for where
-   the grammar is pointed at each kind of thing. */
+/* A button is round. The cut corner is the console's, and the console
+   is the panels -- see `themes/chrome.css`. A button is a thing inside
+   one, there are a great many of them, and machining every one made
+   the room something to look at rather than to talk in. */
 button {
   font: inherit;
-  --cut-ink: var(--cut-ink-control);
   border: 1px solid var(--btn-border);
-  background: var(--cut-control-edges), var(--btn-image) var(--btn-bg);
+  background: var(--btn-image) var(--btn-bg);
   color: var(--btn-ink);
   border-radius: var(--btn-radius);
-  clip-path: var(--cut-control);
   box-shadow: var(--btn-shadow);
   padding: 6px 12px;
   cursor: pointer;
 }
 button:hover {
   border-color: var(--btn-hover-border);
-  background: var(--cut-control-edges), var(--btn-image) var(--btn-hover-bg);
+  background: var(--btn-image) var(--btn-hover-bg);
   color: var(--btn-hover-ink);
 }
 /* A cut corner is a clip, and a clip takes an outline drawn outside the
-   box away with it -- so where corners are cut, the ring is pulled
-   inside. Said once, here, for everything the browser can focus: the
-   room has clipped panels, clipped cards and clipped buttons, and a
-   focus ring you cannot see is the one piece of chrome that is not a
-   matter of taste. */
+   box away with it -- and takes its children's with it too. Said once,
+   here, for everything the browser can focus: the room has clipped
+   panels and clipped cards, the heading that names the room is a
+   button that is one of them, and a focus ring you cannot see is the
+   one piece of chrome that is not a matter of taste. */
 :focus-visible { outline-offset: var(--focus-inset); }
 /* The one the room wants you to press. Same shape as the rest, lit. */
 button.primary {
-  background: var(--cut-control-edges), var(--btn-on-image) var(--btn-on-bg);
+  background: var(--btn-on-image) var(--btn-on-bg);
   color: var(--btn-on-ink);
   border-color: var(--btn-on-border);
   box-shadow: var(--btn-on-shadow);

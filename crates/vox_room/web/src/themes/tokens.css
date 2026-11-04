@@ -97,12 +97,12 @@
   --glow-self: transparent;
 
   /* ---- The corner grammar -------------------------------------------
-     Four cuts, and nothing in the room cuts a corner any other way:
+     Two cuts, and nothing in the room cuts a corner any other way:
 
-       panel    a major panel -- a column, the conversation, the footer
-       control  a button, a card, a field: the same cut, smaller
-       said     a bubble somebody else's words are in
-       mine     the mirror of it, for your own
+       panel  a major panel -- a column, the conversation, the footer,
+              the heading that names the room, the door
+       card   a panel inside a panel -- a fader, the note under them:
+              the same cut, smaller
 
      Each is a pair. `--cut-X` is the shape, as a clip-path.
      `--cut-X-edges` is the line along the faces the cut opened, as
@@ -112,33 +112,32 @@
      that a border, or an inset shadow, is still tracing, so the cut
      face is the one edge nothing else will draw.
 
-     Two cuts for a panel or a control, at the top left and the bottom
-     right, which is the room's motif. One for a bubble, at the top
-     corner away from whoever said it -- the far corner from the face
-     beside it, so a column of them leans away from its speaker.
+     Both cut the top left and the bottom right, which is the room's
+     motif.
 
-     A theme that does not cut corners leaves all eight at `none`, and
+     Two and not more, and not on everything. A cut corner says *this
+     is a piece of the console*, and the pieces are the panels. A
+     button and a bubble are things inside one, they are small and
+     there are a great many of them, and cutting those as well turned
+     every paragraph and every control into another piece of machinery
+     to look at -- so they are round, from `--btn-radius` and
+     `--bubble-radius`, and the geometry is left to the frames.
+
+     A theme that does not cut corners leaves all four at `none`, and
      then `--frame-radius` and `--card-radius` are the whole of the
-     shape. Keep a theme's cuts to these four: a fifth is a shape the
-     next thing added to the room has to guess at. */
+     shape. */
   --cut-panel: none;
   --cut-panel-edges: none;
-  --cut-control: none;
-  --cut-control-edges: none;
-  --cut-said: none;
-  --cut-said-edges: none;
-  --cut-mine: none;
-  --cut-mine-edges: none;
+  --cut-card: none;
+  --cut-card-edges: none;
   /* What each cut's face is drawn in. The two gradients a theme builds
      its `--cut-X-edges` out of read `--cut-ink`, and `chrome.css`
      points that at one of these on whichever element it is drawing --
      so the same pair of gradients comes out in the frame's colour on a
-     panel, a card's on a card, and the speaker's on a bubble. */
+     panel and the card's on a card. */
   --cut-ink: transparent;
   --cut-ink-panel: var(--cut-ink);
-  --cut-ink-control: var(--cut-ink);
-  --cut-ink-said: var(--cut-ink);
-  --cut-ink-mine: var(--cut-ink);
+  --cut-ink-card: var(--cut-ink);
 
   /* ---- The frame around a panel -----------------------------------
      The cut above gives a panel its shape; these give it its surface
@@ -153,7 +152,7 @@
 
   /* ---- A card: a panel inside a panel ------------------------------
      A fader, a dealt card, the note at the foot of the column. The
-     control cut, and a bevel of its own -- quieter than a panel's on
+     card cut, and a bevel of its own -- quieter than a panel's on
      purpose: a card sits inside one, and two rings of equal weight
      around the same thing read as a mistake. */
   --card-bg: transparent;
@@ -193,7 +192,8 @@
   --key-down-shadow: var(--btn-shadow);
   /* Where a focus ring is drawn. A cut corner is a clip, and a clip
      takes the outline outside the box with it -- so a theme that cuts
-     its controls pulls the ring inside them. */
+     anything focusable, the heading that names the room among them,
+     pulls the ring inside it. */
   --focus-inset: 0px;
 
   /* ---- Fields -------------------------------------------------------- */

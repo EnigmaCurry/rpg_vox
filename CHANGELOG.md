@@ -169,23 +169,19 @@ releases.
   columns told apart by a hairline. Everything structural in it is the
   default, so it is forty lines of colour.
 
-  The cuts are a grammar rather than a decoration: four of them and no
-  more -- `--cut-panel`, `--cut-control`, `--cut-said` and its mirror
-  `--cut-mine` -- so a button, a card and a bubble are recognisably the
-  same object at three scales and the next thing added to the room has
-  one of four answers rather than a guess. A bubble takes a single cut,
-  at the top corner away from the face beside it, so a column of them
-  leans away from whoever is talking; your own comes out in your amber,
-  with the bar down the side turning the corner rather than being
-  sliced off at it. The talk button is the one thing in the footer
-  shaped like something to press -- a deeper bevel, and a face that
-  sinks when you press it -- and the faders are a groove with a
-  machined slug in it rather than the browser's bead.
+  The cuts are a grammar rather than a decoration: two of them and no
+  more -- `--cut-panel` for a column, the conversation, the footer and
+  the door, and `--cut-card` for a panel inside one. A cut corner says
+  *this is a piece of the console*, and the pieces are the panels;
+  buttons and message bubbles are the things inside one, and they are
+  round. The talk button is the one thing in the footer shaped like
+  something to press -- a deeper bevel, and a face that sinks when you
+  press it -- and the faders are a groove with a machined slug in it
+  rather than the browser's bead.
 
   A cut is a `clip-path`, and a clip takes anything drawn outside the
   box with it, so the focus ring is pulled inside anything cut
-  (`--focus-inset`) and the rings that say a line is still arriving are
-  inset shadows now.
+  (`--focus-inset`).
 
   **Settings → The look** chooses. It is this browser's own and goes
   nowhere near the server: two people in the same room can be sitting in

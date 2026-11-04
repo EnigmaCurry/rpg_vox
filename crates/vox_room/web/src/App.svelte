@@ -372,12 +372,11 @@
          the picture and out of anything reading the page aloud. -->
     {#snippet says()}
       <span class="says">
-        <span>{saying}</span>
+        <span>{saying} <kbd>{key}</kbd></span>
         {#each SAYS as could (could)}
-          <span class="ghost" aria-hidden="true">{could}</span>
+          <span class="ghost" aria-hidden="true">{could} <kbd>{key}</kbd></span>
         {/each}
       </span>
-      <kbd>{key}</kbd>
     {/snippet}
 
     <footer class="panel">
@@ -629,16 +628,14 @@
     padding: 9px 18px;
     font-size: 15px;
     min-width: 12.5em;
-    /* A row, so the stack of labels and the key's name sit side by
-       side and the stack can be a grid of its own. */
+    /* The stack of labels is a grid of its own, centred in here. */
     display: inline-flex;
-    align-items: baseline;
     justify-content: center;
     text-align: center;
-    background: var(--cut-control-edges), var(--key-image) var(--btn-bg);
+    background: var(--key-image) var(--btn-bg);
     box-shadow: var(--key-shadow);
   }
-  .big:hover { background: var(--cut-control-edges), var(--key-image) var(--btn-hover-bg); }
+  .big:hover { background: var(--key-image) var(--btn-hover-bg); }
   /* Down: the face sinks and the light moves to the bottom edge. */
   .big:active:not(:disabled), .big.talking { box-shadow: var(--key-down-shadow); }
   .big.muted {
@@ -658,9 +655,15 @@
      rather than being pulled apart by it. */
   /* Every label the button can have, in one cell: the cell is as wide
      as the widest of them, and the one being said is the only one you
-     can see. */
+     can see.
+
+     The key's name is inside each of them rather than beside the
+     stack, so that what is centred is the whole of what the button
+     says. Beside it, `Mute` sat in the middle of a cell as wide as
+     `Muted on the mixer` and the key was left stranded out on the
+     right. */
   .says { display: grid; justify-items: center; }
-  .says > * { grid-area: 1 / 1; }
+  .says > * { grid-area: 1 / 1; white-space: nowrap; }
   /* Measured, not read. `visibility: hidden` takes them out of the
      accessibility tree as well as off the screen, which `opacity: 0`
      would not. */
