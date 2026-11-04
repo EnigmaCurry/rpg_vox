@@ -641,18 +641,30 @@
      a page of machined paragraphs is a page the eye cannot rest on.
      Whose it is is said in the colour down the side, which is one
      thing to read and does not have to be looked at. */
+  /* The coloured edge is on the side facing the middle of the column,
+     which is the side away from the face: the right of a line
+     somebody else said, the left of your own, which hang on the other
+     side. Mirrored rather than always on the left, so the two sides of
+     the conversation are the two sides of the conversation -- and both
+     colours run down the inside of the column where the eye already
+     is, instead of one of them hiding behind a face. */
   .text {
     background: var(--bubble);
     border: var(--bubble-border);
-    border-left: var(--bubble-edge-w) solid var(--person-edge);
+    border-right: var(--bubble-edge-w) solid var(--person-edge);
     padding: 8px 12px;
     border-radius: var(--bubble-radius);
     box-shadow: var(--bubble-shadow);
     white-space: pre-wrap;
     overflow-wrap: anywhere;
   }
-  .entry.you .text { border-left-color: var(--self); }
-  .agent .text { border-left-color: var(--agent); }
+  /* Your own: the edge swaps sides, and the side it came from goes
+     back to being an edge like the other three. */
+  .entry.you .text {
+    border-right: var(--bubble-border);
+    border-left: var(--bubble-edge-w) solid var(--self);
+  }
+  .agent .text { border-right-color: var(--agent); }
   .text.partial { color: var(--muted); }
   /* Still arriving. Inset, so it is a line lit just inside the
      bubble's own edge rather than a second ring outside it. */
