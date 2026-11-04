@@ -43,6 +43,20 @@ const byBots = (p) =>
 const switches = (p) =>
   Object.fromEntries((p.roster ?? []).map((q) => [q.name, q.bots]));
 
+/// And what the browser makes of it: the mark against each name in the
+/// list of who is here. `null` for somebody the AIs may answer, which
+/// is everybody to begin with -- the mark is the exception, since one
+/// against every name in the room would be a mark that says nothing.
+const marks = (page) =>
+  page.evaluate(() =>
+    Object.fromEntries(
+      [...document.querySelectorAll('.rooms .strip')].map((s) => {
+        const who = s.querySelector('.label').textContent.replace(/\s*\(you\)\s*/, '').trim();
+        const mark = s.querySelector('.bots');
+        return [who, mark ? (mark.classList.contains('all') ? 'never' : 'named') : null];
+      }),
+    ));
+
 (async () => {
   const ryan = await socket(token(ryanLink));
   await wait(400);
@@ -92,12 +106,21 @@ const switches = (p) =>
   // roster says so for everybody: this is not a thing hidden in one
   // browser.
   is('the AIs may answer everybody to begin with', switches(ryan), { Alex: 'any', Ryan: 'any' });
+  is('so nobody is marked in the list of who is here',
+    await marks(alex.page), { Alex: null, Ryan: null, Vox: null, Sage: null });
 
   // Off meaning never: nothing of theirs reaches an AI, its own name
   // included.
   ryan.send({ type: 'bots', how: 'never' });
   await wait(600);
   is('one person turned them off', switches(ryan), { Alex: 'any', Ryan: 'never' });
+  // And everybody can see which of them it was. An AI that answers one
+  // person and not the one beside them is a room where the reason has
+  // to be somewhere, or it reads as a fault -- so the mark is on
+  // somebody else's screen too, not only on the screen of whoever
+  // threw the switch.
+  is('and the room can see who it was', await marks(alex.page),
+    { Alex: null, Ryan: 'never', Vox: null, Sage: null });
   const off = byBots(ryan).length;
   ryan.send({ type: 'text', text: 'Vox, are you there?' });
   await settled(ryan);
@@ -119,6 +142,8 @@ const switches = (p) =>
   ryan.send({ type: 'bots', how: 'named' });
   await wait(600);
   is('off, but not to its name', switches(ryan), { Alex: 'any', Ryan: 'named' });
+  is('and the mark says which way it is off', await marks(alex.page),
+    { Alex: null, Ryan: 'named', Vox: null, Sage: null });
   ryan.send({ type: 'text', text: 'Sage, one more thing.' });
   await settled(ryan);
   is('and calling one by name is answered',

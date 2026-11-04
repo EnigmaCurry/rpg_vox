@@ -1,5 +1,5 @@
 <script>
-  import { command, room } from '../lib/room.svelte.js';
+  import { command, room, theAI, theAIs } from '../lib/room.svelte.js';
   import { hue } from '../lib/color.js';
   import { screen, showThumb, streamOf, unwatch, watch } from '../lib/screen.svelte.js';
   import Face from './Face.svelte';
@@ -36,6 +36,11 @@
     // has a face to show beside the name. The interpreter is a channel
     // and not anybody, and has none.
     somebody = false,
+    // Whether this person is taking answers from the AIs: their own
+    // BOTS switch, which is on the roster everybody is sent. Only a
+    // person has one -- an AI is the other side of that question, and
+    // the interpreter is not anybody -- so it is left out for those.
+    bots = undefined,
   } = $props();
 
   const strip = $derived(fader ?? room.strips[key] ?? { gain: 1, mute: false });
@@ -56,6 +61,25 @@
 
   const state = $derived(
     doing ?? (speaking ? 'talking' : mic && muted ? 'muted' : mic ? 'mic on' : 'no mic'),
+  );
+
+  // The AIs being off for this person, which is only ever worth saying
+  // when they are: everybody starts with the switch on, and a mark
+  // against every name in the room would be a mark that means nothing.
+  // So the icon is the exception and its absence is the rule.
+  const off = $derived(bots && bots !== 'any' ? bots : null);
+  const yours = $derived(label === room.you);
+  const one = $derived(theAIs().length === 1);
+  const why = $derived(
+    !off
+      ? ''
+      : yours
+        ? off === 'never'
+          ? `You have BOTS off all the way: nothing you say reaches ${theAI()}, its own name included. Nobody else in the room is affected.`
+          : `You have BOTS off: ${theAI()} ${one ? 'stays' : 'stay'} out of what you say until you say its name. Nobody else in the room is affected.`
+        : off === 'never'
+          ? `${label} has BOTS off all the way: nothing they say reaches ${theAI()}, its own name included. Everybody else is answered as usual.`
+          : `${label} has BOTS off: ${theAI()} ${one ? 'stays' : 'stay'} out of what they say until they say its name. Everybody else is answered as usual.`,
   );
 
   function gain(e) {
@@ -84,7 +108,22 @@
     {:else}
       <span class="dot"></span>
     {/if}
-    <span class="label">{label}{#if label === room.you}<em>&nbsp;(you)</em>{/if}</span>
+    <span class="label">{label}{#if yours}<em>&nbsp;(you)</em>{/if}</span>
+    <!-- Not taking answers. The same mark for both ways of being off,
+         because at this size the thing to see is whether the AIs are
+         in what somebody says at all; which of the two it is is the
+         nuance, and it is in the title and in how solid the mark is. -->
+    {#if off}
+      <span class="bots" class:all={off === 'never'} role="img" title={why} aria-label={why}>
+        <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" focusable="false">
+          <path d="M3 2.5h10A1.5 1.5 0 0 1 14.5 4v4.5A1.5 1.5 0 0 1 13 10H7.5L4.75 12.25V10H3A1.5 1.5 0 0 1 1.5 8.5V4A1.5 1.5 0 0 1 3 2.5Z"
+            fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" />
+          <!-- Struck through, and heavier than the bubble: at this size
+               the thing that has to read is the crossing out. -->
+          <path d="M2.6 13.4 13.4 2.6" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" />
+        </svg>
+      </span>
+    {/if}
     <span class="state">{state}</span>
   </div>
   {#if stream}
@@ -144,6 +183,17 @@
   .label { font-weight: 600; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .label em { font-weight: 400; color: var(--muted); font-style: normal; }
   .state { font-size: 11px; color: var(--muted); flex: none; }
+  /* The AIs are out of what this person says. In the room's own colour
+     for an AI, since that is what it is about. */
+  .bots {
+    flex: none;
+    display: inline-flex;
+    color: var(--agent);
+    /* Off unless they are named is halfway off, and reads that way.
+       All the way off is the solid mark. */
+    opacity: 0.5;
+  }
+  .bots.all { opacity: 1; }
   /* The desktop they are sharing, under their name. A button, because
      the only thing it does is open the picture on this screen. */
   .desktop {

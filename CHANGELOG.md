@@ -90,6 +90,21 @@ releases.
 
 ### Voice room
 
+- **Who the AIs are staying out of is now visible in the room.**
+  Whether an AI may answer you became each person's own switch, and it
+  has been on the roster everybody is sent ever since -- an AI that
+  answers one person and not the one beside them is a room where the
+  reason has to be somewhere, or it reads as a fault -- but nothing
+  drew it. Now a crossed-out speech bubble sits against the name in the
+  list of who is here, in the colour the room uses for an AI.
+
+  Only when the switch is off. Everybody starts with it on, so a mark
+  against every name in the room would be a mark that says nothing: the
+  mark is the exception and its absence is the rule. The same mark for
+  both ways of being off, because at that size the thing to see is
+  whether the AIs are in what somebody says at all -- which of the two
+  it is is in the tooltip, and in how solid the mark is.
+
 - **Which key talks is yours to pick.** It was Space, because that is
   what the person who wrote it likes, and Space is wrong for somebody:
   it is how a screen reader works a page, and it is taken if you are

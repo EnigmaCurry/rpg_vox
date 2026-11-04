@@ -1010,6 +1010,15 @@ the roster the room sends everybody, because an AI that answers one
 person and not the one beside them is a room where the reason has to be
 visible or it reads as a fault.
 
+**And it is visible**: a crossed-out speech bubble against their name
+in the list of who is here, in the colour the room uses for an AI.
+Only when the switch is off, on everybody's screen and not just their
+own — everybody starts with it on, and a mark against every name in the
+room would be a mark that says nothing. The same mark for both ways of
+being off, since at that size the thing to see is whether the AIs are
+in what somebody says at all; which of the two it is is in the tooltip,
+and in how solid the mark is.
+
 ### Games
 
 In the lobby (the room's ordinary conversation) the AI can design a game

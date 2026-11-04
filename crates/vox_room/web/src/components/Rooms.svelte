@@ -174,7 +174,7 @@
          elsewhere is on the room they are in, with a count. -->
     {#each room.people as p (p.name)}
       <Strip key={p.name} label={p.name} mic={p.mic} muted={p.muted} speaking={p.speaking}
-        somebody />
+        bots={p.bots} somebody />
     {/each}
     <!-- The AIs in this room, each with its own fader and its
          own say in when it speaks -- and the puppets, which have a
