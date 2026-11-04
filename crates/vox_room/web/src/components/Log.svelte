@@ -620,9 +620,12 @@
   /* The column beside the face. `min-width: 0` so a long word or a
      wide table shrinks it rather than pushing the face off. */
   .said-by { min-width: 0; flex: 1; display: flex; flex-direction: column; align-items: flex-start; }
-  /* Beside the name rather than the bubble: the name is a line of
-     12px text above the words, and the square lines up with it. */
-  .entry > :global(.face) { margin-top: 14px; }
+  /* Beside the words rather than the name above them: the square sits
+     against the first line of the bubble, not against the 12px line of
+     name and time over it. Measured by eye against the bubble as it is
+     now -- its own border and the air inside it both moved this -- so
+     it is a number to look at again if either changes. */
+  .entry > :global(.face) { margin-top: 19px; }
   .entry.you .said-by { align-items: flex-end; }
   .who { font-size: 12px; color: var(--muted); display: flex; gap: 8px; margin: 0 4px 2px; }
   .entry.you .who { justify-content: flex-end; }
