@@ -105,6 +105,10 @@
 {/if}
 
 <style>
+  /* The sheet scrolls, not the card on it: a card that is its own
+     scroller leaves the whole of the screen around it dead to the
+     wheel, which on a tall face and a long description is most of
+     what you are looking at. See the note in `app.css`. */
   .shade {
     position: fixed;
     inset: 0;
@@ -112,6 +116,8 @@
     display: grid;
     place-items: center;
     padding: 16px;
+    overflow-y: auto;
+    overscroll-behavior: contain;
     z-index: 50;
   }
   .who-card {
@@ -120,8 +126,6 @@
     border-radius: 14px;
     padding: 20px;
     width: min(26em, 100%);
-    max-height: 90vh;
-    overflow-y: auto;
     display: flex;
     flex-direction: column;
     align-items: center;

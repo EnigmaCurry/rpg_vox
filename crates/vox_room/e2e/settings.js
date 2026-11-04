@@ -172,6 +172,19 @@ const sayAt = (page) => page.evaluate(() => {
       log: !!document.querySelector('.log'),
     })),
     { settings: true, room: false, log: false });
+
+  // And the whole width of it scrolls. A page centred with `max-width`
+  // and an auto margin makes the *column* the scrolling element, and
+  // the margins either side of it do nothing -- a page that looks
+  // scrollable everywhere and only is over the words. So the wheel is
+  // tried where there are none.
+  await page.mouse.move(30, 430);
+  await page.mouse.wheel(0, 600);
+  await wait(400);
+  is('the settings scroll from the margin, not only over the words',
+    await page.evaluate(() => document.querySelector('.settings').scrollTop > 0), true);
+  await page.evaluate(() => document.querySelector('.settings').scrollTo(0, 0));
+  await wait(200);
   // What it is for: the things you set once and don't watch. The two
   // switches themselves are not those -- they are what you reach for
   // mid-conversation -- so they stay in the footer, and what each of

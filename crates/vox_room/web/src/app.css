@@ -133,7 +133,26 @@ input[type="range"]::-moz-range-thumb {
   box-shadow: var(--range-thumb-shadow);
 }
 
-/* The room's dialogs: the question, a game's card, a game's prompt. They
+/* A page that scrolls, and where the scrolling happens.
+   =====================================================
+
+   Anything that fills the window and scrolls -- the settings, the
+   owner's page, the conversation, the cards -- must be the scroller
+   *across the whole width*, and centre what is in it with padding:
+
+     padding: 24px max(16px, calc((100% - 44em) / 2)) 48px;
+
+   Not `max-width` with an auto margin. That makes the column of text
+   the scrolling element and leaves the margins either side of it inert
+   -- the wheel does nothing unless the pointer is over the words, which
+   is a page that looks scrollable everywhere and isn't. The same goes
+   for a sheet laid over the room: the sheet scrolls, not the card in
+   the middle of it, or the half of the screen around the card is dead.
+
+   `overscroll-behavior: contain` belongs on each of them too, so a
+   flick that runs off the end of one doesn't take the page with it.
+
+   The room's dialogs: the question, a game's card, a game's prompt. They
    are raised from more than one component, so the look is global. */
 dialog.ask {
   border: 1px solid var(--line);

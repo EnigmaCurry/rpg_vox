@@ -357,9 +357,13 @@
 
 <style>
   .people {
-    max-width: 60em;
-    margin: 0 auto;
-    padding: 24px 16px 48px;
+    /* The whole width scrolls, not just the column of text.
+       Centred with padding rather than with `max-width` and an auto
+       margin, because those two make the *column* the scroller and
+       leave the margins beside it inert -- the wheel does nothing
+       unless the pointer happens to be over the words. See the note
+       on full-page scrollers in `app.css`. */
+    padding: 24px max(16px, calc((100% - 60em) / 2)) 48px;
     height: 100%;
     overflow: auto;
     overscroll-behavior: contain;
