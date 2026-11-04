@@ -16,9 +16,13 @@
 //! * **Handing over**: once nobody has said anything for `reply_after`,
 //!   the paragraphs since the last hand-over join the conversation (each
 //!   engine starts a new paragraph), and the AI is asked for a reply if
-//!   the room is in "always" mode or someone said its name. A bot set to
-//!   [`Mode::Never`] is asked for nothing, by anything: not by its own
-//!   name, and not by a game that wants every pause answered.
+//!   the room is in "always" mode or someone said its name. Two things
+//!   have to allow it. Each person has a switch of their own ([`Bots`],
+//!   **BOTS** in the footer) saying whether their words may be answered
+//!   at all, and words that may not are not a pause anybody is given.
+//!   And a bot set to [`Mode::Never`] is asked for nothing, by anything:
+//!   not by its own name, and not by a game that wants every pause
+//!   answered.
 //! * **Staying in**: in `Named` mode, addressing the AI by name puts the
 //!   room in a back-and-forth -- it answers every pause from then on,
 //!   without being named again, until the room has been idle for
@@ -286,16 +290,80 @@ impl Kind {
     }
 }
 
+/// Whether the AIs may answer one person: their own switch, and
+/// nobody else's.
+///
+/// **BOTS** in the footer, beside push to talk. When an AI speaks used
+/// to be the AI's setting -- one Answers control per bot, which
+/// everybody in the room shared and anybody could change -- and it is
+/// now each person's own, because being answered is something that
+/// happens to *you*: two people at one table can want opposite things
+/// of the same AI, and the one who wants to be left alone should not
+/// have to silence it for the other.
+///
+/// It is a filter on what reaches the turn, not on what is written
+/// down. Everything said in the room is in the one conversation
+/// whoever said it, and an AI answering somebody else reads the whole
+/// of it -- the room is a room. What this decides is whether *your*
+/// words can be the thing it answers.
+///
+/// Kept against the unchanging invite name, so it survives a rename,
+/// and the same in every room: it is how somebody wants to be spoken
+/// to rather than a fact about one room. The bot's own [`Mode`] is
+/// still the other half of the question -- a game may bind it, a show
+/// may silence it, and it can stand itself down -- and a turn wants
+/// both halves to allow it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Bots {
+    /// The button is on: anything they say may be answered. What
+    /// everybody starts as.
+    #[default]
+    Any,
+    /// Off, and off means *unless they are called by name*. The AI
+    /// stays out of what this person says until they say its name, and
+    /// then it answers -- which is the nuance the switch would
+    /// otherwise lose: somebody who wants a quiet room still wants to
+    /// be able to ask a question.
+    Named,
+    /// Off, and off means nothing at all. Not even its own name
+    /// reaches it from this person.
+    Never,
+}
+
+impl Bots {
+    /// What the database and the browser call it. Empty, the column's
+    /// default, is [`Bots::Any`]: everybody starts with the button on,
+    /// and a row written before the column existed is somebody nobody
+    /// had asked.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "any" | "" => Some(Bots::Any),
+            "named" => Some(Bots::Named),
+            "never" => Some(Bots::Never),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Bots::Any => "any",
+            Bots::Named => "named",
+            Bots::Never => "never",
+        }
+    }
+}
+
 /// When the AI answers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Mode {
-    /// Not at all. It is still in the room and still on its fader; it
-    /// just has nothing to say until somebody changes this -- not when
-    /// it is named, and not when a game asks for a bot that answers
-    /// every pause. A room may have an AI in it that nobody wants
-    /// answering today, and silencing one is not the same as taking it
-    /// out of the room.
+    /// Not at all: not when it is named, and not when a game asks for
+    /// a bot that answers every pause. It is still in the room and
+    /// still on its fader -- silencing a voice is not the same as
+    /// taking it out of the room -- and this is the room's own doing
+    /// rather than anybody's switch: a puppet show silences its
+    /// director and its cast for as long as the curtain is up. What
+    /// one *person* wants of the AIs is [`Bots`], and theirs alone.
     Never,
     /// Only when someone says its name.
     Named,
@@ -396,7 +464,7 @@ pub enum Seat {
 }
 
 impl Seat {
-    fn parse(s: &str) -> Option<Self> {
+    pub(crate) fn parse(s: &str) -> Option<Self> {
         match s {
             "audience" => Some(Seat::Audience),
             "box" => Some(Seat::Box),
@@ -405,7 +473,7 @@ impl Seat {
         }
     }
 
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Seat::Audience => "audience",
             Seat::Box => "box",
@@ -422,6 +490,15 @@ impl Seat {
     /// is, and the people in it are not conspiring.
     fn hears(self, said: Seat) -> bool {
         !(matches!(self, Seat::Box | Seat::Stage) && said == Seat::Audience)
+    }
+
+    /// Whether somebody in this seat can hear a thing that was said in
+    /// `said`. `None` is a thing said in a room that had no parts to
+    /// it, or one the room put in front of everybody, and either way
+    /// everyone hears it however the room is divided now -- see
+    /// [`Entry::seat`].
+    fn hears_from(self, said: Option<Seat>) -> bool {
+        said.is_none_or(|said| self.hears(said))
     }
 }
 
@@ -650,6 +727,28 @@ pub struct Entry {
     /// nobody in the room is going to read a job id out.
     #[serde(skip)]
     pub note: String,
+    /// Which part of the playhouse it was said in, for the things that
+    /// were *said*: somebody's words, a reply, a line on the stage.
+    /// It is what decides who is ever shown it, because the box and
+    /// the stage cannot hear the audience -- see [`Seat`].
+    ///
+    /// It is the speaker's seat at the moment they said it, and it
+    /// never changes afterwards. That is the whole reason it is kept
+    /// here rather than read off where they happen to be sitting now:
+    /// somebody who goes round to the box does not thereby say
+    /// everything again from inside it, and a director handed the
+    /// audience's last hour because one of them came for a word is the
+    /// audience being heard through the back door.
+    ///
+    /// `None` for everything the room *posts* in front of everybody --
+    /// every kind of card, and the programme at the curtain -- and for
+    /// everything said in a room with no show on, which has no parts to
+    /// be sitting in. Both are heard by everyone, however the room is
+    /// divided by the time they come to be read. A card held up in a
+    /// room is seen rather than heard, and the rule here is about
+    /// hearing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seat: Option<Seat>,
     /// Unix milliseconds when it started.
     pub at: u64,
     /// Handed to the conversation (people's entries only).
@@ -906,6 +1005,10 @@ struct Person {
     /// holds against their unchanging name, kept here because the roster
     /// is keyed by display name and a rename replaces the entry.
     language: String,
+    /// Whether the AIs may answer them: their BOTS button. Held here
+    /// for the same reason as the language, and read the same way --
+    /// out of the invite list, by `reconcile_people`.
+    bots: Bots,
     /// Where they are sitting while a show is on, and meaningless the
     /// rest of the time -- see [`Seat`]. Everybody comes back to the
     /// audience when the curtain falls, so this is never stale into a
@@ -1166,11 +1269,13 @@ struct BotState {
 }
 
 impl BotState {
-    /// Whether a pause could be this one's: it is in the room, the
-    /// people here haven't told it to say nothing, and there is
-    /// something behind it to answer with.
+    /// Whether a pause could be this one's: it is in the room, nothing
+    /// the room is doing has told it to say nothing, and there is
+    /// something behind it to answer with. Whether a pause of *yours*
+    /// could be is also your own switch -- see [`Bots`] -- which is
+    /// read where the pause is handed over and not here.
     ///
-    /// A puppet is never answering, whatever its Answers says. It has
+    /// A puppet is never answering, whatever its mode says. It has
     /// no brain: a turn given to it would be a turn nobody takes, and
     /// the room would sit waiting for a reply that cannot come. Its
     /// name still reaches the AI that speaks through it -- see
@@ -1243,6 +1348,31 @@ fn on_stage(st: &State) -> Vec<String> {
         .filter(|b| b.puppet())
         .map(|b| b.cfg.name.clone())
         .collect()
+}
+
+/// Where somebody is sitting as they speak, for the entry they are
+/// about to put in the log: a person or a bot, and the audience for a
+/// name the room has never heard of.
+///
+/// `None` when there is no show on. There are no seats in a room with
+/// no stage in it, and tagging what was said there with the audience
+/// would make the box deaf to the hour of conversation before the
+/// curtain went up -- which nobody was shut out of, because there was
+/// nothing to be shut out of. See [`Entry::seat`].
+fn seated(st: &State, who: &str) -> Option<Seat> {
+    if on_stage(st).is_empty() {
+        return None;
+    }
+    if let Some(p) = st.people.get(who) {
+        return Some(p.seat);
+    }
+    Some(
+        st.bots
+            .iter()
+            .find(|b| b.cfg.name == who)
+            .map(|b| b.seat)
+            .unwrap_or_default(),
+    )
 }
 
 /// What the model is told when it asks for a puppet in a house with no
@@ -1609,19 +1739,22 @@ impl Room {
         // answer rather than a thing to arrange per person.
         let placed = store.bots_in(if cfg.only.is_some() { "@" } else { &cfg.id })?;
         // One of these per bot, each with its own channel to its own
-        // agent thread. What the people picked for it is kept under its
-        // name -- except the first, whose setting is the plain `mode`
-        // the room had when a room had one AI in it.
+        // agent thread.
+        //
+        // When a bot answers is no longer written down anywhere, and a
+        // room comes up at whatever the room is configured to. Nobody
+        // picks it any more -- that question is each person's now, and
+        // it is kept against the person; see `Bots`. What is left of a
+        // bot's own mode is the room's own doing: a game's rule, a
+        // show, and a bot standing itself down for the afternoon, none
+        // of which should outlive the room that was in the middle of
+        // it. A mode saved by the control that used to be here would
+        // only be a bot left silent with nothing on any screen to turn
+        // it back on.
         let mut bots = Vec::new();
         let mut wiring = Vec::new();
         for (n, bot) in cfg.bots.iter().enumerate() {
-            let key = format!("mode:{}", bot.name);
-            let chosen = match store.setting(&key)? {
-                Some(m) => Mode::parse(&m),
-                None if n == 0 => store.setting("mode")?.as_deref().and_then(Mode::parse),
-                None => None,
-            }
-            .unwrap_or(cfg.default_mode);
+            let chosen = cfg.default_mode;
             let stops = store
                 .setting(&format!("stops:{}", bot.name))?
                 .as_deref()
@@ -1680,8 +1813,9 @@ impl Room {
                 generation,
                 turns,
                 chosen,
-                // A bot somebody has silenced stays silent, whatever
-                // the game asks for -- see `refresh_mode`.
+                // The game being played binds every bot in the room,
+                // and a room that opens mid-game opens under its rule
+                // -- see `refresh_mode`.
                 mode: match chosen {
                     Mode::Never => Mode::Never,
                     _ => game_mode.unwrap_or(chosen),
@@ -2278,6 +2412,43 @@ impl Room {
         Ok(chosen.to_string())
     }
 
+    /// Whether the AIs may answer `person`: their BOTS button, and
+    /// what they have said the off position means. Theirs alone, kept
+    /// against the name that never changes, and the same in every room
+    /// of the house -- see [`Bots`].
+    ///
+    /// Answers with what it settled on, so a tab that asked for
+    /// something the room doesn't know is put right rather than left
+    /// showing a button that means nothing.
+    pub fn set_bots(&self, person: &str, how: &str) -> Result<String, String> {
+        let Some(bots) = Bots::parse(how.trim()) else {
+            return Err("The room doesn't know that one.".into());
+        };
+        // Against the key, not the display name: a rename must not lose
+        // it, exactly as with the language.
+        let name = match self.store().person_called(person) {
+            Ok(Some(name)) => name,
+            Ok(None) => return Err("The room doesn't know you.".into()),
+            Err(err) => {
+                warn!(person, "set_bots: {err:#}");
+                return Err("The room couldn't save that.".into());
+            }
+        };
+        if let Err(err) = self.store().set_bots(&name, bots.as_str()) {
+            warn!(person, "set_bots: {err:#}");
+            return Err("The room couldn't save that.".into());
+        }
+        info!(person, bots = bots.as_str(), "said when the AIs may answer");
+        let mut st = self.lock();
+        if let Some(p) = st.people.get_mut(person) {
+            p.bots = bots;
+        }
+        // Every tab, not just theirs: the roster is where it is shown,
+        // and it is shown to everybody.
+        self.emit_people(&st);
+        Ok(bots.as_str().to_string())
+    }
+
     /// What `person` speaks and hears, for a tab that is joining.
     pub fn language_for(&self, person: &str) -> String {
         let st = self.lock();
@@ -2335,6 +2506,12 @@ impl Room {
                         "muted": p.muted(),
                         "speaking": p.speaking,
                         "language": self.language_of(p),
+                        // Whether the AIs may answer them, which is
+                        // theirs alone to set and everybody's to see:
+                        // an AI that answers one person and not the
+                        // one beside them is a room where the reason
+                        // has to be somewhere, or it reads as a fault.
+                        "bots": p.bots.as_str(),
                     })
                 })
                 .collect(),
@@ -2604,6 +2781,8 @@ impl Room {
             typed: false,
             translations: BTreeMap::new(),
             note: String::new(),
+            // Posted to the whole room, not said in a part of it.
+            seat: None,
             at: now_ms(),
             sent: true,
         };
@@ -2755,6 +2934,8 @@ impl Room {
             typed: false,
             translations: BTreeMap::new(),
             note: String::new(),
+            // Posted to the whole room, not said in a part of it.
+            seat: None,
             at: now_ms(),
             sent: true,
         };
@@ -2937,14 +3118,19 @@ impl Room {
     pub fn reconcile_people(&self) {
         let mut st = self.lock();
         // State first, then the store: the order everything else here uses.
-        // Display name to the language they chose, which is how a choice
-        // made at the door -- or carried through a rename, since the store
-        // keys it by the name instead -- reaches the roster.
-        let invited: BTreeMap<String, String> = match self.store().people() {
+        // Display name to the two things of theirs the room reads out of
+        // the invite list -- the language they chose and whether the AIs
+        // may answer them -- which is how a choice made at the door, or
+        // carried through a rename since the store keys it by the name
+        // instead, reaches the roster.
+        let invited: BTreeMap<String, (String, Bots)> = match self.store().people() {
             Ok(people) => people
                 .into_iter()
                 .filter(|p| self.cfg.admits(&p.name))
-                .map(|p| (p.display, p.language))
+                .map(|p| {
+                    let bots = Bots::parse(&p.bots).unwrap_or_default();
+                    (p.display, (p.language, bots))
+                })
                 .collect(),
             Err(err) => {
                 warn!("couldn't read the invite list: {err:#}");
@@ -2958,17 +3144,22 @@ impl Room {
         // Anyone whose language the roster has just learned, so the
         // mixer can be told which queue their tabs listen to.
         let mut retrack: Vec<String> = Vec::new();
-        for (name, language) in invited {
+        for (name, (language, bots)) in invited {
             match st.people.entry(name) {
                 btree_map::Entry::Vacant(slot) => {
                     info!(person = %slot.key(), "invited");
                     slot.insert(Person {
                         language,
+                        bots,
                         ..Person::default()
                     });
                     changed = true;
                 }
                 btree_map::Entry::Occupied(mut slot) => {
+                    if slot.get().bots != bots {
+                        slot.get_mut().bots = bots;
+                        changed = true;
+                    }
                     if slot.get().language != language {
                         slot.get_mut().language = language;
                         // The mixer feeds each tab from a language it was
@@ -3347,6 +3538,8 @@ impl Room {
             typed: false,
             translations: BTreeMap::new(),
             note: String::new(),
+            // Posted to the whole room, not said in a part of it.
+            seat: None,
             at: now_ms(),
             sent: true,
         };
@@ -4086,6 +4279,8 @@ impl Room {
             typed: false,
             translations: BTreeMap::new(),
             note: String::new(),
+            // Posted to the whole room, not said in a part of it.
+            seat: None,
             at: now_ms(),
             sent: true,
         };
@@ -4324,6 +4519,8 @@ impl Room {
             cut: false,
             typed: false,
             translations: BTreeMap::new(),
+            // Posted to the whole room, not said in a part of it.
+            seat: None,
             at: now_ms(),
             sent: true,
         };
@@ -4552,9 +4749,9 @@ impl Room {
     /// written down. Asked out loud afterwards to speak in something
     /// else, it does -- and comes back up in the one chosen here.
     ///
-    /// Anybody in the room may, like **Answers** and the faders: the
-    /// control is no more than the sentence they could say instead,
-    /// and a room of somebody's own is theirs anyway.
+    /// Anybody in the room may, like the faders: the control is no
+    /// more than the sentence they could say instead, and a room of
+    /// somebody's own is theirs anyway.
     ///
     /// `voice` is the name a voice is called out loud, or None for the
     /// bot's own. Ok says what it is wearing now, in the same words
@@ -5137,6 +5334,9 @@ impl Room {
             typed: false,
             translations: BTreeMap::new(),
             note: String::new(),
+            // The stage, which is where a puppet stands: its line is
+            // said up there and everybody can hear it.
+            seat: seated(&st, who),
             at: now_ms(),
             sent: true,
         };
@@ -5424,14 +5624,11 @@ impl Room {
         }
     }
 
-    /// Set one voice's Answers and Stops, as the controls do and
-    /// written down the same way -- but without cutting off whatever
-    /// it is in the middle of saying.
+    /// Set one voice's mode and Stops -- but without cutting off
+    /// whatever it is in the middle of saying.
     ///
-    /// That is the whole reason this is not [`Room::set_mode`]:
-    /// silencing a bot from the controls stops it mid-sentence,
-    /// because a control that waited for the sentence to end would not
-    /// be the control anybody pressed. The curtain going up is the
+    /// Silencing a bot anywhere else stops it mid-sentence, because
+    /// whatever asked for it wanted it now. The curtain going up is the
     /// opposite case -- it happens *inside* the reply where the AI is
     /// announcing the show, and a show that began by cutting off its
     /// own announcement would lose the sentence that explains it.
@@ -5445,16 +5642,17 @@ impl Room {
         if mode == Mode::Never {
             st.pending.retain(|p| p.bot != bot);
         }
-        let store = self.store();
-        for (key, value) in [
-            (format!("mode:{bot}"), mode.as_str()),
-            (format!("stops:{bot}"), stops.as_str()),
-        ] {
-            if let Err(err) = store.set_setting(&key, value) {
-                warn!("store {key}: {err:#}");
-            }
+        // Only what is read again when the room opens. When a bot
+        // answers is not written down at all any more -- see
+        // `Room::new` -- and a show that was on when the server stopped
+        // puts the modes back out of `SHOW_WAS`, which is the record
+        // that matters here.
+        if let Err(err) = self
+            .store()
+            .set_setting(&format!("stops:{bot}"), stops.as_str())
+        {
+            warn!("store stops:{bot}: {err:#}");
         }
-        drop(store);
         self.refresh_mode(st, bot);
         self.emit(json!({ "type": "stops", "bot": bot, "stops": stops.as_str() }));
     }
@@ -5483,8 +5681,8 @@ impl Room {
         let was: BTreeMap<String, (Mode, Stops)> = read
             .into_iter()
             // Only the AIs: a puppet's row is for a puppet that is no
-            // longer anywhere, and `set_mode` on a name the room
-            // hasn't got does nothing anyway.
+            // longer anywhere, and a mode put back on a name the
+            // room hasn't got does nothing anyway.
             .filter(|(who, _)| self.cfg.bots.iter().any(|b| &b.name == who))
             .filter_map(|(who, (m, s))| Some((who, (Mode::parse(&m)?, Stops::parse(&s)?))))
             .collect();
@@ -5538,6 +5736,10 @@ impl Room {
             typed: false,
             translations: BTreeMap::new(),
             note: String::new(),
+            // The programme is the room's, not the box's: it is what the
+            // conversation keeps of a show that is over, so it is read
+            // there by everybody. See `Entry::seat`.
+            seat: None,
             at: now_ms(),
             sent: true,
         };
@@ -5587,6 +5789,11 @@ impl Room {
             }
         }
         let conversation = st.conversation;
+        // Where they are sitting as they start the paragraph, kept with
+        // it for good: the entry is written once, at the first word,
+        // and what it says about who could hear it has to be as true in
+        // an hour as it is now. See `Entry::seat`.
+        let seat = seated(&st, person);
         let idx = match st.log.iter().position(|e| e.id == para.id) {
             Some(i) => i,
             None => {
@@ -5605,6 +5812,7 @@ impl Room {
                     typed: false,
                     translations: BTreeMap::new(),
                     note: String::new(),
+                    seat,
                     at: now_ms(),
                     sent: false,
                 });
@@ -5981,46 +6189,6 @@ impl Room {
         self.emit_people(&st);
     }
 
-    /// Someone picked a mode: that is the room's own, and it ends any
-    /// back-and-forth. The game being played may still require another.
-    pub fn set_mode(&self, bot: &str, mode: &str) {
-        let Some(mode) = Mode::parse(mode) else {
-            return;
-        };
-        let mut st = self.lock();
-        if !st.bots.iter().any(|b| b.cfg.name == bot) {
-            return;
-        }
-        // A puppet answers nothing because there is nothing behind it,
-        // not because anybody chose that. There is no setting here to
-        // change, and the control is not shown for one.
-        if st.bots.iter().any(|b| b.cfg.name == bot && b.puppet()) {
-            return;
-        }
-        let b = st.bot(bot);
-        b.chosen = mode;
-        b.engaged = None;
-        // Nothing anybody asked of it outlives being silenced -- not a
-        // silence it wanted shown again, and not a turn another voice
-        // put to it.
-        if mode == Mode::Never {
-            st.pending.retain(|p| p.bot != bot);
-        }
-        if let Err(err) = self
-            .store()
-            .set_setting(&format!("mode:{bot}"), mode.as_str())
-        {
-            warn!("store mode: {err:#}");
-        }
-        self.refresh_mode(&mut st, bot);
-        // Silencing one in the middle of a sentence stops it there:
-        // a control that waited for the sentence to end would not be
-        // the control anybody pressed.
-        if mode == Mode::Never {
-            self.hush(&mut st, &[bot.to_string()]);
-        }
-    }
-
     /// Put one AI in this room, or take it out: the owner's tick in
     /// **People and rooms**, which is the only thing that decides it.
     ///
@@ -6044,7 +6212,7 @@ impl Room {
         }
         info!(bot, room = %self.cfg.id, here, "the owner said who is in the room");
         // Every tab is told the room has a different set of voices in
-        // it: a fader appears or goes, and so does its Answers.
+        // it: a fader appears or goes, and so does its Stops.
         self.emit(json!({
             "type": "agents_here",
             "agents": self.agents_json(&st),
@@ -6069,7 +6237,7 @@ impl Room {
                     // itself says so where everyone can see it.
                     "voice": b.voice,
                     // A puppet, not an AI: it has a fader like
-                    // everybody else and no Answers to set, because
+                    // everybody else and nothing to set, because
                     // there is nothing behind it to answer with.
                     "puppet": b.puppet(),
                 })
@@ -6104,9 +6272,14 @@ impl Room {
     }
 
     /// The AI standing down by itself: back to answering only when it is
-    /// named. It changes the room's own mode, as if someone picked it,
-    /// and answers with what the room is actually doing afterwards --
-    /// which is still `always` if the game being played requires it.
+    /// named. It answers with what the room is actually doing
+    /// afterwards -- which is still `always` if the game being played
+    /// requires it.
+    ///
+    /// This afternoon's and not written down: standing down is a thing
+    /// a voice does about the conversation it is in, and a room that
+    /// came back up from a restart still waiting to be named would be
+    /// a room nobody could tell why about.
     pub fn wait_until_named(&self, generation: u64) -> &'static str {
         let mut st = self.lock();
         let Some(b) = st.turn_of(generation) else {
@@ -6118,12 +6291,6 @@ impl Room {
         }
         b.chosen = Mode::Named;
         b.engaged = None;
-        if let Err(err) = self
-            .store()
-            .set_setting(&format!("mode:{bot}"), Mode::Named.as_str())
-        {
-            warn!("store mode: {err:#}");
-        }
         self.refresh_mode(&mut st, &bot);
         st.bot(&bot).mode.as_str()
     }
@@ -6712,6 +6879,8 @@ impl Room {
             typed: false,
             translations: BTreeMap::new(),
             note: String::new(),
+            // Posted to the whole room, not said in a part of it.
+            seat: None,
             at: now_ms(),
             sent: true,
         };
@@ -6760,6 +6929,11 @@ impl Room {
                 typed: true,
                 translations: BTreeMap::new(),
                 note: String::new(),
+                // Where they were sitting as they typed it. Typing a
+                // thing and saying it are the same act done two ways,
+                // and a message typed in the audience is as unheard in
+                // the box as a spoken one.
+                seat: seated(&st, person),
                 at: now_ms(),
                 sent: false,
             };
@@ -7557,14 +7731,16 @@ impl Room {
             return;
         }
         let conversation = st.conversation;
-        // What was said, and where each of them was sitting when they
-        // said it. The seat matters because a show divides the room
-        // into parts that cannot all hear each other: the audience may
-        // talk as freely as it likes and the box hears none of it. So
-        // the words are kept with their speaker rather than run
-        // together, and each voice is handed the ones it can actually
-        // hear -- see `Seat::hears`.
-        let mut heard: Vec<(String, String, Seat)> = Vec::new();
+        // What was said, and the part of the room each of them said it
+        // in -- off the entry, where it was written down at the first
+        // word, and not off where they are sitting now. The seat
+        // matters because a show divides the room into parts that
+        // cannot all hear each other: the audience may talk as freely
+        // as it likes and the box hears none of it. So the words are
+        // kept with their speaker rather than run together, and each
+        // voice is handed the ones it can actually hear -- see
+        // `Seat::hears_from` and `Entry::seat`.
+        let mut heard: Vec<(String, String, Option<Seat>)> = Vec::new();
         let mut who = std::collections::BTreeSet::new();
         for &i in &pending {
             let e = &mut st.log[i];
@@ -7576,12 +7752,7 @@ impl Room {
                 warn!("store entry: {err:#}");
             }
             self.emit_entry(&entry);
-            let seat = st
-                .people
-                .get(&entry.who)
-                .map(|p| p.seat)
-                .unwrap_or_default();
-            heard.push((entry.who, entry.text, seat));
+            heard.push((entry.who, entry.text, entry.seat));
         }
         for name in &who {
             if let Some(e) = st.people.get(name).and_then(|p| p.engine.as_ref()) {
@@ -7613,6 +7784,16 @@ impl Room {
         // see `tell_about_sample`.
         st.pending.retain(|p| p.why == Why::Reading);
         st.ai_turns = 0;
+        // Whether the AIs may answer each of the people who just spoke:
+        // their own switch, read before any bot is looked at. See
+        // [`Bots`].
+        let may: BTreeMap<String, Bots> = who
+            .iter()
+            .map(|n| {
+                let bots = st.people.get(n).map(|p| p.bots).unwrap_or_default();
+                (n.clone(), bots)
+            })
+            .collect();
         let mut turns: Vec<(String, Cue)> = Vec::new();
         for bot in bots {
             // What this one heard of it. Outside a show that is all of
@@ -7620,16 +7801,37 @@ impl Room {
             // deaf to the audience, so a name said out there is not its
             // name being said and a pause out there is not its pause.
             let seat = st.bot(&bot).seat;
-            let mine: String = heard
-                .iter()
-                .filter(|(_, _, said_in)| seat.hears(*said_in))
-                .map(|(_, text, _)| text.as_str())
-                .collect::<Vec<_>>()
-                .join(" ");
-            let was_named = self.named(st, &mine).contains(&bot);
+            // And not the same as what was said, either: each person's
+            // BOTS switch says whether their words may be answered at
+            // all. On, they count like anybody's; off, only a sentence
+            // with this one's name in it counts, or nothing does. So
+            // the words are taken one speaker at a time rather than run
+            // together -- see `Bots`.
+            let mut mine = String::new();
+            let mut was_named = false;
+            for (said_by, text, said_in) in &heard {
+                if !seat.hears_from(*said_in) {
+                    continue;
+                }
+                let called = self.named(st, text).contains(&bot);
+                let counts = match may.get(said_by).copied().unwrap_or_default() {
+                    Bots::Any => true,
+                    Bots::Named => called,
+                    Bots::Never => false,
+                };
+                if !counts {
+                    continue;
+                }
+                if !mine.is_empty() {
+                    mine.push(' ');
+                }
+                mine.push_str(text);
+                was_named |= called;
+            }
             // Nothing it could hear was said at all: the audience was
             // talking among themselves, which is theirs to do and none
-            // of this one's business.
+            // of this one's business -- and so is anything said by
+            // somebody whose switch keeps the AIs out of it.
             if mine.trim().is_empty() {
                 st.bot(&bot).talked_over = false;
                 continue;
@@ -7715,29 +7917,21 @@ impl Room {
             false => Vec::new(),
         };
         let mine: Vec<String> = puppets.iter().map(|(n, _)| n.clone()).collect();
-        // Whose lines this one cannot hear: the audience, when it is
-        // sitting in the box or on the stage. The transcript has to
-        // agree with the turn-taking, or the AI reads a question it was
-        // deliberately never given the turn to answer and answers it
-        // anyway -- which is the audience being heard through the back
-        // door.
+        // Where this one is sitting, which decides what of the
+        // conversation it is shown at all: the box and the stage are
+        // handed the box's log and the stage's and nothing of the
+        // audience's. The transcript has to agree with the turn-taking,
+        // or the AI reads a question it was deliberately never given
+        // the turn to answer and answers it anyway -- which is the
+        // audience being heard through the back door.
         let seat = st.bot(bot).seat;
-        let deaf_to: Vec<String> = match on_stage(st).is_empty() {
-            true => Vec::new(),
-            false => st
-                .people
-                .iter()
-                .filter(|(_, p)| !seat.hears(p.seat))
-                .map(|(n, _)| n.clone())
-                .collect(),
-        };
         let mut messages = conversation_messages(
             &st.log,
             self.cfg.history,
             &self.cfg.language,
             bot,
             &mine,
-            &deaf_to,
+            seat,
         );
         let game = match &st.game {
             Some(name) => match self.store().game(name) {
@@ -7764,6 +7958,9 @@ impl Room {
             typed: false,
             translations: BTreeMap::new(),
             note: String::new(),
+            // Where this one is sitting: the director answers from the
+            // box, and what it says there is read in the box.
+            seat: seated(st, bot),
             at: now_ms(),
             sent: true,
         };
@@ -7891,7 +8088,7 @@ impl Room {
         // among itself is not a pause anybody in the box is going to
         // answer, and a strip that said "waiting" at it would be
         // promising a turn that is never coming.
-        let from = |e: &Entry| st.people.get(&e.who).map(|p| p.seat).unwrap_or_default();
+        let from = |e: &Entry| e.seat;
         // In `Auto` it is the bot's call, so the room doesn't
         // promise an answer it may not give. Somebody is going to
         // answer if any of them answers every pause, or if any of
@@ -7902,12 +8099,12 @@ impl Room {
             b.here
                 && b.mode == Mode::Always
                 && !b.talked_over
-                && pending.iter().any(|e| b.seat.hears(from(e)))
+                && pending.iter().any(|e| b.seat.hears_from(from(e)))
         }) || pending.iter().any(|e| {
             self.named(st, &e.text).iter().any(|n| {
                 st.bots
                     .iter()
-                    .any(|b| &b.cfg.name == n && b.seat.hears(from(e)))
+                    .any(|b| &b.cfg.name == n && b.seat.hears_from(from(e)))
             })
         })
     }
@@ -8194,11 +8391,17 @@ fn conversation_messages(
     language: &str,
     me: &str,
     puppets: &[String],
-    deaf_to: &[String],
+    seat: Seat,
 ) -> Vec<(Role, String)> {
     let done: Vec<&Entry> = log
         .iter()
-        .filter(|e| !deaf_to.contains(&e.who))
+        // What this voice could hear of it, which during a show is not
+        // all of it: the audience has a log of its own and the box and
+        // the stage are deaf to it. Entry by entry, by where each one
+        // was *said* -- not by who said it, because somebody who goes
+        // round to the box does not carry the audience's last hour in
+        // with them. See `Entry::seat`.
+        .filter(|e| seat.hears_from(e.seat))
         .filter(|e| match e.kind {
             Kind::Human => e.sent && !e.text.trim().is_empty(),
             // A reply, and a line in a play: the same thing to a
@@ -8476,6 +8679,36 @@ mod tests {
         r.lock().only().generation.load(Ordering::SeqCst)
     }
 
+    /// Put one bot in a mode, the way the room itself does.
+    ///
+    /// There is no control for this any more -- when a bot answers is
+    /// the room's own business now, and when it answers *you* is your
+    /// switch; see `Bots`. What is left of it is still reachable: a
+    /// game binds every bot in the room, a show silences the director
+    /// and its puppets, and a bot can stand itself down. This is how a
+    /// test puts a bot in one of those states without staging the whole
+    /// of it, and it does what silencing one has always done --
+    /// including stopping it mid-sentence, since a show's curtain is
+    /// the only thing that waits for the sentence to end.
+    fn set_mode(r: &Room, bot: &str, mode: &str) {
+        let mode = Mode::parse(mode).expect("a mode the room knows");
+        let mut st = r.lock();
+        assert!(
+            st.bots.iter().any(|b| b.cfg.name == bot && !b.puppet()),
+            "no AI called {bot} in the room"
+        );
+        let b = st.bot(bot);
+        b.chosen = mode;
+        b.engaged = None;
+        if mode == Mode::Never {
+            st.pending.retain(|p| p.bot != bot);
+        }
+        r.refresh_mode(&mut st, bot);
+        if mode == Mode::Never {
+            r.hush(&mut st, &[bot.to_string()]);
+        }
+    }
+
     fn room(mode: Mode) -> (Arc<Room>, crossbeam_channel::Receiver<Turn>) {
         let (r, turns, _) = room_with(mode, &[]);
         (r, turns)
@@ -8493,12 +8726,11 @@ mod tests {
         let store = Store::memory().in_room("Lobby");
         store.invite("Ryan").unwrap();
         store.invite("Alex").unwrap();
-        store.set_setting("mode", mode.as_str()).unwrap();
         let cfg = RoomConfig {
             id: "Lobby".into(),
             title: "Lobby".into(),
             only: None,
-            default_mode: Mode::Named,
+            default_mode: mode,
             bots: vec![BotConfig::new("Vox", vec!["box".into()])],
             reply_after: Duration::from_millis(1000),
             confirm: Duration::from_millis(300),
@@ -8700,7 +8932,7 @@ mod tests {
         // The model is told it is theirs and that it did not make it:
         // one told only that a picture is in the chat takes credit for
         // it, and then offers to change a thing it never made.
-        let msgs = conversation_messages(&r.lock().log, 50, "English", "Vox", &[], &[]);
+        let msgs = conversation_messages(&r.lock().log, 50, "English", "Vox", &[], Seat::Audience);
         let said = msgs
             .iter()
             .map(|(_, t)| t.as_str())
@@ -8728,7 +8960,7 @@ mod tests {
         r.finish_picture(&id, &png(), "Job a47b27c5aeb7: 64x64 sprite, 16 colours.");
 
         let read_back = |r: &Room| {
-            conversation_messages(&r.lock().log, 50, "English", "Vox", &[], &[])
+            conversation_messages(&r.lock().log, 50, "English", "Vox", &[], Seat::Audience)
                 .iter()
                 .map(|(_, t)| t.as_str())
                 .collect::<Vec<_>>()
@@ -9331,6 +9563,108 @@ mod tests {
         assert_eq!(heard(&s), "One two. Three four");
     }
 
+    /// Whether the AIs may answer *you* is your own switch, and the
+    /// room reads it one speaker at a time: with it off, your pause is
+    /// not a pause anybody answers, and your calling it by name still
+    /// is.
+    #[test]
+    fn the_bots_switch_says_whether_your_words_are_answered() {
+        let (r, turns) = room(Mode::Auto);
+
+        // On, which is what everybody starts as: a pause of theirs is
+        // handed over like anybody's.
+        r.on_paragraph("Ryan", &para("p1", "I check the door.", false));
+        r.tick(quiet(&r));
+        assert!(turns.try_recv().is_ok(), "the button is on to begin with");
+        r.stop_agent();
+
+        // Off: the AI stays out of what they say...
+        assert_eq!(r.set_bots("Ryan", "named"), Ok("named".into()));
+        r.on_paragraph("Ryan", &para("p2", "And then along the wall.", false));
+        r.tick(quiet(&r));
+        assert!(turns.try_recv().is_err(), "theirs to be left out of");
+
+        // ...until they ask it something, which is the whole of the
+        // nuance in the switch.
+        r.on_paragraph("Ryan", &para("p3", "Vox, what do I see?", false));
+        r.tick(quiet(&r));
+        let t = turns.try_recv().expect("called by name");
+        assert_eq!(t.cue, Cue::Speak, "asked, so it answers rather than judges");
+        assert_eq!(
+            t.messages,
+            vec![(
+                Role::User,
+                "Ryan: I check the door.\nRyan: And then along the wall.\nRyan: Vox, what do I see?"
+                    .into()
+            )],
+            "and it reads the whole conversation, which is the room's"
+        );
+        r.stop_agent();
+
+        // Off meaning never: not even its own name reaches it.
+        assert_eq!(r.set_bots("Ryan", "never"), Ok("never".into()));
+        r.on_paragraph("Ryan", &para("p4", "Vox, are you there?", false));
+        r.tick(quiet(&r));
+        assert!(turns.try_recv().is_err(), "nothing of theirs at all");
+
+        // And back on.
+        assert_eq!(r.set_bots("Ryan", "any"), Ok("any".into()));
+        r.on_paragraph("Ryan", &para("p5", "Right then.", false));
+        r.tick(quiet(&r));
+        assert!(turns.try_recv().is_ok(), "the button again");
+
+        assert!(
+            r.set_bots("Ryan", "sometimes").is_err(),
+            "and a switch the room has never heard of is refused"
+        );
+        assert!(r.set_bots("Mallory", "never").is_err(), "and so is a stranger");
+    }
+
+    /// One person's switch is one person's. The room is a room: the AI
+    /// goes on answering everybody else, and the words of somebody who
+    /// has turned it off are still in the conversation it reads.
+    #[test]
+    fn one_person_turning_the_ais_off_leaves_everybody_else_alone() {
+        let (r, turns) = room(Mode::Auto);
+        assert_eq!(r.set_bots("Ryan", "never"), Ok("never".into()));
+
+        r.on_paragraph("Ryan", &para("p1", "The lock is stuck.", false));
+        r.on_paragraph("Alex", &para("p2", "Try the window.", false));
+        r.tick(quiet(&r));
+        let t = turns.try_recv().expect("Alex is still owed an answer");
+        assert_eq!(
+            t.messages,
+            vec![(
+                Role::User,
+                "Ryan: The lock is stuck.\nAlex: Try the window.".into()
+            )],
+            "and what Ryan said is in the conversation, which nobody's switch hides"
+        );
+        r.stop_agent();
+
+        // Alone, the same pause is nobody's to answer.
+        r.on_paragraph("Ryan", &para("p3", "Still stuck.", false));
+        r.tick(quiet(&r));
+        assert!(turns.try_recv().is_err(), "theirs alone, and left alone");
+    }
+
+    /// The switch is kept against the name that never changes, like
+    /// the language, so renaming yourself at the door doesn't quietly
+    /// bring the AIs back.
+    #[test]
+    fn the_switch_survives_a_rename() {
+        let (r, turns) = room(Mode::Auto);
+        assert_eq!(r.set_bots("Ryan", "never"), Ok("never".into()));
+        assert_eq!(r.rename("Ryan", "Thorne"), Ok("Thorne".to_string()));
+        assert_eq!(
+            r.lock().people.get("Thorne").map(|p| p.bots),
+            Some(Bots::Never)
+        );
+        r.on_paragraph("Thorne", &para("p1", "Vox, are you there?", false));
+        r.tick(quiet(&r));
+        assert!(turns.try_recv().is_err(), "still theirs to be left out of");
+    }
+
     #[test]
     fn answers_only_when_named_in_named_mode() {
         let (r, turns) = room(Mode::Named);
@@ -9430,7 +9764,7 @@ mod tests {
         assert!(e.text.ends_with(" —"), "{:?}", e.text);
         assert!(r.lock().only().reply.is_none());
         // The model hears where it was cut off.
-        let msgs = conversation_messages(&r.lock().log, 50, "English", "Vox", &[], &[]);
+        let msgs = conversation_messages(&r.lock().log, 50, "English", "Vox", &[], Seat::Audience);
         assert!(msgs.last().unwrap().1.ends_with(CUT_NOTE));
     }
 
@@ -9831,7 +10165,7 @@ mod tests {
             let e = st.log.iter_mut().find(|e| e.id == "p1").unwrap();
             e.sent = true;
         }
-        let msgs = conversation_messages(&r.lock().log, 50, "English", "Vox", &[], &[]);
+        let msgs = conversation_messages(&r.lock().log, 50, "English", "Vox", &[], Seat::Audience);
         assert_eq!(msgs.last().unwrap().1, "Alex: The door is locked.");
     }
 
@@ -9980,7 +10314,7 @@ mod tests {
         assert_eq!(e.translations["Russian"], format!("{ru0} {ru1}"));
         // What the model is shown is still the one language it writes
         // in: a translation of its own words is not news to it.
-        let msgs = conversation_messages(&r.lock().log, 50, "English", "Vox", &[], &[]);
+        let msgs = conversation_messages(&r.lock().log, 50, "English", "Vox", &[], Seat::Audience);
         let last = &msgs.last().unwrap().1;
         assert_eq!(
             last,
@@ -10369,7 +10703,7 @@ mod tests {
         assert!(r.read_game("Dragon Heist").is_err());
 
         // The model is told about the button in later turns.
-        let msgs = conversation_messages(&r.lock().log, 50, "English", "Vox", &[], &[]);
+        let msgs = conversation_messages(&r.lock().log, 50, "English", "Vox", &[], Seat::Audience);
         assert!(msgs.last().unwrap().1.contains("\"Dragon Caper\""));
 
         // Entering: a fresh conversation, and the AI opens with the prompt.
@@ -10552,8 +10886,8 @@ mod tests {
 
         // Each answers to its own name, and in `named` neither answers
         // anything else.
-        r.set_mode("Vox", "named");
-        r.set_mode("Sage", "named");
+        set_mode(&r, "Vox", "named");
+        set_mode(&r, "Sage", "named");
         r.stop_agent();
         r.on_paragraph("Ryan", &para("p2", "Sage, what about the door?", false));
         r.tick(quiet(&r));
@@ -10561,7 +10895,7 @@ mod tests {
         assert!(turns["Vox"].try_recv().is_err(), "it was not");
 
         // And one bot's setting is not the other's.
-        r.set_mode("Sage", "always");
+        set_mode(&r, "Sage", "always");
         let modes: Vec<Mode> = r.lock().bots.iter().map(|b| b.chosen).collect();
         assert_eq!(modes, [Mode::Named, Mode::Always]);
     }
@@ -10623,7 +10957,7 @@ mod tests {
         // given that last pause and neither took it, and a turn nobody
         // ended holds the room: end them first.
         r.stop_agent();
-        r.set_mode("Sage", "never");
+        set_mode(&r, "Sage", "never");
         r.on_paragraph("Ryan", &para("p3", "Still there?", false));
         r.tick(quiet(&r));
         let vox = turns["Vox"].try_recv().expect("Vox answers");
@@ -10791,7 +11125,7 @@ mod tests {
         assert!(err(r.hand_to(sage.generation, "Ryan")).contains("nobody here called"));
         assert!(err(r.hand_to(sage.generation, "Sage")).contains("that is you"));
         // And not to one that has been told to say nothing at all.
-        r.set_mode("Vox", "never");
+        set_mode(&r, "Vox", "never");
         assert!(err(r.hand_to(sage.generation, "Vox")).contains("say nothing at all"));
         assert!(r.lock().pending.is_empty());
         // A turn that is over can't hand anything on either.
@@ -11207,7 +11541,7 @@ mod tests {
         assert_eq!(mode_now(&r), (Mode::Never, false), "and no back-and-forth");
 
         // Turned back on, it answers the next pause.
-        r.set_mode("Vox", "always");
+        set_mode(&r, "Vox", "always");
         r.on_paragraph("Ryan", &para("p2", "Still there?", false));
         r.tick(quiet(&r));
         assert!(turns.try_recv().is_ok(), "on again");
@@ -11235,7 +11569,7 @@ mod tests {
             r.mixer.tick();
         }
         r.tick(Instant::now());
-        r.set_mode("Vox", "never");
+        set_mode(&r, "Vox", "never");
         assert!(r.lock().only().reply.is_none(), "stopped mid-sentence");
         assert_eq!(agent_entry(&r).text, "Once upon a time —");
 
@@ -11249,7 +11583,7 @@ mod tests {
         assert!(turns.try_recv().is_err(), "named in a game, and silent");
 
         // Turned back on, the game's rule is what it comes back to.
-        r.set_mode("Vox", "named");
+        set_mode(&r, "Vox", "named");
         assert_eq!(mode_now(&r), (Mode::Always, false));
     }
 
@@ -11510,7 +11844,7 @@ mod tests {
 
         // And the AI is shown its own card in full, so it can go on
         // playing by what the room is looking at.
-        let said = conversation_messages(&r.lock().log, 50, "English", "Vox", &[], &[]);
+        let said = conversation_messages(&r.lock().log, 50, "English", "Vox", &[], Seat::Audience);
         assert_eq!(said.len(), 1);
         assert_eq!(said[0].0, Role::Assistant);
         assert!(said[0].1.contains("The rules"), "{}", said[0].1);
@@ -12187,11 +12521,12 @@ mod tests {
             typed: false,
             translations: BTreeMap::new(),
             note: note.into(),
+            seat: None,
             at: 0,
             sent: true,
         };
         let told = |e: Entry| {
-            conversation_messages(&[e], 50, "English", "Vox", &[], &[])
+            conversation_messages(&[e], 50, "English", "Vox", &[], Seat::Audience)
                 .into_iter()
                 .map(|(_, t)| t)
                 .collect::<Vec<_>>()
@@ -12337,6 +12672,30 @@ mod tests {
             "a puppet it is holding is not somebody else in the room to it"
         );
 
+        // And it is handed the question that was put to it in the box,
+        // with nothing of what the same person said from the audience.
+        // Somebody coming round for a word does not bring the
+        // audience's log in with them: the seat is the one they were
+        // sitting in when the words were said, and theirs was the
+        // audience. A director handed that line would answer it --
+        // which is the audience being heard through the back door, and
+        // the whole of what the box is for.
+        let said = given
+            .messages
+            .iter()
+            .map(|(_, t)| t.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            said.contains("Grimble, what is through the gate?"),
+            "the question asked in the box: {said}"
+        );
+        assert_eq!(
+            said.matches("through the gate").count(),
+            1,
+            "and not the one asked from the audience: {said}"
+        );
+
         // Nothing is waiting for a reply from the puppet itself.
         assert!(
             !r.lock()
@@ -12363,6 +12722,7 @@ mod tests {
             typed: false,
             translations: BTreeMap::new(),
             note: String::new(),
+            seat: None,
             at: 0,
             sent: true,
         };
@@ -12373,21 +12733,21 @@ mod tests {
             "English",
             "Vox",
             &["Grimble".to_string()],
-            &[],
+            Seat::Audience,
         );
         assert_eq!(
             mine,
             [(Role::Assistant, "[as Grimble] None shall pass.".to_string())]
         );
         // To anybody else: another voice in the room, which is what it is.
-        let theirs = conversation_messages(&[line], 50, "English", "Sage", &[], &[]);
+        let theirs = conversation_messages(&[line], 50, "English", "Sage", &[], Seat::Audience);
         assert_eq!(
             theirs,
             [(Role::User, "Grimble: None shall pass.".to_string())]
         );
     }
 
-    /// The curtain sets Answers and Stops on every voice in the room
+    /// The curtain sets the mode and Stops of every voice in the room
     /// and puts them back afterwards -- and it must not cut off the
     /// reply the AI is announcing the show in.
     #[test]
@@ -12395,7 +12755,7 @@ mod tests {
         let (r, _turns) = room_with_puppets();
         r.make_puppet(a_puppet("Grimble", "a gatekeeper")).unwrap();
         r.cast_puppet("Grimble").unwrap();
-        r.set_mode("Vox", "always");
+        set_mode(&r, "Vox", "always");
         r.set_stops("Vox", "interrupted");
 
         // Mid-announcement: a turn of the AI's own, part said.
@@ -12774,7 +13134,7 @@ mod tests {
         // The model is told it is a file and not a reading. A model
         // told only that there is a clip in the chat thanks somebody
         // for reading a recording they already had.
-        let told = conversation_messages(&r.log_now(), 50, "English", "Vox", &[], &[])
+        let told = conversation_messages(&r.log_now(), 50, "English", "Vox", &[], Seat::Audience)
             .into_iter()
             .map(|(_, t)| t)
             .collect::<Vec<_>>()
@@ -12814,6 +13174,70 @@ mod tests {
             assert!(!seat.hears(Seat::Audience), "{seat:?} hears the audience");
             assert!(seat.hears(Seat::Box));
             assert!(seat.hears(Seat::Stage));
+        }
+    }
+
+    /// A log with parts to it. The box's lines and the audience's sit
+    /// in one list -- it is one conversation in one room, and the
+    /// history keeps it that way -- and what holds them apart is where
+    /// each line was *said*.
+    ///
+    /// Filtering by who said it instead is the bug this replaced:
+    /// somebody who came round to the box from the audience would hand
+    /// the director every word they had said out front, an hour of it,
+    /// and the director would answer it.
+    #[test]
+    fn the_box_is_handed_its_own_log_and_not_the_audiences() {
+        let said = |id: &str, text: &str, seat: Option<Seat>| Entry {
+            id: id.into(),
+            who: "Ryan".into(),
+            kind: Kind::Human,
+            title: String::new(),
+            text: text.into(),
+            live: false,
+            partial: false,
+            cut: false,
+            typed: false,
+            translations: BTreeMap::new(),
+            note: String::new(),
+            seat,
+            at: 0,
+            sent: true,
+        };
+        // One person, three places. Before the curtain the room had no
+        // parts to it, so nobody was shut out of that; then the same
+        // person out front, then the same person round in the box.
+        let log = [
+            said("a", "we were talking about this earlier", None),
+            said("b", "psst, make the goblin lose", Some(Seat::Audience)),
+            said("c", "give the goblin a limp", Some(Seat::Box)),
+        ];
+        let heard = |seat: Seat| {
+            conversation_messages(&log, 50, "English", "Vox", &[], seat)
+                .into_iter()
+                .map(|(_, t)| t)
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let in_box = heard(Seat::Box);
+        assert!(
+            in_box.contains("earlier"),
+            "the room before the show is nobody's secret: {in_box}"
+        );
+        assert!(in_box.contains("limp"), "said in the box: {in_box}");
+        assert!(
+            !in_box.contains("goblin lose"),
+            "the audience's log is not the box's, whoever was speaking: {in_box}"
+        );
+        // The stage is deaf the same way, and the audience follows all
+        // of it: the rule refuses in one direction only.
+        assert!(!heard(Seat::Stage).contains("goblin lose"));
+        let out_front = heard(Seat::Audience);
+        for line in ["earlier", "goblin lose", "limp"] {
+            assert!(
+                out_front.contains(line),
+                "the audience can follow the play and the box: {out_front}"
+            );
         }
     }
 

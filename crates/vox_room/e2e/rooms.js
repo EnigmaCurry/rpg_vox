@@ -24,11 +24,12 @@ const [ryanToken, alexToken] = process.argv.slice(2).map((l) => l.replace(/.*\/j
   is('both are in Main', ryan.rooms.find((r) => r.id === 'Main').here, ['Alex', 'Ryan']);
   is('the roster is who is in Main', ryan.people, ['Alex', 'Ryan']);
   is('one language, so nothing to say about who speaks what', ryan.speaks, null);
-  is('Main waits to be named', ryan.mode, 'named');
+  is('Main judges its pauses', ryan.mode, 'auto');
 
-  // Something said in Main, so there is a log to tell the rooms apart by.
-  ryan.send({ type: 'mode', bot: 'Vox', mode: 'always' });
-  ryan.send({ type: 'text', text: 'this is the shared room' });
+  // Something said in Main, so there is a log to tell the rooms apart
+  // by -- and said to the AI by name, since a room people share is a
+  // room the AI judges rather than answers into.
+  ryan.send({ type: 'text', text: 'Vox, this is the shared room' });
   await wait(2500);
 
   // Ryan steps into his own room.

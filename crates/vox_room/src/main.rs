@@ -1067,7 +1067,7 @@ fn serve(cli: Cli, store: Store, db: PathBuf) -> Result<()> {
         id: String::new(),
         title: String::new(),
         only: None,
-        default_mode: room::Mode::Named,
+        default_mode: room::Mode::Auto,
         ai_turns: cli.ai_turns,
         bots,
         reply_after: Duration::from_millis(cli.reply_after_ms),

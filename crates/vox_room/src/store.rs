@@ -3,7 +3,7 @@
 //! ```sql
 //! people(name, display, token, used, language)  -- an invite, and whose it is
 //! sessions(id, name)                   -- a browser that traded its link in
-//! entries(conversation, id, who, kind, title, text, cut, typed, translations, at)
+//! entries(conversation, id, who, kind, title, text, cut, typed, translations, seat, at)
 //! settings(key, value)                 -- `ROOM:key` for one room's own
 //! games(name, summary, prompt, settings, created, played)  -- names unique, ignoring case
 //! conversations(id, room, game, title, at) -- a room's history
@@ -20,7 +20,7 @@ use std::path::Path;
 use anyhow::{bail, Context as _, Result};
 use rusqlite::{params, Connection, OptionalExtension as _};
 
-use crate::room::{Card, Entry, GameSettings, Kind};
+use crate::room::{Card, Entry, GameSettings, Kind, Seat};
 
 pub struct Store {
     db: Connection,
@@ -92,7 +92,16 @@ CREATE TABLE IF NOT EXISTS people (
     language TEXT NOT NULL DEFAULT '',
     -- 'owner' or empty. The owner invites everybody else and says which
     -- rooms they may go to; see `grants`.
-    role TEXT NOT NULL DEFAULT ''
+    role TEXT NOT NULL DEFAULT '',
+    -- Whether the AIs may answer this person, which is theirs to say
+    -- and nobody else's: the BOTS button in the footer. Empty is the
+    -- button on -- anything they say may be answered -- and the other
+    -- two are the two ways it can be off: 'named', where it still
+    -- answers when they call it by name, and 'never'. Kept against the
+    -- name like the language, and for the same reason, and the same in
+    -- every room of the house: it is how they want to be spoken to,
+    -- not a fact about one room. See `room::Bots`.
+    bots TEXT NOT NULL DEFAULT ''
 );
 -- The rooms of the house. One row each, made when somebody makes the
 -- room and kept until somebody takes it away.
@@ -166,6 +175,13 @@ CREATE TABLE IF NOT EXISTS entries (
     -- the entry it is about, and put back in front of the model when
     -- the history is built. Empty for everything a tool did not make.
     note TEXT NOT NULL DEFAULT '',
+    -- Which part of the playhouse it was said in: 'audience', 'box' or
+    -- 'stage'. Empty for everything the room posted in front of
+    -- everybody and for everything said with no show on, which is a
+    -- room with no parts to be sitting in -- either way, everyone
+    -- hears it. It is where the speaker was at the time and never
+    -- changes: that is what keeps the audience's log out of the box's.
+    seat TEXT NOT NULL DEFAULT '',
     at   INTEGER NOT NULL,
     PRIMARY KEY (conversation, id)
 );
@@ -476,6 +492,10 @@ pub struct Invited {
     /// ("Russian"). Empty until they choose one at the door, which means
     /// the room's own language.
     pub language: String,
+    /// Whether the AIs may answer them: empty for yes, which is what
+    /// everybody starts as, or the way their BOTS button is off. See
+    /// [`crate::room::Bots`].
+    pub bots: String,
     /// Whether this is the owner: the one who invites everybody else and
     /// says which rooms they may go to. There is at most one.
     pub owner: bool,
@@ -886,7 +906,7 @@ impl Store {
         Ok(self
             .db
             .query_row(
-                "SELECT p.name, p.display, p.token, p.used, p.language, p.role FROM sessions s
+                "SELECT p.name, p.display, p.token, p.used, p.language, p.role, p.bots FROM sessions s
                  JOIN people p ON p.name = s.name WHERE s.id = ?1",
                 [id],
                 invited_row,
@@ -909,7 +929,7 @@ impl Store {
         Ok(self
             .db
             .query_row(
-                "SELECT name, display, token, used, language, role FROM people
+                "SELECT name, display, token, used, language, role, bots FROM people
                  WHERE token = ?1 AND used = 0",
                 [token],
                 invited_row,
@@ -932,7 +952,7 @@ impl Store {
             return Ok(None);
         }
         let invited: Invited = tx.query_row(
-            "SELECT name, display, token, used, language, role FROM people WHERE token = ?1",
+            "SELECT name, display, token, used, language, role, bots FROM people WHERE token = ?1",
             [token],
             invited_row,
         )?;
@@ -1001,6 +1021,16 @@ impl Store {
         )? > 0)
     }
 
+    /// Whether the AIs may answer `name`, and how their BOTS button is
+    /// off when it is: empty for on. False when nobody is invited under
+    /// that name. See [`crate::room::Bots`].
+    pub fn set_bots(&self, name: &str, bots: &str) -> Result<bool> {
+        Ok(self.db.execute(
+            "UPDATE people SET bots = ?2 WHERE name = ?1",
+            params![name, bots],
+        )? > 0)
+    }
+
     /// Whose display name this is, ignoring case. The way back from what
     /// the room calls somebody to the key everything is stored against.
     pub fn person_called(&self, display: &str) -> Result<Option<String>> {
@@ -1018,7 +1048,7 @@ impl Store {
         Ok(self
             .db
             .query_row(
-                "SELECT name, display, token, used, language, role FROM people WHERE name = ?1",
+                "SELECT name, display, token, used, language, role, bots FROM people WHERE name = ?1",
                 [name],
                 invited_row,
             )
@@ -1027,7 +1057,7 @@ impl Store {
 
     pub fn people(&self) -> Result<Vec<Invited>> {
         let mut q = self.db.prepare(
-            "SELECT name, display, token, used, language, role FROM people ORDER BY name",
+            "SELECT name, display, token, used, language, role, bots FROM people ORDER BY name",
         )?;
         let rows = q.query_map([], invited_row)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -1362,8 +1392,9 @@ impl Store {
     pub fn put_entry(&self, conversation: i64, e: &Entry) -> Result<()> {
         self.db.execute(
             "INSERT INTO entries
-                 (conversation, id, who, kind, title, text, cut, typed, translations, note, at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                 (conversation, id, who, kind, title, text, cut, typed, translations, note,
+                  seat, at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT(conversation, id) DO UPDATE SET
                text = excluded.text, cut = excluded.cut,
                translations = excluded.translations, note = excluded.note",
@@ -1378,6 +1409,7 @@ impl Store {
                 e.typed as i64,
                 serde_json::to_string(&e.translations).unwrap_or_else(|_| "{}".into()),
                 e.note,
+                e.seat.map(Seat::as_str).unwrap_or(""),
                 e.at as i64
             ],
         )?;
@@ -1387,12 +1419,17 @@ impl Store {
     /// The last `limit` entries of `conversation`, oldest first.
     pub fn entries(&self, conversation: i64, limit: usize) -> Result<Vec<Entry>> {
         let mut q = self.db.prepare(
-            "SELECT id, who, kind, title, text, cut, typed, translations, note, at FROM entries
+            "SELECT id, who, kind, title, text, cut, typed, translations, note, seat, at
+             FROM entries
              WHERE conversation = ?1 ORDER BY at DESC, rowid DESC LIMIT ?2",
         )?;
         let rows = q.query_map(params![conversation, limit as i64], |r| {
             let kind: String = r.get(2)?;
             let translations: String = r.get(7)?;
+            // Empty is nowhere in particular, which everybody hears --
+            // and it is what every row written before there were seats
+            // says, which is right: there was no box to be shut out of.
+            let seat: String = r.get(9)?;
             Ok(Entry {
                 id: r.get(0)?,
                 who: r.get(1)?,
@@ -1405,7 +1442,8 @@ impl Store {
                 typed: r.get::<_, i64>(6)? != 0,
                 translations: serde_json::from_str(&translations).unwrap_or_default(),
                 note: r.get(8)?,
-                at: r.get::<_, i64>(9)? as u64,
+                seat: Seat::parse(&seat),
+                at: r.get::<_, i64>(10)? as u64,
                 sent: true,
             })
         })?;
@@ -2250,6 +2288,7 @@ fn invited_row(r: &rusqlite::Row) -> rusqlite::Result<Invited> {
     let used: i64 = r.get(3)?;
     let language: String = r.get(4)?;
     let role: String = r.get(5)?;
+    let bots: String = r.get(6)?;
     Ok(Invited {
         // A row from before display names had their own column, or one
         // written by hand: the name is the name.
@@ -2262,6 +2301,7 @@ fn invited_row(r: &rusqlite::Row) -> rusqlite::Result<Invited> {
         owner: role == OWNER,
         link: (used == 0).then_some(token),
         language,
+        bots,
     })
 }
 
@@ -2327,6 +2367,13 @@ fn migrate(db: &Connection) -> Result<()> {
     if !has_column(db, "people", "language")? {
         db.execute_batch("ALTER TABLE people ADD COLUMN language TEXT NOT NULL DEFAULT ''")?;
     }
+    // When the AIs may answer somebody used to be the bots' own
+    // setting, one per bot per room, and is now each person's own.
+    // Everybody already invited comes back with the button on, which
+    // is what the default says and what the empty string means.
+    if !has_column(db, "people", "bots")? {
+        db.execute_batch("ALTER TABLE people ADD COLUMN bots TEXT NOT NULL DEFAULT ''")?;
+    }
     // A room used to have one kind of person in it, and anybody invited
     // could walk into any of its rooms. Everyone is
     // left roleless, so a house that has not been given an owner has
@@ -2363,6 +2410,12 @@ fn migrate(db: &Connection) -> Result<()> {
     }
     if !has_column(db, "entries", "note")? {
         db.execute_batch("ALTER TABLE entries ADD COLUMN note TEXT NOT NULL DEFAULT ''")?;
+    }
+    // Where each entry was said. Old rows get the empty string, which
+    // is heard by everybody: before this column there was one log, so
+    // there is nothing in it that was ever said apart.
+    if !has_column(db, "entries", "seat")? {
+        db.execute_batch("ALTER TABLE entries ADD COLUMN seat TEXT NOT NULL DEFAULT ''")?;
     }
     if !has_column(db, "conversations", "room")? {
         db.execute_batch(
@@ -2903,6 +2956,7 @@ mod tests {
             typed: false,
             translations: BTreeMap::new(),
             note: String::new(),
+            seat: None,
             at: 10,
             sent: true,
         };
@@ -2981,6 +3035,39 @@ mod tests {
         assert!(s.set_language("Mike", "").unwrap());
         assert_eq!(s.person("Mike").unwrap().unwrap().language, "");
         assert!(!s.set_language("Nobody", "Russian").unwrap());
+    }
+
+    /// And so is whether the AIs may answer them, for the same reason
+    /// and on the same column: it is theirs, not a room's. See
+    /// `room::Bots`.
+    #[test]
+    fn whether_the_ais_may_answer_somebody_is_kept_against_the_key_too() {
+        let s = Store::memory();
+        let link = s.invite("Mike").unwrap();
+        assert_eq!(
+            s.person("Mike").unwrap().unwrap().bots,
+            "",
+            "everybody starts with the button on"
+        );
+
+        assert!(s.set_bots("Mike", "never").unwrap());
+        assert_eq!(s.person("Mike").unwrap().unwrap().bots, "never");
+        // Every way of reading a person back carries it, because each
+        // SELECT has its own column list.
+        assert_eq!(s.live_invite(&link).unwrap().unwrap().bots, "never");
+        assert_eq!(s.people().unwrap()[0].bots, "never");
+
+        // And a rename doesn't bring them back.
+        assert!(s.rename("Mike", "Mikey").unwrap());
+        assert_eq!(s.person("Mike").unwrap().unwrap().bots, "never");
+
+        let (id, invited) = s.claim_invite(&link).unwrap().unwrap();
+        assert_eq!(invited.bots, "never");
+        assert_eq!(s.person_for_session(&id).unwrap().unwrap().bots, "never");
+
+        assert!(s.set_bots("Mike", "").unwrap(), "and back on");
+        assert_eq!(s.person("Mike").unwrap().unwrap().bots, "");
+        assert!(!s.set_bots("Nobody", "never").unwrap());
     }
 
     /// A database on disk, since two rooms are two connections to one
@@ -3070,6 +3157,7 @@ mod tests {
             typed: false,
             translations: BTreeMap::new(),
             note: String::new(),
+            seat: None,
             at: 10,
             sent: true,
         };
@@ -3202,6 +3290,11 @@ mod tests {
         assert_eq!(mike.language, "", "the room's own language, as before");
         assert!(s.set_language("Mike", "Russian").unwrap());
         assert_eq!(s.person("Mike").unwrap().unwrap().language, "Russian");
+        // And the column after it: somebody invited before the AIs
+        // were anybody's to turn off comes back with them on.
+        assert_eq!(mike.bots, "", "the button on, which is the default");
+        assert!(s.set_bots("Mike", "never").unwrap());
+        assert_eq!(s.person("Mike").unwrap().unwrap().bots, "never");
     }
 
     /// A house that was already talking when `note` was added keeps
@@ -3279,6 +3372,7 @@ mod tests {
             typed: false,
             translations: BTreeMap::new(),
             note: String::new(),
+            seat: None,
             at,
             sent: true,
         };
@@ -3322,6 +3416,22 @@ mod tests {
             .unwrap()
             .iter()
             .any(|e| e.id == "a" && (e.typed || !e.translations.is_empty())));
+
+        // Where it was said comes back with it. A reload during a show
+        // that put the audience's lines back into the box's log would
+        // be the same leak by a slower route, and nothing the room
+        // posted in front of everybody picks up a seat it never had.
+        let mut out_front = e("said-out-front", 50);
+        out_front.seat = Some(Seat::Audience);
+        s.put_entry(1, &out_front).unwrap();
+        let mut in_box = e("said-in-the-box", 60);
+        in_box.seat = Some(Seat::Box);
+        s.put_entry(1, &in_box).unwrap();
+        let back = s.entries(1, 10).unwrap();
+        let seat = |id: &str| back.iter().find(|e| e.id == id).unwrap().seat;
+        assert_eq!(seat("said-out-front"), Some(Seat::Audience));
+        assert_eq!(seat("said-in-the-box"), Some(Seat::Box));
+        assert_eq!(seat("a"), None, "nowhere in particular, heard by everybody");
     }
 
     #[test]

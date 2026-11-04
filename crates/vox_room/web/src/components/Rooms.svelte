@@ -37,31 +37,6 @@
       : [{ id: room.where, title: room.title, private: room.alone, here: [] }],
   );
 
-  // When a bot speaks. It is that bot's setting in that room, so it
-  // lives under that bot in that room, and each of them has its own.
-  const modes = (bot) => [
-    {
-      mode: 'never',
-      label: 'never',
-      hint: `${bot.name} says nothing at all: not when it is named, and not in a game that wants every pause answered. It stays in the room, on its fader, until this is changed back.`,
-    },
-    {
-      mode: 'named',
-      label: 'when named',
-      hint: `${bot.name} says nothing until someone says its name.`,
-    },
-    {
-      mode: 'auto',
-      label: 'when it fits',
-      hint: `${bot.name} is shown every pause and decides for itself whether the moment is its own, so it can sit in a conversation without answering every gap.`,
-    },
-    {
-      mode: 'always',
-      label: 'every pause',
-      hint: `${bot.name} answers whenever the room goes quiet, with no judgment about whose turn it is.`,
-    },
-  ];
-
   // What a voice talking over the bot does to the reply it is in the
   // middle of. Its own setting as well, and never a game's: a game
   // says when a bot answers, not how it is stopped.
@@ -81,16 +56,34 @@
   const stopHint = (bot) =>
     `What somebody talking over ${bot.name} does to the reply it is in the middle of. Yours to set whatever else the room is doing, and Stop always stops it.`;
 
-  // Why a bot's mode is what it is, when the room and not a click
-  // decided it.
-  const modeHint = (bot) =>
+  // What the room has this one doing, when it is doing something worth
+  // a line of its own. When an AI speaks is nobody's control any more
+  // -- whether it may answer *you* is your BOTS button, and these are
+  // the states the room itself puts a voice into.
+  const doing = (bot) =>
     bot.mode === 'never'
-      ? `${bot.name} is set to say nothing at all, which is nobody's to override — not a game's, and not its own name's.`
+      ? {
+          what: room.show ? 'In the show' : 'Saying nothing',
+          why: room.show
+            ? `${bot.name} answers nothing while the curtain is up. Stop ends the show and gives it back.`
+            : `${bot.name} is saying nothing at all just now: not when it is named, and not in a game that wants every pause answered.`,
+        }
       : room.locked
-      ? `${room.game} decides when ${bot.name} answers, so this can't be changed until the room leaves the game.`
+      ? {
+          what: 'Answering every pause',
+          why: `${room.game} is being played, and it requires that of every voice in the room.`,
+        }
       : bot.engaged
-        ? `You said its name, so ${bot.name} has the turn at every pause — judging each one — until the room has been quiet a while. Say "thanks" or "goodbye" and it goes back to waiting for its name.`
-        : `When ${bot.name} speaks in this room.`;
+      ? {
+          what: 'In a back-and-forth',
+          why: `Somebody said its name, so ${bot.name} has the turn at every pause — judging each one — until the room has been quiet a while.`,
+        }
+      : bot.mode === 'named'
+      ? {
+          what: 'Waiting to be named',
+          why: `${bot.name} stood itself down: it has nothing to say until somebody says its name.`,
+        }
+      : null;
 
   // An interpreter is only here while it has something to do: somebody
   // in this room speaking a language somebody else here doesn't read.
@@ -165,7 +158,8 @@
 <nav class="rooms" aria-label="Who is in {room.title}">
   <!-- A puppet show playing. Said here, over the strips, because the
        faders below are where the puppets are and because this is the
-       one time the room has set everybody's Answers and Stops itself:
+       one time the room has set what every voice answers and what
+       stops it, itself:
        the line says why they read the way they do. Stop brings it
        down. -->
   {#if room.show}
@@ -202,29 +196,20 @@
           </p>
         {/if}
         {:else}
-        <!-- When this bot speaks, in this room. -->
-        <!-- A row of three buttons wants more width than this
-             column has, and the names are the whole point: a
-             "Named / Fits / Every" that fits is a control you
-             have to already understand. This reads as what it
-             is — Vox answers when named. -->
-        <label class="when" title={modeHint(bot)}>
-          <span class="what">
-            Answers{#if bot.engaged}<span class="dot" aria-hidden="true"></span>{/if}
-          </span>
-          <select value={bot.mode} disabled={room.locked}
-            aria-label="When {bot.name} speaks"
-            onchange={(e) =>
-              command({ type: 'mode', bot: bot.name, mode: e.currentTarget.value })}>
-            {#each modes(bot) as m (m.mode)}
-              <option value={m.mode} title={m.hint}>{m.label}</option>
-            {/each}
-          </select>
-        </label>
-        <!-- And what talking over it does: the other half of the same
-             question, so it sits directly under it. Not locked by a
-             game -- a game says when a bot answers, not how it is
-             stopped. -->
+        <!-- When this bot speaks is no longer a control here. Whether
+             an AI may answer *you* is your own BOTS switch in the
+             footer, and nobody else's: one control for the whole room
+             made being answered a thing the room decided about you.
+             What is left is the room's own doing -- a game's rule, a
+             show, a voice that has stood itself down -- and it is said
+             rather than set, because none of it is a thing to press. -->
+        {#if doing(bot)}
+          {@const d = doing(bot)}
+          <p class="wearing" title={d.why}>{d.what}</p>
+        {/if}
+        <!-- What talking over it does, which really is the bot's: not
+             locked by a game either -- a game says when a bot answers,
+             not how it is stopped. -->
         <label class="when" title={stopHint(bot)}>
           <span class="what">Stops</span>
           <select value={bot.stops}
@@ -411,9 +396,9 @@
     white-space: nowrap;
   }
   .show .at { color: var(--muted); font-variant-numeric: tabular-nums; flex: none; }
-  /* When the bot above speaks, in this room. */
-  /* Said plainly, not shouted: it is a fact about the bot, like
-     what it is doing. */
+  /* What the bot above is doing or wearing: said plainly, not
+     shouted, because it is a fact about the bot rather than a
+     control. */
   .wearing {
     margin: 2px 0 0;
     font-size: 11px;
@@ -421,8 +406,8 @@
     overflow-wrap: anywhere;
   }
   .when { display: flex; align-items: center; gap: 6px; }
-  /* Wide enough for "Answers" with its dot, so the row under it lines
-     up with it rather than starting a column of its own. */
+  /* Wide enough for "Stops", so the lines in a strip start in the
+     same column. */
   .what { font-size: 11px; color: var(--muted); flex: none; min-width: 52px; }
   .when select {
     flex: 1;
@@ -436,16 +421,4 @@
     color: var(--ink);
   }
   .when select:disabled { opacity: 0.6; }
-  /* A back-and-forth the room started, rather than a mode anyone picked. */
-  .what .dot {
-    display: inline-block;
-    width: 5px;
-    height: 5px;
-    margin-left: 4px;
-    border-radius: 50%;
-    background: var(--agent);
-    animation: pulse 2s ease-in-out infinite;
-  }
-  @keyframes pulse { 0%, 100% { opacity: 0.35; } 50% { opacity: 1; } }
-  @media (prefers-reduced-motion: reduce) { .what .dot { animation: none; } }
 </style>

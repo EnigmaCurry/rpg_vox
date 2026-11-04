@@ -37,25 +37,45 @@ const sayAt = (page) => page.evaluate(() => {
   await page.setViewportSize({ width: 1280, height: 860 });
   await wait(400);
 
-  // The button you talk with, and the box you type in. Nothing else --
-  // and Send is not down there at all until there is something to send.
+  // The button you talk with, the two switches that say what the room
+  // does with your microphone and with the AIs, and the box you type
+  // in. Nothing else -- and Send is not down there at all until there
+  // is something to send.
   const row = await feet(page);
   const wide = row[0].width;
-  is('what is down there', row.map((b) => b.what), ['Mute Space']);
+  is('what is down there', row.map((b) => b.what), ['Mute Space', 'PTT', 'BOTS']);
   const foot = await page.evaluate(() => document.querySelector('footer').getBoundingClientRect().width);
   is('mute is on the left', row[0].left < foot / 3, true);
   const box = await sayAt(page);
   is('and the box you type in takes the rest',
     box.left > row[0].left + wide && foot - box.right < 20, true);
 
+  // The two switches are one column beside that button, each half its
+  // height, so the pair is exactly as tall as the button they are
+  // about and neither of them can move it.
+  is('the switches are stacked beside it, half-height each',
+    await page.evaluate(() => {
+      const big = document.querySelector('footer button.big').getBoundingClientRect();
+      const ptt = document.querySelector('footer .ptt-switch').getBoundingClientRect();
+      const bots = document.querySelector('footer .bots-switch').getBoundingClientRect();
+      return {
+        beside: Math.round(ptt.left) === Math.round(bots.left) && ptt.left > big.right - 1,
+        stacked: bots.top > ptt.top,
+        half: ptt.height < big.height * 0.6 && bots.height < big.height * 0.6,
+        together: Math.abs((bots.bottom - ptt.top) - big.height) < 8,
+      };
+    }),
+    { beside: true, stacked: true, half: true, together: true });
+
   // Send turns up with the first thing worth sending, and goes with it.
   await page.fill('.say textarea', 'something');
   await wait(200);
   is('send arrives with something to send', (await feet(page)).map((b) => b.what),
-    ['Mute Space', 'Send']);
+    ['Mute Space', 'PTT', 'BOTS', 'Send']);
   await page.fill('.say textarea', '   ');
   await wait(200);
-  is('and spaces are not something', (await feet(page)).map((b) => b.what), ['Mute Space']);
+  is('and spaces are not something', (await feet(page)).map((b) => b.what),
+    ['Mute Space', 'PTT', 'BOTS']);
   await page.fill('.say textarea', '');
   await wait(200);
 
@@ -76,15 +96,33 @@ const sayAt = (page) => page.evaluate(() => {
   await page.click('footer button.big');
   await wait(400);
 
-  // Nothing is strung along it but the one switch that says what the
-  // button beside it does.
+  // Nothing is strung along it but those two switches: no sliders, no
+  // readouts, nothing to read while you are talking.
   is('no sliders or readouts down there',
     await page.evaluate(() => ({
       sliders: document.querySelectorAll('footer input[type=range]').length,
-      boxes: document.querySelectorAll('footer input[type=checkbox]').length,
+      boxes: document.querySelectorAll('footer input').length,
       meters: document.querySelectorAll('footer .hear').length,
+      switches: document.querySelectorAll('footer .switch').length,
     })),
-    { sliders: 0, boxes: 1, meters: 0 });
+    { sliders: 0, boxes: 0, meters: 0, switches: 2 });
+
+  // BOTS is on to begin with -- the AIs may answer you until you say
+  // otherwise -- and it is yours: pressing it says so on the roster,
+  // where everybody can see why an AI answers one person and not the
+  // one beside them.
+  is('the AIs may answer you to begin with',
+    await page.evaluate(() => document.querySelector('footer .bots-switch').getAttribute('aria-pressed')),
+    'true');
+  await page.click('footer .bots-switch');
+  await wait(600);
+  is('and turning them off is said on the button',
+    await page.evaluate(() => document.querySelector('footer .bots-switch').getAttribute('aria-pressed')),
+    'false');
+  await page.click('footer .bots-switch');
+  await wait(600);
+  is('and back on', await page.evaluate(() =>
+    document.querySelector('footer .bots-switch').getAttribute('aria-pressed')), 'true');
 
   // The box grows with what is in it, and stops at half the window.
   const tall = () =>
@@ -130,17 +168,29 @@ const sayAt = (page) => page.evaluate(() => {
       log: !!document.querySelector('.log'),
     })),
     { settings: true, room: false, log: false });
-  // What it is for: the things you set once and don't watch. Push to
-  // talk is not one of those -- it says what the button under your
-  // hand does -- so it is beside that button and not here.
+  // What it is for: the things you set once and don't watch. The two
+  // switches themselves are not those -- they are what you reach for
+  // mid-conversation -- so they stay in the footer, and what each of
+  // them *means* when it is off is here, where you settle it once.
   is('what is set here',
     await page.evaluate(() => ({
       name: !!document.querySelector('.settings .name input'),
       volume: !!document.querySelector('.settings input[type=range]'),
-      pushToTalk: !!document.querySelector('.settings input[type=checkbox]'),
+      duplex: document.querySelectorAll('.settings input[name=duplex]').length,
+      botsOff: document.querySelectorAll('.settings input[name=bots-off]').length,
+      switches: document.querySelectorAll('.settings .switch').length,
       meter: !!document.querySelector('.settings .hear'),
     })),
-    { name: true, volume: true, pushToTalk: false, meter: false });
+    { name: true, volume: true, duplex: 2, botsOff: 2, switches: 0, meter: false });
+  // And out of the box both are the ones that cannot surprise
+  // anybody: you go on hearing the room while you hold the key, and
+  // turning the AIs off still leaves you able to ask one a question.
+  is('the defaults are the forgiving ones',
+    await page.evaluate(() => ({
+      duplex: [...document.querySelectorAll('.settings input[name=duplex]')].map((r) => r.checked),
+      bots: [...document.querySelectorAll('.settings input[name=bots-off]')].map((r) => r.checked),
+    })),
+    { duplex: [true, false], bots: [true, false] });
 
   // The room kept running: still joined, and the socket never went.
   is('still in the audio', await page.evaluate(() => !document.querySelector('.enter')), true);
@@ -150,11 +200,11 @@ const sayAt = (page) => page.evaluate(() => {
 
   // Push to talk, beside the button it changes: ticking it is what
   // turns that button into one you hold.
-  await page.click('footer .switch input');
+  await page.click('footer .ptt-switch');
   await wait(400);
   is('the button says to hold it', (await feet(page))[0].what, 'Hold to talk Space');
   is('and is the same width', (await feet(page))[0].width, wide);
-  await page.click('footer .switch input');
+  await page.click('footer .ptt-switch');
   await wait(400);
   is('and back again', (await feet(page))[0].what, 'Mute Space');
 

@@ -184,8 +184,10 @@
           <small>
             If push-to-talk is enabled, you will be muted unless you
             hold down the Spacebar. This allows you to control
-            explicit transmission, and can help with audio feedback
-            issues.
+            explicit transmission. You go on hearing the room while you
+            hold it; on speakers, where what they play goes back into
+            your microphone, Settings can have the room go quiet
+            instead.
           </small>
         </span>
       </label>

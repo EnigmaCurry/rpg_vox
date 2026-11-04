@@ -1,6 +1,6 @@
 <script>
   import { onMount } from 'svelte';
-  import { room, command, ask, answer, whoami, leaveAudio, setMuted, setPushToTalk, talk, busyAI, dropPicture, notice, mutedByRoom } from './lib/room.svelte.js';
+  import { room, command, ask, answer, whoami, leaveAudio, setMuted, setPushToTalk, setBots, talk, busyAI, dropPicture, notice, mutedByRoom, theAI, theAIs } from './lib/room.svelte.js';
   import { screen, share, stopSharing, supported as canShare } from './lib/screen.svelte.js';
   import Log from './components/Log.svelte';
   import Cards from './components/Cards.svelte';
@@ -301,14 +301,17 @@
         <div class="mic">
         {#if room.pushToTalk}
           <!-- `hushed` is the room's own sound being off while you
-               hold, which is what push to talk is for: see
-               `RoomAudio.hushRoom`. It does not change the button's
-               size -- the one under your hand must stay where it is --
-               so what it says is in the title, and the switch beside
-               it says the same thing before you ever turn it on. -->
+               hold, which is what push to talk is for somebody on
+               speakers: see `RoomAudio.hushRoom`. On a headset it is
+               nothing you want, so it is a setting and the title says
+               which way it is set -- it does not change the button's
+               size, since the one under your hand must stay where it
+               is. -->
           <button class="big ptt" class:talking={room.talking} class:hushed={room.hushed}
             disabled={!room.mic || stripMuted}
-            title="While you hold this, the room's own sound is off, so your microphone hears only you."
+            title={room.pttHush
+              ? "While you hold this, the room's own sound is off, so your microphone hears only you. Settings has the other way round."
+              : 'While you hold this, you go on hearing the room — which is what a headset wants. Settings can cut it instead, for speakers.'}
             onpointerdown={(e) => { e.currentTarget.setPointerCapture(e.pointerId); talk(true); }}
             onpointerup={() => talk(false)} onpointercancel={() => talk(false)}
             onkeydown={(e) => { if (e.code === 'Enter') { e.preventDefault(); talk(true); } }}
@@ -320,13 +323,38 @@
             {stripMuted ? 'Muted on the mixer' : room.muted ? 'Unmute' : 'Mute'} <kbd>Space</kbd>
           </button>
         {/if}
-        <!-- Beside the button it changes, because it changes what that
-             button is. -->
-        <label class="switch" title="Your mic opens only while you hold Space or the talk button — and the room goes quiet while you hold it, so your microphone hears you and not the speakers.">
-          <input type="checkbox" checked={room.pushToTalk}
-            onchange={(e) => setPushToTalk(e.currentTarget.checked)} />
-          <span>Push to talk</span>
-        </label>
+        <!-- The two switches that say what the room does with your
+             microphone, stacked beside the button they are about and
+             half its height each, so the pair is exactly as tall as it
+             is and nothing moves when either changes. Both are yours
+             alone, both are set here rather than in Settings because
+             they are reached mid-conversation, and both have a nuance
+             on the settings page: what the off position means. -->
+        <div class="switches">
+          <button class="switch ptt-switch" class:on={room.pushToTalk}
+            aria-pressed={room.pushToTalk}
+            onclick={() => setPushToTalk(!room.pushToTalk)}
+            title={room.pushToTalk
+              ? (room.pttHush
+                ? 'Push to talk is on: your mic opens only while you hold Space or the talk button, and the room goes quiet while you hold it. Off, your mic is simply open.'
+                : 'Push to talk is on: your mic opens only while you hold Space or the talk button, and you go on hearing the room while you talk. Off, your mic is simply open.')
+              : 'Your mic is open and everybody hears everybody. Turn this on and it opens only while you hold Space or the talk button — Settings says what holding it does to the room’s own sound.'}>
+            PTT
+          </button>
+          <!-- Whether the AIs may answer you, which is yours and
+               nobody else's: it changes nothing for anybody else in
+               the room. -->
+          <button class="switch bots-switch" class:on={room.bots === 'any'}
+            aria-pressed={room.bots === 'any'}
+            onclick={() => setBots(room.bots !== 'any')}
+            title={room.bots === 'any'
+              ? `${theAI('or')} may answer what you say. Turn this off and ${theAIs().length === 1 ? 'it stays' : 'they stay'} out of it — Settings says whether your calling ${theAIs().length === 1 ? 'it' : 'one of them'} by name still gets an answer.`
+              : room.bots === 'named'
+              ? `${theAI('or')} stays out of what you say unless you say its name. Nobody else is affected.`
+              : `${theAI('or')} answers nothing of yours, not even its own name. Nobody else is affected.`}>
+            BOTS
+          </button>
+        </div>
         </div>
         <!-- Your mic on the left, and what you do with the room on the
              right: everything you set once is behind the cog. A footer
@@ -498,8 +526,21 @@
      the box beside them grows upward, and these stay on its last line
      rather than being pulled apart by it. */
   .mic { display: flex; align-items: center; gap: 8px; }
-  .switch { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); cursor: pointer; }
-  .switch input { margin: 0; }
+  /* Two rows the height of the one button beside them: the gap between
+     them is the gap `.mic` already uses, so the three edges line up. */
+  .switches { display: flex; flex-direction: column; gap: 3px; }
+  .switch {
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    line-height: 1;
+    padding: 5px 9px;
+    min-width: 4.2em;
+    color: var(--muted);
+  }
+  /* On is on, and reads as on without being read: these are the two
+     switches nobody looks at twice. */
+  .switch.on { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
   kbd { font-size: 11px; opacity: 0.7; border: 1px solid currentColor; border-radius: 4px; padding: 0 4px; margin-left: 4px; }
   .vol { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); }
   /* Device names run long; keep one from pushing the controls off. */

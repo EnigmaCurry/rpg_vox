@@ -1,7 +1,7 @@
 <script>
   import {
     room, setName, setVolume, avatarOf, forgetAvatar, myFaces, faceAt, wearFace,
-    command,
+    command, setPttHush, setBotsOff, theAI, theAIs,
   } from '../lib/room.svelte.js';
   import { NAME_MAX } from '../lib/names.js';
   import { scaledDown } from '../lib/pixels.js';
@@ -34,6 +34,10 @@
   // puppets: a puppet's voice is the part it plays, decided when the
   // character was made up, and there is nothing here to choose.
   const speakers = $derived(room.agents.filter((b) => !b.puppet));
+
+  // A room can have more than one AI in it, and prose written for one
+  // of them reads wrong the moment it does.
+  const one = $derived(theAIs().length === 1);
 
   // The faces you have worn, newest first. Re-read whenever the one
   // you are wearing changes -- the AI may have given you another
@@ -155,6 +159,86 @@
     {/if}
   </section>
 
+  <!-- What push to talk *means*, which is not the same question as
+       whether it is on. The switch for that is beside the button it
+       changes, down in the footer, because it is a thing you flip while
+       talking; this is a thing you settle once, when you decide where
+       you are sitting and what you are listening on. Both ways are
+       right for somebody: see `setPttHush`. -->
+  <section>
+    <h2>Holding the talk button</h2>
+    <p class="note first">
+      With push to talk off, your mic is simply open and everybody hears
+      everybody. With it on, this is what holding it does to the room's own
+      sound.
+    </p>
+    <label class="duplex">
+      <input type="radio" name="duplex" checked={!room.pttHush}
+        onchange={() => setPttHush(false)} />
+      <span>
+        You keep hearing the room
+        <small>
+          Full duplex. You hear everybody while you talk, so holding the key
+          to interrupt lets you hear the AI stop. Right for a headset or
+          headphones.
+        </small>
+      </span>
+    </label>
+    <label class="duplex">
+      <input type="radio" name="duplex" checked={room.pttHush}
+        onchange={() => setPttHush(true)} />
+      <span>
+        The room goes quiet
+        <small>
+          Half duplex. Everything the room is saying is cut for as long as you
+          hold, and comes back once your mic has closed. Right for speakers:
+          what they play is in front of your microphone, and it would be picked
+          up, written down as something you said, and read back to the room as
+          yours.
+        </small>
+      </span>
+    </label>
+  </section>
+
+  <!-- The other half of the footer's pair: what BOTS off means. The
+       switch itself is down there, because turning the AIs off is
+       something you do in the middle of a conversation; which of the
+       two ways it is off is a thing about you and your table, and it
+       is settled here. See `setBotsOff`. -->
+  <section>
+    <h2>Turning {one ? 'the AI' : 'the AIs'} off</h2>
+    <p class="note first">
+      <strong>BOTS</strong> in the footer says whether {theAI('or')}
+      {one ? 'may answer' : 'may answer'} what you say. It is yours alone — turning it
+      off changes nothing for anybody else in the room, and everything said is
+      still written into the one conversation. This is what off means for you.
+    </p>
+    <label class="duplex">
+      <input type="radio" name="bots-off" checked={room.botsOff === 'named'}
+        onchange={() => setBotsOff('named')} />
+      <span>
+        Unless I say its name
+        <small>
+          {one ? 'It stays' : 'They stay'} out of what you say, and still
+          {one ? 'answers' : 'answer'} when you call {one ? 'it' : 'one of them'} by
+          name — so a quiet room is still a room you can ask a question in.
+        </small>
+      </span>
+    </label>
+    <label class="duplex">
+      <input type="radio" name="bots-off" checked={room.botsOff === 'never'}
+        onchange={() => setBotsOff('never')} />
+      <span>
+        Never
+        <small>
+          Nothing you say reaches {one ? 'it' : 'them'}, its own name included.
+          Someone else in the room can still bring {one ? 'it' : 'them'} in, and
+          you will hear the answer.
+        </small>
+      </span>
+    </label>
+  </section>
+
   <section>
     <h2>What you hear</h2>
     <label class="slider">
@@ -241,6 +325,14 @@
     margin-top: 16px;
   }
   .note { display: block; color: var(--muted); font-size: 13px; line-height: 1.5; margin: 10px 0 0; }
+  /* The one that comes before what it is about, rather than after it:
+     the heading has already said what this is, and a gap under the
+     heading as well as over the first choice reads as a missing line. */
+  .note.first { margin: 0 0 12px; }
+  .duplex { display: flex; align-items: flex-start; gap: 10px; font-size: 14px; cursor: pointer; margin: 0 0 10px; }
+  .duplex:last-child { margin-bottom: 0; }
+  .duplex input { margin-top: 3px; }
+  .duplex small { display: block; font-size: 12px; color: var(--muted); line-height: 1.45; margin-top: 2px; }
   .back { text-align: center; }
   .manage { margin-top: 10px; }
   .slider { display: flex; align-items: center; gap: 10px; font-size: 13px; margin: 0; }

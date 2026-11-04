@@ -171,9 +171,8 @@ share.
 A **room of your own** is where the AI is yours alone. Its roster is
 you; its mixer shows you and the AI and nobody else; nothing said in it
 reaches the house, and nothing said in the house reaches it. Because
-there is nobody there to take the turn from, it starts out answering
-every pause rather than waiting to be named — which you can change, and
-it will remember. It is called *You and Vox*, after whatever you called
+there is nobody there to take the turn from, it answers every pause
+rather than judging each one, which is what a room people share does. It is called *You and Vox*, after whatever you called
 the AI, and it is the first thing in the list.
 
 (A room called **Lobby** is a room. The *game* sense of "the lobby" —
@@ -225,10 +224,12 @@ What each of them is is its own:
   Nobody in the room may call themselves after any of them.
 - **Its own fader.** One strip each, under the room, so turning one
   down is turning *that one* down.
-- **Its own Answers.** Never, when named, when it fits, every pause —
-  per bot and per room, so Sage can answer every pause in your own room
-  while waiting to be named in the Lobby, and say nothing at all in the
-  Cellar.
+- **Its own turn.** How each takes a pause is per bot and per room —
+  Sage answers every pause in your own room, judges them in the Lobby,
+  and says nothing at all while a show it is in is on. Nobody sets it
+  from a control any more: whether an AI may answer *you* is
+  [your own switch](#when-an-ai-may-answer-you), and the rest is the
+  room's own doing.
 - **Its own Stops.** Whether a voice talking over it cuts it off or it
   finishes what it was saying. Per bot and per room as well, and never
   a game's to take.
@@ -504,26 +505,19 @@ See ROOM_DOCKER.md.
   before, to read; **New conversation** starts the next one; and while
   a game is on, its name and **Leave the game**. See [What a room has
   said before](#what-a-room-has-said-before).
-- **Answers: never / when named / when it fits / every pause**, under
-  the AI's own strip: who gets the turn when the room goes
-  quiet. It is that bot's setting in that room — the same AI answers
-  differently in the Lobby and in your own room, and a second bot in
-  the room carries its own. Shared by everyone in the room, like the
-  faders beside it.
-  - **Never** — it says nothing at all. It is still in the room and
-    still on its fader; it just has no turn to be given, and saying its
-    name doesn't give it one. **Nothing overrides this**: not its name,
-    not a back-and-forth, and not a game that wants every pause
-    answered — a bot you silenced is not something a game gets to turn
-    back on, and a game entered with every bot silenced opens in the
-    quiet it was asked for. Pick it while one is talking and it stops
-    there and then. With two AIs in a room it is how you put one of
-    them aside for a while without losing its fader, its voice or what
-    it has already said.
-  - **When named** — the AI says nothing until someone says its name, so
-    two people can talk without it butting in. The default.
+- **BOTS**, in the footer: whether the AIs may answer **you**. See
+  [When an AI may answer you](#when-an-ai-may-answer-you) — it is one
+  switch per person rather than one control per bot, and it is the one
+  thing here that is yours alone.
+- **How a bot takes a pause** is the room's own, and there is nothing to
+  press for it. What it can be:
+  - **Every pause** — it answers whenever the room goes quiet, no
+    judgment involved. What a room of your own does, since there is
+    nobody to take the turn from, and what a game that deals the turns
+    asks for.
   - **When it fits** — at every pause the AI is *given the turn* and
-    decides for itself whether the moment is its own. It is shown the
+    decides for itself whether the moment is its own. What a room
+    people share does. It is shown the
     conversation, **who is in the room**, and whether it is already
     mid-conversation, because a pause means different things in different
     rooms: with one person there is nobody else they could be talking to,
@@ -535,27 +529,37 @@ See ROOM_DOCKER.md.
     conversation again if the quiet actually lasts that long — how it
     waits for a real silence instead of the 1.2 s gap it was shown. Only
     once per silence, so a quiet room can't loop.
-  - **Every pause** — answers whenever the room goes quiet, no judgment
-    involved. The cheapest, and what a game that deals the turns wants.
-- **The back-and-forth**: saying its name doesn't buy you one answer, it
-  starts a conversation. From then on the AI keeps the turn at every pause
-  without being named again — the button moves to "When it fits" with a
-  dot beside it, so it is still judging each pause rather than answering
-  every one — until the room has been idle for 30 seconds
-  (`--engaged-for-ms`), when it goes back to waiting for its name. You can
-  also end it in words: "thanks", "goodbye", "that's all", or just turning
-  to talk to someone else, and the AI stands down by itself with its
-  `wait_until_named` tool. Only the mode you pick with the buttons is
-  remembered; a back-and-forth is never stored, so a restart comes back to
-  what you chose.
+  - **When named** — it says nothing until someone says its name. Where
+    a bot puts *itself* when it decides it is not wanted for a while
+    (its `wait_until_named` tool — "thanks", "goodbye", or you simply
+    turning to talk to somebody else), and what a game can ask for.
+  - **Never** — it says nothing at all: not when it is named, and not
+    in a game that wants every pause answered. A show puts its director
+    and its cast here for as long as the curtain is up, and it stops
+    one mid-sentence rather than waiting for the sentence to end.
+
+  The strip under the bot says which of these it is doing whenever it
+  is doing something worth saying — *In the show*, *Waiting to be
+  named*, *In a back-and-forth*, *Answering every pause* — with why in
+  the tooltip. None of it is written down: a room comes back up after a
+  restart taking its pauses the way the room is configured to, because
+  a voice that went quiet about this afternoon's conversation should
+  not come back quiet about tomorrow's with nothing on any screen to
+  say why.
+- **The back-and-forth**: to a bot waiting to be named, saying its name
+  doesn't buy you one answer, it starts a conversation. From then on it
+  keeps the turn at every pause without being named again — still
+  judging each pause rather than answering every one — until the room
+  has been idle for 30 seconds (`--engaged-for-ms`), when it goes back
+  to waiting for its name.
 - **Interrupting**: start talking while it speaks. It drops in volume at
   once and stops for good once your speech is confirmed (300 ms of voice
   or the first recognised word), so a cough only dips it. **Stop** does
   the same with a click.
-- **Stops: when interrupted / when finished**, directly under that bot's
-  Answers, because it is the other half of the same question. Its own
-  setting in that room, like Answers, and unlike Answers no game ever
-  takes it: a game says when a bot answers, never how it is stopped.
+- **Stops: when interrupted / when finished**, under that bot's strip:
+  the one thing about an AI that is still set per AI, and the one a
+  game never takes — a game says when a bot answers, never how it is
+  stopped. Its own setting in that room.
   - **When interrupted** — what is written just above. The default, and
     what a conversation wants: talking over it is how you take the turn
     back.
@@ -828,9 +832,13 @@ See ROOM_DOCKER.md.
 - **The footer** is the two ways of saying something, side by side,
   and nothing else. **Mute** (or **Hold to talk**) is one width
   whatever it says, so the button under your hand is the same button it
-  was a moment ago and nothing beside it moves, with **Push to talk**
-  next to it — it says what that button does. Then the box you type in,
-  taking the rest of the width. Anything the room has to tell you
+  was a moment ago and nothing beside it moves. Beside it, stacked and
+  half its height each so the pair is exactly as tall as it is:
+  **PTT**, which is what turns that button into one you hold, and
+  **BOTS**, which is whether the AIs may answer you. Both are yours
+  alone, both light up when they are on, and both have a nuance on the
+  settings page — what the *off* position means. Then the box you type
+  in, taking the rest of the width. Anything the room has to tell you
   appears along it too.
 - **What you do with the room** is three icons over the people in the
   left column, where the room they are about is: **📺️** share a
@@ -839,7 +847,10 @@ See ROOM_DOCKER.md.
   looking, and these are not it.
 - **Settings**, behind the cog: a page of its own with
   the things you set once and don't watch — **Your name**, **App
-  volume**, and which microphone the browser gave the room. Changing
+  volume**, which microphone the browser gave the room, what
+  **holding the talk button** does to the room's own sound (see the
+  mixer below), and what **turning the AI off** means for you (see
+  [When an AI may answer you](#when-an-ai-may-answer-you)). Changing
   your name changes it everywhere, the conversation
   included: the room calls you one thing, not a different thing per
   paragraph. The room
@@ -876,23 +887,36 @@ See ROOM_DOCKER.md.
   hold Space (or the talk button): everything said in one hold is one
   entry, and the AI waits for you to let go however long you pause.
 
-  **The room goes quiet while you hold it.** Push to talk is the mode
-  for somebody on speakers with a microphone pointed at them: whatever
-  the room is saying goes into that mic, is written down as theirs, and
-  is read back as something they said. A microphone cannot be made deaf
-  to one sound in the room it is in, so the room stops making it — the
+  **An open mic is full duplex**: everybody hears everybody, all the
+  time, and nothing of the room's sound is ever cut.
+
+  **What holding the key does to the room's own sound is yours to
+  settle**, in Settings → *Holding the talk button*, because the two
+  rooms it is held in want opposite things of it.
+
+  *You keep hearing the room* — full duplex, and the default — is for
+  a headset or headphones: nothing is cut, so holding the key to
+  interrupt lets you hear the AI stop.
+
+  *The room goes quiet* is half duplex, and is for speakers with a
+  microphone pointed at them: whatever the room is saying goes into
+  that mic, is written down as theirs, and is read back as something
+  they said — and echo cancellation is deliberately off here, so
+  nothing else is keeping it out. A microphone cannot be made deaf to
+  one sound in the room it is in, so the room stops making it: the
   sound is taken to nothing as the key goes down and brought back when
   the mic has actually closed, which is a moment after you let go,
   because that moment is still a microphone in front of the speakers.
   It is a fade of a few milliseconds and not a switch, since a hard cut
   is a click and a click is a sound the mic hears too.
 
-  What is said while you hold is missed rather than queued: a room that
-  caught up afterwards would be a room talking over itself, a second
-  behind, every time somebody let go. On headphones that is a cost
-  rather than a saving — hold the key to interrupt and you won't hear
-  the AI stop — which is the trade push to talk is, and the open mic is
-  the other side of it.
+  What the room said while you held is then missed rather than queued:
+  a room that caught up afterwards would be a room talking over itself,
+  a second behind, every time somebody let go. That is the cost of the
+  half-duplex setting and the reason it is not the default — it buys
+  nothing on headphones, where there is no sound in front of the mic to
+  cut. The setting is a page away from the key and still lands on the
+  hold you are in: the room goes on running behind that page.
 
   **The space bar is the microphone's wherever you left the focus.** On
   a button you have just clicked -- a room in the list, a mute,
@@ -908,6 +932,47 @@ See ROOM_DOCKER.md.
   one you are speaking into does.
 - **New conversation** clears the screen and the AI's memory. Old
   conversations stay in the database.
+
+### When an AI may answer you
+
+**BOTS**, under **PTT** in the footer. On, which is how everybody
+starts: the AIs in the room may answer what you say. Off: they stay out
+of it.
+
+**It is yours and nobody else's.** When an AI answered used to be the
+AI's own setting — one *Answers* control per bot, shared by the whole
+room and changeable by anybody in it — which made being answered a
+thing the room decided about you. Two people at one table want opposite
+things of the same AI: one is working through something with it, the
+other wants to be left alone, and the one who wants quiet should not
+have to silence it for the other. So the question is asked of the
+person it happens to. Turning it off changes nothing for anybody else:
+they go on being answered exactly as before, and you still hear every
+word of it.
+
+**It is a filter on the turn, not on the transcript.** Everything said
+in the room is written into the one conversation whoever said it, and
+an AI answering somebody else reads the whole of it — the room is a
+room, and a log with holes in it would be a worse thing than an AI that
+heard you. What the switch stops is *your* words being the thing an AI
+answers.
+
+**Off has two meanings, and you pick which**, in Settings → *Turning
+the AI off*:
+
+- *Unless I say its name* — the default. The AI stays out of what you
+  say and still answers when you call it by name, so a quiet room is
+  still a room you can ask a question in.
+- *Never* — nothing you say reaches it, its own name included. Somebody
+  else in the room can still bring it in, and you will hear the answer.
+
+Which of the two is this browser's, like the push-to-talk nuance above
+it; which position the switch is *in* is the room's, kept against your
+invite name. So it survives a rename, it is the same in every room of
+the house, and it is still off when you come back tomorrow. It is on
+the roster the room sends everybody, because an AI that answers one
+person and not the one beside them is a room where the reason has to be
+visible or it reads as a fault.
 
 ### Games
 
@@ -936,11 +1001,13 @@ A game also carries settings, not just a prompt. Today that is
 | `named` | the AI speaks only when a player says its name |
 
 The AI picks one as it designs the game and can be told which you want.
-While a game that sets one of the last three is being played the
-**Answers** control is locked to it; leaving the game restores what you
-chose. Two things it cannot reach: a bot set to **never**, which stays
-silent in any game and is still silent when you leave it, and
-**Stops**, which is nobody's but the bot's. A game also records how many players it is for (`players_min` and
+While a game that sets one of the last three is being played it binds
+every AI in the room; leaving the game puts them back as they were.
+Three things it cannot reach: a bot set to **never**, which stays
+silent in any game and is still silent when you leave it; **Stops**,
+which is nobody's but the bot's; and anybody's **BOTS** switch, which
+is theirs — a game decides how the room is run, not who may be spoken
+to. A game also records how many players it is for (`players_min` and
 `players_max`, either end open), which the AI works out with you.
 
 A saved game is announced in the conversation it was designed in, as a
@@ -1456,10 +1523,10 @@ every session.
 **That choice is the house's, not the room's.** It is the same AI in
 every room — one name, one face, one voice — so settling it anywhere
 settles it everywhere, there and then: the other rooms put it on
-without waiting for a restart. Which is the opposite of **Answers** and
-**Stops**, which are each room's own, because when an AI speaks depends
-on what the room is for and what it sounds like does not. Anybody in
-the room may set it, like Answers and the faders: the control is no
+without waiting for a restart. Which is the opposite of **Stops** and
+of how a bot takes a pause, which are each room's own, because when an
+AI speaks depends on what the room is for and what it sounds like does
+not. Anybody in the room may set it, like the faders: the control is no
 more than the sentence you could say instead.
 
 The two ways do not fight. Ask it out loud for a different voice and it
@@ -1503,7 +1570,7 @@ and a fader of its own — to anybody in the room it *is* another voice
 in the room — and nothing behind it at all. What a puppet says is the
 first AI's, written in advance and said through it. **Nothing ever
 gives a puppet the turn**, because there is nothing there to take one:
-its Answers is `never` and is not a setting anybody chose. Saying a
+it answers nothing, and that is not a setting anybody chose. Saying a
 puppet's name gives the turn to the AI that holds it, which is how a
 puppet left standing after a show takes a question.
 
@@ -1587,7 +1654,7 @@ which one you are in decides who can hear you:
 | | |
 |---|---|
 | **Stage** | the characters, at twice the size they are in the conversation, with the one speaking lit — and the lines they are saying, in a log of their own. Going up there is joining the play |
-| **Director's box** | where the AI running the show sits. What is said here is the only thing it hears |
+| **Director's box** | where the AI running the show sits. What is said here is the only thing it hears — and it is **read here too**, in a log of its own under the faces, not down in the conversation |
 | **Audience** | the conversation, and everybody watching. Talk as freely as you like |
 
 **The box and the stage cannot hear the audience.** That is the whole
@@ -1601,6 +1668,33 @@ moves you, and the one seat nobody may move is the director's.
 It is not a politeness. The audience's lines are not in the AI's
 transcript at all, because a model shown a question and told to ignore
 it answers it.
+
+**The box and the audience keep separate logs.** Every entry is marked
+with the part of the playhouse it was said in, at the moment it was
+said, and that mark never changes — so the box is handed the box's log
+and the stage's and nothing else, line by line. It is *where it was
+said* and not *who said it*: somebody who comes round to the box from
+the audience does not thereby say everything again from inside it, and a
+director handed their last hour out front because they came for a word
+would be the audience being heard through the back door. Going back out
+to the audience does not take the words they said in the box with them
+either.
+
+Anything said with no show on is said in a room that has no parts to it,
+and everybody hears it however the room is divided later: the hour of
+conversation before the curtain went up is the director's to read, since
+there was no box to be shut out of. And everything the room *posts* in
+front of everybody — cards, pictures, voice clips, the programme at the
+curtain — stays in the conversation whoever posted it. A card held up in
+a room is seen rather than heard, and the rule here is about hearing.
+
+When the last character leaves, the playhouse goes and the box goes with
+it: what was said up there drops into the conversation on everyone's
+screen, so the whole show reads back in order afterwards. Nothing is
+hidden by any of this — the audience can read the box's log in the box
+while the show is on, and the conversation afterwards. What is kept
+apart is kept apart *for the AI*, which is the only reader a play
+depends on not hearing the stalls.
 
 Somebody who goes up **onto the stage** is joining the play. Whatever
 script was running **stops where it is** — the remaining lines are
@@ -1623,10 +1717,11 @@ dialogue, and left lying open in the middle of yours it would push
 everything the room actually said off the screen.
 
 **While a script plays, the room is set for it.** The AI and every voice
-in the room go to **Answers: never** and **Stops: when finished** the
-moment the curtain goes up, and back to exactly what they were when it
-comes down. Both are *set*, visibly, on the same controls anybody could
-set them with, because a scripted exchange that stopped dead when
+in the room go to answering **nothing** and **Stops: when finished**
+the moment the curtain goes up, and back to exactly what they were when
+it comes down. Both are *set*, visibly — the strips say *In the show*,
+and Stops is the control anybody could have set themselves — because a
+scripted exchange that stopped dead when
 somebody in the audience cleared their throat is not a play, and a
 director that broke off mid-scene to answer a question is not one
 either. A show is a thing the room is doing and it binds every bot in
@@ -1723,7 +1818,7 @@ pays for a rejected request before every reply.
 | `VOX_ROOM_BOTS` | | more AIs in every room, `NAME[:VOICE[:PROMPT_FILE]]`, comma-separated. They see each other and answer to their own names; the first AI is the one that runs the room. See [More than one AI in a room](#more-than-one-ai-in-a-room) |
 | `VOX_ROOM_REPLY_AFTER_MS` | `1200` | quiet before what was said is handed over |
 | `VOX_ROOM_CONFIRM_MS` | `300` | continuous speech that cuts the AI off |
-| `VOX_ROOM_ENGAGED_FOR_MS` | `30000` | idle time that ends a back-and-forth and goes back to "when named" |
+| `VOX_ROOM_ENGAGED_FOR_MS` | `30000` | idle time that ends a back-and-forth with a bot that was waiting to be named |
 | `VOX_ROOM_AI_TURNS` | `2` | replies the AIs may give each other with nobody human saying anything in between; reset whenever somebody speaks or types. 0 is AIs that only answer people |
 | `VOX_ROOM_HISTORY` | `60` | entries of the conversation sent to the model |
 | `VOX_SCRIBE_LLM_URL`, `VOX_SCRIBE_LLM_MODEL`, `VOX_SCRIBE_LLM_KEY` | as for scribe and `agent` | the model |
@@ -1776,11 +1871,11 @@ CHROME=$(which chromium) ./run.sh            # or: ./run.sh rooms bots
 | suite | |
 |---|---|
 | `rooms` | several rooms on one socket: where a tab lands, who may go where, a room of your own admitting one person, and the mix arriving across every move. No browser at all — two sockets are enough |
-| `bots` | two AIs in one room: a fader, an Answers and a Stops setting each, each answering to its own name, one of them silenced while the other carries on, and one pause going to exactly one of them |
+| `bots` | two AIs in one room: a fader and a Stops setting each, each answering to its own name -- and each person's own **BOTS** switch, which keeps the AIs out of what *they* say without touching anybody else, still answers when they call one by name, or doesn't, and follows them into another room |
 | `door` | the door is a page with no room behind it and no socket open; **Join Audio** does nothing until you agree to be recorded, and the Language box is never blank |
 | `roles` | the house and the people: making a room, renaming one under somebody standing in it, taking one away from under them — and the owner and the rest: who is shown the people and who is answered when they ask for them, a room given and taken away while somebody sits in the house, and an invite made from the page |
-| `settings` | the footer: one width for the talk button whatever it says, sharing and the way out on the other side, and the cog opening a page with everything that used to be strung along it |
-| `ptt` | push to talk: the space bar reaching the microphone from wherever the focus was left -- a button you clicked, the history panel, a mute -- and not reaching it in a text box or a dialog, and the room's own sound going to nothing while the key is down and coming back only once the mic has closed |
+| `settings` | the footer: one width for the talk button whatever it says, the two half-height switches stacked beside it, sharing and the way out on the other side, and the cog opening a page with what each switch means when it is off |
+| `ptt` | push to talk: the space bar reaching the microphone from wherever the focus was left -- a button you clicked, the history panel, a mute -- and not reaching it in a text box or a dialog; and what holding it does to the room's own sound, which is nothing until you ask for it, and then going to nothing while the key is down, coming back only once the mic has closed, and changing under a hold that is already being held |
 | `permalinks` | `/`, `/lobby` and `/room/<id>`; back and forward move between rooms, a pasted address opens that room, a stale one is put right |
 | `conversations` | the room's history: naming one, reading an old one read-only without moving anybody else's screen, deleting one for everybody, and empty ones never being archived |
 | `game` | a game played inside a room, and leaving it putting the room back where it was for everyone in it |

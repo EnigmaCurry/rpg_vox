@@ -1,5 +1,7 @@
 <script>
-  import { room, enterGame, peekGame, theAI, theAIs, waitingAI, pictureOf, sampleOf } from '../lib/room.svelte.js';
+  import {
+    room, enterGame, peekGame, theAI, theAIs, waitingAI, pictureOf, sampleOf, boxLines,
+  } from '../lib/room.svelte.js';
   import History from './History.svelte';
   import Face from './Face.svelte';
   import Stage from './Stage.svelte';
@@ -99,7 +101,18 @@
   // here: it is read on the stage, where it was said, and the
   // conversation keeps one folded note of the whole play at the
   // curtain. See `Kind::Line` in room.rs.
-  const shown = $derived((room.reading?.log ?? room.log).filter((e) => e.kind !== 'line'));
+  //
+  // Nor is what was said in the director's box. This column is the
+  // audience's log and the box's is its own — that is the whole of
+  // keeping the two apart — so while the playhouse is open those lines
+  // are read up in the box, where anybody may follow them. An old
+  // conversation has no box to read them in, so everything that was
+  // ever said in it is here. See `Entry::seat` in room.rs.
+  const shown = $derived(
+    (room.reading?.log ?? room.log).filter(
+      (e) => e.kind !== 'line' && !(!room.reading && room.show && e.seat === 'box'),
+    ),
+  );
   const archived = $derived(!!room.reading);
 
   // A room can have more than one AI in it, and prose written for one
@@ -127,8 +140,8 @@
        everybody -- see ROOM.md, Puppets. -->
   {#if room.show}
     <Stage />
-    <Seats seat="box" title="Director's box"
-      why="Where {room.seats?.director ?? 'the AI'} runs the show. It hears what is said in here and nothing from the audience." />
+    <Seats seat="box" title="Director's box" lines={boxLines()}
+      why="Where {room.seats?.director ?? 'the AI'} runs the show. It hears what is said in here and nothing from the audience, and what is said in here is read in here." />
     <Seats seat="audience" title="Audience" size={28}
       why="Watching. Talk as freely as you like — the box cannot hear a word of it." />
   {/if}
@@ -142,15 +155,22 @@
           Nothing was ever said in this one.
         {:else if room.game}
           Entering <strong>{room.game}</strong>…
+        {:else if room.bots === 'never'}
+          Nothing said yet. You have <strong>BOTS</strong> off, so nothing you say
+          reaches {it} — the room is yours. Turn it on in the footer, or let
+          somebody else bring {it} in.
+        {:else if room.bots === 'named'}
+          Nothing said yet. You have <strong>BOTS</strong> off, so {it}
+          {one ? 'stays' : 'stay'} out of what you say until you say
+          <strong>{theAI()}</strong>. Turn it on and {answers} whenever you pause.
         {:else if ais.every((a) => a.mode === 'never')}
-          Nothing said yet. {theAI()} {one ? 'is' : 'are'} set to say nothing at all,
-          so the room is yours: join the audio and talk. Change
-          <strong>Answers</strong> beside {it} to bring {it} in.
+          Nothing said yet. The room has {theAI()} saying nothing just now,
+          so it is yours: join the audio and talk.
         {:else}
-          Nothing said yet. Join the audio and start talking; say <strong>{theAI()}</strong>
+          Nothing said yet. Join the audio and start talking;
           {ais.every((a) => a.mode === 'named')
-            ? `to bring ${it} in`
-            : `or just talk, and ${answers} when you pause`}.
+            ? `say ${theAI()} to bring ${it} in`
+            : `${answers} when you pause, or say ${theAI()} to be sure of ${one ? 'it' : 'them'}`}.
           Ask {it} to design a game with you, then ask {it} to start, change or delete games by voice.
         {/if}
       </p>

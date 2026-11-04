@@ -573,6 +573,12 @@ is yours to speak with.";
 /// says, and a model that does not know that will wonder why a room
 /// full of people has gone quiet, or apologise for ignoring somebody,
 /// or address a question nobody put to it.
+///
+/// Nor does somebody who comes round to the box bring the audience's
+/// log in with them -- the box's transcript is the box's, line by line
+/// by where each was said (see `Entry::seat`) -- so it is told that
+/// too: a person it is suddenly talking to with no history behind them
+/// is the normal case, not a gap to go looking for.
 const PLAYHOUSE_NOTE: &str = "\
 **A show is on, so the room is a playhouse in three parts and you are in \
 the director's box.** You cannot hear the audience. Not \"should not \
@@ -584,9 +590,12 @@ can hear you perfectly well and you cannot hear them, which is what \
 being on the other side of the footlights is.{box}
 
 Somebody who wants a word with you comes round to the box, and then you \
-hear them: that is who you are talking to about the show -- what to put \
-on next, what to change, when to stop. They may be passing on what the \
-audience wanted, since that is the only way a suggestion reaches you.
+hear them -- from that moment, and not a word of what they said out \
+front before it, which you were never shown and never will be. That is \
+who you are talking to about the show: what to put on next, what to \
+change, when to stop. They may be passing on what the audience wanted, \
+since that is the only way a suggestion reaches you. If you want to \
+know what was said out there, ask them.
 
 Somebody who comes up **onto the stage** is joining the play. Whatever \
 script was running has already stopped -- the room stops it the moment \

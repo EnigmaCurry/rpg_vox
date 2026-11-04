@@ -11,7 +11,7 @@
 //! {"type": "ptt", "on": true}
 //! {"type": "strip", "name": "Alex", "gain": 0.8, "mute": false}
 //! {"type": "interpreter", "gain": 0.8, "mute": false}
-//! {"type": "mode", "bot": "Vox", "mode": "always"}
+//! {"type": "bots", "how": "any"}
 //! {"type": "stops", "bot": "Vox", "stops": "finished"}
 //! {"type": "voice", "bot": "Vox", "voice": "Alan Watts"}
 //! {"type": "name_conversation", "conversation": 7, "title": "The heist"}
@@ -1302,10 +1302,12 @@ enum Command {
         gain: Option<f32>,
         mute: Option<bool>,
     },
-    /// When one bot in this room answers.
-    Mode {
-        bot: String,
-        mode: String,
+    /// Whether the AIs may answer whoever sent it: their BOTS button,
+    /// and what they have said the off position means -- "any",
+    /// "named" or "never". Theirs alone, and the same in every room of
+    /// the house. See `room::Bots`.
+    Bots {
+        how: String,
     },
     /// Whether talking over one bot in this room cuts it off.
     Stops {
@@ -1520,7 +1522,14 @@ async fn client(
                         Ok(Command::Interpreter { gain, mute }) => {
                             room.set_interpreter(id, gain, mute)
                         }
-                        Ok(Command::Mode { bot, mode }) => room.set_mode(&bot, &mode),
+                        // Only the tab that asked hears why not: a
+                        // switch this room has never heard of is that
+                        // browser's problem and nobody else's news.
+                        Ok(Command::Bots { how }) => {
+                            if let Err(why) = room.set_bots(&name, &how) {
+                                room.tell(&name, &why);
+                            }
+                        }
                         Ok(Command::Stops { bot, stops }) => room.set_stops(&bot, &stops),
                         // Only the tab that asked hears why not: a
                         // voice that has been deleted while somebody

@@ -38,7 +38,7 @@ const focused = (page) =>
   const { browser, page } = await person(ryanLink);
 
   // Push to talk is beside the button it changes.
-  await page.click('footer .switch input');
+  await page.click('footer .ptt-switch');
   await page.waitForTimeout(400);
   is('the talk button is there to hold', await page.evaluate(() => !!document.querySelector('footer .big.ptt')), true);
   is('and the mic is not open until it is', await page.evaluate(() => !!document.querySelector('footer .big.ptt.talking')), false);
@@ -94,12 +94,10 @@ const focused = (page) =>
   await page.waitForTimeout(400);
   is('unmuted, the key is yours again', await space(page), true);
 
-  // The room goes quiet while the key is down, which is the whole
-  // point of the mode: somebody on speakers with a microphone pointed
-  // at them. The mic cannot be made deaf to one sound in the room it
-  // is in, so the room stops making it -- and starts again only once
-  // the mic has actually closed, since the tail after letting go is
-  // still a moment with a microphone in front of the speakers.
+  // What holding the key does to the room's own sound, which is a
+  // setting and not a given: full duplex out of the box (you go on
+  // hearing everybody, which is what a headset wants), half duplex if
+  // you ask for it on the settings page.
   await page.evaluate(() => document.activeElement?.blur());
   // What the button says is one thing and what the speakers do is
   // another, so the gain itself is watched: every ramp any audio
@@ -113,6 +111,32 @@ const focused = (page) =>
       return ramp.call(this, value, when);
     };
   });
+
+  // The default: nothing is cut. Holding the key to interrupt and not
+  // hearing the AI stop is the cost of the other way round, and it is
+  // not a cost anybody on headphones is paying without asking.
+  await page.keyboard.down('Space');
+  await page.waitForTimeout(250);
+  is('the room is still playing while you hold, out of the box',
+    await page.evaluate(() => !!document.querySelector('footer .big.ptt.hushed')), false);
+  is('and nothing was taken to nothing',
+    await page.evaluate(() => window.__ramps.includes(0)), false);
+  await page.keyboard.up('Space');
+  await page.waitForTimeout(800);
+
+  // And the other way round, asked for where it is set: the room goes
+  // quiet while the key is down, which is what somebody on speakers
+  // with a microphone pointed at them holds it for. The mic cannot be
+  // made deaf to one sound in the room it is in, so the room stops
+  // making it -- and starts again only once the mic has actually
+  // closed, since the tail after letting go is still a moment with a
+  // microphone in front of the speakers.
+  await page.click('.tools button.cog');
+  await page.waitForSelector('.settings');
+  await page.locator('.settings input[name=duplex]').nth(1).check();
+  await page.click('.settings button.primary');
+  await page.waitForSelector('footer .big.ptt');
+  await page.evaluate(() => document.activeElement?.blur());
   await page.keyboard.down('Space');
   await page.waitForTimeout(250);
   is('the room is quiet while the key is down',
@@ -129,16 +153,39 @@ const focused = (page) =>
   is('with the sound brought back up where it was',
     await page.evaluate(() => window.__ramps.at(-1)), 1);
 
-  // And turning the mode off mid-hold is not a room left silent: the
-  // switch is beside the button, which is where a hand goes.
+  // The setting is a page away from the key, and it still lands on the
+  // hold you are in: the room is still running behind the settings
+  // page, the space bar still talks from there, so changing it there
+  // while holding it has to be heard at once rather than next time.
+  await page.evaluate(() => { window.__ramps = []; });
   await page.keyboard.down('Space');
   await page.waitForTimeout(250);
-  await page.click('footer .switch input');
+  await page.click('.tools button.cog');
+  await page.waitForSelector('.settings');
+  await page.locator('.settings input[name=duplex]').nth(0).check();
+  await page.waitForTimeout(150);
+  is('the room comes back mid-hold when you ask to keep hearing it',
+    await page.evaluate(() => window.__ramps.at(-1)), 1);
+  await page.locator('.settings input[name=duplex]').nth(1).check();
+  await page.waitForTimeout(150);
+  is('and goes again when you ask for the other way',
+    await page.evaluate(() => window.__ramps.at(-1)), 0);
+  await page.keyboard.up('Space');
+  await page.waitForTimeout(800);
+  await page.click('.settings button.primary');
+  await page.waitForSelector('footer .big.ptt');
+
+  // And turning the mode off mid-hold is not a room left silent: the
+  // switch is beside the button, which is where a hand goes.
+  await page.evaluate(() => document.activeElement?.blur());
+  await page.keyboard.down('Space');
+  await page.waitForTimeout(250);
+  await page.click('footer .ptt-switch');
   await page.keyboard.up('Space');
   await page.waitForTimeout(400);
   is('letting go of push to talk while holding it gives the room back',
     await page.evaluate(() => !!document.querySelector('footer .big.hushed')), false);
-  await page.click('footer .switch input');
+  await page.click('footer .ptt-switch');
   await page.waitForTimeout(400);
 
   // Where Space is not yours: typing it types it.

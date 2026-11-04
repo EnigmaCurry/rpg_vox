@@ -63,14 +63,16 @@ export const room = $state({
   // lives: the server settles the scheme, this only follows it.
   rooms: [],
   // The voices in this room: { name, strip, state, mode, engaged,
-  // stops, puppet }. When each answers is its own, not the room's —
-  // except that a game's rule binds all of them, which is what
-  // `locked` says. `stops` is whether talking over it cuts it off, and
-  // that one is nobody's but the bot's: a game never takes it.
+  // stops, puppet }. `mode` is what the room has this one doing — a
+  // game's rule, a show, or a voice that has stood itself down — and
+  // nothing here sets it: whether an AI may answer *you* is your own
+  // BOTS switch, which is `bots` below. `stops` is whether talking
+  // over it cuts it off, and that one is the bot's: a game never
+  // takes it.
   //
   // `puppet` is a character the first AI speaks through rather than an
   // AI of its own. It has a name, a face and a fader like everybody
-  // else and no Answers to set: there is nothing behind it to answer
+  // else and nothing to set: there is nothing behind it to answer
   // with. See ROOM.md, Puppets.
   agents: [
     {
@@ -118,20 +120,28 @@ export const room = $state({
     gain: readNumber('vox_room.interpreter', 1),
     mute: readPref('vox_room.interpreter_mute'),
   },
-  // How the AI takes its turn. `mode` is what the room is actually doing;
-  // `engaged` is true while a back-and-forth (started by saying its name)
-  // has it answering every pause, and `locked` while the game being
-  // played requires the mode and the buttons can't change it.
-  // A game's rule binds every bot in the room while it is played, and
-  // then nobody's Answers control is theirs to change.
+  // The game being played requires a mode of every bot in the room,
+  // which is a thing to say in prose and nothing anybody can change.
   locked: false,
+  // Whether the AIs may answer *you*: the BOTS button in the footer,
+  // beside push to talk. 'any' is the button on, which is what
+  // everybody starts as; 'named' and 'never' are the two ways it can
+  // be off. The room is the authority -- it is kept against you, in
+  // every room of the house and after a restart -- and this is what it
+  // last said, so the button reads the truth after a reconnect.
+  bots: 'any',
+  // Which of those two the off position means, for you. This browser's,
+  // like `pttHush`: the nuance belongs with the person holding the
+  // button, and the room only ever hears which of the three it is
+  // being put into. See `setBotsOff`.
+  botsOff: readChoice('vox_room.bots_off') === 'never' ? 'never' : 'named',
   // Whether what people say out loud is put into the other languages as
   // well as the AI's replies. False means a line spoken in a language
   // you don't read is shown as it was said, because no translation of
   // it is coming.
   interprets: false,
   // Who is in this room, and nobody else: { name, mic, muted, speaking,
-  // language }. Somebody invited but in another room is not on it --
+  // language, bots }. Somebody invited but in another room is not on it --
   // they are on that room's count in `rooms`.
   people: [],
   // What language everybody the room knows speaks, here or not, by
@@ -250,11 +260,19 @@ export const room = $state({
   // Push to talk: the mic stays muted except while Space (or the talk
   // button) is held.
   pushToTalk: readPref('vox_room.push_to_talk'),
+  // What holding it means for the room's own sound. False -- the
+  // default, and what an open mic always is -- is full duplex: you go
+  // on hearing everybody while you talk, which is what a headset
+  // wants. True is half duplex: the room goes silent for as long as
+  // you hold, which is what speakers in front of a microphone want.
+  // Yours and this browser's, like the mode it qualifies; see
+  // `setPttHush`.
+  pttHush: readPref('vox_room.ptt_hush'),
   talking: false,
   // Whether the room's own sound is cut just now, which it is for as
-  // long as push to talk is held: the mic is open and the speakers are
-  // in front of it. Said on the button, because silence that is not
-  // explained is a fault.
+  // long as push to talk is held on half duplex: the mic is open and
+  // the speakers are in front of it. Said on the button, because
+  // silence that is not explained is a fault.
   hushed: false,
   // Peak level of what this tab hears, for its meter.
   hearing: 0,
@@ -671,6 +689,20 @@ export function takeSeat(seat, who = undefined) {
 /// stage has a log of its own and this is it.
 export function stageLines() {
   return room.log.filter((e) => e.kind === 'line');
+}
+
+/// What has been said in the director's box in this show, oldest
+/// first. While the playhouse is open it is never in the conversation
+/// below — the box is the one part of the room the audience's log must
+/// not be mingled with, in either direction — so the box has a log of
+/// its own and this is it, the way the stage does.
+///
+/// Only what was *said* in there. Cards, pictures and the programme at
+/// the curtain are put in front of the whole room and stay in the
+/// conversation, where they can be opened and played.
+export function boxLines() {
+  if (!room.show || room.reading) return [];
+  return room.log.filter((e) => e.seat === 'box' && !!e.text?.trim());
 }
 
 /// What to call the AIs in a sentence: one name, or every name with
@@ -1151,6 +1183,13 @@ function languageOf(people, you) {
   return people?.find((p) => p.name === you)?.language;
 }
 
+/// Whether the AIs may answer you, off the roster the room just sent.
+/// The room keeps it against you rather than against this browser, so
+/// what it says is what it is -- in this room and the next one.
+function botsOf(people, you) {
+  return people?.find((p) => p.name === you)?.bots ?? 'any';
+}
+
 /// What language the system is set to, spelled the way the room spells
 /// it ("Russian"), when the room speaks it — and the room's own when it
 /// doesn't. `Intl` does the naming, so there is no table of codes to
@@ -1234,6 +1273,7 @@ function apply(ev) {
       // their browser's language -- shown at the door, and not saved
       // until they come in.
       room.lang = myLanguage(room.languages, languageOf(ev.people, ev.you));
+      room.bots = botsOf(ev.people, ev.you);
       // A seat in a new room knows nothing of this tab's mic: the
       // server gave it a fresh one, open and unmuted, so say again
       // what it is really doing. Harmless on the way in, where it is
@@ -1308,6 +1348,9 @@ function apply(ev) {
       // Faces ride along with the roster; see `Room::emit_people`.
       room.avatars = ev.avatars ?? {};
       room.lang = myLanguage(room.languages, languageOf(ev.people, room.you));
+      // And so does your BOTS switch, which is what makes the button
+      // right again after a reconnect or a change of room.
+      room.bots = botsOf(ev.people, room.you);
       break;
     case 'entry':
       upsert(ev.entry);
@@ -1411,8 +1454,8 @@ function apply(ev) {
       break;
     case 'agents_here':
       // The owner put an AI in this room or took one out, or a puppet
-      // came on or left the stage: a fader appears or goes, with its
-      // Answers and its Stops.
+      // came on or left the stage: a fader appears or goes, with
+      // what it is doing and its Stops.
       room.agents = ev.agents ?? [];
       break;
     case 'show':
@@ -1609,7 +1652,8 @@ export function setMuted(m) {
 }
 
 /// Push to talk on: muted until Space or the talk button is held. Off:
-/// back to an open mic.
+/// back to an open mic, which is full duplex -- everybody hears
+/// everybody, all the time.
 export function setPushToTalk(on) {
   room.pushToTalk = on;
   writePref('vox_room.push_to_talk', on);
@@ -1621,6 +1665,71 @@ export function setPushToTalk(on) {
   hushRoom(false);
   command({ type: 'ptt', on });
   setMuted(on);
+}
+
+/// Whether the AIs may answer you: the BOTS button in the footer.
+///
+/// The inversion of a control that used to be the bot's. When an AI
+/// answers was one setting per bot, shared by the room and changeable
+/// by anybody in it, which made being answered a thing the room
+/// decided about you -- and two people at one table want opposite
+/// things of the same AI. This is the same question asked of the
+/// person it happens to.
+///
+/// Off is not silence in the room: everybody else goes on being
+/// answered, and everything said is in the one conversation whoever
+/// said it. What it stops is your words being the thing an AI answers.
+///
+/// The room is the authority and keeps it against you, in every room
+/// of the house and after a restart, so this only asks -- `room.bots`
+/// is set from the roster that comes back.
+export function setBots(on) {
+  const how = on ? 'any' : room.botsOff;
+  // Shown at once rather than when the roster lands: the button is a
+  // button. A room that refuses it says so and sends the roster, which
+  // is what puts this right.
+  room.bots = how;
+  command({ type: 'bots', how });
+}
+
+/// What the off position of that button means, which is the one nuance
+/// in it: `named` -- the default -- still lets an AI answer when you
+/// call it by its name, and `never` is nothing at all.
+///
+/// This browser's, like `setPttHush`: it is a sentence about how you
+/// want to be spoken to, and the room only ever hears which of the
+/// three states the switch is in. Changed while the button is already
+/// off, it moves the switch there now -- the setting would otherwise
+/// be a promise about next time.
+export function setBotsOff(how) {
+  room.botsOff = how === 'never' ? 'never' : 'named';
+  writeChoice('vox_room.bots_off', room.botsOff);
+  if (room.bots !== 'any') setBots(false);
+}
+
+/// What holding the talk button does to the room's own sound.
+///
+/// Two different rooms want opposite things of the same hold, and only
+/// the person holding it knows which room they are in. On a headset,
+/// cutting the room is a loss and nothing else: you cannot hear the
+/// word you are talking over, so holding the key to interrupt means
+/// not hearing the AI stop. On speakers, the room's own sound is in
+/// front of an open microphone -- it is picked up, written down as
+/// something you said, and read back to the room as yours -- and
+/// echo cancellation is deliberately off here (see
+/// `RoomAudio.startMic`), so nothing else is keeping it out.
+///
+/// Full duplex is the default because it is the one that cannot
+/// surprise anybody: a room that goes silent when you speak is a room
+/// people report as broken, and headsets are the common case.
+///
+/// Changed mid-hold, it takes effect on the hold you are in -- the
+/// setting is a page away from the key, but a page you can reach with
+/// the other hand while the room is running.
+export function setPttHush(on) {
+  room.pttHush = on;
+  writePref('vox_room.ptt_hush', on);
+  hushRoom(on && room.pushToTalk && room.talking);
 }
 
 // After letting go, the mic stays open a moment so the last word gets
@@ -1646,11 +1755,13 @@ export function talk(on) {
   if (on) {
     room.talking = true;
     // The room goes quiet before the mic opens, and not the other way
-    // round. Push to talk is the mode for somebody on speakers: what
-    // the room is saying is in front of their microphone, and a mic
-    // cannot be made deaf to one sound in the room it is in. See
-    // `RoomAudio.hushRoom`.
-    hushRoom(true);
+    // round -- on half duplex, which is what somebody on speakers
+    // holds this key for: what the room is saying is in front of their
+    // microphone, and a mic cannot be made deaf to one sound in the
+    // room it is in. On a headset there is nothing to be deaf to, so
+    // the hold costs you nothing you were hearing. See `setPttHush`
+    // and `RoomAudio.hushRoom`.
+    hushRoom(room.pttHush);
     if (room.muted) setMuted(false);
   } else if (room.talking) {
     room.talking = false;

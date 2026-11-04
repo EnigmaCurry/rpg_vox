@@ -211,7 +211,7 @@ async function socket(token, base = BASE) {
   const cookie = await cookieFor(token, base);
   const ws = new WebSocket(`${base.replace('http', 'ws')}/room.ws`, { headers: { cookie } });
   ws.binaryType = 'arraybuffer';
-  const p = { ws, cookie, rooms: [], notices: [], frames: 0, seen: '', people: [], said: [] };
+  const p = { ws, cookie, rooms: [], notices: [], frames: 0, seen: '', people: [], roster: [], said: [] };
   p.send = (m) => ws.send(JSON.stringify(m));
   ws.onmessage = (ev) => {
     if (typeof ev.data !== 'string') {
@@ -222,6 +222,10 @@ async function socket(token, base = BASE) {
     if (m.type === 'hello') {
       p.where = m.room;
       p.people = m.people.map((q) => q.name);
+      // The roster itself, for what it says about each of them:
+      // whether their mic is open, and whether the AIs may answer
+      // them, which is each person's own switch.
+      p.roster = m.people;
       // The AIs in the room, each with its own name, fader and say in
       // when it speaks. `mode` is the first one's, which is the room's
       // when there is only one of them in it.
@@ -235,6 +239,7 @@ async function socket(token, base = BASE) {
       p.conversation = m.conversation;
     } else if (m.type === 'people') {
       p.people = m.people.map((q) => q.name);
+      p.roster = m.people;
       p.speaks = m.speaks;
     } else if (m.type === 'mode') {
       const bot = (p.agents ?? []).find((b) => b.name === m.bot);

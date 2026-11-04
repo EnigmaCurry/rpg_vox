@@ -165,9 +165,12 @@ impl Rooms {
                 id: room.id.clone(),
                 title: room.title.clone(),
                 only: None,
-                // The house room waits to be named, so two people can
-                // talk in it without the AI butting in.
-                default_mode: Mode::Named,
+                // Shown every pause and left to judge whether the
+                // moment is its own, so two people can talk in a room
+                // with an AI in it without being answered every time
+                // they draw breath. Whether it may answer *you* at all
+                // is your own switch and not this -- see `room::Bots`.
+                default_mode: Mode::Auto,
                 ..base.clone()
             };
             let built = make(cfg).with_context(|| format!("open the {} room", room.title))?;
@@ -385,7 +388,7 @@ impl Rooms {
             id: row.id.clone(),
             title: row.title.clone(),
             only: None,
-            default_mode: Mode::Named,
+            default_mode: Mode::Auto,
             ..self.home().config().clone()
         };
         let room = match (self.make)(cfg) {
@@ -785,7 +788,7 @@ mod tests {
             id: String::new(),
             title: String::new(),
             only: None,
-            default_mode: Mode::Named,
+            default_mode: Mode::Auto,
             bots: vec![BotConfig::new("Vox", vec![])],
             reply_after: Duration::from_millis(1200),
             confirm: Duration::from_millis(300),
@@ -866,6 +869,7 @@ mod tests {
             display: name.into(),
             link: None,
             language: String::new(),
+            bots: String::new(),
             owner: false,
         }
     }

@@ -90,6 +90,115 @@ releases.
 
 ### Voice room
 
+- **Whether an AI may answer you is now your own switch, and the bots'
+  Answers control is gone.** When an AI spoke was one setting per bot
+  -- *never / when named / when it fits / every pause* -- shared by the
+  whole room and changeable by anybody in it. That made being answered
+  a thing the room decided about you, and a room is more than one
+  person: one of them is working something through with the AI and the
+  other wants to be left alone, and the one who wants quiet had to
+  silence it for everybody or put up with it.
+
+  **BOTS**, in the footer under **PTT**, asks the same question of the
+  person it happens to. On, which is how everybody starts: the AIs may
+  answer what you say. Off: they stay out of it, and nothing changes
+  for anybody else in the room -- they go on being answered exactly as
+  before, and you hear every word of it.
+
+  Off has two meanings and Settings → *Turning the AI off* picks which.
+  *Unless I say its name* is the default and is the nuance the switch
+  would otherwise lose: the AI stays out of what you say and still
+  answers when you call it by name, so a quiet room is still a room you
+  can ask a question in. *Never* is nothing at all, its own name
+  included.
+
+  It filters the turn, not the transcript. Everything said in the room
+  is still written into the one conversation whoever said it, and an AI
+  answering somebody else still reads the whole of it: a log with holes
+  in it would be a worse thing than an AI that heard you. The switch is
+  kept against your invite name, so it survives a rename, it is the
+  same in every room of the house, and it is still off tomorrow -- and
+  it is on the roster everybody is sent, because an AI that answers one
+  person and not the one beside them is a room where the reason has to
+  be visible or it reads as a fault.
+
+  What is left of a bot's own mode is the room's own doing and has no
+  control: a game's rule binds every voice in the room, a show silences
+  its director and its cast until the curtain comes down, and a bot can
+  still stand itself down until it is named. The strip says which of
+  those it is doing -- *In the show*, *Waiting to be named*, *In a
+  back-and-forth* -- instead of offering a menu, and none of it is
+  written down any more, so a room comes back up from a restart taking
+  its pauses the way it is configured to rather than the way one
+  afternoon left it. A room people share now judges each pause
+  (*when it fits*) instead of waiting to be named, since waiting to be
+  named was the old way of not being interrupted and the switch is the
+  new one. **Stops** is untouched: it is the one thing about an AI that
+  is still set per AI.
+
+- **Push to talk no longer has to cost you hearing the room, and by
+  default it doesn't.** Holding the key cut the room's own sound dead,
+  for everybody, with nothing to say otherwise -- which is exactly
+  right for somebody on speakers with a microphone pointed at them, and
+  a pure loss on a headset: you held the key to interrupt the AI and
+  then could not hear it stop. One hold, two rooms, opposite answers,
+  and only the person holding it knows which room they are in.
+
+  **Settings → Holding the talk button** is now that question, asked
+  once. *You keep hearing the room* is full duplex and the new default:
+  nothing is cut, and an interruption is a conversation rather than a
+  guess. *The room goes quiet* is the old behaviour, kept whole -- taken
+  to nothing as the key goes down, brought back only once the mic has
+  actually closed, a fade of a few milliseconds because a hard cut is a
+  click and a click is a sound the mic hears too -- and now chosen by
+  the one person it helps, since echo cancellation is deliberately off
+  here and on speakers nothing else keeps the room out of their mic.
+
+  Full duplex is the default because it is the setting that cannot
+  surprise anybody: a room that goes silent the moment you speak is a
+  room people report as broken, and headsets are the common case. The
+  switch for whether push to talk is on at all has not moved -- it is
+  beside the button it changes, in the footer, because that is a thing
+  you flip while talking. This is a thing you settle by what you are
+  listening on, so it is on the page for those. Changed mid-hold it
+  lands on the hold you are in, since the room goes on running behind
+  that page. An open mic was always full duplex and still is.
+
+- **The director's box now keeps a log of its own, and the audience's
+  stays out of it.** The box being deaf to the audience was decided one
+  way in three places and worked only while nobody moved: the
+  transcript handed to the AI dropped every line by every *person*
+  sitting in the audience, which is the right answer only as long as
+  where somebody is sitting now is where they were sitting when they
+  spoke. It isn't. Somebody who went round to the box stopped being an
+  audience member, and so the director was handed everything they had
+  said out front -- the whole hour of it, at once, as though they had
+  come in and read it aloud. Going back out to the stalls hid what they
+  had said in the box by the same mistake in reverse.
+
+  An entry is now marked with the part of the playhouse it was said in,
+  at the moment it was said, and that mark never changes. The box is
+  handed the box's log and the stage's and nothing else, line by line,
+  by *where it was said* rather than *who said it* -- so coming round
+  to the box is a person arriving, not a transcript arriving with them.
+
+  Two things deliberately have no part to them. Anything said with no
+  show on is said in a room that has no parts to it, so the hour before
+  the curtain went up is the director's to read: there was no box to be
+  shut out of. And everything the room posts in front of everybody --
+  cards, pictures, voice clips, the programme at the curtain -- stays in
+  the conversation whoever posted it, because a card held up in a room
+  is seen rather than heard, and the rule is about hearing.
+
+  On screen the box now reads what it hears. The lines said up there
+  are in a shallow log under its faces, the way the stage has had one
+  all along, and they are out of the conversation below while the
+  playhouse is open: that column is the audience's. Nothing is hidden
+  from anybody -- the audience can follow the box perfectly well, up in
+  the box -- and when the last character leaves, the playhouse goes and
+  what was said in it drops into the conversation, so the whole show
+  reads back in order afterwards.
+
 - **Push to talk now shuts the room up while you hold the key.** The
   mode is for somebody on speakers with a microphone pointed at them,
   and it only did half the job: the mic opened, and the room went on

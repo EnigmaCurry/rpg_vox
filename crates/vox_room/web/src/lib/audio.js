@@ -69,9 +69,10 @@ export class RoomAudio {
     this.decoder = null;
     this.player = null;
     this.volume = null;
-    // The room's sound, cut while push to talk is held. Its own node
-    // rather than the volume one: what you set in Settings is yours to
-    // come back to, and a hush that moved the slider would lose it.
+    // The room's sound, cut while push to talk is held on half duplex.
+    // Its own node rather than the volume one: what you set in Settings
+    // is yours to come back to, and a hush that moved the slider would
+    // lose it.
     this.hush = null;
     // Whether it is cut right now, for `takeHeard`: a meter showing
     // what is coming down the socket while the speakers are silent is
@@ -95,12 +96,13 @@ export class RoomAudio {
 
   /// Cut the room's sound dead, or let it back in.
   ///
-  /// Held for as long as push to talk is held. The whole point of that
-  /// mode is somebody on speakers with a microphone pointed at them:
-  /// whatever the room is saying goes into their mic, is transcribed as
-  /// theirs, and is read back to the room as something they said. The
-  /// mic cannot be made deaf to one sound in the room it is in, so the
-  /// room stops making it.
+  /// Held for as long as push to talk is held, by somebody who has
+  /// asked for half duplex -- see `setPttHush`. That is the setting for
+  /// speakers with a microphone pointed at them: whatever the room is
+  /// saying goes into their mic, is transcribed as theirs, and is read
+  /// back to the room as something they said. The mic cannot be made
+  /// deaf to one sound in the room it is in, so the room stops making
+  /// it. On a headset nothing is cut and this is never called.
   ///
   /// Ramped rather than switched. Zero at a stroke is a click, and a
   /// click is a sound the mic hears too; `HUSH_S` is too short to be a
@@ -207,7 +209,8 @@ export class RoomAudio {
 
   /// Open the mic and start sending it. Echo cancellation and noise
   /// suppression stay off so the voice comes through as it is (on
-  /// speakers, push to talk keeps the room's sound out).
+  /// speakers, push to talk on half duplex keeps the room's sound out
+  /// -- see `setPttHush`).
   async startMic({ deviceId } = {}) {
     if (this.stream) return;
     this.stream = await navigator.mediaDevices.getUserMedia({
