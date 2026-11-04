@@ -90,6 +90,29 @@ releases.
 
 ### Voice room
 
+- **Escape gives the keyboard back.** The space bar is the
+  microphone's from wherever you left the focus, with two exceptions:
+  the box you type into and the `Stops` menu on a fader, where Space is
+  typing or opening a list. Both keep the focus after you have finished
+  with them, so the key stayed theirs until you thought to click the
+  background -- something you had to know rather than something you
+  could see, and the reason a vim-keys extension is the difference
+  between the room working and not.
+
+  Escape now lets go of whatever has the keyboard, for everybody.
+  Nothing else: what you had typed is still in the box to come back to,
+  and a field with its own idea about Escape -- the conversation's
+  title, where it means *cancel this rename* -- has already handled it
+  and blurred itself before this runs.
+
+  It is only ever about the box. The other things Escape does here --
+  shutting the settings page, the owner's page, a shared desktop --
+  now ask the same question of the same event and stand down when the
+  answer is yes, so a press meant for the name field does not take the
+  page out from under it; the next one does. A dropdown that is *open*
+  is the one case where the first press does nothing visible: the
+  browser keeps that Escape to close the list and never hands it on.
+
 - **The room has a look, and it is now a thing you can choose.** Every
   colour, every border and every corner in the app came out of thirteen
   custom properties and a `prefers-color-scheme` block, which was one

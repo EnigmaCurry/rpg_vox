@@ -4,6 +4,7 @@
     command, setPttHush, setBotsOff, theAI, theAIs,
   } from '../lib/room.svelte.js';
   import { theme, setTheme, THEMES } from '../lib/theme.svelte.js';
+  import { fieldAt } from '../lib/keys.js';
   import { NAME_MAX } from '../lib/names.js';
   import { scaledDown } from '../lib/pixels.js';
   import Face from './Face.svelte';
@@ -21,8 +22,11 @@
   // are not decisions you make while watching the conversation, and the
   // room is still running behind it. The audio never stops, and the
   // space bar still works, so you can hear what a change did.
+  // Escape leaves this page -- unless the press was about a box you
+  // were typing in, in which case it was the keyboard asking to be let
+  // out of the box and `App` has already let it out. See `lib/keys.js`.
   function onkeydown(e) {
-    if (e.key === 'Escape') room.settings = false;
+    if (e.key === 'Escape' && !fieldAt(e.target)) room.settings = false;
   }
 
   // The name you are typing, until the room has it; `null` means the

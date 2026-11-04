@@ -925,6 +925,19 @@ See ROOM_DOCKER.md.
   something else: a text box, a dropdown, and a dialog that is asking
   you something. A focused button is still worked by Enter.
 
+  **Escape gives the keyboard back.** A text box and a dropdown both
+  keep the focus after you have finished with them, so without this the
+  space bar stays theirs until you think to click the background —
+  something to know rather than something to see. Escape lets go of
+  whatever has it and changes nothing else: what you had typed is still
+  in the box to come back to. It is only ever about the box, too, so a
+  press meant for the name field does not also take the settings page
+  out from under you; press it again for that. (A dropdown that is
+  *open* is the one case where the first press does nothing visible —
+  the browser keeps that one to close the list, and the next one
+  reaches the room.) People who run a vim-keys extension already have
+  this key; this is the same one, for everybody else.
+
   Mute, push to talk and the mic belong to the **tab**, not to you, so
   two of your own tabs can't argue over them: you are muted once every
   tab with its mic open says so, and a tab sitting at the door — or left
@@ -1939,7 +1952,7 @@ CHROME=$(which chromium) ./run.sh            # or: ./run.sh rooms bots
 | `door` | the door is a page with no room behind it and no socket open; **Join Audio** does nothing until you agree to be recorded, and the Language box is never blank |
 | `roles` | the house and the people: making a room, renaming one under somebody standing in it, taking one away from under them — and the owner and the rest: who is shown the people and who is answered when they ask for them, a room given and taken away while somebody sits in the house, and an invite made from the page |
 | `settings` | the footer: one width for the talk button whatever it says, the two half-height switches stacked beside it, sharing and the way out on the other side, and the cog opening a page with what each switch means when it is off |
-| `ptt` | push to talk: the space bar reaching the microphone from wherever the focus was left -- a button you clicked, the history panel, a mute -- and not reaching it in a text box or a dialog; and what holding it does to the room's own sound, which is nothing until you ask for it, and then going to nothing while the key is down, coming back only once the mic has closed, and changing under a hold that is already being held |
+| `ptt` | push to talk: the space bar reaching the microphone from wherever the focus was left -- a button you clicked, the history panel, a mute -- and not reaching it in a text box, a dropdown or a dialog; Escape giving it back from each of those without disturbing what is in them; and what holding it does to the room's own sound, which is nothing until you ask for it, and then going to nothing while the key is down, coming back only once the mic has closed, and changing under a hold that is already being held |
 | `permalinks` | `/`, `/lobby` and `/room/<id>`; back and forward move between rooms, a pasted address opens that room, a stale one is put right |
 | `conversations` | the room's history: naming one, reading an old one read-only without moving anybody else's screen, deleting one for everybody, and empty ones never being archived |
 | `game` | a game played inside a room, and leaving it putting the room back where it was for everyone in it |

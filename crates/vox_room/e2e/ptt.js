@@ -193,7 +193,51 @@ const focused = (page) =>
   await page.fill('.say textarea', 'a');
   is('the box has it instead', await space(page), false);
   is('and it went in as a space', await page.inputValue('.say textarea'), 'a ');
+
+  // And Escape is the way back out of it. The box keeps the focus
+  // after you have finished with it, so without this the space bar
+  // stays the box's until you think to click the background.
+  await page.keyboard.press('Escape');
+  await page.waitForTimeout(200);
+  is('Escape lets the box go', await focused(page), 'body');
+  is('and what you had typed is still there', await page.inputValue('.say textarea'), 'a ');
+  is('and the key is the microphone\u2019s again', await space(page), true);
   await page.fill('.say textarea', '');
+
+  // The other thing that takes it: a menu on a fader, where Space
+  // opens the list rather than the microphone. The first Escape here
+  // shuts the list the click opened, which leaves the state anybody
+  // who has just set `Stops` is actually in -- list closed, menu still
+  // holding the focus.
+  await page.click('.rooms .when select');
+  await page.keyboard.press('Escape');
+  await page.waitForTimeout(200);
+  is('a menu keeps the focus after it is used', (await focused(page)).startsWith('select'), true);
+  is('and Space is not yours while it has it', await space(page), false);
+  // That Space opened the list again, and the browser keeps the Escape
+  // that shuts a list it opened -- the page is never told about that
+  // one. The next press is the one that reaches us.
+  await page.keyboard.press('Escape');
+  await page.waitForTimeout(150);
+  await page.keyboard.press('Escape');
+  await page.waitForTimeout(200);
+  is('Escape lets that go too', await focused(page), 'body');
+  is('and the key is yours again', await space(page), true);
+
+  // Escape in a box is about the box and nothing else: the settings
+  // page has its own Escape, and a press meant for the name field must
+  // not take the page out from under it.
+  await page.click('.tools button.cog');
+  await page.waitForSelector('.settings');
+  await page.click('.settings .name input');
+  await page.keyboard.press('Escape');
+  await page.waitForTimeout(300);
+  is('the settings page is still open', await page.evaluate(() => !!document.querySelector('.settings')), true);
+  is('with the box let go of', await focused(page), 'body');
+  await page.keyboard.press('Escape');
+  await page.waitForTimeout(400);
+  is('and the next press leaves it', await page.evaluate(() => !!document.querySelector('.settings')), false);
+  await page.waitForSelector('footer .big.ptt');
 
   // A dialog answers with Space, so it keeps it.
   await page.click('.bar button:has-text("New conversation")');

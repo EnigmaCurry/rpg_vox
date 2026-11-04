@@ -12,6 +12,7 @@
     renameRoom,
     deleteRoom,
   } from '../lib/room.svelte.js';
+  import { fieldAt } from '../lib/keys.js';
 
   // The house, for the one who owns it: the rooms it has, who is
   // invited, and which of those rooms each of them may go to.
@@ -53,8 +54,11 @@
 
   const full = (link) => new URL(link, location.origin).toString();
 
+  // Escape leaves this page -- unless the press was about a box you
+  // were typing in, in which case it was the keyboard asking to be let
+  // out of the box and `App` has already let it out. See `lib/keys.js`.
   function onkeydown(e) {
-    if (e.key === 'Escape') room.managing = false;
+    if (e.key === 'Escape' && !fieldAt(e.target)) room.managing = false;
   }
 
   async function copy(link) {

@@ -240,6 +240,13 @@ const sayAt = (page) => page.evaluate(() => {
   await page.locator('input[name="theme"]').nth(0).check();
   await wait(300);
   is('and back again', (await look()).on, 'obsidian');
+  // Choosing one leaves the focus on it, and Escape in something you
+  // are choosing from is about that and not about the page: the first
+  // press lets the radio go, the second leaves. See `lib/keys.js`.
+  await page.keyboard.press('Escape');
+  await wait(200);
+  is('the page is still here after letting the radio go',
+    await page.evaluate(() => !!document.querySelector('.settings')), true);
   await page.keyboard.press('Escape');
   await wait(400);
 

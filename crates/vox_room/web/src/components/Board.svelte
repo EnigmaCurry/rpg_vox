@@ -2,14 +2,18 @@
   // One shared desktop, full size, on this screen alone. Opening or
   // closing it changes nothing for anyone else in the room.
   import { screen, showBoard, unwatch } from '../lib/screen.svelte.js';
+  import { fieldAt } from '../lib/keys.js';
 
   const stream = $derived(screen.streams.find((s) => s.id === screen.watching));
 
   let canvas = $state();
   $effect(() => (canvas ? showBoard(canvas) : undefined));
 
+  // Escape stops watching -- unless the press was about the box along
+  // the foot of the room, which is still there to type into while a
+  // desktop is on the screen. See `lib/keys.js`.
   function onkeydown(e) {
-    if (e.key === 'Escape') unwatch();
+    if (e.key === 'Escape' && !fieldAt(e.target)) unwatch();
   }
 </script>
 

@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import { room, command, ask, answer, whoami, leaveAudio, setMuted, setPushToTalk, setBots, talk, busyAI, dropPicture, notice, mutedByRoom, theAI, theAIs } from './lib/room.svelte.js';
   import { screen, share, stopSharing, supported as canShare } from './lib/screen.svelte.js';
+  import { TYPING, fieldAt } from './lib/keys.js';
   import Log from './components/Log.svelte';
   import Cards from './components/Cards.svelte';
   import Enter from './components/Enter.svelte';
@@ -144,11 +145,44 @@
   // from pressing that button again while you talk.
   //
   // A dialog is an exception, because there Space is how you answer it.
-  const TYPING = 'input, textarea, select, [contenteditable=""], [contenteditable="true"], dialog';
+  // What counts as typing is `lib/keys.js`, because Escape below has to
+  // agree with it.
   function spaceKey(e) {
     return e.code === 'Space' && room.audio === 'on' && !e.target.closest(TYPING);
   }
+  // Escape gives the keyboard back.
+  //
+  // The two things in the room that take Space off your microphone are
+  // the box you type into and the `Stops` menu on a fader, and both of
+  // them keep the focus after you have finished with them -- so the
+  // space bar stays theirs until you think to click the background.
+  // That is a thing to know rather than a thing to see, and people who
+  // have a vim-keys extension in their browser already press Escape
+  // for it. This is the same key, for everybody else.
+  //
+  // It only lets go; it changes nothing in the box it let go of. What
+  // you had typed is still there to come back to, and a field with its
+  // own idea about Escape -- the conversation's title, where it means
+  // *cancel this rename* -- has already handled it and blurred itself
+  // by the time this runs, which makes this a no-op there.
+  //
+  // Nothing is stopped or swallowed. The other things Escape does in
+  // this room -- shutting the settings page, the owner's page, a
+  // shared desktop -- ask `fieldAt` the same question and stand down
+  // when the answer is yes, so a press that was about a text box is
+  // only ever about the text box. That is one line in each of them
+  // rather than this one trying to be first.
+  //
+  // An open `select` is the one case where the first press does
+  // nothing visible: the browser takes that Escape to close the list
+  // and never hands it on. The second press lands here.
+  function escape(e) {
+    const field = fieldAt(e.target);
+    if (field) field.blur();
+  }
+
   function onkeydown(e) {
+    if (e.key === 'Escape') return escape(e);
     if (!spaceKey(e)) return;
     e.preventDefault();
     // Muted on the room's mixer, the space bar still belongs to your
