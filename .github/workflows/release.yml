@@ -96,8 +96,8 @@ jobs:
   # The Scribe dictation app (android/). arm64-v8a only: it covers every
   # current phone, and the 32-bit-only phones a second ABI would add are
   # too slow for the speech models anyway.
-  android:
-    name: build (android-arm64 apk)
+  android-scribe:
+    name: build (scribe apk, arm64)
     runs-on: ubuntu-24.04
     env:
       ANDROID_NDK_VERSION: 30.0.16248370
@@ -201,7 +201,7 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: [build, android, android-room]
+    needs: [build, android-scribe, android-room]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-24.04
     permissions:
