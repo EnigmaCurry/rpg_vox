@@ -827,6 +827,10 @@ android-apk VERSION=`git describe --tags --always --dirty`: _android-jni
 # VOX_ROOM_KEYSTORE_PASSWORD, VOX_ROOM_KEY_ALIAS, VOX_ROOM_KEY_PASSWORD)
 # when set, the debug key otherwise.
 #
+# That is the same key scribe's APK is signed with -- `android-keystore`
+# makes it and there is one of it -- so point VOX_ROOM_KEYSTORE at the
+# same file, with its password and its alias.
+#
 # Nothing native in it and nothing to cross-compile -- it is Kotlin and a
 # WebView -- so this is one APK for every phone and there is no NDK, no
 # Rust and no `_android-jni` in front of it.
@@ -844,12 +848,20 @@ room-apk VERSION=`git describe --tags --always --dirty`:
     (cd dist && shasum -a 256 "$name" > "$name.sha256")
     echo "packaged dist/$name"
 
-# Release signing key for the APK: creates KEYSTORE (asks for a password)
-# unless it exists, then, after confirmation, stores it and its password as
-# the repo secrets the release workflow signs with (needs `gh`). Every APK
-# must be signed by this same key to install over the last one. GitHub
-# can't give the secret back, so a lost KEYSTORE only matters if the
-# secret goes too: a new key then means uninstalling Scribe once.
+# Release signing key for both Android apps: creates KEYSTORE (asks for a
+# password) unless it exists, then, after confirmation, stores it and its
+# password as the repo secrets the release workflow signs with (needs
+# `gh`). Every APK must be signed by this same key to install over the
+# last one. GitHub can't give the secret back, so a lost KEYSTORE only
+# matters if the secret goes too: a new key then means uninstalling both
+# apps once.
+#
+# One key for scribe and the voice room. A key can sign any number of
+# packages, and two of them kept on one machine, backed up together and
+# stored in one place do not fail separately -- so a second key would
+# have doubled the bookkeeping to insure against a risk it does not
+# actually spread. The secrets are named SCRIBE_* because scribe was the
+# only Android app here when they were made.
 android-keystore KEYSTORE="":
     #!/usr/bin/env bash
     set -euo pipefail
@@ -881,42 +893,6 @@ android-keystore KEYSTORE="":
     printf %s "$SCRIBE_KEYSTORE_PASSWORD" | gh secret set SCRIBE_KEYSTORE_PASSWORD
     printf %s "$SCRIBE_KEYSTORE_PASSWORD" | gh secret set SCRIBE_KEY_PASSWORD
     printf %s "$alias" | gh secret set SCRIBE_KEY_ALIAS
-
-# Release signing key for the voice room APK, as `android-keystore` is
-# for scribe's. A separate key because they are separate apps: one
-# keystore signing both would mean losing it costs two reinstalls
-# instead of one. Needs `gh`.
-room-keystore KEYSTORE="":
-    #!/usr/bin/env bash
-    set -euo pipefail
-    export JAVA_HOME="${JAVA_HOME:-/opt/homebrew/opt/openjdk@21}"
-    keytool="$JAVA_HOME/bin/keytool"
-    keystore="{{KEYSTORE}}"
-    keystore="${keystore:-$HOME/vox_room.jks}"
-    alias=vox_room
-    read -rsp "Keystore password: " VOX_ROOM_KEYSTORE_PASSWORD; echo
-    export VOX_ROOM_KEYSTORE_PASSWORD
-    if [ -f "$keystore" ]; then
-      "$keytool" -list -keystore "$keystore" -storepass:env VOX_ROOM_KEYSTORE_PASSWORD -alias "$alias" >/dev/null \
-        || { echo "wrong password, or no $alias key in $keystore" >&2; exit 1; }
-      echo "using existing $keystore"
-    else
-      [ "${#VOX_ROOM_KEYSTORE_PASSWORD}" -ge 6 ] || { echo "password needs 6+ characters" >&2; exit 1; }
-      read -rsp "Again: " again; echo
-      [ "$again" = "$VOX_ROOM_KEYSTORE_PASSWORD" ] || { echo "passwords differ" >&2; exit 1; }
-      # PKCS12 keystores use the store password for the key too.
-      "$keytool" -genkeypair -keystore "$keystore" -alias "$alias" \
-        -keyalg RSA -keysize 4096 -validity 10000 -dname "CN=Voice Room" \
-        -storepass:env VOX_ROOM_KEYSTORE_PASSWORD
-      chmod 600 "$keystore"
-      echo "created $keystore; back it up"
-    fi
-    read -rp "Store it as secrets of $(gh repo view --json nameWithOwner -q .nameWithOwner)? [y/N] " ok
-    [ "$ok" = y ] || [ "$ok" = Y ] || exit 0
-    base64 < "$keystore" | gh secret set VOX_ROOM_KEYSTORE_BASE64
-    printf %s "$VOX_ROOM_KEYSTORE_PASSWORD" | gh secret set VOX_ROOM_KEYSTORE_PASSWORD
-    printf %s "$VOX_ROOM_KEYSTORE_PASSWORD" | gh secret set VOX_ROOM_KEY_PASSWORD
-    printf %s "$alias" | gh secret set VOX_ROOM_KEY_ALIAS
 
 # libvox_android.so and the sherpa-onnx libs it loads, into the app's jniLibs.
 _android-jni:

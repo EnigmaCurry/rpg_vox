@@ -44,7 +44,9 @@ back to a call nothing is in.
 
 Every release carries `voice-room-<version>-android.apk`, built by the
 release workflow and signed with the same key each time, so one installs
-over the last.
+over the last. It is the same key scribe's APK is signed with; they are
+different apps and Android only asks that an update be signed by
+whatever signed the one before it.
 
 Download it from the [releases
 page](https://github.com/EnigmaCurry/rpg_vox/releases) on the phone and
@@ -77,6 +79,12 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 they are not. A debug key made on one machine is not the debug key made
 on another, which is why an APK can refuse to install over its own
 predecessor.
+
+It is the same key [scribe's app](SCRIBE_ANDROID.md) is signed with, and
+`just android-keystore` is what makes it. A key signs packages, not
+apps, so one of them can sign both; the release workflow hands this job
+the same secrets it hands that one, which are named `SCRIBE_*` because
+scribe was the only Android app here when they were made.
 
 There is no native code in it and nothing to cross-compile: it is Kotlin
 and a WebView, so one APK covers every phone. That is the whole reason

@@ -176,22 +176,28 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
       - uses: extractions/setup-just@v2
 
-      # Release signing key, if the repo has one (base64 keystore plus
-      # passwords in secrets); otherwise `just room-apk` signs with a
-      # throwaway debug key and each release must be installed fresh.
+      # The same key that signs scribe's APK. One key can sign any number
+      # of packages; Android only asks that an update to a package be
+      # signed by whatever signed it last. The secrets are named for
+      # scribe because scribe was the only Android app here when they
+      # were made, and GitHub will not hand a secret back to be stored
+      # again under a better name.
+      #
+      # Without them `just room-apk` signs with a throwaway debug key and
+      # each release has to be installed fresh.
       - name: Release keystore
         env:
-          KEYSTORE_B64: ${{ secrets.VOX_ROOM_KEYSTORE_BASE64 }}
+          KEYSTORE_B64: ${{ secrets.SCRIBE_KEYSTORE_BASE64 }}
         if: env.KEYSTORE_B64 != ''
         run: |
-          echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/vox_room.jks"
-          echo "VOX_ROOM_KEYSTORE=$RUNNER_TEMP/vox_room.jks" >> "$GITHUB_ENV"
+          echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/android.jks"
+          echo "VOX_ROOM_KEYSTORE=$RUNNER_TEMP/android.jks" >> "$GITHUB_ENV"
 
       - name: Build APK
         env:
-          VOX_ROOM_KEYSTORE_PASSWORD: ${{ secrets.VOX_ROOM_KEYSTORE_PASSWORD }}
-          VOX_ROOM_KEY_ALIAS: ${{ secrets.VOX_ROOM_KEY_ALIAS }}
-          VOX_ROOM_KEY_PASSWORD: ${{ secrets.VOX_ROOM_KEY_PASSWORD }}
+          VOX_ROOM_KEYSTORE_PASSWORD: ${{ secrets.SCRIBE_KEYSTORE_PASSWORD }}
+          VOX_ROOM_KEY_ALIAS: ${{ secrets.SCRIBE_KEY_ALIAS }}
+          VOX_ROOM_KEY_PASSWORD: ${{ secrets.SCRIBE_KEY_PASSWORD }}
         run: just room-apk "$GITHUB_REF_NAME"
 
       - uses: actions/upload-artifact@v4
