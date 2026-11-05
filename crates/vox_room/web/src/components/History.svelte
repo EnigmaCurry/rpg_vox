@@ -202,6 +202,15 @@
     border-radius: var(--field-radius);
     padding: 2px 6px;
   }
+  /* Narrow: the name is what this bar is for -- it is the heading and
+     it is the box you rename the conversation in -- so it gets what is
+     left after the buttons, and the console's decorative corner, which
+     is only ever decoration, stops competing with it for the width. */
+  @media (max-width: 860px) {
+    .bar { gap: 6px; }
+    .mark { display: none; }
+    .name { flex: 1 1 auto; min-width: 0; }
+  }
   .name:hover { border-color: var(--line); }
   .name:focus { border-color: var(--accent); outline: none; background: var(--field-bg); }
   .playing {

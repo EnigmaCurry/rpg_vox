@@ -128,7 +128,7 @@
   <header>
     <h1>Settings</h1>
     <div class="spacer"></div>
-    <button class="primary" onclick={() => (room.settings = false)}>Done <kbd>Esc</kbd></button>
+    <button class="primary" onclick={() => (room.settings = false)}>Done <kbd class="shortcut">Esc</kbd></button>
   </header>
 
   <!-- The one name here that is yours. Whoever runs the room picked

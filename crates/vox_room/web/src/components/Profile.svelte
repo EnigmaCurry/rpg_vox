@@ -99,7 +99,7 @@
         {/if}
       {/if}
 
-      <button class="primary" onclick={closeProfile}>Done <kbd>Esc</kbd></button>
+      <button class="primary" onclick={closeProfile}>Done <kbd class="shortcut">Esc</kbd></button>
     </div>
   </div>
 {/if}

@@ -372,9 +372,9 @@
          the picture and out of anything reading the page aloud. -->
     {#snippet says()}
       <span class="says">
-        <span>{saying} <kbd>{key}</kbd></span>
+        <span>{saying} <kbd class="shortcut">{key}</kbd></span>
         {#each SAYS as could (could)}
-          <span class="ghost" aria-hidden="true">{could} <kbd>{key}</kbd></span>
+          <span class="ghost" aria-hidden="true">{could} <kbd class="shortcut">{key}</kbd></span>
         {/each}
       </span>
     {/snippet}

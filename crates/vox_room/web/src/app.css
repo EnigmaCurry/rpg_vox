@@ -79,6 +79,18 @@ button.danger { color: var(--danger); }
 button:disabled { opacity: 0.5; cursor: default; }
 input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
 
+/* A key named beside the thing it works on -- `Done Esc`, `Mute Space`
+   -- is help on a keyboard and a lie on a phone, where it names a key
+   there is no way to press. Marked `shortcut` at each of the few places
+   it is a hint, because a `<kbd>` is just as often the binding itself
+   or a word in a sentence, and neither of those may go anywhere.
+
+   Touch-primary rather than narrow: a small window on a laptop still
+   has the keys, and a tablet with one attached keeps them too. */
+@media (hover: none) and (pointer: coarse) {
+  kbd.shortcut { display: none; }
+}
+
 /* The faders, and the one volume slider that is not one.
    =====================================================
 

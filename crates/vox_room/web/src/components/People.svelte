@@ -168,7 +168,7 @@
   <header>
     <h1>People and rooms</h1>
     <div class="spacer"></div>
-    <button class="primary" onclick={() => (room.managing = false)}>Done <kbd>Esc</kbd></button>
+    <button class="primary" onclick={() => (room.managing = false)}>Done <kbd class="shortcut">Esc</kbd></button>
   </header>
 
   {#if house.loading}

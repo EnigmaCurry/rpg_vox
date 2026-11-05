@@ -24,7 +24,7 @@
     <h2>{stream?.person}'s desktop</h2>
     <span class="hint">Only you are looking at this.</span>
     <div class="spacer"></div>
-    <button onclick={unwatch}>Close <kbd>Esc</kbd></button>
+    <button onclick={unwatch}>Close <kbd class="shortcut">Esc</kbd></button>
   </header>
   <!-- The picture keeps its own shape; the frame around it is the room's. -->
   <div class="picture">
