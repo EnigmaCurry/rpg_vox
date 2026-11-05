@@ -50,12 +50,13 @@ everything in it: premise, setting, rules, how to run turns among several \
 players, and how to open. If the game has anything meant for one player \
 alone, say in its prompt how to deal it with send_card. A game also sets \
 reply_mode, which is how the room runs while it is played: \"always\" for a \
-game you deal the turns in, where you answer every pause; \"named\" for one \
-where you only speak when a player calls you; \"room\" (the default) to \
-leave it however the people have the room set. Decide it from how the game \
-actually plays and say which you picked when you propose it. Set \
-players_min and players_max to the number of people the game is for, \
-leaving either out when that end is open; the players see it on the \
+game you deal the turns in, where you answer every pause; \"auto\" for one \
+where you are shown every pause and judge for yourself whether to come in; \
+\"named\" for one where you only speak when a player calls you; \"room\" \
+(the default) to leave it however the people have the room set. Decide it \
+from how the game actually plays and say which you picked when you propose \
+it. Set players_min and players_max to the number of people the game is \
+for, leaving either out when that end is open; the players see it on the \
 game's card, so work it out with them rather than guessing. The players never \
 see the prompt, so never read it aloud or describe its secrets; a card with \
 its name and summary appears in the chat. The players run everything by \
@@ -2150,12 +2151,14 @@ fn quiet_tool() -> Value {
     )
 }
 
-/// The `reply_mode` a game is saved with.
+/// The `reply_mode` a game is saved with. Every [`ReplyMode`] it can be
+/// is offered, because a game is also something a player can ask for by
+/// name -- see `reply_mode_arg_offers_every_mode`.
 fn reply_mode_arg() -> Value {
     json!({
         "type": "string",
-        "enum": ["room", "always", "named"],
-        "description": "How the room runs while this game is played: \"always\" (you answer every pause, for a game you deal the turns in), \"named\" (you speak only when a player says your name), or \"room\" (leave it however the people have it set). Defaults to \"room\".",
+        "enum": ["room", "auto", "always", "named"],
+        "description": "How the room runs while this game is played: \"room\" (the default: leave it however the people have it set), \"auto\" (you are shown every pause and judge for yourself whether the moment is yours), \"always\" (you answer every pause, for a game you deal the turns in), or \"named\" (you speak only when a player says your name). \"auto\" is the room's own automatic mode asked for by the game, so unlike \"room\" it holds even where you had stood down to being named.",
     })
 }
 
@@ -3954,6 +3957,54 @@ mod tests {
         t.hand_on = 0;
         let alone = agent.messages(&t, None);
         assert_eq!(alone.len(), 2, "system and the conversation: {alone:?}");
+    }
+
+    /// Every mode a game can be *saved* with is a mode a game can be
+    /// *asked* for, so the schema's list and [`ReplyMode`] have to be
+    /// the one list. They drifted: `auto` parsed, bound every bot in
+    /// the room, and was read back by `read_game`, while the schema
+    /// said it was not a word -- so a player could ask for the one
+    /// mode that is the room's own judgment made the game's rule, and
+    /// get told there is no such thing.
+    #[test]
+    fn reply_mode_arg_offers_every_mode() {
+        let arg = reply_mode_arg();
+        let offered: Vec<&str> = arg["enum"]
+            .as_array()
+            .expect("an enum of strings")
+            .iter()
+            .map(|m| m.as_str().expect("a string"))
+            .collect();
+        let described = arg["description"].as_str().expect("a description");
+        // Exhaustive on purpose: a fifth `ReplyMode` stops this
+        // compiling until it is offered here as well.
+        let named = |m: ReplyMode| match m {
+            ReplyMode::Room | ReplyMode::Auto | ReplyMode::Always | ReplyMode::Named => m.as_str(),
+        };
+        for mode in [
+            ReplyMode::Room,
+            ReplyMode::Auto,
+            ReplyMode::Always,
+            ReplyMode::Named,
+        ] {
+            let name = named(mode);
+            assert!(
+                offered.contains(&name),
+                "a game can be saved as {name:?} but not asked for one: {offered:?}"
+            );
+            assert!(
+                described.contains(&format!("{name:?}")),
+                "{name:?} is offered without being explained: {described}"
+            );
+        }
+        // And nothing is offered that the room would then turn down.
+        for name in &offered {
+            assert_eq!(
+                ReplyMode::parse(name).map(|m| m.as_str()),
+                Some(*name),
+                "{name:?} is offered and not understood"
+            );
+        }
     }
 
     #[test]

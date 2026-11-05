@@ -7,6 +7,26 @@ releases.
 
 ## Unreleased
 
+### Voice room
+
+- **A game may be asked for the mode it could already be saved
+  with.** `reply_mode` has four settings and the room acts on all
+  four, but the `save_game` and `revise_game` schemas offered only
+  three: `auto` -- the room's own judgment made the game's rule, where
+  the AI is shown every pause and decides for itself whether the
+  moment is its own -- was missing, while the error you got for an unknown
+  one listed it, and `read_game` handed it back for any game that had
+  it. So a player could ask for a game that works that way, the AI
+  would be told there is no such mode, and a game already saved that
+  way read back as a word the schema called invalid.
+
+  `auto` is offered now, and its description says the part that is
+  easy to miss: unlike `room`, which inherits, `auto` binds -- it
+  holds even where a bot had stood itself down to answering only when
+  named. A test keeps the schema's list and `ReplyMode` the one list,
+  and will not compile if a fifth mode is added without being
+  offered.
+
 ## v0.2.2 (2026-11-05)
 
 ### Voice room
