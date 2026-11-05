@@ -15,13 +15,9 @@ export class Link {
     this.worker = new Worker(new URL('./audio.worker.js', import.meta.url), { type: 'module' });
     /// Whether there is a socket to send on right now.
     this.up = false;
-    /// The loudest the mix has been in the last tenth of a second, as
-    /// the worker last reported it. Read by the meter; see `heard`.
-    this.peak = 0;
     this.worker.onmessage = (ev) => {
       const m = ev.data;
       if (m.type === 'event') onEvent?.(m.ev);
-      else if (m.type === 'heard') this.peak = m.peak;
       else if (m.type === 'up') {
         this.up = true;
         onUp?.();
@@ -66,13 +62,6 @@ export class Link {
     this.worker.postMessage({ type: 'send', msg });
   }
 
-  /// The loudest the mix has been lately. Not reset on reading: it is
-  /// the last window the worker measured, and it falls to nothing on its
-  /// own when the room goes quiet.
-  heard() {
-    return this.peak;
-  }
-
   /// Hand the worker the port it plays the mix down. One end of a
   /// channel goes into the worklet and the other into the worker, so
   /// the decoded audio goes straight between them.
@@ -101,9 +90,6 @@ export class Link {
   /// talked to even when this tab has stopped listening to it.
   silence() {
     this.worker.postMessage({ type: 'silence' });
-    // The worker stops measuring, so what it last reported would stand
-    // for as long as the page kept asking. Nothing is being heard.
-    this.peak = 0;
   }
 
   /// Shut the socket and stay shut. The worker itself stays: it is this

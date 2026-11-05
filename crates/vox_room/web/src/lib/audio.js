@@ -78,9 +78,8 @@ export class RoomAudio {
     // is yours to come back to, and a hush that moved the slider would
     // lose it.
     this.hush = null;
-    // Whether it is cut right now, for `takeHeard`: a meter showing
-    // what is coming down the socket while the speakers are silent is
-    // the room telling you that you can hear something you cannot.
+    // Whether it is cut right now, so a context started while push to
+    // talk is held comes up silent rather than opening at full.
     this.silent = false;
     this.stream = null;
     this._muted = false;
@@ -97,14 +96,6 @@ export class RoomAudio {
   set muted(on) {
     this._muted = on;
     this.link.setMuted(on);
-  }
-
-  /// How loud the room is, for the meter. The worker measures it; what
-  /// is added here is the hush, because a meter showing what is coming
-  /// down the socket while the speakers are silent is the room telling
-  /// you that you can hear something you cannot.
-  takeHeard() {
-    return this.silent ? 0 : this.link.heard();
   }
 
   /// Cut the room's sound dead, or let it back in.

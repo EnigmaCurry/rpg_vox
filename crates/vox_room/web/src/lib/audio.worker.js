@@ -19,9 +19,6 @@
 
 const RATE = 48000;
 const FRAME_US = 20000;
-/// How often the meter goes to the page. The peak is kept here between
-/// sends, so this is how often it is *drawn*, not how often it is taken.
-const HEARD_MS = 100;
 
 let ws = null;
 /// Whether there is supposed to be a socket. One that drops comes back;
@@ -41,9 +38,6 @@ let player = null;
 let inTs = 0;
 let outTs = 0;
 let muted = false;
-/// Loudest sample of the mix since the last meter went out.
-let peak = 0;
-let heardTimer = null;
 
 function connect() {
   clearTimeout(timer);
@@ -81,10 +75,6 @@ function makeDecoder() {
         data.copyTo(pcm, { planeIndex: 0, format: 'f32-planar' });
       } finally {
         data.close();
-      }
-      for (let i = 0; i < pcm.length; i++) {
-        const s = Math.abs(pcm[i]);
-        if (s > peak) peak = s;
       }
       player?.postMessage(pcm, [pcm.buffer]);
     },
@@ -155,19 +145,6 @@ function closeMic() {
   encoder = null;
 }
 
-/// The meter runs on its own clock rather than on the frames, so a
-/// socket that went quiet shows as quiet instead of freezing at
-/// whatever it last heard.
-function meter(on) {
-  clearInterval(heardTimer);
-  heardTimer = null;
-  if (!on) return;
-  heardTimer = setInterval(() => {
-    postMessage({ type: 'heard', peak });
-    peak = 0;
-  }, HEARD_MS);
-}
-
 onmessage = (ev) => {
   const m = ev.data;
   switch (m.type) {
@@ -200,7 +177,6 @@ onmessage = (ev) => {
     case 'player':
       player = m.port;
       makeDecoder();
-      meter(true);
       break;
     case 'mic':
       openMic(m.port);
@@ -212,7 +188,6 @@ onmessage = (ev) => {
       muted = m.on;
       break;
     case 'silence':
-      meter(false);
       closeMic();
       try { decoder?.close(); } catch {}
       decoder = null;

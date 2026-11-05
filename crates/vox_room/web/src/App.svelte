@@ -694,8 +694,6 @@
   /* Device names run long; keep one from pushing the controls off. */
   .warn { color: var(--danger); font-size: 13px; }
   .dismiss { padding: 0 6px; line-height: 1.4; }
-  .hear { width: 80px; height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; }
-  .hear span { display: block; height: 100%; background: var(--meter); transition: width 80ms linear; }
   .views { grid-area: views; gap: 0; padding: 0 12px 6px; }
   .views button {
     flex: 1;

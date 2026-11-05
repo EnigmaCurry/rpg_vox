@@ -276,7 +276,6 @@ export const room = $state({
   // silence that is not explained is a fault.
   hushed: false,
   // Peak level of what this tab hears, for its meter.
-  hearing: 0,
 });
 
 function readChoice(key) {
@@ -328,7 +327,6 @@ let invite = location.pathname.startsWith(JOIN)
 let link = null;
 let audio = null;
 let noticeTimer = null;
-let hearTimer = null;
 
 /// Open both of the room's sockets: its events and this tab's audio on
 /// /room.ws, and desktop sharing on /screen.ws. Separate connections, so
@@ -1570,7 +1568,6 @@ export async function joinAudio() {
     addEventListener('pointerdown', resumeAudio);
     addEventListener('keydown', resumeAudio);
     room.audio = 'on';
-    hearTimer = setInterval(() => (room.hearing = audio?.takeHeard() ?? 0), 100);
     await audio.startMic({ deviceId: room.micId });
     room.micName = await audio.micName();
     if (room.pushToTalk) setMuted(true);
@@ -1604,8 +1601,6 @@ export async function leaveAudio() {
   // coming back in should land you in the conversation, not in the
   // settings you left open.
   room.settings = false;
-  clearInterval(hearTimer);
-  room.hearing = 0;
   room.hushed = false;
   await audio?.stop();
   audio = null;
