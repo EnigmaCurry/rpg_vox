@@ -63,7 +63,23 @@ let board = null;
 const decoders = new Map();
 let publisher = null;
 
+/// Shut the desktop socket and stay shut. Called when you go back to
+/// the door: the room is voice, and from out there a desktop is a
+/// picture of somewhere you cannot hear.
+export function disconnect() {
+  wanted = false;
+  stopSharing();
+  moved();
+  const old = ws;
+  ws = null;
+  old?.close();
+  screen.connected = false;
+}
+
+let wanted = false;
+
 export function connect() {
+  wanted = true;
   const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
   ws = new WebSocket(`${scheme}://${location.host}/screen.ws`);
   ws.binaryType = 'arraybuffer';
@@ -80,6 +96,8 @@ export function connect() {
   };
   ws.onclose = () => {
     screen.connected = false;
+    // Shut on purpose: don't crawl back.
+    if (!wanted) return;
     // The decoders are of streams that may be gone, or resized, by the
     // time we are back: the server sends a keyframe to start again with.
     for (const d of decoders.values()) close(d);
@@ -120,6 +138,14 @@ function apply(ev) {
     }
     case 'publishing':
       if (publisher) publisher.id = ev.id;
+      break;
+    case 'unshared':
+      // The room we were sharing into is not the room we are in any
+      // more. The server has already taken the picture off that room's
+      // list; this lets go of the desktop the browser gave us, so the
+      // encoder stops and the tab stops saying it is being captured.
+      // Sharing here is a thing to ask for again, on purpose.
+      stopSharing();
       break;
     case 'keyframe':
       publisher?.keyframe(ev.kind);
@@ -441,6 +467,22 @@ export async function share() {
     publisher.stop();
     publisher = null;
   }
+}
+
+/// This tab has gone to another room. Nothing it was being sent came
+/// from here, so let go of every decoder and wait to be told who is
+/// sharing in the room it has arrived in -- the server says, the
+/// moment it has moved us.
+///
+/// A share of our own is not stopped here. The server is what ends it,
+/// because the server is what knows we really did change rooms, and it
+/// says so down this socket (`unshared` above) -- which is also how a
+/// second tab of ours pressing another room stops the desktop this one
+/// is sharing.
+export function moved() {
+  for (const s of screen.streams) drop(s.id);
+  screen.streams = [];
+  screen.watching = null;
 }
 
 export function stopSharing() {

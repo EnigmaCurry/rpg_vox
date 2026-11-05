@@ -21,6 +21,9 @@ const [ryanUrl, alexUrl, secs = '60', shot = 'hear-out.png'] = process.argv.slic
 
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 const JOIN = 'button:has-text("Join Audio")';
+// Nobody comes in without agreeing to be recorded, so the box is part of
+// pressing the button now.
+const AGREE = '.consent input';
 
 async function person(name, url, language) {
   const browser = await chromium.launch({
@@ -43,6 +46,7 @@ async function person(name, url, language) {
   page.on('pageerror', (e) => console.log(`[${name} pageerror] ${e}`));
   await page.goto(url);
   await page.waitForSelector(JOIN);
+  await page.locator(AGREE).check();
   if (language) await page.selectOption('label:has-text("Language") select', language);
   return { name, browser, page };
 }
@@ -68,8 +72,8 @@ const show = (ts) =>
   await wait(1000);
   // Named, which is the room's own default: the message says the name,
   // so there is no mode to set and no microphone in this at all.
-  await ryan.page.fill('.composer input', 'Vox, say two sentences about the sea.');
-  await ryan.page.click('.composer button');
+  await ryan.page.fill('.say textarea', 'Vox, say two sentences about the sea.');
+  await ryan.page.click('.say button');
 
   const t0 = Date.now();
   let last = '';

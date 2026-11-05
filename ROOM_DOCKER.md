@@ -13,7 +13,7 @@ cd docker
 just config                   # asks about each setting, writes .env
 just install                  # builds the image and starts the room
 just logs -f                  # the first start downloads the models
-just room-invite Ryan
+just room-invite-owner Ryan   # who invites everybody else, from the room
 ```
 
 | recipe | what it does |
@@ -26,14 +26,20 @@ just room-invite Ryan
 | `status` | what exists, what is running, which volumes are there |
 | `logs` | `just logs -f` to follow |
 | `shell` | a bash shell in the container; `just shell -u root` for root |
-| `room-invite` / `room-uninvite` / `room-people` | the room's CLI inside the container |
+| `room-invite-owner` / `room-invite` / `room-uninvite` / `room-people` | the room's CLI inside the container |
 | `show-config` | the fully interpolated compose file, Traefik labels and all |
 
 `just room-invite NAME` prints the link to send someone, which works
 once: their browser trades it for a cookie when they press **Join
-Audio**, and `just room-uninvite NAME` takes both away. All three CLI
+Audio**, and `just room-uninvite NAME` takes both away. The CLI
 recipes read and write the same SQLite file the running room has open,
 which is fine — they are brief writes.
+
+Start with `just room-invite-owner NAME`. The owner invites everybody
+else and hands out the rooms from inside the room itself, so it is the
+only one of these you have to run at a terminal; there is one, and
+changing it means `just room-uninvite` first. See [Who owns the
+room](ROOM.md#who-owns-the-room).
 
 `docker/.env` is deliberately *not* the repository's own `.env` (that one
 belongs to `just` and rpg_vox, and holds unrelated secrets). The compose
@@ -156,6 +162,12 @@ Things worth knowing:
   and nobody else can — but a link sitting unused in a log is a way in.
   If you log request paths, redact or drop `/join/`.
 
+  The room itself never writes it down: `/join/<token>` is served the
+  app and nothing more, and the page sends the token back in a request
+  *body* for exactly this reason — a body is the one part of the
+  exchange an access log doesn't keep. The URL is the only copy, so
+  your log is the only place it can leak.
+
 There is no `networks:` block and no `traefik.docker.network` label:
 Traefik is assumed to run on the host network, so it reaches the
 container on the compose project's own bridge network at the address the
@@ -168,6 +180,117 @@ attach to, nothing to keep in sync.
 means the machine the *daemon* runs on. With a remote context that is the
 remote host, not your workstation, so `VOX_SCRIBE_LLM_URL` and
 `VOX_ROOM_TTS_URL` need names the remote host can resolve.
+
+## Faces, and the MCP server behind them
+
+The AI makes somebody a face by calling out to an MCP server, which is
+configured entirely in `.env` — `env_file` passes the whole file to the
+room, so there is nothing to change in `docker-compose.yaml`:
+
+```ini
+VOX_ROOM_MCP=art=https://comfyui-mcp.example.com/mcp=generate_pixel_art,refine_pixel_art,list_styles
+VOX_ROOM_MCP_KEY=…
+```
+
+The tool list after the URL is not optional punctuation: that server
+offers eight tools and a room that wants faces needs those three — one
+to make a picture, one to change a picture already made, and one that
+says what looks it can draw in, since that server draws in more than
+one and which look is the person's to choose. See
+[Faces](ROOM.md#faces).
+
+Two of the five left out are an exception worth knowing about: the
+pair that takes a picture somebody dropped into the room and gives it
+to the server, so it can then be changed like one the AI drew. The
+room calls those itself — the step between them is a file going up a
+socket, which no model can do — and it calls them whether or not they
+are in the list above. Naming them lends nothing and is warned about
+at startup. See [Changing a picture you dropped
+in](ROOM.md#changing-a-picture-you-dropped-in).
+
+Both variables take several servers, separated by semicolons, and the
+name is what pairs a key with its server:
+
+```ini
+VOX_ROOM_MCP=art=https://comfyui-mcp.example.com/mcp=generate_pixel_art;docs=https://docs.example.com/mcp=search
+VOX_ROOM_MCP_KEY=art=…;docs=sk-…
+```
+
+The bare key in the first example is shorthand for "the only server
+there is". Written with several servers it is refused at startup —
+one vendor's key is not a thing to send to another — so the room tells
+you to name them rather than silently picking one.
+
+**A `$` in the key is eaten.** Compose interpolates this file, so
+`abc$def` reaches the container as `abc` — the key fails to
+authenticate and nothing says why. Write it `abc$$def`. The `;`, `,`
+and `=` in the server line need no escaping.
+
+**Check it took.** The room says hello to each server on its own thread
+as it starts, and logs what it got:
+
+```console
+$ docker compose logs vox_room | grep -i mcp
+… pixel-art 1.30.0: lending 3 of its 8 tools, not create_upload_ticket, import_image, get_job_status, list_jobs, get_job_image …
+```
+
+A server that is down, or a key that is wrong, is a warning on that
+line and nothing else — the rooms open either way, and the AI simply
+has no picture tools until it answers. That is deliberate: a picture
+server is not something a voice room should fail to start over.
+
+The URL is resolved and fetched from inside the container, so it has
+to work from there and not from your workstation. A hosted server
+needs egress, which a locked-down host may not give it. A server of
+your own needs a name the container can resolve *and* a route to the
+address it resolves to, and `localhost` is never one.
+
+**Split-horizon DNS is the trap, and it looks like nothing.** If you
+run the picture server behind the same Traefik as this room, your
+workstation is probably on the private network and resolves the name
+to a private address, while the Docker host is on the public resolver
+and gets the public one — which may not be routable from there at all.
+Everything looks configured; the log says only:
+
+```console
+… no tools from this one: say hello to https://…/mcp: initialize: …
+Connection Failed: Connect error: connection timed out; the room
+carries on without it …
+```
+
+The fix is the same pin the TTS server uses, which is why there are
+three slots — a room commonly needs the voice it speaks with, the voice
+it clones with and the server it draws with, all behind the one
+Traefik:
+
+```ini
+VOX_ROOM_PIN_HOST=qwen3-tts.example.com
+VOX_ROOM_PIN_IP=host-gateway
+VOX_ROOM_PIN_HOST_2=comfyui-mcp.example.com
+VOX_ROOM_PIN_IP_2=host-gateway
+VOX_ROOM_PIN_HOST_3=qwen3-tts-clone.example.com
+VOX_ROOM_PIN_IP_3=host-gateway
+```
+
+`host-gateway` is the Docker host itself, which is the right answer
+whenever the service is behind the same Traefik. Only the lookup is
+overridden — the URL keeps the name, so TLS and the `Host` header are
+unaffected, which is what makes this safe to do to a name Traefik
+routes on.
+
+Checking it from inside the container is worth knowing how to do, and
+there is one way to get it wrong: `/bin/sh` is dash, and `/dev/tcp` is
+a bash feature, so under `sh` every probe fails and the answer looks
+like "no egress at all".
+
+```console
+$ docker compose exec -T vox_room bash -c \
+    'timeout 5 bash -c "echo > /dev/tcp/comfyui-mcp.example.com/443" \
+     && echo reachable'
+```
+
+Generating holds the connection while it runs, and the room allows two
+minutes for it. A refine on a busy GPU is the one that gets close.
 
 ## Blank is not unset
 

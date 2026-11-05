@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- The room's own deep colour, which is the field its panels lie
+         on (the `deep` token in web/src/themes/obsidian.css). The
+         artwork is a glyph on nothing now, so what it stands on is a
+         choice rather than a colour matched to its corners, and the
+         room already had one. -->
+    <color name="ic_launcher_background">#07080D</color>
+</resources>

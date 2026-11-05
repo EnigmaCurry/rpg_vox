@@ -7,6 +7,1581 @@ releases.
 
 ## Unreleased
 
+### scribe, Scribe for Android
+
+- **A language can now be read in yours even when it is written the
+  same way.** French into English was refused outright, and so was
+  Russian with Ukrainian, because a paragraph's language was worked out
+  from its alphabet and nothing else -- the recognizer that hears 25
+  languages never says which one it heard. The alphabet was never wrong
+  about Cyrillic against Latin, and could say nothing at all about Latin
+  against Latin, so the honest thing was to refuse the pair rather than
+  send a paragraph to a model that would translate it out of a language
+  it was not in and return confident nonsense.
+
+  The alphabet still goes first, still costs nothing and is still never
+  overruled when it answers. What it could not settle now goes to
+  fastText's `lid.176`: 917 KB for 176 languages, pure Rust, asked only
+  about the languages you turned on and only above nine-tenths
+  certainty. Under that the paragraph stands as it was said, which is
+  what used to happen to every one of them.
+
+  Nine-tenths is measured and not a round number. Over Flores-200 and
+  over real decodes from this repo's own recordings it is where the
+  wrong answers stop: Czech against Slovak against Polish is 2.2% wrong
+  with no floor and 0.04% at this one, and the one English paragraph
+  that was called Spanish is called Spanish at every floor up to 0.8
+  and refused at 0.9. `examples/langid_bench.rs` is what took the
+  numbers and `just langid-bench` takes them again.
+
+  For Scribe for Android, reading in English, that turns five offered
+  languages -- never more than two of them on at once, one per alphabet
+  -- into twenty-one, with no limit on how many. For `scribe` it means
+  `--other-language` may share an alphabet with yours or with another of
+  them; without the classifier the old refusal stands, rather than a
+  guess.
+
+### Scribe for Android
+
+- **Models are a page of their own.** Downloading them was a section of
+  the Languages page that had grown until it was most of it, and it
+  could only ever offer what the language settings happened to want.
+  **Settings → Models** is now every model: what each is for, how big
+  it is, whether it is on the phone, and a button to fetch or delete
+  it, with the total on disk at the top. A row says whether a model is
+  in use, unused, or wanted by a chosen language and missing -- which
+  is the state in which nothing is being read, and which previously
+  looked like a recording that simply would not translate.
+
+  The Languages page keeps the three things it is for: the language you
+  read in, the languages to listen out for, and what a paragraph shows
+  while its reading catches up. Nothing on it downloads anything, and
+  the rule that turning on one language turned off whichever other one
+  shared its alphabet is gone with the restriction behind it.
+
+- **A reading says that it is a reading, and will show you the line it
+  was made from.** A translated paragraph was the same black text as
+  one somebody actually said, with nothing to tell them apart and no
+  way to see what the translator had been given. It now carries a rule
+  down its left edge -- the whole of the indicator, present on readings
+  and on nothing else -- and over it the language it was heard in,
+  **From English**.
+
+  Tapping that opens the thread sentence by sentence: each sentence as
+  it was said, faintly, with its reading on the line beneath it. Zipped
+  rather than the reading followed by the paragraph, because checking a
+  reading means holding one sentence against one sentence, and down a
+  long paragraph two blocks are too far apart to do it. A sentence the
+  translator hasn't reached stands alone; tapping a reading plays from
+  where its own sentence was spoken, as before.
+
+  One switch for the whole transcript and not one per paragraph: any
+  tag throws it, they all show the same chevron, and one tap puts the
+  thread back to the readings alone. Reading a translated thread
+  against the original is a way of reading, not a note taken on one
+  paragraph. A paragraph nothing has been read of stays closed however
+  the switch is set -- there is nothing to compare it against yet, so
+  its tag is a label with no chevron.
+
+  Distinct from **Show what was said**, which is about the sentence a
+  reading has not reached yet. This is about the ones it has. The
+  switch is not stored: it is how the transcript is being read just
+  now, and it starts closed.
+
+### Voice room
+
+- **An AI's strip gains the controls that were missing, and loses the
+  one nobody wanted.** It had a fader and a **Stops**; it now has an
+  **On/Off** switch, a **Mute** that means something different for a
+  voice the room made, a **Voice** picker, and no fader at all --
+  nobody has ever wanted one of these louder or quieter than the rest
+  of the room.
+
+  **Off is off.** No turn is given to it by anything, so nothing is
+  asked of a model, nothing is thought and nothing is said. It keeps
+  its place in the list and everything set on it, the strip dims and
+  says `off`, and it is the room's, like **Stops**: the room down the
+  hall has its own answer and this one is still off tomorrow. Not the
+  same as the `Mode::Never` a game or a show sets -- that one is the
+  room's own doing and is put back by whatever set it, and this is a
+  switch a person threw.
+
+  **Mute now means the room is reading that voice rather than hearing
+  it.** It used to synthesize every word and throw the audio away.
+  Nothing is synthesized at all now, in any language -- and because the
+  words are no longer paced to audio that does not exist, the whole
+  reply lands at once, as fast as it is thought. Nor can anybody talk
+  over it: there is nothing in the air to talk over, so **Stops** has
+  nothing to do and a sentence is never cut off half-written. **Stop**
+  still stops it.
+
+  **Voice** picks which of the house's cloned voices it speaks in *in
+  this room*. Which voice an AI speaks in is still the house's -- one
+  name, one face, one voice -- and a room may now disagree: *as the
+  house has it* is where every room starts and what most of them stay,
+  and a room with an answer of its own keeps it when the house is
+  settled afterwards. Handing the question back is not the same as
+  choosing the AI's own voice here, which is an answer like any other.
+
+- **Who the AIs are staying out of is now visible in the room.**
+  Whether an AI may answer you became each person's own switch, and it
+  has been on the roster everybody is sent ever since -- an AI that
+  answers one person and not the one beside them is a room where the
+  reason has to be somewhere, or it reads as a fault -- but nothing
+  drew it. Now a crossed-out speech bubble sits against the name in the
+  list of who is here, in the colour the room uses for an AI.
+
+  Only when the switch is off. Everybody starts with it on, so a mark
+  against every name in the room would be a mark that says nothing: the
+  mark is the exception and its absence is the rule. The same mark for
+  both ways of being off, because at that size the thing to see is
+  whether the AIs are in what somebody says at all -- which of the two
+  it is is in the tooltip, and in how solid the mark is.
+
+- **Which key talks is yours to pick.** It was Space, because that is
+  what the person who wrote it likes, and Space is wrong for somebody:
+  it is how a screen reader works a page, and it is taken if you are
+  playing something in another window. **Settings → The talk key**
+  binds another.
+
+  You press the key rather than naming it. A box you type a key's name
+  into is a box you can be wrong in -- *Spacebar*, *ctrl space*, a key
+  whose name you don't know -- and what comes out of it is a microphone
+  that doesn't open. Pressing it also means the keys the browser never
+  hands over need no list: press one and nothing arrives, and the
+  button goes on waiting, which is the truth about that key.
+
+  Three kinds do arrive and are still refused, each with its reason
+  said at the moment you press it: ones the browser keeps (`Ctrl+W`
+  would close the tab and take the audio with it), ones the room has
+  already spent (Escape is how you get the keyboard back out of a text
+  box; Enter and Tab are how a keyboard works the page at all), and a
+  modifier on its own, which is held down whenever you use it with
+  anything else.
+
+  Combinations are allowed, and the reason they can be is that release
+  is matched on the key alone. Hold `Ctrl+Space`, let go of Ctrl first,
+  and the keyup for Space arrives with `ctrlKey` already false -- a
+  release that insisted on the modifiers would never match it, and the
+  microphone would stay open with nothing on the screen saying so. In a
+  room where everybody hears everybody that is the worst thing this app
+  can do, so going down matches the key and the modifiers, and coming
+  up matches the key.
+
+  Kept in this browser like the theme, and for the same reason: a
+  binding is a fact about a keyboard, not about a person.
+
+- **Escape gives the keyboard back.** The space bar is the
+  microphone's from wherever you left the focus, with two exceptions:
+  the box you type into and the `Stops` menu on a fader, where Space is
+  typing or opening a list. Both keep the focus after you have finished
+  with them, so the key stayed theirs until you thought to click the
+  background -- something you had to know rather than something you
+  could see, and the reason a vim-keys extension is the difference
+  between the room working and not.
+
+  Escape now lets go of whatever has the keyboard, for everybody.
+  Nothing else: what you had typed is still in the box to come back to,
+  and a field with its own idea about Escape -- the conversation's
+  title, where it means *cancel this rename* -- has already handled it
+  and blurred itself before this runs.
+
+  It is only ever about the box. The other things Escape does here --
+  shutting the settings page, the owner's page, a shared desktop --
+  now ask the same question of the same event and stand down when the
+  answer is yes, so a press meant for the name field does not take the
+  page out from under it; the next one does. A dropdown that is *open*
+  is the one case where the first press does nothing visible: the
+  browser keeps that Escape to close the list and never hands it on.
+
+- **The room has a look, and it is now a thing you can choose.** Every
+  colour, every border and every corner in the app came out of thirteen
+  custom properties and a `prefers-color-scheme` block, which was one
+  look in two shades and no way to have another. The vocabulary is now
+  about seventy tokens -- surfaces, frames, bevels, glows, fields,
+  bubbles, headings, what a person's hue is made of -- declared once in
+  `web/src/themes/tokens.css`, answered by a theme, and read by every
+  component. Nothing in a component names a colour.
+
+  **Obsidian Comms** is the new default and the reason for the rest:
+  dark glass panels with their top-left and bottom-right corners cut,
+  laid on a near-black field and lit along their edges. The AI speaks in
+  violet and you speak in amber, so a glance down the conversation says
+  whose line is whose without reading a name; everybody else keeps the
+  hue their own name hashes to. The cut corners are `clip-path` and the
+  two diagonal faces are hard-stopped gradients -- there is no image in
+  the theme, so it costs no requests and is sharp at any size.
+
+  **Plain** is the old look, kept whole: paper by day and graphite by
+  night, following whatever the machine is set to, flat, with the
+  columns told apart by a hairline. Everything structural in it is the
+  default, so it is forty lines of colour.
+
+  The cuts are a grammar rather than a decoration: two of them and no
+  more -- `--cut-panel` for a column, the conversation, the footer and
+  the door, and `--cut-card` for a panel inside one. A cut corner says
+  *this is a piece of the console*, and the pieces are the panels;
+  buttons and message bubbles are the things inside one, and they are
+  round. The talk button is the one thing in the footer shaped like
+  something to press -- a deeper bevel, and a face that sinks when you
+  press it -- and the faders are a groove with a machined slug in it
+  rather than the browser's bead.
+
+  A cut is a `clip-path`, and a clip takes anything drawn outside the
+  box with it, so the focus ring is pulled inside anything cut
+  (`--focus-inset`).
+
+  **Settings → The look** chooses. It is this browser's own and goes
+  nowhere near the server: two people in the same room can be sitting in
+  two different ones and neither can tell, and the same person at a desk
+  and on a phone may well want different answers. `index.html` reads the
+  choice before the first paint, so the room does not flash white on its
+  way to being black.
+
+- **Whether an AI may answer you is now your own switch, and the bots'
+  Answers control is gone.** When an AI spoke was one setting per bot
+  -- *never / when named / when it fits / every pause* -- shared by the
+  whole room and changeable by anybody in it. That made being answered
+  a thing the room decided about you, and a room is more than one
+  person: one of them is working something through with the AI and the
+  other wants to be left alone, and the one who wants quiet had to
+  silence it for everybody or put up with it.
+
+  **BOTS**, in the footer under **PTT**, asks the same question of the
+  person it happens to. On, which is how everybody starts: the AIs may
+  answer what you say. Off: they stay out of it, and nothing changes
+  for anybody else in the room -- they go on being answered exactly as
+  before, and you hear every word of it.
+
+  Off has two meanings and Settings → *Turning the AI off* picks which.
+  *Unless I say its name* is the default and is the nuance the switch
+  would otherwise lose: the AI stays out of what you say and still
+  answers when you call it by name, so a quiet room is still a room you
+  can ask a question in. *Never* is nothing at all, its own name
+  included.
+
+  It filters the turn, not the transcript. Everything said in the room
+  is still written into the one conversation whoever said it, and an AI
+  answering somebody else still reads the whole of it: a log with holes
+  in it would be a worse thing than an AI that heard you. The switch is
+  kept against your invite name, so it survives a rename, it is the
+  same in every room of the house, and it is still off tomorrow -- and
+  it is on the roster everybody is sent, because an AI that answers one
+  person and not the one beside them is a room where the reason has to
+  be visible or it reads as a fault.
+
+  What is left of a bot's own mode is the room's own doing and has no
+  control: a game's rule binds every voice in the room, a show silences
+  its director and its cast until the curtain comes down, and a bot can
+  still stand itself down until it is named. The strip says which of
+  those it is doing -- *In the show*, *Waiting to be named*, *In a
+  back-and-forth* -- instead of offering a menu, and none of it is
+  written down any more, so a room comes back up from a restart taking
+  its pauses the way it is configured to rather than the way one
+  afternoon left it. A room people share now judges each pause
+  (*when it fits*) instead of waiting to be named, since waiting to be
+  named was the old way of not being interrupted and the switch is the
+  new one. **Stops** is untouched: it is the one thing about an AI that
+  is still set per AI.
+
+- **Push to talk no longer has to cost you hearing the room, and by
+  default it doesn't.** Holding the key cut the room's own sound dead,
+  for everybody, with nothing to say otherwise -- which is exactly
+  right for somebody on speakers with a microphone pointed at them, and
+  a pure loss on a headset: you held the key to interrupt the AI and
+  then could not hear it stop. One hold, two rooms, opposite answers,
+  and only the person holding it knows which room they are in.
+
+  **Settings → Holding the talk button** is now that question, asked
+  once. *You keep hearing the room* is full duplex and the new default:
+  nothing is cut, and an interruption is a conversation rather than a
+  guess. *The room goes quiet* is the old behaviour, kept whole -- taken
+  to nothing as the key goes down, brought back only once the mic has
+  actually closed, a fade of a few milliseconds because a hard cut is a
+  click and a click is a sound the mic hears too -- and now chosen by
+  the one person it helps, since echo cancellation is deliberately off
+  here and on speakers nothing else keeps the room out of their mic.
+
+  Full duplex is the default because it is the setting that cannot
+  surprise anybody: a room that goes silent the moment you speak is a
+  room people report as broken, and headsets are the common case. The
+  switch for whether push to talk is on at all has not moved -- it is
+  beside the button it changes, in the footer, because that is a thing
+  you flip while talking. This is a thing you settle by what you are
+  listening on, so it is on the page for those. Changed mid-hold it
+  lands on the hold you are in, since the room goes on running behind
+  that page. An open mic was always full duplex and still is.
+
+- **The director's box now keeps a log of its own, and the audience's
+  stays out of it.** The box being deaf to the audience was decided one
+  way in three places and worked only while nobody moved: the
+  transcript handed to the AI dropped every line by every *person*
+  sitting in the audience, which is the right answer only as long as
+  where somebody is sitting now is where they were sitting when they
+  spoke. It isn't. Somebody who went round to the box stopped being an
+  audience member, and so the director was handed everything they had
+  said out front -- the whole hour of it, at once, as though they had
+  come in and read it aloud. Going back out to the stalls hid what they
+  had said in the box by the same mistake in reverse.
+
+  An entry is now marked with the part of the playhouse it was said in,
+  at the moment it was said, and that mark never changes. The box is
+  handed the box's log and the stage's and nothing else, line by line,
+  by *where it was said* rather than *who said it* -- so coming round
+  to the box is a person arriving, not a transcript arriving with them.
+
+  Two things deliberately have no part to them. Anything said with no
+  show on is said in a room that has no parts to it, so the hour before
+  the curtain went up is the director's to read: there was no box to be
+  shut out of. And everything the room posts in front of everybody --
+  cards, pictures, voice clips, the programme at the curtain -- stays in
+  the conversation whoever posted it, because a card held up in a room
+  is seen rather than heard, and the rule is about hearing.
+
+  On screen the box now reads what it hears. The lines said up there
+  are in a shallow log under its faces, the way the stage has had one
+  all along, and they are out of the conversation below while the
+  playhouse is open: that column is the audience's. Nothing is hidden
+  from anybody -- the audience can follow the box perfectly well, up in
+  the box -- and when the last character leaves, the playhouse goes and
+  what was said in it drops into the conversation, so the whole show
+  reads back in order afterwards.
+
+- **Push to talk now shuts the room up while you hold the key.** The
+  mode is for somebody on speakers with a microphone pointed at them,
+  and it only did half the job: the mic opened, and the room went on
+  talking into it. Whatever it said was picked up, written down as
+  something that person said, and read back to the room -- which is
+  also how a sentence of the AI's own came back to it as a thing it had
+  been told. `audio.js` has claimed this worked all along, in the
+  comment explaining why echo cancellation is off ("on speakers, push
+  to talk keeps the room's sound out").
+
+  The room's sound is now taken to nothing as the key goes down and
+  brought back once the mic has actually closed -- a moment after you
+  let go, since the tail that catches your last word is still a moment
+  with a microphone in front of the speakers. A fade of a few
+  milliseconds rather than a switch, because a hard cut is a click and
+  a click is a sound the mic hears too. Its own gain, so the volume you
+  set in Settings is still there when it comes back.
+
+  What the room said while you held is missed rather than queued: a
+  room that caught up afterwards would be talking over itself, a second
+  behind, every time somebody let go.
+
+- **A cloned voice can be the voice an AI speaks in, and stay that
+  way.** Asking out loud was the only way to put one on, and `speak_as`
+  is deliberately the afternoon's -- it is not written down, so every
+  restart brought every AI back up in the preset voice the house was
+  started with, and a room whose AI should always sound like somebody
+  had to be asked again every session. The configured voice was no help
+  either: it names a preset on the preset server, which structurally
+  cannot speak a clone.
+
+  **Settings -> Voices** now has a picker per AI: its own voice, or any
+  the house has cloned. It wears the choice at once, keeps it, and
+  comes back up in it. Anybody in the room may set it, like Answers and
+  the faders -- the control is no more than the sentence they could say
+  instead -- and a puppet has no picker, since its voice is the part it
+  plays.
+
+  **The choice is the house's and not one room's.** It is the same AI
+  in every room -- one name, one face, one voice -- so a choice kept
+  per room would make it a different character down the hall. Settling
+  it anywhere settles it everywhere, there and then. Which is the
+  opposite of Answers and Stops, and deliberately: when an AI speaks
+  depends on what the room is for, and what it sounds like does not.
+
+  The two ways do not fight: asked out loud for another voice it
+  obliges, in that room and for as long as the house is up, and every
+  room opens next time in the one that was settled on. Deleting a voice
+  unsettles it everywhere and takes it off any AI speaking in it in any
+  room -- the setting names a voice rather than holding its id, and a
+  bot left holding the id of a clone the server no longer has is a bot
+  whose next sentence fails instead of coming out in its own voice.
+
+- **A face changed in Settings reached nobody.** Putting an old face
+  back on, or taking one off, wrote the change to the database and then
+  told *the lobby* about it -- because the request comes in over HTTP
+  rather than down a room's socket, and the handler reached for "a room
+  to ask about things that are the server's". Anybody sitting anywhere
+  else, which includes everybody in a room of their own, saw their own
+  face stay exactly as it was until something unrelated made their
+  roster go out again.
+
+  A face is the person's, not one room's: it is beside their name on
+  every roster in the house, including the rooms they are not sitting
+  in. So all three ways a face changes -- the AI setting one, wearing
+  an old one again, taking one off -- now tell the house rather than
+  the room they happened in, and every room says who is here again. The
+  same goes for the voice an AI was settled on, which travels the same
+  way for the same reason.
+
+- **A picture server stopped working after a quiet hour, and now does
+  not.** The session a server hands out at the handshake is ended when
+  nothing has used it for a while -- the house's own server times an
+  idle one out and says so in its log -- and a room goes hours between
+  pictures, because nobody asks for one between conversations. The room
+  kept the id it was given as it opened and sent it for the life of the
+  process, so the first picture asked for after a quiet spell was
+  answered `404 Session not found`, and so was every one after it until
+  the house was restarted. The AI said it couldn't, correctly and
+  uselessly.
+
+  404 is the protocol's way of saying "not that session, start
+  another", so that is what happens now: the handshake is done again
+  and the call is made once more, once. A second 404 is a 404 about
+  something else and is reported as one.
+
+- **A picture you dropped into the room can now be changed, not only
+  worn.** Asking for a hat on one got an apology: a tool that changes a
+  picture knows only the pictures its own server drew, by the handle
+  that server wrote on the card, and a photograph off a phone is a
+  stranger to it. On screen the two kinds of card look alike, so "put a
+  hat on that one" worked or didn't depending on where the picture came
+  from, and the AI could only say so afterwards.
+
+  `redraw_picture` is the step in front: it hands a picture in the chat
+  to the picture server, which redraws it in one of its looks and keeps
+  it from then on. What lands is a new card with the next number and a
+  handle on it, which is then changed like any the AI made; the one
+  they brought in stays in the conversation untouched. What comes back
+  is a redrawn copy in the server's look rather than their photograph
+  with something added, so the AI is told to say that and ask first --
+  and which look it is drawn in is theirs to pick, like every other
+  picture, since no later change can alter it. A picture that is
+  already what somebody wants still needs none of this: `set_avatar`
+  takes it as it came.
+
+  The server does this in two tools and a file going up a socket, and
+  the socket is why neither tool is ever lent to the model: it cannot
+  post a file, and a model holding half of this is a model that will
+  describe the other half as done. The room calls both itself, from
+  the picture already in its database, whether or not they are named
+  in `--mcp` -- naming them lends nothing and is warned about at
+  startup. Where the file may be posted is checked before it goes: the
+  configured server's own address, or https, and nowhere else, because
+  the URL arrives inside a tool result and what is going up is
+  somebody's photograph.
+
+- **A recording can be dropped into the room and a voice cloned from
+  it.** Cloning needed somebody to sit at a microphone and read a
+  passage, which is the right way to get a voice from a person in the
+  room and no way at all to use fifteen seconds you already have. A
+  dropped file now gets the next number in the conversation, plays
+  there, and `save_voice` takes that number exactly as it takes a read
+  one.
+
+  The browser decodes it, which is the whole reason it works for mp3,
+  m4a, ogg and a voice memo off a phone: it already has a decoder for
+  everything it can play, and the room would need a library for each
+  and would still be guessing at the rest. What arrives is a WAV, and
+  what the room does with it is what a server must always do for
+  itself -- check it, make it mono at the rate the clone server wants,
+  bound it to the thirty seconds a recorded clip is bounded to. Then it
+  **reads the clip with the same model the room's own last pass uses**,
+  which is already loaded, so the clone server is told what the clip
+  says instead of cloning blind -- it clones markedly better that way,
+  and a dropped file has no transcript of its own.
+
+  **It is not dressed up as a recording**, for the reason a picture
+  somebody brought in is not a picture the AI made: they are different
+  events. It is its own kind of entry, the card says it was brought in
+  and names the file, and the AI is told plainly that nobody read this
+  one here -- a model told only that there is a clip in the chat thanks
+  somebody for reading a recording they already had. The clone server's
+  own consent field records which of the two kinds a clip was, since it
+  asks for one and that is what the house actually knows.
+
+- **A room with a puppet in it is a playhouse, and the director cannot
+  hear the audience.** A show used to be a thing the room did to itself
+  for the length of a script: everybody silenced, everybody finishing
+  their sentences, then back to normal. That is right for the three
+  minutes a scene takes and wrong for everything around it. So a show
+  is now *a puppet being in the room* and nothing else --
+  `bring_on_puppets` opens the playhouse, the last `send_off_puppets`
+  closes it -- and a script is something that happens inside a show
+  rather than what a show is.
+
+  An open playhouse has three parts, stacked above the conversation:
+  the **stage** with the characters on it at twice the size they are in
+  the conversation, the one speaking lit, and a log of the lines they
+  are saying; the **director's box** where the AI running it sits; and
+  the **audience**, which is the conversation and everybody watching.
+  **Sit here** on a band moves you, and the one seat nobody may move is
+  the director's.
+
+  **The box and the stage cannot hear the audience.** One rule,
+  refusing in one direction, and the point of the whole thing: a play
+  with the audience shouting suggestions at the director is not a play,
+  and a suggestion reaches the director the way it does in a real
+  theatre -- somebody goes round to the box. It took three places
+  agreeing: `hand_over` now keeps each speaker's words with the seat
+  they were said from and hands each voice only the ones it can hear,
+  `will_answer` won't promise a turn nobody is going to take, and the
+  audience's lines are left out of the AI's transcript altogether
+  rather than marked unheard, because a model shown a question and told
+  to ignore it answers it. **This is a real change in what the room
+  does**: the audience can no longer put a question to the puppets
+  without going round to the box or up onto the stage.
+
+  Going up **onto the stage** is joining the play. Whatever script was
+  running stops where it is -- the puppets have to answer the person
+  who is up there rather than say what was written before they were --
+  and from then on it is an **adlib**, improvised a line at a time. The
+  stage says which of the two it is.
+
+  And **a play is not the room talking.** The lines are read on the
+  stage and never enter the conversation; what the conversation keeps
+  is one note at the curtain, folded up, with the whole script inside
+  it. They were in the conversation to begin with, which made one
+  conversation out of two: half an hour of somebody else's dialogue in
+  the middle of yours, with no way to tell which was which.
+
+  `put_on_show` also **ends the reply it was called in**. Asked for a
+  play, the AI announced it, called the tool, and then said "that's it,
+  how did that land?" -- before a word had been heard, since the play
+  does not begin until it stops speaking. The tool's answer says to
+  stop talking and so does the prompt, and the room then hands every
+  tool result back with "carry on from there" on the end of it, which
+  is the opposite instruction and the one nearer the model. So it is
+  structural now, the way starting a game already was.
+
+- **The AI can put puppets in the room and act out a scene with them.**
+  A bot has a brain of its own, and two of them in a room are two
+  models talking to each other -- a request each per line, each
+  deciding for itself what to say next. That is the point of them, and
+  it is also why they cannot act out a scene: neither knows what the
+  other is about to say, so every line waits for a model to finish
+  thinking and an interjection lands wherever the round trip put it.
+
+  A **puppet** is the other half of that. It has a name, a face, a
+  voice and a fader of its own -- to anybody in the room it is another
+  voice in the room -- and nothing behind it at all. What it says is
+  the first AI's, written in advance and said through it. Nothing ever
+  gives a puppet the turn; saying a puppet's name gives the turn to the
+  AI that holds it, which is how one left standing after a show takes a
+  question.
+
+  So `put_on_show` takes a whole script in one call and the room
+  **renders it ahead of itself** -- a line or two in front of the one
+  being heard, so the audio for line four is made while line three is
+  playing. The lines then land exactly where the script put them: a
+  beat of silence, an answer on the last word, or `over`, which brings
+  a line in a given number of seconds before the previous one ends so
+  that both are heard at once. The timing is the whole reason to do
+  this; a play made up a line at a time is not worth the puppets.
+
+  **Every line is spoken in full, and an interruption is written rather
+  than performed.** A line that gets cut off is written as far as the
+  character gets, ending in a dash -- "But I only wanted--" -- and the
+  interrupting line comes in over its tail. The first cut of this
+  worked the other way: it synthesized the whole line and then cut the
+  audio off with the same machinery a person talking over a bot uses.
+  That was wrong twice over -- the cut landed where the wall clock said
+  rather than where the writing meant, and most of a line the speech
+  server had been paid for was thrown away -- and it was also wrong in
+  principle. A playwright knows the sentence breaks after "wanted";
+  nothing else does.
+
+  `pause` is now measured from the moment the line before it was heard
+  *out*, which is what it always claimed to be. It was measured from
+  the moment that line was *pushed*, so for any line longer than the
+  pause it had already elapsed by the time the line drained, and every
+  line ran back to back whatever the script asked for.
+
+  **It is a conversation first.** The AI is told to ask who is in it,
+  from the roster or made now, and what it is about, before it writes
+  anything. `make_puppet` keeps a character under a name with a line of
+  delivery notes -- written as instructions to an actor, *"gruff and
+  slow, an old soldier who has told this story before"* -- which is
+  what makes a puppet sound like itself rather than like the AI, and
+  which is the usual answer in a house where nobody has recorded a
+  voice: the notes go to Qwen3-TTS as its `instructions` over whichever
+  of the server's voices the character was built on. Where somebody has
+  read for a cloned voice, a puppet can have that instead. It wears a
+  face the way everybody in the room does, by `set_avatar` and
+  `set_bio` on its name, and the name, the voice, the face and the bio
+  are the house's from then on: a character made one evening can be
+  cast again months later without being made again.
+
+  Everything a puppet's line *is* on screen -- the entry with its name
+  on it, the words appearing as the audio plays, the dash where it was
+  cut, the line in the history afterwards -- is the room's own reply
+  machinery, used exactly as a bot's reply uses it. A puppet is one of
+  the room's voices and not a list of its own, which is why it gets a
+  fader, a face and a place on the roster without any of that being
+  written twice.
+
+  **While a show plays, the room is set for it.** Every voice in the
+  room goes to Answers: never and Stops: when finished as the curtain
+  goes up, and back to exactly what it was when it comes down -- both
+  *set*, visibly, on the same controls anybody could set them with,
+  because a scripted exchange that stopped dead when somebody cleared
+  their throat is not a play and a director that broke off mid-scene to
+  answer a question is not one either. A show binds every bot in the
+  room the way a game's reply mode does. The settings are written down
+  as well as set, so a server that stops in the middle of the second
+  act does not come back up with its AI silenced for good. **Stop**
+  brings the curtain down: that button is never a game's or a show's to
+  take.
+
+  When it ends the AI gets the turn, with a card saying what played and
+  who is still standing there, and the room is its own again -- it
+  answers and it can be interrupted. The puppets can be sent away with
+  `send_off_puppets`, or left to take questions, which is `say_as`: one
+  line as one of them, rendered first and queued second so two of them
+  answering in turn have no hole between them.
+
+  Needs a speech server. Without one there are no puppets at all and
+  nothing in the prompt mentions them -- a puppet with no voice is a
+  name on a fader.
+
+  The room **asks the speech server which voices it has** (`GET
+  /v1/audio/voices`) as it opens, and keeps its own voices rather than
+  the clones uploaded to it. That is not where this started: it held a
+  list written down from the names a picker shows, and the first puppet
+  ever asked to speak said nothing at all, because the voice everybody
+  calls "Uncle Fu" is `uncle_fu` to the endpoint and the server
+  answered HTTP 400 in the middle of the line. A preset asked for by
+  the name anybody says it by is now matched to the server's own
+  spelling and kept that way, and `VOX_ROOM_TTS_VOICES` is left as an
+  override for a server that will not say. A voice that fails anyway
+  reports **what the server said** into the room rather than "its voice
+  said nothing at all", because the one who can fix a puppet built on a
+  voice that does not exist is the AI that built it. See
+  **[Puppets](ROOM.md#puppets)**.
+
+- **The AI can clone somebody's voice from a few seconds of them
+  reading aloud, and be asked to speak in it.** There is a second
+  Qwen3-TTS server in `qwen3-tts/` that has always been able to do
+  this -- the Base model, which takes a reference clip where the preset
+  one takes a speaker's name -- and nothing in the room could reach it.
+  What was missing was never the cloning. It was the recording: a few
+  seconds of one person's voice, clean, with a transcript, taken
+  without anybody being recorded unawares.
+
+  The room already had all of it. The mic frames it transcribes are the
+  frames a clip is made of, the transcription is the `ref_text` the
+  server clones better with, and cards are how the room puts words on
+  one person's screen. So `take_voice_sample` puts a passage on their
+  screen, and a card in the conversation with a red dot on it saying
+  the room is listening. **No microphone here is recorded without a
+  light on it**, and the light is in the conversation where the room
+  can see it rather than on the screen of the one person being
+  recorded.
+
+  The clip starts on their first word -- the room keeps the moment
+  before it, so nothing is clipped -- and ends when they stop. Two
+  words and a pause is forgotten and the room keeps listening: *"go on
+  then"* is not a reading. Nobody reading at all is given up on from
+  the clock rather than off their audio, because somebody who shut the
+  tab sends none.
+
+  **What they are reading is a clip and not a turn.** The room does not
+  hand the AI a passage it wrote itself as something said to it, even
+  where it answers every pause: `hand_over` waits for the reading, and
+  what the AI is given afterwards is the pause with the card already in
+  front of it -- how long the clip is and what they said. A bot that
+  speaks only when it is named is given the turn outright, since nobody
+  says an AI's name while reading at a microphone.
+
+  Then `save_voice` keeps it under the name they asked for, and it is
+  the house's: `list_voices` says what there is and asks the server
+  whether it still has each one, `speak_as` wears one from the next
+  sentence on, `forget_voice` deletes one for good. A voice is written
+  down and which voice a bot is wearing is not -- that is this
+  afternoon's, so a restart is every AI in its own voice again -- and a
+  voice deleted from under a bot that is wearing it leaves it sounding
+  like itself rather than silent.
+
+  `VOX_ROOM_TTS_CLONE_URL` is the whole of the configuration. Without
+  it the AI has none of these tools and nothing in its prompt mentions
+  them.
+
+- **A face can be drawn in more than one look now, and which one is
+  yours to choose.** The picture server the room is pointed at grew a
+  second style -- a 768-pixel cel-shaded portrait with ink lineart,
+  beside the 64-pixel sprite it had always drawn -- and a room that
+  had quietly been a pixel-art room found three things in its way.
+
+  The look is now part of the interview. The AI is told that where the
+  tools can draw in more than one, which look is the person's to pick
+  and not its to default to: find out what there is, say what each one
+  is in a word or two, and ask before anything is made. It belongs in
+  the interview rather than after it because it is the one thing about
+  a picture that a later change cannot give you -- a tool that changes
+  one keeps the look it was drawn in, which is what makes it a change
+  rather than a fresh start -- so changing your mind costs a whole new
+  picture and another wait.
+
+  **Not one style is named anywhere in the room.** Not in the prompt,
+  not in the code, not in the browser. What looks there are is the
+  server's to publish, and a room that listed them would be wrong the
+  next time whoever runs that server adds one, with the AI
+  confidently offering a look that is no longer there. So the room
+  lends `list_styles` as a third tool -- it generates nothing, costs
+  no GPU time, and is how the AI finds out what it is offering you --
+  and says only the part it knows, which is that the choice is yours
+  and is made up front. A call that only asks what there is gets no
+  card: asking a question in the middle of an interview is not a
+  picture being made, and a spinner for it would promise one nobody
+  is making.
+
+  **The most a face may be is 1 MB, up from 512 KB.** The old number
+  was set against a sprite, which is a handful of kilobytes, and the
+  headroom it looked like it had was gone against a full-resolution
+  style: the busiest thing that server will draw, 1024 square and
+  quantized to 24 colours, measures about 420 KB. A face the room
+  refuses *after* somebody has looked at it and said yes is the one
+  failure here that cannot be explained to them. It costs little --
+  every face is fetched once and cached under a version that never
+  changes meaning.
+
+  **And the row of faces you have worn is drawn the right way round.**
+  Every other square in the room already asked the picture which way
+  it was being scaled -- blown up past its own pixels wants nearest
+  neighbour, shrunk wants smoothing -- but Settings magnified
+  regardless. A 768-pixel portrait in a 56-pixel thumbnail throws away
+  thirteen pixels in fourteen that way, and what is left is noise
+  rather than a face. It asks now, per picture, because that row holds
+  both kinds at once: a sprite dropped in at its own 64 pixels is
+  blown up, and anything a picture server made is shrunk. That bug was
+  there before this style was, for a photograph dropped in and for a
+  sprite the server handed back magnified; a row of ten thumbnails is
+  just where it finally showed.
+
+- **A picture can be dropped into the room, and the AI can be asked
+  for it as your face.** Drag one onto the room and let go of it
+  anywhere, or paste one with Ctrl+V -- a screenshot is on the
+  clipboard as a file, so the two are one act with one path behind
+  them. A paste that is text *with* pictures in it is left to whatever
+  has the cursor: that one is meant for the box you are typing in, and
+  a screenshot carries no text with it, which is how they are told
+  apart. Either way
+  it becomes a card in the conversation with your name on it
+  and the next number -- the same numbering the AI's own pictures use,
+  because "the second one" is said out loud about whatever is on
+  screen and nobody in the room counts the two apart. From then on it
+  is a picture like any other, which is the whole of why it is worth
+  having: `set_avatar` already takes a number, so *"make that my
+  face"* needed nothing new to work.
+
+  The AI is told it is there, whose it is, and what the file was
+  called -- and told plainly that it did not make this one. It is
+  shown no picture here, its own included; a model told only that a
+  picture is in the chat takes credit for it, and then offers to
+  change a thing it never made.
+
+  The tab re-encodes what was dropped before any of it is sent:
+  decoded by the browser, so whatever the browser reads is a picture
+  here, scaled down to the size the room actually shows a picture at,
+  and written out as a PNG, which is what everything here that holds
+  one has always been. So a photograph straight off a phone comes in
+  as a few tens of kilobytes instead of being refused for being what
+  phones make. The server keeps nothing over 1 MB, which is also the
+  most a face may be -- anything in the chat can be worn -- and checks
+  the bytes and the size for itself, because a page is not where a
+  limit lives. Anything that is not a picture is declined where it was
+  dropped, with a word in the footer and nothing uploaded.
+
+  The faces are no longer a thing only a picture server can offer.
+  `set_avatar` and `set_bio` were gated on the house having one, on
+  the reasoning that a tool with nothing to put is a tool to leave
+  out -- which stopped being true the moment a picture could arrive
+  without being drawn. The prompt split along the same line: what the
+  room knows about faces is always there, and the interview, the cost
+  and the iterating are added only where something can actually draw.
+
+  **A picture is drawn the way it is being scaled**, which is a thing
+  the room had not had to decide before. Faces here are pixel art, and
+  everything that showed one asked for nearest-neighbour: blowing a
+  128-pixel sprite up into the square is the whole point of the form.
+  A photograph is the same question with the numbers the other way
+  round -- it arrives bigger than anything that shows it, and nearest
+  neighbour on the way *down* throws most of it away. So the picture
+  is asked rather than the room guessing: wider than the square it is
+  shown in means smoothing, narrower means pixel by pixel, answered
+  when the browser has the image and in one place for the card, the
+  face beside every line, and the card that opens when a face is
+  clicked.
+
+  It is its own kind of entry rather than a made picture with a
+  person's name on it. The two are different events -- one is the AI
+  having done what it said it would, the other is somebody bringing
+  something in -- and they read differently on screen and to the
+  model. What they share is the numbering, which is the half that
+  matters out loud.
+
+- **A picture is made where the room can watch, and a face is only set
+  once somebody says yes.** The first version of this went from "make
+  me an avatar" to a changed face in one unbroken motion: the AI
+  generated a picture nobody had seen and put it on you. It worked,
+  which was the problem -- there was no moment in it where anybody
+  could say no.
+
+  So a picture now goes into the conversation as a card of its own,
+  numbered, the moment the AI starts drawing -- with a spinner on it
+  until it lands. Generating one takes the better part of a minute,
+  and the card is what tells the room that something is happening
+  rather than that the AI has gone quiet.
+
+  Then it is looked at and argued about. Another take is another card
+  with the next number, and the earlier ones stay where they are, so
+  going back to the second one is a thing somebody can ask for and the
+  AI can do. `set_avatar` takes that number rather than "the one you
+  just made", and the prompt tells it not to call it at all until
+  somebody has said they are happy.
+
+  Clicking any face -- in the conversation, anybody's -- opens who
+  that person is: the picture at a size worth looking at, a few lines
+  the AI wrote about them in the same interview, what the picture was
+  asked for, and what the house knows (the language they read in,
+  whether the room is theirs, whether they are here). `set_bio` writes
+  those lines and can rewrite them without making a new picture. An
+  AI's own face opens the same card, which says it is not a person.
+
+  The pictures belong to the conversation and go when it does. A face
+  does not: it is copied when it is set, so deleting the conversation
+  you sat for leaves you looking the same. One that was still being
+  drawn when the room stopped is marked as never having arrived on the
+  way back up -- the call it was waiting on died with the process, and
+  a spinner is a promise that something is still happening.
+
+  A picture is nobody's until it is assigned. Any of them can go to
+  anyone here -- a person, the AI itself, or another AI in the room --
+  so one picture can be looked at and then given to whoever it suits,
+  and one nobody wants is offered around rather than thrown away.
+
+  **Settings keeps the last ten faces you have worn** and offers them
+  back. Choosing one again costs nothing and needs no AI, so it is a
+  row of thumbnails and a press rather than something to ask for out
+  loud; taking your face off leaves it in that row, because that is
+  not the same as never having had one. Faces are also beside every
+  name in the list of who is here, not only in the conversation.
+
+- **Everybody has a face now, and the AI can make you one.** Every line
+  in the conversation carries a square beside it: a picture when one
+  has been made, and otherwise the tint that name already has with the
+  initials in it -- the same size and shape, so the column of names
+  lines up whether or not anybody has sat through an interview.
+
+  Making one is a conversation rather than a form. Ask out loud, and
+  the AI asks who you are, what you are wearing, what sort of face,
+  says what it is about to make, makes it and puts it on you; then you
+  tell it what to change. It cannot see what it made -- it is told how
+  many pictures it has and refers to one by number -- so the room is
+  its eyes, and setting another replaces the first.
+
+  The pictures come from an **MCP server**, which is new and is not
+  only for pictures: `--mcp NAME=URL=TOOL,TOOL` lends the AI any
+  streamable-HTTP MCP server's tools, under a prefix of their own. A
+  ComfyUI pixel-art server is what it is run against:
+
+  ```bash
+  vox_room --room Lobby \
+    --mcp 'art=https://comfyui-mcp.example.com/mcp=generate_pixel_art,refine_pixel_art' \
+    --mcp-key "$ART_KEY"
+  ```
+
+  Two tools, because a change to a face is usually a change and not a
+  fresh start: `refine_pixel_art` edits the picture already made --
+  "give it a red hat" -- and keeps everything else as it was. The new
+  one gets the next number and the earlier ones stay in the chat, so
+  going back to one is still a thing to ask for.
+
+  **A card remembers what the tool said when it made it.** Changing a
+  picture means telling the tool which one, by a handle only the tool
+  knows -- and the tool says it once, in the reply to the call that
+  drew the thing. That reply does not survive the turn: the
+  conversation a model is given is what was said out loud, and a tool
+  result is not that. Nobody asks for the hat to be red in the same
+  breath as "here it is", so by the time it was asked the handle was
+  always gone, and the AI would say it did not have one. The tool's
+  own words are kept against the card now and read back every turn
+  after, verbatim -- the room does not know which server it is talking
+  to, and what the tool said is what the tool will understand when it
+  comes back. They are kept for the model and not for the people: a
+  job id is not something anybody is going to read out, and the
+  browser is never sent it.
+
+  **The tool list after the URL is the point of the flag, not a
+  convenience.** That server offers seven tools and a room that wants
+  faces needs those two; the rest are five more ways for a voice
+  answering "make me an avatar" to end up somewhere else -- uploading
+  a file the AI does not have, re-posting a picture already in the
+  chat, listing every job on the server including other rooms'. Which
+  tools a room lends is a decision about the room, made once in the
+  configuration, rather than one the model re-makes every turn.
+
+  **The key never reaches the model.** Some servers take it as an
+  argument rather than a header -- Retro Diffusion's tools want an
+  `rd_api_key` -- and a model shown a field like that fills it in:
+  with something it invented, or, worse, correctly, which would put
+  the key into a transcript that is written down and shown on screen.
+  So it is stripped out of every schema the AI is shown and filled
+  back in when the call is made. A server that wants only the bearer
+  header never has anything stripped.
+
+  Nothing is said to the AI about what a picture costs, because the
+  room cannot know: a server on the house's own machine costs GPU time
+  and a hosted one bills per image. What it is told instead is the
+  wait -- the whole room spends it listening to nothing -- which is
+  why it says what it is about to make before it makes it, and makes
+  one at a time.
+
+  A face belongs to the person and not to the room or the
+  conversation: it is kept against the name on their invite rather
+  than the name the room calls them, so renaming yourself keeps it, it
+  follows you between rooms, and it outlasts the conversation it was
+  made in. **Settings -> Your face** takes yours off, and yours is the
+  only one you can take off -- not even the owner can clear somebody
+  else's.
+
+- **A card is written in markdown, so an AI can show you a thing while
+  it tells you.** Ask for the weather and the answer is a handful of
+  figures: speech is bad at "nine degrees, fourteen degrees, two
+  degrees" and a table is good at it. `post_card` already put text in
+  the conversation for the whole room, beside the spoken reply and
+  separate from it, but the body was rendered as plain text -- a table
+  arrived as a row of pipes.
+
+  So a card's body is markdown now: tables, bullet and numbered lists,
+  headings, bold, code blocks, quotes, rules and links. The cards only
+  one person can see are the same -- a hand is a list, a standing order
+  has the important part in bold. It is the only thing in the room
+  written in markdown, because it is the only thing here written to be
+  looked at rather than heard, and the prompt asks for both halves: the
+  short version in the AI's own voice, the detail on the card, and a
+  word to say the card is there, since nobody hears one appear.
+
+  **Nothing in a card can become markup.** The body is written by a
+  model, so it is escaped before a single tag is built from it: every
+  tag in the result was put there by the renderer, a `<script>` in a
+  card is three words on the screen, and a `javascript:` link is not a
+  link. No images, no raw HTML, nothing that fetches anything. The new
+  `cards` suite asserts it against a card written to try it on.
+
+  Every AI in the room can post one, including the ones that may do
+  nothing else: writing something for the room to look at is saying it,
+  the same thing they do with their voices. What stays the first AI's
+  are the tools that change what somebody is *holding* or what the room
+  is doing -- `send_card`, `take_back_card`, and the games.
+
+- **Which rooms an AI is in is the owner's to say.** A second AI was
+  in every room the moment the server started with one: the house's
+  rooms, and everybody's own. A room of your own is the one place
+  nobody else comes into, so an AI arriving in it uninvited is the
+  room breaking its own rule -- *You and Vox* with a third voice in
+  it.
+
+  So the AIs are given rooms the way people are, with a tick per room
+  on **People and rooms**, and a column for **rooms of their own**:
+  one answer for all of them, because which AIs are in a room of your
+  own is the house's business rather than a thing to arrange person by
+  person. The first AI is in every room and its ticks are fixed -- it
+  is what a room has, the way a room has a lobby, and the owner's row
+  in the table above it is fixed for the same reason.
+
+  A tick reaches the room at once: a fader appears or goes for
+  everybody sitting in it, and an AI taken out of a room it was
+  speaking in stops where it is. Nothing is torn down -- it keeps its
+  thread, its Answers, its Stops and everything it has said there, so
+  being given a room is a tick and not a restart.
+
+  Houses that already have a second AI keep it where it already was:
+  every AI is placed once, into the rooms people share and into
+  nobody's own, and from then on the table is the answer. Taking one
+  out of the lobby stays done.
+
+- **And they can put something to each other.** Seeing each other was
+  half of it: a voice could refer to what another had said, but only a
+  person could ever cause one to speak, so "say hi to Vortex Prime"
+  got a hello that Vortex Prime never answered.
+
+  **A name is somebody being addressed, whichever mouth it came out
+  of.** A bot that finishes a reply naming another voice in the room
+  hands that voice the turn, which is the rule the room has always had
+  about who is being talked to -- it had only ever been applied to
+  people. `hand_to` does it deliberately as well, for a bot that wants
+  the next turn to be somebody else's without naming them aloud. That
+  is what makes a conversation of three rather than two people taking
+  turns with one AI.
+
+  A name in passing hands over too, and that is the design rather than
+  a tolerated miss: the turn it hands over is one the other bot can
+  give straight back, and a turn given back leaves nothing at all. The
+  cost of reading a mention as an address is one quiet turn. The cost
+  of not reading it that way is the hello nobody answered.
+
+  What keeps it from being two AIs talking while the people watch is
+  `--ai-turns` (default 2): replies they may give each other with
+  nobody human saying anything in between, and **the count goes back
+  to nothing the moment somebody speaks or types**. So the people in
+  the conversation are the whole of what keeps it going; stop joining
+  in and it stops too, within a turn or two. `--ai-turns 0` is AIs
+  that only ever answer people.
+
+  A bot is told when it is on the last of them, and is not offered
+  `hand_to` at all then: it is asked to finish the thought and put it
+  back to the people. A bot that discovered the limit by calling the
+  tool and being refused would already have written a reply for a
+  conversation about to stop dead -- "I'll let Cora take that" with
+  nobody able to.
+
+  Turns that are waiting to be given out now live in one queue in the
+  room, which is also where a bot's "show me this silence again" ask
+  went. They want the same thing of the room -- a moment that is
+  nobody else's -- and differ only in what happens when the moment
+  doesn't come: a silence that didn't happen is spent, while a voice
+  waiting to be answered waits for the voice ahead of it. Anything
+  waiting is dropped when a person speaks, when the room is stopped,
+  and when a bot is silenced.
+
+- **Two AIs in a room can see each other.** Each was shown the other's
+  replies as its own -- every AI entry went to the model as a plain
+  assistant turn with no name on it -- so Vox read what Cora had just
+  said as something Vox said, and would repeat it, answer for it or
+  argue with itself. Each bot is now shown the others the way it is
+  shown a person: a line of the transcript with the name on it, its own
+  words still its own. Cards and saved games are attributed the same
+  way, so "you posted a card" is only ever true of the bot that posted
+  it.
+
+  Each is also told which of the names in the room are AI voices and
+  which are people, and a bot judging a pause is told a pause may be
+  another AI's rather than its own -- "Ryan is the only person here, so
+  there is nobody else they could be talking to" stops being true the
+  moment there is a second AI in the room. A silenced bot is left out
+  of all of this: a pause can't be its, so nothing is left to it.
+
+- **And what each of them may do is not the same.** The first AI is the
+  one the room was built around -- the one `--name`, `--voice` and
+  `--prompt` describe -- and it is the one that runs the room: cards,
+  games, the web. Every other bot is a voice in it, with `list_people`
+  and `look_up` and nothing else. A second AI dealing cards and
+  starting games is two hands on the same room, and nobody asked the
+  second one.
+
+  It keeps `stay_quiet` and `wait_until_named`, which are not powers
+  but how a turn is handed back: without them a bot cannot be put on
+  "when it fits", and cannot get out of a back-and-forth it was pulled
+  into. Its prompt loses the notes about the tools it hasn't got, and
+  a tool it was never offered is refused if the model calls for it
+  anyway.
+
+- **An AI can be told to say nothing at all, and nothing overrides it.**
+  **Answers** has a fourth setting, **never**, beside *when named*,
+  *when it fits* and *every pause*. A bot set to it stays in the room
+  and keeps its fader, its voice and everything it has said; it simply
+  has no turn to be given. Saying its name doesn't give it one, a
+  back-and-forth can't start, and a game that wants every pause
+  answered doesn't get this bot -- a game entered with every AI
+  silenced opens in the quiet it was asked for, and leaving the game
+  finds it still silent. Picking it while one is talking stops it where
+  it is. With two AIs in a room it is how to put one aside for a while
+  without taking it out of the room.
+
+- **And whether talking over an AI cuts it off is now a setting of its
+  own: Stops.** **When interrupted** is what the room has always done
+  and is still the default. **When finished** means it says the whole
+  of its reply: a voice still ducks it, so you can be heard over it,
+  but nothing cuts it off -- so a cough, a false start or a word to
+  somebody else can't cost you the answer you just asked for. **Stop**
+  still stops it; only the voice is disarmed, never the button.
+
+  What you said over it is neither thrown away nor taken for a
+  question. It is transcribed and on screen as always, it waits where
+  it is while the reply plays out, and then the pause it made is handed
+  to the AI to *judge* -- the judgment "when it fits" makes, even for a
+  bot on "every pause", and it is told the words arrived over its own
+  voice. So a throat-clear costs nothing and a follow-up asked while it
+  was still talking gets its answer one turn later. It is the same
+  model call that pause was going to cost, asked a different question.
+
+  Both settings are per bot and per room, like the fader beside them,
+  and **Stops** is one a game never takes: a game says when a bot
+  answers, not how it is stopped.
+
+- **The footer is the two ways of saying something, and nothing else.**
+  **Share screen** and **Leave audio** are now **📺️** and **🚪**,
+  over the people in the left column with the cog beside them — that is
+  the column the room is in, and the footer is for the button you aim
+  at without looking. What takes the room they left is the box you type
+  in, which moves down out of the conversation: saying a thing and
+  typing it are the same act done two ways, so they sit side by side,
+  and the conversation keeps the rows.
+
+- **A typed message can have more than one line.** The box is a
+  textarea now: **Enter** sends, **Shift+Enter** starts a line, and it
+  grows to hold what is in it up to half the window, after which it
+  scrolls. Its prompt is "Type your message here ...".
+
+  Messages used to be flattened to one line, because the model reads
+  the conversation as `Name: what they said` lines and a break inside
+  one of them would read as the start of somebody else's turn. The
+  flattening has moved to the one place that was ever about: the
+  transcript handed to the model. What is stored, shown and read by
+  people keeps the shape it was typed in — runs of spaces still become
+  one, at most one blank line in a row survives, and every other
+  control character is still a space.
+
+- **Push to talk is beside the button it changes.** It was on the
+  settings page, a page away from the button whose job it decides. It
+  is a tickbox in the footer next to **Mute** / **Hold to talk** now.
+  The settings page keeps what you set once and don't watch: your name,
+  the app's volume, and which microphone the browser handed over. The
+  **Coming in** meter is gone — it never worked — and **Your volume**,
+  which is this browser's and not the room's, is called **App volume**.
+
+- **The room has no title bar.** It held the room's name and four
+  buttons, and every one of them belonged somewhere else. The name is
+  the heading of the room column; starting a new conversation and
+  leaving a game are over the conversation, beside the way into the
+  old ones; and **Stop** is in the footer with the rest of what you
+  reach for while talking. The row they shared is a row of the
+  conversation now.
+
+- **The rooms are behind their own name.** They were a list down the
+  left with the room you were in opened out into its strips, so the
+  strips sat at whatever height the list left them and moved whenever
+  anybody made a room. Which room you are in is the heading of the page
+  now; press it and every room you may go to drops down **over** the
+  strips, press one and the list shuts and you are there. A house can
+  hold a great many rooms, so the list scrolls rather than running off
+  the screen — and the strips underneath never move, because they are
+  the one place to look for who is here and how loud they are, and a
+  list that pushed them down the screen would make you find them again
+  afterwards.
+
+  On a narrow screen the heading is above the tabs rather than inside
+  one: which room you are in is true of whichever area you are looking
+  at. The tab that held the rooms holds who is in this one, so it is
+  called **People**.
+
+- **The room hands a browser nothing until Join Audio.** Opening an
+  invite link used to write the token straight into a cookie and keep
+  it for a day. Looking at a link is not using one: `/join/<token>` is
+  served the app and nothing else now -- no cookie, no redirect, nothing
+  written down -- and the token stays in the address bar, where whoever
+  followed the link put it. The page holds it in memory and sends it
+  with each of the three requests the door makes; **Join Audio** spends
+  it for the one cookie this browser is ever given, and is the only
+  thing that puts anything in a browser at all.
+
+  So a link you opened and thought better of leaves no trace: close the
+  tab and there is nothing to find. And a browser with no cookie and no
+  link in the bar is one the room knows nothing about -- which is what
+  being logged out is, and which it did not used to be: a day-old link
+  cookie went on greeting you by whatever name it named, outranking
+  your own cookie, and **Join Audio** would have spent somebody else's
+  link and made the browser theirs. A link the *page* is holding now
+  only speaks for a browser that has no name of its own; otherwise the
+  door says plainly that it is carrying one, and logging out is what
+  hands the room over to it.
+
+  The token travels in a request body rather than a path or a query,
+  because a body is the one part of the exchange an access log doesn't
+  keep. The URL is the only copy there is.
+
+- **Fixed: the door could greet you with somebody else's name.**
+  The door answers with the identity of the one browser that asked --
+  who it is, or whose invite link its page is holding -- and it said
+  nothing at all about caching. A private window held an earlier test's
+  answer in memory and greeted the next browsing session with the wrong
+  account's name, on a fresh invite link that had set the right cookie.
+  Every endpoint that answers one browser about itself now goes out
+  `no-store` with `Vary: Cookie`, so neither the browser nor anything
+  between it and the room can hand one person's answer to another.
+
+- **The app's own files are cached the right way round.** The hashed
+  files under `assets/` are named after their contents, so they are
+  kept for a year and never asked about again; `index.html`, the one
+  name that stays put, is revalidated every time against an `ETag`,
+  because it is what says which hashed files the app is made of now.
+  A missing file under `assets/` is a plain 404 as well: it used to be
+  answered with the app itself, so a stale index asking for a bundle
+  this build doesn't have got HTML where a module was expected, and the
+  page came up blank with nothing to say why.
+
+- **Your name in the room is yours to change, and it is the only name
+  you can.** Whoever runs the room picks the name on your invite --
+  it is what you are revoked by and what a room of your own is yours by,
+  and it never moves. What everybody reads was settable at the door and
+  never again; it is now **Settings → Your name**, from inside the
+  room, with your microphone still running.
+
+  Changing it changes it everywhere. The roster, the faders, the
+  meters, your cards and every line you have ever said move with it, in
+  the database as well as on screen: the room calls you one thing, not
+  a different thing per paragraph, and an old conversation is read
+  under the name on the roster now. The name you give up is free for
+  somebody else, and taking it does not pick up what was said under it.
+
+  A room socket is told whose it is when it opens, so each of your tabs
+  comes back on a fresh connection under the new name -- the audio does
+  not stop for it, and a desktop you are sharing keeps being shared.
+
+- **A desktop you are sharing stops when you walk into another room.**
+  It used to come along. A share is made *to a room*, and carrying it
+  into the next one shows a room something nobody in it asked to see,
+  with no moment for the person walking in to decide otherwise. It ends
+  on the way out now -- the browser lets the desktop go, so the capture
+  indicator goes with it -- and sharing where you have arrived is
+  something you ask for again.
+
+  A dropped connection is not walking out. A reconnecting socket used
+  to be seated in the lobby and the tab had to ask to be moved back,
+  which is a change of rooms: a moment of bad wifi silently moved you
+  out of the room you were in, wrote the address bar to match, and now
+  would have ended your share as well. The socket says which room it
+  was sitting in, and the room is looked up as one of theirs like any
+  other, so naming a room that isn't yours seats you in the lobby.
+
+- **The box you type into is a fixture, not a bubble.** It was a
+  rounded pill at the end of the conversation, stuck to the foot of the
+  scroller and inside the conversation's own margins -- so it read as
+  one more message, which is the one thing it isn't. It is a row of the
+  room now: a bar across the full width of the conversation with a rule
+  along its top, nothing round about it, and the caret where the names
+  above it start. The whole bar lights up when it has the focus,
+  because the whole bar is the field, and **Send** is a word at the end
+  of it rather than a second pill. The header and footer have been
+  brought in at the same time, and the rows they give up are rows of
+  the conversation.
+
+- **No pull-to-refresh.** A swipe down at the top of the room reloaded
+  it on iOS Safari, which drops the audio, the socket and your place in
+  the conversation -- for a page where there is nothing a reload would
+  fetch. The document and every list in it keep their overscroll to
+  themselves now, so running off the end of the conversation or the
+  room list is the end of it rather than the start of a reload.
+  `overscroll-behavior` is Safari 16 and later; an older one keeps the
+  gesture.
+
+- **The owner makes the rooms.** The house used to be the command
+  line's: `--room` at startup, and a restart to add one. The rooms are
+  rows now, made, renamed and taken away from the **People and rooms**
+  page while the server runs and people are talking in them.
+  `VOX_ROOM_ROOMS` still names the first rooms of a house that has
+  none, and is ignored after that -- from the first start the house is
+  the database's.
+
+  A room is known by an **id of its own** rather than by its name, so
+  the owner can call it something else and nothing follows the word:
+  its conversations, its faders, its settings and who may go to it are
+  all kept against the id. (A room that existed before this keeps its
+  old name as its id, so nothing of its past had to be moved.)
+
+  Taking a room away, or taking it away from one person, happens where
+  they are sitting: anybody left in a room that has stopped being
+  theirs is put back in the lobby and told why. A room nobody may enter
+  is not a room to leave somebody in -- it would be off every list,
+  with no way out of it but the door. The lobby is not the owner's to
+  take away: it is where a tab lands and the one room nobody can be
+  refused. What was said in a room that is taken away stays in the
+  database rather than being destroyed by a click.
+
+- **Somebody owns the room, and rooms are given out.** A house used to
+  be flat: anybody with a link could walk into any room in it. Now one
+  person **owns** it, made at the server with
+  `vox_room invite-owner NAME` -- there is one, and the way to a
+  different one is to uninvite the first. It is a command and not a
+  button because a house whose owner can be changed from a browser is a
+  house with a way in through its own front door.
+
+  The owner invites everybody else and says who may go where, from a
+  **People** page inside the room: a link to copy, a tick per room, a
+  fresh link for one gone astray, and removing somebody -- link,
+  browsers and rooms together. Nobody else is shown it, and nobody else
+  is answered when they ask the server for it: every one of those
+  endpoints asks who is asking and tells anybody else there is no such
+  thing.
+
+  Everybody has **the lobby** and **a room of their own**. Every other
+  room is given out one person at a time, and until it is given it is
+  neither on their list nor behind its address -- a room you may not go
+  to and a room that isn't there get the same answer, because which of
+  the two it is is not the asker's business. The owner has every room in
+  the house; nobody has anybody else's own room, the owner included,
+  because *Just you and Vox* is a promise the room makes on its face.
+
+  Upgrading a room that was already running: everybody invited keeps
+  every room they could already walk into, so the new rule takes nothing
+  from anybody. A database made after it starts empty, as it should.
+
+- **A footer you can reach for, and a settings page for the rest.** The
+  foot of the room was a row of everything: the talk button, a push to
+  talk box, the name of your microphone, a meter, a volume slider, then
+  sharing and the way out. It is now your microphone on the left and
+  what you do with the room on the right -- **Share screen**, **Leave
+  audio**, and a cog -- and nothing in between. The talk button is one
+  width whatever it says, so **Mute** and **Unmute** are the same shape
+  and nothing beside it moves as you press it.
+
+  The cog opens **Settings**, a page of its own with the things you set
+  once: push to talk, your volume, what is coming in, and which
+  microphone the browser gave the room. The room goes on running behind
+  it -- you are still in the audio, and the space bar still mutes or
+  talks from there. **Done** or Escape comes back.
+
+- **Fixed: no Language box at the door until you had joined once.** The
+  door is a page with no socket behind it, so it asks `/api/door` what
+  the room offers -- but the answer carried the list of languages only
+  for somebody arriving on an invite link. A browser the room already
+  knew got a blank space where the box should be, until a socket from
+  joining filled the list in, and the next reload lost it again. The
+  door now tells either of them what the room offers, along with the
+  language that person chose last time: the room has it against their
+  invite, and it beats what this browser would have guessed from the
+  system.
+
+- **Fixed: the space bar stopped talking once you clicked anything.**
+  Push to talk ignored Space whenever a button had the focus, and a
+  button keeps the focus after you click it -- so opening somebody's
+  shared screen, picking a room, or touching a mute left you holding a
+  key that did nothing, and the way to get the microphone back was to
+  know to click the background first. Space belongs to your microphone
+  everywhere in the room now; it also no longer presses the focused
+  button again while you hold it. Where Space is something else it
+  still is: a text box, a dropdown, and a dialog that is asking you
+  something. A focused button is worked by Enter.
+
+- **More than one AI in a room, and one pause between them.**
+  `--bot NAME[:VOICE[:PROMPT_FILE]]` (`VOX_ROOM_BOTS`) puts another AI
+  in every room. Each has its own name to be called by, its own voice,
+  its own prompt with `{name}` filled in as itself, its own fader under
+  the room, and its own **Answers** setting per room -- so one of them
+  can answer every pause in your own room while waiting to be named in
+  the Lobby.
+
+  **Who answers a pause** is settled by who speaks first. Every bot
+  that could answer is given the turn at once and the first to actually
+  say something keeps it; the rest are told to stop. Asking them one at
+  a time would put a round trip of silence in the room for every bot
+  with nothing to say, and letting them all finish would be two voices
+  over each other. A bot cut off this way leaves nothing behind -- no
+  bubble on anyone's screen, nothing in the conversation, and nothing
+  for the model to read back later as a turn where somebody said
+  nothing. A bot already speaking is never cut off by another starting:
+  it is the first word that claims the pause, and it has already had
+  it.
+
+  Nothing inside the room assumes there is one AI any more. A card is
+  signed by the bot that dealt it, a game's button by the bot that
+  designed it, a failed reply names the bot whose turn it was, and
+  nobody in the room may call themselves after any of them. The screen
+  follows: each strip says what *that* bot is doing, **Stop** names
+  whichever of them is talking, and the prose that used to say "the AI"
+  says all their names.
+
+- **One server, several rooms, and a room of your own.** A `vox_room`
+  used to be a room. It is now a house: the rooms you name with
+  `--room` (`VOX_ROOM_ROOMS`), which everyone shares, and on top of
+  those one of your own for everybody -- made the first time you walk
+  into it, admitting nobody else, and where the AI is yours alone.
+
+  **Moving doesn't cost you the audio.** You call in once and stay
+  called in. The socket, the mic frames going up and the mix coming
+  back are all exactly where they were; what moves is which room's
+  mixer the far end is plugged into, whose conversation your screen is
+  showing and where your voice is being transcribed.
+
+  The rooms are a list down the left, flush to the edge, one line each
+  with a count of who is in it. **Your own room is first and stays
+  first**, then the house's in the order they were named -- the one
+  room that is always there and always the same is the one to put
+  where the eye lands. The room you are **in** opens underneath itself
+  into everybody there -- the faders and meters and mutes that used to be a
+  panel on the right. The mixer is a branch of the room it mixes now,
+  which is what it always was: a fader belongs to the room it is being
+  heard in, and the room you are not in has none you could usefully
+  touch. A list rather than a row of buttons because a server can hold
+  a great many rooms, and a row of buttons cannot.
+
+  **Every room has an address**, and the bar follows you from one to
+  another: `/` is the room of your own (per person, so whoever opens it
+  gets theirs), `/lobby` is the first room named with `--room`, and
+  `/room/<id>` is every other one. Back and forward move between
+  rooms, and a link pasted to somebody opens that room for them. The
+  id is not the room's name, because a name is a thing people change
+  their minds about and a link that changed with it is a link somebody
+  has already sent on. An address that names no room quietly becomes
+  the address of the room you ended up in.
+
+  **A game is something a room does.** It is played in a room, by the
+  people in it, and while it runs the game is what that room is --
+  with the room's own name still in the heading and the game beside
+  it, and the list of rooms saying which room has one on.
+
+  And leaving a game now **puts the room back where it was**. What the
+  room was talking about is put aside rather than thrown away, and
+  *Leave the game* picks it up again -- every word of it, and every
+  card anyone was holding -- for everyone in the room at once. It used
+  to start a third empty conversation, so a game cost you the one you
+  were having to get into it and another to get out. A game is an
+  interruption; the room goes on afterwards. (*Restart game* is not
+  finishing with one, so what it interrupted is still there.)
+
+  **A room keeps the conversations it has had.** *New conversation*
+  closed the one you were having and that was the end of it: it stayed
+  in the database, unreachable. It is the room's history now, and
+  **History** at the head of the conversation is the list — when each
+  was, how much was said, and its opening line, newest first with the
+  live one marked. Open one and you read it as it was, cards and
+  translations and all, with no box to type into: the room has moved
+  on from it, so read-only is what it is rather than a rule about it.
+
+  **A conversation can be called something.** The name at the head of
+  it is a box: type over it and that is what the room calls this
+  conversation, for everyone in it and in the history from then on. It
+  names whichever one you have open, an old one included.
+  Left alone it is when it was — the time of the first thing said, or
+  the day it was started if nothing has been — and emptying the box
+  gives it back to the clock rather than leaving it blank. The room
+  keeps the name and the numbers; how a date reads is each browser's
+  own business, in its own language and timezone.
+
+  What the AI is shown is who is in the room too: `list_people` says it
+  lists who is in the room, and it was listing everybody invited with a
+  flag beside them — which is how it came to deal a card to somebody
+  two doors down. Addressing one to somebody who has just stepped out
+  still works, and the card waits where they left it.
+
+  A conversation nobody said anything in is not one the room had, and
+  isn't on the list — pressing *New conversation* twice leaves nothing
+  behind the second time. The one the room is having now is always
+  there, empty or not, because that is where you are.
+
+  Reading one is **yours alone**. Nobody else's screen moves, which is
+  the only way it could work — a room where one person looking
+  something up pulled everyone else out of the live conversation would
+  be a room nobody dared look anything up in. Deleting one is the
+  exception: it takes that conversation, everything said in it and
+  every card dealt in it away from everybody, for good, and asks
+  first.
+
+  Conversations are written down with the room that had them, from the
+  moment they start, which is what makes any of this possible. A
+  database from before this keeps each room's *current* conversation;
+  the ones before it can't be told apart by room, so they are left out
+  of every room's history rather than guessed into one.
+
+  **The door is a page, and coming in is something you agree to.** The
+  Join Audio card used to be a sheet over a blurred room: the
+  conversation was there to read, and the sockets were open, before
+  anybody had joined anything. It is its own page now, with nothing
+  behind it and nothing open — a tab at the door is not on a roster,
+  not sent a conversation, and not counted as being anywhere, and who
+  is in a room is no longer something the door tells you.
+
+  And the card now says what coming in does: your microphone goes live
+  to everyone else, what you say is transcribed and written into a
+  conversation the room keeps, and that writing is sent on to the AI
+  and to the translation and voice services the operator has
+  configured. **Join Audio** does nothing until you agree. The answer
+  is kept in the browser, so it is asked once, and unticking it takes
+  it back.
+
+  **The door's Language box always has a language in it.** It was blank
+  for anybody the room already knew: the box's first option carried the
+  empty string the room stores for its own language, and what the room
+  answers with is the name. Every option is its own name now. The
+  default is whatever the system is set to, when the room speaks it,
+  and the room's own otherwise — a guess made once and written down in
+  the browser, so it can never afterwards overrule a choice.
+
+  **The interpreter is yours now, and only there when it is working.**
+  It used to be one fader in the room's mixer, shown whenever the room
+  was *configured* to interpret and shared by everyone in it -- so
+  turning the voice down turned it down for people who needed it, and
+  a room where everybody spoke the same language still carried the
+  strip. An interpretation is heard by whoever is listening in that
+  language and by nobody else, so it is theirs: the fader is per
+  listener, the duck follows it per listener, and the strip appears
+  only while somebody in the room is speaking a language you don't
+  read. A room of your own never has one at all -- the AI is already
+  answering in your language, and there is nobody in there to
+  interpret to -- and no longer starts the threads and voices for one.
+
+  **The top bar is the room you are in, and what you press.** "Vox is
+  listening" has gone — what the AI is doing is on the AI's own strip
+  in the room list. The heading is the room's name: the list says it
+  too, but only on a screen wide enough to show the list, and on a
+  narrow one it is behind a tab.
+
+  **When the AI answers now lives under the AI**, in the room list, as
+  that bot's setting in that room -- which is the shape a second bot in
+  a room would need. And the Games menu has gone from the top bar: a
+  game is announced in the conversation that designed it, and that card
+  is where **Play** and **Peek** are, which is one place to look
+  instead of two.
+
+  The default room is called **Lobby**. That word already had a job
+  here -- "the lobby" was the room being in no game -- so the button
+  that leaves a game now says **Leave the game**, which is what it
+  does and what it always did; a button reading "back to the lobby"
+  beside a room called Lobby would be a button that lies.
+
+  Each room is a whole room: its own conversation, its own faders, its
+  own mode, its own games and cards. Walk out of one and back into it
+  and it is as you left it. What is the person's rather than the
+  room's -- the invite list, the saved games, your name, the language
+  you hear -- is shared across all of them, so choosing a language at
+  the door still follows you everywhere.
+
+  A room of your own has a roster of one and a mixer with you and the
+  AI on it. Nothing said in it reaches the house, and nothing said in
+  the house reaches it. Because nobody is there to take the turn from,
+  it starts out answering every pause instead of waiting to be named --
+  having to say "Vox" to a room with only the two of you in it is a
+  ceremony with no point to it. Change it and it remembers.
+
+  **You are in a room or you are not.** The list under a room is who
+  is there, and that is the whole of it: somebody invited but in
+  another room is on that room's count, not greyed out as "away" on
+  this one. The roster used to be everyone invited with a flag, which
+  made "away" stand for two unrelated things — gone, and standing two
+  doors down — and neither of them is a thing this room has any
+  business claiming about a person. What they speak is still known
+  wherever they are, so a line they said before they walked out is
+  still read in your language.
+
+  The strips lost their boxes and a third of their height along the
+  way, since a column that has to hold the rooms as well cannot spend
+  eighty pixels a person. Everything is still there: the meter, the
+  fader, the mute. The decibel reading is the one thing that comes and
+  goes — it appears while the fader is off unity, which is exactly when
+  you are looking for it, and the fader gets its width back the rest of
+  the time.
+
+  Two other things came with all this. A desktop is shared with the
+  room you are in and no other, and the share goes with you when you
+  leave. And the clocks -- the 20 ms mixer frame and the 50 ms
+  turn-taking tick -- are the server's now rather than each room's: a
+  thread per room waking fifty times a second to find nobody in it is a
+  poor way to hold an empty room open.
+
+  Each room keeps its conversation, its mode and its faders in the
+  database under its own name, so renaming a room starts it fresh and
+  the old one's conversation waits there for the name to come back. An
+  existing database has one room in it, and its things become the first
+  `--room`'s the first time the new version starts.
+
+- **"Just for you" is gone when there is nothing in it.** Half the
+  window used to be given over to a column saying what might one day
+  appear in it -- a secret role, a hand, what only you noticed -- and
+  for most of a conversation that is all it ever said. Now the area is
+  only there while you are holding a card: no cards, no column, and the
+  conversation has the half back. The first one dealt opens it; the
+  last one taken back closes it again. On a narrow screen the tab comes
+  and goes with it, and if the last card is taken back while you are
+  looking at that tab you are put back on the conversation rather than
+  left on an empty one.
+
+  Nothing about the cards themselves changed: they are still the AI's
+  to give, rewrite and take back, and still on nobody else's screen.
+
 ## v0.2.0 (2026-11-01)
 
 ### scribe

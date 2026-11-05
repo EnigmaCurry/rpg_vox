@@ -419,6 +419,35 @@ download-streaming-stt-model-ru:
 # go in the same binary as sherpa-onnx -- their protobufs are different
 # versions of the same symbols. `download-models` also sees to the
 # recognizer, which is a no-op once that is there.
+# fastText's lid.176 into models/, for telling languages apart inside
+# one alphabet (vox_transcribe::langid). The quantized model: 917 KB for
+# 176 languages, against ~5 MB *per language* for the alternative, which
+# is most of why it is the one that can be chosen from a settings page.
+#
+# CC-BY-SA 3.0, which is why it is fetched rather than vendored.
+download-langid-model:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dest="models/langid/lid.176.ftz"
+    if [ -f "$dest" ]; then
+      echo "language classifier already present at $dest"
+      exit 0
+    fi
+    mkdir -p models/langid
+    echo "downloading lid.176.ftz …"
+    curl -fL --progress-bar -o "$dest.part" \
+      https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.ftz
+    mv "$dest.part" "$dest"
+    echo "installed the language classifier → $dest"
+
+# Score the language classifiers and the floor they are used at, over
+# Flores-200 and over real decodes. See examples/langid_bench.rs for
+# what the numbers mean and where to get Flores.
+langid-bench *ARGS: download-langid-model
+    nix-shell --run "cargo run --release -p vox_transcribe \
+      --features langid-fasttext,langid-lingua,sherpa-static \
+      --example langid_bench -- {{ARGS}}"
+
 # Download both Marian translation models (en-ru, ru-en) into models/.
 download-translate-model-ru: release-scribe
     VOX_SCRIBE_MODELS=models ./target/release/scribe \
@@ -793,12 +822,46 @@ android-apk VERSION=`git describe --tags --always --dirty`: _android-jni
     (cd dist && shasum -a 256 "$name" > "$name.sha256")
     echo "packaged dist/$name"
 
-# Release signing key for the APK: creates KEYSTORE (asks for a password)
-# unless it exists, then, after confirmation, stores it and its password as
-# the repo secrets the release workflow signs with (needs `gh`). Every APK
-# must be signed by this same key to install over the last one. GitHub
-# can't give the secret back, so a lost KEYSTORE only matters if the
-# secret goes too: a new key then means uninstalling Scribe once.
+# Release APK of the voice room app in dist/, as the release workflow
+# ships it. Signed with the keystore in VOX_ROOM_KEYSTORE (plus
+# VOX_ROOM_KEYSTORE_PASSWORD, VOX_ROOM_KEY_ALIAS, VOX_ROOM_KEY_PASSWORD)
+# when set, the debug key otherwise.
+#
+# That is the same key scribe's APK is signed with -- `android-keystore`
+# makes it and there is one of it -- so point VOX_ROOM_KEYSTORE at the
+# same file, with its password and its alias.
+#
+# Nothing native in it and nothing to cross-compile -- it is Kotlin and a
+# WebView -- so this is one APK for every phone and there is no NDK, no
+# Rust and no `_android-jni` in front of it.
+room-apk VERSION=`git describe --tags --always --dirty`:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export ANDROID_HOME="${ANDROID_HOME:-/opt/homebrew/share/android-commandlinetools}"
+    export JAVA_HOME="${JAVA_HOME:-/opt/homebrew/opt/openjdk@21}"
+    [ -f android-room/local.properties ] || echo "sdk.dir=$ANDROID_HOME" > android-room/local.properties
+    (cd android-room && ./gradlew assembleRelease \
+      -ProomVersionName="{{VERSION}}")
+    name="voice-room-{{VERSION}}-android.apk"
+    mkdir -p dist
+    cp android-room/app/build/outputs/apk/release/app-release.apk "dist/$name"
+    (cd dist && shasum -a 256 "$name" > "$name.sha256")
+    echo "packaged dist/$name"
+
+# Release signing key for both Android apps: creates KEYSTORE (asks for a
+# password) unless it exists, then, after confirmation, stores it and its
+# password as the repo secrets the release workflow signs with (needs
+# `gh`). Every APK must be signed by this same key to install over the
+# last one. GitHub can't give the secret back, so a lost KEYSTORE only
+# matters if the secret goes too: a new key then means uninstalling both
+# apps once.
+#
+# One key for scribe and the voice room. A key can sign any number of
+# packages, and two of them kept on one machine, backed up together and
+# stored in one place do not fail separately -- so a second key would
+# have doubled the bookkeeping to insure against a risk it does not
+# actually spread. The secrets are named SCRIBE_* because scribe was the
+# only Android app here when they were made.
 android-keystore KEYSTORE="":
     #!/usr/bin/env bash
     set -euo pipefail
@@ -1030,6 +1093,8 @@ install-agent BIN="~/.local/bin":
 # --- vox_room (voice room in the browser, see ROOM.md) ---
 
 # Run the voice room on http://127.0.0.1:7340, e.g. `just room --echo`.
+# `--room NAME` (repeatable) names the rooms the house shares; everybody
+# has one of their own besides. See ROOM.md.
 room *ARGS:
     cargo run -p vox_room --release -- {{ARGS}}
 
@@ -1037,9 +1102,22 @@ room *ARGS:
 room-invite NAME:
     cargo run -p vox_room --release -- invite "{{NAME}}"
 
+# Make NAME the owner and print their link: they invite everybody else
+# and hand out the rooms from the room itself. There is one owner.
+room-invite-owner NAME:
+    cargo run -p vox_room --release -- invite-owner "{{NAME}}"
+
 # The room's web app with hot reload on :5173, against `just room`.
 room-ui:
     cd crates/vox_room/web && pnpm install && pnpm dev
+
+# The room's end-to-end suites, each against a room of its own on a
+# scratch database: `just room-e2e` for all, `just room-e2e rooms door`
+# for some. Wants playwright beside the scripts and a chromium it can
+# launch (CHROME); see ROOM.md's Testing section.
+room-e2e *SUITES:
+    cargo build -p vox_room --release
+    crates/vox_room/e2e/run.sh {{SUITES}}
 
 # --- vox_room in Docker behind Traefik (see ROOM_DOCKER.md) ---
 

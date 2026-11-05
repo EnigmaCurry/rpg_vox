@@ -7,19 +7,22 @@
 //! So the language is read off the text afterwards, and the only thing
 //! read off it here is the **script**.
 //!
-//! That is a real limit and it is deliberate. Russian against English is
-//! Cyrillic against Latin, which is as unambiguous as text ever gets and
-//! needs no model, no download and no network. German against English is
-//! Latin against Latin, which this cannot tell apart at all and must not
-//! pretend to -- a wrong guess sends a line to a model that translates it
-//! from a language it is not in, and what comes back is confident
-//! nonsense. [`Interpreter::new`] therefore refuses a pair that shares a
-//! script, rather than guessing and being wrong later.
+//! The script is read first and is most of the answer. Russian against
+//! English is Cyrillic against Latin, which is as unambiguous as text
+//! ever gets and needs no model, no download and no network. German
+//! against English is Latin against Latin, which the script cannot tell
+//! apart at all and must not pretend to -- a wrong guess sends a line to
+//! a model that translates it from a language it is not in, and what
+//! comes back is confident nonsense.
 //!
-//! Telling languages apart *within* a script is a different job wanting a
-//! different tool (a classifier, or a recognizer that reports what it
-//! heard). When there is one, it goes behind [`of`] and everything above
-//! it keeps working.
+//! That second question is a different job wanting a different tool, and
+//! [`crate::langid`] is it: a text classifier, asked only what the
+//! alphabet could not decide and only over the languages a caller is
+//! listening for. It goes behind [`of`], which still reads the script
+//! first and still refuses rather than guesses -- so an [`Interpreter`]
+//! built without one behaves exactly as the version that read nothing
+//! but the script, and [`pair`] goes on refusing a same-script set when
+//! there is nothing that could tell it apart.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -79,62 +82,157 @@ pub fn script(text: &str) -> Option<Script> {
     (n as f32 / total as f32 >= MAJORITY).then_some(best)
 }
 
-/// The script a language is written in, for the languages this knows.
+/// Every language a decode can come back in: how it is spelled here,
+/// its ISO 639-1 code, and the alphabet it is written in.
+///
+/// The first twenty-five are what Parakeet v3 decodes, which is the set
+/// a line can actually arrive in. The rest are SenseVoice's, and are
+/// here because [`crate::engine`] can be run with that recognizer
+/// instead and because they are offered as languages to read into.
 ///
 /// A language missing from here is one no [`Interpreter`] can be built
 /// for, which is the honest answer: it would have nothing to decide on.
+///
+/// The code is what a classifier speaks. Language *names* are this
+/// codebase's own spelling and no two libraries agree on them, where
+/// 639-1 is the one thing fastText, lingua and this table all key on.
+const LANGUAGES: &[(&str, &str, Script)] = &[
+    // Parakeet v3's twenty-five.
+    ("Bulgarian", "bg", Script::Cyrillic),
+    ("Croatian", "hr", Script::Latin),
+    ("Czech", "cs", Script::Latin),
+    ("Danish", "da", Script::Latin),
+    ("Dutch", "nl", Script::Latin),
+    ("English", "en", Script::Latin),
+    ("Estonian", "et", Script::Latin),
+    ("Finnish", "fi", Script::Latin),
+    ("French", "fr", Script::Latin),
+    ("German", "de", Script::Latin),
+    ("Greek", "el", Script::Other),
+    ("Hungarian", "hu", Script::Latin),
+    ("Italian", "it", Script::Latin),
+    ("Latvian", "lv", Script::Latin),
+    ("Lithuanian", "lt", Script::Latin),
+    ("Maltese", "mt", Script::Latin),
+    ("Polish", "pl", Script::Latin),
+    ("Portuguese", "pt", Script::Latin),
+    ("Romanian", "ro", Script::Latin),
+    ("Russian", "ru", Script::Cyrillic),
+    ("Slovak", "sk", Script::Latin),
+    ("Slovenian", "sl", Script::Latin),
+    ("Spanish", "es", Script::Latin),
+    ("Swedish", "sv", Script::Latin),
+    ("Ukrainian", "uk", Script::Cyrillic),
+    // Not Parakeet's, and kept for the reasons above.
+    //
+    // Serbian is written in both alphabets and is put down as the one
+    // it is written in where it is not also written in Latin. A line of
+    // Latin Serbian is Latin here and will not be told from Croatian,
+    // which is the truth of that pair and not a shortcoming of this.
+    ("Serbian", "sr", Script::Cyrillic),
+    ("Chinese", "zh", Script::Other),
+    ("Japanese", "ja", Script::Other),
+    ("Korean", "ko", Script::Other),
+];
+
+/// The script a language is written in, for the languages this knows.
 pub fn script_of(language: &str) -> Option<Script> {
     let l = language.trim();
-    for (name, s) in [
-        ("English", Script::Latin),
-        ("German", Script::Latin),
-        ("French", Script::Latin),
-        ("Spanish", Script::Latin),
-        ("Italian", Script::Latin),
-        ("Portuguese", Script::Latin),
-        ("Russian", Script::Cyrillic),
-        ("Ukrainian", Script::Cyrillic),
-        ("Bulgarian", Script::Cyrillic),
-        ("Serbian", Script::Cyrillic),
-        ("Greek", Script::Other),
-        ("Chinese", Script::Other),
-        ("Japanese", Script::Other),
-        ("Korean", Script::Other),
-    ] {
-        if name.eq_ignore_ascii_case(l) {
-            return Some(s);
-        }
-    }
-    None
+    LANGUAGES
+        .iter()
+        .find(|(name, _, _)| name.eq_ignore_ascii_case(l))
+        .map(|(_, _, s)| *s)
 }
 
-/// Which of `candidates` a line is in, by script alone. `None` when the
-/// script cannot be read, or belongs to none of them, or to more than
-/// one -- Russian and Ukrainian are both Cyrillic, and this has no way
-/// of choosing between them.
-pub fn of<'a>(text: &str, candidates: &'a [String]) -> Option<&'a str> {
+/// The ISO 639-1 code of a language, for talking to a classifier.
+pub fn code_of(language: &str) -> Option<&'static str> {
+    let l = language.trim();
+    LANGUAGES
+        .iter()
+        .find(|(name, _, _)| name.eq_ignore_ascii_case(l))
+        .map(|(_, code, _)| *code)
+}
+
+/// How sure a classifier has to be, over the candidates that share the
+/// line's alphabet, before its answer is used.
+///
+/// High, and deliberately so. The decision this feeds is which Marian
+/// direction a sentence goes to, and a model told to translate out of a
+/// language the text is not in does not fail -- it returns fluent
+/// nonsense (see [`crate::ct2`]). Refusing is cheap by comparison: the
+/// line stands as it was said, which is what every path above here
+/// already does when the alphabet says nothing.
+///
+/// Measured rather than picked: this is where the wrong answers stop,
+/// on Flores-200 and on real decodes both. See `examples/langid_bench.rs`
+/// for the numbers and `just langid-bench` to take them again.
+pub const CERTAIN: f32 = 0.9;
+
+/// Which of `candidates` a line is in.
+///
+/// The alphabet goes first, always. It costs nothing, it is certain
+/// when it answers, and it is usually the whole answer: when exactly
+/// one candidate is written in the line's alphabet, that is the one,
+/// and no classifier is consulted and no model is touched.
+///
+/// `by` is asked only what the alphabet could not decide -- two or more
+/// candidates in the same alphabet, which is Russian against Ukrainian
+/// or English against French -- and only its answer above [`CERTAIN`]
+/// is taken. With no classifier that case is the refusal it has always
+/// been, so passing `None` here is exactly the behaviour of the version
+/// that read nothing but the script.
+///
+/// `None` when the alphabet cannot be read (too little text, or too
+/// much of a mixture), when it belongs to none of the candidates, or
+/// when the classifier was not sure enough. Those are one answer
+/// because they have one outcome: nobody above here may guess.
+pub fn of<'a>(
+    text: &str,
+    candidates: &'a [String],
+    by: Option<&dyn crate::langid::Classify>,
+) -> Option<&'a str> {
     let s = script(text)?;
-    let mut found = None;
-    for c in candidates {
-        if script_of(c) != Some(s) {
-            continue;
+    let same: Vec<&'a str> = candidates
+        .iter()
+        .filter(|c| script_of(c) == Some(s))
+        .map(|c| c.as_str())
+        .collect();
+    match same.len() {
+        0 => None,
+        1 => Some(same[0]),
+        _ => {
+            let (i, sure) = by?.among(text, &same)?;
+            if sure < CERTAIN {
+                warn!(
+                    best = %same[i],
+                    %sure,
+                    "a line could be any of {}, and nothing says which",
+                    same.join(" / ")
+                );
+                return None;
+            }
+            Some(same[i])
         }
-        if found.is_some() {
-            return None;
-        }
-        found = Some(c.as_str());
     }
-    found
 }
 
 /// Whether a native language and the ones to translate are a set this
 /// can decide between, with the reason when they are not.
 ///
+/// `telling` is whether a classifier will be there to tell languages
+/// apart within one alphabet. Without one, a set with two languages in
+/// the same alphabet is refused here rather than guessed at later --
+/// see the module comment. With one, that set is exactly what it is
+/// for, and only the mistakes no classifier could fix are refused: a
+/// language this does not know, an empty list, the language you read in
+/// listed among the ones to translate out of, or the same language
+/// twice.
+///
 /// Separate from [`Interpreter::new`] so a caller can say what is wrong
 /// with its command line before it loads a translation model: the
 /// languages are a mistake whatever translator was asked for, and
 /// hearing about the model first only hides them.
-pub fn pair(into: &str, from: &[String]) -> Result<()> {
+pub fn pair(into: &str, from: &[String], telling: bool) -> Result<()> {
     let Some(native) = script_of(into) else {
         bail!("{into} is not a language this knows the alphabet of");
     };
@@ -142,14 +240,17 @@ pub fn pair(into: &str, from: &[String]) -> Result<()> {
         bail!("no language to translate from");
     }
     let mut seen = vec![native];
-    for f in from {
+    for (n, f) in from.iter().enumerate() {
         let Some(s) = script_of(f) else {
             bail!("{f} is not a language this knows the alphabet of");
         };
         if f.eq_ignore_ascii_case(into) {
             bail!("{f} is the language you read in, so there is nothing to translate");
         }
-        if seen.contains(&s) {
+        if from[..n].iter().any(|o| o.eq_ignore_ascii_case(f)) {
+            bail!("{f} is listed twice");
+        }
+        if !telling && seen.contains(&s) {
             bail!(
                 "{f} is written in the same alphabet as {}, and telling them apart \
                  is not something reading the alphabet can do",
@@ -264,11 +365,26 @@ pub fn complete_settled(text: &str) -> &str {
 pub struct Interpreter {
     /// The language to read in: what the operator speaks.
     into: String,
-    /// The languages to look for and translate out of. Each is a
-    /// different script from `into` and from the others, or
-    /// [`Interpreter::new`] would have refused it.
+    /// The languages to look for and translate out of. Without a
+    /// `telling`, each is a different script from `into` and from the
+    /// others, or [`Interpreter::new`] would have refused it.
     from: Vec<String>,
+    /// `into` and then `from`, which is the set a line is placed in.
+    ///
+    /// The native language is a candidate because "this is already in
+    /// the language you read" is an answer and not a failure to find
+    /// one. Leaving it out is only safe while no candidate shares its
+    /// alphabet: then Latin text could not be native and the one Latin
+    /// candidate won by elimination. Once a classifier lets English and
+    /// French be listened for together that reasoning is gone, and
+    /// English has to be able to win on its own evidence -- otherwise
+    /// an English paragraph is handed to a French translator by the same
+    /// elimination that used to be sound.
+    candidates: Vec<String>,
     by: Arc<dyn Translate>,
+    /// What tells languages apart inside one alphabet, when there is
+    /// anything that can.
+    telling: Option<Arc<dyn crate::langid::Classify>>,
 }
 
 impl std::fmt::Debug for Interpreter {
@@ -298,17 +414,29 @@ fn line_of(placed: &(&str, Option<String>, usize, usize), text: String) -> Line 
 
 impl Interpreter {
     /// `into` is the native language, `from` the ones to translate; both
-    /// as a language is spelled in English ("Russian").
+    /// as a language is spelled in English ("Russian"). `telling` is
+    /// what tells two languages in one alphabet apart, when there is
+    /// anything that can.
     ///
-    /// Refuses what it could not decide: an unknown language, and any
-    /// pair sharing a script -- see the module comment for why that is a
-    /// refusal and not a guess.
-    pub fn new(into: &str, from: &[String], by: Arc<dyn Translate>) -> Result<Self> {
-        pair(into, from)?;
+    /// Refuses what it could not decide: an unknown language, and --
+    /// with no `telling` -- any pair sharing a script. See the module
+    /// comment for why that is a refusal and not a guess.
+    pub fn new(
+        into: &str,
+        from: &[String],
+        by: Arc<dyn Translate>,
+        telling: Option<Arc<dyn crate::langid::Classify>>,
+    ) -> Result<Self> {
+        pair(into, from, telling.is_some())?;
+        let mut candidates = Vec::with_capacity(from.len() + 1);
+        candidates.push(into.to_string());
+        candidates.extend(from.iter().cloned());
         Ok(Self {
             into: into.to_string(),
             from: from.to_vec(),
+            candidates,
             by,
+            telling,
         })
     }
 
@@ -356,7 +484,14 @@ impl Interpreter {
         // line in the native one, and there is nothing to do with it --
         // taking the hint there would send English to a translator to
         // get English back.
-        let language = match of(text, &self.from) {
+        //
+        // The native language is among the candidates, so "already in
+        // the language you read" comes back as an answer here and is
+        // turned into the nothing-to-do below. See
+        // [`Interpreter::candidates`] for why it has to be able to win
+        // on its own evidence rather than by elimination.
+        let language = match of(text, &self.candidates, self.telling.as_deref()) {
+            Some(l) if l.eq_ignore_ascii_case(&self.into) => return Ok(None),
             Some(l) => l,
             None if script(text).is_none() => {
                 let Some(assumed) = assume else {
@@ -373,14 +508,30 @@ impl Interpreter {
             }
             None => return Ok(None),
         };
+        // Whether a sentence in the native alphabet, inside a paragraph
+        // in this language, can be taken for an aside at all.
+        //
+        // It can when the two are written differently: a line of Latin
+        // in a Russian paragraph is a URL, a name, an English aside,
+        // and translating it would be a round trip to get back what we
+        // started with. It cannot when the paragraph's language is
+        // written in the native alphabet too -- then *every* sentence
+        // of a French paragraph looks like an English aside by this
+        // test, and the whole paragraph would pass through untouched.
+        //
+        // A sentence is usually too short for a classifier to place
+        // (see `ENOUGH`), so there is nothing better to ask here than
+        // the alphabet. So the shortcut is given up rather than
+        // guessed at, and an English aside inside a French paragraph
+        // does make the round trip. That costs a sentence that comes
+        // back roughly as it went in, which is the cheap failure --
+        // the expensive one is a paragraph that is never read at all.
+        let asides = script_of(language) != script_of(&self.into);
         // Each sentence with its place in the paragraph, and the
         // reading it already has: one it was given on an earlier pass
         // of this paragraph (the sentence is the key, so that is a hit
         // only while the sentence is still what it was), or itself,
-        // when its own script is the native one -- a URL, a name, an
-        // English aside in a Russian paragraph. Translating one of
-        // those would be a round trip to get back what we started
-        // with, at best.
+        // when it is an aside by the test above.
         let mut at = 0usize;
         let placed: Vec<(&str, Option<String>, usize, usize)> = sentences
             .iter()
@@ -388,10 +539,9 @@ impl Interpreter {
                 let n = crate::filters::count_words(s);
                 let (first, last) = (at.min(words), (at + n).min(words));
                 at += n;
-                let had = known
-                    .get(s)
-                    .cloned()
-                    .or_else(|| (script(s) == script_of(&self.into)).then(|| s.to_string()));
+                let had = known.get(s).cloned().or_else(|| {
+                    (asides && script(s) == script_of(&self.into)).then(|| s.to_string())
+                });
                 (s, had, first, last)
             })
             .collect();
@@ -479,7 +629,29 @@ mod tests {
     }
 
     fn interpreter() -> Interpreter {
-        Interpreter::new("English", &["Russian".to_string()], Arc::new(Marker)).unwrap()
+        Interpreter::new("English", &["Russian".to_string()], Arc::new(Marker), None).unwrap()
+    }
+
+    /// A classifier that always names the same language, as sure as it
+    /// is told to be. Everything interesting about the real ones is how
+    /// often they are right, which is the bench's subject and not a
+    /// unit test's; what wants testing here is what [`of`] does with an
+    /// answer once it has one.
+    struct Guess(&'static str, f32);
+
+    impl crate::langid::Classify for Guess {
+        fn name(&self) -> &str {
+            "guess"
+        }
+
+        fn among(&self, _text: &str, candidates: &[&str]) -> Option<(usize, f32)> {
+            let i = candidates.iter().position(|c| *c == self.0)?;
+            Some((i, self.1))
+        }
+    }
+
+    fn guessing(l: &'static str, sure: f32) -> Arc<dyn crate::langid::Classify> {
+        Arc::new(Guess(l, sure))
     }
 
     /// A translator that counts what it was asked to translate, so a
@@ -525,7 +697,7 @@ mod tests {
     #[test]
     fn a_paragraph_read_again_pays_only_for_what_is_new() {
         let by = Arc::new(Counter::default());
-        let i = Interpreter::new("English", &["Russian".to_string()], by.clone()).unwrap();
+        let i = Interpreter::new("English", &["Russian".to_string()], by.clone(), None).unwrap();
         let mut known = Known::new();
 
         // First pass, while she is still talking: one finished sentence.
@@ -590,12 +762,56 @@ mod tests {
     #[test]
     fn a_language_is_only_named_when_the_script_names_it_alone() {
         let one = ["Russian".to_string()];
-        assert_eq!(of("Я пью чай на крыше дома", &one), Some("Russian"));
-        assert_eq!(of("I am drinking tea on the roof", &one), None);
+        assert_eq!(of("Я пью чай на крыше дома", &one, None), Some("Russian"));
+        assert_eq!(of("I am drinking tea on the roof", &one, None), None);
         // Two Cyrillic candidates: the script cannot choose, so it
         // doesn't.
         let two = ["Russian".to_string(), "Ukrainian".to_string()];
-        assert_eq!(of("Я пью чай на крыше дома", &two), None);
+        assert_eq!(of("Я пью чай на крыше дома", &two, None), None);
+    }
+
+    /// The property that makes the classifier safe to add: it is only
+    /// ever asked the question that used to be answered `None`.
+    #[test]
+    fn a_classifier_can_only_fill_in_what_the_alphabet_refused() {
+        let two = ["Russian".to_string(), "Ukrainian".to_string()];
+        let ru = "Я пью чай на крыше дома";
+        // What it fills in.
+        assert_eq!(of(ru, &two, None), None);
+        assert_eq!(
+            of(ru, &two, Some(&*guessing("Ukrainian", 1.0))),
+            Some("Ukrainian")
+        );
+        // And what it is never asked. One candidate in the line's
+        // alphabet is the alphabet's own answer, so a classifier that
+        // would have said something else does not get to: no model is
+        // loaded and no text is classified on the common path.
+        let one = ["Russian".to_string()];
+        let wrong = guessing("Ukrainian", 1.0);
+        assert_eq!(of(ru, &one, Some(&*wrong)), Some("Russian"));
+        // Nor when the alphabet belongs to none of them...
+        assert_eq!(
+            of("I am drinking tea on the roof", &one, Some(&*wrong)),
+            None
+        );
+        // ...nor when there is too little of it to read at all.
+        assert_eq!(of("Да.", &two, Some(&*guessing("Russian", 1.0))), None);
+    }
+
+    #[test]
+    fn a_classifier_that_is_not_sure_enough_is_not_used() {
+        // Below the floor is the refusal it was before there was a
+        // classifier, not a best guess: the line stands as it was said.
+        let two = ["Russian".to_string(), "Ukrainian".to_string()];
+        let ru = "Я пью чай на крыше дома";
+        assert_eq!(
+            of(ru, &two, Some(&*guessing("Russian", CERTAIN))),
+            Some("Russian")
+        );
+        assert_eq!(
+            of(ru, &two, Some(&*guessing("Russian", CERTAIN - 0.01))),
+            None
+        );
     }
 
     #[test]
@@ -603,24 +819,101 @@ mod tests {
         let by: Arc<dyn Translate> = Arc::new(Marker);
         // The whole point: this would otherwise send English prose to an
         // de->en model and get confident nonsense back.
-        let e = Interpreter::new("English", &["German".to_string()], by.clone()).unwrap_err();
+        let e = Interpreter::new("English", &["German".to_string()], by.clone(), None).unwrap_err();
         assert!(format!("{e:#}").contains("same alphabet"), "{e:#}");
         // And two of each other's.
         let e = Interpreter::new(
             "English",
             &["Russian".to_string(), "Ukrainian".to_string()],
             by.clone(),
+            None,
         )
         .unwrap_err();
         assert!(format!("{e:#}").contains("same alphabet"), "{e:#}");
-        assert!(Interpreter::new("Klingon", &["Russian".to_string()], by).is_err());
+        assert!(Interpreter::new("Klingon", &["Russian".to_string()], by, None).is_err());
+    }
+
+    /// The same sets, accepted once something can tell them apart.
+    #[test]
+    fn a_pair_that_shares_an_alphabet_is_allowed_when_something_can_tell() {
+        let by: Arc<dyn Translate> = Arc::new(Marker);
+        let telling = guessing("German", 1.0);
+        assert!(Interpreter::new(
+            "English",
+            &["German".to_string()],
+            by.clone(),
+            Some(telling.clone())
+        )
+        .is_ok());
+        assert!(Interpreter::new(
+            "English",
+            &["Russian".to_string(), "Ukrainian".to_string()],
+            by.clone(),
+            Some(telling.clone())
+        )
+        .is_ok());
+        // The mistakes no classifier could fix are still mistakes.
+        for from in [
+            vec!["English"],
+            vec!["Klingon"],
+            vec!["German", "German"],
+            vec![],
+        ] {
+            let from: Vec<String> = from.into_iter().map(String::from).collect();
+            assert!(
+                Interpreter::new("English", &from, by.clone(), Some(telling.clone())).is_err(),
+                "{from:?}"
+            );
+        }
+    }
+
+    /// With English and French both listened for, an English paragraph
+    /// has to come back as English *on its own evidence*. The version
+    /// that left the native language out of the candidates got this by
+    /// elimination -- Latin text could not be native, because no
+    /// candidate was Latin -- and that reasoning dies the moment a
+    /// same-alphabet pair is allowed.
+    #[test]
+    fn the_language_you_read_in_can_win_against_a_candidate_in_its_own_alphabet() {
+        let by: Arc<dyn Translate> = Arc::new(Marker);
+        let i = Interpreter::new(
+            "English",
+            &["French".to_string()],
+            by.clone(),
+            Some(guessing("English", 1.0)),
+        )
+        .unwrap();
+        let r = i
+            .read(
+                "I am drinking tea on the roof. ",
+                8,
+                &[],
+                &Known::new(),
+                None,
+            )
+            .unwrap();
+        assert!(r.is_none(), "English stays English: {r:?}");
+        // And French still reaches the translator.
+        let i = Interpreter::new(
+            "English",
+            &["French".to_string()],
+            by,
+            Some(guessing("French", 1.0)),
+        )
+        .unwrap();
+        let r = i
+            .read("Je bois du thé sur le toit. ", 7, &[], &Known::new(), None)
+            .unwrap()
+            .expect("a reading");
+        assert_eq!(r.language, "French");
+        assert!(r.text.contains("French->English"), "{}", r.text);
     }
 
     #[test]
     fn a_pair_is_checked_without_a_translator_to_check_it_with() {
         // So a wrong command line is reported as a wrong command line,
         // before any weights are loaded to find it out with.
-        assert!(pair("English", &["Russian".to_string()]).is_ok());
+        assert!(pair("English", &["Russian".to_string()], false).is_ok());
         for (into, from, says) in [
             ("English", vec!["German"], "same alphabet"),
             ("English", vec!["Russian", "Ukrainian"], "same alphabet"),
@@ -628,10 +921,59 @@ mod tests {
             ("English", vec![], "no language to translate from"),
             ("Klingon", vec!["Russian"], "knows the alphabet of"),
             ("English", vec!["Klingon"], "knows the alphabet of"),
+            ("English", vec!["Russian", "Russian"], "listed twice"),
         ] {
             let from: Vec<String> = from.into_iter().map(String::from).collect();
-            let e = pair(into, &from).expect_err(&format!("{into} <- {from:?}"));
+            let e = pair(into, &from, false).expect_err(&format!("{into} <- {from:?}"));
             assert!(format!("{e:#}").contains(says), "{e:#}");
+        }
+    }
+
+    /// Every language the table knows has a code, and no two share one:
+    /// the codes are what a classifier is asked in, and a duplicate
+    /// would quietly make one language unaskable.
+    #[test]
+    fn every_language_has_its_own_code() {
+        let mut codes: Vec<&str> = LANGUAGES.iter().map(|(_, c, _)| *c).collect();
+        codes.sort_unstable();
+        let n = codes.len();
+        codes.dedup();
+        assert_eq!(codes.len(), n, "a code is in the table twice");
+        for (name, code, _) in LANGUAGES {
+            assert_eq!(code_of(name), Some(*code), "{name}");
+            assert_eq!(code.len(), 2, "{name}: {code} is not ISO 639-1");
+        }
+        assert_eq!(code_of("Klingon"), None);
+        // The twenty-five Parakeet decodes are all in it, which is what
+        // makes the table enough to place any line it returns.
+        for l in [
+            "Bulgarian",
+            "Croatian",
+            "Czech",
+            "Danish",
+            "Dutch",
+            "English",
+            "Estonian",
+            "Finnish",
+            "French",
+            "German",
+            "Greek",
+            "Hungarian",
+            "Italian",
+            "Latvian",
+            "Lithuanian",
+            "Maltese",
+            "Polish",
+            "Portuguese",
+            "Romanian",
+            "Russian",
+            "Slovak",
+            "Slovenian",
+            "Spanish",
+            "Swedish",
+            "Ukrainian",
+        ] {
+            assert!(script_of(l).is_some(), "{l} is not in the table");
         }
     }
 
@@ -821,7 +1163,7 @@ mod tests {
     #[test]
     fn the_new_sentences_of_a_paragraph_go_in_one_call() {
         let by = Arc::new(Batches::default());
-        let i = Interpreter::new("English", &["Russian".to_string()], by.clone()).unwrap();
+        let i = Interpreter::new("English", &["Russian".to_string()], by.clone(), None).unwrap();
         let said = "Я пью чай. Вот так, друзья мои. Ну ладно. Вот";
         let r = i
             .read(complete(said), 10, &[], &Known::new(), None)
@@ -841,7 +1183,7 @@ mod tests {
     #[test]
     fn a_sentence_already_read_ends_the_run() {
         let by = Arc::new(Batches::default());
-        let i = Interpreter::new("English", &["Russian".to_string()], by.clone()).unwrap();
+        let i = Interpreter::new("English", &["Russian".to_string()], by.clone(), None).unwrap();
         let mut known = Known::new();
         known.insert("Вот так, друзья мои.".to_string(), "Like so.".to_string());
         let said = "Я пью чай. Вот так, друзья мои. Ну ладно. Вот";
@@ -852,9 +1194,11 @@ mod tests {
         let calls = by.calls.lock().expect("lock").clone();
         assert_eq!(
             calls,
-            vec![vec!["Я пью чай.".to_string()], vec!["Ну ладно.".to_string()]],
+            vec![
+                vec!["Я пью чай.".to_string()],
+                vec!["Ну ладно.".to_string()]
+            ],
         );
         assert_eq!(r.text, "<Я пью чай.> Like so. <Ну ладно.>");
     }
-
 }

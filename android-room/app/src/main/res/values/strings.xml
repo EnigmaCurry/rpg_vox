@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Voice Room</string>
+    <string name="setup_title">Voice Room</string>
+    <string name="setup_blurb">Paste the invite link you were sent. If you have been in this room before on this phone, its address on its own is enough.</string>
+    <string name="setup_hint">https://room.example.com/join/…</string>
+    <string name="setup_go">Enter the room</string>
+    <string name="setup_need_url">Put the room\'s address in first.</string>
+    <string name="setup_need_https">It has to be an https address. A browser only gives the microphone to a secure page, so a plain http room could be read but never talked in.</string>
+    <string name="setup_not_a_url">That doesn\'t look like a web address.</string>
+    <string name="setup_change">Change room</string>
+    <string name="note_title">In the voice room</string>
+    <string name="note_text">Holding the call. Tap to come back.</string>
+    <string name="note_leave">Leave</string>
+    <string name="setup_checking">Finding the room…</string>
+    <string name="setup_unreachable">Couldn\'t reach that room. Check the address, and that this phone is online.</string>
+    <string name="need_link">That room doesn\'t know this phone. Paste an invite link to come in.</string>
+    <string name="link_spent">That link has been used already. A link works once, so ask for another.</string>
+    <string name="no_mic">Voice Room needs the microphone to put you in a room.</string>
+</resources>

@@ -109,11 +109,29 @@ impl Models {
         Ok(Self { offline, streaming })
     }
 
+    /// A way to transcribe one clip of audio in one go, for something
+    /// that is not a person talking in the room: a recording somebody
+    /// brought in from their own computer.
+    ///
+    /// The same model the room's own last pass uses, which is the whole
+    /// reason this is worth having -- it is already loaded. A voice is
+    /// cloned markedly better when the server is told what the clip
+    /// says, and the alternative for a dropped file was to clone from
+    /// it blind.
+    ///
+    /// Taken before [`Models::factory`], which consumes the models.
+    pub fn transcriber(&self) -> crate::room::Transcriber {
+        let offline = self.offline.clone();
+        Arc::new(move |samples: &[f32], rate: u32| offline.transcribe(samples, rate))
+    }
+
     /// A factory the room calls the first time each person's audio
-    /// arrives, with the language they speak.
+    /// arrives, with the language they speak. One of these is handed to
+    /// every room on the server: the models are loaded once, and a
+    /// session off them is what costs anything.
     pub fn factory(self) -> EngineFactory {
         let models = Arc::new(self);
-        Box::new(move |person: &str, language: &str, room: Arc<Room>| {
+        Arc::new(move |person: &str, language: &str, room: Arc<Room>| {
             models.engine(person, language, room)
         })
     }

@@ -1,6 +1,9 @@
 # Build release archives on a version tag and attach them to a GitHub
 # Release. Each target builds natively; `just dist` does the build and
-# packaging, so a local `just dist` produces the same archives.
+# packaging, so a local `just dist` produces the same archives. The two
+# Android apps are built the same way, by the recipe that packages them:
+# `just android-apk` for scribe's and `just room-apk` for the voice
+# room's.
 #
 # Each target builds CTranslate2 with CMake, for scribe's `--translate
 # local` (`just dist` turns on `translate-local`). Every runner image
@@ -93,8 +96,8 @@ jobs:
   # The Scribe dictation app (android/). arm64-v8a only: it covers every
   # current phone, and the 32-bit-only phones a second ABI would add are
   # too slow for the speech models anyway.
-  android:
-    name: build (android-arm64 apk)
+  android-scribe:
+    name: build (scribe apk, arm64)
     runs-on: ubuntu-24.04
     env:
       ANDROID_NDK_VERSION: 30.0.16248370
@@ -155,8 +158,56 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  # The voice room app (android-room/). No native code in it: it is
+  # Kotlin and a WebView, so there is no NDK, no Rust and no
+  # cross-compiling, one APK covers every phone, and it builds in about
+  # a minute.
+  android-room:
+    name: build (voice room apk)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: gradle/actions/setup-gradle@v4
+      - uses: extractions/setup-just@v2
+
+      # The same key that signs scribe's APK. One key can sign any number
+      # of packages; Android only asks that an update to a package be
+      # signed by whatever signed it last. The secrets are named for
+      # scribe because scribe was the only Android app here when they
+      # were made, and GitHub will not hand a secret back to be stored
+      # again under a better name.
+      #
+      # Without them `just room-apk` signs with a throwaway debug key and
+      # each release has to be installed fresh.
+      - name: Release keystore
+        env:
+          KEYSTORE_B64: ${{ secrets.SCRIBE_KEYSTORE_BASE64 }}
+        if: env.KEYSTORE_B64 != ''
+        run: |
+          echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/android.jks"
+          echo "VOX_ROOM_KEYSTORE=$RUNNER_TEMP/android.jks" >> "$GITHUB_ENV"
+
+      - name: Build APK
+        env:
+          VOX_ROOM_KEYSTORE_PASSWORD: ${{ secrets.SCRIBE_KEYSTORE_PASSWORD }}
+          VOX_ROOM_KEY_ALIAS: ${{ secrets.SCRIBE_KEY_ALIAS }}
+          VOX_ROOM_KEY_PASSWORD: ${{ secrets.SCRIBE_KEY_PASSWORD }}
+        run: just room-apk "$GITHUB_REF_NAME"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-android-room
+          path: dist/*
+          if-no-files-found: error
+
   release:
-    needs: [build, android]
+    needs: [build, android-scribe, android-room]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-24.04
     permissions:

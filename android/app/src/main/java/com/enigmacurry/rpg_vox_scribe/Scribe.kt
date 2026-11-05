@@ -331,6 +331,26 @@ object Scribe {
      */
     var showSaid by mutableStateOf(true)
         private set
+    /**
+     * Whether every reading is opened up against what was said, rather
+     * than standing on its own.
+     *
+     * One switch for the whole transcript and not one per paragraph:
+     * reading a translated thread with the original beside it is a way
+     * of reading, not a note taken on one paragraph, and having to open
+     * each paragraph in turn to do it is the same tap over and over.
+     * Any paragraph's language tag throws it, and throws it for all of
+     * them.
+     *
+     * Not stored: it is how the transcript is being read just now, and
+     * it starts closed, which is what a transcript you can read is for.
+     *
+     * Distinct from [showSaid], which is about the sentence a reading has
+     * not reached yet. This is about the ones it has: a reading that looks
+     * wrong can only be judged against the line it was made from.
+     */
+    var saidShown by mutableStateOf(false)
+        private set
     /** The input the mic source is recording from, while it runs. */
     var micName by mutableStateOf<String?>(null)
         private set
@@ -423,11 +443,12 @@ object Scribe {
         native = Language.of(prefs.getString("native_language", null))
         others = (prefs.getStringSet("other_languages", null) ?: emptySet())
             .mapNotNull { name -> Language.entries.firstOrNull { it.name == name } }
-            // A language whose model was removed, or whose alphabet now
-            // clashes with a changed native language, is dropped rather
-            // than failing the load it would be part of.
+            // A language whose model was removed, or which has no model
+            // into a changed native language, is dropped rather than
+            // failing the load it would be part of. Nothing is dropped
+            // for sharing an alphabet any more; what that set needs is
+            // the classifier, and [tellingMissing] says so.
             .filter { it != native && store.installed(translation(it, native) ?: return@filter false) }
-            .distinctBy { it.script }
             .toSet()
         // Two settings that were settings for one version each: which
         // language pass 1 listens in, which pass 1 now works out for
@@ -493,6 +514,11 @@ object Scribe {
         app.getSharedPreferences("scribe", Context.MODE_PRIVATE).edit().putBoolean("show_said", on).apply()
     }
 
+    /** Open every reading against what was said, or close them all. */
+    fun toggleSaid() {
+        saidShown = !saidShown
+    }
+
     fun chooseFontStep(step: Int) {
         fontStep = step.coerceIn(0, FONT_SCALES.size - 1)
         app.getSharedPreferences("scribe", Context.MODE_PRIVATE).edit().putInt("font_step", fontStep).apply()
@@ -550,15 +576,16 @@ object Scribe {
             .mapNotNull { l -> l.streaming?.let { l to it } }
 
     /**
-     * Listen out for [l] as well, or stop. Turning one on replaces
-     * whichever other language shares its alphabet, since a paragraph in
-     * either could not be told from one in the other.
+     * Listen out for [l] as well, or stop.
+     *
+     * Any number of them, in any alphabets, including the one you read
+     * in: what used to replace whichever language shared an alphabet
+     * with this one is gone, because [LANGID] tells them apart. What
+     * that costs is the models, which the Models page is for, and
+     * [wanted] now asks for the classifier too.
      */
     fun chooseOther(l: Language, on: Boolean) {
-        val next = when {
-            !on -> others - l
-            else -> others.filter { it.script != l.script }.toSet() + l
-        }
+        val next = if (on) others + l else others - l
         if (next == others) return
         others = next
         app.getSharedPreferences("scribe", Context.MODE_PRIVATE).edit()
@@ -611,9 +638,33 @@ object Scribe {
     /** Whether [p] is shown as what was said, rather than as its reading. */
     fun saidAsIs(p: Para) = p.own(native.script)
 
-    /** The models the languages now ask for, in the order they install. */
-    fun wanted(): List<Model> =
-        pass1Models().map { it.second } + others.mapNotNull { translation(it, native) }
+    /**
+     * The models the languages now ask for, in the order they install.
+     *
+     * The classifier is among them whenever two chosen languages share
+     * an alphabet -- counting the one you read in, which is a candidate
+     * like the others. Without it the engine refuses the whole set
+     * rather than guessing, so this is not an optimization: a set that
+     * needs it and hasn't got it is a set that will not load.
+     *
+     * Asked for only when needed, even at 917 KB, so that a reader who
+     * listens for Russian while reading English is never told to
+     * download something their languages do not use.
+     */
+    fun wanted(): List<Model> {
+        val pass1 = pass1Models().map { it.second }
+        val reading = others.mapNotNull { translation(it, native) }
+        val sharing = (listOf(native) + others).groupBy { it.script }.any { it.value.size > 1 }
+        return pass1 + reading + if (sharing && others.isNotEmpty()) listOf(LANGID) else emptyList()
+    }
+
+    /**
+     * Whether the languages chosen need the classifier and haven't got
+     * it, which is a set the engine will refuse: saying so is what
+     * keeps that from looking like a recording that won't start.
+     */
+    val tellingMissing: Boolean
+        get() = LANGID in wanted() && !store.installed(LANGID)
 
     /**
      * A language pass 1 should be able to listen in and has no model for
@@ -628,8 +679,8 @@ object Scribe {
     /** Models downloaded for a language setting that no longer wants them. */
     fun spare(): List<Model> {
         val keep = (wanted() + BUNDLES).map { it.dir }.toSet()
-        return (NATIVE_LANGUAGES.mapNotNull { it.streaming } +
-            NATIVE_LANGUAGES.flatMap { into -> translatable(into).mapNotNull { translation(it, into) } })
+        return catalogue()
+            .map { it.model }
             .filter { it.dir !in keep && store.installed(it) }
             .distinctBy { it.dir }
     }
@@ -887,10 +938,32 @@ object Scribe {
         InstallService.start(app, missing)
     }
 
-    /** Delete a model a language setting no longer wants. */
+    /** Download one model, from the Models page. */
+    fun installModel(m: Model) {
+        if (store.installed(m)) return
+        InstallService.start(app, listOf(m))
+    }
+
+    /** Download everything the Models page can offer. */
+    fun installAll() {
+        val missing = catalogue().map { it.model }.distinctBy { it.dir }.filterNot(store::installed)
+        if (missing.isNotEmpty()) InstallService.start(app, missing)
+    }
+
+    /**
+     * Delete a model: one a language setting no longer wants, or one
+     * deleted from the Models page outright.
+     *
+     * [reload] afterwards and not just a repaint, because deleting a
+     * model a chosen language still uses changes what the engine can
+     * do. It is a no-op while a recording is running, which is the
+     * right answer there too -- the engine in use keeps the weights it
+     * loaded, and the next recording gets the truth.
+     */
     fun removeModel(m: Model) {
         store.remove(m)
         languageModels++
+        reload()
     }
 
     /**

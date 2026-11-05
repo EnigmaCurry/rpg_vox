@@ -27,6 +27,9 @@ import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.foundation.Canvas
@@ -123,6 +126,9 @@ import androidx.core.content.ContextCompat
  * closed is read a moment later; two is the phone not keeping up.
  */
 private const val BEHIND = 2
+
+/** The width of the rule marking a paragraph as a reading. */
+private val RULE = 3.dp
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -474,6 +480,7 @@ private fun Dictate() {
         // Read once: the status line names the language and counts the
         // paragraphs, and both are getters over state another thread moves.
         val missing = Scribe.pass1Missing
+        val telling = Scribe.tellingMissing
         val behind = Scribe.readingBehind
         val copyButton: @Composable () -> Unit = {
             DockButton(DockIcons.Copy, stringResource(R.string.action_copy), enabled = hasText) {
@@ -523,6 +530,13 @@ private fun Dictate() {
                     // where that matters, so it is said here.
                     missing != null ->
                         stringResource(R.string.dock_listening_missing, time, stringResource(missing.nameRes))
+                    // The classifier the chosen languages need and
+                    // haven't got. Said here for the same reason: two
+                    // languages in one alphabet with nothing to tell
+                    // them apart is a set the engine refuses, so
+                    // nothing is being read, and the recording that
+                    // looks fine is where that is noticed.
+                    telling -> stringResource(R.string.dock_listening_no_telling, time)
                     // The reading has fallen behind the speaking, which
                     // it does when Scribe spends the recording off
                     // screen: it says so instead of the readings simply
@@ -1044,6 +1058,14 @@ private fun Reading(p: Para, canPlay: Boolean) {
     // Nothing of it to show: what was said is standing in for no
     // reading, or there is no reading yet and nothing standing in.
     val pending = parts.isEmpty() || !Scribe.showSaid && rows.any { it.reading == null }
+    // Whether any of it has been read yet, which is whether there is
+    // anything to check against what was said. Until then the block is
+    // what was said (faintly, under **Show what was said**) or an
+    // ellipsis, and opening it up would either show it twice or show it
+    // against nothing -- so a paragraph nothing has been read of stays
+    // closed, and is only labelled, however the switch is set.
+    val read = rows.any { it.reading != null }
+    val showing = read && Scribe.saidShown
     // Where each reading starts in the block, and when it was spoken,
     // for a tap to find it.
     var offset = 0
@@ -1064,30 +1086,163 @@ private fun Reading(p: Para, canPlay: Boolean) {
         }
     }
     var layout by remember { mutableStateOf<TextLayoutResult?>(null) }
-    Text(
-        text,
-        style = MaterialTheme.typography.bodyLarge.scaled(FONT_SCALES[Scribe.fontStep]),
-        onTextLayout = { layout = it },
-        modifier = Modifier
+    val scale = FONT_SCALES[Scribe.fontStep]
+    val rule = MaterialTheme.colorScheme.primary.copy(alpha = 0.5f)
+    Column(
+        Modifier
             .fillMaxWidth()
-            .semantics {
-                heardIn?.let { contentDescription = context.getString(R.string.a11y_read_as, it, text) }
+            // The rule down the left edge is the indicator, and it is
+            // the whole of it: these words are a reading and nobody said
+            // them. Drawn rather than laid out beside the text so that
+            // it spans however many lines the reading wraps to, without
+            // a Row whose height has to be an intrinsic measurement.
+            .drawBehind {
+                drawRoundRect(
+                    color = rule,
+                    size = Size(RULE.toPx(), size.height),
+                    cornerRadius = CornerRadius(RULE.toPx() / 2),
+                )
             }
-            .pointerInput(p.id, canPlay, taps) {
-                if (!canPlay) return@pointerInput
-                awaitEachGesture {
-                    val playingAtDown = Playback.playing != null && !Playback.paused
-                    val up = awaitTap(PointerEventPass.Main) ?: return@awaitEachGesture
-                    if (playingAtDown || Playback.playing != null && !Playback.paused) {
-                        return@awaitEachGesture
+            .padding(start = RULE + 10.dp),
+    ) {
+        ReadingTag(heardIn, read, showing, scale)
+        if (showing) {
+            // Zipped: each sentence as it was said with its reading on
+            // the line under it, rather than the whole reading and then
+            // the whole paragraph. Checking a reading means holding one
+            // sentence against one sentence, and over a long paragraph
+            // the two blocks are too far apart to do it -- by the foot
+            // of the reading there is nothing on screen to check it
+            // against.
+            //
+            // What was said leads each pair and the reading answers it,
+            // because that is the order they were made in. Said is
+            // faint: the pair is one thought, and two lines of equal
+            // weight read as two.
+            Zipped(p, rows, canPlay, faint, scale)
+        } else {
+            Text(
+                text,
+                style = MaterialTheme.typography.bodyLarge.scaled(scale),
+                onTextLayout = { layout = it },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .semantics {
+                        heardIn?.let { contentDescription = context.getString(R.string.a11y_read_as, it, text) }
                     }
-                    val l = layout ?: return@awaitEachGesture
-                    val c = l.getOffsetForPosition(up)
-                    val i = taps.indexOfLast { it.first <= c }
-                    val from = taps.getOrNull(i)?.second ?: return@awaitEachGesture
-                    Scribe.play(p, Word("", from, from))
+                    .pointerInput(p.id, canPlay, taps) {
+                        if (!canPlay) return@pointerInput
+                        awaitEachGesture {
+                            val playingAtDown = Playback.playing != null && !Playback.paused
+                            val up = awaitTap(PointerEventPass.Main) ?: return@awaitEachGesture
+                            if (playingAtDown || Playback.playing != null && !Playback.paused) {
+                                return@awaitEachGesture
+                            }
+                            val l = layout ?: return@awaitEachGesture
+                            val c = l.getOffsetForPosition(up)
+                            val i = taps.indexOfLast { it.first <= c }
+                            val from = taps.getOrNull(i)?.second ?: return@awaitEachGesture
+                            Scribe.play(p, Word("", from, from))
+                        }
+                    },
+            )
+        }
+    }
+}
+
+/**
+ * A paragraph's sentences against their readings, a pair at a time: what
+ * was said, faint, and the reading of it on the line beneath.
+ *
+ * A sentence the translator has not reached stands alone -- there is
+ * nothing to put under it yet, and an ellipsis there would be a line per
+ * sentence saying the same thing the one tag over the paragraph already
+ * says. It is still shown, because a sentence missing from the
+ * comparison is worse than one waiting in it.
+ *
+ * Tapping a reading plays from where its sentence was spoken, the same
+ * as tapping the block does when it is closed; here each reading is its
+ * own line, so there is no offset to work back from.
+ */
+@Composable
+private fun Zipped(p: Para, rows: List<Row>, canPlay: Boolean, faint: Color, scale: Float) {
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        for ((i, r) in rows.withIndex()) {
+            if (r.said.isBlank()) continue
+            Column {
+                Text(
+                    r.said,
+                    style = MaterialTheme.typography.bodyMedium.scaled(scale),
+                    color = faint,
+                    fontStyle = FontStyle.Italic,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                r.reading?.let { reading ->
+                    Text(
+                        reading,
+                        style = MaterialTheme.typography.bodyLarge.scaled(scale),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .playFrom(p.id to i, canPlay) { Scribe.play(p, Word("", r.startMs, r.startMs)) },
+                    )
                 }
-            },
+            }
+        }
+    }
+}
+
+/**
+ * Tap to play, with the guard the transcript taps all share: a tap that
+ * lands while something is playing is the one that paused it, and must
+ * not also start it somewhere else.
+ */
+private fun Modifier.playFrom(key: Any?, canPlay: Boolean, play: () -> Unit) =
+    pointerInput(key, canPlay) {
+        if (!canPlay) return@pointerInput
+        awaitEachGesture {
+            val playingAtDown = Playback.playing != null && !Playback.paused
+            awaitTap(PointerEventPass.Main) ?: return@awaitEachGesture
+            if (playingAtDown || Playback.playing != null && !Playback.paused) return@awaitEachGesture
+            play()
+        }
+    }
+
+/**
+ * The line over a reading naming the language it was heard in, and the
+ * handle that opens every reading in the thread against what was said.
+ *
+ * One switch and not one per paragraph ([Scribe.saidShown] holds it), so
+ * every tag in the transcript shows the same chevron and any of them
+ * throws it. Tappable only once something has been read ([read]); before
+ * that the block already is what was said, so there is nothing to open
+ * and the tag is only a label. It is its own tap target because the
+ * reading's own tap plays the audio from the sentence touched, and one
+ * gesture cannot do both.
+ */
+@Composable
+private fun ReadingTag(heardIn: String?, read: Boolean, showing: Boolean, scale: Float) {
+    val context = LocalContext.current
+    val label = when (heardIn) {
+        null -> stringResource(R.string.reading_from_unknown)
+        else -> stringResource(R.string.reading_from, heardIn)
+    }
+    val tint = MaterialTheme.colorScheme.primary.copy(alpha = 0.8f)
+    Text(
+        if (read) "${if (showing) "▾" else "▸"} $label" else label,
+        style = MaterialTheme.typography.labelSmall.scaled(scale),
+        color = tint,
+        modifier = Modifier
+            .then(
+                when {
+                    read -> Modifier.clickable(
+                        onClickLabel = context.getString(
+                            if (showing) R.string.a11y_hide_said else R.string.a11y_show_said,
+                        ),
+                    ) { Scribe.toggleSaid() }
+                    else -> Modifier
+                },
+            )
+            .padding(vertical = 2.dp),
     )
 }
 

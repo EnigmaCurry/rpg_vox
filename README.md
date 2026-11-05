@@ -25,16 +25,16 @@ scribe -o notes
 
 [Read more →](SCRIBE.md)
 
-## [Scribe for Android](ANDROID.md)
+## [Scribe for Android](SCRIBE_ANDROID.md)
 
 scribe as a phone app: live transcription of the mic, other apps'
 audio, or shared files, kept as threads, plus a voice keyboard for
 dictating into any app. Everything runs on the phone after a one-time
 model download. Arm64, Android 8.0 or newer.
 
-[Read more →](ANDROID.md)
+[Read more →](SCRIBE_ANDROID.md)
 
-## [Scribe for iOS](IOS.md)
+## [Scribe for iOS](SCRIBE_IOS.md)
 
 scribe as an iPhone and iPad app (work in progress): live
 transcription of the mic or shared audio and video files, dictations
@@ -42,7 +42,7 @@ you can keep editing by voice, threads, and playback of kept audio.
 Everything runs on the device after a one-time model download. iOS 17
 or newer, built and installed from source for now.
 
-[Read more →](IOS.md)
+[Read more →](SCRIBE_IOS.md)
 
 ## [agent](AGENT.md)
 
@@ -80,12 +80,30 @@ sees one live transcript of who said what. The AI answers out loud and
 can be interrupted just by talking; the log keeps only what it actually
 said. macOS and Linux.
 
+One server holds several rooms, and you move between them without the
+audio stopping — the house's rooms, and one of your own where you can
+talk to the AI with nobody listening.
+
 ```bash
 just room-invite Ryan
-just room
+just room --room Lounge --room Studio
 ```
 
 [Read more →](ROOM.md)
+
+## [Voice room for Android](ROOM_ANDROID.md)
+
+The room as a phone app, so a call survives the screen going off the
+way a phone's own calls do. It is a wrapper and says so: the whole of
+it is a WebView and a foreground service, and the room inside is the
+same room a browser gets.
+
+It ships no address. Whose room it is belongs to whoever installed it,
+so the first screen asks and the answer is kept; after that the app
+remembers the room rather than the link, because a link is spent the
+moment it works. Android 11 or newer, one APK for every phone.
+
+[Read more →](ROOM_ANDROID.md)
 
 ## [rpg_vox](RPG_VOX.md)
 

@@ -20,6 +20,9 @@ const [ryanUrl, alexUrl, ryanWav, alexWav, secs = '90', shot = 'interpret'] =
 
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 const JOIN = 'button:has-text("Join Audio")';
+// Nobody comes in without agreeing to be recorded, so the box is part of
+// pressing the button now.
+const AGREE = '.consent input';
 
 async function person(name, url, wav, language) {
   const browser = await chromium.launch({
@@ -40,6 +43,7 @@ async function person(name, url, wav, language) {
   page.on('pageerror', (e) => console.log(`[${name} pageerror] ${e}`));
   await page.goto(url);
   await page.waitForSelector(JOIN);
+  await page.locator(AGREE).check();
   if (language) await page.selectOption('label:has-text("Language") select', language);
   return { name, browser, page };
 }

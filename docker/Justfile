@@ -3,7 +3,8 @@
 #   just config      # answer questions, writes .env
 #   just install     # build and start
 #   just logs -f     # the first start downloads the speech-to-text models
-#   just room-invite Ryan
+#   just room-invite-owner Ryan   # who manages it from the room itself
+#   just room-invite Alex
 
 _default:
     @just --list --unsorted
@@ -96,7 +97,7 @@ install:
     docker compose up --detach --build
     echo
     echo "The first start downloads the speech-to-text models (minutes)."
-    echo "Watch it with \`just logs -f\`, then \`just room-invite NAME\`."
+    echo "Watch it with \`just logs -f\`, then \`just room-invite-owner NAME\`."
 
 # Throw the containers away and build them again, keeping the volumes.
 reinstall:
@@ -163,6 +164,12 @@ shell *ARGS:
 # Print the invite link for NAME, making one if needed.
 room-invite NAME:
     @docker compose exec vox_room vox_room invite "{{NAME}}"
+
+# Make NAME the owner and print their link. The owner invites everybody
+# else and hands out the rooms from inside the room. There is one: to
+# change it, `room-uninvite` the old one first.
+room-invite-owner NAME:
+    @docker compose exec vox_room vox_room invite-owner "{{NAME}}"
 
 # Revoke NAME's invite link.
 room-uninvite NAME:

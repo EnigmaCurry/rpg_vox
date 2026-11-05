@@ -4,21 +4,24 @@
 
 mod agent;
 mod interp;
+mod mcp;
 mod mixer;
+mod puppet;
 mod room;
+mod rooms;
 mod screen;
 mod store;
 mod stt;
 mod tts;
+mod voices;
 mod web;
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{bail, Context as _, Result};
 use clap::{CommandFactory as _, Parser, Subcommand, ValueEnum};
@@ -58,6 +61,44 @@ struct Cli {
     #[arg(long)]
     no_stt: bool,
 
+    /// The rooms a *new* house starts with, the first of them the
+    /// lobby. Only read when the database has no rooms yet: after the
+    /// first start the house is the database's, and the owner makes
+    /// and unmakes rooms from the room itself (see ROOM.md). Everyone
+    /// also has a room of their own, always, which is not named here
+    /// -- it is made the first time they go into it.
+    #[arg(
+        long = "room",
+        env = "VOX_ROOM_ROOMS",
+        value_delimiter = ',',
+        default_value = "Lobby"
+    )]
+    rooms: Vec<String>,
+
+    /// Another AI in every room, as `NAME`, `NAME:VOICE` or
+    /// `NAME:VOICE:PROMPT_FILE`. Repeat it for more.
+    ///
+    /// The first AI is the one `--name`, `--voice`, `--alias` and
+    /// `--prompt` describe; these are the ones beside it. Each has its
+    /// own voice, its own fader, and its own say in when it speaks —
+    /// and at a pause every one of them that could answer is given the
+    /// turn at once, with the first to actually say something keeping
+    /// it and the rest told to stop. Two or three is the sane number:
+    /// each one judging each pause is a request each.
+    ///
+    /// They see each other: what one says is in the others' transcript
+    /// with its name on it, as a person's is. What they may *do*
+    /// differs — the first AI runs the room (cards, games, the web),
+    /// and every other one can see who is here and look things up, and
+    /// no more. See `agent::Allowed`.
+    ///
+    /// This says which AIs the server has, not where they are. The
+    /// first is in every room; the rest are given rooms by the owner,
+    /// on **People and rooms**, the way people are — they start in the
+    /// rooms people share and in nobody's own.
+    #[arg(long = "bot", env = "VOX_ROOM_BOTS", value_delimiter = ',')]
+    bots: Vec<String>,
+
     /// The AI's name. In "named" mode it answers when someone says it.
     #[arg(long, env = "VOX_ROOM_AGENT_NAME", default_value = "Vox")]
     name: String,
@@ -82,6 +123,19 @@ struct Cli {
     /// Entries of the conversation sent to the model with each turn.
     #[arg(long, env = "VOX_ROOM_HISTORY", default_value_t = 60)]
     history: usize,
+    /// Replies the AIs may give each other with nobody saying anything
+    /// in between.
+    ///
+    /// A voice can put something to another voice and hand it the turn
+    /// (`hand_to`), which is how three of you have a conversation
+    /// rather than two people taking turns with one AI. This is what
+    /// keeps that from becoming two AIs talking to each other while
+    /// the people watch: the count goes back to nothing the moment
+    /// somebody speaks or types, so a conversation people are in can
+    /// go round for as long as they are in it. 0 is AIs that only ever
+    /// answer people.
+    #[arg(long, env = "VOX_ROOM_AI_TURNS", default_value_t = 2)]
+    ai_turns: u32,
 
     /// OpenAI-compatible base URL ending in /v1. The same service as
     /// scribe's --llm and `agent`; the key comes from VOX_SCRIBE_LLM_KEY.
@@ -112,6 +166,27 @@ struct Cli {
     /// llama.cpp has no such thing, and each search costs a request.
     #[arg(long, env = "VOX_ROOM_SEARCH")]
     search: bool,
+    /// An MCP server the AI may use, as NAME=URL[=TOOL,TOOL,...]. NAME
+    /// is the prefix its tools are offered under (`art` gives
+    /// `art_generate_pixel_art`), and the tools after it are the only
+    /// ones the room lends -- leave them out to lend the lot, which is
+    /// only sane for a server you know is small. Repeat for more
+    /// servers. The key is --mcp-key.
+    ///
+    /// For a ComfyUI art server:
+    ///
+    ///   --mcp 'art=https://comfyui-mcp.example.com/mcp=generate_pixel_art,refine_pixel_art'
+    ///
+    /// That server draws in more than one look, so a third tool goes
+    /// with those two: `list_styles`, which is how the AI finds out
+    /// what there is to choose between.
+    #[arg(long = "mcp", env = "VOX_ROOM_MCP", value_delimiter = ';')]
+    mcp: Vec<String>,
+    /// The key for the --mcp servers, as NAME=KEY, or on its own for
+    /// the only one. Sent as a bearer token and filled into whichever
+    /// argument each tool wants it in, so it never reaches the model.
+    #[arg(long = "mcp-key", env = "VOX_ROOM_MCP_KEY", value_delimiter = ';')]
+    mcp_key: Vec<String>,
     /// No model: the AI says back what it heard. For trying the room.
     #[arg(long)]
     echo: bool,
@@ -135,12 +210,42 @@ struct Cli {
     /// name one, which is right for a server with a single model.
     #[arg(long, env = "VOX_ROOM_TTS_MODEL")]
     tts_model: Option<String>,
+    /// A voice-cloning server: the same vllm-omni speech API, holding
+    /// Qwen3-TTS's Base model instead of the preset speakers (the
+    /// `clone` service of `qwen3-tts/docker-compose.yml`). With one
+    /// configured, the AI can record a few seconds of somebody in the
+    /// room reading aloud, keep a voice cloned from it under a name,
+    /// and be asked to speak in it. Without one it has none of those
+    /// tools at all. A different host from `--tts-url` on purpose: the
+    /// preset server cannot speak in an uploaded voice, and asking it
+    /// to would quietly get a preset.
+    #[arg(long, env = "VOX_ROOM_TTS_CLONE_URL")]
+    tts_clone_url: Option<String>,
+    /// Bearer token for the clone server. Defaults to `--tts-key`,
+    /// which is right when the two servers are one deployment behind
+    /// one gate.
+    #[arg(long, env = "VOX_ROOM_TTS_CLONE_KEY")]
+    tts_clone_key: Option<String>,
     /// Qwen3 voice.
     #[arg(long, env = "VOX_ROOM_VOICE", default_value = "aiden")]
     voice: String,
     /// How the Qwen3 voice should speak, e.g. "calm and warm".
     #[arg(long, env = "VOX_ROOM_INSTRUCT", default_value = "")]
     instruct: String,
+    /// The voices the speech server has, comma-separated. Only needed
+    /// for a server that won't say: the room asks `/v1/audio/voices`
+    /// as it opens, and what comes back is what a [puppet](ROOM.md)
+    /// may be built on.
+    ///
+    /// Given here, this is used instead of asking. It wants the names
+    /// the server's own `/v1/audio/speech` takes, which are not the
+    /// names a picker shows: `uncle_fu`, not "Uncle Fu".
+    #[arg(
+        long = "tts-voices",
+        env = "VOX_ROOM_TTS_VOICES",
+        value_delimiter = ','
+    )]
+    tts_voices: Vec<String>,
     #[arg(long, env = "VOX_ROOM_LANGUAGE", default_value = "English")]
     language: String,
     /// Other languages the door offers, comma-separated and spelled out
@@ -191,6 +296,10 @@ struct Cli {
 enum Cmd {
     /// Print the one-time invite link for NAME, making one if needed.
     Invite { name: String },
+    /// Make NAME the owner and print their link. The owner invites
+    /// everybody else and says which rooms they may go to, from inside
+    /// the room. There is one; `uninvite` the old one first.
+    InviteOwner { name: String },
     /// Revoke NAME: their link and their browsers' cookies.
     Uninvite { name: String },
     /// List everyone invited, with the links not yet used.
@@ -247,6 +356,80 @@ fn canonical_language(name: &str) -> String {
             );
             name.to_string()
         }
+    }
+}
+
+/// How to make a voice, for every room on the server. The settings are
+/// the same wherever it is speaking, so a call only says what language
+/// and which preset.
+struct Speakers {
+    kind: TtsKind,
+    url: Option<String>,
+    key: Option<String>,
+    model: Option<String>,
+    instruct: String,
+    /// Where a voice cloned from somebody in the room is spoken from,
+    /// when the house has such a server. See [`crate::voices`].
+    clone_url: Option<String>,
+    /// The one Kokoro, when that is the voice: it is the whole model,
+    /// so every room reads through this copy. None for the others,
+    /// which are cheap enough to make per room.
+    kokoro: Option<tts::Shared>,
+}
+
+impl Speakers {
+    /// Whether a voice of this kind can be asked for a language other
+    /// than its own, which is what says whether the other languages the
+    /// door offers are ever really spoken.
+    fn multilingual(&self) -> bool {
+        self.kind == TtsKind::Qwen3
+    }
+
+    /// `borrowed` is the cell this voice reads to find out whether the
+    /// bot it belongs to has been lent a cloned voice. Every one of a
+    /// bot's voices is given the same cell; anything that is nobody's
+    /// bot -- an interpreter -- is given one of its own, which nothing
+    /// ever sets.
+    ///
+    /// `delivery` is how this one voice is to be spoken, instead of
+    /// the house's `--instruct`. Empty for everything the house set up
+    /// itself; a puppet is the thing that uses it, because a made-up
+    /// character's voice is a preset plus the way it talks -- which is
+    /// how a room with no clone server has more than one voice in it.
+    fn voice(
+        &self,
+        language: &str,
+        preset: &str,
+        delivery: &str,
+        borrowed: tts::Borrowed,
+    ) -> Result<Box<dyn tts::Voice>> {
+        let instruct = match delivery.trim() {
+            "" => self.instruct.as_str(),
+            said => said,
+        };
+        Ok(match self.kind {
+            TtsKind::Qwen3 => {
+                let Some(url) = self.url.clone() else {
+                    bail!("--tts qwen3 needs --tts-url (or VOX_ROOM_TTS_URL)");
+                };
+                Box::new(
+                    tts::Qwen3::new(
+                        &url,
+                        preset,
+                        instruct,
+                        language,
+                        self.key.clone(),
+                        self.model.clone(),
+                    )
+                    .cloning(self.clone_url.clone(), borrowed),
+                )
+            }
+            TtsKind::Kokoro => match &self.kokoro {
+                Some(shared) => shared.handle(),
+                None => Box::new(tts::Silent),
+            },
+            TtsKind::None => Box::new(tts::Silent),
+        })
     }
 }
 
@@ -309,6 +492,117 @@ fn env_names(cmd: &clap::Command, out: &mut Vec<OsString>) {
 /// The old `VOX_AGENT_THINK`, read by hand and leniently: as a clap flag
 /// anything but exactly `true` or `false` stopped the room from starting
 /// at all, which an old `.env` saying `0` should not do.
+/// Which key is `name`'s.
+///
+/// `--mcp-key` is either `NAME=KEY` per server, or -- when the house
+/// has exactly one server -- the key on its own, which is what a
+/// one-server house actually wants to write. A named key always wins.
+///
+/// What counts as "on its own" is not "has no `=`": a base64 key ends
+/// in one. It is "the part before the first `=` is not one of the
+/// servers' names", which is the question actually being asked.
+///
+/// A key on its own with more than one server is an error rather than
+/// a key quietly dropped. Somebody who wrote a key meant it to be
+/// used, and the room cannot guess which server they meant -- and
+/// guessing wrong means handing one vendor's key to another.
+fn key_for(name: &str, keys: &[&str], names: &[String]) -> Result<String> {
+    fn named<'k>(k: &'k str, names: &[String]) -> Option<(&'k str, &'k str)> {
+        k.split_once('=')
+            .filter(|(who, _)| names.iter().any(|n| n == who.trim()))
+    }
+    if let Some(key) = keys
+        .iter()
+        .filter_map(|k| named(k, names))
+        .find(|(who, _)| who.trim() == name)
+        .map(|(_, key)| key)
+    {
+        return Ok(key.trim().to_string());
+    }
+    let Some(bare) = keys.iter().find(|k| named(k, names).is_none()) else {
+        return Ok(String::new());
+    };
+    if names.len() > 1 {
+        bail!(
+            "--mcp-key is a key on its own, but there are {} --mcp servers ({}): \
+             say which with NAME=KEY, separated by semicolons -- one server's key \
+             is not to be sent to another",
+            names.len(),
+            names.join(", ")
+        );
+    }
+    Ok(bare.trim().to_string())
+}
+
+/// The `--mcp` servers, with their keys attached.
+///
+/// `NAME=URL` or `NAME=URL=tool,tool`. The key comes from `--mcp-key`,
+/// as `NAME=KEY` or -- when there is exactly one server -- on its own,
+/// which is the shape a one-server house actually wants.
+fn mcp_servers(specs: &[String], keys: &[String]) -> Result<Vec<Arc<mcp::Server>>> {
+    let specs: Vec<&str> = specs.iter().map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+    let keys: Vec<&str> = keys.iter().map(|k| k.trim()).filter(|k| !k.is_empty()).collect();
+    // Every server's name, worked out before any of them is built: a
+    // key is matched to a server by name, and telling `art=rdpk-…`
+    // from a bare key that merely contains an `=` needs to know which
+    // names there are.
+    let names: Vec<String> = specs
+        .iter()
+        .filter_map(|spec| spec.split('=').next())
+        .map(|n| n.trim().to_string())
+        .collect();
+    let mut out = Vec::new();
+    for spec in &specs {
+        let mut parts = spec.splitn(3, '=');
+        let name = parts.next().unwrap_or_default().trim().to_string();
+        let url = parts.next().unwrap_or_default().trim().to_string();
+        if name.is_empty() || url.is_empty() {
+            bail!("--mcp wants NAME=URL[=TOOL,TOOL], not {spec:?}");
+        }
+        // The name is a prefix on a tool name, and a tool name is not
+        // allowed to be anything: the endpoints want
+        // `^[a-zA-Z0-9_-]+$`, and a name that breaks that breaks every
+        // tool the server lends rather than just itself.
+        if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+            bail!("--mcp NAME is letters, digits, _ and - (it prefixes tool names), not {name:?}");
+        }
+        if !url.starts_with("https://") && !url.starts_with("http://") {
+            bail!("--mcp {name} wants an http(s) URL; only streamable HTTP is spoken, not stdio");
+        }
+        if out.iter().any(|s: &Arc<mcp::Server>| s.name() == name) {
+            bail!("two --mcp servers called {name:?}: their tools would collide");
+        }
+        let only: Vec<String> = parts
+            .next()
+            .unwrap_or("")
+            .split(',')
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect();
+        if only.is_empty() {
+            warn!(
+                server = %name,
+                "no tool list after the URL, so every tool it has is offered to the AI; \
+                 a big server is a big list in front of every reply"
+            );
+        }
+        let key = key_for(&name, &keys, &names)?;
+        if key.is_empty() {
+            warn!(
+                server = %name,
+                "no --mcp-key for this one; it had better not want authenticating"
+            );
+        }
+        out.push(Arc::new(mcp::Server::new(mcp::Config {
+            name,
+            url,
+            key,
+            only,
+        })));
+    }
+    Ok(out)
+}
+
 fn thinks(flag: bool) -> bool {
     flag || std::env::var("VOX_AGENT_THINK").is_ok_and(|v| {
         matches!(
@@ -352,13 +646,7 @@ fn main() -> Result<()> {
     let store = Store::open(&db)?;
     match &cli.command {
         Some(Cmd::Invite { name }) => {
-            let name = name.trim();
-            if name.is_empty() || name.starts_with('@') {
-                bail!("give the person a name");
-            }
-            if name.chars().count() > room::NAME_MAX {
-                bail!("names are at most {} characters", room::NAME_MAX);
-            }
+            let name = check_person_name(name)?;
             // A second link for somebody who has already traded one in
             // is a deliberate thing (another browser), so say so.
             if store.person(name)?.is_some_and(|p| p.link.is_none()) {
@@ -367,22 +655,46 @@ fn main() -> Result<()> {
             println!("{}/join/{}", base_url(&cli), store.invite(name)?);
             return Ok(());
         }
+        Some(Cmd::InviteOwner { name }) => {
+            let name = check_person_name(name)?;
+            // invite_owner refuses while somebody else is the owner,
+            // and says who to uninvite.
+            let token = store.invite_owner(name)?;
+            println!("{}/join/{token}", base_url(&cli));
+            eprintln!(
+                "{name} is the owner: they invite everybody else and say which rooms \
+                 people may go to, from the room itself."
+            );
+            return Ok(());
+        }
         Some(Cmd::Uninvite { name }) => {
+            let was_owner = store.owner()?.as_deref() == Some(name.as_str());
             if !store.uninvite(name)? {
                 bail!("{name} wasn't invited");
             }
             println!(
                 "{name}'s link and cookie are gone (an open tab stays connected until it reloads)"
             );
+            if was_owner {
+                eprintln!(
+                    "The room has no owner now: `vox_room invite-owner NAME` to give it one."
+                );
+            }
             return Ok(());
         }
         Some(Cmd::People) => {
+            if store.owner()?.is_none() {
+                eprintln!("Nobody owns this room: `vox_room invite-owner NAME` to give it one.");
+            }
             for p in store.people()? {
-                let who = if p.display == p.name {
+                let mut who = if p.display == p.name {
                     p.name.clone()
                 } else {
                     format!("{} (in the room as {})", p.name, p.display)
                 };
+                if p.owner {
+                    who.push_str(" [owner]");
+                }
                 match p.link {
                     Some(token) => println!("{who}\t{}/join/{token}", base_url(&cli)),
                     None => println!("{who}\tjoined; `vox_room invite {}` for a new link", p.name),
@@ -392,13 +704,46 @@ fn main() -> Result<()> {
         }
         None => {}
     }
-    serve(cli, store)
+    serve(cli, store, db)
 }
 
-fn serve(cli: Cli, store: Store) -> Result<()> {
+/// A name somebody can be invited under: `vox_room uninvite` names it,
+/// and `@` opens a room of one's own.
+fn check_person_name(name: &str) -> Result<&str> {
+    let name = name.trim();
+    if name.is_empty() || name.starts_with('@') {
+        bail!("give the person a name");
+    }
+    if name.chars().count() > room::NAME_MAX {
+        bail!("names are at most {} characters", room::NAME_MAX);
+    }
+    Ok(name)
+}
+
+fn serve(cli: Cli, store: Store, db: PathBuf) -> Result<()> {
     if store.people()?.is_empty() {
         warn!("nobody is invited yet: run `vox_room invite NAME` for a link");
     }
+    match store.owner()? {
+        Some(owner) => info!(%owner, "the owner invites people and hands out the rooms"),
+        // Everything still works; what is missing is the managing of it
+        // from a browser, and nothing else can be done about that from
+        // one -- which is the point of its being a command.
+        None => warn!(
+            "nobody owns this room: run `vox_room invite-owner NAME` to let somebody \
+             invite people and hand out rooms from the room itself"
+        ),
+    }
+    // A database written before there was more than one room: what was
+    // the whole server's -- the conversation, the mode, the faders --
+    // is the first room's. Done before any room opens, so none of them
+    // reads a half-moved setting.
+    let first = cli.rooms.first().map(|r| r.trim()).unwrap_or_default();
+    if first.is_empty() {
+        bail!("--room NAME, at least once");
+    }
+    store.adopt(first)?;
+    drop(store);
     let llm = if cli.echo {
         agent::Llm::Echo
     } else {
@@ -462,6 +807,30 @@ fn serve(cli: Cli, store: Store) -> Result<()> {
     } else {
         TtsKind::None
     });
+    // The voice-cloning server, where there is one. Only ever with
+    // Qwen3: cloning somebody's voice and then speaking in it are the
+    // same server's two halves, and a house that could record a clip
+    // it has no way to speak with would offer the AI three tools that
+    // end in nothing.
+    let clone_url = cli.tts_clone_url.clone().filter(|url| {
+        if kind == TtsKind::Qwen3 {
+            return true;
+        }
+        warn!(
+            url = %url,
+            "a voice-cloning server needs --tts qwen3 to speak the voices it keeps, \
+             so the AI is not offered them"
+        );
+        false
+    });
+    let clone_key = cli
+        .tts_clone_key
+        .clone()
+        .or_else(|| cli.tts_key.clone())
+        .filter(|k| !k.is_empty());
+    let clones = clone_url
+        .as_deref()
+        .map(|url| Arc::new(voices::Clones::new(url, clone_key.clone())));
     // The room's own language first, then the others the door offers,
     // each at most once however it was spelled -- and settled to the one
     // spelling everything downstream matches on, so `english` in the
@@ -482,57 +851,38 @@ fn serve(cli: Cli, store: Store) -> Result<()> {
             out
         });
 
-    // One voice per language the room is listening in, each on its own
-    // thread, so the languages are spoken at the same time instead of
-    // one after another. A Qwen3 voice is only an HTTP client, so having
-    // several costs nothing; Kokoro would be the whole model again, and
-    // it only speaks English anyway, so it stays alone.
-    let make_voice = |language: &str, preset: &str| -> anyhow::Result<Box<dyn tts::Voice>> {
-        Ok(match kind {
-            TtsKind::Qwen3 => {
-                let Some(url) = tts_url.clone() else {
-                    bail!("--tts qwen3 needs --tts-url (or VOX_ROOM_TTS_URL)");
-                };
-                info!(
-                    %url,
-                    language,
-                    voice = %preset,
-                    model = cli.tts_model.as_deref().unwrap_or("(unnamed)"),
-                    key = cli.tts_key.is_some(),
-                    "voice: Qwen3-TTS"
-                );
-                Box::new(tts::Qwen3::new(
-                    &url,
-                    preset,
-                    &cli.instruct,
-                    language,
-                    cli.tts_key.clone(),
-                    cli.tts_model.clone(),
-                ))
-            }
+    // What the voices can actually say, which is not always what the
+    // door offers: one voice means one language, however many are on
+    // the list. Settled here, once, because it goes into the config
+    // every room is built from.
+    let speakers = Speakers {
+        kind,
+        url: tts_url.clone(),
+        key: cli.tts_key.clone(),
+        model: cli.tts_model.clone(),
+        instruct: cli.instruct.clone(),
+        clone_url: clone_url.clone(),
+        // Loaded now and shared by every room: see `tts::Shared`.
+        kokoro: match kind {
             TtsKind::Kokoro => {
                 info!(voice = %cli.kokoro_voice, "voice: Kokoro");
-                Box::new(tts::Kokoro::load(&kokoro_dir, &cli.kokoro_voice)?)
+                Some(tts::Shared::new(Box::new(tts::Kokoro::load(
+                    &kokoro_dir,
+                    &cli.kokoro_voice,
+                )?)))
             }
-            TtsKind::None => {
-                warn!("no voice: the AI's replies are shown, silently, at reading pace");
-                Box::new(tts::Silent)
-            }
-        })
+            _ => None,
+        },
     };
-    let mut voices = vec![(language.clone(), make_voice(&language, &cli.voice)?)];
-    let others: Vec<String> = cfg_languages
-        .iter()
-        .filter(|l| **l != language)
-        .cloned()
-        .collect();
-    if !others.is_empty() {
-        if voices[0].1.multilingual() {
-            for language in others {
-                let voice = make_voice(&language, &cli.voice)?;
-                voices.push((language, voice));
-            }
-        } else {
+    let spoken: Vec<String> = if speakers.multilingual() {
+        cfg_languages.clone()
+    } else {
+        let others: Vec<&str> = cfg_languages
+            .iter()
+            .filter(|l| **l != language)
+            .map(String::as_str)
+            .collect();
+        if !others.is_empty() {
             // Said once, loudly: the door would otherwise offer languages
             // that quietly come out in the room's own.
             warn!(
@@ -542,9 +892,70 @@ fn serve(cli: Cli, store: Store) -> Result<()> {
                  them spoken)",
             );
         }
+        vec![language.clone()]
+    };
+    match kind {
+        TtsKind::Qwen3 if tts_url.is_none() => {
+            bail!("--tts qwen3 needs --tts-url (or VOX_ROOM_TTS_URL)")
+        }
+        TtsKind::Qwen3 => info!(
+            url = tts_url.as_deref().unwrap_or_default(),
+            voice = %cli.voice,
+            model = cli.tts_model.as_deref().unwrap_or("(unnamed)"),
+            key = cli.tts_key.is_some(),
+            languages = %spoken.join(", "),
+            "voice: Qwen3-TTS"
+        ),
+        TtsKind::Kokoro => {}
+        TtsKind::None => {
+            warn!("no voice: the AI's replies are shown, silently, at reading pace")
+        }
+    }
+    if let Some(url) = &clone_url {
+        info!(
+            url = %url,
+            key = clone_key.is_some(),
+            "voices: the AI can record somebody reading aloud and clone it"
+        );
     }
 
-    let factory = if cli.no_stt {
+    // What the speech server holds, for building a puppet's voice on
+    // one of them. Asked rather than assumed: the names its
+    // `/v1/audio/speech` takes are not the names a picker shows --
+    // `uncle_fu`, not "Uncle Fu" -- and a name it does not know is an
+    // HTTP 400 in the middle of a line somebody was waiting to hear.
+    // `--tts-voices` overrides it for a server that will not say.
+    let given: Vec<String> = cli
+        .tts_voices
+        .iter()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .collect();
+    let presets: Vec<String> = match (&given[..], &speakers.url) {
+        ([], Some(url)) if speakers.kind == TtsKind::Qwen3 => {
+            match tts::presets(url, speakers.key.as_deref()) {
+                Ok(have) => {
+                    info!(voices = %have.join(", "), "the speech server's own voices");
+                    have
+                }
+                // Not fatal. What it costs is the AI being told what
+                // it may build a puppet on, and it is told nothing
+                // rather than told wrong -- a preset it invents is
+                // refused by the server with its own list in the
+                // refusal, which is the next best thing.
+                Err(err) => {
+                    warn!(
+                        "the speech server wouldn't say which voices it has, so the \
+                         AI isn't told: {err:#}"
+                    );
+                    Vec::new()
+                }
+            }
+        }
+        _ => given,
+    };
+
+    let (factory, reader) = if cli.no_stt {
         // Said out loud, because from inside the room it looks like a
         // fault rather than a choice: everyone hears everyone, the
         // meters move, and not a word is written down.
@@ -552,35 +963,19 @@ fn serve(cli: Cli, store: Store) -> Result<()> {
             "--no-stt: nothing anyone says is transcribed, so there is no \
              conversation and the AI cannot hear the room"
         );
-        None
+        (None, None)
     } else {
-        Some(stt::Models::load(&models_dir)?.factory())
+        let models = stt::Models::load(&models_dir)?;
+        // The one-shot reader first: `factory` consumes the models,
+        // and both want the same loaded copy of the last-pass model.
+        let reader = models.transcriber();
+        (Some(models.factory()), Some(reader))
     };
 
-    let generation = Arc::new(AtomicU64::new(0));
-    let (turn_tx, turn_rx) = crossbeam_channel::unbounded();
-    let cfg = RoomConfig {
-        agent_name: cli.name.clone(),
-        aliases: cli
-            .aliases
-            .iter()
-            .map(|a| a.trim().to_string())
-            .filter(|a| !a.is_empty())
-            .collect(),
-        reply_after: Duration::from_millis(cli.reply_after_ms),
-        confirm: Duration::from_millis(cli.confirm_ms),
-        engaged_for: Duration::from_millis(cli.engaged_for_ms),
-        history: cli.history,
-        language: language.clone(),
-        languages: cfg_languages.clone(),
-        // What the voices above can actually say, which is not always
-        // what the door offers: one voice means one language, however
-        // many are on the list.
-        spoken: voices.iter().map(|(l, _)| l.clone()).collect(),
-    };
     // Who translates, when there is more than one language and a model
-    // to do it with. Built once and shared: the local one is 75 MB of
-    // weights per direction, and every voice thread reads the same copy.
+    // to do it with. Built once and shared by every room: the local one
+    // is 75 MB of weights per direction, and every voice thread on the
+    // server reads the same copy.
     let translate: Option<Arc<dyn vox_transcribe::translate::Translate>> = match cli.translate {
         _ if cfg_languages.len() < 2 => None,
         TranslateKind::Openai => match &llm {
@@ -603,91 +998,248 @@ fn serve(cli: Cli, store: Store) -> Result<()> {
         },
         TranslateKind::Local => Some(local_translator(&models_dir, &cfg_languages)?),
     };
-
-    // The two ends of the typing queue are handed out separately: the
-    // room is built with the one it puts work on, the translators get
-    // the other once there is a room for them to report back to.
-    let typing = agent::typing_queue(translate.as_ref());
-    let (typing_tx, typing_rx) = match typing {
-        Some((tx, rx)) => (Some(tx), Some(rx)),
-        None => (None, None),
-    };
-    // The interpreters: one per language the room is listening in,
-    // including its own -- a Russian speaker's words have to reach the
-    // English listeners as much as the other way about. Same two
-    // conditions as the AI's own languages, for the same reasons: a
-    // translator to put it into words, and a voice that can say them.
-    let mut interp_tx = BTreeMap::new();
-    let mut interp_rx = Vec::new();
-    if cli.interpret && translate.is_some() && voices.len() > 1 {
-        for (language, _) in &voices {
-            let (tx, rx) = interp::queue();
-            interp_tx.insert(language.clone(), tx);
-            interp_rx.push((language.clone(), rx));
-        }
+    if cli.interpret && translate.is_some() && spoken.len() > 1 {
         info!(
-            languages = %voices.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>().join(", "),
+            languages = %spoken.join(", "),
             voice = %cli.interpreter_voice,
             "interpreting: what people say is spoken to whoever doesn't speak it"
         );
     }
-    let room = Room::new(
-        store,
-        cfg,
-        generation.clone(),
-        turn_tx,
-        typing_tx,
-        interp_tx,
-        factory,
-    )?;
-    if let Some(rx) = typing_rx {
-        if let Some(t) = translate.clone() {
-            agent::spawn_typists(room.clone(), t, rx, 2);
+
+    // The AIs every room gets. The first is the one the old flags
+    // describe; `--bot` adds the others, each with a voice and a
+    // prompt of its own.
+    let mut bots = vec![room::BotConfig::new(
+        &cli.name,
+        cli.aliases
+            .iter()
+            .map(|a| a.trim().to_string())
+            .filter(|a| !a.is_empty())
+            .collect(),
+    )];
+    let mut voices: BTreeMap<String, String> =
+        BTreeMap::from([(cli.name.clone(), cli.voice.clone())]);
+    let mut prompts: BTreeMap<String, String> = BTreeMap::new();
+    for spec in cli.bots.iter().filter(|b| !b.trim().is_empty()) {
+        let mut parts = spec.splitn(3, ':');
+        let name = parts.next().unwrap_or_default().trim().to_string();
+        if name.is_empty() {
+            bail!("--bot wants a name, as NAME or NAME:VOICE or NAME:VOICE:PROMPT_FILE");
         }
+        if bots.iter().any(|b| b.name.eq_ignore_ascii_case(&name)) {
+            bail!("two AIs called {name:?}: they answer to their names, so they need their own");
+        }
+        let said = parts.next().unwrap_or("").trim();
+        voices.insert(
+            name.clone(),
+            if said.is_empty() {
+                cli.voice.clone()
+            } else {
+                said.to_string()
+            },
+        );
+        if let Some(file) = parts.next().map(str::trim).filter(|f| !f.is_empty()) {
+            let text = std::fs::read_to_string(file)
+                .with_context(|| format!("read {name}'s prompt from {file}"))?;
+            prompts.insert(name.clone(), text);
+        }
+        // A bot nobody configured aliases for answers to its own name.
+        bots.push(room::BotConfig::new(&name, Vec::new()));
     }
-    for (language, rx) in interp_rx {
-        let Some(t) = translate.clone() else { break };
-        interp::spawn(
-            room.clone(),
-            &language,
-            make_voice(&language, &cli.interpreter_voice)?,
-            t,
-            rx,
+    if bots.len() > 1 {
+        info!(
+            bots = %bots.iter().map(|b| b.name.as_str()).collect::<Vec<_>>().join(", "),
+            "more than one AI in every room: at a pause they are all given the \
+             turn, and the first to say something keeps it"
         );
     }
-    room.mixer.spawn();
-    agent::Agent {
-        llm,
-        prompt,
-        translate,
-        generation,
-    }
-    .spawn(room.clone(), voices, turn_rx);
 
-    let r = room.clone();
-    std::thread::Builder::new()
-        .name("vox-room-tick".into())
-        .spawn(move || {
-            let mut meters = false;
-            let mut ticks: u32 = 0;
-            loop {
-                r.tick(Instant::now());
-                // Meters at 10 per second.
-                meters = !meters;
-                if meters {
-                    r.emit_levels();
+    // The MCP servers the house lends its AIs. Said hello to on their
+    // own threads, so a picture server that is slow or down costs the
+    // AI its picture tools and nothing else; see `mcp::connect_all`.
+    let mcp = mcp_servers(&cli.mcp, &cli.mcp_key)?;
+    mcp::connect_all(&mcp);
+
+    // The settings every room shares. What makes one room different
+    // from another -- its name, who it admits, how its AI takes the
+    // turn to begin with -- is filled in by `rooms::Rooms`.
+    let base = RoomConfig {
+        id: String::new(),
+        title: String::new(),
+        only: None,
+        default_mode: room::Mode::Auto,
+        ai_turns: cli.ai_turns,
+        bots,
+        reply_after: Duration::from_millis(cli.reply_after_ms),
+        confirm: Duration::from_millis(cli.confirm_ms),
+        engaged_for: Duration::from_millis(cli.engaged_for_ms),
+        history: cli.history,
+        language: language.clone(),
+        languages: cfg_languages.clone(),
+        spoken,
+    };
+
+    // Everything a room is made of, built on demand: the shared rooms
+    // now, somebody's own the first time they walk into it. What it
+    // captures is the expensive part, made once -- the loaded models,
+    // the translator, the endpoint -- and what it builds per room is
+    // the cheap part: a database handle, a mixer, a few threads.
+    let make: rooms::Make = {
+        let db = db.clone();
+        let speakers = Arc::new(speakers);
+        let translate = translate.clone();
+        let clones = clones.clone();
+        let voice = cli.voice.clone();
+        let presets = presets.clone();
+        let reader = reader.clone();
+        let interpreter_voice = cli.interpreter_voice.clone();
+        let (voices, prompts) = (voices, prompts);
+        let interpret = cli.interpret;
+        Box::new(move |cfg: RoomConfig| -> Result<Arc<Room>> {
+            // `Room::new` scopes it to the room it is given.
+            let store = Store::open(&db)?;
+            let languages = cfg.spoken.clone();
+            // The two ends of the typing queue are handed out
+            // separately: the room is built with the one it puts work
+            // on, the translators get the other once there is a room
+            // for them to report back to.
+            let (typing_tx, typing_rx) = match agent::typing_queue(translate.as_ref()) {
+                Some((tx, rx)) => (Some(tx), Some(rx)),
+                None => (None, None),
+            };
+            // The interpreters: one per language the room is listening
+            // in, including its own -- a Russian speaker's words have
+            // to reach the English listeners as much as the other way
+            // about. Same two conditions as the AI's own languages, for
+            // the same reasons: a translator to put it into words, and
+            // a voice that can say them.
+            let mut interp_tx = BTreeMap::new();
+            let mut interp_rx = Vec::new();
+            // Never in a room of somebody's own: there is one person
+            // in it and the AI already answers in their language, so
+            // there is nobody for an interpreter to interpret to.
+            if interpret && translate.is_some() && languages.len() > 1 && cfg.only.is_none() {
+                for language in &languages {
+                    let (tx, rx) = interp::queue();
+                    interp_tx.insert(language.clone(), tx);
+                    interp_rx.push((language.clone(), rx));
                 }
-                // `vox_room invite` and `uninvite` write to the database
-                // from their own process, so look for their work now and
-                // then rather than only at startup.
-                ticks = ticks.wrapping_add(1);
-                if ticks.is_multiple_of(40) {
-                    r.reconcile_people();
-                }
-                std::thread::sleep(Duration::from_millis(50));
             }
+            // How this room makes a voice for somebody who wasn't
+            // there when it opened, which is what a puppet is. None
+            // where there is nothing to speak with, and then there
+            // are no puppets and nothing in the AI's prompt mentions
+            // them -- a puppet with no voice is a name on a fader.
+            let speaking: Option<room::VoiceFactory> = match speakers.kind {
+                TtsKind::None => None,
+                _ => {
+                    let speakers = speakers.clone();
+                    let own = voice.clone();
+                    Some(Arc::new(
+                        move |language: &str,
+                              preset: &str,
+                              delivery: &str,
+                              borrowed: tts::Borrowed| {
+                            // A puppet nobody gave a voice to gets the
+                            // room's own: a character that sounds like
+                            // the AI beats one that says nothing.
+                            let preset = match preset.trim() {
+                                "" => own.as_str(),
+                                said => said,
+                            };
+                            speakers.voice(language, preset, delivery, borrowed)
+                        },
+                    ))
+                }
+            };
+            let (room, wiring) =
+                Room::new(
+                    store,
+                    cfg,
+                    typing_tx,
+                    interp_tx,
+                    factory.clone(),
+                    speaking,
+                    reader.clone(),
+                )?;
+            if let Some(rx) = typing_rx {
+                if let Some(t) = translate.clone() {
+                    agent::spawn_typists(room.clone(), t, rx, 2);
+                }
+            }
+            for (language, rx) in interp_rx {
+                let Some(t) = translate.clone() else { break };
+                interp::spawn(
+                    room.clone(),
+                    &language,
+                    speakers.voice(&language, &interpreter_voice, "", Default::default())?,
+                    t,
+                    rx,
+                );
+            }
+            // One agent thread per bot, and one voice per language it
+            // is spoken in -- each on its own thread, so the languages
+            // are said at the same time rather than one after another,
+            // and so are the bots.
+            // The first AI is the one this room was built around and
+            // the one that runs it; the rest are voices in it. See
+            // `agent::Allowed`.
+            // One per room: a picture made here is handed to somebody
+            // here. See `agent::Art`.
+            let art = Arc::new(agent::Art {
+                servers: mcp.clone(),
+            });
+            for (n, bot) in wiring.into_iter().enumerate() {
+                let preset = voices.get(&bot.name).unwrap_or(&voice);
+                let mut speaking: Vec<(String, Box<dyn tts::Voice>)> = Vec::new();
+                for language in &languages {
+                    // Every language this bot speaks in reads the one
+                    // cell: a voice it has been lent is the bot's, and
+                    // a bot that changed voice in English alone would
+                    // be two different people in one room.
+                    speaking.push((
+                        language.clone(),
+                        speakers.voice(language, preset, "", bot.borrowed.clone())?,
+                    ));
+                }
+                agent::Agent {
+                    llm: llm.clone(),
+                    name: bot.name.clone(),
+                    // The voice-cloning server, where the house has
+                    // one: the tools that record somebody and keep a
+                    // voice from them are its, and a bot in a house
+                    // without one is never offered them.
+                    clones: clones.clone(),
+                    // What the speech server holds, for building a
+                    // puppet's voice on one of them. Only the first
+                    // AI is ever offered a puppet, so only it is ever
+                    // shown this.
+                    presets: presets.clone(),
+                    // Its own instructions, or the room's when it was
+                    // given none of its own. `{name}` is filled in
+                    // either way, so the default already says which of
+                    // them it is talking as.
+                    prompt: prompts.get(&bot.name).unwrap_or(&prompt).clone(),
+                    allowed: if n == 0 {
+                        agent::Allowed::Everything
+                    } else {
+                        agent::Allowed::Looking
+                    },
+                    translate: translate.clone(),
+                    generation: bot.generation,
+                    art: art.clone(),
+                }
+                .spawn(room.clone(), speaking, bot.turns);
+            }
+            Ok(room)
         })
-        .context("spawn tick thread")?;
+    };
+
+    // The rooms' own handle on the invite list: who may go where is
+    // asked on the way into a room, and the answer is not any one
+    // room's to give.
+    let rooms = rooms::Rooms::new(Store::open(&db)?, &base, &cli.rooms, make)?;
+    rooms.spawn_clocks()?;
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
@@ -698,7 +1250,7 @@ fn serve(cli: Cli, store: Store) -> Result<()> {
             "room open on http://{} (invite people with `vox_room invite NAME`)",
             cli.listen
         );
-        axum::serve(listener, web::router(room, screen::Screen::new()))
+        axum::serve(listener, web::router(rooms, screen::Screen::new()))
             .with_graceful_shutdown(async {
                 let _ = tokio::signal::ctrl_c().await;
             })
@@ -710,6 +1262,95 @@ fn serve(cli: Cli, store: Store) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mcp(specs: &[&str], keys: &[&str]) -> Result<Vec<Arc<mcp::Server>>> {
+        let own = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        mcp_servers(&own(specs), &own(keys))
+    }
+
+    /// Why it was refused. Through `map` rather than `unwrap_err`,
+    /// which wants `Debug` on the servers -- and a `Debug` on one of
+    /// those would print the key it holds, which is the whole thing
+    /// `mcp.rs` is careful about.
+    fn mcp_err(specs: &[&str], keys: &[&str]) -> String {
+        mcp(specs, keys)
+            .map(|_| ())
+            .expect_err("this one is not allowed")
+            .to_string()
+    }
+
+    /// Which key is whose. A key on its own is the one-server
+    /// shorthand; past that they are named, because one vendor's key
+    /// is not to be handed to another.
+    #[test]
+    fn a_key_belongs_to_the_server_it_names() {
+        let art = "art=https://example.invalid/mcp=create_inference";
+        let docs = "docs=https://docs.invalid/mcp=search";
+
+        // One server: the key on its own is obviously its.
+        let one = mcp(&[art], &["rdpk-abc"]).unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].key_for_test(), "rdpk-abc");
+
+        // Several: each is named, and each gets its own and no other.
+        let two = mcp(&[art, docs], &["art=rdpk-abc", "docs=sk-xyz"]).unwrap();
+        assert_eq!(two[0].key_for_test(), "rdpk-abc");
+        assert_eq!(two[1].key_for_test(), "sk-xyz");
+
+        // Order doesn't matter, and a named key wins over a bare one.
+        let two = mcp(&[art, docs], &["docs=sk-xyz", "art=rdpk-abc"]).unwrap();
+        assert_eq!(two[0].key_for_test(), "rdpk-abc");
+
+        // A key on its own with more than one server is refused, not
+        // quietly dropped: it was written to be used, and which server
+        // it belongs to is not the room's to guess.
+        let err = mcp_err(&[art, docs], &["rdpk-abc"]);
+        assert!(err.contains("key on its own"), "{err}");
+        assert!(err.contains("NAME=KEY"), "it says what to write: {err}");
+        assert!(err.contains("art, docs"), "and which servers: {err}");
+
+        // A server nobody gave a key is allowed -- not everything
+        // wants authenticating -- and gets an empty one.
+        let two = mcp(&[art, docs], &["art=rdpk-abc"]).unwrap();
+        assert_eq!(two[1].key_for_test(), "");
+        assert_eq!(mcp(&[art], &[]).unwrap()[0].key_for_test(), "");
+
+        // A key that merely contains `=` is still a key on its own:
+        // base64 ends in one, and `art=…` is only named because `art`
+        // is a server here.
+        let one = mcp(&[art], &["c2VjcmV0Lw=="]).unwrap();
+        assert_eq!(one[0].key_for_test(), "c2VjcmV0Lw==");
+    }
+
+    /// What the flag refuses, and why each would be worse discovered
+    /// in the middle of a conversation.
+    #[test]
+    fn a_server_has_to_be_one_the_room_can_lend() {
+        let art = "art=https://example.invalid/mcp=create_inference";
+
+        // The name prefixes a tool name, and the endpoints want
+        // `^[a-zA-Z0-9_-]+$` -- so a bad one breaks every tool the
+        // server lends, not just itself.
+        let err = mcp_err(&["my art=https://example.invalid/mcp"], &[]);
+        assert!(err.contains("prefixes tool names"), "{err}");
+
+        // Only streamable HTTP is spoken.
+        let err = mcp_err(&["art=npx @retrodiffusion/mcp"], &[]);
+        assert!(err.contains("not stdio"), "{err}");
+
+        // Two servers of one name would collide in the offer.
+        let err = mcp_err(&[art, "art=https://other.invalid/mcp"], &[]);
+        assert!(err.contains("two --mcp servers"), "{err}");
+
+        // Nothing at all is a house with no picture tools, not an error.
+        assert!(mcp(&[], &[]).unwrap().is_empty());
+        assert!(mcp(&["", "  "], &[""]).unwrap().is_empty(), "blank is not a server");
+
+        // And the tool list is optional, though leaving it off lends
+        // every tool the server has.
+        let all = mcp(&["art=https://example.invalid/mcp"], &[]).unwrap();
+        assert_eq!(all.len(), 1);
+    }
 
     /// One test, because it mutates the process environment.
     #[test]

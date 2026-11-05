@@ -1,72 +1,237 @@
-:root {
-  --bg: #f6f5f2;
-  --panel: #ffffff;
-  --ink: #1d1d1f;
-  --muted: #6b6b70;
-  --line: #e3e1dc;
-  --accent: #3d5afe;
-  --accent-ink: #ffffff;
-  --agent: #7c4dff;
-  --danger: #d93025;
-  --ok: #188038;
-  --meter: #34a853;
-  --bubble: #f0efeb;
-  --shadow: 0 1px 2px rgb(0 0 0 / 6%), 0 2px 8px rgb(0 0 0 / 4%);
-  color-scheme: light;
-}
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #141416;
-    --panel: #1c1c1f;
-    --ink: #ececee;
-    --muted: #9a9aa1;
-    --line: #2c2c31;
-    --accent: #7b8cff;
-    --accent-ink: #0d0d10;
-    --agent: #b39dff;
-    --danger: #ff6b5e;
-    --ok: #5bd17a;
-    --meter: #5bd17a;
-    --bubble: #242428;
-    --shadow: none;
-    color-scheme: dark;
-  }
-}
+/* The room's global styles.
+   =========================
+
+   Three things live here and nothing else: the look the room is wearing
+   (imported below), the handful of element defaults every component
+   inherits, and the two blocks of markup that are built outside any
+   component -- the dialogs, which are raised from several places, and
+   the HTML a card's body is turned into.
+
+   Nothing here names a colour. `themes/tokens.css` says what the
+   vocabulary is; `themes/obsidian.css` and `themes/legacy.css` answer
+   it; and `themes/chrome.css` draws the one shape -- a panel -- that
+   would otherwise be copied into nine components. */
+
+/* The vocabulary first, so a theme overrides it rather than the other
+   way round, then the themes, then the furniture built out of both. */
+@import './themes/tokens.css';
+@import './themes/obsidian.css';
+@import './themes/legacy.css';
+@import './themes/chrome.css';
+
 * { box-sizing: border-box; }
-html, body { margin: 0; height: 100%; }
+html, body {
+  margin: 0;
+  height: 100%;
+  /* No pull-to-refresh. The room is a page you sit in with your
+     microphone open: a swipe that reloads it drops the audio, the
+     socket and your place in the conversation, and there is nothing
+     here that a reload would fetch. It also stops a swipe that runs
+     off the end of a list from rubber-banding the whole page.
+     Honoured by Safari 16 and later; older ones keep the gesture. */
+  overscroll-behavior: none;
+}
 body {
-  background: var(--bg);
+  /* The field the panels lie on. In a flat theme this is the page
+     itself and there are no panels; in a framed one it is darker than
+     anything laid on it, and what shows between the frames. */
+  background: var(--deep-image) var(--deep);
+  background-attachment: fixed;
   color: var(--ink);
-  font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  font: var(--font);
 }
 #app { height: 100%; }
+/* A button is round. The cut corner is the console's, and the console
+   is the panels -- see `themes/chrome.css`. A button is a thing inside
+   one, there are a great many of them, and machining every one made
+   the room something to look at rather than to talk in. */
 button {
   font: inherit;
-  border: 1px solid var(--line);
-  background: var(--panel);
-  color: var(--ink);
-  border-radius: 8px;
+  border: 1px solid var(--btn-border);
+  background: var(--btn-image) var(--btn-bg);
+  color: var(--btn-ink);
+  border-radius: var(--btn-radius);
+  box-shadow: var(--btn-shadow);
   padding: 6px 12px;
   cursor: pointer;
 }
-button:hover { border-color: var(--muted); }
-button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+button:hover {
+  border-color: var(--btn-hover-border);
+  background: var(--btn-image) var(--btn-hover-bg);
+  color: var(--btn-hover-ink);
+}
+/* A cut corner is a clip, and a clip takes an outline drawn outside the
+   box away with it -- and takes its children's with it too. Said once,
+   here, for everything the browser can focus: the room has clipped
+   panels and clipped cards, the heading that names the room is a
+   button that is one of them, and a focus ring you cannot see is the
+   one piece of chrome that is not a matter of taste. */
+:focus-visible { outline-offset: var(--focus-inset); }
+/* The one the room wants you to press. Same shape as the rest, lit. */
+button.primary {
+  background: var(--btn-on-image) var(--btn-on-bg);
+  color: var(--btn-on-ink);
+  border-color: var(--btn-on-border);
+  box-shadow: var(--btn-on-shadow);
+}
+button.primary:hover { color: var(--btn-on-ink); }
 button.danger { color: var(--danger); }
 button:disabled { opacity: 0.5; cursor: default; }
-input[type="range"] { accent-color: var(--accent); }
+input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
 
-/* The room's dialogs: the question, a game's card, a game's prompt. They
+/* A key named beside the thing it works on -- `Done Esc`, `Mute Space`
+   -- is help on a keyboard and a lie on a phone, where it names a key
+   there is no way to press. Marked `shortcut` at each of the few places
+   it is a hint, because a `<kbd>` is just as often the binding itself
+   or a word in a sentence, and neither of those may go anywhere.
+
+   Touch-primary rather than narrow: a small window on a laptop still
+   has the keys, and a tablet with one attached keeps them too. */
+@media (hover: none) and (pointer: coarse) {
+  kbd.shortcut { display: none; }
+}
+
+/* The faders, and the one volume slider that is not one.
+   =====================================================
+
+   Themed like everything else rather than left to the browser. How far
+   along the thing has got is `--at`, set on the input by whoever knows
+   the number: a range the page has styled gives no way to paint the
+   part behind the thumb, and a fader you can only read off the thumb
+   is a fader you have to look twice at.
+
+   The flat theme's values are the native control's -- a hairline
+   groove, a round bead in the accent colour -- so this is the same
+   fader it always was, with a theme able to get at it. */
+input[type="range"] {
+  appearance: none;
+  -webkit-appearance: none;
+  height: var(--range-h);
+  background:
+    linear-gradient(var(--range-fill), var(--range-fill))
+      left center / var(--at, 0%) var(--range-groove) no-repeat,
+    linear-gradient(var(--range-track), var(--range-track))
+      left center / 100% var(--range-groove) no-repeat;
+  border-radius: calc(var(--range-groove) / 2);
+  cursor: pointer;
+}
+/* The slug. Each browser names it differently and throws out a whole
+   rule it cannot parse, so the two say the same thing twice. The
+   margin is what centres it: with the page styling the track, the
+   thumb hangs from the top of it. */
+input[type="range"]::-webkit-slider-runnable-track {
+  height: var(--range-h);
+  background: none;
+}
+input[type="range"]::-webkit-slider-thumb {
+  appearance: none;
+  -webkit-appearance: none;
+  width: var(--range-thumb-size);
+  height: var(--range-thumb-size);
+  margin-top: calc((var(--range-h) - var(--range-thumb-size)) / 2);
+  border-radius: 50%;
+  background: var(--range-thumb-image) var(--range-thumb);
+  border: 1px solid var(--range-thumb-border);
+  box-shadow: var(--range-thumb-shadow);
+}
+input[type="range"]::-moz-range-track { height: var(--range-h); background: none; }
+input[type="range"]::-moz-range-progress { background: none; }
+input[type="range"]::-moz-range-thumb {
+  width: var(--range-thumb-size);
+  height: var(--range-thumb-size);
+  border-radius: 50%;
+  background: var(--range-thumb-image) var(--range-thumb);
+  border: 1px solid var(--range-thumb-border);
+  box-shadow: var(--range-thumb-shadow);
+}
+
+/* A page that scrolls, and where the scrolling happens.
+   =====================================================
+
+   Anything that fills the window and scrolls -- the settings, the
+   owner's page, the conversation, the cards -- must be the scroller
+   *across the whole width*, and centre what is in it with padding:
+
+     padding: 24px max(16px, calc((100% - 44em) / 2)) 48px;
+
+   Not `max-width` with an auto margin. That makes the column of text
+   the scrolling element and leaves the margins either side of it inert
+   -- the wheel does nothing unless the pointer is over the words, which
+   is a page that looks scrollable everywhere and isn't. The same goes
+   for a sheet laid over the room: the sheet scrolls, not the card in
+   the middle of it, or the half of the screen around the card is dead.
+
+   `overscroll-behavior: contain` belongs on each of them too, so a
+   flick that runs off the end of one doesn't take the page with it.
+
+   The room's dialogs: the question, a game's card, a game's prompt. They
    are raised from more than one component, so the look is global. */
 dialog.ask {
   border: 1px solid var(--line);
   border-radius: 12px;
   padding: 18px 20px;
   max-width: min(28em, calc(100vw - 32px));
-  background: var(--bg, var(--bubble));
-  color: inherit;
+  background: var(--dialog-bg);
+  color: var(--ink);
   box-shadow: 0 12px 40px rgb(0 0 0 / 18%);
 }
 dialog.ask::backdrop { background: rgb(0 0 0 / 35%); }
 dialog.ask p { margin: 0 0 14px; }
 .ask-actions { display: flex; justify-content: flex-end; align-items: center; gap: 8px; }
 .ask-actions .hint { margin-right: auto; }
+
+/* What a card's body is written in. The markup is built by
+   lib/markdown.js and dropped in with {@html}, so it is outside any
+   component's scoped styles — and two components show cards, which
+   would have wanted the same block twice anyway.
+
+   A card is read rather than heard, so this is the one place in the
+   room with tables, lists and code in it. */
+.md > :first-child { margin-top: 0; }
+.md > :last-child { margin-bottom: 0; }
+.md p { margin: 0 0 8px; }
+.md h4, .md h5, .md h6 { margin: 12px 0 6px; line-height: 1.3; }
+.md h4 { font-size: 15px; }
+.md h5, .md h6 { font-size: 14px; color: var(--muted); }
+.md ul, .md ol { margin: 0 0 8px; padding-left: 1.4em; }
+.md li { margin: 2px 0; }
+.md li > ul, .md li > ol { margin: 2px 0; }
+.md blockquote {
+  margin: 0 0 8px;
+  padding-left: 10px;
+  border-left: 3px solid var(--line);
+  color: var(--muted);
+}
+.md hr { border: none; border-top: 1px solid var(--line); margin: 10px 0; }
+.md code {
+  font: 0.92em/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+  background: var(--bubble);
+  border-radius: 4px;
+  padding: 0 4px;
+}
+/* A block of code scrolls on its own rather than widening the card:
+   the room is a column, and a long line is not worth the whole of it. */
+.md pre {
+  margin: 0 0 8px;
+  padding: 8px 10px;
+  background: var(--bubble);
+  border-radius: 8px;
+  overflow-x: auto;
+}
+.md pre code { background: none; padding: 0; }
+/* The same for a table, which keeps its columns rather than squeezing
+   them: the box around it is as wide as the card, the table is as wide
+   as it needs to be, and the difference is a scrollbar. */
+.md .scroll {
+  overflow-x: auto;
+  margin: 0 0 8px;
+}
+.md table {
+  width: max-content;
+  max-width: none;
+  border-collapse: collapse;
+  font-size: 14px;
+}
+.md th, .md td { border: 1px solid var(--line); padding: 4px 8px; text-align: left; }
+.md th { background: var(--bubble); font-weight: 650; }
+.md a { color: var(--accent); }

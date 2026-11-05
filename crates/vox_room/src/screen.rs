@@ -19,6 +19,13 @@
 //! viewer who falls behind is put back to the next keyframe instead of
 //! being shown a torn picture, and the publisher is asked for one.
 //!
+//! A desktop is shared with **the room you are in** and no other: a
+//! picture reaches whoever can hear you talk about it, which is what
+//! sharing it meant. Which room that is comes from the room socket --
+//! see [`Screen::place`] -- rather than from anything this socket says,
+//! so nothing a browser can send puts its screen somewhere it isn't.
+//! Walking into another room takes your share with you.
+//!
 //! Every frame, both ways, is a 12-byte header and one encoded chunk:
 //!
 //! ```text
@@ -102,6 +109,10 @@ fn codec_ok(codec: &str) -> bool {
 
 struct Client {
     person: String,
+    /// The room this tab's person is in, as the room socket last said.
+    /// Empty until it has said: a screen socket that gets in first sees
+    /// nothing and is shown everything a moment later, by [`Screen::place`].
+    room: String,
     frames: mpsc::Sender<Vec<u8>>,
     ctl: mpsc::Sender<String>,
     /// The one full-size stream this tab has open, if any.
@@ -129,6 +140,11 @@ struct State {
     clients: HashMap<u64, Client>,
     /// Keyed by the socket that is sharing: one tab, one desktop.
     publishers: HashMap<u64, Publisher>,
+    /// Which room each person is in, by the name the rooms call them.
+    /// Kept per person rather than per socket because this is what a
+    /// screen socket opening later has to be told from, and the room
+    /// socket is what knows.
+    places: HashMap<String, String>,
     next_id: u16,
 }
 
@@ -173,27 +189,24 @@ impl Screen {
         let (frames, frames_rx) = mpsc::channel(VIEWER_QUEUE);
         let (ctl, ctl_rx) = mpsc::channel(CTL_QUEUE);
         let mut st = self.lock();
-        let needs_key = st
-            .publishers
-            .values()
-            .map(|p| (p.id, THUMB))
-            .collect::<HashSet<_>>();
+        let room = st.places.get(person).cloned().unwrap_or_default();
+        let needs_key = keys_in(&st, &room);
         st.clients.insert(
             id,
             Client {
                 person: person.to_string(),
+                room: room.clone(),
                 frames,
                 ctl,
                 watching: None,
                 needs_key,
             },
         );
-        let streams = streams_event(&st);
+        let streams = streams_event(&st, &room);
         send_ctl(&mut st, id, &streams);
         // Somebody new wants a picture, and the next keyframe of its own
         // accord could be a second or two away.
-        let sockets: Vec<u64> = st.publishers.keys().copied().collect();
-        for socket in sockets {
+        for socket in sharers_in(&st, &room) {
             ask_key(&mut st, socket, THUMB);
         }
         (frames_rx, ctl_rx)
@@ -202,6 +215,86 @@ impl Screen {
     pub fn remove_client(&self, id: u64) {
         let mut st = self.lock();
         forget(&mut st, id);
+    }
+
+    /// The rooms call `was` `now`. Everything here is keyed by that
+    /// name -- which socket belongs to whom, which room each person is
+    /// in, and whose desktop a stream is -- so it all moves at once,
+    /// rather than their share going on being somebody who is no
+    /// longer on any roster.
+    ///
+    /// A desktop being shared keeps being shared. Taking a new name is
+    /// not leaving the room -- the room socket comes back as the new
+    /// name and asks for the room it was already in, which is no
+    /// change of rooms and so no [`Screen::unshare`] -- and the browser
+    /// is never asked for the desktop again.
+    ///
+    /// Said by the room socket, like [`Screen::place`], because that is
+    /// the one here that knows. A screen socket claiming a rename could
+    /// claim somebody else's name with it.
+    pub fn renamed(&self, was: &str, now: &str) {
+        let mut st = self.lock();
+        if let Some(room) = st.places.remove(was) {
+            st.places.insert(now.to_string(), room);
+        }
+        let mut sharing = false;
+        for c in st.clients.values_mut().filter(|c| c.person == was) {
+            c.person = now.to_string();
+        }
+        for p in st.publishers.values_mut().filter(|p| p.person == was) {
+            p.person = now.to_string();
+            sharing = true;
+        }
+        // Whose a stream is goes out in the list, so the rooms watching
+        // one of theirs are told again. Nobody is sharing, nothing to
+        // say: the names in here are the publishers' alone.
+        if sharing {
+            broadcast_streams(&mut st);
+        }
+    }
+
+    /// `person` is in `room` now. Said by their room socket, on the way
+    /// in and every time they change rooms, because that socket is the
+    /// one thing here that knows -- and because a tab asked where it
+    /// was could lie, and share a desktop into a room it isn't in.
+    ///
+    /// Only where they are. A share of theirs does not come along --
+    /// [`Screen::unshare`] ends it on the way out, and this is said
+    /// after it, so the room they are arriving in is told a list with
+    /// nothing of theirs on it.
+    pub fn place(&self, person: &str, room: &str) {
+        let mut st = self.lock();
+        if st.places.get(person).is_some_and(|r| r == room) {
+            return;
+        }
+        st.places.insert(person.to_string(), room.to_string());
+        let moved: Vec<u64> = st
+            .clients
+            .iter()
+            .filter(|(_, c)| c.person == person)
+            .map(|(id, _)| *id)
+            .collect();
+        if moved.is_empty() {
+            return;
+        }
+        let fresh = keys_in(&st, room);
+        for id in &moved {
+            let Some(c) = st.clients.get_mut(id) else {
+                continue;
+            };
+            c.room = room.to_string();
+            // Whatever they had decoded belonged to the other room.
+            // Start again at the next keyframe of what is here.
+            c.needs_key = fresh.clone();
+            c.watching = None;
+        }
+        // Both rooms: the one that has lost a picture and the one that
+        // has gained it.
+        broadcast_streams(&mut st);
+        wants(&mut st);
+        for socket in sharers_in(&st, room) {
+            ask_key(&mut st, socket, THUMB);
+        }
     }
 
     /// A tab is sharing its desktop. Called again when the shared window
@@ -251,8 +344,10 @@ impl Screen {
             }
         };
         // Whatever the viewers had decoded is finished: everyone starts
-        // again at the next keyframe, with the new size.
-        for c in st.clients.values_mut() {
+        // again at the next keyframe, with the new size. Everyone in
+        // this room, that is -- nobody else was being sent it.
+        let room = st.clients[&id].room.clone();
+        for c in st.clients.values_mut().filter(|c| c.room == room) {
             c.needs_key.insert((stream, THUMB));
             c.needs_key.insert((stream, FULL));
         }
@@ -263,6 +358,50 @@ impl Screen {
         broadcast_streams(&mut st);
         wants(&mut st);
         ask_key(&mut st, id, THUMB);
+    }
+
+    /// Everything `person` is sharing stops, because they are leaving
+    /// the room it was being shared into.
+    ///
+    /// A desktop is shared *to a room*. Carrying it into the next one
+    /// would be showing a room something nobody in it asked to be
+    /// shown, and the person walking in had no moment to decide
+    /// otherwise -- so it ends here, and sharing in the new room is a
+    /// thing they do on purpose when they get there.
+    ///
+    /// Per person and not per socket, because which room somebody is in
+    /// is per person (see `places`): a second tab of theirs pressing
+    /// another room moves them, and their desktop is theirs and not
+    /// that tab's.
+    ///
+    /// The tab doing the sharing is told, so it stops encoding, lets go
+    /// of the desktop the browser gave it, and puts its button back.
+    pub fn unshare(&self, person: &str) {
+        let mut st = self.lock();
+        let theirs: Vec<u64> = st
+            .publishers
+            .iter()
+            .filter(|(_, p)| p.person == person)
+            .map(|(socket, _)| *socket)
+            .collect();
+        if theirs.is_empty() {
+            return;
+        }
+        for socket in theirs {
+            let Some(p) = st.publishers.remove(&socket) else {
+                continue;
+            };
+            info!(
+                socket,
+                person,
+                stream = p.id,
+                "stopped sharing: left the room"
+            );
+            stop_watching(&mut st, p.id);
+            send_ctl(&mut st, socket, &json!({ "type": "unshared" }));
+        }
+        broadcast_streams(&mut st);
+        wants(&mut st);
     }
 
     /// A tab stopped sharing (or its share ended by itself -- the
@@ -291,8 +430,14 @@ impl Screen {
         if let Some(old) = c.watching.take() {
             c.needs_key.remove(&(old, FULL));
         }
-        // A stream that has gone away between the click and here.
-        let live = stream.filter(|s| st.publishers.values().any(|p| p.id == *s));
+        // A stream that has gone away between the click and here -- or
+        // one in another room, which is not theirs to open.
+        let room = c.room.clone();
+        let live = stream.filter(|s| {
+            st.publishers
+                .iter()
+                .any(|(socket, p)| p.id == *s && in_room(&st, *socket, &room))
+        });
         if let Some(s) = live {
             let c = st.clients.get_mut(&id).expect("just had it");
             c.watching = Some(s);
@@ -334,6 +479,11 @@ impl Screen {
         if key {
             p.pending.remove(&kind);
         }
+        // Who it goes to: the room the sharer is in, and no other.
+        let room = match st.clients.get(&from) {
+            Some(c) => c.room.clone(),
+            None => return,
+        };
         msg[2..4].copy_from_slice(&stream.to_le_bytes());
         let mut wanting = false;
         let mut hopeless = Vec::new();
@@ -341,6 +491,9 @@ impl Screen {
             // The tab doing the sharing draws its own picture; it has no
             // use for a round trip of it.
             if *id == from {
+                continue;
+            }
+            if c.room != room {
                 continue;
             }
             if kind == FULL && c.watching != Some(stream) {
@@ -382,11 +535,13 @@ impl Screen {
     }
 }
 
-fn streams_event(st: &State) -> Value {
+/// Who is sharing in `room`, as that room's tabs are told it.
+fn streams_event(st: &State, room: &str) -> Value {
     let mut streams: Vec<Value> = st
         .publishers
-        .values()
-        .map(|p| {
+        .iter()
+        .filter(|(socket, _)| in_room(st, **socket, room))
+        .map(|(_, p)| {
             json!({
                 "id": p.id,
                 "person": p.person,
@@ -400,23 +555,70 @@ fn streams_event(st: &State) -> Value {
     json!({ "type": "streams", "streams": streams })
 }
 
+/// Tell every tab who is sharing in the room it is in. One event per
+/// room rather than one for the server: a room is told about itself.
 fn broadcast_streams(st: &mut State) {
-    let ev = streams_event(st);
-    let ids: Vec<u64> = st.clients.keys().copied().collect();
-    for id in ids {
-        send_ctl(st, id, &ev);
+    let rooms: HashSet<String> = st.clients.values().map(|c| c.room.clone()).collect();
+    for room in rooms {
+        let ev = streams_event(st, &room);
+        let ids: Vec<u64> = st
+            .clients
+            .iter()
+            .filter(|(_, c)| c.room == room)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ids {
+            send_ctl(st, id, &ev);
+        }
     }
+}
+
+/// Whether the tab on `socket` is in `room`.
+fn in_room(st: &State, socket: u64, room: &str) -> bool {
+    st.clients.get(&socket).is_some_and(|c| c.room == room)
+}
+
+/// The sockets sharing a desktop in `room`.
+fn sharers_in(st: &State, room: &str) -> Vec<u64> {
+    st.publishers
+        .keys()
+        .copied()
+        .filter(|socket| in_room(st, *socket, room))
+        .collect()
+}
+
+/// Every thumbnail a tab arriving in `room` has yet to see a keyframe
+/// of, which is all of them.
+fn keys_in(st: &State, room: &str) -> HashSet<(u16, u8)> {
+    st.publishers
+        .iter()
+        .filter(|(socket, _)| in_room(st, **socket, room))
+        .map(|(_, p)| (p.id, THUMB))
+        .collect()
 }
 
 /// Tell each publisher whether anyone has its full size open, so it can
 /// stop encoding what nobody is looking at.
 fn wants(st: &mut State) {
-    let watched: HashSet<u16> = st.clients.values().filter_map(|c| c.watching).collect();
+    // By room, so a watcher who has walked out doesn't keep a publisher
+    // encoding the full size for a room they are no longer in.
+    let watched: HashSet<(String, u16)> = st
+        .clients
+        .values()
+        .filter_map(|c| c.watching.map(|s| (c.room.clone(), s)))
+        .collect();
+    let rooms: HashMap<u64, String> = st
+        .clients
+        .iter()
+        .map(|(id, c)| (*id, c.room.clone()))
+        .collect();
     let changed: Vec<(u64, bool)> = st
         .publishers
         .iter_mut()
         .filter_map(|(socket, p)| {
-            let want = watched.contains(&p.id);
+            let want = rooms
+                .get(socket)
+                .is_some_and(|room| watched.contains(&(room.clone(), p.id)));
             (want != p.wanted).then(|| {
                 p.wanted = want;
                 (*socket, want)
@@ -710,6 +912,59 @@ mod tests {
         // Frames from a socket that has gone reach nobody.
         screen.frame(ALEX, frame(THUMB, true));
         assert!(ryan.got().is_empty());
+    }
+
+    /// A desktop is shared to a room. Walking into the next one does
+    /// not take it along: it stops on the way out, and sharing it where
+    /// they have arrived is something they ask for again.
+    #[test]
+    fn changing_rooms_ends_the_share_rather_than_carrying_it() {
+        let screen = Screen::new();
+        let mut alex = tab(&screen, ALEX, "Alex");
+        let mut ryan = tab(&screen, RYAN, "Ryan");
+        let mut mike = tab(&screen, MIKE, "Mike");
+        screen.place("Alex", "Lobby");
+        screen.place("Ryan", "Lobby");
+        screen.place("Mike", "Study");
+        share(&screen, ALEX);
+        screen.watch(RYAN, Some(1));
+        let shown = |t: &mut Tab| {
+            t.control()
+                .into_iter()
+                .rfind(|v| v["type"] == "streams")
+                .map(|v| v["streams"].as_array().unwrap().len())
+        };
+        assert_eq!(
+            shown(&mut ryan),
+            Some(1),
+            "the room it is shared to sees it"
+        );
+        alex.control();
+        mike.control();
+
+        // Alex presses the Study, which is these two calls in the order
+        // the room socket makes them.
+        screen.unshare("Alex");
+        screen.place("Alex", "Study");
+
+        assert!(
+            alex.control().iter().any(|v| v["type"] == "unshared"),
+            "the sharing tab is told to let the desktop go"
+        );
+        assert_eq!(
+            shown(&mut ryan),
+            Some(0),
+            "the room left has nothing of theirs"
+        );
+        assert_eq!(
+            shown(&mut mike),
+            Some(0),
+            "and the room walked into is shown nothing nobody asked for"
+        );
+        // Frames from a share that has ended reach nobody, in either room.
+        screen.frame(ALEX, frame(THUMB, true));
+        assert!(ryan.got().is_empty());
+        assert!(mike.got().is_empty());
     }
 
     #[test]

@@ -1,26 +1,23 @@
 <script>
   import { room } from '../lib/room.svelte.js';
+  import { markdown } from '../lib/markdown.js';
 
   const time = (ms) => new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 </script>
 
 <!-- The cards one person is holding: the server sends these events to
      their tabs and nobody else's, so nothing here is in another browser
-     at all. -->
-<section class="cards" aria-label="Just for you">
+     at all. Holding none of them, you are not shown this at all — App
+     leaves it out rather than giving the screen over to an explanation
+     of what might one day appear in it. -->
+<section class="cards panel" aria-label="Just for you">
   <header>
     <h2>Just for you</h2>
-    {#if room.cards.length}<span class="count">{room.cards.length}</span>{/if}
+    <span class="count">{room.cards.length}</span>
     <span class="only">on no one else's screen</span>
   </header>
 
   <div class="scroll">
-    {#if room.cards.length === 0}
-      <p class="empty">
-        Nothing yet. What {room.agent.name} means for you alone appears here —
-        a secret role, a hand, what only you noticed.
-      </p>
-    {/if}
     <!-- Keyed by when it was dealt as well as which card it is, so one
          the AI has rewritten comes in with the same glow as a new one. -->
     {#each room.cards as c (`${c.id}-${c.at}`)}
@@ -29,7 +26,11 @@
           <span class="title">{c.title}</span>
           <span class="time">{time(c.at)}</span>
         </div>
-        <p class="body">{c.body}</p>
+        <!-- Written to be read, so it is written in markdown: a hand
+             is a list, a standing order has the important part in bold.
+             `markdown` escapes everything before it builds a single
+             tag, so nothing in here can be markup of its own. -->
+        <div class="body md">{@html markdown(c.body)}</div>
       </article>
     {/each}
   </div>
@@ -40,7 +41,12 @@
     display: flex;
     flex-direction: column;
     min-height: 0;
-    background: color-mix(in srgb, var(--agent) 4%, transparent);
+    /* The wash that says this column is the AI's doing. The colour
+       only: `.panel` lays the frame's cut corners and fill into the
+       same property, and a whole `background` here would paint over
+       them. In a flat theme `--surface` is nothing, so this is the
+       same four per cent of agent over the page it always was. */
+    background-color: color-mix(in srgb, var(--agent) 4%, var(--surface));
   }
   header {
     display: flex;
@@ -51,14 +57,15 @@
   }
   h2 {
     font-size: 13px;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
+    text-transform: var(--head-transform);
+    letter-spacing: var(--head-letter);
+    font-weight: var(--head-weight);
     color: var(--agent);
     margin: 0;
   }
   .count {
     font-size: 11px;
-    color: var(--accent-ink);
+    color: var(--on-solid);
     background: var(--agent);
     border-radius: 999px;
     padding: 0 6px;
@@ -66,6 +73,7 @@
   .only { font-size: 12px; color: var(--muted); margin-left: auto; }
   .scroll {
     overflow-y: auto;
+    overscroll-behavior: contain;
     min-height: 0;
     flex: 1;
     display: flex;
@@ -75,11 +83,10 @@
        the width of half an ultrawide. */
     padding: 16px max(16px, calc((100% - 44em) / 2));
   }
-  .empty { color: var(--muted); text-align: center; margin: auto; max-width: 26em; }
   .card {
     border: 1px solid color-mix(in srgb, var(--agent) 45%, var(--line));
     border-radius: 10px;
-    background: var(--panel);
+    background: var(--card-image) var(--panel);
     padding: 10px 14px;
     animation: dealt 1.2s ease-out;
   }
@@ -89,7 +96,6 @@
   .body {
     margin: 6px 0 0;
     line-height: 1.5;
-    white-space: pre-wrap;
     overflow-wrap: anywhere;
   }
   @keyframes dealt {

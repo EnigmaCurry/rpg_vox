@@ -1,6 +1,8 @@
-// Plays this tab's mix: decoded mono PCM posted from the main thread,
-// through an adaptive jitter buffer. Adapted from rpg_vox's
-// monitor-player worklet:
+// Plays this tab's mix: decoded mono PCM posted straight from the worker
+// that decodes it, down a port handed over at startup, through an
+// adaptive jitter buffer. The page's own thread is not in the path; what
+// does go to it, on this processor's own port, is the stats below.
+// Adapted from rpg_vox's monitor-player worklet:
 //
 //   * The target starts at ~40 ms.
 //   * Each underrun (an output block of silence because the ring was
@@ -30,7 +32,11 @@ class Player extends AudioWorkletProcessor {
     this.lastUnderruns = 0;
     this.blocks = 0;
     this.port.onmessage = (ev) => {
-      if (ev.data instanceof Float32Array) this.enqueue(ev.data);
+      if (ev.data?.pcm instanceof MessagePort) {
+        ev.data.pcm.onmessage = (m) => {
+          if (m.data instanceof Float32Array) this.enqueue(m.data);
+        };
+      }
     };
   }
 

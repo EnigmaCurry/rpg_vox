@@ -3,12 +3,20 @@
 // Opus frames at 48 kHz over the room's WebSocket, encoded and decoded
 // with WebCodecs. Needs Chrome 94+, Firefox 130+ or Safari 16.4+, and a
 // secure page (HTTPS or localhost) for the mic.
+//
+// What is here is everything the audio needs the page's own thread for:
+// the devices, the AudioContext and its nodes, the faders. The frames
+// themselves are not -- the socket and both codecs are in a worker (see
+// link.js and audio.worker.js), and the only thing this does with them
+// is introduce its two worklets to it.
 
 import playerUrl from './player.worklet.js?url';
 import micUrl from './mic.worklet.js?url';
 
 const RATE = 48000;
-const FRAME_US = 20000;
+/// How long the room's sound takes to go and to come back, in seconds.
+/// See `RoomAudio.hushRoom`.
+const HUSH_S = 0.015;
 
 export function supported() {
   return typeof window.AudioDecoder === 'function'
@@ -59,27 +67,74 @@ export function onDeviceChange(fn) {
 }
 
 export class RoomAudio {
-  constructor(send) {
-    // send(bytes): put one encoded mic frame on the WebSocket.
-    this.send = send;
+  constructor(link) {
+    // The room's socket and codec, in their worker.
+    this.link = link;
     this.ctx = null;
-    this.decoder = null;
     this.player = null;
     this.volume = null;
-    this.encoder = null;
+    // The room's sound, cut while push to talk is held on half duplex.
+    // Its own node rather than the volume one: what you set in Settings
+    // is yours to come back to, and a hush that moved the slider would
+    // lose it.
+    this.hush = null;
+    // Whether it is cut right now, so a context started while push to
+    // talk is held comes up silent rather than opening at full.
+    this.silent = false;
     this.stream = null;
-    this.muted = false;
-    this.inTs = 0;
-    this.outTs = 0;
+    this._muted = false;
+    // Where the player worklet's own reading of its jitter buffer goes:
+    // `{ bufferMs, targetMs }`, about four times a second. Nothing in
+    // the room draws it -- it is for whoever is working out why the
+    // audio is choppy, and `joinAudio` hands it to the console in a
+    // development build.
+    //
+    // The handler below is set whether or not anybody wants the
+    // numbers, and must stay that way: an `AudioWorkletNode` port with
+    // no `onmessage` is a port that was never started, and the worklet
+    // posts regardless, so the messages would queue for the length of
+    // the call.
     this.onStats = null;
-    // Loudest sample of the mix since the last takeHeard().
-    this.heard = 0;
   }
 
-  takeHeard() {
-    const h = this.heard;
-    this.heard = 0;
-    return h;
+  /// Whether this person's mic is sending silence. Set on the way in and
+  /// whenever it is pressed; the worker is what acts on it, since the
+  /// frames are its to fill.
+  get muted() {
+    return this._muted;
+  }
+
+  set muted(on) {
+    this._muted = on;
+    this.link.setMuted(on);
+  }
+
+  /// Cut the room's sound dead, or let it back in.
+  ///
+  /// Held for as long as push to talk is held, by somebody who has
+  /// asked for half duplex -- see `setPttHush`. That is the setting for
+  /// speakers with a microphone pointed at them: whatever the room is
+  /// saying goes into their mic, is transcribed as theirs, and is read
+  /// back to the room as something they said. The mic cannot be made
+  /// deaf to one sound in the room it is in, so the room stops making
+  /// it. On a headset nothing is cut and this is never called.
+  ///
+  /// Ramped rather than switched. Zero at a stroke is a click, and a
+  /// click is a sound the mic hears too; `HUSH_S` is too short to be a
+  /// fade and long enough not to be an edge.
+  ///
+  /// The frames keep arriving and the player keeps playing them, so
+  /// what is missed is missed rather than queued -- a room that caught
+  /// up afterwards would be a room talking over itself, a second
+  /// behind, every time somebody let go of the key.
+  hushRoom(on) {
+    this.silent = on;
+    const gain = this.hush?.gain;
+    if (!gain || !this.ctx) return;
+    const now = this.ctx.currentTime;
+    gain.cancelScheduledValues(now);
+    gain.setValueAtTime(gain.value, now);
+    gain.linearRampToValueAtTime(on ? 0 : 1, now + HUSH_S);
   }
 
   /// Start hearing the room. Call from a click: browsers only start audio
@@ -95,9 +150,12 @@ export class RoomAudio {
       numberOfOutputs: 1,
       outputChannelCount: [2],
     });
+    // The stats come up this port; the mix goes down a port of its own,
+    // straight from the worker -- see `Link.usePlayer`.
     this.player.port.onmessage = (ev) => this.onStats?.(ev.data);
     this.volume = new GainNode(this.ctx, { gain: volume });
-    this.player.connect(this.volume).connect(this.ctx.destination);
+    this.hush = new GainNode(this.ctx, { gain: this.silent ? 0 : 1 });
+    this.player.connect(this.hush).connect(this.volume).connect(this.ctx.destination);
     // A context the browser suspends or interrupts (a modal dialog, an
     // audio device change) is started again at once, or on the next click.
     this.ctx.onstatechange = () => {
@@ -105,7 +163,7 @@ export class RoomAudio {
       console.info('[room] audio', this.ctx.state);
       if (this.ctx.state !== 'running' && this.ctx.state !== 'closed') this.resume();
     };
-    this.makeDecoder();
+    this.link.usePlayer(this.player);
   }
 
   /// Play the room through one speaker. A device that has gone away
@@ -126,49 +184,14 @@ export class RoomAudio {
     }
   }
 
-  makeDecoder() {
-    this.decoder = new AudioDecoder({
-      output: (data) => {
-        const pcm = new Float32Array(data.numberOfFrames);
-        try {
-          data.copyTo(pcm, { planeIndex: 0, format: 'f32-planar' });
-        } finally {
-          data.close();
-        }
-        let peak = this.heard;
-        for (let i = 0; i < pcm.length; i++) peak = Math.max(peak, Math.abs(pcm[i]));
-        this.heard = peak;
-        this.player?.port.postMessage(pcm, [pcm.buffer]);
-      },
-      error: (e) => console.error('[room] decoder', e),
-    });
-    this.decoder.configure({ codec: 'opus', sampleRate: RATE, numberOfChannels: 1 });
-  }
-
-  /// One Opus frame of this tab's mix.
-  frame(bytes) {
-    if (!this.ctx) return;
-    // A decoder that hit an error is closed for good: make a new one.
-    if (this.decoder?.state === 'closed') {
-      console.warn('[room] decoder closed; starting a new one');
-      this.makeDecoder();
-    }
-    if (this.decoder?.state !== 'configured') return;
-    try {
-      this.decoder.decode(new EncodedAudioChunk({ type: 'key', timestamp: this.inTs, duration: FRAME_US, data: bytes }));
-      this.inTs += FRAME_US;
-    } catch (e) {
-      console.warn('[room] decode', e);
-    }
-  }
-
   setVolume(v) {
     if (this.volume) this.volume.gain.value = v;
   }
 
   /// Open the mic and start sending it. Echo cancellation and noise
   /// suppression stay off so the voice comes through as it is (on
-  /// speakers, push to talk keeps the room's sound out).
+  /// speakers, push to talk on half duplex keeps the room's sound out
+  /// -- see `setPttHush`).
   async startMic({ deviceId } = {}) {
     if (this.stream) return;
     this.stream = await navigator.mediaDevices.getUserMedia({
@@ -181,15 +204,6 @@ export class RoomAudio {
         autoGainControl: false,
       },
     });
-    this.encoder = new AudioEncoder({
-      output: (chunk) => {
-        const buf = new Uint8Array(chunk.byteLength);
-        chunk.copyTo(buf);
-        this.send(buf);
-      },
-      error: (e) => console.error('[room] encoder', e),
-    });
-    this.encoder.configure({ codec: 'opus', sampleRate: RATE, numberOfChannels: 1, bitrate: 64000, opus: { frameDuration: 20000 } });
     const src = new MediaStreamAudioSourceNode(this.ctx, { mediaStream: this.stream });
     const cap = new AudioWorkletNode(this.ctx, 'mic-capture', {
       numberOfInputs: 1,
@@ -197,27 +211,11 @@ export class RoomAudio {
       channelCount: 1,
       channelCountMode: 'explicit',
     });
-    cap.port.onmessage = (ev) => {
-      const pcm = ev.data;
-      // Muted still sends silence: the room's clock and transcription
-      // keep going, and nobody hears a hitch when you unmute.
-      if (this.muted) pcm.fill(0);
-      if (this.encoder?.state !== 'configured') return;
-      const data = new AudioData({
-        format: 'f32-planar',
-        sampleRate: RATE,
-        numberOfChannels: 1,
-        numberOfFrames: pcm.length,
-        timestamp: this.outTs,
-        data: pcm,
-      });
-      this.outTs += FRAME_US;
-      try {
-        this.encoder.encode(data);
-      } finally {
-        data.close();
-      }
-    };
+    // The frames go from this worklet to the worker and no further up:
+    // muting them, encoding them and putting them on the socket are all
+    // its, and none of it waits on the page.
+    this.link.useMic(cap);
+    this.link.setMuted(this._muted);
     src.connect(cap);
     this.micNodes = [src, cap];
   }
@@ -246,14 +244,12 @@ export class RoomAudio {
     this.micNodes = null;
     for (const t of this.stream?.getTracks() || []) t.stop();
     this.stream = null;
-    try { this.encoder?.close(); } catch {}
-    this.encoder = null;
+    this.link.dropMic();
   }
 
   async stop() {
     this.stopMic();
-    try { this.decoder?.close(); } catch {}
-    this.decoder = null;
+    this.link.silence();
     await this.ctx?.close().catch(() => {});
     this.ctx = null;
     this.player = null;

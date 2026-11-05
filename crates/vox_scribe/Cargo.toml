@@ -19,7 +19,13 @@ denoise = ["vox_transcribe/deepfilter"]
 # it; every build here turns it on -- the release archives (`just dist`),
 # the cross-built Windows one (`just win64`) and both Android ones.
 # Only iOS goes without. `--translate openai` needs no feature.
-translate-local = ["vox_transcribe/ct2"]
+translate-local = ["vox_transcribe/ct2", "langid"]
+# Telling two languages in one alphabet apart, which is what lets
+# `--other-language French` be read into English at all. Comes with
+# `translate-local` because deciding a translation direction is the only
+# thing it is for; separable so a build can have the classifier without
+# the 160 MB of Marian weights, which is what the bench wants.
+langid = ["vox_transcribe/langid-fasttext"]
 
 [dependencies]
 vox_transcribe = { path = "../vox_transcribe", features = ["llm", "sherpa-static"] }

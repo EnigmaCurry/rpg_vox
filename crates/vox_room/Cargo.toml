@@ -31,6 +31,9 @@ opus = "0.3"
 rusqlite = { version = "0.31", features = ["bundled"] }
 # Blocking HTTP for the LLM stream and the TTS server, on their own threads.
 ureq = { version = "2", features = ["json"] }
+# What an MCP server hands back a picture in, when it hands one back
+# inline rather than as a URL to fetch. See mcp.rs.
+base64 = "0.22"
 hound = "3"
 rubato = "0.15"
 crossbeam-channel = "0.5"

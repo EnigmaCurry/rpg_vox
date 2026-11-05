@@ -1,12 +1,16 @@
 <script>
   import { onMount } from 'svelte';
   import {
-    room, joinAudio, setName, logOut, setPushToTalk, loadDevices, watchDevices,
-    setMicDevice, setSpeakerDevice, setLanguage,
+    room, joinAudio, setName, logOut, putLinkDown, setPushToTalk, loadDevices, watchDevices,
+    setMicDevice, setSpeakerDevice, setLanguage, setConsent, theAI,
   } from '../lib/room.svelte.js';
   import { supported, canChooseSpeaker } from '../lib/audio.js';
-  import { hue } from '../lib/color.js';
   import { NAME_MAX } from '../lib/names.js';
+  import { talk, keyName, byTouch } from '../lib/keys.svelte.js';
+
+  // The key the door is telling you about, which is whatever this
+  // browser has bound. See `lib/keys.svelte.js`.
+  const key = $derived(keyName(talk.bind));
 
   // The room is voice only, so this stands in front of it until you have
   // joined the audio: everyone in the room is in it by ear, not reading.
@@ -47,25 +51,36 @@
     return watchDevices();
   });
 
-  const here = $derived(
-    room.people.filter((p) => p.online && p.name !== room.you).map((p) => p.name),
-  );
   const starting = $derived(room.audio === 'starting');
   // What the room already has against your name, so the door only saves
   // a language when it is actually a change.
   const mine = $derived(
-    room.people.find((p) => p.name === room.you)?.language ?? '',
+    room.people.find((p) => p.name === room.you)?.language || room.languages[0] || '',
   );
 </script>
 
-<div class="enter" role="dialog" aria-modal="true" aria-labelledby="enter-title">
-  <div class="card">
-    <p class="eyebrow">{room.game ? 'Playing' : 'Voice room'}</p>
-    <h1 id="enter-title">{room.game ?? 'Voice room'}</h1>
+<main class="enter" aria-labelledby="enter-title">
+  <div class="card panel">
+    <!-- One name, said once. The eyebrow is there to say what the
+         heading is when the heading is a game's name, and in a room
+         with no game on it there is nothing for it to add. -->
+    {#if room.game}<p class="eyebrow">Playing</p>{/if}
+    <h1 id="enter-title">{room.game ?? 'Voice Room'}</h1>
     {#if room.door}
       <p class="hi">Hi, {room.door.name}!</p>
     {:else if room.you}
       <p class="hi">Hi, {room.you}!</p>
+    {/if}
+    <!-- Somebody else's link, picked up by this browser and never
+         spent. It is said rather than acted on: a browser is one
+         person, and being quietly handed another's name -- on a link
+         clicked who knows when -- is how you end up in the room as
+         them. Logging out below is what gives the room over to it. -->
+    {#if room.holding}
+      <p class="held">
+        This browser is also holding <strong>{room.holding}</strong>'s invite link.
+        You are in as {room.you}; log out below to come in as {room.holding} instead.
+      </p>
     {/if}
     {#if !supported()}
       <p class="lead">
@@ -74,12 +89,8 @@
       </p>
     {:else}
       <p class="lead">
-        You are entering a voice conference room. Select your device and click
-        <strong>Join Audio</strong> to enter the room.
-        {#if room.door}
-          Your link works once: pressing it is what spends it, and this
-          browser is remembered from then on.
-        {/if}
+        This is a voice and video conference room. Select your microphone and
+        press <strong>Join Audio</strong> to enter.
       </p>
 
       {#if room.door}
@@ -89,11 +100,8 @@
             <input type="text" maxlength={NAME_MAX} value={draft}
               oninput={(e) => (typed = e.currentTarget.value)} onblur={save}
               onkeydown={(e) => { if (e.key === 'Enter') { e.preventDefault(); save(); } }} />
-            <small>
-              Everyone in the room sees this. Your invite stays {room.door.name}'s,
-              whatever you call yourself.
-            </small>
           </label>
+          {#if room.nameError}<p class="warn">{room.nameError}</p>{/if}
         </div>
       {/if}
       {#if room.doorError}
@@ -124,9 +132,13 @@
         {#if room.languages.length > 1}
           <label>
             <span>Language</span>
+            <!-- Every option is its own name, the room's own included.
+                 An empty value for the first one meant the box showed
+                 nothing at all to anybody the room already knew about,
+                 since what the room says back is the name. -->
             <select value={room.lang} onchange={(e) => setLanguage(e.currentTarget.value)}>
-              {#each room.languages as l, i (l)}
-                <option value={i === 0 ? '' : l}>{l}</option>
+              {#each room.languages as l (l)}
+                <option value={l}>{l}</option>
               {/each}
             </select>
           </label>
@@ -142,7 +154,27 @@
         {/if}
       </div>
 
-      <button class="primary join" bind:this={join} onclick={enter} disabled={starting}>
+      <!-- What coming in actually does to you, before you do it. The
+           tick is kept in this browser, so it is asked once; unticking
+           it takes it back, and shuts the door again. -->
+      <div class="consent" class:agreed={room.consented}>
+        <p>
+          Your microphone will be recorded and your speech may be
+          transmitted to other participants in this conference. The
+          transcription of what you say will be indefinitely recorded
+          in the conversation log, and it may be further processed by
+          AI chat bots, set up by this server's operator.
+        </p>
+        <label>
+          <input type="checkbox" checked={room.consented}
+            onchange={(e) => setConsent(e.currentTarget.checked)} />
+          <span>I agree to be recorded and transcribed.</span>
+        </label>
+      </div>
+
+      <button class="primary join" bind:this={join} onclick={enter}
+        disabled={starting || !room.consented}
+        title={room.consented ? undefined : 'Agree above to come in.'}>
         {starting ? 'Starting…' : 'Join Audio'}
       </button>
       {#if room.audioError}
@@ -155,37 +187,29 @@
         <span>
           Push to talk
           <small>
-            On speakers, turn this on: your mic opens only while you hold Space.
-            With a headset, leave it off — anyone can interrupt {room.agent.name}
-            just by talking.
+            If push-to-talk is enabled, you will be muted unless you
+            {#if byTouch.only}are holding the talk button{:else}hold down {key}{/if}.
+            This allows you to control
+            explicit transmission. You go on hearing the room while you
+            hold it; on speakers, where what they play goes back into
+            your microphone, Settings can have the room go quiet
+            instead.
           </small>
         </span>
       </label>
     {/if}
 
-    <!-- Who is in is the room telling you, live. A link not yet spent has
-         no socket to hear it on, so the card says nothing rather than
-         something that was true once. -->
-    {#if !room.door}
-    <p class="who">
-      {#if !room.connected}
-        Connecting to the room…
-      {:else if here.length === 0}
-        Nobody else is here yet.
-      {:else}
-        <span class="dots" aria-hidden="true">
-          {#each here as name (name)}
-            <span class="pip" style="--h: {hue(name)}" title={name}></span>
-          {/each}
-        </span>
-        {here.join(', ')}
-        {here.length === 1 ? 'is' : 'are'} already in.
-      {/if}
-    </p>
-    {/if}
+    <!-- Nothing of the room is said here, and nothing of it is open:
+         the sockets are the room's, and at the door you are not in it.
+         Who is in, what is being said, which rooms there are -- all of
+         it arrives when you come in, and goes when you leave. -->
 
-    <!-- The way out of a browser that is signed in. An invite not yet
-         spent has nothing to give back. -->
+    <!-- The way out, whichever way you came in. Signed in, that is
+         giving the browser back; holding a link, there is nothing to
+         give back and the way out is to put the link down -- which
+         matters most where this page is the whole screen, because the
+         wrong link would otherwise leave joining as the only thing you
+         could do. -->
     {#if !room.door}
       <p class="out">
         <button class="logout" onclick={logOut}
@@ -193,29 +217,41 @@
           Log out
         </button>
       </p>
+    {:else}
+      <p class="out">
+        <button class="logout" onclick={putLinkDown}
+          title="Leave without using it. The link is not spent, so whoever it belongs to can still come in on it.">
+          This isn't my link
+        </button>
+      </p>
     {/if}
   </div>
-</div>
+</main>
 
 <style>
+  /* A page, not a sheet over one. Until the audio is joined there is
+     nothing behind this to look at: the room is voice, and a
+     conversation you can read but not hear is not being in it. */
   .enter {
-    position: fixed;
-    inset: 0;
-    z-index: 30;
+    height: 100%;
     display: grid;
     place-items: center;
     padding: 24px;
     overflow-y: auto;
-    background: color-mix(in srgb, var(--bg) 82%, transparent);
-    backdrop-filter: blur(6px);
+    overscroll-behavior: contain;
   }
+  /* A panel like the room's, with its own fill: the door is not a
+     column of the console, but it is the first thing anybody sees and
+     it is made of the same stuff. The three properties `.panel` would
+     have set are composed here rather than replaced, since this card
+     has a border and a corner of its own on top of the theme's. */
   .card {
     width: min(26em, 100%);
     text-align: center;
-    background: var(--panel);
+    background: var(--frame-corners), var(--panel);
     border: 1px solid var(--line);
     border-radius: 16px;
-    box-shadow: var(--shadow), 0 12px 40px rgb(0 0 0 / 12%);
+    box-shadow: var(--frame-edge), var(--shadow);
     padding: 28px 28px 22px;
   }
   .eyebrow {
@@ -229,6 +265,20 @@
   .hi { font-size: 15px; font-weight: 600; margin: 0 0 8px; }
   .lead { color: var(--muted); margin: 0 0 18px; }
   .lead strong { color: var(--ink); font-weight: 600; white-space: nowrap; }
+  /* What coming in does to you. Plain and above the button, because it
+     is the thing the button is asking about. */
+  .consent {
+    text-align: left;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 10px 12px;
+    margin-bottom: 14px;
+    background: var(--field-bg);
+  }
+  .consent.agreed { border-color: color-mix(in srgb, var(--ok) 45%, var(--line)); }
+  .consent p { font-size: 12px; line-height: 1.5; color: var(--muted); margin: 0 0 8px; }
+  .consent label { display: flex; align-items: flex-start; gap: 8px; font-size: 13px; }
+  .consent input { margin: 2px 0 0; flex: none; }
   .devices { display: flex; flex-direction: column; gap: 10px; margin-bottom: 18px; text-align: left; }
   .devices label { display: flex; flex-direction: column; gap: 4px; }
   .devices span { font-size: 12px; color: var(--muted); }
@@ -236,25 +286,37 @@
     font: inherit;
     width: 100%;
     color: var(--ink);
-    background: var(--bg);
-    border: 1px solid var(--line);
-    border-radius: 8px;
+    background: var(--field-bg);
+    border: 1px solid var(--field-border);
+    border-radius: var(--field-radius);
     padding: 8px 10px;
   }
   select:hover { border-color: var(--muted); }
   .devices.name { margin-bottom: 14px; }
-  .devices.name small { font-size: 12px; color: var(--muted); line-height: 1.45; }
   input[type='text'] {
     font: inherit;
     width: 100%;
     color: var(--ink);
-    background: var(--bg);
-    border: 1px solid var(--line);
-    border-radius: 8px;
+    background: var(--field-bg);
+    border: 1px solid var(--field-border);
+    border-radius: var(--field-radius);
     padding: 8px 10px;
   }
   input[type='text']:hover { border-color: var(--muted); }
   .warn.door { margin: 0 0 14px; }
+  /* A link this browser is carrying for somebody else: worth reading,
+     not a thing that has gone wrong. */
+  .held {
+    text-align: left;
+    font-size: 13px;
+    line-height: 1.45;
+    color: var(--muted);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 8px 12px;
+    margin: 0 0 14px;
+  }
+  .held strong { color: var(--ink); }
   .join {
     width: 100%;
     font-size: 17px;
@@ -276,25 +338,14 @@
   .ptt small { display: block; font-size: 12px; color: var(--muted); line-height: 1.45; }
   .warn { color: var(--danger); font-size: 13px; margin: 12px 0 0; text-align: left; }
   .devices .warn { margin: 2px 0 0; }
-  .who {
-    font-size: 13px;
-    color: var(--muted);
-    margin: 18px 0 0;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 6px;
-    flex-wrap: wrap;
-  }
   .out { margin: 14px 0 0; padding-top: 12px; border-top: 1px solid var(--line); }
   .logout {
     font-size: 13px;
     color: var(--muted);
     background: none;
+    box-shadow: none;
     border: 0;
     padding: 4px 8px;
   }
   .logout:hover { color: var(--danger); }
-  .dots { display: inline-flex; gap: 3px; }
-  .pip { width: 8px; height: 8px; border-radius: 50%; background: hsl(var(--h) 55% 55%); }
 </style>

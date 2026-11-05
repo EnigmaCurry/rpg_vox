@@ -68,7 +68,21 @@ pub const TOKENIZER: &str = "tokenizer.json";
 /// in English beside the code the opus-mt names use. Only pairs whose
 /// directory is actually present are loaded, so this is a naming table
 /// and not a claim about what is installed.
-const CODES: [(&str, &str); 11] = [
+///
+/// A language missing from here is a language whose model is downloaded
+/// into a directory nothing then looks in: `direction_dir` returns
+/// `None`, `has_direction` is false, and [`Ct2Translator::load`] leaves
+/// the direction out -- so the language is chosen, its 80 MB is fetched,
+/// and nothing is ever translated, quietly. The Android app's own table
+/// (`Models.kt`'s `Language.code`) has to agree with this one, and
+/// `LanguagesTest.the_app_and_ct2_agree_on_every_code` is what checks
+/// it; `every_language_here_is_one_the_engine_knows` checks this side.
+///
+/// `jap` is opus-mt's spelling of Japanese and is why these are the
+/// *model's* codes rather than ISO 639-1. The classifier is asked in
+/// 639-1, which is `language::code_of`'s business; the two tables never
+/// meet, because this one is only ever a directory name.
+const CODES: [(&str, &str); 23] = [
     ("English", "en"),
     ("Russian", "ru"),
     ("German", "de"),
@@ -76,6 +90,18 @@ const CODES: [(&str, &str); 11] = [
     ("Spanish", "es"),
     ("Italian", "it"),
     ("Portuguese", "pt"),
+    ("Dutch", "nl"),
+    ("Danish", "da"),
+    ("Swedish", "sv"),
+    ("Finnish", "fi"),
+    ("Hungarian", "hu"),
+    ("Czech", "cs"),
+    ("Slovak", "sk"),
+    ("Polish", "pl"),
+    ("Latvian", "lv"),
+    ("Estonian", "et"),
+    ("Maltese", "mt"),
+    ("Bulgarian", "bg"),
     ("Chinese", "zh"),
     ("Japanese", "jap"),
     ("Korean", "ko"),
@@ -256,6 +282,32 @@ pub unsafe extern "C" fn pthread_setaffinity_np(
 mod tests {
     use super::*;
 
+    /// Every language here is one the rest of the engine knows, and no
+    /// code is in the table twice.
+    ///
+    /// The first half because a direction can only be chosen for a
+    /// language `language::script_of` can place -- `Interpreter::new`
+    /// refuses the rest -- so a name here that it does not know is a
+    /// direction nothing could ever ask for. The second because two
+    /// languages sharing a code share a directory, and the second
+    /// model to be downloaded would overwrite the first.
+    #[test]
+    fn every_language_here_is_one_the_engine_knows() {
+        let mut codes = Vec::new();
+        for (name, code) in CODES {
+            assert!(
+                crate::language::script_of(name).is_some(),
+                "{name} is not a language `language.rs` knows the alphabet of"
+            );
+            assert_eq!(code, code.to_lowercase(), "{name}: {code} is not lowercase");
+            codes.push(code);
+        }
+        codes.sort_unstable();
+        let n = codes.len();
+        codes.dedup();
+        assert_eq!(codes.len(), n, "a code is in the table twice");
+    }
+
     /// A paragraph of real transcript (a recording made on the phone),
     /// translated three ways: a call a sentence at beam 2, which is
     /// what this did before batching; one batch at beam 2, which is
@@ -309,7 +361,9 @@ mod tests {
             let out: Vec<String> = if one_at_a_time {
                 SAID.iter()
                     .map(|s| {
-                        model.translate_batch(&[*s], &beam(size), None).expect("translate")[0]
+                        model
+                            .translate_batch(&[*s], &beam(size), None)
+                            .expect("translate")[0]
                             .0
                             .clone()
                     })

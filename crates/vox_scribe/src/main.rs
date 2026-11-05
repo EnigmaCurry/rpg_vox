@@ -2425,12 +2425,17 @@ fn interpreter(cli: &Cli, models_dir: &std::path::Path) -> Result<Option<Interpr
         .map(|l| l.trim().to_string())
         .filter(|l| !l.is_empty())
         .collect();
+    // What tells two languages in one alphabet apart, fetched before
+    // anything is checked against it: without it `--other-language
+    // French` into English is a pair nothing can decide, and the whole
+    // of the difference is 917 KB.
+    let telling = telling(models_dir, cli.translate != TranslateKind::Off, &others)?;
     if cli.translate != TranslateKind::Off {
         // Before the translator is built: a language pair this cannot
         // decide between is a mistake on the command line whichever
         // translator was asked for, and a missing model or a missing
         // feature reported first only hides it.
-        vox_transcribe::language::pair(&native, &others)?;
+        vox_transcribe::language::pair(&native, &others, telling.is_some())?;
     }
     let by: Arc<dyn vox_transcribe::translate::Translate> = match cli.translate {
         TranslateKind::Off => return Ok(None),
@@ -2453,9 +2458,58 @@ fn interpreter(cli: &Cli, models_dir: &std::path::Path) -> Result<Option<Interpr
             Arc::new(t)
         }
     };
-    let i = Interpreter::new(&native, &others, by)?;
+    let i = Interpreter::new(&native, &others, by, telling)?;
     eprintln!("translating {i:?}");
     Ok(Some(i))
+}
+
+/// The language classifier, downloaded if `wanted` and not here yet.
+///
+/// Fetched rather than offered, unlike the 80 MB translation models: it
+/// is 917 KB, and without it a perfectly ordinary command line
+/// (`--other-language French`) is refused for a reason the person
+/// typing it could do nothing about. Nothing to put behind a prompt.
+///
+/// `None` when nothing is being translated, or when the download failed
+/// -- which is not fatal, because the languages may well be ones the
+/// alphabet can separate on its own. [`vox_transcribe::language::pair`]
+/// is what then says so, and says it about the languages actually
+/// asked for.
+#[cfg(feature = "langid")]
+fn telling(
+    models_dir: &std::path::Path,
+    wanted: bool,
+    others: &[String],
+) -> Result<Option<Arc<dyn vox_transcribe::langid::Classify>>> {
+    if !wanted || others.is_empty() {
+        return Ok(None);
+    }
+    if !models::has_langid(models_dir) {
+        eprintln!(
+            "the language classifier is not here, downloading it once ({})…",
+            models::LANGID_SIZE
+        );
+        if let Err(e) = models::download_langid(models_dir) {
+            eprintln!("could not download the language classifier: {e:#}");
+            return Ok(None);
+        }
+    }
+    match vox_transcribe::langid::FastText::load(models_dir) {
+        Ok(c) => Ok(Some(Arc::new(c))),
+        Err(e) => {
+            eprintln!("could not read the language classifier: {e:#}");
+            Ok(None)
+        }
+    }
+}
+
+#[cfg(not(feature = "langid"))]
+fn telling(
+    _models_dir: &std::path::Path,
+    _wanted: bool,
+    _others: &[String],
+) -> Result<Option<Arc<dyn vox_transcribe::langid::Classify>>> {
+    Ok(None)
 }
 
 fn list_apps() -> Result<()> {

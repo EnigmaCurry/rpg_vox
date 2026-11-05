@@ -516,29 +516,45 @@ whether the translator or the recognizer was at fault.
 
 ### What decides which language it was in
 
-**The alphabet, and nothing else.** Russian against English is Cyrillic
-against Latin, which is as unambiguous as text gets and needs no model,
-no download and no network. German against English is Latin against
-Latin, which this *cannot* tell apart — so it refuses that pair at
-startup instead of guessing and sending English prose to a German model,
-which comes back as confident nonsense:
+**The alphabet first, and it is most of the answer.** Russian against
+English is Cyrillic against Latin, which is as unambiguous as text gets
+and needs no model, no download and no network.
 
-```
-$ scribe --translate local --other-language German
-Error: German is written in the same alphabet as English, and telling
-them apart is not something reading the script can do
+German against English is Latin against Latin, which the alphabet
+*cannot* tell apart and must not pretend to — a wrong guess sends
+English prose to a German model and gets confident nonsense back rather
+than an error. So that question goes to a classifier: fastText's
+`lid.176`, 917 KB for 176 languages, fetched on first use beside the
+translation models. It is asked only what the alphabet could not settle,
+only about the languages you named, and only its answers above
+nine-tenths certainty are used. Below that the paragraph stands as it was
+said, which is what the alphabet alone used to do with all of them.
+
+```bash
+# Latin against Latin, which needed the classifier to be possible at all.
+just scribe --translate local --other-language French
 ```
 
-`--other-language` is repeatable, and every language named has to be in
-a different alphabet from yours and from the others. Russian and
-Ukrainian are both Cyrillic, so you can have either, not both.
+`--other-language` is repeatable and the languages can share an
+alphabet, with each other or with yours: Russian and Ukrainian together,
+or French while you read English. Without the classifier — a build
+without the feature, or a download that failed — a pair that shares an
+alphabet is still refused at startup rather than guessed at.
 
 The decision is per paragraph, so one short sentence can't send a line
 the wrong way; the translating is per *sentence*, which is the unit the
-models work in. A sentence that is already in your language — an English
-aside, a name, a URL — is left exactly as it was said rather than sent
-round the trip. A paragraph that is genuinely half in each language has
+models work in. A paragraph that is genuinely half in each language has
 no majority, so it is left alone: there is no direction to choose.
+
+A sentence already in your language — an aside, a name, a URL — is
+left as it was said rather than sent round the trip, but only when the
+paragraph's language is written differently from yours. When it is not
+(French read into English), the alphabet can no longer tell an English
+aside from the French around it, and a sentence is usually too short to
+ask the classifier about, so every sentence goes to the translator and
+an aside makes the round trip. That costs a sentence that comes back
+roughly as it went in; the alternative was a French paragraph passing
+through untranslated.
 
 ### Who translates
 

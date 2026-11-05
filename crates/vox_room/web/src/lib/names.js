@@ -6,3 +6,6 @@ export const NAME_MAX = 24;
 // The server decides this one too, and sanitizes besides: the field cap
 // is only so the limit is felt while typing rather than on sending.
 export const TYPED_MAX = 2000;
+
+// The longest name anyone may give a conversation (room::TITLE_MAX).
+export const TITLE_MAX = 60;

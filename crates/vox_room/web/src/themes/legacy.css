@@ -1,0 +1,54 @@
+/* Plain -- the room as it looked before it had a look.
+   ===================================================
+
+   Paper in the day and graphite at night, following whatever the
+   machine is set to. Flat: no frames, no fills, no glow. The columns
+   are told apart by a hairline and nothing else, and the page runs to
+   the edges of the window.
+
+   It is kept because it is the one theme that gets out of the way, and
+   because it is the only one that is light. Everything structural here
+   is already the default in `tokens.css`; what is left is colour. */
+[data-theme='legacy'] {
+  color-scheme: light;
+
+  --bg: #f6f5f2;
+  --panel: #ffffff;
+  --ink: #1d1d1f;
+  --muted: #6b6b70;
+  --line: #e3e1dc;
+  --accent: #3d5afe;
+  --accent-ink: #ffffff;
+  --agent: #7c4dff;
+  --danger: #d93025;
+  --ok: #188038;
+  --meter: #34a853;
+  --bubble: #f0efeb;
+  --shadow: 0 1px 2px rgb(0 0 0 / 6%), 0 2px 8px rgb(0 0 0 / 4%);
+}
+
+@media (prefers-color-scheme: dark) {
+  [data-theme='legacy'] {
+    color-scheme: dark;
+
+    --bg: #141416;
+    --panel: #1c1c1f;
+    --ink: #ececee;
+    --muted: #9a9aa1;
+    --line: #2c2c31;
+    --accent: #7b8cff;
+    --accent-ink: #0d0d10;
+    --agent: #b39dff;
+    --danger: #ff6b5e;
+    --ok: #5bd17a;
+    --meter: #5bd17a;
+    --bubble: #242428;
+    --shadow: none;
+
+    /* A face's initials, which used to be a `prefers-color-scheme`
+       block in two components and is now one of these. */
+    --face-bg: hsl(var(--h, 230) 35% 22%);
+    --face-ink: hsl(var(--h, 230) 45% 78%);
+    --face-line: hsl(var(--h, 230) 30% 32%);
+  }
+}

@@ -75,13 +75,13 @@ pub fn spawn(
                 if context.len() > CONTEXT {
                     context.remove(0);
                 }
-                // Two ways of being written and not said: the fader
-                // pulled all the way down, which is the room turning the
-                // voices off, and an interpreter already further behind
-                // than it is any use being. Neither is a reason to stop
-                // reading the room, so the words go on screen either
-                // way; there is just nothing to pay a voice for.
-                if !job.speak || room.mixer.silent(crate::mixer::INTERP_STRIP) {
+                // Two ways of being written and not said: nobody
+                // listening in it having the voice turned up, and an
+                // interpreter already further behind than it is any use
+                // being. Neither is a reason to stop reading the room,
+                // so the words go on screen either way; there is just
+                // nothing to pay a voice for.
+                if !job.speak || !room.mixer.interp_wanted(&job.into) {
                     info!(
                         who = %job.who,
                         into = %job.into,

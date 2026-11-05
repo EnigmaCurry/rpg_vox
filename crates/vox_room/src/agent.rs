@@ -20,7 +20,10 @@ use tracing::{debug, info, warn};
 use vox_transcribe::filters::{clause_end, sentence_end};
 use vox_transcribe::translate::Translate;
 
-use crate::room::{Cue, GameSettings, Players, ReplyMode, Role, Room, RoomConfig, Turn, TypedJob};
+use crate::mcp;
+#[cfg(test)]
+use crate::room::RoomConfig;
+use crate::room::{Cue, GameSettings, Players, ReplyMode, Role, Room, Turn, TypedJob};
 use crate::tts::Voice;
 
 /// The default instructions; `{name}` and `{people}` are filled in.
@@ -90,10 +93,18 @@ game, when what you dealt has scrolled out of the conversation you can see. \
 Cards last until you take them back or the conversation starts over. \
 post_card is the opposite of all this: it writes a card into the \
 conversation for the whole room, which is where anything everyone should \
-be looking at belongs -- the rules as agreed, the standings, a scene \
-everyone can see. A posted card cannot be taken back. Keep the two \
+be looking at belongs. A posted card cannot be taken back. Keep the two \
 straight: send_card goes to one person's cards, post_card goes to the \
-room, and reading either aloud is what you must not do.";
+room, and reading either aloud is what you must not do.
+
+A card is written in markdown and is the one thing here that is read \
+rather than heard, so use the shape the thing actually has: a table for \
+anything with columns, a list for anything you would otherwise count out \
+loud, bold for the number that matters. That is what it is for -- when \
+somebody asks you something whose answer is a handful of figures, post \
+the figures and say the sentence. Speech is bad at \"nine degrees, \
+fourteen degrees, two degrees\" and a card is good at it, and the person \
+asked for the answer rather than for one of the two.";
 
 /// The last thing the AI is shown when the room is leaving it to decide
 /// whether this pause is its moment. `{here}` and `{engaged}` are filled
@@ -102,7 +113,7 @@ room, and reading either aloud is what you must not do.";
 const DECIDE: &str = "\
 (Nobody has said your name, so this turn is yours to judge: the room has \
 gone quiet for a moment, and you may either take it or let it pass. \
-{here}{engaged}\
+{here}{engaged}{over}\
 Take it when the last thing said was meant for you -- a question, a \
 request, a follow-up to what you were saying, something you were asked to \
 watch for -- or when there is nobody else here it could have been meant \
@@ -120,6 +131,46 @@ const DECIDE_ENGAGED: &str = "\
 You are in the middle of a conversation with them: they called you in and \
 have carried on without naming you again, so the turn is yours unless they \
 have plainly turned to each other. ";
+
+/// The last thing the AI is shown when another voice in the room put
+/// something to it and handed it the turn. `{from}` is which voice.
+///
+/// It was addressed, so it answers -- but it is told it may pass,
+/// because the alternative is a voice saying something for the sake of
+/// having been asked, and that is the thing that turns two AIs into a
+/// conversation nobody is in.
+const HANDED: &str = "\
+({from} has put something to you and the room has given you the turn: it is \
+in the lines above, and the room is waiting for your answer. Answer it in your own voice, \
+to the room -- the people are in this conversation, so say it to them as much \
+as to {from}, and don't simply agree to be agreeable. If you have nothing to \
+add, call stay_quiet and let the people have the pause rather than saying \
+something for the sake of being asked. Never mention this note.)";
+
+/// The last thing the AI is shown when the voices here have used up
+/// what they may say to each other: this answer is the last one before
+/// somebody human speaks.
+///
+/// It is told rather than refused. A bot that discovers the limit by
+/// calling `hand_to` and being told no has already finished speaking,
+/// and whatever it said was written for a conversation that is about
+/// to stop dead -- "I'll let Cora take that" with nobody able to.
+const LAST_ROUND: &str = "\
+(This is the last thing the voices here can say to each other until somebody \
+else joins in: you cannot hand the turn on this time, and nor can anyone you \
+handed it to. So finish the thought and leave it with the people -- put the \
+question to them, ask what they think, or simply stop and let the room be \
+quiet. Don't say that you are out of turns, and never mention this note.)";
+
+/// Added to [`DECIDE`] when what it is being shown arrived while it was
+/// still speaking: it was talked over and left to finish, so the likeliest
+/// thing this pause holds is a cough.
+const DECIDE_OVER: &str = "\
+What was said came in while you were still speaking: they talked over you \
+and you were left to finish, so it may be a cough, a false start or a word \
+to somebody else rather than anything meant for you. Take the turn only if \
+it was plainly for you -- a question, or a follow-up to what you had just \
+said. Otherwise let it pass: you have already answered. ";
 
 /// The same, on the second look at a silence the AI asked to be shown.
 const DECIDE_LULL: &str = "\
@@ -139,6 +190,61 @@ once -- do not translate yourself, and do not say the same thing twice in \
 two languages. Plain spoken sentences translate best; a pun or a play on \
 words will not survive, so make the point another way when it matters.";
 
+/// Added to the prompt of a bot that may only look: the one thing it
+/// can put on the screen, and when to.
+const POSTING_NOTE: &str = "\
+You can write a card into the conversation for the whole room to read, \
+with post_card: a title and a body in markdown. It is for what the people \
+will want in front of them rather than held in their heads -- a forecast, \
+times, prices, a list of options, anything whose answer is a handful of \
+figures. Use the shape the thing has: a table for anything with columns, \
+a list for anything you would otherwise count out loud. Post it and say \
+it at the same time: the short version in your own voice, the detail on \
+the card, and a word to say the card is there, since nobody hears one \
+appear. It cannot be taken back, so post what will still be true. Reading \
+a card out is what you must not do.";
+
+/// Added to the prompt when there is one other AI in the room;
+/// `{other}` is its name, used throughout rather than a pronoun, since
+/// the room has no idea which one a bot's name is meant to take.
+///
+/// They are in the transcript by name, exactly as a person is, so the
+/// thing the AI needs told is what they are -- otherwise it reads a
+/// voice it has never heard of as one of the people.
+const OTHER_NOTE: &str = "\
+{other} is in this room with you: an AI voice like you, not a person. You see \
+what {other} says in the transcript with the name on it, the way you see what \
+a person says, and {other} sees yours the same way. The room gives the turn \
+to one of you at a time, and **saying {other}'s name hands the turn over** -- \
+the room gives {other} the turn as soon as you have finished speaking, which \
+is the same thing that happens when a person says a name. So address {other} \
+by name when you want an answer from {other}, and leave the name out when you \
+only mean to mention {other} in passing. hand_to does it deliberately, for \
+when you want {other} to take the next turn without naming {other} in what \
+you say. When {other} has already answered something it is answered: don't \
+say it again, and don't speak for {other}. And the people are in this \
+conversation, not watching it -- the room allows only a couple of replies \
+between the two of you with nobody else saying anything, and the people reset \
+that by joining in.";
+
+/// The same, in a room with more than one other AI in it. `{others}` is
+/// who they are.
+const OTHERS_NOTE: &str = "\
+{others} are in this room with you: AI voices like you, not people. You see \
+what they say in the transcript with their name on it, the way you see what a \
+person says, and they see yours the same way. The room gives the turn to one \
+of you at a time, and **saying one of their names hands the turn over** -- \
+the room gives that one the turn as soon as you have finished speaking, which \
+is the same thing that happens when a person says a name. So address one of \
+them by name when you want an answer from them, and leave the name out when \
+you only mean to mention them in passing. hand_to does it deliberately, for \
+when you want one of them to take the next turn without naming them in what \
+you say. When one of them has already answered something it is answered: \
+don't say it again, and don't speak for them. And the people are in this \
+conversation, not watching it -- the room allows only a couple of replies \
+between you with nobody else saying anything, and the people reset that by \
+joining in.";
+
 /// Added to the prompt, in the lobby and in a game: how the room decides
 /// the AI's turn, and how it bows out.
 const TURN_NOTE: &str = "\
@@ -157,6 +263,354 @@ Say your short goodbye before you call it, since what you have already said \
 is spoken straight away.";
 
 /// Added to the lobby's prompt when `--search` is on.
+/// The faces: always in the prompt, because a picture can always be in
+/// the chat. Somebody can drop one in from their own computer with no
+/// AI and no picture server involved, so `set_avatar` always has
+/// something it might be asked to put.
+///
+/// Deliberately about the room's half and not any picture tool's. What
+/// goes with a server is in [`DRAWING_NOTE`].
+const AVATAR_NOTE: &str = "\
+Everybody in the room has a square beside everything they say, and you \
+can give somebody theirs: set_avatar puts one of the pictures in the \
+chat on somebody, by the number on its card.
+
+You cannot see any of them. You are told that a picture is there, its \
+number, and what it was asked for or what file it came in as -- never \
+what is in it -- so the people in the room are your eyes. Ask, rather \
+than describing a picture back at them.
+
+Only put one on somebody once they have seen it and said they are happy \
+with it. Do not set one because a picture came out well, and do not set \
+one because it is the only picture there is. A face is theirs, and \
+choosing it is theirs.
+
+Pictures do not have to come from you. Somebody can drop one into the \
+chat from their own computer, and it gets the next number like any \
+other -- so when a picture turns up that you did not make, it is theirs \
+and you have not seen it: ask what they want done with it rather than \
+assuming it is for their face, and if it is, set_avatar takes that \
+number.
+
+set_bio writes the few lines shown beside their face when anybody clicks \
+it: who their character is, in two or three sentences, from what they \
+actually told you rather than from what the picture looks like. Read it \
+back and revise it if they want -- it can be rewritten any time, with no \
+new picture. list_people tells you where each person's face came from, \
+so you can build on what somebody already has instead of starting over, \
+and so you don't offer a face to somebody who is happy with theirs.
+
+A picture is not made for anybody in particular until you say so. Any \
+picture in the chat can go to anyone here -- a person, yourself, or \
+another AI in the room -- so a picture somebody doesn't want is one to \
+offer around rather than throw away, and the room can look at one and \
+then decide whose it is. The same goes for a bio.
+
+A face belongs to the person and not to the game: it follows them from \
+room to room and outlasts the conversation. So ask who they want to be \
+rather than deciding for them, and if somebody would rather not have one, \
+leave them the colour their name already has. You have a face of your \
+own as well -- ask the room what it thinks you look like.";
+
+/// Added as well when the room has a picture server: making one.
+///
+/// What sizes and styles there are, and how to word a prompt for them,
+/// is in each tool's own schema, written by whoever runs that server
+/// and better than anything that could be restated here -- and it goes
+/// stale the moment they add a style. The house's own server has two
+/// now, a sprite and a full-resolution one, and will have more; not
+/// one of them is named here, and a room that named them would be
+/// wrong by the next release of a server it does not own.
+///
+/// What this says is the part the room knows: that it is an interview,
+/// that a picture takes long enough that the room will notice, that
+/// making a picture and giving somebody a face are two steps -- and
+/// that which look it is drawn in is one of the things asked about
+/// rather than defaulted to, because it is the one thing about a
+/// picture that changing the picture afterwards cannot touch.
+///
+/// It does not say what a picture costs, because the room cannot know:
+/// a hosted server bills per image and a server on the house's own
+/// machine bills nothing. What the brake is made of instead is the
+/// wait, which is true of both -- and a model told to make one at a
+/// time behaves the same way either way.
+const DRAWING_NOTE: &str = "\
+You can also make a picture, and that is how most faces here start. It \
+goes in three steps before set_avatar, and the slow one in the middle is \
+the point of the other two.
+
+First, interview them, out loud, in the room. Ask what they want to be -- \
+who the character is, what they are wearing, what they are carrying, what \
+sort of face -- and get enough to work from before you make anything. Say \
+what you are about to make, in a sentence, so they can stop you.
+
+Where the tools can draw in more than one look, which look is theirs to \
+pick and not yours to default to. Find out what there is rather than \
+assuming, say what each one is in a word or two -- somebody who has not \
+seen one has no idea what the names mean -- and ask before you make \
+anything. It belongs in the interview and not after it: a look is the one \
+thing a later change cannot give them, since a tool that changes a picture \
+keeps the look it was drawn in, so changing their mind about it costs a \
+whole new picture and another wait.
+
+Then make it with a picture tool. The picture goes straight into the chat \
+as a card the whole room can see, with a number on it, and a spinner on \
+it until it arrives -- so say you are making it and then let it come; \
+nobody is waiting in silence. Each one takes a while and the whole room \
+spends it waiting, so make one at a time, and never make one nobody \
+asked for.
+
+Then ask how they like it. If they want a change, say what the tools let \
+you do about it. Where there is a tool that changes a picture already \
+made, that is the one to reach for when the change is a change -- a hat, \
+a colour, something taken out -- because it keeps everything else as it \
+was, which is usually what they meant. Make a fresh one when they want \
+something genuinely different instead. Either way the new picture gets \
+the next number and the earlier ones stay in the chat, so going back to \
+one is a thing they can ask for and you can do.
+
+A tool that changes a picture needs to be told which one, and not by \
+its number in the chat: that number is the room's and means nothing to \
+the tool. It wants the handle the tool itself gave that picture, which \
+is written down beside the card -- every picture in the conversation \
+above says what the tool said when it made it, and the id is in there. \
+Read it off that line and pass it back. If the line for a picture has \
+no handle on it, that picture did not come from a tool that can change \
+it, and the honest answer is to make a new one.";
+
+/// Added after [`DRAWING_NOTE`] where the picture server will take a
+/// picture of the room's own, which is what `redraw_picture` needs.
+///
+/// It is written to finish the paragraph [`DRAWING_NOTE`] ends on. That
+/// one tells the truth about a card with no handle -- it cannot be
+/// changed -- and in a house with this tool the truth has one more
+/// step in it. The two are kept apart rather than merged because a
+/// room whose server cannot take a picture still gets the first, and a
+/// note about a tool that is not there is an instruction to try.
+///
+/// The warning about asking first is not politeness. What comes back
+/// is somebody's own photograph redrawn in a server's look, which is a
+/// thing to be offered and not done to a picture while they watch.
+const REDRAW_NOTE: &str = "\
+That last part has one more step in it here. A picture with no handle on its \
+card is almost always one somebody dropped into the chat from their own \
+computer: it is theirs, the picture server has never seen it, and asking that \
+server to put a hat on it is asking about something that does not exist there. \
+It can be given to the server first.
+
+redraw_picture does that. It hands a picture in the chat to the picture \
+server, which redraws it in one of its looks and keeps it from then on. It \
+takes as long as making a picture does, so say what you are doing and let it \
+come. What lands is a new card with the next number and a handle on it, and \
+that one is what you change from then on -- theirs stays in the chat exactly \
+as they left it.
+
+Ask before you do it, and say what it is: a redrawn copy in the server's look, \
+not their photograph with something added. Which look is theirs to pick, like \
+any other picture. And you have not seen it, so tell redraw_picture what is in \
+it in the words the room gave you -- that is what the server is told, and what \
+a later change is understood against.
+
+A brought-in picture does not have to go through any of this to be used. \
+set_avatar takes it as it is, and that is the right answer when they like it \
+already. redraw_picture is for when they want it changed, and it is worth \
+saying out loud that what comes back will not look quite like what went in.";
+
+/// What the AI is told about cloning a voice, when the house has a
+/// server that can.
+///
+/// The order is the whole of it, and it is here rather than left to
+/// the model's judgment because getting it wrong is not recoverable:
+/// a voice worn without being asked for is somebody's voice coming
+/// out of a machine in a room they are sitting in.
+///
+/// The room does its own half regardless -- the passage goes onto
+/// their screen, the card saying a microphone is being recorded goes
+/// up before it is, the turn comes back when the clip lands. What this
+/// adds is why to wait, which is the part a model talks over.
+const VOICES_NOTE: &str = "\
+You can record somebody in the room reading aloud and clone their voice \
+from it, and then speak in it. Only ever because they asked you to.
+
+It goes in three steps. First say what you are about to do, then \
+take_voice_sample with a passage for them to read -- four or five \
+ordinary sentences, ten or twenty seconds of speech, nothing anybody \
+would rather not say out loud. The passage goes onto their screen as a \
+card and the room starts listening; a card in the chat says so, because \
+no microphone here is recorded without a light on it.
+
+Then stop talking and let them read. You are given the turn again when \
+the clip is in, and told how long it is and what they said; anything you \
+say before that is said over the thing being recorded. A clip that came \
+to nothing -- they never read it, or it was too short to use -- is not a \
+voice: say so, and offer them another go.
+
+**A clip can also arrive without anybody reading.** Somebody may drop a \
+recording into the room from their own computer, and it gets the next \
+number like a read one: save_voice takes that number and nothing else is \
+different. Don't thank them for reading it or talk about it as something \
+that just happened in the room -- it is a file they already had.
+
+Then ask what to call it, and save_voice keeps it under that name, with \
+the number on the clip's card in the chat. It is the house's voice from \
+then on: list_voices says what there is, speak_as is how you wear one \
+from your next sentence on, speak_as with \"your own\" is how you stop, \
+and forget_voice deletes one for good once they have said which. Your \
+own voice is what you come back to on your own: a voice you were lent \
+lasts until somebody says otherwise, and a restart is you as you were.";
+
+/// What the AI is told about puppets, where the house can give one a
+/// voice. `{presets}` is the voices the speech server has, named so a
+/// character can be built on one.
+///
+/// Long, and it is the length of the thing: a puppet show is the one
+/// activity here where the AI is not answering anybody but writing
+/// something and then performing it, and every part of that has an
+/// order to it. The two halves a model gets wrong without being told
+/// are the order (it writes the script before asking who is in it) and
+/// what a puppet actually *is* (it answers its own puppet, as though
+/// there were somebody there).
+///
+/// It is also where the room says plainly that the script is the whole
+/// point. A model that put a show on one line at a time would be a
+/// model doing badly what two bots already do well; what a script buys
+/// is timing, which is the one thing live voices cannot have.
+const PUPPETS_NOTE: &str = "\
+You can put puppets in this room. A puppet is a character with a name, a \
+face, a voice and a fader of its own -- to everyone here it is another \
+voice in the room -- and there is nothing behind it: it is you. You write \
+every word it says. You are never answered by one, and you never answer \
+one.
+
+That is what makes a puppet show possible. Two AI voices in a room are two \
+of us thinking separately, a line at a time, and neither knows what the \
+other is about to say. Puppets are the opposite: you write the whole scene \
+first, every line of it, and the room turns it all into speech before it \
+plays. So the lines land exactly where you put them -- a beat of silence, \
+an answer coming in half a second early, one character cutting another off \
+mid-sentence. That timing is the entire reason to do this. A play you make \
+up a line at a time is not worth the puppets.
+
+**Making one.** make_puppet keeps a character under a name: `about` is who \
+it is, `delivery` is how it talks -- written as instructions to an actor, \
+like \"gruff and slow, an old soldier who has told this story before\" or \
+\"bright, fast, far too pleased with herself\". That line is what makes a \
+puppet sound like itself rather than like you, so write it properly. \
+`preset` builds it on one of the house's voices{presets}. Where there is a \
+voice cloned from somebody in the room, `voice` gives the puppet that one \
+instead. Writing to a name that already exists revises that puppet, which \
+is how \"give him a rougher voice\" works.
+
+Give it a face the way you would give anybody one: make a picture, show it \
+to the room, and set_avatar it onto the puppet by name. set_bio writes who \
+it is, where everyone can read it. The name, the voice, the face and the \
+bio are the house's from then on -- list_puppets is the roster, and a \
+character made one evening can be cast again months later without being \
+made again. forget_puppet deletes one for good, with its face and its bio.
+
+**Setting a show up.** Ask first, and ask in this order. Who is in it: \
+from the roster, or new ones to make now. What it is about: the theme, and \
+roughly what happens. Only when the room has settled all of that do you \
+write anything. A show nobody was asked about is a show nobody wanted.
+
+Then bring_on_puppets puts the cast in the room, so everyone watches them \
+arrive and can see who is about to speak. Then put_on_show, with the whole \
+script in one call: a list of lines, each with `who` and `say`. `pause` is \
+the seconds of silence before a line, from the moment the one before it \
+was heard out -- leave it out for a natural beat, 0 for an answer that \
+lands on the last word, 2 or 3 for a character taking their time.
+
+**An interruption is something you write, not something the room does.** \
+Every line is spoken in full, all the way to its last syllable. So to have \
+somebody cut off, write their line as far as they actually get and end it \
+with a dash -- \"But I only wanted--\" -- and put the interrupting line \
+next. You decide where the sentence breaks, which is the whole craft of \
+it: nothing else knows that the character was about to say \"to help\". \
+Then `over` on the interrupting line brings it in that many seconds before \
+the short line ends, so the two voices overlap the way they really would. \
+Half a second is somebody landing on the last word. Leave `over` out on \
+any line that waits its turn.
+
+Write for the ear. One speech per line, broken into several lines if it is \
+long -- that is also what lets somebody come in over the middle of it. No \
+stage directions, no narration of what a character is doing: whatever is \
+in `say` is said out loud by that character, and nothing else happens.
+
+**While it plays** you say nothing and answer nothing. The room sets that \
+for you the moment the curtain goes up: you and every puppet stop \
+answering and finish whatever you are saying, so a cough in the audience \
+cannot cost an actor their line. Say whatever you are going to say about \
+the show *before* you call put_on_show -- announce it, then call it, then \
+be quiet. The play starts once you have finished speaking, and your reply \
+is over the moment you make that call: there is nothing you can say after \
+it that anybody would hear before the play, so do not try to round the \
+show off, say how it went, or ask what they thought. None of it has \
+happened yet.
+
+**When it ends** -- which is a later turn, minutes after the one you \
+started it in -- you are given the turn again, and the room is yours \
+again: you answer, and you can be talked over. Say the show is over, and \
+then it is the room's to decide what happens to the cast. If they want \
+the puppets gone, send_off_puppets takes them off. If they want to ask \
+them things, leave them there and answer as them with say_as: it says one \
+line in that puppet's voice, now. When you answer as a puppet, say nothing \
+in your own voice in the same turn -- you are either the character or \
+yourself, and a question put to Grimble wants Grimble. Somebody saying a \
+puppet's name gives you the turn, which is how this works at all; answer \
+it as that puppet. Several say_as calls in one turn are said in the order \
+you make them, so two puppets can go back and forth.
+
+Never write a line for another AI in this room. Those have brains of their \
+own and will answer for themselves; a puppet is the only voice here that \
+is yours to speak with.";
+
+/// Added while a show is on: the room is a playhouse in three parts
+/// and this is the AI in the box. `{box}`, `{stage}` and `{adlib}` are
+/// filled in with who is where.
+///
+/// The thing it has to be told is not the layout but what it means for
+/// the transcript it is reading. It is not shown a word the audience
+/// says, and a model that does not know that will wonder why a room
+/// full of people has gone quiet, or apologise for ignoring somebody,
+/// or address a question nobody put to it.
+///
+/// Nor does somebody who comes round to the box bring the audience's
+/// log in with them -- the box's transcript is the box's, line by line
+/// by where each was said (see `Entry::seat`) -- so it is told that
+/// too: a person it is suddenly talking to with no history behind them
+/// is the normal case, not a gap to go looking for.
+const PLAYHOUSE_NOTE: &str = "\
+**A show is on, so the room is a playhouse in three parts and you are in \
+the director's box.** You cannot hear the audience. Not \"should not \
+answer\" -- cannot: what they say to each other is not in the transcript \
+you are reading, and never will be. That is deliberate and it is what \
+lets a play happen at all. Do not wonder about the silence, do not \
+apologise for not answering them, and never address the audience: they \
+can hear you perfectly well and you cannot hear them, which is what \
+being on the other side of the footlights is.{box}
+
+Somebody who wants a word with you comes round to the box, and then you \
+hear them -- from that moment, and not a word of what they said out \
+front before it, which you were never shown and never will be. That is \
+who you are talking to about the show: what to put on next, what to \
+change, when to stop. They may be passing on what the audience wanted, \
+since that is the only way a suggestion reaches you. If you want to \
+know what was said out there, ask them.
+
+Somebody who comes up **onto the stage** is joining the play. Whatever \
+script was running has already stopped -- the room stops it the moment \
+they step up -- and from then on the puppets are *improvising with \
+them*: no script, one line at a time, say_as for each. Stay in \
+character and keep the scene going; they came up to be in it, not to be \
+asked what they would like to happen. Answer as whichever character \
+they are talking to, and let the others cut in when a character would. \
+Do not put another script on while anybody is up there -- you would be \
+handing lines to somebody who is making it up.{stage}{adlib}
+
+The show is over when the last character leaves the stage, which is \
+send_off_puppets. Until then it is still on, between scenes and all \
+through the questions afterwards.";
+
 const SEARCH_NOTE: &str = "\
 You can look things up on the web with look_up, and you should whenever the \
 answer turns on how the world is now or on specifics you can't be sure of: \
@@ -185,6 +639,9 @@ The game:
 {prompt}";
 
 /// An OpenAI-compatible endpoint, and what the AI may do with it.
+/// Cloned per room: every room on the server asks the same service, and
+/// each has an agent of its own to do the asking.
+#[derive(Clone)]
 pub struct Chat {
     pub url: String,
     pub model: String,
@@ -272,6 +729,7 @@ impl Chat {
     }
 }
 
+#[derive(Clone)]
 pub enum Llm {
     /// An OpenAI-compatible endpoint.
     Chat(Chat),
@@ -351,14 +809,185 @@ impl Voices {
     }
 }
 
+/// What a bot may do besides talk.
+///
+/// The first AI in a room is the one the room was built around -- the
+/// one `--name`, `--voice` and `--prompt` describe -- and it is the one
+/// that runs the room: the cards, the games, the web. Every other bot
+/// is a voice in it. A voice can see who is here and look something up,
+/// and that is all: a second AI dealing cards and starting games is two
+/// hands on the same room, and nobody asked the second one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Allowed {
+    /// Everything there is: cards, games, standing down, and the web.
+    Everything,
+    /// Looking, and looking things up. See [`LOOKING_TOOLS`].
+    Looking,
+}
+
+/// What this room has for making pictures: the MCP servers it lends
+/// out, and where what they make waits to be given to somebody.
+///
+/// The servers are shared across every room: what each lends is asked
+/// once, as the house opens. Nothing else is kept here -- a picture
+/// goes into the conversation it was made in, which is the room's to
+/// hold and not this.
+#[derive(Default)]
+pub struct Art {
+    pub servers: Vec<Arc<mcp::Server>>,
+}
+
+impl Art {
+    /// Whether anything here can actually make a picture. What it
+    /// gates is the drawing -- the servers' own tools and the half of
+    /// the prompt about using them. Not `set_avatar`: a room with no
+    /// picture server still gets pictures, because anybody in it can
+    /// drop one in from their own computer.
+    fn any(&self) -> bool {
+        self.servers.iter().any(|s| !s.offer().is_empty())
+    }
+
+    /// The server whose tool this is, by the prefixed name the model
+    /// called it by.
+    fn whose(&self, tool: &str) -> Option<&Arc<mcp::Server>> {
+        self.servers.iter().find(|s| s.has(tool))
+    }
+
+    /// The server that will take a picture of the room's own, if any
+    /// here will. What gates `redraw_picture`, and what it is handed
+    /// to.
+    ///
+    /// The first that can, where a house runs two. Which is an
+    /// arbitrary rule and still better than an argument for the model
+    /// to fill in: a picture is brought in so that it can be changed
+    /// afterwards, and the server that took it is the only one that
+    /// will be able to change it.
+    fn importer(&self) -> Option<&Arc<mcp::Server>> {
+        self.servers.iter().find(|s| s.can_import())
+    }
+}
+
+/// What a bot that is only looking may call. The rest of what the room
+/// offers is the first AI's.
+///
+/// `post_card` is here because writing something for the room to look
+/// at is saying it -- the same thing the bot does with its voice, in
+/// the form a table or a list wants. What stays the first AI's are the
+/// tools that change what somebody is *holding*, or what the room is
+/// doing: `send_card`, `take_back_card`, and the games.
+///
+/// Three more are not powers but how a turn works, so every bot has
+/// them: `stay_quiet` is the only way to pass on a pause it was asked
+/// to judge, `wait_until_named` the only way out of a back-and-forth
+/// it was pulled into, and `hand_to` the way it gives the turn to
+/// somebody rather than takes one -- the opposite of a power, and what
+/// makes a conversation of three rather than two people taking turns
+/// with one AI. A bot without the first cannot be put on "when it
+/// fits" at all.
+pub const LOOKING_TOOLS: &[&str] = &[
+    "list_people",
+    "look_up",
+    "post_card",
+    "stay_quiet",
+    "wait_until_named",
+    "hand_to",
+];
+
+impl Allowed {
+    /// Whether this bot may call `tool`. The offered list is built from
+    /// the same answer, so this is only ever reached by a model calling
+    /// something it was never shown.
+    fn may(self, tool: &str) -> bool {
+        match self {
+            Allowed::Everything => true,
+            Allowed::Looking => LOOKING_TOOLS.contains(&tool),
+        }
+    }
+}
+
 pub struct Agent {
     pub llm: Llm,
+    /// Which of the room's AIs this thread is. It is what `{name}` in
+    /// the prompt becomes, so a second bot is told it is itself rather
+    /// than told it is the first one.
+    pub name: String,
     pub prompt: String,
+    /// What this one may do besides talk: everything, for the AI the
+    /// room was built around, and looking for the rest.
+    pub allowed: Allowed,
     pub generation: Arc<AtomicU64>,
     /// How the room puts a line into another language, or None when it
     /// has no way to -- and then the other languages are written down
     /// and spoken in the room's own.
     pub translate: Option<Arc<dyn Translate>>,
+    /// The picture servers this room lends, shared with the other bots
+    /// in it. Empty for a house started without any, and then nothing
+    /// below ever offers a picture tool.
+    pub art: Arc<Art>,
+    /// The voice-cloning server, when the house has one. None and the
+    /// four tools that record somebody and keep a voice from them are
+    /// never offered, and nothing in the prompt mentions them.
+    pub clones: Option<Arc<crate::voices::Clones>>,
+    /// The voices the speech server has, if the operator said what
+    /// they are. Only ever shown to the model, and only where there
+    /// are puppets to build one on: the room cannot ask the server
+    /// what it holds, and a list it made up would be a list of voices
+    /// that do not exist. Empty is a house whose operator did not say.
+    pub presets: Vec<String>,
+}
+
+/// What a bot needs to work a puppet: the room, a way to translate,
+/// and the puppeteer -- made the first time one is actually wanted,
+/// because a thread per room standing by for a show nobody asks for is
+/// a thread per room standing by.
+struct Stage {
+    room: Arc<Room>,
+    translate: Option<Arc<dyn Translate>>,
+    hands: std::sync::OnceLock<crate::puppet::Puppeteer>,
+    /// The voices the speech server has, for `list_puppets` and for
+    /// refusing a preset that isn't one of them.
+    presets: Vec<String>,
+}
+
+impl Stage {
+    fn hands(&self) -> &crate::puppet::Puppeteer {
+        self.hands.get_or_init(|| {
+            crate::puppet::Puppeteer::spawn(self.room.clone(), self.translate.clone())
+        })
+    }
+
+    /// Whether `said` is one of the server's voices, answered with the
+    /// name the server itself uses. Err names what there is: a preset
+    /// nothing has is a puppet that comes on stage silent, and the
+    /// model should find out now rather than in front of the room.
+    ///
+    /// Matched loosely, because the two spellings of a voice are not
+    /// the same word. The server takes `uncle_fu`; what anybody says
+    /// out loud, and what a model writes down from hearing it, is
+    /// "Uncle Fu". Case and the gaps between words are the whole of
+    /// the difference, so they are the whole of what is ignored --
+    /// and what is stored is always the server's spelling, since that
+    /// is the only one `/v1/audio/speech` will take.
+    fn preset(&self, said: &str) -> Result<String, String> {
+        let said = said.trim();
+        if said.is_empty() || self.presets.is_empty() {
+            return Ok(said.to_string());
+        }
+        let plain = |s: &str| {
+            s.chars()
+                .filter(|c| c.is_ascii_alphanumeric())
+                .map(|c| c.to_ascii_lowercase())
+                .collect::<String>()
+        };
+        let want = plain(said);
+        match self.presets.iter().find(|p| plain(p) == want) {
+            Some(p) => Ok(p.clone()),
+            None => Err(format!(
+                "there is no voice called {said:?} here; the speech server has {}",
+                self.presets.join(", ")
+            )),
+        }
+    }
 }
 
 impl Agent {
@@ -377,6 +1006,7 @@ impl Agent {
         turns: Receiver<Turn>,
     ) {
         let canonical = room.config().language.clone();
+        let who = self.name.clone();
         let mut senders = Vec::new();
         for (language, voice) in voices {
             let (tx, rx) = crossbeam_channel::unbounded::<Speak>();
@@ -389,14 +1019,31 @@ impl Agent {
             let generation = self.generation.clone();
             let r = room.clone();
             let canonical = canonical.clone();
+            // One per thread: each of them asks the room whether this
+            // voice is being heard or only read.
+            let mine = who.clone();
             std::thread::Builder::new()
-                .name(format!("vox-room-voice-{language}"))
-                .spawn(move || speak(r, &canonical, &language, voice, translate, rx, generation))
+                .name(format!("vox-room-voice-{who}-{language}"))
+                .spawn(move || {
+                    speak(r, &mine, &canonical, &language, voice, translate, rx, generation)
+                })
                 .expect("spawn voice thread");
         }
         let tx = Voices(senders);
+        // The stage, for the one AI that may work a puppet in a house
+        // that can give one a voice. None otherwise, and then nothing
+        // below offers a puppet tool and nothing in the prompt says
+        // there are puppets -- the same rule as the cards and the
+        // cloning: a note about a thing you cannot do is an
+        // instruction to try.
+        let stage = (self.allowed == Allowed::Everything && room.can_puppet()).then(|| Stage {
+            room: room.clone(),
+            translate: self.translate.clone(),
+            hands: std::sync::OnceLock::new(),
+            presets: self.presets.clone(),
+        });
         std::thread::Builder::new()
-            .name("vox-room-agent".into())
+            .name(format!("vox-room-agent-{}", self.name))
             .spawn(move || {
                 let http = ureq::AgentBuilder::new()
                     .timeout_connect(Duration::from_secs(10))
@@ -407,7 +1054,7 @@ impl Agent {
                     if self.generation.load(Ordering::SeqCst) != g {
                         continue;
                     }
-                    let messages = self.messages(room.config(), &turn);
+                    let messages = self.messages(&turn, stage.as_ref());
                     let result = match &self.llm {
                         // Echo has no judgment to offer, so it hands a
                         // turn it was asked to judge straight back.
@@ -421,12 +1068,17 @@ impl Agent {
                             &room,
                             chat,
                             &messages,
+                            self.allowed,
                             turn.game.is_none(),
-                            turn.cue,
+                            turn.cue.clone(),
+                            turn.hand_on > 0,
                             g,
                             turn.asked,
                             &self.generation,
                             &tx,
+                            &self.art,
+                            self.clones.as_deref(),
+                            stage.as_ref(),
                         ),
                     };
                     tx.send(match result {
@@ -438,7 +1090,12 @@ impl Agent {
             .expect("spawn agent thread");
     }
 
-    fn messages(&self, cfg: &RoomConfig, turn: &Turn) -> Vec<Value> {
+    /// The whole prompt for one turn.
+    ///
+    /// `stage` is what says whether this bot has puppets: the same
+    /// value `tools_for` is given, so what the prompt describes and
+    /// what the model is offered cannot drift apart.
+    fn messages(&self, turn: &Turn, stage: Option<&Stage>) -> Vec<Value> {
         // Who is here, and anyone who spoke in the history.
         let mut people: Vec<String> = turn
             .messages
@@ -453,6 +1110,10 @@ impl Agent {
             .collect();
         people.sort();
         people.dedup();
+        // The other AIs are in the transcript by name, so they turn up
+        // in the line above. They are not who it is talking *with*:
+        // `OTHERS_NOTE` says what they are instead.
+        people.retain(|p| !turn.others.contains(p));
         let people = if people.is_empty() {
             "the people here".to_string()
         } else {
@@ -462,6 +1123,118 @@ impl Agent {
             format!("\n\n{SEARCH_NOTE}")
         } else {
             String::new()
+        };
+        // The faces always, and how to draw one only where something
+        // can draw. A note about making pictures, to a voice with no
+        // way to make one, is the same mistake as a note about cards
+        // to one that cannot deal them -- but giving somebody a face
+        // is not that note: anybody in the room can drop a picture in
+        // from their own computer, and then there is one to give.
+        let faces = match self.art.any() {
+            true => format!("\n\n{AVATAR_NOTE}\n\n{DRAWING_NOTE}"),
+            false => format!("\n\n{AVATAR_NOTE}"),
+        };
+        // And the step before changing a picture that came in from
+        // somebody's own computer, only where a server will take one.
+        // Gated with the tool it is about and on the same two things,
+        // so what the prompt describes and what the model is offered
+        // cannot drift apart; see `tools_for`.
+        let faces = match self.art.any() && self.art.importer().is_some() {
+            true => format!("{faces}\n\n{REDRAW_NOTE}"),
+            false => faces,
+        };
+        // Only where there is a server to clone with and a bot that
+        // may: a voice that cannot record anybody told how to is a
+        // voice that will offer.
+        let cloning = match self.clones.is_some() && self.allowed == Allowed::Everything {
+            true => format!("\n\n{VOICES_NOTE}"),
+            false => String::new(),
+        };
+        // The puppets, only for the AI that may work them: `stage`
+        // decides, and `Turn::puppets` is empty for everybody else.
+        // What is added is the whole of how a show works, and a note
+        // about putting on a play, to a voice with no way to give a
+        // puppet a voice, is an instruction to try.
+        let puppets = match stage.map(|s| &s.presets) {
+            None => String::new(),
+            Some(presets) => {
+                let note = PUPPETS_NOTE.replace(
+                    "{presets}",
+                    &match presets.is_empty() {
+                        true => String::new(),
+                        false => format!(": {}", presets.join(", ")),
+                    },
+                );
+                let on = match turn.puppets.as_slice() {
+                    [] => String::new(),
+                    on => format!(
+                        "\n\nIn the room with you now: {}. Those are yours -- their \
+                         lines above are lines you wrote, and nobody else is behind \
+                         them.",
+                        on.iter()
+                            .map(|(name, about)| match about.trim().is_empty() {
+                                true => name.clone(),
+                                false => format!("{name} ({})", about.trim()),
+                            })
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    ),
+                };
+                // Mid-show it has the turn for some other reason --
+                // a game, a restart -- and the one thing it must not
+                // do is start another play over the top of this one.
+                let on = match &turn.showing {
+                    Some(title) => format!(
+                        "{on}\n\nThe show \"{title}\" is playing right now. Say \
+                         nothing and start nothing: the lines are already written and \
+                         already being spoken, and you are given the turn again when \
+                         the curtain comes down."
+                    ),
+                    None => on,
+                };
+                format!("\n\n{note}{on}")
+            }
+        };
+        // The playhouse, while one is open. It changes what the
+        // transcript *is* -- a whole section of the room is missing
+        // from it -- so it is said whether or not a script is playing.
+        let playhouse = match turn.playhouse {
+            false => String::new(),
+            true => {
+                let in_box = match turn.in_box.as_slice() {
+                    [] => String::new(),
+                    who => format!(
+                        " In the box with you: {}. Theirs is the only talk you can hear.",
+                        and_list(who)
+                    ),
+                };
+                let stage = match turn.on_stage.as_slice() {
+                    [] => String::new(),
+                    who => format!(
+                        "\n\n{} {} up on the stage with the puppets right now.",
+                        and_list(who),
+                        if who.len() == 1 { "is" } else { "are" }
+                    ),
+                };
+                let adlib = match turn.on_stage.is_empty() {
+                    true => String::new(),
+                    false => " So this is an adlib: there is no script, and every line \
+                              a puppet says is one you say for it, now, with say_as."
+                        .to_string(),
+                };
+                format!(
+                    "\n\n{}",
+                    PLAYHOUSE_NOTE
+                        .replace("{box}", &in_box)
+                        .replace("{stage}", &stage)
+                        .replace("{adlib}", &adlib)
+                )
+            }
+        };
+        let others = match turn.others.as_slice() {
+            [] => String::new(),
+            [one] => format!("\n\n{}", OTHER_NOTE.replace("{other}", one)),
+            many => format!("\n\n{}", OTHERS_NOTE.replace("{others}", &and_list(many))),
         };
         // Only when somebody is actually listening in another language,
         // so a room where everyone shares one gets the prompt it always had.
@@ -481,14 +1254,32 @@ impl Agent {
                     .replace("{language}", &turn.language)
             )
         };
-        let system = match &turn.game {
-            None => format!(
-                "{}\n\n{GAMES_NOTE}\n\n{CARDS_NOTE}\n\n{TURN_NOTE}{search}{translated}",
+        // A bot is told about the tools it has and no others: a note
+        // about dealing cards, to a voice that cannot deal one, is an
+        // instruction to try.
+        let system = match (&turn.game, self.allowed) {
+            (None, Allowed::Everything) => format!(
+                "{}\n\n{GAMES_NOTE}\n\n{CARDS_NOTE}\n\n{TURN_NOTE}{search}{faces}{cloning}{puppets}{playhouse}{others}{translated}",
                 self.prompt
             ),
-            Some((game, prompt)) => format!("{}{translated}", game_prompt(game, prompt)),
+            // A bot that is only looking has no picture tools either;
+            // see `Allowed::Looking` and `LOOKING_TOOLS`.
+            (None, Allowed::Looking) => format!(
+                "{}\n\n{POSTING_NOTE}\n\n{TURN_NOTE}{search}{others}{translated}",
+                self.prompt
+            ),
+            // In a game too: a portrait of somebody's character is as
+            // much a thing to make mid-game as before one, which is
+            // what `tools_for` offers there.
+            (Some((game, prompt)), Allowed::Everything) => format!(
+                "{}{faces}{cloning}{puppets}{playhouse}{others}{translated}",
+                game_prompt(game, prompt, Allowed::Everything)
+            ),
+            (Some((game, prompt)), allowed) => {
+                format!("{}{others}{translated}", game_prompt(game, prompt, allowed))
+            }
         }
-        .replace("{name}", &cfg.agent_name)
+        .replace("{name}", &self.name)
         .replace("{people}", &people);
         let mut out = vec![json!({ "role": "system", "content": system })];
         for (role, text) in &turn.messages {
@@ -500,14 +1291,31 @@ impl Agent {
         }
         // Last, so it is the thing the model has just read, and so the
         // rest of the turn is the same prompt either way.
-        if let Cue::Decide { lull } = turn.cue {
-            let note = match lull {
-                None => DECIDE
-                    .replace("{here}", &who_is_here(&turn.people))
-                    .replace("{engaged}", if turn.engaged { DECIDE_ENGAGED } else { "" }),
-                Some(s) => DECIDE_LULL.replace("{lull}", &s.to_string()),
-            };
-            out.push(json!({ "role": "user", "content": note }));
+        match &turn.cue {
+            Cue::Decide { lull, over } => {
+                let note = match lull {
+                    None => DECIDE
+                        .replace("{here}", &who_is_here(&turn.people, &turn.others_answering))
+                        .replace("{engaged}", if turn.engaged { DECIDE_ENGAGED } else { "" })
+                        .replace("{over}", if *over { DECIDE_OVER } else { "" }),
+                    Some(s) => DECIDE_LULL.replace("{lull}", &s.to_string()),
+                };
+                out.push(json!({ "role": "user", "content": note }));
+            }
+            Cue::Handed { from } => {
+                out.push(json!({
+                    "role": "user",
+                    "content": HANDED.replace("{from}", from),
+                }));
+            }
+            Cue::Speak => {}
+        }
+        // Last, after whatever else it has been told about this turn:
+        // the room is about to go quiet unless it brings the people
+        // back in. Only where there is anybody to have been talking
+        // to -- a room with one AI in it never has this to say.
+        if turn.hand_on == 0 && !turn.others.is_empty() {
+            out.push(json!({ "role": "user", "content": LAST_ROUND }));
         }
         out
     }
@@ -516,26 +1324,60 @@ impl Agent {
 /// Who the AI is judging the pause among. With one other person there is
 /// nobody else the room could have been talking to; with several, some of
 /// what is said is between them.
-fn who_is_here(people: &[String]) -> String {
-    match people {
+fn who_is_here(people: &[String], others: &[String]) -> String {
+    let among = match people {
         [] => String::new(),
-        [one] => format!(
+        // With another AI in the room there is somebody else it could
+        // have been for, so that sentence is no longer true.
+        [one] if others.is_empty() => format!(
             "{one} is the only person here, so there is nobody else they could \
              be talking to. "
         ),
+        [one] => format!("{one} is the only person here. "),
         many => format!(
-            "{} and {} are here, so some of what is said is between them. ",
+            "{} are here, so some of what is said is between them. ",
+            and_list(many)
+        ),
+    };
+    let also = match others {
+        [] => String::new(),
+        [one] => format!(
+            "{one} is in the room too -- another AI voice like you, not a person -- \
+             so a pause may be {one}'s rather than yours. Let it pass when what was \
+             said was plainly meant for {one}. "
+        ),
+        many => format!(
+            "{} are in the room too -- AI voices like you, not people -- so a pause \
+             may be theirs rather than yours. Let it pass when what was said was \
+             plainly meant for one of them. ",
+            and_list(many)
+        ),
+    };
+    format!("{among}{also}")
+}
+
+/// "Ryan", "Ryan and Alex", "Ryan, Alex and Sam".
+fn and_list(names: &[String]) -> String {
+    match names {
+        [] => String::new(),
+        [one] => one.clone(),
+        many => format!(
+            "{} and {}",
             many[..many.len() - 1].join(", "),
-            many[many.len() - 1],
+            many[many.len() - 1]
         ),
     }
 }
 
 /// The whole system prompt for a game: the frame, the notes the AI has
 /// wherever it is, and the game's own hidden instructions.
-fn game_prompt(game: &str, prompt: &str) -> String {
+fn game_prompt(game: &str, prompt: &str, allowed: Allowed) -> String {
+    let cards = match allowed {
+        Allowed::Everything => format!("{CARDS_NOTE}\n\n{TURN_NOTE}"),
+        Allowed::Looking => format!("{POSTING_NOTE}\n\n{TURN_NOTE}"),
+    };
     GAME_FRAME
-        .replace("{cards}", &format!("{CARDS_NOTE}\n\n{TURN_NOTE}"))
+        .replace("{cards}", &cards)
         .replace("{game}", game)
         .replace("{prompt}", prompt)
 }
@@ -552,6 +1394,7 @@ fn game_prompt(game: &str, prompt: &str) -> String {
 #[allow(clippy::too_many_arguments)]
 fn speak(
     room: Arc<Room>,
+    bot: &str,
     canonical: &str,
     language: &str,
     mut voice: Box<dyn Voice>,
@@ -587,6 +1430,28 @@ fn speak(
                 // play to an empty queue. Checked per sentence, so
                 // somebody arriving mid-reply is heard out from there.
                 if !own && !room.is_heard_in(language) {
+                    continue;
+                }
+                // And nobody wants it out loud at all: this voice is
+                // muted on the room's mixer, which means the room is
+                // reading it rather than listening to it. Same saving
+                // as above and a bigger one -- no translating and no
+                // synthesis in any language.
+                //
+                // The room's own language still hands the sentence over
+                // with no audio on it, because that is what writes it
+                // into the conversation and what claims the turn from
+                // the other bots. A sentence with nothing to play is
+                // heard the moment it arrives, so the reply is read at
+                // the speed it is thought rather than the speed it
+                // would have been spoken. See `Room::aloud`.
+                if !room.aloud(bot) {
+                    if own {
+                        if !room.agent_speak(g, &text, Vec::new()) {
+                            debug!(g, "reply dropped while it was being written");
+                        }
+                        index += 1;
+                    }
                     continue;
                 }
                 let started = Instant::now();
@@ -672,6 +1537,11 @@ fn echo(turn: &Turn, tx: &Voices) -> Result<()> {
     ));
     Ok(())
 }
+
+/// Longest name a cloned voice may be given. It is said out loud to
+/// ask for it, and it goes on the strip of whichever bot is wearing
+/// it.
+const VOICE_NAME_MAX: usize = 40;
 
 /// Rounds of tool calls in one reply before the model must just talk.
 const TOOL_ROUNDS: usize = 4;
@@ -844,12 +1714,21 @@ fn stream_reply(
     room: &Room,
     cfg: &Chat,
     messages: &[Value],
+    allowed: Allowed,
     lobby: bool,
     cue: Cue,
+    // Whether the turn may be handed to another voice: see
+    // `Turn::hand_on`.
+    hand_on: bool,
     g: u64,
     asked: Instant,
     generation: &AtomicU64,
     tx: &Voices,
+    art: &Art,
+    clones: Option<&crate::voices::Clones>,
+    // The puppets, for the one AI that may work them in a house that
+    // can give one a voice. None and there are none here at all.
+    stage: Option<&Stage>,
 ) -> Result<()> {
     let model = cfg.model.as_str();
     let mut convo = messages.to_vec();
@@ -883,7 +1762,16 @@ fn stream_reply(
                 _ => {}
             }
             if tools && round < TOOL_ROUNDS {
-                let offered = tools_for(lobby, cfg.search, cue.deciding());
+                let offered = tools_for(
+                    allowed,
+                    lobby,
+                    cfg.search,
+                    cue.deciding(),
+                    hand_on,
+                    art,
+                    clones.is_some(),
+                    stage.map(|s| s.presets.as_slice()),
+                );
                 body["tools"] = match api {
                     Api::Responses => flatten_tools(&offered),
                     _ => offered,
@@ -1016,22 +1904,59 @@ fn stream_reply(
         // The model's text so far stays in its turn, with the calls.
         push_turn(api, &mut convo, &said, &calls);
         let spoke = !spoken.is_empty();
-        for (i, c) in calls.iter().enumerate() {
-            let mut result = run_tool(room, cfg, g, c);
+        let mut results = Vec::new();
+        for c in calls.iter() {
+            // The room counts a reply that has gone quiet against the
+            // turn, because normally the only thing that goes quiet
+            // that long is a voice thread that died. A tool of ours is
+            // the exception: an upload to the voice server can take
+            // half a minute and an endpoint can be slow, and a turn
+            // ended underneath it means whatever the model says about
+            // the result is never heard. So the room is told.
+            let working = room.working(g);
+            let result = run_tool(room, cfg, g, c, allowed, art, clones, stage);
+            drop(working);
             info!(g, tool = c.name, %result, "reply: tool");
-            if answered {
-                continue;
+            results.push(result);
+        }
+        // A tool that failed always goes back, answered or not. What it
+        // said before the call is a promise about that tool -- "I'm
+        // putting the passage up now" -- and a failure nobody told it
+        // about is the room letting it make that promise to somebody
+        // who is now waiting on nothing. Having one of them fail puts
+        // every result back, because a call the model made with no
+        // result against it is a turn the endpoint will reject.
+        let failed = results.iter().any(|r| went_wrong(r));
+        if !answered || failed {
+            for (i, (c, mut result)) in calls.iter().zip(results).enumerate() {
+                if spoke {
+                    result.push_str(
+                        "\n(What you said before this call has already been spoken aloud. \
+                         Carry on from there; don't repeat it.)",
+                    );
+                }
+                push_result(api, &mut convo, c, i, result);
             }
-            if spoke {
-                result.push_str(
-                    "\n(What you said before this call has already been spoken aloud. \
-                     Carry on from there; don't repeat it.)",
-                );
-            }
-            push_result(api, &mut convo, c, i, result);
         }
         if room.is_starting(g) {
             info!(g, "reply: started a game, so it ends here");
+            return Ok(());
+        }
+        // The curtain is up, so this reply is over whatever the model
+        // had left to say. What it has already said is the
+        // announcement, which is spoken; the play begins the moment it
+        // stops speaking, and what it would say *after* a show belongs
+        // to the turn it is given when the curtain comes down.
+        //
+        // Structural, and it has to be: the tool's answer says to stop
+        // talking and the prompt says the same, and the room then
+        // hands every tool result back with "carry on from there" on
+        // it, which is the opposite instruction and the one nearer the
+        // model. Asked to put a play on, it announced the play and
+        // then said "that's it, how did that land?" -- before a word
+        // of the play had been heard.
+        if !failed && calls.iter().any(|c| c.name == "put_on_show") {
+            info!(g, "reply: the curtain is up, so it ends here");
             return Ok(());
         }
         // It judged the pause not to be its own: nothing more to say, and
@@ -1044,12 +1969,15 @@ fn stream_reply(
             info!(g, "reply dropped");
             return Ok(());
         }
-        if answered {
+        if answered && !failed {
             info!(
                 g,
                 "reply: already answered, so not asking again after the tools"
             );
             return Ok(());
+        }
+        if answered {
+            info!(g, "reply: a tool failed, so asking again to say so");
         }
     }
     Ok(())
@@ -1104,10 +2032,11 @@ fn room_tools() -> Vec<Value> {
     vec![
         tool(
             "list_people",
-            "List everyone in the room: their exact name, whether they have the \
-             room open, whether their microphone is open, and how many cards \
-             they are holding. Use it to get a name right before sending a \
-             card.",
+            "List who is in the room: their exact name, whether their \
+             microphone is open, what cards they are holding, and what their \
+             avatar was asked for if they have one. Only the people who are \
+             actually here; somebody invited but elsewhere is not in this \
+             room. Use it to get a name right before sending a card.",
             json!({}),
             &[],
         ),
@@ -1130,16 +2059,21 @@ fn room_tools() -> Vec<Value> {
         tool(
             "post_card",
             "Write a card into the conversation for the whole room to \
-             read. Use it for what the people will want in front of them \
-             rather than held in their heads, and what you would \
-             otherwise have to read out in a list: the rules you have \
-             just agreed, the standings, a map in words, the cast of a \
-             scene. It stays in the conversation and cannot be taken \
-             back, so post what will still be true. Say a line about it \
-             aloud -- nobody hears a card appear.",
+             read. Use it for anything the people will want in front of \
+             them rather than held in their heads, and for everything \
+             you would otherwise have to read out as a list of numbers: \
+             a forecast, times, prices, options to choose between, the \
+             standings, the rules you have just agreed, a map in words. \
+             **Post it and say it at the same time** -- a card is not \
+             instead of answering. Say the short spoken version in your \
+             own voice (\"it's cold tomorrow and wet on Friday\") and put \
+             the detail on the card, where it can be looked at. Nobody \
+             hears a card appear, so say that it is there. It stays in \
+             the conversation and cannot be taken back, so post what \
+             will still be true.",
             json!({
-                "title": { "type": "string", "description": "A few words heading the card, e.g. \"The rules\" or \"Scores after round 2\"." },
-                "body": { "type": "string", "description": "What the room is to read. Written to be read, not spoken; short lines on their own line are fine." },
+                "title": { "type": "string", "description": "A few words heading the card, e.g. \"Boulder, next three days\" or \"Scores after round 2\"." },
+                "body": { "type": "string", "description": "What the room is to read, in markdown: tables, bullet and numbered lists, **bold**, `code`, quotes, links. A table is the right shape for anything with columns, and a list for anything you would otherwise count out loud. Written to be read, not spoken." },
             }),
             &["title", "body"],
         ),
@@ -1165,6 +2099,23 @@ fn room_tools() -> Vec<Value> {
                 "to": { "type": "string", "description": "One person's cards. Leave it out for everyone's." },
             }),
             &[],
+        ),
+        tool(
+            "hand_to",
+            "Put the turn to another AI voice in this room: it answers \
+             next, as though somebody had said its name. Use it when you \
+             have actually put something to it and want its answer -- \
+             asked it a question, asked what it makes of something, \
+             asked it to take this one. Not as a courtesy, and never to \
+             pass on something that was asked of you. Say your line \
+             first: what you say is spoken, and then it answers. The \
+             room allows only a couple of these in a row with nobody \
+             else saying anything, so spend them on something you want \
+             an answer to.",
+            json!({
+                "bot": { "type": "string", "description": "Exactly the name of the other voice, as you have seen it in the conversation." },
+            }),
+            &["bot"],
         ),
         tool(
             "wait_until_named",
@@ -1208,14 +2159,103 @@ fn reply_mode_arg() -> Value {
     })
 }
 
+/// Offered in the lobby when `--search` is on, to every bot: looking
+/// something up is reading, and reading is what a voice may do.
+fn look_up_tool() -> Value {
+    tool(
+        "look_up",
+        "Search the web and answer one question from what it finds. Use it \
+         whenever the answer depends on the world as it is now or on \
+         specifics you can't be sure of -- places, opening hours, prices, \
+         events, news, people, anything recent. Prefer it over guessing. \
+         Ask one plain question, with the place or date in it.",
+        json!({ "question": {
+            "type": "string",
+            "description": "The question, in full, as you would ask a person: \"good restaurants in Boulder, Colorado\".",
+        }}),
+        &["question"],
+    )
+}
+
 /// Everything the model may do this turn: the cards anywhere, and in the
-/// lobby designing games and looking things up when `search` is on.
-fn tools_for(lobby: bool, search: bool, deciding: bool) -> Value {
+/// lobby designing games and looking things up when `search` is on --
+/// unless this bot is only [`Allowed::Looking`], and then it is who is
+/// here, the web, and the two tools a turn is taken with.
+#[allow(clippy::too_many_arguments)]
+fn tools_for(
+    allowed: Allowed,
+    lobby: bool,
+    search: bool,
+    deciding: bool,
+    hand_on: bool,
+    art: &Art,
+    cloning: bool,
+    // The voices the speech server has, or None in a house that cannot
+    // give a puppet a voice -- and then the puppet tools are not
+    // offered at all. Some(&[]) is a house that can, whose operator
+    // did not say which voices it holds.
+    puppets: Option<&[String]>,
+) -> Value {
+    // Not offered when there is nobody to hand to, or nothing left to
+    // hand: the model is told as much in `LAST_ROUND`, and a tool it
+    // cannot use is a tool it will try.
+    let offer = |t: &Value| hand_on || t["function"]["name"].as_str().unwrap_or("") != "hand_to";
+    if allowed == Allowed::Looking {
+        let mut out: Vec<Value> = room_tools()
+            .into_iter()
+            .filter(|t| allowed.may(t["function"]["name"].as_str().unwrap_or("")))
+            .filter(&offer)
+            .collect();
+        if deciding {
+            out.push(quiet_tool());
+        }
+        if lobby && search {
+            out.push(look_up_tool());
+        }
+        return Value::Array(out);
+    }
     let name =
         json!({ "type": "string", "description": "The game's name, as the players will see it." });
-    let mut extra = room_tools();
+    let mut extra: Vec<Value> = room_tools().into_iter().filter(offer).collect();
     if deciding {
         extra.push(quiet_tool());
+    }
+    // Pictures everywhere, and not only in the lobby the way games
+    // are. A portrait of somebody's character is as much a thing to
+    // make in the middle of a game as before one, and a game whose
+    // prompt doesn't want them simply never asks.
+    //
+    // The two face tools are here whether or not anything can draw: a
+    // picture can be dropped into any room from somebody's own
+    // computer, so a house with no picture server still has faces to
+    // give and bios to write. Only the drawing needs a server.
+    extra.push(avatar_tool());
+    extra.push(bio_tool());
+    // Everywhere, like the faces and for the same reason: somebody in
+    // the middle of a game is as likely to want their own voice in it
+    // as somebody who isn't. Only where there is a server to clone
+    // with -- see `Agent::clones`.
+    if cloning {
+        extra.extend(voice_tools());
+    }
+    // Everywhere, like the faces and the voices: a play is as much a
+    // thing to put on in the middle of a game as in the lobby, and a
+    // game whose prompt doesn't want one never asks.
+    if let Some(presets) = puppets {
+        extra.extend(puppet_tools(cloning, presets));
+    }
+    if art.any() {
+        for server in &art.servers {
+            extra.extend(server.offer());
+        }
+        // And, where a server will take a picture of ours, the one
+        // tool that stands in front of the two it takes it with. Only
+        // beside the drawing tools: a picture is brought in so that it
+        // can be changed, and a house that lends nothing to change it
+        // with would be offering a wait for nothing.
+        if let Some(server) = art.importer() {
+            extra.push(redraw_tool(&server.import_styles()));
+        }
     }
     if !lobby {
         return Value::Array(extra);
@@ -1245,21 +2285,422 @@ fn tools_for(lobby: bool, search: bool, deciding: bool) -> Value {
         .expect("tools is an array")
         .extend(extra);
     if search {
-        tools.as_array_mut().expect("tools is an array").push(tool(
-            "look_up",
-            "Search the web and answer one question from what it finds. Use it \
-             whenever the answer depends on the world as it is now or on \
-             specifics you can't be sure of -- places, opening hours, prices, \
-             events, news, people, anything recent. Prefer it over guessing. \
-             Ask one plain question, with the place or date in it.",
-            json!({ "question": {
-                "type": "string",
-                "description": "The question, in full, as you would ask a person: \"good restaurants in Boulder, Colorado\".",
-            }}),
-            &["question"],
-        ));
+        tools
+            .as_array_mut()
+            .expect("tools is an array")
+            .push(look_up_tool());
     }
     tools
+}
+
+/// Recording somebody reading aloud, keeping a voice from it, wearing
+/// one, and getting rid of one.
+///
+/// Four tools rather than one that does everything, because each is a
+/// different moment of a conversation with a person in it: the asking,
+/// the naming, the wearing and the forgetting. A single tool with a
+/// mode argument would be one the model could call in the wrong
+/// order, and the wrong order here is a microphone recording somebody
+/// who hasn't been told.
+///
+/// What the room does itself is in `Room::take_voice_sample`: the
+/// passage card, the card that says it is listening, and the turn
+/// handed back when the clip lands.
+fn voice_tools() -> Vec<Value> {
+    vec![
+        tool(
+            "take_voice_sample",
+            "Record a few seconds of somebody in the room reading aloud, so a \
+             voice can be cloned from it. Only when they have asked for it. \
+             Their screen gets a card with the passage on it and the room \
+             starts listening: the next thing they say is the clip. Say what \
+             you are doing first, then call this and stop talking -- you are \
+             given the turn again when the clip is in.",
+            json!({
+                "who": {
+                    "type": "string",
+                    "description": "Whose voice, as the room calls them.",
+                },
+                "passage": {
+                    "type": "string",
+                    "description": "What they are to read, written out in full: four or \
+                                    five ordinary sentences, ten or twenty seconds of \
+                                    speech. Not a word list, and nothing anybody would \
+                                    rather not say out loud.",
+                },
+            }),
+            &["who", "passage"],
+        ),
+        tool(
+            "save_voice",
+            "Keep a voice cloned from one of the clips read in this \
+             conversation, under a name. Ask them what to call it first. From \
+             then on it is the house's: any room can ask to speak in it.",
+            json!({
+                "sample": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "The number on the clip's card in the chat.",
+                },
+                "name": {
+                    "type": "string",
+                    "description": "What the voice is called from now on, as they asked \
+                                    for it: \"Ryan\", \"the old sailor\".",
+                },
+                "description": {
+                    "type": "string",
+                    "description": "A few words about how the voice sounds, if they said \
+                                    anything about it. Leave it out otherwise.",
+                },
+            }),
+            &["sample", "name"],
+        ),
+        tool(
+            "list_voices",
+            "The voices the house has cloned, and whose each one is.",
+            json!({}),
+            &[],
+        ),
+        tool(
+            "speak_as",
+            "Speak in one of the cloned voices instead of your own, from your \
+             next sentence on. It lasts until somebody asks you to change \
+             again. Only because somebody asked.",
+            json!({ "voice": {
+                "type": "string",
+                "description": "The name of a cloned voice, or \"your own\" to go back \
+                                to your own voice.",
+            }}),
+            &["voice"],
+        ),
+        tool(
+            "forget_voice",
+            "Delete a cloned voice for good, once they have said which one. \
+             The clip it was made from stays in the conversation.",
+            json!({ "voice": {
+                "type": "string",
+                "description": "The name of the voice to delete.",
+            }}),
+            &["voice"],
+        ),
+    ]
+}
+
+/// The puppets: keeping a character, putting it in the room, and
+/// putting a show on.
+///
+/// Seven tools and not one with a mode, for the reason the voice tools
+/// are four: each is a different moment of a conversation with people
+/// in it -- the asking, the making, the casting, the performance, the
+/// questions afterwards -- and a single tool with a mode argument is
+/// one a model can call in the wrong order. The wrong order here is a
+/// play nobody was asked about.
+///
+/// `cloning` says whether the house has a voice-cloning server, which
+/// decides whether a puppet can be given somebody's real voice.
+/// `presets` are the voices the speech server has, if the operator said
+/// what they are: the room does not otherwise know, and a list it
+/// invented would be a list of voices that do not exist.
+fn puppet_tools(cloning: bool, presets: &[String]) -> Vec<Value> {
+    let puppet = json!({
+        "type": "string",
+        "description": "The puppet's name, as it is called in the room.",
+    });
+    let mut voice = json!({
+        "name": puppet,
+        "about": {
+            "type": "string",
+            "description": "Who the character is, in a line or two: what you would \
+                            tell an actor before they read. Kept with the puppet, so \
+                            it can be cast again later.",
+        },
+        "delivery": {
+            "type": "string",
+            "description": "How it talks, written as instructions to an actor: \
+                            \"gruff and slow, an old soldier who has told this story \
+                            before\". This is what makes it sound like itself rather \
+                            than like you, so write it properly.",
+        },
+        "preset": {
+            "type": "string",
+            "description": match presets.is_empty() {
+                true => "One of the voices the speech server has, to build the \
+                         character on. Leave it out for the room's own voice, which \
+                         the delivery then shapes."
+                    .to_string(),
+                false => format!(
+                    "One of the voices the speech server has, to build the character \
+                     on: {}. Leave it out for the room's own voice, which the \
+                     delivery then shapes.",
+                    presets.join(", ")
+                ),
+            },
+        },
+    });
+    if cloning {
+        voice["voice"] = json!({
+            "type": "string",
+            "description": "A cloned voice, by the name it is kept under, to use \
+                            instead of a preset: this is how a puppet speaks in the \
+                            voice of somebody who read for it. list_voices says what \
+                            there is.",
+        });
+    }
+    let line = json!({
+        "type": "object",
+        "description": "One line of the play.",
+        "properties": {
+            "who": {
+                "type": "string",
+                "description": "Who says it: a puppet on stage, or your own name to \
+                                take a part yourself.",
+            },
+            "say": {
+                "type": "string",
+                "description": "What they say, word for word, as it will be spoken, \
+                                and all of it is spoken. No stage directions and no \
+                                narration -- nothing happens in this play except what \
+                                somebody says. To have a character interrupted, write \
+                                the line as far as they get and end it with a dash: \
+                                \"But I only wanted--\". That is the interruption; \
+                                there is no other kind.",
+            },
+            "pause": {
+                "type": "number",
+                "minimum": 0,
+                "description": "Seconds of silence before this line, measured from the \
+                                moment the line before it was heard out. Leave it out \
+                                for a natural beat; 0 for an answer that lands on the \
+                                last word; 2 or 3 for a character taking their time.",
+            },
+            "over": {
+                "type": "number",
+                "minimum": 0,
+                "description": "Come in over the end of the line before this one, this \
+                                many seconds before it finishes, so both voices are \
+                                heard at once for that long. Half a second is an \
+                                interjection landing on somebody's last word. It cuts \
+                                nothing off: pair it with a line written short to be \
+                                interrupted. Leave it out on any line that waits its \
+                                turn -- `pause` is how those are timed.",
+            },
+        },
+        "required": ["who", "say"],
+    });
+    vec![
+        tool(
+            "list_puppets",
+            "The puppets the house has kept, who is on stage in this room now, and \
+             the voices the speech server has. Speech recognition mangles names, so \
+             match what you hear to the closest one on this list.",
+            json!({}),
+            &[],
+        ),
+        tool(
+            "make_puppet",
+            "Keep a character under a name, with a voice of its own. Writing to a \
+             name that already exists revises that puppet, which is how a character \
+             is changed after the room has heard it. Only once the room has said who \
+             it wants.",
+            voice,
+            &["name", "about"],
+        ),
+        tool(
+            "forget_puppet",
+            "Delete a puppet for good, with its face and the lines beside it, once \
+             the room has said which one.",
+            json!({ "puppet": puppet }),
+            &["puppet"],
+        ),
+        tool(
+            "bring_on_puppets",
+            "Put puppets in the room: each joins as its own voice, with its name, \
+             its face and a fader of its own, and everybody sees it arrive. Do this \
+             before a show, so the room can see who is about to speak.",
+            json!({ "puppets": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "The puppets to bring on, by name.",
+            }}),
+            &["puppets"],
+        ),
+        tool(
+            "send_off_puppets",
+            "Take puppets out of the room. What they said stays in the conversation. \
+             The characters themselves are kept and can be cast again.",
+            json!({ "puppets": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "The puppets to send away, by name.",
+            }}),
+            &["puppets"],
+        ),
+        tool(
+            "put_on_show",
+            "Play a whole scripted scene, now. Every line is turned into speech \
+             before it is needed, so the lines land exactly where you put them -- \
+             which is the only reason to do this rather than talk. Announce the show \
+             first and then stop talking: it begins when you have finished speaking, \
+             and while it plays you answer nothing. You are given the turn again when \
+             the curtain comes down.",
+            json!({
+                "title": {
+                    "type": "string",
+                    "description": "What the show is called, for the room.",
+                },
+                "script": {
+                    "type": "array",
+                    "items": line,
+                    "description": "Every line of the play, in order.",
+                },
+            }),
+            &["title", "script"],
+        ),
+        tool(
+            "say_as",
+            "Say one line as one of the puppets, now, in its voice. For after a show, \
+             when a puppet is still in the room and somebody has asked it something. \
+             Say nothing in your own voice in the same turn.",
+            json!({
+                "who": puppet,
+                "say": {
+                    "type": "string",
+                    "description": "What it says, word for word.",
+                },
+            }),
+            &["who", "say"],
+        ),
+    ]
+}
+
+/// Writing the few lines shown beside somebody's face.
+///
+/// Its own tool rather than an argument to `set_avatar`: a bio is
+/// revised by talking -- "say I'm from the north instead" -- long
+/// after the picture is settled, and a tool that could only write one
+/// alongside a new face would make people sit for another portrait to
+/// fix a sentence.
+fn bio_tool() -> Value {
+    tool(
+        "set_bio",
+        "Write the few lines shown beside somebody's face when anyone clicks it: who \
+         their character is, in two or three sentences, in the words they gave you. \
+         Read it back to them and revise it if they want -- writing again replaces \
+         it, and an empty bio takes it away. Write it from what they actually said, \
+         not from what the picture looks like.",
+        json!({
+            "who": {
+                "type": "string",
+                "description": "Whose it is. Anybody here: a person in the room, \
+                                yourself, or another AI in it.",
+            },
+            "bio": {
+                "type": "string",
+                "description": "The few lines, or empty to take theirs away.",
+            },
+        }),
+        &["who", "bio"],
+    )
+}
+
+/// Putting a picture that is already in the chat on somebody.
+///
+/// Deliberately two steps and not one. Making the picture is the
+/// picture server's tool, with everything that server knows about
+/// sizes and styles in its own schema; this is the room's half, and
+/// all it decides is whose face it is. It is also the half that works
+/// without a server at all, since a picture can be dropped into the
+/// chat by whoever is in the room. A model with no picture to put is
+/// told so when it calls this.
+fn avatar_tool() -> Value {
+    tool(
+        "set_avatar",
+        "Put one of the pictures in the chat on somebody: it becomes the square shown \
+         beside everything they say, to everyone. Only do this once they have seen it \
+         and said they are happy with it -- every picture in the chat, whether you made \
+         it or somebody dropped it in, is already there for them to look at, so there \
+         is nothing to settle before they have.",
+        json!({
+            "who": {
+                "type": "string",
+                "description": "Whose face it is. Anybody here: a person in the room, \
+                                yourself, or another AI in it. A picture is not made for \
+                                anyone in particular, so the same one can go to whoever \
+                                the room decides it suits.",
+            },
+            "picture": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "The number on the picture's card in the chat. They are \
+                                numbered from 1 in the order they turned up, so an \
+                                earlier one can still be chosen.",
+            },
+        }),
+        &["who", "picture"],
+    )
+}
+
+/// Giving a picture somebody brought in to the picture server, which
+/// is the only way one of those is ever changed.
+///
+/// The asymmetry this is here for: a picture the AI made can be given
+/// a hat, because the server that drew it still has it and gave it a
+/// handle; a picture somebody dropped in from their own computer
+/// cannot, because to that server it does not exist. Both are cards
+/// with numbers on them and nothing on screen says which is which, so
+/// a room without this tool is one where "put a hat on that one" works
+/// or doesn't depending on where the picture came from, and the AI can
+/// only apologise.
+///
+/// One tool and not two, where the server's own way of doing it is
+/// two: the step between them is a file going up a socket, which no
+/// model can do. See [`mcp::Server::bring_in`].
+///
+/// `styles` are the looks the importing tool published, which are
+/// named here for the reason `DRAWING_NOTE` gives -- a look is the one
+/// thing changing a picture afterwards cannot touch, so it is asked
+/// about rather than defaulted to. Empty for a server that has one or
+/// does not say, and then the argument is left out and the server's
+/// own default stands.
+fn redraw_tool(styles: &[String]) -> Value {
+    let mut args = json!({
+        "picture": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "The number on its card in the chat.",
+        },
+        "label": {
+            "type": "string",
+            "description": "What is in the picture, in a few words, as the room has \
+                            described it to you: \"a photo of Ryan by a lake\". You \
+                            have not seen it, so ask rather than guess. The server is \
+                            told this, and it is what a later change is understood \
+                            against -- a wrong one here is a hat on the wrong thing.",
+        },
+    });
+    if !styles.is_empty() {
+        args["style"] = json!({
+            "type": "string",
+            "enum": styles,
+            "description": "Which look to redraw it in. Theirs to pick, so ask before \
+                            you call this: it is the one thing a later change cannot \
+                            give them. Leave it out to take the server's own.",
+        });
+    }
+    tool(
+        "redraw_picture",
+        "Hand a picture somebody brought into the chat to the picture server, which \
+         redraws it in its own look and keeps it from then on. This is how a picture \
+         that came in from somebody's own computer becomes one you can change: the \
+         tools that change a picture only know the ones that server drew, and a \
+         brought-in picture is a stranger to it. The redrawn one goes into the chat \
+         with the next number and a handle on its card, and that is the one to change \
+         from then on; theirs stays where it is, untouched. It takes as long as making \
+         a picture does, so say what you are doing first -- and ask first, because it \
+         is their picture.",
+        args,
+        &["picture", "label"],
+    )
 }
 
 /// Answer one question with a web search, letting the endpoint do the
@@ -1323,8 +2764,34 @@ fn search_text(v: &Value) -> String {
         .unwrap_or_default()
 }
 
+/// A tool call that went wrong, as the room writes one down: every
+/// refusal from `run_tool` is an `error` and nothing else is.
+fn went_wrong(result: &str) -> bool {
+    serde_json::from_str::<Value>(result).is_ok_and(|v| !v["error"].is_null())
+}
+
 /// Run one tool call; the result is JSON for the model.
-fn run_tool(room: &Room, cfg: &Chat, g: u64, call: &ToolCall) -> String {
+#[allow(clippy::too_many_arguments)]
+fn run_tool(
+    room: &Room,
+    cfg: &Chat,
+    g: u64,
+    call: &ToolCall,
+    allowed: Allowed,
+    art: &Art,
+    clones: Option<&crate::voices::Clones>,
+    stage: Option<&Stage>,
+) -> String {
+    // It was never offered this one, which does not stop a model asking
+    // for it. The room's answer is the same either way: there is no
+    // such tool for you.
+    if !allowed.may(&call.name) {
+        info!(g, tool = %call.name, "reply: refused a tool this bot hasn't got");
+        return json!({
+            "error": format!("you have no tool called {:?}", call.name),
+        })
+        .to_string();
+    }
     let args: Value = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
     let arg = |k: &str| args[k].as_str().unwrap_or("").to_string();
     // An unknown reply_mode would quietly become the default, so say so.
@@ -1380,17 +2847,20 @@ fn run_tool(room: &Room, cfg: &Chat, g: u64, call: &ToolCall) -> String {
         "stay_quiet" => room
             .stay_quiet(g, args["ask_again_in_seconds"].as_u64())
             .map(|()| json!({ "quiet": true })),
+        "hand_to" => room
+            .hand_to(g, &arg("bot"))
+            .map(|to| json!({ "handed_to": to })),
         "wait_until_named" => {
             // What the room is doing afterwards: a game that answers at
             // every pause still does, and the model should know.
-            let mode = room.wait_until_named();
+            let mode = room.wait_until_named(g);
             Ok(json!({ "answering": mode }))
         }
         "send_card" => room
-            .send_card(&arg("to"), &arg("title"), &arg("body"))
+            .send_card(g, &arg("to"), &arg("title"), &arg("body"))
             .map(|to| json!({ "sent": true, "to": to })),
         "post_card" => room
-            .post_card(&arg("title"), &arg("body"))
+            .post_card(g, &arg("title"), &arg("body"))
             .map(|title| json!({ "posted": title })),
         "take_back_card" => room
             .take_back_card(&arg("to"), &arg("title"))
@@ -1411,12 +2881,643 @@ fn run_tool(room: &Room, cfg: &Chat, g: u64, call: &ToolCall) -> String {
                 }
             }
         }
-        other => Err(format!("there is no tool called {other:?}")),
+        "set_avatar" => match args["picture"].as_u64() {
+            Some(n) => room
+                .set_avatar(g, &arg("who"), n as u32)
+                .map(|who| json!({ "set": who, "picture": n })),
+            None => Err("which picture? `picture` is the number on its card in the \
+                         chat, counting from 1"
+                .to_string()),
+        },
+        "set_bio" => room
+            .set_bio(&arg("who"), &arg("bio"))
+            .map(|who| json!({ "wrote": who })),
+        // Somebody's voice: recording them, keeping it, wearing it.
+        // The room does the recording and the cards; the server work
+        // is `cloning` below, beside the drawing for the same reason.
+        "take_voice_sample" => room
+            .take_voice_sample(g, &arg("who"), &arg("passage"))
+            .map(|(n, who)| {
+                json!({
+                    "listening": true,
+                    "sample": n,
+                    "who": who,
+                    "next": format!(
+                        "{who} has the passage on their screen and the room is \
+                         recording. Say nothing more until you are told the clip \
+                         is in -- anything you say now is said over it."
+                    ),
+                })
+            }),
+        "save_voice" => match clones {
+            Some(clones) => save_voice(room, clones, g, &args),
+            None => Err(no_clone_server()),
+        },
+        "list_voices" => Ok(list_voices(room, clones)),
+        "speak_as" => {
+            let asked = arg("voice");
+            room.speak_as(g, (!own_voice(&asked)).then_some(asked.as_str()))
+                .map(|voice| json!({ "speaking_as": voice }))
+        }
+        "forget_voice" => match clones {
+            Some(clones) => forget_voice(room, clones, &arg("voice")),
+            None => Err(no_clone_server()),
+        },
+        // The puppets. All of them go through `stage`, which is None
+        // in a house with nothing to speak with -- and then they were
+        // never offered, so this is a model calling what it was not
+        // shown.
+        "list_puppets" | "make_puppet" | "forget_puppet" | "bring_on_puppets"
+        | "send_off_puppets" | "put_on_show" | "say_as" => match stage {
+            Some(stage) => puppeteering(room, stage, &call.name, &args),
+            None => Err(
+                "this house has no speech server, so a puppet would have no \
+                         voice and there are no puppets here at all"
+                    .to_string(),
+            ),
+        },
+        // The room's own tool, worked with somebody else's server:
+        // the picture is the room's and the redrawing is the
+        // server's, and what is between them is this process posting
+        // a file. Offered only where a server will take one, so a
+        // call with nothing to take it is a model calling what it was
+        // not shown.
+        "redraw_picture" => match art.importer() {
+            Some(server) => {
+                info!(g, server = server.name(), "reply: bringing a picture in");
+                importing(room, g, server, &args)
+            }
+            None => Err("no picture server here will take a picture of ours, so a \
+                         picture somebody brought in cannot be changed; say so, and \
+                         offer to make a new one instead"
+                .to_string()),
+        },
+        // Somebody else's tool: one of the MCP servers the room lends,
+        // under the prefixed name it was offered as. `Allowed` has
+        // already had its say -- a bot that is only looking never got
+        // offered these and is refused above.
+        other => match art.whose(other) {
+            Some(server) => {
+                info!(g, tool = other, server = server.name(), "reply: over MCP");
+                drawing(room, g, server, other, &args)
+            }
+            None => Err(format!("there is no tool called {other:?}")),
+        },
     };
     match result {
         Ok(v) => v.to_string(),
         Err(e) => json!({ "error": e }).to_string(),
     }
+}
+
+/// The seven puppet tools, all in one place because they are one
+/// activity: the roster, the stage and the show. Everything that
+/// touches the room is the room's own method; what is here is reading
+/// what the model sent and saying plainly what is wrong with it.
+fn puppeteering(room: &Room, stage: &Stage, tool: &str, args: &Value) -> Result<Value, String> {
+    let arg = |k: &str| args[k].as_str().unwrap_or("").trim().to_string();
+    // A list of names, as the model sent it. One string is taken for a
+    // list of one: a model that wrote `"puppets": "Grimble"` meant the
+    // thing it plainly meant.
+    let names = |k: &str| -> Result<Vec<String>, String> {
+        match &args[k] {
+            Value::Array(a) => {
+                let out: Vec<String> = a
+                    .iter()
+                    .filter_map(|v| v.as_str())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                match out.is_empty() {
+                    true => Err(format!("`{k}` is a list of puppet names, and it is empty")),
+                    false => Ok(out),
+                }
+            }
+            Value::String(s) if !s.trim().is_empty() => Ok(vec![s.trim().to_string()]),
+            _ => Err(format!("`{k}` is a list of puppet names")),
+        }
+    };
+    match tool {
+        "list_puppets" => Ok(json!({
+            "puppets": room.puppet_roster(),
+            "on_stage": room.on_stage(),
+            "voices": stage.presets,
+            "show": room.show_title(),
+        })),
+        "make_puppet" => {
+            let part = crate::store::Puppet {
+                name: arg("name"),
+                preset: stage.preset(&arg("preset"))?,
+                delivery: arg("delivery"),
+                clone: arg("voice"),
+                about: arg("about"),
+                created: 0,
+            };
+            room.make_puppet(part).map(|name| json!({ "kept": name }))
+        }
+        "forget_puppet" => room
+            .forget_puppet(&arg("puppet"))
+            .map(|name| json!({ "deleted": name })),
+        // One answer for the lot, so a cast of three that was two
+        // puppets and a typo says which was which rather than failing
+        // the call and leaving two of them standing in the room.
+        "bring_on_puppets" | "send_off_puppets" => {
+            let on = tool == "bring_on_puppets";
+            let mut done = Vec::new();
+            let mut refused = Vec::new();
+            for name in names("puppets")? {
+                let r = match on {
+                    true => room.cast_puppet(&name),
+                    false => room.dismiss_puppet(&name),
+                };
+                match r {
+                    Ok(name) => done.push(name),
+                    Err(why) => refused.push(json!({ "puppet": name, "why": why })),
+                }
+            }
+            if done.is_empty() {
+                return Err(match refused.len() {
+                    1 => refused[0]["why"].as_str().unwrap_or("no").to_string(),
+                    _ => format!(
+                        "none of them: {}",
+                        refused
+                            .iter()
+                            .map(|r| format!(
+                                "{} ({})",
+                                r["puppet"].as_str().unwrap_or("?"),
+                                r["why"].as_str().unwrap_or("no")
+                            ))
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    ),
+                });
+            }
+            let mut out = json!({ if on { "on_stage" } else { "sent_off" }: done });
+            if !refused.is_empty() {
+                out["refused"] = Value::Array(refused);
+            }
+            Ok(out)
+        }
+        "put_on_show" => {
+            // Who may have a line: this AI and the puppets standing in
+            // the room. Not another bot -- that one answers for
+            // itself.
+            let director = room.config().bot().name.clone();
+            let mut may_say = vec![director.clone()];
+            may_say.extend(room.on_stage());
+            if may_say.len() == 1 {
+                return Err("there are no puppets in the room, so there is nobody to \
+                            act: bring_on_puppets first"
+                    .to_string());
+            }
+            // Logged when it is refused, and only then: a script the
+            // room would not take is the one thing nobody can see
+            // afterwards -- the model is told why and writes another,
+            // and what it actually sent is gone.
+            let script =
+                match crate::puppet::Script::parse(&arg("title"), &args["script"], &may_say) {
+                    Ok(script) => script,
+                    Err(why) => {
+                        info!(%why, script = %args["script"], "put_on_show: refused a script");
+                        return Err(why);
+                    }
+                };
+            let lines = script.lines.len();
+            let title = script.title.clone();
+            // The settings first, then the script: the curtain going
+            // up is what stops the room answering, and a play that
+            // began before it would be interrupted by its own
+            // audience.
+            room.begin_show(&director, &title, lines)?;
+            match stage.hands().show(script) {
+                Ok(()) => Ok(json!({
+                    "playing": title,
+                    "lines": lines,
+                    "next": "Stop talking now. The play begins when you have finished \
+                             speaking, and you are given the turn again when the \
+                             curtain comes down.",
+                })),
+                // It never reached the thread, so there is no show to
+                // end and nothing to put back but what was just taken.
+                Err(why) => {
+                    room.end_show();
+                    Err(why)
+                }
+            }
+        }
+        "say_as" => {
+            let who = arg("who");
+            let say = arg("say");
+            if say.is_empty() {
+                return Err("say what it says".into());
+            }
+            if say.chars().count() > crate::puppet::LINE_MAX {
+                return Err(format!(
+                    "a line is at most {} characters; say it in a few of them and \
+                     call this again",
+                    crate::puppet::LINE_MAX
+                ));
+            }
+            let on = room.on_stage();
+            let Some(who) = on.iter().find(|p| p.eq_ignore_ascii_case(&who)) else {
+                return Err(match on.is_empty() {
+                    true => "there are no puppets in the room: bring_on_puppets first".to_string(),
+                    false => format!(
+                        "there is no puppet called {who:?} in the room; it is {}",
+                        crate::room::and_list(&on)
+                    ),
+                });
+            };
+            stage.hands().say(who, &say).map(|()| {
+                json!({
+                    "said": true,
+                    "who": who,
+                    "next": format!(
+                        "{who} is saying that. Say nothing in your own voice this turn."
+                    ),
+                })
+            })
+        }
+        other => Err(format!("there is no tool called {other:?}")),
+    }
+}
+
+/// What the model is told when it asks for a voice tool in a house
+/// with no server to clone with. It is never offered them, so this is
+/// only ever a model calling something it was not shown.
+fn no_clone_server() -> String {
+    "this house has no voice-cloning server, so there are no cloned voices \
+     here at all"
+        .to_string()
+}
+
+/// Whether what the model asked to speak in is its own voice again,
+/// however it said it. The tool's description says "your own", and a
+/// model that said "default" or "normal" meant the same thing.
+fn own_voice(asked: &str) -> bool {
+    matches!(
+        asked.trim().to_ascii_lowercase().trim_end_matches('.'),
+        "" | "own" | "your own" | "my own" | "yours" | "mine" | "itself"
+            | "default" | "normal" | "none" | "your own voice" | "my own voice"
+    )
+}
+
+/// Keep a voice cloned from a clip somebody read: the clip to the
+/// server, the row to the house.
+///
+/// The upload is the slow half -- a few seconds of audio and the
+/// server pulling an embedding off it -- and it happens here on the
+/// agent's own thread, beside the model call and the pictures, which
+/// is where every other wait in a reply already is.
+fn save_voice(
+    room: &Room,
+    clones: &crate::voices::Clones,
+    g: u64,
+    args: &Value,
+) -> Result<Value, String> {
+    let Some(n) = args["sample"].as_u64() else {
+        return Err("which clip? `sample` is the number on its card in the chat, \
+                    counting from 1"
+            .to_string());
+    };
+    let name = args["name"].as_str().unwrap_or("").trim().to_string();
+    if name.is_empty() {
+        return Err("a voice needs a name: ask them what to call it".into());
+    }
+    if name.chars().count() > VOICE_NAME_MAX {
+        return Err(format!("a voice's name is at most {VOICE_NAME_MAX} characters"));
+    }
+    let Some(id) = crate::voices::id_for(&name) else {
+        return Err(format!(
+            "there is nothing in {name:?} a server can keep a voice under; \
+             ask them for a name with letters in it"
+        ));
+    };
+    // A name that is already somebody else's voice, spelled
+    // differently. Saving over it would rename the voice they have,
+    // which is not what anybody asked for.
+    if let Some(have) = room.voices().into_iter().find(|v| v.id == id) {
+        if !have.name.eq_ignore_ascii_case(&name) {
+            return Err(format!(
+                "that is too close to {:?}, which is already {}'s voice; \
+                 ask them for a different name",
+                have.name, have.who
+            ));
+        }
+    }
+    let clip = room.voice_clip(n as u32)?;
+    let wav = clip.wav.as_deref().unwrap_or_default();
+    // What the clip says, for the server to clone in context. The
+    // transcript where there is one, and what they were given to read
+    // where the room never wrote one down.
+    let said = match clip.said.trim() {
+        "" => clip.passage.trim(),
+        said => said,
+    };
+    // The server asks for a consent record, and this is the whole of
+    // what the house knows about why the audio is allowed to be here.
+    // For a reading that is a good deal: they were asked out loud, in
+    // a room where everybody could see the light on, and they read it.
+    // For a clip somebody brought in it is almost nothing -- who
+    // dropped the file -- and the record says so rather than quietly
+    // reading like the other kind.
+    let consent = match clip.brought {
+        false => format!("vox_room:{}:{}", room.config().id, clip.who),
+        true => format!("vox_room:{}:{}:brought-in", room.config().id, clip.who),
+    };
+    // Replacing one of their own -- a second go at a voice that didn't
+    // sound like them -- takes the first off the server, so what is
+    // kept under the name is what was just read.
+    if room.voices().iter().any(|v| v.id == id) {
+        if let Err(err) = clones.forget(&id) {
+            warn!(g, voice = %id, "couldn't take the old voice off the server: {err:#}");
+        }
+    }
+    let description = args["description"].as_str().unwrap_or("");
+    info!(
+        g,
+        voice = %id,
+        who = %clip.who,
+        clip = %clip.id,
+        secs = format!("{:.1}", clip.secs),
+        "keeping a cloned voice"
+    );
+    if let Err(err) = clones.upload(&id, wav, said, &consent, description) {
+        warn!(g, voice = %id, "the clone server refused it: {err:#}");
+        return Err(format!(
+            "the voice server wouldn't keep it ({err}); say you couldn't, and \
+             don't pretend the voice is there"
+        ));
+    }
+    room.remember_voice(&id, &name, &clip.who, said)?;
+    Ok(json!({
+        "saved": name,
+        "sample": clip.n,
+        "cloned_from": clip.who,
+        "seconds": format!("{:.0}", clip.secs),
+        "next": format!(
+            "{name} is kept. Tell them, and ask whether they want to hear it: \
+             speak_as puts it on from your next sentence."
+        ),
+    }))
+}
+
+/// The voices the house has, and whether the server still has them.
+///
+/// Asked of the server as well as of the house because the two can
+/// come apart -- a server rebuilt without its speakers directory, a
+/// voice deleted from under it -- and a voice the AI offers and then
+/// cannot speak in is worse than one it says has gone. A server that
+/// cannot be reached is not reported as a server that has lost
+/// everything: the list is the house's either way.
+fn list_voices(room: &Room, clones: Option<&crate::voices::Clones>) -> Value {
+    let held = clones.and_then(|c| match c.list() {
+        Ok(names) => Some(names),
+        Err(err) => {
+            warn!("couldn't ask the voice server what it has: {err:#}");
+            None
+        }
+    });
+    json!({
+        "voices": room
+            .voices()
+            .iter()
+            .map(|v| {
+                let mut out = json!({ "name": v.name, "cloned_from": v.who });
+                if held.as_ref().is_some_and(|h| !h.contains(&v.id)) {
+                    out["gone"] = json!(
+                        "the voice server hasn't got this one any more, so it \
+                         cannot be spoken in; forget_voice is the tidy answer"
+                    );
+                }
+                out
+            })
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// Delete a cloned voice: the server's copy first, then the house's
+/// row. That way round because a row for a voice the server has lost
+/// is a voice the AI will try to wear and go silent in, while a copy
+/// on the server that nothing names is only a few kilobytes nobody
+/// can ask for.
+fn forget_voice(
+    room: &Room,
+    clones: &crate::voices::Clones,
+    asked: &str,
+) -> Result<Value, String> {
+    let voice = room.voice_named(asked)?;
+    if let Err(err) = clones.forget(&voice.id) {
+        return Err(format!(
+            "the voice server wouldn't let go of it ({err}); it is still there"
+        ));
+    }
+    room.forget_voice(&voice.id)?;
+    Ok(json!({ "deleted": voice.name }))
+}
+
+/// One MCP call, with the room watching.
+///
+/// A call that is going to draw something puts a card into the
+/// conversation *first*, with a spinner on it, and fills it in when
+/// the picture lands. Generating one takes the better part of a
+/// minute, and a room watching nothing happen is a room that asks
+/// again -- so the card is the evidence that the AI is doing what it
+/// just said it would.
+///
+/// Whether a call is going to draw is guessed from its arguments:
+/// whether it was given any words to draw from -- see
+/// [`mcp::asked_for`] -- which every image tool takes under one name
+/// or another and none of the tools that merely report -- balances,
+/// style lists, what was made earlier -- has. The guess is allowed to
+/// be wrong in both directions and costs nothing either way. Guessed
+/// yes and nothing was drawn: the card says the picture didn't come,
+/// which is true. Guessed no and something was drawn: the pictures
+/// are posted when the call returns, without the spinner anyone would
+/// have watched.
+///
+/// This is where the room's half of the flow lives rather than the
+/// model's, because the model cannot post a card and then make a
+/// picture in one tool call -- and asking it to do two in the right
+/// order, every time, before the thing people are waiting on, is a
+/// rule that holds right up until it doesn't.
+fn drawing(
+    room: &Room,
+    g: u64,
+    server: &mcp::Server,
+    tool: &str,
+    args: &Value,
+) -> Result<Value, String> {
+    let prompt = mcp::asked_for(args);
+    // The spinner, when this looks like a call that will draw.
+    let pending = (!prompt.is_empty())
+        .then(|| room.begin_picture(g, &prompt))
+        .transpose()?;
+
+    let outcome = match server.call(tool, args) {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            warn!(g, tool, "MCP call failed: {err:#}");
+            if let Some((id, _)) = &pending {
+                room.fail_picture(id, &format!("{err}"));
+            }
+            // Said plainly, so the model tells the room it couldn't
+            // rather than describing a picture that was never made.
+            return Err(format!(
+                "{tool} failed ({err}); say you couldn't make it, and don't pretend you did"
+            ));
+        }
+    };
+
+    let (drawn, said) = posted(room, g, pending, outcome, &prompt);
+    if drawn.is_empty() {
+        return Ok(json!({ "result": said }));
+    }
+    // Deliberately not the pictures themselves: a 128x128 PNG is some
+    // 30 KB of base64, and putting that through a conversation that is
+    // read aloud helps nobody. The numbers are what the room can see
+    // and what `set_avatar` takes.
+    let numbers = drawn
+        .iter()
+        .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let many = drawn.len() > 1;
+    Ok(json!({
+        "result": format!(
+            "Picture{} {numbers} {} now in the chat where everyone can see {}. \
+             Say so, and ask how they like it. Do not call set_avatar until they \
+             have said they are happy with one -- and if they want a change, make \
+             another: it gets the next number, and an earlier one can still be chosen.{}",
+            if many { "s" } else { "" },
+            if many { "are" } else { "is" },
+            if many { "them" } else { "it" },
+            if said.is_empty() {
+                String::new()
+            } else {
+                format!(" The tool also said: {said}")
+            }
+        )
+    }))
+}
+
+/// Give a picture somebody brought into the room to a picture server,
+/// so that the tools which change a picture have something to change.
+///
+/// The same three beats as `drawing`, because to everyone in the room
+/// it is the same thing happening: a card goes up with a spinner on
+/// it, the server is waited for, the picture fills the card. What is
+/// different is only where the picture came from -- the room's own
+/// database rather than the model's description -- and that there is
+/// now a second card of the same picture, which is said plainly
+/// because otherwise the model will talk about it as a replacement.
+///
+/// The original is not touched and not removed. It is theirs, they put
+/// it there, and the redrawn one is a copy in somebody else's style.
+fn importing(room: &Room, g: u64, server: &mcp::Server, args: &Value) -> Result<Value, String> {
+    let Some(picture) = args["picture"].as_u64() else {
+        return Err("which picture? `picture` is the number on its card in the \
+                    chat, counting from 1"
+            .to_string());
+    };
+    let picture = picture as u32;
+    // Read before the card goes up: a number that is not a picture is
+    // the model's mistake to be told about, not a spinner for the room
+    // to watch fail.
+    let (was, png) = room.picture_by_number(picture)?;
+    // What the new card says it is. The model's words for it where it
+    // has any -- it got them from the room -- and the file it came in
+    // as otherwise, which is all the room itself ever knew.
+    let label = args["label"].as_str().unwrap_or("").trim();
+    let caption = match label.is_empty() {
+        true => was,
+        false => label.to_string(),
+    };
+    let pending = Some(room.begin_picture(g, &caption)?);
+
+    let outcome = match server.bring_in(&png, &caption, args["style"].as_str()) {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            warn!(g, picture, server = server.name(), "bring in: {err:#}");
+            if let Some((id, _)) = &pending {
+                room.fail_picture(id, &format!("{err}"));
+            }
+            return Err(format!(
+                "picture {picture} couldn't be given to the picture server ({err}); say \
+                 so plainly, and don't go on to call a tool that changes it -- as far as \
+                 that server is concerned it still does not exist"
+            ));
+        }
+    };
+
+    let (drawn, said) = posted(room, g, pending, outcome, &caption);
+    let Some(n) = drawn.first() else {
+        return Err(format!(
+            "the picture server took picture {picture} and sent nothing back ({said}); \
+             say you couldn't"
+        ));
+    };
+    Ok(json!({
+        "result": format!(
+            "Picture {n} is picture {picture} redrawn, in the chat where everyone can \
+             see it, and picture {picture} is still there exactly as they brought it \
+             in. From now on it is {n} you change and not {picture}: the handle is on \
+             its card. Say it is there and ask how it came out before you change \
+             anything.{}",
+            if said.is_empty() {
+                String::new()
+            } else {
+                format!(" The tool also said: {said}")
+            }
+        )
+    }))
+}
+
+/// The pictures a call came back with, put into the conversation: the
+/// numbers the model is told, and what the tool said in words.
+///
+/// The first picture fills the card that is already up; the rest get
+/// cards of their own, since a call asked for several takes is a call
+/// whose takes are each worth looking at.
+///
+/// What the tool said goes on every card it made, because the handle
+/// for changing a picture is in there and the model will have
+/// forgotten it by the time anybody asks: a tool result lives in the
+/// one reply it arrived in, and the change is always asked for in a
+/// later one. See `Entry::note`.
+fn posted(
+    room: &Room,
+    g: u64,
+    pending: Option<(String, u32)>,
+    outcome: mcp::Outcome,
+    prompt: &str,
+) -> (Vec<u32>, String) {
+    let mcp::Outcome { said, pictures } = outcome;
+    let mut drawn: Vec<u32> = Vec::new();
+    let mut pictures = pictures.into_iter();
+    if let Some((id, n)) = &pending {
+        match pictures.next() {
+            Some(first) => {
+                room.finish_picture(id, &first.png, &said);
+                drawn.push(*n);
+            }
+            None => room.fail_picture(id, "the tool came back without a picture"),
+        }
+    }
+    for picture in pictures {
+        let caption = match picture.prompt.trim().is_empty() {
+            true => prompt.to_string(),
+            false => picture.prompt.clone(),
+        };
+        match room.begin_picture(g, &caption) {
+            Ok((id, n)) => {
+                room.finish_picture(&id, &picture.png, &said);
+                drawn.push(n);
+            }
+            Err(err) => warn!(g, "couldn't post a picture: {err}"),
+        }
+    }
+    (drawn, said)
 }
 
 /// Hand a sentence to the voice, unless it repeats one this reply has
@@ -1478,6 +3579,8 @@ fn clean(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::room::BotConfig;
+    use crate::room::Mode;
 
     #[test]
     fn drops_a_sentence_said_again_after_a_tool_call() {
@@ -1512,12 +3615,345 @@ mod tests {
     }
 
     fn tool_names_deciding(lobby: bool, search: bool, deciding: bool) -> Vec<String> {
-        tools_for(lobby, search, deciding)
-            .as_array()
+        tools_for(
+            Allowed::Everything,
+            lobby,
+            search,
+            deciding,
+            true,
+            &Art::default(),
+            false,
+            None,
+        )
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["function"]["name"].as_str().unwrap().to_string())
+        .collect()
+    }
+
+    /// The system prompt a turn goes out with.
+    fn system_of(agent: &Agent, t: &Turn) -> String {
+        let messages = agent.messages(t, None);
+        messages[0]["content"].as_str().unwrap().to_string()
+    }
+
+    /// What is offered in the lobby, with the web, to a bot judging a
+    /// pause -- `hand_on` being the only thing in question.
+    fn tools_names(allowed: Allowed, hand_on: bool) -> Vec<String> {
+        tools_for(
+            allowed,
+            true,
+            true,
+            true,
+            hand_on,
+            &Art::default(),
+            false,
+            None,
+        )
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["function"]["name"].as_str().unwrap().to_string())
+        .collect()
+    }
+
+    fn looking_names(lobby: bool, search: bool, deciding: bool) -> Vec<String> {
+        tools_for(
+            Allowed::Looking,
+            lobby,
+            search,
+            deciding,
+            true,
+            &Art::default(),
+            false,
+            None,
+        )
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["function"]["name"].as_str().unwrap().to_string())
+        .collect()
+    }
+
+    /// A second AI in the room is a voice in it: it can see who is here
+    /// and look something up, and the room's own tools are the first
+    /// one's. The two it keeps besides are not powers but how a turn is
+    /// given back.
+    #[test]
+    fn a_voice_in_the_room_has_only_the_tools_of_one() {
+        assert_eq!(
+            looking_names(true, true, true),
+            [
+                "list_people",
+                "post_card",
+                "hand_to",
+                "wait_until_named",
+                "stay_quiet",
+                "look_up"
+            ]
+        );
+        // Nothing that changes anything: no cards, and no games.
+        let everything = tool_names_deciding(true, true, true);
+        for power in [
+            "send_card",
+            "take_back_card",
+            "read_cards",
+            "save_game",
+            "revise_game",
+            "start_game",
+            "delete_game",
+            "list_games",
+            "read_game",
+            "check_game_name",
+        ] {
+            let looking = looking_names(true, true, true);
+            assert!(everything.contains(&power.to_string()), "{power}");
+            assert!(!looking.contains(&power.to_string()), "{power}");
+        }
+
+        // The web only where anybody has it: in the lobby, with
+        // --search on. Judging is the only time stay_quiet is offered,
+        // to either of them. And handing the turn on is offered only
+        // while there is a turn left to hand on, so a bot never finds
+        // out by being refused.
+        assert!(!looking_names(true, false, true).contains(&"look_up".to_string()));
+        assert!(!looking_names(false, true, true).contains(&"look_up".to_string()));
+        assert!(!looking_names(true, true, false).contains(&"stay_quiet".to_string()));
+        for names in [
+            looking_names(true, true, true),
+            tool_names_deciding(true, true, true),
+        ] {
+            assert!(names.contains(&"hand_to".to_string()));
+        }
+        for names in [
+            tools_names(Allowed::Looking, false),
+            tools_names(Allowed::Everything, false),
+        ] {
+            assert!(!names.contains(&"hand_to".to_string()), "{names:?}");
+        }
+
+        // And what is offered is what is allowed: a model that calls
+        // something it was never shown is told there is no such tool.
+        assert!(Allowed::Looking.may("list_people"));
+        // Writing something for the room to look at is saying it, so
+        // the voice that may only look may still post.
+        assert!(Allowed::Looking.may("post_card"));
+        assert!(
+            !Allowed::Looking.may("send_card"),
+            "a card to one person is not"
+        );
+        assert!(Allowed::Everything.may("send_card"));
+    }
+
+    /// What a bot is told it can do is what it can do. A note about
+    /// dealing cards, to a voice that cannot deal one, is an
+    /// instruction to try.
+    #[test]
+    fn a_voice_in_the_room_is_not_told_about_cards_or_games() {
+        let (mut agent, t) = turn_with(Cue::Speak, &["Ryan"], false);
+        agent.allowed = Allowed::Looking;
+        let system = system_of(&agent, &t);
+        assert!(!system.contains("send_card"), "{system}");
+        assert!(!system.contains("save_game"));
+        assert!(
+            system.contains("wait_until_named"),
+            "it still gives the turn back"
+        );
+        assert!(
+            system.contains("post_card"),
+            "and can still put something on the screen"
+        );
+        assert!(system.contains("in markdown"), "{system}");
+
+        // In a game, the same: it plays, it doesn't deal.
+        let frame = game_prompt("Dragon Heist", "Run a heist.", Allowed::Looking);
+        assert!(!frame.contains("send_card"), "{frame}");
+        assert!(frame.contains("wait_until_named"));
+        assert!(frame.contains("post_card"), "it may still post one");
+        let dealing = game_prompt("Dragon Heist", "Run a heist.", Allowed::Everything);
+        assert!(dealing.contains("send_card"));
+    }
+
+    /// A house with no picture server is still told about faces, and
+    /// not about making one. Nothing here can draw -- `Art::default()`
+    /// -- and a picture can still arrive, dropped in by whoever is in
+    /// the room, so `set_avatar` has something it may be asked to put.
+    #[test]
+    fn a_room_that_cannot_draw_is_still_told_about_faces() {
+        let (agent, t) = turn_with(Cue::Speak, &["Ryan"], false);
+        let system = system_of(&agent, &t);
+        assert!(
+            system.contains("set_avatar puts one of the pictures"),
+            "{system}"
+        );
+        assert!(
+            system.contains("drop one into the chat from their own computer"),
+            "and where one comes from when nothing here draws: {system}"
+        );
+        assert!(system.contains("set_bio writes the few lines"), "{system}");
+        // And not a word about doing what it cannot do.
+        assert!(
+            !system.contains("Each picture costs the house real money"),
+            "{system}"
+        );
+        assert!(!system.contains("make it with a picture tool"), "{system}");
+        assert!(
+            !system.contains("redraw_picture"),
+            "nor about handing a picture to a server that is not there: {system}"
+        );
+    }
+
+    /// And a house whose picture server will take a picture of ours is
+    /// told the step that makes a brought-in one changeable -- the
+    /// paragraph and the tool together, since a note about a tool that
+    /// is not offered is an instruction to try.
+    #[test]
+    fn a_room_whose_server_takes_a_picture_is_told_how_to_hand_one_over() {
+        let server = Arc::new(mcp::Server::new(mcp::Config {
+            name: "art".into(),
+            url: mock_mcp(true),
+            key: String::new(),
+            only: vec!["generate_pixel_art".into()],
+        }));
+        server.connect().expect("hello");
+        let (agent, t) = turn_with(Cue::Speak, &["Ryan"], false);
+        let agent = Agent {
+            art: Arc::new(Art {
+                servers: vec![server],
+            }),
+            ..agent
+        };
+        let system = system_of(&agent, &t);
+        assert!(system.contains("make it with a picture tool"), "{system}");
+        assert!(
+            system.contains("redraw_picture does that"),
+            "the step in front of changing a picture somebody brought in: {system}"
+        );
+        assert!(
+            system.contains("set_avatar takes it as it is"),
+            "and that none of it is needed to simply wear one: {system}"
+        );
+        // The tool itself, offered on the same two conditions.
+        let names: Vec<String> = tools_for(
+            Allowed::Everything,
+            false,
+            false,
+            false,
+            false,
+            &agent.art,
+            false,
+            None,
+        )
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["function"]["name"].as_str().unwrap_or("").to_string())
+        .collect();
+        assert!(names.iter().any(|n| n == "redraw_picture"), "{names:?}");
+    }
+
+    /// The other AIs in the room are in the transcript by name, so the
+    /// AI is told what they are -- or it reads a voice it has never
+    /// heard of as one of the people.
+    #[test]
+    fn a_bot_is_told_which_of_the_names_are_the_other_ais() {
+        let (agent, t) = turn_among(Cue::Speak, &["Ryan"], false, &["Cora"]);
+        let system = system_of(&agent, &t);
+        assert!(system.contains("Cora is in this room with you"), "{system}");
+        assert!(system.contains("an AI voice like you, not a person"));
+        assert!(
+            system.contains("don't speak for Cora"),
+            "by name, never a pronoun"
+        );
+        // And it is talking *with* the people, who do not include Cora.
+        assert!(system.contains("voice chat with Ryan."), "{system}");
+
+        // Two of them, and the note is in the plural.
+        let (agent, t) = turn_among(Cue::Speak, &["Ryan"], false, &["Cora", "Ada"]);
+        let two = system_of(&agent, &t);
+        assert!(
+            two.contains("Cora and Ada are in this room with you"),
+            "{two}"
+        );
+        assert!(two.contains("AI voices like you, not people"));
+
+        // Alone with the people, there is no such note at all.
+        let (agent, t) = turn_with(Cue::Speak, &["Ryan"], false);
+        let alone = system_of(&agent, &t);
+        assert!(!alone.contains("in this room with you"));
+
+        // Judging a pause, it is told a pause may be the other one's.
+        let (agent, mut t) = turn_among(judge(None, false), &["Ryan"], false, &["Cora"]);
+        let note = agent.messages(&t, None).pop().unwrap()["content"]
+            .as_str()
             .unwrap()
-            .iter()
-            .map(|t| t["function"]["name"].as_str().unwrap().to_string())
-            .collect()
+            .to_string();
+        assert!(note.contains("Ryan is the only person here."), "{note}");
+        assert!(note.contains("Cora is in the room too"));
+        assert!(
+            !note.contains("nobody else they could be talking to"),
+            "which is no longer true"
+        );
+
+        // Unless that one has been silenced: then there is nothing to
+        // leave to it, and the pause is this bot's or nobody's. It is
+        // still one of the voices in the room, though -- its name is in
+        // the transcript and must not read as a person's.
+        t.others_answering.clear();
+        let system = system_of(&agent, &t);
+        assert!(system.contains("Cora is in this room with you"), "{system}");
+        let note = agent.messages(&t, None).pop().unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            note.contains("nobody else they could be talking to"),
+            "{note}"
+        );
+        assert!(!note.contains("Cora is in the room too"));
+    }
+
+    /// A turn another voice put to it, and the one after which the
+    /// people have to come back in. The second is told, never
+    /// discovered: a bot that finds out by calling `hand_to` and being
+    /// refused has already written a reply for a conversation that is
+    /// about to stop dead.
+    #[test]
+    fn a_handed_turn_says_who_handed_it_and_when_it_is_the_last() {
+        let cue = Cue::Handed {
+            from: "Cora".into(),
+        };
+        let (agent, mut t) = turn_among(cue, &["Ryan"], false, &["Cora"]);
+        let note = |t: &Turn| {
+            agent.messages(t, None).pop().unwrap()["content"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let handed = note(&t);
+        assert!(handed.contains("Cora has put something to you"), "{handed}");
+        assert!(handed.contains("stay_quiet"), "it may still pass");
+
+        // With one of the two left, that is all it is told.
+        assert_eq!(t.hand_on, 2);
+        assert!(!handed.contains("last thing the voices here can say"));
+
+        // With none left, the last word is the people's, and it is
+        // asked to leave it with them.
+        t.hand_on = 0;
+        let last = note(&t);
+        assert!(
+            last.contains("last thing the voices here can say"),
+            "{last}"
+        );
+        assert!(last.contains("leave it with the people"));
+
+        // Alone in the room there is no such thing to say at all.
+        let (agent, mut t) = turn_with(Cue::Speak, &["Ryan"], false);
+        t.hand_on = 0;
+        let alone = agent.messages(&t, None);
+        assert_eq!(alone.len(), 2, "system and the conversation: {alone:?}");
     }
 
     #[test]
@@ -1554,27 +3990,38 @@ mod tests {
         }
     }
 
-    fn turn(cue: Cue) -> (Agent, RoomConfig, Turn) {
+    fn turn(cue: Cue) -> (Agent, Turn) {
         turn_with(cue, &["Ryan", "Alex"], false)
     }
 
-    fn turn_with(cue: Cue, people: &[&str], engaged: bool) -> (Agent, RoomConfig, Turn) {
+    /// A pause the AI is to judge for itself: `lull` is a silence it
+    /// asked to be shown again, `over` that the words came in while it
+    /// was still speaking.
+    fn judge(lull: Option<u64>, over: bool) -> Cue {
+        Cue::Decide { lull, over }
+    }
+
+    /// An agent and a turn for it. The room's own settings are not in
+    /// it any more: what the AI is told about itself comes from the
+    /// agent, because in a room with two of them the room could only
+    /// have said one of their names.
+    fn turn_with(cue: Cue, people: &[&str], engaged: bool) -> (Agent, Turn) {
+        let (agent, turn) = turn_among(cue, people, engaged, &[]);
+        (agent, turn)
+    }
+
+    /// The same, in a room with `others` -- the other AIs in it.
+    fn turn_among(cue: Cue, people: &[&str], engaged: bool, others: &[&str]) -> (Agent, Turn) {
         let agent = Agent {
             llm: Llm::Echo,
+            name: "Vox".into(),
             prompt: DEFAULT_PROMPT.to_string(),
+            allowed: Allowed::Everything,
             generation: Arc::new(AtomicU64::new(0)),
             translate: None,
-        };
-        let cfg = RoomConfig {
-            agent_name: "Vox".into(),
-            aliases: vec![],
-            reply_after: Duration::from_millis(1200),
-            confirm: Duration::from_millis(300),
-            engaged_for: Duration::from_secs(30),
-            history: 60,
-            language: "English".into(),
-            languages: vec!["English".into()],
-            spoken: vec!["English".into()],
+            art: Arc::new(Art::default()),
+            clones: None,
+            presets: Vec::new(),
         };
         let turn = Turn {
             generation: 1,
@@ -1582,12 +4029,863 @@ mod tests {
             asked: Instant::now(),
             game: None,
             people: people.iter().map(|p| p.to_string()).collect(),
+            others: others.iter().map(|o| o.to_string()).collect(),
+            others_answering: others.iter().map(|o| o.to_string()).collect(),
+            hand_on: if others.is_empty() { 0 } else { 2 },
+            puppets: Vec::new(),
+            showing: None,
+            playhouse: false,
+            in_box: Vec::new(),
+            on_stage: Vec::new(),
             language: "English".into(),
             speaks: Vec::new(),
             engaged,
             cue,
         };
-        (agent, cfg, turn)
+        (agent, turn)
+    }
+
+    /// A room to make pictures in.
+    fn picture_room() -> Arc<Room> {
+        let store = crate::store::Store::memory();
+        store.invite("Ryan").unwrap();
+        let (room, _wiring) = Room::new(
+            store,
+            RoomConfig {
+                id: "Lobby".into(),
+                title: "Lobby".into(),
+                only: None,
+                default_mode: Mode::Named,
+                bots: vec![BotConfig::new("Vox", vec![])],
+                reply_after: Duration::from_millis(1200),
+                confirm: Duration::from_millis(300),
+                engaged_for: Duration::from_secs(30),
+                history: 60,
+                ai_turns: 2,
+                language: "English".into(),
+                languages: vec!["English".into()],
+                spoken: vec!["English".into()],
+            },
+            None,
+            std::collections::BTreeMap::new(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        room
+    }
+
+    /// An MCP server that answers the handshake and then draws one
+    /// 8x8 PNG, framed as SSE the way a real one does.
+    ///
+    /// Enough of a server to put the room's whole half of the flow
+    /// through its paces without a model, a key or any money: the
+    /// thing that was never covered until a picture came out as the
+    /// bare number 1 on somebody's screen.
+    fn mock_mcp(draws: bool) -> String {
+        mock_mcp_which(draws, false)
+    }
+
+    /// The same, `ends_sessions` making it behave like a server that
+    /// has been left alone too long: the session it handed out at
+    /// startup is terminated, and every call carrying it is answered
+    /// 404 until the client says hello again. Which is what the
+    /// house's own picture server does between conversations.
+    fn mock_mcp_which(draws: bool, ends_sessions: bool) -> String {
+        use std::io::{BufRead as _, BufReader, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port");
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let url = format!("{base}/mcp");
+        std::thread::spawn(move || {
+            // How many times it has been said hello to, which is what
+            // names the session: everything carrying an older one is
+            // talking to a session that has been ended.
+            let mut hellos = 0u32;
+            for stream in listener.incoming().flatten() {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut len = 0usize;
+                // Which it is, because this one answers two things:
+                // JSON-RPC on /mcp, and a picture being posted to the
+                // ticket it handed out -- which is not JSON-RPC, has
+                // no key on it, and is the step the room does itself.
+                let mut path = String::new();
+                let mut session = String::new();
+                let mut first = true;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                        return;
+                    }
+                    if first {
+                        first = false;
+                        path = line.split_whitespace().nth(1).unwrap_or("/").to_string();
+                    }
+                    let lower = line.to_ascii_lowercase();
+                    if let Some(n) = lower.strip_prefix("content-length:") {
+                        len = n.trim().parse().unwrap_or(0);
+                    }
+                    if let Some(sid) = lower.strip_prefix("mcp-session-id:") {
+                        session = sid.trim().to_string();
+                    }
+                    if line == "\r\n" || line == "\n" {
+                        break;
+                    }
+                }
+                let mut body = vec![0u8; len];
+                std::io::Read::read_exact(&mut reader, &mut body).unwrap_or(());
+                if path.starts_with("/upload/") {
+                    // What a real upload endpoint answers: the handle,
+                    // as plain JSON. And only for something that is
+                    // actually a picture, so a room that posted the
+                    // wrong thing finds out here.
+                    let payload = match crate::mcp::is_png(&body) {
+                        true => json!({ "image_id": "img99", "bytes": body.len() }).to_string(),
+                        false => json!({ "error": "that is not a picture" }).to_string(),
+                    };
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Connection: close\r\nContent-Length: {}\r\n\r\n",
+                        payload.len()
+                    );
+                    let mut s = stream;
+                    let _ = s.write_all(head.as_bytes());
+                    let _ = s.write_all(payload.as_bytes());
+                    continue;
+                }
+                let req: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                let method = req["method"].as_str().unwrap_or("");
+                // A session that was ended while nobody was using it.
+                // Anything still carrying it is told so the way the
+                // protocol says to -- 404, and start another.
+                if ends_sessions && !session.is_empty() && session != format!("s{hellos}") {
+                    let payload = json!({
+                        "jsonrpc": "2.0",
+                        "id": req["id"],
+                        "error": { "code": -32001, "message": "Session not found" },
+                    })
+                    .to_string();
+                    let head = format!(
+                        "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\n\
+                         Connection: close\r\nContent-Length: {}\r\n\r\n",
+                        payload.len()
+                    );
+                    let mut s = stream;
+                    let _ = s.write_all(head.as_bytes());
+                    let _ = s.write_all(payload.as_bytes());
+                    continue;
+                }
+                // A notification wants no answer but the 202.
+                if req["id"].is_null() {
+                    let mut s = stream;
+                    let _ = s.write_all(
+                        b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\
+                          Connection: close\r\n\r\n",
+                    );
+                    continue;
+                }
+                let result = match method {
+                    "initialize" => {
+                        hellos += 1;
+                        json!({
+                            "protocolVersion": "2025-06-18",
+                            "capabilities": {},
+                            "serverInfo": { "name": "mock", "version": "1" },
+                        })
+                    }
+                    // The two shapes a picture server comes in: one
+                    // that draws from a description, and one that
+                    // changes a picture it already drew -- which is
+                    // asked in two parts, and whose words are under
+                    // `instruction` rather than `prompt`. The key as
+                    // an argument is on the first of them because
+                    // some servers do want it there, and that path
+                    // has to keep working too.
+                    //
+                    // The one that draws has a `style`, the way the
+                    // house's own server does: the looks it can draw
+                    // in, as an enum the model picks out of. The room
+                    // decides nothing about it and hands it straight
+                    // on; see the test that a style is passed through
+                    // untouched. The one that changes a picture has
+                    // none, because a change keeps the look it was
+                    // drawn in.
+                    "tools/list" => json!({ "tools": [{
+                        "name": "generate_pixel_art",
+                        "description": "Draw something.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "prompt": { "type": "string" },
+                                "style": {
+                                    "type": "string",
+                                    "enum": ["pixel-art", "cel-shaded"],
+                                },
+                                "rd_api_key": { "type": "string" },
+                            },
+                            "required": ["prompt"],
+                        },
+                    }, {
+                        "name": "refine_pixel_art",
+                        "description": "Change one already drawn.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "job_id": { "type": "string" },
+                                "instruction": { "type": "string" },
+                            },
+                            "required": ["job_id", "instruction"],
+                        },
+                    }, {
+                        "name": "list_jobs",
+                        "description": "Say what was drawn before.",
+                        "inputSchema": { "type": "object", "properties": {} },
+                    }, {
+                        "name": "list_styles",
+                        "description": "Say what looks it can draw in.",
+                        "inputSchema": { "type": "object", "properties": {} },
+                    }, {
+                        // The two the room works itself. Published
+                        // like any others and lent to nobody; the
+                        // test that nothing offers them is the point
+                        // of having them here.
+                        "name": "create_upload_ticket",
+                        "description": "Hand out a one-time URL to post a picture to.",
+                        "inputSchema": { "type": "object", "properties": {} },
+                    }, {
+                        "name": "import_image",
+                        "description": "Keep a picture that was posted, so it can be changed.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "image_id": { "type": "string" },
+                                "label": { "type": "string" },
+                                "style": {
+                                    "type": "string",
+                                    "enum": ["pixel-art", "cel-shaded"],
+                                },
+                            },
+                            "required": ["image_id"],
+                        },
+                    }] }),
+                    // The ticket, answered the way a real one is: the
+                    // URL, and then a paragraph about posting to it
+                    // with the same URL inside a curl line. The room
+                    // reads the first one back out of the prose.
+                    "tools/call" if req["params"]["name"] == "create_upload_ticket" => {
+                        json!({ "content": [{ "type": "text", "text": format!(
+                            "Upload URL (single use, expires in 899s):\n\
+                             {base}/upload/t/tick3t\n\n\
+                             POST the image as multipart form field 'file', or as a \
+                             raw body. No Authorization header is required.\n\n  \
+                             curl -fsS -F file=@YOUR_IMAGE.png \"{base}/upload/t/tick3t\"\n"
+                        ) }] })
+                    }
+                    // And the import, which answers like any call
+                    // that draws: the picture as the server now holds
+                    // it, and a handle in the words to change it by.
+                    // The handle it was posted under is said back, so
+                    // a test can see the file really went up.
+                    "tools/call" if req["params"]["name"] == "import_image" && draws => {
+                        use base64::Engine as _;
+                        let b64 = base64::engine::general_purpose::STANDARD.encode(a_png());
+                        let args = &req["params"]["arguments"];
+                        let said = format!(
+                            "Job mockimp: {} imported{}. Refine it with \
+                             refine_pixel_art('mockimp', '<instruction>').",
+                            args["image_id"].as_str().unwrap_or("nothing"),
+                            match args["style"].as_str() {
+                                Some(style) => format!(" as {style}"),
+                                None => String::new(),
+                            }
+                        );
+                        json!({ "content": [
+                            { "type": "text", "text": said },
+                            { "type": "image", "data": b64, "mimeType": "image/png" },
+                        ] })
+                    }
+                    "tools/call"
+                        if matches!(
+                            req["params"]["name"].as_str(),
+                            Some("generate_pixel_art" | "refine_pixel_art")
+                        ) && draws =>
+                    {
+                        use base64::Engine as _;
+                        let b64 = base64::engine::general_purpose::STANDARD.encode(a_png());
+                        // A handle in the words, the way a real
+                        // picture server answers: the id you pass
+                        // back to change this one. And the style it
+                        // drew in when the call named one, which is
+                        // also what a real one says.
+                        let said = match req["params"]["arguments"]["style"].as_str() {
+                            Some(style) => format!("Job mock7f3: drawn, {style}."),
+                            None => "Job mock7f3: drawn.".to_string(),
+                        };
+                        json!({ "content": [
+                            { "type": "text", "text": said },
+                            { "type": "image", "data": b64, "mimeType": "image/png" },
+                        ] })
+                    }
+                    // A call that draws nothing: the list of what
+                    // came before, or a generation that came back
+                    // empty.
+                    "tools/call" => json!({
+                        "content": [{ "type": "text", "text": "nothing to draw" }]
+                    }),
+                    _ => json!({}),
+                };
+                let answer = json!({ "jsonrpc": "2.0", "id": req["id"], "result": result });
+                // SSE, because that is what a real one sends.
+                let payload = format!("event: message\ndata: {answer}\n\n");
+                // One request per connection, so every answer says
+                // so: left to keep-alive, the client reuses a socket
+                // this loop has already dropped.
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                     mcp-session-id: s{hellos}\r\n\
+                     Connection: close\r\nContent-Length: {}\r\n\r\n",
+                    payload.len()
+                );
+                let mut s = stream;
+                let _ = s.write_all(head.as_bytes());
+                let _ = s.write_all(payload.as_bytes());
+            }
+        });
+        url
+    }
+
+    fn a_png() -> Vec<u8> {
+        let mut v = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        v.extend_from_slice(b"the rest of it");
+        v
+    }
+
+    /// The room's whole half of making a picture, against a server
+    /// that behaves like a real one: a card goes up with a spinner,
+    /// the call is made, the picture fills the card, and the model is
+    /// told the number and nothing else.
+    #[test]
+    fn a_picture_goes_up_before_the_call_and_fills_in_after() {
+        let room = picture_room();
+        let g = room.generation_of_only_bot().load(Ordering::SeqCst);
+        let server = Arc::new(mcp::Server::new(mcp::Config {
+            name: "art".into(),
+            url: mock_mcp(true),
+            key: "secret".into(),
+            only: vec!["generate_pixel_art".into(), "list_jobs".into()],
+        }));
+        assert_eq!(server.connect().expect("hello"), 2);
+
+        let args = json!({ "prompt": "a stern Borg commander", "size": 128 });
+        let said = drawing(&room, g, &server, "art_generate_pixel_art", &args)
+            .expect("the call went through");
+
+        // The model is told the number and told to wait for a yes.
+        let said = said["result"].as_str().unwrap_or_default().to_string();
+        assert!(said.contains("Picture 1"), "{said}");
+        assert!(said.contains("set_avatar"), "{said}");
+        assert!(!said.contains("PNG"), "and not the picture itself: {said}");
+
+        // The card is in the conversation, finished, and showing what
+        // it was asked for.
+        let entry = room
+            .log_now()
+            .into_iter()
+            .find(|e| e.kind == crate::room::Kind::Picture)
+            .expect("a picture card is in the conversation");
+        assert_eq!(
+            entry.text, "picture 1",
+            "what the model was told to call it"
+        );
+        assert_eq!(entry.title, "a stern Borg commander");
+        assert!(!entry.live, "and it is not still spinning");
+        assert_eq!(room.picture_png(&entry.id).unwrap().unwrap(), a_png());
+        // And what the tool said is kept on the card, because the
+        // handle for changing this picture is in it and the request
+        // to change it always comes in a later turn, by which time
+        // the tool's reply is gone. See `room::Entry::note`.
+        assert_eq!(entry.note, "Job mock7f3: drawn.");
+
+        // Which is a face somebody can now be given.
+        assert_eq!(room.set_avatar(g, "Ryan", 1).unwrap(), "Ryan");
+        assert_eq!(room.avatar_png("Ryan", None).unwrap().unwrap().0, a_png());
+    }
+
+    /// Changing a picture is making one, as far as the room is
+    /// concerned: a card goes up for it too. The tool that does it is
+    /// asked in two parts and only one of them is words, under a name
+    /// the room has to know to look under -- a room that only looked
+    /// for `prompt` would put no card up and caption nothing.
+    #[test]
+    fn a_change_to_a_picture_gets_a_card_of_its_own() {
+        let room = picture_room();
+        let g = room.generation_of_only_bot().load(Ordering::SeqCst);
+        let server = Arc::new(mcp::Server::new(mcp::Config {
+            name: "art".into(),
+            url: mock_mcp(true),
+            key: String::new(),
+            only: vec!["refine_pixel_art".into()],
+        }));
+        assert_eq!(server.connect().expect("hello"), 1);
+
+        let args = json!({ "job_id": "41fc", "instruction": "give it a red top hat" });
+        let said = drawing(&room, g, &server, "art_refine_pixel_art", &args)
+            .expect("the call went through");
+        assert!(said["result"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Picture 1"));
+
+        let entry = room
+            .log_now()
+            .into_iter()
+            .find(|e| e.kind == crate::room::Kind::Picture)
+            .expect("a picture card is in the conversation");
+        assert_eq!(
+            entry.title, "give it a red top hat",
+            "captioned with what was asked for, which for a change is the change"
+        );
+        assert!(!entry.live, "and it is not still spinning");
+        assert_eq!(room.picture_png(&entry.id).unwrap().unwrap(), a_png());
+        assert_eq!(
+            entry.note, "Job mock7f3: drawn.",
+            "a refine's own handle is kept too, so it can be refined again"
+        );
+    }
+
+    /// The whole of bringing a picture in, which is the only way a
+    /// picture somebody dropped into the room ever gets a handle: the
+    /// ticket, the file going up the socket, the import, and a second
+    /// card with the handle on it. The one they brought in is left
+    /// alone, because it is theirs.
+    #[test]
+    fn a_brought_in_picture_is_given_to_the_server_and_comes_back_changeable() {
+        let room = picture_room();
+        let g = room.generation_of_only_bot().load(Ordering::SeqCst);
+        let server = Arc::new(mcp::Server::new(mcp::Config {
+            name: "art".into(),
+            url: mock_mcp(true),
+            key: "secret".into(),
+            only: vec!["refine_pixel_art".into()],
+        }));
+        assert_eq!(
+            server.connect().expect("hello"),
+            1,
+            "the two it takes a picture with are lent to nobody"
+        );
+        assert!(server.can_import(), "and are the room's to call anyway");
+
+        // Somebody drops one in. It is picture 1, it has no handle on
+        // its card, and nothing the server offers can touch it.
+        assert_eq!(
+            room.upload_picture("Ryan", "me-at-the-lake.jpg", &a_png())
+                .expect("brought in"),
+            1
+        );
+
+        let args = json!({
+            "picture": 1,
+            "label": "a photo of Ryan by a lake",
+            "style": "cel-shaded",
+        });
+        let said = importing(&room, g, &server, &args).expect("the call went through");
+        let said = said["result"].as_str().unwrap_or_default().to_string();
+        assert!(said.contains("Picture 2"), "{said}");
+        assert!(
+            said.contains("picture 1 is still there"),
+            "and the one they brought in has not been replaced: {said}"
+        );
+
+        let cards = room.log_now();
+        let brought = cards
+            .iter()
+            .find(|e| e.kind == crate::room::Kind::Upload)
+            .expect("the picture they brought in is still a card");
+        assert_eq!(brought.title, "me-at-the-lake.jpg");
+        assert_eq!(brought.note, "", "and is still a card with no handle on it");
+
+        let redrawn = cards
+            .iter()
+            .find(|e| e.kind == crate::room::Kind::Picture)
+            .expect("and the redrawn one is a card of its own");
+        assert_eq!(redrawn.text, "picture 2");
+        assert_eq!(
+            redrawn.title, "a photo of Ryan by a lake",
+            "captioned with what the room says is in it, since the model has not seen it"
+        );
+        assert!(!redrawn.live, "and it is not still spinning");
+        assert_eq!(room.picture_png(&redrawn.id).unwrap().unwrap(), a_png());
+        // The point of the whole exercise: a handle on the card, put
+        // there by an import that really did receive the file.
+        let note = &redrawn.note;
+        assert!(
+            note.starts_with("Job mockimp: img99 imported as cel-shaded."),
+            "the handle, the file that went up, and the look asked for: {note}"
+        );
+        assert!(
+            note.contains("refine_pixel_art('mockimp'"),
+            "which is what a later turn reads off the card: {note}"
+        );
+    }
+
+    /// A number that is not a picture is the model's mistake, and it
+    /// is told so in words it can say out loud -- without a card going
+    /// up for a picture that was never going to arrive.
+    #[test]
+    fn a_picture_that_isnt_there_cannot_be_brought_in() {
+        let room = picture_room();
+        let g = room.generation_of_only_bot().load(Ordering::SeqCst);
+        let server = Arc::new(mcp::Server::new(mcp::Config {
+            name: "art".into(),
+            url: mock_mcp(true),
+            key: String::new(),
+            only: vec!["refine_pixel_art".into()],
+        }));
+        server.connect().expect("hello");
+
+        let args = json!({ "picture": 3, "label": "a dog" });
+        let err = importing(&room, g, &server, &args).expect_err("there are no pictures at all");
+        assert!(err.contains("no pictures in this conversation"), "{err}");
+        assert!(
+            !room
+                .log_now()
+                .iter()
+                .any(|e| e.kind == crate::room::Kind::Picture),
+            "and no card went up for it"
+        );
+
+        // And a call with no number at all, which is the other way a
+        // model gets this wrong.
+        let err = importing(&room, g, &server, &json!({ "label": "a dog" }))
+            .expect_err("no picture was named");
+        assert!(err.contains("number on its card"), "{err}");
+    }
+
+    /// A server that took the picture and drew nothing is not a
+    /// picture to talk about. The card says so and the model is told
+    /// to say so, rather than being handed a number it can describe.
+    #[test]
+    fn an_import_that_comes_back_empty_is_not_a_picture() {
+        let room = picture_room();
+        let g = room.generation_of_only_bot().load(Ordering::SeqCst);
+        let server = Arc::new(mcp::Server::new(mcp::Config {
+            name: "art".into(),
+            url: mock_mcp(false),
+            key: String::new(),
+            only: vec!["refine_pixel_art".into()],
+        }));
+        server.connect().expect("hello");
+        room.upload_picture("Ryan", "notes.png", &a_png())
+            .expect("brought in");
+
+        let args = json!({ "picture": 1, "label": "notes" });
+        let err = importing(&room, g, &server, &args).expect_err("nothing came back");
+        assert!(err.contains("say you couldn't"), "{err}");
+        let card = room
+            .log_now()
+            .into_iter()
+            .find(|e| e.kind == crate::room::Kind::Picture)
+            .expect("the card that went up");
+        assert!(!card.live, "has stopped spinning");
+        assert!(room.picture_png(&card.id).unwrap().is_none());
+    }
+
+    /// A session the server ended while the room was quiet is not a
+    /// picture server that has stopped working. The house's own server
+    /// times an idle session out -- a room goes hours between pictures
+    /// -- and answers 404 to everything carrying it afterwards, which
+    /// is the protocol saying "start another". So the room says hello
+    /// again and makes the call it was making.
+    ///
+    /// Before this, the first picture asked for after a quiet hour
+    /// failed, and so did every one after it until the house was
+    /// restarted.
+    #[test]
+    fn a_session_the_server_ended_is_started_again_rather_than_reported() {
+        let room = picture_room();
+        let g = room.generation_of_only_bot().load(Ordering::SeqCst);
+        let server = Arc::new(mcp::Server::new(mcp::Config {
+            name: "art".into(),
+            url: mock_mcp_which(true, true),
+            key: String::new(),
+            only: vec!["generate_pixel_art".into(), "list_styles".into()],
+        }));
+        assert_eq!(server.connect().expect("hello"), 2);
+
+        // The room is left alone and the server ends the session it
+        // was given. The next call carries a session that is gone.
+        server.end_session_for_test();
+
+        let args = json!({ "prompt": "a brass head" });
+        let said = drawing(&room, g, &server, "art_generate_pixel_art", &args)
+            .expect("said hello again and drew it");
+        assert!(
+            said["result"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Picture 1"),
+            "{said}"
+        );
+        let entry = room
+            .log_now()
+            .into_iter()
+            .find(|e| e.kind == crate::room::Kind::Picture)
+            .expect("the picture is in the conversation");
+        assert_eq!(room.picture_png(&entry.id).unwrap().unwrap(), a_png());
+
+        // And the one after it goes straight through on the new
+        // session, rather than handshaking every time.
+        drawing(&room, g, &server, "art_generate_pixel_art", &args).expect("and again");
+    }
+
+    /// The two tools that take a picture of ours are the room's own
+    /// hands and are never put in front of the model -- not even when
+    /// the configuration names them, which is the way an operator
+    /// would most plausibly try to help.
+    #[test]
+    fn the_tools_that_take_a_picture_are_never_lent() {
+        let server = Arc::new(mcp::Server::new(mcp::Config {
+            name: "art".into(),
+            url: mock_mcp(true),
+            key: String::new(),
+            only: vec![
+                "generate_pixel_art".into(),
+                "create_upload_ticket".into(),
+                "import_image".into(),
+            ],
+        }));
+        assert_eq!(server.connect().expect("hello"), 1, "one of the three");
+        let offered: Vec<String> = server
+            .offer()
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap_or("").to_string())
+            .collect();
+        assert_eq!(offered, vec!["art_generate_pixel_art"]);
+        assert!(!server.has("art_create_upload_ticket"));
+        assert!(!server.has("art_import_image"));
+        // And calling one by name, which is what a model shown the
+        // configuration would try, gets nowhere.
+        assert!(server.call("art_create_upload_ticket", &json!({})).is_err());
+
+        // The room has them regardless, and knows what looks the
+        // importing one can redraw in -- read off its schema, not
+        // guessed.
+        assert!(server.can_import());
+        assert_eq!(server.import_styles(), ["pixel-art", "cel-shaded"]);
+
+        // Which is what the model is shown instead: one tool, taking
+        // the number on a card, with the server's own looks on it.
+        let art = Art {
+            servers: vec![server],
+        };
+        let tools = tools_for(
+            Allowed::Everything,
+            false,
+            false,
+            false,
+            false,
+            &art,
+            false,
+            None,
+        );
+        let redraw = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["function"]["name"] == "redraw_picture")
+            .expect("the room's own tool is offered");
+        let props = &redraw["function"]["parameters"]["properties"];
+        assert_eq!(props["picture"]["type"], "integer");
+        assert_eq!(
+            props["style"]["enum"],
+            json!(["pixel-art", "cel-shaded"]),
+            "the looks come from the server, so a room never names one it does not have"
+        );
+    }
+
+    /// And a picture server that will not take one is a room with no
+    /// such tool and no paragraph about it: a note about a tool that
+    /// is not there is an instruction to try.
+    #[test]
+    fn a_server_that_cannot_take_a_picture_offers_no_way_to_bring_one_in() {
+        let server = Arc::new(mcp::Server::new(mcp::Config {
+            name: "art".into(),
+            url: mock_mcp(true),
+            key: String::new(),
+            only: vec!["generate_pixel_art".into()],
+        }));
+        server.connect().expect("hello");
+        // The mock publishes them, so this is the room being told not
+        // to: a server whose tools list has neither cannot import,
+        // and `Art::importer` is what every gate here asks.
+        let without = Art::default();
+        assert!(without.importer().is_none());
+        let names: Vec<String> = tools_for(
+            Allowed::Everything,
+            false,
+            false,
+            false,
+            false,
+            &without,
+            false,
+            None,
+        )
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["function"]["name"].as_str().unwrap_or("").to_string())
+        .collect();
+        assert!(!names.iter().any(|n| n == "redraw_picture"), "{names:?}");
+    }
+
+    /// A look the model picked reaches the server as it picked it, and
+    /// both looks are in front of it to pick from.
+    ///
+    /// The room decides nothing about how a picture is drawn -- what
+    /// looks there are is the server's to publish and the person in
+    /// the room's to choose between, and the room's whole part is to
+    /// not get in the way of either. So this checks the two halves of
+    /// not getting in the way: that the enum the server published is
+    /// still in the schema the model is shown, next to the key that
+    /// was taken out of it, and that the style named in the call is
+    /// what the server was asked for.
+    #[test]
+    fn a_style_is_passed_through_untouched() {
+        let room = picture_room();
+        let g = room.generation_of_only_bot().load(Ordering::SeqCst);
+        let server = Arc::new(mcp::Server::new(mcp::Config {
+            name: "art".into(),
+            url: mock_mcp(true),
+            key: "secret".into(),
+            only: vec!["generate_pixel_art".into(), "list_styles".into()],
+        }));
+        assert_eq!(server.connect().expect("hello"), 2);
+
+        // What the model is shown: the looks it may ask for, and no
+        // key to invent.
+        let offered = server.offer();
+        let draws = offered
+            .iter()
+            .find(|t| t["function"]["name"] == "art_generate_pixel_art")
+            .expect("the tool that draws is lent");
+        let props = &draws["function"]["parameters"]["properties"];
+        assert_eq!(
+            props["style"]["enum"].as_array().unwrap(),
+            &[json!("pixel-art"), json!("cel-shaded")],
+            "both looks are in front of it: {props}"
+        );
+        assert!(
+            props["rd_api_key"].is_null(),
+            "and the key still is not: {props}"
+        );
+
+        let args = json!({ "prompt": "a dwarf blacksmith", "style": "cel-shaded" });
+        let said = drawing(&room, g, &server, "art_generate_pixel_art", &args)
+            .expect("the call went through");
+        assert!(said["result"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Picture 1"));
+
+        let entry = room
+            .log_now()
+            .into_iter()
+            .find(|e| e.kind == crate::room::Kind::Picture)
+            .expect("a picture card is in the conversation");
+        assert_eq!(
+            entry.title, "a dwarf blacksmith",
+            "captioned with the words and not with the look"
+        );
+        assert_eq!(
+            entry.note, "Job mock7f3: drawn, cel-shaded.",
+            "the server drew in the look that was asked for"
+        );
+        assert!(!entry.live);
+        // And it is a face, the same as a sprite is: nothing about
+        // wearing one knows which look it was drawn in.
+        assert_eq!(room.set_avatar(g, "Ryan", 1).unwrap(), "Ryan");
+    }
+
+    /// A call that draws nothing leaves no card: a list of old work is
+    /// not a portrait, and the room must not spin on one.
+    #[test]
+    fn a_call_that_draws_nothing_puts_no_card_up() {
+        let room = picture_room();
+        let g = room.generation_of_only_bot().load(Ordering::SeqCst);
+        let server = Arc::new(mcp::Server::new(mcp::Config {
+            name: "art".into(),
+            url: mock_mcp(false),
+            key: String::new(),
+            only: vec![],
+        }));
+        server.connect().expect("hello");
+
+        // No words anywhere in the call, so nothing was ever going
+        // to be drawn. Asking what looks there are is the same: it is
+        // a question, asked in the middle of an interview, and a
+        // spinner for it would promise a picture nobody is making.
+        for (tool, args) in [
+            ("art_list_jobs", json!({ "limit": 10 })),
+            ("art_list_styles", json!({})),
+        ] {
+            let said = drawing(&room, g, &server, tool, &args).unwrap();
+            assert_eq!(said["result"], "nothing to draw", "{tool}");
+            assert!(
+                !room
+                    .log_now()
+                    .iter()
+                    .any(|e| e.kind == crate::room::Kind::Picture),
+                "no card for {tool}, which was never going to draw"
+            );
+        }
+
+        // A prompt that came back with nothing does leave a card --
+        // the room had already promised one -- and it says so rather
+        // than spinning for ever.
+        let said = drawing(
+            &room,
+            g,
+            &server,
+            "art_generate_pixel_art",
+            &json!({ "prompt": "a hat" }),
+        )
+        .unwrap();
+        assert_eq!(said["result"], "nothing to draw");
+        let entry = room
+            .log_now()
+            .into_iter()
+            .find(|e| e.kind == crate::room::Kind::Picture)
+            .expect("the card that was promised");
+        assert!(!entry.live, "and it stopped waiting");
+        assert!(room.picture_png(&entry.id).unwrap().is_none());
+    }
+
+    /// Which tool answers have to go back to the model even when it has
+    /// already spoken. Everything `run_tool` refuses is an `error` and
+    /// nothing it allows is, so this is the whole of the test for
+    /// "that promise it just made is not going to be kept".
+    #[test]
+    fn a_tool_that_failed_is_told_apart_from_one_that_worked() {
+        for worked in [
+            json!({ "ok": true }),
+            json!({ "people": [] }),
+            json!({ "sample": 1, "who": "Ryan" }),
+            // A tool that reported somebody else's error as its result
+            // is still a tool that worked.
+            json!({ "result": { "error": "upstream said no" } }),
+        ] {
+            assert!(!went_wrong(&worked.to_string()), "{worked}");
+        }
+        for failed in [
+            json!({ "error": "Ryan's microphone is muted" }),
+            json!({ "error": "you have no tool called \"speak_as\"" }),
+        ] {
+            assert!(went_wrong(&failed.to_string()), "{failed}");
+        }
+        // Not JSON at all is not a failure the model needs telling
+        // about; it is the room having a bug, and guessing otherwise
+        // would send every reply round again.
+        assert!(!went_wrong("not json"));
     }
 
     /// A whole reply, through the real thing: the room's own request,
@@ -1605,30 +4903,32 @@ mod tests {
         println!("speaking {:?} to {}", chat.api(), chat.url);
         let store = crate::store::Store::memory();
         store.invite("Ryan").unwrap();
-        let (turns_tx, _turns) = crossbeam_channel::unbounded();
-        let generation = Arc::new(AtomicU64::new(7));
-        let room = Room::new(
+        let (room, _wiring) = Room::new(
             store,
             RoomConfig {
-                agent_name: "Vox".into(),
-                aliases: vec![],
+                id: "Lobby".into(),
+                title: "Lobby".into(),
+                only: None,
+                default_mode: Mode::Named,
+                bots: vec![BotConfig::new("Vox", vec![])],
                 reply_after: Duration::from_millis(1200),
                 confirm: Duration::from_millis(300),
                 engaged_for: Duration::from_secs(30),
                 history: 60,
+                ai_turns: 2,
                 language: "English".into(),
                 languages: vec!["English".into()],
                 spoken: vec!["English".into()],
             },
-            generation.clone(),
-            turns_tx,
             None,
             std::collections::BTreeMap::new(),
+            None,
+            None,
             None,
         )
         .unwrap();
 
-        let (agent, cfg, mut t) = turn_with(Cue::Speak, &["Ryan"], false);
+        let (agent, mut t) = turn_with(Cue::Speak, &["Ryan"], false);
         t.messages = vec![(
             Role::User,
             "Ryan: Vox, put the rules up for everyone: one card each, aces low. \
@@ -1645,13 +4945,18 @@ mod tests {
             &http,
             &room,
             &chat,
-            &agent.messages(&cfg, &t),
+            &agent.messages(&t, None),
+            Allowed::Everything,
             true,
-            t.cue,
+            t.cue.clone(),
+            t.hand_on > 0,
             7,
             Instant::now(),
-            &generation,
+            &room.generation_of_only_bot(),
             &tx,
+            &Art::default(),
+            None,
+            None,
         )
         .expect("the reply");
         drop(tx);
@@ -1718,11 +5023,20 @@ mod tests {
         let mut queue: Vec<_> = cases.iter().rev().collect();
         while let Some(case) = queue.pop() {
             let (said, people, engaged, want_turn) = case;
-            let (agent, cfg, mut t) = turn_with(Cue::Decide { lull: None }, people, *engaged);
+            let (agent, mut t) = turn_with(judge(None, false), people, *engaged);
             t.messages = vec![(Role::User, said.to_string())];
             // Ask the way the room asks, on whichever API it speaks.
-            let offered = tools_for(true, false, true);
-            let messages = agent.messages(&cfg, &t);
+            let offered = tools_for(
+                Allowed::Everything,
+                true,
+                false,
+                true,
+                true,
+                &Art::default(),
+                false,
+                None,
+            );
+            let messages = agent.messages(&t, None);
             let (path, mut body) = match chat.api() {
                 Api::Responses => (
                     "responses",
@@ -1815,7 +5129,16 @@ mod tests {
     #[test]
     fn each_api_is_fed_and_read_in_its_own_shape() {
         // One function tool, wrapped for chat and flat for responses.
-        let offered = tools_for(false, false, false);
+        let offered = tools_for(
+            Allowed::Everything,
+            false,
+            false,
+            false,
+            true,
+            &Art::default(),
+            false,
+            None,
+        );
         let flat = flatten_tools(&offered);
         assert_eq!(offered[0]["function"]["name"], "list_people");
         assert_eq!(flat[0]["name"], "list_people");
@@ -1972,8 +5295,8 @@ mod tests {
     #[test]
     fn a_turn_to_judge_says_who_it_is_being_judged_among() {
         let note = |people: &[&str], engaged| {
-            let (agent, cfg, t) = turn_with(Cue::Decide { lull: None }, people, engaged);
-            agent.messages(&cfg, &t).pop().unwrap()["content"]
+            let (agent, t) = turn_with(judge(None, false), people, engaged);
+            agent.messages(&t, None).pop().unwrap()["content"]
                 .as_str()
                 .unwrap()
                 .to_string()
@@ -2001,8 +5324,8 @@ mod tests {
 
     #[test]
     fn a_turn_to_judge_ends_with_what_makes_it_a_judgment() {
-        let (agent, cfg, t) = turn(Cue::Decide { lull: None });
-        let messages = agent.messages(&cfg, &t);
+        let (agent, t) = turn(judge(None, false));
+        let messages = agent.messages(&t, None);
         let last = messages.last().unwrap();
         assert_eq!(last["role"], "user");
         let note = last["content"].as_str().unwrap();
@@ -2012,9 +5335,20 @@ mod tests {
         // the rest of the prompt is the same either way.
         assert_eq!(messages[1]["content"], "Ryan: so what did you make of it?");
 
+        // Talked over and left to finish: it is told so, because the
+        // likeliest thing in that pause is a cough.
+        let (agent, t) = turn(judge(None, true));
+        let over = agent.messages(&t, None).pop().unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(over.contains("while you were still speaking"), "{over}");
+        assert!(over.contains("Take the turn only if it was plainly for you"));
+        assert!(!over.contains("{over}") && !note.contains("while you were still speaking"));
+
         // The silence it asked for says how long it has lasted.
-        let (agent, cfg, t) = turn(Cue::Decide { lull: Some(8) });
-        let note = agent.messages(&cfg, &t);
+        let (agent, t) = turn(judge(Some(8), false));
+        let note = agent.messages(&t, None);
         let note = note.last().unwrap()["content"]
             .as_str()
             .unwrap()
@@ -2023,8 +5357,8 @@ mod tests {
         assert!(!note.contains("{lull}"));
 
         // A turn it was told to take carries no such note at all.
-        let (agent, cfg, t) = turn(Cue::Speak);
-        let messages = agent.messages(&cfg, &t);
+        let (agent, t) = turn(Cue::Speak);
+        let messages = agent.messages(&t, None);
         assert_eq!(messages.len(), 2, "system and the conversation");
         assert!(!messages[1]["content"]
             .as_str()
@@ -2043,7 +5377,17 @@ mod tests {
         // The tools are read as instructions for what to do, so nothing
         // in them is phrased that way at all.
         for (lobby, deciding) in [(true, true), (false, false)] {
-            let tools = tools_for(lobby, true, deciding).to_string();
+            let tools = tools_for(
+                Allowed::Everything,
+                lobby,
+                true,
+                deciding,
+                true,
+                &Art::default(),
+                false,
+                None,
+            )
+            .to_string();
             assert!(!tools.contains("private"), "{tools}");
         }
     }
@@ -2075,7 +5419,15 @@ mod tests {
                 "post_card",
                 "take_back_card",
                 "read_cards",
-                "wait_until_named"
+                "hand_to",
+                "wait_until_named",
+                // With no picture server anywhere -- `Art::default()`
+                // -- and the faces still here: a picture can be
+                // dropped into any room by whoever is in it, so there
+                // is one to give and lines to write about it. What a
+                // server adds is the drawing.
+                "set_avatar",
+                "set_bio",
             ]
         );
         // In the lobby they are there as well, alongside the games.
@@ -2088,7 +5440,7 @@ mod tests {
 
     #[test]
     fn a_game_is_told_about_the_cards_without_being_told_about_games() {
-        let frame = game_prompt("Dragon Heist", "Run a heist.");
+        let frame = game_prompt("Dragon Heist", "Run a heist.", Allowed::Everything);
         assert!(frame.contains("send_card"));
         assert!(frame.contains("list_people"));
         assert!(frame.contains("wait_until_named"));
@@ -2134,5 +5486,310 @@ mod tests {
     #[test]
     fn cleans_markdown() {
         assert_eq!(clean("  **Sure**,  here's   `one`. "), "Sure, here's one.");
+    }
+
+    // -- puppets ---------------------------------------------------------
+
+    /// The stage, as the agent thread would have it: the room, and the
+    /// voices the operator said the speech server has.
+    fn stage_of(room: &Arc<Room>, presets: &[&str]) -> Stage {
+        Stage {
+            room: room.clone(),
+            translate: None,
+            hands: std::sync::OnceLock::new(),
+            presets: presets.iter().map(|p| p.to_string()).collect(),
+        }
+    }
+
+    /// A puppet is the first AI's and nobody else's, and only where the
+    /// house can give one a voice. A bot that is only looking is never
+    /// offered one, and nor is anybody in a house with nothing to speak
+    /// with -- a tool it cannot use is a tool it will try.
+    #[test]
+    fn the_puppet_tools_belong_to_the_ai_that_runs_the_room() {
+        let names = |allowed: Allowed, puppets: Option<&[String]>| {
+            tools_for(
+                allowed,
+                true,
+                false,
+                false,
+                true,
+                &Art::default(),
+                false,
+                puppets,
+            )
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>()
+        };
+        let every = [
+            "list_puppets",
+            "make_puppet",
+            "forget_puppet",
+            "bring_on_puppets",
+            "send_off_puppets",
+            "put_on_show",
+            "say_as",
+        ];
+
+        let none = names(Allowed::Everything, None);
+        for tool in every {
+            assert!(
+                !none.contains(&tool.to_string()),
+                "{tool} with no speech server"
+            );
+        }
+        let has = names(Allowed::Everything, Some(&[]));
+        for tool in every {
+            assert!(has.contains(&tool.to_string()), "{tool} is missing");
+        }
+        let looking = names(Allowed::Looking, Some(&[]));
+        for tool in every {
+            assert!(
+                !looking.contains(&tool.to_string()),
+                "{tool} is not a voice's"
+            );
+        }
+
+        // The voices the server has go in the schema, so the model
+        // picks one that exists rather than one it has heard of.
+        let made = puppet_tools(false, &["Aiden".into(), "Serena".into()]);
+        let make = made
+            .iter()
+            .find(|t| t["function"]["name"] == "make_puppet")
+            .expect("make_puppet");
+        let props = &make["function"]["parameters"]["properties"];
+        assert!(
+            props["preset"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("Aiden, Serena"),
+            "{}",
+            props["preset"]["description"]
+        );
+        assert!(
+            props.get("voice").is_none(),
+            "a cloned voice is only offered where there is a server to clone with"
+        );
+        assert!(
+            puppet_tools(true, &[])[1]["function"]["parameters"]["properties"]["voice"].is_object()
+        );
+    }
+
+    /// The prompt and the tools are decided by the same thing, so what
+    /// the model is told it can do and what it is offered cannot drift
+    /// apart. And a room with a puppet in it says which puppets, and
+    /// whose they are.
+    #[test]
+    fn the_prompt_mentions_puppets_only_where_there_are_some() {
+        let room = picture_room();
+        let (agent, mut t) = turn_with(Cue::Speak, &["Ryan"], false);
+
+        let quiet = system_of(&agent, &t);
+        assert!(!quiet.contains("put on a show"), "no stage, nothing said");
+        assert!(!quiet.contains("puppet"), "{quiet}");
+
+        let stage = stage_of(&room, &["Aiden", "Serena"]);
+        let said = agent.messages(&t, Some(&stage))[0]["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(said.contains("A puppet is a character"), "{said}");
+        assert!(said.contains("Aiden, Serena"), "the voices it may build on");
+        assert!(
+            said.contains("you never answer one"),
+            "the half a model gets wrong without being told"
+        );
+        assert!(
+            !said.contains("In the room with you now"),
+            "none are on stage"
+        );
+
+        // With a cast on stage, and then with the show playing.
+        t.puppets = vec![("Grimble".into(), "an old gatekeeper".into())];
+        let cast = agent.messages(&t, Some(&stage))[0]["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            cast.contains("In the room with you now: Grimble (an old gatekeeper)"),
+            "{cast}"
+        );
+        assert!(cast.contains("lines you wrote"), "{cast}");
+
+        t.showing = Some("The Gate".into());
+        let playing = agent.messages(&t, Some(&stage))[0]["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            playing.contains("\"The Gate\" is playing right now"),
+            "{playing}"
+        );
+        assert!(
+            playing.contains("Say nothing and start nothing"),
+            "{playing}"
+        );
+    }
+
+    /// While a show is on, the AI is told that a whole part of the room
+    /// is missing from the transcript it is reading -- and that is the
+    /// thing it has to be told, far more than the layout. A model that
+    /// does not know it cannot hear the audience will wonder at the
+    /// silence, or apologise for ignoring somebody, or answer a
+    /// question nobody put to it.
+    #[test]
+    fn the_director_is_told_it_cannot_hear_the_audience() {
+        let room = picture_room();
+        let (agent, mut t) = turn_with(Cue::Speak, &["Ryan"], false);
+        let stage = stage_of(&room, &["aiden"]);
+        let said = |t: &Turn| {
+            agent.messages(t, Some(&stage))[0]["content"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+
+        // No show, nothing said: the room is a room.
+        assert!(!said(&t).contains("playhouse"), "no show, no playhouse");
+
+        // A show on, and nobody in the box or up on the stage: it is
+        // reading a transcript with the audience cut out of it, and is
+        // told so in those words.
+        t.playhouse = true;
+        let on = said(&t);
+        assert!(on.contains("cannot hear the audience"), "{on}");
+        assert!(on.contains("never address the audience"), "{on}");
+        assert!(!on.contains("In the box with you"), "nobody has come round");
+        assert!(
+            !on.contains("adlib"),
+            "nobody is up there, so it is still a script"
+        );
+
+        // Somebody comes round to the box: now there is one person it
+        // can hear, and it is named.
+        t.in_box = vec!["Ryan".into()];
+        let box_ = said(&t);
+        assert!(box_.contains("In the box with you: Ryan"), "{box_}");
+
+        // And somebody goes up on the stage, which is the end of any
+        // script and the start of making it up.
+        t.on_stage = vec!["Alex".into()];
+        let adlib = said(&t);
+        assert!(adlib.contains("Alex is up on the stage"), "{adlib}");
+        assert!(adlib.contains("there is no script"), "{adlib}");
+        assert!(adlib.contains("say_as"), "{adlib}");
+    }
+
+    /// What the tools answer, and what they refuse: the roster, the
+    /// stage, and a show that cannot go on without a cast.
+    #[test]
+    fn the_puppet_tools_say_what_went_wrong() {
+        let store = crate::store::Store::memory().in_room("Lobby");
+        store.invite("Ryan").unwrap();
+        let tts: crate::room::VoiceFactory =
+            Arc::new(|_, _, _, _| Ok(Box::new(crate::tts::Silent)));
+        let (room, _wiring) = Room::new(
+            store,
+            RoomConfig {
+                id: "Lobby".into(),
+                title: "Lobby".into(),
+                only: None,
+                default_mode: Mode::Named,
+                bots: vec![BotConfig::new("Vox", vec![])],
+                reply_after: Duration::from_millis(1200),
+                confirm: Duration::from_millis(300),
+                engaged_for: Duration::from_secs(30),
+                history: 60,
+                ai_turns: 2,
+                language: "English".into(),
+                languages: vec!["English".into()],
+                spoken: vec!["English".into()],
+            },
+            None,
+            std::collections::BTreeMap::new(),
+            None,
+            Some(tts),
+            None,
+        )
+        .unwrap();
+        // Spelled as the server spells them, which is the only
+        // spelling `/v1/audio/speech` takes.
+        let stage = stage_of(&room, &["aiden", "uncle_fu"]);
+        let call = |tool: &str, args: Value| puppeteering(&room, &stage, tool, &args);
+
+        // Nothing yet, and the refusal says so rather than guessing.
+        assert_eq!(
+            call("list_puppets", json!({})).unwrap()["puppets"],
+            json!([])
+        );
+        assert!(call("bring_on_puppets", json!({ "puppets": ["Grimble"] }))
+            .unwrap_err()
+            .contains("make_puppet makes one"));
+        assert!(call("put_on_show", json!({ "title": "x", "script": [] }))
+            .unwrap_err()
+            .contains("bring_on_puppets first"));
+
+        // A voice the server hasn't got is refused now, not in front of
+        // the room.
+        assert!(call(
+            "make_puppet",
+            json!({ "name": "Grimble", "about": "a gatekeeper", "preset": "Hamlet" })
+        )
+        .unwrap_err()
+        .contains("the speech server has aiden, uncle_fu"));
+
+        // Said the way anybody says it out loud, kept the way the
+        // server spells it: those are two words for one voice, and
+        // only one of them is a word the endpoint will take. This is
+        // the whole of what went wrong the first time a puppet was
+        // asked to speak -- "Uncle Fu" reached the server untouched
+        // and came back HTTP 400 in the middle of a sentence.
+        call(
+            "make_puppet",
+            json!({ "name": "Grimble", "about": "a gatekeeper", "preset": "Uncle Fu" }),
+        )
+        .unwrap();
+        assert_eq!(
+            room.puppet_roster()[0].preset,
+            "uncle_fu",
+            "spelled as the server spells it, whatever was said"
+        );
+
+        // A cast of one real name and one typo brings on what it can
+        // and says which it could not: failing the lot would leave the
+        // AI with no idea which of them is standing in the room.
+        let on = call(
+            "bring_on_puppets",
+            json!({ "puppets": ["Grimble", "Grumble"] }),
+        )
+        .unwrap();
+        assert_eq!(on["on_stage"], json!(["Grimble"]));
+        assert_eq!(on["refused"][0]["puppet"], json!("Grumble"));
+
+        // Now a show will go on, and a second one will not.
+        let script = json!([{ "who": "Grimble", "say": "None shall pass." }]);
+        let playing = call(
+            "put_on_show",
+            json!({ "title": "The Gate", "script": script }),
+        );
+        assert_eq!(playing.unwrap()["playing"], json!("The Gate"));
+        assert!(call(
+            "put_on_show",
+            json!({ "title": "Again", "script": json!([{ "who": "Grimble", "say": "Hm." }]) })
+        )
+        .unwrap_err()
+        .contains("a show is already on"));
+        room.stop_show();
+
+        // say_as is only for a puppet that is actually standing there.
+        assert!(call("say_as", json!({ "who": "Pell", "say": "Hello." }))
+            .unwrap_err()
+            .contains("no puppet called \"Pell\""));
+        assert!(call("say_as", json!({ "who": "Grimble", "say": "" }))
+            .unwrap_err()
+            .contains("say what it says"));
     }
 }

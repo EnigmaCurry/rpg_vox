@@ -1,19 +1,27 @@
 <script>
-  import { room, sendText } from '../lib/room.svelte.js';
+  import {
+    room, enterGame, peekGame, theAI, theAIs, waitingAI, pictureOf, sampleOf, boxLines,
+  } from '../lib/room.svelte.js';
+  import History from './History.svelte';
+  import Face from './Face.svelte';
+  import Stage from './Stage.svelte';
+  import Seats from './Seats.svelte';
   import { hue } from '../lib/color.js';
-  import { TYPED_MAX } from '../lib/names.js';
+  import { markdown } from '../lib/markdown.js';
+  import { scaledDown } from '../lib/pixels.js';
 
   let box;
   let stick = true;
-  let draft = $state('');
 
   // The language you are reading in, and whose language each person is
   // speaking: between them they say whether a message needs translating
   // for you, and so whether to wait for one.
   const roomLanguage = $derived(room.languages[0] ?? '');
   const mine = $derived(room.lang || roomLanguage);
-  const languageOf = (who) =>
-    room.people.find((p) => p.name === who)?.language || roomLanguage;
+  // Not from the roster: that is who is in the room now, and a line
+  // outlives its author's standing in it. `speaks` is what everybody
+  // the room knows reads and says, here or not.
+  const languageOf = (who) => room.speaks[who] || roomLanguage;
 
   /// An entry that has a translation for you: which language it was
   /// written in, and what it says in yours (`null` while that is still
@@ -38,6 +46,19 @@
   // the AI speaks. Yours alone: nobody else's screen changes.
   let asWritten = $state({});
 
+  // How big a picture card's square is, in one place: the CSS draws
+  // it and `lib/pixels.js` is told it, and the two must agree.
+  const SHOT = 192;
+  // Pictures this is scaling *down* rather than up, by id -- which
+  // decides how each is drawn, see `lib/pixels.js`. By id and not one
+  // flag, because a conversation holds both kinds at once: a sprite,
+  // a full-resolution picture beside it, and a photograph somebody
+  // dropped in under them.
+  let smooth = $state({});
+  const sized = (id, img) => {
+    if (scaledDown(img, SHOT)) smooth = { ...smooth, [id]: true };
+  };
+
   /// Which language to read an entry in. Your own by default -- reading
   /// the reply back in a language you don't speak is the whole point of
   /// having asked -- and the one it was written in once you say so.
@@ -54,159 +75,403 @@
   const left = (t) =>
     t.done ? 'heard' : t.total ? `${Math.max(1, Math.ceil((t.total - t.ms) / 1000))}s` : 'translating…';
 
-  function send(ev) {
-    ev.preventDefault();
-    if (sendText(draft)) draft = '';
-  }
-
   function onscroll() {
     stick = box.scrollHeight - box.scrollTop - box.clientHeight < 60;
   }
 
   $effect(() => {
-    // Follow new text while the view is at the bottom.
-    room.log.map((e) => e.text).join();
+    // Follow new text while the view is at the bottom. An archive
+    // doesn't grow, so this is about the live conversation; opening one
+    // scrolls to its foot once, which is where it was left.
+    shown.map((e) => e.text).join();
     // And when a reply grows or loses its row of languages, which is a
     // line of height appearing under the last thing said.
-    room.log.map((e) => tracks(e).length).join();
-    room.agent.state;
+    shown.map((e) => tracks(e).length).join();
+    room.agents.map((a) => a.state).join();
     if (stick && box) queueMicrotask(() => (box.scrollTop = box.scrollHeight));
   });
 
   const time = (ms) => new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+  // What is on screen: the conversation the room is having, or one out
+  // of its history that you have opened. An old one is read-only by its
+  // nature — the room has moved on from it, so there is nothing to say
+  // into — and that is the whole of what read-only means here.
+  // A line said on the stage is not the room talking, so it is not in
+  // here: it is read on the stage, where it was said, and the
+  // conversation keeps one folded note of the whole play at the
+  // curtain. See `Kind::Line` in room.rs.
+  //
+  // Nor is what was said in the director's box. This column is the
+  // audience's log and the box's is its own — that is the whole of
+  // keeping the two apart — so while the playhouse is open those lines
+  // are read up in the box, where anybody may follow them. An old
+  // conversation has no box to read them in, so everything that was
+  // ever said in it is here. See `Entry::seat` in room.rs.
+  const shown = $derived(
+    (room.reading?.log ?? room.log).filter(
+      (e) => e.kind !== 'line' && !(!room.reading && room.show && e.seat === 'box'),
+    ),
+  );
+  const archived = $derived(!!room.reading);
+
+  // A room can have more than one AI in it, and prose written for one
+  // of them reads wrong the moment it does. Puppets are not among them:
+  // nothing here is a thing to ask one of those to do.
+  const ais = $derived(theAIs());
+  const one = $derived(ais.length === 1);
+  const it = $derived(one ? 'it' : 'them');
+  const answers = $derived(one ? 'it answers' : 'they answer');
 </script>
 
-<div class="log" bind:this={box} {onscroll}>
-  {#if room.log.length === 0}
-    <p class="empty">
-      {#if room.game}
-        Entering <strong>{room.game}</strong>…
-      {:else}
-        Nothing said yet. Join the audio and start talking; say <strong>{room.agent.name}</strong>
-        {room.mode === 'named' ? 'to bring it in' : 'or just talk, and it answers when you pause'}.
-        Ask it to design a game with you, then ask it to start, change or delete games by voice.
-      {/if}
-    </p>
-  {/if}
-  {#each room.log as e (e.id)}
-    {#if e.kind === 'game'}
-      {@const g = room.games.find((g) => g.name.toLowerCase() === e.text.toLowerCase())}
-      <div class="entry agent game-entry">
-        <div class="who"><span class="name">{e.who}</span><span class="time">{time(e.at)} · new game</span></div>
-        <div class="card">
-          <div class="title">{e.text}</div>
-          {#if g}<p class="summary">{g.summary}</p>{/if}
-          {#if !g}
-            <span class="hint">This game was deleted.</span>
-          {:else if room.game}
-            <span class="hint">Go back to the lobby to play it.</span>
-          {:else}
-            <span class="hint">Ask {room.agent.name} to start it when you're ready.</span>
-          {/if}
-        </div>
-      </div>
-    {:else if e.kind === 'card'}
-      <!-- A card the AI posted for the whole room; it stays in the
-           conversation like anything that was said. -->
-      <div class="entry agent card-entry">
-        <div class="who"><span class="name">{e.who}</span><span class="time">{time(e.at)} · for the room</span></div>
-        <div class="card posted">
-          <div class="title">{e.title}</div>
-          <p class="body">{e.text}</p>
-        </div>
-      </div>
-    {:else}
-    <div class="entry" class:agent={e.kind === 'agent'} class:you={e.who === room.you} style="--h: {hue(e.who)}">
-      <div class="who">
-        <span class="name">{e.who}</span>
-        {#if e.typed}<span class="typed" title="Typed, not spoken">typed</span>{/if}
-        <span class="time">{time(e.at)}</span>
-      </div>
-      {#if pair(e)}
-        {@const p = pair(e)}
-        {@const from = showing(e) === 'from'}
-        <!-- One language at a time, with a link to the other: both are
-             here, so a translation that went wrong can be seen to have
-             gone wrong, without two copies of every line to read past. -->
-        <div
-          class="text"
-          class:partial={from && e.partial}
-          class:live={e.live}
-          lang={from ? p.from : mine}
-        >
-          {#if from}
-            {#if e.text}{e.text}{:else}<span class="dots"><i></i><i></i><i></i></span>{/if}
-          {:else if p.text}
-            {p.text}
-          {:else}
-            <!-- Not translated yet. Deliberately not the original: being
-                 handed a language you didn't ask for is the thing this
-                 is here to avoid. The link below reaches it. -->
-            <span class="pending">{mine}…</span>
-          {/if}
-        </div>
-        {#if e.text || p.text}
-          <button type="button" class="swap" onclick={() => (asWritten[e.id] = !from)}>
-            {from ? `Show ${mine}` : `Show ${p.from}`}
-          </button>
-        {/if}
-      {:else}
-        <div class="text" class:partial={e.partial} class:live={e.live}>
-          {#if e.text}{e.text}{:else if e.kind === 'agent'}<span class="dots"><i></i><i></i><i></i></span>{/if}
-        </div>
-      {/if}
-      {#if tracks(e).length > 0}
-        <!-- The same words take a different time to say in each
-             language, so whichever one you are listening to, this is
-             where the others have got to. It goes when they are all
-             done, which is the thing it is here to show. -->
-        <div class="tracks" title={e.kind === 'agent'
-          ? `How far ${room.agent.name}'s reply has been heard in each language. The turn is over once every language has heard it out.`
-          : `How far ${e.who} has been heard in each language. Anyone listening in one of these is hearing it now, a phrase behind.`}>
-          {#each tracks(e) as t (t.language)}
-            <span class="track" class:done={t.done} class:waiting={!t.total && !t.done}>
-              <span class="lang">{t.language}</span>
-              <span class="bar"><i style="width: {width(t)}%"></i></span>
-              <span class="left">{left(t)}</span>
-            </span>
-          {/each}
-        </div>
-      {/if}
-    </div>
-    {/if}
-  {/each}
-  {#if room.agent.state === 'waiting'}
-    <div class="entry agent waiting" aria-live="polite">
-      <div class="who"><span class="name">{room.agent.name}</span><span class="time">waiting for a pause</span></div>
-      <div class="text"><span class="dots"><i></i><i></i><i></i></span></div>
-    </div>
+<!-- Nothing but the conversation. The box you type into is along the
+     foot of the room, beside the button you talk with: saying a thing
+     and typing it are the same act done two ways, and this column is
+     for what came of either. -->
+<div class="log panel">
+  <!-- A playhouse, while one is open: the stage at the top with the
+       characters on it, the director's box under it, and then the
+       conversation, which is the audience. Stacked above the
+       scrollport, because a scene is watched and the cast has to stay
+       in front of you while the transcript scrolls past.
+
+       None of it exists without a show. A room with no characters
+       standing in it has no parts to it, and everybody in it can hear
+       everybody -- see ROOM.md, Puppets. -->
+  {#if room.show}
+    <Stage />
+    <Seats seat="box" title="Director's box" lines={boxLines()}
+      why="Where {room.seats?.director ?? 'the AI'} runs the show. It hears what is said in here and nothing from the audience, and what is said in here is read in here." />
+    <Seats seat="audience" title="Audience" size={28}
+      why="Watching. Talk as freely as you like — the box cannot hear a word of it." />
   {/if}
 
-  <!-- Last child of the scroller and stuck to its foot, so the grid
-       above doesn't have to know the conversation has a composer. -->
-  <form class="composer" onsubmit={send}>
-    <input
-      type="text"
-      bind:value={draft}
-      maxlength={TYPED_MAX}
-      autocomplete="off"
-      placeholder="Type instead of saying it — a URL, a name, anything that has to arrive exactly"
-      aria-label="Type a message to the room"
-    />
-    <button type="submit" class="primary" disabled={!draft.trim()}>Send</button>
-  </form>
+  <div class="said" bind:this={box} {onscroll}>
+    <History />
+
+    {#if shown.length === 0}
+      <p class="empty">
+        {#if archived}
+          Nothing was ever said in this one.
+        {:else if room.game}
+          Entering <strong>{room.game}</strong>…
+        {:else if room.bots === 'never'}
+          Nothing said yet. You have <strong>BOTS</strong> off, so nothing you say
+          reaches {it} — the room is yours. Turn it on in the footer, or let
+          somebody else bring {it} in.
+        {:else if room.bots === 'named'}
+          Nothing said yet. You have <strong>BOTS</strong> off, so {it}
+          {one ? 'stays' : 'stay'} out of what you say until you say
+          <strong>{theAI()}</strong>. Turn it on and {answers} whenever you pause.
+        {:else if ais.every((a) => a.mode === 'never')}
+          Nothing said yet. The room has {theAI()} saying nothing just now,
+          so it is yours: join the audio and talk.
+        {:else}
+          Nothing said yet. Join the audio and start talking;
+          {ais.every((a) => a.mode === 'named')
+            ? `say ${theAI()} to bring ${it} in`
+            : `${answers} when you pause, or say ${theAI()} to be sure of ${one ? 'it' : 'them'}`}.
+          Ask {it} to design a game with you, then ask {it} to start, change or delete games by voice.
+        {/if}
+      </p>
+    {/if}
+    {#each shown as e (e.id)}
+      {#if e.kind === 'game'}
+        {@const g = room.games.find((g) => g.name.toLowerCase() === e.text.toLowerCase())}
+        <div class="entry agent game-entry">
+          <Face who={e.who} agent />
+          <div class="said-by">
+          <div class="who"><span class="name">{e.who}</span><span class="time">{time(e.at)} · new game</span></div>
+          <div class="card">
+            <div class="title">{e.text}</div>
+            {#if g}<p class="summary">{g.summary}</p>{/if}
+            <!-- A game is announced here, so this is where it is played
+                 from: the card knows which game it is and whether the
+                 room is already in one. Asking out loud does the same. -->
+            {#if !g}
+              <span class="hint">This game was deleted.</span>
+            {:else}
+              <div class="doings">
+                <button onclick={() => enterGame(g.name)} disabled={!!room.game}
+                  title={room.game
+                    ? `You're in ${room.game}. Leave the game to play another.`
+                    : `Everyone in this room goes into ${g.name}.`}>Play</button>
+                <button onclick={() => peekGame(g.name)}
+                  title="Show the game's hidden prompt, to you only">Peek</button>
+                <span class="hint">
+                  {#if room.game}In {room.game}.{:else}Or ask {theAI()} for it out loud.{/if}
+                </span>
+              </div>
+            {/if}
+          </div>
+          </div>
+        </div>
+      {:else if e.kind === 'picture'}
+        <!-- A picture one of the AIs made. The card goes up the moment
+             it starts drawing, so this is a spinner first and the
+             picture after -- the room watches it happen and says what
+             to change. Numbered, because that number is what somebody
+             says out loud and what set_avatar takes. -->
+        {@const made = room.pictures[e.id]}
+        <div class="entry agent picture-entry">
+          <Face who={e.who} agent />
+          <div class="said-by">
+            <div class="who">
+              <span class="name">{e.who}</span>
+              <span class="time">{time(e.at)} · {e.text}</span>
+            </div>
+            <div class="card shot-card">
+              <div class="shot" class:waiting={!made?.ready && !made?.failed}>
+                {#if made?.ready}
+                  <img src={pictureOf(e.id)} alt={e.title} />
+                {:else if made?.failed}
+                  <span class="broke" title={made.failed}>didn't come</span>
+                {:else}
+                  <span class="spinner" aria-label="Drawing"></span>
+                {/if}
+              </div>
+              {#if e.title}<p class="asked">{e.title}</p>{/if}
+              {#if made?.failed}<p class="hint">{made.failed}</p>{/if}
+            </div>
+          </div>
+        </div>
+      {:else if e.kind === 'upload'}
+        <!-- A picture somebody dropped in from their own computer.
+             The same card as one the AI made, numbered in the same
+             sequence -- that number is what gets said out loud and
+             what set_avatar takes -- and their line, not the AI's: it
+             carries their face and their colour, because bringing
+             something in is a thing a person did. -->
+        {@const made = room.pictures[e.id]}
+        <div class="entry picture-entry" class:you={e.who === room.you} style="--h: {hue(e.who)}">
+          <Face who={e.who} />
+          <div class="said-by">
+            <div class="who">
+              <span class="name">{e.who}</span>
+              <span class="time">{time(e.at)} · {e.text}</span>
+            </div>
+            <div class="card shot-card">
+              <!-- No spinner branch: it arrived whole or it is not
+                   there at all. -->
+              <div class="shot" class:photo={smooth[e.id]}>
+                {#if made?.ready}
+                  <img src={pictureOf(e.id)} alt={e.title} onload={(ev) => sized(e.id, ev.currentTarget)} />
+                {:else}
+                  <span class="broke">gone</span>
+                {/if}
+              </div>
+              {#if e.title}<p class="asked">{e.title}</p>{/if}
+            </div>
+          </div>
+        </div>
+      {:else if e.kind === 'clip'}
+        <!-- A recording somebody brought in from their own computer to
+             clone a voice from. Plays and is numbered exactly like one
+             read into a microphone here, because from here on it is
+             the same thing: save_voice takes that number.
+
+             What it does not do is look like a recording. A card that
+             did would be claiming something happened in this room that
+             did not, and the clip was a file somebody already had. So
+             it says it was brought in, with the name it came in as. -->
+        {@const clip = room.samples[e.id]}
+        <div class="entry sample-entry" class:you={e.who === room.you} style="--h: {hue(e.who)}">
+          <Face who={e.who} />
+          <div class="said-by">
+            <div class="who">
+              <span class="name">{e.who}</span>
+              <span class="time">
+                {time(e.at)} · brought in · {e.text}{clip?.ready ? ` · ${Math.round(clip.secs)}s` : ''}
+              </span>
+            </div>
+            <div class="card clip-card">
+              <p class="hint brought">{e.title || 'a recording'}</p>
+              {#if clip?.ready}
+                <audio controls preload="none" src={sampleOf(e.id)}></audio>
+                {#if clip.said}<p class="asked">“{clip.said}”</p>{/if}
+              {:else}
+                <p class="hint">The room couldn't keep this one.</p>
+              {/if}
+            </div>
+          </div>
+        </div>
+      {:else if e.kind === 'sample'}
+        <!-- A few seconds of somebody reading aloud, recorded so a
+             voice can be cloned from it. The card goes up the moment
+             the room starts listening and says so while it is: it is
+             the light on a microphone being recorded, and it is here
+             in the conversation where nobody can miss it rather than
+             on one person's screen.
+
+             Theirs, not the AI's: it carries their face and their
+             colour, because it is their voice. The clip can be played
+             by anyone in the room, which is no more than they could
+             already hear. -->
+        {@const clip = room.samples[e.id]}
+        <div class="entry sample-entry" class:you={e.who === room.you} style="--h: {hue(e.who)}">
+          <Face who={e.who} />
+          <div class="said-by">
+            <div class="who">
+              <span class="name">{e.who}</span>
+              <span class="time">
+                {time(e.at)} · {e.text}{clip?.ready ? ` · ${Math.round(clip.secs)}s` : ''}
+              </span>
+            </div>
+            <div class="card clip-card">
+              {#if clip?.ready}
+                <audio controls preload="none" src={sampleOf(e.id)}></audio>
+                {#if clip.said}<p class="asked">“{clip.said}”</p>{/if}
+              {:else if clip?.failed}
+                <p class="hint">{clip.failed}</p>
+              {:else}
+                <p class="listening">
+                  <span class="rec" aria-hidden="true"></span>
+                  {#if e.who === room.you}
+                    Recording — read your card aloud.
+                  {:else}
+                    Recording {e.who}.
+                  {/if}
+                </p>
+                {#if clip?.passage}<p class="asked">{clip.passage}</p>{/if}
+              {/if}
+            </div>
+          </div>
+        </div>
+      {:else if e.kind === 'programme'}
+        <!-- A show that has been performed, folded up. The lines were
+             read on the stage while it was on; this is what the
+             conversation keeps of it, and it is shut because a scene
+             is a few hundred words of somebody else's dialogue and
+             would otherwise push everything the room said off the
+             screen. -->
+        <div class="entry agent card-entry">
+          <Face who={e.who} agent />
+          <div class="said-by">
+          <div class="who"><span class="name">{e.who}</span><span class="time">{time(e.at)} · the play</span></div>
+          <details class="card posted programme">
+            <summary><span class="title">{e.title}</span><span class="open">the script</span></summary>
+            <div class="body md">{@html markdown(e.text)}</div>
+          </details>
+          </div>
+        </div>
+      {:else if e.kind === 'card'}
+        <!-- A card the AI posted for the whole room; it stays in the
+             conversation like anything that was said. -->
+        <div class="entry agent card-entry">
+          <Face who={e.who} agent />
+          <div class="said-by">
+          <div class="who"><span class="name">{e.who}</span><span class="time">{time(e.at)} · for the room</span></div>
+          <div class="card posted">
+            <div class="title">{e.title}</div>
+            <!-- Markdown, because a card is the one thing here written
+                 to be looked at rather than heard: a table of times, a
+                 list of options, the numbers as numbers. Escaped before
+                 anything is built from it -- see lib/markdown.js. -->
+            <div class="body md">{@html markdown(e.text)}</div>
+          </div>
+          </div>
+        </div>
+      {:else}
+      <div class="entry" class:agent={e.kind === 'agent'} class:you={e.who === room.you} style="--h: {hue(e.who)}">
+        <Face who={e.who} agent={e.kind === 'agent'} />
+        <div class="said-by">
+        <div class="who">
+          <span class="name">{e.who}</span>
+          {#if e.typed}<span class="typed" title="Typed, not spoken">typed</span>{/if}
+          <span class="time">{time(e.at)}</span>
+        </div>
+        {#if pair(e)}
+          {@const p = pair(e)}
+          {@const from = showing(e) === 'from'}
+          <!-- One language at a time, with a link to the other: both are
+               here, so a translation that went wrong can be seen to have
+               gone wrong, without two copies of every line to read past. -->
+          <div
+            class="text"
+            class:partial={from && e.partial}
+            class:live={e.live}
+            lang={from ? p.from : mine}
+          >
+            {#if from}
+              {#if e.text}{e.text}{:else}<span class="dots"><i></i><i></i><i></i></span>{/if}
+            {:else if p.text}
+              {p.text}
+            {:else}
+              <!-- Not translated yet. Deliberately not the original: being
+                   handed a language you didn't ask for is the thing this
+                   is here to avoid. The link below reaches it. -->
+              <span class="pending">{mine}…</span>
+            {/if}
+          </div>
+          {#if e.text || p.text}
+            <button type="button" class="swap" onclick={() => (asWritten[e.id] = !from)}>
+              {from ? `Show ${mine}` : `Show ${p.from}`}
+            </button>
+          {/if}
+        {:else}
+          <div class="text" class:partial={e.partial} class:live={e.live}>
+            {#if e.text}{e.text}{:else if e.kind === 'agent'}<span class="dots"><i></i><i></i><i></i></span>{/if}
+          </div>
+        {/if}
+        {#if tracks(e).length > 0}
+          <!-- The same words take a different time to say in each
+               language, so whichever one you are listening to, this is
+               where the others have got to. It goes when they are all
+               done, which is the thing it is here to show. -->
+          <div class="tracks" title={e.kind === 'agent'
+            ? `How far ${e.who}'s reply has been heard in each language. The turn is over once every language has heard it out.`
+            : `How far ${e.who} has been heard in each language. Anyone listening in one of these is hearing it now, a phrase behind.`}>
+            {#each tracks(e) as t (t.language)}
+              <span class="track" class:done={t.done} class:waiting={!t.total && !t.done}>
+                <span class="lang">{t.language}</span>
+                <span class="bar"><i style="width: {width(t)}%"></i></span>
+                <span class="left">{left(t)}</span>
+              </span>
+            {/each}
+          </div>
+        {/if}
+        </div>
+      </div>
+      {/if}
+    {/each}
+    {#if !archived && waitingAI()}
+      <div class="entry agent waiting" aria-live="polite">
+        <Face who={waitingAI().name} agent />
+        <div class="said-by">
+          <div class="who"><span class="name">{waitingAI().name}</span><span class="time">waiting for a pause</span></div>
+          <div class="text"><span class="dots"><i></i><i></i><i></i></span></div>
+        </div>
+      </div>
+    {/if}
+  </div>
 </div>
 
 <style>
   .log {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    min-width: 0;
+    /* Keep the conversation in a centered band; on a wide monitor the
+       extra space becomes equal margins instead of a line you have to
+       scan across. One definition, because what you type has to start
+       where what you said starts -- the caret lines up with the names
+       above it, and the bar it sits in runs the full width regardless. */
+    --gutter: max(16px, calc((100% - 64em) / 2));
+  }
+  .said {
+    flex: 1;
+    min-height: 0;
     overflow-y: auto;
-    /* Keep the conversation in a centered band; on a wide monitor the extra
-       space becomes equal margins instead of a line you have to scan across. */
-    padding: 16px max(16px, calc((100% - 64em) / 2));
+    overscroll-behavior: contain;
+    /* No padding at the head of it: the bar at the top of the
+       conversation is stuck to the scrollport, and anything above it is
+       a sliver the entries scroll through on their way past. The bar
+       has padding of its own, so nothing is tight against the top. */
+    padding: 0 var(--gutter) 5px;
     display: flex;
     flex-direction: column;
     gap: 12px;
-    min-height: 0;
   }
   .empty { color: var(--muted); text-align: center; margin: auto; max-width: 28em; }
   .card {
@@ -222,34 +487,190 @@
   .card .title { font-weight: 650; font-size: 16px; }
   /* A posted card is wider than a bubble: it is meant to be read, not
      heard, and often has lines of its own. */
-  .card-entry { max-width: min(46em, 96%); align-self: stretch; }
+  /* A posted card has the whole column: it is a thing to look at, and
+     a table of four columns wants the width a bubble doesn't. Written
+     with both classes so it beats the `.entry` rule below, which has
+     the same weight and the last word otherwise. */
+  .entry.card-entry { max-width: 100%; align-self: stretch; }
   .card.posted { width: 100%; }
+  /* A posted card has the whole column, so the column it is in has to
+     fill what the face leaves of the row. */
+  .card-entry .said-by { width: 100%; }
+  /* The file a clip came in as. Said above the player, because the
+     one thing to know about this card is that nobody read it here. */
+  .clip-card .brought {
+    margin: 0 0 6px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  /* The programme. A card that is shut: the summary is the one line
+     saying a play happened, and opening it is asking to read it. */
+  .programme > summary {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    cursor: pointer;
+    list-style: none;
+  }
+  .programme > summary::-webkit-details-marker { display: none; }
+  .programme > summary::before {
+    content: '▸';
+    color: var(--muted);
+    font-size: 11px;
+  }
+  .programme[open] > summary::before { content: '▾'; }
+  .programme > summary .title { font-weight: 650; }
+  .programme > summary .open { margin-left: auto; font-size: 11px; color: var(--muted); }
+  .programme[open] > .body { margin-top: 8px; }
   .card.posted .body {
     margin: 0;
-    white-space: pre-wrap;
+    /* The card is a column of flex items that line up on the left, so
+       this one has to be told to fill it: left to itself it is as wide
+       as what is in it, and a table would size the body rather than
+       the body holding the table. */
+    width: 100%;
     overflow-wrap: anywhere;
     line-height: 1.5;
   }
   .card .summary { margin: 0; color: var(--muted); }
+  /* A picture is looked at, so it gets room -- but not the whole
+     column: a 128px sprite blown across 42em is a blurry poster.
+     `SHOT` above is this number; they are read together. */
+  .shot {
+    width: 192px;
+    height: 192px;
+    border-radius: 10px;
+    overflow: hidden;
+    display: grid;
+    place-items: center;
+    background: var(--bubble);
+    border: 1px solid var(--line);
+    align-self: center;
+  }
+  .shot img {
+    width: 100%;
+    height: 100%;
+    /* A sprite is drawn at the size it means; scaling it up without
+       smoothing is the whole point of the form. */
+    image-rendering: pixelated;
+    object-fit: contain;
+    display: block;
+  }
+  /* A picture the card is making smaller -- one drawn at full
+     resolution, or a photograph. Smoothing is what that wants; the
+     rule above is about a sprite, which is the other direction. */
+  .shot.photo img { image-rendering: auto; }
+  .shot.waiting { background: color-mix(in srgb, var(--agent) 7%, var(--bubble)); }
+  .shot .broke { color: var(--muted); font-size: 13px; }
+  /* Something is happening and it is going to take a while: a quiet
+     ring rather than anything that demands to be watched. */
+  .spinner {
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    border: 3px solid color-mix(in srgb, var(--agent) 25%, transparent);
+    border-top-color: var(--agent);
+    animation: spin 0.9s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) {
+    .spinner { animation-duration: 2.4s; }
+  }
+  /* What it was asked for, under it: the words to change when the
+     next one is asked for. */
+  .asked { margin: 0; color: var(--muted); font-size: 13px; }
+  /* A picture card is as wide as its picture. It is not a posted
+     card -- those hold tables and want the column -- so it must not
+     inherit the rule that gives them it. */
+  .card.shot-card { width: max-content; max-width: 100%; gap: 6px; }
   .hint { color: var(--muted); font-size: 13px; }
-  .entry { max-width: min(42em, 92%); }
-  .entry.you { align-self: flex-end; }
+  /* A clip is as wide as the player it holds, like a picture card is
+     as wide as its picture. */
+  .card.clip-card { width: max-content; max-width: 100%; gap: 6px; }
+  .clip-card audio { width: min(20rem, 100%); height: 32px; }
+  .clip-card .asked { max-width: 20rem; }
+  .listening { margin: 0; font-size: 13px; display: flex; align-items: center; gap: 6px; }
+  /* The one red thing in the room, and it means exactly one thing:
+     somebody's microphone is being recorded right now. */
+  .rec {
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background: var(--danger);
+    animation: recording 1.6s ease-in-out infinite;
+  }
+  @keyframes recording {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.25; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .rec { animation: none; }
+  }
+  .doings { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+  .doings button { padding: 2px 10px; font-size: 13px; }
+  /* An entry is its face and then everything that was said: the
+     square is a column of its own so that the names, the bubbles and
+     the rows under them all start at the same place whether or not
+     somebody has a picture. */
+  .entry { max-width: min(42em, 92%); display: flex; gap: 8px; }
+  /* Your own lines sit on the right, so your face does too -- it stays
+     on the outside edge, which is where every one of them is. */
+  .entry.you { align-self: flex-end; flex-direction: row-reverse; }
+  /* The column beside the face. `min-width: 0` so a long word or a
+     wide table shrinks it rather than pushing the face off. */
+  .said-by { min-width: 0; flex: 1; display: flex; flex-direction: column; align-items: flex-start; }
+  /* Beside the words rather than the name above them: the square sits
+     against the first line of the bubble, not against the 12px line of
+     name and time over it. Measured by eye against the bubble as it is
+     now -- its own border and the air inside it both moved this -- so
+     it is a number to look at again if either changes. */
+  .entry > :global(.face) { margin-top: 19px; }
+  .entry.you .said-by { align-items: flex-end; }
   .who { font-size: 12px; color: var(--muted); display: flex; gap: 8px; margin: 0 4px 2px; }
   .entry.you .who { justify-content: flex-end; }
-  .name { font-weight: 600; color: hsl(var(--h) 55% 45%); }
+  .name { font-weight: 600; color: var(--person); }
+  /* Your own name and your own bubble, in whatever the theme keeps for
+     you. A theme that keeps nothing leaves `--self` at the hue your
+     name hashes to, which is what every other name here is, and these
+     two rules change nothing. */
+  .entry.you .name { color: var(--self); }
   .agent .name { color: var(--agent); }
+  /* A bubble is round. The cut corner belongs to the panels, which are
+     the pieces of the console; a bubble is a paragraph inside one, and
+     a page of machined paragraphs is a page the eye cannot rest on.
+     Whose it is is said in the colour down the side, which is one
+     thing to read and does not have to be looked at. */
+  /* The coloured edge is on the side facing the middle of the column,
+     which is the side away from the face: the right of a line
+     somebody else said, the left of your own, which hang on the other
+     side. Mirrored rather than always on the left, so the two sides of
+     the conversation are the two sides of the conversation -- and both
+     colours run down the inside of the column where the eye already
+     is, instead of one of them hiding behind a face. */
   .text {
     background: var(--bubble);
-    border-left: 3px solid hsl(var(--h) 55% 55%);
+    border: var(--bubble-border);
+    border-right: var(--bubble-edge-w) solid var(--person-edge);
     padding: 8px 12px;
-    border-radius: 10px;
+    border-radius: var(--bubble-radius);
+    box-shadow: var(--bubble-shadow);
     white-space: pre-wrap;
     overflow-wrap: anywhere;
   }
-  .agent .text { border-left-color: var(--agent); }
+  /* Your own: the edge swaps sides, and the side it came from goes
+     back to being an edge like the other three. */
+  .entry.you .text {
+    border-right: var(--bubble-border);
+    border-left: var(--bubble-edge-w) solid var(--self);
+  }
+  .agent .text { border-right-color: var(--agent); }
   .text.partial { color: var(--muted); }
-  .text.live { box-shadow: 0 0 0 1px hsl(var(--h) 55% 55% / 40%); }
-  .agent .text.live { box-shadow: 0 0 0 1px color-mix(in srgb, var(--agent) 40%, transparent); }
+  /* Still arriving. Inset, so it is a line lit just inside the
+     bubble's own edge rather than a second ring outside it. */
+  .text.live { box-shadow: var(--bubble-shadow), inset 0 0 0 1px color-mix(in srgb, var(--person-edge) 45%, transparent); }
+  .entry.you .text.live { box-shadow: var(--bubble-shadow), inset 0 0 0 1px color-mix(in srgb, var(--self) 45%, transparent); }
+  .agent .text.live { box-shadow: var(--bubble-shadow), inset 0 0 0 1px color-mix(in srgb, var(--agent) 45%, transparent); }
   /* Thinking: an empty reply bubble with bouncing dots and a breathing edge. */
   .agent .text.live:empty, .agent .text.live:has(> .dots) { animation: breathe 1.6s ease-in-out infinite; }
   .dots { display: inline-flex; gap: 5px; padding: 6px 2px; }
@@ -261,8 +682,8 @@
   .waiting .dots i { animation-duration: 1.8s; background: var(--muted); }
   @keyframes bounce { 0%, 60%, 100% { transform: translateY(0); opacity: 0.4; } 30% { transform: translateY(-5px); opacity: 1; } }
   @keyframes breathe {
-    0%, 100% { box-shadow: 0 0 0 1px color-mix(in srgb, var(--agent) 40%, transparent); }
-    50% { box-shadow: 0 0 0 4px color-mix(in srgb, var(--agent) 20%, transparent); }
+    0%, 100% { box-shadow: var(--bubble-shadow), inset 0 0 0 1px color-mix(in srgb, var(--agent) 45%, transparent); }
+    50% { box-shadow: var(--bubble-shadow), inset 0 0 0 4px color-mix(in srgb, var(--agent) 22%, transparent); }
   }
   @media (prefers-reduced-motion: reduce) { .dots i, .text { animation: none !important; } }
 
@@ -287,11 +708,12 @@
     font: inherit;
     font-size: 12px;
     color: var(--muted);
+    box-shadow: none;
     text-decoration: underline dotted;
     text-underline-offset: 2px;
     cursor: pointer;
   }
-  .swap:hover { color: var(--ink); }
+  .swap:hover { color: var(--ink); box-shadow: none; }
   /* Block, so it sits under the bubble rather than beside it, and
      pushed over for your own messages, which hang on the right. */
   .swap { display: block; }
@@ -312,28 +734,4 @@
   .track.waiting .left { font-style: italic; }
   @media (prefers-reduced-motion: reduce) { .bar i { transition: none; } }
 
-  .composer {
-    position: sticky;
-    bottom: 0;
-    display: flex;
-    gap: 8px;
-    /* Stuck to the foot of the scroller, so the messages behind it have
-       to be covered rather than showing through. */
-    background: var(--bg);
-    padding: 10px 0 2px;
-    margin-top: auto;
-  }
-  .composer input {
-    flex: 1;
-    min-width: 0;
-    font: inherit;
-    color: var(--ink);
-    background: var(--bg);
-    border: 1px solid var(--line);
-    border-radius: 999px;
-    padding: 9px 14px;
-  }
-  .composer input:focus-visible { border-color: var(--muted); outline: none; }
-  .composer button { border-radius: 999px; padding: 9px 16px; }
-  .composer button:disabled { opacity: 0.45; cursor: default; }
 </style>

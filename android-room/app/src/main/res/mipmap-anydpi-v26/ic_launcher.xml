@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@color/ic_launcher_background" />
+    <!-- The glyph, inside the 72dp of the 108dp canvas that every
+         launcher mask is promised to show. It reaches almost the full
+         width of its own square (the outermost figures sit at about .96
+         of it), so at this size they stand 35dp out from the middle and
+         the 36dp the mask guarantees covers them. What the mask takes is
+         the empty corners. -->
+    <foreground android:drawable="@mipmap/voice_room" />
+    <!-- A themed icon is one colour on a shape, which a picture cannot
+         be. The microphone the app drew for itself stays for that, and
+         for the notification, which wants a silhouette too. -->
+    <monochrome android:drawable="@drawable/ic_launcher_foreground" />
+</adaptive-icon>

@@ -6,9 +6,14 @@
 //!   server is around.
 //! * `none`: silence as long as the sentence would take to read, so the
 //!   room can be tried without any voice at all.
+//!
+//! A Qwen3 voice can also be *lent* a voice cloned from somebody in the
+//! room, which is a sentence asked of a different server in a different
+//! shape -- see [`Borrowed`] and [`crate::voices`].
 
 use std::io::Read as _;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{bail, Context as _, Result};
@@ -18,16 +23,123 @@ use rubato::{
 
 use crate::mixer::RATE;
 
+/// The voices a Qwen3-TTS server actually holds, by the names its
+/// `/v1/audio/speech` will take.
+///
+/// Asked once, as the house opens, because the answer is the server's
+/// and not ours to guess. The names are not what anybody would write
+/// down from a list of voices: the one spelled "Uncle Fu" in a picker
+/// is `uncle_fu` here, and a name the endpoint does not know is an
+/// HTTP 400 in the middle of a sentence somebody was waiting to hear.
+///
+/// What comes back is filtered to the presets. The same endpoint
+/// reports every voice cloned onto that server as well -- uuids, and
+/// whatever a test left behind -- and those are nobody's character to
+/// build on: they are somebody's voice, reached by name through
+/// [`Borrowed`]. `default` goes too, which is the server saying "the
+/// one you get when you don't ask" rather than naming a voice.
+pub fn presets(url: &str, key: Option<&str>) -> Result<Vec<String>> {
+    let url = format!("{}/v1/audio/voices", url.trim_end_matches('/'));
+    let http = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(5))
+        .timeout(Duration::from_secs(15))
+        .build();
+    let mut req = http.get(&url);
+    if let Some(key) = key {
+        req = req.set("Authorization", &format!("Bearer {key}"));
+    }
+    let said = match req.call() {
+        Ok(r) => r.into_string().context("read the voices")?,
+        Err(ureq::Error::Status(code, r)) => {
+            let detail = r.into_string().unwrap_or_default();
+            bail!(
+                "{url}: HTTP {code}: {}",
+                detail.chars().take(200).collect::<String>()
+            );
+        }
+        Err(e) => return Err(e).with_context(|| format!("GET {url}")),
+    };
+    #[derive(serde::Deserialize)]
+    struct Uploaded {
+        #[serde(default)]
+        name: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct Listed {
+        #[serde(default)]
+        voices: Vec<String>,
+        /// The ones cloned onto it, which the server tells us apart
+        /// from its own -- so the filtering is its answer and not a
+        /// guess about which names look like uuids.
+        #[serde(default)]
+        uploaded_voices: Vec<Uploaded>,
+    }
+    let listed: Listed = serde_json::from_str(&said).with_context(|| {
+        format!(
+            "{url} answered with {}",
+            said.chars().take(200).collect::<String>()
+        )
+    })?;
+    let cloned: Vec<&str> = listed
+        .uploaded_voices
+        .iter()
+        .map(|u| u.name.as_str())
+        .collect();
+    Ok(listed
+        .voices
+        .into_iter()
+        .filter(|v| v != "default" && !cloned.contains(&v.as_str()))
+        .collect())
+}
+
 pub trait Voice: Send {
     /// `language` overrides the voice's own, for a room that is listening
     /// in more than one. Spelled out in English, as Qwen3 wants it.
     fn speak(&mut self, text: &str, language: Option<&str>) -> Result<Vec<f32>>;
+}
 
-    /// Whether this voice can be asked for a language other than its
-    /// own. Only Qwen3 can, so it is the only voice a room can translate
-    /// with.
-    fn multilingual(&self) -> bool {
-        false
+/// A voice one of the AIs has been lent instead of its own: the name a
+/// cloned voice is kept under on the clone server, or None for the
+/// preset it was started with.
+///
+/// Shared, because a bot has one voice per language it speaks in and
+/// they are each on a thread of their own: being lent a voice is the
+/// bot's, not the thread's. The room sets it (see `Room::speak_as`) and
+/// every one of its voices reads it on the next sentence it is asked
+/// for -- so a voice changes where a sentence ends, and never inside
+/// one. Nothing here is written down: the voice it keeps is written
+/// down, and which voice it is speaking in today is not, so a restart
+/// is a bot in its own voice again.
+pub type Borrowed = Arc<Mutex<Option<String>>>;
+
+/// One voice several rooms speak through, in turn.
+///
+/// A Qwen3 voice is only an HTTP client, so a room that wants one makes
+/// its own and they talk at the same time. Kokoro is the whole model --
+/// hundreds of megabytes on the CPU -- and loading it again for every
+/// room somebody opens is not on, so every room shares the one copy.
+/// They queue behind each other, which costs nothing real: the model
+/// is one lot of CPU however many rooms are asking it to read.
+#[derive(Clone)]
+pub struct Shared(Arc<Mutex<Box<dyn Voice>>>);
+
+impl Shared {
+    pub fn new(voice: Box<dyn Voice>) -> Self {
+        Self(Arc::new(Mutex::new(voice)))
+    }
+
+    /// Another way in to the same voice, for another room.
+    pub fn handle(&self) -> Box<dyn Voice> {
+        Box::new(self.clone())
+    }
+}
+
+impl Voice for Shared {
+    fn speak(&mut self, text: &str, language: Option<&str>) -> Result<Vec<f32>> {
+        self.0
+            .lock()
+            .expect("voice mutex poisoned")
+            .speak(text, language)
     }
 }
 
@@ -40,6 +152,12 @@ pub struct Qwen3 {
     key: Option<String>,
     /// Named in the request only when the server serves more than one.
     model: Option<String>,
+    /// The voice-cloning server, where there is one: a different host
+    /// holding a different model, because the preset server cannot
+    /// speak in a voice somebody uploaded. See [`crate::voices`].
+    clone_url: Option<String>,
+    /// A voice this one has been lent, when it has.
+    borrowed: Borrowed,
     http: ureq::Agent,
 }
 
@@ -59,32 +177,96 @@ impl Qwen3 {
             language: language.to_string(),
             key,
             model,
+            clone_url: None,
+            borrowed: Borrowed::default(),
             http: ureq::AgentBuilder::new()
                 .timeout(Duration::from_secs(60))
                 .build(),
         }
     }
+
+    /// Where a cloned voice would come from, and the cell that says
+    /// whether this voice is being lent one. Both or neither: a cell
+    /// that can be set with no server to ask is a voice that would go
+    /// silent the moment somebody borrowed it.
+    pub fn cloning(mut self, clone_url: Option<String>, borrowed: Borrowed) -> Self {
+        if let Some(url) = clone_url {
+            self.clone_url = Some(url.trim_end_matches('/').to_string());
+            self.borrowed = borrowed;
+        }
+        self
+    }
 }
 
 impl Voice for Qwen3 {
-    fn multilingual(&self) -> bool {
-        true
-    }
-
     fn speak(&mut self, text: &str, language: Option<&str>) -> Result<Vec<f32>> {
+        let language = language.unwrap_or(&self.language);
+        // A voice it has been lent, if it has one and there is a server
+        // to ask for it. Read per sentence rather than held: what the
+        // room set between two sentences takes effect at the second,
+        // which is as soon as anybody could hear it anyway.
+        let borrowed = match &self.clone_url {
+            Some(url) => self
+                .borrowed
+                .lock()
+                .expect("borrowed voice mutex poisoned")
+                .clone()
+                .map(|name| (url.clone(), name)),
+            None => None,
+        };
+        // Somebody's own voice, off the clone server, and then its own
+        // again if that fails. `task_type` has to be said: the Base
+        // model is the only one that can speak in an uploaded voice,
+        // and it is also the one that does something else entirely
+        // when it isn't told. No `instructions` -- a cloned voice is
+        // how somebody sounds, and a style on top of it is a style on
+        // top of them.
+        //
+        // The fallback is not politeness. A voice can be deleted from
+        // under a bot that is wearing it -- another room's AI was lent
+        // the same one, the server was rebuilt -- and a bot that went
+        // silent for the rest of the conversation because of it would
+        // be a worse answer than a bot that sounds like itself again.
+        if let Some((url, name)) = borrowed {
+            let body = serde_json::json!({
+                "input": text,
+                "voice": name,
+                "task_type": "Base",
+                "language": language,
+                "response_format": "wav",
+            });
+            match self.ask(&url, body) {
+                Ok(samples) => return Ok(samples),
+                Err(err) => tracing::warn!(
+                    voice = %name,
+                    "the cloned voice didn't answer, so this is in its own: {err:#}"
+                ),
+            }
+        }
         let mut body = serde_json::json!({
             "input": text,
             "voice": self.voice,
-            "language": language.unwrap_or(&self.language),
+            "language": language,
             "response_format": "wav",
         });
         if !self.instruct.is_empty() {
             body["instructions"] = self.instruct.clone().into();
         }
+        // Only ever the preset server's: the clone server is a server
+        // of its own with one model on it, and naming the other one at
+        // it is naming a model it hasn't got.
         if let Some(model) = &self.model {
             body["model"] = model.clone().into();
         }
-        let url = format!("{}/v1/audio/speech", self.url);
+        let url = self.url.clone();
+        self.ask(&url, body)
+    }
+}
+
+impl Qwen3 {
+    /// One sentence asked of one server, as room samples.
+    fn ask(&self, base: &str, body: serde_json::Value) -> Result<Vec<f32>> {
+        let url = format!("{base}/v1/audio/speech");
         let mut req = self.http.post(&url);
         if let Some(key) = &self.key {
             req = req.set("Authorization", &format!("Bearer {key}"));
@@ -104,7 +286,7 @@ impl Voice for Qwen3 {
         resp.into_reader()
             .read_to_end(&mut wav)
             .context("read TTS audio")?;
-        let (samples, rate) = decode_wav(&wav)?;
+        let (samples, rate) = decode_wav(&wav).context("TTS sent no WAV")?;
         to_room_rate(&samples, rate)
     }
 }
@@ -147,9 +329,16 @@ impl Voice for Silent {
     }
 }
 
-/// A WAV file as mono f32 and its sample rate.
-fn decode_wav(bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
-    let mut r = hound::WavReader::new(std::io::Cursor::new(bytes)).context("TTS sent no WAV")?;
+/// A WAV file as mono f32 and its sample rate. Several channels are
+/// mixed down: what everything here wants is one.
+///
+/// Public because a WAV reaches this house two ways -- back from the
+/// speech server, and in from somebody's computer as a clip to clone a
+/// voice from -- and they want the same twenty lines. Each adds its
+/// own context: a WAV that will not read means something different
+/// depending on who sent it.
+pub fn decode_wav(bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
+    let mut r = hound::WavReader::new(std::io::Cursor::new(bytes)).context("that is not a WAV")?;
     let spec = r.spec();
     let channels = spec.channels.max(1) as usize;
     let interleaved: Vec<f32> = match spec.sample_format {
@@ -169,7 +358,15 @@ fn decode_wav(bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
 }
 
 fn to_room_rate(samples: &[f32], rate: u32) -> Result<Vec<f32>> {
-    if rate == RATE || samples.is_empty() {
+    resample(samples, rate, RATE)
+}
+
+/// `samples` at `from` Hz, at `to` Hz instead. The room's own rate is
+/// what a voice is resampled to on the way in; a clip of somebody's
+/// speech on the way out to the clone server is resampled the other
+/// way, which is the only reason this takes both ends.
+pub fn resample(samples: &[f32], from: u32, to: u32) -> Result<Vec<f32>> {
+    if from == to || samples.is_empty() {
         return Ok(samples.to_vec());
     }
     let params = SincInterpolationParameters {
@@ -179,7 +376,7 @@ fn to_room_rate(samples: &[f32], rate: u32) -> Result<Vec<f32>> {
         oversampling_factor: 128,
         window: WindowFunction::BlackmanHarris2,
     };
-    let ratio = RATE as f64 / rate as f64;
+    let ratio = to as f64 / from as f64;
     let chunk = 1024;
     let mut rs = SincFixedIn::<f32>::new(ratio, 2.0, params, chunk, 1)?;
     let mut out = Vec::with_capacity((samples.len() as f64 * ratio) as usize + chunk * 4);
@@ -267,7 +464,6 @@ mod tests {
             .ok()
             .filter(|m| !m.is_empty());
         let mut qwen3 = Qwen3::new(&url, &voice, "", "English", key, model);
-        assert!(qwen3.multilingual(), "or a room can't be translated");
 
         // Its own language, as every room has always asked for it.
         let english = qwen3
@@ -285,6 +481,53 @@ mod tests {
             assert!(secs > 0.3, "{language} came back {secs:.2}s long");
             assert!(peak > 0.01, "{language} came back silent");
         }
+    }
+
+    /// The voices a server says it has, which are the only names its
+    /// `/v1/audio/speech` will take.
+    ///
+    /// The body here is the real one, from the server this was written
+    /// against. The names are nothing like what a picker shows -- the
+    /// voice everybody calls "Uncle Fu" is `uncle_fu` -- and a list
+    /// written down from the display names reached the server untouched
+    /// and came back HTTP 400 in the middle of a line somebody was
+    /// waiting to hear. So it is asked, and the answer is filtered to
+    /// the voices a character can actually be built on: not the clones
+    /// somebody uploaded, which are a person's voice and reached by
+    /// name another way, and not `default`, which is the server saying
+    /// "whatever you get when you don't ask".
+    #[test]
+    fn the_server_says_which_voices_are_its_own() {
+        use std::io::{Read as _, Write as _};
+        let body = r#"{"voices":["28fe97f2-990b-4acf-9224-d48ed4a4088e","aiden","default","dylan","eric","ono_anna","ryan","serena","smoke_test_clone","sohee","uncle_fu","vivian"],"uploaded_voices":[{"name":"28fe97f2-990b-4acf-9224-d48ed4a4088e","consent":"rpg_vox:x"},{"name":"smoke_test_clone","consent":"rpg_vox:y"}]}"#
+            .replace("\\\n", "");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port");
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let served = body.clone();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("a request");
+            let mut buf = [0u8; 2048];
+            let read = stream.read(&mut buf).unwrap_or(0);
+            let asked = String::from_utf8_lossy(&buf[..read]).to_string();
+            assert!(asked.starts_with("GET /v1/audio/voices"), "{asked}");
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                served.len(),
+                served
+            );
+        });
+
+        let have = presets(&url, None).expect("the voices");
+        assert_eq!(
+            have,
+            [
+                "aiden", "dylan", "eric", "ono_anna", "ryan", "serena", "sohee", "uncle_fu",
+                "vivian"
+            ],
+            "its own voices, and not the clones or `default`"
+        );
     }
 
     #[test]

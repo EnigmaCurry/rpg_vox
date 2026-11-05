@@ -2,7 +2,7 @@
 
 [scribe](SCRIBE.md)'s live transcription as an iPhone and iPad app, iOS
 17 or newer: the same models and passes, all on the device, with the
-same features as [Scribe for Android](ANDROID.md) where iOS allows.
+same features as [Scribe for Android](SCRIBE_ANDROID.md) where iOS allows.
 
 * **Transcriptions** (🎙️): record from the mic, live text faint until
   the corrected paragraph replaces it. Pause and resume, Jump to latest,
