@@ -7,6 +7,8 @@ releases.
 
 ## Unreleased
 
+## v0.2.1 (2026-11-04)
+
 ### scribe, Scribe for Android
 
 - **A language can now be read in yours even when it is written the
