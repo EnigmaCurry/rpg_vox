@@ -185,7 +185,10 @@
 <style>
   .bar {
     position: sticky;
-    top: 0;
+    /* Not flush with the top of the scroller: a framed theme draws a
+       rail along the head of the column, and a bar stuck at 0 sits on
+       top of it. Four pixels is the rail. */
+    top: 4px;
     z-index: 5;
     display: flex;
     align-items: center;
