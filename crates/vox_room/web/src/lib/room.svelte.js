@@ -7,6 +7,7 @@
 // what arrives back is a whole new `hello`, because everything below
 // belonged to the room just left.
 
+import { ARM_MS, chirp, hush } from './chirp.js';
 import { RoomAudio, listDevices, onDeviceChange, permitMic } from './audio.js';
 import { Link } from './link.js';
 import {
@@ -267,8 +268,32 @@ export const room = $state({
   // wants. True is half duplex: the room goes silent for as long as
   // you hold, which is what speakers in front of a microphone want.
   // Yours and this browser's, like the mode it qualifies; see
-  // `setPttHush`.
+  // `setTalkHush`.
   pttHush: readPref('vox_room.ptt_hush'),
+  // Which of a phone's volume keys is its push-to-talk key, and whether
+  // holding it chirps. Not this browser's, unlike the talk key and
+  // `pttHush` above: a phone has no keyboard, so the app lends a volume
+  // key to the microphone, and every phone has the same two of them --
+  // where a desk and a laptop have different keyboards, which is why
+  // the room's own talk key is kept per browser. Stored against your
+  // invite so a second phone does not have to be told again.
+  //
+  // Empty means you have never said, and the app on the phone keeps its
+  // own answer. Nothing here does anything in a browser: it is read off
+  // this page by the Android app, which is the only thing with volume
+  // keys to lend. See ROOM_ANDROID.md.
+  phoneKey: '',
+  // Whether holding the talk key chirps -- 'on', 'off', or empty for
+  // the default, which is on. Push to talk's and not the phone's: the
+  // on-screen button and the talk key on a keyboard arm and chirp
+  // exactly as a phone's volume key does. Yours rather than this
+  // browser's, for the same reason as the key above. See `lib/chirp.js`.
+  pttChirp: '',
+  // Why the last change to those two did not stick, or null. Declared
+  // here rather than assigned into the object later: a property that
+  // was not there when the state was made is not one anything redraws
+  // for.
+  pttError: null,
   talking: false,
   // Whether the room's own sound is cut just now, which it is for as
   // long as push to talk is held on half duplex: the mic is open and
@@ -416,6 +441,7 @@ export async function whoami() {
     // browser would have guessed.
     room.languages = d.languages ?? [];
     room.lang = myLanguage(room.languages, d.language ?? '');
+    rememberPhone(d.phoneKey ?? '', d.pttChirp ?? '');
     room.owner = d.owner ?? false;
     return true;
   }
@@ -1549,6 +1575,49 @@ export async function setLanguage(language) {
   }
 }
 
+/// What the phone's volume keys do: which one talks and whether holding
+/// it chirps. Saved on the server against your invite rather than in
+/// this browser, which is the whole point -- it is how a second phone
+/// arrives already knowing.
+///
+/// Nothing in a browser changes. The Android app reads these off this
+/// page; see ROOM_ANDROID.md.
+/// Keep what the room said where the phone can find it.
+///
+/// Written into this browser's storage as well as the state, which is
+/// the odd part and is the whole mechanism: the Android app has no way
+/// to read a Svelte rune, and it already reads the room's talk-key
+/// binding out of `localStorage` to know which key to press. So the
+/// server's answer is mirrored there and the app picks it up in the
+/// poll it already runs. The app reads; it is never told. Nothing is
+/// injected into this page and there is no way back out of it into the
+/// app, which is the property worth keeping. See ROOM_ANDROID.md.
+function rememberPhone(key, chirp) {
+  room.phoneKey = key;
+  room.pttChirp = chirp;
+  writeChoice('vox_room.phone_key', key);
+  writeChoice('vox_room.ptt_chirp', chirp);
+}
+
+export async function setTalk(key, chirp) {
+  const was = [room.phoneKey, room.pttChirp];
+  rememberPhone(key, chirp);
+  room.pttError = null;
+  try {
+    const r = await door('/api/talk', { key, chirp });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(d.error || r.statusText);
+    rememberPhone(d.phoneKey ?? key, d.pttChirp ?? chirp);
+    return true;
+  } catch (e) {
+    // Back to what the room still believes, so the radio is never
+    // showing a choice the phone will not actually be told about.
+    rememberPhone(was[0], was[1]);
+    room.pttError = e.message || String(e);
+    return false;
+  }
+}
+
 /// Agree, or take it back. Taking it back shuts the only way in.
 export function setConsent(on) {
   room.consented = on;
@@ -1716,7 +1785,7 @@ export function setBots(on) {
 /// in it: `named` -- the default -- still lets an AI answer when you
 /// call it by its name, and `never` is nothing at all.
 ///
-/// This browser's, like `setPttHush`: it is a sentence about how you
+/// This browser's, like `setTalkHush`: it is a sentence about how you
 /// want to be spoken to, and the room only ever hears which of the
 /// three states the switch is in. Changed while the button is already
 /// off, it moves the switch there now -- the setting would otherwise
@@ -1746,7 +1815,7 @@ export function setBotsOff(how) {
 /// Changed mid-hold, it takes effect on the hold you are in -- the
 /// setting is a page away from the key, but a page you can reach with
 /// the other hand while the room is running.
-export function setPttHush(on) {
+export function setTalkHush(on) {
   room.pttHush = on;
   writePref('vox_room.ptt_hush', on);
   hushRoom(on && room.pushToTalk && room.talking);
@@ -1766,6 +1835,37 @@ export function mutedByRoom() {
   return room.strips?.[room.you]?.mute === true;
 }
 
+/// The hold that has not opened anything yet, or null.
+///
+/// With the chirp on, a hold arms for [ARM_MS] before the microphone
+/// goes live and the chirp fills that time -- see `lib/chirp.js` for
+/// why it is before and not after. Let go inside it and nothing was
+/// ever said: no mic, no entry, and the chirp cut where it stands.
+let arming = null;
+
+/// Whether the press that just arrived has already done its waiting.
+///
+/// The Android app lends a volume key to the microphone, and it cannot
+/// know whether a press is a tap or a hold without waiting a quarter of
+/// a second to find out. It fills that wait with its own copy of the
+/// chirp -- it has to, since nothing is said to this page until the
+/// wait is over -- and only then presses the key here. Arming again
+/// would make a phone wait twice for one hold. The app leaves a
+/// timestamp to say it has already waited; anything older than one
+/// arming is not about this press.
+///
+/// Read, never called: the app writes a value and this reads it, which
+/// is the same direction everything else between the two goes. See
+/// ROOM_ANDROID.md.
+function armedAlready() {
+  try {
+    const at = Number(localStorage.getItem('vox_room.ptt_armed') || 0);
+    return at > 0 && Date.now() - at < ARM_MS * 2;
+  } catch {
+    return false;
+  }
+}
+
 export function talk(on) {
   // Muted on the mixer, holding the key does nothing and must look
   // like nothing: a talk button that lights up while the room is
@@ -1773,16 +1873,21 @@ export function talk(on) {
   if (!room.pushToTalk || !room.mic || mutedByRoom()) return;
   clearTimeout(releaseTimer);
   if (on) {
-    room.talking = true;
-    // The room goes quiet before the mic opens, and not the other way
-    // round -- on half duplex, which is what somebody on speakers
-    // holds this key for: what the room is saying is in front of their
-    // microphone, and a mic cannot be made deaf to one sound in the
-    // room it is in. On a headset there is nothing to be deaf to, so
-    // the hold costs you nothing you were hearing. See `setPttHush`
-    // and `RoomAudio.hushRoom`.
-    hushRoom(room.pttHush);
-    if (room.muted) setMuted(false);
+    // Already holding, or already arming. A key repeats and a button
+    // can be pressed again; one hold is one thing said.
+    if (room.talking || arming !== null) return;
+    if (room.pttChirp !== 'off' && !armedAlready()) {
+      chirp(true);
+      arming = setTimeout(() => { arming = null; live(); }, ARM_MS);
+      return;
+    }
+    live();
+  } else if (arming !== null) {
+    // Let go before it opened: nothing happened, and the sound saying
+    // something was about to must stop with it.
+    clearTimeout(arming);
+    arming = null;
+    hush();
   } else if (room.talking) {
     room.talking = false;
     releaseTimer = setTimeout(() => {
@@ -1794,7 +1899,22 @@ export function talk(on) {
         hushRoom(false);
       }
     }, RELEASE_MS);
+    if (room.pttChirp !== 'off') chirp(false);
   }
+}
+
+/// Open the microphone, which is what the hold was for.
+function live() {
+    room.talking = true;
+    // The room goes quiet before the mic opens, and not the other way
+    // round -- on half duplex, which is what somebody on speakers
+    // holds this key for: what the room is saying is in front of their
+    // microphone, and a mic cannot be made deaf to one sound in the
+    // room it is in. On a headset there is nothing to be deaf to, so
+    // the hold costs you nothing you were hearing. See `setTalkHush`
+    // and `RoomAudio.hushRoom`.
+    hushRoom(room.pttHush);
+    if (room.muted) setMuted(false);
 }
 
 /// Cut the room's sound, or let it back in, and say so on the button

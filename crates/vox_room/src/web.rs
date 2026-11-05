@@ -217,6 +217,7 @@ pub fn router(rooms: Arc<Rooms>, screen: Arc<Screen>) -> Router {
         .route("/api/door/name", post(door_name))
         .route("/api/door/language", post(door_language))
         .route("/api/door/logout", post(door_logout))
+        .route("/api/talk", post(set_talk))
         // The house's people, which is the owner's business and
         // nobody else's. Every one of these says so for itself: an
         // endpoint that trusts the page not to have been asked is an
@@ -393,6 +394,12 @@ fn in_already(app: &App, p: &Invited, holding: Option<&str>) -> Response {
         // And what they chose last time, which the room has and a
         // fresh tab does not: it beats this browser's own guess.
         "language": p.language,
+        // How their phone is to treat its volume keys. Sent from the
+        // door because the app reads it off the page and is at the door
+        // before it is anywhere else; empty means they have never said
+        // and the app keeps its own answer. See ROOM_ANDROID.md.
+        "phoneKey": p.phone_key,
+        "pttChirp": p.ptt_chirp,
         // Whether this browser owns the house. The page uses it to
         // decide what to show; every endpoint that matters asks
         // again for itself.
@@ -829,6 +836,54 @@ async fn door_language(
             app.rooms.catch_up();
             Json(json!({ "language": language })).into_response()
         }
+        Err(why) => (StatusCode::CONFLICT, Json(json!({ "error": why }))).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct SetTalk {
+    key: String,
+    chirp: String,
+}
+
+/// Which volume key talks on this person's phone, and whether it chirps.
+///
+/// Theirs rather than this browser's, unlike the room's own talk key:
+/// every phone has the same two volume keys, so a second phone should
+/// not have to be told again. See ROOM_ANDROID.md.
+///
+/// Cookie only -- no token path like the language's. This is set from
+/// the settings page, which is a place you can only be once you are in,
+/// and a setting about a phone is not a thing to be deciding at a door.
+///
+/// What may be stored is spelled out here rather than taken as given.
+/// The value travels back out to an app that lends a physical key to a
+/// microphone on the strength of it, and the set of answers it can act
+/// on is small and closed, so anything else is a no rather than a row
+/// in the database nobody can explain later.
+async fn set_talk(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(body): Json<SetTalk>,
+) -> Response {
+    let Some(who) = person(&app, &headers) else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "Not in this room." })),
+        )
+            .into_response();
+    };
+    const KEYS: [&str; 4] = ["", "volume_up", "volume_down", "off"];
+    const CHIRPS: [&str; 3] = ["", "on", "off"];
+    if !KEYS.contains(&body.key.as_str()) || !CHIRPS.contains(&body.chirp.as_str()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "No such talk key." })),
+        )
+            .into_response();
+    }
+    match app.any().set_talk(&who, &body.key, &body.chirp) {
+        Ok(()) => Json(json!({ "phoneKey": body.key, "pttChirp": body.chirp })).into_response(),
         Err(why) => (StatusCode::CONFLICT, Json(json!({ "error": why }))).into_response(),
     }
 }

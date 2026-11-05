@@ -9,6 +9,10 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.graphics.Color
+import android.media.AudioAttributes
+import android.media.AudioFormat
+import android.media.AudioManager
+import android.media.AudioTrack
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -17,6 +21,7 @@ import android.os.Looper
 import android.util.Log
 import android.util.TypedValue
 import android.view.Gravity
+import android.view.KeyEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowInsets
@@ -35,6 +40,9 @@ import android.widget.ScrollView
 import android.widget.TextView
 import java.net.HttpURLConnection
 import java.net.URL
+import kotlin.math.PI
+import kotlin.math.min
+import kotlin.math.sin
 import org.json.JSONObject
 import org.json.JSONTokener
 
@@ -47,7 +55,7 @@ import org.json.JSONTokener
  */
 class MainActivity : Activity() {
     private var web: WebView? = null
-    private val prefs by lazy { getSharedPreferences("room", MODE_PRIVATE) }
+    private val prefs by lazy { getSharedPreferences(PREFS, MODE_PRIVATE) }
 
     /// The notification's buttons have to reach the WebView, which the
     /// service cannot touch. Both of them are presses on the room's own
@@ -83,11 +91,16 @@ class MainActivity : Activity() {
         val w = web ?: return
         w.evaluateJavascript(MUTE_JS) {
             // The label follows the press a frame later.
-            w.postDelayed({ tellTheNotification() }, 300)
+            w.postDelayed({ askTheRoom() }, 300)
         }
     }
 
-    /// Keep the notification saying what the room's talk button says.
+    /// Ask the room what it is doing with your microphone.
+    ///
+    /// Two answers come back from the one question, because both are
+    /// read off the same button: what the notification should offer, and
+    /// whether the phone's talk key is the microphone's right now (see
+    /// [dispatchKeyEvent]).
     ///
     /// Watched rather than written when we happen to press something.
     /// The mute in the footer is the same mute, and somebody using it
@@ -105,16 +118,317 @@ class MainActivity : Activity() {
 
     private val watchTheTalkButton = object : Runnable {
         override fun run() {
-            tellTheNotification()
+            askTheRoom()
             watching.postDelayed(this, 1000)
         }
     }
 
-    private fun tellTheNotification() {
-        val w = web ?: return say("")
-        w.evaluateJavascript(SAYS_JS) { answer ->
-            say(runCatching { JSONTokener(answer).nextValue() as? String }.getOrNull().orEmpty())
+    private fun askTheRoom() {
+        val w = web ?: return forget()
+        w.evaluateJavascript(STATE_JS) { answer ->
+            val said = runCatching {
+                JSONObject(JSONTokener(answer).nextValue() as String)
+            }.getOrNull()
+            pttNow = said?.optBoolean("ptt") ?: false
+            typingNow = said?.optBoolean("typing") ?: false
+            roomKey = said?.optString("key").orEmpty()
+            roomChirp = said?.optString("chirp").orEmpty()
+            say(said?.optString("says").orEmpty())
         }
+    }
+
+    /// No room on the screen: nothing to mute, and no key to lend.
+    private fun forget() {
+        pttNow = false
+        typingNow = false
+        // Not the room's answers. They are about this person's phone and
+        // not about whether a page happens to be up, and throwing them
+        // away here would mean the key reverted for as long as it took
+        // the next room to load.
+        say("")
+    }
+
+    // -- the phone's own talk key ------------------------------------
+
+    /// Whether the room is in push to talk, and whether the focus is in
+    /// something with a cursor in it. Both off the poll above, because
+    /// the decision below has to be made without waiting: `evaluateJavascript`
+    /// answers later and a key event has to be claimed or let go of now.
+    ///
+    /// The cost is that each is up to a second stale. What that buys is
+    /// worth more than it costs in either direction: a second after
+    /// turning push to talk on, the key talks, and a second after
+    /// touching the message box it goes back to being a volume key.
+    private var pttNow = false
+    private var typingNow = false
+
+    /// What the room says this person's phone should do, or empty for
+    /// nothing said. Off the same poll, for the same reason.
+    private var roomKey = ""
+    private var roomChirp = ""
+
+    /// Which key talks: the room's answer when there is one, and this
+    /// phone's own when there is not.
+    ///
+    /// The room wins rather than merely filling a gap, because the point
+    /// of putting it there was that it should reach a phone that has
+    /// already been set up. A phone that quietly kept its own answer
+    /// would be the one phone the setting could not fix. What keeps that
+    /// from being a trap is that the app's own chooser writes *through*
+    /// to the room when it can -- see [TalkKeyActivity] -- so changing
+    /// it here changes the thing that wins.
+    private fun whichKey(): TalkKey =
+        if (roomKey.isNotEmpty()) TalkKey.of(roomKey) else TalkKey.read(prefs)
+
+    private fun chirps(): Boolean = when (roomChirp) {
+        "on" -> true
+        "off" -> false
+        else -> prefs.getBoolean(TalkKey.CHIRP, true)
+    }
+
+    /// How long a volume key has to be down before it is the
+    /// microphone's rather than the phone's.
+    ///
+    /// Everything about the feel of this is this number. Too short and
+    /// a press meant for the volume talks; too long and the wait before
+    /// a sentence is a wait you notice. 250 ms is about the floor at
+    /// which a deliberate tap still reads as a tap, and it is one
+    /// constant so it can be tried at 180 and at 350.
+    private val holdMs = 250L
+
+    /// The key that is down but has not yet been down long enough, or
+    /// zero. Between this and [holding] is the only window in which a
+    /// press is still both things it could be.
+    private var waiting = 0
+
+    /// The key code that opened the microphone, or zero. Remembered
+    /// rather than re-derived, so that whatever changes while a key is
+    /// held -- the setting, push to talk, the focus -- the key that
+    /// opened the microphone is still the key that shuts it. A
+    /// microphone left open because the answer moved underneath the hold
+    /// would be the worst bug this app could have.
+    private var holding = 0
+
+    /// Lend a volume key to the microphone.
+    ///
+    /// Taken here rather than in `onKeyDown` so the question is asked
+    /// before the view hierarchy sees it: the volume keys never reach
+    /// the page as key events anyway, and claiming one this early is
+    /// also what stops Android's own volume handling further down.
+    ///
+    /// Only while there is a room on the screen and push to talk is on
+    /// in it -- a volume key that had stopped changing the volume
+    /// whenever this app was open would be a bad trade for a feature
+    /// that is off most of the time. And only outside a text box, which
+    /// is the same stand-down the room's own talk key makes: with the
+    /// cursor in the message field the key is the field's, and here that
+    /// means it is the phone's.
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        val code = event.keyCode
+        when (event.action) {
+            KeyEvent.ACTION_DOWN -> {
+                // Held, not pressed again. Android repeats a held key
+                // and the room counts one hold as one thing said.
+                //
+                // The `!= 0` tests are not redundant: an unmapped key is
+                // `KEYCODE_UNKNOWN`, which is zero, and without them a
+                // stray one of those would be swallowed by a hold that
+                // is not happening.
+                if (code != 0 && (code == holding || code == waiting)) return true
+                if (!lentToTheMic(code)) return super.dispatchKeyEvent(event)
+                waiting = code
+                // The chirp fills the wait rather than following it: it
+                // ends as the microphone opens, so what it teaches is
+                // exactly the thing worth teaching, and the microphone
+                // it is about never hears it.
+                chirp(rising = true)
+                watching.postDelayed(becomeAHold, holdMs)
+                return true
+            }
+            KeyEvent.ACTION_UP -> {
+                // Let go before it was a hold: a tap, which is the
+                // phone's. The volume change is made rather than handed
+                // back -- an event already claimed cannot be returned,
+                // and re-injecting one wants a permission only the
+                // platform's own apps are given.
+                if (code != 0 && code == waiting) {
+                    waiting = 0
+                    watching.removeCallbacks(becomeAHold)
+                    hush()
+                    turnTheVolume(code)
+                    return true
+                }
+                if (code == 0 || code != holding) return super.dispatchKeyEvent(event)
+                holding = 0
+                hold(false)
+                chirp(rising = false)
+                return true
+            }
+        }
+        return super.dispatchKeyEvent(event)
+    }
+
+    /// Down long enough: the key is the microphone's now.
+    private val becomeAHold = Runnable {
+        val code = waiting
+        if (code == 0) return@Runnable
+        waiting = 0
+        holding = code
+        hold(true)
+    }
+
+    /// A tap, done ourselves, with the system left to say which stream
+    /// a volume press in a call is even about -- which is a question
+    /// worth not answering here, since the room holds a communication
+    /// device and the honest answer changes with it.
+    private fun turnTheVolume(code: Int) {
+        val up = code == KeyEvent.KEYCODE_VOLUME_UP
+        getSystemService(AudioManager::class.java).adjustSuggestedStreamVolume(
+            if (up) AudioManager.ADJUST_RAISE else AudioManager.ADJUST_LOWER,
+            AudioManager.USE_DEFAULT_STREAM_TYPE,
+            AudioManager.FLAG_SHOW_UI,
+        )
+    }
+
+    private fun lentToTheMic(code: Int): Boolean {
+        if (web == null || !pttNow || typingNow) return false
+        val key = whichKey()
+        return key != TalkKey.OFF && code == key.keyCode
+    }
+
+    /// Press the room's talk key, from out here.
+    ///
+    /// The key and not the button: the room's own `onkeydown` is where
+    /// push to talk, the toggle, a mute that came from the room's mixer
+    /// and the text-box stand-down are all already decided, and a
+    /// synthetic press through it inherits every one of them. Pressing
+    /// the on-screen button instead would mean a `pointerdown` carrying
+    /// a pointer id that does not exist, which `setPointerCapture`
+    /// throws on before the room ever hears about it.
+    private fun hold(down: Boolean) {
+        // Said out loud, like the talk button's label is: a volume key
+        // that has stopped talking looks exactly like a volume key that
+        // was never lent, and this is the line that tells the two apart.
+        Log.i(RoomService.TAG, "the talk key is ${if (down) "down" else "up"}")
+        web?.evaluateJavascript(talkJs(down), null)
+    }
+
+    /// Let go, whatever is going on. Called when this leaves the front:
+    /// a key cannot be held through that, and a microphone that thinks
+    /// it still is would stay open.
+    private fun letGo() {
+        watching.removeCallbacks(becomeAHold)
+        waiting = 0
+        hush()
+        if (holding == 0) return
+        holding = 0
+        hold(false)
+        // No chirp. One says the microphone is open and the other says
+        // it has closed, and both are for somebody listening; this is
+        // the app going away under them, where a noise is just a noise.
+    }
+
+    // -- the chirp ----------------------------------------------------
+
+    /// Two beeps, the pair of them exactly as long as the wait: rising
+    /// while the microphone is opening, falling once it has closed.
+    ///
+    /// The rising one is the whole reason the wait is bearable. A hold
+    /// that does nothing for a quarter of a second is a hold you talk
+    /// over; a hold that chirps for a quarter of a second is one you
+    /// speak after, and after one evening nobody thinks about it again.
+    /// The falling one teaches nothing and is there so the two edges of
+    /// a hold sound like two edges of one thing.
+    private var rise: AudioTrack? = null
+    private var fall: AudioTrack? = null
+
+    private fun chirp(rising: Boolean) {
+        if (!chirps()) return
+        val track = (if (rising) rise else fall) ?: beeps(rising).also {
+            if (rising) rise = it else fall = it
+        }
+        runCatching {
+            // How a static track is played a second time.
+            track.stop()
+            track.reloadStaticData()
+            track.play()
+        }.onFailure {
+            // Said rather than swallowed. A chirp that does not play is
+            // silent either way, and the first time this went wrong the
+            // only evidence was the silence.
+            Log.w(RoomService.TAG, "the chirp did not play: $it")
+        }
+    }
+
+    /// Cut a chirp short: the press turned out to be a tap, and the
+    /// rest of a sound that means `you may speak` is a lie.
+    private fun hush() {
+        runCatching { rise?.stop() }
+    }
+
+    /// The chirp runs through the wait and stops as the microphone
+    /// opens, which puts it in the one window where the microphone
+    /// cannot hear it -- on a speakerphone a chirp played *after* the
+    /// open goes out to the room with the first word of every sentence.
+    ///
+    /// The price is that a press which turns out to be a tap has
+    /// already started one. So it does not start on the press: the
+    /// first [lead] of the sound is silence, and only a tap held longer
+    /// than that is audible at all. A quarter of a second is a hold; a
+    /// tap is nothing like 120 ms; the overlap is small and what lands
+    /// in it is a fragment of a beep rather than a whole one.
+    private fun beeps(rising: Boolean): AudioTrack {
+        val rate = 44100
+        val lead = 120                       // ms of silence first: the
+                                             // room a tap gets to be a
+                                             // tap in, silently
+        val beep = 55                        // ms of each
+        val gap = 20                         // ms of silence between
+        val low = 700.0
+        val high = 1050.0                    // a fifth above, which is
+                                             // a pleasant pair and high
+                                             // enough for a phone to
+                                             // actually produce
+        val pcm = ShortArray(rate * (lead + beep * 2 + gap) / 1000)
+        val len = rate * beep / 1000
+        val fade = rate * 0.006              // 6 ms on and off each beep:
+                                             // a sine that starts at full
+                                             // height is a click, and a
+                                             // click in a headset is worse
+                                             // than no chirp at all
+        fun tone(at: Int, freq: Double) {
+            for (i in 0 until len) {
+                val shape = min(1.0, min(i, len - i) / fade)
+                val s = sin(2.0 * PI * freq * i / rate) * shape * 0.35
+                pcm[at + i] = (s * Short.MAX_VALUE).toInt().toShort()
+            }
+        }
+        tone(rate * lead / 1000, if (rising) low else high)
+        tone(rate * (lead + beep + gap) / 1000, if (rising) high else low)
+
+        val track = AudioTrack.Builder()
+            // Where the room is, which is the only place this is any
+            // use. Signalling was the obvious choice and was wrong:
+            // `USAGE_VOICE_COMMUNICATION_SIGNALLING` is the DTMF stream,
+            // which on a phone that is not in a telephony call is routed
+            // somewhere nobody can hear. The room plays on music -- a
+            // volume key pressed in a room moves the music stream, which
+            // is how this was settled -- so the chirp plays there too,
+            // at whatever the room is already set to.
+            .setAudioAttributes(AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_MEDIA)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                .build())
+            .setAudioFormat(AudioFormat.Builder()
+                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                .setSampleRate(rate)
+                .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                .build())
+            .setBufferSizeInBytes(pcm.size * 2)
+            .setTransferMode(AudioTrack.MODE_STATIC)
+            .build()
+        track.write(pcm, 0, pcm.size)
+        return track
     }
 
     /// Only when it has actually changed: each of these is a service
@@ -215,6 +529,7 @@ class MainActivity : Activity() {
     /// either one shown now would be a guess, and the wrong guess is the
     /// one that looks like being thrown out.
     private fun checking() {
+        letGo()
         watchBack(false)
         web?.destroy()
         web = null
@@ -249,6 +564,7 @@ class MainActivity : Activity() {
         val given = next.getStringExtra("url")?.trim()
         val asked = !given.isNullOrEmpty()
         if (!asked) return
+        letGo()
         web?.destroy()
         web = null
         // Through the same decision as a fresh launch, so an intent
@@ -262,6 +578,7 @@ class MainActivity : Activity() {
     /// left from the notification, and whenever Back reaches the door.
     private fun setup(problem: String? = null) {
         RoomService.stop(this)
+        letGo()
         watchBack(false)
         watching.removeCallbacks(watchTheTalkButton)
         web?.destroy()
@@ -600,6 +917,36 @@ class MainActivity : Activity() {
     /// kill for memory both skip -- so a phone that had just joined, and
     /// was then killed rather than closed, came back with no session and
     /// nothing but a spent link to show for it.
+    /// Back from the chooser.
+    ///
+    /// A choice made there that reached the room leaves the page on the
+    /// screen still mirroring the old one -- and that mirror is what the
+    /// poll reads, so without this the app would overrule its own new
+    /// answer with a stale copy until the page next loaded. The flag is
+    /// set only when the room actually took it; see [TalkKeyActivity].
+    ///
+    /// The settings page, if it happens to be open behind this, goes on
+    /// showing what it read when it opened. It is right again the next
+    /// time it is opened, and it is not where the change was made.
+    override fun onResume() {
+        super.onResume()
+        if (!prefs.getBoolean(TalkKey.PUSH, false)) return
+        prefs.edit().remove(TalkKey.PUSH).apply()
+        roomKey = TalkKey.read(prefs).stored
+        roomChirp = if (prefs.getBoolean(TalkKey.CHIRP, true)) "on" else "off"
+        web?.evaluateJavascript(mirrorJs(roomKey, roomChirp), null)
+    }
+
+    /// Going out of the front lets go of the key.
+    ///
+    /// Not of the call: holding that with the screen off is the whole
+    /// point of the service, and nothing here touches it. Only the hold,
+    /// which cannot outlive being able to see the key.
+    override fun onPause() {
+        letGo()
+        super.onPause()
+    }
+
     override fun onStop() {
         CookieManager.getInstance().flush()
         super.onStop()
@@ -607,6 +954,8 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         watching.removeCallbacks(watchTheTalkButton)
+        rise?.release(); rise = null
+        fall?.release(); fall = null
         watchBack(false)
         unregisterReceiver(fromNotification)
         CookieManager.getInstance().flush()
@@ -659,16 +1008,118 @@ private const val MUTE_JS = """
     })()
 """
 
-/// What that button says right now, which is what pressing it will do.
-/// The label is the text beside the key hint rather than the whole of
-/// it: the hint is hidden on a touch screen but is still in the text.
-private const val SAYS_JS = """
+/// What the room is doing with your microphone, in one look at the one
+/// button it is all written on.
+///
+/// `says`: what that button says right now, which is what pressing it
+/// will do, and empty when pressing it is not a mute. The label is the
+/// text beside the key hint rather than the whole of it: the hint is
+/// hidden on a touch screen but is still in the text.
+///
+/// `ptt`: whether that button is the one you hold. It exists only while
+/// the audio is joined *and* push to talk is on -- see the footer in
+/// `App.svelte` -- so finding it is both halves of the question the
+/// phone's talk key has to ask.
+///
+/// `typing`: whether the focus is in something with a cursor in it. The
+/// same selector the room asks it with, from `keys.svelte.js`: the two
+/// must not be able to disagree about whose key it is.
+///
+/// `key` and `chirp`: what the room has against this person for their
+/// phone, which is a setting on the room's own settings page and is
+/// kept on the server, so a second phone arrives already knowing. Read
+/// out of storage rather than handed over: the room mirrors it there
+/// for exactly this (see `rememberPhone` in `room.svelte.js`), and the
+/// app goes on reading the page rather than being called by it. Nothing
+/// is injected into the page and there is no way from the page into the
+/// app, which matters because this app loads whichever room somebody
+/// was invited to and not one it shipped with.
+private const val STATE_JS = """
     (() => {
+      const TYPING = 'input, textarea, select, [contenteditable=""],' +
+        ' [contenteditable="true"], dialog';
       const b = document.querySelector('footer button.big');
-      if (!b || b.classList.contains('ptt') || b.disabled) return '';
-      const live = b.querySelector('.says > span:not(.ghost)') || b;
-      const first = live.childNodes[0];
-      return first ? first.textContent.trim() : '';
+      const ptt = !!(b && b.classList.contains('ptt'));
+      const typing = !!document.activeElement?.closest?.(TYPING);
+      let says = '';
+      if (b && !ptt && !b.disabled) {
+        const live = b.querySelector('.says > span:not(.ghost)') || b;
+        const first = live.childNodes[0];
+        says = first ? first.textContent.trim() : '';
+      }
+      // What the room has against this person for their phone, which
+      // beats what this phone was told on its own. Empty for either
+      // means nobody has ever said and the app keeps its own answer.
+      const key = localStorage.getItem('vox_room.phone_key') || '';
+      const chirp = localStorage.getItem('vox_room.ptt_chirp') || '';
+      return JSON.stringify({ says, ptt, typing, key, chirp });
+    })()
+"""
+
+/// Press, or let go of, the key the room's microphone is on.
+///
+/// A press says first that it has already waited. Push to talk arms for
+/// a quarter of a second before the microphone opens -- the chirp fills
+/// it; see `lib/chirp.js` -- and this press has spent exactly that long
+/// already, deciding whether a volume key was a tap or a hold. Without
+/// the mark the room would arm again and a phone would wait twice for
+/// one hold.
+///
+/// Whichever key that is: the room lets you bind another one and keeps
+/// the answer in this browser's own storage, so it is read from there
+/// rather than assumed to be Space. A binding with modifiers in it is
+/// sent with them, because the room's `pressed` wants the key *and* the
+/// modifiers and would not fire on the bare key.
+///
+/// Dispatched at whatever has the focus rather than at the window. The
+/// room's handler asks `e.target.closest(...)` whose key this is, and
+/// `window` has no `closest` -- an event dispatched there would arrive
+/// as a TypeError rather than as a press.
+///
+/// A press, and only a press, is refused unless the button you hold is
+/// actually there. Out here push to talk is known a second late at
+/// worst, and the room does something quite different with the talk key
+/// when the mode is off: it toggles your mute. A volume key that muted
+/// you because the mode had just been switched off is a bad enough
+/// trade to be worth one DOM query. The question is asked at the moment
+/// of the press rather than off the poll, so there is no window at all.
+///
+/// Letting go is never refused, for the same reason upside down: the
+/// room already drops a hold when the mode goes away under it, and a
+/// query that failed for any reason at all would leave a microphone
+/// open with nothing on the screen saying so.
+private fun talkJs(down: Boolean) = """
+    (() => {
+      ${if (down) "if (!document.querySelector('footer button.big.ptt')) return;" else ""}
+      ${if (down) "try { localStorage.setItem('vox_room.ptt_armed', String(Date.now())); } catch {}" else ""}
+      let bind = { code: 'Space', ctrl: false, alt: false, shift: false, meta: false };
+      try {
+        const raw = JSON.parse(localStorage.getItem('vox_room.talk_key') ?? 'null');
+        if (raw && typeof raw.code === 'string' && raw.code) {
+          bind = { code: raw.code, ctrl: !!raw.ctrl, alt: !!raw.alt,
+                   shift: !!raw.shift, meta: !!raw.meta };
+        }
+      } catch {}
+      const at = document.activeElement ?? document.body;
+      at.dispatchEvent(new KeyboardEvent('${if (down) "keydown" else "keyup"}', {
+        code: bind.code, ctrlKey: bind.ctrl, altKey: bind.alt,
+        shiftKey: bind.shift, metaKey: bind.meta,
+        bubbles: true, cancelable: true,
+      }));
+    })()
+"""
+
+/// Put the page's copy of the phone settings right.
+///
+/// Both values come from [TalkKey]'s own closed set and from nowhere
+/// else -- never from the room, never from anything typed -- so there is
+/// nothing here that could be anything but one of five words.
+private fun mirrorJs(key: String, chirp: String) = """
+    (() => {
+      try {
+        localStorage.setItem('vox_room.phone_key', '$key');
+        localStorage.setItem('vox_room.ptt_chirp', '$chirp');
+      } catch {}
     })()
 """
 

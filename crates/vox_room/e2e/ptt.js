@@ -14,10 +14,41 @@
 const { is, report, person, wait, openRooms, closeRooms } = require('./room.js');
 const [ryanLink] = process.argv.slice(2);
 
+// The phone's talk key, as the Android app actually presses it. The two
+// snippets are read out of the app rather than copied here, because
+// copies of a selector do not break when the selector does: the app
+// reaches into `footer button.big`, its `ptt` class, the label beside
+// the key hint and the room's own `vox_room.talk_key`, and every one of
+// those is this room's private business. If the room moves one of them,
+// the phone goes deaf and this is where it is heard. See ROOM_ANDROID.md.
+const KT = require('path').join(__dirname,
+  '../../../android-room/app/src/main/java/com/enigmacurry/vox_room/MainActivity.kt');
+const kt = require('fs').readFileSync(KT, 'utf8');
+const between = (after) => {
+  const at = kt.indexOf(after);
+  if (at < 0) throw new Error(`the app no longer has ${after.trim()}`);
+  return kt.slice(at + after.length, kt.indexOf('\"\"\"', at + after.length));
+};
+const STATE_JS = between('private const val STATE_JS = \"\"\"');
+// `talkJs` is a Kotlin template, so the `${if (down) ... else ...}` in it
+// are resolved here the way Kotlin would resolve them. Generically, and
+// then checked: a snippet that still has a `${` in it would reach the
+// page as a syntax error, which says nothing about what actually broke.
+const talkJs = (down) => {
+  const js = between('private fun talkJs(down: Boolean) = \"\"\"').replace(
+    /\$\{if \(down\) ("(?:[^"\\]|\\.)*") else ("(?:[^"\\]|\\.)*")\}/g,
+    (_, yes, no) => JSON.parse(down ? yes : no));
+  if (js.includes('${')) throw new Error('the app presses the key with a Kotlin template this script cannot resolve');
+  return js;
+};
+
 /// Hold the space bar and see whether the mic opened.
+/// Longer than the quarter second push to talk arms for before the mic
+/// goes live -- the chirp fills that wait; see `lib/chirp.js`. Waiting
+/// exactly as long as the arming would be a race with it.
 const space = async (page) => {
   await page.keyboard.down('Space');
-  await page.waitForTimeout(250);
+  await page.waitForTimeout(500);
   const talking = await page.evaluate(() => !!document.querySelector('footer .big.ptt.talking'));
   await page.keyboard.up('Space');
   // The mic stays open a moment after you let go, so the next check
@@ -46,6 +77,30 @@ const focused = (page) =>
   // Nothing focused: the case that always worked.
   await page.evaluate(() => document.activeElement?.blur());
   is('Space talks', await space(page), true);
+
+  // The quarter second a hold arms for before it is live. The chirp
+  // fills it and is what it is for -- see `lib/chirp.js` -- and the
+  // microphone is still shut for the whole of it, which is the half
+  // that matters: a chirp that played while you were already live would
+  // go out to the room on a speakerphone with every first word.
+  await page.keyboard.down('Space');
+  await page.waitForTimeout(120);
+  is('a hold is not live while the chirp is still going',
+    await page.evaluate(() => !!document.querySelector('footer .big.ptt.talking')), false);
+  await page.waitForTimeout(400);
+  is('and is live once it has finished',
+    await page.evaluate(() => !!document.querySelector('footer .big.ptt.talking')), true);
+  await page.keyboard.up('Space');
+  await page.waitForTimeout(900);
+
+  // Let go inside it and nothing was ever said: no microphone, and
+  // nothing for the room to have written down.
+  await page.keyboard.down('Space');
+  await page.waitForTimeout(80);
+  await page.keyboard.up('Space');
+  await page.waitForTimeout(600);
+  is('letting go inside the arming never opens the mic at all',
+    await page.evaluate(() => !!document.querySelector('footer .big.ptt.talking')), false);
 
   // The heading that names the room you are in, which is a button and
   // is where the hand goes to look for another room. (Pressing a room
@@ -103,6 +158,10 @@ const focused = (page) =>
   // another, so the gain itself is watched: every ramp any audio
   // parameter is asked for, recorded off the prototype, which is the
   // one place this can be seen from outside the app.
+  // Page-wide, so anything else on this page that moves a gain with a
+  // linear ramp lands in here too and reads as the room's sound. The
+  // chirp deliberately shapes its envelope with `setValueCurveAtTime`
+  // for exactly that reason; see `lib/chirp.js`.
   await page.evaluate(() => {
     window.__ramps = [];
     const ramp = AudioParam.prototype.linearRampToValueAtTime;
@@ -116,7 +175,7 @@ const focused = (page) =>
   // hearing the AI stop is the cost of the other way round, and it is
   // not a cost anybody on headphones is paying without asking.
   await page.keyboard.down('Space');
-  await page.waitForTimeout(250);
+  await page.waitForTimeout(500);
   is('the room is still playing while you hold, out of the box',
     await page.evaluate(() => !!document.querySelector('footer .big.ptt.hushed')), false);
   is('and nothing was taken to nothing',
@@ -138,7 +197,7 @@ const focused = (page) =>
   await page.waitForSelector('footer .big.ptt');
   await page.evaluate(() => document.activeElement?.blur());
   await page.keyboard.down('Space');
-  await page.waitForTimeout(250);
+  await page.waitForTimeout(500);
   is('the room is quiet while the key is down',
     await page.evaluate(() => !!document.querySelector('footer .big.ptt.hushed')), true);
   is('and the sound really was taken to nothing',
@@ -159,7 +218,7 @@ const focused = (page) =>
   // while holding it has to be heard at once rather than next time.
   await page.evaluate(() => { window.__ramps = []; });
   await page.keyboard.down('Space');
-  await page.waitForTimeout(250);
+  await page.waitForTimeout(500);
   await page.click('.tools button.cog');
   await page.waitForSelector('.settings');
   await page.locator('.settings input[name=duplex]').nth(0).check();
@@ -179,7 +238,7 @@ const focused = (page) =>
   // switch is beside the button, which is where a hand goes.
   await page.evaluate(() => document.activeElement?.blur());
   await page.keyboard.down('Space');
-  await page.waitForTimeout(250);
+  await page.waitForTimeout(500);
   await page.click('footer .ptt-switch');
   await page.keyboard.up('Space');
   await page.waitForTimeout(400);
@@ -290,7 +349,7 @@ const focused = (page) =>
 
   await page.keyboard.down('Control');
   await page.keyboard.down('Space');
-  await page.waitForTimeout(250);
+  await page.waitForTimeout(500);
   is('the bound one does',
     await page.evaluate(() => !!document.querySelector('footer .big.ptt.talking')), true);
   // The modifier first, which is how a hand actually lets go.
@@ -322,7 +381,7 @@ const focused = (page) =>
   await page.evaluate(() => document.activeElement?.blur());
   sizes[await page.evaluate(() => document.querySelector('footer .big').innerText.trim())] = await wide();
   await page.keyboard.down('Space');
-  await page.waitForTimeout(250);
+  await page.waitForTimeout(500);
   sizes.talking = await wide();
   await page.keyboard.up('Space');
   await page.waitForTimeout(800);
@@ -346,12 +405,149 @@ const focused = (page) =>
   // Letting go of the key is heard wherever the focus went in between.
   await page.evaluate(() => document.activeElement?.blur());
   await page.keyboard.down('Space');
-  await page.waitForTimeout(250);
+  await page.waitForTimeout(500);
   await page.click('.say textarea');
   await page.keyboard.up('Space');
   await page.waitForTimeout(900);
   is('letting go closes the mic even after the focus moved',
     await page.evaluate(() => !!document.querySelector('footer .big.ptt.talking')), false);
+
+  // -- the phone -----------------------------------------------------
+  //
+  // A phone has no keyboard, so the Android app lends the microphone a
+  // volume key. Android never gives a volume key to the page, so the
+  // app has to press the room's own talk key from outside it -- and it
+  // has to know, synchronously, whether that key is the microphone's
+  // at all, which it reads off the one button it is all written on.
+  await page.evaluate(() => document.activeElement?.blur());
+  const asked = async () => JSON.parse(await page.evaluate(STATE_JS));
+
+  let state = await asked();
+  is('the app can see that push to talk is on', state.ptt, true);
+  is('and offers the notification no mute while it is', state.says, '');
+  is('and knows the key is not being typed with', state.typing, false);
+
+  // Still 250, deliberately, where every press above waits 500: the
+  // app has already done the arming -- it spent a quarter of a second
+  // working out that a volume key was a hold and not a tap, and said so
+  // -- so this press must go live at once. Arming it again would make a
+  // phone wait twice for one hold, and this is the assertion that would
+  // catch it.
+  await page.evaluate(talkJs(true));
+  await page.waitForTimeout(250);
+  is('a volume key talks without waiting to be armed again',
+    await page.evaluate(() => !!document.querySelector('footer .big.ptt.talking')), true);
+  await page.evaluate(talkJs(false));
+  await page.waitForTimeout(900);
+  is('and letting it go closes the mic',
+    await page.evaluate(() => !!document.querySelector('footer .big.ptt.talking')), false);
+
+  // Where the volume key is the phone's again: with the cursor in the
+  // message box the room would refuse the press anyway, so the app
+  // stands down first and leaves the key changing the volume.
+  await page.click('.say textarea');
+  is('the app stands down over a text box', (await asked()).typing, true);
+  await page.keyboard.press('Escape');
+  await page.waitForTimeout(200);
+  is('and takes the key back when the box lets go', (await asked()).typing, false);
+
+  // Whichever key the room is bound to, and not Space by assumption:
+  // the app reads the binding out of the room's own storage, because a
+  // volume key pressing a key the room is not listening for is a
+  // microphone that never opens and nothing on the screen saying why.
+  await page.click('.tools button.cog');
+  await page.waitForSelector('.settings');
+  await page.click('.settings .press');
+  await page.keyboard.down('Control');
+  await page.keyboard.press('Space');
+  await page.keyboard.up('Control');
+  await page.waitForTimeout(300);
+  await page.click('.settings button.primary');
+  await page.waitForSelector('footer .big.ptt');
+  await page.evaluate(() => document.activeElement?.blur());
+  await page.evaluate(talkJs(true));
+  await page.waitForTimeout(250);
+  is('a volume key talks on a bound combination too',
+    await page.evaluate(() => !!document.querySelector('footer .big.ptt.talking')), true);
+  await page.evaluate(talkJs(false));
+  await page.waitForTimeout(900);
+  is('and still lets go of it',
+    await page.evaluate(() => !!document.querySelector('footer .big.ptt.talking')), false);
+  await page.click('.tools button.cog');
+  await page.waitForSelector('.settings');
+  await page.click('.settings .bind button:has-text("Back to Space")');
+  await page.click('.settings button.primary');
+  await page.waitForSelector('footer .big.ptt');
+
+  // Push to talk off: the key goes back to the phone, and the one
+  // thing the app reads off that button is what its notification
+  // should offer instead.
+  await page.click('footer .ptt-switch');
+  await page.waitForTimeout(400);
+  state = await asked();
+  is('with push to talk off the app lends no key', state.ptt, false);
+  is('and reads the mute off the button instead',
+    ['Mute', 'Unmute'].includes(state.says), true);
+
+  // And a press that arrives anyway is refused. Out on the phone the
+  // mode is known a second late at worst, and the room does something
+  // quite different with the talk key when it is off -- it toggles your
+  // mute. A volume key that muted you because the switch had just been
+  // thrown is the one way this could do real harm, so the press asks
+  // the page rather than trusting what it last heard.
+  const muted = () => page.evaluate(() => !!document.querySelector('footer .big.muted'));
+  const before = await muted();
+  await page.evaluate(talkJs(true));
+  await page.waitForTimeout(400);
+  is('and a press with the mode off does not mute you', await muted(), before);
+  await page.evaluate(talkJs(false));
+  await page.waitForTimeout(200);
+
+  await page.click('footer .ptt-switch');
+  await page.waitForTimeout(400);
+
+  // Where the phone's key is actually settled: the room's own settings
+  // page, kept against you on the server rather than in this browser,
+  // so a second phone arrives already knowing. The room mirrors what
+  // the server said into storage and the app reads it from there in
+  // the poll above -- which is the whole mechanism, and is why the app
+  // can take a setting from the room without the room being able to
+  // call into the app. See `rememberPhone` and ROOM_ANDROID.md.
+  const mirror = () => page.evaluate(() => [
+    localStorage.getItem('vox_room.phone_key'),
+    localStorage.getItem('vox_room.ptt_chirp'),
+  ]);
+  is('nothing is said about the phone to begin with', (await asked()).key, '');
+
+  await page.click('.tools button.cog');
+  await page.waitForSelector('.settings');
+  await page.locator('.settings input[name=phonekey]').nth(1).check();
+  await page.waitForTimeout(500);
+  is('choosing a key in the room writes the mirror the app reads',
+    await mirror(), ['volume_down', 'on']);
+  is('and the app sees it', (await asked()).key, 'volume_down');
+
+  await page.locator('.settings input[name=pttchirp]').uncheck();
+  await page.waitForTimeout(500);
+  is('and so does turning the chirp off', (await asked()).chirp, 'off');
+  is('with the key left where it was', (await asked()).key, 'volume_down');
+
+  // It outlives this browser, because it was never this browser's.
+  // The mirror is wiped before the reload on purpose: `localStorage`
+  // survives a reload on its own, so leaving it there would prove
+  // nothing about where the answer actually lives. Emptied and then
+  // refilled is the round trip to the server and back.
+  await page.evaluate(() => {
+    localStorage.removeItem('vox_room.phone_key');
+    localStorage.removeItem('vox_room.ptt_chirp');
+  });
+  await page.reload();
+  // The door, not the room: a reload is back outside the audio, and
+  // the answer is already there before anybody joins anything.
+  await page.waitForSelector('button:has-text("Join Audio")');
+  await page.waitForTimeout(500);
+  is('and it is put back from the server, not from this browser',
+    await mirror(), ['volume_down', 'off']);
 
   await browser.close();
   report();

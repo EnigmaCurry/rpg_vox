@@ -870,6 +870,8 @@ mod tests {
             link: None,
             language: String::new(),
             bots: String::new(),
+            phone_key: String::new(),
+            ptt_chirp: String::new(),
             owner: false,
         }
     }

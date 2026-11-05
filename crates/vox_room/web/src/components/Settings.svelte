@@ -1,7 +1,7 @@
 <script>
   import {
     room, setName, setVolume, avatarOf, forgetAvatar, myFaces, faceAt, wearFace,
-    command, setPttHush, setBotsOff, theAI, theAIs,
+    command, setTalkHush, setBotsOff, setTalk, theAI, theAIs,
   } from '../lib/room.svelte.js';
   import { theme, setTheme, THEMES } from '../lib/theme.svelte.js';
   import {
@@ -16,6 +16,22 @@
   // place: the CSS draws it and `lib/pixels.js` is told it, and the
   // two must agree.
   const PAST = 56;
+
+  // Which volume key a phone may lend to the microphone. `volume_up` is
+  // first and is what the app comes set to: taking a key away costs
+  // less on the one that makes the room louder than on the one that
+  // makes it quieter in a hurry. See ROOM_ANDROID.md.
+  const PHONE_KEYS = [
+    { value: 'volume_up', label: 'Volume up',
+      why: 'The usual answer. Volume down is left alone, so the room can '
+         + 'still be taken quiet in a hurry without letting go of anything.' },
+    { value: 'volume_down', label: 'Volume down',
+      why: 'For a phone whose power button sits directly above volume up, '
+         + 'where reaching for the talk key in the dark finds power instead.' },
+    { value: 'off', label: 'Neither',
+      why: 'Both keys stay the phone\'s. Push to talk on that phone is the '
+         + 'button on the screen and nothing else.' },
+  ];
 
   // The things you set once, off the floor of the room.
   //
@@ -256,12 +272,51 @@
     </p>
   </section>
 
+  <!-- The same question asked of a phone, which has no keyboard to
+       bind and so cannot answer the one above. Kept next to it because
+       it is the same question, and deliberately *not* hidden off a
+       phone: this is the one setting here that is about a device you
+       are probably not holding, and setting it from a laptop for a
+       phone in your pocket is the point of it being here at all.
+
+       Yours rather than this browser's, which is the opposite of the
+       talk key above and for the opposite reason: a desk and a laptop
+       have different keyboards, and every phone has the same two volume
+       keys. See `setTalk`. -->
+  <section>
+    <h2>The talk key on a phone</h2>
+    <p class="note first">
+      A phone has no keyboard, so the Android app lends one of the volume
+      keys to your microphone instead: while push to talk is on, a
+      <em>tap</em> is still the volume and a <em>hold</em> opens your mic.
+      This is yours rather than this browser's, so a second phone arrives
+      already knowing. It does nothing in a browser.
+    </p>
+    {#each PHONE_KEYS as choice (choice.value)}
+      <label class="duplex">
+        <input type="radio" name="phonekey" checked={room.phoneKey === choice.value}
+          onchange={() => setTalk(choice.value, room.pttChirp || 'on')} />
+        <span>
+          {choice.label}
+          <small>{choice.why}</small>
+        </span>
+      </label>
+    {/each}
+    {#if !room.phoneKey}
+      <p class="note">
+        Nothing chosen, so each phone keeps whatever it was set to on the
+        phone itself.
+      </p>
+    {/if}
+    {#if room.pttError}<p class="warn">{room.pttError}</p>{/if}
+  </section>
+
   <!-- What push to talk *means*, which is not the same question as
        whether it is on. The switch for that is beside the button it
        changes, down in the footer, because it is a thing you flip while
        talking; this is a thing you settle once, when you decide where
        you are sitting and what you are listening on. Both ways are
-       right for somebody: see `setPttHush`. -->
+       right for somebody: see `setTalkHush`. -->
   <section>
     <h2>Holding the talk button</h2>
     <p class="note first">
@@ -271,7 +326,7 @@
     </p>
     <label class="duplex">
       <input type="radio" name="duplex" checked={!room.pttHush}
-        onchange={() => setPttHush(false)} />
+        onchange={() => setTalkHush(false)} />
       <span>
         You keep hearing the room
         <small>
@@ -283,7 +338,7 @@
     </label>
     <label class="duplex">
       <input type="radio" name="duplex" checked={room.pttHush}
-        onchange={() => setPttHush(true)} />
+        onchange={() => setTalkHush(true)} />
       <span>
         The room goes quiet
         <small>
@@ -295,6 +350,28 @@
         </small>
       </span>
     </label>
+
+    <!-- The sound of it, which is about push to talk itself and not
+         about any one way of holding it: a keyboard's talk key, the
+         button in the footer and a phone's volume key all arm and chirp
+         the same way. See `lib/chirp.js`. -->
+    <label class="duplex">
+      <input type="checkbox" name="pttchirp" checked={room.pttChirp !== 'off'}
+        onchange={(e) => setTalk(room.phoneKey, e.currentTarget.checked ? 'on' : 'off')} />
+      <span>
+        Chirp while your mic opens
+        <small>
+          Two beeps, rising, ending exactly as your microphone goes live — so
+          what it teaches is when to start talking rather than being one more
+          thing to talk over. A falling pair says the mic has closed. It costs
+          a quarter of a second at the front of every hold, which is the
+          quarter second it is filling; turn it off and your mic opens the
+          moment you press. Yours rather than this browser's, so your phone
+          agrees with your desk.
+        </small>
+      </span>
+    </label>
+    {#if room.pttError}<p class="warn">{room.pttError}</p>{/if}
   </section>
 
   <!-- The other half of the footer's pair: what BOTS off means. The

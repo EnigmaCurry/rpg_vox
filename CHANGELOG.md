@@ -1,11 +1,115 @@
 # Changelog
 
 Changes in each release of scribe, Scribe for Android, Scribe for iOS,
-agent, Pi voice, Voice room and rpg_vox. New entries go under
+agent, Pi voice, Voice room, Voice Room for Android and rpg_vox. New entries go under
 **Unreleased**; `just publish` names that section after the version it
 releases.
 
 ## Unreleased
+
+### Voice room
+
+- **Push to talk arms for a quarter of a second, and chirps while it
+  does.** Two beeps, rising, ending exactly as your microphone goes
+  live; a falling pair when it closes. What it teaches is when to start
+  talking, rather than being one more thing to talk over -- and the
+  quarter second it costs is the quarter second it is filling. Let go
+  inside it and nothing was ever said: no microphone, and nothing for
+  the room to write down.
+
+  **Before the microphone opens, never during**, which is the whole
+  reason the arming exists. A chirp played once you are live goes out
+  to the room with the first word of every sentence on a speakerphone.
+
+  **However the key is held**: a keyboard's talk key, the button in
+  the footer, or the volume key an Android phone lends to its
+  microphone. One setting for all three, on the settings page under
+  *Holding the talk button*, and kept against you on the server rather
+  than in this browser -- unlike the talk key itself, which stays this
+  browser's because a desk and a laptop have different keyboards.
+  Every phone has the same two volume keys, so that one follows you.
+
+  It plays on an `AudioContext` of its own rather than through the
+  room's mixer, deliberately. Half duplex cuts everything the room is
+  playing for as long as you hold, which is right for the room and
+  exactly wrong for this: the people who hold the key on speakers are
+  the ones the cue is most for. App volume is the room's too, and a
+  go-signal that can be turned down to nothing is not one.
+
+- **Which volume key talks on your phone is set in the room.** Under
+  *The talk key on a phone*: volume up, volume down, or neither. Kept
+  against you, so a second phone does not have to be told again, and
+  set from a laptop for a phone in your pocket. It does nothing in a
+  browser -- the Android app is the only thing with volume keys to
+  lend. See ROOM_ANDROID.md.
+
+### Voice room for Android
+
+- **The phone has a push-to-talk button now: one of the volume keys.**
+  Push to talk asks for a key to hold and a phone has no keyboard --
+  the room says so itself, and hides its key hints on a touch screen
+  for the same reason -- so the one real button a phone does have is
+  lent to the microphone. **Tap it and it is still the volume; hold it
+  for a quarter of a second and you are talking.** Let go and the mic
+  shuts.
+
+  **The tap is not a nicety.** Without it the volume is a one-way
+  ratchet while push to talk is on: the key that is not the talk key
+  can only ever take the room down, and there is no way back up short
+  of turning the mode off. A claimed event cannot be handed back to
+  Android -- and re-injecting one wants a permission only the
+  platform's own apps are given -- so the volume change is made
+  directly, with the system left to say which stream a press during a
+  call is even about.
+
+  **A chirp fills the wait** -- and it belongs to push to talk rather
+  than to this app; see the Voice room below.
+
+  **Only one of the two, and only while push to talk is on.** Taking
+  both would leave no way to turn the room down, and *down* is the one
+  worth keeping: the sound you want gone in a hurry is the room's own,
+  coming out of a speaker, at the moment somebody walks in -- and that
+  is this app in front, so a hijack there really would take the button
+  away when it was wanted. Losing *louder* costs nothing like as much,
+  so **volume up** is what it comes set to. With push to talk off, or
+  anywhere but in the room, both keys are the phone's own again, and
+  with the cursor in the message box the key goes back to the phone
+  too -- the room would refuse that press anyway, and a key that does
+  nothing at all is worse than a volume key.
+
+  **Both answers live in the room**, on its settings page, kept
+  against you rather than against a phone, so a second phone arrives
+  already knowing. The app never asks the server for them: the room
+  mirrors what it got into the page's storage and the app reads it
+  there, in the poll it already runs. The app reads the page; the page
+  cannot call the app, and that stays true -- which matters, because
+  this app loads whichever room somebody was invited to and not one it
+  shipped with.
+
+  **Talk key**, a third button on the notification, is the app's own
+  copy of the same two questions, for a phone that has not joined
+  anything yet. It writes through to the room when it can, so changing
+  it there changes the answer that wins.
+  Android's own place for a setting an app has no room for is the
+  launcher's long-press menu, and it is there as well -- but nobody
+  looks there, and this is a setting about a key you only reach for
+  mid-conversation, so it goes where this app already keeps its native
+  controls. Under push to talk there is no mute to offer and it is the
+  second of two. It opens over whatever is behind it and the call carries on
+  underneath, the same arrangement that survives the screen turning
+  off. There was nowhere else to put it -- while a room is up the whole
+  screen is the room's, and the one native screen this app has asks
+  where the room is and is never seen again once it is answered.
+
+  It presses the room's own talk key rather than its on-screen button,
+  so push to talk, the toggle, a mute that came from the mixer and the
+  text-box stand-down are all already decided by the room and inherited
+  rather than guessed at again out here. Whichever key that is: the
+  room lets you bind another one, and the binding is read out of the
+  room instead of assumed to be Space. The `ptt` suite reads both of
+  the app's snippets out of `MainActivity.kt` and runs them against a
+  real room, so the day the room moves the button the phone reaches
+  for, it is a failing test and not a phone gone quietly deaf.
 
 ## v0.2.1 (2026-11-04)
 

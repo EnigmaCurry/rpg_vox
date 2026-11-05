@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The app's own settings have nowhere to live inside it: while a room
+     is up the whole screen is the room's, and the one native screen
+     there is asks where the room is and is never seen again once it has
+     been answered. Holding the icon is where Android puts exactly this,
+     and reaches it without disturbing the call. -->
+<shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
+    <shortcut
+        android:shortcutId="talk_key"
+        android:enabled="true"
+        android:icon="@drawable/ic_launcher_foreground"
+        android:shortcutShortLabel="@string/talk_key_title"
+        android:shortcutLongLabel="@string/talk_key_title">
+        <intent
+            android:action="android.intent.action.VIEW"
+            android:targetPackage="com.enigmacurry.vox_room"
+            android:targetClass="com.enigmacurry.vox_room.TalkKeyActivity" />
+    </shortcut>
+</shortcuts>
