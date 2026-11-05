@@ -12,5 +12,7 @@
     <string name="note_title">In the voice room</string>
     <string name="note_text">Holding the call. Tap to come back.</string>
     <string name="note_leave">Leave</string>
+    <string name="need_link">That room doesn\'t know this phone. Paste an invite link to come in.</string>
+    <string name="link_spent">That link has been used already. A link works once, so ask for another.</string>
     <string name="no_mic">Voice Room needs the microphone to put you in a room.</string>
 </resources>

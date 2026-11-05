@@ -10,12 +10,16 @@ import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.util.Log
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowInsets
+import android.window.OnBackInvokedCallback
+import android.window.OnBackInvokedDispatcher
 import android.webkit.CookieManager
 import android.webkit.PermissionRequest
 import android.webkit.WebChromeClient
@@ -27,6 +31,9 @@ import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import java.net.HttpURLConnection
+import java.net.URL
+import org.json.JSONObject
 
 /**
  * A voice room in a WebView, held up by a foreground service.
@@ -103,6 +110,7 @@ class MainActivity : Activity() {
     /// left from the notification, and whenever Back reaches the door.
     private fun setup(problem: String? = null) {
         RoomService.stop(this)
+        watchBack(false)
         web?.destroy()
         web = null
 
@@ -230,6 +238,9 @@ class MainActivity : Activity() {
         }
         w.webViewClient = object : WebViewClient() {
             override fun onPageFinished(view: WebView, finished: String) {
+                // A page with no way forward sends them to the one screen
+                // that has somewhere to put a link.
+                wayIn(finished)
                 // Remember where the room is, not how we got in. An invite
                 // link is spent by Join Audio, so keeping the one that was
                 // pasted would make every launch after the first open an
@@ -254,6 +265,7 @@ class MainActivity : Activity() {
         setContentView(frame, ViewGroup.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         insetBySystemBars(frame)
+        watchBack(true)
         w.loadUrl(url)
     }
 
@@ -275,19 +287,108 @@ class MainActivity : Activity() {
         v.requestApplyInsets()
     }
 
-    /// Back goes back through the room; at the door it comes out here,
-    /// which is also how you point this at a different room.
-    @Suppress("OverrideDeprecatedMigration")
-    override fun onBackPressed() {
-        val w = web
-        when {
-            w == null -> super.onBackPressed()
-            w.canGoBack() -> w.goBack()
-            else -> setup()
+    /// Back goes back through the room; at the door it comes out to the
+    /// app's own screen, which is how you point this at a different room.
+    ///
+    /// Registered rather than overridden. `onBackPressed` is not called
+    /// at all for anything targeting Android 15 or later -- predictive
+    /// back is on by default there and the system dispatches through
+    /// `OnBackInvokedDispatcher` instead -- so the override that used to
+    /// be here was dead code, and back simply left the app.
+    ///
+    /// It is registered only while the room is up. On the app's own
+    /// screen back means leave, which is the system's job and not ours.
+    private val goingBack = if (Build.VERSION.SDK_INT >= 33) {
+        OnBackInvokedCallback { back() }
+    } else {
+        null
+    }
+    private var backRegistered = false
+
+    private fun watchBack(on: Boolean) {
+        val cb = goingBack ?: return
+        if (on == backRegistered) return
+        if (on) {
+            onBackInvokedDispatcher.registerOnBackInvokedCallback(
+                OnBackInvokedDispatcher.PRIORITY_DEFAULT, cb)
+        } else {
+            onBackInvokedDispatcher.unregisterOnBackInvokedCallback(cb)
         }
+        backRegistered = on
+    }
+
+    private fun back() {
+        val w = web ?: return
+        if (w.canGoBack()) w.goBack() else setup()
+    }
+
+    /// Android 11 and 12 still come through here.
+    @Suppress("OverrideDeprecatedMigration", "DEPRECATION")
+    override fun onBackPressed() {
+        if (web != null) back() else super.onBackPressed()
+    }
+
+    /// Ask the room whether this phone can get in at all.
+    ///
+    /// After **Log out**, and after a link that has already been spent,
+    /// the page is a dead end: it says to ask whoever runs the room for
+    /// an invite, and there is nowhere on it to put one. The place a
+    /// link goes is the app's own screen, so that is where this sends
+    /// them -- otherwise the only way to use a different link is to
+    /// clear the app's data.
+    ///
+    /// Asked of the room rather than read off the page: the page says it
+    /// in whichever language it is wearing, and this has to be true in
+    /// all of them.
+    private fun wayIn(pageUrl: String?) {
+        val uri = runCatching { Uri.parse(pageUrl) }.getOrNull() ?: return
+        val scheme = uri.scheme ?: return
+        val authority = uri.authority ?: return
+        val origin = "$scheme://$authority"
+        // An unspent invite is in the path, and the room cannot say what
+        // it is worth unless it is asked about it: with no token and no
+        // cookie the answer is `none`, which is also the answer for a
+        // page there is no way out of. Sending it is what tells the two
+        // apart -- see `door()` in room.svelte.js, which sends the same.
+        val token = uri.path?.removePrefix("/")?.let {
+            if (it.startsWith("join/")) it.removePrefix("join/").takeIf(String::isNotEmpty) else null
+        }
+        Thread {
+            // A POST, as the page itself asks it -- see `door()` in
+            // room.svelte.js.
+            val state = runCatching {
+                val c = (URL("$origin/api/door").openConnection() as HttpURLConnection).apply {
+                    requestMethod = "POST"
+                    doOutput = true
+                    connectTimeout = 10_000
+                    readTimeout = 10_000
+                    setRequestProperty("content-type", "application/json")
+                    CookieManager.getInstance().getCookie(origin)
+                        ?.let { setRequestProperty("Cookie", it) }
+                }
+                val ask = JSONObject().apply { if (token != null) put("token", token) }
+                c.outputStream.use { it.write(ask.toString().toByteArray()) }
+                val body = (if (c.responseCode in 200..299) c.inputStream else c.errorStream)
+                    ?.bufferedReader()?.use { it.readText() }.orEmpty()
+                c.disconnect()
+                JSONObject(body).optString("state")
+            }.onFailure {
+                Log.w(RoomService.TAG, "could not ask the room about the way in: $it")
+            }.getOrNull() ?: return@Thread
+            // The state and not the address: an invite link is a
+            // credential, and logcat is not where credentials go.
+            Log.i(RoomService.TAG, "the way in: $state")
+            val why = when (state) {
+                "none" -> getString(R.string.need_link)
+                "expired" -> getString(R.string.link_spent)
+                else -> return@Thread
+            }
+            runOnUiThread { if (web != null) setup(why) }
+        }.start()
     }
 
     override fun onDestroy() {
+        watchBack(false)
         unregisterReceiver(leaving)
         CookieManager.getInstance().flush()
         super.onDestroy()
