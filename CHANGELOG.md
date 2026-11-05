@@ -7,6 +7,8 @@ releases.
 
 ## Unreleased
 
+## v0.2.2 (2026-11-05)
+
 ### Voice room
 
 - **The room says what its page may do.** It served no

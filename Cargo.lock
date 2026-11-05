@@ -1561,7 +1561,7 @@ dependencies = [
 
 [[package]]
 name = "discord_vox"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5187,7 +5187,7 @@ dependencies = [
 
 [[package]]
 name = "rpg_vox"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -7484,7 +7484,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vox_agent"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -7498,7 +7498,7 @@ dependencies = [
 
 [[package]]
 name = "vox_android"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "bzip2 0.6.1",
@@ -7514,7 +7514,7 @@ dependencies = [
 
 [[package]]
 name = "vox_audio"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "cpal",
@@ -7537,7 +7537,7 @@ dependencies = [
 
 [[package]]
 name = "vox_chat"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "rusqlite",
@@ -7545,7 +7545,7 @@ dependencies = [
 
 [[package]]
 name = "vox_ios"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "bzip2 0.6.1",
@@ -7560,7 +7560,7 @@ dependencies = [
 
 [[package]]
 name = "vox_room"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -7586,7 +7586,7 @@ dependencies = [
 
 [[package]]
 name = "vox_scribe"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "bzip2 0.4.4",
@@ -7610,7 +7610,7 @@ dependencies = [
 
 [[package]]
 name = "vox_transcribe"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
