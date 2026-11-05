@@ -1,4 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <color name="ic_launcher_background">#2B2D5B</color>
+    <!-- The corners of the artwork, so the field it sits on and the
+         field around it are the same black and there is no seam. -->
+    <color name="ic_launcher_background">#000000</color>
 </resources>

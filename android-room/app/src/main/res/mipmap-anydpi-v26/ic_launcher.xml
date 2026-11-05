@@ -1,6 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
 <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
     <background android:drawable="@color/ic_launcher_background" />
-    <foreground android:drawable="@drawable/ic_launcher_foreground" />
+    <!-- The badge, inside the 72dp of the 108dp canvas that every
+         launcher mask is promised to show. It is a square with a border
+         drawn on it and figures close in against that border, so it
+         cannot go to the edge: a round mask would cut the border off and
+         take two of the people with it. What the mask eats instead is
+         the black around it, which is the same black as its corners. -->
+    <foreground android:drawable="@mipmap/voice_room" />
+    <!-- A themed icon is one colour on a shape, which a picture cannot
+         be. The microphone the app drew for itself stays for that, and
+         for the notification, which wants a silhouette too. -->
     <monochrome android:drawable="@drawable/ic_launcher_foreground" />
 </adaptive-icon>
