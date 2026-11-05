@@ -12,8 +12,18 @@ export default defineConfig({
     strictPort: true,
     proxy: {
       '/api': { target: BACKEND },
-      '/join': { target: BACKEND },
       '/room.ws': { target: BACKEND, ws: true },
+      // `/join/<token>` is deliberately NOT here. The server has no
+      // route for it either (see the router in src/web.rs): an invite
+      // link is the app, and the token is read off `location.pathname`
+      // and spent through `/api/door/join`, which is proxied. Proxied,
+      // what came back was the *built* `index.html` out of the release
+      // binary, asking for `/assets/index-<hash>.js` that this server
+      // has never heard of -- so a fresh invite opened a blank page
+      // with one 404 in the console, and `just room-ui` could not be
+      // used with the only way a new person ever gets in. Left alone,
+      // vite serves the app for it like any other address it does not
+      // recognise, which is exactly what the server does.
     },
   },
   build: {

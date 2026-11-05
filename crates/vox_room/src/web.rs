@@ -71,7 +71,7 @@
 //! of them is about the one browser that asked.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use axum::{
     body::Bytes,
@@ -85,10 +85,13 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
 use futures_util::{SinkExt as _, StreamExt as _};
 use rust_embed::RustEmbed;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::{Digest as _, Sha256};
 use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{debug, info, warn};
 
@@ -1252,6 +1255,120 @@ async fn forget_avatar(
     }
 }
 
+/// What the page may do, and nothing else.
+///
+/// A second line behind the sanitiser, which is at present the only
+/// thing between a model-written card and a running script -- and
+/// `e2e/cards.js` exists because a model did once write a `<script>`
+/// tag into one. It matters more here than on most pages: the Android
+/// app grants the microphone to this page without asking (see
+/// `onPermissionRequest` in MainActivity.kt) and reads the talk key off
+/// it, so script running here is script running next to an open mic.
+///
+/// What each line is for:
+///
+/// - `script-src 'self'` and nothing else executable. The one inline
+///   script is the theme, read before anything is drawn so a dark room
+///   does not arrive a frame after a white one, and it is let through
+///   by the hash of its own bytes rather than by `'unsafe-inline'` --
+///   worked out at startup from what is actually embedded, so it
+///   cannot go stale and there is no hash written down anywhere to
+///   forget to update.
+/// - `style-src` keeps `'unsafe-inline'`: a handful of components set
+///   `style=` to put a meter where the level is, and a style attribute
+///   is not a script.
+/// - `img-src` allows no other origin. Markdown in a card renders
+///   links but never images (see `lib/markdown.js`), so nothing
+///   legitimate wants one -- and a model that wrote an `<img>` at a
+///   server of its own choosing would be writing a tracking pixel into
+///   somebody else's room.
+/// - `connect-src 'self'` covers the room's own WebSocket; `'self'`
+///   matches `ws:`/`wss:` on the same host.
+/// - `frame-ancestors 'none'` so no other page can put this one in a
+///   frame and take clicks on it.
+static CSP: LazyLock<String> = LazyLock::new(policy);
+
+fn policy() -> String {
+    let mut inline = String::new();
+    if let Some(index) = Assets::get("index.html") {
+        for script in inline_scripts(&String::from_utf8_lossy(&index.data)) {
+            let hash = Sha256::digest(script.as_bytes());
+            inline.push_str(&format!(" 'sha256-{}'", BASE64.encode(hash)));
+        }
+    }
+    format!(
+        "default-src 'self'; \
+         script-src 'self'{inline}; \
+         style-src 'self' 'unsafe-inline'; \
+         img-src 'self' data: blob:; \
+         media-src 'self' blob:; \
+         connect-src 'self'; \
+         worker-src 'self' blob:; \
+         object-src 'none'; \
+         base-uri 'none'; \
+         form-action 'none'; \
+         frame-ancestors 'none'"
+    )
+}
+
+/// The body of every `<script>` in `html` that has no `src`, which is
+/// what a hash in the policy has to be taken of. One tag's worth at a
+/// time and no cleverness: this reads one file, written here, and the
+/// test below is what says it still reads it right.
+fn inline_scripts(html: &str) -> Vec<&str> {
+    let mut found = Vec::new();
+    let mut rest = html;
+    while let Some(start) = rest.find("<script") {
+        let after = &rest[start..];
+        let Some(close) = after.find('>') else { break };
+        let tag = &after[..close];
+        let body = &after[close + 1..];
+        let Some(end) = body.find("</script>") else { break };
+        if !tag.contains("src=") {
+            found.push(&body[..end]);
+        }
+        rest = &body[end..];
+    }
+    found
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_policy_lets_through_the_pages_own_inline_script_and_nothing_else() {
+        let found = inline_scripts(
+            r#"<html><head>
+                 <script src="/assets/app.js"></script>
+                 <script>theme()</script>
+               </head><body>
+                 <script type="module" src="/src/main.js"></script>
+                 <script>two()</script>
+               </body></html>"#,
+        );
+        assert_eq!(found, vec!["theme()", "two()"], "the ones with no src, in order");
+
+        // The real page, whatever it is today. If it ever stops having
+        // exactly one inline script this is what says so, because the
+        // policy it is let through by is built from exactly this.
+        let index = Assets::get("index.html").expect("the app is embedded");
+        let html = String::from_utf8_lossy(&index.data);
+        let mine = inline_scripts(&html);
+        assert_eq!(mine.len(), 1, "index.html has one inline script: the theme");
+        assert!(mine[0].contains("vox_room.theme"), "and it is the theme one");
+
+        // And it is in the policy by its hash, rather than by letting
+        // every inline script on the page run.
+        let csp = policy();
+        let hash = BASE64.encode(Sha256::digest(mine[0].as_bytes()));
+        assert!(csp.contains(&format!("'sha256-{hash}'")), "{csp}");
+        assert!(csp.contains("script-src 'self' 'sha256-"), "{csp}");
+        assert!(csp.contains("frame-ancestors 'none'"), "{csp}");
+        assert!(csp.contains("object-src 'none'"), "{csp}");
+    }
+}
+
 async fn assets(headers: HeaderMap, uri: Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
     let path = if path.is_empty() { "index.html" } else { path };
@@ -1280,15 +1397,29 @@ async fn assets(headers: HeaderMap, uri: Uri) -> Response {
     // here that is the same thing: a request under `assets/` either
     // found its file or 404'd above.
     let cache = if hashed { ASSET_CACHE } else { INDEX_CACHE };
-    (
+    let kind = file.metadata.mimetype().to_string();
+    // On the document and not on the script it loads: a policy is about
+    // a page, and a browser reads it off the page's own response.
+    let policy = kind
+        .starts_with("text/html")
+        .then(|| CSP.as_str())
+        .unwrap_or("");
+    let mut res = (
         [
-            (header::CONTENT_TYPE, file.metadata.mimetype().to_string()),
+            (header::CONTENT_TYPE, kind),
             (header::CACHE_CONTROL, cache.to_string()),
             (header::ETAG, tag),
         ],
         file.data,
     )
-        .into_response()
+        .into_response();
+    if !policy.is_empty() {
+        if let Ok(value) = policy.parse() {
+            res.headers_mut()
+                .insert(header::CONTENT_SECURITY_POLICY, value);
+        }
+    }
+    res
 }
 
 /// A quoted, strong validator for one embedded file. Eight bytes of its

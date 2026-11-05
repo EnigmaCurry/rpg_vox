@@ -9,6 +9,28 @@ releases.
 
 ### Voice room
 
+- **The room says what its page may do.** It served no
+  `Content-Security-Policy` at all, which left the markdown sanitiser
+  as the only thing between a model-written card and a running script
+  -- and `e2e/cards.js` exists because a model did once write a
+  `<script>` tag into one. It matters more here than on most pages:
+  the Android app grants the microphone to this page without asking
+  and reads the talk key off it, so script running here is script
+  running next to an open mic.
+
+  `script-src 'self'` and nothing else executable. The page's one
+  inline script -- the theme, read before anything is drawn so a dark
+  room does not arrive a frame after a white one -- is let through by
+  the hash of its own bytes rather than by `'unsafe-inline'`, and the
+  hash is worked out at startup from whatever is actually embedded, so
+  there is nothing written down anywhere to go stale. No other origin
+  may be fetched from, framed in, or have a form posted to it.
+
+  Every end-to-end suite now fails on a refusal by the page's own
+  policy, so a policy a shade too strict is a failing test rather than
+  one feature quietly broken in one browser with nothing on the screen
+  saying why.
+
 - **Push to talk arms for a quarter of a second, and chirps while it
   does.** Two beeps, rising, ending exactly as your microphone goes
   live; a falling pair when it closes. What it teaches is when to start
@@ -36,6 +58,17 @@ releases.
   the ones the cue is most for. App volume is the room's too, and a
   go-signal that can be turned down to nothing is not one.
 
+- **`pnpm dev` can follow an invite link again.** `vite.config.js`
+  proxied `/join` to the backend, which answered with the *built*
+  `index.html` out of the release binary -- asking for an
+  `/assets/index-<hash>.js` the dev server has never heard of. So a
+  fresh invite opened a blank page with one 404 in the console, and
+  `just room-ui` could not be used with the only way a new person ever
+  gets in. The server has no `/join` route either: an invite link is
+  the app, and the token is read off the path and spent through
+  `/api/door`, which is proxied. Left unproxied, vite serves the app
+  for it exactly as the server does.
+
 - **Whether a phone's volume keys talk is set in the room.** Under
   *The talk key on a phone*, and it is a yes or a no rather than a
   choice between the two keys: because a tap still changes the volume,
@@ -46,7 +79,7 @@ releases.
   the Android app is the only thing with volume keys to lend. See
   ROOM_ANDROID.md.
 
-### Voice room for Android
+### Voice Room for Android
 
 - **The phone has a push-to-talk button now: one of the volume keys.**
   Push to talk asks for a key to hold and a phone has no keyboard --
@@ -1690,6 +1723,57 @@ releases.
 
   Nothing about the cards themselves changed: they are still the AI's
   to give, rewrite and take back, and still on nobody else's screen.
+
+### Voice Room for Android
+
+- **First release: the room as an app, so a call survives the screen
+  going off the way a phone's own calls do.** It is a wrapper and says
+  so -- the whole of it is a `WebView` and a foreground service, and
+  there is no audio code in it, because the room already has all of
+  it. What a browser tab cannot have, and what this adds, is a
+  foreground service of its own.
+
+  **It ships no address.** Whose room it is belongs to whoever
+  installed it, so the first screen asks and the answer is kept. After
+  that the app remembers the *room* rather than the link: an invite is
+  spent by **Join Audio**, so keeping the one that was pasted would
+  make every launch after the first open an expired page. What gets you
+  in from then on is the cookie. The address has to be `https`, said at
+  the door rather than found out as a microphone that will not open,
+  with `localhost` the exception browsers themselves make.
+
+  **What holds the call with the screen off is not a wake lock.** One
+  was tried and measured and changes nothing: a wake lock guarantees
+  the CPU, and the CPU was never what went missing. Chromium releases a
+  page's audio device about a minute after its window stops being
+  visible, and the screen turning off is exactly that -- both streams
+  closed under a page that is otherwise still running perfectly, with
+  the room going on listing you while hearing silence. The view is what
+  carries that news, so the view is the only place an embedder can
+  decline to carry it. Measured at four minutes of screen-off, no wake
+  lock, not one silent second.
+
+  **The notification holds the call** and carries what is worth
+  reaching without opening the app: **Mute**, which says `Mute` or
+  `Unmute` because it is the room's own button being pressed and the
+  room's own word read back, and **Leave**, which leaves the audio and
+  puts you at the door. Neither logs you out. **Back** goes back
+  through the room, then out of the audio, then out of the app, and
+  never to the box the address goes in: that screen is for a phone the
+  room does not know, and being asked to type what you are already
+  holding is no better than having nowhere to type it.
+
+  Three other things cost an afternoon each and none are discoverable
+  from the error they cause: `MODIFY_AUDIO_SETTINGS`, without which
+  *every* `getUserMedia` in a WebView fails with
+  `NotReadableError: Could not start audio source` and nothing in the
+  message pointing at a permission; a microphone-typed foreground
+  service being a `SecurityException` and the end of the process until
+  `RECORD_AUDIO` is granted; and everything targeting Android 15 being
+  laid out edge to edge whether it asked to be or not, so a WebView
+  filling the window drew the page under the clock -- which is where
+  the room puts the heading you change rooms from, making the thing you
+  could not reach the thing you most needed. See ROOM_ANDROID.md.
 
 ## v0.2.0 (2026-11-01)
 

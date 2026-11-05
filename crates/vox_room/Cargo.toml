@@ -34,6 +34,10 @@ ureq = { version = "2", features = ["json"] }
 # What an MCP server hands back a picture in, when it hands one back
 # inline rather than as a URL to fetch. See mcp.rs.
 base64 = "0.22"
+# The one inline script in index.html is let through the page's own
+# Content-Security-Policy by the hash of its bytes, worked out at
+# startup from whatever is actually embedded. See `policy()` in web.rs.
+sha2 = "0.10"
 hound = "3"
 rubato = "0.15"
 crossbeam-channel = "0.5"
