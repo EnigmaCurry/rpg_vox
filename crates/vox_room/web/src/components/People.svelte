@@ -325,10 +325,20 @@
                 {#if b.first}<span class="tag">the room's own</span>{/if}
               </td>
               {#each [{ id: house.lobby, title: 'the lobby' }, ...given, { id: house.own, title: 'a room of somebody\'s own' }] as r (r.id)}
+                {@const lobby = r.id === house.lobby}
                 <td class="room">
+                  <!-- Never the lobby, not even for the first one:
+                       nothing said there is written down, and an AI
+                       hears a room by reading what was said in it.
+                       Shown as the empty fixed tick it is rather than
+                       left out, so the column reads as an answer and
+                       not as a row that is missing one. -->
                   <input type="checkbox" aria-label="{b.name} is in {r.title}"
-                    checked={b.first || b.rooms.includes(r.id)}
-                    disabled={b.first || busy === `bot:${b.name}:${r.id}`}
+                    checked={!lobby && (b.first || b.rooms.includes(r.id))}
+                    disabled={lobby || b.first || busy === `bot:${b.name}:${r.id}`}
+                    title={lobby
+                      ? 'No AI is in the lobby: nothing said there is written down, so there is nothing for one to hear.'
+                      : null}
                     onchange={(e) => toggleBot(b.name, r.id, e.currentTarget.checked)} />
                 </td>
               {/each}
@@ -336,6 +346,13 @@
           {/each}
         </tbody>
       </table>
+      <p class="note">
+        <strong>The lobby has no AI in it</strong>, and cannot be given one: nothing said
+        there is written down — it is the one room anybody can walk into, and people wait
+        in it — so there is nothing for an AI to hear. Every other room is written down
+        until the people in it say otherwise, and a room they have taken off the record has
+        no AI in it either, for as long as it stays off.
+      </p>
       <p class="note">
         Which rooms each AI is in. The first one is the room's own — it is what a room has,
         the way a room has a lobby — so its ticks are fixed; the others are somewhere

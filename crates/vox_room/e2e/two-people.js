@@ -21,6 +21,7 @@
 //   CHROME=$(which chromium) node two-people.js RYAN_LINK ALEX_LINK
 const path = require('path');
 const { chromium } = require('playwright');
+const { intoARoom } = require('./room.js');
 const [ryanUrl, alexUrl, secs = '40', ryanWav = 'ryan.wav', alexWav = 'alex.wav', shot = 'room.png'] = process.argv.slice(2);
 
 async function person(name, url, wav) {
@@ -53,6 +54,11 @@ async function person(name, url, wav) {
   const JOIN = 'button:has-text("Join Audio")';
   await Promise.all([ryan.page.click(JOIN), alex.page.click(JOIN)]);
   await ryan.page.waitForTimeout(2000);
+  // A tab lands in the lobby, where nothing is written down and there
+  // is no AI: both of them walk into the first room of the house, which
+  // is the room this is about. Start the room with one.
+  console.log(`both into ${await intoARoom(ryan.page)}`);
+  await intoARoom(alex.page);
   const t0 = Date.now();
   let last = '';
   while (Date.now() - t0 < Number(secs) * 1000) {

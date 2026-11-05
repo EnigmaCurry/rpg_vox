@@ -35,25 +35,62 @@ base=http://127.0.0.1:$port
 }
 
 # What each suite wants the room to be.
+#
+# **Most lists here start with a room called Hall**, and nothing works
+# in it. A tab lands in the first room named, and the first room named
+# is the lobby -- which is never written down and has no AI in it,
+# because it is the room anybody can walk into and the room you wait
+# in (see ROOM.md, Off the record). So a suite that is about anything
+# said in a room is given a hall to land in and a room after it to be
+# about, and `room.js` walks the script out of the one into the other,
+# which is what a person does. The three suites that want the lobby
+# itself -- `rooms`, `roles` and `door` -- are named in `room()` below
+# and stay where they land.
 flags() {
   case $1 in
     interpreter)
-      echo "--room Lobby --room Studio --no-stt --tts qwen3 --tts-url http://127.0.0.1:1
+      echo "--room Hall --room Lobby --room Studio --no-stt --tts qwen3 --tts-url http://127.0.0.1:1
             --model fake --llm-url http://127.0.0.1:1/v1
             --language English --language-also Russian --translate openai" ;;
+    # One room, and no hall in front of it: this suite is about the
+    # door and goes no further than the room's doorstep.
     door)
       echo "--room Lobby --no-stt --tts qwen3 --tts-url http://127.0.0.1:1
             --model fake --llm-url http://127.0.0.1:1/v1
             --language English --language-also Russian --translate openai" ;;
-    rooms)   echo "--room Main --room Studio --echo --no-stt --tts none" ;;
+    rooms)   echo "--room Hall --room Main --room Studio --echo --no-stt --tts none" ;;
     # Three rooms: the lobby everybody has, and two that are given out.
+    # No hall in front of them -- this suite never says a word in a
+    # room, so a lobby nothing is written down in costs it nothing, and
+    # it is the one suite that can say what the lobby itself is like.
     roles)   echo "--room Lobby --room Studio --room Cellar --echo --no-stt --tts none" ;;
     # A short back-and-forth: being named has one AI answering the next
     # pause as well, and this script is about which of them answers.
-    bots)    echo "--room Lobby --bot Sage --echo --no-stt --tts none
+    bots)    echo "--room Hall --room Lobby --bot Sage --echo --no-stt --tts none
                    --engaged-for-ms 600" ;;
-    *)       echo "--room Lobby --room Studio --echo --no-stt --tts none" ;;
+    *)       echo "--room Hall --room Lobby --room Studio --echo --no-stt --tts none" ;;
   esac
+}
+
+# The room each suite works in, which the scripts are told through
+# `VOX_ROOM_E2E_ROOM` and `room.js` walks them into on the way in.
+#
+# Empty for the ones that want the lobby itself: `rooms` and
+# `permalinks` are about where a tab lands and move themselves, `roles`
+# is about who may go where, and `door` never comes further than the
+# doorstep. This is the only place it is said -- no script picks its
+# own room.
+room() {
+  case $1 in
+    rooms|roles|door|permalinks) echo "" ;;
+    *)                          echo "Lobby" ;;
+  esac
+}
+
+# The rooms one suite is started with, in order. The first is the
+# lobby, which is nobody's to be given and nothing's to work in.
+rooms_of() {
+  flags "$1" | tr ' ' '\n' | grep -A1 -x -- --room | grep -vx -- --room | grep -v '^--$'
 }
 
 # Who each suite wants invited, in the order it takes them.
@@ -62,6 +99,9 @@ guests() {
     door) echo "Fresh Known En Ru Fr" ;;
     permalinks|ptt|settings) echo "Ryan" ;;
     roles) echo "[Ryan] Alex" ;;
+    # Two on sockets and a third in a browser: a link is spent by Join
+    # Audio, so the browser cannot be one of the two.
+    record) echo "Ryan Alex Mo" ;;
     *) echo "Ryan Alex" ;;
   esac
 }
@@ -92,7 +132,7 @@ one() {
   # would have done before any of these scripts ran.
   if [[ $suite != roles ]]; then
     local first=1 grant=""
-    for room in $(flags "$suite" | tr ' ' '\n' | grep -A1 -x -- --room | grep -vx -- --room | grep -v '^--$'); do
+    for room in $(rooms_of "$suite"); do
       if [[ $first == 1 ]]; then first=0; continue; fi   # the lobby is everybody's
       for who in $(guests "$suite"); do
         grant+="INSERT OR IGNORE INTO grants (name, room) VALUES ('$who', '$room');"
@@ -209,6 +249,8 @@ one() {
   fi
 
   echo "=== $suite"
+  # Which room the scripts are about, for `room.js` to walk them into.
+  export VOX_ROOM_E2E_ROOM=$(room "$suite")
   # shellcheck disable=SC2046
   "$bin" $(flags "$suite") >"$data/room.log" 2>&1 &
   server=$!
@@ -239,7 +281,7 @@ sqlite_get() { sqlite "$1" "$2"; }
 sqlite_set() { sqlite "$1" "$2" >/dev/null; }
 
 suites=("$@")
-[[ ${#suites[@]} -eq 0 ]] && suites=(rooms bots door permalinks ptt settings roles conversations game cards avatars drop interpreter rename rejoin)
+[[ ${#suites[@]} -eq 0 ]] && suites=(rooms record bots door permalinks ptt settings roles conversations game cards avatars drop interpreter rename rejoin)
 
 bad=0
 for suite in "${suites[@]}"; do

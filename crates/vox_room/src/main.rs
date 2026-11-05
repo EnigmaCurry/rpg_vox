@@ -1077,6 +1077,10 @@ fn serve(cli: Cli, store: Store, db: PathBuf) -> Result<()> {
         language: language.clone(),
         languages: cfg_languages.clone(),
         spoken,
+        // Every room is written down and is the people's to take off
+        // the record. The lobby is the exception and says so for
+        // itself -- see `rooms::Rooms::new`.
+        may_transcribe: true,
     };
 
     // Everything a room is made of, built on demand: the shared rooms

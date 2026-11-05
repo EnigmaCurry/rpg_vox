@@ -98,84 +98,97 @@
   onkeydown={(e) => { if (e.key === 'Escape') open = false; }} />
 
 <div class="bar">
-  {#if reading}<button class="back" onclick={backToNow}>← Back</button>{/if}
+  {#if !room.mayTranscribe}
+    <!-- A room that is never written down has no conversation to name,
+         none to start, and none to read back: there is nothing for any
+         of the three controls to be about. What is left is the one
+         sentence that says why the column below is empty. -->
+    <span class="closed">Nothing here is written down.</span>
+    <div class="spacer"></div>
+    <span class="hatch mark" aria-hidden="true"></span>
+  {:else}
+    {#if reading}<button class="back" onclick={backToNow}>← Back</button>{/if}
 
-  <!-- What this conversation is called, whichever one you have open.
-       Unnamed, it is when it was; type over it and it is whatever you
-       say, for everyone, and the room's history keeps it. -->
-  <input class="name" value={mine} maxlength={TITLE_MAX}
-    aria-label="What to call this conversation"
-    title="What to call this conversation. Everyone here sees it."
-    oninput={(e) => (typing = e.currentTarget.value)}
-    onblur={rename}
-    onkeydown={(e) => {
-      if (e.key === 'Enter') { e.preventDefault(); e.currentTarget.blur(); }
-      if (e.key === 'Escape') { typing = null; e.currentTarget.blur(); }
-    }} />
+    <!-- What this conversation is called, whichever one you have open.
+         Unnamed, it is when it was; type over it and it is whatever you
+         say, for everyone, and the room's history keeps it. -->
+    <input class="name" value={mine} maxlength={TITLE_MAX}
+      aria-label="What to call this conversation"
+      title="What to call this conversation. Everyone here sees it."
+      oninput={(e) => (typing = e.currentTarget.value)}
+      onblur={rename}
+      onkeydown={(e) => {
+        if (e.key === 'Enter') { e.preventDefault(); e.currentTarget.blur(); }
+        if (e.key === 'Escape') { typing = null; e.currentTarget.blur(); }
+      }} />
 
-  {#if reading}
-    <span class="closed">
-      {#if reading.game}{reading.game} · {/if}closed, nothing can be said into it
-    </span>
-  {:else if room.game}
-    <span class="playing">{room.game}</span>
-    <button class="leave" onclick={lobby}>Leave the game</button>
-  {/if}
-
-  <div class="spacer"></div>
-
-  <!-- The console admitting it has a corner. Decoration, hidden from
-       anything that reads the page out, and given no size at all by a
-       theme that does not decorate. -->
-  <span class="hatch mark" aria-hidden="true"></span>
-
-  <!-- Starting the next one, beside the way back into the last ones:
-       they are the same question asked in two directions. -->
-  {#if !reading}
-    <button class="fresh" onclick={newConversation}>
-      {room.game ? 'Restart game' : 'New conversation'}
-    </button>
-  {/if}
-
-  <div class="picker" bind:this={menu}>
-    <button aria-haspopup="menu" aria-expanded={open} class:on={open} onclick={show}>
-      History <span class="caret" aria-hidden="true">▾</span>
-    </button>
-    {#if open}
-      <div class="menu" role="menu">
-        {#if room.history === null}
-          <p class="none">Reading…</p>
-        {:else if room.history.length === 0}
-          <p class="none">This room hasn't had a conversation yet.</p>
-        {/if}
-        {#each room.history ?? [] as c (c.id)}
-          <div class="row" class:current={reading ? reading.id === c.id : c.live}>
-            <button role="menuitem" class="item" onclick={() => pick(c)}>
-              <span class="head">
-                <span class="at">{named(c)}</span>
-                {#if c.live}<span class="tag">now</span>{/if}
-                {#if c.game}<span class="tag game">{c.game}</span>{/if}
-                <span class="meta">{lines(c.lines)}</span>
-              </span>
-              <span class="opening">{c.opening || 'Nothing was said.'}</span>
-            </button>
-            <!-- The live one is the room, not an archive of it. -->
-            {#if !c.live}
-              <button class="drop" title="Delete this conversation for good"
-                aria-label="Delete {named(c)}"
-                onclick={() => forgetConversation(c.id)}>×</button>
-            {/if}
-          </div>
-        {/each}
-      </div>
+    {#if reading}
+      <span class="closed">
+        {#if reading.game}{reading.game} · {/if}closed, nothing can be said into it
+      </span>
+    {:else if room.game}
+      <span class="playing">{room.game}</span>
+      <button class="leave" onclick={lobby}>Leave the game</button>
     {/if}
-  </div>
+
+    <div class="spacer"></div>
+
+    <!-- The console admitting it has a corner. Decoration, hidden from
+         anything that reads the page out, and given no size at all by a
+         theme that does not decorate. -->
+    <span class="hatch mark" aria-hidden="true"></span>
+
+    <!-- Starting the next one, beside the way back into the last ones:
+         they are the same question asked in two directions. -->
+    {#if !reading}
+      <button class="fresh" onclick={newConversation}>
+        {room.game ? 'Restart game' : 'New conversation'}
+      </button>
+    {/if}
+
+    <div class="picker" bind:this={menu}>
+      <button aria-haspopup="menu" aria-expanded={open} class:on={open} onclick={show}>
+        History <span class="caret" aria-hidden="true">▾</span>
+      </button>
+      {#if open}
+        <div class="menu" role="menu">
+          {#if room.history === null}
+            <p class="none">Reading…</p>
+          {:else if room.history.length === 0}
+            <p class="none">This room hasn't had a conversation yet.</p>
+          {/if}
+          {#each room.history ?? [] as c (c.id)}
+            <div class="row" class:current={reading ? reading.id === c.id : c.live}>
+              <button role="menuitem" class="item" onclick={() => pick(c)}>
+                <span class="head">
+                  <span class="at">{named(c)}</span>
+                  {#if c.live}<span class="tag">now</span>{/if}
+                  {#if c.game}<span class="tag game">{c.game}</span>{/if}
+                  <span class="meta">{lines(c.lines)}</span>
+                </span>
+                <span class="opening">{c.opening || 'Nothing was said.'}</span>
+              </button>
+              <!-- The live one is the room, not an archive of it. -->
+              {#if !c.live}
+                <button class="drop" title="Delete this conversation for good"
+                  aria-label="Delete {named(c)}"
+                  onclick={() => forgetConversation(c.id)}>×</button>
+              {/if}
+            </div>
+          {/each}
+        </div>
+      {/if}
+    </div>
+  {/if}
 </div>
 
 <style>
   .bar {
     position: sticky;
-    top: 0;
+    /* Not flush with the top of the scroller: a framed theme draws a
+       rail along the head of the column, and a bar stuck at 0 sits on
+       top of it. Four pixels is the rail. */
+    top: 4px;
     z-index: 5;
     display: flex;
     align-items: center;

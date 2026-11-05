@@ -93,14 +93,18 @@ const asked = async (cookie, path, init = {}) => {
       [...document.querySelectorAll('.people table.who thead th.room')].map((e) => e.textContent.trim())),
     ['Studio', 'Cellar']);
 
-  // The AIs are given rooms the same way, with the lobby among them --
-  // a room can be one no AI answers in -- and one column for every
-  // room of somebody's own, because a room of your own is yours.
+  // The AIs are given rooms the same way, with a column for the lobby
+  // and one for every room of somebody's own, because a room of your
+  // own is yours.
   is('the AI columns are every room, and the private ones at once',
     await boss.page.evaluate(() =>
       [...document.querySelectorAll('.people table.voices thead th.room')].map((e) => e.textContent.trim())),
     ['Lobby', 'Studio', 'Cellar', 'Rooms of their own']);
-  is("the room's own AI is in all of them, and not the owner's to untick",
+  // The lobby is the one room with no AI in it: nothing said there is
+  // written down, so there is nothing for one to hear. Its tick is
+  // empty and fixed, where every other one of the first AI's is on and
+  // fixed -- being in a room is what the room's own AI is.
+  is("the room's own AI is in every room but the lobby, and none of it is the owner's to untick",
     await boss.page.evaluate(() =>
       [...document.querySelectorAll('.people table.voices tbody input[type=checkbox]')].map((c) => [
         c.getAttribute('aria-label'),
@@ -108,7 +112,7 @@ const asked = async (cookie, path, init = {}) => {
         c.disabled,
       ])),
     [
-      ['Vox is in the lobby', true, true],
+      ['Vox is in the lobby', false, true],
       ['Vox is in Studio', true, true],
       ['Vox is in Cellar', true, true],
       ["Vox is in a room of somebody's own", true, true],

@@ -49,8 +49,11 @@
 <svelte:window onresize={fit} />
 
 <!-- Nothing to type into a conversation the room has finished with:
-     there is nowhere for what you typed to go. -->
-{#if !room.reading}
+     there is nowhere for what you typed to go. Nor into a room that is
+     off the record, which is keeping no conversation at all -- saying
+     a thing and typing it are the same act done two ways, and the room
+     takes neither. -->
+{#if !room.reading && room.transcribing}
   <form class="say" onsubmit={send}>
     <textarea
       bind:this={box}

@@ -85,6 +85,14 @@ const TRANSLATION_TAIL: Duration = Duration::from_secs(30);
 const WORKING_TAIL: Duration = Duration::from_secs(180);
 /// Entries a new tab is sent, and kept in memory.
 const LOG_LIMIT: usize = 500;
+/// Where a room keeps whether it is written down: `"off"` for a room
+/// somebody has taken off the record, and nothing at all for a room
+/// that is written down, which is how every room starts.
+///
+/// Per room and not per house: being off the record is a fact about
+/// one room, and the rooms down the hall are not in it. See
+/// [`Room::set_transcribing`].
+const TRANSCRIBE: &str = "transcribe";
 /// Shown to the model after a reply someone talked over.
 const CUT_NOTE: &str = " [interrupted here]";
 /// What the model is told when the room enters a game: it speaks first.
@@ -256,6 +264,19 @@ pub enum Kind {
     /// everything the room actually said off the screen. Shut, it is
     /// one line saying a play happened and offering to show it.
     Programme,
+    /// The one line in the conversation nobody said: the room writing
+    /// down something that happened to it. The entry's `who` is the
+    /// person it happened by and its text is the whole sentence.
+    ///
+    /// There is one thing worth a note, and it is the one thing a
+    /// conversation cannot say for itself -- that it stopped. While a
+    /// room is off the record nothing anybody says reaches it (see
+    /// [`Room::set_transcribing`]), so the gap in it would otherwise
+    /// be indistinguishable from an hour in which nobody spoke. A
+    /// note at each end says who turned it off, who turned it back on,
+    /// and -- by being an entry like any other, with an `at` on it --
+    /// when.
+    Note,
 }
 
 impl Kind {
@@ -271,6 +292,7 @@ impl Kind {
             Kind::Line => "line",
             Kind::Clip => "clip",
             Kind::Programme => "programme",
+            Kind::Note => "note",
         }
     }
 
@@ -285,6 +307,7 @@ impl Kind {
             "line" => Kind::Line,
             "clip" => Kind::Clip,
             "programme" => Kind::Programme,
+            "note" => Kind::Note,
             _ => Kind::Human,
         }
     }
@@ -875,6 +898,20 @@ pub struct RoomConfig {
     /// voice is never translated, so waiting to hear the reply in it
     /// would be waiting for something nobody is making.
     pub spoken: Vec<String>,
+    /// Whether this room may be written down at all.
+    ///
+    /// True everywhere but the lobby, which is never transcribed and
+    /// never has an AI in it: it is the one room nobody can be
+    /// refused, where people arrive before they have agreed to
+    /// anything and wait for whoever they came to talk to. A room
+    /// where strangers land is the wrong place for a transcript, so
+    /// the lobby has none to turn on -- see
+    /// [`Room::set_transcribing`], which says no there.
+    ///
+    /// Every other room starts written down and is the people's to
+    /// turn off. False here is the house's answer and not theirs, so
+    /// it is not a setting and nothing in the room can change it.
+    pub may_transcribe: bool,
 }
 
 impl RoomConfig {
@@ -1434,6 +1471,52 @@ pub fn and_list(names: &[String]) -> String {
     }
 }
 
+/// Why the room won't take something somebody is trying to put into
+/// it while it is off the record. One sentence, said the same way
+/// wherever it is said: what was refused, and the one reason anything
+/// is refused here.
+fn off_the_record(what: &str) -> String {
+    format!("this room is off the record, so {what} can't go into the conversation")
+}
+
+/// The note that goes into the conversation when a room goes off the
+/// record: who did it, and what it means for everybody. `left` is the
+/// AIs that were in the room until this moment, which is what the room
+/// has just lost -- an AI the owner never put here was never in it to
+/// leave, and is not news.
+fn said_off(person: &str, left: &[String]) -> String {
+    let mut said = format!(
+        "{person} turned transcription off. \
+         Nothing said in this room from here is written down"
+    );
+    match left.len() {
+        0 => said.push('.'),
+        1 => said.push_str(&format!(", and {} is out of the room.", left[0])),
+        _ => said.push_str(&format!(", and {} are out of the room.", and_list(left))),
+    }
+    said
+}
+
+/// How long something went on for, in a sentence: "12 minutes", "2
+/// hours". Rounded to the unit, because the one in the note is read by
+/// somebody asking how long the room was off the record and not by
+/// anybody timing it.
+///
+/// Said in English, like the rest of the note it goes in: what the
+/// room writes about itself is not put into the other languages the
+/// way what somebody said is. See [`Kind::Note`].
+fn how_long(ms: u64) -> String {
+    let plural = |n: u64, unit: &str| match n {
+        1 => format!("1 {unit}"),
+        n => format!("{n} {unit}s"),
+    };
+    match ms / 1000 {
+        secs if secs < 60 => plural(secs.max(1), "second"),
+        secs if secs < 3600 => plural(secs / 60, "minute"),
+        secs => plural(secs / 3600, "hour"),
+    }
+}
+
 struct State {
     conversation: i64,
     /// What this conversation is called, and when it was started.
@@ -1480,6 +1563,17 @@ struct State {
     /// The puppet show being played, if one is. None is a room not in
     /// the middle of a play, which is nearly always.
     show: Option<Showing>,
+    /// Whether what is said here is being written down just now.
+    ///
+    /// The people's to turn off, and the one setting that changes what
+    /// the room *is* rather than what it does: off, nobody's voice
+    /// reaches a transcription engine, the conversation takes nothing,
+    /// and the AIs are out of the room -- there is nothing for one to
+    /// hear. See [`Room::set_transcribing`].
+    ///
+    /// Always false where [`RoomConfig::may_transcribe`] is: the lobby
+    /// has nothing to turn on.
+    transcribing: bool,
 }
 
 /// What a bot's agent thread needs from the room it answers in: which
@@ -1767,6 +1861,19 @@ impl Room {
         // your own is yours, and which AIs are in it is the house's
         // answer rather than a thing to arrange per person.
         let placed = store.bots_in(if cfg.only.is_some() { "@" } else { &cfg.id })?;
+        // Whether the room is written down, and still is this morning:
+        // being off the record is the people's answer about the room
+        // and not about the afternoon they were having, so a room that
+        // was off the record when the house went down comes back up
+        // off it -- with the note that says so still at the end of its
+        // conversation. The lobby has nothing to read: it is never
+        // written down, and a row saying otherwise could only ever be
+        // wrong.
+        let transcribing = cfg.may_transcribe
+            && store
+                .setting(TRANSCRIBE)?
+                .as_deref()
+                .is_none_or(|v| v != "off");
         // One of these per bot, each with its own channel to its own
         // agent thread.
         //
@@ -1871,7 +1978,13 @@ impl Room {
                 // The first AI is in every room; the rest are where
                 // they were put. It is still wired up either way, so
                 // being given a room is a tick and not a restart.
-                here: n == 0 || placed.contains(&bot.name),
+                //
+                // Except in a room that is off the record, which has
+                // no AI in it at all: there is nothing for one to
+                // hear. Where the owner put it is still in the
+                // database, and turning the room back on reads it
+                // again -- see `set_transcribing`.
+                here: transcribing && (n == 0 || placed.contains(&bot.name)),
                 stops,
                 off,
                 here_voice: store.setting(&key)?.is_some(),
@@ -1927,6 +2040,7 @@ impl Room {
                 interp: BTreeMap::new(),
                 next_stream: 0,
                 show: None,
+                transcribing,
             }),
             events,
             mixer: Mixer::new(strips, &cfg.language),
@@ -2984,6 +3098,12 @@ impl Room {
             ));
         }
         let mut st = self.lock();
+        // A picture in the conversation is something in the
+        // conversation, and a room that is off the record takes
+        // nothing: see `set_transcribing`.
+        if !st.transcribing {
+            return Err(off_the_record("a picture"));
+        }
         // Who it is from, by the name the conversation carries -- and
         // whether this room has ever heard of them, which is the one
         // thing a name arriving in a request has to be checked for.
@@ -3320,6 +3440,13 @@ impl Room {
                 "languages": self.interp.keys().collect::<Vec<_>>(),
             })),
             "locked": st.game_mode.is_some(),
+            // Whether anything said here is written down, and whether
+            // that is a thing the room can be asked about at all: the
+            // lobby is never written down and has nothing to turn on,
+            // so the control says so rather than offering a choice
+            // that would be refused. See `set_transcribing`.
+            "transcribing": st.transcribing,
+            "may_transcribe": self.cfg.may_transcribe,
             // A puppet show on, so a tab that opened in the middle of
             // one sees what everyone else is watching -- and where
             // everybody is sitting, which is what decides who can hear
@@ -4021,6 +4148,16 @@ impl Room {
         let silent = self.mixer.is_muted(person);
         let (pusher, muted) = {
             let mut st = self.lock();
+            // Off the record: their voice went to the room on the line
+            // above and goes nowhere else. No engine is made and none
+            // is fed, so there is nothing to turn it into words --
+            // which is the whole of what being off the record is. It
+            // is also why nothing below runs: a voice sample is a
+            // recording, and a room that is not writing anything down
+            // is not making one either.
+            if !st.transcribing {
+                return;
+            }
             let Some(p) = st.people.get_mut(person) else {
                 return;
             };
@@ -4567,6 +4704,11 @@ impl Room {
             },
         };
         let mut st = self.lock();
+        // As with a picture: a card in the conversation is the
+        // conversation, and this room is keeping none.
+        if !st.transcribing {
+            return Err(off_the_record("a voice clip"));
+        }
         let (_, whose) = self.whose(&st, who)?;
         let name: String = one_line(name.trim())
             .chars()
@@ -5946,6 +6088,14 @@ impl Room {
     /// A paragraph of `person`'s transcription changed.
     pub fn on_paragraph(&self, person: &str, para: &Paragraph) {
         let mut st = self.lock();
+        // The last of what an engine had in hand, arriving after the
+        // room went off the record: the engine is dropped rather than
+        // stopped, and a thread part-way through a paragraph can still
+        // report it. Nothing said after the switch is written down,
+        // and that includes the word it was in the middle of.
+        if !st.transcribing {
+            return;
+        }
         let now = Instant::now();
         st.last_change = now;
         let partial = para.has_partial();
@@ -6355,6 +6505,212 @@ impl Room {
         self.emit_people(&st);
     }
 
+    /// Whether what is said in this room is written down just now.
+    ///
+    /// Nothing in the running room asks: everything that gates on it
+    /// has the state locked already, and what a tab is told is in
+    /// [`Room::hello`] and the `transcribe` event. This is for the
+    /// tests, which are the one reader that has only the room.
+    #[cfg(test)]
+    pub fn transcribing(&self) -> bool {
+        self.lock().transcribing
+    }
+
+    /// Somebody put the room off the record, or back on it.
+    ///
+    /// Off, the room is voice and nothing else. Nobody's microphone
+    /// reaches a transcription engine, so there is no text for the
+    /// conversation to take, nothing to translate and nothing to
+    /// interpret; and the AIs go out of the room, because an AI hears
+    /// the room by reading what it said and there is none of that any
+    /// more. What everyone is left with is what they came for: each
+    /// other's voices, live, going nowhere.
+    ///
+    /// One note goes into the conversation at each end of it -- who
+    /// did this and when -- and nothing else does. That note is the
+    /// whole of what an off-the-record stretch leaves behind, and it
+    /// is there so that the gap can be told from an hour in which
+    /// nobody happened to speak. See [`Kind::Note`].
+    ///
+    /// Anybody in the room may do it, and it is written down who. One
+    /// switch for the whole room could hardly be otherwise: being
+    /// recorded is not something that happens to one person at a
+    /// table, so it is not one person's to decide, and the room is
+    /// told which of them decided it.
+    ///
+    /// The lobby says no: it is never written down at all, so there is
+    /// nothing in it to turn off. See [`RoomConfig::may_transcribe`].
+    pub fn set_transcribing(&self, person: &str, on: bool) -> Result<(), String> {
+        if !self.cfg.may_transcribe {
+            return Err("Nothing said in the lobby is written down, and nothing can be.".into());
+        }
+        {
+            let st = self.lock();
+            if st.transcribing == on {
+                return Ok(());
+            }
+            if !st.people.contains_key(person) {
+                return Err("The room doesn't know you.".into());
+            }
+        }
+        // A play is the AIs speaking through puppets, and there are no
+        // AIs in a room that is off the record: the curtain comes down
+        // with them. Brought down first and not last, while the room
+        // is still written down, so the programme is the last thing in
+        // the conversation before the note rather than the first thing
+        // after it.
+        if !on && self.lock().show.is_some() {
+            self.end_show();
+        }
+        let mut st = self.lock();
+        st.transcribing = on;
+        if let Err(err) = self
+            .store()
+            .set_setting(TRANSCRIBE, if on { "on" } else { "off" })
+        {
+            // Said to the room rather than refused: the room is off the
+            // record from this moment either way, and a database that
+            // won't take the note is not a reason to go on recording
+            // people who have asked not to be.
+            warn!("store {TRANSCRIBE}: {err:#}");
+        }
+        let was = st
+            .log
+            .iter()
+            .rev()
+            .find(|e| e.kind == Kind::Note)
+            .map(|e| e.at);
+        let bots: Vec<String> = st.bots.iter().map(|b| b.cfg.name.clone()).collect();
+        let said = if on {
+            // Where the owner put each of them, read again: what took
+            // the AIs out of the room was this switch and not a tick
+            // on **People and rooms**, so it is the ticks that say who
+            // comes back.
+            let whose = if self.cfg.only.is_some() {
+                "@"
+            } else {
+                &self.cfg.id
+            };
+            let placed = match self.store().bots_in(whose) {
+                Ok(placed) => placed,
+                Err(err) => {
+                    // The first AI is what a room has, so a database
+                    // that won't answer still leaves the room with the
+                    // one it was built around.
+                    warn!(room = %self.cfg.id, "which AIs are in here: {err:#}");
+                    Vec::new()
+                }
+            };
+            for (n, bot) in bots.iter().enumerate() {
+                let here = n == 0 || placed.contains(bot);
+                st.bot(bot).here = here;
+            }
+            self.said_back_on(person, was)
+        } else {
+            // Which of them were actually in here, named while they
+            // still are: the note says what the room has lost, and an
+            // AI the owner never put here was never in it to leave.
+            let left: Vec<String> = st
+                .bots
+                .iter()
+                .filter(|b| b.here && !b.puppet())
+                .map(|b| b.cfg.name.clone())
+                .collect();
+            // Everything in flight goes with the switch. A reply still
+            // being spoken when the room went off the record is the
+            // room still talking after being told to stop, and a
+            // paragraph half transcribed is text arriving after the
+            // last of it anybody agreed to.
+            st.pending.clear();
+            for bot in &bots {
+                st.bot(bot).engaged = None;
+                st.bot(bot).here = false;
+            }
+            self.hush(&mut st, &bots);
+            for p in st.people.values_mut() {
+                // Dropped, not kept for later: the thread it is on is
+                // what turns a voice into words, and there is to be
+                // none of that. The next frame of audio after the room
+                // is written down again makes a new one.
+                p.engine = None;
+            }
+            // What was on screen and not yet handed over: a line
+            // somebody was in the middle of saying as the room went
+            // quiet about it. It was never part of the conversation,
+            // and it is not to become part of one now.
+            let dropping: Vec<String> = st
+                .log
+                .iter()
+                .filter(|e| e.kind == Kind::Human && !e.sent)
+                .map(|e| e.id.clone())
+                .collect();
+            st.log.retain(|e| e.kind != Kind::Human || e.sent);
+            for id in dropping {
+                self.emit(json!({ "type": "entry_removed", "id": id }));
+            }
+            said_off(person, &left)
+        };
+        let note = Entry {
+            id: format!("note-{}", uuid::Uuid::new_v4().simple()),
+            who: person.to_string(),
+            kind: Kind::Note,
+            title: String::new(),
+            text: said,
+            live: false,
+            partial: false,
+            cut: false,
+            typed: false,
+            translations: BTreeMap::new(),
+            note: String::new(),
+            // The room's own, in front of everybody: a note about
+            // whether the room is written down is not said in a part
+            // of it.
+            seat: None,
+            at: now_ms(),
+            sent: true,
+        };
+        if let Err(err) = self.store().put_entry(st.conversation, &note) {
+            warn!("store note: {err:#}");
+        }
+        self.emit_entry(&note);
+        st.log.push(note);
+        trim_log(&mut st.log);
+        info!(
+            room = %self.cfg.id,
+            person,
+            on,
+            "the room was put off the record, or back on it"
+        );
+        self.emit(json!({
+            "type": "transcribe",
+            "on": on,
+            "who": person,
+        }));
+        self.emit_agents_here(&st);
+        Ok(())
+    }
+
+    /// And the one at the other end: who turned it back on, and how
+    /// long the room was off the record for.
+    ///
+    /// The length is worth a clause because it is the one thing the
+    /// conversation cannot show. Two notes a minute apart and two an
+    /// hour apart look alike in a column of text, and it is the hour
+    /// that somebody reading this back will want to know about.
+    fn said_back_on(&self, person: &str, since: Option<u64>) -> String {
+        match since.map(|was| now_ms().saturating_sub(was)) {
+            Some(ms) if ms >= 60_000 => format!(
+                "{person} turned transcription back on, after {} off the record. \
+                 Everything said from here is written down again.",
+                how_long(ms)
+            ),
+            _ => format!(
+                "{person} turned transcription back on. \
+                 Everything said from here is written down again."
+            ),
+        }
+    }
+
     /// Put one AI in this room, or take it out: the owner's tick in
     /// **People and rooms**, which is the only thing that decides it.
     ///
@@ -6362,9 +6718,17 @@ impl Room {
     /// fader and everything it has said here, and comes back to all of
     /// it. Taken out, it stops where it is: it is no longer in the room
     /// to be finishing a sentence in it.
+    ///
+    /// Not while the room is off the record, which has no AI in it
+    /// whatever the owner has ticked. The tick is in the database
+    /// either way, and turning the room back on is what reads it: see
+    /// [`Room::set_transcribing`].
     pub fn set_bot_here(&self, bot: &str, here: bool) {
         let mut st = self.lock();
         if !st.bots.iter().any(|b| b.cfg.name == bot) {
+            return;
+        }
+        if !st.transcribing {
             return;
         }
         if st.bot(bot).here == here {
@@ -7147,6 +7511,17 @@ impl Room {
             let mut st = self.lock();
             if !st.people.contains_key(person) {
                 return Err("The room doesn't know you.".into());
+            }
+            // Typing a thing and saying it are the same act done two
+            // ways, so a room that is writing nothing down takes
+            // neither. The box is gone from the footer while the room
+            // is off the record; this is for the tab that had it open
+            // as the switch went.
+            if !st.transcribing {
+                return Err(
+                    "This room is off the record: nothing said or typed here is written down."
+                        .into(),
+                );
             }
             // The quiet the AI waits for starts again here, so a message
             // gets the same beat as speech in which to be joined by
@@ -8717,6 +9092,11 @@ fn conversation_messages(
             // A clip somebody brought in arrived whole: there was
             // never anything to wait for.
             Kind::Clip => true,
+            // The room saying it stopped being written down, and then
+            // that it started again. A model reading back over a
+            // conversation with a gap in it is told what the gap was,
+            // which is the whole reason the note is written.
+            Kind::Note => true,
         })
         .collect();
     let start = done.len().saturating_sub(history);
@@ -8958,6 +9338,14 @@ fn conversation_messages(
                     ),
                 );
             }
+            // The room saying it went off the record, and that it came
+            // back. Nothing is added to it: the sentence was written
+            // to be read, and what it says is exactly what the model
+            // has to know -- that there is an hour of this room it was
+            // not in and will not be shown. Being told so is what
+            // stops it treating the line before the gap as the line
+            // before the one after it.
+            Kind::Note => said_to_me(&mut out, format!("[{}]", e.text.trim())),
         }
     }
     out
@@ -9034,6 +9422,7 @@ mod tests {
             language: "English".into(),
             languages: vec!["English".into(), "Russian".into()],
             spoken: vec!["English".into(), "Russian".into()],
+            may_transcribe: true,
         };
         let mut interp_tx = BTreeMap::new();
         let mut interp_rx = BTreeMap::new();
@@ -9067,6 +9456,7 @@ mod tests {
             language: "English".into(),
             languages: vec!["English".into()],
             spoken: vec!["English".into()],
+            may_transcribe: true,
         };
         let (r, _wiring) = Room::new(store, cfg, None, BTreeMap::new(), None, None, None).unwrap();
         r
@@ -9394,6 +9784,7 @@ mod tests {
             language: "English".into(),
             languages: vec!["English".into()],
             spoken: vec!["English".into()],
+            may_transcribe: true,
         };
         let (r, _wiring) = Room::new(store, cfg, None, BTreeMap::new(), None, None, None).unwrap();
         let g = r.lock().only().generation.load(Ordering::SeqCst);
@@ -9622,6 +10013,7 @@ mod tests {
                 language: "English".into(),
                 languages: vec!["English".into()],
                 spoken: vec!["English".into()],
+                may_transcribe: true,
             },
             None,
             BTreeMap::new(),
@@ -11104,6 +11496,7 @@ mod tests {
                 language: "English".into(),
                 languages: vec!["English".into()],
                 spoken: vec!["English".into()],
+                may_transcribe: true,
             },
             None,
             BTreeMap::new(),
@@ -11470,6 +11863,197 @@ mod tests {
         assert_eq!(agents(&r), ["Vox"]);
         // And what it said is still in the conversation: it was said.
         assert!(r.lock().log.iter().any(|e| e.who == "Sage"));
+    }
+
+    /// The AIs in the room, by name, as a tab is told about them.
+    fn agents_here(r: &Room) -> Vec<String> {
+        r.hello("Ryan")["agents"]
+            .as_array()
+            .expect("a list of the AIs in the room")
+            .iter()
+            .map(|a| a["name"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    /// The notes in the conversation, which is the one thing a room
+    /// that is off the record writes down.
+    fn notes(r: &Room) -> Vec<String> {
+        r.lock()
+            .log
+            .iter()
+            .filter(|e| e.kind == Kind::Note)
+            .map(|e| e.text.clone())
+            .collect()
+    }
+
+    /// Off the record, the room is voice and nothing else: nobody is
+    /// transcribed, nothing reaches the conversation, and the AIs are
+    /// out of the room. What is left behind is one note at each end
+    /// saying who did it.
+    #[test]
+    fn off_the_record_takes_the_transcript_and_the_ais_with_it() {
+        let (r, turns) = room(Mode::Always);
+        let mut events = r.subscribe();
+        r.on_paragraph("Ryan", &para("p1", "Before anything.", false));
+        r.tick(quiet(&r));
+        turns.try_recv().expect("the pause was the AI's");
+        assert_eq!(agents_here(&r), ["Vox"]);
+
+        r.set_transcribing("Ryan", false).unwrap();
+        assert!(!r.transcribing());
+        assert!(agents_here(&r).is_empty(), "no AI in a room with no words");
+        assert_eq!(
+            r.store().setting(TRANSCRIBE).unwrap().as_deref(),
+            Some("off"),
+            "and a restart finds the room as it was left"
+        );
+        assert_eq!(
+            events_of(&mut events, "transcribe").len(),
+            1,
+            "every tab is told"
+        );
+        let note = notes(&r);
+        assert_eq!(note.len(), 1, "one note, not a running commentary");
+        assert!(
+            note[0].starts_with("Ryan turned transcription off"),
+            "{note:?}"
+        );
+        assert!(note[0].contains("Vox is out of the room"), "{note:?}");
+
+        // Said and typed, and neither is written down.
+        r.on_paragraph("Ryan", &para("p2", "Not this.", false));
+        r.tick(quiet(&r));
+        assert!(
+            !r.lock().log.iter().any(|e| e.text.contains("Not this")),
+            "nothing said off the record reaches the conversation"
+        );
+        assert!(turns.try_recv().is_err(), "and no turn is given to anybody");
+        let refused = r.typed("Ryan", "nor typed").unwrap_err();
+        assert!(refused.contains("off the record"), "{refused}");
+
+        // Back on, and the room is a room again: the AI is in it, and
+        // the second note says who asked for that.
+        r.set_transcribing("Alex", true).unwrap();
+        assert!(r.transcribing());
+        assert_eq!(agents_here(&r), ["Vox"]);
+        let note = notes(&r);
+        assert_eq!(note.len(), 2);
+        assert!(
+            note[1].starts_with("Alex turned transcription back on"),
+            "{note:?}"
+        );
+        r.on_paragraph("Ryan", &para("p3", "And after.", false));
+        r.tick(quiet(&r));
+        assert!(r.lock().log.iter().any(|e| e.text.contains("And after")));
+        turns.try_recv().expect("the pause is the AI's again");
+    }
+
+    /// The note names the voices the room has actually lost. An AI the
+    /// owner never put in here was never in it to leave, and a note
+    /// that said otherwise would be the room announcing the departure
+    /// of somebody nobody had seen.
+    #[test]
+    fn the_note_names_the_ais_that_were_in_the_room() {
+        let (r, _turns) = room_of_two_where(false);
+        assert_eq!(agents_here(&r), ["Vox"]);
+        r.set_transcribing("Ryan", false).unwrap();
+        let note = notes(&r);
+        assert_eq!(note.len(), 1);
+        assert!(note[0].contains("Vox is out of the room"), "{note:?}");
+        assert!(!note[0].contains("Sage"), "never in it: {note:?}");
+
+        // And only the one that was here comes back.
+        r.set_transcribing("Ryan", true).unwrap();
+        assert_eq!(agents_here(&r), ["Vox"]);
+    }
+
+    /// A line somebody was in the middle of saying as the room went
+    /// off the record. It was never handed over, so it is not part of
+    /// the conversation -- and it is not to become part of one.
+    #[test]
+    fn a_line_still_being_said_is_not_kept_when_the_room_goes_quiet_about_it() {
+        let (r, _turns) = room(Mode::Named);
+        r.on_paragraph("Ryan", &para("p1", "Said and done.", false));
+        r.tick(quiet(&r));
+        r.on_paragraph("Ryan", &para("p2", "And I was just say", true));
+        assert!(r.lock().log.iter().any(|e| e.id == "p2"));
+
+        let mut events = r.subscribe();
+        r.set_transcribing("Ryan", false).unwrap();
+        assert!(
+            !r.lock().log.iter().any(|e| e.id == "p2"),
+            "the half-said line goes"
+        );
+        assert_eq!(events_of(&mut events, "entry_removed").len(), 1);
+        assert!(
+            r.lock().log.iter().any(|e| e.id == "p1"),
+            "and what was handed over stays: it was said"
+        );
+        // The engine is let go of with it, so there is no thread left
+        // turning anybody's voice into words.
+        assert!(r.lock().people.values().all(|p| p.engine.is_none()));
+    }
+
+    /// A room that was off the record when the house went down comes
+    /// back up off it, with the note still at the end of its
+    /// conversation. Being off the record is an answer about the room.
+    #[test]
+    fn a_room_comes_back_up_off_the_record() {
+        let scratch = Scratch::new("off_the_record");
+        let store = scratch.open();
+        store.invite("Ryan").unwrap();
+        let r = room_again(store);
+        r.set_transcribing("Ryan", false).unwrap();
+        drop(r);
+
+        let again = room_again(scratch.open());
+        assert!(!again.transcribing());
+        assert!(agents_here(&again).is_empty());
+        assert_eq!(notes(&again).len(), 1, "the note is in the conversation");
+
+        again.set_transcribing("Ryan", true).unwrap();
+        drop(again);
+        let third = room_again(scratch.open());
+        assert!(third.transcribing());
+        assert_eq!(agents_here(&third), ["Vox"]);
+        assert_eq!(notes(&third).len(), 2);
+    }
+
+    /// The model is told about the gap. A conversation with an hour
+    /// cut out of it reads as one continuous thing otherwise, and the
+    /// line before the gap is not the line before the one after it.
+    #[test]
+    fn the_model_is_told_the_room_went_off_the_record() {
+        let (r, _turns) = room(Mode::Named);
+        r.on_paragraph("Ryan", &para("p1", "Right, that's settled.", false));
+        r.tick(quiet(&r));
+        r.set_transcribing("Ryan", false).unwrap();
+        r.set_transcribing("Ryan", true).unwrap();
+        let said = conversation_messages(&r.lock().log, 50, "English", "Vox", &[], Seat::Audience);
+        let read = said
+            .iter()
+            .map(|(_, text)| text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(read.contains("Ryan: Right, that's settled."), "{read}");
+        assert!(read.contains("[Ryan turned transcription off"), "{read}");
+        assert!(
+            read.contains("[Ryan turned transcription back on"),
+            "{read}"
+        );
+    }
+
+    /// How long the room was off the record, in the note that says it
+    /// is back on: the one thing a column of text cannot show.
+    #[test]
+    fn how_long_reads_as_a_length_of_time() {
+        assert_eq!(how_long(0), "1 second");
+        assert_eq!(how_long(1_000), "1 second");
+        assert_eq!(how_long(42_000), "42 seconds");
+        assert_eq!(how_long(60_000), "1 minute");
+        assert_eq!(how_long(12 * 60_000), "12 minutes");
+        assert_eq!(how_long(3_600_000), "1 hour");
+        assert_eq!(how_long(3 * 3_600_000 + 60_000), "3 hours");
     }
 
     /// A conversation can be called something, and what it is called is
@@ -12877,6 +13461,7 @@ mod tests {
             language: "English".into(),
             languages: vec!["English".into()],
             spoken: vec!["English".into()],
+            may_transcribe: true,
         };
         let tts: VoiceFactory = Arc::new(|_, _, _, _| Ok(Box::new(crate::tts::Silent)));
         let (r, mut wiring) =
@@ -13145,6 +13730,7 @@ mod tests {
             language: "English".into(),
             languages: vec!["English".into()],
             spoken: vec!["English".into()],
+            may_transcribe: true,
         };
         let (r, _wiring) = Room::new(store, cfg, None, BTreeMap::new(), None, None, None).unwrap();
         let st = r.lock();
