@@ -9,6 +9,17 @@ releases.
 
 ### Voice room
 
+- **A voice that is gone is said to be gone once.** A bot whose
+  cloned voice had been deleted logged `the voice it was set to speak
+  in is gone` at every start from then on, with an empty voice name --
+  once per room, forever. Forgetting the choice writes a blank
+  setting, and blank is also what Settings writes for the AI's own
+  voice; the startup read took it as a voice *called* blank, failed to
+  find one, warned, and wrote the blank back, which set the same trap
+  for the next start. It reads blank as never having chosen now, the
+  way `reload_voice` and `forget_voice` already did. Nothing sounds
+  different -- the bot came up in its own voice before and still does.
+
 - **The cut corners come out in the colour the theme wrote for
   them.** Obsidian's panels and cards are drawn with a corner bitten
   off and a lit line along the face the cut opened, and that line had

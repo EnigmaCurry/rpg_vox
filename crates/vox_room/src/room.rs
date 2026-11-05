@@ -1809,9 +1809,21 @@ impl Room {
             // deleted since is nobody's: the room comes up in its own
             // and forgets the choice, rather than asking a clone
             // server for an id it no longer holds.
+            //
+            // Blank is no choice at all rather than a voice by that
+            // name, and has to be read as one here: it is what
+            // Settings writes for the AI's own voice, and it is what
+            // the forgetting below writes. Taken as a name it finds
+            // nothing, so the forgetting warned about itself at every
+            // start from then on, about a voice the room had already
+            // let go of. The other two readers -- `reload_voice` and
+            // `forget_voice` -- had it right; this one did not.
             let borrowed = crate::tts::Borrowed::default();
             let key = voice_key(&bot.name);
-            let worn = match store.house_setting(&key)? {
+            let settled = store
+                .house_setting(&key)?
+                .filter(|name| !name.trim().is_empty());
+            let worn = match settled {
                 None => None,
                 Some(name) => match store.voice(&name)? {
                     Some(v) => {
@@ -12515,7 +12527,15 @@ mod tests {
             "settled on nothing, which is not the same as never having chosen"
         );
         drop(again);
-        assert_eq!(borrowed(&room_again(scratch.open())), None);
+        // And comes up in its own: blank is read as never having
+        // chosen, not as a voice called "" that has gone missing.
+        let own = room_again(scratch.open());
+        assert_eq!(borrowed(&own), None);
+        assert_eq!(
+            own.store().house_setting("voice:Vox").unwrap().as_deref(),
+            Some(""),
+            "opening the room is not the room choosing for itself"
+        );
     }
 
     /// Two rooms over the one database, wired to each other the way
