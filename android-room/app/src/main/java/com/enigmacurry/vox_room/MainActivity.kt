@@ -391,9 +391,35 @@ class MainActivity : Activity() {
         backRegistered = on
     }
 
+    /// Back through the room, then out of the audio, then out of the app.
+    ///
+    /// Never to the box the address goes in. That screen is for a phone
+    /// the room does not know, and backing into it from inside a room
+    /// you are logged into asks you to type what you are already
+    /// holding. The way to point this at a different room is to log out
+    /// of the one you are in, which the room's own settings do, and
+    /// which lands here by way of [wayIn].
+    ///
+    /// The room's own door is the step between: whether there is one to
+    /// go to is the same question as whether the audio is joined, and
+    /// the room answers it by having a Leave audio button or not having
+    /// one. Pressing its button rather than loading the door ourselves,
+    /// so the sockets are let go of the way the room lets go of them.
     private fun back() {
         val w = web ?: return
-        if (w.canGoBack()) w.goBack() else setup()
+        if (w.canGoBack()) return w.goBack()
+        w.evaluateJavascript(
+            """(() => {
+                 const leave = document.querySelector('.tools button[aria-label="Leave audio"]');
+                 if (!leave) return 'door';
+                 leave.click();
+                 return 'left';
+               })()"""
+        ) { answer ->
+            // Already at the door: there is nowhere further back inside
+            // the room, so back means what it means everywhere else.
+            if (answer == null || answer.contains("door")) finish()
+        }
     }
 
     /// Android 11 and 12 still come through here.
@@ -489,6 +515,13 @@ class MainActivity : Activity() {
         watchBack(false)
         unregisterReceiver(leaving)
         CookieManager.getInstance().flush()
+        // Going for good takes the service with it. Not merely going out
+        // of sight: being out of sight with the service still up is the
+        // entire point of having one, and is what holds the call with the
+        // screen off. `isFinishing` is the difference between the two,
+        // and without it backing out of the app left a notification
+        // saying it was holding a call that nothing was in.
+        if (isFinishing) RoomService.stop(this)
         super.onDestroy()
     }
 }
