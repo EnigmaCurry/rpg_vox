@@ -754,5 +754,17 @@
     .app:not(.show-cards) :global(.cards) { display: none; }
     .app:not(.show-room) :global(.rooms) { display: none; }
     footer { padding: 5px 10px; }
+    /* The two switches come out from beside the talk button and take a
+       row under it. Holding is the whole gesture on a phone -- there is
+       no key to hold instead -- so the thing you hold gets the full
+       width, and the pair that says what holding does stops being two
+       slivers beside it. As tall as they were, in a row rather than a
+       column, so the footer is no deeper than it was. */
+    /* `footer` is a wrapping row, so this has to claim the whole of one
+       or the button is only as wide as its widest label. */
+    .mic { flex: 1 1 100%; flex-wrap: wrap; }
+    .big { flex: 1 1 100%; min-width: 0; }
+    .switches { flex-direction: row; width: 100%; gap: 6px; }
+    .switch { flex: 1 1 0; min-width: 0; padding: 8px 9px; }
   }
 </style>

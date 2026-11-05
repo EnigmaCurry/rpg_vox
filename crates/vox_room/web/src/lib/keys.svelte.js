@@ -10,6 +10,28 @@
 /// Both questions are the same question, so it is asked in one place: is
 /// the focus in something with a cursor in it?
 
+/// Whether the room is being used with a finger and nothing else.
+///
+/// The talk key is the room's best idea on a keyboard and a thing that
+/// does not exist on a phone, and the room says so out loud in more
+/// than one place: the door explains push to talk by naming the key you
+/// hold. Naming a key at somebody who has none is worse than saying
+/// nothing, so the few sentences that do it ask here first.
+///
+/// Touch-primary rather than narrow, because the question is whether
+/// there are keys and not how wide the window is: a small window on a
+/// laptop still has them, and a tablet with one attached has them too.
+/// It is live, so a keyboard appearing is noticed -- the same media
+/// query hides the key hints in `app.css`, and the two must not be able
+/// to disagree.
+const COARSE = '(hover: none) and (pointer: coarse)';
+export const byTouch = $state({ only: false });
+if (typeof window !== 'undefined' && window.matchMedia) {
+  const mq = window.matchMedia(COARSE);
+  byTouch.only = mq.matches;
+  mq.addEventListener('change', (e) => (byTouch.only = e.matches));
+}
+
 // -- what takes a key off the room --------------------------------------
 
 /// What takes the talk key off the microphone: a box with a cursor in

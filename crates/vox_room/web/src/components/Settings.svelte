@@ -6,6 +6,7 @@
   import { theme, setTheme, THEMES } from '../lib/theme.svelte.js';
   import {
     fieldAt, talk, bindTalk, keyName, refuse, bindOf, isDefault, DEFAULT,
+    byTouch,
   } from '../lib/keys.svelte.js';
   import { NAME_MAX } from '../lib/names.js';
   import { scaledDown } from '../lib/pixels.js';
@@ -217,7 +218,17 @@
        same person at a desk and on a laptop may want two answers. -->
   <section>
     <h2>The talk key</h2>
-    <p class="note first">
+    {#if byTouch.only}
+      <!-- Kept rather than hidden: `(pointer: coarse)` cannot tell a
+           phone from a tablet with a keyboard on it, and a section that
+           vanished would take the binder with it for the one of those
+           that can use it. So it stays and says who it is for. -->
+      <p class="note first aside">
+        This is for a keyboard. With only a screen, the talk button in the
+        footer is the one you hold, and nothing here has to be set.
+      </p>
+    {/if}
+    <p class="note" class:first={!byTouch.only}>
       The key your microphone is on, wherever you have left the focus — it
       mutes and unmutes you, and with push to talk on it is the key you hold.
       It is off duty while you are typing: in the message box, or a menu, the
@@ -444,6 +455,11 @@
      the heading has already said what this is, and a gap under the
      heading as well as over the first choice reads as a missing line. */
   .note.first { margin: 0 0 12px; }
+  /* The line that says who a section is for, where that is not
+     everybody. Not muted like the notes around it: it is the first
+     thing to read here and, for most of the people who see it, the
+     reason to stop reading. */
+  .note.aside { color: var(--ink); }
   .duplex { display: flex; align-items: flex-start; gap: 10px; font-size: 14px; cursor: pointer; margin: 0 0 10px; }
   .duplex:last-child { margin-bottom: 0; }
   .duplex input { margin-top: 3px; }

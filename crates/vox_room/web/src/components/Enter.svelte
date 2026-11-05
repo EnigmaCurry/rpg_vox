@@ -6,7 +6,7 @@
   } from '../lib/room.svelte.js';
   import { supported, canChooseSpeaker } from '../lib/audio.js';
   import { NAME_MAX } from '../lib/names.js';
-  import { talk, keyName } from '../lib/keys.svelte.js';
+  import { talk, keyName, byTouch } from '../lib/keys.svelte.js';
 
   // The key the door is telling you about, which is whatever this
   // browser has bound. See `lib/keys.svelte.js`.
@@ -188,7 +188,8 @@
           Push to talk
           <small>
             If push-to-talk is enabled, you will be muted unless you
-            hold down {key}. This allows you to control
+            {#if byTouch.only}are holding the talk button{:else}hold down {key}{/if}.
+            This allows you to control
             explicit transmission. You go on hearing the room while you
             hold it; on speakers, where what they play goes back into
             your microphone, Settings can have the room go quiet
