@@ -95,7 +95,7 @@ const SETS: &[&[&str]] = &[
     // The pair the alphabet already handles, as a control: this should
     // never reach a classifier at all.
     &["English", "Russian"],
-    // Cyrillic, and the pair ANDROID.md has to refuse today.
+    // Cyrillic, and the pair SCRIBE_ANDROID.md has to refuse today.
     &["Russian", "Ukrainian"],
     &["Russian", "Ukrainian", "Bulgarian"],
     // Latin, and the rest of what refusing by alphabet costs.

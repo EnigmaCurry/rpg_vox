@@ -1,6 +1,6 @@
 # Voice Room for Android
 
-[The room](../ROOM.md) as an app, so a call survives the screen going
+[The room](ROOM.md) as an app, so a call survives the screen going
 off the way a phone's own calls do.
 
 It is a wrapper and says so: the whole of the app is a `WebView` and a
@@ -21,25 +21,67 @@ better said at the door than found out as a microphone that will not
 open. `localhost` is the exception browsers themselves make, and is how
 this is tested against a room on a laptop (below).
 
-**Back** goes back through the room; at the door it comes out to that
-first screen again, which is also how you point the app at a different
-room. **Leave** in the notification does the same and ends the call.
+**Back** goes back through the room, then out of the audio, then out of
+the app. It never goes to that first screen: the box an address goes in
+is for a phone the room does not know, and being asked to type what you
+are already holding is no better than having nowhere to type it.
+
+The way to point the app at a different room is to **log out** of the one
+you are in, which is in the room's own settings and says what it costs. A
+link you did not mean to follow is a special case and has its own way
+out: the door of an unspent invite offers **This isn't my link**, which
+puts it down without spending it.
+
+While a call is up the notification holds it, and carries the two things
+worth reaching without opening the app: **Mute**, which says `Mute` or
+`Unmute` because it is the room's own button being pressed and the room's
+own word being read back, and **Leave**, which leaves the audio and puts
+you at the door. Neither logs you out. Leaving from there ends the
+service with it, so there is no notification left offering to take you
+back to a call nothing is in.
+
+## Install
+
+Every release carries `voice-room-<version>-android.apk`, built by the
+release workflow and signed with the same key each time, so one installs
+over the last.
+
+Download it from the [releases
+page](https://github.com/EnigmaCurry/rpg_vox/releases) on the phone and
+open it. Android asks you to allow installs from your browser or file
+manager the first time.
+
+If a new version will not install over the old one, the two were signed
+with different keys: uninstall Voice Room first. That loses the cookie,
+so coming back takes a new invite link.
 
 ## Building
 
 Needs an Android SDK; `local.properties` points at it, as in
-[scribe's app](../ANDROID.md).
+[scribe's app](SCRIBE_ANDROID.md).
+
+```bash
+just room-apk          # release APK into dist/, as the workflow ships it
+```
+
+Or, for something to put on a phone over adb while working on it:
 
 ```bash
 cd android-room && ./gradlew assembleDebug
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
-For something installable over a previous release, set `VOX_ROOM_KEYSTORE`
-(and `VOX_ROOM_KEYSTORE_PASSWORD`, `VOX_ROOM_KEY_ALIAS`,
-`VOX_ROOM_KEY_PASSWORD`) and `./gradlew assembleRelease`. Without a key
-the debug key signs, and a debug key built somewhere else is a different
-key, which is why an APK can refuse to install over its own predecessor.
+`just room-apk` signs with the keystore in `VOX_ROOM_KEYSTORE` (plus
+`VOX_ROOM_KEYSTORE_PASSWORD`, `VOX_ROOM_KEY_ALIAS`,
+`VOX_ROOM_KEY_PASSWORD`) when they are set, and with the debug key when
+they are not. A debug key made on one machine is not the debug key made
+on another, which is why an APK can refuse to install over its own
+predecessor.
+
+There is no native code in it and nothing to cross-compile: it is Kotlin
+and a WebView, so one APK covers every phone. That is the whole reason
+it builds in a minute where [scribe's app](SCRIBE_ANDROID.md) builds in
+twenty.
 
 Android 11 (API 30) and up. Higher than scribe's 26 on purpose: a typed
 foreground service wants 29, and reading the window insets without a

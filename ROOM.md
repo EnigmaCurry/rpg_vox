@@ -21,6 +21,10 @@ cough can't cost you the answer you asked for — see **Stops** under
 
 It runs on macOS and Linux (no PipeWire: all the audio is the browsers').
 
+There is an Android app, which is this same room in a WebView with a
+foreground service holding it up, so a call goes on with the screen off:
+see **[Voice room for Android](ROOM_ANDROID.md)**.
+
 ## Running it
 
 ```bash

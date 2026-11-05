@@ -469,7 +469,7 @@ private fun KeyboardPage() {
  *
  * All of which is said here in a line apiece. A settings page that
  * explains itself in paragraphs is one nobody reads to the end of, and
- * everything it would have said is in ANDROID.md, where there is room
+ * everything it would have said is in SCRIBE_ANDROID.md, where there is room
  * for it.
  */
 @Composable
