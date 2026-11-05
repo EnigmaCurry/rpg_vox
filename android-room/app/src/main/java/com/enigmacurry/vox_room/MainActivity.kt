@@ -81,11 +81,83 @@ class MainActivity : Activity() {
         begin()
     }
 
+    /// Where to go back to: the room's address, kept so a phone that is
+    /// already known goes straight there.
+    private val roomUrl get() = prefs.getString("url", "").orEmpty()
+
+    /// What was last typed in and has not yet got anybody in. Kept
+    /// separately from the address because the two have different
+    /// lives: an invite link is spent the moment it works, and a box
+    /// offering a spent link back is offering nothing. Cleared when the
+    /// room says this phone is in, which is the moment it was consumed.
+    private val typedUrl get() = prefs.getString("typed", "").orEmpty()
+
+    private fun consumeTyped() {
+        if (typedUrl.isNotEmpty()) prefs.edit().remove("typed").apply()
+    }
+
     private fun begin() {
         // `-e url` lets a run of this be scripted; see README.md.
         val given = intent?.getStringExtra("url")?.trim()
-        val where = given?.takeIf { it.isNotEmpty() } ?: prefs.getString("url", "").orEmpty()
-        if (where.isEmpty()) setup() else enter(where)
+        // A cookie for the room is this phone being known to it, and
+        // the address is then the thing to open: the link that got us
+        // there is spent, and asking the room about a spent link is a
+        // roundabout way of finding out what the cookie already says.
+        // With no cookie, a link typed in but not yet used is the only
+        // thing worth anything, and the bare address is not.
+        val known = roomUrl.isNotEmpty() &&
+            !CookieManager.getInstance().getCookie(roomUrl).isNullOrEmpty()
+        val where = given?.takeIf { it.isNotEmpty() }
+            ?: roomUrl.takeIf { known }
+            ?: typedUrl.takeIf { it.isNotEmpty() }
+            ?: roomUrl
+        if (where.isEmpty()) return setup()
+        // Ask before showing anything. The room's own page for somebody
+        // it does not know says to go and ask for an invite link, and
+        // loading it first only to leave it again puts that page on the
+        // screen for a moment on the way to the one that can actually
+        // take a link. Known: the door. Not known: the field.
+        checking()
+        askDoor(where) { state ->
+            when (state) {
+                // In already. Whatever got us here is spent -- the room
+                // says `in` for a link of your own you have used before
+                // -- so the box stops offering it back, and we go to the
+                // room's address rather than through the spent link.
+                "in" -> { consumeTyped(); enter(roomUrl.ifEmpty { where }) }
+                "invited" -> enter(where)
+                "expired" -> { consumeTyped(); setup(getString(R.string.link_spent)) }
+                "none" -> setup(getString(R.string.need_link))
+                else -> setup(getString(R.string.setup_unreachable))
+            }
+        }
+    }
+
+    /// While the room is being asked. Neither answer's screen, because
+    /// either one shown now would be a guess, and the wrong guess is the
+    /// one that looks like being thrown out.
+    private fun checking() {
+        watchBack(false)
+        web?.destroy()
+        web = null
+        val dp = { n: Int -> TypedValue.applyDimension(
+            TypedValue.COMPLEX_UNIT_DIP, n.toFloat(), resources.displayMetrics).toInt() }
+        val col = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(24), dp(24), dp(24), dp(24))
+            addView(TextView(context).apply {
+                text = getString(R.string.setup_title)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 28f)
+                setPadding(0, 0, 0, dp(8))
+            })
+            addView(TextView(context).apply {
+                text = getString(R.string.setup_checking)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+            })
+        }
+        setContentView(col)
+        insetBySystemBars(col)
     }
 
     /// A second launch is an intent into the instance already here.
@@ -101,7 +173,9 @@ class MainActivity : Activity() {
         if (!asked) return
         web?.destroy()
         web = null
-        enter(given?.takeIf { it.isNotEmpty() } ?: prefs.getString("url", "").orEmpty())
+        // Through the same decision as a fresh launch, so an intent
+        // cannot walk past the question of whether there is a way in.
+        begin()
     }
 
     // -- the one screen this app has of its own ------------------------
@@ -128,7 +202,7 @@ class MainActivity : Activity() {
         }
         val field = EditText(this).apply {
             hint = getString(R.string.setup_hint)
-            setText(prefs.getString("url", ""))
+            setText(typedUrl)
             inputType = android.text.InputType.TYPE_CLASS_TEXT or
                 android.text.InputType.TYPE_TEXT_VARIATION_URI
             setSingleLine()
@@ -176,7 +250,7 @@ class MainActivity : Activity() {
             when (val said = check(field.text.toString().trim())) {
                 is Where.Bad -> { warn.text = said.why; warn.visibility = View.VISIBLE }
                 is Where.Good -> {
-                    prefs.edit().putString("url", said.url).apply()
+                    prefs.edit().putString("typed", said.url).apply()
                     enter(said.url)
                 }
             }
@@ -341,9 +415,27 @@ class MainActivity : Activity() {
     /// in whichever language it is wearing, and this has to be true in
     /// all of them.
     private fun wayIn(pageUrl: String?) {
-        val uri = runCatching { Uri.parse(pageUrl) }.getOrNull() ?: return
-        val scheme = uri.scheme ?: return
-        val authority = uri.authority ?: return
+        askDoor(pageUrl) { state ->
+            if (state == "in") consumeTyped()
+            val why = when (state) {
+                "none" -> getString(R.string.need_link)
+                "expired" -> { consumeTyped(); getString(R.string.link_spent) }
+                // Anything else, including not being able to ask, leaves
+                // a page that is already up alone: it is working until
+                // something says otherwise.
+                else -> return@askDoor
+            }
+            if (web != null) setup(why)
+        }
+    }
+
+    /// Ask the room what this phone is to it, and say so on the main
+    /// thread. `null` means the room could not be asked at all.
+    private fun askDoor(pageUrl: String?, then: (String?) -> Unit) {
+        val uri = runCatching { Uri.parse(pageUrl) }.getOrNull()
+        val scheme = uri?.scheme
+        val authority = uri?.authority
+        if (uri == null || scheme == null || authority == null) return then(null)
         val origin = "$scheme://$authority"
         // An unspent invite is in the path, and the room cannot say what
         // it is worth unless it is asked about it: with no token and no
@@ -374,17 +466,23 @@ class MainActivity : Activity() {
                 JSONObject(body).optString("state")
             }.onFailure {
                 Log.w(RoomService.TAG, "could not ask the room about the way in: $it")
-            }.getOrNull() ?: return@Thread
+            }.getOrNull()
             // The state and not the address: an invite link is a
             // credential, and logcat is not where credentials go.
-            Log.i(RoomService.TAG, "the way in: $state")
-            val why = when (state) {
-                "none" -> getString(R.string.need_link)
-                "expired" -> getString(R.string.link_spent)
-                else -> return@Thread
-            }
-            runOnUiThread { if (web != null) setup(why) }
+            Log.i(RoomService.TAG, "the way in: ${state ?: "could not ask"}")
+            runOnUiThread { then(state) }
         }.start()
+    }
+
+    /// Write the cookies down whenever this leaves the screen.
+    ///
+    /// They were only flushed in `onDestroy`, which a force-stop and a
+    /// kill for memory both skip -- so a phone that had just joined, and
+    /// was then killed rather than closed, came back with no session and
+    /// nothing but a spent link to show for it.
+    override fun onStop() {
+        CookieManager.getInstance().flush()
+        super.onStop()
     }
 
     override fun onDestroy() {
