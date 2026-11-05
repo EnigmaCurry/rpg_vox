@@ -206,6 +206,20 @@ class MainActivity : Activity() {
     /// would be the worst bug this app could have.
     private var holding = 0
 
+    /// A lent key pressed on top of a hold that is already under way,
+    /// or zero. Swallowed whole until it is let go of: no chirp, no
+    /// second arming, and no volume either.
+    ///
+    /// One hold is one thing said, and the room counts it that way.
+    /// Both volume keys being the microphone's makes this reachable by
+    /// accident -- a hand on the rocker catches the other one -- and
+    /// without it the second press chirped over a microphone that was
+    /// already open and, worse, [becomeAHold] moved `holding` onto it.
+    /// The key actually being held then matched nothing on the way up,
+    /// so letting go of it changed the volume and left the microphone
+    /// open until the other one was released too.
+    private var ignoring = 0
+
     /// Lend a volume key to the microphone.
     ///
     /// Taken here rather than in `onKeyDown` so the question is asked
@@ -231,8 +245,17 @@ class MainActivity : Activity() {
                 // `KEYCODE_UNKNOWN`, which is zero, and without them a
                 // stray one of those would be swallowed by a hold that
                 // is not happening.
-                if (code != 0 && (code == holding || code == waiting)) return true
+                if (code != 0 && (code == holding || code == waiting || code == ignoring)) {
+                    return true
+                }
                 if (!lentToTheMic(code)) return super.dispatchKeyEvent(event)
+                // Already holding, or about to be. The keys are the
+                // microphone's for as long as it is open, so this one
+                // is taken and nothing is done with it.
+                if (holding != 0 || waiting != 0) {
+                    ignoring = code
+                    return true
+                }
                 waiting = code
                 // The chirp fills the wait rather than following it: it
                 // ends as the microphone opens, so what it teaches is
@@ -243,6 +266,10 @@ class MainActivity : Activity() {
                 return true
             }
             KeyEvent.ACTION_UP -> {
+                if (code != 0 && code == ignoring) {
+                    ignoring = 0
+                    return true
+                }
                 // Let go before it was a hold: a tap, which is the
                 // phone's. The volume change is made rather than handed
                 // back -- an event already claimed cannot be returned,
@@ -319,6 +346,7 @@ class MainActivity : Activity() {
     private fun letGo() {
         watching.removeCallbacks(becomeAHold)
         waiting = 0
+        ignoring = 0
         hush()
         if (holding == 0) return
         holding = 0
