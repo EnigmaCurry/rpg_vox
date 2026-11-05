@@ -464,7 +464,16 @@ nothing anywhere reports an error. The view is what carries word that the
 window went away, so the view is the only place an embedder can decline
 to carry it. Measured, with it: the screen off and verified off at 0, 45,
 90 and 135 seconds, and not one teardown, where without it the streams
-closed at 63.
+closed at 63. Both directions survive it, though only one of them could
+be shown from the server and the other was an open question here for a
+while: the mixer writes a level for every person ten times a second and
+an input that has run dry is padded with exactly zero where a live
+microphone never is, so a phone that has gone *deaf* shows the server
+nothing at all. It took a headset to settle and a headset settled it --
+screen off, held by the trigger on a BTECH BS-22, and the room was
+heard. By ear rather than off a meter, because by ear is the only place
+that direction can be read, and nothing on the phone had to be changed
+for it.
 
 **A wake lock does not help**, and that is worth writing down so nobody
 spends the afternoon again. It guarantees the CPU, and the CPU was never
@@ -481,13 +490,6 @@ rooms from, so the thing you could not reach was the thing you most
 needed. Making the view itself smaller is what the page notices.
 
 ## What is still unknown
-
-Whether the phone can still *hear* with the screen off. Only the
-direction out of it was ever measured, because only that one can be read
-from the server: the mixer writes a level for every person ten times a
-second, and an input that has run dry is padded with exactly zero where a
-live microphone never is. A headset settles the other direction in a
-minute.
 
 The room's own interface is a desktop one. It works here and it is not
 yet *designed* here; see the note above about the heading under the
