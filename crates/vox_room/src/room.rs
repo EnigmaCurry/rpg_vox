@@ -1479,6 +1479,15 @@ fn off_the_record(what: &str) -> String {
     format!("this room is off the record, so {what} can't go into the conversation")
 }
 
+/// The language the room writes about itself in.
+///
+/// Hard-wired rather than the room's own, because [`said_off`] and
+/// [`Room::said_back_on`] are English prose in the source: a room set
+/// to Russian does not make them Russian, it only makes them a line
+/// every reader in it has to be given a translation of. `Log.svelte`
+/// has the same constant under the same name, and the two must agree.
+const NOTE_LANGUAGE: &str = "English";
+
 /// The note that goes into the conversation when a room goes off the
 /// record: who did it, and what it means for everybody. `left` is the
 /// AIs that were in the room until this moment, which is what the room
@@ -1502,9 +1511,10 @@ fn said_off(person: &str, left: &[String]) -> String {
 /// somebody asking how long the room was off the record and not by
 /// anybody timing it.
 ///
-/// Said in English, like the rest of the note it goes in: what the
-/// room writes about itself is not put into the other languages the
-/// way what somebody said is. See [`Kind::Note`].
+/// Said in English, like the rest of the note it goes in, and then
+/// translated with it -- see [`NOTE_LANGUAGE`]. This is a clause in a
+/// sentence rather than a thing of its own, so it goes through the
+/// translators as part of the note and not on its own account.
 fn how_long(ms: u64) -> String {
     let plural = |n: u64, unit: &str| match n {
         1 => format!("1 {unit}"),
@@ -6674,6 +6684,10 @@ impl Room {
             warn!("store note: {err:#}");
         }
         self.emit_entry(&note);
+        // Who has to be able to read it, worked out while the room is
+        // still locked and the note still to hand.
+        let targets = self.listening_in(&st, NOTE_LANGUAGE);
+        let (id, text) = (note.id.clone(), note.text.clone());
         st.log.push(note);
         trim_log(&mut st.log);
         info!(
@@ -6688,6 +6702,22 @@ impl Room {
             "who": person,
         }));
         self.emit_agents_here(&st);
+        // Out of the lock before the translators are asked, like
+        // `typed` does it: the queue is somebody else's thread and the
+        // room is not held while it is handed to.
+        drop(st);
+        // The one line the room writes about itself still has to be
+        // readable by everybody in it. Nothing else in the conversation
+        // is left in a language somebody cannot read, and a note whose
+        // whole job is to explain a gap does that job for nobody if it
+        // explains it in English to a room reading Russian.
+        //
+        // Not a contradiction of being off the record, though it uses
+        // the same queue that is otherwise shut while the room is: the
+        // translators are being handed the room's own sentence about
+        // the switch, which is the one thing an off-the-record stretch
+        // keeps on purpose, and not anything anybody said or typed.
+        self.translate(&id, &text, NOTE_LANGUAGE, targets);
         Ok(())
     }
 
@@ -7552,46 +7582,59 @@ impl Room {
                 at: now_ms(),
                 sent: false,
             };
-            // Every language the room is listening in except the one it
-            // was typed in -- including the room's own, since a message
-            // typed in another still has to reach the people on that.
             let mine = st
                 .people
                 .get(person)
                 .map(|p| self.language_of(p).to_string())
                 .unwrap_or_else(|| self.cfg.language.clone());
-            let targets: BTreeSet<String> = std::iter::once(self.cfg.language.clone())
-                .chain(
-                    st.people
-                        .values()
-                        .filter(|p| p.online())
-                        .map(|p| self.language_of(p).to_string()),
-                )
-                .filter(|l| *l != mine)
-                .collect();
+            let targets = self.listening_in(&st, &mine);
             st.log.push(entry.clone());
             trim_log(&mut st.log);
             (entry, targets, mine)
         };
         info!(person, chars = entry.text.chars().count(), "typed");
         self.emit_entry(&entry);
-        if let Some(tx) = &self.typing {
-            for into in targets {
-                let job = TypedJob {
-                    id: entry.id.clone(),
-                    text: entry.text.clone(),
-                    from: mine.clone(),
-                    into,
-                };
-                // Dropped rather than waited on: a backed-up translator
-                // must not hold up the socket this came in on. The
-                // message itself is already on everyone's screen.
-                if tx.try_send(job).is_err() {
-                    warn!(id = %entry.id, "translation queue is full");
-                }
+        self.translate(&entry.id, &entry.text, &mine, targets);
+        Ok(())
+    }
+
+    /// Every language the room is listening in except the one something
+    /// was written in -- including the room's own, since a line written
+    /// in another still has to reach the people on that, and since what
+    /// is kept is read back in the language of the conversation it is
+    /// kept in.
+    fn listening_in(&self, st: &State, written_in: &str) -> BTreeSet<String> {
+        std::iter::once(self.cfg.language.clone())
+            .chain(
+                st.people
+                    .values()
+                    .filter(|p| p.online())
+                    .map(|p| self.language_of(p).to_string()),
+            )
+            .filter(|l| l != written_in)
+            .collect()
+    }
+
+    /// Put one line through the translators, once for each language it
+    /// has to reach. Nothing to do in a room with one language, where
+    /// `into` comes back empty.
+    ///
+    /// Dropped rather than waited on: a backed-up translator must not
+    /// hold up whatever this line arrived on, and the line is already
+    /// on everyone's screen in the language it was written in.
+    fn translate(&self, id: &str, text: &str, from: &str, into: BTreeSet<String>) {
+        let Some(tx) = &self.typing else { return };
+        for one in into {
+            let job = TypedJob {
+                id: id.to_string(),
+                text: text.to_string(),
+                from: from.to_string(),
+                into: one,
+            };
+            if tx.try_send(job).is_err() {
+                warn!(id, "translation queue is full");
             }
         }
-        Ok(())
     }
 
     /// What a typed message says in one other language, back from a
@@ -9404,6 +9447,41 @@ mod tests {
         mode: Mode,
         interpreters: &[&str],
     ) -> (Arc<Room>, crossbeam_channel::Receiver<Turn>, Interpreters) {
+        let (store, cfg) = lobby(mode);
+        let mut interp_tx = BTreeMap::new();
+        let mut interp_rx = BTreeMap::new();
+        for language in interpreters {
+            let (tx, rx) = crossbeam_channel::bounded(16);
+            interp_tx.insert(language.to_string(), tx);
+            interp_rx.insert(language.to_string(), rx);
+        }
+        let (r, mut wiring) = Room::new(store, cfg, None, interp_tx, None, None, None).unwrap();
+        // The turns the room's one bot is given, in place of the agent
+        // thread that would be reading them.
+        let turns = wiring.pop().expect("a room has an AI in it").turns;
+        (r, turns, interp_rx)
+    }
+
+    /// A room with a translator on the other end of the typing queue,
+    /// so a test can see what was *asked* of it and not only what came
+    /// back. `room_with` leaves that queue unwired, because most tests
+    /// are the voice at the other end instead.
+    fn room_translating() -> (
+        Arc<Room>,
+        crossbeam_channel::Receiver<Turn>,
+        crossbeam_channel::Receiver<TypedJob>,
+    ) {
+        let (store, cfg) = lobby(Mode::Named);
+        let (tx, typed) = crossbeam_channel::bounded(16);
+        let (r, mut wiring) =
+            Room::new(store, cfg, Some(tx), BTreeMap::new(), None, None, None).unwrap();
+        let turns = wiring.pop().expect("a room has an AI in it").turns;
+        (r, turns, typed)
+    }
+
+    /// The room every test here is about: two people invited, English
+    /// its own language and Russian the other one anybody can read in.
+    fn lobby(mode: Mode) -> (Store, RoomConfig) {
         // Scoped as the room will scope it, since what is written here
         // is written before the room is built.
         let store = Store::memory().in_room("Lobby");
@@ -9425,18 +9503,7 @@ mod tests {
             spoken: vec!["English".into(), "Russian".into()],
             may_transcribe: true,
         };
-        let mut interp_tx = BTreeMap::new();
-        let mut interp_rx = BTreeMap::new();
-        for language in interpreters {
-            let (tx, rx) = crossbeam_channel::bounded(16);
-            interp_tx.insert(language.to_string(), tx);
-            interp_rx.insert(language.to_string(), rx);
-        }
-        let (r, mut wiring) = Room::new(store, cfg, None, interp_tx, None, None, None).unwrap();
-        // The turns the room's one bot is given, in place of the agent
-        // thread that would be reading them.
-        let turns = wiring.pop().expect("a room has an AI in it").turns;
-        (r, turns, interp_rx)
+        (store, cfg)
     }
 
     /// A room opened over a database that is already there, which is
@@ -11885,6 +11952,73 @@ mod tests {
             .filter(|e| e.kind == Kind::Note)
             .map(|e| e.text.clone())
             .collect()
+    }
+
+    /// The room's own note about itself reaches everybody in the room
+    /// in their own language.
+    ///
+    /// Everything else in the conversation is put into the languages
+    /// the room is listening in -- what is said is interpreted and what
+    /// is typed is translated -- and this was the one line that was
+    /// not. A note whose whole job is to explain a gap explains it to
+    /// nobody in a language they cannot read.
+    #[test]
+    fn the_note_about_the_room_is_translated_like_everything_else() {
+        let (r, _turns, typed) = room_translating();
+        r.set_language("Alex", "Russian").unwrap();
+        r.join("Alex", 1);
+        r.join("Ryan", 1);
+
+        r.set_transcribing("Ryan", false).unwrap();
+        let note = last_note(&r);
+
+        // Asked for in Alex's Russian and in nothing else: the note is
+        // English and so is the room, so Russian is the one language in
+        // here that cannot read what was just written.
+        let jobs: Vec<TypedJob> = typed.try_iter().collect();
+        let into: Vec<&str> = jobs.iter().map(|j| j.into.as_str()).collect();
+        assert_eq!(into, ["Russian"], "one language to reach, asked once");
+        assert_eq!(jobs[0].id, note.id, "and it is the note it was asked about");
+        assert_eq!(jobs[0].from, NOTE_LANGUAGE, "which the room writes in");
+        assert_eq!(jobs[0].text, note.text);
+
+        // What a translator sends back lands on a note the way it lands
+        // on anything else, `typed_translated` finding it by id.
+        r.typed_translated(&note.id, "Russian", "Райан отключил расшифровку.");
+        let after = last_note(&r);
+        assert_eq!(
+            after.translations.get("Russian").map(String::as_str),
+            Some("Райан отключил расшифровку.")
+        );
+        assert_eq!(
+            after.text, note.text,
+            "the English is kept beside it, like every other translation"
+        );
+    }
+
+    /// A room with one language asks for nothing: there is nobody in it
+    /// the note is not already written for.
+    #[test]
+    fn a_room_that_reads_one_language_translates_no_note() {
+        let (r, _turns, typed) = room_translating();
+        r.join("Ryan", 1);
+        r.set_transcribing("Ryan", false).unwrap();
+        assert!(
+            typed.try_iter().next().is_none(),
+            "nothing to ask, so nothing asked"
+        );
+        assert!(last_note(&r).translations.is_empty());
+    }
+
+    /// The last note in the conversation, whole.
+    fn last_note(r: &Room) -> Entry {
+        r.lock()
+            .log
+            .iter()
+            .rev()
+            .find(|e| e.kind == Kind::Note)
+            .cloned()
+            .expect("a note was written")
     }
 
     /// Off the record, the room is voice and nothing else: nobody is

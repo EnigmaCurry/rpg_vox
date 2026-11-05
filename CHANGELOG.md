@@ -107,6 +107,29 @@ releases.
   and will not compile if a fifth mode is added without being
   offered.
 
+- **A room's note about itself is read in your own language.** The line
+  the room writes when somebody takes it off the record, and again when
+  they put it back, was English for everybody: in a room listening in
+  two languages a Russian reader got the English sentence. Everything
+  else in the conversation reaches people in the language they read in
+  -- what is said is interpreted, what is typed is translated -- and
+  this was the one line that did not, which is a poor one for it to be.
+  A note is there to explain a gap, and it explains it to nobody in a
+  language they cannot read.
+
+  It goes through the same translators a typed message does and arrives
+  the same way: your language, with the English a tap away under it, so
+  a translation that went wrong can be seen to have. The room writes
+  these in English wherever the room is -- the sentences are English
+  prose in the server rather than anything the room's own language
+  reaches -- so English is what it is translated *from*, and a room
+  that reads only English asks for nothing.
+
+  Using the translators while a room is off the record is not a hole in
+  being off the record. What is handed over is the room's own sentence
+  about the switch, which is the one thing an off-the-record stretch
+  keeps on purpose, and not anything anybody said or typed.
+
 ### Voice Room for Android
 
 - **A headset with a talk button of its own now works that button.**
