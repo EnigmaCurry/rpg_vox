@@ -107,6 +107,42 @@ releases.
   and will not compile if a fifth mode is added without being
   offered.
 
+### Voice Room for Android
+
+- **A headset with a talk button of its own now works that button.**
+  A radio-style Bluetooth speaker-mic -- the one this was found on is a
+  BTECH BS-22 -- has the button push to talk was drawn for: one
+  momentary switch whose only job is to open a microphone. Hold it and
+  you are live; let go and you are not. Nothing has to be set and there
+  is nothing to bind.
+
+  None of the care the volume keys need applies here, and that is the
+  whole of the difference between them. A volume key has another job,
+  so it waits a quarter of a second to find out whether a press was a
+  tap, fills the wait with a chirp of its own, stands down whenever the
+  cursor is in the message box, and lets go the moment the app leaves
+  the front. This button has none of those: down is the microphone,
+  immediately, and the room arms and chirps for it exactly as it does
+  for a talk key on a keyboard -- one sound, played once, by whoever
+  owns the wait. It talks with the cursor in the message box too, since
+  the stand-down is about a key a box has a claim on and a trigger on a
+  speaker-mic is not one. And the hold outlives the screen going off,
+  which is the thing holding a radio's button in a pocket is for.
+
+  It is not a key and could not have been bound as one. The BS-22
+  pairs as A2DP and hands-free and registers no HID device at all, so
+  nothing about it reaches a key event; what the button sends is a
+  vendor-specific hands-free AT command, `AT+XEVENT=PTT_DOWN` and
+  `PTT_UP`. See ROOM_ANDROID.md, which has how that was found and why
+  the app now asks for **Nearby devices**: that broadcast is only
+  delivered to an app holding it. Refuse it and everything else works,
+  with the volume keys still the talk key.
+
+  The one way a hold can end without a release is the headset leaving,
+  so a headset switched off mid-hold is listened for and closes the
+  microphone. Without that it would have left one open with nothing
+  able to close it.
+
 ## v0.2.2 (2026-11-05)
 
 ### Voice room

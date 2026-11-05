@@ -56,6 +56,10 @@ volume key is still the volume and a hold opens your mic.** Let go and
 the mic shuts. With push to talk off, or anywhere but in the room, they
 are the phone's own again.
 
+A headset with a trigger of its own needs none of the care the rest of
+this section is about, and gets none of it; see [a headset with a talk
+button of its own](#a-headset-with-a-talk-button-of-its-own) below.
+
 **Both of them, or neither — never one.** It was one of the two at
 first, chosen on the reasoning that taking a key away costs less on the
 one that makes the room louder than on the one that makes it quieter in
@@ -127,6 +131,205 @@ key. That is the same stand-down the room's own talk key makes — with
 the focus in a text box the key is the box's — and out here it may as
 well be the phone's, since a key that does nothing at all is worse than
 one that changes the volume.
+
+## A headset with a talk button of its own
+
+Everything awkward about the volume keys comes from their having another
+job. A radio-style Bluetooth speaker-mic has the button push to talk was
+drawn for: one momentary switch whose only purpose is to open a
+microphone. **Hold it and you are live; let go and you are not.**
+Nothing has to be set, there is nothing to bind, and there is no setting
+for it — a button with no other job is one there is nothing to weigh up
+about, which is the same reasoning that ended up lending both volume
+keys rather than one.
+
+It does what the key does, and in four ways does it more plainly. Each
+is one piece of care the volume keys need and this does not:
+
+- **No quarter second.** Down is the microphone, immediately. The wait
+  is there to tell a tap from a hold, and there is no tap to tell apart.
+- **One chirp, and the room's.** Since the app does no waiting, it does
+  not claim the wait: the room arms and chirps for this press exactly as
+  it does for a talk key on a keyboard. The volume keys have to fill
+  their own wait and then say so, or a phone would wait twice for one
+  hold — and a button that said so without having waited would skip the
+  chirp and open a microphone with no warning at all.
+- **No stand-down for the message box.** That stand-down is about a key
+  a text box has a claim on: the room's talk key is Space out of the
+  box, and a Space typed into a message is a space. A squeeze on a
+  speaker-mic is not a thing any box has a claim on, and a trigger that
+  went dead whenever the cursor was in the box would be dead most of the
+  time somebody wanted it.
+- **The hold survives the screen going off.** A key's does not, because
+  a key cannot be held through not being reachable. This plainly can:
+  holding a radio's button with the phone in a pocket is what it is for.
+  It rests on three things rather than on a measurement of its own, and
+  each was already settled: the receiver is subscribed from `onCreate`
+  to `onDestroy` and so is live while the activity is merely paused;
+  `letGo`, which drops a key's hold on the way out of the front, is not
+  given this one to drop; and reaching the page while its window is
+  gone is the thing `KeptVisibleWebView` exists for and the thing the
+  screen-off measurements below already cover — the same poll runs
+  every second throughout, answering in 2–6 ms.
+
+### It is not a key, which is why this is not two lines
+
+A BTECH BS-22 pairs as A2DP and hands-free and **registers no HID device
+at all**, so nothing about its button reaches `dispatchKeyEvent` or
+`/dev/input`, and there is no key code to bind. Nor does it arrive as a
+media button: hands-free turns `AT+CKPD` into one of those, and this
+headset does not send `AT+CKPD`. What it sends is a vendor-specific AT
+command — `AT+XEVENT=PTT_DOWN` and `AT+XEVENT=PTT_UP`, which is
+Plantronics' extension — and Android forwards that to whoever
+subscribes, as `BluetoothHeadset.ACTION_VENDOR_SPECIFIC_HEADSET_EVENT`.
+
+**The log is what found it, and is also the proof it can be had.** The
+platform's own `RemoteDevices` subscribes to that broadcast in order to
+read battery levels out of it, and says so when it sees one of these and
+puts it down again:
+
+    getBatteryLevelFromXEventVsc() skip none BATTERY event: PTT_DOWN
+
+Reading that line is the only way that function is ever called, so the
+line is the broadcast arriving somewhere. Finding it is one command:
+
+```bash
+adb logcat | grep -iE 'XEvent|bta_ag_at'   # then press the button
+```
+
+**The constant for it is hidden.** Android publishes the broadcast, and
+publishes the category that subscribes to it, and keeps
+`BluetoothHeadset.VENDOR_SPECIFIC_HEADSET_EVENT_XEVENT` `@hide` — so the
+one string an app needs in order to use a public API is the one it is not
+given, and `"+XEVENT"` is written out in `HeadsetPtt.kt`. The company id
+is part of the subscription rather than of the message: a filter without
+the category naming whose extension this is matches nothing at all,
+however right the action is. The receiver is registered
+`RECEIVER_EXPORTED`, because the sender is the platform and not this
+package.
+
+**Down and up, really** — measured on the button rather than taken from
+a datasheet, because a toggle and a hold are indistinguishable until
+somebody holds one. Holds of 206 ms, 506 ms, 3033 ms, 3061 ms, 4813 ms
+and 5099 ms each came through as one `PTT_DOWN` and one `PTT_UP` the
+held distance apart, with nothing repeating in between and nothing
+latched afterwards. End to end, the app had the press 2–44 ms after the
+broadcast. A third event, `AT+XEVENT=BLE`, trails every release by about
+30 ms, and is ignored by not being named.
+
+**Only what was measured is named.** Other makes spell this differently,
+and a spelling nobody here has held in their hand would be a guess
+written where it reads as a fact.
+
+**Nearby devices** is asked for because of this and nothing else: that
+broadcast is only delivered to an app holding `BLUETOOTH_CONNECT`. It is
+the one permission this app can do without — refuse it and everything
+works, with the volume keys still the talk key — so a refusal is not
+reported anywhere.
+
+**A headset leaving is the only other way a hold can end**, so it is
+listened for: a headset switched off or walked out of range mid-squeeze
+closes the microphone. Without that it would have left one open with
+nothing able to close it, which is the worst shape a failure can have
+here.
+
+**It does anything only while push to talk is on in the room.** With the
+mode off the room's talk key is a mute toggle rather than a hold, and the
+press is refused rather than allowed to mute somebody who squeezed a
+trigger. Push to talk is the room's own switch, beside the talk button in
+the footer.
+
+### A speaker-mic that hisses is hissing on its own
+
+A BTECH BS-22 hisses faintly from the moment the app is opened and goes
+on hissing until the headset itself is power-cycled. **It is the
+headset, and nothing here can stop it.** That is worth writing down
+because the obvious theory is wrong and was believed here for a while:
+the noise is *not* the hands-free SCO link, and not anything the phone
+is sending.
+
+What settles it is one reading taken while the noise was audible:
+
+    pid: 7118                                        ← the app is running
+    Bluetooth SCO on, requested: false, applied: false
+    mScoAudioState: SCO_STATE_INACTIVE
+    mAudioState: 10                                  ← no SCO audio
+    players: (every one idle)
+    output threads: (every one in standby)
+    Bluetooth A2DP suspended ... applied false       ← nothing streaming
+
+Every audio path on the phone is shut, and the headset hisses anyway.
+There is no stream to stop, no link to close and no volume to turn down,
+because nothing is being sent.
+
+**What appears to trigger it is the first time anything opens an audio
+path to the headset at all**, after which its amplifier stays awake on
+its own. That is the shape of the observations: powered on with the app
+not running it is silent; opening the app starts the noise; leaving the
+audio does not stop it; force-closing the app does not stop it; and only
+power-cycling the headset with the app not running gets the silence
+back. A latching amplifier is ordinary for the class of device and is
+nobody's bug.
+
+**How this was got wrong, since the mistake is instructive.** SCO *is*
+held open for as long as you are in the audio — that part is true and
+`dumpsys audio` shows it, with the app as the only client wanting it —
+and a single listen seemed to show the noise stopping when the link
+closed. One unreplicated listen was then written up as settled. It did
+not replicate. The lesson is the ordinary one: a correlation with
+something the log can show is seductive precisely because the log can
+show it, and the thing to measure was the noise, which the log cannot
+show at all.
+
+So there is nothing here to fix, and a reader who arrives with a hissing
+headset should stop looking at this app. Leaving the audio is still
+worth doing, because the link really is held open for as long as you are
+in it — but the hiss belongs to the headset and goes when the headset is
+switched off and on.
+
+### A headset whose speaker seems dead has its own volume down
+
+Worth knowing before anybody debugs the room for this, because it looks
+exactly like a broken speaker and it took a long detour to find: **a
+Bluetooth headset owns its own volume, and the phone cannot set it.**
+The BS-22 arrived at **1 of 15**, which in practice is off — the room
+inaudible, the hiss not — so the whole of what came out of it was noise.
+Its own volume-up button moved it from 1 to 7 and the room was there all
+along.
+
+Reading it, which is the only way to know:
+
+```bash
+adb shell dumpsys bluetooth_manager | grep mSpeakerVolume
+```
+
+It is the headset that reports that number, as incoming
+`EVENT_TYPE_VOLUME_CHANGED` events in the headset state machine, and it
+is the headset that decides it. Setting it from this end did not take:
+three `setStreamVolume` calls were accepted by `AudioService` and logged
+with the index they were replacing —
+
+    setStreamVolume(stream:STREAM_VOICE_CALL index:12 flags:0x0 oldIndex:1)
+    setStreamVolume(stream:STREAM_MUSIC index:18 flags:0x0 oldIndex:0)
+
+— and changed nothing that could be read back afterwards. The headset's
+own button changed it at once.
+
+Two further traps sit behind that one, and both make a silent headset
+look like a bug in the room:
+
+- **Android keeps a separate volume index per output device.** Media on
+  `bt_sco_hs` is its own number, unrelated to the one the phone's
+  speaker or A2DP uses, and it starts at zero. `dumpsys audio` prints
+  the whole row: `20 (bt_sco_hs): 0, 80 (bt_a2dp): 14`.
+- **The room plays as media, not as a call.** Its output carries
+  `usage=USAGE_MEDIA`, so it lands on `STREAM_MUSIC` and takes that
+  stream's index for whichever device it is routed to. It is media
+  because the room asks for an unprocessed microphone — `lib/audio.js`
+  turns echo cancellation, noise suppression and gain control all off on
+  purpose — and a capture with no processing opens as `MIC` rather than
+  `VOICE_COMMUNICATION`, which is also why `dumpsys audio` reports
+  `Actual mode = MODE_NORMAL` in the middle of a call.
 
 ## Install
 
