@@ -84,6 +84,19 @@ class RoomService : Service() {
             this, 2, Intent(this, RoomService::class.java).setAction(ACTION_MUTE),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
+        // Which volume key talks, reachable while a call is up.
+        //
+        // It is on the launcher's long-press menu as well, which is
+        // where Android puts a setting an app has no room for -- but
+        // nobody looks there, and the setting is about a key you only
+        // ever reach for mid-conversation. This is the app's native
+        // controls, so this is where it goes. Straight to the activity
+        // rather than through here: it opens over the room and has
+        // nothing to ask the service.
+        val talkKey = PendingIntent.getActivity(
+            this, 3, Intent(this, TalkKeyActivity::class.java),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
         val note: Notification = Notification.Builder(this, CHANNEL)
             .setContentTitle(getString(R.string.note_title))
             .setContentText(getString(R.string.note_text))
@@ -100,6 +113,11 @@ class RoomService : Service() {
             }
             .addAction(Notification.Action.Builder(
                 null, getString(R.string.note_leave), leave).build())
+            // Last of the three Android will show. Under push to talk
+            // there is no mute to offer and this is the second of two,
+            // which is the moment it is most worth having.
+            .addAction(Notification.Action.Builder(
+                null, getString(R.string.talk_key_title), talkKey).build())
             .build()
         startForeground(ID, note, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
         Log.i(TAG, "holding the room")

@@ -1,11 +1,151 @@
 # Changelog
 
 Changes in each release of scribe, Scribe for Android, Scribe for iOS,
-agent, Pi voice, Voice room and rpg_vox. New entries go under
+agent, Pi voice, Voice room, Voice Room for Android and rpg_vox. New entries go under
 **Unreleased**; `just publish` names that section after the version it
 releases.
 
 ## Unreleased
+
+### Voice room
+
+- **The room says what its page may do.** It served no
+  `Content-Security-Policy` at all, which left the markdown sanitiser
+  as the only thing between a model-written card and a running script
+  -- and `e2e/cards.js` exists because a model did once write a
+  `<script>` tag into one. It matters more here than on most pages:
+  the Android app grants the microphone to this page without asking
+  and reads the talk key off it, so script running here is script
+  running next to an open mic.
+
+  `script-src 'self'` and nothing else executable. The page's one
+  inline script -- the theme, read before anything is drawn so a dark
+  room does not arrive a frame after a white one -- is let through by
+  the hash of its own bytes rather than by `'unsafe-inline'`, and the
+  hash is worked out at startup from whatever is actually embedded, so
+  there is nothing written down anywhere to go stale. No other origin
+  may be fetched from, framed in, or have a form posted to it.
+
+  Every end-to-end suite now fails on a refusal by the page's own
+  policy, so a policy a shade too strict is a failing test rather than
+  one feature quietly broken in one browser with nothing on the screen
+  saying why.
+
+- **Push to talk arms for a quarter of a second, and chirps while it
+  does.** Two beeps, rising, ending exactly as your microphone goes
+  live; a falling pair when it closes. What it teaches is when to start
+  talking, rather than being one more thing to talk over -- and the
+  quarter second it costs is the quarter second it is filling. Let go
+  inside it and nothing was ever said: no microphone, and nothing for
+  the room to write down.
+
+  **Before the microphone opens, never during**, which is the whole
+  reason the arming exists. A chirp played once you are live goes out
+  to the room with the first word of every sentence on a speakerphone.
+
+  **However the key is held**: a keyboard's talk key, the button in
+  the footer, or the volume key an Android phone lends to its
+  microphone. One setting for all three, on the settings page under
+  *Holding the talk button*, and kept against you on the server rather
+  than in this browser -- unlike the talk key itself, which stays this
+  browser's because a desk and a laptop have different keyboards.
+  Every phone has the same two volume keys, so that one follows you.
+
+  It plays on an `AudioContext` of its own rather than through the
+  room's mixer, deliberately. Half duplex cuts everything the room is
+  playing for as long as you hold, which is right for the room and
+  exactly wrong for this: the people who hold the key on speakers are
+  the ones the cue is most for. App volume is the room's too, and a
+  go-signal that can be turned down to nothing is not one.
+
+- **`pnpm dev` can follow an invite link again.** `vite.config.js`
+  proxied `/join` to the backend, which answered with the *built*
+  `index.html` out of the release binary -- asking for an
+  `/assets/index-<hash>.js` the dev server has never heard of. So a
+  fresh invite opened a blank page with one 404 in the console, and
+  `just room-ui` could not be used with the only way a new person ever
+  gets in. The server has no `/join` route either: an invite link is
+  the app, and the token is read off the path and spent through
+  `/api/door`, which is proxied. Left unproxied, vite serves the app
+  for it exactly as the server does.
+
+- **Whether a phone's volume keys talk is set in the room.** Under
+  *The talk key on a phone*, and it is a yes or a no rather than a
+  choice between the two keys: because a tap still changes the volume,
+  lending both costs nothing that has to be weighed up, and asking
+  which one only ever made somebody stop and think. Kept against you,
+  so a second phone does not have to be told again, and set from a
+  laptop for a phone in your pocket. It does nothing in a browser --
+  the Android app is the only thing with volume keys to lend. See
+  ROOM_ANDROID.md.
+
+### Voice Room for Android
+
+- **The phone has a push-to-talk button now: one of the volume keys.**
+  Push to talk asks for a key to hold and a phone has no keyboard --
+  the room says so itself, and hides its key hints on a touch screen
+  for the same reason -- so the one real button a phone does have is
+  lent to the microphone. **Tap one and it is still the volume; hold
+  one for a quarter of a second and you are talking.** Let go and the
+  mic shuts. Both keys, or neither: a tap still works, so lending them
+  costs nothing, and which one it should be was a question not worth
+  asking.
+
+  **The tap is not a nicety.** It is what makes lending both keys
+  free. A claimed event cannot be handed back to
+  Android -- and re-injecting one wants a permission only the
+  platform's own apps are given -- so the volume change is made
+  directly, with the system left to say which stream a press during a
+  call is even about.
+
+  **A chirp fills the wait** -- and it belongs to push to talk rather
+  than to this app; see the Voice room below.
+
+  **Only one of the two, and only while push to talk is on.** Taking
+  both would leave no way to turn the room down, and *down* is the one
+  worth keeping: the sound you want gone in a hurry is the room's own,
+  coming out of a speaker, at the moment somebody walks in -- and that
+  is this app in front, so a hijack there really would take the button
+  away when it was wanted. Losing *louder* costs nothing like as much,
+  so **volume up** is what it comes set to. With push to talk off, or
+  anywhere but in the room, both keys are the phone's own again, and
+  with the cursor in the message box the key goes back to the phone
+  too -- the room would refuse that press anyway, and a key that does
+  nothing at all is worse than a volume key.
+
+  **Both answers live in the room**, on its settings page, kept
+  against you rather than against a phone, so a second phone arrives
+  already knowing. The app never asks the server for them: the room
+  mirrors what it got into the page's storage and the app reads it
+  there, in the poll it already runs. The app reads the page; the page
+  cannot call the app, and that stays true -- which matters, because
+  this app loads whichever room somebody was invited to and not one it
+  shipped with.
+
+  **Talk key**, a third button on the notification, is the app's own
+  copy of the same two questions, for a phone that has not joined
+  anything yet. It writes through to the room when it can, so changing
+  it there changes the answer that wins.
+  Android's own place for a setting an app has no room for is the
+  launcher's long-press menu, and it is there as well -- but nobody
+  looks there, and this is a setting about a key you only reach for
+  mid-conversation, so it goes where this app already keeps its native
+  controls. Under push to talk there is no mute to offer and it is the
+  second of two. It opens over whatever is behind it and the call carries on
+  underneath, the same arrangement that survives the screen turning
+  off. There was nowhere else to put it -- while a room is up the whole
+  screen is the room's, and the one native screen this app has asks
+  where the room is and is never seen again once it is answered.
+
+  It presses the room's own talk key rather than its on-screen button,
+  so push to talk, the toggle, a mute that came from the mixer and the
+  text-box stand-down are all already decided by the room and inherited
+  rather than guessed at again out here. Whichever key that is: the
+  room lets you bind another one, and the binding is read out of the
+  room instead of assumed to be Space. The `ptt` suite reads both of
+  the app's snippets out of `MainActivity.kt` and runs them against a
+  real room, so the day the room moves the button the phone reaches
+  for, it is a failing test and not a phone gone quietly deaf.
 
 ## v0.2.1 (2026-11-04)
 
@@ -1583,6 +1723,57 @@ releases.
 
   Nothing about the cards themselves changed: they are still the AI's
   to give, rewrite and take back, and still on nobody else's screen.
+
+### Voice Room for Android
+
+- **First release: the room as an app, so a call survives the screen
+  going off the way a phone's own calls do.** It is a wrapper and says
+  so -- the whole of it is a `WebView` and a foreground service, and
+  there is no audio code in it, because the room already has all of
+  it. What a browser tab cannot have, and what this adds, is a
+  foreground service of its own.
+
+  **It ships no address.** Whose room it is belongs to whoever
+  installed it, so the first screen asks and the answer is kept. After
+  that the app remembers the *room* rather than the link: an invite is
+  spent by **Join Audio**, so keeping the one that was pasted would
+  make every launch after the first open an expired page. What gets you
+  in from then on is the cookie. The address has to be `https`, said at
+  the door rather than found out as a microphone that will not open,
+  with `localhost` the exception browsers themselves make.
+
+  **What holds the call with the screen off is not a wake lock.** One
+  was tried and measured and changes nothing: a wake lock guarantees
+  the CPU, and the CPU was never what went missing. Chromium releases a
+  page's audio device about a minute after its window stops being
+  visible, and the screen turning off is exactly that -- both streams
+  closed under a page that is otherwise still running perfectly, with
+  the room going on listing you while hearing silence. The view is what
+  carries that news, so the view is the only place an embedder can
+  decline to carry it. Measured at four minutes of screen-off, no wake
+  lock, not one silent second.
+
+  **The notification holds the call** and carries what is worth
+  reaching without opening the app: **Mute**, which says `Mute` or
+  `Unmute` because it is the room's own button being pressed and the
+  room's own word read back, and **Leave**, which leaves the audio and
+  puts you at the door. Neither logs you out. **Back** goes back
+  through the room, then out of the audio, then out of the app, and
+  never to the box the address goes in: that screen is for a phone the
+  room does not know, and being asked to type what you are already
+  holding is no better than having nowhere to type it.
+
+  Three other things cost an afternoon each and none are discoverable
+  from the error they cause: `MODIFY_AUDIO_SETTINGS`, without which
+  *every* `getUserMedia` in a WebView fails with
+  `NotReadableError: Could not start audio source` and nothing in the
+  message pointing at a permission; a microphone-typed foreground
+  service being a `SecurityException` and the end of the process until
+  `RECORD_AUDIO` is granted; and everything targeting Android 15 being
+  laid out edge to edge whether it asked to be or not, so a WebView
+  filling the window drew the page under the clock -- which is where
+  the room puts the heading you change rooms from, making the thing you
+  could not reach the thing you most needed. See ROOM_ANDROID.md.
 
 ## v0.2.0 (2026-11-01)
 

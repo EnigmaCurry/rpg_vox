@@ -71,7 +71,7 @@
 //! of them is about the one browser that asked.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use axum::{
     body::Bytes,
@@ -85,10 +85,13 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
 use futures_util::{SinkExt as _, StreamExt as _};
 use rust_embed::RustEmbed;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::{Digest as _, Sha256};
 use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{debug, info, warn};
 
@@ -217,6 +220,7 @@ pub fn router(rooms: Arc<Rooms>, screen: Arc<Screen>) -> Router {
         .route("/api/door/name", post(door_name))
         .route("/api/door/language", post(door_language))
         .route("/api/door/logout", post(door_logout))
+        .route("/api/talk", post(set_talk))
         // The house's people, which is the owner's business and
         // nobody else's. Every one of these says so for itself: an
         // endpoint that trusts the page not to have been asked is an
@@ -393,6 +397,12 @@ fn in_already(app: &App, p: &Invited, holding: Option<&str>) -> Response {
         // And what they chose last time, which the room has and a
         // fresh tab does not: it beats this browser's own guess.
         "language": p.language,
+        // How they hold the talk key. Sent from the
+        // door because the app reads it off the page and is at the door
+        // before it is anywhere else; empty means they have never said
+        // and the app keeps its own answer. See ROOM_ANDROID.md.
+        "volumeTalk": p.volume_talk,
+        "pttChirp": p.ptt_chirp,
         // Whether this browser owns the house. The page uses it to
         // decide what to show; every endpoint that matters asks
         // again for itself.
@@ -833,6 +843,55 @@ async fn door_language(
     }
 }
 
+#[derive(Deserialize)]
+struct SetTalk {
+    volume: String,
+    chirp: String,
+}
+
+/// Whether a phone's volume keys talk, and whether holding one chirps.
+///
+/// Theirs rather than this browser's, unlike the room's own talk key:
+/// every phone has the same two volume keys, so a second phone should
+/// not have to be told again. See ROOM_ANDROID.md.
+///
+/// Cookie only -- no token path like the language's. This is set from
+/// the settings page, which is a place you can only be once you are in,
+/// and a setting about a phone is not a thing to be deciding at a door.
+///
+/// What may be stored is spelled out here rather than taken as given.
+/// The value travels back out to an app that lends a physical key to a
+/// microphone on the strength of it, and the set of answers it can act
+/// on is small and closed, so anything else is a no rather than a row
+/// in the database nobody can explain later.
+async fn set_talk(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(body): Json<SetTalk>,
+) -> Response {
+    let Some(who) = person(&app, &headers) else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "Not in this room." })),
+        )
+            .into_response();
+    };
+    const EITHER: [&str; 3] = ["", "on", "off"];
+    if !EITHER.contains(&body.volume.as_str()) || !EITHER.contains(&body.chirp.as_str()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "No such answer." })),
+        )
+            .into_response();
+    }
+    match app.any().set_talk(&who, &body.volume, &body.chirp) {
+        Ok(()) => {
+            Json(json!({ "volumeTalk": body.volume, "pttChirp": body.chirp })).into_response()
+        }
+        Err(why) => (StatusCode::CONFLICT, Json(json!({ "error": why }))).into_response(),
+    }
+}
+
 /// A game's hidden prompt, for one person who asked to peek. It is never
 /// broadcast to the room.
 async fn game_prompt(
@@ -1196,6 +1255,120 @@ async fn forget_avatar(
     }
 }
 
+/// What the page may do, and nothing else.
+///
+/// A second line behind the sanitiser, which is at present the only
+/// thing between a model-written card and a running script -- and
+/// `e2e/cards.js` exists because a model did once write a `<script>`
+/// tag into one. It matters more here than on most pages: the Android
+/// app grants the microphone to this page without asking (see
+/// `onPermissionRequest` in MainActivity.kt) and reads the talk key off
+/// it, so script running here is script running next to an open mic.
+///
+/// What each line is for:
+///
+/// - `script-src 'self'` and nothing else executable. The one inline
+///   script is the theme, read before anything is drawn so a dark room
+///   does not arrive a frame after a white one, and it is let through
+///   by the hash of its own bytes rather than by `'unsafe-inline'` --
+///   worked out at startup from what is actually embedded, so it
+///   cannot go stale and there is no hash written down anywhere to
+///   forget to update.
+/// - `style-src` keeps `'unsafe-inline'`: a handful of components set
+///   `style=` to put a meter where the level is, and a style attribute
+///   is not a script.
+/// - `img-src` allows no other origin. Markdown in a card renders
+///   links but never images (see `lib/markdown.js`), so nothing
+///   legitimate wants one -- and a model that wrote an `<img>` at a
+///   server of its own choosing would be writing a tracking pixel into
+///   somebody else's room.
+/// - `connect-src 'self'` covers the room's own WebSocket; `'self'`
+///   matches `ws:`/`wss:` on the same host.
+/// - `frame-ancestors 'none'` so no other page can put this one in a
+///   frame and take clicks on it.
+static CSP: LazyLock<String> = LazyLock::new(policy);
+
+fn policy() -> String {
+    let mut inline = String::new();
+    if let Some(index) = Assets::get("index.html") {
+        for script in inline_scripts(&String::from_utf8_lossy(&index.data)) {
+            let hash = Sha256::digest(script.as_bytes());
+            inline.push_str(&format!(" 'sha256-{}'", BASE64.encode(hash)));
+        }
+    }
+    format!(
+        "default-src 'self'; \
+         script-src 'self'{inline}; \
+         style-src 'self' 'unsafe-inline'; \
+         img-src 'self' data: blob:; \
+         media-src 'self' blob:; \
+         connect-src 'self'; \
+         worker-src 'self' blob:; \
+         object-src 'none'; \
+         base-uri 'none'; \
+         form-action 'none'; \
+         frame-ancestors 'none'"
+    )
+}
+
+/// The body of every `<script>` in `html` that has no `src`, which is
+/// what a hash in the policy has to be taken of. One tag's worth at a
+/// time and no cleverness: this reads one file, written here, and the
+/// test below is what says it still reads it right.
+fn inline_scripts(html: &str) -> Vec<&str> {
+    let mut found = Vec::new();
+    let mut rest = html;
+    while let Some(start) = rest.find("<script") {
+        let after = &rest[start..];
+        let Some(close) = after.find('>') else { break };
+        let tag = &after[..close];
+        let body = &after[close + 1..];
+        let Some(end) = body.find("</script>") else { break };
+        if !tag.contains("src=") {
+            found.push(&body[..end]);
+        }
+        rest = &body[end..];
+    }
+    found
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_policy_lets_through_the_pages_own_inline_script_and_nothing_else() {
+        let found = inline_scripts(
+            r#"<html><head>
+                 <script src="/assets/app.js"></script>
+                 <script>theme()</script>
+               </head><body>
+                 <script type="module" src="/src/main.js"></script>
+                 <script>two()</script>
+               </body></html>"#,
+        );
+        assert_eq!(found, vec!["theme()", "two()"], "the ones with no src, in order");
+
+        // The real page, whatever it is today. If it ever stops having
+        // exactly one inline script this is what says so, because the
+        // policy it is let through by is built from exactly this.
+        let index = Assets::get("index.html").expect("the app is embedded");
+        let html = String::from_utf8_lossy(&index.data);
+        let mine = inline_scripts(&html);
+        assert_eq!(mine.len(), 1, "index.html has one inline script: the theme");
+        assert!(mine[0].contains("vox_room.theme"), "and it is the theme one");
+
+        // And it is in the policy by its hash, rather than by letting
+        // every inline script on the page run.
+        let csp = policy();
+        let hash = BASE64.encode(Sha256::digest(mine[0].as_bytes()));
+        assert!(csp.contains(&format!("'sha256-{hash}'")), "{csp}");
+        assert!(csp.contains("script-src 'self' 'sha256-"), "{csp}");
+        assert!(csp.contains("frame-ancestors 'none'"), "{csp}");
+        assert!(csp.contains("object-src 'none'"), "{csp}");
+    }
+}
+
 async fn assets(headers: HeaderMap, uri: Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
     let path = if path.is_empty() { "index.html" } else { path };
@@ -1224,15 +1397,29 @@ async fn assets(headers: HeaderMap, uri: Uri) -> Response {
     // here that is the same thing: a request under `assets/` either
     // found its file or 404'd above.
     let cache = if hashed { ASSET_CACHE } else { INDEX_CACHE };
-    (
+    let kind = file.metadata.mimetype().to_string();
+    // On the document and not on the script it loads: a policy is about
+    // a page, and a browser reads it off the page's own response.
+    let policy = kind
+        .starts_with("text/html")
+        .then(|| CSP.as_str())
+        .unwrap_or("");
+    let mut res = (
         [
-            (header::CONTENT_TYPE, file.metadata.mimetype().to_string()),
+            (header::CONTENT_TYPE, kind),
             (header::CACHE_CONTROL, cache.to_string()),
             (header::ETAG, tag),
         ],
         file.data,
     )
-        .into_response()
+        .into_response();
+    if !policy.is_empty() {
+        if let Ok(value) = policy.parse() {
+            res.headers_mut()
+                .insert(header::CONTENT_SECURITY_POLICY, value);
+        }
+    }
+    res
 }
 
 /// A quoted, strong validator for one embedded file. Eight bytes of its

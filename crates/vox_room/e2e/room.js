@@ -46,6 +46,18 @@ function is(what, got, want) {
   return ok;
 }
 
+/// A page refusing to do something because of its own policy.
+///
+/// Never acceptable and never only cosmetic: the room sets a strict
+/// `Content-Security-Policy` (see `policy()` in web.rs) and a policy
+/// that is a shade too strict breaks a feature quietly, in one browser,
+/// with nothing on the screen saying why. Every suite watches for it,
+/// so whichever one touches the broken thing is the one that says so.
+function violation(text) {
+  failed++;
+  console.log(`FAIL the page was refused by its own policy: ${text}`);
+}
+
 /// Say how it went and leave with an exit code that says the same.
 function report() {
   console.log(failed ? `\n${failed} failed` : '\nall ok');
@@ -98,7 +110,9 @@ async function person(url, { wav, locale, capture, viewport, quiet = false, sett
   if (!quiet) {
     page.on('pageerror', (e) => console.log('[pageerror]', e.message));
     page.on('console', (m) => {
-      if (m.type() === 'error') console.log('[console]', m.text());
+      if (m.type() !== 'error') return;
+      if (/Content Security Policy/i.test(m.text())) return violation(m.text());
+      console.log('[console]', m.text());
     });
   }
   await page.goto(url);

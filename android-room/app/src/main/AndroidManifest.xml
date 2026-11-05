@@ -30,7 +30,24 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <!-- Holding the icon is the way to the talk key. It has to
+                 be declared on the launcher activity rather than on the
+                 one it opens. -->
+            <meta-data
+                android:name="android.app.shortcuts"
+                android:resource="@xml/shortcuts" />
         </activity>
+        <!-- Which volume key talks, if either. A dialog over whatever is
+             behind it; the call carries on underneath. Exported because
+             the launcher is what starts it, which is safe enough: it is
+             three radio buttons over one preference of this app's own,
+             and there is nothing behind it to reach. -->
+        <activity
+            android:name=".TalkKeyActivity"
+            android:exported="true"
+            android:label="@string/talk_key_title"
+            android:excludeFromRecents="true"
+            android:theme="@android:style/Theme.Material.Dialog" />
         <!-- What keeps the call alive while the screen is off: Android
              keeps the process scheduled, and the WebView inside it goes
              on holding the room. See README.md. -->
