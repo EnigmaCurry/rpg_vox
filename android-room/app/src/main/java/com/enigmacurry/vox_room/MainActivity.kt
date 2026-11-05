@@ -379,6 +379,12 @@ class MainActivity : Activity() {
     }
     private var backRegistered = false
 
+    /// What the room last said this phone was to it. Back reads it: the
+    /// door of a room you are logged into is the end of the road and
+    /// back means leave, but the door of a link you are only holding
+    /// has the app's own screen behind it.
+    private var lastWayIn: String? = null
+
     private fun watchBack(on: Boolean) {
         val cb = goingBack ?: return
         if (on == backRegistered) return
@@ -418,7 +424,10 @@ class MainActivity : Activity() {
         ) { answer ->
             // Already at the door: there is nowhere further back inside
             // the room, so back means what it means everywhere else.
-            if (answer == null || answer.contains("door")) finish()
+            if (answer != null && !answer.contains("door")) return@evaluateJavascript
+            // At the door. Logged in, there is nothing behind it; only
+            // holding a link, the screen that takes one is.
+            if (lastWayIn == "in") finish() else setup()
         }
     }
 
@@ -496,7 +505,10 @@ class MainActivity : Activity() {
             // The state and not the address: an invite link is a
             // credential, and logcat is not where credentials go.
             Log.i(RoomService.TAG, "the way in: ${state ?: "could not ask"}")
-            runOnUiThread { then(state) }
+            runOnUiThread {
+                lastWayIn = state
+                then(state)
+            }
         }.start()
     }
 

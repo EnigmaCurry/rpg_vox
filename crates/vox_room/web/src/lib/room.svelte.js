@@ -507,6 +507,21 @@ export async function logOut() {
   location.reload();
 }
 
+/// Put down an invite without spending it.
+///
+/// The way out of a link you did not mean to follow. Logging out is no
+/// help here and is not offered: holding an unspent invite means there
+/// is no cookie to give back, and the only thing tying this browser to
+/// that room is the token in the address. So this is the address
+/// without it -- which in a browser is the room saying you need a link,
+/// and in the Android app is the screen that takes one.
+///
+/// Nothing is spent and nothing is asked first. The link still works,
+/// and whoever it belongs to can still use it.
+export function putLinkDown() {
+  location.href = '/';
+}
+
 export function command(msg) {
   if (link?.up) link.send(msg);
 }

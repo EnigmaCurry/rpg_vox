@@ -1,7 +1,7 @@
 <script>
   import { onMount } from 'svelte';
   import {
-    room, joinAudio, setName, logOut, setPushToTalk, loadDevices, watchDevices,
+    room, joinAudio, setName, logOut, putLinkDown, setPushToTalk, loadDevices, watchDevices,
     setMicDevice, setSpeakerDevice, setLanguage, setConsent, theAI,
   } from '../lib/room.svelte.js';
   import { supported, canChooseSpeaker } from '../lib/audio.js';
@@ -204,13 +204,24 @@
          Who is in, what is being said, which rooms there are -- all of
          it arrives when you come in, and goes when you leave. -->
 
-    <!-- The way out of a browser that is signed in. An invite not yet
-         spent has nothing to give back. -->
+    <!-- The way out, whichever way you came in. Signed in, that is
+         giving the browser back; holding a link, there is nothing to
+         give back and the way out is to put the link down -- which
+         matters most where this page is the whole screen, because the
+         wrong link would otherwise leave joining as the only thing you
+         could do. -->
     {#if !room.door}
       <p class="out">
         <button class="logout" onclick={logOut}
           title="Forget this browser. Your invite link is spent, so coming back takes a new one.">
           Log out
+        </button>
+      </p>
+    {:else}
+      <p class="out">
+        <button class="logout" onclick={putLinkDown}
+          title="Leave without using it. The link is not spent, so whoever it belongs to can still come in on it.">
+          This isn't my link
         </button>
       </p>
     {/if}
