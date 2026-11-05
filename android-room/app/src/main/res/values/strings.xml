@@ -18,11 +18,9 @@
     <string name="link_spent">That link has been used already. A link works once, so ask for another.</string>
     <string name="no_mic">Voice Room needs the microphone to put you in a room.</string>
     <string name="talk_key_title">Talk key</string>
-    <string name="talk_key_blurb">Push to talk asks for a key to hold, and a phone has no keyboard. One of the volume keys can be it: while push to talk is on in the room, <b>hold</b> that key to open your microphone and let go to shut it. A <b>tap</b> is still the volume, as it always was. With push to talk off, or anywhere but in the room, both keys are the phone\'s own again.</string>
-    <string name="talk_key_up">Volume up</string>
-    <string name="talk_key_down">Volume down</string>
-    <string name="talk_key_off">Neither — both keys stay the phone\'s</string>
-    <string name="talk_key_chirp">Chirp while the mic opens, and when it closes</string>
+    <string name="talk_key_blurb">Push to talk asks for a key to hold, and a phone has no keyboard. The volume keys can be it: while push to talk is on in the room, <b>hold</b> either one to open your microphone and let go to shut it. A <b>tap</b> is still the volume, exactly as it always was — which is why it is both keys and not a choice between them. With push to talk off, or anywhere but in the room, they are the phone\'s own again.</string>
+    <string name="talk_key_volume">Hold a volume key to talk</string>
+    <string name="talk_key_chirp">Chirp while your mic opens</string>
     <string name="talk_key_saved">Saved to your room, so your other phones get it too.</string>
     <string name="talk_key_not_saved">Couldn\'t reach the room, so this is for this phone only. If your room has an answer of its own, it still wins.</string>
     <string name="talk_key_phone_only">This phone only — join a room and it will be saved against you instead.</string>

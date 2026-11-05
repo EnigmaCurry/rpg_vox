@@ -17,21 +17,6 @@
   // two must agree.
   const PAST = 56;
 
-  // Which volume key a phone may lend to the microphone. `volume_up` is
-  // first and is what the app comes set to: taking a key away costs
-  // less on the one that makes the room louder than on the one that
-  // makes it quieter in a hurry. See ROOM_ANDROID.md.
-  const PHONE_KEYS = [
-    { value: 'volume_up', label: 'Volume up',
-      why: 'The usual answer. Volume down is left alone, so the room can '
-         + 'still be taken quiet in a hurry without letting go of anything.' },
-    { value: 'volume_down', label: 'Volume down',
-      why: 'For a phone whose power button sits directly above volume up, '
-         + 'where reaching for the talk key in the dark finds power instead.' },
-    { value: 'off', label: 'Neither',
-      why: 'Both keys stay the phone\'s. Push to talk on that phone is the '
-         + 'button on the screen and nothing else.' },
-  ];
 
   // The things you set once, off the floor of the room.
   //
@@ -286,28 +271,25 @@
   <section>
     <h2>The talk key on a phone</h2>
     <p class="note first">
-      A phone has no keyboard, so the Android app lends one of the volume
-      keys to your microphone instead: while push to talk is on, a
-      <em>tap</em> is still the volume and a <em>hold</em> opens your mic.
-      This is yours rather than this browser's, so a second phone arrives
-      already knowing. It does nothing in a browser.
+      A phone has no keyboard, so the Android app can lend the volume keys
+      to your microphone instead. Yours rather than this browser's, so a
+      second phone arrives already knowing. It does nothing in a browser.
     </p>
-    {#each PHONE_KEYS as choice (choice.value)}
-      <label class="duplex">
-        <input type="radio" name="phonekey" checked={room.phoneKey === choice.value}
-          onchange={() => setTalk(choice.value, room.pttChirp || 'on')} />
-        <span>
-          {choice.label}
-          <small>{choice.why}</small>
-        </span>
-      </label>
-    {/each}
-    {#if !room.phoneKey}
-      <p class="note">
-        Nothing chosen, so each phone keeps whatever it was set to on the
-        phone itself.
-      </p>
-    {/if}
+    <label class="duplex">
+      <input type="checkbox" name="volumetalk" checked={room.volumeTalk !== 'off'}
+        onchange={(e) => setTalk(e.currentTarget.checked ? 'on' : 'off', room.pttChirp || 'on')} />
+      <span>
+        Hold a volume key to talk
+        <small>
+          Either of them, while push to talk is on: a <em>hold</em> opens your
+          mic, and a <em>tap</em> is still the volume exactly as it always
+          was. Because the tap still works, lending them costs you nothing —
+          which is why it is both keys rather than a choice between them. Off,
+          they stay the phone's, and push to talk there is the button on the
+          screen.
+        </small>
+      </span>
+    </label>
     {#if room.pttError}<p class="warn">{room.pttError}</p>{/if}
   </section>
 
@@ -357,7 +339,7 @@
          the same way. See `lib/chirp.js`. -->
     <label class="duplex">
       <input type="checkbox" name="pttchirp" checked={room.pttChirp !== 'off'}
-        onchange={(e) => setTalk(room.phoneKey, e.currentTarget.checked ? 'on' : 'off')} />
+        onchange={(e) => setTalk(room.volumeTalk || 'on', e.currentTarget.checked ? 'on' : 'off')} />
       <span>
         Chirp while your mic opens
         <small>

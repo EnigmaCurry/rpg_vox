@@ -93,17 +93,18 @@ CREATE TABLE IF NOT EXISTS people (
     -- 'owner' or empty. The owner invites everybody else and says which
     -- rooms they may go to; see `grants`.
     role TEXT NOT NULL DEFAULT '',
-    -- Which of a phone's volume keys is their push-to-talk key. A phone
-    -- has no keyboard, so the talk key the room binds cannot exist on
-    -- one and a volume key is lent to the microphone instead; see
-    -- ROOM_ANDROID.md. Kept against the person rather than the browser
-    -- -- unlike the room's own talk key, which is deliberately this
-    -- browser's because a desk and a laptop want different answers --
-    -- because every phone has the same two volume keys, and the point
-    -- of setting it here is that a second phone does not have to be
-    -- told again. Empty means nothing has been said and the app's own
-    -- answer stands.
-    phone_key TEXT NOT NULL DEFAULT '',
+    -- Whether a phone's volume keys talk. A phone has no keyboard, so
+    -- the talk key the room binds cannot exist on one and the volume
+    -- keys are lent to the microphone instead; see ROOM_ANDROID.md.
+    -- Both of them or neither, never one: a tap still changes the
+    -- volume, so lending them costs nothing that would have to be
+    -- weighed up, and which one it is was a question not worth asking.
+    -- Kept against the person rather than the browser -- unlike the
+    -- room's own talk key, which is deliberately this browser's because
+    -- a desk and a laptop want different answers -- because every phone
+    -- has the same two volume keys. 'on', 'off', or empty for the
+    -- default, which is on.
+    volume_talk TEXT NOT NULL DEFAULT '',
     -- Whether holding the talk key chirps while the microphone opens.
     -- Push to talk's rather than any one device's: a hold arms for a
     -- quarter of a second before going live and the chirp fills it, on
@@ -513,11 +514,11 @@ pub struct Invited {
     /// everybody starts as, or the way their BOTS button is off. See
     /// [`crate::room::Bots`].
     pub bots: String,
-    /// Which volume key talks on their phone -- `volume_up`,
-    /// `volume_down` or `off` -- and whether holding it chirps, `on` or
-    /// `off`. Either empty means they have never said, and the app on
-    /// the phone keeps its own answer. See [`Store::set_talk`].
-    pub phone_key: String,
+    /// Whether a phone's volume keys talk, `on` or `off`, and whether
+    /// holding one chirps. Either empty means they have never said, and
+    /// the app on the phone keeps its own answer. See
+    /// [`Store::set_talk`].
+    pub volume_talk: String,
     pub ptt_chirp: String,
     /// Whether this is the owner: the one who invites everybody else and
     /// says which rooms they may go to. There is at most one.
@@ -929,7 +930,7 @@ impl Store {
         Ok(self
             .db
             .query_row(
-                "SELECT p.name, p.display, p.token, p.used, p.language, p.role, p.bots, p.phone_key, p.ptt_chirp FROM sessions s
+                "SELECT p.name, p.display, p.token, p.used, p.language, p.role, p.bots, p.volume_talk, p.ptt_chirp FROM sessions s
                  JOIN people p ON p.name = s.name WHERE s.id = ?1",
                 [id],
                 invited_row,
@@ -952,7 +953,7 @@ impl Store {
         Ok(self
             .db
             .query_row(
-                "SELECT name, display, token, used, language, role, bots, phone_key, ptt_chirp
+                "SELECT name, display, token, used, language, role, bots, volume_talk, ptt_chirp
                  FROM people WHERE token = ?1 AND used = 0",
                 [token],
                 invited_row,
@@ -975,7 +976,7 @@ impl Store {
             return Ok(None);
         }
         let invited: Invited = tx.query_row(
-            "SELECT name, display, token, used, language, role, bots, phone_key, ptt_chirp
+            "SELECT name, display, token, used, language, role, bots, volume_talk, ptt_chirp
              FROM people WHERE token = ?1",
             [token],
             invited_row,
@@ -1055,14 +1056,14 @@ impl Store {
         )? > 0)
     }
 
-    /// How `name`'s phone is to treat its volume keys: which one talks
-    /// (`volume_up`, `volume_down`, `off`) and whether it chirps (`on`,
-    /// `off`). Either empty leaves the app on the phone to decide.
-    /// False when nobody is invited under that name.
-    pub fn set_talk(&self, name: &str, key: &str, chirp: &str) -> Result<bool> {
+    /// How `name` holds the talk key: whether a phone's volume keys
+    /// talk (`on`, `off`) and whether holding one chirps (`on`, `off`).
+    /// Either empty leaves the app on the phone to decide. False when
+    /// nobody is invited under that name.
+    pub fn set_talk(&self, name: &str, volume: &str, chirp: &str) -> Result<bool> {
         Ok(self.db.execute(
-            "UPDATE people SET phone_key = ?2, ptt_chirp = ?3 WHERE name = ?1",
-            params![name, key, chirp],
+            "UPDATE people SET volume_talk = ?2, ptt_chirp = ?3 WHERE name = ?1",
+            params![name, volume, chirp],
         )? > 0)
     }
 
@@ -1083,7 +1084,7 @@ impl Store {
         Ok(self
             .db
             .query_row(
-                "SELECT name, display, token, used, language, role, bots, phone_key, ptt_chirp
+                "SELECT name, display, token, used, language, role, bots, volume_talk, ptt_chirp
                  FROM people WHERE name = ?1",
                 [name],
                 invited_row,
@@ -1093,7 +1094,7 @@ impl Store {
 
     pub fn people(&self) -> Result<Vec<Invited>> {
         let mut q = self.db.prepare(
-            "SELECT name, display, token, used, language, role, bots, phone_key, ptt_chirp
+            "SELECT name, display, token, used, language, role, bots, volume_talk, ptt_chirp
              FROM people ORDER BY name",
         )?;
         let rows = q.query_map([], invited_row)?;
@@ -2340,7 +2341,7 @@ fn invited_row(r: &rusqlite::Row) -> rusqlite::Result<Invited> {
     let language: String = r.get(4)?;
     let role: String = r.get(5)?;
     let bots: String = r.get(6)?;
-    let phone_key: String = r.get(7)?;
+    let volume_talk: String = r.get(7)?;
     let ptt_chirp: String = r.get(8)?;
     Ok(Invited {
         // A row from before display names had their own column, or one
@@ -2355,7 +2356,7 @@ fn invited_row(r: &rusqlite::Row) -> rusqlite::Result<Invited> {
         link: (used == 0).then_some(token),
         language,
         bots,
-        phone_key,
+        volume_talk,
         ptt_chirp,
     })
 }
@@ -2433,8 +2434,8 @@ fn migrate(db: &Connection) -> Result<()> {
     // the app's own answer and nobody else's; everybody already invited
     // comes back having said nothing, which is what empty means and
     // leaves the app deciding exactly as it did before.
-    if !has_column(db, "people", "phone_key")? {
-        db.execute_batch("ALTER TABLE people ADD COLUMN phone_key TEXT NOT NULL DEFAULT ''")?;
+    if !has_column(db, "people", "volume_talk")? {
+        db.execute_batch("ALTER TABLE people ADD COLUMN volume_talk TEXT NOT NULL DEFAULT ''")?;
     }
     // Asked separately rather than along with the key above. The chirp
     // began as a thing a phone's volume key did and is now what push to
@@ -3107,44 +3108,44 @@ mod tests {
         assert!(!s.set_language("Nobody", "Russian").unwrap());
     }
 
-    /// And so is what their phone's volume keys do. The room's own talk
-    /// key is deliberately the *browser's* -- a desk and a laptop have
-    /// different keyboards -- but every phone has the same two volume
-    /// keys, and the whole point of keeping this here is that a second
-    /// phone arrives already knowing. See ROOM_ANDROID.md.
+    /// And so is whether a phone's volume keys talk. The room's own
+    /// talk key is deliberately the *browser's* -- a desk and a laptop
+    /// have different keyboards -- but every phone has the same two
+    /// volume keys, and the whole point of keeping this here is that a
+    /// second phone arrives already knowing. See ROOM_ANDROID.md.
     #[test]
-    fn what_a_phone_does_with_its_volume_keys_is_kept_against_the_person() {
+    fn whether_a_phones_volume_keys_talk_is_kept_against_the_person() {
         let s = Store::memory();
         let link = s.invite("Mike").unwrap();
         let p = s.person("Mike").unwrap().unwrap();
         assert_eq!(
-            (p.phone_key.as_str(), p.ptt_chirp.as_str()),
+            (p.volume_talk.as_str(), p.ptt_chirp.as_str()),
             ("", ""),
             "nothing said, so a phone keeps its own answer"
         );
 
-        assert!(s.set_talk("Mike", "volume_down", "off").unwrap());
+        assert!(s.set_talk("Mike", "off", "off").unwrap());
         let p = s.person("Mike").unwrap().unwrap();
-        assert_eq!(p.phone_key, "volume_down");
+        assert_eq!(p.volume_talk, "off");
         assert_eq!(p.ptt_chirp, "off");
 
         // It reaches a phone the way everything else does: through the
         // link, and then through the cookie the link is spent for.
         let token = link.rsplit('/').next().unwrap();
-        assert_eq!(s.live_invite(token).unwrap().unwrap().phone_key, "volume_down");
+        assert_eq!(s.live_invite(token).unwrap().unwrap().volume_talk, "off");
         let (id, _) = s.claim_invite(token).unwrap().unwrap();
         assert_eq!(
-            s.person_for_session(&id).unwrap().unwrap().phone_key,
-            "volume_down",
+            s.person_for_session(&id).unwrap().unwrap().volume_talk,
+            "off",
             "and the browser that spent the link sees it too"
         );
 
         // Against the key that never changes, so renaming keeps it --
         // which is the whole reason it is stored against `name`.
         assert!(s.rename("Mike", "Mikey").unwrap());
-        assert_eq!(s.person("Mike").unwrap().unwrap().phone_key, "volume_down");
+        assert_eq!(s.person("Mike").unwrap().unwrap().volume_talk, "off");
 
-        assert!(!s.set_talk("Nobody", "volume_up", "on").unwrap());
+        assert!(!s.set_talk("Nobody", "on", "on").unwrap());
     }
 
     /// And so is whether the AIs may answer them, for the same reason

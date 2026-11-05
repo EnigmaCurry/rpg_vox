@@ -270,19 +270,22 @@ export const room = $state({
   // Yours and this browser's, like the mode it qualifies; see
   // `setTalkHush`.
   pttHush: readPref('vox_room.ptt_hush'),
-  // Which of a phone's volume keys is its push-to-talk key, and whether
-  // holding it chirps. Not this browser's, unlike the talk key and
-  // `pttHush` above: a phone has no keyboard, so the app lends a volume
-  // key to the microphone, and every phone has the same two of them --
-  // where a desk and a laptop have different keyboards, which is why
-  // the room's own talk key is kept per browser. Stored against your
-  // invite so a second phone does not have to be told again.
+  // Whether a phone's volume keys talk: 'on', 'off', or empty for the
+  // default, which is on. Both of them or neither, never one -- a tap
+  // still changes the volume, so lending them costs nothing that has to
+  // be weighed up, and which one it was is a question not worth asking.
   //
-  // Empty means you have never said, and the app on the phone keeps its
-  // own answer. Nothing here does anything in a browser: it is read off
-  // this page by the Android app, which is the only thing with volume
-  // keys to lend. See ROOM_ANDROID.md.
-  phoneKey: '',
+  // Not this browser's, unlike the talk key and `pttHush` above: a
+  // phone has no keyboard, so the app lends the volume keys to the
+  // microphone, and every phone has the same two of them -- where a
+  // desk and a laptop have different keyboards, which is why the room's
+  // own talk key is kept per browser. Stored against your invite so a
+  // second phone does not have to be told again.
+  //
+  // Nothing here does anything in a browser: it is read off this page
+  // by the Android app, which is the only thing with volume keys to
+  // lend. See ROOM_ANDROID.md.
+  volumeTalk: '',
   // Whether holding the talk key chirps -- 'on', 'off', or empty for
   // the default, which is on. Push to talk's and not the phone's: the
   // on-screen button and the talk key on a keyboard arm and chirp
@@ -441,7 +444,7 @@ export async function whoami() {
     // browser would have guessed.
     room.languages = d.languages ?? [];
     room.lang = myLanguage(room.languages, d.language ?? '');
-    rememberPhone(d.phoneKey ?? '', d.pttChirp ?? '');
+    rememberTalk(d.volumeTalk ?? '', d.pttChirp ?? '');
     room.owner = d.owner ?? false;
     return true;
   }
@@ -1575,10 +1578,10 @@ export async function setLanguage(language) {
   }
 }
 
-/// What the phone's volume keys do: which one talks and whether holding
-/// it chirps. Saved on the server against your invite rather than in
-/// this browser, which is the whole point -- it is how a second phone
-/// arrives already knowing.
+/// How you hold the talk key: whether a phone's volume keys talk, and
+/// whether holding one chirps. Saved on the server against your invite
+/// rather than in this browser, which is the whole point -- it is how a
+/// second phone arrives already knowing.
 ///
 /// Nothing in a browser changes. The Android app reads these off this
 /// page; see ROOM_ANDROID.md.
@@ -1592,27 +1595,27 @@ export async function setLanguage(language) {
 /// poll it already runs. The app reads; it is never told. Nothing is
 /// injected into this page and there is no way back out of it into the
 /// app, which is the property worth keeping. See ROOM_ANDROID.md.
-function rememberPhone(key, chirp) {
-  room.phoneKey = key;
+function rememberTalk(volume, chirp) {
+  room.volumeTalk = volume;
   room.pttChirp = chirp;
-  writeChoice('vox_room.phone_key', key);
+  writeChoice('vox_room.volume_talk', volume);
   writeChoice('vox_room.ptt_chirp', chirp);
 }
 
-export async function setTalk(key, chirp) {
-  const was = [room.phoneKey, room.pttChirp];
-  rememberPhone(key, chirp);
+export async function setTalk(volume, chirp) {
+  const was = [room.volumeTalk, room.pttChirp];
+  rememberTalk(volume, chirp);
   room.pttError = null;
   try {
-    const r = await door('/api/talk', { key, chirp });
+    const r = await door('/api/talk', { volume, chirp });
     const d = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(d.error || r.statusText);
-    rememberPhone(d.phoneKey ?? key, d.pttChirp ?? chirp);
+    rememberTalk(d.volumeTalk ?? volume, d.pttChirp ?? chirp);
     return true;
   } catch (e) {
     // Back to what the room still believes, so the radio is never
     // showing a choice the phone will not actually be told about.
-    rememberPhone(was[0], was[1]);
+    rememberTalk(was[0], was[1]);
     room.pttError = e.message || String(e);
     return false;
   }

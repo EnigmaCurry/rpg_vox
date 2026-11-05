@@ -131,7 +131,7 @@ class MainActivity : Activity() {
             }.getOrNull()
             pttNow = said?.optBoolean("ptt") ?: false
             typingNow = said?.optBoolean("typing") ?: false
-            roomKey = said?.optString("key").orEmpty()
+            roomVolume = said?.optString("volume").orEmpty()
             roomChirp = said?.optString("chirp").orEmpty()
             say(said?.optString("says").orEmpty())
         }
@@ -164,11 +164,11 @@ class MainActivity : Activity() {
 
     /// What the room says this person's phone should do, or empty for
     /// nothing said. Off the same poll, for the same reason.
-    private var roomKey = ""
+    private var roomVolume = ""
     private var roomChirp = ""
 
-    /// Which key talks: the room's answer when there is one, and this
-    /// phone's own when there is not.
+    /// Whether the volume keys talk: the room's answer when there is
+    /// one, and this phone's own when there is not.
     ///
     /// The room wins rather than merely filling a gap, because the point
     /// of putting it there was that it should reach a phone that has
@@ -177,14 +177,11 @@ class MainActivity : Activity() {
     /// from being a trap is that the app's own chooser writes *through*
     /// to the room when it can -- see [TalkKeyActivity] -- so changing
     /// it here changes the thing that wins.
-    private fun whichKey(): TalkKey =
-        if (roomKey.isNotEmpty()) TalkKey.of(roomKey) else TalkKey.read(prefs)
+    private fun whichWay(): Boolean =
+        if (roomVolume.isNotEmpty()) TalkKey.on(roomVolume) else TalkKey.volume(prefs)
 
-    private fun chirps(): Boolean = when (roomChirp) {
-        "on" -> true
-        "off" -> false
-        else -> prefs.getBoolean(TalkKey.CHIRP, true)
-    }
+    private fun chirps(): Boolean =
+        if (roomChirp.isNotEmpty()) TalkKey.on(roomChirp) else TalkKey.chirp(prefs)
 
     /// How long a volume key has to be down before it is the
     /// microphone's rather than the phone's.
@@ -241,7 +238,7 @@ class MainActivity : Activity() {
                 // ends as the microphone opens, so what it teaches is
                 // exactly the thing worth teaching, and the microphone
                 // it is about never hears it.
-                chirp(rising = true)
+                chirp()
                 watching.postDelayed(becomeAHold, holdMs)
                 return true
             }
@@ -261,7 +258,6 @@ class MainActivity : Activity() {
                 if (code == 0 || code != holding) return super.dispatchKeyEvent(event)
                 holding = 0
                 hold(false)
-                chirp(rising = false)
                 return true
             }
         }
@@ -290,10 +286,14 @@ class MainActivity : Activity() {
         )
     }
 
+    /// Either volume key, never one of them. A tap still changes the
+    /// volume -- see the `ACTION_UP` arm above -- so lending both costs
+    /// nothing that has to be weighed up, and which one it is was a
+    /// question that only ever made somebody stop and think.
     private fun lentToTheMic(code: Int): Boolean {
         if (web == null || !pttNow || typingNow) return false
-        val key = whichKey()
-        return key != TalkKey.OFF && code == key.keyCode
+        if (code != KeyEvent.KEYCODE_VOLUME_UP && code != KeyEvent.KEYCODE_VOLUME_DOWN) return false
+        return whichWay()
     }
 
     /// Press the room's talk key, from out here.
@@ -330,23 +330,24 @@ class MainActivity : Activity() {
 
     // -- the chirp ----------------------------------------------------
 
-    /// Two beeps, the pair of them exactly as long as the wait: rising
-    /// while the microphone is opening, falling once it has closed.
+    /// Two beeps rising, exactly as long as the wait they fill.
     ///
-    /// The rising one is the whole reason the wait is bearable. A hold
-    /// that does nothing for a quarter of a second is a hold you talk
-    /// over; a hold that chirps for a quarter of a second is one you
-    /// speak after, and after one evening nobody thinks about it again.
-    /// The falling one teaches nothing and is there so the two edges of
-    /// a hold sound like two edges of one thing.
+    /// Only the rising one. It is the whole reason the wait is bearable
+    /// -- a hold that does nothing for a quarter of a second is a hold
+    /// you talk over -- and this app is the only thing that can play it,
+    /// because nothing is said to the page until the wait is over and a
+    /// hold has been told from a tap.
+    ///
+    /// The falling pair that says the microphone has closed is the
+    /// room's, and is played by the page like every other way of
+    /// letting go of the key. There is no wait on that edge and so
+    /// nothing only this app can do, and when both of them played it
+    /// you heard it twice. See `lib/chirp.js`.
     private var rise: AudioTrack? = null
-    private var fall: AudioTrack? = null
 
-    private fun chirp(rising: Boolean) {
+    private fun chirp() {
         if (!chirps()) return
-        val track = (if (rising) rise else fall) ?: beeps(rising).also {
-            if (rising) rise = it else fall = it
-        }
+        val track = rise ?: beeps().also { rise = it }
         runCatching {
             // How a static track is played a second time.
             track.stop()
@@ -377,7 +378,7 @@ class MainActivity : Activity() {
     /// than that is audible at all. A quarter of a second is a hold; a
     /// tap is nothing like 120 ms; the overlap is small and what lands
     /// in it is a fragment of a beep rather than a whole one.
-    private fun beeps(rising: Boolean): AudioTrack {
+    private fun beeps(): AudioTrack {
         val rate = 44100
         val lead = 120                       // ms of silence first: the
                                              // room a tap gets to be a
@@ -403,8 +404,8 @@ class MainActivity : Activity() {
                 pcm[at + i] = (s * Short.MAX_VALUE).toInt().toShort()
             }
         }
-        tone(rate * lead / 1000, if (rising) low else high)
-        tone(rate * (lead + beep + gap) / 1000, if (rising) high else low)
+        tone(rate * lead / 1000, low)
+        tone(rate * (lead + beep + gap) / 1000, high)
 
         val track = AudioTrack.Builder()
             // Where the room is, which is the only place this is any
@@ -813,6 +814,20 @@ class MainActivity : Activity() {
     private fun back() {
         val w = web ?: return
         if (w.canGoBack()) return w.goBack()
+        // One layer at a time. The room has pages and panels over itself
+        // -- settings, the owner's page, somebody's desktop, a profile,
+        // a dropdown -- and every one of them is a thing Escape closes
+        // rather than a page the WebView navigated to, so `canGoBack` is
+        // false inside all of them and back used to mean leave. Backing
+        // out of the settings page put the whole app away.
+        w.evaluateJavascript(CLOSE_JS) { shut ->
+            if (shut != null && shut.contains("closed")) return@evaluateJavascript
+            leaveOrFinish(w)
+        }
+    }
+
+    /// Nothing left open: back through the audio, and then out.
+    private fun leaveOrFinish(w: WebView) {
         w.evaluateJavascript(
             """(() => {
                  const leave = document.querySelector('.tools button[aria-label="Leave audio"]');
@@ -932,9 +947,9 @@ class MainActivity : Activity() {
         super.onResume()
         if (!prefs.getBoolean(TalkKey.PUSH, false)) return
         prefs.edit().remove(TalkKey.PUSH).apply()
-        roomKey = TalkKey.read(prefs).stored
-        roomChirp = if (prefs.getBoolean(TalkKey.CHIRP, true)) "on" else "off"
-        web?.evaluateJavascript(mirrorJs(roomKey, roomChirp), null)
+        roomVolume = if (TalkKey.volume(prefs)) "on" else "off"
+        roomChirp = if (TalkKey.chirp(prefs)) "on" else "off"
+        web?.evaluateJavascript(mirrorJs(roomVolume, roomChirp), null)
     }
 
     /// Going out of the front lets go of the key.
@@ -955,7 +970,6 @@ class MainActivity : Activity() {
     override fun onDestroy() {
         watching.removeCallbacks(watchTheTalkButton)
         rise?.release(); rise = null
-        fall?.release(); fall = null
         watchBack(false)
         unregisterReceiver(fromNotification)
         CookieManager.getInstance().flush()
@@ -985,6 +999,38 @@ class MainActivity : Activity() {
  * audio or the socket. Measured: four minutes of screen-off, no wake
  * lock, not one silent second. See README.md.
  */
+/// Shut whatever the room has over itself, one layer, if it has any.
+///
+/// Back on a phone is the gesture Escape is on a keyboard, and the room
+/// already knows what Escape means for each of these -- so this presses
+/// Escape rather than reaching in and closing things itself, and
+/// whatever the room decides that means is what back means too. A text
+/// box with the cursor in it gets the first press, exactly as it would
+/// from a keyboard; the next one closes the page it is on.
+///
+/// A `dialog` is the exception, because a native dialog's Escape is the
+/// browser's own and a synthetic key never reaches it. The room answers
+/// `cancel` on its dialogs, so that is what is sent.
+///
+/// Answers `closed` when it took the press, and `nothing` when there
+/// was nothing over the room and back means what it meant before.
+private const val CLOSE_JS = """
+    (() => {
+      const dialog = document.querySelector('dialog[open]');
+      if (dialog) {
+        dialog.dispatchEvent(new Event('cancel', { cancelable: true }));
+        return 'closed';
+      }
+      const OVER = 'main.settings, main.people, section.board, .shade, .menu';
+      if (!document.querySelector(OVER)) return 'nothing';
+      const at = document.activeElement ?? document.body;
+      at.dispatchEvent(new KeyboardEvent('keydown', {
+        key: 'Escape', code: 'Escape', bubbles: true, cancelable: true,
+      }));
+      return 'closed';
+    })()
+"""
+
 /// Leaving the audio: the room's own way out, so its sockets are let go
 /// of the way it lets go of them.
 private const val LEAVE_JS = """
@@ -1025,8 +1071,8 @@ private const val MUTE_JS = """
 /// same selector the room asks it with, from `keys.svelte.js`: the two
 /// must not be able to disagree about whose key it is.
 ///
-/// `key` and `chirp`: what the room has against this person for their
-/// phone, which is a setting on the room's own settings page and is
+/// `volume` and `chirp`: what the room has against this person for the
+/// talk key, which is a setting on the room's own settings page and is
 /// kept on the server, so a second phone arrives already knowing. Read
 /// out of storage rather than handed over: the room mirrors it there
 /// for exactly this (see `rememberPhone` in `room.svelte.js`), and the
@@ -1050,9 +1096,9 @@ private const val STATE_JS = """
       // What the room has against this person for their phone, which
       // beats what this phone was told on its own. Empty for either
       // means nobody has ever said and the app keeps its own answer.
-      const key = localStorage.getItem('vox_room.phone_key') || '';
+      const volume = localStorage.getItem('vox_room.volume_talk') || '';
       const chirp = localStorage.getItem('vox_room.ptt_chirp') || '';
-      return JSON.stringify({ says, ptt, typing, key, chirp });
+      return JSON.stringify({ says, ptt, typing, volume, chirp });
     })()
 """
 
@@ -1111,13 +1157,13 @@ private fun talkJs(down: Boolean) = """
 
 /// Put the page's copy of the phone settings right.
 ///
-/// Both values come from [TalkKey]'s own closed set and from nowhere
-/// else -- never from the room, never from anything typed -- so there is
-/// nothing here that could be anything but one of five words.
-private fun mirrorJs(key: String, chirp: String) = """
+/// Both values are built from a boolean right here and from nowhere
+/// else -- never from the room, never from anything typed -- so neither
+/// can be anything but `on` or `off`.
+private fun mirrorJs(volume: String, chirp: String) = """
     (() => {
       try {
-        localStorage.setItem('vox_room.phone_key', '$key');
+        localStorage.setItem('vox_room.volume_talk', '$volume');
         localStorage.setItem('vox_room.ptt_chirp', '$chirp');
       } catch {}
     })()

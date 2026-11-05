@@ -412,6 +412,36 @@ const focused = (page) =>
   is('letting go closes the mic even after the focus moved',
     await page.evaluate(() => !!document.querySelector('footer .big.ptt.talking')), false);
 
+  // -- back ----------------------------------------------------------
+  //
+  // Back on a phone is the gesture Escape is on a keyboard. The room
+  // puts pages and panels over itself that the WebView never navigated
+  // to, so the app cannot ask the browser whether there is anywhere
+  // back to go -- `canGoBack` is false inside every one of them, and
+  // back used to mean leave, which put the whole app away from the
+  // settings page. It asks the room what it has open instead. Read out
+  // of the app like the snippets above, for the same reason.
+  const CLOSE_JS = between('private const val CLOSE_JS = \"\"\"');
+  is('with nothing over the room, back is not the room\'s to take',
+    await page.evaluate(CLOSE_JS), 'nothing');
+
+  await page.click('.tools button.cog');
+  await page.waitForSelector('.settings');
+  is('the settings page is a layer to close', await page.evaluate(CLOSE_JS), 'closed');
+  await page.waitForTimeout(400);
+  is('and back closed it rather than the app',
+    await page.evaluate(() => !!document.querySelector('main.settings')), false);
+  await page.waitForSelector('footer .big');
+
+  // A panel over the room is a layer too, and the same press shuts it.
+  await page.click('.picker > button');
+  await page.waitForTimeout(600);
+  is('a panel over the room is one as well', await page.evaluate(CLOSE_JS), 'closed');
+  await page.waitForTimeout(400);
+  is('and that shut too',
+    await page.evaluate(() => !!document.querySelector('.menu')), false);
+  is('with nothing left over the room', await page.evaluate(CLOSE_JS), 'nothing');
+
   // -- the phone -----------------------------------------------------
   //
   // A phone has no keyboard, so the Android app lends the microphone a
@@ -514,23 +544,23 @@ const focused = (page) =>
   // can take a setting from the room without the room being able to
   // call into the app. See `rememberPhone` and ROOM_ANDROID.md.
   const mirror = () => page.evaluate(() => [
-    localStorage.getItem('vox_room.phone_key'),
+    localStorage.getItem('vox_room.volume_talk'),
     localStorage.getItem('vox_room.ptt_chirp'),
   ]);
-  is('nothing is said about the phone to begin with', (await asked()).key, '');
+  is('nothing is said about the phone to begin with', (await asked()).volume, '');
 
   await page.click('.tools button.cog');
   await page.waitForSelector('.settings');
-  await page.locator('.settings input[name=phonekey]').nth(1).check();
+  await page.locator('.settings input[name=volumetalk]').uncheck();
   await page.waitForTimeout(500);
-  is('choosing a key in the room writes the mirror the app reads',
-    await mirror(), ['volume_down', 'on']);
-  is('and the app sees it', (await asked()).key, 'volume_down');
+  is('settling it in the room writes the mirror the app reads',
+    await mirror(), ['off', 'on']);
+  is('and the app sees it', (await asked()).volume, 'off');
 
   await page.locator('.settings input[name=pttchirp]').uncheck();
   await page.waitForTimeout(500);
   is('and so does turning the chirp off', (await asked()).chirp, 'off');
-  is('with the key left where it was', (await asked()).key, 'volume_down');
+  is('with the volume keys left where they were', (await asked()).volume, 'off');
 
   // It outlives this browser, because it was never this browser's.
   // The mirror is wiped before the reload on purpose: `localStorage`
@@ -538,7 +568,7 @@ const focused = (page) =>
   // nothing about where the answer actually lives. Emptied and then
   // refilled is the round trip to the server and back.
   await page.evaluate(() => {
-    localStorage.removeItem('vox_room.phone_key');
+    localStorage.removeItem('vox_room.volume_talk');
     localStorage.removeItem('vox_room.ptt_chirp');
   });
   await page.reload();
@@ -547,7 +577,7 @@ const focused = (page) =>
   await page.waitForSelector('button:has-text("Join Audio")');
   await page.waitForTimeout(500);
   is('and it is put back from the server, not from this browser',
-    await mirror(), ['volume_down', 'off']);
+    await mirror(), ['off', 'off']);
 
   await browser.close();
   report();

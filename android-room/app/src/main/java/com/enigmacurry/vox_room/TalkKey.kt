@@ -12,14 +12,12 @@ import android.view.Gravity
 import android.view.KeyEvent
 import android.view.View
 import android.view.ViewGroup
+import android.webkit.CookieManager
 import android.widget.Button
-import android.widget.LinearLayout
 import android.widget.CheckBox
-import android.widget.RadioButton
-import android.widget.RadioGroup
+import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
-import android.webkit.CookieManager
 import java.net.HttpURLConnection
 import java.net.URL
 import org.json.JSONObject
@@ -29,89 +27,72 @@ import org.json.JSONObject
 const val PREFS = "room"
 
 /**
- * Which of the phone's physical keys talks.
+ * Whether this phone's volume keys talk.
  *
  * Push to talk is the room's best idea on a keyboard and asks for a key
  * to hold, which is the one thing a phone does not have -- `keys.svelte.js`
  * says so out loud, and the room hides its key hints on a touch screen
  * for the same reason. A phone does have two real buttons, though, and
- * one of them can be lent to the microphone.
+ * they can be lent to the microphone.
  *
- * Only one of them. Taking both would leave no way to turn the room
- * down, and *down* is the one worth keeping: the sound you want gone in
- * a hurry is the room's own, coming out of a speaker, at the moment
- * somebody walks in -- and that is this app in front, so a hijack there
- * really would take the button away when it was wanted. Losing *louder*
- * costs nothing like as much, which is why up is the one offered first.
+ * **Both of them, or neither.** It was one of the two at first, on the
+ * reasoning that taking a key away costs less on the one that makes the
+ * room louder than on the one that makes it quieter in a hurry. Then a
+ * tap stopped being taken away at all -- a tap is the volume, a hold is
+ * the microphone -- and that reasoning dissolved with it. Lending both
+ * costs nothing, so there is nothing to weigh up, and *which one* was a
+ * question that only ever made somebody stop and think.
  *
- * It is this app's answer and not the room's. The room keeps the talk
- * key per browser, deliberately -- it is a fact about a keyboard rather
- * than about a person -- and this is a fact about a phone. Nothing about
- * it goes to the server.
+ * The room's answer wins over this one when there is one. See
+ * [MainActivity.whichWay].
  */
-enum class TalkKey(val stored: String, val keyCode: Int, val label: Int) {
-    VOLUME_UP("volume_up", KeyEvent.KEYCODE_VOLUME_UP, R.string.talk_key_up),
-    VOLUME_DOWN("volume_down", KeyEvent.KEYCODE_VOLUME_DOWN, R.string.talk_key_down),
+object TalkKey {
+    /// Whether the volume keys talk, and whether holding one chirps.
+    /// Both are 'on' or 'off' here -- booleans, stored as the same
+    /// words the room stores, so there is one vocabulary and not two.
+    const val VOLUME = "volume_talk"
+    const val CHIRP = "chirp"
 
-    /// Neither: both keys stay the phone's, and push to talk on this
-    /// phone is the on-screen button alone.
-    OFF("off", KeyEvent.KEYCODE_UNKNOWN, R.string.talk_key_off);
+    /// Set when a choice made here reached the room, and read by
+    /// [MainActivity] on the way back in: the page it is showing
+    /// mirrored the *old* answer into its storage, and that mirror is
+    /// what the app reads. Without this, a change made here would be
+    /// overruled by a stale copy until the page reloaded.
+    const val PUSH = "talk_push"
 
-    companion object {
-        const val PREF = "talk_key"
+    /// Both on out of the box. A phone with push to talk on and nothing
+    /// to hold is the thing this exists to fix, and neither of them
+    /// costs anything until push to talk is actually turned on in the
+    /// room -- see [MainActivity.dispatchKeyEvent].
+    fun volume(prefs: SharedPreferences) = prefs.getBoolean(VOLUME, true)
+    fun chirp(prefs: SharedPreferences) = prefs.getBoolean(CHIRP, true)
 
-        /// Whether a hold is announced. On by default: the quarter of a
-        /// second a hold waits before it talks is only bearable because
-        /// something fills it, and somebody who turns the chirp off
-        /// should be doing it having heard what it is for.
-        const val CHIRP = "chirp"
-
-        /// Set when a choice made here reached the room, and read by
-        /// [MainActivity] on the way back in: the page it is showing
-        /// mirrored the *old* answer into its storage, and that mirror
-        /// is what the app reads. Without this, a key changed here
-        /// would be overruled by a stale copy until the page reloaded.
-        const val PUSH = "phone_push"
-
-        /// Volume up, lent to the microphone. On rather than off out of
-        /// the box because push to talk with no key to hold is the thing
-        /// this setting exists to fix, and because it costs nothing until
-        /// push to talk is actually turned on in the room -- see
-        /// [MainActivity.dispatchKeyEvent].
-        val DEFAULT = VOLUME_UP
-
-        /// By the name it is stored and sent under. Anything else is
-        /// [DEFAULT] -- a value from a newer room, or one edited by
-        /// hand, must not leave somebody with a talk key that cannot
-        /// talk and nothing saying why.
-        fun of(stored: String?): TalkKey =
-            entries.firstOrNull { it.stored == stored } ?: DEFAULT
-
-        fun read(prefs: SharedPreferences): TalkKey = of(prefs.getString(PREF, null))
-
-        fun write(prefs: SharedPreferences, key: TalkKey) {
-            prefs.edit().putString(PREF, key.stored).apply()
-        }
-    }
+    /// What the room says, in the words it says it in.
+    fun on(said: String?) = said != "off"
 }
 
 /**
- * The one thing this app asks that the room cannot be asked.
+ * The two things this app asks that the room cannot be asked.
  *
- * A dialog over whatever is behind it, reached by holding the app's icon
- * -- not a screen inside the app, because the app has no native chrome
- * while a room is up and adding some for a setting nobody looks at twice
- * would be the wrong trade. Opening it does not disturb the call: the
- * WebView declines to notice its window going away (see
- * `KeptVisibleWebView`) and the service goes on holding the room, which
- * is the same arrangement that survives the screen turning off.
+ * A dialog over whatever is behind it, reached from the notification
+ * while a call is up and by holding the app's icon otherwise -- not a
+ * screen inside the app, because the app has no native chrome while a
+ * room is up. Opening it does not disturb the call: the WebView
+ * declines to notice its window going away (see `KeptVisibleWebView`)
+ * and the service goes on holding the room, which is the same
+ * arrangement that survives the screen turning off.
+ *
+ * These are the room's settings really. What is here is for a phone
+ * that has not joined anything yet, and it writes through to the room
+ * the moment it can.
  */
 class TalkKeyActivity : Activity() {
+    private var said: TextView? = null
+
     override fun onCreate(saved: Bundle?) {
         super.onCreate(saved)
         setTitle(R.string.talk_key_title)
         val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
-        val chosen = TalkKey.read(prefs)
         val dp = { n: Int -> TypedValue.applyDimension(
             TypedValue.COMPLEX_UNIT_DIP, n.toFloat(), resources.displayMetrics).toInt() }
 
@@ -120,38 +101,18 @@ class TalkKeyActivity : Activity() {
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
             setPadding(0, 0, 0, dp(16))
         }
-        // Ids are the ordinal plus one: a RadioButton with id 0 is a
-        // RadioButton with no id, and the group would not keep the
-        // check on it.
-        val group = RadioGroup(this).apply {
-            TalkKey.entries.forEach { key ->
-                addView(RadioButton(this@TalkKeyActivity).apply {
-                    id = key.ordinal + 1
-                    text = getString(key.label)
-                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
-                    setPadding(dp(8), dp(10), 0, dp(10))
-                    isChecked = key == chosen
-                })
-            }
-            // Written as it is chosen rather than on the way out, so
-            // the answer survives being swiped away instead of pressed
-            // through. Done closes; it does not confirm.
-            setOnCheckedChangeListener { _, id ->
-                TalkKey.entries.getOrNull(id - 1)?.let {
-                    TalkKey.write(prefs, it)
-                    tellTheRoom()
-                }
-            }
+        val volume = tick(R.string.talk_key_volume, TalkKey.volume(prefs), dp) { on ->
+            prefs.edit().putBoolean(TalkKey.VOLUME, on).apply()
+            tellTheRoom()
         }
-        val chirp = CheckBox(this).apply {
-            text = getString(R.string.talk_key_chirp)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
-            setPadding(dp(8), dp(16), 0, 0)
-            isChecked = prefs.getBoolean(TalkKey.CHIRP, true)
-            setOnCheckedChangeListener { _, on ->
-                prefs.edit().putBoolean(TalkKey.CHIRP, on).apply()
-                tellTheRoom()
-            }
+        val chirp = tick(R.string.talk_key_chirp, TalkKey.chirp(prefs), dp) { on ->
+            prefs.edit().putBoolean(TalkKey.CHIRP, on).apply()
+            tellTheRoom()
+        }
+        said = TextView(this).apply {
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            setPadding(dp(8), dp(12), 0, 0)
+            visibility = View.GONE
         }
         val done = Button(this).apply {
             text = getString(R.string.talk_key_done)
@@ -161,17 +122,11 @@ class TalkKeyActivity : Activity() {
             layoutParams = lp
             setOnClickListener { finish() }
         }
-
-        said = TextView(this).apply {
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
-            setPadding(dp(8), dp(12), 0, 0)
-            visibility = View.GONE
-        }
         val col = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_VERTICAL
             setPadding(dp(20), dp(20), dp(20), dp(20))
-            addView(blurb); addView(group); addView(chirp); addView(said); addView(done)
+            addView(blurb); addView(volume); addView(chirp); addView(said); addView(done)
         }
         setContentView(ScrollView(this).apply {
             addView(col, ViewGroup.LayoutParams(
@@ -179,7 +134,17 @@ class TalkKeyActivity : Activity() {
         })
     }
 
-    private var said: TextView? = null
+    /// Written as it is ticked rather than on the way out, so the answer
+    /// survives being swiped away instead of pressed through. Done
+    /// closes; it does not confirm.
+    private fun tick(label: Int, on: Boolean, dp: (Int) -> Int, then: (Boolean) -> Unit) =
+        CheckBox(this).apply {
+            text = getString(label)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+            setPadding(dp(8), dp(10), 0, dp(10))
+            isChecked = on
+            setOnCheckedChangeListener { _, ticked -> then(ticked) }
+        }
 
     /// Write the choice through to the room, where it is kept against
     /// the person rather than against the phone.
@@ -193,15 +158,15 @@ class TalkKeyActivity : Activity() {
     ///
     /// Nothing is undone when it fails. The local answer still stands
     /// for a phone the room has said nothing about, and saying so is
-    /// better than a radio button that moves back under the finger.
+    /// better than a tick that moves back under the finger.
     private fun tellTheRoom() {
         val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
         val origin = prefs.getString("url", "").orEmpty()
         val cookie = if (origin.isEmpty()) null
             else CookieManager.getInstance().getCookie(origin)
         if (origin.isEmpty() || cookie.isNullOrEmpty()) return note(R.string.talk_key_phone_only)
-        val key = TalkKey.read(prefs).stored
-        val chirp = if (prefs.getBoolean(TalkKey.CHIRP, true)) "on" else "off"
+        val volume = if (TalkKey.volume(prefs)) "on" else "off"
+        val chirp = if (TalkKey.chirp(prefs)) "on" else "off"
         Thread {
             val ok = runCatching {
                 val c = (URL("$origin/api/talk").openConnection() as HttpURLConnection).apply {
@@ -212,7 +177,7 @@ class TalkKeyActivity : Activity() {
                     setRequestProperty("content-type", "application/json")
                     setRequestProperty("Cookie", cookie)
                 }
-                val ask = JSONObject().put("key", key).put("chirp", chirp)
+                val ask = JSONObject().put("volume", volume).put("chirp", chirp)
                 c.outputStream.use { it.write(ask.toString().toByteArray()) }
                 val good = c.responseCode in 200..299
                 c.disconnect()

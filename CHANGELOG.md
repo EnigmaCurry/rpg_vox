@@ -36,12 +36,15 @@ releases.
   the ones the cue is most for. App volume is the room's too, and a
   go-signal that can be turned down to nothing is not one.
 
-- **Which volume key talks on your phone is set in the room.** Under
-  *The talk key on a phone*: volume up, volume down, or neither. Kept
-  against you, so a second phone does not have to be told again, and
-  set from a laptop for a phone in your pocket. It does nothing in a
-  browser -- the Android app is the only thing with volume keys to
-  lend. See ROOM_ANDROID.md.
+- **Whether a phone's volume keys talk is set in the room.** Under
+  *The talk key on a phone*, and it is a yes or a no rather than a
+  choice between the two keys: because a tap still changes the volume,
+  lending both costs nothing that has to be weighed up, and asking
+  which one only ever made somebody stop and think. Kept against you,
+  so a second phone does not have to be told again, and set from a
+  laptop for a phone in your pocket. It does nothing in a browser --
+  the Android app is the only thing with volume keys to lend. See
+  ROOM_ANDROID.md.
 
 ### Voice room for Android
 
@@ -49,14 +52,14 @@ releases.
   Push to talk asks for a key to hold and a phone has no keyboard --
   the room says so itself, and hides its key hints on a touch screen
   for the same reason -- so the one real button a phone does have is
-  lent to the microphone. **Tap it and it is still the volume; hold it
-  for a quarter of a second and you are talking.** Let go and the mic
-  shuts.
+  lent to the microphone. **Tap one and it is still the volume; hold
+  one for a quarter of a second and you are talking.** Let go and the
+  mic shuts. Both keys, or neither: a tap still works, so lending them
+  costs nothing, and which one it should be was a question not worth
+  asking.
 
-  **The tap is not a nicety.** Without it the volume is a one-way
-  ratchet while push to talk is on: the key that is not the talk key
-  can only ever take the room down, and there is no way back up short
-  of turning the mode off. A claimed event cannot be handed back to
+  **The tap is not a nicety.** It is what makes lending both keys
+  free. A claimed event cannot be handed back to
   Android -- and re-injecting one wants a permission only the
   platform's own apps are given -- so the volume change is made
   directly, with the system left to say which stream a press during a

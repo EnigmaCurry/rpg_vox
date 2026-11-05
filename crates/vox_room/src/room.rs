@@ -2487,9 +2487,10 @@ impl Room {
         Ok(bots.as_str().to_string())
     }
 
-    /// Which volume key talks on `person`'s phone, and whether holding
-    /// it chirps. Theirs and not this browser's, and the same in every
-    /// room of the house: see the `people` table and ROOM_ANDROID.md.
+    /// Whether `person`'s phone lends its volume keys to the microphone,
+    /// and whether holding one chirps. Theirs and not this browser's,
+    /// and the same in every room of the house: see the `people` table
+    /// and ROOM_ANDROID.md.
     ///
     /// Nothing is broadcast. This is a fact about one person's phone and
     /// no part of what the room is doing, so nobody else is told and
@@ -2498,7 +2499,7 @@ impl Room {
     ///
     /// The values are checked by the handler that takes them, which is
     /// where the closed set they come from is written down.
-    pub fn set_talk(&self, person: &str, key: &str, chirp: &str) -> Result<(), String> {
+    pub fn set_talk(&self, person: &str, volume: &str, chirp: &str) -> Result<(), String> {
         // Against the key, not the display name: a rename must not lose
         // it, exactly as with the language. Resolved in a statement of
         // its own, because `store()` is a guard and reading the database
@@ -2511,11 +2512,11 @@ impl Room {
                 return Err("The room couldn't save that.".into());
             }
         };
-        if let Err(err) = self.store().set_talk(&name, key, chirp) {
+        if let Err(err) = self.store().set_talk(&name, volume, chirp) {
             warn!(person, "set_talk: {err:#}");
             return Err("The room couldn't save that.".into());
         }
-        info!(person, key, chirp, "said what their phone's volume keys do");
+        info!(person, volume, chirp, "said how they hold the talk key");
         Ok(())
     }
 

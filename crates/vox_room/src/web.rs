@@ -394,11 +394,11 @@ fn in_already(app: &App, p: &Invited, holding: Option<&str>) -> Response {
         // And what they chose last time, which the room has and a
         // fresh tab does not: it beats this browser's own guess.
         "language": p.language,
-        // How their phone is to treat its volume keys. Sent from the
+        // How they hold the talk key. Sent from the
         // door because the app reads it off the page and is at the door
         // before it is anywhere else; empty means they have never said
         // and the app keeps its own answer. See ROOM_ANDROID.md.
-        "phoneKey": p.phone_key,
+        "volumeTalk": p.volume_talk,
         "pttChirp": p.ptt_chirp,
         // Whether this browser owns the house. The page uses it to
         // decide what to show; every endpoint that matters asks
@@ -842,11 +842,11 @@ async fn door_language(
 
 #[derive(Deserialize)]
 struct SetTalk {
-    key: String,
+    volume: String,
     chirp: String,
 }
 
-/// Which volume key talks on this person's phone, and whether it chirps.
+/// Whether a phone's volume keys talk, and whether holding one chirps.
 ///
 /// Theirs rather than this browser's, unlike the room's own talk key:
 /// every phone has the same two volume keys, so a second phone should
@@ -873,17 +873,18 @@ async fn set_talk(
         )
             .into_response();
     };
-    const KEYS: [&str; 4] = ["", "volume_up", "volume_down", "off"];
-    const CHIRPS: [&str; 3] = ["", "on", "off"];
-    if !KEYS.contains(&body.key.as_str()) || !CHIRPS.contains(&body.chirp.as_str()) {
+    const EITHER: [&str; 3] = ["", "on", "off"];
+    if !EITHER.contains(&body.volume.as_str()) || !EITHER.contains(&body.chirp.as_str()) {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "No such talk key." })),
+            Json(json!({ "error": "No such answer." })),
         )
             .into_response();
     }
-    match app.any().set_talk(&who, &body.key, &body.chirp) {
-        Ok(()) => Json(json!({ "phoneKey": body.key, "pttChirp": body.chirp })).into_response(),
+    match app.any().set_talk(&who, &body.volume, &body.chirp) {
+        Ok(()) => {
+            Json(json!({ "volumeTalk": body.volume, "pttChirp": body.chirp })).into_response()
+        }
         Err(why) => (StatusCode::CONFLICT, Json(json!({ "error": why }))).into_response(),
     }
 }

@@ -50,29 +50,30 @@ room knows it: `keys.svelte.js` says the talk key is its best idea on a
 keyboard and a thing that does not exist on a phone, and the key hints
 are hidden on a touch screen for the same reason.
 
-A phone does have two real buttons, though, and this app lends one of
-them to the microphone. **While push to talk is on in the room, a
-tap of that volume key is still the volume and a hold opens your mic.**
-Let go and the mic shuts. With push to talk off, or anywhere but in the
-room, both keys are the phone's own again.
+A phone does have two real buttons, though, and this app lends them to
+the microphone. **While push to talk is on in the room, a tap of either
+volume key is still the volume and a hold opens your mic.** Let go and
+the mic shuts. With push to talk off, or anywhere but in the room, they
+are the phone's own again.
 
-**A quarter of a second** is where one becomes the other. Both halves of
-that matter. Without the tap the volume is a one-way ratchet: the key
-that is not the talk key can only ever take the room down, and there is
-no way back up without turning push to talk off. And a tap cannot simply
-be handed back once it has been claimed — an event already consumed
-cannot be un-consumed, and re-injecting one wants a permission only the
-platform's own apps are given — so the volume change is made directly,
-with the system left to say which stream a press during a call is about.
+**Both of them, or neither — never one.** It was one of the two at
+first, chosen on the reasoning that taking a key away costs less on the
+one that makes the room louder than on the one that makes it quieter in
+a hurry. Then the tap stopped being taken away at all, and that
+reasoning dissolved with it: lending a key you can still tap costs
+nothing, so there is nothing to weigh up, and *which one* turned out to
+be a question whose only effect was to make somebody stop and think
+about their phone instead of the room.
 
-**Volume up out of the box**, and only ever one of the two. Taking both
-would leave no way to turn the room down in a hurry, and *down* is the
-one worth keeping: the sound you want gone now is the room's own, coming
-out of a speaker, at the moment somebody walks in — and that is this app
-in front. Losing a hold on *louder* costs much less. If the power button
-on your phone sits directly above volume up, the other way round is the
-better trade: groping for the talk key in the dark and hitting power is
-a worse accident than losing a volume step.
+**A quarter of a second** is where a tap becomes a hold. Keeping the tap
+is what makes the whole arrangement cost nothing — without it the volume
+is a one-way ratchet, since the key that was not the talk key could only
+ever take the room down and there was no way back up short of turning
+push to talk off. A tap cannot simply be handed back once it has been
+claimed, though: an event already consumed cannot be un-consumed, and
+re-injecting one wants a permission only the platform's own apps are
+given. So the volume change is made directly, with the system left to
+say which stream a press during a call is even about.
 
 **The chirp** — two beeps, rising — fills that quarter second and stops
 as the mic opens, so what it teaches is exactly the thing worth
@@ -98,7 +99,8 @@ does not arm it a second time and make a phone wait twice for one hold.
 The two players are kept to the same numbers; they are meant to be the
 same sound.
 
-**Where it is set.** Both answers live on the room's own settings page,
+**Where it is set.** Both answers — whether the volume keys talk, and
+whether holding one chirps — live on the room's own settings page,
 kept against you on the server rather than against this phone, so a
 second phone arrives already knowing — which is the point of putting
 them there. The app never asks the server for them: the room mirrors
@@ -107,7 +109,7 @@ the poll it already runs. The app reads the page; the page cannot call
 the app, and that stays true. It matters because this app loads
 whichever room somebody was invited to and not one it shipped with.
 
-**Talk key, on the notification** is the app's own copy of the same two
+**Talk key, on the notification** is the app's own copy of those two
 questions, for a phone that has not joined anything yet — and it writes
 through to the room when it can, so changing it there changes the answer
 that wins. It is on the launcher's long-press menu too, which is where
