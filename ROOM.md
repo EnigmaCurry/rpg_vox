@@ -12,6 +12,11 @@ one connection: the rooms of the house, and a room of your own where
 you can talk to the AI with nobody listening. See
 **[More than one room](#more-than-one-room)**.
 
+Any room can be taken **off the record** by anybody in it: the AIs
+leave, nobody is transcribed, and what is left is everyone's voices,
+live, going nowhere. The lobby is always that way. See
+**[Off the record](#off-the-record)**.
+
 It is full duplex: anyone can talk over the AI to interrupt it, with no
 key to press. The conversation keeps only what the AI actually said
 before it was cut off, ending with ` —`, and the AI is told where it was
@@ -184,6 +189,14 @@ being in no game, just the room's own conversation — is the room's
 state, not a place you travel to, and the button that leaves a game
 says **Leave the game** so that the two can't be read for each other.)
 
+**The lobby is never written down.** It is the room a tab lands in and
+the one room nobody can be refused, which makes it the room a stranger
+walks into and the room you wait in — so nothing said there is
+transcribed, there is no conversation and no history, and there is no
+AI in it to hear any of it. It is the one room where that is not a
+setting: see [Off the record](#off-the-record). Go to any other room to
+be transcribed and answered.
+
 The faders for the room you are in hang off it in that same list, so
 the mixer is part of the room rather than a panel beside it. **You are
 in a room or you are not**: the list under it is who is there, and
@@ -194,9 +207,50 @@ to read, because there is no such state.
 Sharing a desktop follows the same rule as talking — it reaches the
 room you are in and no other, and it goes with you when you leave.
 
+### Off the record
+
+**Transcription**, at the top of the room column over the faders, is
+whether what is said in this room is written down. Anybody in the room
+may change it and it changes the room for everyone in it, because being
+recorded is not something that happens to one person at a table.
+
+Off, the room is voice and nothing else:
+
+- **Nobody is transcribed.** No microphone in the room reaches a
+  speech-to-text engine, so there is nothing to write, nothing to
+  translate and nothing to interpret. The audio itself is untouched —
+  everybody hears everybody, the meters move, and the faders and mutes
+  work as they always did.
+- **The AIs leave the room.** An AI hears a room by reading what was
+  said in it, so with none of that there is nothing for one to be in
+  the room for: the faders go, no turn is given to anybody, and a reply
+  in the middle of being spoken stops where it is. Where the owner put
+  each of them is untouched — turning the room back on brings back
+  exactly who was there.
+- **The conversation takes nothing.** Not what is said, not what is
+  typed (the box goes from the footer), and not a picture or a clip
+  dropped in. A line somebody was in the middle of saying as the switch
+  went is taken off the screen with it: it had not been handed over,
+  and it is not to become part of a conversation now.
+- **Except one note.** The conversation keeps one line at each end —
+  who turned it off, who turned it back on, and how long the room was
+  off the record for. That note is the whole of what is left behind,
+  and it is there because a gap in a transcript is otherwise
+  indistinguishable from an hour in which nobody spoke. The AI is shown
+  it when the room comes back, so it reads the line before the gap as
+  the line before a gap.
+
+It is a fact about the room and not about the afternoon: a room left off
+the record is still off it after a restart, with the note still at the
+end of its conversation. The [lobby](#more-than-one-room) is off the
+record always and has no switch to turn — the control there says so
+rather than offering a choice that would be refused.
+
 ### More than one AI in a room
 
-Every room has the AI in it. `--bot NAME[:VOICE[:PROMPT_FILE]]` puts
+Every room that is written down has the AI in it — which is every room
+but the lobby, and any room the people in it have not taken
+[off the record](#off-the-record). `--bot NAME[:VOICE[:PROMPT_FILE]]` puts
 another one on the server — repeat it, or comma-separate
 `VOX_ROOM_BOTS`. Each has its own voice, its own prompt, and its own
 name to be called by; the first is the one `--name`, `--voice` and
@@ -204,13 +258,18 @@ name to be called by; the first is the one `--name`, `--voice` and
 
 **Which rooms each of them is in is the owner's to say**, on the
 [People and rooms](#in-the-room) page, with a tick per room exactly as
-for people. The first AI is in every room and its ticks are fixed: it
-is what a room *has*, the way a room has a lobby, and a room of your
-own is named after it. Every other one is somewhere because the owner
-put it there. They start in the rooms people share and in nobody's own
-— a room of your own is yours, and a second AI arriving in it
-uninvited is the thing this is for — and the house decides that once
-per AI, so taking one out of the lobby stays done across a restart.
+for people. The first AI is in every room that has one and its ticks
+are fixed: it is what a room *has*, and a room of your own is named
+after it. Every
+other one is somewhere because the owner put it there. They start in
+the rooms people share and in nobody's own — a room of your own is
+yours, and a second AI arriving in it uninvited is the thing this is
+for — and the house decides that once per AI, so taking one out of a
+room stays done across a restart.
+
+The lobby is the one room with no tick to give: nothing said there is
+written down, so there is nothing for an AI to hear, and not even the
+first one is in it.
 
 A tick reaches the room at once, wherever anybody is sitting: a fader
 appears or goes, and an AI taken out of a room it was speaking in
@@ -509,6 +568,12 @@ See ROOM_DOCKER.md.
   before, to read; **New conversation** starts the next one; and while
   a game is on, its name and **Leave the game**. See [What a room has
   said before](#what-a-room-has-said-before).
+- **Transcription**, at the top of the room column: whether what is
+  said in this room is written down at all. Off, the room is live voice
+  and nothing else — no transcript, no AI in the room, and nothing kept
+  but a note saying who turned it off. Anybody in the room may change
+  it, and it changes the room for everyone in it. See
+  [Off the record](#off-the-record).
 - **BOTS**, in the footer: whether the AIs may answer **you**. See
   [When an AI may answer you](#when-an-ai-may-answer-you) — it is one
   switch per person rather than one control per bot, and it is the one
@@ -1962,7 +2027,7 @@ pays for a rejected request before every reply.
 | `VOX_ROOM_DATA` | `~/.local/share/vox_room` (macOS: `~/Library/Application Support/vox_room`) | the database |
 | `VOX_ROOM_AGENT_NAME` | `Vox` | the AI's name |
 | `VOX_ROOM_AGENT_ALIASES` | | other spellings that count as its name, comma-separated (what speech-to-text hears, e.g. `box,fox`) |
-| `VOX_ROOM_BOTS` | | more AIs in every room, `NAME[:VOICE[:PROMPT_FILE]]`, comma-separated. They see each other and answer to their own names; the first AI is the one that runs the room. See [More than one AI in a room](#more-than-one-ai-in-a-room) |
+| `VOX_ROOM_BOTS` | | more AIs on the server, `NAME[:VOICE[:PROMPT_FILE]]`, comma-separated. They see each other and answer to their own names; the first AI is the one that runs the room, and where the rest of them are is the owner's to say. See [More than one AI in a room](#more-than-one-ai-in-a-room) |
 | `VOX_ROOM_REPLY_AFTER_MS` | `1200` | quiet before what was said is handed over |
 | `VOX_ROOM_CONFIRM_MS` | `300` | continuous speech that cuts the AI off |
 | `VOX_ROOM_ENGAGED_FOR_MS` | `30000` | idle time that ends a back-and-forth with a bot that was waiting to be named |
@@ -2009,6 +2074,14 @@ mints the invite links each suite wants (a link is spent by **Join
 Audio**, so every run needs fresh ones), runs the suite and stops the
 room again — your own database is never touched:
 
+Most suites are started with a room called **Hall** in front of their
+own, and walk out of it on the way in: a tab lands in the lobby, and
+the lobby is never written down and has no AI in it (see
+[Off the record](#off-the-record)), so a suite about anything said in a
+room needs a hall to land in and a room to be about. The three that
+want the lobby itself — `rooms`, `roles` and `permalinks` — stay where
+they land and say so.
+
 ```bash
 cargo build -p vox_room --release
 cd crates/vox_room/e2e && npm i playwright   # not a dependency of anything built here
@@ -2017,7 +2090,8 @@ CHROME=$(which chromium) ./run.sh            # or: ./run.sh rooms bots
 
 | suite | |
 |---|---|
-| `rooms` | several rooms on one socket: where a tab lands, who may go where, a room of your own admitting one person, and the mix arriving across every move. No browser at all — two sockets are enough |
+| `rooms` | several rooms on one socket: where a tab lands — the lobby, with nothing written down in it and no AI in it — who may go where, a room of your own admitting one person, and the mix arriving across every move. No browser at all — two sockets are enough |
+| `record` | a room taken [off the record](#off-the-record): the AI leaving it, what is typed into it being refused, the one note at each end saying who did it and who undid it, and the dropdown that does it asking first and leaving everything alone when the question is cancelled — and the lobby, which has no answer to give, no conversation to name, start or read back, and no AI whatever anybody asks |
 | `bots` | two AIs in one room: a fader and a Stops setting each, each answering to its own name -- and each person's own **BOTS** switch, which keeps the AIs out of what *they* say without touching anybody else, still answers when they call one by name, or doesn't, and follows them into another room |
 | `door` | the door is a page with no room behind it and no socket open; **Join Audio** does nothing until you agree to be recorded, and the Language box is never blank |
 | `roles` | the house and the people: making a room, renaming one under somebody standing in it, taking one away from under them — and the owner and the rest: who is shown the people and who is answered when they ask for them, a room given and taken away while somebody sits in the house, and an invite made from the page |

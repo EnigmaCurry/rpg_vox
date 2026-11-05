@@ -17,6 +17,7 @@
 //
 //   CHROME=$(which chromium) node share-screen.js RYAN_LINK ALEX_LINK
 const { chromium } = require('playwright');
+const { intoARoom } = require('./room.js');
 const [ryanUrl, alexUrl, prefix = 'share'] = process.argv.slice(2);
 
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -107,6 +108,11 @@ async function painted(page, selector, ms = 15000) {
     ryan.page.click(JOIN),
     alex.page.click(JOIN),
   ]);
+  // Out of the lobby and into the first room of the house: a desktop
+  // is shared to the room you are in, and the lobby is the room nobody
+  // stays in. Start the room with one.
+  await intoARoom(ryan.page);
+  await intoARoom(alex.page);
   await Promise.all([
     ryan.page.waitForSelector(strip('Alex')),
     alex.page.waitForSelector(strip('Ryan')),

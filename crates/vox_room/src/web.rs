@@ -13,6 +13,7 @@
 //! {"type": "interpreter", "gain": 0.8, "mute": false}
 //! {"type": "bots", "how": "any"}
 //! {"type": "stops", "bot": "Vox", "stops": "finished"}
+//! {"type": "transcribe", "on": false}
 //! {"type": "bot_off", "bot": "Sage", "off": true}
 //! {"type": "voice", "bot": "Vox", "voice": "Alan Watts"}
 //! {"type": "room_voice", "bot": "Vox", "voice": "Alan Watts", "here": true}
@@ -237,7 +238,7 @@ pub fn router(rooms: Arc<Rooms>, screen: Arc<Screen>) -> Router {
             post(rename_room).delete(delete_room),
         )
         .route("/api/games/:name/prompt", get(game_prompt))
-        .route("/api/profile/:who", get(profile))
+        .route("/api/rooms/:room/profile/:who", get(profile))
         // A picture dropped into the room. The one endpoint here that
         // takes bytes rather than JSON, and the only one with a limit
         // of its own: what it will keep is smaller than what axum
@@ -1183,11 +1184,22 @@ async fn sample(State(app): State<App>, headers: HeaderMap, Path(id): Path<Strin
 /// Asked for when the modal opens rather than sent with the roster. A
 /// bio is a paragraph and the roster goes out whenever anybody's
 /// microphone moves.
-async fn profile(State(app): State<App>, headers: HeaderMap, Path(who): Path<String>) -> Response {
-    if invited(&app, &headers).is_none() {
-        return (StatusCode::FORBIDDEN, "not invited").into_response();
-    }
-    match app.any().profile(&who) {
+///
+/// Asked of a room, because half the card is about one: whether they
+/// are *here*, and whether an AI is in it. It used to be asked of the
+/// lobby whoever asked and wherever they were standing, which was only
+/// ever right for the people in the lobby -- and is right for nobody
+/// now that the lobby is a room nobody stays in (see
+/// `room::RoomConfig::may_transcribe`).
+async fn profile(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Path((id, who)): Path<(String, String)>,
+) -> Response {
+    let Some((_, room)) = their_room(&app, &headers, &id) else {
+        return (StatusCode::NOT_FOUND, "no such room").into_response();
+    };
+    match room.profile(&who) {
         Some(profile) => Json(profile).into_response(),
         None => (StatusCode::NOT_FOUND, "nobody here by that name").into_response(),
     }
@@ -1503,6 +1515,14 @@ enum Command {
         bot: String,
         stops: String,
     },
+    /// Whether what is said in this room is written down. Off, the
+    /// room is voice and nothing else: no transcript, no conversation,
+    /// and no AI in it. Anybody in the room may send it, the room says
+    /// in its own conversation who did, and the lobby refuses it. See
+    /// `room::Room::set_transcribing`.
+    Transcribe {
+        on: bool,
+    },
     /// Switch one bot off in this room, or back on. Off is off: no
     /// turn is given to it, so nothing is asked of a model. It keeps
     /// its place in the list and everything set on it. See
@@ -1740,6 +1760,15 @@ async fn client(
                             }
                         }
                         Ok(Command::Stops { bot, stops }) => room.set_stops(&bot, &stops),
+                        // Only the tab that asked hears why not, as
+                        // everywhere else: a room that won't be asked
+                        // this is the lobby, and the control there
+                        // already says so.
+                        Ok(Command::Transcribe { on }) => {
+                            if let Err(why) = room.set_transcribing(&name, on) {
+                                room.tell(&name, &why);
+                            }
+                        }
                         Ok(Command::BotOff { bot, off }) => room.set_bot_off(&bot, off),
                         // Like `Voice`, only the tab that asked hears
                         // why not: a voice deleted while somebody had

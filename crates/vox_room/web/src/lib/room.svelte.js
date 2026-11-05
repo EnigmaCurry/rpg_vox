@@ -125,6 +125,18 @@ export const room = $state({
   // The game being played requires a mode of every bot in the room,
   // which is a thing to say in prose and nothing anybody can change.
   locked: false,
+  // Whether what is said in this room is being written down. Off, the
+  // room is voice and nothing else: nobody's speech is transcribed,
+  // the conversation takes nothing but the note saying who turned it
+  // off, and there is no AI in the room to hear any of it. The room's
+  // and not yours — anybody in it may change it, and everybody sees
+  // the same answer. See `Room::set_transcribing` in room.rs.
+  transcribing: true,
+  // Whether it is a thing this room can be asked about at all. False
+  // in the lobby, which is never written down and has no transcript to
+  // turn on: the control says so there rather than offering a choice
+  // that would be refused.
+  mayTranscribe: true,
   // Whether the AIs may answer *you*: the BOTS button in the footer,
   // beside push to talk. 'any' is the button on, which is what
   // everybody starts as; 'named' and 'never' are the two ways it can
@@ -1160,7 +1172,11 @@ export async function openProfile(who) {
 
 async function loadProfile(who) {
   try {
-    const r = await fetch(`/api/profile/${encodeURIComponent(who)}`);
+    // Asked of the room you are standing in: half the card is about
+    // one -- whether they are here, and whether an AI is in it.
+    const r = await fetch(
+      `/api/rooms/${encodeURIComponent(room.where)}/profile/${encodeURIComponent(who)}`,
+    );
     if (!r.ok) throw new Error(String(r.status));
     const got = await r.json();
     // Not if they closed it, or opened somebody else, while this was
@@ -1278,6 +1294,8 @@ function apply(ev) {
       room.agents = ev.agents ?? [];
       room.interpreter = ev.interpreter ?? null;
       room.locked = ev.locked ?? false;
+      room.transcribing = ev.transcribing ?? true;
+      room.mayTranscribe = ev.may_transcribe ?? true;
       room.show = ev.show ?? null;
       room.seats = ev.seats ?? null;
       room.interprets = ev.interprets ?? false;
@@ -1488,6 +1506,12 @@ function apply(ev) {
       // came on or left the stage: a fader appears or goes, with
       // what it is doing and its Stops.
       room.agents = ev.agents ?? [];
+      break;
+    case 'transcribe':
+      // Somebody put the room off the record, or back on it. The note
+      // saying who arrives as an entry of its own, and the AIs leaving
+      // or coming back as `agents_here`: this is only the switch.
+      room.transcribing = !!ev.on;
       break;
     case 'show':
       // A show opened, got a line further on, or closed.
@@ -1782,6 +1806,18 @@ export function setBots(on) {
   // is what puts this right.
   room.bots = how;
   command({ type: 'bots', how });
+}
+
+/// Put the room off the record, or back on it.
+///
+/// The room's and not yours: it changes what happens to everybody's
+/// voice, so it is one answer for the room and the room writes down
+/// which of you gave it. Nothing is shown at once -- unlike the BOTS
+/// button, which is a button -- because what this asks for is the
+/// room to become a different room, and until the server says it has,
+/// it hasn't.
+export function setTranscribing(on) {
+  command({ type: 'transcribe', on });
 }
 
 /// What the off position of that button means, which is the one nuance

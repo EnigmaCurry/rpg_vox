@@ -15,6 +15,7 @@
 // Each browser is new, so each run wants new invite links.
 const path = require('path');
 const { chromium } = require('playwright');
+const { intoARoom } = require('./room.js');
 const [ryanUrl, alexUrl, ryanWav, alexWav, secs = '90', shot = 'interpret'] =
   process.argv.slice(2);
 
@@ -69,6 +70,11 @@ const level = (page) =>
   const ryan = await person('Ryan', ryanUrl, ryanWav, '');
   const alex = await person('Alex', alexUrl, alexWav, 'Russian');
   await Promise.all([ryan.page.click(JOIN), alex.page.click(JOIN)]);
+  // Out of the lobby, which is never written down and has nothing to
+  // interpret, and into the first room of the house. Start the room
+  // with one.
+  console.log(`both into ${await intoARoom(ryan.page)}`);
+  await intoARoom(alex.page);
 
   // The conversation may already have lines in it from before this run;
   // the log only ever grows, so anything past this mark is ours.

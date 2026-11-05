@@ -871,6 +871,7 @@ mod tests {
             language: "English".into(),
             languages: vec!["English".into()],
             spoken: vec!["English".into()],
+            may_transcribe: true,
         };
         let tts: crate::room::VoiceFactory =
             Arc::new(|_, _, _, _| Ok(Box::new(crate::tts::Silent)));

@@ -260,10 +260,14 @@ const waitForCards = (page, n) =>
     ),
     'That conversation is over; come back to the one the room is having.',
   );
+  // Still the room's own address: reading an old conversation is a
+  // thing you do inside the room you are in, not somewhere else.
   is(
     'with the room still on the screen',
-    await ryan.page.evaluate(() => !!document.querySelector('.app') && location.pathname),
-    '/lobby',
+    await ryan.page.evaluate(
+      () => !!document.querySelector('.app') && /^\/room\/[0-9a-f]{32}$/.test(location.pathname),
+    ),
+    true,
   );
   // The one being read is the one they were dropped into, so this is
   // also the archive still having them: a picture is part of what was

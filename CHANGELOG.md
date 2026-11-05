@@ -9,6 +9,49 @@ releases.
 
 ### Voice room
 
+- **A room can be taken off the record.** **Transcription**, at the
+  top of the room column over the faders, is whether what is said in
+  this room is written down. Anybody in the room may change it and it
+  changes the room for everyone in it: being recorded is not something
+  that happens to one person at a table, so it is not one person's to
+  decide, and the room says in its own conversation which of them
+  decided it.
+
+  Off, the room is voice and nothing else. No microphone in it reaches
+  a speech-to-text engine, so there is nothing to write down, nothing
+  to translate and nothing to interpret; the audio is untouched, and
+  everybody goes on hearing everybody with the meters moving and the
+  faders working. The AIs leave the room, because an AI hears a room by
+  reading what was said in it and there is none of that any more: the
+  faders go, no turn is given to anybody, a reply in the middle of
+  being spoken stops where it is, and a play that was on comes down.
+  Where the owner put each of them is untouched, and turning the room
+  back on brings back exactly who was there. The conversation takes
+  nothing at all -- not what is said, not what is typed (the box goes
+  from the footer), not a picture or a clip dropped in -- and a line
+  somebody was in the middle of saying as the switch went is taken off
+  the screen with it, having never been handed over.
+
+  What is left behind is one note at each end: who turned it off, who
+  turned it back on, and how long the room was off the record for. That
+  is there because a gap in a transcript is otherwise indistinguishable
+  from an hour in which nobody spoke, and the AI is shown it when the
+  room comes back so that it reads the line before the gap as the line
+  before a gap. It is a fact about the room rather than about the
+  afternoon: a room left off the record is still off it after a
+  restart, with the note still at the end of its conversation.
+
+- **The lobby is never written down, and has no AI in it.** It is the
+  room a tab lands in and the one room nobody can be refused -- the
+  room a stranger walks into, and the room you wait in -- so nothing
+  said there is transcribed, and there is nothing for an AI to hear:
+  not even the first one, which is in every other room without being
+  asked. It is the one room where this is not a setting. The
+  conversation column there offers no name, no **New conversation** and
+  no **History**, because there is no conversation to be about, and
+  **People and rooms** shows the lobby's column of AI ticks as the
+  empty fixed answer it now is.
+
 - **A voice that is gone is said to be gone once.** A bot whose
   cloned voice had been deleted logged `the voice it was set to speak
   in is gone` at every start from then on, with an empty voice name --

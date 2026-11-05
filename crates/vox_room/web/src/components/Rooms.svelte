@@ -1,5 +1,7 @@
 <script>
-  import { room, command, enterRoom, setInterpreter, theAI } from '../lib/room.svelte.js';
+  import {
+    room, command, enterRoom, setInterpreter, setTranscribing, theAI, theAIs, ask,
+  } from '../lib/room.svelte.js';
   import Strip from './Strip.svelte';
 
   // Two things, in one component because they are one idea: which room
@@ -110,9 +112,13 @@
   // in this room speaking a language somebody else here doesn't read.
   // A room where everyone shares one has nothing to interpret, and a
   // room of your own can't have anyone to interpret to.
+  // Nor in a room that is off the record: an interpreter puts what
+  // somebody said into another language, and nothing anybody says
+  // there is turned into words at all.
   const mine = $derived(room.people.find((p) => p.name === room.you)?.language);
   const interpreted = $derived(
     !!room.interpreter &&
+      room.transcribing &&
       !!mine &&
       room.people.some((p) => p.name !== room.you && p.language !== mine),
   );
@@ -123,6 +129,46 @@
   const interpreting = $derived(
     room.myInterpreter.mute || room.myInterpreter.gain <= 0 ? 'off' : 'on',
   );
+
+  /// Whether the room is written down, which is the one control in this
+  /// column that is about the room rather than about one voice in it —
+  /// and the only one that changes what happens to everybody's
+  /// microphone. It is above the faders for that reason: what the room
+  /// is comes before who is in it and how loud.
+  ///
+  /// Asked first, both ways. Off is the room becoming a different room
+  /// for everyone in it, and on is everybody being written down again
+  /// — which is the half somebody who relaxed when it went off must
+  /// not have happen quietly behind them.
+  const recordHint = $derived(
+    !room.mayTranscribe
+      ? 'Nothing said in the lobby is written down, and nothing can be: it is the one room anybody can walk into. Go to another room to be heard by the AI.'
+      : room.transcribing
+      ? `Everything said here is transcribed into the conversation, and ${theAI('and')} reads it. Off the record, the room is voice and nothing else — no transcript, no AI in the room, and nothing kept but a note saying who turned it off.`
+      : 'Off the record: nobody is being transcribed, nothing is going into the conversation, and there is no AI in the room. Put it back and everything said from then on is written down again.',
+  );
+
+  async function transcribe(e) {
+    // The picker itself, before anything is awaited: `currentTarget` is
+    // only the element while the event is being dispatched, and by the
+    // time the question has been answered it is null.
+    const picker = e.currentTarget;
+    const on = picker.value === 'on';
+    const ais = theAIs().map((a) => a.name);
+    const question = on
+      ? 'Write this room down again? Everything said from now on goes into the conversation, for everyone here.'
+      : `Take this room off the record? Nothing anybody says is transcribed or kept${
+          ais.length ? `, and ${ais.join(' and ')} ${ais.length === 1 ? 'leaves' : 'leave'} the room` : ''
+        }. The conversation keeps one note saying you did it.`;
+    if (await ask(question, on ? 'Write it down' : 'Off the record')) {
+      setTranscribing(on);
+      return;
+    }
+    // Nothing changed, so `room.transcribing` has not changed either —
+    // and a select the room never answered about would otherwise sit
+    // showing the answer that was cancelled.
+    picker.value = room.transcribing ? 'on' : 'off';
+  }
 
   // Who is in a room you are not in. The count is on the row; this is
   // the whole of what the row can say, for a tooltip.
@@ -177,6 +223,35 @@
 </h1>
 
 <nav class="rooms panel" aria-label="Who is in {room.title}">
+  <!-- The room itself, over the people in it. Everything below this is
+       one voice in the room; this is the room, and it is the one thing
+       here that decides what happens to all of them. -->
+  <div class="is">
+    <label class="when stack" title={recordHint}>
+      <span class="what">Transcription</span>
+      <select value={room.transcribing ? 'on' : 'off'} disabled={!room.mayTranscribe}
+        aria-label="Whether what is said in this room is written down"
+        onchange={transcribe}>
+        <option value="on">On — written down</option>
+        <option value="off">Off — live audio only</option>
+      </select>
+    </label>
+    <!-- Said and not only hovered: a room that is keeping nothing
+         looks exactly like a room that is, and the one place anybody
+         would think to look for the difference is here. -->
+    {#if !room.mayTranscribe}
+      <p class="wearing">
+        The lobby is never written down, and has no AI in it. Go to another room to
+        be heard.
+      </p>
+    {:else if !room.transcribing}
+      <p class="wearing">
+        Live audio only. Nobody is transcribed, nothing is said into the
+        conversation, and {theAI('or')} is out of the room.
+      </p>
+    {/if}
+  </div>
+
   <!-- A puppet show playing. Said here, over the strips, because the
        faders below are where the puppets are and because this is the
        one time the room has set what every voice answers and what
@@ -423,6 +498,21 @@
     overscroll-behavior: contain;
   }
   .who { display: flex; flex-direction: column; gap: 7px; }
+  /* What the room is, over who is in it, with the rule that already
+     divides this column's own sections under it. */
+  .is {
+    margin: 0 0 9px;
+    padding-bottom: 9px;
+    border-bottom: 1px solid var(--line);
+  }
+  /* The label over the picker rather than beside it: "Transcription"
+     and "Off — live audio only" do not both fit on one line of a
+     260px column, and the two halves of this one are a sentence
+     either way. Both classes, so this wins wherever `.when` is
+     written: that one centres its children, which in a column is
+     centred text under a label that is centred too. */
+  .when.stack { flex-direction: column; align-items: stretch; gap: 3px; }
+  .when.stack .what { min-width: 0; }
   /* The note at the foot of the column: what this room is, said once.
      A card in a framed theme, plain text in a flat one -- which is
      what `--card-*` being nothing comes to. */

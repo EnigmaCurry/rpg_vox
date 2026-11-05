@@ -17,6 +17,7 @@
 // Each browser is new, so each run wants new invite links: the Join
 // Audio click spends them.
 const { chromium } = require('playwright');
+const { intoARoom } = require('./room.js');
 const [ryanUrl, alexUrl, secs = '60', shot = 'hear-out.png'] = process.argv.slice(2);
 
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -70,6 +71,11 @@ const show = (ts) =>
   const alex = await person('Alex', alexUrl, 'Russian');
   await Promise.all([ryan.page.click(JOIN), alex.page.click(JOIN)]);
   await wait(1000);
+  // Out of the lobby, where nothing is written down and no AI is in
+  // the room, and into the first room of the house. Start the room
+  // with one.
+  console.log(`both into ${await intoARoom(ryan.page)}`);
+  await intoARoom(alex.page);
   // Named, which is the room's own default: the message says the name,
   // so there is no mode to set and no microphone in this at all.
   await ryan.page.fill('.say textarea', 'Vox, say two sentences about the sea.');

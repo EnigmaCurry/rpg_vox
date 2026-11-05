@@ -153,6 +153,14 @@
       <p class="empty">
         {#if archived}
           Nothing was ever said in this one.
+        {:else if !room.mayTranscribe}
+          Nothing said in the lobby is written down, and nothing can be: it is the
+          room anybody can walk into, and people wait here. Go to another room to be
+          transcribed and heard.
+        {:else if !room.transcribing}
+          This room is off the record. Everybody hears everybody, live, and not a
+          word of it is written down or kept — see <strong>Transcription</strong>
+          beside the faders.
         {:else if room.game}
           Entering <strong>{room.game}</strong>…
         {:else if room.bots === 'never'}
@@ -354,6 +362,17 @@
           </details>
           </div>
         </div>
+      {:else if e.kind === 'note'}
+        <!-- The one line in here nobody said: the room saying it
+             stopped being written down, and that it started again.
+             No face and no name beside it, because it is not somebody
+             talking -- it is the conversation itself, admitting a gap
+             that would otherwise be indistinguishable from an hour in
+             which nobody spoke. -->
+        <p class="note-entry">
+          {e.text}
+          <span class="note-at">{time(e.at)}</span>
+        </p>
       {:else if e.kind === 'card'}
         <!-- A card the AI posted for the whole room; it stays in the
              conversation like anything that was said. -->
@@ -474,6 +493,25 @@
     gap: 12px;
   }
   .empty { color: var(--muted); text-align: center; margin: auto; max-width: 28em; }
+  /* The room's own line, across the column rather than in it: a seam
+     in the conversation, ruled at both edges because what it marks is
+     where the conversation stopped and where it started again. No
+     bubble and no face -- nobody said it. */
+  .note-entry {
+    display: flex;
+    align-items: baseline;
+    justify-content: center;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin: 8px 4px;
+    padding: 7px 10px;
+    border-top: 1px dashed var(--line);
+    border-bottom: 1px dashed var(--line);
+    font-size: 12px;
+    color: var(--muted);
+    text-align: center;
+  }
+  .note-at { font-variant-numeric: tabular-nums; opacity: 0.75; }
   .card {
     border: 1px solid color-mix(in srgb, var(--agent) 45%, var(--line));
     background: color-mix(in srgb, var(--agent) 8%, var(--bubble));

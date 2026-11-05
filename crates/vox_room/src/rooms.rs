@@ -150,7 +150,13 @@ impl Rooms {
         // placed the house leaves it alone: taking one out of the lobby
         // is an answer, and a restart must not give it back.
         let elsewhere: Vec<String> = base.bots.iter().skip(1).map(|b| b.name.clone()).collect();
-        let everywhere: Vec<String> = held.iter().map(|r| r.id.clone()).collect();
+        // Every room people share but the lobby, which has no AI in it
+        // and never had one to be placed there.
+        let everywhere: Vec<String> = held
+            .iter()
+            .filter(|r| !r.lobby)
+            .map(|r| r.id.clone())
+            .collect();
         match people.place_bots(&elsewhere, &everywhere) {
             Ok(placed) if !placed.is_empty() => info!(
                 bots = %placed.join(", "),
@@ -171,6 +177,15 @@ impl Rooms {
                 // they draw breath. Whether it may answer *you* at all
                 // is your own switch and not this -- see `room::Bots`.
                 default_mode: Mode::Auto,
+                // The lobby is never written down and never has an AI
+                // in it. It is the one room nobody can be refused:
+                // people land there before they have agreed to
+                // anything, and whoever is waiting for somebody is
+                // waiting in the one room a stranger can walk into.
+                // A transcript of that is a transcript nobody asked
+                // for, so there is none to turn on. See
+                // `room::RoomConfig::may_transcribe`.
+                may_transcribe: !room.lobby,
                 ..base.clone()
             };
             let built = make(cfg).with_context(|| format!("open the {} room", room.title))?;
@@ -318,9 +333,19 @@ impl Rooms {
     /// It reaches the room at once, wherever anybody is sitting: a
     /// fader appears or goes, and a bot taken out of a room it was
     /// speaking in stops where it is.
+    ///
+    /// Not the lobby, which has no AI in it at all: nothing said there
+    /// is written down, and an AI hears a room by reading what was
+    /// said in it. See `room::RoomConfig::may_transcribe`.
     pub fn set_bot_room(&self, bot: &str, room: &str, allowed: bool) -> Result<bool> {
         if !self.is_bot(bot) {
             bail!("there is no AI called {bot:?}");
+        }
+        if room == self.lobby {
+            bail!(
+                "no AI is in the lobby: nothing said there is written down, \
+                 so there is nothing for one to hear"
+            );
         }
         if self.first_bot() == bot {
             bail!("{bot} is in every room: it is what a room has");
@@ -389,6 +414,13 @@ impl Rooms {
             title: row.title.clone(),
             only: None,
             default_mode: Mode::Auto,
+            // The base here is the lobby's, which is the one room that
+            // is never written down: a room made from it inherits that
+            // unless it is said otherwise, and a house whose every new
+            // room quietly had no transcript and no AI in it would be
+            // a house nobody could tell why about. Same below, for a
+            // room of somebody's own.
+            may_transcribe: true,
             ..self.home().config().clone()
         };
         let room = match (self.make)(cfg) {
@@ -479,6 +511,10 @@ impl Rooms {
             // to say its name to a room with only the two of you in it
             // is a ceremony with no point to it.
             default_mode: Mode::Always,
+            // Written down, like every room but the lobby this is
+            // built from -- and theirs to take off the record, which
+            // in a room of your own is you and the AI going for a walk.
+            may_transcribe: true,
             ..self.home().config().clone()
         };
         match (self.make)(cfg) {
@@ -764,23 +800,67 @@ mod tests {
     fn the_ais_are_given_rooms_and_the_first_one_has_them_all() {
         let rooms = rooms_of_two(&["Lobby", "Studio"]);
         assert_eq!(rooms.bots(), ["Vox", "Sage"]);
-        // Placed in the rooms people share, and in nobody's own.
-        assert_eq!(rooms.bot_rooms("Sage").unwrap(), ["Lobby", "Studio"]);
+        // Placed in the rooms people share, and in nobody's own. Not
+        // the lobby: nothing said there is written down, so there is
+        // nothing for an AI to hear.
+        assert_eq!(rooms.bot_rooms("Sage").unwrap(), ["Studio"]);
         assert!(
             rooms.bot_rooms("Vox").unwrap().is_empty(),
             "the first is in every room without being put anywhere"
         );
 
-        // The first is nobody's to move, and there is no third.
+        // The first is nobody's to move, there is no third, and the
+        // lobby is nobody's to be put in -- not even the first AI's,
+        // which is in every other room without being asked.
         assert!(rooms.set_bot_room("Vox", "Studio", false).is_err());
         assert!(rooms.set_bot_room("Ada", "Studio", true).is_err());
         assert!(rooms.set_bot_room("Sage", "The Attic", true).is_err());
+        assert!(rooms.set_bot_room("Sage", "Lobby", true).is_err());
+        assert!(rooms.set_bot_room("Vox", "Lobby", true).is_err());
 
         // Out of the Studio, and into everybody's own room, which is
         // one answer rather than one per person.
         assert!(rooms.set_bot_room("Sage", "Studio", false).unwrap());
         assert!(rooms.set_bot_room("Sage", Rooms::OWN, true).unwrap());
-        assert_eq!(rooms.bot_rooms("Sage").unwrap(), ["@", "Lobby"]);
+        assert_eq!(rooms.bot_rooms("Sage").unwrap(), ["@"]);
+    }
+
+    /// The lobby is never written down and has no AI in it; every
+    /// other room is written down to begin with and has whoever was
+    /// put there.
+    #[test]
+    fn the_lobby_is_never_written_down_and_the_other_rooms_are() {
+        let rooms = rooms_of_two(&["Lobby", "Studio"]);
+        let lobby = rooms.home();
+        assert!(!lobby.config().may_transcribe);
+        assert!(!lobby.transcribing());
+        assert!(
+            lobby.hello("Ryan")["agents"]
+                .as_array()
+                .expect("a list of the AIs in the room")
+                .is_empty(),
+            "no AI is in the lobby, not even the first"
+        );
+        assert!(
+            lobby.set_transcribing("Ryan", true).is_err(),
+            "and there is nothing there to turn on"
+        );
+
+        let studio = rooms.find_shared("Studio").expect("the Studio is open");
+        assert!(studio.config().may_transcribe);
+        assert!(studio.transcribing());
+        assert_eq!(
+            studio.hello("Ryan")["agents"].as_array().map(|a| a.len()),
+            Some(1),
+            "the first AI is in every room that is written down"
+        );
+
+        // A room made while the house is open is written down, though
+        // the configuration it is built from is the lobby's.
+        let id = rooms.make_room("Attic").unwrap();
+        let attic = rooms.find_shared(&id).expect("the Attic is open");
+        assert!(attic.config().may_transcribe);
+        assert!(attic.transcribing());
     }
 
     fn base() -> RoomConfig {
@@ -798,6 +878,7 @@ mod tests {
             language: "English".into(),
             languages: vec!["English".into()],
             spoken: vec!["English".into()],
+            may_transcribe: true,
         }
     }
 

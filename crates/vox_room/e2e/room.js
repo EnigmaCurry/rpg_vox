@@ -12,6 +12,20 @@
 
 const BASE = process.env.VOX_ROOM_URL || 'http://127.0.0.1:7340';
 
+/// The room a script is about, which `run.sh` names in `room()`.
+///
+/// A tab lands in the lobby, and the lobby is never written down and
+/// has no AI in it: it is the room anybody can walk into and the room
+/// you wait in (see ROOM.md, **Off the record**). So a suite about
+/// anything said in a room is started with a hall to land in and a
+/// room after it to be about, and `person` and `socket` walk out of
+/// the one into the other -- which is what a person does.
+///
+/// Unset is a suite that wants the lobby itself and stays where it
+/// lands. `run.sh` is the only place that is decided; `room:` here is
+/// for a second person in a script who belongs somewhere else.
+const ROOM = process.env.VOX_ROOM_E2E_ROOM || null;
+
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /// Wait until something is so. Room state arrives when the room has
@@ -98,8 +112,9 @@ async function comeIn(page, { settle = 2200 } = {}) {
   await page.waitForTimeout(settle);
 }
 
-/// Somebody at a link, through the door and in the room.
-async function person(url, { wav, locale, capture, viewport, quiet = false, settle } = {}) {
+/// Somebody at a link, through the door and in the room the suite is
+/// about -- see [`ROOM`]. `room: null` stays where it landed.
+async function person(url, { wav, locale, capture, viewport, quiet = false, settle, room = ROOM } = {}) {
   const browser = await launch({ wav, capture });
   const ctx = await browser.newContext({
     permissions: ['microphone'],
@@ -117,6 +132,7 @@ async function person(url, { wav, locale, capture, viewport, quiet = false, sett
   }
   await page.goto(url);
   await comeIn(page, settle === undefined ? {} : { settle });
+  if (room) await goTo(page, room);
   return { browser, ctx, page };
 }
 
@@ -176,6 +192,34 @@ async function roomsListed(page) {
   return rows;
 }
 
+/// Out of the lobby and into the first room of the house after it.
+///
+/// A tab lands in the lobby, which is never written down and has no AI
+/// in it -- it is the room anybody can walk into, and the room you
+/// wait in (see ROOM.md, **Off the record**). The scripts that are run
+/// by hand against a room somebody started themselves have no name to
+/// walk to, so they walk to the first room after the lobby: the picker
+/// lists your own room, then the house's in the order they were named.
+/// A house that is nothing but a lobby leaves them where they are, and
+/// says so rather than waiting for a room that isn't there.
+async function intoARoom(page, settle = 1400) {
+  await page.click('.pick .current');
+  await page.waitForSelector('.pick .list');
+  const rooms = await page.evaluate(() =>
+    [...document.querySelectorAll('.pick .list button .name')].map((e) => e.textContent.trim()),
+  );
+  // Your own room, then the lobby, then the rooms of the house.
+  const want = rooms[2];
+  if (!want) {
+    await closeRooms(page);
+    console.log('[room] this house is nothing but a lobby, where nothing is written down');
+    return null;
+  }
+  await page.click('.pick .list button:nth-of-type(3)');
+  await page.waitForTimeout(settle);
+  return want;
+}
+
 /// Go to another room: open the heading, press the room, and let the
 /// new one arrive. The list shuts itself on the way.
 async function goTo(page, title, settle = 1200) {
@@ -221,7 +265,7 @@ async function cookieFor(token, base = BASE) {
 /// Somebody in the room on nothing but a socket: no browser, no audio,
 /// no WebCodecs. Enough for everything that is room state rather than
 /// something you have to hear or look at.
-async function socket(token, base = BASE) {
+async function socket(token, { base = BASE, room = ROOM } = {}) {
   const cookie = await cookieFor(token, base);
   const ws = new WebSocket(`${base.replace('http', 'ws')}/room.ws`, { headers: { cookie } });
   ws.binaryType = 'arraybuffer';
@@ -235,6 +279,11 @@ async function socket(token, base = BASE) {
     const m = JSON.parse(ev.data);
     if (m.type === 'hello') {
       p.where = m.room;
+      // Whether this room is written down, and whether that is a thing
+      // it can be asked about at all: the lobby is never written down
+      // and has nothing to turn on.
+      p.transcribing = m.transcribing;
+      p.mayTranscribe = m.may_transcribe;
       p.people = m.people.map((q) => q.name);
       // The roster itself, for what it says about each of them:
       // whether their mic is open, and whether the AIs may answer
@@ -296,10 +345,24 @@ async function socket(token, base = BASE) {
       // words in it: it leaves nothing on anybody's screen, so it must
       // leave nothing here either.
       p.said = p.said.filter((e) => e.id !== m.id);
+    } else if (m.type === 'transcribe') {
+      // Somebody put the room off the record, or back on it. The note
+      // saying who arrives as an entry like any other, and the AIs
+      // leaving or coming back as `agents_here`.
+      p.transcribing = m.on;
     }
   };
   ws.onerror = (e) => console.log('[socket]', e.message);
   await new Promise((ok) => (ws.onopen = ok));
+  // Out of the hall and into the room this suite is about, which is
+  // what the person whose socket this is would have done.
+  if (room) {
+    await until(() => !!p.where);
+    if (p.where.id !== room) {
+      p.send({ type: 'enter_room', id: room });
+      await until(() => p.where?.id === room);
+    }
+  }
   return p;
 }
 
@@ -320,6 +383,7 @@ module.exports = {
   openRooms,
   closeRooms,
   roomsListed,
+  intoARoom,
   goTo,
   said,
   type,

@@ -7,10 +7,15 @@
 // admits one person, that nothing said in it reaches the house, and that
 // the mix keeps arriving across every move.
 //
-// Wants a room started with two shared rooms:
-//   vox_room --room Main --room Studio --echo --no-stt --tts none
+// Wants a room started with three shared rooms, the first of them the
+// hall a tab lands in:
+//   vox_room --room Hall --room Main --room Studio --echo --no-stt --tts none
+//
+// This suite stays where it lands -- moving is what it is about -- so
+// it walks into Main itself rather than being put there on the way in.
+// `run.sh` says which suites do; see `room()` there.
 
-const { is, report, wait, socket } = require('./room.js');
+const { is, report, wait, until, socket } = require('./room.js');
 const [ryanToken, alexToken] = process.argv.slice(2).map((l) => l.replace(/.*\/join\//, ''));
 
 (async () => {
@@ -18,13 +23,23 @@ const [ryanToken, alexToken] = process.argv.slice(2).map((l) => l.replace(/.*\/j
   const alex = await socket(alexToken);
   await wait(400);
 
-  is('a tab lands in the first room named', ryan.where.id, 'Main');
-  is('his own first, then the house', ryan.rooms.map((r) => r.id), ['@Ryan', 'Main', 'Studio']);
-  is('hers first, then the house', alex.rooms.map((r) => r.id), ['@Alex', 'Main', 'Studio']);
+  is('a tab lands in the first room named', ryan.where.id, 'Hall');
+  is('which is the lobby, and is never written down', ryan.mayTranscribe, false);
+  is('so it has no AI in it either', ryan.agents, []);
+  is('his own first, then the house', ryan.rooms.map((r) => r.id), ['@Ryan', 'Hall', 'Main', 'Studio']);
+  is('hers first, then the house', alex.rooms.map((r) => r.id), ['@Alex', 'Hall', 'Main', 'Studio']);
+
+  // Out of the hall and into a room, which is what people do.
+  for (const p of [ryan, alex]) {
+    p.send({ type: 'enter_room', id: 'Main' });
+    await until(() => p.where?.id === 'Main');
+  }
+  await wait(400);
   is('both are in Main', ryan.rooms.find((r) => r.id === 'Main').here, ['Alex', 'Ryan']);
   is('the roster is who is in Main', ryan.people, ['Alex', 'Ryan']);
   is('one language, so nothing to say about who speaks what', ryan.speaks, null);
   is('Main judges its pauses', ryan.mode, 'auto');
+  is('and it is written down', ryan.transcribing, true);
 
   // Something said in Main, so there is a log to tell the rooms apart
   // by -- and said to the AI by name, since a room people share is a
