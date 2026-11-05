@@ -5110,11 +5110,12 @@ impl Room {
             (Some(_), Some(v)) => format!("{} (cloned from {})", v.name, v.who),
             (Some(_), None) => "its own voice".to_string(),
         };
-        let stored = match voice {
-            // No opinion: the row goes, and the house is heard again.
-            None => None,
-            Some(_) => Some(cloned.as_ref().map(|v| v.name.clone()).unwrap_or_default()),
-        };
+        // What goes in the row, if anything: no opinion clears it and the
+        // house is heard again. An empty name is this room asking for the
+        // AI's own voice, which is a choice and not the absence of one, so
+        // it has to stay `Some("")` and not collapse into `None` -- which
+        // is why the outer `map` is on `voice` and not on `cloned`.
+        let stored = voice.map(|_| cloned.as_ref().map(|v| v.name.clone()).unwrap_or_default());
         let wrote = match &stored {
             Some(v) => self.store().set_setting(&key, v),
             None => self.store().clear_setting(&key),
