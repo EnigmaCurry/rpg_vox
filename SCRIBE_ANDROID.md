@@ -62,11 +62,21 @@ published.
    [Add Scribe to Obtainium](https://apps.obtainium.imranr.dev/redirect?r=obtainium://add/https://github.com/EnigmaCurry/rpg_vox),
    or tap **Add App** in Obtainium and enter
    `https://github.com/EnigmaCurry/rpg_vox`.
-3. Tap **Add**, then **Install**. Android asks you to allow installs
+3. In the app's settings, put this in **Custom APK link filter by
+   regular expression**:
+
+   ```
+   scribe-.*-android-arm64\.apk$
+   ```
+
+4. Tap **Add**, then **Install**. Android asks you to allow installs
    from Obtainium the first time.
 
-Each release also carries the desktop scribe archives, but Obtainium
-only looks at the `.apk`.
+A release carries two APKs now, scribe's and [the voice
+room's](ROOM_ANDROID.md), so without that filter Obtainium asks **Pick
+an APK** every time one is published, and the wrong answer installs the
+other app. The filter is what makes the choice once. The desktop
+archives are not `.apk` and were never in the running.
 
 ### By hand
 

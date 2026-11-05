@@ -48,7 +48,37 @@ over the last. It is the same key scribe's APK is signed with; they are
 different apps and Android only asks that an update be signed by
 whatever signed the one before it.
 
-Download it from the [releases
+### With Obtainium (recommended)
+
+[Obtainium](https://github.com/ImranR98/Obtainium) installs apps
+straight from their GitHub releases and updates them when a new one is
+published.
+
+1. Install Obtainium.
+2. On the phone, open
+   [Add Voice Room to Obtainium](https://apps.obtainium.imranr.dev/redirect?r=obtainium://add/https://github.com/EnigmaCurry/rpg_vox),
+   or tap **Add App** in Obtainium and enter
+   `https://github.com/EnigmaCurry/rpg_vox`.
+3. In the app's settings, put this in **Custom APK link filter by
+   regular expression**:
+
+   ```
+   voice-room-.*-android\.apk$
+   ```
+
+4. Tap **Add**, then **Install**. Android asks you to allow installs
+   from Obtainium the first time.
+
+The filter is not optional here. One repository publishes two apps, so a
+release has two APKs in it, and without a filter Obtainium asks **Pick
+an APK** on every release and the wrong answer installs
+[scribe](SCRIBE_ANDROID.md) instead. Adding both apps to Obtainium is
+adding the same repository twice, each with its own filter, which is
+what tells them apart.
+
+### By hand
+
+Download `voice-room-<version>-android.apk` from the [releases
 page](https://github.com/EnigmaCurry/rpg_vox/releases) on the phone and
 open it. Android asks you to allow installs from your browser or file
 manager the first time.
