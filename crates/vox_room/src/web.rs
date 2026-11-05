@@ -1412,10 +1412,11 @@ async fn assets(headers: HeaderMap, uri: Uri) -> Response {
     let kind = file.metadata.mimetype().to_string();
     // On the document and not on the script it loads: a policy is about
     // a page, and a browser reads it off the page's own response.
-    let policy = kind
-        .starts_with("text/html")
-        .then(|| CSP.as_str())
-        .unwrap_or("");
+    let policy = if kind.starts_with("text/html") {
+        CSP.as_str()
+    } else {
+        ""
+    };
     let mut res = (
         [
             (header::CONTENT_TYPE, kind),

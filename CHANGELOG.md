@@ -107,6 +107,65 @@ releases.
   and will not compile if a fifth mode is added without being
   offered.
 
+- **A room's note about itself is read in your own language.** The line
+  the room writes when somebody takes it off the record, and again when
+  they put it back, was English for everybody: in a room listening in
+  two languages a Russian reader got the English sentence. Everything
+  else in the conversation reaches people in the language they read in
+  -- what is said is interpreted, what is typed is translated -- and
+  this was the one line that did not, which is a poor one for it to be.
+  A note is there to explain a gap, and it explains it to nobody in a
+  language they cannot read.
+
+  It goes through the same translators a typed message does and arrives
+  the same way: your language, with the English a tap away under it, so
+  a translation that went wrong can be seen to have. The room writes
+  these in English wherever the room is -- the sentences are English
+  prose in the server rather than anything the room's own language
+  reaches -- so English is what it is translated *from*, and a room
+  that reads only English asks for nothing.
+
+  Using the translators while a room is off the record is not a hole in
+  being off the record. What is handed over is the room's own sentence
+  about the switch, which is the one thing an off-the-record stretch
+  keeps on purpose, and not anything anybody said or typed.
+
+### Voice Room for Android
+
+- **A headset with a talk button of its own now works that button.**
+  A radio-style Bluetooth speaker-mic -- the one this was found on is a
+  BTECH BS-22 -- has the button push to talk was drawn for: one
+  momentary switch whose only job is to open a microphone. Hold it and
+  you are live; let go and you are not. Nothing has to be set and there
+  is nothing to bind.
+
+  None of the care the volume keys need applies here, and that is the
+  whole of the difference between them. A volume key has another job,
+  so it waits a quarter of a second to find out whether a press was a
+  tap, fills the wait with a chirp of its own, stands down whenever the
+  cursor is in the message box, and lets go the moment the app leaves
+  the front. This button has none of those: down is the microphone,
+  immediately, and the room arms and chirps for it exactly as it does
+  for a talk key on a keyboard -- one sound, played once, by whoever
+  owns the wait. It talks with the cursor in the message box too, since
+  the stand-down is about a key a box has a claim on and a trigger on a
+  speaker-mic is not one. And the hold outlives the screen going off,
+  which is the thing holding a radio's button in a pocket is for.
+
+  It is not a key and could not have been bound as one. The BS-22
+  pairs as A2DP and hands-free and registers no HID device at all, so
+  nothing about it reaches a key event; what the button sends is a
+  vendor-specific hands-free AT command, `AT+XEVENT=PTT_DOWN` and
+  `PTT_UP`. See ROOM_ANDROID.md, which has how that was found and why
+  the app now asks for **Nearby devices**: that broadcast is only
+  delivered to an app holding it. Refuse it and everything else works,
+  with the volume keys still the talk key.
+
+  The one way a hold can end without a release is the headset leaving,
+  so a headset switched off mid-hold is listened for and closes the
+  microphone. Without that it would have left one open with nothing
+  able to close it.
+
 ## v0.2.2 (2026-11-05)
 
 ### Voice room

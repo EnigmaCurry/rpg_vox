@@ -23,6 +23,20 @@
   // the room knows reads and says, here or not.
   const languageOf = (who) => room.speaks[who] || roomLanguage;
 
+  // What language the room writes its own notes in. English wherever
+  // the room is, because the sentences are English prose in the server
+  // rather than anything the room's own language reaches. `room.rs`
+  // has the same constant under the same name, and the two must agree.
+  const NOTE_LANGUAGE = 'English';
+
+  /// What language an entry was written in.
+  ///
+  /// A note is the one entry whose language has nothing to do with
+  /// whose line it is: its `who` is the person the switch happened by,
+  /// not its author, because its author is the room.
+  const writtenIn = (e) =>
+    e.kind === 'note' ? NOTE_LANGUAGE : e.kind === 'agent' ? roomLanguage : languageOf(e.who);
+
   /// An entry that has a translation for you: which language it was
   /// written in, and what it says in yours (`null` while that is still
   /// coming). `null` for an entry that needs no translation at all.
@@ -34,9 +48,12 @@
   /// it isn't, there is no translation coming and the line is shown as
   /// it was said.
   function pair(e) {
-    const from = e.kind === 'agent' ? roomLanguage : languageOf(e.who);
+    const from = writtenIn(e);
     if (!from || from === mine) return null;
-    if (e.kind !== 'agent' && !e.typed && !room.interprets) return null;
+    // A spoken line in a room that is not interpreting has no
+    // translation coming, so there is nothing to wait for. The AI's
+    // reply was not spoken and nor was a note, so neither waits on it.
+    if (e.kind !== 'agent' && e.kind !== 'note' && !e.typed && !room.interprets) return null;
     return { from, text: e.translations?.[mine] ?? null };
   }
 
@@ -370,7 +387,22 @@
              that would otherwise be indistinguishable from an hour in
              which nobody spoke. -->
         <p class="note-entry">
-          {e.text}
+          {#if pair(e)}
+            {@const p = pair(e)}
+            {@const from = showing(e) === 'from'}
+            <!-- The room's own line, in the language you read in. It is
+                 here to explain a gap, and it explains it to nobody in a
+                 language they cannot read. Same swap as every other
+                 line, for the same reason. -->
+            <span lang={from ? p.from : mine}>
+              {#if from}{e.text}{:else if p.text}{p.text}{:else}<span class="pending">{mine}…</span>{/if}
+            </span>
+            <button type="button" class="swap" onclick={() => (asWritten[e.id] = !from)}>
+              {from ? `Show ${mine}` : `Show ${p.from}`}
+            </button>
+          {:else}
+            {e.text}
+          {/if}
           <span class="note-at">{time(e.at)}</span>
         </p>
       {:else if e.kind === 'card'}
@@ -512,6 +544,9 @@
     text-align: center;
   }
   .note-at { font-variant-numeric: tabular-nums; opacity: 0.75; }
+  /* A flex child here, not a line of its own: the note is one centred
+     row, and the swap belongs in it beside the words it swaps. */
+  .note-entry .swap { margin: 0; }
   .card {
     border: 1px solid color-mix(in srgb, var(--agent) 45%, var(--line));
     background: color-mix(in srgb, var(--agent) 8%, var(--bubble));

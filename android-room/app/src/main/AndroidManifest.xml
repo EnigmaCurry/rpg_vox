@@ -10,6 +10,13 @@
          `Unable to select communication device!` in the log. It is a
          normal permission, so declaring it is the whole of granting it. -->
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <!-- A headset with a talk button of its own. The button is not a
+         key and arrives as a vendor-specific hands-free AT command,
+         which Android only forwards to an app holding this; see
+         HeadsetPtt.kt. A runtime permission, and the one thing the app
+         asks for that it can do without: deny it and the volume keys
+         are still the talk key. -->
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />

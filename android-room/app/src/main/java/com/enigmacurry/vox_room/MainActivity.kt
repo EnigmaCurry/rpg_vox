@@ -69,6 +69,25 @@ class MainActivity : Activity() {
         }
     }
 
+    /// A headset's own talk button, which does not arrive as a key and
+    /// so cannot be bound as one. See [HeadsetPtt] for what it arrives
+    /// as instead, and [squeeze] for what is done with it.
+    ///
+    /// Exported, because the sender is the platform's Bluetooth process
+    /// and not this package -- `RECEIVER_NOT_EXPORTED` would subscribe
+    /// to a broadcast nothing local ever sends. What that opens is an
+    /// app on this phone being able to forge a press and talk into the
+    /// room you are in; it is worth naming and it is not worth much,
+    /// since anything able to do that could record the microphone
+    /// itself, which is the thing such an app would actually want.
+    private val fromHeadset = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            val said = intent ?: return
+            if (HeadsetPtt.gone(said)) return squeeze(false)
+            squeeze(HeadsetPtt.pressed(said) ?: return)
+        }
+    }
+
     /// Leave the audio, and let the service go with it.
     ///
     /// Not a log out, and not a way back to the box the address goes in.
@@ -356,6 +375,56 @@ class MainActivity : Activity() {
         // the app going away under them, where a noise is just a noise.
     }
 
+    // -- the headset's own talk button --------------------------------
+
+    /// Whether the headset's button is down.
+    ///
+    /// Kept so a repeat cannot be mistaken for a second press. Nothing
+    /// seen so far repeats -- the measurements in [HeadsetPtt] found no
+    /// event at all between a down and its up -- but one hold is one
+    /// thing said and the room counts it that way, and a headset that
+    /// did chatter would otherwise say it twice.
+    private var squeezing = false
+
+    /// Hold, or let go of, the room's talk key, because a button whose
+    /// only job is that was pressed.
+    ///
+    /// None of [dispatchKeyEvent]'s care is wanted here, and that is
+    /// the whole difference between the two. A volume key has another
+    /// job, so it waits a quarter of a second to find out whether the
+    /// press was a tap, fills the wait with a chirp of its own, and
+    /// then tells the room the waiting is already done. This button has
+    /// no other job: down is the microphone, immediately, and the room
+    /// arms and chirps for it exactly as it does for a talk key on a
+    /// keyboard. One sound, played once, by whoever owns the wait.
+    ///
+    /// It is not stood down for a text box either, where a volume key
+    /// is. That stand-down is about a key the box has a claim on -- the
+    /// room's own talk key is Space out of the box, and a Space typed
+    /// into a message is a space -- and nothing here has a claim worth
+    /// honouring: a squeeze on a speaker-mic while the cursor happens to
+    /// be in the message box is somebody who wants to talk, and a
+    /// button that went dead whenever the box had the focus would be
+    /// dead most of the time somebody wanted it. See [talkJs].
+    ///
+    /// A hold survives the screen going off, unlike a key's: [letGo]
+    /// drops those because a key cannot be held through not being
+    /// reachable, and this one plainly can -- holding a radio's button
+    /// with a phone in a pocket is the thing it is for. What ends it is
+    /// the release, which goes on arriving, or the headset leaving,
+    /// which is the only other way out and is why [HeadsetPtt.gone]
+    /// is listened for. Without that, a headset switched off mid-hold
+    /// would leave a microphone open with nothing to close it.
+    private fun squeeze(down: Boolean) {
+        if (down == squeezing) return
+        squeezing = down
+        // Said out loud for the same reason a lent key's hold is: from
+        // the outside a button that has stopped talking and a button
+        // that was never heard from look exactly alike.
+        Log.i(RoomService.TAG, "the headset's talk button is ${if (down) "down" else "up"}")
+        web?.evaluateJavascript(talkJs(down, key = false), null)
+    }
+
     // -- the chirp ----------------------------------------------------
 
     /// Two beeps rising, exactly as long as the wait they fill.
@@ -476,8 +545,22 @@ class MainActivity : Activity() {
             IntentFilter(RoomService.ACTION_LEAVE).apply { addAction(RoomService.ACTION_MUTE) },
             RECEIVER_NOT_EXPORTED,
         )
+        // Registered before the permission below has been answered, on
+        // purpose: a receiver may subscribe to a broadcast it is not
+        // yet allowed to be sent, and the allowance is checked when one
+        // is delivered rather than when one is asked for. So the grant
+        // arriving later is enough, and there is no second place that
+        // has to remember to do this.
+        registerReceiver(fromHeadset, HeadsetPtt.buttonFilter(), RECEIVER_EXPORTED)
+        registerReceiver(fromHeadset, HeadsetPtt.goneFilter(), RECEIVER_EXPORTED)
         val want = mutableListOf(Manifest.permission.RECORD_AUDIO,
-            Manifest.permission.POST_NOTIFICATIONS)
+            Manifest.permission.POST_NOTIFICATIONS,
+            // Only so a headset's own talk button can be heard. It is
+            // the one thing asked for here that the app does without:
+            // refused, everything works and the volume keys are still
+            // the talk key, so a refusal is not reported anywhere and
+            // `onRequestPermissionsResult` does not test for it.
+            Manifest.permission.BLUETOOTH_CONNECT)
         val missing = want.filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
         if (missing.isNotEmpty()) {
             // Nothing may start until this comes back: a microphone-typed
@@ -1000,6 +1083,8 @@ class MainActivity : Activity() {
         rise?.release(); rise = null
         watchBack(false)
         unregisterReceiver(fromNotification)
+        // One call for both filters: a receiver is unregistered whole.
+        unregisterReceiver(fromHeadset)
         CookieManager.getInstance().flush()
         // Going for good takes the service with it. Not merely going out
         // of sight: being out of sight with the service still up is the
@@ -1132,12 +1217,21 @@ private const val STATE_JS = """
 
 /// Press, or let go of, the key the room's microphone is on.
 ///
-/// A press says first that it has already waited. Push to talk arms for
-/// a quarter of a second before the microphone opens -- the chirp fills
-/// it; see `lib/chirp.js` -- and this press has spent exactly that long
-/// already, deciding whether a volume key was a tap or a hold. Without
-/// the mark the room would arm again and a phone would wait twice for
-/// one hold.
+/// `key` is whether a key was held, which is to say whether a volume key
+/// is standing in for the one the room is bound to. Two things follow
+/// from it, and both are about the key's other job rather than about the
+/// microphone -- so a headset's own talk button, which has no other job,
+/// passes `false` and gets neither. See [MainActivity.squeeze].
+///
+/// A press by a key says first that it has already waited. Push to talk
+/// arms for a quarter of a second before the microphone opens -- the
+/// chirp fills it; see `lib/chirp.js` -- and such a press has spent
+/// exactly that long already, deciding whether a volume key was a tap or
+/// a hold. Without the mark the room would arm again and a phone would
+/// wait twice for one hold. A button that never waited must not claim
+/// the wait: the room has the whole quarter second to fill and is the
+/// only one that can, and a mark left here would skip the chirp and open
+/// the microphone under somebody with no warning at all.
 ///
 /// Whichever key that is: the room lets you bind another one and keeps
 /// the answer in this browser's own storage, so it is read from there
@@ -1149,6 +1243,16 @@ private const val STATE_JS = """
 /// room's handler asks `e.target.closest(...)` whose key this is, and
 /// `window` has no `closest` -- an event dispatched there would arrive
 /// as a TypeError rather than as a press.
+///
+/// That same question is the second thing `key` decides. A press
+/// arriving as a key is dispatched where the focus is, so the room's own
+/// stand-down applies and a message box keeps the key it has a claim on.
+/// A button is dispatched at the body instead, which is the truth about
+/// it: it was not pressed anywhere in particular, and there is no box a
+/// speaker-mic's trigger belongs to. The release follows the press
+/// wherever it went, and would land either way -- the room checks whose
+/// key it is on the way down and never on the way up, for the same
+/// reason nothing here may refuse one.
 ///
 /// A press, and only a press, is refused unless the button you hold is
 /// actually there. Out here push to talk is known a second late at
@@ -1162,10 +1266,10 @@ private const val STATE_JS = """
 /// room already drops a hold when the mode goes away under it, and a
 /// query that failed for any reason at all would leave a microphone
 /// open with nothing on the screen saying so.
-private fun talkJs(down: Boolean) = """
+private fun talkJs(down: Boolean, key: Boolean = true) = """
     (() => {
       ${if (down) "if (!document.querySelector('footer button.big.ptt')) return;" else ""}
-      ${if (down) "try { localStorage.setItem('vox_room.ptt_armed', String(Date.now())); } catch {}" else ""}
+      ${if (down && key) "try { localStorage.setItem('vox_room.ptt_armed', String(Date.now())); } catch {}" else ""}
       let bind = { code: 'Space', ctrl: false, alt: false, shift: false, meta: false };
       try {
         const raw = JSON.parse(localStorage.getItem('vox_room.talk_key') ?? 'null');
@@ -1174,7 +1278,7 @@ private fun talkJs(down: Boolean) = """
                    shift: !!raw.shift, meta: !!raw.meta };
         }
       } catch {}
-      const at = document.activeElement ?? document.body;
+      const at = ${if (key) "document.activeElement ?? document.body" else "document.body"};
       at.dispatchEvent(new KeyboardEvent('${if (down) "keydown" else "keyup"}', {
         code: bind.code, ctrlKey: bind.ctrl, altKey: bind.alt,
         shiftKey: bind.shift, metaKey: bind.meta,
