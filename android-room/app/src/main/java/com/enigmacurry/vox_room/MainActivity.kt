@@ -12,6 +12,8 @@ import android.graphics.Color
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import android.util.TypedValue
 import android.view.Gravity
@@ -85,17 +87,43 @@ class MainActivity : Activity() {
         }
     }
 
-    /// Tell the service what the room's talk button says, so the
-    /// notification offers the same press. Empty where there is nothing
-    /// to mute: before the audio is joined, and under push to talk,
-    /// where the microphone is shut unless something is being held.
-    private fun tellTheNotification() {
-        val w = web ?: return RoomService.says(this, "")
-        w.evaluateJavascript(SAYS_JS) { answer ->
-            val said = runCatching { JSONTokener(answer).nextValue() as? String }
-                .getOrNull().orEmpty()
-            RoomService.says(this, said)
+    /// Keep the notification saying what the room's talk button says.
+    ///
+    /// Watched rather than written when we happen to press something.
+    /// The mute in the footer is the same mute, and somebody using it
+    /// leaves the notification offering the opposite of the truth --
+    /// which was the first thing anybody noticed about it. There is no
+    /// event to listen for from out here, so it is asked, once a second,
+    /// for as long as there is a room on the screen.
+    ///
+    /// The cost is a few microseconds of a WebView that is already
+    /// running: the screen-off measurements in README.md were taken with
+    /// exactly this, a `Date.now()` asked at the same rate, answering in
+    /// 2 to 6 ms without once falling behind.
+    private val watching = Handler(Looper.getMainLooper())
+    private var lastSaid: String? = null
+
+    private val watchTheTalkButton = object : Runnable {
+        override fun run() {
+            tellTheNotification()
+            watching.postDelayed(this, 1000)
         }
+    }
+
+    private fun tellTheNotification() {
+        val w = web ?: return say("")
+        w.evaluateJavascript(SAYS_JS) { answer ->
+            say(runCatching { JSONTokener(answer).nextValue() as? String }.getOrNull().orEmpty())
+        }
+    }
+
+    /// Only when it has actually changed: each of these is a service
+    /// start and a notification posted again.
+    private fun say(said: String) {
+        if (said == lastSaid) return
+        lastSaid = said
+        Log.i(RoomService.TAG, "the talk button says: ${said.ifEmpty { "nothing to mute" }}")
+        RoomService.says(this, said)
     }
 
     override fun onCreate(saved: Bundle?) {
@@ -235,6 +263,7 @@ class MainActivity : Activity() {
     private fun setup(problem: String? = null) {
         RoomService.stop(this)
         watchBack(false)
+        watching.removeCallbacks(watchTheTalkButton)
         web?.destroy()
         web = null
 
@@ -390,6 +419,9 @@ class MainActivity : Activity() {
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         insetBySystemBars(frame)
         watchBack(true)
+        lastSaid = null
+        watching.removeCallbacks(watchTheTalkButton)
+        watching.post(watchTheTalkButton)
         w.loadUrl(url)
     }
 
@@ -569,15 +601,12 @@ class MainActivity : Activity() {
     /// was then killed rather than closed, came back with no session and
     /// nothing but a spent link to show for it.
     override fun onStop() {
-        // Going out of sight is the moment before the notification is
-        // the only thing on screen, so it is the moment to make sure it
-        // is offering the right press.
-        tellTheNotification()
         CookieManager.getInstance().flush()
         super.onStop()
     }
 
     override fun onDestroy() {
+        watching.removeCallbacks(watchTheTalkButton)
         watchBack(false)
         unregisterReceiver(fromNotification)
         CookieManager.getInstance().flush()
