@@ -28,10 +28,21 @@ class RoomService : Service() {
         const val TAG = "VoxRoom"
         private const val CHANNEL = "room"
         private const val ID = 1
-        private const val ACTION_LEAVE = "leave"
+        const val ACTION_LEAVE = "leave"
+        const val ACTION_MUTE = "mute"
+        private const val EXTRA_SAYS = "says"
 
         fun start(context: Context) {
             context.startForegroundService(Intent(context, RoomService::class.java))
+        }
+
+        /// What the room's own talk button says, so the notification can
+        /// offer the same press. Empty while there is nothing to mute --
+        /// before the audio is joined, or under push to talk, where the
+        /// microphone is already shut unless something is being held.
+        fun says(context: Context, label: String) {
+            context.startForegroundService(
+                Intent(context, RoomService::class.java).putExtra(EXTRA_SAYS, label))
         }
 
         fun stop(context: Context) {
@@ -39,16 +50,21 @@ class RoomService : Service() {
         }
     }
 
+    /// What the room's talk button says, or empty for no mute action.
+    private var says = ""
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == ACTION_LEAVE) {
-            // Leaving from the notification closes the room as well as the
-            // service: a call you dismissed should not go on listening.
-            sendBroadcast(Intent(ACTION_LEAVE).setPackage(packageName))
-            stopSelf()
+        // Both of these are the activity's to carry out: the room is a
+        // page, and pressing its buttons is the only way to work it.
+        // Leaving also ends this service -- but the activity says when,
+        // once the room has actually been left.
+        if (intent?.action == ACTION_LEAVE || intent?.action == ACTION_MUTE) {
+            sendBroadcast(Intent(intent.action).setPackage(packageName))
             return START_NOT_STICKY
         }
+        intent?.getStringExtra(EXTRA_SAYS)?.let { says = it }
         val nm = getSystemService(NotificationManager::class.java)
         if (nm.getNotificationChannel(CHANNEL) == null) {
             nm.createNotificationChannel(
@@ -64,12 +80,24 @@ class RoomService : Service() {
             this, 1, Intent(this, RoomService::class.java).setAction(ACTION_LEAVE),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
+        val mute = PendingIntent.getService(
+            this, 2, Intent(this, RoomService::class.java).setAction(ACTION_MUTE),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
         val note: Notification = Notification.Builder(this, CHANNEL)
             .setContentTitle(getString(R.string.note_title))
             .setContentText(getString(R.string.note_text))
             .setSmallIcon(R.drawable.ic_launcher_foreground)
             .setContentIntent(open)
             .setOngoing(true)
+            // The room's own word for it, so the notification offers
+            // the same press as the button behind it rather than a
+            // second vocabulary for the same microphone.
+            .also { b ->
+                if (says.isNotEmpty()) {
+                    b.addAction(Notification.Action.Builder(null, says, mute).build())
+                }
+            }
             .addAction(Notification.Action.Builder(
                 null, getString(R.string.note_leave), leave).build())
             .build()

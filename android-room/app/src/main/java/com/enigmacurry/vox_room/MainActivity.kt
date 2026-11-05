@@ -34,6 +34,7 @@ import android.widget.TextView
 import java.net.HttpURLConnection
 import java.net.URL
 import org.json.JSONObject
+import org.json.JSONTokener
 
 /**
  * A voice room in a WebView, held up by a foreground service.
@@ -46,15 +47,64 @@ class MainActivity : Activity() {
     private var web: WebView? = null
     private val prefs by lazy { getSharedPreferences("room", MODE_PRIVATE) }
 
-    /// Leaving from the notification has to reach the WebView, which the
-    /// service cannot touch.
-    private val leaving = object : BroadcastReceiver() {
-        override fun onReceive(context: Context?, intent: Intent?) = setup()
+    /// The notification's buttons have to reach the WebView, which the
+    /// service cannot touch. Both of them are presses on the room's own
+    /// controls -- the room is a page, and that is how a page is worked.
+    private val fromNotification = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            when (intent?.action) {
+                RoomService.ACTION_LEAVE -> leaveAudio()
+                RoomService.ACTION_MUTE -> toggleMute()
+            }
+        }
+    }
+
+    /// Leave the audio, and let the service go with it.
+    ///
+    /// Not a log out, and not a way back to the box the address goes in.
+    /// It used to be both: it threw the page away and showed that box,
+    /// which from the outside is indistinguishable from being logged
+    /// out, and logging out is not a thing a stray tap on a notification
+    /// should be able to do. The room is still this phone's room
+    /// afterwards; the door is simply where you are when you are not in
+    /// the audio.
+    private fun leaveAudio() {
+        val w = web
+        if (w == null) return RoomService.stop(this)
+        w.evaluateJavascript(LEAVE_JS) {
+            RoomService.stop(this)
+        }
+    }
+
+    /// Mute or unmute, by pressing the room's own button.
+    private fun toggleMute() {
+        val w = web ?: return
+        w.evaluateJavascript(MUTE_JS) {
+            // The label follows the press a frame later.
+            w.postDelayed({ tellTheNotification() }, 300)
+        }
+    }
+
+    /// Tell the service what the room's talk button says, so the
+    /// notification offers the same press. Empty where there is nothing
+    /// to mute: before the audio is joined, and under push to talk,
+    /// where the microphone is shut unless something is being held.
+    private fun tellTheNotification() {
+        val w = web ?: return RoomService.says(this, "")
+        w.evaluateJavascript(SAYS_JS) { answer ->
+            val said = runCatching { JSONTokener(answer).nextValue() as? String }
+                .getOrNull().orEmpty()
+            RoomService.says(this, said)
+        }
     }
 
     override fun onCreate(saved: Bundle?) {
         super.onCreate(saved)
-        registerReceiver(leaving, IntentFilter("leave"), RECEIVER_NOT_EXPORTED)
+        registerReceiver(
+            fromNotification,
+            IntentFilter(RoomService.ACTION_LEAVE).apply { addAction(RoomService.ACTION_MUTE) },
+            RECEIVER_NOT_EXPORTED,
+        )
         val want = mutableListOf(Manifest.permission.RECORD_AUDIO,
             Manifest.permission.POST_NOTIFICATIONS)
         val missing = want.filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
@@ -519,13 +569,17 @@ class MainActivity : Activity() {
     /// was then killed rather than closed, came back with no session and
     /// nothing but a spent link to show for it.
     override fun onStop() {
+        // Going out of sight is the moment before the notification is
+        // the only thing on screen, so it is the moment to make sure it
+        // is offering the right press.
+        tellTheNotification()
         CookieManager.getInstance().flush()
         super.onStop()
     }
 
     override fun onDestroy() {
         watchBack(false)
-        unregisterReceiver(leaving)
+        unregisterReceiver(fromNotification)
         CookieManager.getInstance().flush()
         // Going for good takes the service with it. Not merely going out
         // of sight: being out of sight with the service still up is the
@@ -553,6 +607,42 @@ class MainActivity : Activity() {
  * audio or the socket. Measured: four minutes of screen-off, no wake
  * lock, not one silent second. See README.md.
  */
+/// Leaving the audio: the room's own way out, so its sockets are let go
+/// of the way it lets go of them.
+private const val LEAVE_JS = """
+    (() => {
+      const leave = document.querySelector('.tools button[aria-label="Leave audio"]');
+      if (!leave) return 'none';
+      leave.click();
+      return 'left';
+    })()
+"""
+
+/// Muting: the one button in the footer that is a mute. Under push to
+/// talk the same button is hold-to-talk and pressing it is not a mute,
+/// so it is left alone.
+private const val MUTE_JS = """
+    (() => {
+      const b = document.querySelector('footer button.big');
+      if (!b || b.classList.contains('ptt') || b.disabled) return 'none';
+      b.click();
+      return 'pressed';
+    })()
+"""
+
+/// What that button says right now, which is what pressing it will do.
+/// The label is the text beside the key hint rather than the whole of
+/// it: the hint is hidden on a touch screen but is still in the text.
+private const val SAYS_JS = """
+    (() => {
+      const b = document.querySelector('footer button.big');
+      if (!b || b.classList.contains('ptt') || b.disabled) return '';
+      const live = b.querySelector('.says > span:not(.ghost)') || b;
+      const first = live.childNodes[0];
+      return first ? first.textContent.trim() : '';
+    })()
+"""
+
 private class KeptVisibleWebView(context: Context) : WebView(context) {
     override fun onWindowVisibilityChanged(visibility: Int) {
         super.onWindowVisibilityChanged(View.VISIBLE)
