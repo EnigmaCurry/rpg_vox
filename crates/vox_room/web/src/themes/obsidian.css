@@ -17,9 +17,12 @@
 [data-theme='obsidian'] {
   color-scheme: dark;
 
-  /* The lit line along a panel's edges. Theme-private: `--frame-edge`
-     and `--frame-corners` below are what the room actually reads, and
-     this is only so the two of them agree. */
+  /* The lit line along a panel's straight edges. Theme-private:
+     `--frame-edge` below is what the room actually reads, and this is
+     only so its ring and its inner glow agree.
+
+     The cut corners are deliberately not this, and are brighter --
+     see `--cut-ink-panel` in the corner grammar below. */
   --edge: #6871b4;
 
   /* ---- The field the panels lie on ------------------------------- */
@@ -75,26 +78,51 @@
      line along the faces it opened; the line is a gradient because a
      border traces the rectangle the clip just bit a corner out of.
 
-     `--cut-face` is the diagonal both of them lie on, written once and
-     placed in the corners below. 135deg puts a gradient's own middle
-     exactly along it, which is what makes the band land on the cut and
-     not beside it. The colour is substituted where the token is
-     *used*, so a card's cut comes out in the card's line and a panel's
-     in the frame's, from the one gradient. */
-  --cut-face: linear-gradient(135deg,
-    transparent calc(50% - 0.8px), var(--cut-ink) calc(50% - 0.8px),
-    var(--cut-ink) calc(50% + 0.8px), transparent calc(50% + 0.8px));
+     First what they are drawn in. A panel's cut is the one place in
+     the theme where something is brighter than the frame around it: a
+     pale sky blue, light enough to carry as the one pixel it comes
+     out as over a near-black field, and off-hue from both the violet
+     the AI speaks in and the amber you do, so a lit corner never
+     looks like it means something. The straight edges stay in
+     periwinkle -- the contrast
+     between the two is what makes the notches read as the motif
+     rather than as more of the frame.
 
-  /* The frame is lit; a card inside one is not. */
-  --cut-ink-panel: var(--edge);
-  --cut-ink-card: #3b4370;
+     A card inside a panel is the same hue held well back. A card is
+     quieter than its frame everywhere else (see `--card-edge` below),
+     and a notch on a fader lit as hard as the column's would put the
+     brightest thing in the room on its smallest piece. */
+  --cut-ink-panel: #7ad5ff;
+  --cut-ink-card: #3f6f8c;
+
+  /* Then the diagonal the cuts lie on, once per ink. 135deg puts a
+     gradient's own middle exactly along the cut, which is what makes
+     the band land on the face and not beside it.
+
+     Two gradients rather than one shape taking whichever ink the
+     element it lands on is carrying, because a `var()` written inside
+     a custom property is substituted where that property is
+     *declared*, not where it is used. One gradient here reading a
+     colour that panels and cards each set on themselves resolves
+     here, against this element, which sets no such colour -- so it
+     took the `transparent` `tokens.css` starts every theme at, and
+     nothing set further down could reach it afterwards. That is what
+     the corners used to be drawn in. Both inks above are declared in
+     this same rule, beside the gradients that read them, which is the
+     whole of what makes them arrive. */
+  --cut-face-panel: linear-gradient(135deg,
+    transparent calc(50% - 0.8px), var(--cut-ink-panel) calc(50% - 0.8px),
+    var(--cut-ink-panel) calc(50% + 0.8px), transparent calc(50% + 0.8px));
+  --cut-face-card: linear-gradient(135deg,
+    transparent calc(50% - 0.8px), var(--cut-ink-card) calc(50% - 0.8px),
+    var(--cut-ink-card) calc(50% + 0.8px), transparent calc(50% + 0.8px));
 
   /* A major panel: 16px off the top left and the bottom right. */
   --cut-panel: polygon(16px 0, 100% 0, 100% calc(100% - 16px),
     calc(100% - 16px) 100%, 0 100%, 0 16px);
   --cut-panel-edges:
-    var(--cut-face) top left / 16px 16px no-repeat,
-    var(--cut-face) bottom right / 16px 16px no-repeat;
+    var(--cut-face-panel) top left / 16px 16px no-repeat,
+    var(--cut-face-panel) bottom right / 16px 16px no-repeat;
 
   /* A card inside a panel -- a fader, the note under them: the same cut
      at 9px, which on something a few lines tall reads as a bevel
@@ -107,8 +135,8 @@
   --cut-card: polygon(9px 0, 100% 0, 100% calc(100% - 9px),
     calc(100% - 9px) 100%, 0 100%, 0 9px);
   --cut-card-edges:
-    var(--cut-face) top left / 9px 9px no-repeat,
-    var(--cut-face) bottom right / 9px 9px no-repeat;
+    var(--cut-face-card) top left / 9px 9px no-repeat,
+    var(--cut-face-card) bottom right / 9px 9px no-repeat;
 
   /* ---- The frame ------------------------------------------------------- */
   --frame-radius: 3px;

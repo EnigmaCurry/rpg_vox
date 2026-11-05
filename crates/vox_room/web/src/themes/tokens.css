@@ -130,14 +130,16 @@
   --cut-panel-edges: none;
   --cut-card: none;
   --cut-card-edges: none;
-  /* What each cut's face is drawn in. The two gradients a theme builds
-     its `--cut-X-edges` out of read `--cut-ink`, and `chrome.css`
-     points that at one of these on whichever element it is drawing --
-     so the same pair of gradients comes out in the frame's colour on a
-     panel and the card's on a card. */
-  --cut-ink: transparent;
-  --cut-ink-panel: var(--cut-ink);
-  --cut-ink-card: var(--cut-ink);
+  /* What each cut's face is drawn in. A theme declares both, and
+     builds its `--cut-X-edges` against them *in the same rule it
+     declares them in*: a `var()` inside a custom property is
+     substituted where that property is declared, so a gradient
+     written here against a colour a panel sets on itself resolves
+     here, to this `transparent`, and the cut comes out invisible. A
+     theme that cuts nothing can leave both alone -- the edges above
+     are `none` and nothing reads these. */
+  --cut-ink-panel: transparent;
+  --cut-ink-card: transparent;
 
   /* ---- The frame around a panel -----------------------------------
      The cut above gives a panel its shape; these give it its surface

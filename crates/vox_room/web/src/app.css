@@ -55,9 +55,16 @@ button {
   padding: 6px 12px;
   cursor: pointer;
 }
+/* Only the colour. The face is `--btn-image` either way, so the
+   shorthand here would be re-stating what the rule above already said
+   -- except that it also resets `background-image`, and one button in
+   the room is a panel: the heading that names the room carries
+   `.panel`, whose cut corners are background layers in that same
+   property. `button:hover` outranks `.panel`, so the shorthand
+   repainted the corners away for as long as the pointer was on it. */
 button:hover {
   border-color: var(--btn-hover-border);
-  background: var(--btn-image) var(--btn-hover-bg);
+  background-color: var(--btn-hover-bg);
   color: var(--btn-hover-ink);
 }
 /* A cut corner is a clip, and a clip takes an outline drawn outside the

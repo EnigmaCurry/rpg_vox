@@ -9,6 +9,32 @@ releases.
 
 ### Voice room
 
+- **The cut corners come out in the colour the theme wrote for
+  them.** Obsidian's panels and cards are drawn with a corner bitten
+  off and a lit line along the face the cut opened, and that line had
+  been invisible since it was written. The gradient read `--cut-ink`,
+  a token each element set on itself -- but a `var()` inside a custom
+  property is substituted where that property is *declared*, not where
+  it is used, so the gradient resolved in the theme's own rule against
+  the `transparent` every theme starts at, and nothing set further
+  down could reach it afterwards. There is now one gradient per ink,
+  declared in the same rule as the inks it reads, and `chrome.css` no
+  longer points a token at itself per element.
+
+  With the corners actually arriving they are coloured for the first
+  time: a panel's in a pale sky blue, the one thing in the theme
+  brighter than the frame around it and off-hue from both the violet
+  the AI speaks in and the amber you do, so a lit corner never looks
+  like it means something; a card's in the same hue held well back, so
+  a notch on a fader is not the brightest thing in the room.
+
+  And they stay there under the pointer. `button:hover` set
+  `background`, the shorthand, which also resets `background-image` --
+  where a panel keeps its cut corners. The heading that names the room
+  is both a button and a panel, and hovering it repainted its corners
+  away for as long as the pointer was on it. It sets only
+  `background-color` now; the face was `--btn-image` either way.
+
 - **A game may be asked for the mode it could already be saved
   with.** `reply_mode` has four settings and the room acts on all
   four, but the `save_game` and `revise_game` schemas offered only

@@ -34,7 +34,6 @@
    slid away up the screen would be worse than no edge. */
 .panel {
   position: relative;
-  --cut-ink: var(--cut-ink-panel);
   background: var(--cut-panel-edges), var(--surface-image) var(--surface);
   border-radius: var(--frame-radius);
   clip-path: var(--cut-panel);
@@ -52,7 +51,6 @@
    read as a mistake rather than as two objects. */
 .card-chrome {
   position: relative;
-  --cut-ink: var(--cut-ink-card);
   background: var(--cut-card-edges), var(--card-image) var(--card-bg);
   border-radius: var(--card-radius);
   clip-path: var(--cut-card);
