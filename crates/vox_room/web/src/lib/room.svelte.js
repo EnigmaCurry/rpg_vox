@@ -1564,6 +1564,7 @@ export async function joinAudio() {
   try {
     audio = new RoomAudio(link);
     await audio.start(room.volume, room.speakerId);
+    openInsides();
     // Any click or key brings back audio the browser stopped.
     addEventListener('pointerdown', resumeAudio);
     addEventListener('keydown', resumeAudio);
@@ -1589,6 +1590,29 @@ function resumeAudio() {
   audio?.resume();
 }
 
+/// The room's insides, for the console, while developing.
+///
+/// `vox.jitter` is the player worklet's reading of its own buffer --
+/// how much sound it is holding and how much it wants to be -- which is
+/// the one number worth having when the audio is choppy and the only
+/// one nothing in the room shows. `vox.link` and `vox.audio` are there
+/// to be poked at: the socket and the codec are the worker's, and
+/// everything else here is module-scoped and out of reach otherwise.
+///
+/// `import.meta.env.DEV` is `false` in a built app and the whole of this
+/// goes with it, so `just room` serves nothing of it. It is `pnpm dev`
+/// on :5173 that has it (see `just room-ui`).
+function openInsides() {
+  if (!import.meta.env.DEV) return;
+  window.vox = { link, audio, jitter: null };
+  audio.onStats = (s) => (window.vox.jitter = s);
+}
+
+function closeInsides() {
+  if (!import.meta.env.DEV) return;
+  delete window.vox;
+}
+
 export async function leaveAudio() {
   // Back at the door is out of the room, and out is out: the sockets go
   // with the audio. Nobody at the door is on a roster, is sent a
@@ -1604,6 +1628,7 @@ export async function leaveAudio() {
   room.hushed = false;
   await audio?.stop();
   audio = null;
+  closeInsides();
   room.audio = 'off';
   close();
 }

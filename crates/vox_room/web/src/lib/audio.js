@@ -83,6 +83,17 @@ export class RoomAudio {
     this.silent = false;
     this.stream = null;
     this._muted = false;
+    // Where the player worklet's own reading of its jitter buffer goes:
+    // `{ bufferMs, targetMs }`, about four times a second. Nothing in
+    // the room draws it -- it is for whoever is working out why the
+    // audio is choppy, and `joinAudio` hands it to the console in a
+    // development build.
+    //
+    // The handler below is set whether or not anybody wants the
+    // numbers, and must stay that way: an `AudioWorkletNode` port with
+    // no `onmessage` is a port that was never started, and the worklet
+    // posts regardless, so the messages would queue for the length of
+    // the call.
     this.onStats = null;
   }
 
