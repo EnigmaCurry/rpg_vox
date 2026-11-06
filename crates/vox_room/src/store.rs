@@ -401,6 +401,53 @@ CREATE TABLE IF NOT EXISTS samples (
     at           INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS samples_in_order ON samples (conversation, n);
+-- A recording of the whole room: everything that was audible in it
+-- between somebody pressing record and somebody stopping it, as one
+-- clip. Numbered within its conversation like a picture or a voice
+-- sample, because the number is what the card shows and what anybody
+-- says out loud about it.
+--
+-- Ogg/Opus and not a WAV, which is the one place this differs from
+-- `samples`. A voice sample is a few seconds and goes to a clone
+-- server that wants the raw samples; a recording is as long as a
+-- meeting, and an hour of 48 kHz mono WAV is 345 MB of database where
+-- the same hour of Opus is about ten.
+--
+-- The row is written when recording starts, with no `audio`: the card
+-- goes up at once saying the room is being recorded, which is the
+-- light on the microphone, and it fills in when somebody stops. A
+-- recording does not survive the room going away -- the audio is in
+-- memory until it is stopped -- so one left unfinished is failed on
+-- the way back up, the way an armed sample is. See
+-- `abandoned_recordings`.
+--
+-- The transcript of a recording is not here. It is rendered from the
+-- entries between `at` and `until` whenever somebody asks for it (see
+-- `transcript.rs`), which means a translation that landed late is in
+-- it and nothing has to be kept twice.
+CREATE TABLE IF NOT EXISTS recordings (
+    id           TEXT PRIMARY KEY,
+    conversation INTEGER NOT NULL,
+    -- Its number in this conversation, from 1.
+    n            INTEGER NOT NULL,
+    -- Who started it, and who stopped it: the room writes both down,
+    -- because being recorded is not something that happens to one
+    -- person at a table.
+    who          TEXT NOT NULL,
+    stopped_by   TEXT NOT NULL DEFAULT '',
+    -- Null while it is still running. A row that has one is a
+    -- recording: Ogg/Opus, 48 kHz mono.
+    audio        BLOB,
+    secs         REAL NOT NULL DEFAULT 0,
+    -- Why there will never be one: the room restarted while it was
+    -- recording, or the encoder gave out.
+    failed       TEXT NOT NULL DEFAULT '',
+    -- When it started, and when it stopped (zero while it runs). The
+    -- two together are the bounds of its transcript.
+    at           INTEGER NOT NULL,
+    until        INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS recordings_in_order ON recordings (conversation, n);
 -- A voice cloned from one of those clips and kept under a name.
 --
 -- The house's, not the room's: a voice is somebody's voice wherever it
@@ -536,6 +583,7 @@ impl Store {
         indexes(&db)?;
         abandoned_pictures(&db)?;
         abandoned_samples(&db)?;
+        abandoned_recordings(&db)?;
         // Several rooms are several connections to the one file, and
         // `vox_room invite` is a whole other process writing to it.
         // Wait for a writer rather than failing the read.
@@ -682,6 +730,50 @@ impl Store {
             tx.execute("DELETE FROM bot_rooms WHERE room = ?1", [id])?;
         }
         tx.commit()?;
+        // And everything that was ever said in it. Nothing points at a
+        // conversation from outside its room -- `conversations.room`
+        // names the room and nothing maps the other way -- so a room
+        // taken out of the house without this leaves its whole history
+        // in the database with no way to reach it, and every card,
+        // picture, clip and recording in it with nothing left that
+        // knows they are there.
+        if gone {
+            self.purge_room(id, None)?;
+        }
+        Ok(gone)
+    }
+
+    /// Forget every conversation this room has had, except `keep`.
+    ///
+    /// The answer is how many went. One function and not a loop at
+    /// every caller, because there are two of them -- a room being
+    /// taken out of the house and a room having its history purged --
+    /// and the two must not come to disagree about what a room owns.
+    /// What one conversation owns is [`Store::forget_conversation`]'s
+    /// to say, and this does not repeat it: a table added there is
+    /// purged here on the day it is added.
+    ///
+    /// `keep` is for the room that is still being sat in. A purge
+    /// takes the conversation you are in like any other -- a button
+    /// that left it would be a lie about what it did -- so the room
+    /// starts a fresh one first and keeps that, which is why this
+    /// takes an exception rather than the caller deleting around it.
+    pub fn purge_room(&self, room: &str, keep: Option<i64>) -> Result<usize> {
+        let had: Vec<i64> = {
+            let mut q = self
+                .db
+                .prepare("SELECT id FROM conversations WHERE room = ?1")?;
+            let rows = q.query_map([room], |r| r.get(0))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        let mut gone = 0;
+        for id in had {
+            if Some(id) == keep {
+                continue;
+            }
+            self.forget_conversation(id)?;
+            gone += 1;
+        }
         Ok(gone)
     }
 
@@ -1268,7 +1360,8 @@ impl Store {
 
     /// Forget a conversation: everything said in it, every card dealt
     /// in it, every picture made in it, every clip of somebody reading
-    /// aloud in it, and the row that says the room ever had it.
+    /// aloud in it, every recording made of the room while it was
+    /// going on, and the row that says the room ever had it.
     ///
     /// A face already made from one of those pictures stays: it was
     /// copied into `avatars` when it was set, and it belongs to the
@@ -1285,6 +1378,8 @@ impl Store {
             .execute("DELETE FROM pictures WHERE conversation = ?1", [id])?;
         self.db
             .execute("DELETE FROM samples WHERE conversation = ?1", [id])?;
+        self.db
+            .execute("DELETE FROM recordings WHERE conversation = ?1", [id])?;
         self.db
             .execute("DELETE FROM conversations WHERE id = ?1", [id])?;
         Ok(())
@@ -1468,14 +1563,25 @@ impl Store {
         Ok(())
     }
 
+    /// Everything ever said in `conversation`, oldest first.
+    ///
+    /// [`Store::entries`] takes the last `limit` of them, which is a
+    /// screen's worth; this is for a file somebody is taking away,
+    /// where a cap is the difference between a transcript and most of
+    /// one and nothing in the file would say which it was.
+    pub fn all_entries(&self, conversation: i64) -> Result<Vec<Entry>> {
+        self.entries(conversation, usize::MAX)
+    }
+
     /// The last `limit` entries of `conversation`, oldest first.
     pub fn entries(&self, conversation: i64, limit: usize) -> Result<Vec<Entry>> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let mut q = self.db.prepare(
             "SELECT id, who, kind, title, text, cut, typed, translations, note, seat, at
              FROM entries
              WHERE conversation = ?1 ORDER BY at DESC, rowid DESC LIMIT ?2",
         )?;
-        let rows = q.query_map(params![conversation, limit as i64], |r| {
+        let rows = q.query_map(params![conversation, limit], |r| {
             let kind: String = r.get(2)?;
             let translations: String = r.get(7)?;
             // Empty is nowhere in particular, which everybody hears --
@@ -1924,6 +2030,96 @@ impl Store {
         Ok(())
     }
 
+    fn next_recording(&self, conversation: i64) -> Result<u32> {
+        Ok(self.db.query_row(
+            "SELECT COALESCE(MAX(n), 0) + 1 FROM recordings WHERE conversation = ?1",
+            [conversation],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Start a recording of the room: a row with no audio in it, which
+    /// is a card saying the room is being recorded. The answer is its
+    /// number in this conversation.
+    pub fn begin_recording(&self, conversation: i64, id: &str, who: &str) -> Result<u32> {
+        let n = self.next_recording(conversation)?;
+        self.db.execute(
+            "INSERT INTO recordings
+                 (id, conversation, n, who, stopped_by, audio, secs, failed, at, until)
+             VALUES (?1, ?2, ?3, ?4, '', NULL, 0, '', ?5, 0)",
+            params![id, conversation, n, who, now_ms()],
+        )?;
+        Ok(n)
+    }
+
+    /// Somebody stopped it: who, and when. Written at the moment they
+    /// did, which is what `until` means -- the clip itself follows a
+    /// beat later, once the file has been finished off, and may never
+    /// come at all.
+    pub fn stopped_recording(&self, id: &str, person: &str) -> Result<()> {
+        self.db.execute(
+            "UPDATE recordings SET stopped_by = ?2, until = ?3 WHERE id = ?1 AND until = 0",
+            params![id, person, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// The clip, and how long it runs.
+    pub fn finish_recording(&self, id: &str, audio: &[u8], secs: f32) -> Result<()> {
+        self.db.execute(
+            "UPDATE recordings SET audio = ?2, secs = ?3, failed = '' WHERE id = ?1",
+            params![id, audio, secs as f64],
+        )?;
+        Ok(())
+    }
+
+    /// There will never be a clip, and the card says so rather than
+    /// showing a light on a microphone nothing is listening to.
+    pub fn fail_recording(&self, id: &str, why: &str) -> Result<()> {
+        self.db.execute(
+            "UPDATE recordings SET failed = ?2, until = ?3 WHERE id = ?1 AND until = 0",
+            params![id, why, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// One recording's audio, or None while it is still running.
+    pub fn recording_audio(&self, id: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .db
+            .query_row("SELECT audio FROM recordings WHERE id = ?1", [id], |r| {
+                r.get::<_, Option<Vec<u8>>>(0)
+            })
+            .optional()?
+            .flatten())
+    }
+
+    /// One recording, without its audio: what a card is drawn from and
+    /// what says which stretch of a conversation its transcript is of.
+    pub fn recording(&self, id: &str) -> Result<Option<Taped>> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT id, conversation, n, who, stopped_by, audio IS NOT NULL,
+                        secs, failed, at, until
+                   FROM recordings WHERE id = ?1",
+                [id],
+                taped,
+            )
+            .optional()?)
+    }
+
+    /// The recordings made in `conversation`, oldest first.
+    pub fn recordings(&self, conversation: i64) -> Result<Vec<Taped>> {
+        let mut q = self.db.prepare(
+            "SELECT id, conversation, n, who, stopped_by, audio IS NOT NULL,
+                    secs, failed, at, until
+               FROM recordings WHERE conversation = ?1 ORDER BY n",
+        )?;
+        let rows = q.query_map([conversation], taped)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// One clip's audio, or None while the room is still listening.
     pub fn sample_wav(&self, id: &str) -> Result<Option<Vec<u8>>> {
         Ok(self
@@ -2221,6 +2417,48 @@ pub struct Reading {
     #[serde(skip_serializing_if = "String::is_empty")]
     pub failed: String,
     pub at: u64,
+}
+
+/// A recording of the whole room, as a card needs it: everything but
+/// the audio itself.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Taped {
+    pub id: String,
+    /// Which conversation it was made in, and so which conversation's
+    /// entries its transcript is rendered from.
+    pub conversation: i64,
+    /// Its number in that conversation, from 1.
+    pub n: u32,
+    /// Who started it.
+    pub who: String,
+    /// Who stopped it; empty while it is still running.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub stopped_by: String,
+    /// The clip is there. Until then the card says the room is being
+    /// recorded, which is the light on the microphone.
+    pub ready: bool,
+    pub secs: f32,
+    /// Why there will never be one, or empty.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub failed: String,
+    /// When it started, and when it stopped: zero while it runs.
+    pub at: u64,
+    pub until: u64,
+}
+
+fn taped(r: &rusqlite::Row) -> rusqlite::Result<Taped> {
+    Ok(Taped {
+        id: r.get(0)?,
+        conversation: r.get(1)?,
+        n: r.get(2)?,
+        who: r.get(3)?,
+        stopped_by: r.get(4)?,
+        ready: r.get(5)?,
+        secs: r.get::<_, f64>(6)? as f32,
+        failed: r.get(7)?,
+        at: r.get::<_, i64>(8)? as u64,
+        until: r.get::<_, i64>(9)? as u64,
+    })
 }
 
 /// A voice the house has cloned from somebody, as it is kept here:
@@ -2541,6 +2779,28 @@ fn abandoned_samples(db: &Connection) -> Result<()> {
     )?;
     if left > 0 {
         tracing::info!(samples = left, "the room was listening for these when it stopped");
+    }
+    Ok(())
+}
+
+/// A recording that was still running when the room stopped. The
+/// audio was in memory on its way to being one clip and went with the
+/// process, so there is nothing to recover and nothing coming.
+///
+/// Said once, on the way up, for the reason `abandoned_samples` says
+/// it: a card showing a light on a microphone is a promise that
+/// something is being recorded.
+fn abandoned_recordings(db: &Connection) -> Result<()> {
+    let left = db.execute(
+        "UPDATE recordings SET failed = 'the room restarted while it was recording'
+          WHERE audio IS NULL AND failed = ''",
+        [],
+    )?;
+    if left > 0 {
+        tracing::info!(
+            recordings = left,
+            "the room was recording these when it stopped"
+        );
     }
     Ok(())
 }
@@ -3324,6 +3584,91 @@ mod tests {
                 .collect::<Vec<_>>(),
             [game, second]
         );
+    }
+
+    /// Everything a room has ever said goes in one go, and only that
+    /// room's -- and the same function is what a room being taken out
+    /// of the house takes with it, so the two cannot come to disagree
+    /// about what a room owns.
+    #[test]
+    fn purging_a_room_takes_every_conversation_it_had_and_nobody_elses() {
+        let scratch = Scratch::new("purge");
+        let lounge = scratch.open("Lounge");
+        let studio = scratch.open("Studio");
+        let said = |store: &Store, c: i64, id: &str| {
+            store
+                .put_entry(
+                    c,
+                    &Entry {
+                        id: id.into(),
+                        who: "Ryan".into(),
+                        kind: Kind::Human,
+                        title: String::new(),
+                        text: "something".into(),
+                        live: false,
+                        partial: false,
+                        cut: false,
+                        typed: false,
+                        translations: BTreeMap::new(),
+                        note: String::new(),
+                        seat: None,
+                        at: 10,
+                        sent: true,
+                    },
+                )
+                .unwrap();
+        };
+        let first = lounge.conversation().unwrap();
+        said(&lounge, first, "a");
+        let second = lounge.new_conversation(None).unwrap();
+        said(&lounge, second, "b");
+        // And something in it that is not words: a purge that took the
+        // rows and left the audio would be the leak this is for.
+        lounge
+            .put_clip(second, "clip-1", "Ryan", b"RIFFfake", 1.0, "hello")
+            .unwrap();
+        lounge
+            .begin_recording(second, "recording-1", "Ryan")
+            .unwrap();
+        let theirs = studio.conversation().unwrap();
+        said(&studio, theirs, "c");
+
+        // The one the room is in is kept, because the room is still
+        // sitting in it; everything else goes.
+        assert_eq!(lounge.purge_room("Lounge", Some(second)).unwrap(), 1);
+        assert!(lounge.entries(first, 10).unwrap().is_empty());
+        assert_eq!(lounge.entries(second, 10).unwrap().len(), 1);
+        assert_eq!(studio.entries(theirs, 10).unwrap().len(), 1, "not theirs");
+
+        // And then the lot, audio included.
+        assert_eq!(lounge.purge_room("Lounge", None).unwrap(), 1);
+        assert!(lounge.history().unwrap().is_empty());
+        assert_eq!(lounge.sample_wav("clip-1").unwrap(), None);
+        assert!(lounge.recording("recording-1").unwrap().is_none());
+        assert_eq!(studio.history().unwrap().len(), 1, "still theirs");
+    }
+
+    /// A room taken out of the house takes its conversations with it.
+    /// Without that, `conversations.room` goes on naming a room that
+    /// is gone and nothing points at the rows from anywhere else, so
+    /// every word, card, picture and clip in them is unreachable
+    /// rather than deleted.
+    #[test]
+    fn a_room_taken_out_of_the_house_does_not_leave_its_history_behind() {
+        let scratch = Scratch::new("delete_room");
+        let house = scratch.open("");
+        house.adopt_rooms(&["Hall".into(), "Lounge".into()]).unwrap();
+        let lounge = scratch.open("Lounge");
+        let had = lounge.conversation().unwrap();
+        lounge
+            .put_clip(had, "clip-1", "Ryan", b"RIFFfake", 1.0, "hello")
+            .unwrap();
+        assert_eq!(lounge.history().unwrap().len(), 1);
+
+        assert!(house.delete_room("Lounge").unwrap());
+        assert!(lounge.history().unwrap().is_empty());
+        assert_eq!(lounge.conversation_room(had).unwrap(), None);
+        assert_eq!(lounge.sample_wav("clip-1").unwrap(), None);
     }
 
     /// A database from when the server was one room: what was the whole

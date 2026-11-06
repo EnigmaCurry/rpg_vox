@@ -99,6 +99,9 @@ guests() {
     door) echo "Fresh Known En Ru Fr" ;;
     permalinks|ptt|settings) echo "Ryan" ;;
     roles) echo "[Ryan] Alex" ;;
+    # Ryan owns the house here, because purging a room is the owner's
+    # and the button is only drawn for them.
+    conversations) echo "[Ryan] Alex" ;;
     # Two on sockets and a third in a browser: a link is spent by Join
     # Audio, so the browser cannot be one of the two.
     record) echo "Ryan Alex Mo" ;;

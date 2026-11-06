@@ -184,6 +184,21 @@ dialog.ask {
 }
 dialog.ask::backdrop { background: rgb(0 0 0 / 35%); }
 dialog.ask p { margin: 0 0 14px; }
+/* The box for a question that wants a word written out before it will
+   take an answer. Full width, because what goes in it is a name and
+   not a yes. */
+dialog.ask .confirm {
+  display: block;
+  width: 100%;
+  margin: 0 0 14px;
+  font: inherit;
+  padding: 6px 8px;
+  color: var(--ink);
+  background: var(--field-bg);
+  border: 1px solid var(--line);
+  border-radius: var(--field-radius);
+}
+dialog.ask .confirm:focus { border-color: var(--accent); outline: none; }
 .ask-actions { display: flex; justify-content: flex-end; align-items: center; gap: 8px; }
 .ask-actions .hint { margin-right: auto; }
 

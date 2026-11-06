@@ -30,14 +30,28 @@ const between = (after) => {
   return kt.slice(at + after.length, kt.indexOf('\"\"\"', at + after.length));
 };
 const STATE_JS = between('private const val STATE_JS = \"\"\"');
-// `talkJs` is a Kotlin template, so the `${if (down) ... else ...}` in it
-// are resolved here the way Kotlin would resolve them. Generically, and
-// then checked: a snippet that still has a `${` in it would reach the
-// page as a syntax error, which says nothing about what actually broke.
-const talkJs = (down) => {
-  const js = between('private fun talkJs(down: Boolean) = \"\"\"').replace(
-    /\$\{if \(down\) ("(?:[^"\\]|\\.)*") else ("(?:[^"\\]|\\.)*")\}/g,
-    (_, yes, no) => JSON.parse(down ? yes : no));
+// `talkJs` is a Kotlin template, so the `${if (…) … else …}` in it are
+// resolved here the way Kotlin would resolve them. Generically, and
+// then checked twice over: a condition this does not know is thrown on
+// by name rather than guessed at, and a snippet that still has a `${`
+// in it would reach the page as a syntax error, which says nothing
+// about what actually broke.
+//
+// `key` is which button is being held. True is a volume key, which has
+// another job and so arms, stands down over a text box and presses
+// whatever has the focus; false is a headset's own trigger, which has
+// no other job and presses the body. The app writes one snippet for
+// both, so both are resolved here.
+const talkJs = (down, key = true) => {
+  const held = { down, key, 'down && key': down && key };
+  const js = between('private fun talkJs(down: Boolean, key: Boolean = true) = \"\"\"').replace(
+    /\$\{if \(([^)]+)\) ("(?:[^"\\]|\\.)*") else ("(?:[^"\\]|\\.)*")\}/g,
+    (_, when_, yes, no) => {
+      if (!(when_ in held)) {
+        throw new Error(`the app presses the key on \`${when_}\`, which this script can't resolve`);
+      }
+      return JSON.parse(held[when_] ? yes : no);
+    });
   if (js.includes('${')) throw new Error('the app presses the key with a Kotlin template this script cannot resolve');
   return js;
 };
@@ -470,6 +484,26 @@ const focused = (page) =>
   await page.evaluate(talkJs(false));
   await page.waitForTimeout(900);
   is('and letting it go closes the mic',
+    await page.evaluate(() => !!document.querySelector('footer .big.ptt.talking')), false);
+
+  // A headset's own trigger, which is the same snippet with `key`
+  // false: nothing is armed on the way in -- a button whose only job
+  // is the microphone has no tap to be told apart from a hold, so the
+  // room does the waiting and the chirp -- and the press goes to the
+  // body rather than to whatever has the focus. Waited out like the
+  // space bar for that reason, where a volume key goes live at once.
+  //
+  // The BS-22 registers no HID device at all, so nothing about that
+  // button reaches a key event and there is no other way to check that
+  // the room end of it still works. See ROOM_ANDROID.md.
+  await page.evaluate(() => document.activeElement?.blur());
+  await page.evaluate(talkJs(true, false));
+  await page.waitForTimeout(500);
+  is("a headset's own button talks",
+    await page.evaluate(() => !!document.querySelector('footer .big.ptt.talking')), true);
+  await page.evaluate(talkJs(false, false));
+  await page.waitForTimeout(900);
+  is('and lets go of it',
     await page.evaluate(() => !!document.querySelector('footer .big.ptt.talking')), false);
 
   // Where the volume key is the phone's again: with the cursor in the

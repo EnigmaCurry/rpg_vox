@@ -1,6 +1,7 @@
 <script>
   import {
     room, enterGame, peekGame, theAI, theAIs, waitingAI, pictureOf, sampleOf, boxLines,
+    recordingOf, recordingTranscriptUrl,
   } from '../lib/room.svelte.js';
   import History from './History.svelte';
   import Face from './Face.svelte';
@@ -109,6 +110,13 @@
   });
 
   const time = (ms) => new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+  // How long a recording runs. Minutes and seconds, because this sits
+  // beside a player somebody is about to check it against.
+  const length = (secs) => {
+    const s = Math.max(0, Math.round(secs ?? 0));
+    return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, '0')}s`;
+  };
 
   // What is on screen: the conversation the room is having, or one out
   // of its history that you have opened. An old one is read-only by its
@@ -362,6 +370,50 @@
             </div>
           </div>
         </div>
+      {:else if e.kind === 'recording'}
+        <!-- A recording of the whole room. The card goes up the moment
+             somebody starts one and says so while it runs: it is the
+             light on the room being recorded, and it is here in the
+             conversation where nobody in the room can miss it rather
+             than on one person's screen.
+
+             Theirs, with their face and their colour, because starting
+             one is a thing a person did and the room writes down
+             which. When it stops there are two things on it: the clip,
+             and the stretch of transcript it covers as a file — the
+             same transcript the whole conversation downloads as, with
+             bounds. -->
+        {@const taped = room.recordings[e.id]}
+        <div class="entry sample-entry" class:you={e.who === room.you} style="--h: {hue(e.who)}">
+          <Face who={e.who} />
+          <div class="said-by">
+            <div class="who">
+              <span class="name">{e.who}</span>
+              <span class="time">
+                {time(e.at)} · the room · {e.text}{taped?.ready ? ` · ${length(taped.secs)}` : ''}
+              </span>
+            </div>
+            <div class="card clip-card">
+              {#if taped?.ready}
+                <audio controls preload="none" src={recordingOf(e.id)}></audio>
+                <p class="hint">
+                  Recorded by {e.who}{taped.stopped_by && taped.stopped_by !== e.who
+                    ? `, stopped by ${taped.stopped_by}`
+                    : ''}.
+                  <a class="save" href={recordingTranscriptUrl(e.id)}
+                    title="Download what was said while this was recording">⤓ transcript</a>
+                </p>
+              {:else if taped?.failed}
+                <p class="hint">{taped.failed}</p>
+              {:else}
+                <p class="listening">
+                  <span class="rec" aria-hidden="true"></span>
+                  The room is being recorded — {e.who} started it.
+                </p>
+              {/if}
+            </div>
+          </div>
+        </div>
       {:else if e.kind === 'programme'}
         <!-- A show that has been performed, folded up. The lines were
              read on the stage while it was on; this is what the
@@ -498,6 +550,14 @@
 </div>
 
 <style>
+  /* The way out of a recording, on its card: a link and not a button,
+     so the browser saves it the way it saves anything else. */
+  .card .save {
+    color: var(--muted);
+    text-decoration: none;
+    white-space: nowrap;
+  }
+  .card .save:hover { color: var(--ink); text-decoration: underline; }
   .log {
     display: flex;
     flex-direction: column;
@@ -665,7 +725,9 @@
   .clip-card .asked { max-width: 20rem; }
   .listening { margin: 0; font-size: 13px; display: flex; align-items: center; gap: 6px; }
   /* The one red thing in the room, and it means exactly one thing:
-     somebody's microphone is being recorded right now. */
+     something is being recorded right now -- somebody's microphone for
+     a voice sample, or the whole room. The same dot is in
+     Rooms.svelte, beside the switch; keep the two the same. */
   .rec {
     width: 9px;
     height: 9px;

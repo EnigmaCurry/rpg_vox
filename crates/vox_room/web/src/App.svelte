@@ -53,9 +53,20 @@
   });
 
   let dialog = $state();
+  // What has been written into a question that wants a word written
+  // out. Cleared as each one opens, so an answer typed for the last
+  // question is never already in the box for the next.
+  let typed = $state('');
+  const written = $derived(
+    !room.asking?.type ||
+      typed.trim().toLowerCase() === room.asking.type.trim().toLowerCase(),
+  );
   $effect(() => {
     if (!dialog) return;
-    if (room.asking && !dialog.open) dialog.showModal();
+    if (room.asking && !dialog.open) {
+      typed = '';
+      dialog.showModal();
+    }
     if (!room.asking && dialog.open) dialog.close();
   });
 
@@ -269,9 +280,20 @@
 <dialog class="ask" bind:this={dialog} oncancel={(e) => { e.preventDefault(); answer(false); }}>
   {#if room.asking}
     <p>{room.asking.text}</p>
+    <!-- A word to write out, for the few things that cannot be undone
+         and take away what other people did. One click is too cheap
+         for those, and a dialog that looks like every other dialog is
+         one click. -->
+    {#if room.asking.type}
+      <!-- svelte-ignore a11y_autofocus -->
+      <input class="confirm" bind:value={typed} autofocus autocomplete="off"
+        aria-label="Write {room.asking.type} to confirm"
+        placeholder={room.asking.type}
+        onkeydown={(e) => { if (e.key === 'Enter' && written) answer(true); }} />
+    {/if}
     <div class="ask-actions">
       <button onclick={() => answer(false)}>Cancel</button>
-      <button class="primary" onclick={() => answer(true)}>{room.asking.yes}</button>
+      <button class="primary" disabled={!written} onclick={() => answer(true)}>{room.asking.yes}</button>
     </div>
   {/if}
 </dialog>

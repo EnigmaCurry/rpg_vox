@@ -9,6 +9,10 @@
 //! of the time. Nothing here is a realtime audio callback, so plain
 //! mutexes are fine; each lock is held for well under a millisecond.
 //!
+//! A recording of the room is taken here too, when one is being made:
+//! the sum before any of it is encoded for anybody, which is the room
+//! rather than one of the headphones. See [`Mixer::record_to`].
+//!
 //! The AI's speech is queued as whole sentences, and the mixer counts how
 //! much of each it has played. That count is what "said" means for the
 //! conversation log: [`Mixer::ai_clear`] stops the AI and returns exactly
@@ -272,6 +276,9 @@ struct State {
     canonical: String,
     /// Peak level per strip (post-fader) since the last `take_levels`.
     peaks: HashMap<String, f32>,
+    /// Where a recording of the room is being taken, while one is: see
+    /// [`Mixer::record_to`].
+    record: Option<crossbeam_channel::Sender<Vec<f32>>>,
 }
 
 pub struct Mixer {
@@ -292,6 +299,7 @@ impl Mixer {
                 floor: HashMap::new(),
                 canonical: canonical.to_string(),
                 peaks: HashMap::new(),
+                record: None,
             }),
         })
     }
@@ -339,6 +347,32 @@ impl Mixer {
             tx,
         });
         Ok(())
+    }
+
+    /// Start handing the room's own mix to `tx`, or stop (`None`).
+    ///
+    /// WHAT IS IN IT: every microphone at its fader, summed, plus the
+    /// AI in the room's own language -- the language its turn is
+    /// recorded in, see `State::canonical`. PCM, in the same 20 ms
+    /// frames everything else here works in, before any of it has been
+    /// encoded for anybody.
+    ///
+    /// WHAT IS NOT, and why this is not just another listener: a
+    /// listener hears the room *minus their own voice*, with the AI in
+    /// whichever language they read and their own choice of how loud
+    /// the interpreter is. Recording through one of those would be
+    /// recording a pair of headphones rather than the room -- and it
+    /// would mean decoding Opus back to PCM to get a file out of it. An
+    /// interpretation is left out for the same reason: it is one
+    /// listener's way in to what was already said, and all of them at
+    /// once is nobody's. The transcript beside the clip has every
+    /// language in it.
+    ///
+    /// Frames are dropped rather than waited for if the writer falls
+    /// behind, as a slow listener's are: the room's clock is not the
+    /// recorder's to hold up.
+    pub fn record_to(&self, tx: Option<crossbeam_channel::Sender<Vec<f32>>>) {
+        self.lock().record = tx;
     }
 
     pub fn remove_listener(&self, id: u64) {
@@ -640,15 +674,32 @@ impl Mixer {
             *p = p.max(peak);
             interp.insert(language.clone(), f);
         }
-        if st.listeners.is_empty() {
-            return;
-        }
         // Everyone's mics, which everybody hears whatever they speak.
         let mut total = [0.0f32; FRAME];
         for (_, f) in &frames {
             for (t, s) in total.iter_mut().zip(f.iter()) {
                 *t += s;
             }
+        }
+        // A recording of the room, if one is being made. Before the
+        // early return below and not after it: a room with nobody
+        // listening can still have the AI talking in it, and a
+        // recording that skipped those frames would come out shorter
+        // than the stretch of transcript beside it.
+        if let Some(tx) = &st.record {
+            let mut f = total;
+            if let Some(ai) = ai.get(&st.canonical) {
+                for (t, s) in f.iter_mut().zip(ai.iter()) {
+                    *t += s;
+                }
+            }
+            for s in f.iter_mut() {
+                *s = s.clamp(-1.0, 1.0);
+            }
+            let _ = tx.try_send(f.to_vec());
+        }
+        if st.listeners.is_empty() {
+            return;
         }
         // What language each person is in, which is what says whether
         // they are being interpreted for a given listener.

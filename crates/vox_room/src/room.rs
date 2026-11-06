@@ -50,10 +50,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
-use vox_transcribe::{Paragraph, ParagraphMode, Pusher, Stage};
+use vox_transcribe::filters::is_junk;
+use vox_transcribe::{Clip, Paragraph, ParagraphMode, Pusher, Stage};
 
 use crate::mixer::{Mixer, Strip, TrackProgress, AGENT_STRIP, RATE};
 use crate::store::{Invited, Store};
+use crate::transcript;
 
 /// Room events waiting for a slow tab before it starts skipping.
 const EVENT_CAPACITY: usize = 512;
@@ -264,6 +266,18 @@ pub enum Kind {
     /// everything the room actually said off the screen. Shut, it is
     /// one line saying a play happened and offering to show it.
     Programme,
+    /// A recording of the whole room: the entry's text is its number,
+    /// like a clip's, and the card plays it and offers the stretch of
+    /// transcript it covers as a file.
+    ///
+    /// Its own kind and not a [`Kind::Clip`], for the reason an upload
+    /// is not a picture the AI drew: they are different events. A clip
+    /// is one person's voice, kept so a voice can be cloned from it; a
+    /// recording is the room itself, everybody in it, for as long as
+    /// somebody held the room to it. The card is also the only light
+    /// there is on a room being recorded, which is a job no other card
+    /// has. See [`Room::set_recording`].
+    Recording,
     /// The one line in the conversation nobody said: the room writing
     /// down something that happened to it. The entry's `who` is the
     /// person it happened by and its text is the whole sentence.
@@ -292,6 +306,7 @@ impl Kind {
             Kind::Line => "line",
             Kind::Clip => "clip",
             Kind::Programme => "programme",
+            Kind::Recording => "recording",
             Kind::Note => "note",
         }
     }
@@ -307,6 +322,7 @@ impl Kind {
             "line" => Kind::Line,
             "clip" => Kind::Clip,
             "programme" => Kind::Programme,
+            "recording" => Kind::Recording,
             "note" => Kind::Note,
             _ => Kind::Human,
         }
@@ -1584,6 +1600,30 @@ struct State {
     /// Always false where [`RoomConfig::may_transcribe`] is: the lobby
     /// has nothing to turn on.
     transcribing: bool,
+    /// The recording being made of the room, while one is. None is
+    /// nearly always. See [`Room::set_recording`].
+    tape: Option<Tape>,
+}
+
+/// A recording of the room, while it is still being made.
+///
+/// Called a tape because `Recording` is taken in here by the few
+/// seconds of somebody reading a passage aloud, which is a different
+/// thing in every respect but the word.
+struct Tape {
+    /// The `recordings` row, and the id of the entry in the
+    /// conversation: they are the same string, as a sample's are.
+    id: String,
+    /// Who started it. Written down because being recorded is not
+    /// something that happens to one person at a table.
+    who: String,
+    /// Which conversation it belongs to. A recording is of a stretch
+    /// of one conversation, so the room starting another one ends it.
+    conversation: i64,
+    /// Where the mixer is sending the room's mix. Dropping this is
+    /// what stops the recording: the writer thread sees the channel
+    /// close, finishes the file and says so.
+    frames: crossbeam_channel::Sender<Vec<f32>>,
 }
 
 /// What a bot's agent thread needs from the room it answers in: which
@@ -2051,6 +2091,7 @@ impl Room {
                 next_stream: 0,
                 show: None,
                 transcribing,
+                tape: None,
             }),
             events,
             mixer: Mixer::new(strips, &cfg.language),
@@ -2280,7 +2321,87 @@ impl Room {
                 warn!(conversation = id, "read its voice samples: {err:#}");
                 Vec::new()
             }),
+            // And the recordings made of the room while it was going
+            // on, which its cards play.
+            "recordings": self.store().recordings(id).unwrap_or_else(|err| {
+                warn!(conversation = id, "read its recordings: {err:#}");
+                Vec::new()
+            }),
         }))
+    }
+
+    /// A conversation as a file somebody can take away: what to call
+    /// the file and the markdown in it, or `None` where there is
+    /// nothing to hand over.
+    ///
+    /// `language` is the language to read it in and `clock` the
+    /// reader's own offset from UTC, in minutes, for the times. Both
+    /// come from whoever asked, because both are facts about the reader
+    /// rather than about the room -- see [`transcript::Head`].
+    ///
+    /// WHO MAY: anybody who can walk into the room, which is anybody
+    /// who can already read the conversation on screen -- the same
+    /// question `their_room` asks in web.rs, and the same answer. A
+    /// file that leaves the room is a stronger act than a column of
+    /// text that stays in it, but it is not a different one: every
+    /// word in it was already on the screen of everybody who was
+    /// there. The one room where that is not true is the lobby, which
+    /// is never written down (`RoomConfig::may_transcribe`) and so has
+    /// nothing to give.
+    pub fn transcript(&self, id: i64, language: &str, clock: i32) -> Option<(String, String)> {
+        if !self.cfg.may_transcribe || !self.holds(id) {
+            return None;
+        }
+        // Every read of the database first, and the room's own state
+        // after: `store()` hands out a guard, and a second read inside
+        // the first would be waiting on itself.
+        let (title, at) = self.store().conversation_name(id).unwrap_or_default();
+        let mut log = self.store().all_entries(id).unwrap_or_else(|err| {
+            warn!(conversation = id, "read a conversation to hand over: {err:#}");
+            Vec::new()
+        });
+        // The conversation the room is in is still arriving. What is in
+        // the database is what has been handed over, and the last thing
+        // somebody said is on everybody's screen a second or two before
+        // it gets there -- so the live one is topped up from the room's
+        // own log, which is exactly what the screen is showing. A file
+        // that stopped a sentence short of the conversation you are
+        // sitting in would read as a loss, and it is the half most
+        // worth having.
+        let live = {
+            let st = self.lock();
+            (id == st.conversation).then(|| st.log.clone())
+        };
+        for e in live.into_iter().flatten() {
+            match log.iter_mut().find(|k| k.id == e.id) {
+                Some(k) => *k = e,
+                None => log.push(e),
+            }
+        }
+        log.sort_by_key(|e| e.at);
+        let head = transcript::Head {
+            room: if self.cfg.title.is_empty() {
+                &self.cfg.id
+            } else {
+                &self.cfg.title
+            },
+            conversation: id,
+            title: &title,
+            at: if at > 0 {
+                at
+            } else {
+                // A conversation from before they were stamped: when it
+                // was is when the first thing in it was said.
+                log.first().map_or(at, |e| e.at)
+            },
+            language,
+            clock,
+            what: transcript::What::Conversation,
+        };
+        Some((
+            transcript::file_name(&head),
+            transcript::markdown(&head, &log),
+        ))
     }
 
     /// Forget one of this room's past conversations, and everything
@@ -2302,6 +2423,54 @@ impl Room {
                 Err("The room couldn't delete that.".into())
             }
         }
+    }
+
+    /// Forget every conversation this room has ever had, and
+    /// everything said, dealt, drawn, read aloud or recorded in any of
+    /// them. The answer is how many went.
+    ///
+    /// INCLUDING THE ONE THE ROOM IS IN. A button called Purge room
+    /// that left the conversation everybody is sitting in would be a
+    /// lie about what it did, and the one thing it left would be the
+    /// one most likely to be the reason for pressing it. So the room
+    /// starts a fresh conversation first and purges around that --
+    /// everyone is left in an empty room rather than staring at a
+    /// conversation the database no longer has.
+    ///
+    /// The game goes on, the way it does through **New conversation**;
+    /// what cannot is the conversation a game was started *from*,
+    /// since that has gone with the rest, so the room has nothing to
+    /// come back to and says so by forgetting it.
+    ///
+    /// Who may is not asked here. It is the owner's, and the endpoint
+    /// says so -- see `web::purge_room`.
+    pub fn purge_room(&self, person: &str) -> Result<usize, String> {
+        let mut st = self.lock();
+        let was = st.conversation;
+        // The fresh one first, so there is never a moment where the
+        // room is in a conversation that has been deleted.
+        self.set_resume(&mut st, None);
+        let game = st.game.clone();
+        self.start_conversation(&mut st, game);
+        let now = st.conversation;
+        if now == was {
+            // `start_conversation` says why in the room when it can't.
+            return Err("The room couldn't start a new conversation, so nothing was purged.".into());
+        }
+        let gone = self
+            .store()
+            .purge_room(&self.cfg.id, Some(now))
+            .map_err(|err| {
+                warn!(room = %self.cfg.id, "purge a room: {err:#}");
+                "The room couldn't purge its history.".to_string()
+            })?;
+        info!(
+            room = %self.cfg.id,
+            person,
+            conversations = gone,
+            "a room's whole history was purged"
+        );
+        Ok(gone)
     }
 
     /// Whether conversation `id` is this room's.
@@ -3480,6 +3649,11 @@ impl Room {
             // card, and the clip itself is fetched by whoever presses
             // play.
             "samples": self.samples_json(&st),
+            // The recordings made of the room in this conversation,
+            // without the audio, for the same reason. The one still
+            // being made is among them, with no clip on it yet: that
+            // card is the light that says a room is being recorded.
+            "recordings": self.recordings_json(&st),
             "voices": self.voices_json(),
             "languages": self.cfg.languages,
             "strips": self.mixer.strips(),
@@ -4782,6 +4956,327 @@ impl Room {
             Err(err) => warn!("read a clip back: {err:#}"),
         }
         Ok(n)
+    }
+
+    // -- recording the room ------------------------------------------------
+
+    /// Start recording the room, or stop.
+    ///
+    /// What a recording is: everything that was audible in the room
+    /// between one press and the next, as one Ogg/Opus clip in the
+    /// conversation, with the stretch of transcript beside it. See
+    /// [`Mixer::record_to`] for what is in the mix and
+    /// [`crate::recorder`] for why it is Opus.
+    ///
+    /// WHO MAY, and the whole of the policy. Anybody in the room, and
+    /// the room writes down who -- the same reasoning
+    /// [`Room::set_transcribing`] is built on, which applies here at
+    /// least as hard: being recorded is not something that happens to
+    /// one person at a table, so it is not one person's to decide, and
+    /// the room says which of them decided it. The card goes up in the
+    /// conversation the moment it starts, before a sample of audio is
+    /// kept, and it is the light on the microphone: there is no way to
+    /// record this room without the room saying so in front of
+    /// everybody in it.
+    ///
+    /// ONLY A ROOM THAT IS ON THE RECORD. A recording is strictly
+    /// stronger than a transcript, so a room that has been taken off
+    /// the record cannot be recorded -- audio with no transcript is
+    /// coherent, and it is also exactly what nobody in that room
+    /// agreed to. For the same reason, taking the room off the record
+    /// while it is recording stops the recording where it stands and
+    /// keeps what it has; the note the room writes about going off the
+    /// record is already the explanation of why the clip ends there.
+    /// The lobby therefore cannot be recorded at all, and does not
+    /// have to say so twice: it is never transcribing.
+    ///
+    /// Starting another conversation also stops it, because a
+    /// recording belongs to the conversation it was made in -- that is
+    /// where its card is and that is the transcript it is of.
+    pub fn set_recording(self: &Arc<Self>, person: &str, on: bool) -> Result<(), String> {
+        {
+            let st = self.lock();
+            if st.tape.is_some() == on {
+                return Ok(());
+            }
+            if !st.people.contains_key(person) {
+                return Err("The room doesn't know you.".into());
+            }
+            if on && !st.transcribing {
+                return Err(if self.cfg.may_transcribe {
+                    "This room is off the record, so it can't be recorded.                      Turn transcription back on first."
+                        .into()
+                } else {
+                    "Nothing said in the lobby is written down, and it isn't recorded either."
+                        .into()
+                });
+            }
+        }
+        if !on {
+            self.stop_recording(person);
+            return Ok(());
+        }
+        let id = format!("recording-{}", uuid::Uuid::new_v4().simple());
+        let mut st = self.lock();
+        let conversation = st.conversation;
+        let n = self
+            .store()
+            .begin_recording(conversation, &id, person)
+            .map_err(|err| format!("{err:#}"))?;
+        // The mixer is given somewhere to send the room before the
+        // card goes up, so that nothing between the two is missed --
+        // but after the row is written, so a database that refused
+        // leaves the room not being recorded rather than being
+        // recorded with nowhere to put it.
+        //
+        // Ten seconds of slack on the channel. The writer is one Opus
+        // encode behind the mixer, which is microseconds, so this is
+        // only ever about a machine that stalled -- and a stall should
+        // cost the recording a gap, not hold up everybody's audio.
+        let (tx, rx) = crossbeam_channel::bounded(500);
+        let room = self.clone();
+        let taped = id.clone();
+        if let Err(err) = crate::recorder::spawn(&id, rx, move |out| {
+            room.recorded(&taped, out);
+        }) {
+            let _ = self.store().fail_recording(&id, "the room couldn't start recording");
+            return Err(format!("{err:#}"));
+        }
+        self.mixer.record_to(Some(tx.clone()));
+        st.tape = Some(Tape {
+            id: id.clone(),
+            who: person.to_string(),
+            conversation,
+            frames: tx,
+        });
+        let entry = Entry {
+            id: id.clone(),
+            who: person.to_string(),
+            kind: Kind::Recording,
+            // Spelled out rather than the bare number, as a picture's
+            // and a voice sample's are: a client that has never heard
+            // of this kind falls back to an entry's text, and
+            // "recording 1" is a thing a person can read.
+            text: format!("recording {n}"),
+            title: String::new(),
+            // The room is being recorded, and this card is the only
+            // light there is on it.
+            live: true,
+            partial: false,
+            cut: false,
+            typed: false,
+            translations: BTreeMap::new(),
+            note: String::new(),
+            // Posted in front of everybody. A recording is of the
+            // whole room, including the parts of a playhouse that
+            // cannot hear each other, so it is not said in one of
+            // them.
+            seat: None,
+            at: now_ms(),
+            sent: true,
+        };
+        if let Err(err) = self.store().put_entry(conversation, &entry) {
+            warn!("store a recording's entry: {err:#}");
+        }
+        info!(n, %id, person, room = %self.cfg.id, "started recording the room");
+        self.emit_entry(&entry);
+        st.log.push(entry);
+        trim_log(&mut st.log);
+        self.emit_recording(&id);
+        self.emit(json!({ "type": "recording_on", "on": true, "who": person }));
+        Ok(())
+    }
+
+    /// Stop whatever recording is being made, if one is: `person` is
+    /// who stopped it, which the room writes down beside who started
+    /// it. Empty for the room stopping it on its own account -- going
+    /// off the record, or starting another conversation.
+    ///
+    /// The file is finished on the writer's thread, so this returns
+    /// before there is a clip; [`Room::recorded`] is what lands it.
+    /// The card goes on saying the room was being recorded until then,
+    /// which is a second at most.
+    fn stop_recording(&self, person: &str) {
+        let mut st = self.lock();
+        let Some(tape) = st.tape.take() else {
+            return;
+        };
+        // In this order: nothing more is sent, and then there is
+        // nothing left holding the channel open.
+        self.mixer.record_to(None);
+        drop(tape.frames);
+        // Who stopped it and when, written down now rather than
+        // carried to the writer thread: this is the moment it stopped,
+        // and the row is where the two ends of a recording are kept.
+        if let Err(err) = self.store().stopped_recording(&tape.id, person) {
+            warn!(recording = %tape.id, "write down who stopped a recording: {err:#}");
+        }
+        info!(
+            recording = %tape.id,
+            started_by = %tape.who,
+            stopped_by = person,
+            "stopped recording the room"
+        );
+        self.emit(json!({ "type": "recording_on", "on": false, "who": person }));
+    }
+
+    /// The writer thread has finished with a recording: the clip, or
+    /// why there will never be one.
+    ///
+    /// Called from the recorder's own thread once the frames have
+    /// stopped coming, which is why it takes the room by `Arc` and
+    /// locks for itself.
+    fn recorded(&self, id: &str, out: anyhow::Result<(Vec<u8>, f32)>) {
+        match out {
+            // Nothing at all came through, which is a mixer that never
+            // ticked rather than a quiet room -- a room with nobody
+            // saying anything in it still records the silence, and
+            // that is a recording. A file of two header pages is not,
+            // and offering it as one would be offering a player that
+            // plays nothing.
+            Ok((audio, secs)) if secs > 0.0 => {
+                if let Err(err) = self.store().finish_recording(id, &audio, secs) {
+                    warn!(recording = %id, "keep a recording: {err:#}");
+                    let _ = self
+                        .store()
+                        .fail_recording(id, "the room couldn't keep the recording");
+                }
+            }
+            Ok(_) => {
+                let _ = self
+                    .store()
+                    .fail_recording(id, "nothing was recorded; there was no audio in the room");
+            }
+            Err(err) => {
+                warn!(recording = %id, "recording the room: {err:#}");
+                let _ = self.store().fail_recording(id, "the recording went wrong");
+            }
+        }
+        // The card stops saying the room is being recorded, whichever
+        // of those it was: a light left on is a promise that something
+        // is still happening.
+        let mut st = self.lock();
+        if let Some(e) = st.log.iter_mut().find(|e| e.id == id) {
+            e.live = false;
+            let entry = e.clone();
+            self.emit_entry(&entry);
+        }
+        drop(st);
+        self.emit_recording(id);
+    }
+
+    /// One recording's audio, for the endpoint that serves it. None
+    /// while it is still being made, or if it never landed.
+    pub fn recording_audio(&self, id: &str) -> Result<Option<Vec<u8>>, String> {
+        self.store()
+            .recording_audio(id)
+            .map_err(|err| format!("{err:#}"))
+    }
+
+    /// The row a card is drawn from, to everybody: a recording
+    /// starting, and the same recording when it has landed.
+    fn emit_recording(&self, id: &str) {
+        match self.store().recording(id) {
+            Ok(Some(taped)) => self.emit(json!({ "type": "recording", "recording": taped })),
+            Ok(None) => warn!(recording = %id, "a recording that isn't in the database"),
+            Err(err) => warn!("read a recording back: {err:#}"),
+        }
+    }
+
+    /// The recordings made in this conversation, without the audio.
+    fn recordings_json(&self, st: &State) -> Value {
+        match self.store().recordings(st.conversation) {
+            Ok(taped) => serde_json::to_value(taped).unwrap_or_else(|_| json!([])),
+            Err(err) => {
+                warn!("read the recordings: {err:#}");
+                json!([])
+            }
+        }
+    }
+
+    /// A recording's transcript: the stretch of its conversation it
+    /// covers, as the file somebody downloads beside the clip.
+    ///
+    /// The same renderer the whole conversation uses, with bounds --
+    /// which is the point. A transcript of a recording and a
+    /// transcript of a conversation that disagreed about translations,
+    /// pictures or the off-the-record notes would be two answers to
+    /// one question. See [`Room::transcript`], whose reasoning about
+    /// the reader's language and clock applies here word for word.
+    ///
+    /// Rendered when it is asked for rather than kept: a translation
+    /// that landed after the recording stopped is in it, and nothing
+    /// is stored twice.
+    pub fn recording_transcript(
+        &self,
+        id: &str,
+        language: &str,
+        clock: i32,
+    ) -> Option<(String, String)> {
+        let taped = match self.store().recording(id) {
+            Ok(Some(taped)) => taped,
+            Ok(None) => return None,
+            Err(err) => {
+                warn!(recording = %id, "read a recording: {err:#}");
+                return None;
+            }
+        };
+        if !self.cfg.may_transcribe || !self.holds(taped.conversation) {
+            return None;
+        }
+        let (title, _) = self
+            .store()
+            .conversation_name(taped.conversation)
+            .unwrap_or_default();
+        let mut log = self
+            .store()
+            .all_entries(taped.conversation)
+            .unwrap_or_else(|err| {
+                warn!(recording = %id, "read a recording's transcript: {err:#}");
+                Vec::new()
+            });
+        // Topped up from the room's own log for the same reason
+        // `transcript` does it: a recording somebody stopped a moment
+        // ago ends with the line they were saying as they stopped, and
+        // that line reaches the database a second or two later.
+        let live = {
+            let st = self.lock();
+            (taped.conversation == st.conversation).then(|| st.log.clone())
+        };
+        for e in live.into_iter().flatten() {
+            match log.iter_mut().find(|k| k.id == e.id) {
+                Some(k) => *k = e,
+                None => log.push(e),
+            }
+        }
+        log.sort_by_key(|e| e.at);
+        // What was said while it was running. `until` is zero while a
+        // recording is still going, which is every line since it
+        // started -- a transcript of a recording in progress is as
+        // true as the recording is long.
+        let until = if taped.until == 0 {
+            u64::MAX
+        } else {
+            taped.until
+        };
+        log.retain(|e| e.at >= taped.at && e.at <= until);
+        let head = transcript::Head {
+            room: if self.cfg.title.is_empty() {
+                &self.cfg.id
+            } else {
+                &self.cfg.title
+            },
+            conversation: taped.conversation,
+            title: &title,
+            at: taped.at,
+            language,
+            clock,
+            what: transcript::What::Recording { secs: taped.secs },
+        };
+        Some((
+            transcript::file_name(&head),
+            transcript::markdown(&head, &log),
+        ))
     }
 
     /// The clips read in this conversation, without the audio: what a
@@ -6479,20 +6974,100 @@ impl Room {
         }
     }
 
+    /// The engine has taken a paragraph back.
+    ///
+    /// It does that when pass 2 decodes an utterance to nothing (or to
+    /// one of the lone "I." / "The." hallucinations), on the reading
+    /// that the voice detector fired on something which was not speech
+    /// -- see `Engine::on_final`. For a dictation window that is right:
+    /// nobody had read the line yet, and a transcript is better off
+    /// without the blips.
+    ///
+    /// A room is not that. An entry exists here only because somebody
+    /// said enough for pass 1 to put words on everybody's screen
+    /// (`on_paragraph` creates nothing for an empty paragraph), so a
+    /// retraction this late is not "nothing was said" -- it is the two
+    /// recognizers disagreeing about what, with one of them having
+    /// already shown its answer to the room. Deleting it then is the
+    /// one failure a room whose job is writing down what was said
+    /// cannot have: the line appears while you talk and vanishes as you
+    /// stop, with nothing in its place and no error anywhere.
+    ///
+    /// So the room stands by what pass 1 heard and lets it be the final
+    /// word, which is what `Engine::on_final` already does for a decode
+    /// that *failed*. The exception is text the same junk test would
+    /// throw out on its own account: pass 1 heard noise too, and two
+    /// passes agreeing there were no words is the blip the engine was
+    /// talking about.
     pub fn on_paragraph_removed(&self, id: &str) {
         let mut st = self.lock();
-        if let Some(i) = st
+        let Some(i) = st
             .log
             .iter()
             .position(|e| e.id == id && e.kind == Kind::Human)
-        {
-            if st.log[i].sent {
-                // Already part of the conversation; keep what was handed over.
-                return;
-            }
+        else {
+            return;
+        };
+        if st.log[i].sent {
+            // Already part of the conversation; keep what was handed over.
+            return;
+        }
+        if is_junk(&st.log[i].text) {
             st.log.remove(i);
             self.emit(json!({ "type": "entry_removed", "id": id }));
+            return;
         }
+        let e = &mut st.log[i];
+        // Nothing more is coming for it: the paragraph it was a guess
+        // at is gone, so there is no pass 2 left to replace the text
+        // and no pass 3 to revise it. Saying so is also what frees
+        // `hand_over` to put it in the conversation, which waits on
+        // every line of a turn being settled.
+        e.partial = false;
+        e.live = false;
+        let entry = e.clone();
+        // Said out loud, because two passes disagreeing about whether
+        // anybody spoke at all is worth knowing about later, when the
+        // transcript is read back and a line in it looks wrong.
+        info!(
+            who = %entry.who,
+            text = %entry.text,
+            "pass 2 found no words where pass 1 heard these: standing by what was shown"
+        );
+        self.emit_entry(&entry);
+        // And into the other languages, like any other finished line.
+        // Interpretation is per clip and only of clips pass 2 has
+        // landed, so a line kept this way has nothing it would ever
+        // reach -- the paragraph was taken back before any clip of it
+        // was final. What it is handed instead is the kept text as the
+        // one finished clip it has now become, which is exactly what
+        // the room is standing by. Without this a reader in another
+        // language is handed the line in a language they did not ask
+        // for, which is the one thing the interpreters exist to avoid.
+        let said = Paragraph {
+            id: entry.id.clone(),
+            start_ms: 0,
+            end_ms: 0,
+            text: entry.text.clone(),
+            clips: vec![Clip {
+                id: format!("{}-kept", entry.id),
+                start_ms: 0,
+                duration_ms: None,
+                text: entry.text.clone(),
+                stage: Stage::Final,
+                words: Vec::new(),
+                speaker: None,
+            }],
+            words: Vec::new(),
+            speaker: None,
+            closed: true,
+            hardened: true,
+            pass3_inflight: false,
+            pass4: None,
+            translation: None,
+        };
+        let who = entry.who.clone();
+        self.interpret(&mut st, &who, &said);
     }
 
     /// Voice activity of `person`, about every 50 ms of their audio.
@@ -6572,6 +7147,15 @@ impl Room {
         // after it.
         if !on && self.lock().show.is_some() {
             self.end_show();
+        }
+        // And a recording stops where the room stops being written
+        // down. A recording is the stronger of the two acts, so it
+        // cannot outlive the weaker one -- see `set_recording`. Also
+        // before the note, so the clip's card comes above the sentence
+        // that explains why it ends there. Nobody's name on it: it is
+        // the room doing this and not a person pressing stop.
+        if !on {
+            self.stop_recording("");
         }
         let mut st = self.lock();
         st.transcribing = on;
@@ -7281,6 +7865,26 @@ impl Room {
         game: Option<String>,
         log: Vec<Entry>,
     ) {
+        // A recording belongs to the conversation it was made in --
+        // that is where its card is, and that is the stretch of
+        // transcript it is of -- so it ends here rather than
+        // straddling two of them. Done through the state in hand,
+        // since `stop_recording` takes the lock for itself and this is
+        // called with it held.
+        if let Some(tape) = st.tape.take() {
+            self.mixer.record_to(None);
+            drop(tape.frames);
+            if let Err(err) = self.store().stopped_recording(&tape.id, "") {
+                warn!(recording = %tape.id, "write down the end of a recording: {err:#}");
+            }
+            info!(
+                recording = %tape.id,
+                was = tape.conversation,
+                now = conversation,
+                "a recording ended with the conversation it was of"
+            );
+            self.emit(json!({ "type": "recording_on", "on": false, "who": "" }));
+        }
         // Everything any bot was in the middle of belonged to the
         // conversation the room is leaving.
         let bots: Vec<String> = st.bots.iter().map(|b| b.cfg.name.clone()).collect();
@@ -7340,6 +7944,13 @@ impl Room {
                     // is in the log and what it is showing would not
                     // be anywhere.
                     "pictures": self.pictures_json(st),
+                    // And the clips and the recordings, for exactly
+                    // that reason: a card whose audio the browser has
+                    // never been told about says the room couldn't
+                    // keep it, which is a lie about a clip that is
+                    // sitting in the database.
+                    "samples": self.samples_json(st),
+                    "recordings": self.recordings_json(st),
                 }),
             );
         }
@@ -9136,6 +9747,13 @@ fn conversation_messages(
             // A clip somebody brought in arrived whole: there was
             // never anything to wait for.
             Kind::Clip => true,
+            // A recording of the room, both while it is being made and
+            // after. Unlike a picture or a reading, the AI is told
+            // about this one while it is still happening: a room being
+            // recorded is a fact about the room it is talking in, and
+            // an hour of not knowing is worse than hearing about it
+            // twice. The note says which of the two it is.
+            Kind::Recording => true,
             // The room saying it stopped being written down, and then
             // that it started again. A model reading back over a
             // conversation with a gap in it is told what the gap was,
@@ -9382,6 +10000,28 @@ fn conversation_messages(
                     ),
                 );
             }
+            // The room being recorded, which is a thing happening to
+            // everybody in it including this voice. Said plainly, and
+            // not claimed by the AI even when it was the AI's turn
+            // that the press landed in: nobody asked it to record
+            // anything, and it cannot play the clip back any more than
+            // it can look at a picture.
+            Kind::Recording => {
+                let note = if e.live {
+                    format!(
+                        "[{} started recording the room. Everything said here is being \
+                         recorded as {}, and the conversation has the card for it.]",
+                        e.who, e.text
+                    )
+                } else {
+                    format!(
+                        "[{} recorded the room; it is in the conversation as {}, with the \
+                         transcript of that stretch beside it. You cannot play it back.]",
+                        e.who, e.text
+                    )
+                };
+                said_to_me(&mut out, note);
+            }
             // The room saying it went off the record, and that it came
             // back. Nothing is added to it: the sentence was written
             // to be read, and what it says is exactly what the model
@@ -9398,7 +10038,6 @@ fn conversation_messages(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vox_transcribe::{Clip, Stage};
 
     /// The turn the room's one bot is working on.
     fn turn(r: &Room) -> u64 {
@@ -12127,6 +12766,288 @@ mod tests {
         // The engine is let go of with it, so there is no thread left
         // turning anybody's voice into words.
         assert!(r.lock().people.values().all(|p| p.engine.is_none()));
+    }
+
+    /// Purging takes the conversation everybody is sitting in like
+    /// every other one -- a button that left it would be a lie about
+    /// what it did -- so the room has to be left somewhere to be.
+    #[test]
+    fn purging_a_room_leaves_it_in_a_fresh_conversation() {
+        let (r, _turns) = room(Mode::Named);
+        r.on_paragraph("Ryan", &para("p1", "The first conversation.", false));
+        r.tick(quiet(&r));
+        let first = r.lock().conversation;
+        r.new_conversation();
+        r.on_paragraph("Ryan", &para("p2", "And the second.", false));
+        r.tick(quiet(&r));
+        let second = r.lock().conversation;
+        assert_eq!(r.history().len(), 2);
+
+        assert_eq!(r.purge_room("Ryan").unwrap(), 2, "both of them went");
+        let now = r.lock().conversation;
+        assert!(now != first && now != second, "a fresh one to sit in");
+        assert!(r.lock().log.is_empty(), "and nothing in it");
+        assert_eq!(
+            r.history().len(),
+            1,
+            "the history is the one the room is having"
+        );
+        assert!(r.read_conversation(first).is_none(), "and the rest are gone");
+        assert!(r.store().entries(second, 10).unwrap().is_empty());
+    }
+
+    /// Pass 2 disagreed with pass 1 about whether anything was said at
+    /// all. The words were on everybody's screen while it was being
+    /// decided, so they stay.
+    #[test]
+    fn a_paragraph_the_engine_takes_back_keeps_what_pass_1_heard() {
+        let (r, _turns) = room(Mode::Named);
+        let mut events = r.subscribe();
+        r.on_paragraph("Ryan", &para("p1", "THE DOOR IS LOCKED", true));
+        r.on_paragraph_removed("p1");
+
+        let log = r.lock().log.clone();
+        let e = log
+            .iter()
+            .find(|e| e.id == "p1")
+            .expect("the line is still there");
+        assert_eq!(e.text, "THE DOOR IS LOCKED");
+        assert!(!e.partial, "nothing is left to replace the guess");
+        assert!(
+            events_of(&mut events, "entry_removed").is_empty(),
+            "and nobody is told to take it off their screen"
+        );
+
+        // Settled, so the turn it is part of can be handed over: a line
+        // left looking like a guess would hold the whole room up.
+        r.tick(quiet(&r));
+        assert!(r.lock().log.iter().find(|e| e.id == "p1").unwrap().sent);
+    }
+
+    /// A line the room stood by reaches the other languages like any
+    /// other finished line. Interpretation is of clips pass 2 has
+    /// landed, and a kept line has none -- so without this the one
+    /// line in the conversation that needed explaining would be the
+    /// one left in a language the reader did not ask for.
+    #[test]
+    fn a_line_the_room_stands_by_is_interpreted_like_any_other() {
+        let (r, _turns, interp) = room_with(Mode::Named, &["English", "Russian"]);
+        r.set_language("Alex", "Russian").unwrap();
+        r.join("Alex", 1);
+        r.join("Ryan", 2);
+        r.on_paragraph("Ryan", &para("p1", "THE DOOR IS LOCKED", true));
+        assert!(interp["Russian"].try_recv().is_err(), "not from a partial");
+
+        r.on_paragraph_removed("p1");
+        let job = interp["Russian"]
+            .try_recv()
+            .expect("the kept line, to interpret");
+        assert_eq!(job.text, "THE DOOR IS LOCKED");
+        assert_eq!(job.who, "Ryan");
+        assert_eq!(job.entry, "p1");
+        assert_eq!(job.into, "Russian");
+        assert!(interp["English"].try_recv().is_err(), "not into its own");
+    }
+
+    /// Both passes agree there were no words in it: the voice detector
+    /// fired on a noise, and that is the blip the retraction is for.
+    #[test]
+    fn a_paragraph_the_engine_takes_back_goes_when_it_was_never_words() {
+        let (r, _turns) = room(Mode::Named);
+        let mut events = r.subscribe();
+        r.on_paragraph("Ryan", &para("p1", "...", true));
+        assert!(r.lock().log.iter().any(|e| e.id == "p1"));
+        r.on_paragraph_removed("p1");
+        assert!(!r.lock().log.iter().any(|e| e.id == "p1"));
+        assert_eq!(events_of(&mut events, "entry_removed").len(), 1);
+    }
+
+    // -- recording the room ------------------------------------------------
+
+    /// The `recordings` row, once the writer thread has finished with
+    /// it one way or the other. The file is built off the room's
+    /// thread, so every test about what landed has to wait for it.
+    fn landed(r: &Arc<Room>, id: &str) -> crate::store::Taped {
+        for _ in 0..300 {
+            let row = r.store().recording(id).ok().flatten();
+            match row {
+                Some(t) if t.ready || !t.failed.is_empty() => return t,
+                _ => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        panic!("the recording never landed");
+    }
+
+    /// The card in the conversation for whatever recording there is.
+    fn tape_card(r: &Arc<Room>) -> Entry {
+        r.lock()
+            .log
+            .iter()
+            .rev()
+            .find(|e| e.kind == Kind::Recording)
+            .cloned()
+            .expect("a card for the recording")
+    }
+
+    /// `secs` of the room going past the mixer, which is where a
+    /// recording is taken from.
+    fn play(r: &Arc<Room>, secs: f32) {
+        for _ in 0..(secs * 50.0) as usize {
+            r.mixer.tick();
+        }
+    }
+
+    /// Starting one is announced in the conversation before a sample of
+    /// audio is kept: the card is the only light there is on a room
+    /// being recorded, and it says whose press it was.
+    #[test]
+    fn recording_the_room_puts_a_light_up_and_says_who_started_it() {
+        let (r, _turns) = room(Mode::Named);
+        let mut events = r.subscribe();
+        r.set_recording("Ryan", true).expect("a room on the record");
+
+        let card = tape_card(&r);
+        assert_eq!(card.who, "Ryan");
+        assert_eq!(card.text, "recording 1", "numbered, to be said out loud");
+        assert!(card.live, "and it is lit while the room is being recorded");
+        assert_eq!(
+            events_of(&mut events, "recording_on").len(),
+            1,
+            "every tab is told"
+        );
+        let row = r.store().recording(&card.id).unwrap().expect("a row");
+        assert_eq!(row.who, "Ryan");
+        assert!(!row.ready, "with no clip on it yet");
+        assert_eq!(row.until, 0, "and no end to it");
+    }
+
+    /// And stopping it leaves the clip, with who stopped it beside who
+    /// started it.
+    #[test]
+    fn a_recording_lands_in_the_conversation_when_somebody_stops_it() {
+        let (r, _turns) = room(Mode::Named);
+        r.set_recording("Ryan", true).expect("a room on the record");
+        let card = tape_card(&r);
+        play(&r, 1.0);
+        r.set_recording("Alex", false).expect("anybody here may stop");
+
+        let row = landed(&r, &card.id);
+        assert_eq!(row.failed, "", "it landed");
+        assert!(row.ready, "with audio on it");
+        assert_eq!(row.who, "Ryan");
+        assert_eq!(row.stopped_by, "Alex", "the room writes down both ends");
+        assert!((row.secs - 1.0).abs() < 0.1, "{}s", row.secs);
+        assert!(row.until > 0);
+        let audio = r
+            .store()
+            .recording_audio(&card.id)
+            .unwrap()
+            .expect("the clip");
+        assert_eq!(&audio[..4], b"OggS", "an Ogg/Opus file");
+        assert!(
+            !tape_card(&r).live,
+            "and the light goes out: a lit card is a promise that \
+             something is still being recorded"
+        );
+
+        // The transcript beside it is the conversation's own renderer
+        // with bounds -- the thing #17 and this have to share.
+        let (name, md) = r
+            .recording_transcript(&card.id, "English", 0)
+            .expect("a transcript of the stretch it covers");
+        assert!(name.ends_with("-recording.md"), "{name}");
+        assert!(md.contains("while it was being recorded"), "{md}");
+    }
+
+    /// A recording is the stronger of the two acts, so it cannot
+    /// happen where the weaker one is switched off. The lobby refuses
+    /// it by the same test -- it is never transcribing at all.
+    #[test]
+    fn a_room_off_the_record_cannot_be_recorded() {
+        let (r, _turns) = room(Mode::Named);
+        r.set_transcribing("Ryan", false).unwrap();
+        let why = r.set_recording("Ryan", true).expect_err("refused");
+        assert!(why.contains("off the record"), "{why}");
+        assert!(
+            !r.lock().log.iter().any(|e| e.kind == Kind::Recording),
+            "and nothing is in the conversation about it"
+        );
+    }
+
+    /// And one that is already running ends where the room stops being
+    /// written down. The note the room writes about going off the
+    /// record is the explanation of why the clip ends there.
+    #[test]
+    fn going_off_the_record_stops_a_recording() {
+        let (r, _turns) = room(Mode::Named);
+        r.set_recording("Ryan", true).unwrap();
+        let card = tape_card(&r);
+        play(&r, 0.5);
+        r.set_transcribing("Alex", false).unwrap();
+
+        let row = landed(&r, &card.id);
+        assert!(row.ready, "what it had is kept: {}", row.failed);
+        assert!(row.until > 0, "and it is over");
+        // The room did this, not a person pressing stop.
+        assert_eq!(row.stopped_by, "");
+        // The card is above the note that explains it.
+        let log = r.lock().log.clone();
+        let tape = log.iter().position(|e| e.id == card.id).expect("the card");
+        let note = log.iter().rposition(|e| e.kind == Kind::Note).expect("a note");
+        assert!(tape < note, "the clip comes before the sentence about it");
+    }
+
+    /// A recording belongs to the conversation it was made in: that is
+    /// where its card is and that is the stretch of transcript it is
+    /// of. So the next conversation starts without it.
+    #[test]
+    fn a_new_conversation_ends_the_recording_it_was_of() {
+        let (r, _turns) = room(Mode::Named);
+        r.set_recording("Ryan", true).unwrap();
+        let card = tape_card(&r);
+        play(&r, 0.5);
+        let was = r.lock().conversation;
+        r.new_conversation();
+
+        let row = landed(&r, &card.id);
+        assert!(row.ready, "what it had is kept: {}", row.failed);
+        assert_eq!(row.conversation, was, "filed where it was made");
+        assert!(
+            r.lock().tape.is_none(),
+            "and the room is not being recorded in the new one"
+        );
+        // Which means recording again here is recording 1 of this
+        // conversation, not 2 of the last.
+        r.set_recording("Ryan", true).unwrap();
+        assert_eq!(tape_card(&r).text, "recording 1");
+        r.set_recording("Ryan", false).unwrap();
+    }
+
+    /// A room that goes away mid-recording had the audio in memory, so
+    /// there is nothing to come back to. The card says so rather than
+    /// showing a light on a microphone nothing is listening to.
+    #[test]
+    fn a_recording_the_room_was_making_when_it_stopped_says_so() {
+        let scratch = Scratch::new("recording");
+        let id = {
+            let store = scratch.open();
+            store.invite("Ryan").unwrap();
+            let r = room_again(store);
+            r.set_recording("Ryan", true).unwrap();
+            play(&r, 0.3);
+            tape_card(&r).id
+            // The room goes away with the recording still running, and
+            // without the writer thread being given the chance to
+            // finish: that is what a restart is.
+        };
+        let r = room_again(scratch.open());
+        let row = r.store().recording(&id).unwrap().expect("the row");
+        assert!(!row.ready);
+        assert_eq!(row.failed, "the room restarted while it was recording");
+        assert!(
+            !r.lock().log.iter().any(|e| e.kind == Kind::Recording && e.live),
+            "and no card comes back up lit"
+        );
     }
 
     /// A room that was off the record when the house went down comes

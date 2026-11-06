@@ -182,6 +182,16 @@ export const room = $state({
   // this says whether the room is still listening, what was recorded,
   // and how long it is.
   samples: {},
+  // The recordings made of the room in this conversation, by id:
+  // { n, who, stopped_by, ready, secs, failed, at, until }. Read by
+  // the card in the log the way a clip's is: the entry says which
+  // recording it is and this says whether the room is still recording
+  // it, how long it is, and whether it ever landed.
+  recordings: {},
+  // Whether the room is being recorded just now, and who started it.
+  // The card in the conversation is the light on it; this is what the
+  // control in the room column shows.
+  recording: null,
   // The voices the house has cloned from any of them: { id, name, who,
   // said, created }. Not a control -- which voice an AI speaks in is
   // asked of it out loud -- but the room shows what there is, because
@@ -569,10 +579,14 @@ export function command(msg) {
 
 /// Ask the user to confirm, in the page. (The browser's own confirm()
 /// blocks the page, and with it the room's audio.)
-export function ask(text, yes = 'OK') {
+/// A question with two answers. `type`, where there is one, is a word
+/// the person has to write out before the answer will take — for the
+/// handful of things where one click is too cheap a way to lose
+/// something that cannot come back.
+export function ask(text, yes = 'OK', type = null) {
   return new Promise((resolve) => {
     room.asking?.resolve(false);
-    room.asking = { text, yes, resolve };
+    room.asking = { text, yes, type, resolve };
   });
 }
 
@@ -802,6 +816,8 @@ export async function readConversation(id) {
     for (const p of got.pictures ?? []) room.pictures[p.id] = p;
     // And its own voice samples, for the same reason.
     for (const c of got.samples ?? []) room.samples[c.id] = c;
+    // And the recordings made of the room while it was going on.
+    for (const r of got.recordings ?? []) room.recordings[r.id] = r;
     room.reading = got;
   } catch (e) {
     console.error('[room] read', e);
@@ -812,6 +828,59 @@ export async function readConversation(id) {
 /// Back to the one the room is having now.
 export function backToNow() {
   room.reading = null;
+}
+
+/// Where to get a conversation as a file of its own.
+///
+/// A plain address rather than a fetch: the browser saves it, names it
+/// whatever the room called it (the server says so in
+/// `Content-Disposition`), and no copy of an afternoon has to sit in
+/// this page's memory on the way past.
+///
+/// The clock goes with it because the room has no business guessing
+/// which one you keep — a date is a thing you spell in the reader's own
+/// clock, and this is the only place that knows it. `getTimezoneOffset`
+/// counts the other way round from everybody else, hence the minus.
+export const transcriptUrl = (id) =>
+  `${roomPath()}/${id}/transcript?clock=${-new Date().getTimezoneOffset()}`;
+
+/// Forget the whole of this room's history: every conversation it has
+/// had, this one included, and everything said, dealt, drawn, read
+/// aloud or recorded in any of them.
+///
+/// The owner's, which is why the button is only drawn for them — and
+/// the server says no to everybody else regardless. Asked twice over:
+/// a question, and then the room's name written out, because this is
+/// every conversation in it and a dialog that looks like the one for
+/// deleting a single conversation is too cheap a way to lose a year.
+///
+/// It says what it does and no more than that. The rows go and the
+/// room starts a fresh conversation in the same breath; the space they
+/// took is the database's to use again rather than handed back to the
+/// disk, and the dialog says so rather than implying the file has been
+/// scrubbed.
+export async function purgeRoom() {
+  const name = room.title || room.where;
+  if (!(await ask(
+    `Purge ${name}? Every conversation this room has ever had goes — everything said in them, every card, every picture, every clip and every recording — for everyone, and it cannot be undone. The one you are in now goes too, and the room starts a fresh one. Type the room's name to confirm.`,
+    'Purge the room',
+    name,
+  ))) return;
+  try {
+    const r = await fetch(`${roomPath()}/purge`, { method: 'POST' });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(d.error || r.statusText);
+    room.history = d.conversations;
+    backToNow();
+    notify(
+      d.purged === 1
+        ? 'One conversation purged. The room is starting again.'
+        : `${d.purged} conversations purged. The room is starting again.`,
+    );
+  } catch (e) {
+    console.error('[room] purge', e);
+    notify(`Can't purge this room: ${e.message || e}`, true);
+  }
 }
 
 /// Delete one for good, for everybody. The only thing here that takes
@@ -940,6 +1009,18 @@ export function pictureOf(id) {
 export function sampleOf(id) {
   return `/api/sample/${encodeURIComponent(id)}`;
 }
+
+/// Where to fetch a recording of the room.
+export function recordingOf(id) {
+  return `/api/recording/${encodeURIComponent(id)}`;
+}
+
+/// Where to get the stretch of transcript a recording covers, as a
+/// file. The same clock question as a conversation's — see
+/// `transcriptUrl`, whose comment is this one too.
+export const recordingTranscriptUrl = (id) =>
+  `/api/rooms/${encodeURIComponent(room.where)}/recording/${encodeURIComponent(id)}` +
+  `/transcript?clock=${-new Date().getTimezoneOffset()}`;
 
 // -- a picture dropped into the room -----------------------------------
 //
@@ -1304,6 +1385,12 @@ function apply(ev) {
       room.avatars = ev.avatars ?? {};
       room.pictures = Object.fromEntries((ev.pictures ?? []).map((p) => [p.id, p]));
       room.samples = Object.fromEntries((ev.samples ?? []).map((s) => [s.id, s]));
+      room.recordings = Object.fromEntries((ev.recordings ?? []).map((r) => [r.id, r]));
+      // The one still being made, if there is one: a row with no clip
+      // on it and no end to it yet. Worked out here rather than sent
+      // as a second thing, so the two can't disagree.
+      room.recording =
+        (ev.recordings ?? []).find((r) => !r.ready && !r.failed && !r.until) ?? null;
       room.voices = ev.voices ?? [];
       room.strips = ev.strips;
       room.log = ev.log;
@@ -1416,6 +1503,18 @@ function apply(ev) {
       // or says why there is nothing.
       room.samples[ev.sample.id] = ev.sample;
       break;
+    case 'recording':
+      // A recording started, or stopped and landed, or went wrong. The
+      // card is already in the log; this is what turns the light into
+      // a clip to play, or into why there isn't one.
+      room.recordings[ev.recording.id] = ev.recording;
+      break;
+    case 'recording_on':
+      // Somebody started recording the room, or stopped. The card
+      // saying so is an entry of its own: this is only the switch, for
+      // the control beside Transcription.
+      room.recording = ev.on ? { who: ev.who } : null;
+      break;
     case 'voices':
       // One was kept or deleted. The whole list, because it is short
       // and the house's rather than this conversation's.
@@ -1453,6 +1552,14 @@ function apply(ev) {
       // the ones that were on screen.
       room.cards = ev.cards ?? [];
       room.pictures = Object.fromEntries((ev.pictures ?? []).map((p) => [p.id, p]));
+      // And the clips and recordings, for the same reason: a card
+      // whose audio this tab has never been told about says the room
+      // couldn't keep it, which is a lie about one sitting in the
+      // database.
+      room.samples = Object.fromEntries((ev.samples ?? []).map((c) => [c.id, c]));
+      room.recordings = Object.fromEntries((ev.recordings ?? []).map((r) => [r.id, r]));
+      room.recording =
+        (ev.recordings ?? []).find((r) => !r.ready && !r.failed && !r.until) ?? null;
       break;
     case 'card': {
       // Only this person's tabs are sent it; say so, without the contents.
@@ -1818,6 +1925,12 @@ export function setBots(on) {
 /// it hasn't.
 export function setTranscribing(on) {
   command({ type: 'transcribe', on });
+}
+
+/// Start recording the room, or stop. Anybody in the room may, and the
+/// room writes down who did which — see `Room::set_recording`.
+export function setRecording(on) {
+  command({ type: 'record', on });
 }
 
 /// What the off position of that button means, which is the one nuance
