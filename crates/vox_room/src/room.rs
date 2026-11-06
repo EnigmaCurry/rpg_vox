@@ -50,7 +50,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
-use vox_transcribe::{Paragraph, ParagraphMode, Pusher, Stage};
+use vox_transcribe::filters::is_junk;
+use vox_transcribe::{Clip, Paragraph, ParagraphMode, Pusher, Stage};
 
 use crate::mixer::{Mixer, Strip, TrackProgress, AGENT_STRIP, RATE};
 use crate::store::{Invited, Store};
@@ -6479,20 +6480,100 @@ impl Room {
         }
     }
 
+    /// The engine has taken a paragraph back.
+    ///
+    /// It does that when pass 2 decodes an utterance to nothing (or to
+    /// one of the lone "I." / "The." hallucinations), on the reading
+    /// that the voice detector fired on something which was not speech
+    /// -- see `Engine::on_final`. For a dictation window that is right:
+    /// nobody had read the line yet, and a transcript is better off
+    /// without the blips.
+    ///
+    /// A room is not that. An entry exists here only because somebody
+    /// said enough for pass 1 to put words on everybody's screen
+    /// (`on_paragraph` creates nothing for an empty paragraph), so a
+    /// retraction this late is not "nothing was said" -- it is the two
+    /// recognizers disagreeing about what, with one of them having
+    /// already shown its answer to the room. Deleting it then is the
+    /// one failure a room whose job is writing down what was said
+    /// cannot have: the line appears while you talk and vanishes as you
+    /// stop, with nothing in its place and no error anywhere.
+    ///
+    /// So the room stands by what pass 1 heard and lets it be the final
+    /// word, which is what `Engine::on_final` already does for a decode
+    /// that *failed*. The exception is text the same junk test would
+    /// throw out on its own account: pass 1 heard noise too, and two
+    /// passes agreeing there were no words is the blip the engine was
+    /// talking about.
     pub fn on_paragraph_removed(&self, id: &str) {
         let mut st = self.lock();
-        if let Some(i) = st
+        let Some(i) = st
             .log
             .iter()
             .position(|e| e.id == id && e.kind == Kind::Human)
-        {
-            if st.log[i].sent {
-                // Already part of the conversation; keep what was handed over.
-                return;
-            }
+        else {
+            return;
+        };
+        if st.log[i].sent {
+            // Already part of the conversation; keep what was handed over.
+            return;
+        }
+        if is_junk(&st.log[i].text) {
             st.log.remove(i);
             self.emit(json!({ "type": "entry_removed", "id": id }));
+            return;
         }
+        let e = &mut st.log[i];
+        // Nothing more is coming for it: the paragraph it was a guess
+        // at is gone, so there is no pass 2 left to replace the text
+        // and no pass 3 to revise it. Saying so is also what frees
+        // `hand_over` to put it in the conversation, which waits on
+        // every line of a turn being settled.
+        e.partial = false;
+        e.live = false;
+        let entry = e.clone();
+        // Said out loud, because two passes disagreeing about whether
+        // anybody spoke at all is worth knowing about later, when the
+        // transcript is read back and a line in it looks wrong.
+        info!(
+            who = %entry.who,
+            text = %entry.text,
+            "pass 2 found no words where pass 1 heard these: standing by what was shown"
+        );
+        self.emit_entry(&entry);
+        // And into the other languages, like any other finished line.
+        // Interpretation is per clip and only of clips pass 2 has
+        // landed, so a line kept this way has nothing it would ever
+        // reach -- the paragraph was taken back before any clip of it
+        // was final. What it is handed instead is the kept text as the
+        // one finished clip it has now become, which is exactly what
+        // the room is standing by. Without this a reader in another
+        // language is handed the line in a language they did not ask
+        // for, which is the one thing the interpreters exist to avoid.
+        let said = Paragraph {
+            id: entry.id.clone(),
+            start_ms: 0,
+            end_ms: 0,
+            text: entry.text.clone(),
+            clips: vec![Clip {
+                id: format!("{}-kept", entry.id),
+                start_ms: 0,
+                duration_ms: None,
+                text: entry.text.clone(),
+                stage: Stage::Final,
+                words: Vec::new(),
+                speaker: None,
+            }],
+            words: Vec::new(),
+            speaker: None,
+            closed: true,
+            hardened: true,
+            pass3_inflight: false,
+            pass4: None,
+            translation: None,
+        };
+        let who = entry.who.clone();
+        self.interpret(&mut st, &who, &said);
     }
 
     /// Voice activity of `person`, about every 50 ms of their audio.
@@ -9398,7 +9479,6 @@ fn conversation_messages(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vox_transcribe::{Clip, Stage};
 
     /// The turn the room's one bot is working on.
     fn turn(r: &Room) -> u64 {
@@ -12127,6 +12207,72 @@ mod tests {
         // The engine is let go of with it, so there is no thread left
         // turning anybody's voice into words.
         assert!(r.lock().people.values().all(|p| p.engine.is_none()));
+    }
+
+    /// Pass 2 disagreed with pass 1 about whether anything was said at
+    /// all. The words were on everybody's screen while it was being
+    /// decided, so they stay.
+    #[test]
+    fn a_paragraph_the_engine_takes_back_keeps_what_pass_1_heard() {
+        let (r, _turns) = room(Mode::Named);
+        let mut events = r.subscribe();
+        r.on_paragraph("Ryan", &para("p1", "THE DOOR IS LOCKED", true));
+        r.on_paragraph_removed("p1");
+
+        let log = r.lock().log.clone();
+        let e = log
+            .iter()
+            .find(|e| e.id == "p1")
+            .expect("the line is still there");
+        assert_eq!(e.text, "THE DOOR IS LOCKED");
+        assert!(!e.partial, "nothing is left to replace the guess");
+        assert!(
+            events_of(&mut events, "entry_removed").is_empty(),
+            "and nobody is told to take it off their screen"
+        );
+
+        // Settled, so the turn it is part of can be handed over: a line
+        // left looking like a guess would hold the whole room up.
+        r.tick(quiet(&r));
+        assert!(r.lock().log.iter().find(|e| e.id == "p1").unwrap().sent);
+    }
+
+    /// A line the room stood by reaches the other languages like any
+    /// other finished line. Interpretation is of clips pass 2 has
+    /// landed, and a kept line has none -- so without this the one
+    /// line in the conversation that needed explaining would be the
+    /// one left in a language the reader did not ask for.
+    #[test]
+    fn a_line_the_room_stands_by_is_interpreted_like_any_other() {
+        let (r, _turns, interp) = room_with(Mode::Named, &["English", "Russian"]);
+        r.set_language("Alex", "Russian").unwrap();
+        r.join("Alex", 1);
+        r.join("Ryan", 2);
+        r.on_paragraph("Ryan", &para("p1", "THE DOOR IS LOCKED", true));
+        assert!(interp["Russian"].try_recv().is_err(), "not from a partial");
+
+        r.on_paragraph_removed("p1");
+        let job = interp["Russian"]
+            .try_recv()
+            .expect("the kept line, to interpret");
+        assert_eq!(job.text, "THE DOOR IS LOCKED");
+        assert_eq!(job.who, "Ryan");
+        assert_eq!(job.entry, "p1");
+        assert_eq!(job.into, "Russian");
+        assert!(interp["English"].try_recv().is_err(), "not into its own");
+    }
+
+    /// Both passes agree there were no words in it: the voice detector
+    /// fired on a noise, and that is the blip the retraction is for.
+    #[test]
+    fn a_paragraph_the_engine_takes_back_goes_when_it_was_never_words() {
+        let (r, _turns) = room(Mode::Named);
+        let mut events = r.subscribe();
+        r.on_paragraph("Ryan", &para("p1", "...", true));
+        assert!(r.lock().log.iter().any(|e| e.id == "p1"));
+        r.on_paragraph_removed("p1");
+        assert!(!r.lock().log.iter().any(|e| e.id == "p1"));
+        assert_eq!(events_of(&mut events, "entry_removed").len(), 1);
     }
 
     /// A room that was off the record when the house went down comes

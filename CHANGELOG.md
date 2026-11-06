@@ -9,6 +9,46 @@ releases.
 
 ### Voice room
 
+- **Speech no longer vanishes from the transcript as pass 2 arrives.**
+  You would be talking, watch the line appear as you spoke it, and then
+  as you stopped -- the moment the better decode should have replaced
+  the guess -- the line would go instead. Not corrected: gone, with
+  nothing in its place and no error anywhere. Intermittent, and the
+  worst failure a room whose whole job is writing down what was said
+  can have.
+
+  Two recognizers are listening to you. Pass 1 is the streaming one and
+  its guess is what you read while you are still speaking; pass 2
+  decodes the finished utterance and has the last word. When pass 2
+  comes back with no words in it, the engine takes the whole paragraph
+  back, on the reading that the voice detector fired on a cough or a
+  door and there was never anything there. For a dictation window that
+  is right -- nobody had read it yet, and a transcript is better off
+  without the blips. In a room it is a line that was on everybody's
+  screen, and pass 2 finding nothing where pass 1 heard a sentence is
+  not "nobody spoke": it is the two of them disagreeing about what was
+  said, with one of them having already shown its answer to the room.
+
+  The room now stands by what pass 1 heard and lets it be the final
+  word, which is what the engine already did for a decode that *failed*
+  -- the same reasoning, for the case that does not raise an error. It
+  stops being shown as a guess, so the turn it belongs to can be handed
+  over, and it goes into the conversation like anything else said. A
+  line kept this way is logged, because a transcript that reads oddly
+  in one place is worth being able to explain afterwards.
+
+  The blips are still dropped. The test is the engine's own: if what
+  pass 1 heard is itself punctuation, empty, or one of the lone "I." /
+  "The." hallucinations, then both passes agree there were no words and
+  the line goes as before. Nothing a room ever showed you as a sentence
+  is removed from it again.
+
+  A line kept this way reaches the other languages like any other.
+  Interpretation is of the clips the second pass has landed, and a kept
+  line has none of those — so otherwise the one line in the
+  conversation that needed explaining would have been the one left in a
+  language its reader never asked for.
+
 - **A room can be taken off the record.** **Transcription**, at the
   top of the room column over the faders, is whether what is said in
   this room is written down. Anybody in the room may change it and it
