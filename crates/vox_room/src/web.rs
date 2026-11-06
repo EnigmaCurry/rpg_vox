@@ -149,6 +149,16 @@ struct PictureName {
     name: String,
 }
 
+/// `?clock=` on a transcript: the reader's own offset from UTC, in
+/// minutes east of it. The browser knows it and the room does not --
+/// see `transcript::Head::clock` -- and a file asked for without it is
+/// written in UTC and says so.
+#[derive(Deserialize)]
+struct Clock {
+    #[serde(default)]
+    clock: i32,
+}
+
 /// `?v=` on a face: which one of somebody's to serve.
 #[derive(Deserialize)]
 struct AvatarQuery {
@@ -254,6 +264,10 @@ pub fn router(rooms: Arc<Rooms>, screen: Arc<Screen>) -> Router {
         )
         .route("/api/rooms/:room/history", get(history))
         .route("/api/rooms/:room/history/:id", get(read_conversation))
+        .route(
+            "/api/rooms/:room/history/:id/transcript",
+            get(download_transcript),
+        )
         .route(
             "/api/rooms/:room/history/:id/delete",
             post(forget_conversation),
@@ -946,6 +960,64 @@ async fn read_conversation(
         Some(v) => Json(v).into_response(),
         None => (StatusCode::NOT_FOUND, "no such conversation").into_response(),
     }
+}
+
+/// One conversation as a markdown file to keep.
+///
+/// A conversation can be read on screen and could not be taken away.
+/// Everything needed was already here -- the room reads one back in
+/// order, says what it is called and when it was -- and nothing
+/// assembled it, so the only copy of an afternoon was the room's.
+///
+/// Markdown rather than JSON, for the reader: the same conversation is
+/// already JSON at `GET /api/rooms/:room/history/:id`, which is what a
+/// tool wants and loses nothing, so a second format here would be the
+/// same bytes behind a second button. What this adds is the one thing
+/// that endpoint cannot be: a file with a name, that reads as a
+/// transcript when it is opened.
+///
+/// The reader decides two things about it and the room neither: the
+/// language (theirs, from the door) and the clock (`?clock=`).
+async fn download_transcript(
+    State(app): State<App>,
+    Path((id, conversation)): Path<(String, i64)>,
+    Query(q): Query<Clock>,
+    headers: HeaderMap,
+) -> Response {
+    let Some((who, room)) = their_room(&app, &headers, &id) else {
+        return (StatusCode::NOT_FOUND, "no such room").into_response();
+    };
+    // Every real clock is within a day of UTC. Anything else is a
+    // browser that is wrong or an address somebody typed, and neither
+    // is a reason to write times nobody can line anything up against.
+    let clock = q.clock.clamp(-14 * 60, 14 * 60);
+    let language = room.language_for(&who.display);
+    let Some((name, markdown)) = room.transcript(conversation, &language, clock) else {
+        return (StatusCode::NOT_FOUND, "no such conversation").into_response();
+    };
+    info!(
+        room = %id,
+        conversation,
+        who = %who.display,
+        "handed over a transcript"
+    );
+    (
+        [
+            (
+                header::CONTENT_TYPE,
+                "text/markdown; charset=utf-8".to_string(),
+            ),
+            // Safe to quote without escaping anything: the name is
+            // letters, digits and dashes by construction -- see
+            // `transcript::file_name`.
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{name}\""),
+            ),
+        ],
+        markdown,
+    )
+        .into_response()
 }
 
 /// A picture somebody dropped into the room: it becomes a card in the

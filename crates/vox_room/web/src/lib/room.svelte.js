@@ -814,6 +814,20 @@ export function backToNow() {
   room.reading = null;
 }
 
+/// Where to get a conversation as a file of its own.
+///
+/// A plain address rather than a fetch: the browser saves it, names it
+/// whatever the room called it (the server says so in
+/// `Content-Disposition`), and no copy of an afternoon has to sit in
+/// this page's memory on the way past.
+///
+/// The clock goes with it because the room has no business guessing
+/// which one you keep — a date is a thing you spell in the reader's own
+/// clock, and this is the only place that knows it. `getTimezoneOffset`
+/// counts the other way round from everybody else, hence the minus.
+export const transcriptUrl = (id) =>
+  `${roomPath()}/${id}/transcript?clock=${-new Date().getTimezoneOffset()}`;
+
 /// Delete one for good, for everybody. The only thing here that takes
 /// something away from the room rather than from your own screen, so
 /// it asks first.

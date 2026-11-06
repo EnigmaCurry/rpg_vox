@@ -55,6 +55,7 @@ use vox_transcribe::{Clip, Paragraph, ParagraphMode, Pusher, Stage};
 
 use crate::mixer::{Mixer, Strip, TrackProgress, AGENT_STRIP, RATE};
 use crate::store::{Invited, Store};
+use crate::transcript;
 
 /// Room events waiting for a slow tab before it starts skipping.
 const EVENT_CAPACITY: usize = 512;
@@ -2282,6 +2283,80 @@ impl Room {
                 Vec::new()
             }),
         }))
+    }
+
+    /// A conversation as a file somebody can take away: what to call
+    /// the file and the markdown in it, or `None` where there is
+    /// nothing to hand over.
+    ///
+    /// `language` is the language to read it in and `clock` the
+    /// reader's own offset from UTC, in minutes, for the times. Both
+    /// come from whoever asked, because both are facts about the reader
+    /// rather than about the room -- see [`transcript::Head`].
+    ///
+    /// WHO MAY: anybody who can walk into the room, which is anybody
+    /// who can already read the conversation on screen -- the same
+    /// question `their_room` asks in web.rs, and the same answer. A
+    /// file that leaves the room is a stronger act than a column of
+    /// text that stays in it, but it is not a different one: every
+    /// word in it was already on the screen of everybody who was
+    /// there. The one room where that is not true is the lobby, which
+    /// is never written down (`RoomConfig::may_transcribe`) and so has
+    /// nothing to give.
+    pub fn transcript(&self, id: i64, language: &str, clock: i32) -> Option<(String, String)> {
+        if !self.cfg.may_transcribe || !self.holds(id) {
+            return None;
+        }
+        // Every read of the database first, and the room's own state
+        // after: `store()` hands out a guard, and a second read inside
+        // the first would be waiting on itself.
+        let (title, at) = self.store().conversation_name(id).unwrap_or_default();
+        let mut log = self.store().all_entries(id).unwrap_or_else(|err| {
+            warn!(conversation = id, "read a conversation to hand over: {err:#}");
+            Vec::new()
+        });
+        // The conversation the room is in is still arriving. What is in
+        // the database is what has been handed over, and the last thing
+        // somebody said is on everybody's screen a second or two before
+        // it gets there -- so the live one is topped up from the room's
+        // own log, which is exactly what the screen is showing. A file
+        // that stopped a sentence short of the conversation you are
+        // sitting in would read as a loss, and it is the half most
+        // worth having.
+        let live = {
+            let st = self.lock();
+            (id == st.conversation).then(|| st.log.clone())
+        };
+        for e in live.into_iter().flatten() {
+            match log.iter_mut().find(|k| k.id == e.id) {
+                Some(k) => *k = e,
+                None => log.push(e),
+            }
+        }
+        log.sort_by_key(|e| e.at);
+        let head = transcript::Head {
+            room: if self.cfg.title.is_empty() {
+                &self.cfg.id
+            } else {
+                &self.cfg.title
+            },
+            conversation: id,
+            title: &title,
+            at: if at > 0 {
+                at
+            } else {
+                // A conversation from before they were stamped: when it
+                // was is when the first thing in it was said.
+                log.first().map_or(at, |e| e.at)
+            },
+            language,
+            clock,
+            what: transcript::What::Conversation,
+        };
+        Some((
+            transcript::file_name(&head),
+            transcript::markdown(&head, &log),
+        ))
     }
 
     /// Forget one of this room's past conversations, and everything

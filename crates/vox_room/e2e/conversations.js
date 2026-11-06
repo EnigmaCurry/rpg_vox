@@ -1,5 +1,5 @@
 // A room keeps the conversations it has had, and they can be named,
-// read and deleted:
+// read, downloaded and deleted:
 //   node conversations.js RYAN_LINK ALEX_LINK
 //
 // **New conversation** closes the one you were having; the old one goes
@@ -117,6 +117,27 @@ const shut = async (page) => {
   await ryan.page.waitForTimeout(600);
   is('back in the live one', (await said(ryan.page)).some((t) => /afterwards/.test(t)), true);
   is('and can type again', await canType(ryan.page), true);
+
+  // And one can be taken away. Fetched rather than clicked: what the
+  // link does is hand the browser a download, and the question here is
+  // what is in it -- which is also the one way to see that the server
+  // assembled it at all.
+  await openHistory(ryan.page);
+  const file = await ryan.page.evaluate(async () => {
+    const href = document.querySelector('.menu .row:last-child .save')?.getAttribute('href');
+    if (!href) return null;
+    const r = await fetch(href);
+    return { ok: r.ok, as: r.headers.get('content-disposition'), md: await r.text() };
+  });
+  is('a conversation can be downloaded', file?.ok, true);
+  is('as a file named after the room, the conversation and the day',
+    /^attachment; filename="lobby-\d+-\d{4}-\d{2}-\d{2}-transcript\.md"$/.test(file?.as ?? ''), true);
+  is('under the name it was given', /^# The heist, properly$/m.test(file?.md ?? ''), true);
+  is('with who said what, and when they said it',
+    /\*\*\d{2}:\d{2} · Ryan\*\* \(typed\) — planning the heist$/m.test(file?.md ?? ''), true);
+  is('and the clock the times are in',
+    /times are UTC([+-]\d{2}:\d{2})?\./.test(file?.md ?? ''), true);
+  await shut(ryan.page);
 
   // Deleting takes it from everybody, and for good.
   await openHistory(ryan.page);

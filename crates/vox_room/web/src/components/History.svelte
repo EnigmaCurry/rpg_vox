@@ -1,7 +1,7 @@
 <script>
   import {
     room, ask, command, loadHistory, readConversation, backToNow, forgetConversation,
-    nameConversation, whenItWas,
+    nameConversation, whenItWas, transcriptUrl,
   } from '../lib/room.svelte.js';
   import { TITLE_MAX } from '../lib/names.js';
 
@@ -168,6 +168,15 @@
                 </span>
                 <span class="opening">{c.opening || 'Nothing was said.'}</span>
               </button>
+              <!-- Taking one away. A link and not a button, so the
+                   browser saves it the way it saves anything else and
+                   names it what the room called it; it is on every row
+                   including the live one, because the conversation you
+                   are in is the one most likely to be wanted and
+                   reading it back is not what downloading it is for. -->
+              <a class="save" href={transcriptUrl(c.id)}
+                title="Download this conversation as a text file"
+                aria-label="Download {named(c)}">⤓</a>
               <!-- The live one is the room, not an archive of it. -->
               {#if !c.live}
                 <button class="drop" title="Delete this conversation for good"
@@ -293,6 +302,19 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+  /* The way out, beside the way to get rid of it: the same quiet
+     square, and it only colours in under the pointer. */
+  .save {
+    flex: none;
+    align-self: center;
+    color: var(--muted);
+    text-decoration: none;
+    font-size: 15px;
+    line-height: 1;
+    padding: 4px 9px;
+    border-radius: 6px;
+  }
+  .save:hover { background: var(--bubble); color: var(--ink); }
   .drop {
     flex: none;
     align-self: center;

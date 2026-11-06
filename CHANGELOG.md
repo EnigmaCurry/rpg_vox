@@ -9,6 +9,43 @@ releases.
 
 ### Voice room
 
+- **A conversation can be taken away.** The **⤓** beside each
+  conversation in **History** downloads it as a markdown file: who said
+  what, when they said it, and the gaps the room explained for itself.
+  A room could show you its conversation and could not give it to you,
+  which made the room the only copy of an afternoon.
+
+  It is on every row including the live one — the conversation you are
+  in is the one most likely to be wanted — and what is in the file is
+  what is on the screen, down to the line somebody finished saying a
+  second ago, rather than only the part that has reached the database.
+
+  It is a transcript, so it says so about the parts a text file cannot
+  hold rather than leaving them out: a picture, a clip read aloud, a
+  recording brought in, each one line saying it was there and what it
+  was. A card and a folded-up play keep their own text, quoted so that
+  their headings cannot restructure the file they landed in. A play's
+  lines are in it once — in the programme the conversation keeps, which
+  is where the script lives — and not again one by one. And the notes at
+  either end of a stretch the room was **off the record** for come
+  through like any other line, because they are the only thing that
+  tells a reader why there is an hour with nothing in it.
+
+  Two things about the file are the reader's and not the room's. The
+  language: a line said in another one is given in yours with the
+  original under it, the same way the screen shows it, so a translation
+  that went wrong can still be seen to have. And the clock: the browser
+  says which one it keeps, the times are in it, and the head of the file
+  says which it used — the room has never spelled a date for anybody and
+  does not start here.
+
+  Nothing new decides who may. Anybody who can walk into the room could
+  already read the whole conversation on screen, and every word in the
+  file was on their screen already; the lobby is never written down, so
+  it has nothing to hand over. A tool that wants the conversation rather
+  than a file to read already had it as JSON at the address the room
+  reads one back from, which is why there is no second button for that.
+
 - **Speech no longer vanishes from the transcript as pass 2 arrives.**
   You would be talking, watch the line appear as you spoke it, and then
   as you stopped -- the moment the better decode should have replaced

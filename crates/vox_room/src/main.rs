@@ -12,6 +12,7 @@ mod rooms;
 mod screen;
 mod store;
 mod stt;
+mod transcript;
 mod tts;
 mod voices;
 mod web;

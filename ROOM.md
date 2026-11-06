@@ -451,8 +451,39 @@ in it and every card dealt in it away from everybody, for good, and
 asks first. The live one has no **×** — it is the room, not an archive
 of it.
 
+**Taking one away.** The **⤓** beside each conversation downloads it
+as a markdown file: who said what, when they said it, and the gaps the
+room explained for itself. It is on every row including the live one —
+the conversation you are in is the one most likely to be wanted, and
+what is in the file is what is on the screen, including the last thing
+somebody said a second ago.
+
+It is a transcript and not an archive, so it says so about the parts
+it cannot hold. A picture, a clip somebody read aloud, a recording
+brought in: each is one line saying it was there and what it was,
+because a file that quietly dropped them would be telling you about a
+different afternoon. A card and a folded-up play keep their own text,
+quoted so their headings cannot restructure the file they land in. And
+the notes at either end of a stretch the room was **off the record**
+for come through like any other line — they are the only thing that
+tells a reader why there is an hour with nothing in it.
+
+Two things in it are yours rather than the room's. The language: a
+line said in another one is given in yours with the original under it,
+the same way the screen shows it, so a translation that went wrong can
+still be seen to have. And the clock: the times are in your own, and
+the head of the file says which, because a transcript with bare times
+and no zone on it is one nobody can line up against anything else.
+
+A tool that wants the conversation rather than a file to read already
+has it: `GET /api/rooms/<room>/history/<id>` is the same conversation
+as JSON, with every field on every entry, which is why there is no
+second download button for it.
+
 Each room's history is its own, and a conversation can only be read
-from the room that had it.
+from the room that had it. The lobby has no history at all: nothing
+said there is written down, so there is nothing to read back and
+nothing to hand over.
 
 ### A game is something a room does
 

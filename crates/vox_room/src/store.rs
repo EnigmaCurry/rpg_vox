@@ -1468,14 +1468,25 @@ impl Store {
         Ok(())
     }
 
+    /// Everything ever said in `conversation`, oldest first.
+    ///
+    /// [`Store::entries`] takes the last `limit` of them, which is a
+    /// screen's worth; this is for a file somebody is taking away,
+    /// where a cap is the difference between a transcript and most of
+    /// one and nothing in the file would say which it was.
+    pub fn all_entries(&self, conversation: i64) -> Result<Vec<Entry>> {
+        self.entries(conversation, usize::MAX)
+    }
+
     /// The last `limit` entries of `conversation`, oldest first.
     pub fn entries(&self, conversation: i64, limit: usize) -> Result<Vec<Entry>> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let mut q = self.db.prepare(
             "SELECT id, who, kind, title, text, cut, typed, translations, note, seat, at
              FROM entries
              WHERE conversation = ?1 ORDER BY at DESC, rowid DESC LIMIT ?2",
         )?;
-        let rows = q.query_map(params![conversation, limit as i64], |r| {
+        let rows = q.query_map(params![conversation, limit], |r| {
             let kind: String = r.get(2)?;
             let translations: String = r.get(7)?;
             // Empty is nowhere in particular, which everybody hears --
