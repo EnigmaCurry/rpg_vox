@@ -9,6 +9,52 @@ releases.
 
 ### Voice room
 
+- **A room's whole history can be purged.** **Purge room**, at the foot
+  of the **History** list, forgets every conversation this room has ever
+  had and everything said, dealt, drawn, read aloud and recorded in any
+  of them. Deleting them one at a time was the only way, and a room that
+  has been talking for a year is not a thing anybody is going to clear
+  one × at a time.
+
+  It takes the conversation you are in with the rest, and the room
+  starts a fresh one in the same breath. A button of that name that left
+  the live one would be lying about what it did, and the one it left
+  would often be exactly the one somebody pressed it for.
+
+  It is the owner's, and the only thing about a conversation that is.
+  Anybody in a room may put it off the record — that changes what
+  happens next, and anybody it was wrong for can change it straight back
+  — but this takes away what other people already said, including
+  conversations from before whoever presses it ever walked in, and
+  nothing brings it back. It sits with making, renaming and deleting
+  rooms rather than with the switches in the room. The button is only
+  drawn for the owner, and the endpoint says no to everybody else
+  regardless of what the page did or didn't ask.
+
+  It asks twice: the question, and then the room's name written out.
+  One click is too cheap a way to lose a year, and a dialog that looks
+  exactly like the one for deleting a single conversation is one click.
+  (Any question in the room can now ask for a word to be written out
+  like this; this is the first that does.) What it promises is what it
+  does: the rows go, and the space they took is the database's to use
+  again rather than handed back to the disk — so nothing in it implies
+  the file has been scrubbed.
+
+  **And a room taken out of the house now takes its history with it.**
+  Deleting a room removed the room, who could go to it and which AIs
+  were in it, and left every conversation it had ever had in the
+  database with nothing anywhere pointing at them — every word, card,
+  picture, clip and recording unreachable rather than deleted. Both
+  paths go through one function now, so the two cannot come to disagree
+  about what a room owns.
+
+  Two smaller things fixed on the way past. A conversation the room
+  comes *back* to — leaving a game, or any other reset — now arrives
+  with its clips and recordings as well as its pictures, so a card that
+  has audio in the database no longer says the room couldn't keep it.
+  And the **History** list, left open while the room starts another
+  conversation, reads itself again instead of sitting on "Reading…".
+
 - **The room can be recorded, and the recording leaves a clip and a
   transcript in the conversation.** **Recording**, under
   **Transcription** in the room column, is the stronger of the two and

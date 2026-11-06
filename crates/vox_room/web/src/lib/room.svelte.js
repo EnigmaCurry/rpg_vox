@@ -579,10 +579,14 @@ export function command(msg) {
 
 /// Ask the user to confirm, in the page. (The browser's own confirm()
 /// blocks the page, and with it the room's audio.)
-export function ask(text, yes = 'OK') {
+/// A question with two answers. `type`, where there is one, is a word
+/// the person has to write out before the answer will take — for the
+/// handful of things where one click is too cheap a way to lose
+/// something that cannot come back.
+export function ask(text, yes = 'OK', type = null) {
   return new Promise((resolve) => {
     room.asking?.resolve(false);
-    room.asking = { text, yes, resolve };
+    room.asking = { text, yes, type, resolve };
   });
 }
 
@@ -839,6 +843,45 @@ export function backToNow() {
 /// counts the other way round from everybody else, hence the minus.
 export const transcriptUrl = (id) =>
   `${roomPath()}/${id}/transcript?clock=${-new Date().getTimezoneOffset()}`;
+
+/// Forget the whole of this room's history: every conversation it has
+/// had, this one included, and everything said, dealt, drawn, read
+/// aloud or recorded in any of them.
+///
+/// The owner's, which is why the button is only drawn for them — and
+/// the server says no to everybody else regardless. Asked twice over:
+/// a question, and then the room's name written out, because this is
+/// every conversation in it and a dialog that looks like the one for
+/// deleting a single conversation is too cheap a way to lose a year.
+///
+/// It says what it does and no more than that. The rows go and the
+/// room starts a fresh conversation in the same breath; the space they
+/// took is the database's to use again rather than handed back to the
+/// disk, and the dialog says so rather than implying the file has been
+/// scrubbed.
+export async function purgeRoom() {
+  const name = room.title || room.where;
+  if (!(await ask(
+    `Purge ${name}? Every conversation this room has ever had goes — everything said in them, every card, every picture, every clip and every recording — for everyone, and it cannot be undone. The one you are in now goes too, and the room starts a fresh one. Type the room's name to confirm.`,
+    'Purge the room',
+    name,
+  ))) return;
+  try {
+    const r = await fetch(`${roomPath()}/purge`, { method: 'POST' });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(d.error || r.statusText);
+    room.history = d.conversations;
+    backToNow();
+    notify(
+      d.purged === 1
+        ? 'One conversation purged. The room is starting again.'
+        : `${d.purged} conversations purged. The room is starting again.`,
+    );
+  } catch (e) {
+    console.error('[room] purge', e);
+    notify(`Can't purge this room: ${e.message || e}`, true);
+  }
+}
 
 /// Delete one for good, for everybody. The only thing here that takes
 /// something away from the room rather than from your own screen, so
@@ -1509,6 +1552,14 @@ function apply(ev) {
       // the ones that were on screen.
       room.cards = ev.cards ?? [];
       room.pictures = Object.fromEntries((ev.pictures ?? []).map((p) => [p.id, p]));
+      // And the clips and recordings, for the same reason: a card
+      // whose audio this tab has never been told about says the room
+      // couldn't keep it, which is a lie about one sitting in the
+      // database.
+      room.samples = Object.fromEntries((ev.samples ?? []).map((c) => [c.id, c]));
+      room.recordings = Object.fromEntries((ev.recordings ?? []).map((r) => [r.id, r]));
+      room.recording =
+        (ev.recordings ?? []).find((r) => !r.ready && !r.failed && !r.until) ?? null;
       break;
     case 'card': {
       // Only this person's tabs are sent it; say so, without the contents.

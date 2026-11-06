@@ -277,6 +277,7 @@ pub fn router(rooms: Arc<Rooms>, screen: Arc<Screen>) -> Router {
             "/api/rooms/:room/history/:id/delete",
             post(forget_conversation),
         )
+        .route("/api/rooms/:room/history/purge", post(purge_room))
         // Everything above answers one browser about itself, so none
         // of it may be cached. The sockets, the health check, the
         // faces and the app's own files below are the same for
@@ -1147,6 +1148,40 @@ async fn forget_conversation(
         Ok(()) => {
             info!(person = %who.name, room = %id, conversation, "deleted a conversation");
             Json(json!({ "conversations": room.history() })).into_response()
+        }
+        Err(why) => (StatusCode::CONFLICT, Json(json!({ "error": why }))).into_response(),
+    }
+}
+
+/// Everything a room has ever said: every conversation it has had, and
+/// everything said, dealt, drawn, read aloud or recorded in any of
+/// them.
+///
+/// THE OWNER'S, and the one thing about a conversation that is. Anybody
+/// in a room may put it off the record, on the reasoning that being
+/// recorded is not one person's decision to make for a table -- but
+/// that changes what happens *next*, and anybody it was wrong for can
+/// change it straight back. This takes away what other people already
+/// said, including conversations from before whoever presses it ever
+/// walked in, and nothing brings it back. It belongs with making,
+/// renaming and deleting rooms, which are the owner's, and not with
+/// the switches in the room.
+///
+/// The browser asks twice over and makes them type the room's name
+/// before it gets here; this says no to everybody else regardless,
+/// because an endpoint that trusts the page not to have been asked is
+/// an endpoint anybody can ask with curl.
+async fn purge_room(State(app): State<App>, Path(id): Path<String>, headers: HeaderMap) -> Response {
+    let Some(who) = owner(&app, &headers) else {
+        return not_for_them();
+    };
+    let Some(room) = app.rooms.find(&who, &id) else {
+        return (StatusCode::NOT_FOUND, "no such room").into_response();
+    };
+    match room.purge_room(&who.display) {
+        Ok(gone) => {
+            info!(person = %who.name, room = %id, conversations = gone, "purged a room");
+            Json(json!({ "purged": gone, "conversations": room.history() })).into_response()
         }
         Err(why) => (StatusCode::CONFLICT, Json(json!({ "error": why }))).into_response(),
     }

@@ -523,10 +523,34 @@ has it: `GET /api/rooms/<room>/history/<id>` is the same conversation
 as JSON, with every field on every entry, which is why there is no
 second download button for it.
 
+**Purging the room.** At the foot of the **History** list, under the
+conversations, is **Purge room** — every conversation this room has
+ever had, and everything said, dealt, drawn, read aloud and recorded in
+any of them, gone for everyone. It takes the conversation you are in
+along with the rest and the room starts a fresh one in the same breath:
+a button that left the live one would be a lie about what it did, and
+the one it left would often be the reason somebody pressed it.
+
+It is **the owner's**, and the only thing about a conversation that is.
+Anybody in a room may put it off the record, because that changes what
+happens next and anybody it was wrong for can change it back; this
+takes away what other people already said, including conversations from
+before whoever presses it ever walked in, and nothing brings it back.
+It belongs with making, renaming and deleting rooms. The button is only
+drawn for the owner and the server refuses everybody else regardless.
+
+It asks twice over: the question, and then the room's name written out,
+because one click is too cheap a way to lose a year of a room. And it
+says what it does and no more — the rows go and the space they took is
+the database's to use again, rather than handed back to the disk, so
+nothing here implies the file has been scrubbed.
+
 Each room's history is its own, and a conversation can only be read
 from the room that had it. The lobby has no history at all: nothing
 said there is written down, so there is nothing to read back and
-nothing to hand over.
+nothing to hand over. A room taken out of the house takes its whole
+history with it, for the same reason purging exists: a conversation
+nothing points at is not kept, it is only unreachable.
 
 ### A game is something a room does
 

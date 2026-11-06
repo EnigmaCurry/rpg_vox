@@ -730,6 +730,50 @@ impl Store {
             tx.execute("DELETE FROM bot_rooms WHERE room = ?1", [id])?;
         }
         tx.commit()?;
+        // And everything that was ever said in it. Nothing points at a
+        // conversation from outside its room -- `conversations.room`
+        // names the room and nothing maps the other way -- so a room
+        // taken out of the house without this leaves its whole history
+        // in the database with no way to reach it, and every card,
+        // picture, clip and recording in it with nothing left that
+        // knows they are there.
+        if gone {
+            self.purge_room(id, None)?;
+        }
+        Ok(gone)
+    }
+
+    /// Forget every conversation this room has had, except `keep`.
+    ///
+    /// The answer is how many went. One function and not a loop at
+    /// every caller, because there are two of them -- a room being
+    /// taken out of the house and a room having its history purged --
+    /// and the two must not come to disagree about what a room owns.
+    /// What one conversation owns is [`Store::forget_conversation`]'s
+    /// to say, and this does not repeat it: a table added there is
+    /// purged here on the day it is added.
+    ///
+    /// `keep` is for the room that is still being sat in. A purge
+    /// takes the conversation you are in like any other -- a button
+    /// that left it would be a lie about what it did -- so the room
+    /// starts a fresh one first and keeps that, which is why this
+    /// takes an exception rather than the caller deleting around it.
+    pub fn purge_room(&self, room: &str, keep: Option<i64>) -> Result<usize> {
+        let had: Vec<i64> = {
+            let mut q = self
+                .db
+                .prepare("SELECT id FROM conversations WHERE room = ?1")?;
+            let rows = q.query_map([room], |r| r.get(0))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        let mut gone = 0;
+        for id in had {
+            if Some(id) == keep {
+                continue;
+            }
+            self.forget_conversation(id)?;
+            gone += 1;
+        }
         Ok(gone)
     }
 
@@ -3540,6 +3584,91 @@ mod tests {
                 .collect::<Vec<_>>(),
             [game, second]
         );
+    }
+
+    /// Everything a room has ever said goes in one go, and only that
+    /// room's -- and the same function is what a room being taken out
+    /// of the house takes with it, so the two cannot come to disagree
+    /// about what a room owns.
+    #[test]
+    fn purging_a_room_takes_every_conversation_it_had_and_nobody_elses() {
+        let scratch = Scratch::new("purge");
+        let lounge = scratch.open("Lounge");
+        let studio = scratch.open("Studio");
+        let said = |store: &Store, c: i64, id: &str| {
+            store
+                .put_entry(
+                    c,
+                    &Entry {
+                        id: id.into(),
+                        who: "Ryan".into(),
+                        kind: Kind::Human,
+                        title: String::new(),
+                        text: "something".into(),
+                        live: false,
+                        partial: false,
+                        cut: false,
+                        typed: false,
+                        translations: BTreeMap::new(),
+                        note: String::new(),
+                        seat: None,
+                        at: 10,
+                        sent: true,
+                    },
+                )
+                .unwrap();
+        };
+        let first = lounge.conversation().unwrap();
+        said(&lounge, first, "a");
+        let second = lounge.new_conversation(None).unwrap();
+        said(&lounge, second, "b");
+        // And something in it that is not words: a purge that took the
+        // rows and left the audio would be the leak this is for.
+        lounge
+            .put_clip(second, "clip-1", "Ryan", b"RIFFfake", 1.0, "hello")
+            .unwrap();
+        lounge
+            .begin_recording(second, "recording-1", "Ryan")
+            .unwrap();
+        let theirs = studio.conversation().unwrap();
+        said(&studio, theirs, "c");
+
+        // The one the room is in is kept, because the room is still
+        // sitting in it; everything else goes.
+        assert_eq!(lounge.purge_room("Lounge", Some(second)).unwrap(), 1);
+        assert!(lounge.entries(first, 10).unwrap().is_empty());
+        assert_eq!(lounge.entries(second, 10).unwrap().len(), 1);
+        assert_eq!(studio.entries(theirs, 10).unwrap().len(), 1, "not theirs");
+
+        // And then the lot, audio included.
+        assert_eq!(lounge.purge_room("Lounge", None).unwrap(), 1);
+        assert!(lounge.history().unwrap().is_empty());
+        assert_eq!(lounge.sample_wav("clip-1").unwrap(), None);
+        assert!(lounge.recording("recording-1").unwrap().is_none());
+        assert_eq!(studio.history().unwrap().len(), 1, "still theirs");
+    }
+
+    /// A room taken out of the house takes its conversations with it.
+    /// Without that, `conversations.room` goes on naming a room that
+    /// is gone and nothing points at the rows from anywhere else, so
+    /// every word, card, picture and clip in them is unreachable
+    /// rather than deleted.
+    #[test]
+    fn a_room_taken_out_of_the_house_does_not_leave_its_history_behind() {
+        let scratch = Scratch::new("delete_room");
+        let house = scratch.open("");
+        house.adopt_rooms(&["Hall".into(), "Lounge".into()]).unwrap();
+        let lounge = scratch.open("Lounge");
+        let had = lounge.conversation().unwrap();
+        lounge
+            .put_clip(had, "clip-1", "Ryan", b"RIFFfake", 1.0, "hello")
+            .unwrap();
+        assert_eq!(lounge.history().unwrap().len(), 1);
+
+        assert!(house.delete_room("Lounge").unwrap());
+        assert!(lounge.history().unwrap().is_empty());
+        assert_eq!(lounge.conversation_room(had).unwrap(), None);
+        assert_eq!(lounge.sample_wav("clip-1").unwrap(), None);
     }
 
     /// A database from when the server was one room: what was the whole

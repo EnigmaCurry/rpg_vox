@@ -1,7 +1,7 @@
 <script>
   import {
     room, ask, command, loadHistory, readConversation, backToNow, forgetConversation,
-    nameConversation, whenItWas, transcriptUrl,
+    nameConversation, whenItWas, transcriptUrl, purgeRoom,
   } from '../lib/room.svelte.js';
   import { TITLE_MAX } from '../lib/names.js';
 
@@ -74,6 +74,15 @@
       command({ type: 'lobby' });
     }
   }
+
+  // The room moved on while the list was open, so what is in it is out
+  // of date and has been thrown away (`reset` does that, from anywhere:
+  // somebody starting a new conversation, a game opening, a purge).
+  // Read it again rather than leaving the menu sitting on "Reading…"
+  // for as long as somebody keeps it open.
+  $effect(() => {
+    if (open && room.history === null) loadHistory();
+  });
 
   function rename() {
     if (typing === null) return;
@@ -152,6 +161,10 @@
       </button>
       {#if open}
         <div class="menu" role="menu">
+          <!-- The conversations in a box of their own, so that what is
+               below them -- which is about the room and not about any
+               one of them -- is not the last of them. -->
+          <div class="rows">
           {#if room.history === null}
             <p class="none">Reading…</p>
           {:else if room.history.length === 0}
@@ -185,6 +198,19 @@
               {/if}
             </div>
           {/each}
+          </div>
+          <!-- The whole of it, at the foot of the list of it. The
+               owner's alone: anybody in the room may put it off the
+               record, because that changes what happens next and can
+               be changed straight back, but this takes away what
+               other people already said and nothing brings it back.
+               The server says no to everybody else regardless. -->
+          {#if room.owner && room.history?.length}
+            <button class="purge" role="menuitem" onclick={purgeRoom}>
+              Purge room…
+              <span class="why">every conversation this room has had, for good</span>
+            </button>
+          {/if}
         </div>
       {/if}
     </div>
@@ -315,6 +341,28 @@
     border-radius: 6px;
   }
   .save:hover { background: var(--bubble); color: var(--ink); }
+  /* The one thing in the list that is about the room and not one
+     conversation, so it is under them with a line over it and says
+     what it does under its own name. */
+  .purge {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+    width: 100%;
+    text-align: left;
+    margin-top: 4px;
+    border: 0;
+    border-top: 1px solid var(--line);
+    border-radius: 0 0 7px 7px;
+    box-shadow: none;
+    background: transparent;
+    color: var(--muted);
+    font-size: 13px;
+    padding: 8px 10px;
+  }
+  .purge:hover { background: var(--danger); color: var(--on-solid); }
+  .purge .why { font-size: 12px; opacity: 0.8; }
   .drop {
     flex: none;
     align-self: center;

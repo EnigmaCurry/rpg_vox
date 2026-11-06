@@ -2425,6 +2425,54 @@ impl Room {
         }
     }
 
+    /// Forget every conversation this room has ever had, and
+    /// everything said, dealt, drawn, read aloud or recorded in any of
+    /// them. The answer is how many went.
+    ///
+    /// INCLUDING THE ONE THE ROOM IS IN. A button called Purge room
+    /// that left the conversation everybody is sitting in would be a
+    /// lie about what it did, and the one thing it left would be the
+    /// one most likely to be the reason for pressing it. So the room
+    /// starts a fresh conversation first and purges around that --
+    /// everyone is left in an empty room rather than staring at a
+    /// conversation the database no longer has.
+    ///
+    /// The game goes on, the way it does through **New conversation**;
+    /// what cannot is the conversation a game was started *from*,
+    /// since that has gone with the rest, so the room has nothing to
+    /// come back to and says so by forgetting it.
+    ///
+    /// Who may is not asked here. It is the owner's, and the endpoint
+    /// says so -- see `web::purge_room`.
+    pub fn purge_room(&self, person: &str) -> Result<usize, String> {
+        let mut st = self.lock();
+        let was = st.conversation;
+        // The fresh one first, so there is never a moment where the
+        // room is in a conversation that has been deleted.
+        self.set_resume(&mut st, None);
+        let game = st.game.clone();
+        self.start_conversation(&mut st, game);
+        let now = st.conversation;
+        if now == was {
+            // `start_conversation` says why in the room when it can't.
+            return Err("The room couldn't start a new conversation, so nothing was purged.".into());
+        }
+        let gone = self
+            .store()
+            .purge_room(&self.cfg.id, Some(now))
+            .map_err(|err| {
+                warn!(room = %self.cfg.id, "purge a room: {err:#}");
+                "The room couldn't purge its history.".to_string()
+            })?;
+        info!(
+            room = %self.cfg.id,
+            person,
+            conversations = gone,
+            "a room's whole history was purged"
+        );
+        Ok(gone)
+    }
+
     /// Whether conversation `id` is this room's.
     fn holds(&self, id: i64) -> bool {
         self.store()
@@ -7896,6 +7944,13 @@ impl Room {
                     // is in the log and what it is showing would not
                     // be anywhere.
                     "pictures": self.pictures_json(st),
+                    // And the clips and the recordings, for exactly
+                    // that reason: a card whose audio the browser has
+                    // never been told about says the room couldn't
+                    // keep it, which is a lie about a clip that is
+                    // sitting in the database.
+                    "samples": self.samples_json(st),
+                    "recordings": self.recordings_json(st),
                 }),
             );
         }
@@ -12711,6 +12766,34 @@ mod tests {
         // The engine is let go of with it, so there is no thread left
         // turning anybody's voice into words.
         assert!(r.lock().people.values().all(|p| p.engine.is_none()));
+    }
+
+    /// Purging takes the conversation everybody is sitting in like
+    /// every other one -- a button that left it would be a lie about
+    /// what it did -- so the room has to be left somewhere to be.
+    #[test]
+    fn purging_a_room_leaves_it_in_a_fresh_conversation() {
+        let (r, _turns) = room(Mode::Named);
+        r.on_paragraph("Ryan", &para("p1", "The first conversation.", false));
+        r.tick(quiet(&r));
+        let first = r.lock().conversation;
+        r.new_conversation();
+        r.on_paragraph("Ryan", &para("p2", "And the second.", false));
+        r.tick(quiet(&r));
+        let second = r.lock().conversation;
+        assert_eq!(r.history().len(), 2);
+
+        assert_eq!(r.purge_room("Ryan").unwrap(), 2, "both of them went");
+        let now = r.lock().conversation;
+        assert!(now != first && now != second, "a fresh one to sit in");
+        assert!(r.lock().log.is_empty(), "and nothing in it");
+        assert_eq!(
+            r.history().len(),
+            1,
+            "the history is the one the room is having"
+        );
+        assert!(r.read_conversation(first).is_none(), "and the rest are gone");
+        assert!(r.store().entries(second, 10).unwrap().is_empty());
     }
 
     /// Pass 2 disagreed with pass 1 about whether anything was said at
