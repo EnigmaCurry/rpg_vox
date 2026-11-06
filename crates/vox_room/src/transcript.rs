@@ -21,6 +21,9 @@ use crate::room::{Entry, Kind, Seat};
 pub enum What {
     /// Everything a conversation holds.
     Conversation,
+    /// The stretch of one that a recording covers, and how long the
+    /// clip beside it runs for.
+    Recording { secs: f32 },
 }
 
 /// Everything the document says about itself.
@@ -67,6 +70,12 @@ pub fn markdown(head: &Head, entries: &[Entry]) -> String {
             "Everything said in **{}**, conversation {}, as the room wrote it\ndown.",
             head.room, head.conversation
         )),
+        What::Recording { secs } => out.push_str(&format!(
+            "What was said in **{}** while it was being recorded — {} of it,\nin conversation {}.",
+            head.room,
+            length(secs),
+            head.conversation
+        )),
     }
     out.push_str(&format!(
         " Started {date} {time}; {}; times are {}.\n",
@@ -98,6 +107,7 @@ pub fn file_name(head: &Head) -> String {
     let (date, _) = stamp(head.at, head.clock);
     let what = match head.what {
         What::Conversation => "transcript",
+        What::Recording { .. } => "recording",
     };
     format!("{}-{}-{date}-{what}.md", slug(head.room), head.conversation)
 }
@@ -179,6 +189,14 @@ fn entry(head: &Head, e: &Entry, out: &mut String) {
                 quoted(&e.title, out);
                 out.push('\n');
             }
+            out.push_str("*The recording is not in this file.*\n");
+        }
+        // The room itself, recorded. The clip is a card in the
+        // conversation and the transcript of the stretch it covers is
+        // this same renderer with bounds, so a file that is already
+        // one of those does not carry the other.
+        Kind::Recording => {
+            out.push_str(&format!("{who} recorded the room — {}  \n", one_line(text)));
             out.push_str("*The recording is not in this file.*\n");
         }
         Kind::Clip => {
@@ -265,6 +283,17 @@ fn lines(n: usize) -> String {
         0 => "nothing was said in it".to_string(),
         1 => "1 line".to_string(),
         n => format!("{n} lines"),
+    }
+}
+
+/// How long a recording runs, to the second: this is the length of a
+/// file sitting beside it, which somebody may well be checking against
+/// the player, and not the rounded clause a sentence wants.
+fn length(secs: f32) -> String {
+    let s = secs.max(0.0).round() as u64;
+    match (s / 60, s % 60) {
+        (0, s) => format!("{s}s"),
+        (m, s) => format!("{m}m {s:02}s"),
     }
 }
 
@@ -485,6 +514,22 @@ mod tests {
         assert!(md.contains("put up the play — **The Locked Room**"), "{md}");
         assert!(md.contains("> **Thorne.** Who goes there?"), "{md}");
         assert!(!md.contains("· Thorne"), "{md}");
+    }
+
+    /// The same document with different bounds: what #18 hands to a
+    /// conversation beside the clip, and it must name the clip's own
+    /// length so the two files can be checked against each other.
+    #[test]
+    fn a_recording_is_the_same_transcript_of_a_stretch_of_one() {
+        let head = Head {
+            what: What::Recording { secs: 92.4 },
+            ..head("English")
+        };
+        let md = markdown(&head, &[entry_of(Kind::Human, "Ryan", "Say that again.")]);
+        assert!(md.contains("while it was being recorded — 1m 32s"), "{md}");
+        assert!(md.contains("— Say that again."), "{md}");
+        assert_eq!(file_name(&head), "kitchen-table-7-2026-11-05-recording.md");
+        assert_eq!(length(9.2), "9s");
     }
 
     #[test]

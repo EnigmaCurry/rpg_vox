@@ -25,8 +25,13 @@ axum = { version = "0.7", features = ["ws"] }
 futures-util = "0.3"
 # The Svelte SPA (web/), built by build.rs into dist-ui/.
 rust-embed = { version = "8", features = ["mime-guess"] }
-# Mic frames in, each listener's mix out: 20 ms Opus frames.
+# Mic frames in, each listener's mix out: 20 ms Opus frames. And a
+# recording of the room, which is the same encoder pointed at a file.
 opus = "0.3"
+# The container a recording of the room goes in. Opus has to be in one
+# to be a file a browser will play, and this writes the pages. See
+# `recorder.rs`.
+ogg = "0.9"
 # Pinned to share libsqlite3-sys with the rest of the workspace.
 rusqlite = { version = "0.31", features = ["bundled"] }
 # Blocking HTTP for the LLM stream and the TTS server, on their own threads.

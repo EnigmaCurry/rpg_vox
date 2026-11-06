@@ -7,6 +7,7 @@ mod interp;
 mod mcp;
 mod mixer;
 mod puppet;
+mod recorder;
 mod room;
 mod rooms;
 mod screen;

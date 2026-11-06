@@ -246,6 +246,49 @@ end of its conversation. The [lobby](#more-than-one-room) is off the
 record always and has no switch to turn — the control there says so
 rather than offering a choice that would be refused.
 
+### Recording the room
+
+**Recording**, under **Transcription** and the stronger of the two, is
+whether everything audible in this room is being kept as a clip.
+Anybody in the room may start one and anybody may stop it, and the room
+writes down which of them did each — the same reasoning the switch
+above it is built on, which applies here at least as hard.
+
+Starting one asks first, and then the room says so where nobody can
+miss it: a card goes into the conversation, lit, before a sample of
+audio is kept, and a line appears under the switch for as long as it
+runs. There is no way to record this room without the room saying so in
+front of everybody in it.
+
+Stopping leaves two things on that card. **The clip** — everything
+audible in the room as one Ogg/Opus file, which is every microphone at
+its fader plus the AI. Not any one person's headphones: a listener
+hears the room minus their own voice, with the AI in whichever language
+they read and the interpreter at whatever level they set it, and a
+recording of the room has to be the room. (An interpretation is left
+out for the same reason — it is one listener's way in to what was
+already said, and the transcript has every language in it.) And **the
+transcript**, ⤓ beside it: what was said while it ran, as the same
+markdown file a whole [conversation](#what-a-room-has-said-before)
+downloads as, with bounds. It is rendered when you ask for it rather
+than kept, so a translation that landed after the clip stopped is in
+it.
+
+A recording cannot outlive the transcript it is the stronger version
+of. **A room that is off the record cannot be recorded at all**, and
+taking the room off the record while one is running stops it where it
+stands and keeps what it has — the note the room writes about going off
+the record is already the explanation of why the clip ends there. The
+lobby, which is never written down, is never recorded either. Starting
+a new conversation also ends it, because a recording belongs to the
+conversation it was made in: that is where its card is, and that is the
+stretch of transcript it is of.
+
+A recording does not survive the room going away. The audio is being
+built in memory until somebody stops it, so a restart in the middle of
+one leaves nothing to come back to — and the card says exactly that,
+rather than showing a light on a microphone nothing is listening to.
+
 ### More than one AI in a room
 
 Every room that is written down has the AI in it — which is every room

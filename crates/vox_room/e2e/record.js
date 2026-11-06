@@ -1,4 +1,5 @@
-// A room off the record, and a lobby that is never on it:
+// A room off the record, a lobby that is never on it, and a room being
+// recorded:
 //   node record.js RYAN_LINK ALEX_LINK MO_LINK
 //
 // Two sockets and one browser. The sockets are for what the room does
@@ -115,13 +116,14 @@ const words = (p) => entries(p, (e) => e.kind !== 'note');
   // invite link is spent by Join Audio, so this is somebody else's --
   // Ryan's and Alex's are already in the room on sockets.
   const her = await person(moLink);
-  const picked = () => her.page.inputValue('.rooms .is select');
+  const picked = () => her.page.inputValue('.rooms .is .writing select');
+  const taping = () => her.page.inputValue('.rooms .is .taping-switch select');
   is('the room says it is written down', await picked(), 'on');
   is('and the AI is on a fader', (await strips(her.page)).includes('Vox'), true);
   is('with a box to type into', await her.page.evaluate(() => !!document.querySelector('.say textarea')), true);
 
   // Asked first, because it changes the room for everyone in it.
-  await her.page.selectOption('.rooms .is select', 'off');
+  await her.page.selectOption('.rooms .is .writing select', 'off');
   await her.page.waitForSelector('dialog.ask[open]');
   is('the question names what goes',
     /off the record/.test(await her.page.textContent('dialog.ask p')), true);
@@ -134,7 +136,7 @@ const words = (p) => entries(p, (e) => e.kind !== 'note');
   is('and the AI where it was', (await strips(her.page)).includes('Vox'), true);
 
   // And again, through with it.
-  await her.page.selectOption('.rooms .is select', 'off');
+  await her.page.selectOption('.rooms .is .writing select', 'off');
   await her.page.waitForSelector('dialog.ask[open]');
   await her.page.click('dialog.ask .ask-actions button.primary');
   await her.page.waitForTimeout(900);
@@ -149,10 +151,92 @@ const words = (p) => entries(p, (e) => e.kind !== 'note');
   // conversation where the words would have been.
   await her.page.screenshot({ path: '/tmp/vox-room-off-the-record.png' });
 
+  // -- recording the room ----------------------------------------------
+
+  // The stronger of the two switches, under the other one. While the
+  // room is off the record there is nothing for a recording to be the
+  // stronger version of, so it is not offered.
+  is('a room off the record cannot be recorded',
+    await her.page.evaluate(() =>
+      !!document.querySelector('.rooms .is .taping-switch select[disabled]')), true);
+
+  // Back on the record, through the control, and the switch opens.
+  await her.page.selectOption('.rooms .is .writing select', 'on');
+  await her.page.waitForSelector('dialog.ask[open]');
+  await her.page.click('dialog.ask .ask-actions button.primary');
+  await her.page.waitForTimeout(900);
+  is('and once it is written down again it can be',
+    await her.page.evaluate(() =>
+      !!document.querySelector('.rooms .is .taping-switch select:not([disabled])')), true);
+  is('off, to begin with', await taping(), 'off');
+
+  // Asked first, because being recorded happens to everybody in the
+  // room and not to whoever pressed it.
+  await her.page.selectOption('.rooms .is .taping-switch select', 'on');
+  await her.page.waitForSelector('dialog.ask[open]');
+  is('the question says what it does',
+    /Record this room\?/.test(await her.page.textContent('dialog.ask p')), true);
+  await her.page.click('dialog.ask .ask-actions button:not(.primary)');
+  await her.page.waitForTimeout(400);
+  is('cancelling leaves the room unrecorded', await taping(), 'off');
+
+  // And through with it: the card in the conversation is the light.
+  await her.page.selectOption('.rooms .is .taping-switch select', 'on');
+  await her.page.waitForSelector('dialog.ask[open]');
+  await her.page.click('dialog.ask .ask-actions button.primary');
+  await her.page.waitForTimeout(900);
+  is('the room is being recorded', await taping(), 'on');
+  is('the column says so where anybody would look',
+    /Being recorded/.test(await her.page.textContent('.rooms .is')), true);
+  is('and the conversation has a lit card for it',
+    await her.page.evaluate(() =>
+      !!document.querySelector('.entry .clip-card .listening .rec')), true);
+  is('the other sockets in the room were told about it',
+    entries(alex, (e) => e.kind === 'recording').length, 1);
+  await her.page.screenshot({ path: '/tmp/vox-room-recording.png' });
+
+  // A couple of seconds of room, then stop. Stopping is not asked
+  // about: it takes nothing away from anybody and leaves the clip.
+  await wait(2000);
+  await her.page.selectOption('.rooms .is .taping-switch select', 'off');
+  await her.page.waitForTimeout(1500);
+  is('stopping is not a question', await her.page.evaluate(() => !!document.querySelector('dialog.ask[open]')), false);
+  is('the room is not being recorded', await taping(), 'off');
+  is('the card is a player now',
+    await her.page.evaluate(() => !!document.querySelector('.entry .clip-card audio')), true);
+  is('and it says who recorded it',
+    /Recorded by Mo/.test(await her.page.textContent('.entry .clip-card')), true);
+
+  await her.page.screenshot({ path: '/tmp/vox-room-recorded.png' });
+
+  // The two things a finished recording leaves: the clip and the
+  // stretch of transcript it covers. Both fetched rather than clicked
+  // -- the question is what the server made, not what Chrome does
+  // with a download.
+  const made = await her.page.evaluate(async () => {
+    const audio = document.querySelector('.entry .clip-card audio')?.getAttribute('src');
+    const file = document.querySelector('.entry .clip-card a.save')?.getAttribute('href');
+    const [a, t] = await Promise.all([fetch(audio), fetch(file)]);
+    const bytes = new Uint8Array(await a.arrayBuffer());
+    return {
+      type: a.headers.get('content-type'),
+      ogg: String.fromCharCode(...bytes.slice(0, 4)),
+      bytes: bytes.length,
+      as: t.headers.get('content-disposition'),
+      md: await t.text(),
+    };
+  });
+  is('the clip is an Ogg/Opus file', [made.type, made.ogg], ['audio/ogg', 'OggS']);
+  is('with some seconds of room in it', made.bytes > 1000, true);
+  is('and the transcript beside it is a file of its own',
+    /^attachment; filename="lobby-\d+-\d{4}-\d{2}-\d{2}-recording\.md"$/.test(made.as ?? ''), true);
+  is('saying it is of a recording and how long',
+    /while it was being recorded — \ds/.test(made.md ?? ''), true);
+
   // The hall, in the browser: nothing to name, nothing to start, and
   // nothing to read back.
   await goTo(her.page, 'Hall');
-  is('the lobby offers no switch', await her.page.evaluate(() => !!document.querySelector('.rooms .is select[disabled]')), true);
+  is('the lobby offers no switch', await her.page.evaluate(() => !!document.querySelector('.rooms .is .writing select[disabled]')), true);
   is('no New conversation', await her.page.evaluate(() => !!document.querySelector('.bar .fresh')), false);
   is('no History', await her.page.evaluate(() => !!document.querySelector('.bar .picker')), false);
   is('and no name for a conversation it never has',

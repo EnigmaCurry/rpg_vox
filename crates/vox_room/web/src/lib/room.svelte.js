@@ -182,6 +182,16 @@ export const room = $state({
   // this says whether the room is still listening, what was recorded,
   // and how long it is.
   samples: {},
+  // The recordings made of the room in this conversation, by id:
+  // { n, who, stopped_by, ready, secs, failed, at, until }. Read by
+  // the card in the log the way a clip's is: the entry says which
+  // recording it is and this says whether the room is still recording
+  // it, how long it is, and whether it ever landed.
+  recordings: {},
+  // Whether the room is being recorded just now, and who started it.
+  // The card in the conversation is the light on it; this is what the
+  // control in the room column shows.
+  recording: null,
   // The voices the house has cloned from any of them: { id, name, who,
   // said, created }. Not a control -- which voice an AI speaks in is
   // asked of it out loud -- but the room shows what there is, because
@@ -802,6 +812,8 @@ export async function readConversation(id) {
     for (const p of got.pictures ?? []) room.pictures[p.id] = p;
     // And its own voice samples, for the same reason.
     for (const c of got.samples ?? []) room.samples[c.id] = c;
+    // And the recordings made of the room while it was going on.
+    for (const r of got.recordings ?? []) room.recordings[r.id] = r;
     room.reading = got;
   } catch (e) {
     console.error('[room] read', e);
@@ -954,6 +966,18 @@ export function pictureOf(id) {
 export function sampleOf(id) {
   return `/api/sample/${encodeURIComponent(id)}`;
 }
+
+/// Where to fetch a recording of the room.
+export function recordingOf(id) {
+  return `/api/recording/${encodeURIComponent(id)}`;
+}
+
+/// Where to get the stretch of transcript a recording covers, as a
+/// file. The same clock question as a conversation's — see
+/// `transcriptUrl`, whose comment is this one too.
+export const recordingTranscriptUrl = (id) =>
+  `/api/rooms/${encodeURIComponent(room.where)}/recording/${encodeURIComponent(id)}` +
+  `/transcript?clock=${-new Date().getTimezoneOffset()}`;
 
 // -- a picture dropped into the room -----------------------------------
 //
@@ -1318,6 +1342,12 @@ function apply(ev) {
       room.avatars = ev.avatars ?? {};
       room.pictures = Object.fromEntries((ev.pictures ?? []).map((p) => [p.id, p]));
       room.samples = Object.fromEntries((ev.samples ?? []).map((s) => [s.id, s]));
+      room.recordings = Object.fromEntries((ev.recordings ?? []).map((r) => [r.id, r]));
+      // The one still being made, if there is one: a row with no clip
+      // on it and no end to it yet. Worked out here rather than sent
+      // as a second thing, so the two can't disagree.
+      room.recording =
+        (ev.recordings ?? []).find((r) => !r.ready && !r.failed && !r.until) ?? null;
       room.voices = ev.voices ?? [];
       room.strips = ev.strips;
       room.log = ev.log;
@@ -1429,6 +1459,18 @@ function apply(ev) {
       // becomes the clip, with what was said and a button to hear it,
       // or says why there is nothing.
       room.samples[ev.sample.id] = ev.sample;
+      break;
+    case 'recording':
+      // A recording started, or stopped and landed, or went wrong. The
+      // card is already in the log; this is what turns the light into
+      // a clip to play, or into why there isn't one.
+      room.recordings[ev.recording.id] = ev.recording;
+      break;
+    case 'recording_on':
+      // Somebody started recording the room, or stopped. The card
+      // saying so is an entry of its own: this is only the switch, for
+      // the control beside Transcription.
+      room.recording = ev.on ? { who: ev.who } : null;
       break;
     case 'voices':
       // One was kept or deleted. The whole list, because it is short
@@ -1832,6 +1874,12 @@ export function setBots(on) {
 /// it hasn't.
 export function setTranscribing(on) {
   command({ type: 'transcribe', on });
+}
+
+/// Start recording the room, or stop. Anybody in the room may, and the
+/// room writes down who did which — see `Room::set_recording`.
+export function setRecording(on) {
+  command({ type: 'record', on });
 }
 
 /// What the off position of that button means, which is the one nuance

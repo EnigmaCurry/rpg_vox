@@ -14,6 +14,7 @@
 //! {"type": "bots", "how": "any"}
 //! {"type": "stops", "bot": "Vox", "stops": "finished"}
 //! {"type": "transcribe", "on": false}
+//! {"type": "record", "on": true}
 //! {"type": "bot_off", "bot": "Sage", "off": true}
 //! {"type": "voice", "bot": "Vox", "voice": "Alan Watts"}
 //! {"type": "room_voice", "bot": "Vox", "voice": "Alan Watts", "here": true}
@@ -269,6 +270,10 @@ pub fn router(rooms: Arc<Rooms>, screen: Arc<Screen>) -> Router {
             get(download_transcript),
         )
         .route(
+            "/api/rooms/:room/recording/:id/transcript",
+            get(download_recording_transcript),
+        )
+        .route(
             "/api/rooms/:room/history/:id/delete",
             post(forget_conversation),
         )
@@ -285,6 +290,7 @@ pub fn router(rooms: Arc<Rooms>, screen: Arc<Screen>) -> Router {
         .route("/api/avatar/:who/all", get(faces))
         .route("/api/picture/:id", get(picture))
         .route("/api/sample/:id", get(sample))
+        .route("/api/recording/:id", get(recording))
         .route("/room.ws", get(ws))
         .route("/screen.ws", get(screen_ws))
         .route("/healthz", get(|| async { "ok" }))
@@ -1020,6 +1026,45 @@ async fn download_transcript(
         .into_response()
 }
 
+/// The stretch of conversation one recording covers, as the markdown
+/// file beside the clip.
+///
+/// The same renderer and the same two questions as
+/// `download_transcript` -- the reader's language and the reader's
+/// clock -- because a transcript of a recording and a transcript of a
+/// conversation are one document with different bounds. See
+/// `room::Room::recording_transcript`.
+async fn download_recording_transcript(
+    State(app): State<App>,
+    Path((room_id, id)): Path<(String, String)>,
+    Query(q): Query<Clock>,
+    headers: HeaderMap,
+) -> Response {
+    let Some((who, room)) = their_room(&app, &headers, &room_id) else {
+        return (StatusCode::NOT_FOUND, "no such room").into_response();
+    };
+    let clock = q.clock.clamp(-14 * 60, 14 * 60);
+    let language = room.language_for(&who.display);
+    let Some((name, markdown)) = room.recording_transcript(&id, &language, clock) else {
+        return (StatusCode::NOT_FOUND, "no such recording").into_response();
+    };
+    info!(room = %room_id, recording = %id, who = %who.display, "handed over a recording's transcript");
+    (
+        [
+            (
+                header::CONTENT_TYPE,
+                "text/markdown; charset=utf-8".to_string(),
+            ),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{name}\""),
+            ),
+        ],
+        markdown,
+    )
+        .into_response()
+}
+
 /// A picture somebody dropped into the room: it becomes a card in the
 /// conversation with the next number on it, which is then a picture
 /// like any other -- the AI can be asked for it as somebody's face,
@@ -1247,6 +1292,40 @@ async fn sample(State(app): State<App>, headers: HeaderMap, Path(id): Path<Strin
             (header::VARY, "Cookie".to_string()),
         ],
         wav,
+    )
+        .into_response()
+}
+
+/// A recording of the room: the clip its card plays.
+///
+/// Anybody invited, like a voice sample and for the same reason: it is
+/// the room they were in, and everything on it they could already
+/// hear. Cached like a face -- the bytes under one of these ids never
+/// change, because stopping a recording is what makes them.
+async fn recording(State(app): State<App>, headers: HeaderMap, Path(id): Path<String>) -> Response {
+    if invited(&app, &headers).is_none() {
+        return (StatusCode::FORBIDDEN, "not invited").into_response();
+    }
+    let found = match app.any().recording_audio(&id) {
+        Ok(found) => found,
+        Err(err) => {
+            warn!("read a recording: {err:#}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "no").into_response();
+        }
+    };
+    // Still running, or it never landed. The card says which, from
+    // what the room told it rather than from this.
+    let Some(audio) = found else {
+        return (StatusCode::NOT_FOUND, "not yet").into_response();
+    };
+    (
+        [
+            (header::CONTENT_TYPE, "audio/ogg".to_string()),
+            (header::CACHE_CONTROL, AVATAR_CACHE.to_string()),
+            (header::ETAG, format!("\"{id}\"")),
+            (header::VARY, "Cookie".to_string()),
+        ],
+        audio,
     )
         .into_response()
 }
@@ -1596,6 +1675,14 @@ enum Command {
     Transcribe {
         on: bool,
     },
+    /// Whether the room is being recorded. Anybody in the room may
+    /// send it and the room writes down who started and who stopped;
+    /// a room that is off the record refuses it, because a recording
+    /// is the stronger of the two acts and cannot outlive the weaker.
+    /// See `room::Room::set_recording`.
+    Record {
+        on: bool,
+    },
     /// Switch one bot off in this room, or back on. Off is off: no
     /// turn is given to it, so nothing is asked of a model. It keeps
     /// its place in the list and everything set on it. See
@@ -1839,6 +1926,15 @@ async fn client(
                         // already says so.
                         Ok(Command::Transcribe { on }) => {
                             if let Err(why) = room.set_transcribing(&name, on) {
+                                room.tell(&name, &why);
+                            }
+                        }
+                        // Only the tab that asked hears why not, like
+                        // `Transcribe` above: the reasons are both of
+                        // them about the room this browser is in and
+                        // the control there says them already.
+                        Ok(Command::Record { on }) => {
+                            if let Err(why) = room.set_recording(&name, on) {
                                 room.tell(&name, &why);
                             }
                         }

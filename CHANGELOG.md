@@ -9,6 +9,59 @@ releases.
 
 ### Voice room
 
+- **The room can be recorded, and the recording leaves a clip and a
+  transcript in the conversation.** **Recording**, under
+  **Transcription** in the room column, is the stronger of the two and
+  is next to it because it is the same question asked harder. Anybody
+  in the room may start one and anybody may stop it, and the room
+  writes down which of them did each: being recorded is not something
+  that happens to one person at a table, which is the reasoning the
+  switch above it was built on.
+
+  Starting one asks first and is then announced where nobody can miss
+  it — a card goes into the conversation, lit, before a sample of audio
+  is kept, and a line appears under the switch for as long as it runs.
+  Stopping is not asked about: it takes nothing away from anybody and
+  leaves the clip, and a question there would only be in the way of
+  somebody trying to stop being recorded.
+
+  What a finished one leaves is on that card. The clip — everything
+  audible in the room, as one Ogg/Opus file you can play there or save.
+  And the transcript of the stretch it covers, ⤓ beside it, which is
+  the same renderer a whole conversation downloads through with
+  different bounds; there is deliberately one of those and not two,
+  because two would disagree about translations, pictures and the
+  off-the-record notes by the end of the month.
+
+  The recording is the room and not anybody's headphones. Every
+  microphone at its fader, plus the AI in the room's own language: what
+  a listener hears is the room minus their own voice, with the AI in
+  whichever language they read and the interpreter wherever they left
+  it, and a recording of that would be a recording of one pair of
+  headphones. The interpreters are left out for the same reason — an
+  interpretation is one listener's way in to what was already said, and
+  the transcript beside the clip has every language in it. It is taken
+  as the sum before any of it is encoded for anybody, so nothing is
+  decoded and re-encoded on the way.
+
+  Opus, which is the one place this differs from a voice sample. A
+  sample is a few seconds and goes to a clone server that wants the raw
+  samples; a recording is as long as a meeting and lives in the
+  database beside its conversation, where an hour of 48 kHz WAV would
+  be 345 MB and an hour of Opus is about ten.
+
+  A recording cannot outlive the transcript it is the stronger version
+  of. A room that is off the record cannot be recorded at all; taking
+  the room off the record while one is running stops it where it stands
+  and keeps what it has, with the room's own note about the switch
+  standing as the explanation of why the clip ends there; and the
+  lobby, never written down, is never recorded. Starting a new
+  conversation ends it too, because a recording belongs to the
+  conversation it was made in. And it does not survive the room going
+  away — the audio is in memory until somebody stops it — so a restart
+  in the middle of one leaves a card that says so, rather than a light
+  on a microphone nothing is listening to.
+
 - **A conversation can be taken away.** The **⤓** beside each
   conversation in **History** downloads it as a markdown file: who said
   what, when they said it, and the gaps the room explained for itself.
