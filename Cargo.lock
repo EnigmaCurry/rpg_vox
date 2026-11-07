@@ -4818,6 +4818,7 @@ dependencies = [
  "clap",
  "hound",
  "reqwest",
+ "rubato 0.15.0",
  "serde",
  "serde_json",
  "sha2 0.10.9",

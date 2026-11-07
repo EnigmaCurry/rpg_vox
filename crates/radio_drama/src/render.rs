@@ -32,7 +32,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use anyhow::{bail, Context as _, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use tracing::{debug, info, warn};
 
@@ -615,9 +615,16 @@ pub fn mix(
 /// One row of the manifest. Flat and string-tagged rather than a tagged
 /// union, because the thing most likely to read it is a few lines of
 /// `jq` looking for every cue with its timestamps.
-#[derive(Debug, Clone, Serialize)]
+/// Deserialize as well as Serialize: `radio_drama music` reads back the
+/// manifest a render wrote, because where a scene *is* in the finished
+/// audio is a fact about the render, not about the script.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManifestEntry {
-    pub kind: &'static str,
+    /// `"scene"`, `"slug"`, `"line"`, `"pause"`, `"long_pause"`,
+    /// `"cue"`. A `String` rather than a `&'static str` so the manifest
+    /// reads back as well as writes: `radio_drama music` needs the
+    /// scenes' timings out of it.
+    pub kind: String,
     pub start_s: f64,
     pub end_s: f64,
     /// The scene this falls in, including for the scene heading itself.
@@ -644,7 +651,10 @@ pub struct ManifestEntry {
     /// The cache entry this line's audio came from.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache: Option<String>,
-    #[serde(skip_serializing_if = "is_false")]
+    /// `default` as well as `skip_serializing_if`: the field is left out
+    /// when false, so reading a manifest back has to tolerate its
+    /// absence.
+    #[serde(default, skip_serializing_if = "is_false")]
     pub continuation: bool,
 }
 
@@ -661,7 +671,7 @@ fn manifest_entry(
     end_s: f64,
 ) -> ManifestEntry {
     let base = ManifestEntry {
-        kind: "",
+        kind: String::new(),
         start_s,
         end_s,
         scene: scene.map(str::to_string),
@@ -677,21 +687,21 @@ fn manifest_entry(
     };
     match element {
         Element::Scene(title) => ManifestEntry {
-            kind: "scene",
+            kind: "scene".into(),
             heading: Some(title.clone()),
             ..base
         },
         Element::Slug(text) => ManifestEntry {
-            kind: "slug",
+            kind: "slug".into(),
             heading: Some(text.clone()),
             ..base
         },
         Element::Pause { long } => ManifestEntry {
-            kind: if *long { "long_pause" } else { "pause" },
+            kind: if *long { "long_pause" } else { "pause" }.into(),
             ..base
         },
         Element::Cue { kind, text } => ManifestEntry {
-            kind: "cue",
+            kind: "cue".into(),
             cue: Some(kind.clone()),
             text: (!text.is_empty()).then(|| text.clone()),
             ..base
@@ -708,7 +718,7 @@ fn manifest_entry(
                 StepKind::Silence { .. } => (None, None, None),
             };
             ManifestEntry {
-                kind: "line",
+                kind: "line".into(),
                 speaker: Some(line.speaker.clone()),
                 voice,
                 direction: line.direction.clone(),
@@ -744,7 +754,25 @@ pub struct Manifest {
     pub duration_s: f64,
     pub generated_utc: String,
     pub voices: Vec<ManifestVoice>,
+    /// The score, when one was laid under this render.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub music: Vec<ManifestCue>,
     pub entries: Vec<ManifestEntry>,
+}
+
+/// One cue as it ended up: where it sits in the finished audio, and
+/// what it took to fill that span.
+#[derive(Debug, Clone, Serialize)]
+pub struct ManifestCue {
+    pub file: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scene: Option<String>,
+    pub start_s: f64,
+    pub end_s: f64,
+    pub gain_db: f32,
+    pub passes: usize,
+    #[serde(skip_serializing_if = "is_false")]
+    pub no_duck: bool,
 }
 
 impl Manifest {
@@ -754,6 +782,7 @@ impl Manifest {
         cast: &ResolvedCast,
         mix: &Mix,
         audio_name: &str,
+        scored: Option<&crate::music::Scored>,
     ) -> Self {
         Self {
             script: script_path.display().to_string(),
@@ -764,9 +793,9 @@ impl Manifest {
                 .or_else(|| script.title.clone()),
             subtitle: script.subtitle.clone(),
             audio: audio_name.to_string(),
-            sample_rate: mix.sample_rate,
-            channels: 1,
-            duration_s: mix.duration_s(),
+            sample_rate: scored.map_or(mix.sample_rate, |s| s.sample_rate),
+            channels: if scored.is_some() { 2 } else { 1 },
+            duration_s: scored.map_or_else(|| mix.duration_s(), |s| s.duration_s()),
             generated_utc: chrono::Utc::now().to_rfc3339(),
             voices: cast
                 .voices
@@ -782,6 +811,24 @@ impl Manifest {
                     },
                 })
                 .collect(),
+            music: scored.map_or_else(Vec::new, |s| {
+                s.placements
+                    .iter()
+                    .map(|p| ManifestCue {
+                        file: p
+                            .file
+                            .file_name()
+                            .map(|f| f.to_string_lossy().to_string())
+                            .unwrap_or_default(),
+                        scene: p.scene.clone(),
+                        start_s: p.start_s,
+                        end_s: p.start_s + p.seconds,
+                        gain_db: p.gain_db,
+                        passes: p.loops,
+                        no_duck: p.no_duck,
+                    })
+                    .collect()
+            }),
             entries: mix.entries.clone(),
         }
     }
@@ -935,7 +982,7 @@ mod tests {
         let mix = mix(&s, &c, &plan, &dir, -1.0).unwrap();
         assert_eq!(mix.sample_rate, 24_000);
 
-        let kinds: Vec<&str> = mix.entries.iter().map(|e| e.kind).collect();
+        let kinds: Vec<&str> = mix.entries.iter().map(|e| e.kind.as_str()).collect();
         assert_eq!(kinds, vec!["scene", "line", "pause", "line"]);
 
         // Every entry runs forward and none overlaps the next.
@@ -971,11 +1018,62 @@ mod tests {
 
     /// A line of normal length, and the same words taking four times
     /// as long: only the second is a failed generation.
+    /// `radio_drama music` reads the manifest a render wrote, so what
+    /// is written has to be what can be read -- including the fields
+    /// that are left out when they are empty.
+    #[test]
+    fn a_manifest_entry_round_trips_through_json() {
+        for entry in [
+            ManifestEntry {
+                kind: "line".into(),
+                start_s: 1.0,
+                end_s: 2.5,
+                scene: Some("SCENE ONE".into()),
+                heading: None,
+                cue: None,
+                speaker: Some("VOSS".into()),
+                voice: Some("v".into()),
+                direction: Some("over vox".into()),
+                effect: Some("over vox".into()),
+                text: Some("Analysis continues.".into()),
+                cache: Some("abc".into()),
+                continuation: true,
+            },
+            // The sparse case: a scene heading, with every optional
+            // field and the false bool all omitted on the way out.
+            ManifestEntry {
+                kind: "scene".into(),
+                start_s: 0.0,
+                end_s: 2.0,
+                scene: Some("SCENE ONE".into()),
+                heading: Some("SCENE ONE".into()),
+                cue: None,
+                speaker: None,
+                voice: None,
+                direction: None,
+                effect: None,
+                text: None,
+                cache: None,
+                continuation: false,
+            },
+        ] {
+            let json = serde_json::to_string(&entry).unwrap();
+            let back: ManifestEntry =
+                serde_json::from_str(&json).unwrap_or_else(|e| panic!("{json}: {e}"));
+            assert_eq!(back.kind, entry.kind);
+            assert_eq!(back.start_s, entry.start_s);
+            assert_eq!(back.heading, entry.heading);
+            assert_eq!(back.speaker, entry.speaker);
+            assert_eq!(back.cache, entry.cache);
+            assert_eq!(back.continuation, entry.continuation);
+        }
+    }
+
     #[test]
     fn an_overlong_line_is_found_and_a_merely_slow_one_is_not() {
         fn line(text: &str, start: f64, seconds: f64) -> ManifestEntry {
             ManifestEntry {
-                kind: "line",
+                kind: "line".into(),
                 start_s: start,
                 end_s: start + seconds,
                 scene: None,
@@ -1017,7 +1115,7 @@ mod tests {
         let mut entries: Vec<ManifestEntry> = Vec::new();
         for i in 0..30 {
             entries.push(ManifestEntry {
-                kind: "line",
+                kind: "line".into(),
                 start_s: i as f64 * 10.0,
                 end_s: i as f64 * 10.0 + 2.0,
                 scene: None,
@@ -1044,7 +1142,7 @@ mod tests {
     fn too_few_lines_to_have_a_pace_reports_nothing() {
         let entries: Vec<ManifestEntry> = (0..5)
             .map(|i| ManifestEntry {
-                kind: "line",
+                kind: "line".into(),
                 start_s: i as f64,
                 end_s: i as f64 + 20.0,
                 scene: None,

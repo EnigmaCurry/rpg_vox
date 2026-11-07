@@ -107,19 +107,21 @@ moment it works. Android 11 or newer, one APK for every phone.
 
 ## [radio_drama](RADIO_DRAMA.md)
 
-status: **v1 — speech only**
+status: **v2 — speech and score**
 
 Turns a written radio play into a finished audio drama. You give it the
-script and a recording of each voice; it gives you the whole play as one
-file, every line spoken in its character's voice, paced like a
-performance rather than a list. The voices are cloned with Qwen3-TTS
-from three seconds of reference audio each.
+script, a recording of each voice, and your music; it gives you the
+whole play as one file, every line spoken in its character's voice, the
+score underneath it and out of the way, paced like a performance rather
+than a list. The voices are cloned with Qwen3-TTS from three seconds of
+reference audio each.
 
 The script is the document somebody would have written anyway — a play
 in markdown, with `**NAME:**` for who speaks and `[SFX: …]` for what
-else happens. Music and effects are not produced yet, but every cue is
-placed, timed, and written to a manifest beside the audio, so there is
-an exact place to put one later.
+else happens. Each cue of music underscores a scene, looping to fill it
+and ducking whenever anybody speaks. Sound effects are not produced, but
+every `[SFX]` is placed, timed, and written to a manifest beside the
+audio, so there is an exact place to put one later.
 
 ```bash
 just install-radio-drama

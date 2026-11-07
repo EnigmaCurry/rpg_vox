@@ -18,11 +18,11 @@ pub struct Pcm {
     pub sample_rate: u32,
 }
 
-/// Read a wav into mono `f32`. Handles the integer and float sample
-/// formats hound knows and mixes any channel count down, so a cache
-/// written by a future server that returns stereo or 32-bit float still
-/// reads back.
-pub fn read_wav(path: &Path) -> Result<Pcm> {
+/// Read a wav keeping its channels: interleaved samples, the channel
+/// count, and the rate. Handles the integer and float formats hound
+/// knows, so a cache written by a future server that returns stereo or
+/// 32-bit float still reads back.
+pub fn read_wav_interleaved(path: &Path) -> Result<(Vec<f32>, usize, u32)> {
     let mut reader =
         hound::WavReader::open(path).with_context(|| format!("opening wav {}", path.display()))?;
     let spec = reader.spec();
@@ -41,22 +41,191 @@ pub fn read_wav(path: &Path) -> Result<Pcm> {
                 .with_context(|| format!("reading {}", path.display()))?
         }
     };
-    let samples = if channels == 1 {
-        interleaved
-    } else {
-        interleaved
-            .chunks(channels)
-            .map(|frame| frame.iter().sum::<f32>() / channels as f32)
-            .collect()
-    };
+    Ok((interleaved, channels, spec.sample_rate))
+}
+
+/// Average the channels of an interleaved buffer down to one.
+fn to_mono(interleaved: Vec<f32>, channels: usize) -> Vec<f32> {
+    if channels <= 1 {
+        return interleaved;
+    }
+    interleaved
+        .chunks(channels)
+        .map(|frame| frame.iter().sum::<f32>() / channels as f32)
+        .collect()
+}
+
+/// Read a wav into mono `f32`.
+pub fn read_wav(path: &Path) -> Result<Pcm> {
+    let (interleaved, channels, sample_rate) = read_wav_interleaved(path)?;
     Ok(Pcm {
-        samples,
-        sample_rate: spec.sample_rate,
+        samples: to_mono(interleaved, channels),
+        sample_rate,
     })
 }
 
-/// Decode any audio file the operator might have recorded a reference
-/// with, to mono `f32`.
+/// Two channels of `f32`, as long as each other.
+///
+/// The speech-only mix is mono and stays that way; this exists for the
+/// scored master, where the dialogue goes up the middle and the cues
+/// keep the width their composer gave them.
+#[derive(Debug, Clone)]
+pub struct Stereo {
+    pub left: Vec<f32>,
+    pub right: Vec<f32>,
+}
+
+impl Stereo {
+    pub fn silence(frames: usize) -> Self {
+        Self {
+            left: vec![0.0; frames],
+            right: vec![0.0; frames],
+        }
+    }
+
+    pub fn frames(&self) -> usize {
+        self.left.len().min(self.right.len())
+    }
+
+    pub fn gain(&mut self, g: f32) {
+        for s in self.left.iter_mut().chain(self.right.iter_mut()) {
+            *s *= g;
+        }
+    }
+
+    pub fn fade_in(&mut self, frames: usize) {
+        let frames = frames.min(self.frames());
+        for i in 0..frames {
+            let g = i as f32 / frames as f32;
+            self.left[i] *= g;
+            self.right[i] *= g;
+        }
+    }
+
+    pub fn fade_out(&mut self, frames: usize) {
+        let n = self.frames();
+        let frames = frames.min(n);
+        for i in 0..frames {
+            let g = i as f32 / frames as f32;
+            self.left[n - 1 - i] *= g;
+            self.right[n - 1 - i] *= g;
+        }
+    }
+
+    pub fn peak_db(&self) -> Option<f32> {
+        let peak = self
+            .left
+            .iter()
+            .chain(self.right.iter())
+            .fold(0.0f32, |m, s| m.max(s.abs()));
+        (peak > 0.0).then(|| 20.0 * peak.log10())
+    }
+
+    /// Pull the whole thing down if it exceeds `target_db`; leave it
+    /// alone if it does not. Returns the gain applied, in dB.
+    pub fn limit_peak(&mut self, target_db: f32) -> f32 {
+        match self.peak_db() {
+            Some(peak) if peak > target_db => {
+                self.gain(crate::dsp::db_to_gain(target_db - peak));
+                target_db - peak
+            }
+            _ => 0.0,
+        }
+    }
+
+    /// Interleaved `[L0, R0, L1, R1, …]`, which is the layout both
+    /// encoders want.
+    fn interleaved(&self) -> Vec<f32> {
+        let n = self.frames();
+        let mut out = Vec::with_capacity(n * 2);
+        for i in 0..n {
+            out.push(self.left[i]);
+            out.push(self.right[i]);
+        }
+        out
+    }
+}
+
+pub struct DecodedStereo {
+    pub audio: Stereo,
+    pub rate: u32,
+}
+
+/// Decode a file keeping both channels. A mono file comes back with the
+/// same signal in each, which is what a mono cue should sound like
+/// rather than a cue only on the left.
+pub fn decode_stereo(path: &Path) -> Result<DecodedStereo> {
+    let (interleaved, channels, rate) = decode_interleaved(path)?;
+    let frames = interleaved.len() / channels.max(1);
+    let mut audio = Stereo::silence(frames);
+    for i in 0..frames {
+        let frame = &interleaved[i * channels..(i + 1) * channels];
+        match channels {
+            1 => {
+                audio.left[i] = frame[0];
+                audio.right[i] = frame[0];
+            }
+            _ => {
+                audio.left[i] = frame[0];
+                audio.right[i] = frame[1];
+            }
+        }
+    }
+    Ok(DecodedStereo { audio, rate })
+}
+
+/// Sinc resampling, the same settings rpg_vox uses. Identity when the
+/// rates already agree, which is the common case for a cue that was
+/// bounced at the mastering rate.
+pub fn resample_mono(samples: &[f32], from: u32, to: u32) -> Result<Vec<f32>> {
+    if from == to || samples.is_empty() {
+        return Ok(samples.to_vec());
+    }
+    use rubato::{
+        Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
+    };
+    let params = SincInterpolationParameters {
+        sinc_len: 128,
+        f_cutoff: 0.95,
+        interpolation: SincInterpolationType::Cubic,
+        oversampling_factor: 128,
+        window: WindowFunction::BlackmanHarris2,
+    };
+    let mut rs = SincFixedIn::<f32>::new(to as f64 / from as f64, 2.0, params, 1024, 1)
+        .context("building resampler")?;
+    let chunk = rs.input_frames_next();
+    let mut out = Vec::with_capacity(samples.len() * to as usize / from as usize + chunk);
+    for block in samples.chunks(chunk) {
+        let mut padded;
+        let slice: &[f32] = if block.len() == chunk {
+            block
+        } else {
+            padded = vec![0.0f32; chunk];
+            padded[..block.len()].copy_from_slice(block);
+            &padded
+        };
+        let done = rs.process(&[slice], None).context("resampling")?;
+        out.extend_from_slice(&done[0]);
+    }
+    // The tail is whatever the last padded block produced past the real
+    // input; trim to the length the ratio implies so a cue does not
+    // grow by a few milliseconds per pass.
+    let want = (samples.len() as f64 * to as f64 / from as f64).round() as usize;
+    out.truncate(want);
+    Ok(out)
+}
+
+pub fn resample_stereo(audio: &Stereo, from: u32, to: u32) -> Result<Stereo> {
+    if from == to {
+        return Ok(audio.clone());
+    }
+    Ok(Stereo {
+        left: resample_mono(&audio.left, from, to)?,
+        right: resample_mono(&audio.right, from, to)?,
+    })
+}
+
+/// Decode a reference recording the operator supplied, to mono `f32`.
 ///
 /// symphonia covers wav, flac, mp3 and ogg/vorbis. What it does not
 /// cover is Ogg Opus — it has no Opus decoder, and the one that works
@@ -65,19 +234,14 @@ pub fn read_wav(path: &Path) -> Result<Pcm> {
 /// pulled straight out of a scribe recording usable without this crate
 /// having to link anything.
 pub fn decode_reference(path: &Path) -> Result<Pcm> {
-    if !path.exists() {
-        bail!("reference audio {} does not exist", path.display());
-    }
-    match decode_with_symphonia(path) {
-        Ok(pcm) if !pcm.samples.is_empty() => Ok(pcm),
-        // An empty decode counts as a failure: a reference with no audio
-        // in it registers a voice that sounds like nothing.
-        Ok(_) => decode_via_ffmpeg(path, "it decoded to no samples"),
-        Err(e) => decode_via_ffmpeg(path, &format!("{e:#}")),
-    }
+    let (interleaved, channels, sample_rate) = decode_interleaved(path)?;
+    Ok(Pcm {
+        samples: to_mono(interleaved, channels),
+        sample_rate,
+    })
 }
 
-fn decode_with_symphonia(path: &Path) -> Result<Pcm> {
+fn decode_with_symphonia(path: &Path) -> Result<(Vec<f32>, usize, u32)> {
     use symphonia::core::audio::SampleBuffer;
     use symphonia::core::codecs::DecoderOptions;
     use symphonia::core::errors::Error as SymError;
@@ -114,6 +278,7 @@ fn decode_with_symphonia(path: &Path) -> Result<Pcm> {
         .context("no decoder for this codec")?;
 
     let mut samples = Vec::new();
+    let mut channels = 1usize;
     loop {
         let packet = match format.next_packet() {
             Ok(p) => p,
@@ -132,55 +297,68 @@ fn decode_with_symphonia(path: &Path) -> Result<Pcm> {
             Err(e) => return Err(e.into()),
         };
         let spec = *decoded.spec();
-        let channels = spec.channels.count().max(1);
+        channels = spec.channels.count().max(1);
         let mut buf = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
         buf.copy_interleaved_ref(decoded);
-        for frame in buf.samples().chunks_exact(channels) {
-            samples.push(frame.iter().sum::<f32>() / channels as f32);
-        }
+        samples.extend_from_slice(buf.samples());
     }
-    Ok(Pcm {
-        samples,
-        sample_rate,
-    })
+    Ok((samples, channels, sample_rate))
 }
 
-fn decode_via_ffmpeg(path: &Path, why: &str) -> Result<Pcm> {
-    let staged =
-        std::env::temp_dir().join(format!("radio_drama-reference-{}.wav", std::process::id()));
+fn decode_via_ffmpeg(path: &Path, why: &str) -> Result<(Vec<f32>, usize, u32)> {
+    let staged = std::env::temp_dir().join(format!(
+        "radio_drama-decode-{}-{}.wav",
+        std::process::id(),
+        // Two decodes in one process must not share a staging path.
+        path.file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default()
+    ));
     let out = std::process::Command::new("ffmpeg")
         .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
         .arg(path)
-        .args(["-ac", "1", "-c:a", "pcm_s16le"])
+        .args(["-c:a", "pcm_s16le"])
         .arg(&staged)
         .output()
         .map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => anyhow::anyhow!(
-                "cannot read reference audio {} ({why}), and ffmpeg is not on PATH \
-                 to convert it. Supply the reference as wav, flac, mp3 or ogg/vorbis, \
-                 or install ffmpeg.",
+                "cannot read {} ({why}), and ffmpeg is not on PATH to convert it. \
+                 Supply it as wav, flac, mp3 or ogg/vorbis, or install ffmpeg.",
                 path.display()
             ),
             _ => anyhow::anyhow!("running ffmpeg on {}: {e}", path.display()),
         })?;
     let result = (|| {
         if !out.status.success() {
-            let _ = std::fs::remove_file(&staged);
             bail!(
-                "cannot read reference audio {} ({why}), and ffmpeg could not \
-                 convert it either: {}",
+                "cannot read {} ({why}), and ffmpeg could not convert it either: {}",
                 path.display(),
                 String::from_utf8_lossy(&out.stderr).trim()
             );
         }
-        let pcm = read_wav(&staged)?;
-        if pcm.samples.is_empty() {
-            bail!("reference audio {} decoded to no samples", path.display());
+        let (interleaved, channels, rate) = read_wav_interleaved(&staged)?;
+        if interleaved.is_empty() {
+            bail!("{} decoded to no samples", path.display());
         }
-        Ok(pcm)
+        Ok((interleaved, channels, rate))
     })();
     let _ = std::fs::remove_file(&staged);
     result
+}
+
+/// Decode anything, keeping its channels: symphonia first, ffmpeg for
+/// what it refuses.
+fn decode_interleaved(path: &Path) -> Result<(Vec<f32>, usize, u32)> {
+    if !path.exists() {
+        bail!("{} does not exist", path.display());
+    }
+    match decode_with_symphonia(path) {
+        Ok((samples, ch, rate)) if !samples.is_empty() => Ok((samples, ch, rate)),
+        // An empty decode counts as a failure: a reference with no audio
+        // in it registers a voice that sounds like nothing.
+        Ok(_) => decode_via_ffmpeg(path, "it decoded to no samples"),
+        Err(e) => decode_via_ffmpeg(path, &format!("{e:#}")),
+    }
 }
 
 /// Decode a reference recording and re-encode it as the 16-bit mono wav
@@ -192,8 +370,13 @@ pub fn reference_as_wav(path: &Path) -> Result<Vec<u8>> {
 
 /// 16-bit mono wav, in memory.
 pub fn encode_wav_i16(samples: &[f32], sample_rate: u32) -> Result<Vec<u8>> {
+    encode_wav_i16_ch(samples, 1, sample_rate)
+}
+
+/// 16-bit wav of `channels` interleaved channels, in memory.
+pub fn encode_wav_i16_ch(samples: &[f32], channels: u16, sample_rate: u32) -> Result<Vec<u8>> {
     let spec = hound::WavSpec {
-        channels: 1,
+        channels,
         sample_rate,
         bits_per_sample: 16,
         sample_format: hound::SampleFormat::Int,
@@ -214,6 +397,21 @@ pub fn encode_wav_i16(samples: &[f32], sample_rate: u32) -> Result<Vec<u8>> {
 pub fn write_wav(path: &Path, samples: &[f32], sample_rate: u32) -> Result<()> {
     let bytes = encode_wav_i16(samples, sample_rate)?;
     write_atomic(path, &bytes)
+}
+
+pub fn write_wav_stereo(path: &Path, audio: &Stereo, sample_rate: u32) -> Result<()> {
+    let bytes = encode_wav_i16_ch(&audio.interleaved(), 2, sample_rate)?;
+    write_atomic(path, &bytes)
+}
+
+/// FLAC, through the same staged-wav-and-ffmpeg path as the mono
+/// writer. See [`write_flac`] for why it is not encoded in process.
+pub fn write_flac_stereo(path: &Path, audio: &Stereo, sample_rate: u32) -> Result<()> {
+    let staged = path.with_extension("staging.wav");
+    write_wav_stereo(&staged, audio, sample_rate)?;
+    let result = run_ffmpeg_flac(&staged, path);
+    let _ = std::fs::remove_file(&staged);
+    result
 }
 
 /// Write the mixdown as FLAC, by writing the wav and handing it to

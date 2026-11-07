@@ -33,6 +33,7 @@
 mod audio;
 mod cast;
 mod dsp;
+mod music;
 mod qwen3;
 mod render;
 mod script;
@@ -83,6 +84,20 @@ enum Command {
         #[command(flatten)]
         script: ScriptArgs,
     },
+    /// Write a music file for a play: every scene in it, paired with
+    /// whichever cue file names that scene. Needs a render first, since
+    /// the scenes' timings come from its manifest.
+    Music {
+        #[command(flatten)]
+        script: ScriptArgs,
+        /// Where the cue files are. Defaults to `music/` beside the
+        /// script.
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// Overwrite an existing music file.
+        #[arg(long)]
+        force: bool,
+    },
     /// List the voices the clone server has registered.
     Voices {
         #[command(flatten)]
@@ -119,6 +134,14 @@ enum Command {
         /// dBFS. A mix under it is left alone.
         #[arg(long, default_value_t = -1.0)]
         peak_db: f32,
+        /// Lay a score under the dialogue, from this music file.
+        /// Defaults to `<script>.music.toml` if it exists; `--no-music`
+        /// renders speech only even when it does.
+        #[arg(long)]
+        music: Option<PathBuf>,
+        /// Render speech only, ignoring any music file.
+        #[arg(long, conflicts_with = "music")]
+        no_music: bool,
     },
 }
 
@@ -169,6 +192,12 @@ impl ScriptArgs {
             p.set_extension("cast.toml");
             p
         })
+    }
+
+    fn music_path(&self) -> PathBuf {
+        let mut p = self.script.clone();
+        p.set_extension("music.toml");
+        p
     }
 
     fn parse_options(&self) -> ParseOptions {
@@ -229,6 +258,7 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Cast { script, force } => cmd_cast(&script, force),
         Command::Check { script } => cmd_check(&script),
+        Command::Music { script, dir, force } => cmd_music(&script, dir, force),
         Command::Voices { server } => block_on(cmd_voices(server)),
         Command::Render {
             script,
@@ -239,6 +269,8 @@ fn main() -> Result<()> {
             refresh,
             offline,
             peak_db,
+            music,
+            no_music,
         } => block_on(cmd_render(RenderArgs {
             script,
             server,
@@ -248,6 +280,8 @@ fn main() -> Result<()> {
             refresh,
             offline,
             peak_db,
+            music,
+            no_music,
         })),
     }
 }
@@ -338,6 +372,122 @@ fn cmd_check(args: &ScriptArgs) -> Result<()> {
     Ok(())
 }
 
+/// Pair each scene with whichever cue file names it.
+///
+/// Needs a render to have happened: a cue is placed against a scene,
+/// and where a scene *is* in the finished audio is a fact about the
+/// render rather than about the script, so the timings come from the
+/// manifest the render wrote.
+fn cmd_music(args: &ScriptArgs, dir: Option<PathBuf>, force: bool) -> Result<()> {
+    let script = args.read()?;
+    let stem = script_stem(&args.script);
+    let out_dir = args.script.parent().unwrap_or(Path::new(".")).join(&stem);
+    let manifest_path = out_dir.join(format!("{stem}.manifest.json"));
+    let entries = read_manifest_entries(&manifest_path)?;
+
+    // A manifest from before the script was last edited would place
+    // every cue at a time that is no longer where its scene is. The
+    // scene list is the cheapest thing that notices.
+    let in_script: Vec<&str> = script
+        .elements
+        .iter()
+        .filter_map(|e| match e {
+            script::Element::Scene(title) => Some(title.as_str()),
+            _ => None,
+        })
+        .collect();
+    let in_manifest: Vec<&str> = entries
+        .iter()
+        .filter(|e| e.kind == "scene")
+        .filter_map(|e| e.heading.as_deref())
+        .collect();
+    if in_script != in_manifest {
+        bail!(
+            "{} is from a different version of this script ({} scenes there, {} here). \
+             Render again before placing cues, or the timings will be wrong.",
+            manifest_path.display(),
+            in_manifest.len(),
+            in_script.len()
+        );
+    }
+
+    let base = args.script.parent().unwrap_or(Path::new(".")).to_path_buf();
+    let dir = dir.unwrap_or_else(|| PathBuf::from("music"));
+    let cue_dir = base.join(&dir);
+    let mut cue_files: Vec<PathBuf> = std::fs::read_dir(&cue_dir)
+        .with_context(|| format!("reading cue directory {}", cue_dir.display()))?
+        .filter_map(|e| e.ok())
+        .map(|e| PathBuf::from(e.file_name()))
+        .filter(|p| {
+            matches!(
+                p.extension()
+                    .and_then(|e| e.to_str())
+                    .map(str::to_lowercase)
+                    .as_deref(),
+                Some("mp3" | "wav" | "flac" | "ogg" | "opus" | "m4a")
+            )
+        })
+        .collect();
+    cue_files.sort();
+    if cue_files.is_empty() {
+        bail!("no audio files in {}", cue_dir.display());
+    }
+
+    let path = args.music_path();
+    if path.exists() && !force {
+        bail!(
+            "{} already exists; pass --force to write it again",
+            path.display()
+        );
+    }
+    let text = music::scaffold(&entries, &cue_files, &dir);
+    audio::write_atomic(&path, text.as_bytes())?;
+
+    let placed = text.matches("\n[[cue]]").count() + usize::from(text.starts_with("[[cue]]"));
+    let scenes = entries.iter().filter(|e| e.kind == "scene").count();
+    println!("wrote {}", path.display());
+    println!(
+        "  {} cue file{} in {}, {placed} placed across {scenes} scene{}",
+        cue_files.len(),
+        plural(cue_files.len()),
+        cue_dir.display(),
+        plural(scenes)
+    );
+    for line in text.lines().filter(|l| l.starts_with("# no cue matched:")) {
+        println!("  {}", line.trim_start_matches("# "));
+    }
+    println!();
+    println!(
+        "  check it, then: radio_drama render {} (it picks the file up on its own)",
+        args.script.display()
+    );
+    Ok(())
+}
+
+fn script_stem(script: &Path) -> String {
+    script
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "radio_drama".to_string())
+}
+
+/// The entries of a manifest a previous render wrote.
+fn read_manifest_entries(path: &Path) -> Result<Vec<render::ManifestEntry>> {
+    #[derive(serde::Deserialize)]
+    struct Shape {
+        entries: Vec<render::ManifestEntry>,
+    }
+    let text = std::fs::read_to_string(path).map_err(|e| {
+        anyhow::anyhow!(
+            "no manifest at {} ({e}). Render the play first: the scenes' timings come from it.",
+            path.display()
+        )
+    })?;
+    let parsed: Shape = serde_json::from_str(&text)
+        .with_context(|| format!("parsing manifest {}", path.display()))?;
+    Ok(parsed.entries)
+}
+
 async fn cmd_voices(server: ServerArgs) -> Result<()> {
     let client = server.client()?;
     let voices = client.voices().await?;
@@ -357,6 +507,8 @@ struct RenderArgs {
     refresh: bool,
     offline: bool,
     peak_db: f32,
+    music: Option<PathBuf>,
+    no_music: bool,
 }
 
 async fn cmd_render(args: RenderArgs) -> Result<()> {
@@ -431,23 +583,76 @@ async fn cmd_render(args: RenderArgs) -> Result<()> {
     }
 
     let mix = render::mix(&script, &resolved, &plan, &cache_dir, args.peak_db)?;
+
+    // A music file beside the script is picked up on its own. The
+    // normal case needs no flag.
+    let music_path = args.music.clone().or_else(|| {
+        let beside = args.script.music_path();
+        (!args.no_music && beside.exists()).then_some(beside)
+    });
+    let scored = match &music_path {
+        Some(path) => {
+            let file = music::MusicFile::load(path)?;
+            let base = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+            Some(music::score(&mix, &file, &base)?)
+        }
+        None => None,
+    };
+
     let audio_name = format!("{stem}.{}", args.format.extension());
     let audio_path = out_dir.join(&audio_name);
-    match args.format {
-        Format::Flac => audio::write_flac(&audio_path, &mix.samples, mix.sample_rate)?,
-        Format::Wav => audio::write_wav(&audio_path, &mix.samples, mix.sample_rate)?,
+    match (&scored, args.format) {
+        (Some(s), Format::Flac) => audio::write_flac_stereo(&audio_path, &s.audio, s.sample_rate)?,
+        (Some(s), Format::Wav) => audio::write_wav_stereo(&audio_path, &s.audio, s.sample_rate)?,
+        (None, Format::Flac) => audio::write_flac(&audio_path, &mix.samples, mix.sample_rate)?,
+        (None, Format::Wav) => audio::write_wav(&audio_path, &mix.samples, mix.sample_rate)?,
     }
     let manifest_path = out_dir.join(format!("{stem}.manifest.json"));
-    Manifest::build(&args.script.script, &script, &resolved, &mix, &audio_name)
-        .write(&manifest_path)?;
+    Manifest::build(
+        &args.script.script,
+        &script,
+        &resolved,
+        &mix,
+        &audio_name,
+        scored.as_ref(),
+    )
+    .write(&manifest_path)?;
 
     println!();
-    println!("duration: {}", hms(mix.duration_s()));
-    match mix.peak_db {
+    if let Some(s) = &scored {
+        println!(
+            "score:    {} cue{} under the dialogue, stereo at {} Hz",
+            s.placements.len(),
+            plural(s.placements.len()),
+            s.sample_rate
+        );
+        for p in &s.placements {
+            println!(
+                "  {:>8}  {:<30} {:>7}{}",
+                hms(p.start_s),
+                p.file
+                    .file_name()
+                    .map(|f| f.to_string_lossy().to_string())
+                    .unwrap_or_default(),
+                hms(p.seconds),
+                match p.loops {
+                    0 | 1 => String::new(),
+                    n => format!("  {n} passes"),
+                }
+            );
+        }
+        println!();
+    }
+    let (duration, peak, limited) = match &scored {
+        Some(s) => (s.duration_s(), s.audio.peak_db(), s.limited_db),
+        None => (mix.duration_s(), mix.peak_db, mix.limited_db),
+    };
+    println!("duration: {}", hms(duration));
+    match peak {
         Some(peak) => println!(
             "peak:     {peak:.1} dBFS{}",
-            if mix.limited_db < 0.0 {
-                format!(" (pulled down {:.1} dB)", -mix.limited_db)
+            if limited < 0.0 {
+                format!(" (pulled down {:.1} dB)", -limited)
             } else {
                 String::new()
             }

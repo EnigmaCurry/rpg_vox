@@ -10,6 +10,68 @@ releases.
 
 ### radio_drama
 
+- **A score goes under the dialogue.** `radio_drama music play.md` reads
+  the manifest of a render and writes a music file: every scene in the
+  play, paired with whichever cue file names that scene. Render again
+  and the cues are laid in — looped to fill their scene, ducked while
+  anybody is speaking, faded at both ends — and the master comes out
+  stereo. The speech-only render is unchanged and still mono; nothing
+  needs a flag for either case, because a music file sitting beside the
+  script is picked up on its own.
+
+  Four things decide how it sounds, and all four come from how a
+  composer's cue sheet talks about underscoring rather than from what
+  was convenient to implement.
+
+  **A cue underscores a scene, not a moment.** "Atmospheric
+  underscoring" is what a cue sheet calls this, and it is why cue names
+  and scene titles turn out to be the same words in a different shape —
+  `M04_administratum.mp3` and `SCENE THREE — THE ADMINISTRATUM`. So a
+  cue is placed against a scene and runs to the next one, which also
+  means the score follows the script: edit a line and the bed moves with
+  its scene instead of drifting away from a timestamp somebody wrote
+  down once. `at_s` and `for_s` are there for anything that is not a
+  scene bed, and a scene name that matches two scenes is an error rather
+  than a coin toss.
+
+  **It loops to fit, with a crossfade.** These cues run 38 to 65 seconds
+  and the scenes to five minutes. A cue does not end on the sample it
+  began on, so butting a loop point against itself clicks — once a
+  minute, for the length of the scene. A couple of seconds of overlap is
+  what makes a 52-second bed sound like five minutes of underscore.
+
+  **It ducks under speech.** A threshold on the dialogue's own envelope
+  and a one-pole smoother on the music's gain, with the attack short and
+  the release long. The asymmetry is the whole thing: being late to duck
+  loses the first syllable of a line, and coming back quickly makes the
+  music surge in every gap between two lines. Measured on the first real
+  production, the inter-line gaps sit 4 to 7 dB below where they would
+  without it, which is the slow release still holding the bed down
+  across a short pause.
+
+  **The master is stereo.** The dialogue is one mono track and goes up
+  the middle — the side signal is exact digital silence wherever no cue
+  is playing — and the cues keep whatever width their composer gave
+  them. Mastering is at the highest rate in the production rather than
+  the synthesizer's, so a 32 kHz score is not cut down to the 12 kHz of
+  bandwidth speech happened to need. This is why the speech-only version
+  stayed mono rather than pretending: a stereo field is where music
+  lives, and there was none yet.
+
+  Mixing happens after the cache, like every other effect, so laying a
+  score under a 42-minute play that is already synthesized takes nine
+  seconds and no requests.
+
+  Two things the first real cue sheet found. The scaffold's stop-word
+  list had "prologue" and "epilogue" in it, on the theory that they were
+  structural filler next to "scene" — but they are the only name those
+  parts have, so a cue called `M13_epilogue.mp3` was left with nothing
+  to match. And `ManifestEntry` now deserializes as well as serializes,
+  since placing a cue means reading back the manifest a render wrote;
+  `kind` became a `String` to allow it, and a round-trip test covers the
+  sparse case, where every empty field is left out on the way down.
+
+
 - **A written radio play can be performed.** `radio_drama` is a new
   program: give it a script and a recording of each voice, and it gives
   you the whole play as one file, every line spoken in its character's

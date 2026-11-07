@@ -37,6 +37,12 @@ toml = "0.8"
 # multipart for voice registration, rustls to stay off system OpenSSL.
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
 
+# Resampling, for laying music under dialogue: the two arrive at
+# different rates and the mix is done at the higher of them, so the
+# score is not band-limited to what speech needed. Pure Rust, and the
+# same crate rpg_vox resamples with.
+rubato = "0.15"
+
 # Cache keys and content-addressed voice names.
 sha2 = "0.10"
 

@@ -1,6 +1,6 @@
 # radio_drama
 
-status: **v1 — speech only**
+status: **v2 — speech and score**
 
 `radio_drama` turns a written radio play into a finished audio drama. You
 give it the script and a recording of each voice; it gives you the whole
@@ -13,16 +13,23 @@ just install-radio-drama
 radio_drama cast  play.md     # list the parts; fill in the voices
 radio_drama check play.md     # what a render would do, without doing it
 radio_drama render play.md    # the play
+
+radio_drama music  play.md    # pair the cue files with the scenes
+radio_drama render play.md    # again: it picks the music file up on its own
 ```
 
 The voices are cloned with [Qwen3-TTS](qwen3-tts/) from three seconds of
 reference audio each — the same clone deploy rpg_vox uses, so a checkout
 already set up for that needs nothing added.
 
-Music and sound effects are **not** produced. Every `[SFX]`, `[MUSIC]`
-and `[TRANSITION]` cue in the script is kept, given a hole of silence to
-sit in, and written to the manifest with the timestamps of that hole, so
-a later pass has an exact place to put one.
+A score goes under it: give it cue files and a music file saying which
+cue underscores which scene, and it lays them in, looped to fill, ducked
+under the dialogue, and writes a stereo master. See [Music](#music).
+
+Sound effects are **not** produced. Every `[SFX]` and `[TRANSITION]` cue
+in the script is kept, given a configurable hole of silence to sit in,
+and written to the manifest with the timestamps of that hole, so a later
+pass has an exact place to put one.
 
 ## The script
 
@@ -272,6 +279,80 @@ rounder would cost quality and size to gain nothing.
 
 `RUST_LOG=radio_drama=info` shows each request and registration.
 
+## Music
+
+```sh
+radio_drama music play.md
+```
+
+reads the manifest of a render and writes `play.music.toml`: every scene
+in the play, paired with whichever cue file names that scene. It matches
+on words, so `M04_administratum.mp3` finds `SCENE THREE — THE
+ADMINISTRATUM`, and anything it cannot pair is written down rather than
+guessed at — both the scenes with no cue and the cues with no scene. A
+manifest from a different version of the script is refused, since a cue
+placed against a stale scene list lands at a time the scene has moved
+away from.
+
+```toml
+[score]
+dir = "music"
+gain_db = -6              # every cue, before ducking
+duck_db = -11             # how far music drops under speech
+duck_threshold_db = -40
+duck_attack_ms = 80       # fast: being late to duck loses a syllable
+duck_release_ms = 900     # slow: music must not surge between two lines
+fade_in_s = 2
+fade_out_s = 3
+loop_crossfade_s = 2.5
+
+[[cue]]
+file = "M04_administratum.mp3"
+scene = "THE ADMINISTRATUM"
+```
+
+A cue runs from its scene's heading to the next scene's, so the score
+follows the script: edit a line and the bed moves with the scene instead
+of drifting away from a timestamp somebody wrote down once. A scene name
+is matched as a substring, case-insensitively, and a name matching two
+scenes is an error rather than a coin toss.
+
+| Per cue | |
+|---|---|
+| `scene` | The scene it underscores. The usual form. |
+| `at_s`, `for_s` | A fixed time instead, for something that is not a scene bed. |
+| `gain_db` | Trim for this cue alone, on top of `score.gain_db`. |
+| `once` | Play once instead of filling the span. |
+| `no_duck` | Stay at full level under speech — for a stinger in a gap. |
+
+Four things decide how it sounds, and they come from how a cue sheet
+talks about underscoring rather than from what was convenient:
+
+* **A cue underscores a scene, not a moment.** That is what
+  "atmospheric underscoring" means, and it is why cue names and scene
+  titles turn out to be the same words.
+
+* **It loops to fit, with a crossfade.** A 50-second cue under a
+  five-minute scene has to repeat, and a cue does not end on the sample
+  it began on — so a hard loop splice clicks once a minute for the
+  length of the scene. A couple of seconds of overlap is what makes a
+  52-second bed sound like five minutes of underscore.
+
+* **It ducks under speech.** A threshold on the dialogue's own level and
+  a one-pole smoother on the music's gain, fast to get out of the way
+  and slow to come back. The asymmetry is the point: a fast release
+  makes the music surge in every gap between two lines.
+
+* **The master is stereo.** The dialogue is one mono track and goes up
+  the middle; the cues keep whatever width their composer gave them.
+  Mastering happens at the highest rate in the production — 32 kHz if
+  that is what the cues are — so the score is not band-limited to the
+  12 kHz of bandwidth the speech needed. `score.sample_rate` overrides.
+
+`--no-music` renders speech only even when a music file is sitting
+beside the script; `--music FILE` names a different one, which is how
+two mixes get compared.
+
 ## The manifest
 
 The third output, and the reason the cues are kept. Every scene, slug,
@@ -301,7 +382,11 @@ silence it occupies:
 }
 ```
 
-So scoring the production later is a matter of reading this file:
+When a score was laid under the render, the manifest also carries a
+`music` array: each cue with the span it ended up occupying, its level,
+and how many passes it took to fill.
+
+Reading the cues out of it is how anything else gets placed:
 
 ```sh
 jq -r '.entries[] | select(.kind=="cue") | "\(.start_s)\t\(.cue)\t\(.text)"' \
@@ -332,15 +417,17 @@ Deleting the entry and rendering again costs one request, because
 everything else is still cached. If *many* lines are reported at once,
 suspect a `ref_text` rather than bad luck.
 
-## What v1 does not do
+## What it does not do
 
-* **No music or sound effects.** The cues are placed and timed, not
-  produced.
-* **Mono.** A stereo field is where effects and music want to live, so
-  it belongs with them rather than ahead of them.
+* **No sound effects.** `[SFX]` and `[TRANSITION]` cues are placed and
+  timed, not produced. The manifest says where each one goes.
 * **No delivery control.** See [Performance
   directions](#performance-directions): the model has no style input,
   and this does not pretend otherwise.
+* **Nothing clever about the music.** A cue is placed, looped, faded and
+  ducked. It is not beat-matched to anything, not edited to land a hit
+  on a line, and not analysed for a loop point — the crossfade goes
+  where the arithmetic says, not where the bar is.
 
 ## Requirements
 
