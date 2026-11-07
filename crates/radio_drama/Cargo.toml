@@ -1,0 +1,49 @@
+[package]
+name = "radio_drama"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Renders a written radio play into a finished audio drama with cloned voices"
+
+[dependencies]
+# Reference-audio decoding: a cast's samples are whatever the operator
+# happened to record with, and the clone server only takes wav.
+#
+# symphonia directly rather than this workspace's `vox_audio`, even
+# though that wraps the same crate, because vox_audio also owns the
+# capture and playback backends — so on Linux it brings PipeWire, libspa
+# and cpal with it, and anything depending on it needs alsa.pc and the
+# PipeWire headers to build. Nothing here opens an audio device: this
+# reads files and writes files. Borrowing one decode function is not
+# worth making a batch renderer unbuildable outside the nix shell.
+#
+# Pure Rust, so this whole crate needs no system library at all.
+symphonia = { version = "0.5", features = ["wav", "flac", "mp3", "ogg", "vorbis", "pcm"] }
+
+anyhow.workspace = true
+clap = { workspace = true, features = ["env"] }
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tokio.workspace = true
+
+# The cast file. TOML rather than JSON because it is written and edited
+# by hand, and because a character's name is its table header, which is
+# the one place a key with spaces, slashes and dashes in it reads well.
+toml = "0.8"
+
+# Same client shape as rpg_vox's qwen3 backend: json bodies for synth,
+# multipart for voice registration, rustls to stay off system OpenSSL.
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
+
+# Cache keys and content-addressed voice names.
+sha2 = "0.10"
+
+# Writes the mixdown and reads back cached utterances. The cache holds
+# exactly what the server sent, which is always a PCM wav.
+hound = "3"
+
+# `generated_utc` in the manifest, so a render can be told from the one
+# before it without diffing audio.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }

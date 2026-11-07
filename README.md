@@ -105,6 +105,29 @@ moment it works. Android 11 or newer, one APK for every phone.
 
 [Read more →](ROOM_ANDROID.md)
 
+## [radio_drama](RADIO_DRAMA.md)
+
+status: **v1 — speech only**
+
+Turns a written radio play into a finished audio drama. You give it the
+script and a recording of each voice; it gives you the whole play as one
+file, every line spoken in its character's voice, paced like a
+performance rather than a list. The voices are cloned with Qwen3-TTS
+from three seconds of reference audio each.
+
+The script is the document somebody would have written anyway — a play
+in markdown, with `**NAME:**` for who speaks and `[SFX: …]` for what
+else happens. Music and effects are not produced yet, but every cue is
+placed, timed, and written to a manifest beside the audio, so there is
+an exact place to put one later.
+
+```bash
+just install-radio-drama
+radio_drama cast play.md && radio_drama render play.md
+```
+
+[Read more →](RADIO_DRAMA.md)
+
 ## [rpg_vox](RPG_VOX.md)
 
 status: **EXPERIMENTAL**

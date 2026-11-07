@@ -1,11 +1,119 @@
 # Changelog
 
 Changes in each release of scribe, Scribe for Android, Scribe for iOS,
-agent, Pi voice, Voice room, Voice Room for Android and rpg_vox. New entries go under
+agent, Pi voice, Voice room, Voice Room for Android, radio_drama and
+rpg_vox. New entries go under
 **Unreleased**; `just publish` names that section after the version it
 releases.
 
 ## Unreleased
+
+### radio_drama
+
+- **A written radio play can be performed.** `radio_drama` is a new
+  program: give it a script and a recording of each voice, and it gives
+  you the whole play as one file, every line spoken in its character's
+  voice, paced like a performance rather than a list. The voices are
+  cloned with Qwen3-TTS from about three seconds of reference audio
+  each — the same clone deploy rpg_vox uses, so a checkout already set
+  up for that needs nothing added. See [RADIO_DRAMA.md](RADIO_DRAMA.md).
+
+  The input is the document somebody would have written anyway. A radio
+  play in markdown, with `**MAX:**` for who speaks, `**VOSS** *(over
+  vox)*:` when there is a direction, `## SCENE TWO` for where it
+  happens and `[SFX: …]` for what else does. Nothing had to be marked
+  up for this; the first script it was built against was written to be
+  read by people, and that is the whole format.
+
+  Four things about such a script decide how it is read, and getting
+  any of them wrong would be obvious in the audio. Scripts are
+  hard-wrapped, so a cue or a speech routinely spans three lines and
+  each paragraph is unwrapped before anything looks at it. A speaker
+  label is written once and the paragraphs under it keep belonging to
+  that speaker — and those paragraphs are deliberate beats ("The
+  thirst." / "The screams."), so each becomes its own utterance with a
+  shorter gap in front of it than a new speech gets, which is what
+  makes narration sound narrated. A direction on the label carries to
+  the whole speech, because that is what it means. And the script is
+  longer than the play: the production notes at the end of one contain
+  `**Voss:**` paragraphs that are indistinguishable from dialogue by
+  shape, so the play is bounded structurally — nothing counts until the
+  first line or cue appears, and the first `#` heading after that ends
+  it.
+
+  `radio_drama cast play.md` reads the script and writes the cast file:
+  every speaking part in it, in the order each is first heard, with its
+  line and word counts and nowhere to guess who should sound like what.
+  A part takes reference audio from disk, or the name of a voice the
+  server already has, or another part to share. Speaker names are
+  matched loosely, so whether the script writes `**Voss:**` or
+  `**VOSS:**` and whether the cast file writes `GM — TABLE` or
+  `GM-TABLE` stops being something anybody has to get right. The game
+  master narrating and the game master adjudicating at the table are
+  one person, so the second is cast as the first rather than left as a
+  part to fill. Running it again after the script gains a character
+  keeps everything already assigned.
+
+  Reference audio is content-addressed: the same wav always registers
+  under the same name on the server, so a second render uploads
+  nothing, and a changed wav gets a different name, which also
+  invalidates every cached line that voice had spoken. Nothing has to
+  be cleared by hand.
+
+  **Every effect is applied at mix time, not before the cache.** The
+  cache holds exactly what the server sent, so re-pacing or
+  re-balancing a thirty-eight-minute play is a two-second job rather
+  than a re-render, and editing one line of the script costs one
+  request. Identical text in the same voice is synthesized once however
+  many times the script says it. `--offline` mixes from the cache alone
+  and refuses rather than quietly rendering a play with a line missing.
+  Every gap is a number in the cast file, and so is the trim that makes
+  those numbers mean anything — the server's padding is not consistent,
+  and without cutting it the pacing is advisory at best.
+
+  **Music and sound effects are not produced.** Every `[SFX]`,
+  `[MUSIC]` and `[TRANSITION]` cue is kept, given a hole of silence to
+  sit in, and written to a manifest beside the audio with the
+  timestamps of that hole, next to every line with the timestamps of
+  the speech. So scoring the production later reads a JSON file rather
+  than parsing the script again.
+
+  **Performance directions are honoured as far as the audio allows and
+  no further.** The clone model takes no style input — it accepts an
+  `instructions` field and ignores it, which a test of the same text
+  with and without one settles — so a direction can only be realized by
+  processing what comes back. Level is honest, and a band-pass with a
+  little saturation is a fair reading of "over vox"; the band limits
+  are applied on both sides of the saturation, because `tanh` makes
+  harmonics and filtering before it alone let them straight back out
+  above the cutoff. `(with ritual gravity)` and `(laughing)` are notes
+  to a human performer: they are stripped from what is spoken, so the
+  synthesizer never reads one aloud, and `check` lists them rather than
+  faking them.
+
+  `check` does all of the above except the requests, so the length of
+  the play, the parts with no voice and the directions nothing can do
+  anything about are all known before the first byte goes out.
+
+  **It links no system library.** Unlike everything else in this
+  workspace, `radio_drama` builds with plain cargo outside the nix
+  shell — it reads files and writes files and never opens an audio
+  device, so it has no business needing PipeWire, ALSA or libopus. It
+  reaches symphonia directly rather than through this workspace's
+  `vox_audio`, which wraps the same crate but owns the capture and
+  playback backends too, and so brings all three with it; borrowing one
+  decode function from it made `just install-radio-drama` fail on
+  `alsa.pc`. What that costs is Ogg Opus references, which symphonia
+  has no decoder for — so anything it refuses is handed to `ffmpeg`
+  instead, and a clip pulled straight out of a scribe recording still
+  works.
+
+  FLAC is written by handing a wav to `ffmpeg` rather than encoding in
+  process. flacenc, which rpg_vox uses for its scene downloads, writes
+  frame numbers that the reference decoder reports as "file might not
+  be seekable" and that symphonia — this repo's own decoder — refuses
+  to open at all. A forty-minute drama nothing can scrub through is not
+  an acceptable default. `--format wav` needs no ffmpeg.
 
 ### Voice room
 

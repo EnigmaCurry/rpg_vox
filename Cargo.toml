@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/radio_drama",
     "crates/rpg_vox",
     "crates/discord_vox",
     "crates/vox_transcribe",

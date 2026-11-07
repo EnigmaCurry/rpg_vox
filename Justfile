@@ -1090,6 +1090,41 @@ install-agent BIN="~/.local/bin":
     install -m 755 target/release/agent "$bin/agent"
     echo "installed $bin/agent"
 
+# --- radio_drama (written radio play -> audio drama, see RADIO_DRAMA.md) ---
+
+# radio_drama links no system library of its own, so unlike the rest of
+# this workspace it builds with plain cargo. The nix-shell is still used
+# where there is one, so a build from this checkout uses the same
+# toolchain everything else here does.
+#
+# The clone server comes from RADIO_DRAMA_CLONE_URL or
+# RPG_VOX_QWEN3_CLONE_URL (which .env already sets); `--format flac`
+# needs ffmpeg on PATH. See RADIO_DRAMA.md.
+# Render a radio play, e.g. `just radio-drama render play.md`.
+radio-drama *ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if command -v nix-shell >/dev/null; then
+      nix-shell --run "cargo run -p radio_drama --release -- {{ARGS}}"
+    else
+      cargo run -p radio_drama --release -- {{ARGS}}
+    fi
+
+# Build radio_drama and install it to BIN.
+install-radio-drama BIN="~/.local/bin":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if command -v nix-shell >/dev/null; then
+      nix-shell --run "cargo build -p radio_drama --release"
+    else
+      cargo build -p radio_drama --release
+    fi
+    bin="{{BIN}}"
+    bin="${bin/#\~/$HOME}"
+    mkdir -p "$bin"
+    install -m 755 target/release/radio_drama "$bin/radio_drama"
+    echo "installed $bin/radio_drama"
+
 # --- vox_room (voice room in the browser, see ROOM.md) ---
 
 # Run the voice room on http://127.0.0.1:7340, e.g. `just room --echo`.
