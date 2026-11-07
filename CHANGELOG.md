@@ -95,6 +95,39 @@ releases.
   the play, the parts with no voice and the directions nothing can do
   anything about are all known before the first byte goes out.
 
+  **A line that came back wrong is pointed at rather than left to be
+  found.** Synthesis is sampled, so once in a few hundred utterances the
+  model does not stop when the line ends and fills the rest of its token
+  budget with something else -- one line in 783, on the render this was
+  built against, ran fifteen seconds for ten words. In a forty-minute
+  drama that is one stretch of nonsense nobody is going to find by
+  looking. So a line whose audio is much longer than its words can
+  account for is reported with the command that redoes it, judged
+  against the play's own median speaking rate rather than a fixed
+  words-per-second, so a deliberately slow cast is not reported
+  wholesale and a merely slow line is not either.
+
+  A quoted line is spoken without its quote marker. A script sets apart
+  the words it wants set apart, and `> By the Motive Force, authenticate.`
+  is still the line of whoever is speaking -- but the `>` was reaching
+  the synthesizer, which was handed a character to pronounce in place of
+  the first word of a prayer.
+
+  `ref_text` is documented as better left out than guessed at, and the
+  one server error whose cause is not in its message says so where it
+  appears. The clone conditions on the reference recording and that text
+  *as a pair*, so a transcript which disagrees with the audio breaks the
+  conditioning rather than refining it: the model stops deciding when it
+  has finished speaking. Measured on a 16-second reference against an
+  automatic transcript of disfluent conversation, half the requests
+  failed with "did not emit codec EOS before its token budget" and the
+  rest ran four times longer than the words needed; the same recording
+  with no `ref_text` failed none of sixteen and came back the right
+  length every time. Three other voices showed the same direction, less
+  severely. So an accurate transcript helps, an approximate one is worse
+  than none, and "optional, improves the clone" was the wrong thing for
+  this to have said.
+
   **It links no system library.** Unlike everything else in this
   workspace, `radio_drama` builds with plain cargo outside the nix
   shell — it reads files and writes files and never opens an audio

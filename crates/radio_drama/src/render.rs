@@ -411,6 +411,91 @@ pub struct Mix {
     /// needed pulling down.
     pub limited_db: f32,
     pub peak_db: Option<f32>,
+    /// Lines that came back far longer than their words can account
+    /// for. See [`overlong_lines`].
+    pub overlong: Vec<Overlong>,
+}
+
+/// A line whose audio is much longer than its text should take to say.
+///
+/// Synthesis is sampled, so once in a few hundred utterances the model
+/// does not stop when it has finished the words and fills the rest of
+/// its budget with something else. One such line in a forty-minute
+/// drama is fifteen seconds of nonsense that nobody will find by
+/// looking, which is reason enough to point at it: re-synthesizing is
+/// one request, because deleting its cache entry is all it takes.
+#[derive(Debug, Clone)]
+pub struct Overlong {
+    pub speaker: String,
+    pub text: String,
+    pub cache: String,
+    pub start_s: f64,
+    pub seconds: f64,
+    /// What it should have taken at the play's own median pace.
+    pub expected_s: f64,
+}
+
+/// How many times longer than the median pace a line has to be before
+/// it is called out. Measured against a 783-line render whose slowest
+/// legitimate narration sat at about half the median rate and whose one
+/// genuinely broken line sat at a quarter of it, so this is set between
+/// the two rather than at a round number.
+const OVERLONG_FACTOR: f64 = 2.5;
+
+/// Find the lines worth a second look.
+///
+/// The yardstick is the play's own median speaking rate rather than a
+/// fixed words-per-second, so a deliberately slow cast is not reported
+/// wholesale. Short lines are skipped: a three-word line is mostly
+/// trim margins and breath, and its rate says little.
+fn overlong_lines(entries: &[ManifestEntry]) -> Vec<Overlong> {
+    let measurable: Vec<(f64, &ManifestEntry)> = entries
+        .iter()
+        .filter(|e| e.kind == "line")
+        .filter_map(|e| {
+            let words = e
+                .text
+                .as_deref()
+                .map_or(0, |t| t.split_whitespace().count());
+            let seconds = e.end_s - e.start_s;
+            (words >= 4 && seconds > 0.0).then_some((words as f64 / seconds, e))
+        })
+        .collect();
+    if measurable.len() < 20 {
+        // Too few to have a median worth comparing against.
+        return Vec::new();
+    }
+    let mut rates: Vec<f64> = measurable.iter().map(|(r, _)| *r).collect();
+    rates.sort_by(|a, b| a.partial_cmp(b).expect("rates are finite"));
+    let median = rates[rates.len() / 2];
+
+    let mut out: Vec<Overlong> = measurable
+        .iter()
+        .filter_map(|(rate, e)| {
+            let seconds = e.end_s - e.start_s;
+            let expected_s = e
+                .text
+                .as_deref()
+                .map_or(0, |t| t.split_whitespace().count()) as f64
+                / median;
+            // Both tests: far off the pace, and long enough in absolute
+            // terms that somebody would hear it as a hole.
+            (*rate * OVERLONG_FACTOR < median && seconds > 3.0).then(|| Overlong {
+                speaker: e.speaker.clone().unwrap_or_default(),
+                text: e.text.clone().unwrap_or_default(),
+                cache: e.cache.clone().unwrap_or_default(),
+                start_s: e.start_s,
+                seconds,
+                expected_s,
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        (b.seconds / b.expected_s.max(0.001))
+            .partial_cmp(&(a.seconds / a.expected_s.max(0.001)))
+            .expect("ratios are finite")
+    });
+    out
 }
 
 impl Mix {
@@ -516,12 +601,14 @@ pub fn mix(
 
     let limited_db = dsp::limit_peak(&mut out, peak_target_db);
     let peak_db = dsp::peak_db(&out);
+    let overlong = overlong_lines(&entries);
     Ok(Mix {
         samples: out,
         sample_rate: rate,
         entries,
         limited_db,
         peak_db,
+        overlong,
     })
 }
 
@@ -880,6 +967,99 @@ mod tests {
         let loud = at(&mix.entries[1]);
         let quiet = at(voss);
         assert!(quiet < loud - 4.0, "loud {loud} quiet {quiet}");
+    }
+
+    /// A line of normal length, and the same words taking four times
+    /// as long: only the second is a failed generation.
+    #[test]
+    fn an_overlong_line_is_found_and_a_merely_slow_one_is_not() {
+        fn line(text: &str, start: f64, seconds: f64) -> ManifestEntry {
+            ManifestEntry {
+                kind: "line",
+                start_s: start,
+                end_s: start + seconds,
+                scene: None,
+                heading: None,
+                cue: None,
+                speaker: Some("VOSS".into()),
+                voice: Some("v".into()),
+                direction: None,
+                effect: None,
+                text: Some(text.into()),
+                cache: Some(format!("cache-{start}")),
+                continuation: false,
+            }
+        }
+        // Thirty lines at five words in two seconds: 2.5 words/second.
+        let mut entries: Vec<ManifestEntry> = (0..30)
+            .map(|i| line("one two three four five", i as f64 * 10.0, 2.0))
+            .collect();
+        // Slower than the pace, but not by enough to be broken.
+        entries.push(line("one two three four five", 400.0, 3.5));
+        // The same five words over fifteen seconds.
+        entries.push(line("one two three four five", 500.0, 15.0));
+
+        let found = overlong_lines(&entries);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].start_s, 500.0);
+        assert!((found[0].seconds - 15.0).abs() < 1e-9);
+        assert!(
+            (found[0].expected_s - 2.0).abs() < 0.1,
+            "{}",
+            found[0].expected_s
+        );
+        assert_eq!(found[0].cache, "cache-500");
+    }
+
+    #[test]
+    fn a_short_line_is_not_judged_on_its_rate() {
+        // Mostly trim margin and breath; its rate means nothing.
+        let mut entries: Vec<ManifestEntry> = Vec::new();
+        for i in 0..30 {
+            entries.push(ManifestEntry {
+                kind: "line",
+                start_s: i as f64 * 10.0,
+                end_s: i as f64 * 10.0 + 2.0,
+                scene: None,
+                heading: None,
+                cue: None,
+                speaker: Some("A".into()),
+                voice: Some("v".into()),
+                direction: None,
+                effect: None,
+                text: Some("one two three four five".into()),
+                cache: Some("c".into()),
+                continuation: false,
+            });
+        }
+        let mut short = entries[0].clone();
+        short.start_s = 400.0;
+        short.end_s = 410.0;
+        short.text = Some("Yes.".into());
+        entries.push(short);
+        assert!(overlong_lines(&entries).is_empty());
+    }
+
+    #[test]
+    fn too_few_lines_to_have_a_pace_reports_nothing() {
+        let entries: Vec<ManifestEntry> = (0..5)
+            .map(|i| ManifestEntry {
+                kind: "line",
+                start_s: i as f64,
+                end_s: i as f64 + 20.0,
+                scene: None,
+                heading: None,
+                cue: None,
+                speaker: Some("A".into()),
+                voice: Some("v".into()),
+                direction: None,
+                effect: None,
+                text: Some("one two three four five".into()),
+                cache: Some("c".into()),
+                continuation: false,
+            })
+            .collect();
+        assert!(overlong_lines(&entries).is_empty());
     }
 
     #[test]

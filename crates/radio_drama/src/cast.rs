@@ -176,8 +176,15 @@ pub struct CastEntry {
     /// Reference audio for a clone, relative to the cast file.
     #[serde(default)]
     pub sample: Option<PathBuf>,
-    /// What the sample says. Optional — the server builds the voice from
-    /// the audio either way — but giving it makes the clone closer.
+    /// What the sample says, word for word. Optional, and better left
+    /// out than guessed at: the clone conditions on the audio and this
+    /// text *as a pair*, so a transcript that disagrees with the
+    /// recording breaks it rather than refining it. Measured on a
+    /// 16-second reference with a speech-to-text transcript of
+    /// disfluent conversation, half the requests failed with "did not
+    /// emit codec EOS" and the rest ran four times longer than the
+    /// words needed; the same recording with this unset failed none.
+    /// Set it only when the transcript is exact.
     #[serde(default)]
     pub ref_text: Option<String>,
     /// A voice already registered on the clone server, by name.
@@ -507,7 +514,7 @@ pub fn scaffold(script: &Script, existing: Option<&CastFile>) -> String {
          # A character takes one of:\n\
          #\n\
          #   sample       = \"voices/name.wav\"   reference audio to clone\n\
-         #   ref_text     = \"what it says\"      optional, improves the clone\n\
+         #   ref_text     = \"what it says\"      only if word-for-word exact\n\
          #   server_voice = \"old-man\"           a voice already on the server\n\
          #   same_as      = \"ANOTHER CHARACTER\" share another part's voice\n\
          #\n\

@@ -390,12 +390,28 @@ impl<'a> Parser<'a> {
     }
 }
 
+/// Strip markdown blockquote markers from the front of a line.
+///
+/// A script quotes the words it wants set apart — Voss's prayers are
+/// written this way — and they are still his lines. Without this the
+/// `>` reaches the synthesizer, which is handed a character to
+/// pronounce in place of the first word of a prayer.
+fn strip_quote_marker(line: &str) -> &str {
+    let mut rest = line;
+    loop {
+        match rest.strip_prefix('>') {
+            Some(after) => rest = after.trim_start(),
+            None => return rest,
+        }
+    }
+}
+
 /// Split on blank lines and unwrap each paragraph back into one string.
 fn paragraphs(markdown: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur: Vec<&str> = Vec::new();
     for raw in markdown.lines() {
-        let line = raw.trim();
+        let line = strip_quote_marker(raw.trim());
         if line.is_empty() {
             if !cur.is_empty() {
                 out.push(cur.join(" "));
@@ -554,6 +570,41 @@ mod tests {
         assert_eq!(got[0].text, "From the weakness of the mind.");
         assert!(!got[0].continuation);
         assert!(got[1].continuation);
+    }
+
+    /// A quoted prayer is still the line of whoever is speaking, and
+    /// the `>` is not part of what they say.
+    #[test]
+    fn a_blockquote_is_spoken_without_its_marker() {
+        let got = lines(
+            "**VOSS** *(with ritual gravity)*:\n\n> By the Motive Force, authenticate.\n> Omnissiah, bless these ledgers.\n",
+        );
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].key, "VOSS");
+        assert_eq!(got[0].direction.as_deref(), Some("with ritual gravity"));
+        assert_eq!(
+            got[0].text,
+            "By the Motive Force, authenticate. Omnissiah, bless these ledgers."
+        );
+        assert!(!got[0].continuation);
+    }
+
+    #[test]
+    fn a_nested_quote_marker_goes_too() {
+        let got = lines("**MAX:** He wrote:\n\n>> Nobody came.\n");
+        assert_eq!(got[1].text, "Nobody came.");
+    }
+
+    #[test]
+    fn a_cue_inside_a_blockquote_is_still_a_cue() {
+        let got = parse("**MAX:** Listen.\n\n> [SFX: A door closes.]\n");
+        assert_eq!(
+            got.elements[1],
+            Element::Cue {
+                kind: "SFX".into(),
+                text: "A door closes.".into(),
+            }
+        );
     }
 
     #[test]

@@ -124,7 +124,7 @@ A part is cast one of three ways:
 | Key | Means |
 |---|---|
 | `sample` | Reference audio on disk — wav, flac, mp3 or ogg/vorbis, and anything else `ffmpeg` can read — registered with the clone server for you. Three seconds is enough. |
-| `ref_text` | What the sample says. Optional; the server builds the voice either way, but giving it makes the clone closer. |
+| `ref_text` | What the sample says, word for word. Optional — and better left out than guessed at, see below. |
 | `server_voice` | A voice already registered on the server. `radio_drama voices` lists them. |
 | `same_as` | Another part in this file, whose voice this one shares. |
 
@@ -137,6 +137,24 @@ Change it if you want them to sound different.
 
 Re-running `cast` after the script gains a character keeps everything
 already assigned and adds the new parts; `--force` starts over.
+
+### A word about `ref_text`
+
+Leave it out unless the transcript is exact.
+
+The clone conditions on the recording and this text *as a pair*, so a
+transcript that disagrees with the audio breaks the conditioning rather
+than refining it — the model stops deciding when it has finished
+speaking. Measured on a 16-second reference with a `scribe` transcript of
+disfluent conversation ("I would I would I would", with a gap in the
+middle), half the requests failed with `did not emit codec EOS before its
+token budget` and the other half ran four times longer than the words
+needed. The same recording with no `ref_text` at all failed none of
+sixteen and came back the right length every time. Three other voices
+showed the same direction, less severely.
+
+So a hand-checked transcript helps, an automatic one hurts, and nothing
+is safe. `render` says this where the error appears, not only here.
 
 Sample-based voices are **content-addressed**. The same wav always
 registers under the same server-side name, so a second render uploads
@@ -289,6 +307,30 @@ So scoring the production later is a matter of reading this file:
 jq -r '.entries[] | select(.kind=="cue") | "\(.start_s)\t\(.cue)\t\(.text)"' \
   play/play.manifest.json
 ```
+
+### Lines that came back wrong
+
+Synthesis is sampled, so once in a few hundred utterances the model does
+not stop when the line ends and fills the rest of its budget with
+something else. In a forty-minute drama that is one stretch of nonsense
+nobody is going to find by looking, so `render` finds it: a line whose
+audio is much longer than its words can account for, judged against the
+play's own median speaking rate rather than a fixed figure, is reported
+with the one command that redoes it.
+
+```
+1 line came back far longer than the words account for. Synthesis is
+sampled, so now and then the model does not stop when the line ends.
+To redo one, delete its cache entry and render again:
+
+  VOSS at 39m 32s  15.2s, expected ~4.0s
+    "Drusilla Hammerfort: increased informal authority corresponding …"
+    rm play/cache/02b05a7d…wav
+```
+
+Deleting the entry and rendering again costs one request, because
+everything else is still cached. If *many* lines are reported at once,
+suspect a `ref_text` rather than bad luck.
 
 ## What v1 does not do
 

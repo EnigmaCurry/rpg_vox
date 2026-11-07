@@ -460,7 +460,59 @@ async fn cmd_render(args: RenderArgs) -> Result<()> {
         size_of(&audio_path)
     );
     println!("          {}", manifest_path.display());
+    report_overlong(&mix, &cache_dir);
     Ok(())
+}
+
+/// Point at the lines that came back far longer than their words can
+/// account for, with the one command that redoes each.
+///
+/// Worth its own paragraph rather than a log line: in a forty-minute
+/// drama a single bad generation is fifteen seconds of nonsense that
+/// nobody is going to find by looking, and the fix is cheap enough that
+/// not knowing is the only real cost.
+fn report_overlong(mix: &render::Mix, cache_dir: &Path) {
+    if mix.overlong.is_empty() {
+        return;
+    }
+    println!();
+    println!(
+        "{} line{} came back far longer than the words account for. Synthesis is",
+        mix.overlong.len(),
+        plural(mix.overlong.len())
+    );
+    println!("sampled, so now and then the model does not stop when the line ends.");
+    println!("To redo one, delete its cache entry and render again:");
+    for line in mix.overlong.iter().take(10) {
+        println!();
+        println!(
+            "  {} at {}  {:.1}s, expected ~{:.1}s",
+            line.speaker,
+            hms(line.start_s),
+            line.seconds,
+            line.expected_s
+        );
+        println!("    {:?}", snippet(&line.text));
+        println!(
+            "    rm {}",
+            cache_dir.join(format!("{}.wav", line.cache)).display()
+        );
+    }
+    if mix.overlong.len() > 10 {
+        println!();
+        println!(
+            "  ... and {} more; the manifest has every line's timings",
+            mix.overlong.len() - 10
+        );
+    }
+}
+
+fn snippet(text: &str) -> String {
+    let mut out: String = text.chars().take(64).collect();
+    if text.chars().count() > 64 {
+        out.push('\u{2026}');
+    }
+    out
 }
 
 fn report_script(script: &Script, resolved: &ResolvedCast, args: &ScriptArgs) {

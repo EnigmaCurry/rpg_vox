@@ -181,7 +181,11 @@ impl Client {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            bail!("POST {url} returned {status}: {}", first_line(&body));
+            bail!(
+                "POST {url} returned {status}: {}{}",
+                first_line(&body),
+                eos_hint(&body)
+            );
         }
         let bytes = resp.bytes().await.context("reading audio response")?;
         if bytes.len() < 44 || &bytes[..4] != b"RIFF" {
@@ -198,6 +202,29 @@ impl Client {
             "synthesized"
         );
         Ok(Wav(bytes.to_vec()))
+    }
+}
+
+/// The one server error whose cause is not in the message.
+///
+/// "did not emit codec EOS before its token budget" means the model
+/// never decided it had finished speaking. On this deploy the usual
+/// reason is a `ref_text` that does not match its reference recording:
+/// the clone conditions on the pair, and a transcript that disagrees
+/// with the audio breaks it. Measured on a 16-second reference with an
+/// automatic transcript of disfluent speech, half the requests failed
+/// this way and the other half ran four times longer than the words
+/// needed; the same recording with no `ref_text` at all failed none and
+/// came back the right length. So an empty `ref_text` is better than an
+/// approximate one, and that is worth saying where it is read rather
+/// than only in the documentation.
+fn eos_hint(body: &str) -> &'static str {
+    if body.contains("did not emit codec EOS") {
+        " [the voice's ref_text probably does not match its sample; an \
+         accurate transcript or none at all both work better than an \
+         approximate one]"
+    } else {
+        ""
     }
 }
 
@@ -229,6 +256,13 @@ mod tests {
     fn a_trailing_slash_is_not_doubled() {
         let c = Client::new("https://example.test/", Duration::from_secs(1)).unwrap();
         assert_eq!(c.base(), "https://example.test");
+    }
+
+    #[test]
+    fn the_eos_error_carries_its_cause() {
+        let body = r#"{"error": {"message": "Qwen3-TTS Base did not emit codec EOS before its token budget (192/192 codec tokens)"}}"#;
+        assert!(eos_hint(body).contains("ref_text"));
+        assert_eq!(eos_hint(r#"{"error": "something else"}"#), "");
     }
 
     #[test]
