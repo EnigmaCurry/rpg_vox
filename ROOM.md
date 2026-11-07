@@ -246,6 +246,49 @@ end of its conversation. The [lobby](#more-than-one-room) is off the
 record always and has no switch to turn — the control there says so
 rather than offering a choice that would be refused.
 
+### Recording the room
+
+**Recording**, under **Transcription** and the stronger of the two, is
+whether everything audible in this room is being kept as a clip.
+Anybody in the room may start one and anybody may stop it, and the room
+writes down which of them did each — the same reasoning the switch
+above it is built on, which applies here at least as hard.
+
+Starting one asks first, and then the room says so where nobody can
+miss it: a card goes into the conversation, lit, before a sample of
+audio is kept, and a line appears under the switch for as long as it
+runs. There is no way to record this room without the room saying so in
+front of everybody in it.
+
+Stopping leaves two things on that card. **The clip** — everything
+audible in the room as one Ogg/Opus file, which is every microphone at
+its fader plus the AI. Not any one person's headphones: a listener
+hears the room minus their own voice, with the AI in whichever language
+they read and the interpreter at whatever level they set it, and a
+recording of the room has to be the room. (An interpretation is left
+out for the same reason — it is one listener's way in to what was
+already said, and the transcript has every language in it.) And **the
+transcript**, ⤓ beside it: what was said while it ran, as the same
+markdown file a whole [conversation](#what-a-room-has-said-before)
+downloads as, with bounds. It is rendered when you ask for it rather
+than kept, so a translation that landed after the clip stopped is in
+it.
+
+A recording cannot outlive the transcript it is the stronger version
+of. **A room that is off the record cannot be recorded at all**, and
+taking the room off the record while one is running stops it where it
+stands and keeps what it has — the note the room writes about going off
+the record is already the explanation of why the clip ends there. The
+lobby, which is never written down, is never recorded either. Starting
+a new conversation also ends it, because a recording belongs to the
+conversation it was made in: that is where its card is, and that is the
+stretch of transcript it is of.
+
+A recording does not survive the room going away. The audio is being
+built in memory until somebody stops it, so a restart in the middle of
+one leaves nothing to come back to — and the card says exactly that,
+rather than showing a light on a microphone nothing is listening to.
+
 ### More than one AI in a room
 
 Every room that is written down has the AI in it — which is every room
@@ -451,8 +494,63 @@ in it and every card dealt in it away from everybody, for good, and
 asks first. The live one has no **×** — it is the room, not an archive
 of it.
 
+**Taking one away.** The **⤓** beside each conversation downloads it
+as a markdown file: who said what, when they said it, and the gaps the
+room explained for itself. It is on every row including the live one —
+the conversation you are in is the one most likely to be wanted, and
+what is in the file is what is on the screen, including the last thing
+somebody said a second ago.
+
+It is a transcript and not an archive, so it says so about the parts
+it cannot hold. A picture, a clip somebody read aloud, a recording
+brought in: each is one line saying it was there and what it was,
+because a file that quietly dropped them would be telling you about a
+different afternoon. A card and a folded-up play keep their own text,
+quoted so their headings cannot restructure the file they land in. And
+the notes at either end of a stretch the room was **off the record**
+for come through like any other line — they are the only thing that
+tells a reader why there is an hour with nothing in it.
+
+Two things in it are yours rather than the room's. The language: a
+line said in another one is given in yours with the original under it,
+the same way the screen shows it, so a translation that went wrong can
+still be seen to have. And the clock: the times are in your own, and
+the head of the file says which, because a transcript with bare times
+and no zone on it is one nobody can line up against anything else.
+
+A tool that wants the conversation rather than a file to read already
+has it: `GET /api/rooms/<room>/history/<id>` is the same conversation
+as JSON, with every field on every entry, which is why there is no
+second download button for it.
+
+**Purging the room.** At the foot of the **History** list, under the
+conversations, is **Purge room** — every conversation this room has
+ever had, and everything said, dealt, drawn, read aloud and recorded in
+any of them, gone for everyone. It takes the conversation you are in
+along with the rest and the room starts a fresh one in the same breath:
+a button that left the live one would be a lie about what it did, and
+the one it left would often be the reason somebody pressed it.
+
+It is **the owner's**, and the only thing about a conversation that is.
+Anybody in a room may put it off the record, because that changes what
+happens next and anybody it was wrong for can change it back; this
+takes away what other people already said, including conversations from
+before whoever presses it ever walked in, and nothing brings it back.
+It belongs with making, renaming and deleting rooms. The button is only
+drawn for the owner and the server refuses everybody else regardless.
+
+It asks twice over: the question, and then the room's name written out,
+because one click is too cheap a way to lose a year of a room. And it
+says what it does and no more — the rows go and the space they took is
+the database's to use again, rather than handed back to the disk, so
+nothing here implies the file has been scrubbed.
+
 Each room's history is its own, and a conversation can only be read
-from the room that had it.
+from the room that had it. The lobby has no history at all: nothing
+said there is written down, so there is nothing to read back and
+nothing to hand over. A room taken out of the house takes its whole
+history with it, for the same reason purging exists: a conversation
+nothing points at is not kept, it is only unreachable.
 
 ### A game is something a room does
 

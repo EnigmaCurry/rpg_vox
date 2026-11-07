@@ -7569,6 +7569,7 @@ dependencies = [
  "crossbeam-channel",
  "futures-util",
  "hound",
+ "ogg",
  "opus",
  "rubato 0.15.0",
  "rusqlite",

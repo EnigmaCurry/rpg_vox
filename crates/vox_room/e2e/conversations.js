@@ -1,5 +1,5 @@
 // A room keeps the conversations it has had, and they can be named,
-// read and deleted:
+// read, downloaded and deleted:
 //   node conversations.js RYAN_LINK ALEX_LINK
 //
 // **New conversation** closes the one you were having; the old one goes
@@ -118,6 +118,27 @@ const shut = async (page) => {
   is('back in the live one', (await said(ryan.page)).some((t) => /afterwards/.test(t)), true);
   is('and can type again', await canType(ryan.page), true);
 
+  // And one can be taken away. Fetched rather than clicked: what the
+  // link does is hand the browser a download, and the question here is
+  // what is in it -- which is also the one way to see that the server
+  // assembled it at all.
+  await openHistory(ryan.page);
+  const file = await ryan.page.evaluate(async () => {
+    const href = document.querySelector('.menu .row:last-child .save')?.getAttribute('href');
+    if (!href) return null;
+    const r = await fetch(href);
+    return { ok: r.ok, as: r.headers.get('content-disposition'), md: await r.text() };
+  });
+  is('a conversation can be downloaded', file?.ok, true);
+  is('as a file named after the room, the conversation and the day',
+    /^attachment; filename="lobby-\d+-\d{4}-\d{2}-\d{2}-transcript\.md"$/.test(file?.as ?? ''), true);
+  is('under the name it was given', /^# The heist, properly$/m.test(file?.md ?? ''), true);
+  is('with who said what, and when they said it',
+    /\*\*\d{2}:\d{2} · Ryan\*\* \(typed\) — planning the heist$/m.test(file?.md ?? ''), true);
+  is('and the clock the times are in',
+    /times are UTC([+-]\d{2}:\d{2})?\./.test(file?.md ?? ''), true);
+  await shut(ryan.page);
+
   // Deleting takes it from everybody, and for good.
   await openHistory(ryan.page);
   await ryan.page.click('.menu .row:last-child .drop');
@@ -133,6 +154,65 @@ const shut = async (page) => {
   await ryan.page.waitForTimeout(2500);
   await openHistory(ryan.page);
   is('still one after a reload, so it is gone from the server', (await rows(ryan.page)).length, 1);
+
+  // -- purging the whole room -------------------------------------------
+
+  // Say something else, so there are two again and one of them is the
+  // one being sat in.
+  await shut(ryan.page);
+  await type(ryan.page, 'and one more thing');
+  await ryan.page.click('.bar button:has-text("New conversation")');
+  await ryan.page.waitForTimeout(300);
+  await ryan.page.click('dialog.ask button.primary');
+  await ryan.page.waitForTimeout(1400);
+  await type(ryan.page, 'the one we are in');
+  await openHistory(ryan.page);
+  is('two conversations to purge', (await rows(ryan.page)).length, 2);
+
+  // The owner's alone — Alex is in the same room and has no button.
+  is('only the owner is offered it',
+    await alex.page.evaluate(() => !!document.querySelector('.menu .purge')), false);
+
+  // Asked twice over: a question, and the room's name written out,
+  // because one click is too cheap a way to lose every conversation.
+  await ryan.page.click('.menu .purge');
+  await ryan.page.waitForSelector('dialog.ask[open]');
+  is('the question names the room and says the live one goes too',
+    /Purge Lobby\?.*The one you are in now goes too/s.test(await ryan.page.textContent('dialog.ask p')), true);
+  is('and it will not take yes for an answer yet',
+    await ryan.page.evaluate(() => document.querySelector('dialog.ask button.primary')?.disabled), true);
+  await ryan.page.fill('dialog.ask input.confirm', 'Lounge');
+  is('nor the wrong name',
+    await ryan.page.evaluate(() => document.querySelector('dialog.ask button.primary')?.disabled), true);
+  await ryan.page.screenshot({ path: '/tmp/vox-room-purge.png' });
+  await ryan.page.fill('dialog.ask input.confirm', 'Lobby');
+  await ryan.page.waitForTimeout(200);
+  is('the room\'s own name is the key',
+    await ryan.page.evaluate(() => document.querySelector('dialog.ask button.primary')?.disabled), false);
+  await ryan.page.click('dialog.ask button.primary');
+  await ryan.page.waitForTimeout(1600);
+
+  // Everything went, including the one he was in — and the room is
+  // left somewhere to be rather than staring at a conversation that
+  // is no longer there.
+  is('nothing is left on screen', await said(ryan.page), []);
+  is('and everyone in the room is in the fresh one', await said(alex.page), []);
+  // The list is still open, as it is after deleting one, and it has
+  // re-read itself: what is in it now is the conversation the room
+  // started in the same breath.
+  await ryan.page.waitForTimeout(600);
+  is('the history is the one the room is having now', (await rows(ryan.page)).length, 1);
+  is('which is the live one', /now/.test((await rows(ryan.page))[0].head), true);
+  is('and it has nothing in it', (await rows(ryan.page))[0].opening, 'Nothing was said.');
+  await shut(ryan.page);
+
+  await ryan.page.reload();
+  await ryan.page.locator('.consent input').check();
+  await ryan.page.click('button:has-text("Join Audio")');
+  await ryan.page.waitForTimeout(2500);
+  await openHistory(ryan.page);
+  is('still one after a reload, so the room really is empty',
+    (await rows(ryan.page)).length, 1);
 
   await ryan.browser.close();
   await alex.browser.close();

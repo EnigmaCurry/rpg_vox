@@ -1,6 +1,6 @@
 <script>
   import {
-    room, command, enterRoom, setInterpreter, setTranscribing, theAI, theAIs, ask,
+    room, command, enterRoom, setInterpreter, setTranscribing, setRecording, theAI, theAIs, ask,
   } from '../lib/room.svelte.js';
   import Strip from './Strip.svelte';
 
@@ -148,6 +148,46 @@
       : 'Off the record: nobody is being transcribed, nothing is going into the conversation, and there is no AI in the room. Put it back and everything said from then on is written down again.',
   );
 
+  /// Whether the room is being recorded, which is the other control
+  /// about the room rather than about one voice in it — and the
+  /// stronger of the two. It is beside Transcription because the two
+  /// are the same question asked harder, and it is refused while the
+  /// room is off the record: a recording cannot outlive the transcript
+  /// it is the stronger version of. See `Room::set_recording`.
+  const taping = $derived(!!room.recording);
+  const tapeHint = $derived(
+    !room.mayTranscribe
+      ? 'Nothing said in the lobby is written down, and it is not recorded either.'
+      : !room.transcribing
+      ? 'This room is off the record, so it cannot be recorded. Turn transcription back on first.'
+      : taping
+      ? `${room.recording.who} started recording the room. It stops when anybody here stops it, when the room goes off the record, or when a new conversation starts — and the clip and what was said while it ran go into the conversation.`
+      : 'Record everything audible in this room — every microphone and the AI — as one clip in the conversation, with the transcript of what was said while it ran beside it. Anybody here may start or stop it, and the room says who in front of everybody.',
+  );
+
+  async function record(e) {
+    const picker = e.currentTarget;
+    const on = picker.value === 'on';
+    // Asked on the way in and not on the way out. Starting one is the
+    // room becoming a room that is being recorded, and nobody should
+    // be able to do that to everybody with a stray click; stopping one
+    // takes nothing away from anybody and leaves the clip where it is,
+    // so a question there would only be in the way of somebody trying
+    // to stop being recorded.
+    if (!on) {
+      setRecording(false);
+      return;
+    }
+    if (await ask(
+      'Record this room? Everything said here — every microphone and the AI — goes into one clip in the conversation, with the transcript of what was said while it runs. Everybody here is told, and anybody here can stop it.',
+      'Record the room',
+    )) {
+      setRecording(true);
+      return;
+    }
+    picker.value = taping ? 'on' : 'off';
+  }
+
   async function transcribe(e) {
     // The picker itself, before anything is awaited: `currentTarget` is
     // only the element while the event is being dispatched, and by the
@@ -227,13 +267,27 @@
        one voice in the room; this is the room, and it is the one thing
        here that decides what happens to all of them. -->
   <div class="is">
-    <label class="when stack" title={recordHint}>
+    <label class="when stack writing" title={recordHint}>
       <span class="what">Transcription</span>
       <select value={room.transcribing ? 'on' : 'off'} disabled={!room.mayTranscribe}
         aria-label="Whether what is said in this room is written down"
         onchange={transcribe}>
         <option value="on">On — written down</option>
         <option value="off">Off — live audio only</option>
+      </select>
+    </label>
+    <!-- The stronger half of the same question, under it: whether the
+         room is being recorded. Off while the room is off the record,
+         because there is nothing for a recording to be the stronger
+         version of. -->
+    <label class="when stack taping-switch" title={tapeHint}>
+      <span class="what">Recording</span>
+      <select value={taping ? 'on' : 'off'}
+        disabled={!room.mayTranscribe || !room.transcribing}
+        aria-label="Whether the room is being recorded"
+        onchange={record}>
+        <option value="on">On — being recorded</option>
+        <option value="off">Off — not recorded</option>
       </select>
     </label>
     <!-- Said and not only hovered: a room that is keeping nothing
@@ -248,6 +302,14 @@
       <p class="wearing">
         Live audio only. Nobody is transcribed, nothing is said into the
         conversation, and {theAI('or')} is out of the room.
+      </p>
+    {:else if taping}
+      <!-- Said and not only hovered, for the reason the line above is:
+           a room being recorded looks exactly like one that is not,
+           and this is where anybody would look. -->
+      <p class="wearing taping">
+        <span class="rec" aria-hidden="true"></span>
+        Being recorded — {room.recording.who} started it. Anybody here can stop it.
       </p>
     {/if}
   </div>
@@ -562,6 +624,26 @@
     font-size: 11px;
     color: var(--muted);
     overflow-wrap: anywhere;
+  }
+  .wearing.taping { display: flex; align-items: center; gap: 6px; }
+  /* The one red thing in the room, meaning what it means on a clip's
+     card: something is being recorded right now. The same dot, written
+     twice because a style here cannot reach into Log.svelte -- keep
+     the two the same. */
+  .rec {
+    flex: none;
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background: var(--danger);
+    animation: recording 1.6s ease-in-out infinite;
+  }
+  @keyframes recording {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.25; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .rec { animation: none; }
   }
   .when { display: flex; align-items: center; gap: 6px; }
   /* Wide enough for "Stops", so the lines in a strip start in the

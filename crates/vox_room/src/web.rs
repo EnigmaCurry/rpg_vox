@@ -14,6 +14,7 @@
 //! {"type": "bots", "how": "any"}
 //! {"type": "stops", "bot": "Vox", "stops": "finished"}
 //! {"type": "transcribe", "on": false}
+//! {"type": "record", "on": true}
 //! {"type": "bot_off", "bot": "Sage", "off": true}
 //! {"type": "voice", "bot": "Vox", "voice": "Alan Watts"}
 //! {"type": "room_voice", "bot": "Vox", "voice": "Alan Watts", "here": true}
@@ -149,6 +150,16 @@ struct PictureName {
     name: String,
 }
 
+/// `?clock=` on a transcript: the reader's own offset from UTC, in
+/// minutes east of it. The browser knows it and the room does not --
+/// see `transcript::Head::clock` -- and a file asked for without it is
+/// written in UTC and says so.
+#[derive(Deserialize)]
+struct Clock {
+    #[serde(default)]
+    clock: i32,
+}
+
 /// `?v=` on a face: which one of somebody's to serve.
 #[derive(Deserialize)]
 struct AvatarQuery {
@@ -255,9 +266,18 @@ pub fn router(rooms: Arc<Rooms>, screen: Arc<Screen>) -> Router {
         .route("/api/rooms/:room/history", get(history))
         .route("/api/rooms/:room/history/:id", get(read_conversation))
         .route(
+            "/api/rooms/:room/history/:id/transcript",
+            get(download_transcript),
+        )
+        .route(
+            "/api/rooms/:room/recording/:id/transcript",
+            get(download_recording_transcript),
+        )
+        .route(
             "/api/rooms/:room/history/:id/delete",
             post(forget_conversation),
         )
+        .route("/api/rooms/:room/history/purge", post(purge_room))
         // Everything above answers one browser about itself, so none
         // of it may be cached. The sockets, the health check, the
         // faces and the app's own files below are the same for
@@ -271,6 +291,7 @@ pub fn router(rooms: Arc<Rooms>, screen: Arc<Screen>) -> Router {
         .route("/api/avatar/:who/all", get(faces))
         .route("/api/picture/:id", get(picture))
         .route("/api/sample/:id", get(sample))
+        .route("/api/recording/:id", get(recording))
         .route("/room.ws", get(ws))
         .route("/screen.ws", get(screen_ws))
         .route("/healthz", get(|| async { "ok" }))
@@ -948,6 +969,103 @@ async fn read_conversation(
     }
 }
 
+/// One conversation as a markdown file to keep.
+///
+/// A conversation can be read on screen and could not be taken away.
+/// Everything needed was already here -- the room reads one back in
+/// order, says what it is called and when it was -- and nothing
+/// assembled it, so the only copy of an afternoon was the room's.
+///
+/// Markdown rather than JSON, for the reader: the same conversation is
+/// already JSON at `GET /api/rooms/:room/history/:id`, which is what a
+/// tool wants and loses nothing, so a second format here would be the
+/// same bytes behind a second button. What this adds is the one thing
+/// that endpoint cannot be: a file with a name, that reads as a
+/// transcript when it is opened.
+///
+/// The reader decides two things about it and the room neither: the
+/// language (theirs, from the door) and the clock (`?clock=`).
+async fn download_transcript(
+    State(app): State<App>,
+    Path((id, conversation)): Path<(String, i64)>,
+    Query(q): Query<Clock>,
+    headers: HeaderMap,
+) -> Response {
+    let Some((who, room)) = their_room(&app, &headers, &id) else {
+        return (StatusCode::NOT_FOUND, "no such room").into_response();
+    };
+    // Every real clock is within a day of UTC. Anything else is a
+    // browser that is wrong or an address somebody typed, and neither
+    // is a reason to write times nobody can line anything up against.
+    let clock = q.clock.clamp(-14 * 60, 14 * 60);
+    let language = room.language_for(&who.display);
+    let Some((name, markdown)) = room.transcript(conversation, &language, clock) else {
+        return (StatusCode::NOT_FOUND, "no such conversation").into_response();
+    };
+    info!(
+        room = %id,
+        conversation,
+        who = %who.display,
+        "handed over a transcript"
+    );
+    (
+        [
+            (
+                header::CONTENT_TYPE,
+                "text/markdown; charset=utf-8".to_string(),
+            ),
+            // Safe to quote without escaping anything: the name is
+            // letters, digits and dashes by construction -- see
+            // `transcript::file_name`.
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{name}\""),
+            ),
+        ],
+        markdown,
+    )
+        .into_response()
+}
+
+/// The stretch of conversation one recording covers, as the markdown
+/// file beside the clip.
+///
+/// The same renderer and the same two questions as
+/// `download_transcript` -- the reader's language and the reader's
+/// clock -- because a transcript of a recording and a transcript of a
+/// conversation are one document with different bounds. See
+/// `room::Room::recording_transcript`.
+async fn download_recording_transcript(
+    State(app): State<App>,
+    Path((room_id, id)): Path<(String, String)>,
+    Query(q): Query<Clock>,
+    headers: HeaderMap,
+) -> Response {
+    let Some((who, room)) = their_room(&app, &headers, &room_id) else {
+        return (StatusCode::NOT_FOUND, "no such room").into_response();
+    };
+    let clock = q.clock.clamp(-14 * 60, 14 * 60);
+    let language = room.language_for(&who.display);
+    let Some((name, markdown)) = room.recording_transcript(&id, &language, clock) else {
+        return (StatusCode::NOT_FOUND, "no such recording").into_response();
+    };
+    info!(room = %room_id, recording = %id, who = %who.display, "handed over a recording's transcript");
+    (
+        [
+            (
+                header::CONTENT_TYPE,
+                "text/markdown; charset=utf-8".to_string(),
+            ),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{name}\""),
+            ),
+        ],
+        markdown,
+    )
+        .into_response()
+}
+
 /// A picture somebody dropped into the room: it becomes a card in the
 /// conversation with the next number on it, which is then a picture
 /// like any other -- the AI can be asked for it as somebody's face,
@@ -1030,6 +1148,40 @@ async fn forget_conversation(
         Ok(()) => {
             info!(person = %who.name, room = %id, conversation, "deleted a conversation");
             Json(json!({ "conversations": room.history() })).into_response()
+        }
+        Err(why) => (StatusCode::CONFLICT, Json(json!({ "error": why }))).into_response(),
+    }
+}
+
+/// Everything a room has ever said: every conversation it has had, and
+/// everything said, dealt, drawn, read aloud or recorded in any of
+/// them.
+///
+/// THE OWNER'S, and the one thing about a conversation that is. Anybody
+/// in a room may put it off the record, on the reasoning that being
+/// recorded is not one person's decision to make for a table -- but
+/// that changes what happens *next*, and anybody it was wrong for can
+/// change it straight back. This takes away what other people already
+/// said, including conversations from before whoever presses it ever
+/// walked in, and nothing brings it back. It belongs with making,
+/// renaming and deleting rooms, which are the owner's, and not with
+/// the switches in the room.
+///
+/// The browser asks twice over and makes them type the room's name
+/// before it gets here; this says no to everybody else regardless,
+/// because an endpoint that trusts the page not to have been asked is
+/// an endpoint anybody can ask with curl.
+async fn purge_room(State(app): State<App>, Path(id): Path<String>, headers: HeaderMap) -> Response {
+    let Some(who) = owner(&app, &headers) else {
+        return not_for_them();
+    };
+    let Some(room) = app.rooms.find(&who, &id) else {
+        return (StatusCode::NOT_FOUND, "no such room").into_response();
+    };
+    match room.purge_room(&who.display) {
+        Ok(gone) => {
+            info!(person = %who.name, room = %id, conversations = gone, "purged a room");
+            Json(json!({ "purged": gone, "conversations": room.history() })).into_response()
         }
         Err(why) => (StatusCode::CONFLICT, Json(json!({ "error": why }))).into_response(),
     }
@@ -1175,6 +1327,40 @@ async fn sample(State(app): State<App>, headers: HeaderMap, Path(id): Path<Strin
             (header::VARY, "Cookie".to_string()),
         ],
         wav,
+    )
+        .into_response()
+}
+
+/// A recording of the room: the clip its card plays.
+///
+/// Anybody invited, like a voice sample and for the same reason: it is
+/// the room they were in, and everything on it they could already
+/// hear. Cached like a face -- the bytes under one of these ids never
+/// change, because stopping a recording is what makes them.
+async fn recording(State(app): State<App>, headers: HeaderMap, Path(id): Path<String>) -> Response {
+    if invited(&app, &headers).is_none() {
+        return (StatusCode::FORBIDDEN, "not invited").into_response();
+    }
+    let found = match app.any().recording_audio(&id) {
+        Ok(found) => found,
+        Err(err) => {
+            warn!("read a recording: {err:#}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "no").into_response();
+        }
+    };
+    // Still running, or it never landed. The card says which, from
+    // what the room told it rather than from this.
+    let Some(audio) = found else {
+        return (StatusCode::NOT_FOUND, "not yet").into_response();
+    };
+    (
+        [
+            (header::CONTENT_TYPE, "audio/ogg".to_string()),
+            (header::CACHE_CONTROL, AVATAR_CACHE.to_string()),
+            (header::ETAG, format!("\"{id}\"")),
+            (header::VARY, "Cookie".to_string()),
+        ],
+        audio,
     )
         .into_response()
 }
@@ -1524,6 +1710,14 @@ enum Command {
     Transcribe {
         on: bool,
     },
+    /// Whether the room is being recorded. Anybody in the room may
+    /// send it and the room writes down who started and who stopped;
+    /// a room that is off the record refuses it, because a recording
+    /// is the stronger of the two acts and cannot outlive the weaker.
+    /// See `room::Room::set_recording`.
+    Record {
+        on: bool,
+    },
     /// Switch one bot off in this room, or back on. Off is off: no
     /// turn is given to it, so nothing is asked of a model. It keeps
     /// its place in the list and everything set on it. See
@@ -1767,6 +1961,15 @@ async fn client(
                         // already says so.
                         Ok(Command::Transcribe { on }) => {
                             if let Err(why) = room.set_transcribing(&name, on) {
+                                room.tell(&name, &why);
+                            }
+                        }
+                        // Only the tab that asked hears why not, like
+                        // `Transcribe` above: the reasons are both of
+                        // them about the room this browser is in and
+                        // the control there says them already.
+                        Ok(Command::Record { on }) => {
+                            if let Err(why) = room.set_recording(&name, on) {
                                 room.tell(&name, &why);
                             }
                         }

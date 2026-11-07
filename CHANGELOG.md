@@ -9,6 +9,182 @@ releases.
 
 ### Voice room
 
+- **A room's whole history can be purged.** **Purge room**, at the foot
+  of the **History** list, forgets every conversation this room has ever
+  had and everything said, dealt, drawn, read aloud and recorded in any
+  of them. Deleting them one at a time was the only way, and a room that
+  has been talking for a year is not a thing anybody is going to clear
+  one × at a time.
+
+  It takes the conversation you are in with the rest, and the room
+  starts a fresh one in the same breath. A button of that name that left
+  the live one would be lying about what it did, and the one it left
+  would often be exactly the one somebody pressed it for.
+
+  It is the owner's, and the only thing about a conversation that is.
+  Anybody in a room may put it off the record — that changes what
+  happens next, and anybody it was wrong for can change it straight back
+  — but this takes away what other people already said, including
+  conversations from before whoever presses it ever walked in, and
+  nothing brings it back. It sits with making, renaming and deleting
+  rooms rather than with the switches in the room. The button is only
+  drawn for the owner, and the endpoint says no to everybody else
+  regardless of what the page did or didn't ask.
+
+  It asks twice: the question, and then the room's name written out.
+  One click is too cheap a way to lose a year, and a dialog that looks
+  exactly like the one for deleting a single conversation is one click.
+  (Any question in the room can now ask for a word to be written out
+  like this; this is the first that does.) What it promises is what it
+  does: the rows go, and the space they took is the database's to use
+  again rather than handed back to the disk — so nothing in it implies
+  the file has been scrubbed.
+
+  **And a room taken out of the house now takes its history with it.**
+  Deleting a room removed the room, who could go to it and which AIs
+  were in it, and left every conversation it had ever had in the
+  database with nothing anywhere pointing at them — every word, card,
+  picture, clip and recording unreachable rather than deleted. Both
+  paths go through one function now, so the two cannot come to disagree
+  about what a room owns.
+
+  Two smaller things fixed on the way past. A conversation the room
+  comes *back* to — leaving a game, or any other reset — now arrives
+  with its clips and recordings as well as its pictures, so a card that
+  has audio in the database no longer says the room couldn't keep it.
+  And the **History** list, left open while the room starts another
+  conversation, reads itself again instead of sitting on "Reading…".
+
+- **The room can be recorded, and the recording leaves a clip and a
+  transcript in the conversation.** **Recording**, under
+  **Transcription** in the room column, is the stronger of the two and
+  is next to it because it is the same question asked harder. Anybody
+  in the room may start one and anybody may stop it, and the room
+  writes down which of them did each: being recorded is not something
+  that happens to one person at a table, which is the reasoning the
+  switch above it was built on.
+
+  Starting one asks first and is then announced where nobody can miss
+  it — a card goes into the conversation, lit, before a sample of audio
+  is kept, and a line appears under the switch for as long as it runs.
+  Stopping is not asked about: it takes nothing away from anybody and
+  leaves the clip, and a question there would only be in the way of
+  somebody trying to stop being recorded.
+
+  What a finished one leaves is on that card. The clip — everything
+  audible in the room, as one Ogg/Opus file you can play there or save.
+  And the transcript of the stretch it covers, ⤓ beside it, which is
+  the same renderer a whole conversation downloads through with
+  different bounds; there is deliberately one of those and not two,
+  because two would disagree about translations, pictures and the
+  off-the-record notes by the end of the month.
+
+  The recording is the room and not anybody's headphones. Every
+  microphone at its fader, plus the AI in the room's own language: what
+  a listener hears is the room minus their own voice, with the AI in
+  whichever language they read and the interpreter wherever they left
+  it, and a recording of that would be a recording of one pair of
+  headphones. The interpreters are left out for the same reason — an
+  interpretation is one listener's way in to what was already said, and
+  the transcript beside the clip has every language in it. It is taken
+  as the sum before any of it is encoded for anybody, so nothing is
+  decoded and re-encoded on the way.
+
+  Opus, which is the one place this differs from a voice sample. A
+  sample is a few seconds and goes to a clone server that wants the raw
+  samples; a recording is as long as a meeting and lives in the
+  database beside its conversation, where an hour of 48 kHz WAV would
+  be 345 MB and an hour of Opus is about ten.
+
+  A recording cannot outlive the transcript it is the stronger version
+  of. A room that is off the record cannot be recorded at all; taking
+  the room off the record while one is running stops it where it stands
+  and keeps what it has, with the room's own note about the switch
+  standing as the explanation of why the clip ends there; and the
+  lobby, never written down, is never recorded. Starting a new
+  conversation ends it too, because a recording belongs to the
+  conversation it was made in. And it does not survive the room going
+  away — the audio is in memory until somebody stops it — so a restart
+  in the middle of one leaves a card that says so, rather than a light
+  on a microphone nothing is listening to.
+
+- **A conversation can be taken away.** The **⤓** beside each
+  conversation in **History** downloads it as a markdown file: who said
+  what, when they said it, and the gaps the room explained for itself.
+  A room could show you its conversation and could not give it to you,
+  which made the room the only copy of an afternoon.
+
+  It is on every row including the live one — the conversation you are
+  in is the one most likely to be wanted — and what is in the file is
+  what is on the screen, down to the line somebody finished saying a
+  second ago, rather than only the part that has reached the database.
+
+  It is a transcript, so it says so about the parts a text file cannot
+  hold rather than leaving them out: a picture, a clip read aloud, a
+  recording brought in, each one line saying it was there and what it
+  was. A card and a folded-up play keep their own text, quoted so that
+  their headings cannot restructure the file they landed in. A play's
+  lines are in it once — in the programme the conversation keeps, which
+  is where the script lives — and not again one by one. And the notes at
+  either end of a stretch the room was **off the record** for come
+  through like any other line, because they are the only thing that
+  tells a reader why there is an hour with nothing in it.
+
+  Two things about the file are the reader's and not the room's. The
+  language: a line said in another one is given in yours with the
+  original under it, the same way the screen shows it, so a translation
+  that went wrong can still be seen to have. And the clock: the browser
+  says which one it keeps, the times are in it, and the head of the file
+  says which it used — the room has never spelled a date for anybody and
+  does not start here.
+
+  Nothing new decides who may. Anybody who can walk into the room could
+  already read the whole conversation on screen, and every word in the
+  file was on their screen already; the lobby is never written down, so
+  it has nothing to hand over. A tool that wants the conversation rather
+  than a file to read already had it as JSON at the address the room
+  reads one back from, which is why there is no second button for that.
+
+- **Speech no longer vanishes from the transcript as pass 2 arrives.**
+  You would be talking, watch the line appear as you spoke it, and then
+  as you stopped -- the moment the better decode should have replaced
+  the guess -- the line would go instead. Not corrected: gone, with
+  nothing in its place and no error anywhere. Intermittent, and the
+  worst failure a room whose whole job is writing down what was said
+  can have.
+
+  Two recognizers are listening to you. Pass 1 is the streaming one and
+  its guess is what you read while you are still speaking; pass 2
+  decodes the finished utterance and has the last word. When pass 2
+  comes back with no words in it, the engine takes the whole paragraph
+  back, on the reading that the voice detector fired on a cough or a
+  door and there was never anything there. For a dictation window that
+  is right -- nobody had read it yet, and a transcript is better off
+  without the blips. In a room it is a line that was on everybody's
+  screen, and pass 2 finding nothing where pass 1 heard a sentence is
+  not "nobody spoke": it is the two of them disagreeing about what was
+  said, with one of them having already shown its answer to the room.
+
+  The room now stands by what pass 1 heard and lets it be the final
+  word, which is what the engine already did for a decode that *failed*
+  -- the same reasoning, for the case that does not raise an error. It
+  stops being shown as a guess, so the turn it belongs to can be handed
+  over, and it goes into the conversation like anything else said. A
+  line kept this way is logged, because a transcript that reads oddly
+  in one place is worth being able to explain afterwards.
+
+  The blips are still dropped. The test is the engine's own: if what
+  pass 1 heard is itself punctuation, empty, or one of the lone "I." /
+  "The." hallucinations, then both passes agree there were no words and
+  the line goes as before. Nothing a room ever showed you as a sentence
+  is removed from it again.
+
+  A line kept this way reaches the other languages like any other.
+  Interpretation is of the clips the second pass has landed, and a kept
+  line has none of those — so otherwise the one line in the
+  conversation that needed explaining would have been the one left in a
+  language its reader never asked for.
+
 - **A room can be taken off the record.** **Transcription**, at the
   top of the room column over the faders, is whether what is said in
   this room is written down. Anybody in the room may change it and it
