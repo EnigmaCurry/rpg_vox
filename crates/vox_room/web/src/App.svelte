@@ -453,9 +453,7 @@
             aria-pressed={room.bots === 'any'}
             onclick={() => setBots(room.bots !== 'any')}
             title={room.bots === 'any'
-              ? `${theAI('or')} may answer what you say. Turn this off and ${theAIs().length === 1 ? 'it stays' : 'they stay'} out of it — Settings says whether your calling ${theAIs().length === 1 ? 'it' : 'one of them'} by name still gets an answer.`
-              : room.bots === 'named'
-              ? `${theAI('or')} stays out of what you say unless you say its name. Nobody else is affected.`
+              ? `${theAI('or')} may answer what you say. Turn this off and ${theAIs().length === 1 ? 'it stays' : 'they stay'} out of it, ${theAIs().length === 1 ? 'its' : 'their'} name included.`
               : `${theAI('or')} answers nothing of yours, not even its own name. Nobody else is affected.`}>
             BOTS
           </button>

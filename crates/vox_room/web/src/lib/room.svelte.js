@@ -139,16 +139,11 @@ export const room = $state({
   mayTranscribe: true,
   // Whether the AIs may answer *you*: the BOTS button in the footer,
   // beside push to talk. 'any' is the button on, which is what
-  // everybody starts as; 'named' and 'never' are the two ways it can
-  // be off. The room is the authority -- it is kept against you, in
+  // everybody starts as, and 'never' is it off -- nothing of yours is
+  // answered, an AI's own name included. The room is the authority -- it is kept against you, in
   // every room of the house and after a restart -- and this is what it
   // last said, so the button reads the truth after a reconnect.
   bots: 'any',
-  // Which of those two the off position means, for you. This browser's,
-  // like `pttHush`: the nuance belongs with the person holding the
-  // button, and the room only ever hears which of the three it is
-  // being put into. See `setBotsOff`.
-  botsOff: readChoice('vox_room.bots_off') === 'never' ? 'never' : 'named',
   // Whether what people say out loud is put into the other languages as
   // well as the AI's replies. False means a line spoken in a language
   // you don't read is shown as it was said, because no translation of
@@ -1907,7 +1902,7 @@ export function setPushToTalk(on) {
 /// of the house and after a restart, so this only asks -- `room.bots`
 /// is set from the roster that comes back.
 export function setBots(on) {
-  const how = on ? 'any' : room.botsOff;
+  const how = on ? 'any' : 'never';
   // Shown at once rather than when the roster lands: the button is a
   // button. A room that refuses it says so and sends the roster, which
   // is what puts this right.
@@ -1931,21 +1926,6 @@ export function setTranscribing(on) {
 /// room writes down who did which — see `Room::set_recording`.
 export function setRecording(on) {
   command({ type: 'record', on });
-}
-
-/// What the off position of that button means, which is the one nuance
-/// in it: `named` -- the default -- still lets an AI answer when you
-/// call it by its name, and `never` is nothing at all.
-///
-/// This browser's, like `setTalkHush`: it is a sentence about how you
-/// want to be spoken to, and the room only ever hears which of the
-/// three states the switch is in. Changed while the button is already
-/// off, it moves the switch there now -- the setting would otherwise
-/// be a promise about next time.
-export function setBotsOff(how) {
-  room.botsOff = how === 'never' ? 'never' : 'named';
-  writeChoice('vox_room.bots_off', room.botsOff);
-  if (room.bots !== 'any') setBots(false);
 }
 
 /// What holding the talk button does to the room's own sound.

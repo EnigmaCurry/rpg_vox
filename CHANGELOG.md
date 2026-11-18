@@ -212,6 +212,28 @@ releases.
 
 ### Voice room
 
+- **BOTS off is off.** Turning it off used to mean, by default, that
+  an AI stayed out of what you said *unless you said its name* -- with
+  a setting to make it mean nothing at all. That made the switch
+  something to think about before flipping it. Now there is one off:
+  nothing you say reaches an AI, its name included, and the setting is
+  gone. Somebody who had chosen the old softer off is simply off, and a
+  tab still running the old page asking for it is put right rather
+  than refused. The room also no longer shows a strip as waiting to
+  answer a pause it is not going to answer, which it could do for
+  somebody with BOTS off who said an AI's name.
+
+- **A program in the room can write down its own words.** Something
+  that joins the way a person does -- a bot with its own voice, a music
+  player, a sound board -- can send `{"type": "own_words", "on": true}`
+  and its audio is heard by everybody but never transcribed: no
+  speech-to-text engine is made for it, nothing it plays counts as
+  talking (so it neither ducks an AI nor cuts one off), and it is never
+  kept as a voice sample. What it sends as `text` is what goes in the
+  conversation and what the AIs answer. It lasts for the connection and
+  follows it from room to room. See ROOM.md, *A program that writes
+  down its own words*.
+
 - **A room's whole history can be purged.** **Purge room**, at the foot
   of the **History** list, forgets every conversation this room has ever
   had and everything said, dealt, drawn, read aloud and recorded in any

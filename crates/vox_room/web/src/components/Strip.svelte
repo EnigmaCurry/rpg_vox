@@ -1,5 +1,5 @@
 <script>
-  import { command, room, theAI, theAIs } from '../lib/room.svelte.js';
+  import { command, room, theAI } from '../lib/room.svelte.js';
   import { hue } from '../lib/color.js';
   import { screen, showThumb, streamOf, unwatch, watch } from '../lib/screen.svelte.js';
   import Face from './Face.svelte';
@@ -76,17 +76,12 @@
   // So the icon is the exception and its absence is the rule.
   const botsOff = $derived(bots && bots !== 'any' ? bots : null);
   const yours = $derived(label === room.you);
-  const one = $derived(theAIs().length === 1);
   const why = $derived(
     !botsOff
       ? ''
       : yours
-        ? botsOff === 'never'
-          ? `You have BOTS off all the way: nothing you say reaches ${theAI()}, its own name included. Nobody else in the room is affected.`
-          : `You have BOTS off: ${theAI()} ${one ? 'stays' : 'stay'} out of what you say until you say its name. Nobody else in the room is affected.`
-        : botsOff === 'never'
-          ? `${label} has BOTS off all the way: nothing they say reaches ${theAI()}, its own name included. Everybody else is answered as usual.`
-          : `${label} has BOTS off: ${theAI()} ${one ? 'stays' : 'stay'} out of what they say until they say its name. Everybody else is answered as usual.`,
+        ? `You have BOTS off: nothing you say reaches ${theAI()}, its own name included. Nobody else in the room is affected.`
+        : `${label} has BOTS off: nothing they say reaches ${theAI()}, its own name included. Everybody else is answered as usual.`,
   );
 
   function gain(e) {
@@ -130,7 +125,7 @@
          in what somebody says at all; which of the two it is is the
          nuance, and it is in the title and in how solid the mark is. -->
     {#if botsOff}
-      <span class="bots" class:all={botsOff === 'never'} role="img" title={why} aria-label={why}>
+      <span class="bots" role="img" title={why} aria-label={why}>
         <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" focusable="false">
           <path d="M3 2.5h10A1.5 1.5 0 0 1 14.5 4v4.5A1.5 1.5 0 0 1 13 10H7.5L4.75 12.25V10H3A1.5 1.5 0 0 1 1.5 8.5V4A1.5 1.5 0 0 1 3 2.5Z"
             fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" />
@@ -222,11 +217,7 @@
     flex: none;
     display: inline-flex;
     color: var(--agent);
-    /* Off unless they are named is halfway off, and reads that way.
-       All the way off is the solid mark. */
-    opacity: 0.5;
   }
-  .bots.all { opacity: 1; }
   /* The desktop they are sharing, under their name. A button, because
      the only thing it does is open the picture on this screen. */
   .desktop {

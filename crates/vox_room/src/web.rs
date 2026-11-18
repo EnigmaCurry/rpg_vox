@@ -9,6 +9,7 @@
 //! {"type": "mic", "on": true}
 //! {"type": "mute", "on": true}
 //! {"type": "ptt", "on": true}
+//! {"type": "own_words", "on": true}
 //! {"type": "strip", "name": "Alex", "gain": 0.8, "mute": false}
 //! {"type": "interpreter", "gain": 0.8, "mute": false}
 //! {"type": "bots", "how": "any"}
@@ -72,7 +73,7 @@
 //! the room over to it. None of these answers may be cached: every one
 //! of them is about the one browser that asked.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 
 use axum::{
@@ -1678,6 +1679,13 @@ enum Command {
     Ptt {
         on: bool,
     },
+    /// This connection writes down its own words: its audio is heard
+    /// but never transcribed, and what it sends as `text` is what the
+    /// conversation gets. For programs that join as a person would.
+    /// See `room::Tab::own_words`.
+    OwnWords {
+        on: bool,
+    },
     Strip {
         name: String,
         gain: Option<f32>,
@@ -1691,9 +1699,8 @@ enum Command {
         mute: Option<bool>,
     },
     /// Whether the AIs may answer whoever sent it: their BOTS button,
-    /// and what they have said the off position means -- "any",
-    /// "named" or "never". Theirs alone, and the same in every room of
-    /// the house. See `room::Bots`.
+    /// "any" (on) or "never" (off). Theirs alone, and the same in every
+    /// room of the house. See `room::Bots`.
     Bots {
         how: String,
     },
@@ -1782,13 +1789,21 @@ enum Command {
 
 /// Take a seat in a room: on its roster, and fed its mix down the
 /// channel this connection already has.
+///
+/// `own_words` goes with the connection rather than the room, so a
+/// program that writes down its own words is not put back through
+/// speech-to-text by changing rooms.
 fn enter(
     room: &Arc<Room>,
     person: &str,
     tab: u64,
     audio: &mpsc::Sender<Vec<u8>>,
+    own_words: &AtomicBool,
 ) -> anyhow::Result<()> {
     room.join(person, tab);
+    if own_words.load(Ordering::Relaxed) {
+        room.set_own_words(person, tab, true);
+    }
     room.mixer
         .add_listener(tab, person, &room.language_for(person), audio.clone())
 }
@@ -1818,7 +1833,11 @@ async fn client(
     let home = seat
         .and_then(|id| rooms.find(who, id))
         .unwrap_or_else(|| rooms.home());
-    enter(&home, &name, id, &audio_tx)?;
+    // Whether this connection writes down its own words: see
+    // `Command::OwnWords`. Nothing yet, so the first room needs no
+    // telling.
+    let own_words = AtomicBool::new(false);
+    enter(&home, &name, id, &audio_tx, &own_words)?;
     app.screen.place(&name, &home.config().id);
     rooms.announce();
     // Which room this tab is in. The two halves of the socket both need
@@ -1876,7 +1895,7 @@ async fn client(
                         if rooms.find(who, &room.config().id).is_none() {
                             let back = rooms.home();
                             part(&room, &name, id);
-                            enter(&back, &name, id, &audio_news)?;
+                            enter(&back, &name, id, &audio_news, &own_words)?;
                             // Out of the room is out of the room: a
                             // desktop they were sharing into it stops,
                             // the same as if they had walked.
@@ -1938,6 +1957,10 @@ async fn client(
                         Ok(Command::Mic { on }) => room.set_mic(&name, id, on),
                         Ok(Command::Mute { on }) => room.set_muted(&name, id, on),
                         Ok(Command::Ptt { on }) => room.set_ptt(&name, id, on),
+                        Ok(Command::OwnWords { on }) => {
+                            own_words.store(on, Ordering::Relaxed);
+                            room.set_own_words(&name, id, on);
+                        }
                         Ok(Command::Strip {
                             name: strip,
                             gain,
@@ -2031,7 +2054,7 @@ async fn client(
                                 continue;
                             };
                             part(&room, &name, id);
-                            enter(&next, &name, id, &audio_tx)?;
+                            enter(&next, &name, id, &audio_tx, &own_words)?;
                             // Their desktop does not go with them. It
                             // was shared to the room they just left,
                             // and sharing it here is a thing to decide

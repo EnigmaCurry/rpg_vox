@@ -9,9 +9,8 @@
 // And when an AI answers *you* is your own switch -- BOTS in the
 // footer, one per person -- which is the thing that used to be one
 // Answers control per bot that the whole room shared. Off, the AIs
-// stay out of what you say; off and called by name, they still answer,
-// which is the nuance in it; off meaning never, not even that. None of
-// it touches anybody else in the room.
+// stay out of what you say, their own names included. None of it
+// touches anybody else in the room.
 //
 // Wants a room with a second bot in it:
 //   vox_room --room Lobby --bot Sage --echo --no-stt --tts none
@@ -53,7 +52,7 @@ const marks = (page) =>
       [...document.querySelectorAll('.rooms .strip')].map((s) => {
         const who = s.querySelector('.label').textContent.replace(/\s*\(you\)\s*/, '').trim();
         const mark = s.querySelector('.bots');
-        return [who, mark ? (mark.classList.contains('all') ? 'never' : 'named') : null];
+        return [who, mark ? 'never' : null];
       }),
     ));
 
@@ -109,8 +108,7 @@ const marks = (page) =>
   is('so nobody is marked in the list of who is here',
     await marks(alex.page), { Alex: null, Ryan: null, Vox: null, Sage: null });
 
-  // Off meaning never: nothing of theirs reaches an AI, its own name
-  // included.
+  // Off: nothing of theirs reaches an AI, its own name included.
   ryan.send({ type: 'bots', how: 'never' });
   await wait(600);
   is('one person turned them off', switches(ryan), { Alex: 'any', Ryan: 'never' });
@@ -136,38 +134,46 @@ const marks = (page) =>
   is('and what the one who turned them off said is still in the conversation',
     ryan.said.some((e) => e.text.includes('are you there')), true);
 
-  // Off meaning only-when-named, which is the nuance and the default:
-  // a quiet room is still a room you can ask a question in.
-  const named = byBots(ryan).length;
+  // The softer off that used to exist -- "unless named" -- is off,
+  // so a tab still running the old page is put right, not refused.
   ryan.send({ type: 'bots', how: 'named' });
   await wait(600);
-  is('off, but not to its name', switches(ryan), { Alex: 'any', Ryan: 'named' });
-  is('and the mark says which way it is off', await marks(alex.page),
-    { Alex: null, Ryan: 'named', Vox: null, Sage: null });
-  ryan.send({ type: 'text', text: 'Sage, one more thing.' });
-  await settled(ryan);
-  is('and calling one by name is answered',
-    byBots(ryan).slice(named).map((e) => e.who), ['Sage']);
+  is('the old way of being off is off', switches(ryan), { Alex: 'any', Ryan: 'never' });
 
   // It is theirs rather than a room's: it follows them down the hall,
   // into a room of their own and back.
   ryan.send({ type: 'enter_room', id: '@Ryan' });
   await wait(700);
-  is('the switch follows them into their own room', switches(ryan), { Ryan: 'named' });
+  is('the switch follows them into their own room', switches(ryan), { Ryan: 'never' });
   ryan.send({ type: 'enter_room', id: 'Lobby' });
   await wait(700);
-  is('and back', switches(ryan), { Alex: 'any', Ryan: 'named' });
+  is('and back', switches(ryan), { Alex: 'any', Ryan: 'never' });
 
   // And a switch the room has never heard of is refused, to the one
   // tab that asked and nobody else.
   ryan.send({ type: 'bots', how: 'sometimes' });
   await wait(500);
   is('a switch the room has no position for', ryan.notices.length > 0, true);
-  is('and nothing moved', switches(ryan).Ryan, 'named');
+  is('and nothing moved', switches(ryan).Ryan, 'never');
 
   ryan.send({ type: 'bots', how: 'any' });
   await wait(600);
   is('and back on', switches(ryan), { Alex: 'any', Ryan: 'any' });
+
+  // A program that writes down its own words: its audio is not
+  // transcribed (this room has no speech-to-text to show that with --
+  // the unit tests do), and what it sends as text is what is answered.
+  const own = byBots(ryan).length;
+  const complaints = ryan.notices.length;
+  ryan.send({ type: 'own_words', on: true });
+  await wait(300);
+  is('a program may say it writes its own words, without complaint',
+    ryan.notices.length, complaints);
+  ryan.send({ type: 'text', text: 'Vox, now playing the tavern theme.' });
+  await settled(ryan);
+  is('and what it sends is what is answered',
+    byBots(ryan).slice(own).map((e) => e.who), ['Vox']);
+  ryan.send({ type: 'own_words', on: false });
 
   // Switched off in this room: not silenced, not taken out of the
   // house -- asked nothing, so nothing is thought and nothing is
@@ -376,7 +382,7 @@ const marks = (page) =>
   await alex.page.click('footer .bots-switch');
   await wait(800);
   is('and the one in the footer is each person’s own',
-    switches(ryan), { Alex: 'named', Ryan: 'any' });
+    switches(ryan), { Alex: 'never', Ryan: 'any' });
 
   await alex.browser.close();
   report();

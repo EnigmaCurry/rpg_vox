@@ -1003,8 +1003,8 @@ See ROOM_DOCKER.md.
   half its height each so the pair is exactly as tall as it is:
   **PTT**, which is what turns that button into one you hold, and
   **BOTS**, which is whether the AIs may answer you. Both are yours
-  alone, both light up when they are on, and both have a nuance on the
-  settings page — what the *off* position means. Then the box you type
+  alone and both light up when they are on; push to talk has a nuance
+  on the settings page, and BOTS is simply on or off. Then the box you type
   in, taking the rest of the width. Anything the room has to tell you
   appears along it too.
 - **What you do with the room** is three icons over the people in the
@@ -1161,17 +1161,13 @@ room, and a log with holes in it would be a worse thing than an AI that
 heard you. What the switch stops is *your* words being the thing an AI
 answers.
 
-**Off has two meanings, and you pick which**, in Settings → *Turning
-the AI off*:
+**Off is off.** Nothing you say reaches an AI, its own name included;
+somebody else in the room can still bring it in, and you will hear the
+answer. There used to be a softer off that still let its name through,
+and it went: a switch you have to think about before flipping is not
+the easy on/off this needs to be.
 
-- *Unless I say its name* — the default. The AI stays out of what you
-  say and still answers when you call it by name, so a quiet room is
-  still a room you can ask a question in.
-- *Never* — nothing you say reaches it, its own name included. Somebody
-  else in the room can still bring it in, and you will hear the answer.
-
-Which of the two is this browser's, like the push-to-talk nuance above
-it; which position the switch is *in* is the room's, kept against your
+Which position the switch is in is the room's, kept against your
 invite name. So it survives a rename, it is the same in every room of
 the house, and it is still off when you come back tomorrow. It is on
 the roster the room sends everybody, because an AI that answers one
@@ -1182,10 +1178,7 @@ visible or it reads as a fault.
 in the list of who is here, in the colour the room uses for an AI.
 Only when the switch is off, on everybody's screen and not just their
 own — everybody starts with it on, and a mark against every name in the
-room would be a mark that says nothing. The same mark for both ways of
-being off, since at that size the thing to see is whether the AIs are
-in what somebody says at all; which of the two it is is in the tooltip,
-and in how solid the mark is.
+room would be a mark that says nothing.
 
 **An AI's own strip has four things on it**, and no fader: a voice the
 room made is as loud as the room asked it to be, and nobody has ever
@@ -1206,6 +1199,40 @@ wanted one louder or quieter than the rest of the room.
   nothing to do and a sentence is never cut off half-written. **Stop**
   still stops it; that one is the room saying so.
 - **Stops** and **Voice**, above.
+
+### A program that writes down its own words
+
+Anything can join the room the way a person does: follow an invite
+link through the door, open `/room.ws`, and send 20 ms Opus frames.
+Some of what joins that way is not a person talking -- a bot with its
+own voice, a music player, a sound board -- and putting its audio
+through speech-to-text writes nonsense into the conversation, or words
+it already had the exact text of. So such a program can say it writes
+down its own words:
+
+```json
+{"type": "own_words", "on": true}
+```
+
+From then on, for as long as that connection is open and in whichever
+room it moves to:
+
+- **Its audio is heard exactly as before.** It is in everybody's mix,
+  under its own strip and fader.
+- **None of it is transcribed.** No engine is made for it, so it costs
+  no speech-to-text; nothing it plays is taken for talking, so it never
+  ducks an AI or cuts one off; and it is never kept as a voice sample.
+- **Its words are what it sends**, as `{"type": "text", "text": "…"}`
+  -- the same message the box in the footer sends. That is what goes
+  into the conversation under its name and what the AIs answer, subject
+  to its **BOTS** switch like anybody's. Send one whenever there is
+  something to say: what a line of speech said, what a track is, or
+  nothing at all.
+
+`{"type": "own_words", "on": false}` hands its audio back to
+speech-to-text. It is not remembered: a new connection starts
+transcribed, because it is a fact about the program on the other end
+and not a preference somebody set.
 
 ### Games
 
@@ -2190,7 +2217,7 @@ CHROME=$(which chromium) ./run.sh            # or: ./run.sh rooms bots
 |---|---|
 | `rooms` | several rooms on one socket: where a tab lands — the lobby, with nothing written down in it and no AI in it — who may go where, a room of your own admitting one person, and the mix arriving across every move. No browser at all — two sockets are enough |
 | `record` | a room taken [off the record](#off-the-record): the AI leaving it, what is typed into it being refused, the one note at each end saying who did it and who undid it, and the dropdown that does it asking first and leaving everything alone when the question is cancelled — and the lobby, which has no answer to give, no conversation to name, start or read back, and no AI whatever anybody asks |
-| `bots` | two AIs in one room: a fader and a Stops setting each, each answering to its own name -- and each person's own **BOTS** switch, which keeps the AIs out of what *they* say without touching anybody else, still answers when they call one by name, or doesn't, and follows them into another room |
+| `bots` | two AIs in one room: a fader and a Stops setting each, each answering to its own name -- and each person's own **BOTS** switch, which keeps the AIs out of what *they* say -- their names included -- without touching anybody else, and follows them into another room |
 | `door` | the door is a page with no room behind it and no socket open; **Join Audio** does nothing until you agree to be recorded, and the Language box is never blank |
 | `roles` | the house and the people: making a room, renaming one under somebody standing in it, taking one away from under them — and the owner and the rest: who is shown the people and who is answered when they ask for them, a room given and taken away while somebody sits in the house, and an invite made from the page |
 | `settings` | the footer: one width for the talk button whatever it says, the two half-height switches stacked beside it, sharing and the way out on the other side, and the cog opening a page with what each switch means when it is off |

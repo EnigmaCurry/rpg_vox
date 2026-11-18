@@ -1,7 +1,7 @@
 <script>
   import {
     room, setName, setVolume, avatarOf, forgetAvatar, myFaces, faceAt, wearFace,
-    command, setTalkHush, setBotsOff, setTalk, theAI, theAIs,
+    command, setTalkHush, setTalk, theAI, theAIs,
   } from '../lib/room.svelte.js';
   import { theme, setTheme, THEMES } from '../lib/theme.svelte.js';
   import {
@@ -354,45 +354,6 @@
       </span>
     </label>
     {#if room.pttError}<p class="warn">{room.pttError}</p>{/if}
-  </section>
-
-  <!-- The other half of the footer's pair: what BOTS off means. The
-       switch itself is down there, because turning the AIs off is
-       something you do in the middle of a conversation; which of the
-       two ways it is off is a thing about you and your table, and it
-       is settled here. See `setBotsOff`. -->
-  <section>
-    <h2>Turning {one ? 'the AI' : 'the AIs'} off</h2>
-    <p class="note first">
-      <strong>BOTS</strong> in the footer says whether {theAI('or')}
-      {one ? 'may answer' : 'may answer'} what you say. It is yours alone — turning it
-      off changes nothing for anybody else in the room, and everything said is
-      still written into the one conversation. This is what off means for you.
-    </p>
-    <label class="duplex">
-      <input type="radio" name="bots-off" checked={room.botsOff === 'named'}
-        onchange={() => setBotsOff('named')} />
-      <span>
-        Unless I say its name
-        <small>
-          {one ? 'It stays' : 'They stay'} out of what you say, and still
-          {one ? 'answers' : 'answer'} when you call {one ? 'it' : 'one of them'} by
-          name — so a quiet room is still a room you can ask a question in.
-        </small>
-      </span>
-    </label>
-    <label class="duplex">
-      <input type="radio" name="bots-off" checked={room.botsOff === 'never'}
-        onchange={() => setBotsOff('never')} />
-      <span>
-        Never
-        <small>
-          Nothing you say reaches {one ? 'it' : 'them'}, its own name included.
-          Someone else in the room can still bring {one ? 'it' : 'them'} in, and
-          you will hear the answer.
-        </small>
-      </span>
-    </label>
   </section>
 
   <section>

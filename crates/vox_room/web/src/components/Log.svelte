@@ -188,14 +188,10 @@
           beside the faders.
         {:else if room.game}
           Entering <strong>{room.game}</strong>…
-        {:else if room.bots === 'never'}
+        {:else if room.bots !== 'any'}
           Nothing said yet. You have <strong>BOTS</strong> off, so nothing you say
           reaches {it} — the room is yours. Turn it on in the footer, or let
           somebody else bring {it} in.
-        {:else if room.bots === 'named'}
-          Nothing said yet. You have <strong>BOTS</strong> off, so {it}
-          {one ? 'stays' : 'stay'} out of what you say until you say
-          <strong>{theAI()}</strong>. Turn it on and {answers} whenever you pause.
         {:else if ais.every((a) => a.mode === 'never')}
           Nothing said yet. The room has {theAI()} saying nothing just now,
           so it is yours: join the audio and talk.

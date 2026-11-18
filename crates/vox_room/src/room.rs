@@ -358,14 +358,10 @@ pub enum Bots {
     /// everybody starts as.
     #[default]
     Any,
-    /// Off, and off means *unless they are called by name*. The AI
-    /// stays out of what this person says until they say its name, and
-    /// then it answers -- which is the nuance the switch would
-    /// otherwise lose: somebody who wants a quiet room still wants to
-    /// be able to ask a question.
-    Named,
-    /// Off, and off means nothing at all. Not even its own name
-    /// reaches it from this person.
+    /// Off, and off is off. Nothing they say reaches a turn, their
+    /// calling an AI by name included. There used to be a softer off
+    /// that still let a name through; it made the switch something to
+    /// think about rather than something to flip, so it went.
     Never,
 }
 
@@ -373,12 +369,14 @@ impl Bots {
     /// What the database and the browser call it. Empty, the column's
     /// default, is [`Bots::Any`]: everybody starts with the button on,
     /// and a row written before the column existed is somebody nobody
-    /// had asked.
+    /// had asked. "named" is the softer off that no longer exists, so
+    /// somebody who had chosen it -- in the store or in a tab still
+    /// running the old page -- is off, which is what they had asked
+    /// for when they turned the button off.
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "any" | "" => Some(Bots::Any),
-            "named" => Some(Bots::Named),
-            "never" => Some(Bots::Never),
+            "never" | "named" => Some(Bots::Never),
             _ => None,
         }
     }
@@ -386,7 +384,6 @@ impl Bots {
     pub fn as_str(self) -> &'static str {
         match self {
             Bots::Any => "any",
-            Bots::Named => "named",
             Bots::Never => "never",
         }
     }
@@ -1039,6 +1036,17 @@ struct Tab {
     /// Push to talk: unmuted means holding the key, and everything said
     /// until release is one entry, however long the pauses.
     ptt: bool,
+    /// This client writes down its own words, so the room must not.
+    /// For a program that joins as a person would -- a bot with its
+    /// own voice, a music player, a sound board -- whose audio is not
+    /// speech, or is speech it already has the text of. Its audio is
+    /// heard by the room exactly as before; it is never put through
+    /// speech-to-text, never counts as talking (so it neither ducks
+    /// nor cuts off an AI), and never becomes a voice sample. What it
+    /// sends as `text` is what goes in the conversation, and what the
+    /// AIs answer. Lasts as long as the connection: it is a fact about
+    /// the program on the other end, not a preference to keep.
+    own_words: bool,
 }
 
 #[derive(Default)]
@@ -2755,8 +2763,8 @@ impl Room {
         Ok(chosen.to_string())
     }
 
-    /// Whether the AIs may answer `person`: their BOTS button, and
-    /// what they have said the off position means. Theirs alone, kept
+    /// Whether the AIs may answer `person`: their BOTS button, on or
+    /// off. Theirs alone, kept
     /// against the name that never changes, and the same in every room
     /// of the house -- see [`Bots`].
     ///
@@ -4321,6 +4329,22 @@ impl Room {
         }
     }
 
+    /// Whether `person`'s client, in one tab, writes down its own words
+    /// rather than having the room transcribe its audio. See
+    /// [`Tab::own_words`].
+    ///
+    /// An utterance the engine was in the middle of is closed by the
+    /// silence it is fed from here on, as with a mute, so turning this
+    /// on mid-sentence loses nothing already heard.
+    pub fn set_own_words(&self, person: &str, tab: u64, on: bool) {
+        let mut st = self.lock();
+        let Some(t) = st.people.get_mut(person).and_then(|p| p.tabs.get_mut(&tab)) else {
+            return;
+        };
+        t.own_words = on;
+        info!(person, tab, on, "transcribes itself");
+    }
+
     /// Decoded mic audio (48 kHz mono) from `person`.
     pub fn mic_audio(self: &Arc<Self>, person: &str, pcm: &[f32]) {
         self.mixer.push_mic(person, pcm);
@@ -4345,6 +4369,12 @@ impl Room {
             let Some(p) = st.people.get_mut(person) else {
                 return;
             };
+            // Writing down its own words: nothing here is for the
+            // engine, and none is made for it. One made before the
+            // switch is fed silence below, so it closes what it had.
+            if p.own_words() && p.engine.is_none() {
+                return;
+            }
             if p.engine.is_none() {
                 if let Some(make) = &self.stt {
                     // Their language picks the streaming model, so an
@@ -4367,7 +4397,7 @@ impl Room {
                     }
                 }
             }
-            (p.engine.clone(), p.muted() || silent)
+            (p.engine.clone(), p.muted() || p.own_words() || silent)
         };
         if let Some(e) = pusher {
             if muted {
@@ -9124,8 +9154,8 @@ impl Room {
             let seat = st.bot(&bot).seat;
             // And not the same as what was said, either: each person's
             // BOTS switch says whether their words may be answered at
-            // all. On, they count like anybody's; off, only a sentence
-            // with this one's name in it counts, or nothing does. So
+            // all. On, they count like anybody's; off, nothing of
+            // theirs does, this one's name included. So
             // the words are taken one speaker at a time rather than run
             // together -- see `Bots`.
             let mut mine = String::new();
@@ -9137,7 +9167,6 @@ impl Room {
                 let called = self.named(st, text).contains(&bot);
                 let counts = match may.get(said_by).copied().unwrap_or_default() {
                     Bots::Any => true,
-                    Bots::Named => called,
                     Bots::Never => false,
                 };
                 if !counts {
@@ -9403,6 +9432,11 @@ impl Room {
             .log
             .iter()
             .filter(|e| e.kind == Kind::Human && !e.sent && !e.text.is_empty())
+            // Somebody with BOTS off is owed nothing, so nothing of
+            // theirs is a promise -- see `Bots`.
+            .filter(|e| {
+                st.people.get(&e.who).map(|p| p.bots).unwrap_or_default() == Bots::Any
+            })
             .collect();
         if st.people.values().any(|p| p.speaking || p.holding()) || pending.is_empty() {
             return false;
@@ -9512,6 +9546,13 @@ impl Person {
     /// words are broken into entries.
     fn ptt(&self) -> bool {
         self.live().any(|t| t.ptt)
+    }
+
+    /// Writes down its own words, from any tab, open mic or not: the
+    /// audio can arrive before a `mic`, and none of it is to be taken
+    /// for speech. See [`Tab::own_words`].
+    fn own_words(&self) -> bool {
+        self.tabs.values().any(|t| t.own_words)
     }
 
     /// Holding push to talk: not done talking, however long the pause.
@@ -10956,10 +10997,8 @@ mod tests {
         assert_eq!(heard(&s), "One two. Three four");
     }
 
-    /// Whether the AIs may answer *you* is your own switch, and the
-    /// room reads it one speaker at a time: with it off, your pause is
-    /// not a pause anybody answers, and your calling it by name still
-    /// is.
+    /// BOTS is on or off, and off is off: with it off, nothing you say
+    /// is answered -- calling the AI by name included.
     #[test]
     fn the_bots_switch_says_whether_your_words_are_answered() {
         let (r, turns) = room(Mode::Auto);
@@ -10972,45 +11011,78 @@ mod tests {
         r.stop_agent();
 
         // Off: the AI stays out of what they say...
-        assert_eq!(r.set_bots("Ryan", "named"), Ok("named".into()));
+        assert_eq!(r.set_bots("Ryan", "never"), Ok("never".into()));
         r.on_paragraph("Ryan", &para("p2", "And then along the wall.", false));
         r.tick(quiet(&r));
         assert!(turns.try_recv().is_err(), "theirs to be left out of");
 
-        // ...until they ask it something, which is the whole of the
-        // nuance in the switch.
+        // ...and its name is no way round that.
         r.on_paragraph("Ryan", &para("p3", "Vox, what do I see?", false));
+        assert!(!r.will_answer(&r.lock()), "nor is an answer promised");
         r.tick(quiet(&r));
-        let t = turns.try_recv().expect("called by name");
-        assert_eq!(t.cue, Cue::Speak, "asked, so it answers rather than judges");
+        assert!(turns.try_recv().is_err(), "not even its own name");
+
+        // And back on: the next pause is answered, reading the whole
+        // conversation, which is the room's.
+        assert_eq!(r.set_bots("Ryan", "any"), Ok("any".into()));
+        r.on_paragraph("Ryan", &para("p4", "Right then.", false));
+        r.tick(quiet(&r));
+        let t = turns.try_recv().expect("the button again");
         assert_eq!(
             t.messages,
             vec![(
                 Role::User,
-                "Ryan: I check the door.\nRyan: And then along the wall.\nRyan: Vox, what do I see?"
+                "Ryan: I check the door.\nRyan: And then along the wall.\nRyan: Vox, what do I see?\nRyan: Right then."
                     .into()
             )],
-            "and it reads the whole conversation, which is the room's"
         );
-        r.stop_agent();
 
-        // Off meaning never: not even its own name reaches it.
-        assert_eq!(r.set_bots("Ryan", "never"), Ok("never".into()));
-        r.on_paragraph("Ryan", &para("p4", "Vox, are you there?", false));
-        r.tick(quiet(&r));
-        assert!(turns.try_recv().is_err(), "nothing of theirs at all");
-
-        // And back on.
-        assert_eq!(r.set_bots("Ryan", "any"), Ok("any".into()));
-        r.on_paragraph("Ryan", &para("p5", "Right then.", false));
-        r.tick(quiet(&r));
-        assert!(turns.try_recv().is_ok(), "the button again");
-
+        // The softer off that used to exist is off, so a tab still
+        // running the old page is put right rather than refused.
+        assert_eq!(r.set_bots("Ryan", "named"), Ok("never".into()));
         assert!(
             r.set_bots("Ryan", "sometimes").is_err(),
             "and a switch the room has never heard of is refused"
         );
         assert!(r.set_bots("Mallory", "never").is_err(), "and so is a stranger");
+    }
+
+    /// A client that writes down its own words is heard but never
+    /// transcribed: no engine is made for it, its audio is not
+    /// talking, and what it types is what the AI answers.
+    #[test]
+    fn a_client_that_writes_its_own_words_is_not_transcribed() {
+        let (store, cfg) = lobby(Mode::Auto);
+        let made = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = made.clone();
+        let stt: EngineFactory = Arc::new(move |_, _, _| {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            anyhow::bail!("no models in a test")
+        });
+        let (r, mut wiring) =
+            Room::new(store, cfg, None, BTreeMap::new(), Some(stt), None, None).unwrap();
+        let turns = wiring.pop().expect("a room has an AI in it").turns;
+
+        r.join("Jukebox", 1);
+        r.set_mic("Jukebox", 1, true);
+        r.set_own_words("Jukebox", 1, true);
+        r.mic_audio("Jukebox", &speech(0.5));
+        assert_eq!(made.load(std::sync::atomic::Ordering::SeqCst), 0, "nothing to transcribe it with");
+        assert!(r.lock().people["Jukebox"].engine.is_none());
+
+        // What it sends as text is its words, and is answered.
+        r.typed("Jukebox", "Now playing: the tavern theme.").unwrap();
+        r.tick(quiet(&r));
+        let t = turns.try_recv().expect("its own words are answered");
+        assert_eq!(
+            t.messages,
+            vec![(Role::User, "Jukebox: Now playing: the tavern theme.".into())],
+        );
+
+        // Turned off, its audio goes back through speech-to-text.
+        r.set_own_words("Jukebox", 1, false);
+        r.mic_audio("Jukebox", &speech(0.02));
+        assert_eq!(made.load(std::sync::atomic::Ordering::SeqCst), 1, "transcribed again");
     }
 
     /// One person's switch is one person's. The room is a room: the AI
