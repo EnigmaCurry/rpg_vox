@@ -331,7 +331,7 @@
        audio and the space bar still works. -->
   <Settings />
 {:else}
-  <div class="app show-{area}" class:watching={screen.watching != null} class:nocards={!hasCards}>
+  <div class="app show-{area}" class:watching={screen.watching != null || screen.waiting} class:nocards={!hasCards}>
     <!-- What is about to happen, while a file is over the room: the
          one thing a drop can do here, said before it is let go of. -->
     {#if dragging > 0}
@@ -386,7 +386,7 @@
 
     <Log />
 
-    {#if screen.watching != null}<Board />{/if}
+    {#if screen.watching != null || screen.waiting}<Board />{/if}
 
     <!-- What the talk button says, and how wide it is. The one it is
          saying is on top of the rest, which are there to be measured

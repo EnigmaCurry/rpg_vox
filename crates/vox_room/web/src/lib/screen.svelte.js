@@ -27,6 +27,9 @@ const THUMB_BITRATE = 150_000;
 // A keyframe this often even if nobody asked, so a tab that arrives
 // between requests still fills in quickly.
 const KEY_EVERY_MS = 2000;
+// How long a desktop that was cut off, rather than stopped, stays up
+// full size waiting for its sharer to come back with it.
+const WAIT_MS = 60_000;
 
 export const screen = $state({
   connected: false,
@@ -34,10 +37,19 @@ export const screen = $state({
   // Everyone sees the same list -- it is who is sharing, not who is
   // watching.
   streams: [],
+  // Which room `streams` is the list of, as the server said it. The
+  // room socket says when this tab changes rooms, and this socket says
+  // who is sharing there, and the two arrive in either order.
+  room: null,
   // This tab is sharing its own desktop.
   sharing: false,
   // The stream this tab has open full size, and nobody else's business.
   watching: null,
+  // The person whose desktop this tab had open full size when their
+  // connection dropped: { person, until }. The full-size view stays up,
+  // showing the last picture, and opens their desktop again by itself
+  // if they are back sharing it before `until`.
+  waiting: null,
   error: null,
 });
 
@@ -119,6 +131,7 @@ function apply(ev) {
     case 'streams': {
       const before = new Map(screen.streams.map((s) => [s.id, s]));
       screen.streams = ev.streams;
+      screen.room = ev.room ?? null;
       // A stream that stopped, or came back a different size, has
       // decoders configured for a picture that no longer exists.
       for (const s of ev.streams) {
@@ -134,8 +147,22 @@ function apply(ev) {
       if (screen.watching != null && !ev.streams.some((s) => s.id === screen.watching)) {
         screen.watching = null;
       }
+      // Back, under a new id: open it again.
+      if (screen.waiting) {
+        const back = ev.streams.find((s) => s.person === screen.waiting.person);
+        if (back) {
+          stopWaiting();
+          watch(back.id);
+        }
+      }
       break;
     }
+    case 'dropped':
+      // What we had open full size was cut off, not stopped. The
+      // `streams` without it comes next and lets go of it; keep the
+      // view up for its sharer to come back to.
+      if (ev.id === screen.watching) wait(ev.person);
+      break;
     case 'publishing':
       if (publisher) publisher.id = ev.id;
       break;
@@ -239,6 +266,23 @@ export function showThumb(id, canvas) {
   };
 }
 
+let waitTimer = null;
+
+function wait(person) {
+  stopWaiting();
+  screen.waiting = { person, until: Date.now() + WAIT_MS };
+  waitTimer = setTimeout(() => {
+    waitTimer = null;
+    screen.waiting = null;
+  }, WAIT_MS);
+}
+
+function stopWaiting() {
+  if (waitTimer) clearTimeout(waitTimer);
+  waitTimer = null;
+  screen.waiting = null;
+}
+
 /// Open one desktop full size, on this screen alone. `null` closes it.
 export function watch(id) {
   if (id != null && !screen.streams.some((s) => s.id === id)) return;
@@ -249,6 +293,7 @@ export function watch(id) {
 }
 
 export function unwatch() {
+  stopWaiting();
   if (screen.watching != null) drop(screen.watching);
   board = null;
   screen.watching = null;
@@ -469,20 +514,31 @@ export async function share() {
   }
 }
 
-/// This tab has gone to another room. Nothing it was being sent came
-/// from here, so let go of every decoder and wait to be told who is
-/// sharing in the room it has arrived in -- the server says, the
-/// moment it has moved us.
+/// This tab has gone to `where`. Nothing it was being sent from the
+/// room it left belongs here, so let go of every decoder and wait to be
+/// told who is sharing in the room it has arrived in -- the server
+/// says, the moment it has moved us.
+///
+/// Unless it already has. The server says so down this socket, and the
+/// room's `hello` that brought us here comes down the other one: there
+/// is no telling which lands first. Wiping a list that is already the
+/// new room's left the tab sure nobody was sharing until somebody
+/// started or stopped -- a desktop on everyone else's screen and not on
+/// this one, put right only by a reload or a reshare.
 ///
 /// A share of our own is not stopped here. The server is what ends it,
 /// because the server is what knows we really did change rooms, and it
 /// says so down this socket (`unshared` above) -- which is also how a
 /// second tab of ours pressing another room stops the desktop this one
 /// is sharing.
-export function moved() {
+export function moved(where) {
+  if (where != null && screen.room === where) return;
   for (const s of screen.streams) drop(s.id);
   screen.streams = [];
+  screen.room = null;
   screen.watching = null;
+  // Their desktop, if they come back with it, is in the room we left.
+  stopWaiting();
 }
 
 export function stopSharing() {

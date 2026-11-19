@@ -5,6 +5,9 @@
   import { fieldAt } from '../lib/keys.svelte.js';
 
   const stream = $derived(screen.streams.find((s) => s.id === screen.watching));
+  // Their connection dropped: the last picture stays up, dimmed, until
+  // they are back sharing it or the wait runs out.
+  const person = $derived(stream?.person ?? screen.waiting?.person);
 
   let canvas = $state();
   $effect(() => (canvas ? showBoard(canvas) : undefined));
@@ -19,9 +22,9 @@
 
 <svelte:window {onkeydown} />
 
-<section class="board" aria-label="{stream?.person ?? 'A'}'s desktop">
+<section class="board" class:waiting={!stream} aria-label="{person ?? 'A'}'s desktop">
   <header>
-    <h2>{stream?.person}'s desktop</h2>
+    <h2>{person}'s desktop</h2>
     <span class="hint">Only you are looking at this.</span>
     <div class="spacer"></div>
     <button onclick={unwatch}>Close <kbd class="shortcut">Esc</kbd></button>
@@ -29,6 +32,9 @@
   <!-- The picture keeps its own shape; the frame around it is the room's. -->
   <div class="picture">
     <canvas bind:this={canvas}></canvas>
+    {#if !stream}
+      <p class="lost" role="status">{person} dropped off. Waiting for them to come back&hellip;</p>
+    {/if}
   </div>
 </section>
 
@@ -58,6 +64,16 @@
     align-items: center;
     justify-content: center;
     padding: 8px;
+    position: relative;
+  }
+  .waiting canvas { opacity: 0.35; filter: grayscale(1); }
+  .lost {
+    position: absolute;
+    margin: 0;
+    padding: 10px 16px;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    font-size: 13px;
   }
   /* A desktop is wider than it is tall and the area rarely matches it:
      fit the picture inside, rather than cropping or stretching it. */

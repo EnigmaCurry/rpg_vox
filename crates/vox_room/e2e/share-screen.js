@@ -5,7 +5,8 @@
 // a thumbnail of Ryan's desktop, that Ryan's own strip shows the picture
 // he is encoding, that opening it full size is Alex's alone -- Ryan's
 // screen doesn't change -- and that closing it stops the full-size
-// stream. Needs `playwright` (with Chromium). Each browser is new, so
+// stream -- and that Alex walking out and back in finds the desktop
+// still there. Needs `playwright` (with Chromium). Each browser is new, so
 // each run wants new invite links.
 //
 // Headless Chromium has no desktop to capture, so the script makes
@@ -17,7 +18,7 @@
 //
 //   CHROME=$(which chromium) node share-screen.js RYAN_LINK ALEX_LINK
 const { chromium } = require('playwright');
-const { intoARoom } = require('./room.js');
+const { goTo, intoARoom } = require('./room.js');
 const [ryanUrl, alexUrl, prefix = 'share'] = process.argv.slice(2);
 
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -45,6 +46,16 @@ async function person(name, url) {
   await ctx.addInitScript(() => {
     const real = navigator.mediaDevices.getDisplayMedia.bind(navigator.mediaDevices);
     navigator.mediaDevices.getDisplayMedia = (opts) => real({ ...opts, preferCurrentTab: true });
+    // Every socket the page opens, so a test can cut one the way a
+    // dropped connection would.
+    const Real = window.WebSocket;
+    window.__sockets = [];
+    window.WebSocket = class extends Real {
+      constructor(...a) {
+        super(...a);
+        window.__sockets.push(this);
+      }
+    };
   });
   const page = await ctx.newPage();
   await page.setViewportSize({ width: 1200, height: 760 });
@@ -111,7 +122,7 @@ async function painted(page, selector, ms = 15000) {
   // Out of the lobby and into the first room of the house: a desktop
   // is shared to the room you are in, and the lobby is the room nobody
   // stays in. Start the room with one.
-  await intoARoom(ryan.page);
+  const here = await intoARoom(ryan.page);
   await intoARoom(alex.page);
   await Promise.all([
     ryan.page.waitForSelector(strip('Alex')),
@@ -133,6 +144,19 @@ async function painted(page, selector, ms = 15000) {
     "Alex, who is sharing nothing, has no thumbnail of his own",
   );
 
+  // Who is sharing comes down the desktop socket and the change of
+  // room down the other, in no particular order. A tab that let the
+  // room's `hello` wipe a list that was already the new room's saw
+  // nobody sharing until somebody started or stopped. Racy by nature,
+  // so it goes round a few times.
+  console.log('\nAlex walks out and back in');
+  for (let i = 1; i <= 4; i++) {
+    await goTo(alex.page, 'Studio', 600);
+    await goTo(alex.page, here, 0);
+    const back = await painted(alex.page, thumb, 8000);
+    check(back?.spread > 20, `Ryan's desktop is still in Alex's mixer when he is back (${i})`, JSON.stringify(back));
+  }
+
   console.log('\nAlex opens it full size');
   await alex.page.click(`${strip('Ryan')} .desktop`);
   await alex.page.waitForSelector('.board');
@@ -151,6 +175,22 @@ async function painted(page, selector, ms = 15000) {
 
   await alex.page.screenshot({ path: `${prefix}-watching.png` });
 
+  // Ryan's connection drops with Alex watching. The picture stays up
+  // waiting, and when Ryan's tab is back sharing -- a new stream, by
+  // the server's count -- Alex is looking at it again without doing
+  // anything.
+  console.log("\nRyan's desktop socket drops while Alex watches");
+  await ryan.page.evaluate(() => {
+    for (const s of window.__sockets) if (s.url.endsWith('/screen.ws')) s.close();
+  });
+  await alex.page.waitForSelector('.board .lost', { timeout: 5000 }).catch(() => {});
+  check(!!(await alex.page.locator('.board .lost').count()), 'Alex is told Ryan dropped off, and the view stays up');
+  await alex.page.screenshot({ path: `${prefix}-waiting.png` });
+  await alex.page.waitForSelector('.board .lost', { state: 'detached', timeout: 15000 }).catch(() => {});
+  check(!(await alex.page.locator('.board .lost').count()), 'and stops waiting when Ryan is back');
+  const again = await painted(alex.page, '.board canvas');
+  check(again?.spread > 20 && again.w > alexThumb.w, "Alex is watching Ryan's desktop full size again", JSON.stringify(again));
+
   console.log('\nAlex closes it');
   await alex.page.click('.board button');
   await alex.page.waitForSelector('.board', { state: 'detached' });
@@ -158,8 +198,13 @@ async function painted(page, selector, ms = 15000) {
   const after = await painted(alex.page, thumb);
   check(after?.spread > 20, 'the thumbnail carries on after the full size is closed', JSON.stringify(after));
 
-  console.log('\nRyan stops sharing');
+  console.log('\nRyan stops sharing, with Alex watching');
+  await alex.page.click(`${strip('Ryan')} .desktop`);
+  await alex.page.waitForSelector('.board');
   await ryan.page.click(STOP);
+  // On purpose is not a drop: nothing to wait for.
+  await alex.page.waitForSelector('.board', { state: 'detached', timeout: 5000 }).catch(() => {});
+  check(!(await alex.page.locator('.board').count()), "Alex's full-size view closes at once");
   await alex.page.waitForSelector(`${strip('Ryan')} .desktop`, { state: 'detached' });
   check(true, "the thumbnail goes from Alex's mixer");
 

@@ -1420,7 +1420,7 @@ function apply(ev) {
         room.reading = null;
       }
       // Whatever was being shared belonged to the room just left.
-      if (moved) screenMoved();
+      if (moved) screenMoved(room.where);
       // The directory may not have arrived yet, the first time; `rooms`
       // does this too, and whichever comes second is the one that acts.
       syncUrl();

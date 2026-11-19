@@ -47,11 +47,15 @@
 //! And to one:
 //!
 //! ```json
-//! {"type": "streams", "streams": [{"id":3,"person":"Alex","codec":"vp8","thumb":{…},"full":{…}}]}
+//! {"type": "streams", "room": "study", "streams": [{"id":3,"person":"Alex","codec":"vp8","thumb":{…},"full":{…}}]}
 //! {"type": "publishing", "id": 3}
 //! {"type": "keyframe", "kind": 0}
 //! {"type": "want", "full": true}
+//! {"type": "dropped", "id": 3, "person": "Alex"}
 //! ```
+//!
+//! `dropped` goes only to the tabs that had that stream open full size,
+//! when the socket sharing it went away rather than stopped sharing.
 //!
 //! `want` is how a publisher learns whether to encode the full size at
 //! all, and `keyframe` is the only thing the relay ever asks for.
@@ -552,7 +556,11 @@ fn streams_event(st: &State, room: &str) -> Value {
         })
         .collect();
     streams.sort_by_key(|s| s["id"].as_u64().unwrap_or(0));
-    json!({ "type": "streams", "streams": streams })
+    // Which room this is the list of. The tab hears about changing rooms
+    // on its other socket, and the two don't arrive in any order: this
+    // is how it tells a list for the room it has just walked into from
+    // one for the room it left.
+    json!({ "type": "streams", "room": room, "streams": streams })
 }
 
 /// Tell every tab who is sharing in the room it is in. One event per
@@ -688,6 +696,22 @@ fn forget(st: &mut State, id: u64) {
     st.clients.remove(&id);
     if let Some(p) = st.publishers.remove(&id) {
         info!(socket = id, person = %p.person, stream = p.id, "sharing ended with the socket");
+        // Whoever had it open full size is told it was cut off rather
+        // than stopped, before the list without it. A sharer whose
+        // connection dropped is usually back in seconds, sharing under
+        // a new id, and a viewer keeps the picture up waiting for that
+        // rather than being thrown back to the room. A share stopped
+        // on purpose says nothing of the kind, and closes.
+        let watchers: Vec<u64> = st
+            .clients
+            .iter()
+            .filter(|(_, c)| c.watching == Some(p.id))
+            .map(|(id, _)| *id)
+            .collect();
+        let ev = json!({ "type": "dropped", "id": p.id, "person": p.person });
+        for w in watchers {
+            send_ctl(st, w, &ev);
+        }
         stop_watching(st, p.id);
         broadcast_streams(st);
     }
@@ -903,15 +927,38 @@ mod tests {
         screen.watch(RYAN, Some(1));
         ryan.control();
         screen.remove_client(ALEX);
-        let last = ryan
-            .control()
-            .into_iter()
-            .rfind(|v| v["type"] == "streams")
-            .expect("a streams event");
-        assert_eq!(last["streams"].as_array().unwrap().len(), 0);
+        let got = ryan.control();
+        // Ryan had it open: he hears it was cut off, then the list
+        // without it, in that order.
+        let dropped = got.iter().position(|v| v["type"] == "dropped");
+        let streams = got.iter().rposition(|v| v["type"] == "streams");
+        assert!(dropped < streams && dropped.is_some(), "{got:?}");
+        assert_eq!(got[dropped.unwrap()]["person"], "Alex");
+        assert_eq!(got[streams.unwrap()]["streams"].as_array().unwrap().len(), 0);
         // Frames from a socket that has gone reach nobody.
         screen.frame(ALEX, frame(THUMB, true));
         assert!(ryan.got().is_empty());
+    }
+
+    /// Only a share that was cut off says so, and only to who had it
+    /// open: stopping on purpose closes everyone's view of it.
+    #[test]
+    fn a_stop_on_purpose_is_not_a_drop() {
+        let screen = Screen::new();
+        let _alex = tab(&screen, ALEX, "Alex");
+        let mut ryan = tab(&screen, RYAN, "Ryan");
+        let mut mike = tab(&screen, MIKE, "Mike");
+        share(&screen, ALEX);
+        screen.watch(RYAN, Some(1));
+        screen.unpublish(ALEX);
+        assert!(!ryan.control().iter().any(|v| v["type"] == "dropped"));
+
+        share(&screen, ALEX);
+        screen.watch(RYAN, Some(2));
+        mike.control();
+        screen.remove_client(ALEX);
+        assert!(ryan.control().iter().any(|v| v["type"] == "dropped" && v["id"] == 2));
+        assert!(!mike.control().iter().any(|v| v["type"] == "dropped"), "Mike wasn't watching");
     }
 
     /// A desktop is shared to a room. Walking into the next one does
@@ -965,6 +1012,25 @@ mod tests {
         screen.frame(ALEX, frame(THUMB, true));
         assert!(ryan.got().is_empty());
         assert!(mike.got().is_empty());
+
+        // Each list says whose it is, so a tab can tell the room it
+        // walked into from the one it left whichever socket is first.
+        let last = |t: &mut Tab| {
+            t.control()
+                .into_iter()
+                .rfind(|v| v["type"] == "streams")
+                .map(|v| {
+                    let room = v["room"].as_str().unwrap_or_default().to_string();
+                    (room, v["streams"].as_array().unwrap().len())
+                })
+        };
+        share(&screen, ALEX);
+        assert_eq!(last(&mut mike), Some(("Study".into(), 1)));
+        assert_eq!(
+            last(&mut ryan),
+            Some(("Lobby".into(), 0)),
+            "the Lobby's own list, with nothing of the Study's on it"
+        );
     }
 
     #[test]

@@ -212,6 +212,25 @@ releases.
 
 ### Voice room
 
+- **A desktop you are watching waits for its sharer to come back.** If
+  the person sharing dropped off -- a flaky connection, a reload --
+  everyone watching their desktop full size was thrown back to the
+  room, and had to find the thumbnail and open it again once they were
+  back. Now the full-size view stays up for a minute, showing the last
+  picture dimmed and saying who it is waiting for, and goes straight
+  back to the live desktop as soon as they are sharing it again.
+  Stopping a share on purpose still closes it for everyone at once.
+
+- **A desktop being shared is there when you walk in.** Somebody coming
+  into a room where a desktop was already being shared could be shown
+  nobody sharing it -- no thumbnail under the sharer's name, nothing to
+  open -- until a reload, or until the sharer stopped and shared again.
+  A tab hears that it has changed rooms on one socket and who is
+  sharing there on another, and the two can land in either order; when
+  the list of who is sharing came first, the change of room wiped it.
+  Now each list says which room it is for, and one that is already the
+  new room's is kept.
+
 - **BOTS off is off.** Turning it off used to mean, by default, that
   an AI stayed out of what you said *unless you said its name* -- with
   a setting to make it mean nothing at all. That made the switch
