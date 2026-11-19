@@ -13,12 +13,18 @@
 // was asked to play rather than trying to: what is checked is the
 // choosing, not the sound.
 //
+// Twice: once the way Chrome does it, with the AudioContext pointed at
+// the speakers, and once the way Firefox has to, with the context's own
+// `setSinkId` taken away and the room's sound played by an `<audio>`
+// element that is pointed instead -- and only while it is going
+// somewhere other than the system default.
+//
 //   vox_room --room Hall --room Lobby --room Studio --echo --no-stt --tts none
 
-const { is, report, launch, comeIn, goTo, whereYouAre, wait } = require('./room.js');
+const { is: check, report, launch, comeIn, goTo, whereYouAre, wait } = require('./room.js');
 const [ryanLink] = process.argv.slice(2);
 
-const ROOM_SELECT = '.settings label.speaker select';
+const ROOM_SELECT = '.rooms label.speaker select';
 const DOOR_SELECT = '.enter label:has(span:text-is("Speakers")) select';
 
 /// Two speakers the page can be pointed at, and a record of where it was.
@@ -41,20 +47,36 @@ function fakeSpeakers() {
   };
 }
 
-/// Where the room is playing just now: the last place it was sent.
-const playing = (page) => page.evaluate(() => window.__sinks.at(-1) ?? null);
+/// Firefox, as far as the room can tell: no `AudioContext.setSinkId`,
+/// and an `HTMLMediaElement.setSinkId` that writes down which element
+/// was pointed where.
+function likeFirefox() {
+  window.__firefox = true;
+  delete AudioContext.prototype.setSinkId;
+  window.__els = new Set();
+  HTMLMediaElement.prototype.setSinkId = function (id) {
+    window.__els.add(this);
+    this.__sink = id;
+    return Promise.resolve();
+  };
+}
+
+/// Where the room is playing just now. Chrome's way, the last place the
+/// context was sent. Firefox's, the element still playing the room's
+/// stream, if there is one -- none at all being the system default,
+/// which in this suite is never where the room is meant to be.
+const playing = (page) =>
+  page.evaluate(() => {
+    if (!window.__firefox) return window.__sinks.at(-1) ?? null;
+    const on = [...window.__els].filter((e) => e.srcObject && !e.paused);
+    return on.length === 1 ? on[0].__sink : on.length ? 'several' : 'default';
+  });
 const stored = (page) =>
   page.evaluate(() => JSON.parse(localStorage.getItem('vox_room.speaker.rooms') ?? '{}'));
 
-async function openSettings(page) {
-  await page.click('.tools button.cog');
+async function speakersHere(page) {
   await page.waitForSelector(ROOM_SELECT);
   await wait(400);
-}
-
-async function closeSettings(page) {
-  await page.keyboard.press('Escape');
-  await page.waitForSelector('.settings', { state: 'detached' });
 }
 
 async function plugDesk(page, on) {
@@ -69,10 +91,23 @@ async function plugDesk(page, on) {
   const browser = await launch();
   const ctx = await browser.newContext({ permissions: ['microphone'] });
   await ctx.addInitScript(fakeSpeakers);
-  const page = await ctx.newPage();
-  page.on('pageerror', (e) => console.log('[pageerror]', e.message));
+  // The invite is spent by the first pass; the second is the same
+  // browser, so it comes in on the cookie the first was given.
+  await scenario(await ctx.newPage(), 'chrome', ryanLink);
+  const firefox = await ctx.newPage();
+  await firefox.addInitScript(likeFirefox);
+  await scenario(firefox, 'firefox', ryanLink);
+  await browser.close();
+  report();
+})().catch((e) => {
+  console.error(e);
+  process.exit(1);
+});
 
-  await page.goto(ryanLink);
+async function scenario(page, how, link) {
+  page.on('pageerror', (e) => console.log('[pageerror]', e.message));
+  const is = (what, got, want) => check(`${how}: ${what}`, got, want);
+  await page.goto(link);
   await page.waitForSelector(DOOR_SELECT);
   await wait(600);
   await page.selectOption(DOOR_SELECT, 'headset');
@@ -80,7 +115,7 @@ async function plugDesk(page, on) {
   await goTo(page, 'Lobby');
   is('the door chose the headset, so the room plays there', await playing(page), 'headset');
 
-  await openSettings(page);
+  await speakersHere(page);
   is('this room has no speakers of its own yet', await page.inputValue(ROOM_SELECT), '');
   is('and says which ones it is borrowing from the door',
     await page.locator(`${ROOM_SELECT} option[value=""]`).textContent(),
@@ -89,13 +124,11 @@ async function plugDesk(page, on) {
   await wait(300);
   is('choosing the desk for this room plays it there', await playing(page), 'desk');
   is('and is written down against this room', await stored(page), { Lobby: 'desk' });
-  await closeSettings(page);
 
   await goTo(page, 'Studio');
   is('another room plays through the door\'s', await playing(page), 'headset');
-  await openSettings(page);
+  await speakersHere(page);
   is('and has nothing of its own', await page.inputValue(ROOM_SELECT), '');
-  await closeSettings(page);
 
   await goTo(page, 'Lobby');
   is('walking back in plays through the desk again', await playing(page), 'desk');
@@ -106,13 +139,13 @@ async function plugDesk(page, on) {
   if ((await whereYouAre(page)) !== 'Lobby') await goTo(page, 'Lobby');
   is('a room remembers its speakers across a reload', await playing(page), 'desk');
 
-  await openSettings(page);
-  is('and Settings says so', await page.inputValue(ROOM_SELECT), 'desk');
+  await speakersHere(page);
+  is('and the room says so', await page.inputValue(ROOM_SELECT), 'desk');
   await plugDesk(page, false);
   is('desk unplugged: back to the door\'s', await playing(page), 'headset');
   is('but the choice is kept', await page.inputValue(ROOM_SELECT), 'desk');
   is('and the page says why the sound moved',
-    (await page.locator('.settings .speaker + .hint').textContent()).includes('aren\'t plugged in'),
+    (await page.locator('.rooms .speaker + .wearing').textContent()).includes('aren\'t plugged in'),
     true);
   await plugDesk(page, true);
   is('plugged back in: the desk again', await playing(page), 'desk');
@@ -122,9 +155,16 @@ async function plugDesk(page, on) {
   is('back to the door\'s speakers', await playing(page), 'headset');
   is('and nothing is left written down', await stored(page), {});
 
-  await browser.close();
-  report();
-})().catch((e) => {
-  console.error(e);
-  process.exit(1);
-});
+  // The system default at the door: Chrome points the context back at
+  // it, and Firefox has no element playing the room at all.
+  await page.reload();
+  await page.waitForSelector(DOOR_SELECT);
+  await wait(600);
+  await page.selectOption(DOOR_SELECT, '');
+  await comeIn(page);
+  if ((await whereYouAre(page)) !== 'Studio') await goTo(page, 'Studio');
+  is('the system default plays the room the plain way', await playing(page),
+    how === 'firefox' ? 'default' : '');
+
+  await page.close();
+}

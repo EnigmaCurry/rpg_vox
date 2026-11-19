@@ -212,6 +212,16 @@ releases.
 
 ### Voice room
 
+- **A room can play through speakers of its own, in Firefox too.**
+  Under **Speakers**, beside Transcription and Recording at the top of
+  the room's column, a room can be given other speakers than the ones
+  chosen at the door. It is remembered in this browser for that room
+  alone; every other room keeps the door's, and unplugged speakers are
+  only set aside until they are back. Firefox, which could not choose
+  speakers at all before, now can -- at the door as well -- by playing
+  the room through an audio element whenever it is going anywhere but
+  the system default.
+
 - **A desktop you are watching waits for its sharer to come back.** If
   the person sharing dropped off -- a flaky connection, a reload --
   everyone watching their desktop full size was thrown back to the

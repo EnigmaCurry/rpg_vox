@@ -25,12 +25,28 @@ export function supported() {
     && !!navigator.mediaDevices?.getUserMedia;
 }
 
-/// Whether this browser can send the room's sound to a chosen speaker.
-/// AudioContext.setSinkId is Chrome's; elsewhere the output follows the
-/// system default and the room doesn't offer the choice.
-export function canChooseSpeaker() {
+/// Whether the AudioContext itself can be sent to a chosen speaker.
+/// That is Chrome's `AudioContext.setSinkId`, and the room's sound goes
+/// straight out of the context to wherever it is pointed.
+function contextSinks() {
   return typeof AudioContext !== 'undefined'
     && typeof AudioContext.prototype.setSinkId === 'function';
+}
+
+/// Whether a media element can be: Firefox's way (116+). There the
+/// context has no say in where it plays, so a room on other speakers
+/// than the system's leaves the context through a MediaStream into an
+/// `<audio>` element pointed at them -- see `RoomAudio.setSpeaker`.
+function elementSinks() {
+  return typeof HTMLMediaElement !== 'undefined'
+    && typeof HTMLMediaElement.prototype.setSinkId === 'function';
+}
+
+/// Whether this browser can send the room's sound to a chosen speaker
+/// at all. Elsewhere the output follows the system default and the room
+/// doesn't offer the choice.
+export function canChooseSpeaker() {
+  return contextSinks() || elementSinks();
 }
 
 /// Ask for the microphone once, without keeping it: until permission has
@@ -73,6 +89,12 @@ export class RoomAudio {
     this.ctx = null;
     this.player = null;
     this.volume = null;
+    // Firefox's way to other speakers: the room's sound into a
+    // MediaStream and out of an `<audio>` element, only while it is
+    // being played somewhere other than the system default. See
+    // `setSpeaker`.
+    this.out = null;
+    this.outEl = null;
     // The room's sound, cut while push to talk is held on half duplex.
     // Its own node rather than the volume one: what you set in Settings
     // is yours to come back to, and a hush that moved the slider would
@@ -141,7 +163,6 @@ export class RoomAudio {
   /// after a gesture.
   async start(volume = 1, speakerId = null) {
     this.ctx = new AudioContext({ sampleRate: RATE, latencyHint: 'interactive' });
-    await this.setSpeaker(speakerId);
     if (this.ctx.state === 'suspended') await this.ctx.resume().catch(() => {});
     await this.ctx.audioWorklet.addModule(playerUrl);
     await this.ctx.audioWorklet.addModule(micUrl);
@@ -156,6 +177,9 @@ export class RoomAudio {
     this.volume = new GainNode(this.ctx, { gain: volume });
     this.hush = new GainNode(this.ctx, { gain: this.silent ? 0 : 1 });
     this.player.connect(this.hush).connect(this.volume).connect(this.ctx.destination);
+    // After the graph exists: on Firefox where it goes is a matter of
+    // what `volume` is connected to.
+    await this.setSpeaker(speakerId);
     // A context the browser suspends or interrupts (a modal dialog, an
     // audio device change) is started again at once, or on the next click.
     this.ctx.onstatechange = () => {
@@ -168,13 +192,56 @@ export class RoomAudio {
 
   /// Play the room through one speaker. A device that has gone away
   /// falls back to the system default rather than failing to start.
+  ///
+  /// Chrome points the context itself. Firefox can't, so there the
+  /// room's sound is taken off `ctx.destination` and played by an
+  /// `<audio>` element that can be pointed -- but only while it is
+  /// going somewhere other than the system default. The element is a
+  /// MediaStream's worth of buffering more than the context on its own,
+  /// and a room on the default speakers has no reason to pay for it.
   async setSpeaker(id) {
-    if (!this.ctx || !canChooseSpeaker()) return;
+    if (!this.ctx) return;
+    if (contextSinks()) {
+      try {
+        await this.ctx.setSinkId(id || '');
+      } catch (e) {
+        console.warn('[room] speaker', e);
+      }
+      return;
+    }
+    if (!elementSinks() || !this.volume) return;
+    if (!id) {
+      this.toContext();
+      return;
+    }
     try {
-      await this.ctx.setSinkId(id || '');
+      if (!this.outEl) {
+        this.out = new MediaStreamAudioDestinationNode(this.ctx, { channelCount: 2 });
+        this.outEl = new Audio();
+        this.outEl.srcObject = this.out.stream;
+      }
+      await this.outEl.setSinkId(id);
+      await this.outEl.play();
+      // Over only once the element is playing, so the room is never
+      // silent between the two -- and never in both at once either.
+      this.volume.disconnect();
+      this.volume.connect(this.out);
     } catch (e) {
       console.warn('[room] speaker', e);
+      this.toContext();
     }
+  }
+
+  /// Back out of the context's own output, and the element put away.
+  toContext() {
+    if (!this.outEl) return;
+    this.volume?.disconnect();
+    this.volume?.connect(this.ctx.destination);
+    this.outEl.pause();
+    this.outEl.srcObject = null;
+    this.outEl = null;
+    this.out?.disconnect();
+    this.out = null;
   }
 
   /// Start the audio again if the browser stopped it.
@@ -250,6 +317,12 @@ export class RoomAudio {
   async stop() {
     this.stopMic();
     this.link.silence();
+    if (this.outEl) {
+      this.outEl.pause();
+      this.outEl.srcObject = null;
+      this.outEl = null;
+      this.out = null;
+    }
     await this.ctx?.close().catch(() => {});
     this.ctx = null;
     this.player = null;

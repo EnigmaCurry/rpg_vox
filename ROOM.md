@@ -614,11 +614,15 @@ See ROOM_DOCKER.md.
   Pick your microphone and speakers there (both are remembered for next
   time), and push to talk, before you come in. **Leave audio** puts you
   back at the door and takes the sockets with it. Every room plays
-  through the door's speakers unless you give it others in
-  **Settings → What you hear → Speakers in *this room***: that choice
-  is kept in this browser for that room alone, so walking out goes back
-  to the door's and walking back in goes back to its own. If the room's
-  speakers are unplugged it plays through the door's until they are back.
+  through the door's speakers unless you give it others under
+  **Speakers**, with Transcription and Recording at the top of the
+  room's column: that choice is kept in this browser for that room
+  alone, so walking out goes back to the door's and walking back in
+  goes back to its own. If the room's speakers are unplugged it plays
+  through the door's until they are back. Chrome points the room's
+  audio straight at the speakers; Firefox can't, so there the room
+  plays through a hidden audio element instead, and only while it is
+  going somewhere other than the system default.
 
   **Agreeing to be heard.** Coming in means your microphone goes live to
   everyone else in the room, what you say is transcribed on the server

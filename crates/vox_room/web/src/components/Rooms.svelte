@@ -1,7 +1,9 @@
 <script>
   import {
     room, command, enterRoom, setInterpreter, setTranscribing, setRecording, theAI, theAIs, ask,
+    loadDevices, watchDevices, setRoomSpeaker,
   } from '../lib/room.svelte.js';
+  import { canChooseSpeaker } from '../lib/audio.js';
   import Strip from './Strip.svelte';
 
   // Two things, in one component because they are one idea: which room
@@ -25,6 +27,27 @@
   // put you in.
   let open = $state(false);
   let picker = $state();
+
+  // The speakers this room plays through, with what the room is. The
+  // door's list is from when you came in, so it is asked for again --
+  // the permission was given then, so the names come with it -- and
+  // kept up to date while you are here.
+  $effect(() => {
+    if (!canChooseSpeaker()) return;
+    loadDevices();
+    return watchDevices();
+  });
+  const doorSpeaker = $derived(
+    room.devices.speakers.find((d) => d.id === room.speakerId)?.label ?? 'System default',
+  );
+  const roomSpeakerGone = $derived(
+    !!room.roomSpeakerId && !room.devices.speakers.some((d) => d.id === room.roomSpeakerId),
+  );
+  const speakerHint = $derived(
+    roomSpeakerGone
+      ? "The speakers chosen for this room aren't plugged in, so it is playing through the door's until they are."
+      : 'Remembered for this room in this browser. Every other room keeps playing through the speakers chosen at the door.',
+  );
 
   function choose(r) {
     open = false;
@@ -290,6 +313,27 @@
         <option value="off">Off — not recorded</option>
       </select>
     </label>
+    <!-- Where this room comes out of, for you alone: the one thing up
+         here that is yours rather than everybody's, and here because
+         it is a choice about this room and no other. -->
+    {#if canChooseSpeaker()}
+      <label class="when stack speaker" title={speakerHint}>
+        <span class="what">Speakers</span>
+        <select value={room.roomSpeakerId} aria-label="Which speakers {room.title || 'this room'} plays through"
+          onchange={(e) => setRoomSpeaker(e.currentTarget.value)}>
+          <option value="">Same as the door: {doorSpeaker}</option>
+          {#each room.devices.speakers as d (d.id)}
+            <option value={d.id}>{d.label}</option>
+          {/each}
+          {#if roomSpeakerGone}
+            <option value={room.roomSpeakerId}>Unplugged speakers</option>
+          {/if}
+        </select>
+      </label>
+      {#if roomSpeakerGone}
+        <p class="wearing">{speakerHint}</p>
+      {/if}
+    {/if}
     <!-- Said and not only hovered: a room that is keeping nothing
          looks exactly like a room that is, and the one place anybody
          would think to look for the difference is here. -->
