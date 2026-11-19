@@ -29,7 +29,7 @@ const THUMB_BITRATE = 150_000;
 const KEY_EVERY_MS = 2000;
 // How long a desktop that was cut off, rather than stopped, stays up
 // full size waiting for its sharer to come back with it.
-const WAIT_MS = 60_000;
+const WAIT_MS = 180_000;
 
 export const screen = $state({
   connected: false,

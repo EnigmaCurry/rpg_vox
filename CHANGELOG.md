@@ -216,7 +216,7 @@ releases.
   the person sharing dropped off -- a flaky connection, a reload --
   everyone watching their desktop full size was thrown back to the
   room, and had to find the thumbnail and open it again once they were
-  back. Now the full-size view stays up for a minute, showing the last
+  back. Now the full-size view stays up for three minutes, showing the last
   picture dimmed and saying who it is waiting for, and goes straight
   back to the live desktop as soon as they are sharing it again.
   Stopping a share on purpose still closes it for everyone at once.
