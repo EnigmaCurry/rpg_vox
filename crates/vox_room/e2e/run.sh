@@ -97,7 +97,7 @@ rooms_of() {
 guests() {
   case $1 in
     door) echo "Fresh Known En Ru Fr" ;;
-    permalinks|ptt|settings) echo "Ryan" ;;
+    permalinks|ptt|settings|speakers) echo "Ryan" ;;
     roles) echo "[Ryan] Alex" ;;
     # Ryan owns the house here, because purging a room is the owner's
     # and the button is only drawn for them.
@@ -284,7 +284,7 @@ sqlite_get() { sqlite "$1" "$2"; }
 sqlite_set() { sqlite "$1" "$2" >/dev/null; }
 
 suites=("$@")
-[[ ${#suites[@]} -eq 0 ]] && suites=(rooms record bots door permalinks ptt settings roles conversations game cards avatars drop interpreter rename rejoin)
+[[ ${#suites[@]} -eq 0 ]] && suites=(rooms record bots door permalinks ptt settings speakers roles conversations game cards avatars drop interpreter rename rejoin)
 
 bad=0
 for suite in "${suites[@]}"; do

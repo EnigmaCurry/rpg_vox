@@ -247,6 +247,13 @@ export const room = $state({
   devices: { mics: [], speakers: [] },
   micId: readChoice('vox_room.mic'),
   speakerId: readChoice('vox_room.speaker'),
+  // The speakers this room plays through instead, or empty for the ones
+  // chosen at the door. This browser's, like the door's choice, and
+  // remembered for each room apart: the room you run a game in may want
+  // the speakers across the desk while every other room stays in your
+  // headset. Filled in from `vox_room.speaker.rooms` by each `hello`;
+  // see `setRoomSpeaker`.
+  roomSpeakerId: '',
   // The language you speak and want to hear, also chosen at the door.
   // Unlike the devices this one is the room's business too, so it is
   // saved on the server; the copy here is only what to show until the
@@ -329,6 +336,35 @@ function readChoice(key) {
 
 function writeChoice(key, id) {
   try { localStorage.setItem(key, id || ''); } catch {}
+}
+
+const ROOM_SPEAKERS = 'vox_room.speaker.rooms';
+
+/// Every room's own speakers, as `{ roomId: deviceId }`.
+function roomSpeakers() {
+  try {
+    const map = JSON.parse(localStorage.getItem(ROOM_SPEAKERS) ?? '{}');
+    return map && typeof map === 'object' ? map : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeRoomSpeaker(roomId, id) {
+  const map = roomSpeakers();
+  if (id) map[roomId] = id;
+  else delete map[roomId];
+  try { localStorage.setItem(ROOM_SPEAKERS, JSON.stringify(map)); } catch {}
+}
+
+/// The speakers this room plays through just now: its own, if it has
+/// some and they are plugged in, otherwise the door's. A room's choice
+/// that is unplugged is not forgotten -- it is the same headset or the
+/// same speakers when they come back -- only not used meanwhile.
+export function speakerNow() {
+  const own = room.roomSpeakerId;
+  if (own && room.devices.speakers.some((d) => d.id === own)) return own;
+  return room.speakerId;
 }
 
 function readNumber(key, fallback) {
@@ -1364,6 +1400,8 @@ function apply(ev) {
       // The worker reconnects on its own, so it is the one that has to
       // know which room to ask for.
       link?.setSeat(room.where);
+      room.roomSpeakerId = roomSpeakers()[room.where] ?? '';
+      audio?.setSpeaker(speakerNow());
       room.title = ev.room?.title ?? 'Voice room';
       room.alone = ev.room?.private ?? false;
       room.you = ev.you;
@@ -1650,6 +1688,8 @@ export async function loadDevices({ permit = false } = {}) {
   const keep = (list, id) => (list.some((d) => d.id === id) ? id : '');
   room.micId = keep(room.devices.mics, room.micId);
   room.speakerId = keep(room.devices.speakers, room.speakerId);
+  // Plugged back in, or pulled out: this room's own may be the one.
+  audio?.setSpeaker(speakerNow());
   return room.devices;
 }
 
@@ -1666,7 +1706,15 @@ export function setMicDevice(id) {
 export function setSpeakerDevice(id) {
   room.speakerId = id;
   writeChoice('vox_room.speaker', id);
-  audio?.setSpeaker(id);
+  audio?.setSpeaker(speakerNow());
+}
+
+/// Play this room through other speakers than the door's, or (with an
+/// empty id) go back to them. Kept for this room and this browser only.
+export function setRoomSpeaker(id) {
+  room.roomSpeakerId = id;
+  if (room.where) writeRoomSpeaker(room.where, id);
+  audio?.setSpeaker(speakerNow());
 }
 
 /// Type something into the room instead of saying it: exactly the
@@ -1776,7 +1824,7 @@ export async function joinAudio() {
   open();
   try {
     audio = new RoomAudio(link);
-    await audio.start(room.volume, room.speakerId);
+    await audio.start(room.volume, speakerNow());
     openInsides();
     // Any click or key brings back audio the browser stopped.
     addEventListener('pointerdown', resumeAudio);

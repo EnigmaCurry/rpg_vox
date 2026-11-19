@@ -2,7 +2,9 @@
   import {
     room, setName, setVolume, avatarOf, forgetAvatar, myFaces, faceAt, wearFace,
     command, setTalkHush, setTalk, theAI, theAIs,
+    loadDevices, watchDevices, setRoomSpeaker,
   } from '../lib/room.svelte.js';
+  import { canChooseSpeaker } from '../lib/audio.js';
   import { theme, setTheme, THEMES } from '../lib/theme.svelte.js';
   import {
     fieldAt, talk, bindTalk, keyName, refuse, bindOf, isDefault, DEFAULT,
@@ -16,6 +18,22 @@
   // place: the CSS draws it and `lib/pixels.js` is told it, and the
   // two must agree.
   const PAST = 56;
+
+  // The speakers to choose between for this room. The door's list is
+  // from when you came in, so it is asked for again -- the permission
+  // was given then, so the names come with it -- and kept up to date
+  // while this page is open.
+  $effect(() => {
+    if (!canChooseSpeaker()) return;
+    loadDevices();
+    return watchDevices();
+  });
+  const doorSpeaker = $derived(
+    room.devices.speakers.find((d) => d.id === room.speakerId)?.label ?? 'System default',
+  );
+  const roomSpeakerGone = $derived(
+    !!room.roomSpeakerId && !room.devices.speakers.some((d) => d.id === room.roomSpeakerId),
+  );
 
 
   // The things you set once, off the floor of the room.
@@ -365,6 +383,29 @@
         oninput={(e) => setVolume(Number(e.currentTarget.value))} />
       <span class="much">{Math.round(room.volume * 100)}%</span>
     </label>
+    {#if canChooseSpeaker()}
+      <label class="speaker">
+        <span>Speakers in {room.title || 'this room'}</span>
+        <select value={room.roomSpeakerId} onchange={(e) => setRoomSpeaker(e.currentTarget.value)}>
+          <option value="">Same as the door: {doorSpeaker}</option>
+          {#each room.devices.speakers as d (d.id)}
+            <option value={d.id}>{d.label}</option>
+          {/each}
+          {#if roomSpeakerGone}
+            <option value={room.roomSpeakerId}>Unplugged speakers</option>
+          {/if}
+        </select>
+      </label>
+      <p class="hint">
+        {#if roomSpeakerGone}
+          The speakers chosen for this room aren't plugged in, so it is playing
+          through the door's until they are.
+        {:else}
+          Remembered for this room in this browser. Every other room keeps
+          playing through the speakers chosen at the door.
+        {/if}
+      </p>
+    {/if}
   </section>
 
   <!-- What the room looks like, which is this browser's business and
@@ -494,6 +535,8 @@
   .manage { margin-top: 10px; }
   .slider { display: flex; align-items: center; gap: 10px; font-size: 13px; margin: 0; }
   .slider input[type='range'] { flex: 1; max-width: 18em; }
+  .speaker { display: flex; align-items: center; gap: 10px; font-size: 13px; margin: 12px 0 0; }
+  .speaker select { flex: 1; min-width: 0; max-width: 24em; }
   .name { display: flex; flex-direction: column; gap: 4px; max-width: 22em; }
   .name span { font-size: 12px; color: var(--muted); }
   .name input {
